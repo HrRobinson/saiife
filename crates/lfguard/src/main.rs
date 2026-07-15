@@ -34,7 +34,18 @@ enum Cmd {
     /// Print the full decision trace for a command (always exit 0).
     Explain { command: String },
     /// Hook mode: read a PreToolUse JSON payload on stdin, emit the response.
-    Check,
+    Check {
+        /// Deny via exit code 2 + stderr reason (universal agent contract)
+        /// instead of the JSON permissionDecision payload.
+        #[arg(long = "hook-exit")]
+        hook_exit: bool,
+        /// Append a JSONL record for each DENY to this file (best-effort).
+        #[arg(long = "audit-log", value_name = "PATH")]
+        audit_log: Option<String>,
+        /// Tag (pane id) attached to audit records.
+        #[arg(long = "audit-tag", value_name = "TAG")]
+        audit_tag: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -52,7 +63,9 @@ fn main() -> ExitCode {
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine, &command),
         Cmd::Explain { command } => cmd_explain(&engine, &command),
-        Cmd::Check => cmd_check(&engine),
+        Cmd::Check { hook_exit, audit_log, audit_tag } => {
+            cmd_check(&engine, hook_exit, audit_log.as_deref(), audit_tag.as_deref())
+        }
     }
 }
 
@@ -119,12 +132,17 @@ fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_check(engine: &Engine) -> ExitCode {
+fn cmd_check(
+    engine: &Engine,
+    hook_exit: bool,
+    audit_log: Option<&str>,
+    audit_tag: Option<&str>,
+) -> ExitCode {
     // Fail open: any error reading/parsing the payload -> allow.
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         warn("could not read hook payload; failing open (allow)");
-        return emit_allow();
+        return if hook_exit { ExitCode::SUCCESS } else { emit_allow() };
     }
     let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
         Ok(c) => c,
@@ -132,13 +150,47 @@ fn cmd_check(engine: &Engine) -> ExitCode {
             warn(&format!(
                 "hook payload not usable ({e}); failing open (allow)"
             ));
-            return emit_allow();
+            return if hook_exit { ExitCode::SUCCESS } else { emit_allow() };
         }
     };
-    match engine.evaluate(&command) {
-        Decision::Deny { reason, .. } => emit_deny(&reason),
-        Decision::Allow { .. } => emit_allow(),
+    let decision = engine.evaluate(&command);
+    if let (Some(path), Decision::Deny { reason, pack, .. }) = (audit_log, &decision) {
+        append_audit(path, audit_tag, &command, reason, pack);
     }
+    match decision {
+        Decision::Deny { reason, .. } => {
+            if hook_exit {
+                warn(&reason);
+                ExitCode::from(2)
+            } else {
+                emit_deny(&reason)
+            }
+        }
+        Decision::Allow { .. } => {
+            if hook_exit {
+                ExitCode::SUCCESS
+            } else {
+                emit_allow()
+            }
+        }
+    }
+}
+
+/// Best-effort append of one JSONL deny record. Never fails the process.
+fn append_audit(path: &str, tag: Option<&str>, command: &str, reason: &str, pack: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let rec = serde_json::json!({
+        "ts": ts, "tag": tag, "command": command, "reason": reason, "pack": pack,
+    });
+    use std::io::Write as _;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{rec}"));
 }
 
 /// Emit a PreToolUse "allow" response and exit 0.
