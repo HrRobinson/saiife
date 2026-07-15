@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/lfguard"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/HrRobinson/localflow"
+
+[profile.release]
+# lfguard is spawned per command by agent hooks; a small, fast binary matters.
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,61 @@
+# Cloud: gcloud / gsutil — opt-in.
+#
+# Blocks destructive Google Cloud operations: deleting projects, SQL instances,
+# compute instances, storage buckets, KMS keys; recursive object deletion; and
+# removing IAM policy bindings. Opt-in per environment (guard.packs), because a
+# machine that never touches GCP should not pay for these rules.
+#
+# Specific rules come first so the block reason names the resource class; a
+# general `gcloud ... delete` catch-all backs them for the long tail.
+
+[pack]
+id = "cloud.gcloud"
+name = "Cloud: gcloud"
+description = "Guards destructive gcloud/gsutil operations (project/SQL/compute/bucket/KMS deletes, IAM removal)."
+default_on = false
+version = 1
+triggers = ["gcloud", "gsutil"]
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+projects\s+delete\b'
+reason = "deletes an entire GCP project and every resource in it"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+(?:resource-manager\s+)?(?:projects|organizations|folders)\s+remove-iam-policy-binding\b'
+reason = "removes an IAM policy binding at project/org/folder scope (can lock out access)"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+sql\s+instances\s+delete\b'
+reason = "deletes a Cloud SQL instance and all of its databases"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+compute\s+instances\s+delete\b'
+reason = "deletes a Compute Engine instance and its local disks"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+storage\s+buckets\s+delete\b'
+reason = "deletes a Cloud Storage bucket"
+
+[[deny]]
+# `gsutil rb` (remove bucket) is the legacy-tool equivalent of
+# `gcloud storage buckets delete` above and was previously unguarded.
+pattern = '^(?:sudo\s+)?gsutil\s+(?:-\S+\s+)*rb(?:\s|$)'
+reason = "gsutil rb permanently removes a Cloud Storage bucket"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?(?:gcloud\s+storage\s+rm|gsutil\s+(?:-\S+\s+)*rm)\s+(?:\S+\s+)*(?:-[a-zA-Z]*r[a-zA-Z]*|-R|--recursive)\b'
+reason = "recursively deletes objects from a Cloud Storage bucket"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?gcloud\s+kms\s+(?:keys|keyrings)\s+.*\b(?:destroy|delete)\b'
+reason = "destroys a Cloud KMS key or keyring (data encrypted with it becomes unrecoverable)"
+
+[[deny]]
+# `delete` must be its own whitespace-delimited token (the actual verb
+# position), not merely a `\b`-bounded substring — `\bdelete\b` alone still
+# matches inside a resource *name* like `delete-me-vm` (a hyphen is a
+# non-word character, so a word boundary sits right after "delete" there
+# too), wrongly blocking read-only commands such as
+# `gcloud compute instances describe delete-me-vm`.
+pattern = '^(?:sudo\s+)?gcloud\s+\S+.*\sdelete(?:\s|$)'
+reason = "destructive gcloud delete operation"
