@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::lexer::{find_all_substitutions, split_segments};
 use crate::normalize::build_argv;
 use crate::pack::Pack;
-use crate::payload::inline_payload;
+use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
 use crate::wrappers::unwrap_transparent_prefix;
@@ -300,14 +300,17 @@ impl Engine {
                 }
             }
 
-            // Structural inline-payload re-entry: `bash -c '…'` etc. Not
-            // gated behind the pre-filter above — the payload may only
-            // resolve to something trigger-bearing once it is *re-lexed* on
-            // its own (a nested quote inside an outer single-quoted `-c`
-            // argument is invisible to the outer scan by design; the
-            // recursive call re-tokenizes it correctly).
+            // Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`,
+            // and `watch CMD …` (which joins its remaining args and runs them
+            // via `sh -c`). Not gated behind the pre-filter above — the
+            // payload may only resolve to something trigger-bearing once it is
+            // *re-lexed* on its own (a nested quote inside an outer
+            // single-quoted `-c` argument is invisible to the outer scan by
+            // design; the recursive call re-tokenizes it correctly). The two
+            // extractors are mutually exclusive on argv[0], so trying one then
+            // the other never double-recurses the same segment.
             if depth < MAX_INLINE_DEPTH {
-                if let Some(inner) = inline_payload(&argv) {
+                if let Some(inner) = inline_payload(&argv).or_else(|| watch_payload(&argv)) {
                     if start.elapsed() > self.budget {
                         return Decision::Allow {
                             trace: AllowTrace::FailedOpenTimeout,
