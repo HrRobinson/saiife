@@ -2,8 +2,9 @@
 //! no external pack files. At runtime localflow also loads `guard/packs/*.toml`
 //! from userData; the built-ins are the shipped defaults.
 //!
-//! G1 ships all four v1 packs: `core.filesystem` + `core.git` (default-on) and
-//! `cloud.gcloud` + `db.postgres` (opt-in via a profile — see `profile`).
+//! Ships `core.filesystem` + `core.git` (default-on) and the opt-in packs
+//! `cloud.gcloud`, `cloud.aws`, `iac.terraform`, and `db.postgres` (activated
+//! via a profile — see `profile`).
 
 use crate::pack::{load_pack_str, Pack, PackWarning};
 
@@ -17,6 +18,14 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     (
         "<builtin>cloud.gcloud",
         include_str!("../packs/cloud.gcloud.toml"),
+    ),
+    (
+        "<builtin>cloud.aws",
+        include_str!("../packs/cloud.aws.toml"),
+    ),
+    (
+        "<builtin>iac.terraform",
+        include_str!("../packs/iac.terraform.toml"),
     ),
     (
         "<builtin>db.postgres",

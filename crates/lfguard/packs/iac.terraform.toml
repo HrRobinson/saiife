@@ -1,0 +1,80 @@
+# IaC: Terraform — opt-in.
+#
+# The `terraform plan -out=plan.tfplan` -> human review -> `terraform apply
+# plan.tfplan` split IS localflow's approval gate. These rules exist to make
+# that gate unbypassable: they block the shapes that mutate infrastructure
+# WITHOUT a human-reviewed saved plan, plus the state-surgery and lock-bypass
+# footguns. Read-only verbs (`plan`, `output`, `show`, `state list/show`) never
+# block. Opt-in per environment (guard.packs) — a machine that never runs
+# Terraform should not pay for these rules.
+#
+# Precision matters more than coverage (the engine's zero-false-positive
+# invariant): a pack that blocks a safe command trains users to disable it. The
+# keystone "bare apply" rule therefore denies only the CLEARLY-bare form (no
+# positional plan-file argument); anything with a positional argument is treated
+# as a reviewed plan file and allowed. Fail-open on ambiguity, always.
+#
+# Specific rules come first so the block reason names the exact hazard; the
+# bare-apply keystone is last so more-specific reasons (destroy, auto-approve)
+# win when several shapes overlap.
+#
+# `terraform` accepts both single- and double-dash flags (Go flag parsing), so
+# flag rules match `--?`. A leading `-chdir=DIR`/other global option before the
+# subcommand is tolerated via an optional `(?:-\S+\s+)*` run.
+
+[pack]
+id = "iac.terraform"
+name = "IaC: Terraform"
+description = "Guards unreviewed/destructive Terraform (destroy, bare apply, -auto-approve, state rm/mv, force-unlock)."
+default_on = false
+version = 1
+triggers = ["terraform"]
+
+[[deny]]
+# Bare `terraform destroy` — tears down every managed resource. Any flags
+# (`-auto-approve`, `-target=...`) are still a destroy.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*destroy\b'
+reason = "'terraform destroy' tears down every managed resource — run a reviewed plan instead"
+
+[[deny]]
+# `terraform apply -destroy` / `--destroy` — the apply-shaped destroy.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*apply\b.*\s--?destroy\b'
+reason = "'terraform apply -destroy' tears down every managed resource — run a reviewed plan instead"
+
+[[deny]]
+# `-auto-approve` on apply or destroy, anywhere in argv — defeats the
+# interactive confirmation categorically.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*(?:apply|destroy)\b.*\s--?auto-approve\b'
+reason = "-auto-approve skips the interactive confirmation — apply a human-reviewed saved plan instead"
+
+[[deny]]
+# `terraform state rm` / `state mv` — silently detaches a resource from state;
+# a later apply may orphan or recreate it. Read verbs (`state list/show/pull`)
+# are untouched.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*state\s+(?:rm|mv)\b'
+reason = "'terraform state rm/mv' detaches resources from state — a later apply can orphan or recreate them"
+
+[[deny]]
+# `terraform force-unlock` — bypasses the state-lock that protects against
+# concurrent, state-corrupting runs.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*force-unlock\b'
+reason = "'terraform force-unlock' bypasses state-lock protection against concurrent runs"
+
+[[deny]]
+# KEYSTONE — bare `terraform apply` with NO saved plan file: it re-plans and
+# applies blind, defeating the human plan-review gate. Matches `apply` followed
+# only by flags to end-of-line; a POSITIONAL argument (the `.tfplan` the human
+# reviewed) stops the match, so `terraform apply plan.tfplan` is allowed.
+#
+# The subtlety is a value-taking flag whose value is a SEPARATE token
+# (`-var region=us-east-1`, `-target aws_instance.foo`): a naive `(?:\s+--?\S+)*`
+# run stops at the value (it isn't `-`-prefixed), leaving the value looking like a
+# positional plan file — so bare `apply -var x=y` slipped through UNblocked and
+# applied blind. The flag run therefore recognizes the known value-taking flags
+# and consumes their following value (both `-flag value` and `-flag=value`) before
+# looking for end-of-line, while any other `--?token` is still a bare flag. A real
+# positional plan file (`apply plan.tfplan`, `apply out`) is not `-`-prefixed and
+# is not the value of a preceding value-flag, so the run stops and the `\s*$`
+# anchor fails there — still allowed, still fail-open toward the reviewed path.
+pattern = '^(?:sudo\s+)?terraform\s+(?:-\S+\s+)*apply(?:\s+(?:--?(?:var|var-file|target|state|state-out|backup|lock-timeout|parallelism|replace|refresh)(?:=\S+|\s+\S+)|--?\S+))*\s*$'
+reason = "bare 'terraform apply' re-plans and applies blind — run 'terraform plan -out=plan.tfplan', review, then apply that plan file"

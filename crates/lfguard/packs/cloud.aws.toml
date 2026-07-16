@@ -1,0 +1,141 @@
+# Cloud: aws — opt-in.
+#
+# Blocks irreversible AWS operations: CloudFormation stack deletion, S3 bucket
+# force-removal / recursive object deletion, EC2 termination, un-snapshotted RDS
+# deletion, DynamoDB table deletion, IAM self-privilege-escalation shapes, and
+# org-level mutations — plus a tuned catch-all for the destructive long tail.
+# Opt-in per environment (guard.packs), because a machine that never touches AWS
+# should not pay for these rules.
+#
+# Precision over coverage (the engine's zero-false-positive invariant): read
+# verbs (`describe`/`list`/`get`) never block, and — the `cloud.gcloud` lesson —
+# `delete` must be matched as a whitespace-delimited OPERATION token, not a
+# substring, so a resource literally named `delete-me` in a `describe`/`ls`
+# command is never blocked. The operation is AWS's `aws <service> <operation>`
+# word (argv[2]); the catch-all anchors to that position so a `delete`/
+# `terminate`/`force` sitting in a resource NAME or a benign `--force-*` flag is
+# never mistaken for a destructive verb.
+#
+# GLOBAL OPTIONS. The AWS CLI accepts global options BETWEEN `aws` and the
+# service (`aws --region us-east-1 ec2 …`, `aws --profile prod dynamodb …`),
+# and a value-taking global's value is a SEPARATE token (`--region us-east-1`),
+# not only the `--region=us-east-1` form. A naive `^aws\s+<service>` anchor is
+# therefore bypassable: the option shifts the service out of argv[1]. Every rule
+# below tolerates a run of global options via the shared `<GLOBALS>` prefix —
+# the known value-taking globals (each consuming its following value token,
+# `=`-joined or separate) and the known boolean globals. Matching the known set
+# explicitly (rather than a loose `-\S+` run) is deliberate: it skips a flag AND
+# its separate-token value WITHOUT ever swallowing the service token, so the
+# service/operation anchor still lands where it must.
+#
+#   <GLOBALS> = (?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*
+#
+# The RDS carve-out uses an ALLOW rule (evaluated before deny): a delete WITH
+# `--final-db-snapshot-identifier` is recoverable and must pass, while a delete
+# without it is genuinely unrecoverable and is denied. Specific rules come first
+# so the reason names the resource class; the catch-all is last. A second ALLOW
+# carve-out exempts routine, recoverable delete verbs (SQS message-ack, tag
+# removal, single versioned-object delete) that the catch-all would otherwise
+# over-block — blocking those trains users to disable the pack.
+
+[pack]
+id = "cloud.aws"
+name = "Cloud: aws"
+description = "Guards destructive AWS CLI operations (stack/table/instance/DB deletion, S3 force-remove, IAM/org mutations)."
+default_on = false
+version = 1
+triggers = ["aws"]
+
+# --- Allow carve-out (checked before every deny) ------------------------------
+
+[[allow]]
+# An RDS delete that keeps a final snapshot is recoverable — do not block it,
+# even though the catch-all and the un-snapshotted deny below would otherwise
+# match. Mirrors gcloud's distinguish-don't-blanket approach.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*rds\s+delete-db-(?:instance|cluster)\b.*\s--final-db-snapshot-identifier\b'
+reason = "RDS delete keeps a final snapshot (recoverable)"
+
+[[allow]]
+# Routine, recoverable delete verbs that the destructive catch-all would
+# otherwise over-block. Each is non-bulk and reversible/harmless: `delete-message`
+# / `delete-message-batch` is the standard SQS consume-acknowledge call (blocking
+# it breaks every SQS poller); `delete-tags` removes tags and destroys no data;
+# `delete-object` deletes a SINGLE S3 object, recoverable under bucket versioning
+# (bulk `delete-objects` is deliberately NOT exempted — the trailing `s` fails the
+# token boundary, so it falls through to the catch-all). Anchored to the operation
+# position (right after the service token) so it can never carve out a genuinely
+# destructive verb.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*\S+\s+(?:delete-message|delete-message-batch|delete-tags|delete-object)(?:\s|$)'
+reason = "routine/recoverable AWS delete (SQS message ack / tag removal / single versioned object)"
+
+# --- Specific deny rules ------------------------------------------------------
+
+[[deny]]
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*cloudformation\s+delete-stack\b'
+reason = "'cloudformation delete-stack' deletes a stack and, per DeletionPolicy, its resources"
+
+[[deny]]
+# `aws s3 rb ... --force` removes a bucket AND every object in it.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*s3\s+rb\b.*\s--force\b'
+reason = "'s3 rb --force' removes a bucket and every object in it"
+
+[[deny]]
+# `aws s3 rm ... --recursive` recursively deletes objects under a prefix.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*s3\s+rm\b.*\s--recursive\b'
+reason = "'s3 rm --recursive' recursively deletes every object under the prefix"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*ec2\s+terminate-instances\b'
+reason = "'ec2 terminate-instances' irreversibly terminates instances (use stop-instances instead)"
+
+[[deny]]
+# RDS delete WITHOUT `--final-db-snapshot-identifier` — the recoverable form is
+# carved out by the allow rule above, so reaching here means no final snapshot.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*rds\s+delete-db-(?:instance|cluster)\b'
+reason = "RDS delete without --final-db-snapshot-identifier destroys the database unrecoverably"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*dynamodb\s+delete-table\b'
+reason = "'dynamodb delete-table' deletes a table and all of its data"
+
+[[deny]]
+# IAM identity / permission teardown — deleting a role/user or detaching a
+# policy is the self-privilege-escalation / lock-out shape L2 (§5) prevents
+# structurally; catch the attempt at the command level as defense-in-depth.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*iam\s+(?:delete-role|delete-user|delete-role-policy|delete-user-policy|detach-role-policy|detach-user-policy)\b'
+reason = "IAM role/user deletion or policy detach can escalate privilege or lock out access"
+
+[[deny]]
+# IAM inline-policy WRITES — the quieter self-privilege-escalation shape. A
+# `put-role-policy`/`put-user-policy`/`put-group-policy` can inline a `*:*`
+# statement (grant full admin WITHOUT the literal "AdministratorAccess" the
+# attach rule below keys on), and `create-policy-version` can swap a managed
+# policy's active document to the same effect. Widening the agent's own boundary
+# is exactly what L2 (§5) prevents structurally; block the attempt here too.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*iam\s+(?:put-role-policy|put-user-policy|put-group-policy|create-policy-version)\b'
+reason = "IAM inline-policy write (put-*-policy / create-policy-version) can grant *:* and self-escalate privilege"
+
+[[deny]]
+# Attaching AdministratorAccess to any principal — the explicit self-priv-esc
+# move. `(?i:...)` so a mixed-case ARN still matches.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*iam\s+attach-(?:role|user|group)-policy\b.*(?i:administratoraccess)'
+reason = "attaching AdministratorAccess grants full-account privilege — the self-escalation shape"
+
+[[deny]]
+# Organization-level mutations — blast radius across every account; never
+# agent-callable.
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*organizations\s+(?:delete-organization|leave-organization|detach-policy|delete-policy)\b'
+reason = "AWS Organizations mutation has org-wide blast radius — never agent-callable"
+
+# --- Catch-all (last) ---------------------------------------------------------
+
+[[deny]]
+# Destructive long tail: an OPERATION (the token right after the service) that
+# STARTS with `delete`, or contains `terminate`/`force`. Anchored to the
+# operation position so `delete`/`terminate`/`force` appearing in a resource
+# NAME (a later value token) or a benign `--force-*` flag does NOT match, and so
+# read verbs (`describe-*`/`list-*`/`get-*`) and restore verbs (`undelete-*`)
+# never trip it. Routine/recoverable delete verbs are exempted by the second
+# allow rule above (checked first).
+pattern = '^(?:sudo\s+)?aws\s+(?:--(?:profile|region|endpoint-url|output|query|color|ca-bundle|cli-read-timeout|cli-connect-timeout|cli-binary-format)(?:=\S+|\s+\S+)\s+|--(?:debug|no-sign-request|no-verify-ssl|no-paginate|no-cli-pager|cli-auto-prompt|no-cli-auto-prompt)\s+)*[^-\s]\S*\s+(?:delete[\w-]*|\S*(?:terminate|force)\S*)(?:\s|$)'
+reason = "destructive AWS operation (delete/terminate/force) — verify the blast radius before running"
