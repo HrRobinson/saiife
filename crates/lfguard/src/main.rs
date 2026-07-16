@@ -188,12 +188,28 @@ fn cmd_check(
         append_audit(path, audit_tag, &command, reason, pack);
     }
     match decision {
-        Decision::Deny { reason, .. } => {
+        Decision::Deny {
+            pack,
+            reason,
+            via_inline,
+            ..
+        } => {
+            // Same "BLOCKED by <pack>: <reason> (inline: ...)" shape as
+            // `cmd_test`/`cmd_explain` for this identical Decision::Deny — the
+            // hook path is what a real user hits day to day, so it must not
+            // drop the pack name the other two paths already surface. This
+            // only enriches the message; the decision itself (deny, exit 2 /
+            // permissionDecision: deny) is unchanged.
+            let where_ = via_inline
+                .as_deref()
+                .map(|i| format!(" (inline: {i})"))
+                .unwrap_or_default();
+            let msg = format!("BLOCKED by {pack}: {reason}{where_}");
             if hook_exit {
-                warn(&reason);
+                warn(&msg);
                 ExitCode::from(2)
             } else {
-                emit_deny(&reason)
+                emit_deny(&msg)
             }
         }
         Decision::Allow { .. } => {
