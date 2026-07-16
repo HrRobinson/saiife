@@ -45,6 +45,12 @@ enum Cmd {
         /// Tag (pane id) attached to audit records.
         #[arg(long = "audit-tag", value_name = "TAG")]
         audit_tag: Option<String>,
+        /// Overwrite a per-tag invocation marker at <PATH>/<audit-tag> on EVERY
+        /// evaluation (allow or deny), so localflow can observe that the hook
+        /// actually fired for this pane. Best-effort; overwrite (truncate)
+        /// semantics — one small file per tag, no unbounded growth.
+        #[arg(long = "seen-dir", value_name = "PATH")]
+        seen_dir: Option<String>,
     },
 }
 
@@ -63,9 +69,18 @@ fn main() -> ExitCode {
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine, &command),
         Cmd::Explain { command } => cmd_explain(&engine, &command),
-        Cmd::Check { hook_exit, audit_log, audit_tag } => {
-            cmd_check(&engine, hook_exit, audit_log.as_deref(), audit_tag.as_deref())
-        }
+        Cmd::Check {
+            hook_exit,
+            audit_log,
+            audit_tag,
+            seen_dir,
+        } => cmd_check(
+            &engine,
+            hook_exit,
+            audit_log.as_deref(),
+            audit_tag.as_deref(),
+            seen_dir.as_deref(),
+        ),
     }
 }
 
@@ -137,12 +152,17 @@ fn cmd_check(
     hook_exit: bool,
     audit_log: Option<&str>,
     audit_tag: Option<&str>,
+    seen_dir: Option<&str>,
 ) -> ExitCode {
     // Fail open: any error reading/parsing the payload -> allow.
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         warn("could not read hook payload; failing open (allow)");
-        return if hook_exit { ExitCode::SUCCESS } else { emit_allow() };
+        return if hook_exit {
+            ExitCode::SUCCESS
+        } else {
+            emit_allow()
+        };
     }
     let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
         Ok(c) => c,
@@ -150,10 +170,20 @@ fn cmd_check(
             warn(&format!(
                 "hook payload not usable ({e}); failing open (allow)"
             ));
-            return if hook_exit { ExitCode::SUCCESS } else { emit_allow() };
+            return if hook_exit {
+                ExitCode::SUCCESS
+            } else {
+                emit_allow()
+            };
         }
     };
     let decision = engine.evaluate(&command);
+    // Best-effort invocation marker: proves the hook fired for this pane. Placed
+    // after evaluate and before any verdict return so the verdict is emitted
+    // regardless of marker outcome (observability, never enforcement).
+    if let Some(dir) = seen_dir {
+        write_seen_marker(dir, audit_tag);
+    }
     if let (Some(path), Decision::Deny { reason, pack, .. }) = (audit_log, &decision) {
         append_audit(path, audit_tag, &command, reason, pack);
     }
@@ -191,6 +221,26 @@ fn append_audit(path: &str, tag: Option<&str>, command: &str, reason: &str, pack
         .append(true)
         .open(path)
         .and_then(|mut f| writeln!(f, "{rec}"));
+}
+
+/// Best-effort per-tag invocation marker. Overwrites <dir>/<tag> with the
+/// current epoch-ms each call — one small file per tag, rewritten in place,
+/// so the directory never grows. Any error (bad dir, permissions, unusable
+/// tag) is swallowed: this is observability, never enforcement, and must
+/// never influence the guard verdict.
+fn write_seen_marker(dir: &str, tag: Option<&str>) {
+    let Some(tag) = tag else { return };
+    // Defense in depth: never let a tag escape `dir`. Guard tags are pane
+    // UUIDs ([A-Za-z0-9-]+); reject anything with a separator or `..`.
+    if tag.is_empty() || tag.contains('/') || tag.contains('\\') || tag.contains("..") {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(std::path::Path::new(dir).join(tag), ts.to_string());
 }
 
 /// Emit a PreToolUse "allow" response and exit 0.
