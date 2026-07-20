@@ -1,0 +1,57 @@
+# DB: mysql — opt-in.
+#
+# Blocks irreversible MySQL statements issued through the CLI — `mysql -e "…"`,
+# `mysql db < file`, or the `mysqladmin` admin tool: DROP DATABASE/SCHEMA/TABLE,
+# TRUNCATE, a WHERE-less DELETE (the "empties the whole table" footgun),
+# `mysqladmin drop`, and `GRANT ALL` (privilege escalation). Rules are
+# case-insensitive ((?i)) since SQL keywords may be upper or lower case; MySQL
+# identifiers may be backtick-quoted, so the identifier character classes allow
+# a backtick. Opt-in per environment (guard.packs).
+#
+# Scope: the triggers are `mysql`/`mysqladmin`, so this pack fires only on
+# statements run THROUGH the MySQL CLI — a bare SQL string with no CLI prefix is
+# out of scope here (and, if it matters, covered by enabling `db.postgres`,
+# whose SQL-keyword triggers catch raw statements). Precision over coverage: a
+# SELECT, a DELETE *with* a WHERE, and read/backup tools (`mysqldump`,
+# `mysqladmin status/ping`) never block.
+
+[pack]
+id = "db.mysql"
+name = "DB: mysql"
+description = "Guards destructive MySQL CLI statements (DROP/TRUNCATE, WHERE-less DELETE, mysqladmin drop, GRANT ALL)."
+default_on = false
+version = 1
+triggers = ["mysql", "mysqladmin"]
+
+[[deny]]
+pattern = '(?i)\bdrop\s+database\b'
+reason = "DROP DATABASE permanently destroys an entire database"
+
+[[deny]]
+pattern = '(?i)\bdrop\s+schema\b'
+reason = "DROP SCHEMA permanently destroys a database (schema is a database in MySQL)"
+
+[[deny]]
+pattern = '(?i)\bdrop\s+table\b'
+reason = "DROP TABLE permanently destroys a table and all its data"
+
+[[deny]]
+pattern = '(?i)\btruncate\s+(?:table\s+)?[\w.`"]+'
+reason = "TRUNCATE empties a table irreversibly (no WHERE, no per-row rollback)"
+
+[[deny]]
+# DELETE with no WHERE clause — the statement ends (`;` or end of the argument)
+# right after the table name, so every row goes. A DELETE … WHERE has more
+# tokens before the end and does not match.
+pattern = '(?i)\bdelete\s+from\s+[\w.`"]+\s*(?:;|$)'
+reason = "DELETE without a WHERE clause removes every row in the table"
+
+[[deny]]
+pattern = '(?i)\bgrant\s+all\b'
+reason = "GRANT ALL grants full privileges on the target (privilege escalation)"
+
+[[deny]]
+# `mysqladmin drop <db>` destroys a database. Connection flags (`-u`, `-p…`) are
+# tolerated; `drop` must be a whole token so `-u dropuser` does not trip it.
+pattern = '(?i)^(?:sudo\s+)?mysqladmin\s+(?:\S+\s+)*drop\b'
+reason = "'mysqladmin drop' destroys an entire MySQL database"

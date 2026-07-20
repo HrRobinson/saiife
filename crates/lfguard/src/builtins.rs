@@ -3,7 +3,8 @@
 //! from userData; the built-ins are the shipped defaults.
 //!
 //! Ships `core.filesystem` + `core.git` (default-on) and the opt-in packs
-//! `cloud.gcloud`, `cloud.aws`, `iac.terraform`, and `db.postgres` (activated
+//! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
+//! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
 
 use crate::pack::{load_pack_str, Pack, PackWarning};
@@ -30,6 +31,26 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     (
         "<builtin>db.postgres",
         include_str!("../packs/db.postgres.toml"),
+    ),
+    (
+        "<builtin>cloud.azure",
+        include_str!("../packs/cloud.azure.toml"),
+    ),
+    (
+        "<builtin>db.mysql",
+        include_str!("../packs/db.mysql.toml"),
+    ),
+    (
+        "<builtin>db.mongo",
+        include_str!("../packs/db.mongo.toml"),
+    ),
+    (
+        "<builtin>container.docker",
+        include_str!("../packs/container.docker.toml"),
+    ),
+    (
+        "<builtin>container.k8s",
+        include_str!("../packs/container.k8s.toml"),
     ),
 ];
 

@@ -1,0 +1,68 @@
+# Container: docker — opt-in.
+#
+# Blocks irreversible Docker operations that destroy DATA or force-kill running
+# state: volume removal (`docker volume rm/prune`), a `system prune` that also
+# wipes volumes, force-removing a (possibly running) container (`docker rm -f`),
+# force image removal, and network removal. Opt-in per environment (guard.packs)
+# — a machine that never runs Docker should not pay for these rules.
+#
+# Precision over coverage (the engine's zero-false-positive invariant): the
+# routine, recoverable verbs an agent uses constantly — `ps`, `build`, `run`,
+# `logs`, `images`, `exec`, `start`/`stop`, `volume ls`, `network ls`,
+# `system df`, and a plain `docker rm <stopped>` / `docker rmi <image>` — never
+# block. The destructive shapes are anchored to the SUBCOMMAND position
+# (`volume rm`, `network rm`, `rm … -f`), so a container/volume/network literally
+# NAMED `delete-me` or passed to `docker run --name drop-me` is never mistaken
+# for a destructive verb. `docker run --rm` is a run flag, not the `rm`
+# subcommand, and is untouched.
+#
+# GLOBAL OPTIONS. The docker CLI accepts global options BETWEEN `docker` and the
+# subcommand (`docker --context prod volume rm`, `docker -H unix:///… rm -f`), and
+# a value-taking global's value can be a SEPARATE token (`--host unix:///…`), not
+# only the `--host=…` form. Every rule tolerates a run of global options via the
+# shared `<GLOBALS>` prefix — the known value-taking globals (each consuming its
+# following value token, `=`-joined or separate) and the known boolean globals —
+# so the subcommand anchor still lands where it must.
+#
+#   <GLOBALS> = (?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*
+
+[pack]
+id = "container.docker"
+name = "Container: docker"
+description = "Guards destructive Docker operations (volume rm/prune, prune --volumes, rm -f, force rmi, network rm)."
+default_on = false
+version = 1
+triggers = ["docker"]
+
+[[deny]]
+# `docker system prune --volumes` additionally removes unused named/anonymous
+# volumes — that is the data-loss part (bare `system prune` only reclaims
+# recoverable cache/images, so it is deliberately NOT blocked).
+pattern = '^(?:sudo\s+)?docker\s+(?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*system\s+prune\b.*\s--volumes\b'
+reason = "'docker system prune --volumes' deletes unused volumes and the data in them"
+
+[[deny]]
+# `docker volume rm` / `docker volume prune` permanently delete volume data.
+pattern = '^(?:sudo\s+)?docker\s+(?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*volume\s+(?:rm|remove|prune)\b'
+reason = "'docker volume rm/prune' permanently deletes the volume and all data stored in it"
+
+[[deny]]
+# `docker rm -f` / `--force` force-removes a container even while it is RUNNING;
+# its writable layer (any data not in a volume) is lost. A plain `docker rm`
+# (stopped container) is routine cleanup and is NOT blocked.
+pattern = '^(?:sudo\s+)?docker\s+(?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*(?:container\s+)?rm\b.*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?:\s|$)'
+reason = "'docker rm -f' force-removes a running container and loses its writable layer"
+
+[[deny]]
+# Force image removal (`docker rmi -f` / `docker image rm --force`) deletes an
+# image even when containers still reference it. Plain `docker rmi` (no force)
+# is not blocked — images are re-pullable and the daemon refuses in-use ones.
+pattern = '^(?:sudo\s+)?docker\s+(?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*(?:rmi|image\s+(?:rm|remove))\b.*\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force)(?:\s|$)'
+reason = "force image removal deletes an image still referenced by containers"
+
+[[deny]]
+# `docker network rm` / `docker network prune` removes networks; running
+# services lose connectivity. Read verbs (`ls`, `inspect`, `create`, `connect`)
+# are untouched.
+pattern = '^(?:sudo\s+)?docker\s+(?:--(?:config|context|host|log-level|tlscacert|tlscert|tlskey)(?:=\S+|\s+\S+)\s+|-[cHl](?:=\S+|\s+\S+)\s+|--(?:debug|tls|tlsverify)\s+|-D\s+)*network\s+(?:rm|remove|prune)\b'
+reason = "'docker network rm/prune' removes networks and severs running-container connectivity"

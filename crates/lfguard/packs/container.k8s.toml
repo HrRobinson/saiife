@@ -1,0 +1,59 @@
+# Container: kubernetes (kubectl / helm) — opt-in.
+#
+# Blocks the irreversible Kubernetes shapes: deleting a namespace (cascades to
+# every object in it), deleting a PersistentVolume / PersistentVolumeClaim
+# (storage data loss), deleting resources declared in a manifest
+# (`kubectl delete -f`), a bulk `--all` delete, draining a node (evicts every
+# pod), and `helm uninstall`/`delete` (removes a release and all it created).
+# Opt-in per environment (guard.packs).
+#
+# Precision over coverage (the engine's zero-false-positive invariant): read and
+# routine verbs never block — `get`, `describe`, `logs`, `apply`, `diff`,
+# `create`, `edit`, `scale`, `rollout`, `helm install`/`upgrade`/`list`/`status`.
+# A single `kubectl delete pod <x>` is deliberately NOT blocked (pods are
+# ephemeral and controller-managed); only the enumerated data/blast-radius
+# shapes are. `delete` must be the whitespace-delimited VERB token, and the
+# dangerous resource kind must be its own token (`ns`, `pv`, `pvc`, …) — so a
+# pod literally NAMED `pv`, or a namespace named `delete-me`, is never mistaken
+# for the operation. Global flags before the verb (`kubectl -n prod delete …`,
+# `kubectl --context prod drain …`) are tolerated by the `(?:\S+\s+)*` run.
+
+[pack]
+id = "container.k8s"
+name = "Container: kubernetes"
+description = "Guards destructive kubectl/helm operations (delete namespace/pv/pvc, delete -f, --all, drain, helm uninstall)."
+default_on = false
+version = 1
+triggers = ["kubectl", "helm"]
+
+[[deny]]
+# `kubectl drain <node>` cordons a node and evicts every pod running on it.
+pattern = '^(?:sudo\s+)?kubectl\s+(?:\S+\s+)*drain(?:\s|$)'
+reason = "'kubectl drain' cordons a node and evicts every pod running on it"
+
+[[deny]]
+# Deleting a namespace, PersistentVolume, or PersistentVolumeClaim. The kind
+# must be the first operand after `delete` (leading `-flags` tolerated) and a
+# complete token — `pv/name`, `pvc,other` and a trailing space/EOL all count,
+# but a pod NAMED `pv` (`kubectl delete pod pv`) does not, because `pod` sits
+# between `delete` and the kind.
+pattern = '^(?:sudo\s+)?kubectl\s+(?:\S+\s+)*delete\s+(?:-\S+\s+)*(?:persistentvolumeclaims?|persistentvolumes?|namespaces?|pvc|pv|ns)(?:[\s/,]|$)'
+reason = "'kubectl delete namespace/pv/pvc' cascades to every object it contains (irreversible data loss)"
+
+[[deny]]
+# `kubectl delete -f <manifest>` removes every resource declared in the file.
+# `apply -f` / `diff -f` (the verb is not `delete`) are untouched.
+pattern = '^(?:sudo\s+)?kubectl\s+(?:\S+\s+)*delete\s+(?:\S+\s+)*(?:-f|--filename)(?:[=\s]|$)'
+reason = "'kubectl delete -f' removes every resource declared in the manifest"
+
+[[deny]]
+# A bulk `kubectl delete … --all` wipes every resource of that kind. `--all`
+# must be a complete flag token, so `--all-namespaces` does not trip it.
+pattern = '^(?:sudo\s+)?kubectl\s+(?:\S+\s+)*delete\b.*\s--all(?:\s|$)'
+reason = "'kubectl delete --all' removes every resource of that kind at once"
+
+[[deny]]
+# `helm uninstall <release>` (and the legacy `helm delete`) removes a release
+# and every resource it created. `install`/`upgrade`/`list`/`status` are safe.
+pattern = '^(?:sudo\s+)?helm\s+(?:\S+\s+)*(?:uninstall|delete)(?:\s|$)'
+reason = "'helm uninstall' removes a release and every resource it created"
