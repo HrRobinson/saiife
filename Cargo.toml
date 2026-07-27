@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lfguard"]
+members = ["crates/saiifeguard"]
 resolver = "2"
 
 [workspace.package]
@@ -9,7 +9,7 @@ license = "MIT"
 repository = "https://github.com/HrRobinson/localflow"
 
 [profile.release]
-# lfguard is spawned per command by agent hooks; a small, fast binary matters.
+# saiifeguard is spawned per command by agent hooks; a small, fast binary matters.
 opt-level = 3
 lto = true
 strip = true
