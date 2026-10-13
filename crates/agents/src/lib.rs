@@ -20,6 +20,7 @@ pub mod detect;
 pub mod fingerprint;
 pub mod fsutil;
 pub mod gemini;
+pub mod integrity;
 mod json_hooks;
 
 /// The agents saiife v1 supports.
