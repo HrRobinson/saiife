@@ -13,3 +13,8 @@ repository = "https://github.com/HrRobinson/saiife"
 opt-level = 3
 lto = true
 strip = true
+
+# status/init hash the whole saiife binary; unoptimized SHA-256 of a debug
+# binary takes seconds.
+[profile.dev.package.sha2]
+opt-level = 3

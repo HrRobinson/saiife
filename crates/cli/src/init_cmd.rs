@@ -183,6 +183,9 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .unwrap_or_default();
+    let saiife_sha256 = std::fs::read(&exe)
+        .map(|b| sha256_hex(&b))
+        .unwrap_or_default();
     let record = Integrity {
         v: INTEGRITY_VERSION,
         project: integrity::canonical_project(&root)
@@ -190,6 +193,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             .unwrap_or_else(|_| root.display().to_string()),
         saiife_path: exe.display().to_string(),
         saiife_version: env!("CARGO_PKG_VERSION").to_string(),
+        saiife_sha256,
         config_sha256,
         config_written_sha256,
         hooks,

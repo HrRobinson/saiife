@@ -213,6 +213,7 @@ fn unreadable_audit_dir_is_a_failed_check() {
         .env("HOME", env.home.path())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", &file)
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -249,4 +250,103 @@ fn symlinked_path_and_subdirectory_find_the_same_project() {
     std::fs::create_dir_all(&sub).unwrap();
     let out = env.saiife_in(&sub, &["status"]);
     assert_eq!(code(&out), 0, "{}", stdout(&out));
+}
+
+/// Replace the symlink to the binary under test with a real copy, so the
+/// test can later change the file's content in place.
+fn with_real_copy(agents: &[&str]) -> Env {
+    let env = Env::new(agents);
+    let exe = env.bin.path().join("saiife");
+    std::fs::remove_file(&exe).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_saiife"), &exe).unwrap();
+    // Run init through the copy so the record names it.
+    let out = Command::new(&exe)
+        .arg("init")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    env
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_replaced_in_place_is_reported() {
+    let env = with_real_copy(&["claude"]);
+    assert_eq!(status(&env).0, 0);
+    let exe = env.bin.path().join("saiife");
+    // Same path, same permissions, new content that still claims the version.
+    std::fs::write(
+        &exe,
+        format!("#!/bin/sh\necho 'saiife {}'\n", env!("CARGO_PKG_VERSION")),
+    )
+    .unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("was replaced since `saiife init`"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn version_probe_does_not_hang_on_a_lingering_grandchild() {
+    let env = with_real_copy(&["claude"]);
+    let exe = env.bin.path().join("saiife");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\necho 'saiife {}'\nsleep 30 &\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    // Pretend an older record without a binary hash, so the probe runs.
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["saiife_sha256"] = "".into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let started = std::time::Instant::now();
+    let (c, text) = status(&env);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "hung"
+    );
+    assert_eq!(c, 0, "{text}");
+}
+
+#[test]
+fn unreadable_blocker_input_is_a_failed_check() {
+    let env = initialized(&["claude"]);
+    env.write(".claude/settings.local.json", "{ not json");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains("settings.local.json cannot be read"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Fix: make it readable so saiife can check it"),
+        "{text}"
+    );
+}
+
+#[test]
+fn managed_allow_managed_hooks_only_is_reported_with_admin_fix() {
+    let env = initialized(&["claude"]);
+    std::fs::write(
+        env.managed.path().join("managed-settings.json"),
+        "{\"allowManagedHooksOnly\": true}",
+    )
+    .unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("allowManagedHooksOnly"), "{text}");
+    assert!(text.contains("ask your administrator"), "{text}");
 }

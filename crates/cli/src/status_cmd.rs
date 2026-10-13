@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use saiife_agents::config::CONFIG_REL;
 use saiife_agents::detect::which;
@@ -111,8 +111,22 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             }),
         }
         for b in agent.blockers(&root, home.as_deref()) {
-            let fix = if b.setting == "allowManagedHooksOnly" {
-                "ask your administrator: managed settings only allow their own hooks on this machine".to_string()
+            if let Some(e) = &b.error {
+                problems.push(Problem {
+                    what: format!(
+                        "{} cannot be read, so saiife cannot tell whether it switches off {}'s hooks: {e}",
+                        b.path.display(),
+                        agent.label()
+                    ),
+                    fix: "make it readable so saiife can check it".into(),
+                });
+                continue;
+            }
+            let fix = if b.managed {
+                format!(
+                    "ask your administrator: {} (managed settings) stops hooks on this machine",
+                    b.setting
+                )
             } else {
                 format!("remove `{}` from {}", b.setting, b.path.display())
             };
@@ -205,9 +219,13 @@ fn last_calls(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>)
 
 fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {
     match std::fs::read(root.join(CONFIG_REL)) {
-        Err(_) => problems.push(Problem {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => problems.push(Problem {
             what: format!("{CONFIG_REL} was removed."),
             fix: RESTORE.into(),
+        }),
+        Err(e) => problems.push(Problem {
+            what: format!("{CONFIG_REL} cannot be read: {e}"),
+            fix: "make it readable so saiife can check it".into(),
         }),
         Ok(bytes) if sha256_hex(&bytes) != record.config_sha256 => problems.push(Problem {
             what: format!("{CONFIG_REL} was changed since `saiife init`."),
@@ -253,6 +271,33 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
         });
         return;
     }
+    if record.saiife_sha256.is_empty() {
+        println!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
+    } else {
+        match std::fs::read(&on_path) {
+            Ok(b) if sha256_hex(&b) == record.saiife_sha256 => {}
+            Ok(_) => {
+                problems.push(Problem {
+                    what: format!(
+                        "the saiife binary at {} was replaced since `saiife init` (its contents changed).",
+                        on_path.display()
+                    ),
+                    fix: fix.into(),
+                });
+                return;
+            }
+            Err(e) => {
+                problems.push(Problem {
+                    what: format!(
+                        "the saiife binary at {} cannot be read: {e}",
+                        on_path.display()
+                    ),
+                    fix: fix.into(),
+                });
+                return;
+            }
+        }
+    }
     match binary_version(&on_path) {
         Some(v) if v == record.saiife_version => {
             println!("  binary  {} ({v})", on_path.display());
@@ -265,33 +310,38 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             fix: fix.into(),
         }),
         None => problems.push(Problem {
-            what: format!("{} --version did not answer.", on_path.display()),
+            what: format!("could not read the version of {}.", on_path.display()),
             fix: fix.into(),
         }),
     }
 }
 
-/// `<path> --version` -> the version after "saiife ". Gives up after 2 s.
+/// `<path> --version` -> the version after "saiife ". Gives up after 2 s,
+/// also when a grandchild keeps the output pipe open: the first line is read
+/// on a helper thread (at most 4 KiB) and waited for with a deadline.
 fn binary_version(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+
     let mut child = Command::new(path)
         .arg("--version")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    out.trim().strip_prefix("saiife ").map(str::to_string)
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let r = BufReader::new(stdout.take(4096)).read_line(&mut line);
+        let _ = tx.send(r.ok().map(|_| line));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(2)).ok().flatten();
+    let _ = child.kill();
+    let _ = child.wait();
+    got?.trim().strip_prefix("saiife ").map(str::to_string)
 }
 
 fn ago(t: OffsetDateTime) -> String {

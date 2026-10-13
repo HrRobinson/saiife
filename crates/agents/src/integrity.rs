@@ -29,6 +29,10 @@ pub struct Integrity {
     pub saiife_path: String,
     /// Its version (`CARGO_PKG_VERSION`).
     pub saiife_version: String,
+    /// SHA-256 of the `saiife` binary file that ran `init`. Empty in records
+    /// from older versions.
+    #[serde(default)]
+    pub saiife_sha256: String,
     /// SHA-256 of `.saiife/config.toml` as `init` left it.
     pub config_sha256: String,
     /// SHA-256 of `.saiife/config.toml` as saiife itself last wrote it
@@ -139,6 +143,7 @@ mod tests {
             project: project.into(),
             saiife_path: "/usr/local/bin/saiife".into(),
             saiife_version: "0.1.0".into(),
+            saiife_sha256: "12".repeat(32),
             config_sha256: "cd".repeat(32),
             config_written_sha256: "ef".repeat(32),
             hooks,

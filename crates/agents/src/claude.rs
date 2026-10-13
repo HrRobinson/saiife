@@ -63,8 +63,18 @@ pub fn expected_entry() -> String {
 /// in project, local or user settings, and `allowManagedHooksOnly` /
 /// `disableAllHooks` in managed settings.
 pub fn blockers(project: &Path, home: Option<&Path>) -> Vec<HookBlocker> {
-    let managed: Vec<PathBuf> = MANAGED_DIRS.iter().map(PathBuf::from).collect();
-    blockers_in(project, home, &managed)
+    blockers_in(project, home, &managed_dirs())
+}
+
+/// The managed-settings directories. Debug builds (tests) can replace them
+/// with `SAIIFE_TEST_CLAUDE_MANAGED_DIRS` (a PATH-style list); a release
+/// build ignores it, so it cannot be used to hide a managed lock.
+fn managed_dirs() -> Vec<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(v) = std::env::var_os("SAIIFE_TEST_CLAUDE_MANAGED_DIRS") {
+        return std::env::split_paths(&v).collect();
+    }
+    MANAGED_DIRS.iter().map(PathBuf::from).collect()
 }
 
 /// `blockers` with the managed-settings directories given (tests).
@@ -82,45 +92,83 @@ pub fn blockers_in(
     }
     let mut out = Vec::new();
     for f in &files {
-        if flag_set(f, "disableAllHooks") {
-            out.push(HookBlocker {
-                path: f.clone(),
-                setting: "disableAllHooks",
-            });
-        }
+        check_flag(&mut out, f, "disableAllHooks", false);
     }
     for dir in managed_dirs {
         let mut managed = vec![dir.join("managed-settings.json")];
-        if let Ok(rd) = std::fs::read_dir(dir.join("managed-settings.d")) {
-            let mut dropins: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                .collect();
-            dropins.sort();
-            managed.extend(dropins);
+        let d = dir.join("managed-settings.d");
+        match std::fs::read_dir(&d) {
+            Ok(rd) => {
+                let mut dropins: Vec<PathBuf> = Vec::new();
+                for e in rd {
+                    match e {
+                        Ok(e) => dropins.push(e.path()),
+                        Err(err) => out.push(unreadable(&d, &err, true)),
+                    }
+                }
+                dropins.retain(|p| p.extension().is_some_and(|x| x == "json"));
+                dropins.sort();
+                managed.extend(dropins);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => out.push(unreadable(&d, &e, true)),
         }
         for f in managed {
-            for setting in ["allowManagedHooksOnly", "disableAllHooks"] {
-                if flag_set(&f, setting) {
-                    out.push(HookBlocker {
-                        path: f.clone(),
-                        setting,
-                    });
+            // Read once; report an unreadable file once, not per setting.
+            match read_flags(&f) {
+                Ok(v) => {
+                    for setting in ["allowManagedHooksOnly", "disableAllHooks"] {
+                        if v.get(setting).and_then(Value::as_bool) == Some(true) {
+                            out.push(HookBlocker {
+                                path: f.clone(),
+                                setting,
+                                error: None,
+                                managed: true,
+                            });
+                        }
+                    }
                 }
+                Err(e) => out.push(unreadable_msg(&f, e, true)),
             }
         }
     }
     out
 }
 
-/// True when `path` is a JSON object with `key: true`. Missing or unreadable
-/// files are not blockers.
-fn flag_set(path: &Path, key: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get(key).and_then(Value::as_bool))
-        == Some(true)
+fn unreadable_msg(path: &Path, error: String, managed: bool) -> HookBlocker {
+    HookBlocker {
+        path: path.to_path_buf(),
+        setting: "",
+        error: Some(error),
+        managed,
+    }
+}
+
+fn unreadable(path: &Path, e: &std::io::Error, managed: bool) -> HookBlocker {
+    unreadable_msg(path, e.to_string(), managed)
+}
+
+/// The JSON of `path`; an absent file is an empty object, an unreadable or
+/// unparseable one is an error.
+fn read_flags(path: &Path) -> Result<Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => serde_json::from_str::<Value>(&t).map_err(|e| format!("not valid JSON: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn check_flag(out: &mut Vec<HookBlocker>, path: &Path, key: &'static str, managed: bool) {
+    match read_flags(path) {
+        Ok(v) if v.get(key).and_then(Value::as_bool) == Some(true) => out.push(HookBlocker {
+            path: path.to_path_buf(),
+            setting: key,
+            error: None,
+            managed,
+        }),
+        Ok(_) => {}
+        Err(e) => out.push(unreadable_msg(path, e, managed)),
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +356,24 @@ mod tests {
         let settings: Vec<&str> = found.iter().map(|b| b.setting).collect();
         assert_eq!(settings, ["disableAllHooks", "allowManagedHooksOnly"]);
         assert!(found[0].path.ends_with(".claude/settings.local.json"));
+        assert!(found[1].managed && found[1].error.is_none());
+    }
+
+    #[test]
+    fn unparseable_or_unreadable_inputs_are_reported_not_ignored() {
+        let p = project_with("{ not json");
+        let home = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        // A directory where managed-settings.json should be: unreadable even
+        // as root.
+        fs::create_dir(managed.path().join("managed-settings.json")).unwrap();
+        fs::create_dir(managed.path().join("managed-settings.d")).unwrap();
+        fs::write(managed.path().join("managed-settings.d/a.json"), "][").unwrap();
+        let found = blockers_in(p.path(), Some(home.path()), &[managed.path().to_path_buf()]);
+        let errs: Vec<&HookBlocker> = found.iter().filter(|b| b.error.is_some()).collect();
+        assert_eq!(errs.len(), 3, "{found:?}");
+        assert!(errs[0].path.ends_with(".claude/settings.json"));
+        assert!(errs[1].managed && errs[2].managed);
+        assert!(found.iter().all(|b| b.setting.is_empty()));
     }
 }

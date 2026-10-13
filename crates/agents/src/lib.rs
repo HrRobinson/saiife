@@ -141,6 +141,12 @@ impl Agent {
 pub struct HookBlocker {
     pub path: PathBuf,
     pub setting: &'static str,
+    /// Set when `path` could not be read or parsed, so it is unknown whether
+    /// it switches hooks off (`setting` is then empty). A missing file is
+    /// not an error.
+    pub error: Option<String>,
+    /// The file is a machine-wide managed-settings file (an administrator's).
+    pub managed: bool,
 }
 
 /// What an install or remove did to the config file.

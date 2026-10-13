@@ -16,6 +16,8 @@ pub struct Env {
     pub home: TempDir,
     pub data: TempDir,
     pub audit: TempDir,
+    /// Stands in for /etc/claude-code (`SAIIFE_TEST_CLAUDE_MANAGED_DIRS`).
+    pub managed: TempDir,
 }
 
 /// An executable shell script `dir/name` with `body` after the shebang.
@@ -44,6 +46,7 @@ impl Env {
             home: tempfile::tempdir().unwrap(),
             data: tempfile::tempdir().unwrap(),
             audit: tempfile::tempdir().unwrap(),
+            managed: tempfile::tempdir().unwrap(),
         };
         for a in agents {
             fake_exe(env.bin.path(), a, "exit 0");
@@ -68,6 +71,7 @@ impl Env {
             .env("HOME", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .env("SAIIFE_AUDIT_DIR", self.audit.path())
+            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path())
             .output()
             .unwrap()
     }

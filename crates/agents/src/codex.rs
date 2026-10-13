@@ -105,20 +105,50 @@ pub fn blockers(project: &Path, home: Option<&Path>) -> Vec<HookBlocker> {
     if let Some(home) = home {
         files.push(home.join(".codex/config.toml"));
     }
-    files
-        .into_iter()
-        .filter(|f| {
-            std::fs::read_to_string(f)
-                .ok()
-                .and_then(|t| t.parse::<DocumentMut>().ok())
-                .and_then(|d| d.get("features")?.get("hooks")?.as_bool())
-                == Some(false)
-        })
-        .map(|path: PathBuf| HookBlocker {
-            path,
-            setting: "[features] hooks = false",
-        })
-        .collect()
+    let mut out = Vec::new();
+    for path in files {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                out.push(unreadable(path, e.to_string()));
+                continue;
+            }
+        };
+        match text.parse::<DocumentMut>() {
+            Ok(d) => {
+                if d.get("features")
+                    .and_then(|f| f.get("hooks"))
+                    .and_then(|h| h.as_bool())
+                    == Some(false)
+                {
+                    out.push(HookBlocker {
+                        path,
+                        setting: "[features] hooks = false",
+                        error: None,
+                        managed: false,
+                    });
+                }
+            }
+            Err(e) => out.push(unreadable(
+                path,
+                format!(
+                    "not valid TOML: {}",
+                    e.to_string().trim().replace('\n', " ")
+                ),
+            )),
+        }
+    }
+    out
+}
+
+fn unreadable(path: PathBuf, error: String) -> HookBlocker {
+    HookBlocker {
+        path,
+        setting: "",
+        error: Some(error),
+        managed: false,
+    }
 }
 
 /// The `[[hooks.PreToolUse]]` table `install` appends.
@@ -390,5 +420,17 @@ command = "docs-mcp"
         assert_eq!(found[0].setting, "[features] hooks = false");
         let ok = project_with("[features]\nhooks = true\n");
         assert!(blockers(ok.path(), Some(home.path())).is_empty());
+    }
+
+    #[test]
+    fn unparseable_or_unreadable_config_is_reported() {
+        let p = project_with("model = \n");
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".codex/config.toml")).unwrap();
+        let found = blockers(p.path(), Some(home.path()));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found
+            .iter()
+            .all(|b| b.error.is_some() && b.setting.is_empty()));
     }
 }
