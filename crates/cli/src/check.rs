@@ -193,6 +193,9 @@ fn decide(
             None,
             Some("guard exceeded its latency budget"),
         ),
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { reason },
+        } => audit.write(command, DecisionKind::ErrorAllowed, None, Some(reason)),
     }
 
     match decision {

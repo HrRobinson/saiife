@@ -209,6 +209,9 @@ fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
                 AllowTrace::FailedOpenTimeout => {
                     out.push_str("reason:   guard exceeded its latency budget; failed open\n");
                 }
+                AllowTrace::Unjudgeable { reason } => {
+                    out.push_str(&format!("reason:   not judged ({reason}); failed open\n"));
+                }
             }
         }
     }

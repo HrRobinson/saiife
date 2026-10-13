@@ -1,7 +1,9 @@
 //! Pack model + TOML loader.
 //!
 //! A pack is metadata plus an allow-regex list and a deny-regex list, each deny
-//! carrying a human-readable reason. Loading is fail-open at the granularity of
+//! carrying a human-readable reason, plus optional path rules
+//! (`[[deny_path]]` / `[[allow_path]]`, see `crate::pathrule`) judged against
+//! the files a tool or command touches. Loading is fail-open at the granularity of
 //! the failure: an uncompilable regex drops that *rule* (with a warning), a
 //! malformed or duplicate-id file drops that *pack* (with a warning) — neither
 //! aborts the load of the rest.
@@ -12,6 +14,7 @@ use std::path::Path;
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::pathrule::{validate_glob, PathRule, RuleAccess};
 use crate::prefilter::Prefilter;
 
 /// A compiled matching rule: a regex plus the reason shown when it fires.
@@ -33,12 +36,21 @@ pub struct Pack {
     pub triggers: Vec<String>,
     pub allow: Vec<Rule>,
     pub deny: Vec<Rule>,
+    /// Path carve-outs: a path matching one is exempt from THIS pack's
+    /// `deny_path` rules (never from another pack's).
+    pub allow_path: Vec<PathRule>,
+    pub deny_path: Vec<PathRule>,
 }
 
 impl Pack {
     /// The pack's pre-filter, built from its literal triggers.
     pub fn prefilter(&self) -> Prefilter {
         Prefilter::new(self.triggers.clone())
+    }
+
+    /// Command rules plus path rules.
+    pub fn rule_count(&self) -> usize {
+        self.allow.len() + self.deny.len() + self.allow_path.len() + self.deny_path.len()
     }
 }
 
@@ -54,7 +66,7 @@ pub struct PackWarning {
 pub enum PackError {
     #[error("invalid pack TOML: {0}")]
     Toml(String),
-    #[error("pack is missing [[deny]] reason for pattern {0:?}")]
+    #[error("pack is missing a deny reason for {0:?}")]
     MissingReason(String),
     #[error("pack has no id")]
     MissingId,
@@ -71,6 +83,10 @@ struct RawPackFile {
     allow: Vec<RawRule>,
     #[serde(default)]
     deny: Vec<RawRule>,
+    #[serde(default)]
+    allow_path: Vec<RawPathRule>,
+    #[serde(default)]
+    deny_path: Vec<RawPathRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +109,20 @@ struct RawRule {
     pattern: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPathRule {
+    glob: String,
+    #[serde(default = "default_access")]
+    access: RuleAccess,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn default_access() -> RuleAccess {
+    RuleAccess::Any
 }
 
 fn default_true() -> bool {
@@ -134,6 +164,34 @@ fn compile_rules(
     Ok(out)
 }
 
+/// Check a path rule list. A rule with a bad glob is dropped with a warning;
+/// a deny rule without a reason is a hard error (as for `[[deny]]`).
+fn check_path_rules(
+    source: &str,
+    raw: Vec<RawPathRule>,
+    require_reason: bool,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Vec<PathRule>, PackError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(PackError::MissingReason(r.glob));
+        }
+        match validate_glob(&r.glob) {
+            Ok(()) => out.push(PathRule {
+                glob: r.glob,
+                access: r.access,
+                reason: r.reason.unwrap_or_default(),
+            }),
+            Err(e) => warnings.push(PackWarning {
+                source: source.to_string(),
+                message: format!("skipping path rule: {e}"),
+            }),
+        }
+    }
+    Ok(out)
+}
+
 /// Load and compile a single pack from a TOML string. `source` labels the pack
 /// in any warnings (a filename, or `"<builtin>"`).
 pub fn load_pack_str(
@@ -147,7 +205,9 @@ pub fn load_pack_str(
     }
     let allow = compile_rules(source, raw.allow, false, warnings)?;
     let deny = compile_rules(source, raw.deny, true, warnings)?;
-    if allow.is_empty() && deny.is_empty() {
+    let allow_path = check_path_rules(source, raw.allow_path, false, warnings)?;
+    let deny_path = check_path_rules(source, raw.deny_path, true, warnings)?;
+    if allow.is_empty() && deny.is_empty() && allow_path.is_empty() && deny_path.is_empty() {
         return Err(PackError::NoRules);
     }
     Ok(Pack {
@@ -159,6 +219,8 @@ pub fn load_pack_str(
         triggers: raw.pack.triggers,
         allow,
         deny,
+        allow_path,
+        deny_path,
     })
 }
 
@@ -279,6 +341,56 @@ reason = "good"
         let p = load_pack_str("<t>", toml, &mut w).expect("still loads");
         assert_eq!(p.deny.len(), 1); // the bad one dropped
         assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn loads_path_rules() {
+        let toml = r#"
+[pack]
+id = "t.paths"
+
+[[deny_path]]
+glob = "**/.env"
+access = "read"
+reason = "secrets"
+
+[[allow_path]]
+glob = "**/.env.example"
+
+[[deny_path]]
+glob = "relative/path"
+reason = "bad glob: dropped with a warning"
+"#;
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", toml, &mut w).expect("loads");
+        assert_eq!(
+            p.deny_path,
+            vec![PathRule {
+                glob: "**/.env".into(),
+                access: RuleAccess::Read,
+                reason: "secrets".into()
+            }]
+        );
+        assert_eq!(p.allow_path[0].access, RuleAccess::Any);
+        assert_eq!(p.rule_count(), 2);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].message.contains("relative/path"), "{w:?}");
+    }
+
+    #[test]
+    fn path_rule_errors() {
+        let no_reason = "[pack]\nid = \"t\"\n[[deny_path]]\nglob = \"/x\"\n";
+        let mut w = Vec::new();
+        assert!(matches!(
+            load_pack_str("<t>", no_reason, &mut w),
+            Err(PackError::MissingReason(_))
+        ));
+        let bad_access =
+            "[pack]\nid = \"t\"\n[[deny_path]]\nglob = \"/x\"\naccess = \"exec\"\nreason = \"r\"\n";
+        assert!(matches!(
+            load_pack_str("<t>", bad_access, &mut w),
+            Err(PackError::Toml(_))
+        ));
     }
 
     #[test]

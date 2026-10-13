@@ -14,11 +14,16 @@
 //! never manufactured.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
+
+use crate::canon::{canonicalize, path_forms, PathVars};
 use crate::lexer::{find_all_substitutions, split_segments};
 use crate::normalize::build_argv;
 use crate::pack::Pack;
+use crate::pathrule::{compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
@@ -69,6 +74,9 @@ pub enum AllowTrace {
     },
     /// The guard failed open (budget exceeded); the command was not judged.
     FailedOpenTimeout,
+    /// There was nothing the guard could judge (a path that cannot be
+    /// resolved); allowed, and the caller records it as a fail-open.
+    Unjudgeable { reason: String },
 }
 
 impl Decision {
@@ -86,7 +94,29 @@ pub struct Engine {
     /// rule for. Used only to scope the command-substitution-in-a-guarded-
     /// position policy — see `evaluate_segment`.
     guarded_commands: HashSet<String>,
+    /// Directories paths are resolved against and rule variables bound to.
+    vars: PathVars,
+    /// Each pack's path rules, bound to `vars`.
+    path_rules: Vec<PackPaths>,
 }
+
+/// One pack's path rules with their globs compiled for this machine.
+struct PackPaths {
+    pack: String,
+    allow: Vec<BoundPathRule>,
+    deny: Vec<BoundPathRule>,
+}
+
+struct BoundPathRule {
+    glob: String,
+    regex: Regex,
+    access: RuleAccess,
+    reason: String,
+}
+
+/// Path rules match case-insensitively where the usual filesystem is
+/// case-insensitive (macOS: `.ENV` opens `.env`).
+const PATHS_CASE_INSENSITIVE: bool = cfg!(target_os = "macos");
 
 impl Engine {
     /// Build an engine from loaded packs.
@@ -99,11 +129,133 @@ impl Engine {
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
             .collect();
-        Self {
+        let mut engine = Self {
             combined: Prefilter::new(triggers),
             packs,
             budget: DEFAULT_BUDGET,
             guarded_commands,
+            vars: PathVars::default(),
+            path_rules: Vec::new(),
+        };
+        engine.bind_paths();
+        engine
+    }
+
+    /// Resolve paths against these directories and bind the path rules'
+    /// variables (`~`, `$SAIIFE_BIN`, …) to them. Without this, only rules
+    /// without variables apply and relative paths cannot be judged.
+    pub fn with_paths(mut self, vars: PathVars) -> Self {
+        self.vars = vars;
+        self.bind_paths();
+        self
+    }
+
+    fn bind_paths(&mut self) {
+        let bind = |rules: &[crate::pathrule::PathRule]| -> Vec<BoundPathRule> {
+            rules
+                .iter()
+                .filter_map(|r| {
+                    // Globs were validated at load; a rule whose variable
+                    // has no value on this machine cannot apply.
+                    let regex = compile_glob(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                        .ok()
+                        .flatten()?;
+                    Some(BoundPathRule {
+                        glob: r.glob.clone(),
+                        regex,
+                        access: r.access,
+                        reason: r.reason.clone(),
+                    })
+                })
+                .collect()
+        };
+        self.path_rules = self
+            .packs
+            .iter()
+            .filter(|p| !p.deny_path.is_empty())
+            .map(|p| PackPaths {
+                pack: p.id.clone(),
+                allow: bind(&p.allow_path),
+                deny: bind(&p.deny_path),
+            })
+            .collect();
+    }
+
+    /// `path` as the path rules see it: absolute, symlinks and `..`
+    /// resolved. `None` if it cannot be made absolute.
+    pub fn resolve_path(&self, path: &str) -> Option<PathBuf> {
+        canonicalize(path, None, &self.vars)
+    }
+
+    /// Judge a file tool's access to `path` against the active packs' path
+    /// rules (spec §7.2). Same budget and fail-open rules as `evaluate`.
+    pub fn evaluate_path(&self, access: Access, path: &str) -> Decision {
+        let start = Instant::now();
+        let forms = path_forms(path, None, &self.vars);
+        if forms.is_empty() {
+            return Decision::Allow {
+                trace: AllowTrace::Unjudgeable {
+                    reason: format!("cannot resolve {path:?} to an absolute path"),
+                },
+            };
+        }
+        let mut carved = None;
+        for form in &forms {
+            match self.judge_path(access, form, start) {
+                JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
+                JudgeOutcome::Decided(d) => carved = carved.or(Some(d)),
+                JudgeOutcome::TimedOut => {
+                    return Decision::Allow {
+                        trace: AllowTrace::FailedOpenTimeout,
+                    }
+                }
+                JudgeOutcome::Clean => {}
+            }
+        }
+        carved.unwrap_or(Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        })
+    }
+
+    /// Path rules for one resolved path: per pack, an `allow_path` match
+    /// exempts the path from that pack's `deny_path` rules; the first deny
+    /// in any pack wins.
+    fn judge_path(&self, access: Access, real: &Path, start: Instant) -> JudgeOutcome {
+        let text = real.to_string_lossy();
+        let mut carved: Option<Decision> = None;
+        for pp in &self.path_rules {
+            if start.elapsed() > self.budget {
+                return JudgeOutcome::TimedOut;
+            }
+            let hit = |rules: &[BoundPathRule]| {
+                rules
+                    .iter()
+                    .position(|r| r.access.covers(access) && r.regex.is_match(&text))
+            };
+            if let Some(i) = hit(&pp.allow) {
+                let r = &pp.allow[i];
+                carved.get_or_insert(Decision::Allow {
+                    trace: AllowTrace::AllowRule {
+                        pack: pp.pack.clone(),
+                        pattern: r.glob.clone(),
+                        reason: r.reason.clone(),
+                    },
+                });
+                continue;
+            }
+            if let Some(i) = hit(&pp.deny) {
+                let r = &pp.deny[i];
+                return JudgeOutcome::Decided(Decision::Deny {
+                    pack: pp.pack.clone(),
+                    pattern: r.glob.clone(),
+                    reason: format!("{} ({}: {text})", r.reason, access.label()),
+                    via_inline: None,
+                });
+            }
+        }
+        match carved {
+            Some(d) => JudgeOutcome::Decided(d),
+            None => JudgeOutcome::Clean,
         }
     }
 
@@ -341,7 +493,7 @@ impl Engine {
                             }
                         }
                         Decision::Allow {
-                            trace: AllowTrace::NoMatch,
+                            trace: AllowTrace::NoMatch | AllowTrace::Unjudgeable { .. },
                         } => {}
                     }
                 }
@@ -551,6 +703,149 @@ reason = "deletes untracked files"
     fn case_folded_command_name_is_still_caught() {
         let d = test_engine().evaluate("Git reset --hard");
         assert!(d.is_deny(), "expected DENY, got {d:?}");
+    }
+
+    const PATH_PACK: &str = r#"
+[pack]
+id = "test.paths"
+
+[[deny_path]]
+glob = "**/.env"
+access = "read"
+reason = "secret file"
+
+[[deny_path]]
+glob = "**/.env.*"
+access = "read"
+reason = "secret file"
+
+[[allow_path]]
+glob = "**/.env.example"
+access = "read"
+reason = "template, no secrets"
+
+[[deny_path]]
+glob = "~/.ssh/id_*"
+access = "any"
+reason = "private key"
+
+[[deny_path]]
+glob = "$PROJECT/.locked/**"
+access = "write"
+reason = "locked"
+"#;
+
+    fn path_engine(vars: PathVars) -> Engine {
+        let mut w = Vec::new();
+        let pack = load_pack_str("<t>", PATH_PACK, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        Engine::new(vec![pack]).with_paths(vars)
+    }
+
+    fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = std::fs::canonicalize(d.path()).unwrap();
+        (d, p)
+    }
+
+    #[test]
+    fn evaluate_path_denies_and_carves_out() {
+        let (_d, root) = canonical_tmp();
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let e = path_engine(
+            PathVars::new()
+                .with_cwd(&app)
+                .with_var("HOME", root.join("home"))
+                .with_var("PROJECT", &app),
+        );
+        let d = e.evaluate_path(Access::Read, ".env");
+        match &d {
+            Decision::Deny {
+                pack,
+                pattern,
+                reason,
+                ..
+            } => {
+                assert_eq!(pack, "test.paths");
+                assert_eq!(pattern, "**/.env");
+                assert!(reason.contains("secret file"), "{reason}");
+                assert!(
+                    reason.contains(&app.join(".env").display().to_string()),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+        assert!(e.evaluate_path(Access::Read, ".env.local").is_deny());
+        assert!(matches!(
+            e.evaluate_path(Access::Read, ".env.example"),
+            Decision::Allow {
+                trace: AllowTrace::AllowRule { .. }
+            }
+        ));
+        // Access matters: `.env` rules are read-only; the key rule is "any".
+        assert!(!e.evaluate_path(Access::Write, ".env").is_deny());
+        assert!(e.evaluate_path(Access::Write, "~/.ssh/id_rsa").is_deny());
+        assert!(e.evaluate_path(Access::Write, ".locked/x").is_deny());
+        assert!(!e.evaluate_path(Access::Read, ".locked/x").is_deny());
+        assert_eq!(
+            e.evaluate_path(Access::Read, "src/main.rs"),
+            Decision::Allow {
+                trace: AllowTrace::NoMatch
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_path_without_cwd_or_home() {
+        let e = path_engine(PathVars::new());
+        assert!(matches!(
+            e.evaluate_path(Access::Read, ".env"),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { .. }
+            }
+        ));
+        // Rules without variables still apply to absolute paths; rules with
+        // an unbound variable do not.
+        assert!(e.evaluate_path(Access::Read, "/srv/app/.env").is_deny());
+        assert!(!e
+            .evaluate_path(Access::Read, "/home/u/.ssh/id_rsa")
+            .is_deny());
+    }
+
+    #[test]
+    fn evaluate_path_fails_open_over_budget() {
+        let (_d, root) = canonical_tmp();
+        let e = path_engine(PathVars::new().with_cwd(&root)).with_budget(Duration::ZERO);
+        assert_eq!(
+            e.evaluate_path(Access::Read, ".env"),
+            Decision::Allow {
+                trace: AllowTrace::FailedOpenTimeout
+            }
+        );
+    }
+
+    #[test]
+    fn allow_path_only_exempts_from_its_own_pack() {
+        let other = r#"
+[pack]
+id = "test.other"
+[[deny_path]]
+glob = "**/.env.example"
+access = "read"
+reason = "other pack says no"
+"#;
+        let mut w = Vec::new();
+        let packs = vec![
+            load_pack_str("<t>", PATH_PACK, &mut w).unwrap(),
+            load_pack_str("<o>", other, &mut w).unwrap(),
+        ];
+        let e = Engine::new(packs).with_paths(PathVars::new().with_cwd("/p"));
+        match e.evaluate_path(Access::Read, ".env.example") {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "test.other"),
+            d => panic!("expected deny, got {d:?}"),
+        }
     }
 
     #[test]

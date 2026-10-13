@@ -33,7 +33,7 @@ pub fn render(builtin: &[Pack], project: &[String], cli_packs: &[String]) -> Str
             &p.id,
             if p.default_on { "on" } else { "off" },
             if here { "on" } else { "off" },
-            &(p.allow.len() + p.deny.len()).to_string(),
+            &p.rule_count().to_string(),
             &p.description,
         ));
     }
