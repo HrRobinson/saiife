@@ -94,3 +94,19 @@ fn broken_project_config_fails_open_to_default_packs() {
     let (code, _) = check(audit.path(), p.path(), DROP);
     assert_eq!(code, 0);
 }
+
+#[test]
+fn oversized_project_config_fails_open_to_default_packs() {
+    let audit = tempfile::tempdir().unwrap();
+    let p = project("\"db.postgres\"");
+    let big = format!(
+        "# {}\nversion = 1\npacks = [\"db.postgres\"]\n",
+        "x".repeat(70 * 1024)
+    );
+    std::fs::write(p.path().join(".saiife/config.toml"), big).unwrap();
+    let (code, stderr) = check(audit.path(), p.path(), "rm -rf /");
+    assert_eq!(code, 2, "default-on packs still apply");
+    assert!(stderr.contains("default packs only"), "{stderr}");
+    let (code, _) = check(audit.path(), p.path(), DROP);
+    assert_eq!(code, 0, "opt-in pack from the oversized file is not loaded");
+}

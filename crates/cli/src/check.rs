@@ -46,8 +46,12 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
             fail_open(&audit, &command, &PayloadError::TooLarge)
         }
         Ok(ToolCall::Shell { command }) => {
-            let engine = engine_for(packs, cli_packs, audit.ctx.cwd.as_deref());
-            decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
+            // Built inside `decide`'s unwind guard: a panic while reading
+            // the project config or building the engine fails open too.
+            let cwd = audit.ctx.cwd.clone();
+            decide(&audit, &command, hook_exit, |c| {
+                engine_for(packs, cli_packs, cwd.as_deref()).evaluate(c)
+            })
         }
         Ok(ToolCall::File { paths, .. }) => {
             // Path rules arrive in plan 3; until then file tools are

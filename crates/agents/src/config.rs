@@ -41,7 +41,7 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// Read `<project>/.saiife/config.toml`.
 pub fn load(project: &Path) -> Result<ProjectConfig, AgentError> {
     let path = project.join(CONFIG_REL);
-    let text = std::fs::read_to_string(&path).map_err(fsutil::io_err(&path))?;
+    let text = read_bounded(&path)?;
     let doc = parse(&path, &text)?;
     let packs = match doc.get("packs") {
         None => Vec::new(),
@@ -57,6 +57,26 @@ pub fn load(project: &Path) -> Result<ProjectConfig, AgentError> {
         packs,
         locked: doc.get("locked").and_then(Item::as_bool).unwrap_or(false),
     })
+}
+
+/// A project config is a few lines; anything bigger is refused unread so a
+/// hostile tree cannot make every hook call slow or exhaust memory.
+pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+fn read_bounded(path: &Path) -> Result<String, AgentError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(fsutil::io_err(path))?;
+    let mut text = String::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(fsutil::io_err(path))?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(layout(
+            path,
+            &format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024),
+        ));
+    }
+    Ok(text)
 }
 
 /// Make sure the config exists and lists `packs`. A missing file is created
@@ -192,6 +212,16 @@ mod tests {
             assert!(ensure(p.path(), &ids(&["db.postgres"])).is_err(), "{bad:?}");
             assert_eq!(fs::read_to_string(p.path().join(CONFIG_REL)).unwrap(), bad);
         }
+    }
+
+    #[test]
+    fn oversized_config_is_refused() {
+        let p = tempfile::tempdir().unwrap();
+        fs::create_dir(p.path().join(".saiife")).unwrap();
+        let big = format!("# {}\npacks = []\n", "x".repeat(70 * 1024));
+        fs::write(p.path().join(CONFIG_REL), &big).unwrap();
+        assert!(load(p.path()).is_err());
+        assert_eq!(fs::read_to_string(p.path().join(CONFIG_REL)).unwrap(), big);
     }
 
     #[test]
