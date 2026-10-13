@@ -235,7 +235,8 @@ fn last_calls(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>)
         .collect();
     // An agent may report its cwd through a symlink to the project: compare
     // each distinct recorded path canonicalized too (once per path). A path
-    // that no longer exists is only compared literally.
+    // that no longer exists, or a relative one (it would resolve against
+    // status's own cwd), is only compared literally.
     let mut canonical: HashMap<String, Option<PathBuf>> = HashMap::new();
     all.records
         .into_iter()
@@ -248,7 +249,12 @@ fn last_calls(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>)
             };
             canonical
                 .entry(r.project.clone())
-                .or_insert_with(|| std::fs::canonicalize(&r.project).ok())
+                .or_insert_with(|| {
+                    Path::new(&r.project)
+                        .is_absolute()
+                        .then(|| std::fs::canonicalize(&r.project).ok())
+                        .flatten()
+                })
                 .as_ref()
                 .is_some_and(|p| p.starts_with(croot))
         })

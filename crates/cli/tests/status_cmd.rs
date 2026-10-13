@@ -543,3 +543,36 @@ fn unreadable_managed_settings_tell_you_to_ask_the_administrator() {
     assert!(text.contains("Fix: ask your administrator"), "{text}");
     assert!(!text.contains("make it readable so saiife"), "{text}");
 }
+
+/// Residual (M3): a relative project path in a record (an odd payload)
+/// must not resolve against status's own cwd and count for this project.
+#[test]
+fn relative_recorded_project_does_not_count_as_a_hook_call() {
+    use saiife_audit::{store, DecisionKind, NewRecord, Record};
+    let env = initialized(&["claude"]);
+    for project in [".", "src", "./"] {
+        let rec = Record::new(
+            NewRecord {
+                agent: "claude",
+                project,
+                session: None,
+                tool: "Bash",
+                input: "ls",
+                decision: DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+            },
+            "0.1.0",
+        );
+        store::append(env.audit.path(), &rec).unwrap();
+    }
+    std::fs::create_dir_all(env.root().join("src")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("never"), "{claude}");
+}
