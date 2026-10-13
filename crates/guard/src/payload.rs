@@ -63,6 +63,36 @@ pub fn command_from_hook_json(input: &str, max_bytes: usize) -> Result<String, P
     Err(PayloadError::NoCommand)
 }
 
+/// Metadata about a hook call, for the audit log. Best-effort: any field the
+/// payload does not carry (or an unparseable payload) is `None`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HookContext {
+    pub tool: Option<String>,
+    pub session: Option<String>,
+    pub cwd: Option<String>,
+}
+
+pub fn context_from_hook_json(input: &str) -> HookContext {
+    if input.len() > MAX_PAYLOAD_BYTES {
+        return HookContext::default();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(input) else {
+        return HookContext::default();
+    };
+    let field = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|n| v.get(*n).and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    HookContext {
+        tool: field(&["tool_name", "toolName"]),
+        session: field(&["session_id", "sessionId"]),
+        cwd: field(&["cwd"]),
+    }
+}
+
 /// Interpreters whose `-c <payload>` invocation smuggles a real command line.
 ///
 /// `su` belongs here, NOT in `wrappers::TRANSPARENT_PREFIXES`: its first
@@ -329,5 +359,24 @@ mod tests {
         assert_eq!(inline_payload(&argv(&["su", "rm"])), None);
         assert_eq!(inline_payload(&argv(&["su", "root"])), None);
         assert_eq!(inline_payload(&argv(&["su"])), None);
+    }
+
+    #[test]
+    fn context_reads_claude_fields() {
+        let json = r#"{"session_id":"abc","cwd":"/home/u/app","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        let ctx = context_from_hook_json(json);
+        assert_eq!(ctx.tool.as_deref(), Some("Bash"));
+        assert_eq!(ctx.session.as_deref(), Some("abc"));
+        assert_eq!(ctx.cwd.as_deref(), Some("/home/u/app"));
+    }
+
+    #[test]
+    fn context_reads_camel_case_and_tolerates_garbage() {
+        let ctx = context_from_hook_json(r#"{"toolName":"shell","sessionId":"x"}"#);
+        assert_eq!(ctx.tool.as_deref(), Some("shell"));
+        assert_eq!(ctx.session.as_deref(), Some("x"));
+        assert_eq!(context_from_hook_json("{not json"), HookContext::default());
+        let huge = "a".repeat(MAX_PAYLOAD_BYTES + 1);
+        assert_eq!(context_from_hook_json(&huge), HookContext::default());
     }
 }

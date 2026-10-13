@@ -2,17 +2,17 @@
 //!
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
-//! - `saiife check` -> read agent PreToolUse JSON on stdin, emit the hook
-//!   allow/block response; FAIL OPEN on error.
+//! - `saiife check` -> read agent pre-tool JSON on stdin, audit, emit the hook allow/block response; FAIL OPEN on error.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod check;
+
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
-use saiifeguard::payload::{command_from_hook_json, MAX_PAYLOAD_BYTES};
 use saiifeguard::profile::select_active;
 
 #[derive(Parser)]
@@ -37,24 +37,15 @@ enum Cmd {
     Test { command: String },
     /// Print the full decision trace for a command (always exit 0).
     Explain { command: String },
-    /// Hook mode: read a PreToolUse JSON payload on stdin, emit the response.
+    /// Hook mode: read a pre-tool JSON payload on stdin, decide, audit, respond.
     Check {
         /// Deny via exit code 2 + stderr reason (universal agent contract)
         /// instead of the JSON permissionDecision payload.
         #[arg(long = "hook-exit")]
         hook_exit: bool,
-        /// Append a JSONL record for each DENY to this file (best-effort).
-        #[arg(long = "audit-log", value_name = "PATH")]
-        audit_log: Option<String>,
-        /// Tag (pane id) attached to audit records.
-        #[arg(long = "audit-tag", value_name = "TAG")]
-        audit_tag: Option<String>,
-        /// Overwrite a per-tag invocation marker at <PATH>/<audit-tag> on EVERY
-        /// evaluation (allow or deny), so saiife can observe that the hook
-        /// actually fired for this pane. Best-effort; overwrite (truncate)
-        /// semantics — one small file per tag, no unbounded growth.
-        #[arg(long = "seen-dir", value_name = "PATH")]
-        seen_dir: Option<String>,
+        /// Which agent is calling (claude, codex, gemini); recorded in the audit log.
+        #[arg(long = "agent", default_value = "unknown")]
+        agent: String,
     },
 }
 
@@ -73,18 +64,7 @@ fn main() -> ExitCode {
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine, &command),
         Cmd::Explain { command } => cmd_explain(&engine, &command),
-        Cmd::Check {
-            hook_exit,
-            audit_log,
-            audit_tag,
-            seen_dir,
-        } => cmd_check(
-            &engine,
-            hook_exit,
-            audit_log.as_deref(),
-            audit_tag.as_deref(),
-            seen_dir.as_deref(),
-        ),
+        Cmd::Check { hook_exit, agent } => check::run(&engine, hook_exit, &agent),
     }
 }
 
@@ -151,140 +131,6 @@ fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_check(
-    engine: &Engine,
-    hook_exit: bool,
-    audit_log: Option<&str>,
-    audit_tag: Option<&str>,
-    seen_dir: Option<&str>,
-) -> ExitCode {
-    // Fail open: any error reading/parsing the payload -> allow.
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
-        warn("could not read hook payload; failing open (allow)");
-        return if hook_exit {
-            ExitCode::SUCCESS
-        } else {
-            emit_allow()
-        };
-    }
-    let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
-        Ok(c) => c,
-        Err(e) => {
-            warn(&format!(
-                "hook payload not usable ({e}); failing open (allow)"
-            ));
-            return if hook_exit {
-                ExitCode::SUCCESS
-            } else {
-                emit_allow()
-            };
-        }
-    };
-    let decision = engine.evaluate(&command);
-    // Best-effort invocation marker: proves the hook fired for this pane. Placed
-    // after evaluate and before any verdict return so the verdict is emitted
-    // regardless of marker outcome (observability, never enforcement).
-    if let Some(dir) = seen_dir {
-        write_seen_marker(dir, audit_tag);
-    }
-    if let (Some(path), Decision::Deny { reason, pack, .. }) = (audit_log, &decision) {
-        append_audit(path, audit_tag, &command, reason, pack);
-    }
-    match decision {
-        Decision::Deny {
-            pack,
-            reason,
-            via_inline,
-            ..
-        } => {
-            // Same "BLOCKED by <pack>: <reason> (inline: ...)" shape as
-            // `cmd_test`/`cmd_explain` for this identical Decision::Deny — the
-            // hook path is what a real user hits day to day, so it must not
-            // drop the pack name the other two paths already surface. This
-            // only enriches the message; the decision itself (deny, exit 2 /
-            // permissionDecision: deny) is unchanged.
-            let where_ = via_inline
-                .as_deref()
-                .map(|i| format!(" (inline: {i})"))
-                .unwrap_or_default();
-            let msg = format!("BLOCKED by {pack}: {reason}{where_}");
-            if hook_exit {
-                warn(&msg);
-                ExitCode::from(2)
-            } else {
-                emit_deny(&msg)
-            }
-        }
-        Decision::Allow { .. } => {
-            if hook_exit {
-                ExitCode::SUCCESS
-            } else {
-                emit_allow()
-            }
-        }
-    }
-}
-
-/// Best-effort append of one JSONL deny record. Never fails the process.
-fn append_audit(path: &str, tag: Option<&str>, command: &str, reason: &str, pack: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let rec = serde_json::json!({
-        "ts": ts, "tag": tag, "command": command, "reason": reason, "pack": pack,
-    });
-    use std::io::Write as _;
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| writeln!(f, "{rec}"));
-}
-
-/// Best-effort per-tag invocation marker. Overwrites <dir>/<tag> with the
-/// current epoch-ms each call — one small file per tag, rewritten in place,
-/// so the directory never grows. Any error (bad dir, permissions, unusable
-/// tag) is swallowed: this is observability, never enforcement, and must
-/// never influence the guard verdict.
-fn write_seen_marker(dir: &str, tag: Option<&str>) {
-    let Some(tag) = tag else { return };
-    // Defense in depth: never let a tag escape `dir`. Guard tags are pane
-    // UUIDs ([A-Za-z0-9-]+); reject anything with a separator or `..`.
-    if tag.is_empty() || tag.contains('/') || tag.contains('\\') || tag.contains("..") {
-        return;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(std::path::Path::new(dir).join(tag), ts.to_string());
-}
-
-/// Emit a PreToolUse "allow" response and exit 0.
-fn emit_allow() -> ExitCode {
-    println!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-    );
-    ExitCode::SUCCESS
-}
-
-/// Emit a PreToolUse "deny" response with a reason and exit 0 (the JSON carries
-/// the block decision).
-fn emit_deny(reason: &str) -> ExitCode {
-    let payload = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    });
-    println!("{payload}");
-    ExitCode::SUCCESS
-}
-
-fn warn(msg: &str) {
+pub(crate) fn warn(msg: &str) {
     let _ = writeln!(std::io::stderr(), "saiife: {msg}");
 }

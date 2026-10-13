@@ -457,8 +457,10 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "saiife-audit",
  "saiife-guard",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

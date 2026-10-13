@@ -52,6 +52,7 @@ fn check_denies_via_hook_json() {
     Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
+        .env("SAIIFE_AUDIT_DIR", std::env::temp_dir().join("saiife-test-audit-cli"))
         .write_stdin(
             r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#,
         )
@@ -66,6 +67,10 @@ fn check_fails_open_on_garbage() {
     Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
+        .env(
+            "SAIIFE_AUDIT_DIR",
+            std::env::temp_dir().join("saiife-test-audit-cli"),
+        )
         .write_stdin("{not json at all")
         .assert()
         .success()
