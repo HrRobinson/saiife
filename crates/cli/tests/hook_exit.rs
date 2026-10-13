@@ -73,7 +73,7 @@ fn hook_exit_verdicts_match_test_subcommand_across_a_corpus() {
         );
         let (hook_code, _o, _e) = run_check(&["check", "--hook-exit"], &json);
 
-        let mut test_child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        let test_child = Command::new(env!("CARGO_BIN_EXE_saiife"))
             .args(["test", command])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

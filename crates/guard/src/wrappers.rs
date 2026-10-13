@@ -40,11 +40,10 @@ use crate::lexer::Word;
 /// case-insensitively against each word's text, mirroring the case-fold
 /// applied to argv[0] elsewhere in the pipeline (macOS's case-insensitive
 /// filesystem means `COMMAND rm -rf /` finds the same binary as `command`).
-const TRANSPARENT_PREFIXES: &[&str] =
-    &[
-        "command", "env", "nohup", "nice", "stdbuf", "ionice", "sudo", "time", "timeout", "chroot",
-        "flock",
-    ];
+const TRANSPARENT_PREFIXES: &[&str] = &[
+    "command", "env", "nohup", "nice", "stdbuf", "ionice", "sudo", "time", "timeout", "chroot",
+    "flock",
+];
 
 /// `sudo` short options that take a value, e.g. `-u root`. Bundled/attached
 /// forms (`-uroot`) are also handled — see `unwrap_transparent_prefix`.
@@ -115,7 +114,11 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
                 }
             }
             "stdbuf" | "ionice" | "command" => {
-                while rest.first().map(|w| w.text.starts_with('-')).unwrap_or(false) {
+                while rest
+                    .first()
+                    .map(|w| w.text.starts_with('-'))
+                    .unwrap_or(false)
+                {
                     rest = &rest[1..];
                 }
             }
@@ -125,7 +128,13 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
                 // [OPTIONS] CMD` — value-taking `-o FILE`/`-f FMT` and their
                 // `--output`/`--format` long forms; no positionals precede
                 // the command.
-                rest = skip_options_then_positionals(rest, &['o', 'f'], &["output", "format"], 0, None);
+                rest = skip_options_then_positionals(
+                    rest,
+                    &['o', 'f'],
+                    &["output", "format"],
+                    0,
+                    None,
+                );
             }
             "timeout" => {
                 // `timeout [OPTIONS] DURATION CMD` — value-taking
@@ -419,12 +428,24 @@ mod tests {
     fn helper_skips_value_taking_long_separate_and_attached() {
         let sep = vec![w("--timeout"), w("5"), w("cmd")];
         assert_eq!(
-            texts(skip_options_then_positionals(&sep, &[], &["timeout"], 0, None)),
+            texts(skip_options_then_positionals(
+                &sep,
+                &[],
+                &["timeout"],
+                0,
+                None
+            )),
             vec!["cmd"]
         );
         let att = vec![w("--timeout=5"), w("cmd")];
         assert_eq!(
-            texts(skip_options_then_positionals(&att, &[], &["timeout"], 0, None)),
+            texts(skip_options_then_positionals(
+                &att,
+                &[],
+                &["timeout"],
+                0,
+                None
+            )),
             vec!["cmd"]
         );
     }
@@ -484,7 +505,12 @@ mod tests {
     #[test]
     fn unwraps_time_bare_and_portability_flag() {
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("time"), w("rm"), w("-rf"), w("/")])),
+            texts(unwrap_transparent_prefix(&[
+                w("time"),
+                w("rm"),
+                w("-rf"),
+                w("/")
+            ])),
             vec!["rm", "-rf", "/"]
         );
         assert_eq!(
@@ -503,7 +529,13 @@ mod tests {
     fn unwraps_gnu_time_value_options() {
         // -v boolean, -o FILE / -f FMT separate-value forms.
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("time"), w("-v"), w("rm"), w("-rf"), w("/")])),
+            texts(unwrap_transparent_prefix(&[
+                w("time"),
+                w("-v"),
+                w("rm"),
+                w("-rf"),
+                w("/")
+            ])),
             vec!["rm", "-rf", "/"]
         );
         assert_eq!(
@@ -543,7 +575,12 @@ mod tests {
             vec!["rm", "-rf", "/"]
         );
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("/usr/bin/sudo"), w("rm"), w("-rf"), w("/")])),
+            texts(unwrap_transparent_prefix(&[
+                w("/usr/bin/sudo"),
+                w("rm"),
+                w("-rf"),
+                w("/")
+            ])),
             vec!["rm", "-rf", "/"]
         );
         assert_eq!(
@@ -580,7 +617,13 @@ mod tests {
         );
         // Suffixed duration.
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("timeout"), w("5s"), w("rm"), w("-rf"), w("/")])),
+            texts(unwrap_transparent_prefix(&[
+                w("timeout"),
+                w("5s"),
+                w("rm"),
+                w("-rf"),
+                w("/")
+            ])),
             vec!["rm", "-rf", "/"]
         );
     }
@@ -616,8 +659,10 @@ mod tests {
     #[test]
     fn timeout_no_command_fails_open_without_panic() {
         // bare `timeout`, and `timeout 300` with no command: nothing to run.
-        assert!(unwrap_transparent_prefix(&[w("timeout")]).is_empty()
-            || texts(unwrap_transparent_prefix(&[w("timeout")])) == vec!["timeout"]);
+        assert!(
+            unwrap_transparent_prefix(&[w("timeout")]).is_empty()
+                || texts(unwrap_transparent_prefix(&[w("timeout")])) == vec!["timeout"]
+        );
         assert!(unwrap_transparent_prefix(&[w("timeout"), w("300")]).is_empty());
     }
 
@@ -627,7 +672,12 @@ mod tests {
         // duration slot is not consumed; `rm` stays at argv[0] (still caught
         // as a real command by the pack, but proves the shape guard works).
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("timeout"), w("rm"), w("-rf"), w("/")])),
+            texts(unwrap_transparent_prefix(&[
+                w("timeout"),
+                w("rm"),
+                w("-rf"),
+                w("/")
+            ])),
             vec!["rm", "-rf", "/"]
         );
     }
@@ -661,7 +711,11 @@ mod tests {
     #[test]
     fn chroot_benign_and_no_command() {
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("chroot"), w("/mnt/root"), w("ls")])),
+            texts(unwrap_transparent_prefix(&[
+                w("chroot"),
+                w("/mnt/root"),
+                w("ls")
+            ])),
             vec!["ls"]
         );
         // NEWROOT only, no command -> nothing to judge.
@@ -783,7 +837,11 @@ mod tests {
     #[test]
     fn flock_benign_and_fd_only() {
         assert_eq!(
-            texts(unwrap_transparent_prefix(&[w("flock"), w("/tmp/lock"), w("ls")])),
+            texts(unwrap_transparent_prefix(&[
+                w("flock"),
+                w("/tmp/lock"),
+                w("ls")
+            ])),
             vec!["ls"]
         );
         assert_eq!(
@@ -802,13 +860,19 @@ mod tests {
     #[test]
     fn unwraps_bare_command() {
         let seg = vec![w("command"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_bare_env() {
         let seg = vec![w("env"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
@@ -821,7 +885,10 @@ mod tests {
             w("-rf"),
             w("/"),
         ];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
@@ -839,30 +906,44 @@ mod tests {
     #[test]
     fn unwraps_nice_with_n_flag() {
         let seg = vec![w("nice"), w("-n"), w("10"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_nice_with_short_numeric_flag() {
         let seg = vec![w("nice"), w("-10"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_stacked_wrappers() {
         let seg = vec![w("nohup"), w("env"), w("nice"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_bare_sudo() {
         let seg = vec![w("sudo"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_sudo_with_boolean_flags() {
-        for flag in ["-n", "-E", "-i", "-H", "-s", "-b", "-k", "-K", "-v", "-l", "-A", "-S"] {
+        for flag in [
+            "-n", "-E", "-i", "-H", "-s", "-b", "-k", "-K", "-v", "-l", "-A", "-S",
+        ] {
             let seg = vec![w("sudo"), w(flag), w("rm"), w("-rf"), w("/")];
             assert_eq!(
                 texts(unwrap_transparent_prefix(&seg)),
@@ -875,31 +956,46 @@ mod tests {
     #[test]
     fn unwraps_sudo_with_short_arg_taking_flag_separate_value() {
         let seg = vec![w("sudo"), w("-u"), w("root"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_sudo_with_short_arg_taking_flag_attached_value() {
         let seg = vec![w("sudo"), w("-uroot"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_sudo_with_long_arg_taking_flag_separate_value() {
         let seg = vec![w("sudo"), w("--user"), w("root"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_sudo_with_long_arg_taking_flag_equals_value() {
         let seg = vec![w("sudo"), w("--user=root"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_sudo_with_leading_var_assignment() {
         let seg = vec![w("sudo"), w("FOO=bar"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
@@ -934,25 +1030,45 @@ mod tests {
 
     #[test]
     fn sudo_composes_with_other_wrappers() {
-        let seg = vec![w("nohup"), w("sudo"), w("-u"), w("root"), w("rm"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["rm", "-rf", "/"]);
+        let seg = vec![
+            w("nohup"),
+            w("sudo"),
+            w("-u"),
+            w("root"),
+            w("rm"),
+            w("-rf"),
+            w("/"),
+        ];
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["rm", "-rf", "/"]
+        );
     }
 
     #[test]
     fn unwraps_case_insensitively() {
         let seg = vec![w("COMMAND"), w("RM"), w("-rf"), w("/")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["RM", "-rf", "/"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["RM", "-rf", "/"]
+        );
     }
 
     #[test]
     fn non_wrapper_is_unchanged() {
         let seg = vec![w("git"), w("status")];
-        assert_eq!(texts(unwrap_transparent_prefix(&seg)), vec!["git", "status"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&seg)),
+            vec!["git", "status"]
+        );
     }
 
     #[test]
     fn plain_ls_through_sudo_stays_allow_shaped() {
-        assert_eq!(texts(unwrap_transparent_prefix(&[w("sudo"), w("ls")])), vec!["ls"]);
+        assert_eq!(
+            texts(unwrap_transparent_prefix(&[w("sudo"), w("ls")])),
+            vec!["ls"]
+        );
         assert_eq!(
             texts(unwrap_transparent_prefix(&[
                 w("sudo"),

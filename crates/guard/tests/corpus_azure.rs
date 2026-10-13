@@ -27,7 +27,10 @@ fn denies_destructive_azure_commands() {
     // (command, substring the reason must contain — proves the class is named)
     let cases = [
         ("az group delete --name prod --yes", "resource group"),
-        ("az vm delete --name web --resource-group prod", "virtual machine"),
+        (
+            "az vm delete --name web --resource-group prod",
+            "virtual machine",
+        ),
         (
             "az storage account delete --name acct --resource-group prod",
             "storage account",
@@ -38,7 +41,10 @@ fn denies_destructive_azure_commands() {
             "az role assignment create --assignee x --role Owner --scope /subscriptions/s",
             "privilege",
         ),
-        ("az role assignment delete --assignee x --role Owner", "privilege"),
+        (
+            "az role assignment delete --assignee x --role Owner",
+            "privilege",
+        ),
         ("az role definition delete --name custom-role", "privilege"),
         // global option BEFORE the group must not shift the anchor (separate + attached)
         (
@@ -58,7 +64,10 @@ fn denies_destructive_azure_commands() {
         // sudo-wrapped
         ("sudo az group delete --name prod --yes", "resource group"),
         // chained after a benign command
-        ("az account show && az group delete --name prod", "resource group"),
+        (
+            "az account show && az group delete --name prod",
+            "resource group",
+        ),
     ];
     for (cmd, needle) in cases {
         let (pack, reason) = deny(&e, cmd);

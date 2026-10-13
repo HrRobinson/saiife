@@ -59,7 +59,7 @@ fn allows_safe_mysql_statements() {
         r#"mysql -e "UPDATE users SET active = 0 WHERE id = 2""#,
         r#"mysql -e "INSERT INTO t VALUES (1)""#,
         r#"mysql -e "SHOW GRANTS FOR 'x'@'%'""#, // read, not GRANT ALL
-        r#"mysql -e "SELECT * FROM drop_me""#,    // 'drop' only in a table name
+        r#"mysql -e "SELECT * FROM drop_me""#,   // 'drop' only in a table name
         "mysql prod",
         "mysqldump prod > backup.sql",
         "mysqladmin status",

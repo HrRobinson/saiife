@@ -159,7 +159,10 @@ mod tests {
 
     #[test]
     fn real_command_word_is_not_a_substitution() {
-        assert_eq!(command_position_substitution(&[w("rm"), w("-rf"), w("/")]), None);
+        assert_eq!(
+            command_position_substitution(&[w("rm"), w("-rf"), w("/")]),
+            None
+        );
     }
 
     #[test]

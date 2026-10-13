@@ -822,8 +822,14 @@ mod tests {
 
     #[test]
     fn backslash_outside_quotes_escapes_operators_as_data() {
-        assert_eq!(segs(r"a \; rm -rf /"), vec![vec!["a", ";", "rm", "-rf", "/"]]);
-        assert_eq!(segs(r"a \& rm -rf /"), vec![vec!["a", "&", "rm", "-rf", "/"]]);
+        assert_eq!(
+            segs(r"a \; rm -rf /"),
+            vec![vec!["a", ";", "rm", "-rf", "/"]]
+        );
+        assert_eq!(
+            segs(r"a \& rm -rf /"),
+            vec![vec!["a", "&", "rm", "-rf", "/"]]
+        );
     }
 
     // ---- adjacent-string concatenation ---------------------------------
@@ -849,8 +855,14 @@ mod tests {
             segs("a && b || rm -rf /"),
             vec![vec!["a"], vec!["b"], vec!["rm", "-rf", "/"]]
         );
-        assert_eq!(segs("true; rm -rf ~"), vec![vec!["true"], vec!["rm", "-rf", "~"]]);
-        assert_eq!(segs("foo | rm -rf /"), vec![vec!["foo"], vec!["rm", "-rf", "/"]]);
+        assert_eq!(
+            segs("true; rm -rf ~"),
+            vec![vec!["true"], vec!["rm", "-rf", "~"]]
+        );
+        assert_eq!(
+            segs("foo | rm -rf /"),
+            vec![vec!["foo"], vec!["rm", "-rf", "/"]]
+        );
     }
 
     #[test]
@@ -861,10 +873,7 @@ mod tests {
 
     #[test]
     fn splits_on_newline() {
-        assert_eq!(
-            segs("a\nrm -rf /"),
-            vec![vec!["a"], vec!["rm", "-rf", "/"]]
-        );
+        assert_eq!(segs("a\nrm -rf /"), vec![vec!["a"], vec!["rm", "-rf", "/"]]);
     }
 
     #[test]
@@ -876,7 +885,10 @@ mod tests {
 
     #[test]
     fn drops_empty_segments_from_consecutive_separators() {
-        assert_eq!(segs("echo hi ;; echo bye"), vec![vec!["echo", "hi"], vec!["echo", "bye"]]);
+        assert_eq!(
+            segs("echo hi ;; echo bye"),
+            vec![vec!["echo", "hi"], vec!["echo", "bye"]]
+        );
     }
 
     #[test]
@@ -994,7 +1006,11 @@ mod tests {
         assert_eq!(segs("( ls )"), vec![vec!["ls"]]);
         assert_eq!(
             segs("for i in 1; do echo hi; done"),
-            vec![vec!["for", "i", "in", "1"], vec!["echo", "hi"], vec!["done"]]
+            vec![
+                vec!["for", "i", "in", "1"],
+                vec!["echo", "hi"],
+                vec!["done"]
+            ]
         );
     }
 

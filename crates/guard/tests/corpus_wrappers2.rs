@@ -181,7 +181,11 @@ fn flock_bypass_now_denies() {
 fn flock_benign_still_allows() {
     assert_all_allow(
         &default_engine(),
-        &["flock /tmp/lock ls", "flock /tmp/lock echo hi", "flock -n 9"],
+        &[
+            "flock /tmp/lock ls",
+            "flock /tmp/lock echo hi",
+            "flock -n 9",
+        ],
     );
 }
 
@@ -335,7 +339,10 @@ fn long_chain_with_trailing_wrapper_denies_and_stays_linear() {
         let start = std::time::Instant::now();
         let decision = e.evaluate(&cmd);
         let elapsed = start.elapsed();
-        assert!(decision.is_deny(), "expected DENY for tail {tail:?}, got {decision:?}");
+        assert!(
+            decision.is_deny(),
+            "expected DENY for tail {tail:?}, got {decision:?}"
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(250),
             "5000-segment chain ({tail:?}) took {elapsed:?}, far above linear — possible quadratic blowup"

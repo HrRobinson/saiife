@@ -36,14 +36,8 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
         "<builtin>cloud.azure",
         include_str!("../packs/cloud.azure.toml"),
     ),
-    (
-        "<builtin>db.mysql",
-        include_str!("../packs/db.mysql.toml"),
-    ),
-    (
-        "<builtin>db.mongo",
-        include_str!("../packs/db.mongo.toml"),
-    ),
+    ("<builtin>db.mysql", include_str!("../packs/db.mysql.toml")),
+    ("<builtin>db.mongo", include_str!("../packs/db.mongo.toml")),
     (
         "<builtin>container.docker",
         include_str!("../packs/container.docker.toml"),

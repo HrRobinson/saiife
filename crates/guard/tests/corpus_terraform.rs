@@ -47,7 +47,10 @@ fn denies_destructive_terraform_commands() {
         ("terraform apply -var-file prod.tfvars", "blind"),
         ("terraform apply -target aws_instance.foo", "blind"),
         ("terraform apply -replace aws_instance.foo", "blind"),
-        ("terraform apply -input=false -var region=us-east-1", "blind"),
+        (
+            "terraform apply -input=false -var region=us-east-1",
+            "blind",
+        ),
         // auto-approve, anywhere in argv
         ("terraform apply -auto-approve", "confirmation"),
         ("terraform apply --auto-approve", "confirmation"),

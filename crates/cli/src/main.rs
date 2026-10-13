@@ -16,7 +16,11 @@ use saiifeguard::payload::{command_from_hook_json, MAX_PAYLOAD_BYTES};
 use saiifeguard::profile::select_active;
 
 #[derive(Parser)]
-#[command(name = "saiife", version, about = "Guard and audit for AI coding agents")]
+#[command(
+    name = "saiife",
+    version,
+    about = "Guard and audit for AI coding agents"
+)]
 struct Cli {
     /// Enable an opt-in pack by id (repeatable), e.g. `--pack cloud.gcloud`.
     /// Default-on packs (core.*) are always active.
