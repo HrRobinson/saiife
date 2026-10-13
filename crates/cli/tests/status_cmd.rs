@@ -352,3 +352,46 @@ fn managed_allow_managed_hooks_only_is_reported_with_admin_fix() {
     assert!(text.contains("allowManagedHooksOnly"), "{text}");
     assert!(text.contains("ask your administrator"), "{text}");
 }
+
+/// I1: an agent `init` could not set up is a failed check, not "not set up".
+#[test]
+fn agent_init_could_not_set_up_is_a_failed_check() {
+    let env = Env::new(&["claude"]);
+    let broken = "{\n  // my comment\n  \"model\": \"opus\"\n}\n";
+    env.write(".claude/settings.json", broken);
+    let out = env.saiife(&["init", "--agent", "claude"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(
+        !stdout(&out).contains("- Claude Code:"),
+        "no next steps for a failed agent: {}",
+        stdout(&out)
+    );
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains("`saiife init` could not set up Claude Code"),
+        "{text}"
+    );
+    assert!(
+        text.contains("repair .claude/settings.json, then run `saiife init`"),
+        "{text}"
+    );
+    assert_eq!(env.read(".claude/settings.json"), broken);
+}
+
+/// I1: a record with no hooked agent at all guards nothing.
+#[test]
+fn record_without_any_hooked_agent_is_a_failed_check() {
+    let env = initialized(&["claude"]);
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["hooks"] = serde_json::json!({});
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    std::fs::remove_file(env.root().join(".claude/settings.json")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("no agent is hooked"), "{text}");
+}

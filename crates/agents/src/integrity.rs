@@ -52,8 +52,13 @@ pub struct Integrity {
 pub struct HookRecord {
     /// Config file, relative to the project.
     pub file: String,
-    /// Fingerprint of the hook entry (`Agent::expected_entry`).
+    /// Fingerprint of the hook entry (`Agent::expected_entry`). Empty when
+    /// `error` is set.
     pub sha256: String,
+    /// Set when `init` tried to set this agent up and failed (the reason).
+    /// `status` reports such an agent as a failed check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
@@ -136,6 +141,7 @@ mod tests {
             HookRecord {
                 file: ".claude/settings.json".into(),
                 sha256: "ab".repeat(32),
+                error: None,
             },
         );
         Integrity {

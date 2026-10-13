@@ -147,6 +147,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         describe(&config_change, "packs added", "already set up")
     )];
 
+    let mut installed = Vec::new();
     for agent in &agents {
         match agent.install(&root) {
             Ok(change) => {
@@ -156,8 +157,10 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                     HookRecord {
                         file: agent.config_rel().to_string(),
                         sha256: agent.expected_entry(),
+                        error: None,
                     },
                 );
+                installed.push(*agent);
                 lines.push(format!(
                     "  {:<7} {} ({})",
                     agent.name(),
@@ -167,6 +170,16 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             }
             Err(e) => {
                 failed = true;
+                // Recorded, so `status` reports the agent as not guarded
+                // instead of "not set up".
+                hooks.insert(
+                    agent.name().to_string(),
+                    HookRecord {
+                        file: agent.config_rel().to_string(),
+                        sha256: String::new(),
+                        error: Some(e.to_string()),
+                    },
+                );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
             }
         }
@@ -217,9 +230,11 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         println!("  packs   {}", active.join(", "));
     }
     path_warning(&exe);
-    println!("\nNext steps:");
-    for agent in &agents {
-        println!("  - {}: {}", agent.label(), agent.next_step());
+    if !installed.is_empty() {
+        println!("\nNext steps:");
+        for agent in &installed {
+            println!("  - {}: {}", agent.label(), agent.next_step());
+        }
     }
     println!("Check the setup any time with `saiife status`.");
     if failed {

@@ -78,6 +78,13 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             }
             continue;
         };
+        if let Some(e) = &rec.error {
+            problems.push(Problem {
+                what: format!("`saiife init` could not set up {}: {e}", agent.label()),
+                fix: format!("repair {rel}, then run `saiife init`"),
+            });
+            continue;
+        }
         match found {
             Err(e) => problems.push(Problem {
                 what: format!("{} cannot be checked: {e}", agent.label()),
@@ -142,6 +149,12 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         }
     }
 
+    if !record.hooks.values().any(|h| h.error.is_none()) {
+        problems.push(Problem {
+            what: "no agent is hooked in this project, so saiife guards nothing here.".into(),
+            fix: "run `saiife init --agent <claude|codex|gemini>`".into(),
+        });
+    }
     check_config(&root, &record, builtin, &mut problems);
     check_binary(&record, &mut problems);
 
