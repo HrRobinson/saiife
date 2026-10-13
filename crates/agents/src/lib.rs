@@ -11,15 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::{Path, PathBuf};
+
 pub mod claude;
+pub mod codex;
 pub mod config;
 pub mod detect;
 pub mod fingerprint;
 pub mod fsutil;
 pub mod gemini;
 mod json_hooks;
-
-use std::path::PathBuf;
 
 /// The agents saiife v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,10 +61,77 @@ impl Agent {
         }
     }
 
+    /// The project file `init` writes, relative to the project root.
+    pub fn config_rel(self) -> &'static str {
+        match self {
+            Agent::Claude => claude::SETTINGS_REL,
+            Agent::Codex => codex::CONFIG_REL,
+            Agent::Gemini => gemini::SETTINGS_REL,
+        }
+    }
+
     /// The exact hook command written for this agent. Resolved via `PATH`
     /// so an upgrade never leaves a stale absolute path (spec §5.2).
     pub fn hook_command(self) -> String {
         format!("saiife check --hook-exit --agent {}", self.name())
+    }
+
+    /// What the user still has to do in the agent before the hook runs.
+    pub fn next_step(self) -> &'static str {
+        match self {
+            Agent::Claude => claude::NEXT_STEP,
+            Agent::Codex => codex::NEXT_STEP,
+            Agent::Gemini => gemini::NEXT_STEP,
+        }
+    }
+
+    /// Add saiife's hook entry to this agent's project config.
+    pub fn install(self, project: &Path) -> Result<Change, AgentError> {
+        match self {
+            Agent::Claude => claude::install(project),
+            Agent::Codex => codex::install(project),
+            Agent::Gemini => gemini::install(project),
+        }
+    }
+
+    /// Remove saiife's hook entries (and only those) from this agent's
+    /// project config. With `delete_if_empty` (a file saiife created), a
+    /// file left with nothing in it is deleted.
+    pub fn remove(self, project: &Path, delete_if_empty: bool) -> Result<Change, AgentError> {
+        match self {
+            Agent::Claude => claude::remove(project, delete_if_empty),
+            Agent::Codex => codex::remove(project, delete_if_empty),
+            Agent::Gemini => gemini::remove(project, delete_if_empty),
+        }
+    }
+
+    /// Fingerprints of every saiife hook entry currently in the config, in
+    /// file order. Empty when the file or the entry is missing.
+    pub fn entries(self, project: &Path) -> Result<Vec<String>, AgentError> {
+        match self {
+            Agent::Claude => claude::entries(project),
+            Agent::Codex => codex::entries(project),
+            Agent::Gemini => gemini::entries(project),
+        }
+    }
+
+    /// Settings in this agent's project or user config that stop the hook
+    /// from running at all. Read-only.
+    pub fn blockers(self, project: &Path, home: Option<&Path>) -> Vec<HookBlocker> {
+        match self {
+            Agent::Claude => claude::blockers(project, home),
+            Agent::Codex => codex::blockers(project, home),
+            Agent::Gemini => Vec::new(),
+        }
+    }
+
+    /// Fingerprint of the entry `install` writes.
+    pub fn expected_entry(self) -> String {
+        match self {
+            Agent::Claude => claude::expected_entry(),
+            Agent::Codex => codex::expected_entry(),
+            Agent::Gemini => gemini::expected_entry(),
+        }
     }
 }
 
