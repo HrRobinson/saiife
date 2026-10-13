@@ -197,7 +197,13 @@ fn prune(root: &mut Value, event: &str) {
 }
 
 /// Pretty JSON with the indent the original file used (two spaces if it had
-/// none) and its trailing newline (kept if there was one or no file).
+/// none), its line endings (CRLF if it used any) and its trailing newline
+/// (kept if there was one or no file).
+///
+/// Not preserved: a minified (single-line) file comes back pretty-printed,
+/// and string escapes are normalized (`"\u00e9"` becomes `"é"`, `"\/"`
+/// becomes `"/"`), because the file is re-serialized from parsed values.
+/// The content is unchanged; only its spelling differs.
 fn render(root: &Value, original: Option<&str>) -> String {
     let indent = original.and_then(detect_indent).unwrap_or("  ");
     let mut buf = Vec::new();
@@ -207,6 +213,11 @@ fn render(root: &Value, original: Option<&str>) -> String {
     let mut out = String::from_utf8(buf).expect("serde_json writes UTF-8");
     if original.is_none_or(|t| t.ends_with('\n') || t.trim().is_empty()) {
         out.push('\n');
+    }
+    // serde_json never puts a raw newline inside a string, so every '\n'
+    // here is a line break.
+    if original.is_some_and(|t| t.contains("\r\n")) {
+        out = out.replace('\n', "\r\n");
     }
     out
 }

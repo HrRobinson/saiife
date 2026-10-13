@@ -116,7 +116,9 @@ impl Integrity {
         let mut body = serde_json::to_string_pretty(self).expect("integrity serializes");
         body.push('\n');
         tmp.write_all(body.as_bytes()).map_err(io_err(path))?;
+        tmp.as_file().sync_all().map_err(io_err(path))?;
         tmp.persist(path).map_err(|e| io_err(path)(e.error))?;
+        crate::fsutil::sync_dir(dir);
         Ok(())
     }
 

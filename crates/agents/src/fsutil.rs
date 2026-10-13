@@ -53,12 +53,26 @@ pub fn write(project: &Path, rel: &str, contents: &str) -> Result<Change, AgentE
         Err(_) => default_permissions(),
     };
     fs::set_permissions(tmp.path(), perms).map_err(io_err(&target))?;
+    tmp.as_file().sync_all().map_err(io_err(&target))?;
     tmp.persist(&target).map_err(|e| io_err(&target)(e.error))?;
+    sync_dir(&parent);
     Ok(if existed {
         Change::Updated
     } else {
         Change::Created { created_dirs }
     })
+}
+
+/// Make a rename into `dir` durable: fsync the directory itself. Best
+/// effort: some platforms and filesystems refuse to open or sync a
+/// directory, and the data is already written either way.
+pub(crate) fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Delete `<project>/<rel>`; a missing file is fine.
@@ -146,6 +160,14 @@ mod tests {
             fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// F1: syncing a directory is best effort and never fails a write.
+    #[test]
+    fn sync_dir_is_best_effort() {
+        let p = tempfile::tempdir().unwrap();
+        sync_dir(p.path());
+        sync_dir(&p.path().join("missing"));
     }
 
     #[test]

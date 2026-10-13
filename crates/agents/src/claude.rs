@@ -280,6 +280,24 @@ mod tests {
         assert_eq!(read(p.path()), four);
     }
 
+    /// F2: a CRLF file stays CRLF, and init then --off restores its bytes.
+    #[test]
+    fn crlf_settings_round_trip() {
+        let crlf = USER_SETTINGS.replace('\n', "\r\n");
+        let p = project_with(&crlf);
+        install(p.path()).unwrap();
+        let installed = read(p.path());
+        assert!(installed.contains("saiife check"));
+        assert_eq!(
+            installed.matches('\n').count(),
+            installed.matches("\r\n").count(),
+            "every line ends in CRLF: {installed:?}"
+        );
+        assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(remove(p.path(), false).unwrap(), Change::Updated);
+        assert_eq!(read(p.path()), crlf);
+    }
+
     #[test]
     fn creates_the_file_and_deletes_it_again() {
         let p = tempfile::tempdir().unwrap();
