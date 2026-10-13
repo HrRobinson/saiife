@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiifeguard"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -73,7 +73,7 @@ fn hook_exit_verdicts_match_test_subcommand_across_a_corpus() {
         );
         let (hook_code, _o, _e) = run_check(&["check", "--hook-exit"], &json);
 
-        let mut test_child = Command::new(env!("CARGO_BIN_EXE_saiifeguard"))
+        let mut test_child = Command::new(env!("CARGO_BIN_EXE_saiife"))
             .args(["test", command])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

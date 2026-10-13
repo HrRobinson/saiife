@@ -5,7 +5,7 @@ use predicates::prelude::*;
 
 #[test]
 fn test_deny_exits_1_with_reason() {
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .args(["test", "git reset --hard"])
         .assert()
@@ -17,7 +17,7 @@ fn test_deny_exits_1_with_reason() {
 
 #[test]
 fn test_allow_exits_0() {
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .args(["test", "git status"])
         .assert()
@@ -26,7 +26,7 @@ fn test_allow_exits_0() {
 
 #[test]
 fn explain_prints_pack_rule_reason() {
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .args(["explain", "git reset --hard"])
         .assert()
@@ -38,7 +38,7 @@ fn explain_prints_pack_rule_reason() {
 
 #[test]
 fn explain_allow_shows_carveout() {
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .args(["explain", "git push --force-with-lease"])
         .assert()
@@ -49,7 +49,7 @@ fn explain_allow_shows_carveout() {
 
 #[test]
 fn check_denies_via_hook_json() {
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
         .write_stdin(
@@ -63,7 +63,7 @@ fn check_denies_via_hook_json() {
 #[test]
 fn check_fails_open_on_garbage() {
     // Malformed JSON must NOT block — fail open (allow).
-    Command::cargo_bin("saiifeguard")
+    Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
         .write_stdin("{not json at all")

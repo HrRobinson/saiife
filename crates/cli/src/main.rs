@@ -1,8 +1,8 @@
-//! saiifeguard CLI.
+//! saiife CLI.
 //!
-//! - `saiifeguard test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
-//! - `saiifeguard explain "<cmd>"` -> decision trace to stdout, always exit 0
-//! - `saiifeguard check` -> read agent PreToolUse JSON on stdin, emit the hook
+//! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
+//! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
+//! - `saiife check` -> read agent PreToolUse JSON on stdin, emit the hook
 //!   allow/block response; FAIL OPEN on error.
 
 use std::io::{Read, Write};
@@ -16,7 +16,7 @@ use saiifeguard::payload::{command_from_hook_json, MAX_PAYLOAD_BYTES};
 use saiifeguard::profile::select_active;
 
 #[derive(Parser)]
-#[command(name = "saiifeguard", version, about = "saiife command guard")]
+#[command(name = "saiife", version, about = "Guard and audit for AI coding agents")]
 struct Cli {
     /// Enable an opt-in pack by id (repeatable), e.g. `--pack cloud.gcloud`.
     /// Default-on packs (core.*) are always active.
@@ -282,5 +282,5 @@ fn emit_deny(reason: &str) -> ExitCode {
 }
 
 fn warn(msg: &str) {
-    let _ = writeln!(std::io::stderr(), "saiifeguard: {msg}");
+    let _ = writeln!(std::io::stderr(), "saiife: {msg}");
 }

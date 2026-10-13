@@ -57,11 +57,10 @@ Rust workspace:
 
 ```
 crates/
-  guard/    engine, lexer, packs, payload parsing   (moved from saiifeguard)
+  guard/    engine, lexer, payload parsing, packs/*.toml (embedded at build time)
   audit/    record, mask, write, read, HTML report
   agents/   one module per agent: detect, install hook, remove hook
   cli/      the `saiife` binary; thin command layer over the three above
-packs/      *.toml rule packs (embedded in the binary at build time)
 docs/       one page per pack, install, recipes
 ```
 
