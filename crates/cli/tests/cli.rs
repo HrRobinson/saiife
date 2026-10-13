@@ -49,10 +49,14 @@ fn explain_allow_shows_carveout() {
 
 #[test]
 fn check_denies_via_hook_json() {
+    let audit = tempfile::tempdir().unwrap();
     Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
-        .env("SAIIFE_AUDIT_DIR", std::env::temp_dir().join("saiife-test-audit-cli"))
+        .env("SAIIFE_AUDIT_DIR", audit.path())
+        .env("HOME", audit.path().join("home"))
+        .env("SAIIFE_DATA_DIR", audit.path().join("data"))
+        .current_dir(audit.path())
         .write_stdin(
             r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#,
         )
@@ -64,15 +68,18 @@ fn check_denies_via_hook_json() {
 #[test]
 fn check_fails_open_on_garbage() {
     // Malformed JSON must NOT block — fail open (allow).
+    let audit = tempfile::tempdir().unwrap();
     Command::cargo_bin("saiife")
         .unwrap()
         .arg("check")
-        .env(
-            "SAIIFE_AUDIT_DIR",
-            std::env::temp_dir().join("saiife-test-audit-cli"),
-        )
+        .env("SAIIFE_AUDIT_DIR", audit.path())
+        .env("HOME", audit.path().join("home"))
+        .env("SAIIFE_DATA_DIR", audit.path().join("data"))
+        .current_dir(audit.path())
         .write_stdin("{not json at all")
         .assert()
         .success()
-        .stdout(predicate::str::contains("allow"));
+        // Allow is silence: an explicit "allow" would skip the agent's own
+        // permission prompts (Claude) or count as a failed hook (Codex).
+        .stdout(predicate::str::is_empty());
 }

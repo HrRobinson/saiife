@@ -1,13 +1,22 @@
+mod common;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let audit = tempfile::tempdir().unwrap();
+    run_check_in(audit.path(), args, stdin)
+}
+
+/// `run_check` with the audit log in `audit`.
+fn run_check_in(audit: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    // No `cwd` in these payloads: the project walk starts at the temp dir.
+    common::assert_no_host_config(&std::env::temp_dir());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit);
+    let mut child = cmd
         .args(args)
-        .env(
-            "SAIIFE_AUDIT_DIR",
-            std::env::temp_dir().join(format!("saiife-test-audit-{}", std::process::id())),
-        )
+        .current_dir(audit)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -104,4 +113,68 @@ fn hook_exit_allows_with_code_0() {
 fn hook_exit_fails_open_on_garbage() {
     let (code, _stdout, _stderr) = run_check(&["check", "--hook-exit"], "not json");
     assert_eq!(code, 0, "unparseable stdin must fail open (allow)");
+}
+
+/// Allow is exit 0 with NOTHING on stdout in both modes: Claude Code reads a
+/// JSON `permissionDecision: "allow"` as "skip the user's permission
+/// prompt", and Codex counts an allow without `updatedInput` as a failed hook.
+#[test]
+fn allow_prints_nothing_on_stdout_in_either_mode() {
+    for args in [&["check", "--hook-exit"][..], &["check"][..]] {
+        let (code, stdout, _) = run_check(args, ALLOW_JSON);
+        assert_eq!(code, 0, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?} printed {stdout:?}");
+    }
+}
+
+#[test]
+fn fail_open_prints_nothing_on_stdout_in_either_mode() {
+    for args in [&["check", "--hook-exit"][..], &["check"][..]] {
+        let (code, stdout, _) = run_check(args, "not json");
+        assert_eq!(code, 0, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?} printed {stdout:?}");
+    }
+}
+
+#[test]
+fn json_mode_deny_is_unchanged() {
+    let (code, stdout, _) = run_check(&["check"], DENY_JSON);
+    assert_eq!(code, 0, "JSON mode carries the deny in the payload");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("BLOCKED by core.filesystem"));
+}
+
+/// M2: an unknown flag (e.g. a hook written by a newer saiife) must not
+/// turn into exit 2, which every agent reads as "block": fail open.
+#[test]
+fn check_fails_open_on_unknown_arguments() {
+    let audit = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_check_in(
+        audit.path(),
+        &["check", "--hook-exit", "--agent", "claude", "--future-flag"],
+        DENY_JSON,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("failing open"), "{stderr}");
+    // Failing open is always recorded (spec §1.2 rule 5).
+    let recs = saiife_audit::store::read_all(audit.path()).records;
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r.decision, saiife_audit::DecisionKind::ErrorAllowed);
+    assert_eq!(r.agent, "claude");
+    let reason = r.reason.as_deref().unwrap_or("");
+    assert!(reason.starts_with("bad hook arguments: "), "{reason}");
+    assert!(reason.contains("--future-flag"), "{reason}");
+}
+
+/// M2: other subcommands keep clap's usage error.
+#[test]
+fn other_subcommands_still_reject_unknown_arguments() {
+    let (code, _, _) = run_check(&["status", "--future-flag"], "");
+    assert_eq!(code, 2);
 }

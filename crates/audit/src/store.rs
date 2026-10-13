@@ -57,6 +57,10 @@ pub struct ReadResult {
     /// Month files that could not be read or are not regular files
     /// (symlinks, FIFOs, directories).
     pub unreadable_files: usize,
+    /// Set when the audit directory itself exists but cannot be listed
+    /// (permissions, not a directory). A missing directory is not an error:
+    /// it only means nothing was recorded yet.
+    pub dir_error: Option<String>,
 }
 
 /// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
@@ -64,8 +68,13 @@ pub struct ReadResult {
 /// hides the rest of its file. Other file names are ignored.
 pub fn read_all(dir: &Path) -> ReadResult {
     let mut out = ReadResult::default();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
+        Err(e) => {
+            out.dir_error = Some(e.to_string());
+            return out;
+        }
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -302,6 +311,18 @@ mod tests {
     fn read_all_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_all(&dir.path().join("nope")), ReadResult::default());
+    }
+
+    #[test]
+    fn read_all_of_an_unlistable_dir_says_so() {
+        // A file where the directory should be: unreadable even as root
+        // (the offline CI job runs tests as root in a user namespace).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("audit");
+        fs::write(&file, "x").unwrap();
+        let got = read_all(&file);
+        assert!(got.records.is_empty());
+        assert!(got.dir_error.is_some());
     }
 
     #[cfg(unix)]

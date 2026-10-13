@@ -161,3 +161,17 @@ fn unknown_decision_is_shown_as_other() {
         .success()
         .stdout(predicate::str::contains("No audit records found"));
 }
+
+#[test]
+fn unreadable_audit_dir_is_an_error_not_an_empty_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("audit");
+    std::fs::write(&file, "x").unwrap();
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .arg("audit")
+        .env(DIR_ENV, &file)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot be read"));
+}

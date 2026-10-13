@@ -9,12 +9,25 @@ use std::process::ExitCode;
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::{
-    command_from_hook_json, context_from_hook_json, HookContext, PayloadError, MAX_PAYLOAD_BYTES,
+    classify, context_from_hook_json_bounded, HookContext, PayloadError, ToolCall,
+    MAX_PAYLOAD_BYTES,
 };
+use saiifeguard::profile::select_active;
+use saiifeguard::Pack;
 
+use crate::project::project_packs;
 use crate::warn;
 
-pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
+/// Payloads up to this size are still parsed. File tools (a `Write` of a big
+/// file) are handled normally; a shell command above `MAX_PAYLOAD_BYTES` is
+/// not judged but its command goes into the audit record. Bounded so parsing
+/// stays cheap.
+const PARSE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
+
+/// `packs`: every built-in pack; `cli_packs`: `--pack` ids. The project's
+/// own packs are added from the `.saiife/config.toml` at or above the
+/// payload's `cwd`.
+pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         let audit = Audit::new(agent, HookContext::default());
@@ -25,26 +38,99 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
             None,
             Some("could not read hook payload"),
         );
-        return allow(hook_exit);
+        return allow();
     }
-    let audit = Audit::new(agent, context_from_hook_json(&buf));
-    let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
-        Ok(c) => c,
-        Err(e) => {
-            warn(&format!(
-                "hook payload not usable ({e}); failing open (allow)"
-            ));
-            audit.write(
-                &salvage_command(&buf, &e),
-                DecisionKind::ErrorAllowed,
-                None,
-                Some(&format!("hook payload not usable: {e}")),
-            );
-            return allow(hook_exit);
+    let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+    match classify(&buf, PARSE_MAX_BYTES) {
+        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => {
+            fail_open(&audit, &command, &PayloadError::TooLarge)
         }
-    };
+        Ok(ToolCall::Shell { command }) => {
+            // Built inside `decide`'s unwind guard: a panic while reading
+            // the project config or building the engine fails open too.
+            let cwd = audit.ctx.cwd.clone();
+            decide(&audit, &command, hook_exit, |c| {
+                engine_for(packs, cli_packs, cwd.as_deref()).evaluate(c)
+            })
+        }
+        Ok(ToolCall::File { paths, .. }) => {
+            // Path rules arrive in plan 3; until then file tools are
+            // recorded, never judged.
+            audit.write(&paths.join("\n"), DecisionKind::Allow, None, None);
+            allow()
+        }
+        Ok(ToolCall::Other { .. }) => {
+            audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
+            allow()
+        }
+        Err(e) => fail_open(&audit, "", &e),
+    }
+}
 
-    decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
+/// `saiife check` got arguments it cannot parse: it fails open, so record
+/// that like every other fail-open (spec §1.2 rule 5). Best effort and never
+/// panics: the agent is taken from `--agent` in `args` if present, the
+/// payload is read up to the usual bound (draining the rest, so the agent
+/// gets no EPIPE). The caller exits 0 with nothing on stdout.
+pub fn record_arg_error(args: &[String], error: &str) {
+    let _ = std::panic::catch_unwind(|| {
+        let agent = agent_from_args(args).unwrap_or("unknown");
+        let mut bytes = Vec::new();
+        let mut stdin = std::io::stdin().lock();
+        let _ = (&mut stdin)
+            .take(PARSE_MAX_BYTES as u64)
+            .read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+        let buf = String::from_utf8_lossy(&bytes);
+        let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+        audit.write(
+            "",
+            DecisionKind::ErrorAllowed,
+            None,
+            Some(&format!("bad hook arguments: {error}")),
+        );
+    });
+}
+
+/// The value of `--agent <name>` or `--agent=<name>`.
+fn agent_from_args(args: &[String]) -> Option<&str> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == "--agent" {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            a.strip_prefix("--agent=")
+        }
+    })
+}
+
+/// The engine for this call: default-on packs, `--pack` ids, and the packs
+/// of the project that `cwd` (or this process's directory) belongs to.
+fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engine {
+    let start = match cwd {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    let project = project_packs(&start, &packs);
+    for w in &project.warnings {
+        warn(w);
+    }
+    let mut enabled = cli_packs.to_vec();
+    enabled.extend(project.enabled);
+    Engine::new(select_active(packs, &enabled))
+}
+
+/// The payload could not be judged: allow, and record why.
+fn fail_open(audit: &Audit, input: &str, e: &PayloadError) -> ExitCode {
+    warn(&format!(
+        "hook payload not usable ({e}); failing open (allow)"
+    ));
+    audit.write(
+        input,
+        DecisionKind::ErrorAllowed,
+        None,
+        Some(&format!("hook payload not usable: {e}")),
+    );
+    allow()
 }
 
 /// Judge `command` with `evaluate`, audit the decision and answer the hook.
@@ -68,7 +154,7 @@ fn decide(
                 None,
                 Some("guard crashed"),
             );
-            return allow(hook_exit);
+            return allow();
         }
     };
     match &decision {
@@ -130,23 +216,7 @@ fn decide(
                 emit_deny(&msg)
             }
         }
-        Decision::Allow { .. } => allow(hook_exit),
-    }
-}
-
-/// Payloads up to this size are still parsed after `TooLarge`, only to put
-/// the command in the audit record. Bounded so this stays cheap.
-const SALVAGE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
-
-/// For an oversize payload that is otherwise valid JSON with a command, the
-/// command (the record masks and truncates it), so the log shows what ran
-/// unjudged. Empty for anything else. Never affects the verdict.
-fn salvage_command(buf: &str, err: &PayloadError) -> String {
-    match err {
-        PayloadError::TooLarge => {
-            command_from_hook_json(buf, SALVAGE_MAX_BYTES).unwrap_or_default()
-        }
-        _ => String::new(),
+        Decision::Allow { .. } => allow(),
     }
 }
 
@@ -209,19 +279,11 @@ impl Audit {
     }
 }
 
-fn allow(hook_exit: bool) -> ExitCode {
-    if hook_exit {
-        ExitCode::SUCCESS
-    } else {
-        emit_allow()
-    }
-}
-
-/// Emit a PreToolUse "allow" response and exit 0.
-fn emit_allow() -> ExitCode {
-    println!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-    );
+/// Allow = exit 0 with NOTHING on stdout, for every agent and both modes.
+/// An explicit `permissionDecision: "allow"` would skip Claude Code's own
+/// permission prompts, and Codex treats an allow without `updatedInput` as a
+/// failed hook. Silence means "no objection": the agent's normal flow runs.
+fn allow() -> ExitCode {
     ExitCode::SUCCESS
 }
 
@@ -242,6 +304,21 @@ fn emit_deny(reason: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_is_taken_from_args_when_present() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_from_args(&a(&["check", "--agent", "codex", "--x"])),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_from_args(&a(&["check", "--agent=gemini"])),
+            Some("gemini")
+        );
+        assert_eq!(agent_from_args(&a(&["check", "--x", "--agent"])), None);
+        assert_eq!(agent_from_args(&a(&["check"])), None);
+    }
 
     fn audit_in(dir: &std::path::Path) -> Audit {
         Audit {

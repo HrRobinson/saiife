@@ -2,7 +2,11 @@
 //!
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
-//! - `saiife check` -> read agent pre-tool JSON on stdin, audit, emit the hook allow/block response; FAIL OPEN on error.
+//! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
+//! - `saiife init [--off]` -> hook the agents into this project (or remove exactly that)
+//! - `saiife status` -> tamper checks; exit 1 if any fails
+//! - `saiife packs` -> list packs and which are on here
+//! - `saiife audit` -> the audit log as a table
 
 #![forbid(unsafe_code)]
 
@@ -13,6 +17,10 @@ use clap::{Parser, Subcommand};
 
 mod audit_cmd;
 mod check;
+mod init_cmd;
+mod packs_cmd;
+mod project;
+mod status_cmd;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -50,6 +58,21 @@ enum Cmd {
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
     },
+    /// Turn saiife on for this project: write the guard hook into each
+    /// agent's project config and create .saiife/config.toml.
+    Init {
+        /// Agent to set up (claude, codex, gemini; repeatable). Default: every
+        /// supported agent found on PATH.
+        #[arg(long = "agent", value_name = "AGENT")]
+        agents: Vec<String>,
+        /// Remove exactly what `saiife init` added.
+        #[arg(long, conflicts_with = "agents")]
+        off: bool,
+    },
+    /// Check that this project is still guarded; exit 1 if any check fails.
+    Status,
+    /// List packs: id, on by default, on here, rule count, summary.
+    Packs,
     /// Show the audit log: every allowed, blocked and fail-open decision.
     Audit {
         /// Only records newer than this, e.g. 30m, 24h, 7d.
@@ -68,7 +91,10 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return arg_error(e),
+    };
 
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
@@ -77,12 +103,16 @@ fn main() -> ExitCode {
     for w in &warnings {
         warn(&format!("pack warning ({}): {}", w.source, w.message));
     }
-    let engine = Engine::new(select_active(packs, &cli.packs));
+    let engine = || Engine::new(select_active(packs.clone(), &cli.packs));
 
     match cli.command {
-        Cmd::Test { command } => cmd_test(&engine, &command),
-        Cmd::Explain { command } => cmd_explain(&engine, &command),
-        Cmd::Check { hook_exit, agent } => check::run(&engine, hook_exit, &agent),
+        Cmd::Test { command } => cmd_test(&engine(), &command),
+        Cmd::Explain { command } => cmd_explain(&engine(), &command),
+        Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
+        Cmd::Init { off: true, .. } => init_cmd::off(),
+        Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
+        Cmd::Status => status_cmd::run(&packs),
+        Cmd::Packs => packs_cmd::run(&packs, &cli.packs),
         Cmd::Audit {
             since,
             project,
@@ -95,6 +125,32 @@ fn main() -> ExitCode {
             blocked,
         ),
     }
+}
+
+/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
+/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
+/// flag this binary does not know: warn and fail open, silently on stdout.
+/// Everything else (and `--help` / `--version`) keeps clap's behavior.
+fn arg_error(e: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let hook_mode = std::env::args_os().nth(1).is_some_and(|a| a == "check");
+    if hook_mode && !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let first = e.to_string();
+        let first = first
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("error: ");
+        warn(&format!(
+            "bad hook arguments ({first}); failing open (allow)"
+        ));
+        let args: Vec<String> = std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        check::record_arg_error(&args, first);
+        return ExitCode::SUCCESS;
+    }
+    e.exit()
 }
 
 fn cmd_test(engine: &Engine, command: &str) -> ExitCode {
