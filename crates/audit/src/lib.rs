@@ -7,5 +7,6 @@
 
 pub mod mask;
 pub mod record;
+pub mod store;
 
 pub use record::{DecisionKind, NewRecord, Record};
