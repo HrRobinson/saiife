@@ -2,6 +2,8 @@
 //! audit, and answer in the agent's contract. FAIL OPEN on every error.
 
 use std::io::Read;
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
@@ -42,7 +44,33 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
         }
     };
 
-    let decision = engine.evaluate(&command);
+    decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
+}
+
+/// Judge `command` with `evaluate`, audit the decision and answer the hook.
+/// Split out so the crash path can be tested with a panicking evaluator.
+fn decide(
+    audit: &Audit,
+    command: &str,
+    hook_exit: bool,
+    evaluate: impl FnOnce(&str) -> Decision,
+) -> ExitCode {
+    // A panicking engine must not turn into a non-zero exit the agent may
+    // read as "block" or as a hook error: fail open, and say so in the log.
+    // (Release keeps the default panic=unwind, so this is reachable.)
+    let decision = match std::panic::catch_unwind(AssertUnwindSafe(|| evaluate(command))) {
+        Ok(d) => d,
+        Err(_) => {
+            warn("guard crashed; failing open (allow)");
+            audit.write(
+                command,
+                DecisionKind::ErrorAllowed,
+                None,
+                Some("guard crashed"),
+            );
+            return allow(hook_exit);
+        }
+    };
     match &decision {
         Decision::Deny {
             pack,
@@ -50,7 +78,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
             reason,
             ..
         } => audit.write(
-            &command,
+            command,
             DecisionKind::Deny,
             Some((pack, pattern)),
             Some(reason),
@@ -63,18 +91,18 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
                     reason,
                 },
         } => audit.write(
-            &command,
+            command,
             DecisionKind::Allow,
             Some((pack, pattern)),
             Some(reason),
         ),
         Decision::Allow {
             trace: AllowTrace::NoMatch,
-        } => audit.write(&command, DecisionKind::Allow, None, None),
+        } => audit.write(command, DecisionKind::Allow, None, None),
         Decision::Allow {
             trace: AllowTrace::FailedOpenTimeout,
         } => audit.write(
-            &command,
+            command,
             DecisionKind::ErrorAllowed,
             None,
             Some("guard exceeded its latency budget"),
@@ -109,6 +137,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
 /// Everything about this hook call except the decision, so each exit path
 /// writes a complete record with one call.
 struct Audit {
+    dir: Option<PathBuf>,
     agent: String,
     ctx: HookContext,
     project: String,
@@ -122,6 +151,7 @@ impl Audit {
                 .unwrap_or_default()
         });
         Self {
+            dir: store::default_dir(),
             agent: agent.to_string(),
             ctx,
             project,
@@ -136,7 +166,7 @@ impl Audit {
         rule: Option<(&String, &String)>,
         reason: Option<&str>,
     ) {
-        let Some(dir) = store::default_dir() else {
+        let Some(dir) = &self.dir else {
             return;
         };
         let rec = Record::new(
@@ -153,7 +183,7 @@ impl Audit {
             },
             env!("CARGO_PKG_VERSION"),
         );
-        if let Err(e) = store::append(&dir, &rec) {
+        if let Err(e) = store::append(dir, &rec) {
             warn(&format!("audit write failed ({e}); decision unaffected"));
         }
     }
@@ -187,4 +217,45 @@ fn emit_deny(reason: &str) -> ExitCode {
     });
     println!("{payload}");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audit_in(dir: &std::path::Path) -> Audit {
+        Audit {
+            dir: Some(dir.to_path_buf()),
+            agent: "claude".into(),
+            ctx: HookContext::default(),
+            project: "/p".into(),
+        }
+    }
+
+    #[test]
+    fn engine_panic_fails_open_and_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = decide(&audit_in(dir.path()), "rm -rf /tmp/x", true, |_| {
+            panic!("engine bug")
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        let recs = store::read_all(dir.path()).records;
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].decision, DecisionKind::ErrorAllowed);
+        assert_eq!(recs[0].input, "rm -rf /tmp/x");
+        assert_eq!(recs[0].reason.as_deref(), Some("guard crashed"));
+    }
+
+    #[test]
+    fn normal_decision_still_flows_through_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = decide(&audit_in(dir.path()), "ls", true, |_| Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            store::read_all(dir.path()).records[0].decision,
+            DecisionKind::Allow
+        );
+    }
 }
