@@ -218,6 +218,7 @@ fn off_keeps_an_unreadable_record_and_warns() {
         .path();
     std::fs::write(&rec, "not json").unwrap();
     let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
     assert!(
         stderr(&out).contains("integrity record is unreadable"),
         "{}",

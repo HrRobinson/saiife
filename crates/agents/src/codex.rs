@@ -393,6 +393,39 @@ command = "docs-mcp"
         assert!(!p.path().join(CONFIG_REL).exists());
     }
 
+    /// A user handler and saiife's in one [[hooks.PreToolUse]] group: remove
+    /// takes only saiife's and keeps the group with the user's handler.
+    #[test]
+    fn remove_keeps_the_user_handler_in_a_shared_group() {
+        let shared = r#"[[hooks.PreToolUse]]
+matcher = "^(Bash|apply_patch)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "./audit-shell.sh"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "saiife check --hook-exit --agent codex"
+timeout = 10
+"#;
+        let p = project_with(shared);
+        assert_eq!(entries(p.path()).unwrap().len(), 1);
+        assert_eq!(remove(p.path(), true).unwrap(), Change::Updated);
+        let doc: DocumentMut = read(p.path()).parse().unwrap();
+        let groups = doc["hooks"]["PreToolUse"].as_array_of_tables().unwrap();
+        assert_eq!(groups.len(), 1);
+        let g = groups.get(0).unwrap();
+        assert_eq!(g["matcher"].as_str(), Some(MATCHER));
+        let handlers = g["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(
+            handlers.get(0).unwrap()["command"].as_str(),
+            Some("./audit-shell.sh")
+        );
+        assert!(entries(p.path()).unwrap().is_empty());
+    }
+
     #[test]
     fn tampered_timeout_changes_the_fingerprint() {
         let p = project_with(USER_CONFIG);

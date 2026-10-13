@@ -225,6 +225,10 @@ mod tests {
         assert!(is_saiife_command("  saiife   check"));
         assert!(!is_saiife_command("saiife status"));
         assert!(!is_saiife_command("my-saiife check"));
+        assert!(!is_saiife_command("notsaiife check"));
+        assert!(!is_saiife_command("/opt/bin/notsaiife check"));
+        assert!(!is_saiife_command("saiife-check"));
+        assert!(!is_saiife_command("saiife-check --agent claude"));
         assert!(!is_saiife_command("echo saiife check"));
         assert!(!is_saiife_command(""));
     }

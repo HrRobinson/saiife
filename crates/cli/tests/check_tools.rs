@@ -155,6 +155,12 @@ fn file_tool_fixtures_are_recorded_with_their_paths_and_never_judged() {
             "src/**/*.rs\nREADME.md",
         ),
         (
+            "gemini/grep-search-no-path.json",
+            "gemini",
+            "grep_search",
+            "/home/u/app",
+        ),
+        (
             "gemini/list-directory.json",
             "gemini",
             "list_directory",

@@ -337,6 +337,8 @@ mod tests {
             "{\"model\": \"opus\",}\n",
             "[1, 2]\n",
             "{\"hooks\": {\"PreToolUse\": {\"matcher\": \"Bash\"}}}\n",
+            "{\"hooks\": []}\n",
+            "{\"hooks\": \"x\"}\n",
         ] {
             let p = project_with(bad);
             assert!(install(p.path()).is_err(), "{bad:?}");
