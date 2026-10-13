@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 
 mod audit_cmd;
 mod check;
+mod init_cmd;
 mod project;
 
 use saiifeguard::builtins::builtin_packs;
@@ -51,6 +52,17 @@ enum Cmd {
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
     },
+    /// Turn saiife on for this project: write the guard hook into each
+    /// agent's project config and create .saiife/config.toml.
+    Init {
+        /// Agent to set up (claude, codex, gemini; repeatable). Default: every
+        /// supported agent found on PATH.
+        #[arg(long = "agent", value_name = "AGENT")]
+        agents: Vec<String>,
+        /// Remove exactly what `saiife init` added.
+        #[arg(long, conflicts_with = "agents")]
+        off: bool,
+    },
     /// Show the audit log: every allowed, blocked and fail-open decision.
     Audit {
         /// Only records newer than this, e.g. 30m, 24h, 7d.
@@ -84,6 +96,8 @@ fn main() -> ExitCode {
         Cmd::Test { command } => cmd_test(&engine(), &command),
         Cmd::Explain { command } => cmd_explain(&engine(), &command),
         Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
+        Cmd::Init { off: true, .. } => init_cmd::off(),
+        Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Audit {
             since,
             project,
