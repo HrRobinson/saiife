@@ -231,3 +231,31 @@ fn off_keeps_an_unreadable_record_and_warns() {
         stderr(&out)
     );
 }
+
+#[test]
+fn off_keeps_user_edits_when_init_pack_appends_to_an_edited_config() {
+    let env = Env::new(&["claude"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    env.write(
+        ".saiife/config.toml",
+        "# mine\nversion = 1\npacks = [\"db.mysql\"]\n",
+    );
+    assert_eq!(code(&env.saiife(&["init", "--pack", "db.postgres"])), 0);
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 0);
+    let cfg = env.read(".saiife/config.toml");
+    assert!(
+        cfg.contains("# mine") && cfg.contains("db.postgres"),
+        "{cfg}"
+    );
+}
+
+#[test]
+fn off_deletes_config_after_a_saiife_only_pack_append() {
+    let env = Env::new(&["claude"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    assert_eq!(code(&env.saiife(&["init", "--pack", "db.postgres"])), 0);
+    assert!(env.read(".saiife/config.toml").contains("db.postgres"));
+    assert_eq!(code(&env.saiife(&["init", "--off"])), 0);
+    assert!(!env.root().join(".saiife").exists());
+}

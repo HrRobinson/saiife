@@ -111,6 +111,11 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         .unwrap_or_default();
     let mut hooks = previous.map(|p| p.hooks).unwrap_or_default();
 
+    // Was the config still exactly what saiife wrote, before this run?
+    let config_was_ours = !config_written_sha256.is_empty()
+        && std::fs::read(root.join(CONFIG_REL))
+            .is_ok_and(|b| sha256_hex(&b) == config_written_sha256);
+
     // Project config first: if it cannot be written, touch nothing else.
     let config_change = match config::ensure(&root, &packs) {
         Ok(c) => c,
@@ -121,10 +126,21 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     };
     note_created(&mut created, &config_change, CONFIG_REL);
     let mut failed = false;
-    if matches!(config_change, Change::Created { .. } | Change::Updated) {
-        if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
-            config_written_sha256 = sha256_hex(&bytes);
+    match config_change {
+        Change::Created { .. } => {
+            if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
+                config_written_sha256 = sha256_hex(&bytes);
+            }
         }
+        // Appending packs to a file the user edited must not make their
+        // edits look like saiife's own content.
+        Change::Updated if config_was_ours => {
+            if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
+                config_written_sha256 = sha256_hex(&bytes);
+            }
+        }
+        Change::Updated => config_written_sha256.clear(),
+        _ => {}
     }
     let mut lines = vec![format!(
         "  config  {CONFIG_REL} ({})",
@@ -236,10 +252,12 @@ pub fn off() -> ExitCode {
     let root = project_root(&cwd);
     let record_path = integrity::record_path(&root).ok().flatten();
     let mut record_unreadable = false;
+    let mut failed = false;
     let record = match record_path.as_deref().map(Integrity::load) {
         Some(Ok(r)) => r,
         Some(Err(e)) => {
             record_unreadable = true;
+            failed = true;
             eprintln!(
                 "saiife: WARNING: the integrity record is unreadable ({e}); it is kept for \
                  inspection. Without it saiife cannot tell what init created, so files are \
@@ -253,7 +271,6 @@ pub fn off() -> ExitCode {
         .as_ref()
         .map(|r| r.created.clone())
         .unwrap_or_default();
-    let mut failed = false;
     let mut lines = Vec::new();
 
     for agent in Agent::ALL {
