@@ -115,6 +115,11 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
 pub fn validate_glob(glob: &str) -> Result<(), String> {
     let (_, rest) = split_var(glob)?;
     for (i, comp) in rest.split('/').enumerate() {
+        if comp.is_empty() && i > 0 {
+            return Err(format!(
+                "path glob {glob:?}: empty path component (trailing or doubled `/`)"
+            ));
+        }
         if comp.contains("**") && comp != "**" {
             return Err(format!(
                 "path glob {glob:?}: `**` must be a whole path component"
@@ -139,16 +144,28 @@ pub fn compile_glob(
 ) -> Result<Option<Regex>, String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
-    let mut re = String::from(if case_insensitive { "(?i)^" } else { "^" });
+    let mut re = String::from(if case_insensitive { "(?is)^" } else { "(?s)^" });
     if let Some(name) = var {
         let values = vars.values(name);
         if values.is_empty() {
             return Ok(None);
         }
-        let alts: Vec<String> = values
-            .iter()
-            .map(|v| regex::escape(v.to_string_lossy().trim_end_matches('/')))
-            .collect();
+        let mut alts: Vec<String> = Vec::new();
+        for v in values {
+            let Some(v) = v.to_str() else {
+                // Not representable in a regex over UTF-8 paths: skip the
+                // rule, like an unbound variable.
+                return Ok(None);
+            };
+            let v = v.trim_end_matches('/');
+            // A variable bound to `/` is "" after trimming; the bare
+            // variable must still match `/`.
+            alts.push(if v.is_empty() && rest.is_empty() {
+                "/".to_string()
+            } else {
+                regex::escape(v)
+            });
+        }
         re.push_str(&format!("(?:{})", alts.join("|")));
     }
     let comps: Vec<&str> = rest.split('/').collect();
@@ -281,5 +298,47 @@ mod tests {
         assert!(RuleAccess::Read.covers(Access::Read));
         assert!(!RuleAccess::Read.covers(Access::Write));
         assert!(!RuleAccess::Write.covers(Access::Read));
+    }
+
+    #[test]
+    fn double_star_and_star_match_names_with_newlines() {
+        assert!(m("~/.claude/**", "/home/u/.claude/a\nb"));
+        assert!(m("**/.env", "/a\nb/.env"));
+        assert!(m("/p/*", "/p/a\nb"));
+        assert!(!m("/p/*", "/p/a\nb/c"));
+        assert!(m("/a/**/b", "/a/x\ny/b"));
+    }
+
+    #[test]
+    fn empty_components_are_rejected() {
+        for bad in ["/a/", "/a//b", "~/", "$HOME/", "/", "**/x/", "/a/**/"] {
+            assert!(validate_glob(bad).is_err(), "{bad}");
+        }
+        for good in ["$HOME/x", "/a/**", "**/x"] {
+            assert!(validate_glob(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn a_variable_bound_to_the_root_matches_the_root() {
+        let root = PathVars::new().with_var("HOME", "/");
+        let c = |g: &str| compile_glob(g, &root, false).unwrap().unwrap();
+        assert!(c("~").is_match("/"));
+        assert!(!c("~").is_match("/x"));
+        assert!(c("$HOME/**").is_match("/"));
+        assert!(c("~/.ssh/id_*").is_match("/.ssh/id_rsa"));
+        assert!(c("$HOME/x").is_match("/x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_variable_value_skips_the_rule() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/home/\xff"));
+        let v = PathVars::new().with_var("HOME", bad);
+        assert!(compile_glob("~/.aws/credentials", &v, false)
+            .unwrap()
+            .is_none());
+        assert!(compile_glob("**/.env", &v, false).unwrap().is_some());
     }
 }
