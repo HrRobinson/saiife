@@ -122,6 +122,13 @@ pub fn run(
         blocked_only: blocked,
     };
     let all = store::read_all(&dir);
+    if let Some(e) = &all.dir_error {
+        eprintln!(
+            "saiife: the audit directory {} cannot be read: {e}",
+            dir.display()
+        );
+        return ExitCode::from(1);
+    }
     let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
     if shown.is_empty() {
         println!("No audit records found in {}.", dir.display());

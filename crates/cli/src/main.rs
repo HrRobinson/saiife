@@ -3,6 +3,10 @@
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
 //! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
+//! - `saiife init [--off]` -> hook the agents into this project (or remove exactly that)
+//! - `saiife status` -> tamper checks; exit 1 if any fails
+//! - `saiife packs` -> list packs and which are on here
+//! - `saiife audit` -> the audit log as a table
 
 #![forbid(unsafe_code)]
 
@@ -16,6 +20,7 @@ mod check;
 mod init_cmd;
 mod packs_cmd;
 mod project;
+mod status_cmd;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -64,6 +69,8 @@ enum Cmd {
         #[arg(long, conflicts_with = "agents")]
         off: bool,
     },
+    /// Check that this project is still guarded; exit 1 if any check fails.
+    Status,
     /// List packs: id, on by default, on here, rule count, summary.
     Packs,
     /// Show the audit log: every allowed, blocked and fail-open decision.
@@ -101,6 +108,7 @@ fn main() -> ExitCode {
         Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
+        Cmd::Status => status_cmd::run(&packs),
         Cmd::Packs => packs_cmd::run(&packs, &cli.packs),
         Cmd::Audit {
             since,

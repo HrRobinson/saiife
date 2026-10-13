@@ -1,0 +1,252 @@
+//! `saiife status` tamper checks (spec §7.5, §10 "Tamper detection"): each
+//! check tampers with one thing and expects a warning, a fix and exit 1; an
+//! untouched project exits 0.
+
+mod common;
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use common::{code, fake_exe, stdout, Env};
+
+fn initialized(agents: &[&str]) -> Env {
+    let env = Env::new(agents);
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    env
+}
+
+fn status(env: &Env) -> (i32, String) {
+    let out = env.saiife(&["status"]);
+    (code(&out), stdout(&out))
+}
+
+#[test]
+fn untouched_project_passes() {
+    let env = initialized(&["claude", "codex", "gemini"]);
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(text.contains("All checks passed."), "{text}");
+    for a in ["claude", "codex", "gemini"] {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("never")),
+            "{a}: {text}"
+        );
+    }
+    assert!(text.contains("packs   core.filesystem, core.git"), "{text}");
+    assert!(text.contains("cannot stop a determined agent"), "{text}");
+}
+
+#[test]
+fn not_initialized_fails() {
+    let env = Env::new(&["claude"]);
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("not set up for this project"), "{text}");
+}
+
+#[test]
+fn hook_removed_by_hand_is_reported_with_the_fix() {
+    let env = initialized(&["claude"]);
+    env.write(".claude/settings.json", "{}\n");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains("The saiife hook for Claude Code was removed from .claude/settings.json."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Fix: run `saiife init` to restore it"),
+        "{text}"
+    );
+    // ...and init does restore it.
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    assert_eq!(status(&env).0, 0);
+}
+
+#[test]
+fn hook_changed_is_reported() {
+    let env = initialized(&["codex"]);
+    let t = env
+        .read(".codex/config.toml")
+        .replace("^(Bash|apply_patch)$", "^Nothing$");
+    env.write(".codex/config.toml", &t);
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains("The saiife hook for Codex in .codex/config.toml was changed."),
+        "{text}"
+    );
+}
+
+#[test]
+fn settings_file_deleted_is_reported() {
+    let env = initialized(&["gemini"]);
+    std::fs::remove_file(env.root().join(".gemini/settings.json")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains("was removed from .gemini/settings.json"),
+        "{text}"
+    );
+}
+
+#[test]
+fn config_edited_is_reported() {
+    let env = initialized(&["claude"]);
+    let t = env
+        .read(".saiife/config.toml")
+        .replace("\"core.git\"", "\"db.mysql\"");
+    env.write(".saiife/config.toml", &t);
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains(".saiife/config.toml was changed since `saiife init`."),
+        "{text}"
+    );
+}
+
+#[test]
+fn config_deleted_is_reported() {
+    let env = initialized(&["claude"]);
+    std::fs::remove_file(env.root().join(".saiife/config.toml")).unwrap();
+    // Without the config the project root is the cwd itself, which is still
+    // the project: the record is found by path.
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains(".saiife/config.toml was removed."), "{text}");
+}
+
+#[test]
+fn swapped_binary_on_path_is_reported() {
+    let env = initialized(&["claude"]);
+    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
+    fake_exe(env.bin.path(), "saiife", "echo 'saiife 0.1.0'");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(
+        text.contains("is not the one that ran `saiife init`"),
+        "{text}"
+    );
+}
+
+#[test]
+fn saiife_missing_from_path_is_reported() {
+    let env = initialized(&["claude"]);
+    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("`saiife` is not on PATH"), "{text}");
+}
+
+#[test]
+fn disable_all_hooks_is_reported() {
+    let env = initialized(&["claude"]);
+    env.write(
+        ".claude/settings.local.json",
+        "{\"disableAllHooks\": true}\n",
+    );
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("sets disableAllHooks"), "{text}");
+    // User-level settings count too.
+    std::fs::remove_file(env.root().join(".claude/settings.local.json")).unwrap();
+    std::fs::create_dir_all(env.home.path().join(".claude")).unwrap();
+    std::fs::write(
+        env.home.path().join(".claude/settings.json"),
+        "{\"disableAllHooks\": true}",
+    )
+    .unwrap();
+    assert_eq!(status(&env).0, 1);
+}
+
+#[test]
+fn last_hook_call_is_shown_per_agent() {
+    let env = initialized(&["claude", "codex"]);
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": env.root().join("src"),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "ls" }
+    })
+    .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("s ago"), "{claude}");
+    let codex = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("codex"))
+        .unwrap();
+    assert!(codex.contains("never"), "{codex}");
+}
+
+#[test]
+fn unreadable_audit_dir_is_a_failed_check() {
+    let env = initialized(&["claude"]);
+    let file = env.audit.path().join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("status")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", &file)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("cannot be read"), "{}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_in_the_audit_dir_is_a_failed_check() {
+    let env = initialized(&["claude"]);
+    let fifo = env.audit.path().join("2026-01.jsonl");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let (c, text) = status(&env);
+    assert_eq!(c, 1);
+    assert!(text.contains("are not regular files"), "{text}");
+}
+
+/// Review Focus 3: the same project reached through a symlink, or status
+/// run from a subdirectory, finds the same record.
+#[cfg(unix)]
+#[test]
+fn symlinked_path_and_subdirectory_find_the_same_project() {
+    let env = initialized(&["claude"]);
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("app");
+    std::os::unix::fs::symlink(env.root(), &link).unwrap();
+    let out = env.saiife_in(&link, &["status"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    let sub = env.root().join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    let out = env.saiife_in(&sub, &["status"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+}
