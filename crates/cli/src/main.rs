@@ -91,7 +91,10 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return arg_error(e),
+    };
 
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
@@ -122,6 +125,28 @@ fn main() -> ExitCode {
             blocked,
         ),
     }
+}
+
+/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
+/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
+/// flag this binary does not know: warn and fail open, silently on stdout.
+/// Everything else (and `--help` / `--version`) keeps clap's behavior.
+fn arg_error(e: clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let hook_mode = std::env::args_os().nth(1).is_some_and(|a| a == "check");
+    if hook_mode && !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let first = e.to_string();
+        let first = first
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches("error: ");
+        warn(&format!(
+            "bad hook arguments ({first}); failing open (allow)"
+        ));
+        return ExitCode::SUCCESS;
+    }
+    e.exit()
 }
 
 fn cmd_test(engine: &Engine, command: &str) -> ExitCode {

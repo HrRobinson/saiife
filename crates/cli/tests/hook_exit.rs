@@ -142,3 +142,23 @@ fn json_mode_deny_is_unchanged() {
         .unwrap()
         .contains("BLOCKED by core.filesystem"));
 }
+
+/// M2: an unknown flag (e.g. a hook written by a newer saiife) must not
+/// turn into exit 2, which every agent reads as "block": fail open.
+#[test]
+fn check_fails_open_on_unknown_arguments() {
+    let (code, stdout, stderr) = run_check(
+        &["check", "--hook-exit", "--agent", "claude", "--future-flag"],
+        DENY_JSON,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("failing open"), "{stderr}");
+}
+
+/// M2: other subcommands keep clap's usage error.
+#[test]
+fn other_subcommands_still_reject_unknown_arguments() {
+    let (code, _, _) = run_check(&["status", "--future-flag"], "");
+    assert_eq!(code, 2);
+}
