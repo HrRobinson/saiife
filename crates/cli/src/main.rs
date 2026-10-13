@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 mod audit_cmd;
 mod check;
 mod init_cmd;
+mod packs_cmd;
 mod project;
 
 use saiifeguard::builtins::builtin_packs;
@@ -63,6 +64,8 @@ enum Cmd {
         #[arg(long, conflicts_with = "agents")]
         off: bool,
     },
+    /// List packs: id, on by default, on here, rule count, summary.
+    Packs,
     /// Show the audit log: every allowed, blocked and fail-open decision.
     Audit {
         /// Only records newer than this, e.g. 30m, 24h, 7d.
@@ -98,6 +101,7 @@ fn main() -> ExitCode {
         Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
+        Cmd::Packs => packs_cmd::run(&packs, &cli.packs),
         Cmd::Audit {
             since,
             project,
