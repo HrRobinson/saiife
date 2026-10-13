@@ -13,10 +13,12 @@
 #![forbid(unsafe_code)]
 
 pub mod builtins;
+pub mod canon;
 pub mod engine;
 pub mod lexer;
 pub mod normalize;
 pub mod pack;
+pub mod pathrule;
 pub mod payload;
 pub mod prefilter;
 pub mod profile;
