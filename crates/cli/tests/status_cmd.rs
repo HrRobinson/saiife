@@ -444,3 +444,46 @@ fn record_without_any_hooked_agent_is_a_failed_check() {
     assert_eq!(c, 1, "{text}");
     assert!(text.contains("no agent is hooked"), "{text}");
 }
+
+/// M3: an agent that reports its cwd through a symlink to the project
+/// still counts as a hook call of this project.
+#[cfg(unix)]
+#[test]
+fn last_hook_call_through_a_symlinked_cwd_is_shown() {
+    let env = initialized(&["claude"]);
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("app");
+    std::os::unix::fs::symlink(env.root(), &link).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": link,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "ls" }
+    })
+    .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("s ago"), "{claude}");
+}

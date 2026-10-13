@@ -1,8 +1,9 @@
 //! `saiife status`: is this project still guarded? Runs the tamper checks
 //! of spec §7.5 and exits 1 if any fails, so it can run in scripts and CI.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
@@ -213,8 +214,9 @@ fn last_calls(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>)
             all.skipped_lines
         ));
     }
+    let canonical_root = integrity::canonical_project(root).ok();
     let mut roots = vec![root.display().to_string()];
-    if let Ok(c) = integrity::canonical_project(root) {
+    if let Some(c) = &canonical_root {
         roots.push(c.display().to_string());
     }
     let filters: Vec<Filter> = roots
@@ -224,9 +226,25 @@ fn last_calls(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>)
             ..Default::default()
         })
         .collect();
+    // An agent may report its cwd through a symlink to the project: compare
+    // each distinct recorded path canonicalized too (once per path). A path
+    // that no longer exists is only compared literally.
+    let mut canonical: HashMap<String, Option<PathBuf>> = HashMap::new();
     all.records
         .into_iter()
-        .filter(|r| filters.iter().any(|f| f.matches(r)))
+        .filter(|r| {
+            if filters.iter().any(|f| f.matches(r)) {
+                return true;
+            }
+            let Some(croot) = &canonical_root else {
+                return false;
+            };
+            canonical
+                .entry(r.project.clone())
+                .or_insert_with(|| std::fs::canonicalize(&r.project).ok())
+                .as_ref()
+                .is_some_and(|p| p.starts_with(croot))
+        })
         .collect()
 }
 
