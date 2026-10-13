@@ -93,13 +93,21 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     let previous = match Integrity::load(&record_path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("saiife: {e}; starting a new integrity record");
+            eprintln!(
+                "saiife: WARNING: the integrity record is unreadable ({e}); starting a new one. \
+                 What the earlier init created is no longer tracked, so `saiife init --off` \
+                 will not delete those files."
+            );
             None
         }
     };
     let mut created = previous
         .as_ref()
         .map(|p| p.created.clone())
+        .unwrap_or_default();
+    let mut config_written_sha256 = previous
+        .as_ref()
+        .map(|p| p.config_written_sha256.clone())
         .unwrap_or_default();
     let mut hooks = previous.map(|p| p.hooks).unwrap_or_default();
 
@@ -113,6 +121,11 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     };
     note_created(&mut created, &config_change, CONFIG_REL);
     let mut failed = false;
+    if matches!(config_change, Change::Created { .. } | Change::Updated) {
+        if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
+            config_written_sha256 = sha256_hex(&bytes);
+        }
+    }
     let mut lines = vec![format!(
         "  config  {CONFIG_REL} ({})",
         describe(&config_change, "packs added", "already set up")
@@ -146,8 +159,9 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     let config_sha256 = match std::fs::read(root.join(CONFIG_REL)) {
         Ok(bytes) => sha256_hex(&bytes),
         Err(e) => {
-            eprintln!("saiife: {CONFIG_REL}: {e}");
-            return ExitCode::from(1);
+            failed = true;
+            lines.push(format!("  config  FAILED to read {CONFIG_REL}: {e}"));
+            String::new()
         }
     };
     let exe = std::env::current_exe()
@@ -161,6 +175,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         saiife_path: exe.display().to_string(),
         saiife_version: env!("CARGO_PKG_VERSION").to_string(),
         config_sha256,
+        config_written_sha256,
         hooks,
         created,
     };
@@ -220,9 +235,20 @@ pub fn off() -> ExitCode {
     };
     let root = project_root(&cwd);
     let record_path = integrity::record_path(&root).ok().flatten();
-    let record = record_path
-        .as_deref()
-        .and_then(|p| Integrity::load(p).ok().flatten());
+    let mut record_unreadable = false;
+    let record = match record_path.as_deref().map(Integrity::load) {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => {
+            record_unreadable = true;
+            eprintln!(
+                "saiife: WARNING: the integrity record is unreadable ({e}); it is kept for \
+                 inspection. Without it saiife cannot tell what init created, so files are \
+                 only un-hooked, never deleted."
+            );
+            None
+        }
+        None => None,
+    };
     let created: Vec<String> = record
         .as_ref()
         .map(|r| r.created.clone())
@@ -254,7 +280,9 @@ pub fn off() -> ExitCode {
     let config_path = root.join(CONFIG_REL);
     if config_path.exists() {
         let unchanged = record.as_ref().is_some_and(|r| {
-            std::fs::read(&config_path).is_ok_and(|b| sha256_hex(&b) == r.config_sha256)
+            !r.config_written_sha256.is_empty()
+                && std::fs::read(&config_path)
+                    .is_ok_and(|b| sha256_hex(&b) == r.config_written_sha256)
         });
         if created.iter().any(|c| c == CONFIG_REL) && unchanged {
             match std::fs::remove_file(&config_path) {
@@ -278,7 +306,7 @@ pub fn off() -> ExitCode {
             let _ = std::fs::remove_dir(&p);
         }
     }
-    if !failed {
+    if !failed && !record_unreadable {
         if let Some(p) = &record_path {
             if let Err(e) = Integrity::delete(p) {
                 failed = true;

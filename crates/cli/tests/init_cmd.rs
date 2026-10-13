@@ -183,3 +183,51 @@ fn init_warns_when_saiife_is_not_on_path() {
         stdout(&out)
     );
 }
+
+/// A config the user edited between two inits is not saiife's to delete.
+#[test]
+fn off_keeps_config_edited_between_two_inits() {
+    let env = Env::new(&["claude"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    env.write(
+        ".saiife/config.toml",
+        "version = 1\npacks = [\"db.mysql\"]\n",
+    );
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains("config.toml kept"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(env.read(".saiife/config.toml").contains("db.mysql"));
+}
+
+/// An unreadable integrity record is reported and kept by `--off`.
+#[test]
+fn off_keeps_an_unreadable_record_and_warns() {
+    let env = Env::new(&["claude"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let projects = env.data.path().join("projects");
+    let rec = std::fs::read_dir(&projects)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&rec, "not json").unwrap();
+    let out = env.saiife(&["init", "--off"]);
+    assert!(
+        stderr(&out).contains("integrity record is unreadable"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(rec.exists(), "record kept for inspection");
+    let out = env.saiife(&["init"]);
+    assert!(
+        stderr(&out).contains("integrity record is unreadable"),
+        "{}",
+        stderr(&out)
+    );
+}

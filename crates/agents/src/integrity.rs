@@ -31,6 +31,11 @@ pub struct Integrity {
     pub saiife_version: String,
     /// SHA-256 of `.saiife/config.toml` as `init` left it.
     pub config_sha256: String,
+    /// SHA-256 of `.saiife/config.toml` as saiife itself last wrote it
+    /// (created, or packs appended). `init --off` deletes the file only
+    /// while it still matches. Empty in records from older versions.
+    #[serde(default)]
+    pub config_written_sha256: String,
     /// Agent name (`claude`, `codex`, `gemini`) -> the hook entry written.
     pub hooks: BTreeMap<String, HookRecord>,
     /// Files and directories `init` created, relative to the project, in
@@ -135,6 +140,7 @@ mod tests {
             saiife_path: "/usr/local/bin/saiife".into(),
             saiife_version: "0.1.0".into(),
             config_sha256: "cd".repeat(32),
+            config_written_sha256: "ef".repeat(32),
             hooks,
             created: vec![".saiife".into(), ".saiife/config.toml".into()],
         }
