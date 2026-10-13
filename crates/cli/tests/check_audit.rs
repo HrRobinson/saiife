@@ -49,7 +49,7 @@ fn allow_is_audited_with_context() {
         ),
         0
     );
-    let recs = read_all(dir.path());
+    let recs = read_all(dir.path()).records;
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
     assert_eq!(r.decision, DecisionKind::Allow);
@@ -72,7 +72,7 @@ fn deny_is_audited_with_pack_rule_reason() {
         ),
         2
     );
-    let r = &read_all(dir.path())[0];
+    let r = &read_all(dir.path()).records[0];
     assert_eq!(r.decision, DecisionKind::Deny);
     assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
     assert!(r.rule.is_some());
@@ -83,7 +83,7 @@ fn deny_is_audited_with_pack_rule_reason() {
 fn garbage_payload_is_audited_as_error_allowed() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(check(dir.path(), &["--hook-exit"], "{not json"), 0);
-    let r = &read_all(dir.path())[0];
+    let r = &read_all(dir.path()).records[0];
     assert_eq!(r.decision, DecisionKind::ErrorAllowed);
     assert_eq!(r.agent, "unknown");
     assert!(r.reason.as_deref().unwrap().contains("payload"));
@@ -94,7 +94,10 @@ fn oversize_payload_is_error_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let big = payload(&format!("echo {}", "a".repeat(300 * 1024)));
     assert_eq!(check(dir.path(), &["--hook-exit"], &big), 0);
-    assert_eq!(read_all(dir.path())[0].decision, DecisionKind::ErrorAllowed);
+    assert_eq!(
+        read_all(dir.path()).records[0].decision,
+        DecisionKind::ErrorAllowed
+    );
 }
 
 #[test]
@@ -157,5 +160,5 @@ fn concurrent_checks_write_whole_lines() {
         })
         .sum();
     assert_eq!(lines, 20);
-    assert_eq!(read_all(dir.path()).len(), 20, "every line parses");
+    assert_eq!(read_all(dir.path()).records.len(), 20, "every line parses");
 }

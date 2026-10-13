@@ -37,11 +37,25 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     file.write_all(line.as_bytes())
 }
 
+/// What `read_all` found: the parseable records plus how much it had to skip,
+/// so a viewer can say the log is not complete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadResult {
+    pub records: Vec<Record>,
+    /// Non-blank lines that were not a valid record (bad UTF-8, half-written,
+    /// hand-edited).
+    pub skipped_lines: usize,
+    /// Month files that could not be read or are not regular files.
+    pub unreadable_files: usize,
+}
+
 /// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
-/// first. Unparseable lines and other files are skipped silently.
-pub fn read_all(dir: &Path) -> Vec<Record> {
+/// first. Lines are parsed one by one from raw bytes, so one bad line never
+/// hides the rest of its file. Other file names are ignored.
+pub fn read_all(dir: &Path) -> ReadResult {
+    let mut out = ReadResult::default();
     let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+        return out;
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -52,15 +66,22 @@ pub fn read_all(dir: &Path) -> Vec<Record> {
         })
         .collect();
     files.sort();
-    files
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .flat_map(|body| {
-            body.lines()
-                .filter_map(|l| serde_json::from_str::<Record>(l).ok())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    for p in &files {
+        let Ok(body) = fs::read(p) else {
+            out.unreadable_files += 1;
+            continue;
+        };
+        for line in body.split(|&b| b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            match serde_json::from_slice::<Record>(line) {
+                Ok(r) => out.records.push(r),
+                Err(_) => out.skipped_lines += 1,
+            }
+        }
+    }
+    out
 }
 
 /// `YYYY-MM.jsonl`
@@ -151,7 +172,7 @@ mod tests {
         append(dir.path(), &b).unwrap();
         assert!(dir.path().join("2026-09.jsonl").exists());
         assert!(dir.path().join("2026-10.jsonl").exists());
-        assert_eq!(read_all(dir.path()), vec![a, b]);
+        assert_eq!(read_all(dir.path()).records, vec![a, b]);
     }
 
     #[test]
@@ -168,7 +189,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(read_all(&nested).len(), 1);
+        assert_eq!(read_all(&nested).records.len(), 1);
     }
 
     #[test]
@@ -207,13 +228,47 @@ mod tests {
         writeln!(f).unwrap();
         fs::write(dir.path().join("notes.txt"), "{\"v\":1}").unwrap();
         fs::write(dir.path().join("backup.jsonl"), "{}").unwrap();
-        assert_eq!(read_all(dir.path()), vec![good]);
+        let got = read_all(dir.path());
+        assert_eq!(got.records, vec![good]);
+        assert_eq!(
+            got.skipped_lines, 2,
+            "half-written + not json; blank ignored"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_line_skips_only_that_line_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        let b = rec(
+            "/p",
+            "claude",
+            DecisionKind::Deny,
+            datetime!(2026-10-13 09:00:00 UTC),
+        );
+        append(dir.path(), &a).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("2026-10.jsonl"))
+            .unwrap();
+        f.write_all(b"{\"v\":1,\"input\":\"\xff\"}\n").unwrap();
+        drop(f);
+        append(dir.path(), &b).unwrap();
+        let got = read_all(dir.path());
+        assert_eq!(got.records, vec![a, b]);
+        assert_eq!(got.skipped_lines, 1);
+        assert_eq!(got.unreadable_files, 0);
     }
 
     #[test]
     fn read_all_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_all(&dir.path().join("nope")).is_empty());
+        assert_eq!(read_all(&dir.path().join("nope")), ReadResult::default());
     }
 
     #[cfg(unix)]

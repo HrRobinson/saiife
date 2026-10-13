@@ -102,11 +102,17 @@ pub fn run(
         blocked_only: blocked,
     };
     let all = store::read_all(&dir);
-    let shown: Vec<&Record> = all.iter().filter(|r| filter.matches(r)).collect();
+    let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
     if shown.is_empty() {
         println!("No audit records found in {}.", dir.display());
     } else {
         print!("{}", render_table(&shown));
+    }
+    if all.skipped_lines > 0 {
+        println!("{} unreadable lines skipped", all.skipped_lines);
+    }
+    if all.unreadable_files > 0 {
+        println!("{} unreadable files skipped", all.unreadable_files);
     }
     ExitCode::SUCCESS
 }

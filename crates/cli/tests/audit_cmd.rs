@@ -103,3 +103,29 @@ fn bad_since_exits_2() {
         .code(2)
         .stderr(predicate::str::contains("invalid --since"));
 }
+
+#[test]
+fn invalid_utf8_does_not_hide_a_month_and_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    let month = OffsetDateTime::now_utc();
+    let path = dir.path().join(format!(
+        "{:04}-{:02}.jsonl",
+        month.year(),
+        u8::from(month.month())
+    ));
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut f, b"{\"v\":1,\"input\":\"\xff\"}\n").unwrap();
+    drop(f);
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .arg("audit")
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rm -rf /"))
+        .stdout(predicate::str::contains(
+            "3 decisions · 1 blocked · 0 fail-open",
+        ))
+        .stdout(predicate::str::contains("2 unreadable lines skipped"));
+}
