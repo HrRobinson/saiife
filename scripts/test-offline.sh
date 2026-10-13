@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the full test suite with networking disabled (Linux only).
-# Proves the spec's "no network calls" rule: any network use fails a test.
+# Supports the spec's "no network calls" rule: network use fails inside the
+# namespace, so a test that needs the network cannot pass here.
 set -euo pipefail
 cargo test --workspace --no-run --quiet
 # Sanity check: inside the namespace there must be no network.

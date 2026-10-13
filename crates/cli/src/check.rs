@@ -166,8 +166,12 @@ impl Audit {
                 .map(|d| d.display().to_string())
                 .unwrap_or_default()
         });
+        let dir = store::default_dir();
+        if dir.is_none() {
+            warn("could not determine the audit directory; this decision is not audited");
+        }
         Self {
-            dir: store::default_dir(),
+            dir,
             agent: agent.to_string(),
             ctx,
             project,

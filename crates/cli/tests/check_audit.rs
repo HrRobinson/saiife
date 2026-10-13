@@ -147,7 +147,7 @@ fn concurrent_checks_write_whole_lines() {
             c.stdin
                 .take()
                 .unwrap()
-                .write_all(payload(&format!("echo {i} {}", "x".repeat(3000))).as_bytes())
+                .write_all(payload(&format!("echo {i} {}", "🦀".repeat(20_000))).as_bytes())
                 .unwrap();
             c
         })
@@ -155,16 +155,14 @@ fn concurrent_checks_write_whole_lines() {
     for mut c in children {
         c.wait().unwrap();
     }
-    let lines: usize = std::fs::read_dir(dir.path())
+    let body: String = std::fs::read_dir(dir.path())
         .unwrap()
-        .map(|e| {
-            std::fs::read_to_string(e.unwrap().path())
-                .unwrap()
-                .lines()
-                .count()
-        })
-        .sum();
-    assert_eq!(lines, 20);
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(body.lines().count(), 20);
+    // Records keep 4096 chars of input; 4-byte chars push every line past
+    // 16 KB, well beyond PIPE_BUF-sized writes.
+    assert!(body.lines().all(|l| l.len() > 16 * 1024));
     assert_eq!(read_all(dir.path()).records.len(), 20, "every line parses");
 }
 
