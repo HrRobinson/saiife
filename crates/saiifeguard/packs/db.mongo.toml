@@ -1,0 +1,46 @@
+# DB: mongo (mongosh / mongo) — opt-in.
+#
+# Blocks irreversible MongoDB shell operations issued through the CLI — most
+# often `mongosh --eval "…"` / `mongo --eval "…"`, or piped into the shell:
+# `db.dropDatabase()` (destroys the database), `db.<c>.drop()` (destroys a
+# collection), and the whole-collection wipes `db.<c>.deleteMany({})` /
+# `db.<c>.remove({})` with an EMPTY filter. Opt-in per environment (guard.packs).
+#
+# Precision over coverage (the engine's zero-false-positive invariant): reads
+# and filtered writes never block — `find`, `findOne`, `aggregate`,
+# `countDocuments`, `deleteOne`, a `deleteMany`/`remove` WITH a non-empty filter,
+# and index maintenance (`dropIndex`/`dropIndexes`, which touch no documents).
+# The empty-filter guard requires literal `({})` (whitespace-tolerant), so a
+# real filter like `deleteMany({status:'old'})` is untouched, and a collection
+# literally named `drop_me` (`db.drop_me.find({})`) never trips a `drop`/wipe
+# rule because the method after the collection is not the destructive one.
+
+[pack]
+id = "db.mongo"
+name = "DB: mongo"
+description = "Guards destructive MongoDB shell operations (dropDatabase, collection drop, empty-filter deleteMany/remove)."
+default_on = false
+version = 1
+triggers = ["mongo", "mongosh"]
+
+[[deny]]
+pattern = '(?i)\bdb\.dropDatabase\s*\('
+reason = "db.dropDatabase() permanently destroys the entire database"
+
+[[deny]]
+# `db.<collection>.drop()` — destroys a collection and every document in it.
+# `.dropIndex(`/`.dropIndexes(` do not match (a method name comes between `drop`
+# and the `(`), so index maintenance is not blocked.
+pattern = '(?i)\bdb\.\w+\.drop\s*\('
+reason = "db.<collection>.drop() destroys a collection and all its documents"
+
+[[deny]]
+# `deleteMany({})` with an empty filter deletes every document. A non-empty
+# filter has content between the braces and does not match.
+pattern = '(?i)\bdb\.\w+\.deleteMany\s*\(\s*\{\s*\}\s*\)'
+reason = "db.<collection>.deleteMany({}) deletes every document in the collection"
+
+[[deny]]
+# Legacy `remove({})` with an empty filter — same whole-collection wipe.
+pattern = '(?i)\bdb\.\w+\.remove\s*\(\s*\{\s*\}\s*\)'
+reason = "db.<collection>.remove({}) deletes every document in the collection"

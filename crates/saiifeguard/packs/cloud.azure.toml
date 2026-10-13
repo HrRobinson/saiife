@@ -1,0 +1,64 @@
+# Cloud: azure (az) — opt-in.
+#
+# Blocks irreversible Azure CLI operations: deleting a resource group (which
+# tears down every resource inside it), a VM, a storage account (data loss), an
+# AKS cluster; role-assignment/definition mutations (privilege-escalation /
+# lock-out shapes); plus a tuned catch-all for the destructive `az … delete`
+# long tail. Opt-in per environment (guard.packs) — a machine that never touches
+# Azure should not pay for these rules.
+#
+# Precision over coverage (the engine's zero-false-positive invariant): read
+# verbs (`show`, `list`) never block, and — the `cloud.gcloud`/`cloud.aws`
+# lesson — `delete` is matched as a whitespace-delimited OPERATION token, not a
+# substring, so a resource literally named `delete-me` in an `az … show -n
+# delete-me` is never blocked.
+#
+# GLOBAL OPTIONS. The az CLI accepts global options between `az` and the command
+# group (`az --debug group delete`, `az --subscription sub vm delete`), and a
+# value-taking global's value can be a SEPARATE token (`--subscription sub`),
+# not only the `--subscription=sub` form. The specific rules tolerate a run of
+# global options via the shared `<GLOBALS>` prefix so the group/operation anchor
+# still lands where it must; the catch-all uses a permissive `.*` and needs no
+# explicit prefix.
+#
+#   <GLOBALS> = (?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*
+
+[pack]
+id = "cloud.azure"
+name = "Cloud: azure"
+description = "Guards destructive Azure CLI operations (group/vm/storage-account/aks delete, role mutations)."
+default_on = false
+version = 1
+triggers = ["az"]
+
+[[deny]]
+pattern = '^(?:sudo\s+)?az\s+(?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*group\s+delete\b'
+reason = "'az group delete' deletes a resource group and every resource inside it"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?az\s+(?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*vm\s+delete\b'
+reason = "'az vm delete' permanently deletes the virtual machine"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?az\s+(?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*storage\s+account\s+delete\b'
+reason = "'az storage account delete' deletes the storage account and all the data in it"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?az\s+(?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*aks\s+delete\b'
+reason = "'az aks delete' tears down the AKS cluster and its node pools"
+
+[[deny]]
+# Role-assignment/definition mutations — creating an assignment can grant Owner/
+# Contributor (self-privilege-escalation), deleting one can lock out access.
+pattern = '^(?:sudo\s+)?az\s+(?:--(?:subscription|output|query)(?:=\S+|\s+\S+)\s+|-o(?:=\S+|\s+\S+)\s+|--(?:debug|verbose|only-show-errors|help)\s+|-h\s+)*role\s+(?:assignment\s+(?:create|delete)|definition\s+delete)\b'
+reason = "az role assignment/definition mutation can escalate privilege or lock out access"
+
+# --- Catch-all (last) ---------------------------------------------------------
+
+[[deny]]
+# Destructive long tail: any `az <group…> delete` not named above. `delete` must
+# be a whitespace-delimited operation token, so `delete` inside a resource NAME
+# (`az vm show -n delete-me`) or a `--query` value never trips it, and read
+# verbs (`show`/`list`) never reach here.
+pattern = '^(?:sudo\s+)?az\s+\S+.*\sdelete(?:\s|$)'
+reason = "destructive 'az … delete' operation — verify the blast radius before running"

@@ -1,0 +1,48 @@
+# Core: git — guards irreversible git operations.
+#
+# Allow rules are evaluated before deny rules; a match in [[allow]] carves a
+# safe exception out of a broad deny. Every [[deny]] carries a reason shown to
+# the user when the command is blocked.
+
+[pack]
+id = "core.git"
+name = "Core: git"
+description = "Guards destructive git operations (hard reset, force-push, clean, branch delete)."
+default_on = true
+version = 1
+triggers = ["git"]
+
+# --- allow carve-outs (evaluated first) --------------------------------------
+
+[[allow]]
+# A hard reset that names a commit-ish offset (HEAD~N) is a deliberate,
+# recoverable-by-reflog rewind, not the "throw away my working tree" footgun.
+pattern = '^git\s+reset\s+--hard\s+HEAD~\d+\s*$'
+reason = "reset --hard HEAD~N is a deliberate, reflog-recoverable rewind"
+
+[[allow]]
+# --force-with-lease is the safe force-push: it refuses if the remote moved.
+pattern = '^git\s+push\b.*--force-with-lease\b'
+reason = "force-with-lease is the safe force-push (refuses on stale remote)"
+
+# --- deny rules (first match wins) -------------------------------------------
+
+[[deny]]
+pattern = '^git\s+reset\s+--hard\b'
+reason = "git reset --hard discards all uncommitted changes irreversibly"
+
+[[deny]]
+pattern = '^git\s+clean\s+-[a-zA-Z]*f'
+reason = "git clean -f permanently deletes untracked files (no recovery)"
+
+[[deny]]
+pattern = '^git\s+push\b.*(?:--force\b|(?:^|\s)-f(?:\s|$))'
+reason = "force-push can overwrite a shared branch's history; use --force-with-lease"
+
+[[deny]]
+pattern = '^git\s+branch\s+-D\b'
+reason = "git branch -D force-deletes a branch even if it is unmerged"
+
+[[deny]]
+pattern = '^git\s+checkout\s+(?:--\s+)?\.\s*$'
+reason = "git checkout . mass-discards every unstaged change in the tree"

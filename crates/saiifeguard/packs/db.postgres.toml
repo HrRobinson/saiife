@@ -1,0 +1,41 @@
+# DB: postgres — opt-in.
+#
+# Blocks irreversible PostgreSQL statements, whether typed as raw SQL, passed to
+# `psql -c "..."`, or issued via the `dropdb` CLI. Rules are case-insensitive
+# ((?i)) since SQL keywords may be upper or lower case. DELETE/UPDATE guards fire
+# only when there is NO WHERE clause (the "empties the whole table" footgun).
+# Opt-in per environment (guard.packs).
+
+[pack]
+id = "db.postgres"
+name = "DB: postgres"
+description = "Guards destructive PostgreSQL statements (DROP/TRUNCATE, WHERE-less DELETE, dropdb)."
+default_on = false
+version = 1
+# SQL casing is unpredictable; cover the common upper/lower forms plus the CLI
+# wrappers. Mixed-case keywords (e.g. 'DrOp') fall through and fail open.
+triggers = ["DROP", "drop", "TRUNCATE", "truncate", "DELETE", "delete", "psql", "dropdb"]
+
+[[deny]]
+pattern = '(?i)\bdrop\s+database\b'
+reason = "DROP DATABASE permanently destroys an entire database"
+
+[[deny]]
+pattern = '(?i)\bdrop\s+schema\b'
+reason = "DROP SCHEMA destroys a schema and every object in it"
+
+[[deny]]
+pattern = '(?i)\bdrop\s+table\b'
+reason = "DROP TABLE permanently destroys a table and all its data"
+
+[[deny]]
+pattern = '(?i)\btruncate\s+(?:table\s+)?[\w."]+'
+reason = "TRUNCATE empties a table irreversibly (no WHERE, no per-row rollback)"
+
+[[deny]]
+pattern = '(?i)\bdelete\s+from\s+[\w."]+\s*(?:;|$)'
+reason = "DELETE without a WHERE clause removes every row in the table"
+
+[[deny]]
+pattern = '(?i)^(?:sudo\s+)?dropdb\b'
+reason = "dropdb destroys an entire PostgreSQL database"

@@ -1,0 +1,67 @@
+# Core: filesystem — catastrophic-only, default-on.
+#
+# Precision over coverage: this pack blocks the irrecoverable footguns
+# (wiping a filesystem root / home / system dir, writing over a raw device,
+# formatting a disk) and deliberately stays quiet on ordinary relative or
+# temp-path deletes. Everything it does not match fails open (allowed).
+
+[pack]
+id = "core.filesystem"
+name = "Core: filesystem"
+description = "Guards catastrophic filesystem destruction (root/home/system wipes, device writes, mkfs)."
+default_on = true
+version = 1
+# `sudo` (with or without flags/options) is unwrapped structurally by the
+# engine before matching (see `wrappers::unwrap_transparent_prefix`), so
+# these rules see the effective command at argv[0], not `sudo` itself. The
+# `(?:sudo\s+)?` prefix below predates that and is now redundant/harmless —
+# kept rather than churned. Triggers stay broad + cheap.
+triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/"]
+
+# --- rm: recursive delete of a catastrophic target ----------------------------
+# Requires a recursive flag (combined like -rf/-fr/-Rf, or -r/-R, or
+# --recursive) AND a catastrophic target (filesystem root, a top-level system
+# directory, or the user's home). Ordinary `rm -rf ./build` or `rm -rf /tmp/x`
+# do NOT match — the target must be a root/home/system path. Quoting
+# (`rm -rf "/"`) and repeated slashes (`rm -rf //`) are undone by
+# normalization before these patterns ever run, so they don't need to spell
+# those out. Two orderings are needed because the flag and the target can
+# appear in either order on the command line (`rm -rf /etc` vs `rm /etc -rf`).
+[[deny]]
+pattern = '^(?:sudo\s+)?rm\s+(?:\S+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+(?:\S+\s+)*(?:/\*|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users|Volumes)/?\*?|/)(?:\s|$)'
+reason = "recursive rm on a filesystem root, home, or system directory is catastrophic and irreversible"
+
+[[deny]]
+# Same target class, flag AFTER the target (`rm /etc -rf`, `rm / --recursive`).
+pattern = '^(?:sudo\s+)?rm\s+(?:\S+\s+)*(?:/\*|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users|Volumes)/?\*?|/)\s+(?:\S+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s|$)'
+reason = "recursive rm on a filesystem root, home, or system directory is catastrophic and irreversible"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?rm\s+.*--no-preserve-root\b'
+reason = "rm --no-preserve-root exists only to defeat the root-deletion guard"
+
+# --- raw device / disk destruction -------------------------------------------
+[[deny]]
+pattern = '^(?:sudo\s+)?dd\s+.*\bof=/dev/[a-zA-Z]'
+reason = "dd writing to a block device (of=/dev/...) overwrites the raw disk"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?mkfs(?:\.[a-zA-Z0-9]+)?\b'
+reason = "mkfs formats a filesystem, erasing everything on the target device"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?truncate\s+.*/dev/[a-zA-Z]'
+reason = "truncate on a device node corrupts the raw disk"
+
+[[deny]]
+pattern = '>\s*/dev/(?:sd|hd|vd|disk|rdisk|nvme|mmcblk)'
+reason = "redirecting output onto a raw block device overwrites the disk"
+
+# --- recursive permission changes on a system root ---------------------------
+[[deny]]
+pattern = '^(?:sudo\s+)?chmod\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*(?:/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
+reason = "recursive chmod on a filesystem root or system directory breaks the system"
+
+[[deny]]
+pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+\s+(?:/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
+reason = "recursive chown on a filesystem root or system directory breaks ownership system-wide"
