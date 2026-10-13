@@ -1,0 +1,157 @@
+//! File helpers for writing into a user's project: never leave a half-written
+//! settings file behind, keep the file's permissions, and write through a
+//! symlinked settings file instead of replacing the link.
+
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use crate::{AgentError, Change};
+
+pub(crate) fn io_err(path: &Path) -> impl FnOnce(io::Error) -> AgentError + '_ {
+    move |source| AgentError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The file's text, or `None` if it does not exist.
+pub fn read_optional(path: &Path) -> Result<Option<String>, AgentError> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(path)(e)),
+    }
+}
+
+/// Write `contents` to `<project>/<rel>` atomically (temp file in the same
+/// directory, then rename). An existing file keeps its permissions; a
+/// symlink is followed and its target replaced. Missing directories are
+/// created and reported in `Change::Created`.
+pub fn write(project: &Path, rel: &str, contents: &str) -> Result<Change, AgentError> {
+    let path = project.join(rel);
+    let existed = fs::symlink_metadata(&path).is_ok();
+    let target = if existed {
+        fs::canonicalize(&path).map_err(io_err(&path))?
+    } else {
+        path.clone()
+    };
+    let parent = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let created_dirs = if existed {
+        Vec::new()
+    } else {
+        create_dirs(project, &parent)?
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(&parent).map_err(io_err(&parent))?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(io_err(&target))?;
+    let perms = match fs::metadata(&target) {
+        Ok(m) => m.permissions(),
+        Err(_) => default_permissions(),
+    };
+    fs::set_permissions(tmp.path(), perms).map_err(io_err(&target))?;
+    tmp.persist(&target).map_err(|e| io_err(&target)(e.error))?;
+    Ok(if existed {
+        Change::Updated
+    } else {
+        Change::Created { created_dirs }
+    })
+}
+
+/// Delete `<project>/<rel>`; a missing file is fine.
+pub fn remove(project: &Path, rel: &str) -> Result<(), AgentError> {
+    let path = project.join(rel);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(&path)(e)),
+    }
+}
+
+/// Create `dir` and its missing ancestors; return the ones created, relative
+/// to `project`, outermost first.
+fn create_dirs(project: &Path, dir: &Path) -> Result<Vec<String>, AgentError> {
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.exists() {
+            break;
+        }
+        missing.push(d.to_path_buf());
+        cur = d.parent();
+    }
+    fs::create_dir_all(dir).map_err(io_err(dir))?;
+    missing.reverse();
+    Ok(missing
+        .iter()
+        .filter_map(|d| d.strip_prefix(project).ok())
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect())
+}
+
+fn default_permissions() -> fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o644)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(".").unwrap().permissions()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creates_file_and_reports_new_dirs() {
+        let p = tempfile::tempdir().unwrap();
+        let c = write(p.path(), ".claude/settings.json", "{}\n").unwrap();
+        assert_eq!(
+            c,
+            Change::Created {
+                created_dirs: vec![".claude".into()]
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(p.path().join(".claude/settings.json")).unwrap(),
+            "{}\n"
+        );
+        let c = write(p.path(), ".claude/settings.json", "{\"a\":1}\n").unwrap();
+        assert_eq!(c, Change::Updated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_permissions_and_follows_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = tempfile::tempdir().unwrap();
+        let real = p.path().join("real.json");
+        fs::write(&real, "{}").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::create_dir(p.path().join(".gemini")).unwrap();
+        std::os::unix::fs::symlink(&real, p.path().join(".gemini/settings.json")).unwrap();
+        write(p.path(), ".gemini/settings.json", "{\"x\":1}").unwrap();
+        assert!(fs::symlink_metadata(p.path().join(".gemini/settings.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "{\"x\":1}");
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn read_optional_and_remove_tolerate_missing_files() {
+        let p = tempfile::tempdir().unwrap();
+        assert_eq!(read_optional(&p.path().join("nope")).unwrap(), None);
+        remove(p.path(), "nope").unwrap();
+    }
+}

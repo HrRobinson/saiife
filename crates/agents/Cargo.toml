@@ -1,0 +1,21 @@
+[package]
+name = "saiife-agents"
+description = "Agent hook installers, project config and integrity records for saiife."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_agents"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: settings files keep the user's key order when rewritten.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml_edit = "0.22.27"
+sha2 = "0.10.9"
+dirs = "5"
+thiserror = "1"
+tempfile = "3"
