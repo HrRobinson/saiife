@@ -259,3 +259,28 @@ fn off_deletes_config_after_a_saiife_only_pack_append() {
     assert_eq!(code(&env.saiife(&["init", "--off"])), 0);
     assert!(!env.root().join(".saiife").exists());
 }
+
+/// M1: an agent config that is a symlink to a file outside the project is
+/// refused; the outside file stays byte-identical, other agents still work.
+#[cfg(unix)]
+#[test]
+fn symlinked_config_outside_the_project_is_refused() {
+    let env = Env::new(&["claude", "codex", "gemini"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("config.toml");
+    let original = "# shared codex config\nmodel = \"gpt-5-codex\"\n";
+    std::fs::write(&target, original).unwrap();
+    std::fs::create_dir(env.root().join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".codex/config.toml")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let codex = text
+        .lines()
+        .find(|l| l.contains("codex") && l.contains("FAILED"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(codex.contains("outside the project"), "{codex}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    assert!(env.read(".claude/settings.json").contains("saiife check"));
+    assert!(env.read(".gemini/settings.json").contains("saiife check"));
+}

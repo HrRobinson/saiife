@@ -24,6 +24,30 @@ pub fn read_optional(path: &Path) -> Result<Option<String>, AgentError> {
     }
 }
 
+/// Refuse `<project>/<rel>` when it resolves outside the project: a
+/// symlinked agent config (or config directory) pointing elsewhere, e.g. a
+/// user-wide file, must not be rewritten by a per-project `init`. A missing
+/// file is checked through its nearest existing ancestor.
+pub fn ensure_inside(project: &Path, rel: &str) -> Result<(), AgentError> {
+    let path = project.join(rel);
+    let canon_project = fs::canonicalize(project).map_err(io_err(project))?;
+    let existing = path
+        .ancestors()
+        .find(|p| fs::symlink_metadata(p).is_ok())
+        .unwrap_or(project);
+    let resolved = fs::canonicalize(existing).map_err(io_err(existing))?;
+    if resolved.starts_with(&canon_project) {
+        return Ok(());
+    }
+    Err(AgentError::Layout {
+        path,
+        detail: format!(
+            "it is a symlink to {}, outside the project; saiife only writes inside the project",
+            resolved.display()
+        ),
+    })
+}
+
 /// Write `contents` to `<project>/<rel>` atomically (temp file in the same
 /// directory, then rename). An existing file keeps its permissions; a
 /// symlink is followed and its target replaced. Missing directories are
@@ -160,6 +184,27 @@ mod tests {
             fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// M1: a config (or its directory) resolving outside the project is
+    /// refused; one resolving inside it is fine.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_inside_refuses_paths_resolving_outside_the_project() {
+        let p = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(p.path().join("real.json"), "{}").unwrap();
+        fs::create_dir(p.path().join(".gemini")).unwrap();
+        std::os::unix::fs::symlink(
+            p.path().join("real.json"),
+            p.path().join(".gemini/settings.json"),
+        )
+        .unwrap();
+        ensure_inside(p.path(), ".gemini/settings.json").unwrap();
+        ensure_inside(p.path(), ".claude/settings.json").unwrap();
+        std::os::unix::fs::symlink(outside.path(), p.path().join(".codex")).unwrap();
+        let e = ensure_inside(p.path(), ".codex/config.toml").unwrap_err();
+        assert!(e.to_string().contains("outside the project"), "{e}");
     }
 
     /// F1: syncing a directory is best effort and never fails a write.

@@ -27,6 +27,7 @@ pub const STATUS_MESSAGE: &str = "saiife guard";
 pub const NEXT_STEP: &str = "Codex asks you to trust every new or changed hook once: start `codex` in this folder (the project's .codex folder must be trusted), run `/hooks` and trust the saiife hook.";
 
 pub fn install(project: &Path) -> Result<Change, AgentError> {
+    fsutil::ensure_inside(project, CONFIG_REL)?;
     let path = project.join(CONFIG_REL);
     let text = fsutil::read_optional(&path)?;
     let mut doc = parse(&path, text.as_deref().unwrap_or(""))?;
@@ -64,6 +65,7 @@ pub fn install(project: &Path) -> Result<Change, AgentError> {
 /// Remove saiife's handlers. With `delete_if_empty`, a file left with no
 /// content is deleted (use only for a file saiife created).
 pub fn remove(project: &Path, delete_if_empty: bool) -> Result<Change, AgentError> {
+    fsutil::ensure_inside(project, CONFIG_REL)?;
     let path = project.join(CONFIG_REL);
     let Some(text) = fsutil::read_optional(&path)? else {
         return Ok(Change::Unchanged);

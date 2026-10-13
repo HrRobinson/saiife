@@ -27,6 +27,7 @@ pub(crate) struct JsonHooks {
 
 impl JsonHooks {
     pub fn install(&self, project: &Path) -> Result<Change, AgentError> {
+        fsutil::ensure_inside(project, self.rel)?;
         let path = project.join(self.rel);
         let text = fsutil::read_optional(&path)?;
         let mut root = parse(&path, text.as_deref())?;
@@ -43,6 +44,7 @@ impl JsonHooks {
     /// Remove saiife's handlers. With `delete_if_empty`, a file left as `{}`
     /// is deleted (use only for a file saiife created).
     pub fn remove(&self, project: &Path, delete_if_empty: bool) -> Result<Change, AgentError> {
+        fsutil::ensure_inside(project, self.rel)?;
         let path = project.join(self.rel);
         let Some(text) = fsutil::read_optional(&path)? else {
             return Ok(Change::Unchanged);
