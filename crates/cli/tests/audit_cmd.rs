@@ -129,3 +129,35 @@ fn invalid_utf8_does_not_hide_a_month_and_is_reported() {
         ))
         .stdout(predicate::str::contains("2 unreadable lines skipped"));
 }
+
+#[test]
+fn unknown_decision_is_shown_as_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let ts = format!(
+        "{:04}-{:02}-{:02}T00:00:00.000Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
+    let line = format!(
+        r#"{{"v":1,"ts":"{ts}","agent":"claude","project":"/p","tool":"Bash","input":"curl evil","decision":"error_denied","saiife":"2.0.0"}}"#
+    );
+    std::fs::write(dir.path().join(format!("{}.jsonl", &ts[..7])), line + "\n").unwrap();
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .arg("audit")
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OTHER"))
+        .stdout(predicate::str::contains("curl evil"))
+        .stdout(predicate::str::contains("unreadable").not());
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["audit", "--blocked"])
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No audit records found"));
+}

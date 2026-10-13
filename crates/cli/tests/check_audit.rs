@@ -94,10 +94,15 @@ fn oversize_payload_is_error_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let big = payload(&format!("echo {}", "a".repeat(300 * 1024)));
     assert_eq!(check(dir.path(), &["--hook-exit"], &big), 0);
-    assert_eq!(
-        read_all(dir.path()).records[0].decision,
-        DecisionKind::ErrorAllowed
+    let r = &read_all(dir.path()).records[0];
+    assert_eq!(r.decision, DecisionKind::ErrorAllowed);
+    assert!(
+        r.input.starts_with("echo "),
+        "command kept: {:.40}",
+        r.input
     );
+    assert!(r.input.ends_with("…[truncated]"));
+    assert!(r.reason.as_deref().unwrap().contains("payload"));
 }
 
 #[test]

@@ -23,6 +23,10 @@ pub enum DecisionKind {
     /// The guard failed open (crash, unusable payload, budget exceeded): the
     /// action was allowed without being judged.
     ErrorAllowed,
+    /// A decision value this version does not know (e.g. v2's `error_denied`,
+    /// spec §6.2). Readers keep the record instead of dropping it.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +54,9 @@ pub struct Record {
 
 /// The caller-supplied part of a record. `Record::new` adds the timestamp,
 /// version, masking and truncation so no caller can forget them.
+///
+/// Only `input` is masked. `reason`, `rule` and `project` are written as
+/// given and must never contain command text.
 #[derive(Debug, Clone, Copy)]
 pub struct NewRecord<'a> {
     pub agent: &'a str,
@@ -184,6 +191,13 @@ mod tests {
         assert_eq!(r.decision, DecisionKind::Allow);
         assert_eq!(r.session, None);
         assert_eq!(r.pack, None);
+    }
+
+    #[test]
+    fn unknown_decision_value_is_tolerated() {
+        let line = r#"{"v":1,"ts":"2026-10-13T08:14:02.381Z","agent":"codex","project":"/p","tool":"shell","input":"ls","decision":"error_denied","saiife":"2.0.0"}"#;
+        let r: Record = serde_json::from_str(line).unwrap();
+        assert_eq!(r.decision, DecisionKind::Unknown);
     }
 
     #[test]

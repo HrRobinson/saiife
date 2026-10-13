@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::{
-    command_from_hook_json, context_from_hook_json, HookContext, MAX_PAYLOAD_BYTES,
+    command_from_hook_json, context_from_hook_json, HookContext, PayloadError, MAX_PAYLOAD_BYTES,
 };
 
 use crate::warn;
@@ -35,7 +35,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
                 "hook payload not usable ({e}); failing open (allow)"
             ));
             audit.write(
-                "",
+                &salvage_command(&buf, &e),
                 DecisionKind::ErrorAllowed,
                 None,
                 Some(&format!("hook payload not usable: {e}")),
@@ -131,6 +131,22 @@ fn decide(
             }
         }
         Decision::Allow { .. } => allow(hook_exit),
+    }
+}
+
+/// Payloads up to this size are still parsed after `TooLarge`, only to put
+/// the command in the audit record. Bounded so this stays cheap.
+const SALVAGE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
+
+/// For an oversize payload that is otherwise valid JSON with a command, the
+/// command (the record masks and truncates it), so the log shows what ran
+/// unjudged. Empty for anything else. Never affects the verdict.
+fn salvage_command(buf: &str, err: &PayloadError) -> String {
+    match err {
+        PayloadError::TooLarge => {
+            command_from_hook_json(buf, SALVAGE_MAX_BYTES).unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 

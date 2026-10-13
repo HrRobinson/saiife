@@ -44,6 +44,7 @@ pub fn render_table(records: &[&Record]) -> String {
                 fail_open += 1;
                 "FAIL-OPEN"
             }
+            DecisionKind::Unknown => "OTHER",
         };
         let time = sanitize(r.ts.get(..19).unwrap_or(&r.ts)).replace('T', " ");
         let input = if r.input.is_empty() {
