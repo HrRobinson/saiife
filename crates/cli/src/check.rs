@@ -67,6 +67,42 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
     }
 }
 
+/// `saiife check` got arguments it cannot parse: it fails open, so record
+/// that like every other fail-open (spec §1.2 rule 5). Best effort and never
+/// panics: the agent is taken from `--agent` in `args` if present, the
+/// payload is read up to the usual bound (draining the rest, so the agent
+/// gets no EPIPE). The caller exits 0 with nothing on stdout.
+pub fn record_arg_error(args: &[String], error: &str) {
+    let _ = std::panic::catch_unwind(|| {
+        let agent = agent_from_args(args).unwrap_or("unknown");
+        let mut bytes = Vec::new();
+        let mut stdin = std::io::stdin().lock();
+        let _ = (&mut stdin)
+            .take(PARSE_MAX_BYTES as u64)
+            .read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+        let buf = String::from_utf8_lossy(&bytes);
+        let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+        audit.write(
+            "",
+            DecisionKind::ErrorAllowed,
+            None,
+            Some(&format!("bad hook arguments: {error}")),
+        );
+    });
+}
+
+/// The value of `--agent <name>` or `--agent=<name>`.
+fn agent_from_args(args: &[String]) -> Option<&str> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == "--agent" {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            a.strip_prefix("--agent=")
+        }
+    })
+}
+
 /// The engine for this call: default-on packs, `--pack` ids, and the packs
 /// of the project that `cwd` (or this process's directory) belongs to.
 fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engine {
@@ -268,6 +304,21 @@ fn emit_deny(reason: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_is_taken_from_args_when_present() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_from_args(&a(&["check", "--agent", "codex", "--x"])),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_from_args(&a(&["check", "--agent=gemini"])),
+            Some("gemini")
+        );
+        assert_eq!(agent_from_args(&a(&["check", "--x", "--agent"])), None);
+        assert_eq!(agent_from_args(&a(&["check"])), None);
+    }
 
     fn audit_in(dir: &std::path::Path) -> Audit {
         Audit {

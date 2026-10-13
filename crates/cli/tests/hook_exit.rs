@@ -4,14 +4,19 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
+    let audit = tempfile::tempdir().unwrap();
+    run_check_in(audit.path(), args, stdin)
+}
+
+/// `run_check` with the audit log in `audit`.
+fn run_check_in(audit: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String, String) {
     // No `cwd` in these payloads: the project walk starts at the temp dir.
     common::assert_no_host_config(&std::env::temp_dir());
-    let audit = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
-    let _sandbox = common::hermetic(&mut cmd, audit.path());
+    let _sandbox = common::hermetic(&mut cmd, audit);
     let mut child = cmd
         .args(args)
-        .current_dir(audit.path())
+        .current_dir(audit)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -147,13 +152,24 @@ fn json_mode_deny_is_unchanged() {
 /// turn into exit 2, which every agent reads as "block": fail open.
 #[test]
 fn check_fails_open_on_unknown_arguments() {
-    let (code, stdout, stderr) = run_check(
+    let audit = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_check_in(
+        audit.path(),
         &["check", "--hook-exit", "--agent", "claude", "--future-flag"],
         DENY_JSON,
     );
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("failing open"), "{stderr}");
+    // Failing open is always recorded (spec §1.2 rule 5).
+    let recs = saiife_audit::store::read_all(audit.path()).records;
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r.decision, saiife_audit::DecisionKind::ErrorAllowed);
+    assert_eq!(r.agent, "claude");
+    let reason = r.reason.as_deref().unwrap_or("");
+    assert!(reason.starts_with("bad hook arguments: "), "{reason}");
+    assert!(reason.contains("--future-flag"), "{reason}");
 }
 
 /// M2: other subcommands keep clap's usage error.

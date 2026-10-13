@@ -144,6 +144,10 @@ fn arg_error(e: clap::Error) -> ExitCode {
         warn(&format!(
             "bad hook arguments ({first}); failing open (allow)"
         ));
+        let args: Vec<String> = std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        check::record_arg_error(&args, first);
         return ExitCode::SUCCESS;
     }
     e.exit()
