@@ -46,6 +46,10 @@ docs state which threats a given setup does *not* cover:
   saiife, keys or the audit log. For full autonomy ("give the agent full
   power") on company infrastructure.
 
+The product grows the same way: v2 adds connectors (HubSpot, Shopify, …),
+v3 adds making and running agents and flows (localflow's OpenClaw operator
+and flow engine). §9.5 lists every localflow feature and its version.
+
 ### 1.2 Security principles (binding on every version)
 
 1. **Defense in depth.** No single layer is trusted to be complete; each
@@ -440,7 +444,35 @@ Goal: give an agent full autonomy without trusting it.
   dir + Shopify orders:read + no other network), so companies define "full
   power" per role instead of per agent session.
 
-### 9.5 Also out of v1
+### 9.5 Product features v2/v3 — everything from localflow carries forward
+
+saiife is not only a safety layer: the connectors, agents and automations
+localflow had are part of the product. They return in the CLI, each built on
+the safety layer of its version so a feature never ships ahead of its
+protection. Inventory of localflow features and where each lands:
+
+| localflow feature | saiife form | Version | Built on |
+|---|---|---|---|
+| Connectors: GitHub, GitLab, Slack, Discord, Email, Linear, Sentry, PagerDuty, Stripe, Shopify, WooCommerce, HubSpot, Salesforce, Intercom, Zendesk, Airtable, Segment, generic HTTP, webhooks | `saiife connect <service>` (store credential, pick policy), `saiife api <service> <operation>` for agents | v2 | Connector gateway §9.2 |
+| Agent-facing API client + collections | `saiife api` with saved request collections; credentials by name only | v2 | §9.2 |
+| Per-session cloud credentials (AWS STS, GCP, Azure) | Gateway mints short-lived, least-privilege credentials per agent session | v2 | §9.2 |
+| Environments + switcher (dev / staging / prod) | Named policy sets: `saiife env use prod` tightens packs and connector rules | v2 | §5.1 config, §9.1 lock |
+| Multi-agent overview (status colors: working / waiting / done / exited), session manager | `saiife sessions`: terminal (TUI) list of running agents with status, connectors in use and recent blocks | v3 | Runner §9.4 |
+| Changes + activity views (git diff per agent, activity feed) | `saiife sessions show <id>`: changes and audit trail of one agent | v3 | §9.4, audit |
+| OpenClaw operator (operator config, grants, launch, `saiife` / `saiife-api` skills) | `saiife agent create/run <profile>`: define an agent (model incl. local Ollama/vLLM, connectors, packs, limits) and launch it in the runner; ships the OpenClaw skills | v3 | §9.4 profiles |
+| Flow engine (conditions, templates, builder canvas) | `saiife flow` with flows as TOML files (trigger → agent/connector steps → conditions); visual builder later in the hub | v3 | §9.2 + §9.4 |
+| Hosted ingress / webhooks (saiife-cloud relay) | Local webhook trigger for flows; optional paid hosted relay (the existing `saiife-cloud` design) for machines without a public address | v3 | Flows |
+| Browser control / capture | Browser connector for agents, only inside the runner | v3 (evaluate) | §9.4 |
+| Network tap | Runner egress log, part of the audit trail | v3 | §9.4 |
+| Control plane (`saiife-hub`) | Central multi-machine dashboard: policies, audit, sessions | after v3 | all of the above |
+| Telemetry (PostHog) | Dropped (§1.2 rule 7) | — | — |
+| GUI-only (keybindings, themes, pane layout, peek, watchpoints) | Dropped, or reconsidered for the `saiife sessions` TUI | — | — |
+
+Each row gets its own spec before it is built. A localflow feature missing
+from this table is an omission to fix in the table, not a decision to drop
+it.
+
+### 9.6 Also out of v1
 
 Windows, a central multi-machine dashboard (likely the successor of
 `saiife-hub`), the Electron app.
