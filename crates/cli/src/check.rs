@@ -12,7 +12,10 @@ use saiifeguard::payload::{
     classify, context_from_hook_json_bounded, HookContext, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
+use saiifeguard::profile::select_active;
+use saiifeguard::Pack;
 
+use crate::project::project_packs;
 use crate::warn;
 
 /// Payloads up to this size are still parsed. File tools (a `Write` of a big
@@ -21,7 +24,10 @@ use crate::warn;
 /// stays cheap.
 const PARSE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
 
-pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
+/// `packs`: every built-in pack; `cli_packs`: `--pack` ids. The project's
+/// own packs are added from the `.saiife/config.toml` at or above the
+/// payload's `cwd`.
+pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         let audit = Audit::new(agent, HookContext::default());
@@ -40,6 +46,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
             fail_open(&audit, &command, &PayloadError::TooLarge)
         }
         Ok(ToolCall::Shell { command }) => {
+            let engine = engine_for(packs, cli_packs, audit.ctx.cwd.as_deref());
             decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
         }
         Ok(ToolCall::File { paths, .. }) => {
@@ -54,6 +61,22 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
         }
         Err(e) => fail_open(&audit, "", &e),
     }
+}
+
+/// The engine for this call: default-on packs, `--pack` ids, and the packs
+/// of the project that `cwd` (or this process's directory) belongs to.
+fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engine {
+    let start = match cwd {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    let project = project_packs(&start, &packs);
+    for w in &project.warnings {
+        warn(w);
+    }
+    let mut enabled = cli_packs.to_vec();
+    enabled.extend(project.enabled);
+    Engine::new(select_active(packs, &enabled))
 }
 
 /// The payload could not be judged: allow, and record why.

@@ -505,6 +505,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "saiife-agents",
  "saiife-audit",
  "saiife-guard",
  "serde_json",

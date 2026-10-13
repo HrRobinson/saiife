@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 
 mod audit_cmd;
 mod check;
+mod project;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -77,12 +78,12 @@ fn main() -> ExitCode {
     for w in &warnings {
         warn(&format!("pack warning ({}): {}", w.source, w.message));
     }
-    let engine = Engine::new(select_active(packs, &cli.packs));
+    let engine = || Engine::new(select_active(packs.clone(), &cli.packs));
 
     match cli.command {
-        Cmd::Test { command } => cmd_test(&engine, &command),
-        Cmd::Explain { command } => cmd_explain(&engine, &command),
-        Cmd::Check { hook_exit, agent } => check::run(&engine, hook_exit, &agent),
+        Cmd::Test { command } => cmd_test(&engine(), &command),
+        Cmd::Explain { command } => cmd_explain(&engine(), &command),
+        Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
         Cmd::Audit {
             since,
             project,

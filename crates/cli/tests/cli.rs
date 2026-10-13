@@ -54,6 +54,7 @@ fn check_denies_via_hook_json() {
         .unwrap()
         .arg("check")
         .env("SAIIFE_AUDIT_DIR", audit.path())
+        .current_dir(audit.path())
         .write_stdin(
             r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#,
         )
@@ -70,6 +71,7 @@ fn check_fails_open_on_garbage() {
         .unwrap()
         .arg("check")
         .env("SAIIFE_AUDIT_DIR", audit.path())
+        .current_dir(audit.path())
         .write_stdin("{not json at all")
         .assert()
         .success()

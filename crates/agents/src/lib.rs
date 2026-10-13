@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod detect;
 pub mod fingerprint;
 pub mod fsutil;

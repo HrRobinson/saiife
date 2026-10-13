@@ -6,6 +6,7 @@ fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(args)
         .env("SAIIFE_AUDIT_DIR", audit.path())
+        .current_dir(audit.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

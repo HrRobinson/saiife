@@ -18,6 +18,7 @@ fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> Out {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", agent])
         .env(DIR_ENV, audit_dir)
+        .current_dir(audit_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
