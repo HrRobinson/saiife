@@ -487,3 +487,43 @@ fn last_hook_call_through_a_symlinked_cwd_is_shown() {
         .unwrap();
     assert!(claude.contains("s ago"), "{claude}");
 }
+
+/// M4: when `init` cannot hash its own binary it warns, and status reports
+/// the missing hash as a failed check (not the "older record" note).
+#[cfg(unix)]
+#[test]
+fn unhashable_binary_at_init_is_a_failed_check() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&["claude"]);
+    let exe = env.bin.path().join("saiife");
+    std::fs::remove_file(&exe).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_saiife"), &exe).unwrap();
+    // Execute-only: runs, but cannot be read (unless we are root).
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if std::fs::read(&exe).is_ok() {
+        eprintln!("skipped: running as root, the binary stays readable");
+        return;
+    }
+    let out = Command::new(&exe)
+        .arg("init")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .output()
+        .unwrap();
+    assert!(
+        stdout(&out).contains("WARNING: could not compute the SHA-256"),
+        "{}",
+        stdout(&out)
+    );
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains("could not compute the SHA-256 of the saiife binary"),
+        "{text}"
+    );
+    assert!(!text.contains("made by an older saiife"), "{text}");
+}

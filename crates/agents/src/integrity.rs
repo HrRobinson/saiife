@@ -33,6 +33,11 @@ pub struct Integrity {
     /// from older versions.
     #[serde(default)]
     pub saiife_sha256: String,
+    /// Set when `init` could not compute `saiife_sha256` (the reason), so
+    /// `status` can tell "could not hash" from an older record without the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saiife_sha256_error: Option<String>,
     /// SHA-256 of `.saiife/config.toml` as `init` left it.
     pub config_sha256: String,
     /// SHA-256 of `.saiife/config.toml` as saiife itself last wrote it
@@ -152,6 +157,7 @@ mod tests {
             saiife_path: "/usr/local/bin/saiife".into(),
             saiife_version: "0.1.0".into(),
             saiife_sha256: "12".repeat(32),
+            saiife_sha256_error: None,
             config_sha256: "cd".repeat(32),
             config_written_sha256: "ef".repeat(32),
             hooks,

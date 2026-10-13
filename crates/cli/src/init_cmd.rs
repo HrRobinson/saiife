@@ -193,12 +193,22 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             String::new()
         }
     };
+    let mut warnings = Vec::new();
     let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .unwrap_or_default();
-    let saiife_sha256 = std::fs::read(&exe)
-        .map(|b| sha256_hex(&b))
-        .unwrap_or_default();
+    let (saiife_sha256, saiife_sha256_error) = match std::fs::read(&exe) {
+        Ok(b) => (sha256_hex(&b), None),
+        Err(e) => {
+            let reason = format!("{}: {e}", exe.display());
+            warnings.push(format!(
+                "WARNING: could not compute the SHA-256 of the saiife binary ({reason}), so \
+                 `saiife status` cannot detect if it is replaced and will report a failed check. \
+                 Make the binary readable, then run `saiife init` again."
+            ));
+            (String::new(), Some(reason))
+        }
+    };
     let record = Integrity {
         v: INTEGRITY_VERSION,
         project: integrity::canonical_project(&root)
@@ -207,6 +217,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         saiife_path: exe.display().to_string(),
         saiife_version: env!("CARGO_PKG_VERSION").to_string(),
         saiife_sha256,
+        saiife_sha256_error,
         config_sha256,
         config_written_sha256,
         hooks,
@@ -228,6 +239,9 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             .map(|p| p.id.as_str())
             .collect();
         println!("  packs   {}", active.join(", "));
+    }
+    for w in &warnings {
+        println!("\n{w}");
     }
     path_warning(&exe);
     if !installed.is_empty() {

@@ -302,7 +302,14 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
         });
         return;
     }
-    if record.saiife_sha256.is_empty() {
+    if let (true, Some(e)) = (record.saiife_sha256.is_empty(), &record.saiife_sha256_error) {
+        problems.push(Problem {
+            what: format!(
+                "`saiife init` could not compute the SHA-256 of the saiife binary ({e}), so a replaced binary cannot be detected."
+            ),
+            fix: "make the saiife binary readable, then run `saiife init`".into(),
+        });
+    } else if record.saiife_sha256.is_empty() {
         println!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
     } else {
         match std::fs::read(&on_path) {
