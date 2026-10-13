@@ -9,10 +9,17 @@ use std::process::ExitCode;
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::{
-    command_from_hook_json, context_from_hook_json, HookContext, PayloadError, MAX_PAYLOAD_BYTES,
+    classify, context_from_hook_json_bounded, HookContext, PayloadError, ToolCall,
+    MAX_PAYLOAD_BYTES,
 };
 
 use crate::warn;
+
+/// Payloads up to this size are still parsed. File tools (a `Write` of a big
+/// file) are handled normally; a shell command above `MAX_PAYLOAD_BYTES` is
+/// not judged but its command goes into the audit record. Bounded so parsing
+/// stays cheap.
+const PARSE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
 
 pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
@@ -27,24 +34,40 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
         );
         return allow();
     }
-    let audit = Audit::new(agent, context_from_hook_json(&buf));
-    let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
-        Ok(c) => c,
-        Err(e) => {
-            warn(&format!(
-                "hook payload not usable ({e}); failing open (allow)"
-            ));
-            audit.write(
-                &salvage_command(&buf, &e),
-                DecisionKind::ErrorAllowed,
-                None,
-                Some(&format!("hook payload not usable: {e}")),
-            );
-            return allow();
+    let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+    match classify(&buf, PARSE_MAX_BYTES) {
+        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => {
+            fail_open(&audit, &command, &PayloadError::TooLarge)
         }
-    };
+        Ok(ToolCall::Shell { command }) => {
+            decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
+        }
+        Ok(ToolCall::File { paths, .. }) => {
+            // Path rules arrive in plan 3; until then file tools are
+            // recorded, never judged.
+            audit.write(&paths.join("\n"), DecisionKind::Allow, None, None);
+            allow()
+        }
+        Ok(ToolCall::Other { .. }) => {
+            audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
+            allow()
+        }
+        Err(e) => fail_open(&audit, "", &e),
+    }
+}
 
-    decide(&audit, &command, hook_exit, |c| engine.evaluate(c))
+/// The payload could not be judged: allow, and record why.
+fn fail_open(audit: &Audit, input: &str, e: &PayloadError) -> ExitCode {
+    warn(&format!(
+        "hook payload not usable ({e}); failing open (allow)"
+    ));
+    audit.write(
+        input,
+        DecisionKind::ErrorAllowed,
+        None,
+        Some(&format!("hook payload not usable: {e}")),
+    );
+    allow()
 }
 
 /// Judge `command` with `evaluate`, audit the decision and answer the hook.
@@ -131,22 +154,6 @@ fn decide(
             }
         }
         Decision::Allow { .. } => allow(),
-    }
-}
-
-/// Payloads up to this size are still parsed after `TooLarge`, only to put
-/// the command in the audit record. Bounded so this stays cheap.
-const SALVAGE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
-
-/// For an oversize payload that is otherwise valid JSON with a command, the
-/// command (the record masks and truncates it), so the log shows what ran
-/// unjudged. Empty for anything else. Never affects the verdict.
-fn salvage_command(buf: &str, err: &PayloadError) -> String {
-    match err {
-        PayloadError::TooLarge => {
-            command_from_hook_json(buf, SALVAGE_MAX_BYTES).unwrap_or_default()
-        }
-        _ => String::new(),
     }
 }
 

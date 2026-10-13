@@ -1,0 +1,1 @@
+{"session_id":"c-1","transcript_path":"/home/u/.claude/projects/app/c-1.jsonl","cwd":"/home/u/app","permission_mode":"default","hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"url":"https://example.com","prompt":"summarize"},"tool_use_id":"toolu_08"}

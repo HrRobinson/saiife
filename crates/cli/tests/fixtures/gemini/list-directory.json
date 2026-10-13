@@ -1,0 +1,1 @@
+{"session_id":"g-1","transcript_path":"/home/u/.gemini/tmp/app/chats/g-1.json","cwd":"/home/u/app","hook_event_name":"BeforeTool","timestamp":"2026-10-13T08:14:02.381Z","tool_name":"list_directory","tool_input":{"dir_path":"/home/u/app/src"}}

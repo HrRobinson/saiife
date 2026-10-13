@@ -1,0 +1,1 @@
+{"session_id":"x-1","transcript_path":"/home/u/.codex/sessions/x-1.jsonl","cwd":"/home/u/app","hook_event_name":"PreToolUse","model":"gpt-5-codex","permission_mode":"default","turn_id":"t-1","tool_name":"mcp__docs__search","tool_use_id":"call_4","tool_input":{"query":"hooks"}}
