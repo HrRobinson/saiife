@@ -11,10 +11,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod claude;
 pub mod config;
 pub mod detect;
 pub mod fingerprint;
 pub mod fsutil;
+pub mod gemini;
+mod json_hooks;
 
 use std::path::PathBuf;
 
@@ -62,6 +65,13 @@ impl Agent {
     pub fn hook_command(self) -> String {
         format!("saiife check --hook-exit --agent {}", self.name())
     }
+}
+
+/// A setting that switches an agent's hooks off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookBlocker {
+    pub path: PathBuf,
+    pub setting: &'static str,
 }
 
 /// What an install or remove did to the config file.
