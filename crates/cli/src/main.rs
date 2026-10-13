@@ -4,11 +4,14 @@
 //! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
 //! - `saiife check` -> read agent pre-tool JSON on stdin, audit, emit the hook allow/block response; FAIL OPEN on error.
 
+#![forbid(unsafe_code)]
+
 use std::io::Write;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod audit_cmd;
 mod check;
 
 use saiifeguard::builtins::builtin_packs;
@@ -47,6 +50,21 @@ enum Cmd {
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
     },
+    /// Show the audit log: every allowed, blocked and fail-open decision.
+    Audit {
+        /// Only records newer than this, e.g. 30m, 24h, 7d.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only records from this project directory (or below it).
+        #[arg(long)]
+        project: Option<String>,
+        /// Only records from this agent (claude, codex, gemini).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only blocked actions.
+        #[arg(long)]
+        blocked: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -65,6 +83,17 @@ fn main() -> ExitCode {
         Cmd::Test { command } => cmd_test(&engine, &command),
         Cmd::Explain { command } => cmd_explain(&engine, &command),
         Cmd::Check { hook_exit, agent } => check::run(&engine, hook_exit, &agent),
+        Cmd::Audit {
+            since,
+            project,
+            agent,
+            blocked,
+        } => audit_cmd::run(
+            since.as_deref(),
+            project.as_deref(),
+            agent.as_deref(),
+            blocked,
+        ),
     }
 }
 

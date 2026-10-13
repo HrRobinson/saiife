@@ -1,0 +1,105 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use saiife_audit::store::{append, DIR_ENV};
+use saiife_audit::{DecisionKind, NewRecord, Record};
+use time::{Duration, OffsetDateTime};
+
+fn seed(dir: &std::path::Path) {
+    let now = OffsetDateTime::now_utc();
+    let mk = |input: &str, decision, pack, at| {
+        Record::at(
+            NewRecord {
+                agent: "claude",
+                project: "/home/u/app",
+                session: None,
+                tool: "Bash",
+                input,
+                decision,
+                pack,
+                rule: None,
+                reason: Some("r"),
+            },
+            "0.1.0",
+            at,
+        )
+    };
+    append(dir, &mk("ls", DecisionKind::Allow, None, now)).unwrap();
+    append(
+        dir,
+        &mk("rm -rf /", DecisionKind::Deny, Some("core.filesystem"), now),
+    )
+    .unwrap();
+    append(
+        dir,
+        &mk(
+            "git status",
+            DecisionKind::Allow,
+            None,
+            now - Duration::days(40),
+        ),
+    )
+    .unwrap();
+    // A crashed half-line must not hide the rest.
+    std::fs::write(dir.join("1999-01.jsonl"), "{\"v\":1,\"ts\":").unwrap();
+}
+
+#[test]
+fn shows_all_records_and_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .arg("audit")
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BLOCKED"))
+        .stdout(predicate::str::contains(
+            "3 decisions · 1 blocked · 0 fail-open",
+        ));
+}
+
+#[test]
+fn filters_blocked_and_since() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path());
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["audit", "--blocked"])
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 decisions · 1 blocked"));
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["audit", "--since", "7d"])
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 decisions"))
+        .stdout(predicate::str::contains("git status").not());
+}
+
+#[test]
+fn empty_log_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .arg("audit")
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No audit records found"));
+}
+
+#[test]
+fn bad_since_exits_2() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["audit", "--since", "7w"])
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --since"));
+}
