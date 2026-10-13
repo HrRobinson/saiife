@@ -13,13 +13,17 @@ pub const MASK: &str = "[MASKED]";
 static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     [
         (r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)", MASK),
-        (r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@", "${1}[MASKED]@"),
+        // Whole userinfo, greedy up to the last '@' before the path/query
+        // (`user:p@ss@host`, token-only `TOKEN@host`).
+        (r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]+@", "${1}[MASKED]@"),
         (r#"(?i)(authorization:\s*(?:bearer\s+|basic\s+|token\s+)?)[^\s'"]+"#, "${1}[MASKED]"),
         (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+", "${1}[MASKED]"),
-        (r#"(?i)(--(?:password|passwd|token|secret|api-key|apikey)(?:=|\s+))(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
+        (r#"(?i)(--(?:[a-z0-9]+-)*(?:password|passwd|token|secret|secret-key|api-key|apikey)(?:=|\s+))(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
+        (r#"(?i)(\baws\s+configure\s+set\s+(?:[A-Za-z0-9_-]+\.)*(?:aws_secret_access_key|aws_session_token)\s+)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
         (r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY)[A-Z0-9_]*=)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
-        (r"\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}\b", MASK),
-        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", MASK),
+        // No leading `\b`: a token glued to an identifier (`X_ghp_…`) still counts.
+        (r"(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}\b", MASK),
+        (r"github_pat_[A-Za-z0-9_]{20,}\b", MASK),
         (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", MASK),
     ]
     .into_iter()
@@ -122,6 +126,85 @@ mod tests {
         assert_eq!(
             mask("git clone https://github.com/a/b"),
             "git clone https://github.com/a/b"
+        );
+    }
+
+    #[test]
+    fn hyphenated_secret_flags() {
+        for flag in [
+            "--access-token",
+            "--auth-token",
+            "--client-secret",
+            "--secret-key",
+            "--db-password",
+            "--x-api-key",
+        ] {
+            assert_eq!(
+                mask(&format!("tool {flag}=s3cr3t run")),
+                format!("tool {flag}=[MASKED] run")
+            );
+            assert_eq!(
+                mask(&format!("tool {flag} s3cr3t run")),
+                format!("tool {flag} [MASKED] run")
+            );
+        }
+        assert_eq!(mask("tool --token-file ./path"), "tool --token-file ./path");
+        assert_eq!(
+            mask("tool --access-token-file ./p"),
+            "tool --access-token-file ./p"
+        );
+    }
+
+    #[test]
+    fn github_token_glued_to_identifier() {
+        let tok = format!("ghp_{}", "a".repeat(36));
+        assert_eq!(mask(&format!("echo X_{tok}")), "echo X_[MASKED]");
+        let pat = format!("github_pat_{}", "B".repeat(40));
+        assert_eq!(mask(&format!("echo V{pat}")), "echo V[MASKED]");
+    }
+
+    #[test]
+    fn aws_configure_set_space_form() {
+        assert_eq!(
+            mask("aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG"),
+            "aws configure set aws_secret_access_key [MASKED]"
+        );
+        assert_eq!(
+            mask("aws configure set profile.dev.aws_session_token 'abc def'"),
+            "aws configure set profile.dev.aws_session_token [MASKED]"
+        );
+        assert_eq!(
+            mask("aws configure set region eu-west-1"),
+            "aws configure set region eu-west-1"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_is_masked_up_to_the_last_at() {
+        assert_eq!(
+            mask("curl https://user:p@ss@host/x"),
+            "curl https://[MASKED]@host/x"
+        );
+        let tok = format!("ghp_{}", "a".repeat(36));
+        assert_eq!(
+            mask(&format!("git clone https://{tok}@github.com/a/b")),
+            "git clone https://[MASKED]@github.com/a/b"
+        );
+        assert_eq!(
+            mask("git push https://TOKEN123@host/r.git"),
+            "git push https://[MASKED]@host/r.git"
+        );
+        assert_eq!(
+            mask("git clone git@github.com:a/b"),
+            "git clone git@github.com:a/b"
+        );
+        assert_eq!(
+            mask("git clone https://github.com/a/b"),
+            "git clone https://github.com/a/b"
+        );
+        assert_eq!(
+            mask("curl 'https://h/p?to=a@b.c'"),
+            "curl 'https://h/p?to=a@b.c'"
         );
     }
 
