@@ -166,7 +166,9 @@ fn last_hook_call_is_shown_per_agent() {
     let env = initialized(&["claude", "codex"]);
     let payload = serde_json::json!({
         "session_id": "s",
-        "cwd": env.root().join("src"),
+        // Canonical, as an agent reports its cwd (macOS temp dirs sit behind
+        // the /var -> /private/var symlink).
+        "cwd": env.root().canonicalize().unwrap().join("src"),
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": { "command": "ls" }
