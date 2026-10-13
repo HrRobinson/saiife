@@ -24,7 +24,17 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 - ~~**Plan 2:** `saiife check` answers Claude Code with `permissionDecision: "allow"`~~ — done in plan 2: allow is silent for every agent.
 - ~~**Plan 2 (`status`):** `read_all` returns an empty result with no signal when the audit dir itself is unreadable~~ — done in plan 2: `ReadResult::dir_error`; `status` and `audit` report it.
-- **Plan 3 (verify live):** Codex and Gemini CLI hook entries are built from the research docs but not yet run against a live install: Codex `/hooks` trust flow, `apply_patch` patch text in `tool_input.command`, project `config.toml` hooks loading; Gemini `name`/ms timeout, folder trust, and whether a missing `saiife` (exit 127) blocks every tool.
 - **Plan 4 (report):** escape LRM/RLM/ALM (U+200E/U+200F/U+061C) too; show a project column; mask `mysql -pPASS`; stop the URL rule over-masking across `"`/`'`/`,` (e.g. `https://h","email":"a@b.c`).
 - **Any plan touching `check`:** payloads over 1 MiB are still logged with empty input; engine abort/stack overflow is not caught (only panics).
 - **Housekeeping:** audit dir 0700, checked arithmetic for `--since`, `time` macros as cli dev-dependency, clean up `/tmp/saiife-test-audit-*` in tests.
+
+## Carry-over from plan 2 (for the plans that own them)
+
+- **Plan 3 (path rules):** Claude `Glob`/`LS` are classified as Other, and an `apply_patch` whose patch yields no paths is recorded with empty input; both must be "unjudgeable" (fail open, recorded as such) once path rules exist.
+- **Plan 3 (verify live):** Codex and Gemini CLI hook entries are built from the research docs but not yet run against a live install: Codex `/hooks` trust flow, `apply_patch` patch text in `tool_input.command`, project `config.toml` hooks loading; Gemini `name`/ms timeout and folder trust.
+- **Plan 3 (Gemini, verify live + docs):** whether a missing `saiife` on PATH (exit 127) blocks every Gemini tool; document it on the Gemini docs page and re-check live.
+- **Plan 3 (Gemini status):** Gemini CLI's setting to enable/disable hooks is unverified, so `status` is blind to it (no blocker check for Gemini).
+- **Plan 3 (Codex status):** managed `requirements.toml` `allow_managed_hooks_only` is not checked (its path is unverified).
+- **Plan 3 (Codex layout):** an inline `hooks = [{…}]` / `hooks = { PreToolUse = […] }` layout is refused as a whole; refuse only when it holds saiife's own entry.
+- **Plan 5 (status performance):** `last_calls` loads the whole audit log to find the last hook call per agent.
+- **Status/init UX:** when `.saiife/config.toml` was removed, `status` run from a subdirectory looks for the project at the subdirectory and says "not set up" instead of naming the removed config; a partial `init --off` (one agent failed) leaves a stale integrity record; `off()` output wording; an existing integrity record directory is not tightened to 0700; a dangling symlinked agent config gives an unclear I/O error.
