@@ -45,17 +45,17 @@ pub fn render_table(records: &[&Record]) -> String {
                 "FAIL-OPEN"
             }
         };
-        let time = r.ts.get(..19).unwrap_or(&r.ts).replace('T', " ");
+        let time = sanitize(r.ts.get(..19).unwrap_or(&r.ts)).replace('T', " ");
         let input = if r.input.is_empty() {
-            format!("({})", r.reason.as_deref().unwrap_or("no input"))
+            one_line(&format!("({})", r.reason.as_deref().unwrap_or("no input")))
         } else {
             one_line(&r.input)
         };
         out.push_str(&row(
             &time,
-            &r.agent,
+            &sanitize(&r.agent),
             label,
-            r.pack.as_deref().unwrap_or("-"),
+            &sanitize(r.pack.as_deref().unwrap_or("-")),
             &input,
         ));
     }
@@ -66,9 +66,28 @@ pub fn render_table(records: &[&Record]) -> String {
     out
 }
 
-/// Newlines become `⏎`; anything longer than `INPUT_WIDTH` is cut with `…`.
+/// Make log text safe to print: the log is written from agent-controlled
+/// input, so terminal escapes (C0, DEL, C1 incl. CSI U+009B) and bidi
+/// overrides must not reach the terminal. Newlines become `⏎`; every other
+/// such char becomes a visible `\xNN` / `\u{NNNN}` escape.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push('⏎'),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+                out.push_str(&format!("\\u{{{:04X}}}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `sanitize`, then anything longer than `INPUT_WIDTH` is cut with `…`.
 fn one_line(s: &str) -> String {
-    let flat: String = s.chars().map(|c| if c == '\n' { '⏎' } else { c }).collect();
+    let flat = sanitize(s);
     if flat.chars().count() <= INPUT_WIDTH {
         flat
     } else {
@@ -183,5 +202,55 @@ mod tests {
         assert!(row.ends_with('…'));
         let input_part = row.rsplit("  ").next().unwrap();
         assert_eq!(input_part.chars().count(), INPUT_WIDTH);
+    }
+
+    #[test]
+    fn terminal_control_and_bidi_chars_are_escaped_in_every_field() {
+        let evil = "\u{1b}[1A\u{1b}[2K\r\u{1b}[8m";
+        let mut r = Record::at(
+            NewRecord {
+                agent: &format!("cl{evil}"),
+                project: "/p",
+                session: None,
+                tool: "Bash",
+                input: &format!("ls {evil} \u{202e}txt.exe \u{9b}2J \u{7f}"),
+                decision: DecisionKind::Deny,
+                pack: Some(&format!("pk{evil}")),
+                rule: None,
+                reason: Some(&format!("why{evil}\u{2066}")),
+            },
+            "0.1.0",
+            datetime!(2026-10-13 08:14:02.381 UTC),
+        );
+        let out = render_table(&[&r]);
+        for bad in ['\u{1b}', '\r', '\u{202e}', '\u{9b}', '\u{7f}', '\u{2066}'] {
+            assert!(!out.contains(bad), "{bad:?} reached the terminal: {out:?}");
+        }
+        let row = out.lines().nth(1).unwrap();
+        assert!(row.contains("cl\\x1b[1A"), "{row}");
+        assert!(row.contains("pk\\x1b[1A"), "{row}");
+        assert!(
+            row.contains("ls \\x1b[1A\\x1b[2K\\x0d\\x1b[8m \\u{202E}txt.exe \\x9b2J \\x7f"),
+            "{row}"
+        );
+
+        // Empty input shows the reason instead, also escaped; ts too.
+        r.input.clear();
+        r.ts = format!("2026-10-13T08:{evil}");
+        let out = render_table(&[&r]);
+        assert!(
+            !out.contains('\u{1b}') && !out.contains('\u{2066}'),
+            "{out:?}"
+        );
+        assert!(out.contains("(why\\x1b[1A"), "{out}");
+    }
+
+    #[test]
+    fn width_counts_the_escaped_text() {
+        let r = rec(&"\u{1b}".repeat(100), DecisionKind::Allow, None);
+        let out = render_table(&[&r]);
+        let input_part = out.lines().nth(1).unwrap().rsplit("  ").next().unwrap();
+        assert_eq!(input_part.chars().count(), INPUT_WIDTH);
+        assert!(input_part.starts_with("\\x1b\\x1b"));
     }
 }
