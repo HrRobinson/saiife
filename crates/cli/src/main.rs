@@ -2,7 +2,7 @@
 //!
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
-//! - `saiife check` -> read agent pre-tool JSON on stdin, audit, emit the hook allow/block response; FAIL OPEN on error.
+//! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
 
 #![forbid(unsafe_code)]
 

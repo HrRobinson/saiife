@@ -25,7 +25,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
             None,
             Some("could not read hook payload"),
         );
-        return allow(hook_exit);
+        return allow();
     }
     let audit = Audit::new(agent, context_from_hook_json(&buf));
     let command = match command_from_hook_json(&buf, MAX_PAYLOAD_BYTES) {
@@ -40,7 +40,7 @@ pub fn run(engine: &Engine, hook_exit: bool, agent: &str) -> ExitCode {
                 None,
                 Some(&format!("hook payload not usable: {e}")),
             );
-            return allow(hook_exit);
+            return allow();
         }
     };
 
@@ -68,7 +68,7 @@ fn decide(
                 None,
                 Some("guard crashed"),
             );
-            return allow(hook_exit);
+            return allow();
         }
     };
     match &decision {
@@ -130,7 +130,7 @@ fn decide(
                 emit_deny(&msg)
             }
         }
-        Decision::Allow { .. } => allow(hook_exit),
+        Decision::Allow { .. } => allow(),
     }
 }
 
@@ -209,19 +209,11 @@ impl Audit {
     }
 }
 
-fn allow(hook_exit: bool) -> ExitCode {
-    if hook_exit {
-        ExitCode::SUCCESS
-    } else {
-        emit_allow()
-    }
-}
-
-/// Emit a PreToolUse "allow" response and exit 0.
-fn emit_allow() -> ExitCode {
-    println!(
-        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-    );
+/// Allow = exit 0 with NOTHING on stdout, for every agent and both modes.
+/// An explicit `permissionDecision: "allow"` would skip Claude Code's own
+/// permission prompts, and Codex treats an allow without `updatedInput` as a
+/// failed hook. Silence means "no objection": the agent's normal flow runs.
+fn allow() -> ExitCode {
     ExitCode::SUCCESS
 }
 

@@ -2,12 +2,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
+    let audit = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(args)
-        .env(
-            "SAIIFE_AUDIT_DIR",
-            std::env::temp_dir().join(format!("saiife-test-audit-{}", std::process::id())),
-        )
+        .env("SAIIFE_AUDIT_DIR", audit.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -104,4 +102,37 @@ fn hook_exit_allows_with_code_0() {
 fn hook_exit_fails_open_on_garbage() {
     let (code, _stdout, _stderr) = run_check(&["check", "--hook-exit"], "not json");
     assert_eq!(code, 0, "unparseable stdin must fail open (allow)");
+}
+
+/// Allow is exit 0 with NOTHING on stdout in both modes: Claude Code reads a
+/// JSON `permissionDecision: "allow"` as "skip the user's permission
+/// prompt", and Codex counts an allow without `updatedInput` as a failed hook.
+#[test]
+fn allow_prints_nothing_on_stdout_in_either_mode() {
+    for args in [&["check", "--hook-exit"][..], &["check"][..]] {
+        let (code, stdout, _) = run_check(args, ALLOW_JSON);
+        assert_eq!(code, 0, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?} printed {stdout:?}");
+    }
+}
+
+#[test]
+fn fail_open_prints_nothing_on_stdout_in_either_mode() {
+    for args in [&["check", "--hook-exit"][..], &["check"][..]] {
+        let (code, stdout, _) = run_check(args, "not json");
+        assert_eq!(code, 0, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?} printed {stdout:?}");
+    }
+}
+
+#[test]
+fn json_mode_deny_is_unchanged() {
+    let (code, stdout, _) = run_check(&["check"], DENY_JSON);
+    assert_eq!(code, 0, "JSON mode carries the deny in the payload");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("BLOCKED by core.filesystem"));
 }
