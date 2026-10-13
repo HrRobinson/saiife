@@ -63,6 +63,157 @@ pub fn command_from_hook_json(input: &str, max_bytes: usize) -> Result<String, P
     Err(PayloadError::NoCommand)
 }
 
+/// What a hook call asks to do, by kind of tool. Shell commands go to the
+/// command guard; file tools carry the path(s) they touch (judged by path
+/// rules from plan 3 on); anything else is recorded but not judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCall {
+    Shell {
+        command: String,
+    },
+    File {
+        tool: String,
+        paths: Vec<String>,
+        write: bool,
+    },
+    Other {
+        tool: String,
+    },
+}
+
+/// Shell tools: Claude Code and Codex `Bash`, Gemini `run_shell_command`.
+const SHELL_TOOLS: &[&str] = &["Bash", "run_shell_command"];
+
+/// File tools that only read or list.
+const READ_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "read_file",
+    "read_many_files",
+    "list_directory",
+    "glob",
+    "grep_search",
+];
+
+/// File tools that change files.
+const WRITE_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "write_file",
+    "replace",
+    "apply_patch",
+];
+
+/// Classify a hook payload by its `tool_name`.
+///
+/// - Shell tools yield their `tool_input.command`.
+/// - File tools yield the path(s) they touch. Codex `apply_patch` carries the
+///   patch text in `tool_input.command`; it is parsed for file headers and
+///   never treated as a shell command.
+/// - A payload with no `tool_name` keeps the old behavior: it is a shell
+///   call if a command can be found.
+/// - Any other tool that carries a string `tool_input.command` is treated as
+///   a shell call, so a renamed shell tool is still judged.
+/// - Everything else is `Other`.
+///
+/// Errors (oversize, not JSON, shell call without a command) make the caller
+/// fail open.
+pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError> {
+    if input.len() > max_bytes {
+        return Err(PayloadError::TooLarge);
+    }
+    let v: Value = serde_json::from_str(input).map_err(|e| PayloadError::Json(e.to_string()))?;
+    let tool = ["tool_name", "toolName"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(Value::as_str))
+        .filter(|t| !t.is_empty());
+    let Some(tool) = tool else {
+        return command_from_hook_json(input, max_bytes).map(|command| ToolCall::Shell { command });
+    };
+    let tool_input = v.get("tool_input").unwrap_or(&Value::Null);
+    if SHELL_TOOLS.contains(&tool) {
+        return command_from_hook_json(input, max_bytes).map(|command| ToolCall::Shell { command });
+    }
+    let write = WRITE_TOOLS.contains(&tool);
+    if write || READ_TOOLS.contains(&tool) {
+        let mut paths = if tool == "apply_patch" {
+            let patch = tool_input
+                .get("command")
+                .or_else(|| tool_input.get("input"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            patch_paths(patch)
+        } else {
+            tool_paths(tool_input)
+        };
+        if paths.is_empty() && tool != "apply_patch" {
+            // Search and list tools default to the working directory.
+            if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+                paths.push(cwd.to_string());
+            }
+        }
+        return Ok(ToolCall::File {
+            tool: tool.to_string(),
+            paths,
+            write,
+        });
+    }
+    match tool_input.get("command").and_then(Value::as_str) {
+        Some(cmd) if !cmd.trim().is_empty() => Ok(ToolCall::Shell {
+            command: cmd.to_string(),
+        }),
+        _ => Ok(ToolCall::Other {
+            tool: tool.to_string(),
+        }),
+    }
+}
+
+/// Path fields of the Claude Code and Gemini CLI file tools, in a fixed order.
+fn tool_paths(tool_input: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["file_path", "notebook_path", "path", "dir_path"] {
+        if let Some(p) = tool_input.get(key).and_then(Value::as_str) {
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    if let Some(list) = tool_input.get("include").and_then(Value::as_array) {
+        out.extend(
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+        );
+    }
+    out
+}
+
+/// File paths named in a Codex `apply_patch` body, in patch order.
+fn patch_paths(patch: &str) -> Vec<String> {
+    const HEADERS: &[&str] = &[
+        "*** Add File: ",
+        "*** Update File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim_end_matches('\r');
+        for h in HEADERS {
+            if let Some(p) = line.strip_prefix(h) {
+                let p = p.trim();
+                if !p.is_empty() && !out.iter().any(|q| q == p) {
+                    out.push(p.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Metadata about a hook call, for the audit log. Best-effort: any field the
 /// payload does not carry (or an unparseable payload) is `None`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -73,7 +224,14 @@ pub struct HookContext {
 }
 
 pub fn context_from_hook_json(input: &str) -> HookContext {
-    if input.len() > MAX_PAYLOAD_BYTES {
+    context_from_hook_json_bounded(input, MAX_PAYLOAD_BYTES)
+}
+
+/// `context_from_hook_json` with a caller-chosen size cap, for callers that
+/// still want the context of a payload above `MAX_PAYLOAD_BYTES` (a `Write`
+/// of a large file).
+pub fn context_from_hook_json_bounded(input: &str, max_bytes: usize) -> HookContext {
+    if input.len() > max_bytes {
         return HookContext::default();
     }
     let Ok(v) = serde_json::from_str::<Value>(input) else {
@@ -359,6 +517,225 @@ mod tests {
         assert_eq!(inline_payload(&argv(&["su", "rm"])), None);
         assert_eq!(inline_payload(&argv(&["su", "root"])), None);
         assert_eq!(inline_payload(&argv(&["su"])), None);
+    }
+
+    fn call(json: serde_json::Value) -> ToolCall {
+        classify(&json.to_string(), MAX_PAYLOAD_BYTES).unwrap()
+    }
+
+    #[test]
+    fn classify_shell_tools() {
+        for tool in ["Bash", "run_shell_command"] {
+            let c =
+                call(serde_json::json!({"tool_name": tool, "tool_input": {"command": "rm -rf /"}}));
+            assert_eq!(
+                c,
+                ToolCall::Shell {
+                    command: "rm -rf /".into()
+                },
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_claude_file_tools() {
+        let read = call(
+            serde_json::json!({"tool_name": "Read", "tool_input": {"file_path": "/p/.env", "offset": 1}}),
+        );
+        assert_eq!(
+            read,
+            ToolCall::File {
+                tool: "Read".into(),
+                paths: vec!["/p/.env".into()],
+                write: false
+            }
+        );
+        let nb = call(
+            serde_json::json!({"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/p/a.ipynb", "new_source": "x"}}),
+        );
+        assert_eq!(
+            nb,
+            ToolCall::File {
+                tool: "NotebookEdit".into(),
+                paths: vec!["/p/a.ipynb".into()],
+                write: true
+            }
+        );
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            let c = call(
+                serde_json::json!({"tool_name": tool, "tool_input": {"file_path": "/p/x.rs"}}),
+            );
+            assert_eq!(
+                c,
+                ToolCall::File {
+                    tool: tool.into(),
+                    paths: vec!["/p/x.rs".into()],
+                    write: true
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn classify_grep_without_path_uses_cwd() {
+        let c = call(
+            serde_json::json!({"cwd": "/p", "tool_name": "Grep", "tool_input": {"pattern": "TODO"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Grep".into(),
+                paths: vec!["/p".into()],
+                write: false
+            }
+        );
+        let c = call(
+            serde_json::json!({"cwd": "/p", "tool_name": "Grep", "tool_input": {"pattern": "x", "path": "/p/src"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Grep".into(),
+                paths: vec!["/p/src".into()],
+                write: false
+            }
+        );
+    }
+
+    #[test]
+    fn classify_gemini_file_tools() {
+        let c = call(
+            serde_json::json!({"tool_name": "list_directory", "tool_input": {"dir_path": "/p/src"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "list_directory".into(),
+                paths: vec!["/p/src".into()],
+                write: false
+            }
+        );
+        let c = call(
+            serde_json::json!({"tool_name": "read_many_files", "tool_input": {"include": ["src/**/*.rs", ".env"], "exclude": ["target"]}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "read_many_files".into(),
+                paths: vec!["src/**/*.rs".into(), ".env".into()],
+                write: false
+            }
+        );
+        let c = call(
+            serde_json::json!({"tool_name": "replace", "tool_input": {"file_path": "/p/a", "old_string": "a", "new_string": "b"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "replace".into(),
+                paths: vec!["/p/a".into()],
+                write: true
+            }
+        );
+    }
+
+    #[test]
+    fn classify_apply_patch_never_yields_a_shell_command() {
+        let patch = "*** Begin Patch\n*** Add File: hello.txt\n+rm -rf /\n*** Update File: src/main.rs\n*** Move to: src/app.rs\n@@\n-a\n+b\n*** Delete File: old.txt\n*** End Patch\n";
+        let c =
+            call(serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": patch}}));
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "apply_patch".into(),
+                paths: vec![
+                    "hello.txt".into(),
+                    "src/main.rs".into(),
+                    "src/app.rs".into(),
+                    "old.txt".into()
+                ],
+                write: true
+            }
+        );
+        let c = call(
+            serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": "rm -rf /"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "apply_patch".into(),
+                paths: vec![],
+                write: true
+            }
+        );
+    }
+
+    #[test]
+    fn classify_unknown_tools() {
+        let c =
+            call(serde_json::json!({"tool_name": "WebFetch", "tool_input": {"url": "https://x"}}));
+        assert_eq!(
+            c,
+            ToolCall::Other {
+                tool: "WebFetch".into()
+            }
+        );
+        // A shell tool under a name this version does not know is still judged.
+        let c =
+            call(serde_json::json!({"tool_name": "shell", "tool_input": {"command": "rm -rf /"}}));
+        assert_eq!(
+            c,
+            ToolCall::Shell {
+                command: "rm -rf /".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_without_tool_name_keeps_old_shape() {
+        let c = call(serde_json::json!({"command": "ls"}));
+        assert_eq!(
+            c,
+            ToolCall::Shell {
+                command: "ls".into()
+            }
+        );
+        assert!(matches!(
+            classify(r#"{"x":1}"#, MAX_PAYLOAD_BYTES),
+            Err(PayloadError::NoCommand)
+        ));
+    }
+
+    #[test]
+    fn classify_errors() {
+        assert!(matches!(
+            classify("{not json", MAX_PAYLOAD_BYTES),
+            Err(PayloadError::Json(_))
+        ));
+        assert!(matches!(
+            classify(r#"{"tool_name":"Bash"}"#, 10),
+            Err(PayloadError::TooLarge)
+        ));
+        assert!(matches!(
+            classify(
+                r#"{"tool_name":"Bash","tool_input":{"command":"  "}}"#,
+                MAX_PAYLOAD_BYTES
+            ),
+            Err(PayloadError::NoCommand)
+        ));
+    }
+
+    #[test]
+    fn bounded_context_reads_past_the_default_cap() {
+        let big = format!(
+            r#"{{"tool_name":"Write","session_id":"s","cwd":"/p","tool_input":{{"file_path":"/p/a","content":"{}"}}}}"#,
+            "a".repeat(MAX_PAYLOAD_BYTES)
+        );
+        assert_eq!(context_from_hook_json(&big), HookContext::default());
+        let ctx = context_from_hook_json_bounded(&big, 2 * MAX_PAYLOAD_BYTES);
+        assert_eq!(ctx.tool.as_deref(), Some("Write"));
+        assert_eq!(ctx.cwd.as_deref(), Some("/p"));
     }
 
     #[test]
