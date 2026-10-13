@@ -22,6 +22,11 @@ pub fn default_dir() -> Option<PathBuf> {
 /// dir and file as needed. New files are owner-only (0600) on unix: commands
 /// can reveal what people work on. The whole line goes out in one
 /// `write_all` on an `O_APPEND` handle so parallel hooks do not interleave.
+///
+/// The hook must never hang or write somewhere unexpected: on unix the file
+/// is opened with `O_NONBLOCK | O_NOFOLLOW` (a FIFO or symlink planted at the
+/// month path fails instead of blocking or redirecting the write), and
+/// anything that is not a regular file is refused.
 pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let mut opts = OpenOptions::new();
@@ -29,9 +34,13 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
     let mut file = opts.open(dir.join(format!("{}.jsonl", rec.month())))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("audit log path is not a regular file"));
+    }
     let mut line = serde_json::to_string(rec).map_err(io::Error::other)?;
     line.push('\n');
     file.write_all(line.as_bytes())
@@ -45,7 +54,8 @@ pub struct ReadResult {
     /// Non-blank lines that were not a valid record (bad UTF-8, half-written,
     /// hand-edited).
     pub skipped_lines: usize,
-    /// Month files that could not be read or are not regular files.
+    /// Month files that could not be read or are not regular files
+    /// (symlinks, FIFOs, directories).
     pub unreadable_files: usize,
 }
 
@@ -67,7 +77,7 @@ pub fn read_all(dir: &Path) -> ReadResult {
         .collect();
     files.sort();
     for p in &files {
-        let Ok(body) = fs::read(p) else {
+        let Some(body) = read_regular(p) else {
             out.unreadable_files += 1;
             continue;
         };
@@ -82,6 +92,29 @@ pub fn read_all(dir: &Path) -> ReadResult {
         }
     }
     out
+}
+
+/// The file's bytes if it is a regular file. Never follows a symlink and
+/// never blocks on a FIFO: checked before opening and again on the handle.
+fn read_regular(p: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if !fs::symlink_metadata(p).ok()?.is_file() {
+        return None;
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(p).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut body = Vec::new();
+    f.read_to_end(&mut body).ok()?;
+    Some(body)
 }
 
 /// `YYYY-MM.jsonl`
@@ -288,6 +321,80 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let ok = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "mkfifo failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_refuses_a_symlinked_month_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "original").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("2026-10.jsonl")).unwrap();
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        assert!(append(dir.path(), &r).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_to_a_fifo_errors_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        mkfifo(&dir.path().join("2026-10.jsonl"));
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || tx.send(append(&path, &r).is_err()).unwrap());
+        let errored = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("append blocked on a FIFO");
+        assert!(errored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_all_skips_fifos_and_symlinks_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(dir.path(), &good).unwrap();
+        mkfifo(&dir.path().join("2026-09.jsonl"));
+        std::os::unix::fs::symlink(
+            dir.path().join("2026-10.jsonl"),
+            dir.path().join("2026-08.jsonl"),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || tx.send(read_all(&path)).unwrap());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_all blocked on a FIFO");
+        assert_eq!(got.records, vec![good]);
+        assert_eq!(got.unreadable_files, 2);
     }
 
     #[test]

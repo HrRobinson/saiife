@@ -162,3 +162,49 @@ fn concurrent_checks_write_whole_lines() {
     assert_eq!(lines, 20);
     assert_eq!(read_all(dir.path()).records.len(), 20, "every line parses");
 }
+
+/// A FIFO planted at the month file must not hang the hook: the verdict
+/// still comes back promptly.
+#[cfg(unix)]
+#[test]
+fn fifo_at_month_path_does_not_block_the_verdict() {
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    for month in [now, now + time::Duration::days(1)] {
+        let p = dir.path().join(format!(
+            "{:04}-{:02}.jsonl",
+            month.year(),
+            u8::from(month.month())
+        ));
+        if !p.exists() {
+            assert!(Command::new("mkfifo").arg(&p).status().unwrap().success());
+        }
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--hook-exit"])
+        .env(DIR_ENV, dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload("rm -rf /").as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(2));
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("saiife check blocked on a FIFO audit file");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

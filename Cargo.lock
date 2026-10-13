@@ -469,6 +469,7 @@ name = "saiife-audit"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "regex",
  "serde",
  "serde_json",

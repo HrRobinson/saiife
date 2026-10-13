@@ -19,3 +19,7 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
+libc = "0.2"
