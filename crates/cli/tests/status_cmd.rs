@@ -527,3 +527,19 @@ fn unhashable_binary_at_init_is_a_failed_check() {
     );
     assert!(!text.contains("made by an older saiife"), "{text}");
 }
+
+/// M5: an unreadable managed-settings file is the administrator's to fix.
+#[test]
+fn unreadable_managed_settings_tell_you_to_ask_the_administrator() {
+    let env = initialized(&["claude"]);
+    // A directory where the file should be: unreadable even as root.
+    std::fs::create_dir(env.managed.path().join("managed-settings.json")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains("managed-settings.json cannot be read"),
+        "{text}"
+    );
+    assert!(text.contains("Fix: ask your administrator"), "{text}");
+    assert!(!text.contains("make it readable so saiife"), "{text}");
+}

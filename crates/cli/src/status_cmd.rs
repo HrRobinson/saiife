@@ -126,7 +126,14 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                         b.path.display(),
                         agent.label()
                     ),
-                    fix: "make it readable so saiife can check it".into(),
+                    fix: if b.managed {
+                        format!(
+                            "ask your administrator to make {} (managed settings) a readable JSON object",
+                            b.path.display()
+                        )
+                    } else {
+                        "make it readable so saiife can check it".into()
+                    },
                 });
                 continue;
             }

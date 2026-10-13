@@ -115,7 +115,12 @@ pub fn blockers_in(
         }
         for f in managed {
             // Read once; report an unreadable file once, not per setting.
+            // A managed file that is not a JSON object cannot be read as
+            // settings: report it like an unreadable one.
             match read_flags(&f) {
+                Ok(v) if !v.is_object() && !(v.is_null() && !f.exists()) => {
+                    out.push(unreadable_msg(&f, "not a JSON object".into(), true))
+                }
                 Ok(v) => {
                     for setting in ["allowManagedHooksOnly", "disableAllHooks"] {
                         if v.get(setting).and_then(Value::as_bool) == Some(true) {
@@ -375,6 +380,28 @@ mod tests {
         assert_eq!(settings, ["disableAllHooks", "allowManagedHooksOnly"]);
         assert!(found[0].path.ends_with(".claude/settings.local.json"));
         assert!(found[1].managed && found[1].error.is_none());
+    }
+
+    /// M5: a managed drop-in whose JSON is not an object is reported like an
+    /// unreadable file, not silently skipped.
+    #[test]
+    fn non_object_managed_drop_in_is_reported() {
+        let p = tempfile::tempdir().unwrap();
+        let managed = tempfile::tempdir().unwrap();
+        fs::create_dir(managed.path().join("managed-settings.d")).unwrap();
+        for (name, body) in [("a.json", "[1]"), ("b.json", "null"), ("c.json", "\"x\"")] {
+            fs::write(managed.path().join("managed-settings.d").join(name), body).unwrap();
+        }
+        let found = blockers_in(p.path(), None, &[managed.path().to_path_buf()]);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found
+            .iter()
+            .all(|b| b.managed && b.setting.is_empty() && b.error.is_some()));
+        assert!(found[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not a JSON object"));
     }
 
     #[test]
