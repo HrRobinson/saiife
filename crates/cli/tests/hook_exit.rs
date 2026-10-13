@@ -1,11 +1,16 @@
+mod common;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn run_check(args: &[&str], stdin: &str) -> (i32, String, String) {
+    // No `cwd` in these payloads: the project walk starts at the temp dir.
+    common::assert_no_host_config(&std::env::temp_dir());
     let audit = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit.path());
+    let mut child = cmd
         .args(args)
-        .env("SAIIFE_AUDIT_DIR", audit.path())
         .current_dir(audit.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

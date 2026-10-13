@@ -1,18 +1,22 @@
 //! `saiife check` writes one masked audit record per decision and never lets
 //! the audit log change a verdict.
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use saiife_audit::store::{read_all, DIR_ENV};
+use saiife_audit::store::read_all;
 use saiife_audit::DecisionKind;
 
 fn check(audit_dir: &Path, args: &[&str], stdin: &str) -> i32 {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit_dir);
+    let mut child = cmd
         .arg("check")
         .args(args)
-        .env(DIR_ENV, audit_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -30,7 +34,7 @@ fn check(audit_dir: &Path, args: &[&str], stdin: &str) -> i32 {
 fn payload(cmd: &str) -> String {
     serde_json::json!({
         "session_id": "sess-1",
-        "cwd": "/home/u/app",
+        "cwd": common::FIXTURE_CWD,
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": { "command": cmd }
@@ -134,11 +138,14 @@ fn unwritable_audit_dir_keeps_verdict() {
 #[test]
 fn concurrent_checks_write_whole_lines() {
     let dir = tempfile::tempdir().unwrap();
+    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let mut sandboxes = Vec::new();
     let children: Vec<_> = (0..20)
         .map(|i| {
-            let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"))
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+            sandboxes.push(common::hermetic(&mut cmd, dir.path()));
+            let mut c = cmd
                 .args(["check", "--hook-exit", "--agent", "claude"])
-                .env(DIR_ENV, dir.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -184,9 +191,11 @@ fn fifo_at_month_path_does_not_block_the_verdict() {
             assert!(Command::new("mkfifo").arg(&p).status().unwrap().success());
         }
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, dir.path());
+    let mut child = cmd
         .args(["check", "--hook-exit"])
-        .env(DIR_ENV, dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

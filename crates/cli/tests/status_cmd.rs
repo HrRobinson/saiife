@@ -176,6 +176,8 @@ fn last_hook_call_is_shown_per_agent() {
     .to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", "claude"])
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

@@ -1,11 +1,13 @@
 //! `saiife check` loads the opt-in packs of the project the agent works in:
 //! the nearest `.saiife/config.toml` at or above the payload's `cwd`.
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use saiife_audit::store::{read_all, DIR_ENV};
+use saiife_audit::store::read_all;
 use saiife_audit::DecisionKind;
 
 const DROP: &str = "psql -c 'DROP DATABASE prod'";
@@ -19,9 +21,11 @@ fn check(audit: &Path, cwd: &Path, cmd: &str) -> (i32, String) {
         "tool_input": { "command": cmd }
     })
     .to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    common::assert_no_host_config(&std::env::temp_dir());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit);
+    let mut child = cmd
         .args(["check", "--hook-exit", "--agent", "claude"])
-        .env(DIR_ENV, audit)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

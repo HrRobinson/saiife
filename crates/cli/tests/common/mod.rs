@@ -98,3 +98,38 @@ pub fn stdout(o: &Output) -> String {
 pub fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).to_string()
 }
+
+/// Point a `saiife` command away from every real user directory: HOME and
+/// the data dir go to a fresh temp dir (returned; keep it alive until the
+/// child exits), the audit log to `audit`.
+pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
+    let sandbox = tempfile::tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let data = sandbox.path().join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    cmd.env("HOME", &home)
+        .env("SAIIFE_DATA_DIR", &data)
+        .env("SAIIFE_AUDIT_DIR", audit);
+    sandbox
+}
+
+/// The `cwd` the recorded fixtures use.
+pub const FIXTURE_CWD: &str = "/home/u/app";
+
+/// `saiife check` reads the nearest `.saiife/config.toml` at or above the
+/// payload's `cwd`. Fixture cwds like `/home/u/app` are not temp dirs, so a
+/// project config on this host at `/home/u/app`, `/home/u`, `/home` or `/`
+/// would change the packs under test: fail loudly instead of passing on
+/// the host's config.
+pub fn assert_no_host_config(cwd: &Path) {
+    for d in cwd.ancestors() {
+        let c = d.join(".saiife/config.toml");
+        assert!(
+            !c.exists(),
+            "{} exists on this host; tests that use cwd {} would read it",
+            c.display(),
+            cwd.display()
+        );
+    }
+}

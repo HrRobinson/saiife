@@ -1,11 +1,13 @@
 //! `saiife check` against recorded-shape payloads of every agent and tool
 //! (fixtures built from docs/superpowers/research/2026-10-13-*-hooks.md).
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use saiife_audit::store::{read_all, DIR_ENV};
+use saiife_audit::store::read_all;
 use saiife_audit::{DecisionKind, Record};
 
 struct Out {
@@ -15,9 +17,11 @@ struct Out {
 }
 
 fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> Out {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit_dir);
+    let mut child = cmd
         .args(["check", "--hook-exit", "--agent", agent])
-        .env(DIR_ENV, audit_dir)
         .current_dir(audit_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
