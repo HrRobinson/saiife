@@ -334,11 +334,9 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
 /// on a helper thread (at most 4 KiB) and waited for with a deadline.
 fn binary_version(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
-    use std::os::unix::process::CommandExt;
 
     let mut child = Command::new(path)
         .arg("--version")
-        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

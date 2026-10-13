@@ -295,6 +295,17 @@ fn binary_replaced_in_place_is_reported() {
     assert!(text.contains("was replaced since `saiife init`"), "{text}");
 }
 
+/// Absolute path of `sleep`: the fakes run with PATH = the test's bin dir
+/// only, where a bare `sleep` would not be found (and no grandchild would
+/// hold the pipe).
+fn sleep_bin() -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .chain([std::path::PathBuf::from("/bin")])
+        .map(|d| d.join("sleep"))
+        .find(|p| p.is_file())
+        .expect("sleep on PATH")
+}
+
 #[cfg(unix)]
 #[test]
 fn version_probe_does_not_hang_on_a_lingering_grandchild() {
@@ -303,8 +314,9 @@ fn version_probe_does_not_hang_on_a_lingering_grandchild() {
     std::fs::write(
         &exe,
         format!(
-            "#!/bin/sh\necho 'saiife {}'\nsleep 30 &\n",
-            env!("CARGO_PKG_VERSION")
+            "#!/bin/sh\necho 'saiife {}'\n{} 30 &\n",
+            env!("CARGO_PKG_VERSION"),
+            sleep_bin().display()
         ),
     )
     .unwrap();
@@ -323,6 +335,41 @@ fn version_probe_does_not_hang_on_a_lingering_grandchild() {
         "hung"
     );
     assert_eq!(c, 0, "{text}");
+}
+
+/// F4: the probe's timeout path. The fake prints its version without a
+/// newline and leaves a grandchild holding the pipe, so the first line never
+/// completes: status gives up and says so instead of hanging.
+#[cfg(unix)]
+#[test]
+fn version_probe_times_out_without_a_newline() {
+    let env = with_real_copy(&["claude"]);
+    let exe = env.bin.path().join("saiife");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nprintf 'saiife {}'\n{} 30 &\n",
+            env!("CARGO_PKG_VERSION"),
+            sleep_bin().display()
+        ),
+    )
+    .unwrap();
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["saiife_sha256"] = "".into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let started = std::time::Instant::now();
+    let (c, text) = status(&env);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "hung: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("could not read the version"), "{text}");
 }
 
 #[test]
