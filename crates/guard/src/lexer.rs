@@ -190,18 +190,41 @@ fn lex(input: &str) -> Vec<LexTok> {
     // The first unquoted `=` decides whether the word is an assignment.
     let mut word_eq_seen = false;
     let mut word_assignment = false;
+    // The word has an unquoted `{a,b}` brace expansion.
+    let mut word_brace = false;
+    // Open braces of the brace expansion being read: its `{`/`}` are word
+    // data, not grouping.
+    let mut brace_depth = 0usize;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
         () => {
             if in_word {
-                toks.push(LexTok::Word(Word {
+                let word = Word {
                     text: std::mem::take(&mut word_text),
                     has_substitution: word_has_sub,
                     redirect: false,
                     glob: word_glob,
                     assignment: word_assignment,
-                }));
+                };
+                // Brace expansion happens before anything else looks at
+                // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limit
+                // the word stays as written.
+                let expanded = if word_brace {
+                    crate::canon::expand_braces(&word.text)
+                } else {
+                    None
+                };
+                match expanded {
+                    Some(words) => toks.extend(words.into_iter().map(|text| {
+                        LexTok::Word(Word {
+                            text,
+                            ..word.clone()
+                        })
+                    })),
+                    None => toks.push(LexTok::Word(word)),
+                }
+                word_brace = false;
                 in_word = false;
                 word_has_sub = false;
                 word_quoted = false;
@@ -286,6 +309,22 @@ fn lex(input: &str) -> Vec<LexTok> {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::RParen));
             }
+            '{' if brace_depth > 0 => {
+                brace_depth += 1;
+                word_text.push('{');
+            }
+            '}' if brace_depth > 0 => {
+                brace_depth -= 1;
+                word_text.push('}');
+            }
+            '{' if brace_expansion_ahead(&chars) => {
+                brace_depth = 1;
+                // `{a,b}`: part of the word (expanded when it ends), not a
+                // grouping brace.
+                in_word = true;
+                word_brace = true;
+                word_text.push('{');
+            }
             '{' => {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::LBrace));
@@ -365,6 +404,31 @@ fn lex(input: &str) -> Vec<LexTok> {
     }
     flush_word!();
     toks
+}
+
+/// After an unquoted `{`: does a brace expansion follow — a matching `}`
+/// with a top-level comma, and nothing in between that ends a word or
+/// quotes (whitespace, operators, quotes, backslashes, substitutions)?
+/// `{ cmd; }` (a group) and `{a}` (literal) are not.
+fn brace_expansion_ahead(chars: &Chars) -> bool {
+    let mut depth = 1usize;
+    let mut comma = false;
+    for c in chars.clone() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return comma;
+                }
+            }
+            ',' if depth == 1 => comma = true,
+            ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '\'' | '"'
+            | '\\' | '`' | '$' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn redirect_tok(text: String) -> LexTok {

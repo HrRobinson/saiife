@@ -1566,6 +1566,33 @@ reason = "other pack says no"
         assert_eq!(e.evaluate("cat .env"), timeout);
     }
 
+    #[test]
+    fn brace_expansion_is_judged() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "diff {.env,.env.example}",
+            "cat .{env,x}",
+            "cat {.env,x}",
+            "cp {.env,/tmp/x}",
+            "mv .claude/settings.json{,.bak}",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            "cat {a,b}.md",
+            "echo {1,2}",
+            "{ cat README.md; }",
+            "cat '{.env,x}'",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+        // Brace expansion in command position runs the expanded words.
+        assert!(test_engine().evaluate("{git,reset,--hard}").is_deny());
+        assert!(test_engine().evaluate("{ git reset --hard; }").is_deny());
+    }
+
     const SEGMENT_PACK: &str = r#"
 [pack]
 id = "test.segment"

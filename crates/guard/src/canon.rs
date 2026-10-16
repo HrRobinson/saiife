@@ -260,25 +260,140 @@ pub enum GlobExpansion {
     Overflow,
 }
 
-/// Expand `word` like the shell does (bash defaults: `*`, `?`, `[…]`,
-/// `[!…]`/`[^…]`; a leading `.` must be matched explicitly, so `*` skips
-/// dotfiles while `.env*` finds them), reading at most `GLOB_SCAN_LIMIT`
-/// directory entries. `~`, `$HOME` and relative words are anchored like
+/// Words one brace expansion may produce before it is refused.
+pub const BRACE_LIMIT: usize = 1024;
+
+/// Bash brace expansion of `word`: `a{b,c}d` is `abd acd`, nested and
+/// repeated braces too, empty alternatives allowed (`x{,.bak}`). A brace
+/// without a top-level comma (`{a}`, `${HOME}`) is literal. `None`: more
+/// than `BRACE_LIMIT` words.
+pub fn expand_braces(word: &str) -> Option<Vec<String>> {
+    let mut done = Vec::new();
+    let mut stack = vec![word.to_string()];
+    while let Some(w) = stack.pop() {
+        match find_brace(&w) {
+            None => done.push(w),
+            Some((open, close, commas)) => {
+                let mut cuts = vec![open];
+                cuts.extend(commas);
+                cuts.push(close);
+                let (prefix, suffix) = (&w[..open], &w[close + 1..]);
+                for k in (0..cuts.len() - 1).rev() {
+                    let alt = &w[cuts[k] + 1..cuts[k + 1]];
+                    stack.push(format!("{prefix}{alt}{suffix}"));
+                }
+            }
+        }
+        if done.len() + stack.len() > BRACE_LIMIT {
+            return None;
+        }
+    }
+    Some(done)
+}
+
+/// The first `{…}` in `w` with a top-level comma: byte offsets of `{`,
+/// `}` and the commas. `${…}` is skipped.
+fn find_brace(w: &str) -> Option<(usize, usize, Vec<usize>)> {
+    let b = w.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
+            i = matching_close(b, i + 1).map_or(b.len(), |c| c + 1);
+            continue;
+        }
+        if b[i] == b'{' {
+            if let Some(close) = matching_close(b, i) {
+                let mut depth = 0;
+                let commas: Vec<usize> = (i + 1..close)
+                    .filter(|&k| {
+                        match b[k] {
+                            b'{' => depth += 1,
+                            b'}' => depth -= 1,
+                            _ => {}
+                        }
+                        b[k] == b',' && depth == 0
+                    })
+                    .collect();
+                if !commas.is_empty() {
+                    return Some((i, close, commas));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn matching_close(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, c) in b.iter().enumerate().skip(open) {
+        match c {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Expand `word` like the shell does (bash defaults plus globstar):
+/// `{a,b}` alternatives, `*`, `?`, `[…]`, `[!…]`/`[^…]` within one
+/// component, and `**` for any number of directories. A leading `.` must
+/// be matched explicitly, so `*` and `**` skip dotfiles and hidden
+/// directories while `.env*` finds them; symlinked directories are not
+/// descended into. At most `GLOB_SCAN_LIMIT` directory entries are read
+/// in all. `~`, `$HOME` and relative words are anchored like
 /// `canonicalize` does; a word that cannot be anchored matches nothing.
 pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpansion {
-    if !word.contains(['*', '?', '[']) {
+    let Some(alternatives) = expand_braces(word) else {
+        return GlobExpansion::Overflow;
+    };
+    let has_meta = |w: &str| w.contains(['*', '?', '[']);
+    if alternatives.len() == 1 && !has_meta(&alternatives[0]) {
         return GlobExpansion::NotAGlob;
     }
-    let Some(abs) = absolute(word, cwd, vars) else {
-        return GlobExpansion::Matches(Vec::new());
-    };
-    let mut bases = vec![PathBuf::from("/")];
     let mut scanned = 0usize;
+    let mut all = Vec::new();
+    for alt in &alternatives {
+        let Some(abs) = absolute(alt, cwd, vars) else {
+            continue;
+        };
+        match expand_one(&abs, &mut scanned) {
+            Some(m) => all.extend(m),
+            None => return GlobExpansion::Overflow,
+        }
+    }
+    all.sort();
+    all.dedup();
+    GlobExpansion::Matches(all)
+}
+
+/// One brace-free absolute pattern; `None` past the scan limit.
+fn expand_one(abs: &Path, scanned: &mut usize) -> Option<Vec<PathBuf>> {
+    let comps: Vec<Component> = abs.components().collect();
+    let mut bases = vec![PathBuf::from("/")];
     let mut literal_tail = false;
-    for c in abs.components() {
+    for (idx, c) in comps.iter().enumerate() {
         match c {
             Component::Normal(name) => {
-                let pat: Vec<char> = name.to_string_lossy().chars().collect();
+                let text = name.to_string_lossy();
+                if text == "**" {
+                    let last = idx + 1 == comps.len();
+                    let mut next = Vec::new();
+                    for b in &bases {
+                        descend(b, last, scanned, &mut next)?;
+                    }
+                    next.sort();
+                    bases = next;
+                    literal_tail = false;
+                    continue;
+                }
+                let pat: Vec<char> = text.chars().collect();
                 if !pat.iter().any(|c| matches!(c, '*' | '?' | '[')) {
                     bases.iter_mut().for_each(|b| b.push(name));
                     literal_tail = true;
@@ -291,9 +406,9 @@ pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpan
                         continue;
                     };
                     for e in entries.flatten() {
-                        scanned += 1;
-                        if scanned > GLOB_SCAN_LIMIT {
-                            return GlobExpansion::Overflow;
+                        *scanned += 1;
+                        if *scanned > GLOB_SCAN_LIMIT {
+                            return None;
                         }
                         let n = e.file_name();
                         let s: Vec<char> = n.to_string_lossy().chars().collect();
@@ -307,18 +422,57 @@ pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpan
                 }
                 next.sort();
                 bases = next;
-                if bases.is_empty() {
-                    break;
-                }
             }
             Component::ParentDir => bases.iter_mut().for_each(|b| b.push("..")),
             _ => {}
+        }
+        if bases.is_empty() {
+            break;
         }
     }
     if literal_tail {
         bases.retain(|b| std::fs::symlink_metadata(b).is_ok());
     }
-    GlobExpansion::Matches(bases)
+    Some(bases)
+}
+
+/// `**`: `base` and every non-hidden directory below it (and, as the last
+/// component, every non-hidden file too), without following symlinks.
+fn descend(
+    base: &Path,
+    files_too: bool,
+    scanned: &mut usize,
+    out: &mut Vec<PathBuf>,
+) -> Option<()> {
+    if !base.is_dir() {
+        return Some(());
+    }
+    out.push(base.to_path_buf());
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            *scanned += 1;
+            if *scanned > GLOB_SCAN_LIMIT {
+                return None;
+            }
+            let n = e.file_name();
+            if n.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            let p = dir.join(&n);
+            if is_dir {
+                stack.push(p.clone());
+                out.push(p);
+            } else if files_too {
+                out.push(p);
+            }
+        }
+    }
+    Some(())
 }
 
 /// Shell pattern match of one path component.
@@ -670,5 +824,71 @@ mod tests {
             Some(PathBuf::from("/h/.ssh/id_rsa"))
         );
         assert_eq!(lexical_form(".env", None, &v), None);
+    }
+
+    #[test]
+    fn braces_expand_like_bash() {
+        let b = |w: &str| expand_braces(w).unwrap();
+        assert_eq!(b("a{b,c}d"), vec!["abd", "acd"]);
+        assert_eq!(b("{.env,.env.example}"), vec![".env", ".env.example"]);
+        assert_eq!(b(".{env,x}"), vec![".env", ".x"]);
+        assert_eq!(b("x{,.bak}"), vec!["x", "x.bak"]);
+        assert_eq!(b("{a,b{c,d}}e"), vec!["ae", "bce", "bde"]);
+        assert_eq!(b("{a,b}{1,2}"), vec!["a1", "a2", "b1", "b2"]);
+        // Not brace expansions: kept as written.
+        for w in ["{a}", "${HOME}/x", "a{b", "a}b", "{}", "plain"] {
+            assert_eq!(b(w), vec![w.to_string()], "{w}");
+        }
+        assert_eq!(b("${HOME}/{a,b}"), vec!["${HOME}/a", "${HOME}/b"]);
+        // Too many results: refused, not truncated.
+        assert!(expand_braces(&"{a,b}".repeat(12)).is_none());
+    }
+
+    #[test]
+    fn globs_support_double_star_and_braces() {
+        let (_d, root) = tmp();
+        let app = root.join("app");
+        for d in ["sub/deep", ".git", "node"] {
+            fs::create_dir_all(app.join(d)).unwrap();
+        }
+        for f in [
+            ".env",
+            "sub/deep/.env.local",
+            ".git/.env",
+            "x.toml",
+            "y.env",
+            "node/z.rs",
+        ] {
+            fs::write(app.join(f), "").unwrap();
+        }
+        let v = PathVars::new().with_cwd(&app);
+        let m = |p: &str| match expand_glob(p, None, &v) {
+            GlobExpansion::Matches(m) => m,
+            other => panic!("{p}: {other:?}"),
+        };
+        // `**` is any number of directories, hidden ones excluded (bash
+        // globstar, ripgrep's default).
+        assert_eq!(
+            m("**/.env*"),
+            vec![app.join(".env"), app.join("sub/deep/.env.local")]
+        );
+        assert_eq!(m("**/z.rs"), vec![app.join("node/z.rs")]);
+        assert_eq!(m("sub/**"), vec![app.join("sub"), app.join("sub/deep")]);
+        assert_eq!(
+            m("*.{env,toml}"),
+            vec![app.join("x.toml"), app.join("y.env")]
+        );
+        assert_eq!(m(".{env,nope}"), vec![app.join(".env")]);
+        assert_eq!(m("{sub,node}/**/*.rs"), vec![app.join("node/z.rs")]);
+    }
+
+    #[test]
+    fn double_star_is_bounded() {
+        let (_d, root) = tmp();
+        for i in 0..(GLOB_SCAN_LIMIT + 10) {
+            fs::create_dir_all(root.join(format!("d{}/e{i}", i % 3))).unwrap();
+        }
+        let v = PathVars::new().with_cwd(&root);
+        assert_eq!(expand_glob("**/.env", None, &v), GlobExpansion::Overflow);
     }
 }
