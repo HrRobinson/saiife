@@ -23,10 +23,22 @@ pub struct Operand {
     pub access: Access,
     /// The word had an unquoted `*`, `?` or `[`: the shell expands it.
     pub glob: bool,
-    /// For a copy/move target: the base names of the sources. If the
-    /// target is a directory (ends in `/` or exists as one), what is
-    /// written is `path/<name>` for each, not the directory itself.
-    pub into: Vec<String>,
+    /// For a copy/move target: its sources. If the target is a directory
+    /// (ends in `/` or exists as one), what is written is
+    /// `path/<base name>` for each source, not the directory itself; a
+    /// `contents` source puts each of its entries in `path`.
+    pub into: Vec<Source>,
+}
+
+/// A copy/move source, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub path: String,
+    /// Expand it (unquoted `*?[`) to know the names that land.
+    pub glob: bool,
+    /// Its entries land in the target, not itself: `cp -T dir t`,
+    /// `rsync dir/ t`.
+    pub contents: bool,
 }
 
 /// Every operand is read.
@@ -174,7 +186,7 @@ impl<'a> Tok<'a> {
 struct Out(Vec<Operand>);
 
 impl Out {
-    fn push(&mut self, t: Tok, access: Access, into: Vec<String>) {
+    fn push(&mut self, t: Tok, access: Access, into: Vec<Source>) {
         if !t.s.is_empty() {
             self.0.push(Operand {
                 path: t.s.to_string(),
@@ -335,7 +347,8 @@ fn mv_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
     let args = parse(words, &TARGET_SPEC);
     let ops = operands_of(&args);
     let (target, sources) = split_target(&args, &ops);
-    let mut push = |t: Tok, access, into: Vec<String>| {
+    let contents = no_target_directory(&args);
+    let mut push = |t: Tok, access, into: Vec<Source>| {
         let (path, glob) = under(dir, t);
         out.0.push(Operand {
             path,
@@ -349,12 +362,19 @@ fn mv_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
         push(*s, Access::Write, Vec::new());
     }
     if let Some(t) = target {
-        let into = base_names(sources);
+        let into = sources_of(sources, |_| contents, dir);
         push(t, Access::Read, into.clone());
         push(t, Access::Write, into);
     }
 }
 
+/// `-T` / `--no-target-directory`: the target is the copy itself.
+fn no_target_directory(args: &[Arg]) -> bool {
+    has_opt(args, &[Name::Short('T'), Name::Long("no-target-directory")])
+}
+
+/// `-t DIR`/`--target-directory DIR` name the target; `-S`/`--suffix`
+/// (a backup suffix) is ignored, it names no path.
 const TARGET_SPEC: Spec = Spec {
     short: "tS",
     optional: "",
@@ -374,27 +394,79 @@ fn split_target<'a, 'b>(args: &[Arg<'a>], ops: &'b [Tok<'a>]) -> (Option<Tok<'a>
     }
 }
 
-fn base_names(sources: &[Tok]) -> Vec<String> {
+fn sources_of(sources: &[Tok], contents: impl Fn(&Tok) -> bool, dir: Option<&str>) -> Vec<Source> {
     sources
         .iter()
-        .filter_map(|s| s.s.trim_end_matches('/').rsplit('/').next())
-        .filter(|b| !b.is_empty())
-        .map(str::to_string)
+        .map(|s| Source {
+            path: under(dir, *s).0,
+            glob: s.glob,
+            contents: contents(s),
+        })
         .collect()
 }
 
 /// `cp`, `scp`, `rsync`, `install`, `ln`: the target is written, the
 /// sources read. A single operand (`ln -s x`) is both.
 fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
-    let spec = Spec {
-        short: if cmd == "install" { "tSmog" } else { "tS" },
-        ..TARGET_SPEC
+    let spec = match cmd {
+        // `-m MODE`, `-o OWNER`, `-g GROUP` name no path.
+        "install" => Spec {
+            short: "tSmog",
+            ..TARGET_SPEC
+        },
+        // rsync has no target-directory option (`-t` preserves times);
+        // `-e CMD`, `-B SIZE`, `-M OPT`, `--chmod`/`--chown`, `--filter`
+        // and `--exclude`/`--include` patterns name no path, the
+        // `--*-dest`/`--*-dir` directories are only consulted.
+        // `-T DIR`/`--temp-dir` holds rsync's own temp files.
+        "rsync" => Spec {
+            short: "eTfBM",
+            optional: "",
+            long: &[
+                "rsh",
+                "temp-dir",
+                "filter",
+                "exclude",
+                "include",
+                "chmod",
+                "chown",
+                "compare-dest",
+                "link-dest",
+                "copy-dest",
+                "partial-dir",
+                "backup-dir",
+                "rsync-path",
+                "suffix",
+            ],
+        },
+        // `-i IDENTITY` (a key ssh uses, not one copied), `-F CONFIG`,
+        // `-o OPTION`, `-J JUMP`, `-c CIPHER`, `-l LIMIT`, `-P PORT`,
+        // `-S PROGRAM` name no path being copied.
+        "scp" => Spec {
+            short: "iFoJclPS",
+            optional: "",
+            long: &[],
+        },
+        _ => TARGET_SPEC,
     };
     let args = parse(words, &spec);
     let ops = operands_of(&args);
-    let (target, sources) = split_target(&args, &ops);
+    let (target, sources) = if cmd == "rsync" || cmd == "scp" {
+        match ops.len() {
+            0 | 1 => (None, &ops[..]),
+            n => (ops.last().copied(), &ops[..n - 1]),
+        }
+    } else {
+        split_target(&args, &ops)
+    };
+    let contents = cmd != "scp" && cmd != "rsync" && no_target_directory(&args);
+    let into = sources_of(
+        sources,
+        |s| contents || (cmd == "rsync" && s.s.ends_with('/')),
+        None,
+    );
     match target {
-        Some(t) => out.push(t, Access::Write, base_names(sources)),
+        Some(t) => out.push(t, Access::Write, into),
         None => {
             if let Some(only) = ops.first() {
                 out.write(*only);
@@ -575,35 +647,31 @@ fn git(words: &[Option<Tok>], out: &mut Out) {
     match sub {
         Some("rm") | Some("restore") => rm_like(rest, out, dir),
         Some("mv") => mv_like(rest, out, dir),
-        Some("checkout") => {
-            // Only paths after `--` (otherwise the word may be a branch).
-            if let Some(dd) = rest
-                .iter()
-                .position(|w| matches!(w, Some(t) if t.s == "--"))
-            {
-                for t in rest[dd + 1..].iter().flatten() {
-                    let (path, glob) = under(dir, *t);
-                    out.0.push(Operand {
-                        path,
-                        access: Access::Write,
-                        glob,
-                        into: Vec::new(),
-                    });
-                }
-            }
-        }
+        // Every operand may be a path checkout overwrites; a branch or
+        // ref name (`main`, `-b feature`) matches no path rule.
+        Some("checkout") => rm_like(rest, out, dir),
         _ => {}
     }
 }
 
 /// `tar`: `-f F` is the archive (written when creating, else read), `-C
-/// DIR` where members go; creating reads the operands, extracting writes
-/// them. The first word may be a dashless cluster (`tar czf out.tgz`).
+/// DIR` where tar works (the operands are relative to it; DIR itself is
+/// not written); creating reads the operands, extracting writes them;
+/// `-g F` (`--listed-incremental`) is a snapshot file read and rewritten.
+/// The first word may be a dashless cluster (`tar czf out.tgz`).
 fn tar(words: &[Option<Tok>], out: &mut Out) {
+    // Ignored values: `-b BLOCKS`, `-H FORMAT`, `-K MEMBER` (a name in the
+    // archive), `-L LENGTH`, `-N DATE`, `-V LABEL` name no path.
     let spec = Spec {
         short: "fCTXbHKLNVg",
         optional: "",
-        long: &["file", "directory", "files-from", "exclude-from"],
+        long: &[
+            "file",
+            "directory",
+            "files-from",
+            "exclude-from",
+            "listed-incremental",
+        ],
     };
     let mut args = Vec::new();
     let mut i = 0;
@@ -640,12 +708,11 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
                 Name::Short('T' | 'X') | Name::Long("files-from" | "exclude-from"),
                 Some(v),
             ) => out.read(*v),
+            Arg::Opt(Name::Short('g') | Name::Long("listed-incremental"), Some(v)) => {
+                out.read(*v);
+                out.write(*v);
+            }
             _ => {}
-        }
-    }
-    if extracts {
-        if let Some(d) = dir {
-            out.write(d);
         }
     }
     for t in operands_of(&args) {
@@ -996,7 +1063,7 @@ mod tests {
         assert_eq!(ops("tar -tf a.tar"), vec![r("a.tar")]);
         assert_eq!(
             ops("tar -xf a.tar -C .claude settings.json"),
-            vec![r("a.tar"), w(".claude"), w(".claude/settings.json")]
+            vec![r("a.tar"), w(".claude/settings.json")]
         );
         assert_eq!(
             ops("tar --file=a.tar --extract x"),
@@ -1049,8 +1116,17 @@ mod tests {
             ops("git checkout -- .claude/settings.json"),
             vec![w(".claude/settings.json")]
         );
-        assert_eq!(ops("git checkout main -- a b"), vec![w("a"), w("b")]);
-        assert_eq!(ops("git checkout main"), vec![]);
+        assert_eq!(
+            ops("git checkout main -- a b"),
+            vec![w("main"), w("a"), w("b")]
+        );
+        // Every operand may be a path; a ref name matches no rule.
+        assert_eq!(ops("git checkout main"), vec![w("main")]);
+        assert_eq!(
+            ops("git checkout .claude/settings.json"),
+            vec![w(".claude/settings.json")]
+        );
+        assert_eq!(ops("git checkout -"), vec![]);
         assert_eq!(
             ops("git restore .claude/settings.json"),
             vec![w(".claude/settings.json")]
@@ -1084,13 +1160,59 @@ mod tests {
         let o = full("cp a/review.md notes/ .claude/");
         assert_eq!(o[0].path, ".claude/");
         assert_eq!(o[0].access, Access::Write);
-        assert_eq!(o[0].into, vec!["review.md", "notes"]);
+        let src = |p: &str, glob, contents| Source {
+            path: p.to_string(),
+            glob,
+            contents,
+        };
+        assert_eq!(
+            o[0].into,
+            vec![
+                src("a/review.md", false, false),
+                src("notes/", false, false)
+            ]
+        );
         assert!(o[1..].iter().all(|x| x.into.is_empty()));
         let o = full("mv -t .claude x");
         let target: Vec<_> = o.iter().filter(|x| x.path == ".claude").collect();
         assert_eq!(target.len(), 2);
-        assert!(target.iter().all(|x| x.into == vec!["x"]));
+        assert!(target
+            .iter()
+            .all(|x| x.into == vec![src("x", false, false)]));
         assert!(full("rm -rf .claude/").iter().all(|x| x.into.is_empty()));
+        assert_eq!(
+            full("cp backup/*.json .claude/")[0].into,
+            vec![src("backup/*.json", true, false)]
+        );
+        // `-T`: the source's contents land in the target.
+        for cmd in [
+            "cp -rT backup conf",
+            "cp --no-target-directory -r backup conf",
+            "mv -T backup conf",
+        ] {
+            let o = full(cmd);
+            let t = o.iter().find(|x| x.path == "conf").unwrap();
+            assert_eq!(t.into, vec![src("backup", false, true)], "{cmd}");
+        }
+        // rsync: a source ending in `/` is its contents.
+        assert_eq!(
+            full("rsync -a backup/ x conf")[0].into,
+            vec![src("backup/", false, true), src("x", false, false)]
+        );
+    }
+
+    #[test]
+    fn tar_incremental_snapshots_and_c_dir() {
+        let o = ops("tar -cz -g snap -f out.tgz src");
+        assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
+        let o = ops("tar --listed-incremental=snap -cf o src");
+        assert!(o.contains(&r("snap")) && o.contains(&w("snap")), "{o:?}");
+        // `-C DIR` is where tar works, not a write of DIR.
+        assert_eq!(ops("tar -C ~ -xf x.tar"), vec![r("x.tar")]);
+        assert_eq!(
+            ops("tar -C /srv -czf x.tgz app"),
+            vec![w("x.tgz"), r("/srv/app")]
+        );
     }
 
     #[test]

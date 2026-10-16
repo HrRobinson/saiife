@@ -94,6 +94,7 @@ fn turning_saiife_off_from_the_shell() {
         "rm -rf .claude",
         "echo '{\"disableAllHooks\": true}' > .claude/settings.local.json",
         "sed -i /saiife/d .codex/config.toml",
+        "git checkout .claude/settings.json",
         "mv .gemini/settings.json /tmp/",
         "cp /tmp/empty.json ~/.claude/settings.json",
         "rm ~/.codex/config.toml",
@@ -187,6 +188,11 @@ fn reading_the_setup_and_everyday_work_are_allowed() {
         "echo x > src/main.rs",
         "sed -i s/a/b/ src/main.rs",
         "ls /",
+        "tar -C ~ -xf x.tar",
+        "tar -C ~ -czf backup.tgz app/src",
+        "git checkout main",
+        "git checkout -b feature",
+        "git checkout -",
     ]
     .iter()
     .map(|s| s.to_string())

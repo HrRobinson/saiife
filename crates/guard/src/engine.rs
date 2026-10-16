@@ -19,10 +19,12 @@ use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexSet};
 
-use crate::canon::{canonicalize, expand_glob, lexical_form, path_forms, GlobExpansion, PathVars};
+use crate::canon::{
+    canonicalize, expand_glob, lexical_form, path_forms, GlobExpansion, PathVars, GLOB_SCAN_LIMIT,
+};
 use crate::lexer::{find_all_substitutions, split_segments, Word};
 use crate::normalize::build_argv;
-use crate::operands::operands;
+use crate::operands::{operands, Source};
 use crate::pack::Pack;
 use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
@@ -660,8 +662,10 @@ impl Engine {
             // A copy target that may be a directory waits for pass 2.
             let landing = if op.into.is_empty() {
                 vec![op.path.clone()]
-            } else if op.path.ends_with('/') {
-                into_dir(&op.path, &op.into)
+            } else if op.path.ends_with('/') && op.into.iter().all(|s| !s.glob && !s.contents) {
+                let names: Vec<String> =
+                    op.into.iter().filter_map(|s| base_name(&s.path)).collect();
+                into_dir(&op.path, &names)
             } else {
                 continue;
             };
@@ -701,13 +705,14 @@ impl Engine {
                     vec![op.path.clone()]
                 };
                 for word in words {
-                    let is_dir = !op.into.is_empty()
-                        && (word.ends_with('/')
-                            || canonicalize(&word, *cwd, &self.vars).is_some_and(|p| p.is_dir()));
-                    let landing = if is_dir {
-                        into_dir(&word, &op.into)
-                    } else {
+                    let landing = if op.into.is_empty() {
                         vec![word]
+                    } else {
+                        let (landing, err) = self.landing(&word, &op.into, *cwd);
+                        if let Some(reason) = err {
+                            unjudged.get_or_insert(reason);
+                        }
+                        landing
                     };
                     for raw in landing {
                         for form in path_forms(&raw, *cwd, &self.vars) {
@@ -727,6 +732,65 @@ impl Engine {
         unjudged.map(|reason| Decision::Allow {
             trace: AllowTrace::Unjudgeable { reason },
         })
+    }
+
+    /// The paths a copy/move into `target` writes: `target/<name>` for each
+    /// source when `target` is a directory (glob sources expanded first),
+    /// `target` itself otherwise, and for a `contents` source (`cp -T`,
+    /// `rsync dir/`) `target` plus `target/<entry>` for each top-level
+    /// entry. A reason when a glob or a source directory is too large to
+    /// list (the paths that are known are still returned).
+    fn landing(
+        &self,
+        target: &str,
+        sources: &[Source],
+        cwd: Option<&Path>,
+    ) -> (Vec<String>, Option<String>) {
+        let mut names = Vec::new();
+        let mut entries = Vec::new();
+        let mut err = None;
+        let mut scanned = 0usize;
+        for src in sources {
+            if src.contents {
+                let Some(dir) = canonicalize(&src.path, cwd, &self.vars) else {
+                    continue;
+                };
+                let Ok(list) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in list.flatten() {
+                    scanned += 1;
+                    if scanned > GLOB_SCAN_LIMIT {
+                        // Recorded as unjudgeable; judging thousands of
+                        // landing paths would only spend the budget.
+                        err = Some("copy source too large to judge".to_string());
+                        entries.clear();
+                        break;
+                    }
+                    entries.push(e.file_name().to_string_lossy().into_owned());
+                }
+            } else if src.glob {
+                match expand_glob(&src.path, cwd, &self.vars) {
+                    GlobExpansion::Matches(m) if !m.is_empty() => {
+                        names.extend(m.iter().filter_map(|p| base_name(&p.to_string_lossy())));
+                    }
+                    GlobExpansion::Overflow => err = Some("glob too large to judge".to_string()),
+                    _ => names.extend(base_name(&src.path)),
+                }
+            } else {
+                names.extend(base_name(&src.path));
+            }
+        }
+        let is_dir = target.ends_with('/')
+            || canonicalize(target, cwd, &self.vars).is_some_and(|p| p.is_dir());
+        let mut out = into_dir(target, &entries);
+        if is_dir {
+            out.extend(into_dir(target, &names));
+        }
+        if !is_dir || sources.iter().any(|s| s.contents) {
+            out.push(target.to_string());
+        }
+        (out, err)
     }
 
     /// Add where `cd`/`pushd` may leave the shell to `cwds`: its operand
@@ -828,6 +892,15 @@ impl Engine {
 /// Directories a command line's paths are judged against at most (the
 /// starting one plus `cd` targets).
 const MAX_CWDS: usize = 16;
+
+/// The last component of `path` (`a/b/` is `b`).
+fn base_name(path: &str) -> Option<String> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+}
 
 /// `dir/<name>` for each name copied or moved into `dir`.
 fn into_dir(dir: &str, names: &[String]) -> Vec<String> {
@@ -1078,6 +1151,11 @@ reason = "agent hook config"
 glob = "**/.claude"
 access = "write"
 reason = "agent folder"
+
+[[deny_path]]
+glob = "**/conf/secret.json"
+access = "write"
+reason = "test landing"
 
 [[deny_path]]
 glob = "**/.saiife/**"
@@ -1591,6 +1669,48 @@ reason = "other pack says no"
         // Brace expansion in command position runs the expanded words.
         assert!(test_engine().evaluate("{git,reset,--hard}").is_deny());
         assert!(test_engine().evaluate("{ git reset --hard; }").is_deny());
+    }
+
+    #[test]
+    fn copy_landing_names_follow_globs_and_contents() {
+        let (_d, root) = canonical_tmp();
+        let app = root.join("app");
+        for d in [".claude", "backup", "other", "conf", "big"] {
+            std::fs::create_dir_all(app.join(d)).unwrap();
+        }
+        std::fs::write(app.join("backup/settings.json"), "{}").unwrap();
+        std::fs::write(app.join("backup/secret.json"), "{}").unwrap();
+        std::fs::write(app.join("other/readme.md"), "").unwrap();
+        for i in 0..(crate::canon::GLOB_SCAN_LIMIT + 1) {
+            std::fs::write(app.join(format!("big/f{i}")), "").unwrap();
+        }
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "cp backup/*.json .claude/",
+            "cp backup/* .claude",
+            "cp -rT backup conf",
+            "cp -rT backup newdir/conf",
+            "rsync -a backup/ conf",
+            "rsync -a backup/ conf/",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            "cp other/* .claude/",
+            "cp -rT other conf",
+            "rsync -a backup conf",
+            "rsync -a other/ conf",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+        assert_eq!(
+            e.evaluate("cp -rT big conf"),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable {
+                    reason: "copy source too large to judge".to_string()
+                }
+            }
+        );
     }
 
     const SEGMENT_PACK: &str = r#"
