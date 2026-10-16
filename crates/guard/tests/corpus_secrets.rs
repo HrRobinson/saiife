@@ -748,6 +748,36 @@ fn arithmetic_too_long_to_judge_is_recorded() {
     }
 }
 
+/// Final wave M-1 / N-1: every nested-evaluation depth cap is a recorded
+/// fail-open. A secret read nested 9 to 31 levels deep (past the engine's
+/// cap, short of the lexer's) is denied or recorded as "… nested too
+/// deeply to judge", never a plain allow.
+#[test]
+fn nesting_past_the_depth_cap_is_recorded() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let mut wrong = Vec::new();
+    for n in [5usize, 9, 10, 20, 31] {
+        let forms = [
+            format!("echo {}cat .env{}", "$( ".repeat(n), " )".repeat(n)),
+            format!("echo {}cat .env{}", "\"$( ".repeat(n), " )\"".repeat(n)),
+            format!("{}cat .env{}", "$(".repeat(n), ")".repeat(n)),
+            format!("echo {}cat .env{}", "$( ( ".repeat(n), " ) )".repeat(n)),
+            format!("{}cat .env", "watch ".repeat(n)),
+        ];
+        for cmd in forms {
+            match e.evaluate(&cmd) {
+                d if d.is_deny() => {}
+                Decision::Allow {
+                    trace: saiifeguard::engine::AllowTrace::Unjudgeable { reason },
+                } if reason.ends_with("nested too deeply to judge") => {}
+                d => wrong.push(format!("{n} levels: {cmd:?} -> {d:?}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

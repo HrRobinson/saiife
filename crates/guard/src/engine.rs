@@ -423,6 +423,10 @@ impl Engine {
                             note(trace, &mut allow_trace, &mut unjudged);
                         }
                     }
+                } else {
+                    unjudged.get_or_insert_with(|| {
+                        "command substitution nested too deeply to judge".to_string()
+                    });
                 }
                 // A bare `HOME=$(mktemp -d)` stays set for what follows.
                 env_changed |= effective_is_empty_assignments(&seg, literal_path);
@@ -722,8 +726,12 @@ impl Engine {
             // design; the recursive call re-tokenizes it correctly). The two
             // extractors are mutually exclusive on argv[0], so trying one then
             // the other never double-recurses the same segment.
-            if depth < MAX_INLINE_DEPTH {
-                if let Some(inner) = inline_payload(&argv).or_else(|| watch_payload(&argv)) {
+            if let Some(inner) = inline_payload(&argv).or_else(|| watch_payload(&argv)) {
+                if depth >= MAX_INLINE_DEPTH {
+                    unjudged.get_or_insert_with(|| {
+                        "inline command nested too deeply to judge".to_string()
+                    });
+                } else {
                     if start.elapsed() > self.budget {
                         return Decision::Allow {
                             trace: AllowTrace::FailedOpenTimeout,
