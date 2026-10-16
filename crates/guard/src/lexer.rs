@@ -241,10 +241,12 @@ fn lex(input: &str) -> Vec<LexTok> {
                     });
                 }
                 if !word_quoted && word.text == "[[" {
-                    // A reserved word only where a command starts (after
-                    // assignments and wrappers): `echo [[` is an argument.
-                    let words = current_segment(&toks);
-                    in_test = crate::wrappers::effective_command(&words).is_empty();
+                    // A reserved word only as the first word of a command,
+                    // after assignments and `!`/`time` at most: `echo [[`,
+                    // `env [[` and `sudo [[` are arguments.
+                    in_test = current_segment(&toks)
+                        .iter()
+                        .all(|w| w.assignment || matches!(w.text.as_str(), "!" | "time"));
                 } else if !word_quoted && word.text == "]]" {
                     in_test = false;
                 }

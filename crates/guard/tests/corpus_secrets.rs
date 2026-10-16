@@ -565,6 +565,10 @@ fn round_three_shapes() {
         // `[[` is a test only where a command starts.
         "echo [[ x; cat <.env",
         "echo [[ x\ncat <.env",
+        // After a wrapper, `[[` is an ordinary argument.
+        "env [[ x > .claude/settings.json",
+        "sudo [[ a < .env",
+        "nohup [[ a < .env",
         // `((` without a real `))` is two subshells.
         "((cat .env); true)",
         "((cd src && cat .env) | head)",
@@ -585,6 +589,9 @@ fn round_three_shapes() {
         &[
             "[[ -f .env ]] && echo yes",
             "FOO=1 [[ a < b ]] && echo ok",
+            "! [[ a < b ]]",
+            "time [[ a < b ]]",
+            "[[ -f x ]] && cat README.md",
             "(( i++ ))",
             "((i++)); echo $i",
             "while read l; do echo $l; done <<EOF\na\nEOF",
