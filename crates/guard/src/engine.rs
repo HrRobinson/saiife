@@ -318,7 +318,7 @@ impl Engine {
         cwds: &[PathBuf],
         cwd_unknown: bool,
         env_changed: bool,
-        ifs_changed: bool,
+        ifs_named: bool,
     ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
         // Something could not be judged (a glob too large to expand): the
@@ -331,9 +331,9 @@ impl Engine {
         // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
         // rest of the command line (and for nested evaluations).
         let mut env_changed = env_changed;
-        // The line sets IFS somewhere (`IFS=: …`, `export IFS`, `read
-        // IFS`): how an unquoted value splits is then unknown.
-        let ifs_changed = ifs_changed || mentions_ifs(raw_cmd);
+        // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
+        // comment): values are still judged, the unresolved words too.
+        let ifs_named = ifs_named || mentions_ifs(raw_cmd);
         let (segments, lex_note) = split_segments_noted(raw_cmd);
         if let Some(reason) = lex_note {
             unjudged.get_or_insert_with(|| reason.to_string());
@@ -397,7 +397,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
-                        ifs_changed,
+                        ifs_named,
                     ) {
                         Decision::Deny {
                             pack,
@@ -485,7 +485,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
-                        ifs_changed,
+                        ifs_named,
                     ) {
                         Decision::Deny {
                             pack,
@@ -524,9 +524,9 @@ impl Engine {
             // Words in front of the command (wrappers, assignments,
             // redirections), counted before the arguments are resolved.
             let prefix_len = seg.len() - effective.len();
-            let resolved = resolve_values(effective, ifs_changed, false);
+            let resolved = resolve_values(effective, ifs_named, false);
             // Redirection targets are resolved the same way.
-            let seg_ops = resolve_values(&seg, ifs_changed, true);
+            let seg_ops = resolve_values(&seg, ifs_named, true);
             let effective: &[Word] = &resolved;
             // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
             let reads: Vec<Operand> = wrapper_reads(&seg)
@@ -686,7 +686,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
-                        ifs_changed,
+                        ifs_named,
                     ) {
                         Decision::Deny {
                             pack,
@@ -744,7 +744,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
-                        ifs_changed,
+                        ifs_named,
                     ) {
                         Decision::Deny {
                             pack,
@@ -1151,13 +1151,18 @@ fn mentions_ifs(raw: &str) -> bool {
 /// separately. `targets_only`: only redirection targets (the words after a
 /// redirection operator); otherwise every word but the command name.
 /// - `"$(…)"` (the whole word one double-quoted substitution): one word.
-/// - With IFS changed anywhere on the line, nothing else is resolved.
-/// - An unquoted `$(…)`: split on blanks, each part globbed; as a
-///   redirection target only when it is exactly one part (bash refuses an
-///   ambiguous redirect).
+/// - An unquoted `$(…)`: how it splits depends on `IFS`, which may be set
+///   anywhere (or inherited), so both forms are judged: the default split
+///   (blanks; each part globbed) and the unsplit value. As a redirection
+///   target it is one word: the part when the split gives exactly one,
+///   else the unsplit value (bash refuses an ambiguous redirect under the
+///   default `IFS`, so this only over-judges).
 /// - A word mixing substitutions with text: one word, when no value holds
 ///   blanks or glob characters (`literal_word`).
-fn resolve_values(words: &[Word], ifs_changed: bool, targets_only: bool) -> Vec<Word> {
+/// - `ifs_named`: the line names `IFS`, so it may split at other
+///   characters too: the unresolved word is kept as well, for the
+///   guarded-substitution fail-safe (`IFS=:; rm -f $(echo .saiife:x)`).
+fn resolve_values(words: &[Word], ifs_named: bool, targets_only: bool) -> Vec<Word> {
     let mut out = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let target = i > 0 && words[i - 1].redirect;
@@ -1171,26 +1176,37 @@ fn resolve_values(words: &[Word], ifs_changed: bool, targets_only: bool) -> Vec<
             glob,
             ..w.clone()
         };
+        let globby = |t: &str| t.contains(['*', '?', '[']);
         match value {
             Some((text, _)) if w.dq_substitution => out.push(one(text, false)),
             None => out.push(w.clone()),
-            Some(_) if ifs_changed => out.push(w.clone()),
             Some((text, true)) => {
                 let parts: Vec<&str> = text
                     .split([' ', '\t', '\n'])
                     .filter(|p| !p.is_empty())
                     .collect();
-                if target && parts.len() != 1 {
-                    out.push(w.clone());
+                if target {
+                    match parts.as_slice() {
+                        [p] => out.push(one(p.to_string(), globby(p))),
+                        _ => out.push(one(text.clone(), globby(&text))),
+                    }
                 } else {
-                    out.extend(
-                        parts
-                            .into_iter()
-                            .map(|p| one(p.to_string(), p.contains(['*', '?', '[']))),
-                    );
+                    let split = parts.len() != 1 || parts[0] != text;
+                    out.extend(parts.iter().map(|p| one(p.to_string(), globby(p))));
+                    if split && !text.trim().is_empty() {
+                        out.push(one(text.clone(), globby(&text)));
+                    }
+                    if ifs_named {
+                        out.push(w.clone());
+                    }
                 }
             }
-            Some((text, false)) => out.push(one(text, w.glob)),
+            Some((text, false)) => {
+                out.push(one(text, w.glob));
+                if ifs_named && !target {
+                    out.push(w.clone());
+                }
+            }
         }
     }
     out

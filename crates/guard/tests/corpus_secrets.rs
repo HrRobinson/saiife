@@ -683,6 +683,13 @@ fn round_four_substitution_bodies_are_lexed_like_the_line() {
         "cat $(echo '.env x')''",
         // C: a changed IFS makes unquoted values unknown (fail-safe).
         "IFS=:; rm -f $(echo .saiife:x)",
+        // Round 5 C: `IFS` text never stops a known value from being
+        // judged; the default split and the unsplit value both are.
+        "cat $(echo .env) # IFS",
+        "IFS=x; cat $(echo .env)",
+        "cat $(echo .env) <<< IFS",
+        "git commit -m \"$(echo fix IFS)\" && cat $(echo .env)",
+        "IFS=; cat $(echo '../.ssh/x y/../id_rsa')",
         // D: after an assignment `[[` is a command, `<` a redirection.
         "FOO=1 [[ a < .env ]]",
         // F: redirection targets are resolved like operands.
