@@ -16,8 +16,11 @@ struct Out {
     stderr: String,
 }
 
-fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> Out {
-    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+/// Run `saiife check` on `stdin` with `/home/u` mapped to a real temp home
+/// (see `common::FixtureHome`); return the answer and the audit records in
+/// `audit_dir`, both spelled with `/home/u` again.
+fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> (Out, Vec<Record>) {
+    let home = common::FixtureHome::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit_dir);
     let mut child = cmd
@@ -28,13 +31,24 @@ fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> Out {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&home.real_bytes(stdin))
+        .unwrap();
     let out = child.wait_with_output().unwrap();
-    Out {
+    let out = Out {
         code: out.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-    }
+        stdout: home.spelled(&String::from_utf8_lossy(&out.stdout)),
+        stderr: home.spelled(&String::from_utf8_lossy(&out.stderr)),
+    };
+    let recs = read_all(audit_dir)
+        .records
+        .into_iter()
+        .map(|r| home.spelled_record(r))
+        .collect();
+    (out, recs)
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -48,8 +62,7 @@ fn fixture(name: &str) -> Vec<u8> {
 /// record it wrote.
 fn run(name: &str, agent: &str) -> (Out, Record) {
     let dir = tempfile::tempdir().unwrap();
-    let out = check_bytes(dir.path(), agent, &fixture(name));
-    let mut recs = read_all(dir.path()).records;
+    let (out, mut recs) = check_bytes(dir.path(), agent, &fixture(name));
     assert_eq!(recs.len(), 1, "{name}: exactly one record");
     (out, recs.remove(0))
 }
@@ -278,9 +291,9 @@ fn large_write_is_recorded_as_allow_with_its_path() {
     })
     .to_string();
     let dir = tempfile::tempdir().unwrap();
-    let out = check_bytes(dir.path(), "claude", payload.as_bytes());
+    let (out, recs) = check_bytes(dir.path(), "claude", payload.as_bytes());
     assert_eq!(out.code, 0);
-    let rec = &read_all(dir.path()).records[0];
+    let rec = &recs[0];
     assert_eq!(rec.decision, DecisionKind::Allow);
     assert_eq!(rec.tool, "Write");
     assert_eq!(rec.input, "/home/u/app/big.txt");
@@ -297,8 +310,7 @@ fn variant(name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
 
 fn run_bytes(agent: &str, stdin: &[u8]) -> (Out, Record) {
     let dir = tempfile::tempdir().unwrap();
-    let out = check_bytes(dir.path(), agent, stdin);
-    let mut recs = read_all(dir.path()).records;
+    let (out, mut recs) = check_bytes(dir.path(), agent, stdin);
     assert_eq!(recs.len(), 1, "exactly one record");
     (out, recs.remove(0))
 }
@@ -435,9 +447,9 @@ fn apply_patch_without_headers_is_recorded_as_unjudged() {
 fn pathless_search_without_cwd_judges_the_hook_directory() {
     let stdin = br#"{"session_id":"c-1","hook_event_name":"PreToolUse","tool_name":"Glob","tool_input":{"pattern":"**/*.rs"}}"#;
     let dir = tempfile::tempdir().unwrap();
-    let out = check_bytes(dir.path(), "claude", stdin);
+    let (out, mut recs) = check_bytes(dir.path(), "claude", stdin);
     assert_eq!(out.code, 0, "{}", out.stderr);
-    let rec = read_all(dir.path()).records.remove(0);
+    let rec = recs.remove(0);
     assert_eq!(rec.decision, DecisionKind::Allow);
     let real = std::fs::canonicalize(dir.path()).unwrap();
     assert_eq!(

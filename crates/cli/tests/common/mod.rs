@@ -117,6 +117,54 @@ pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
 /// The `cwd` the recorded fixtures use.
 pub const FIXTURE_CWD: &str = "/home/u/app";
 
+/// The home the recorded fixtures spell.
+pub const FIXTURE_HOME: &str = "/home/u";
+
+/// A real, canonical stand-in for `/home/u`: payloads spell `/home/u`, and
+/// `real` rewrites them to a fresh temp dir (holding `app/`) before they
+/// reach `saiife`, `spelled` maps the paths in the answer back. Paths under
+/// `/home/u` are never resolved for real: on macOS `/home` is an autofs
+/// mount, and resolving through it can stall past the latency budget.
+pub struct FixtureHome {
+    _dir: TempDir,
+    root: String,
+}
+
+impl FixtureHome {
+    pub fn new() -> FixtureHome {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap().join("u");
+        fs::create_dir_all(root.join("app")).unwrap();
+        assert_no_host_config(&root);
+        FixtureHome {
+            _dir: dir,
+            root: root.to_str().unwrap().to_string(),
+        }
+    }
+
+    pub fn real(&self, s: &str) -> String {
+        s.replace(FIXTURE_HOME, &self.root)
+    }
+
+    pub fn real_bytes(&self, b: &[u8]) -> Vec<u8> {
+        match std::str::from_utf8(b) {
+            Ok(s) => self.real(s).into_bytes(),
+            Err(_) => b.to_vec(),
+        }
+    }
+
+    pub fn spelled(&self, s: &str) -> String {
+        s.replace(&self.root, FIXTURE_HOME)
+    }
+
+    pub fn spelled_record(&self, mut r: saiife_audit::Record) -> saiife_audit::Record {
+        r.project = self.spelled(&r.project);
+        r.input = self.spelled(&r.input);
+        r.reason = r.reason.map(|x| self.spelled(&x));
+        r
+    }
+}
+
 /// `saiife check` reads the nearest `.saiife/config.toml` at or above the
 /// payload's `cwd`. Fixture cwds like `/home/u/app` are not temp dirs, so a
 /// project config on this host at `/home/u/app`, `/home/u`, `/home` or `/`
