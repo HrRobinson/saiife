@@ -1565,6 +1565,16 @@ reason = "other pack says no"
             "a[0]=1 cat .env",
             "A+=1 cat .env",
             "X[k]+=v cat .env",
+            r#"a["x"]=1 cat .env"#,
+            "a[$(id)]=1 cat .env",
+            "a[k=v]=1 cat .env",
+            "a[b[1]]=1 cat .env",
+            "sudo FOO=1 cat .env",
+            "sudo -- FOO=1 cat .env",
+            r#"env "FOO=1" cat .env"#,
+            r#"sudo "FOO=1" cat .env"#,
+            "env -- FOO=1 cat .env",
+            "sudo -u x FOO=1 rm -rf .saiife",
         ] {
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }

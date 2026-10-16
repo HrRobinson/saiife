@@ -190,6 +190,10 @@ fn lex(input: &str) -> Vec<LexTok> {
     // The first unquoted `=` decides whether the word is an assignment.
     let mut word_eq_seen = false;
     let mut word_assignment = false;
+    // Inside the `[…]` subscript of a would-be `NAME[…]=` assignment:
+    // quotes, substitutions and `=` there do not decide anything.
+    let mut subscript_depth = 0usize;
+    let mut word_subscripted = false;
     // The word has an unquoted `{a,b}` brace expansion.
     let mut word_brace = false;
     // Open braces of the brace expansion being read: its `{`/`}` are word
@@ -231,6 +235,8 @@ fn lex(input: &str) -> Vec<LexTok> {
                 word_glob = false;
                 word_eq_seen = false;
                 word_assignment = false;
+                subscript_depth = 0;
+                word_subscripted = false;
             }
         };
     }
@@ -388,10 +394,36 @@ fn lex(input: &str) -> Vec<LexTok> {
                 word_text.push_str(&scan_backtick(&mut chars));
                 word_text.push('`');
             }
-            '=' if !word_eq_seen => {
+            '[' if subscript_depth > 0 => {
+                subscript_depth += 1;
+                word_text.push('[');
+            }
+            ']' if subscript_depth > 0 => {
+                subscript_depth -= 1;
+                word_text.push(']');
+                if subscript_depth == 0 {
+                    // The name before `[` was unquoted (checked on entry).
+                    word_quoted = false;
+                    word_subscripted = true;
+                }
+            }
+            '[' if in_word
+                && !word_eq_seen
+                && !word_quoted
+                && !word_has_sub
+                && !word_subscripted
+                && is_assignment_name(&word_text) =>
+            {
+                subscript_depth = 1;
+                word_glob = true;
+                word_text.push('[');
+            }
+            '=' if !word_eq_seen && subscript_depth == 0 => {
                 word_eq_seen = true;
-                word_assignment =
-                    in_word && !word_quoted && !word_has_sub && is_assignment_name(&word_text);
+                word_assignment = in_word
+                    && !word_quoted
+                    && (!word_has_sub || word_subscripted)
+                    && is_assignment_name(&word_text);
                 in_word = true;
                 word_text.push('=');
             }
@@ -1331,6 +1363,10 @@ mod tests {
         assert_eq!(
             a(r#"A=1 B+=2 c[0]=3 d[i+1]+=4 E="x y" cmd F=5"#),
             vec![true, true, true, true, true, false, true]
+        );
+        assert_eq!(
+            a(r#"a["x"]=1 a[$(id)]=1 a[k=v]=1 a['k']+=1 a[x]"="1"#),
+            vec![true, true, true, true, false]
         );
         assert_eq!(
             a(r#""A=1" 'B=2' C"=3" \D=4 1A=5 =6 a-b=7 $(x)=8"#),
