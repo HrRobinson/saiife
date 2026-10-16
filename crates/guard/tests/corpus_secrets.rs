@@ -631,3 +631,97 @@ fn substitution_values_that_are_plain_data() {
         ],
     );
 }
+
+/// Claude Code's commit-message shape: `git commit -m "$(cat <<'EOF'` …
+/// `EOF` `)"`, with `body` as the message.
+fn claude_commit(body: &str) -> String {
+    format!("git commit -m \"$(cat <<'EOF'\n{body}\nEOF\n)\"")
+}
+
+#[test]
+fn round_four_substitution_bodies_are_lexed_like_the_line() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let mut wrong = Vec::new();
+    for cmd in [
+        // A: a substitution body has its own here-docs, quotes and comments.
+        "echo \"$(cat <<'EOF'\nit's\nEOF\n)\"; cat .env",
+        "echo \"$(cat <<'EOF'\n(wip\nEOF\n)\"; cat .env",
+        "echo \"$(cat <<'EOF'\n:)\nEOF\n)\"; cat .env",
+        "echo $(cat <<'EOF'\nit's\nEOF\n); cat .env",
+        "x=$(cat <<'EOF'\n(\nEOF\n)\ncat .env",
+        "echo \"$(echo hi # it's\n)\"; cat .env",
+        "echo \"$(( $(cat <<'EOF'\n1'\nEOF\n) ))\"; cat .env",
+        // A here-document opened in a closed substitution: its body
+        // follows the line (as in bash), then the next command.
+        "echo \"$(cat <<EOF)\"\nx\nEOF\ncat .env",
+        "echo \"$(bash <<EOF)\"\ncat .env\nEOF",
+        // B: only a fully double-quoted `"$(…)"` stays one word.
+        "cat $(echo '.env x')\"\"",
+        "cat $(echo '.env x')''",
+        // C: a changed IFS makes unquoted values unknown (fail-safe).
+        "IFS=:; rm -f $(echo .saiife:x)",
+        // D: after an assignment `[[` is a command, `<` a redirection.
+        "FOO=1 [[ a < .env ]]",
+        // F: redirection targets are resolved like operands.
+        "echo x > \"$(echo .claude)/settings.json\"",
+        "echo x > \"$(cat <<'EOF'\n.claude/settings.json\nEOF\n)\"",
+        "echo x > $(echo .claude/settings.json)",
+    ] {
+        if !e.evaluate(cmd).is_deny() {
+            wrong.push(format!("expected DENY: {cmd:?}"));
+        }
+    }
+    let commits = [
+        claude_commit(
+            "fix: don't break commits\n\nThe guard now:\n1) first\n2) second :)\n(wip\n# not a comment\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        ),
+        claude_commit("it's done"),
+        claude_commit("a) b) c)"),
+        claude_commit("((x"),
+        claude_commit("it's \"quoted\" and `ticked` $HOME"),
+    ];
+    let mut allowed: Vec<&str> = commits.iter().map(String::as_str).collect();
+    allowed.extend([
+        "for f in $(ls); do echo $f; done",
+        "[[ -f x ]] && cat README.md",
+        "if [[ $a < $b ]]; then :; fi",
+        "if [[ $v > .claude/settings.json ]]; then echo; fi",
+        "while [[ $i < 10 ]]; do i=$((i+1)); done",
+        "until [[ $a > .env ]]; do :; done",
+        "(( i++ ))",
+        "echo $((1<<3))",
+        "echo \"$((1<<3))\"\necho ok",
+        "cat <<EOF > notes.md\nDon't commit the .env file (it's secret).\nEOF",
+        "echo x > \"$(echo notes).md\"",
+        "echo \"$(cat <<EOF)\"\ncat .env\nEOF",
+        "git commit -m \"fix $(echo x)\"",
+    ]);
+    for cmd in allowed {
+        let d = e.evaluate(cmd);
+        if d.is_deny() {
+            wrong.push(format!("expected ALLOW: {cmd:?}, got {d:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn arithmetic_too_long_to_judge_is_recorded() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let cmd = format!("(( x = {}1 ))", "1 + ".repeat(2000));
+    match e.evaluate(&cmd) {
+        Decision::Allow {
+            trace: saiifeguard::engine::AllowTrace::Unjudgeable { reason },
+        } => assert_eq!(reason, "arithmetic too long to judge"),
+        d => panic!("expected error_allowed, got {d:?}"),
+    }
+    let deep = format!("echo {}x{}", "\"$(".repeat(40), ")\"".repeat(40));
+    match e.evaluate(&deep) {
+        Decision::Allow {
+            trace: saiifeguard::engine::AllowTrace::Unjudgeable { reason },
+        } => assert_eq!(reason, "command substitution nested too deeply to judge"),
+        d => panic!("expected error_allowed, got {d:?}"),
+    }
+}

@@ -23,7 +23,7 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
-use crate::lexer::{find_all_substitutions, literal_substitution, split_segments, Word};
+use crate::lexer::{find_all_substitutions, literal_word, split_segments_noted, Word};
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
@@ -301,13 +301,15 @@ impl Engine {
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         let start = Instant::now();
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false)
+        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false, false)
     }
 
     /// `cwds`: the directories the shell may be in at the start of
     /// `raw_cmd`. A `cd` adds its target for the segments after it but
     /// never drops the old ones: it may fail (`cd /nonexistent; …`), run
     /// in a subshell (`(cd x); …`) or go somewhere unknown (`cd $(…)`).
+    // The shell state a nested evaluation inherits travels as arguments.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
@@ -316,6 +318,7 @@ impl Engine {
         cwds: &[PathBuf],
         cwd_unknown: bool,
         env_changed: bool,
+        ifs_changed: bool,
     ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
         // Something could not be judged (a glob too large to expand): the
@@ -328,7 +331,13 @@ impl Engine {
         // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
         // rest of the command line (and for nested evaluations).
         let mut env_changed = env_changed;
-        let segments = split_segments(raw_cmd);
+        // The line sets IFS somewhere (`IFS=: …`, `export IFS`, `read
+        // IFS`): how an unquoted value splits is then unknown.
+        let ifs_changed = ifs_changed || mentions_ifs(raw_cmd);
+        let (segments, lex_note) = split_segments_noted(raw_cmd);
+        if let Some(reason) = lex_note {
+            unjudged.get_or_insert_with(|| reason.to_string());
+        }
         let literal_path =
             has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments);
 
@@ -388,6 +397,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
+                        ifs_changed,
                     ) {
                         Decision::Deny {
                             pack,
@@ -451,9 +461,12 @@ impl Engine {
                 }
                 for inner in find_all_substitutions(&word.text) {
                     if depth >= MAX_INLINE_DEPTH {
-                        // Depth cap reached: fail open on this one
-                        // substitution and keep scanning the rest of the
-                        // segment rather than recursing unboundedly.
+                        // Depth cap reached: fail open (recorded) on this
+                        // one substitution and keep scanning the rest of
+                        // the segment rather than recursing unboundedly.
+                        unjudged.get_or_insert_with(|| {
+                            "command substitution nested too deeply to judge".to_string()
+                        });
                         continue;
                     }
                     if start.elapsed() > self.budget {
@@ -468,6 +481,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
+                        ifs_changed,
                     ) {
                         Decision::Deny {
                             pack,
@@ -506,36 +520,9 @@ impl Engine {
             // Words in front of the command (wrappers, assignments,
             // redirections), counted before the arguments are resolved.
             let prefix_len = seg.len() - effective.len();
-            let resolved: Vec<Word> = effective
-                .iter()
-                .enumerate()
-                .flat_map(|(i, w)| {
-                    let value = (i > 0 && w.has_substitution)
-                        .then(|| literal_substitution(&w.text))
-                        .flatten();
-                    match value {
-                        // `"$(…)"`: one word, as printed.
-                        Some(text) if w.quoted => vec![Word {
-                            text,
-                            has_substitution: false,
-                            glob: false,
-                            ..w.clone()
-                        }],
-                        // Unquoted: split on blanks, each part globbed.
-                        Some(text) => text
-                            .split([' ', '\t', '\n'])
-                            .filter(|p| !p.is_empty())
-                            .map(|p| Word {
-                                text: p.to_string(),
-                                has_substitution: false,
-                                glob: p.contains(['*', '?', '[']),
-                                ..w.clone()
-                            })
-                            .collect(),
-                        None => vec![w.clone()],
-                    }
-                })
-                .collect();
+            let resolved = resolve_values(effective, ifs_changed, false);
+            // Redirection targets are resolved the same way.
+            let seg_ops = resolve_values(&seg, ifs_changed, true);
             let effective: &[Word] = &resolved;
             // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
             let reads: Vec<Operand> = wrapper_reads(&seg)
@@ -578,7 +565,7 @@ impl Engine {
                 }
                 env_changed |= effective_is_empty_assignments(&seg, literal_path);
                 if let Some(d) = self.judge_operands(
-                    self.shell_ops(&seg, &[], &[], reads),
+                    self.shell_ops(&seg_ops, &[], &[], reads),
                     &cwds,
                     cwd_unknown,
                     start,
@@ -647,7 +634,7 @@ impl Engine {
             // Files the command reads or writes, judged by the path rules
             // that also guard the agents' file tools.
             if let Some(d) = self.judge_operands(
-                self.shell_ops(&seg, effective, &argv, reads),
+                self.shell_ops(&seg_ops, effective, &argv, reads),
                 &cwds,
                 cwd_unknown,
                 start,
@@ -695,6 +682,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
+                        ifs_changed,
                     ) {
                         Decision::Deny {
                             pack,
@@ -748,6 +736,7 @@ impl Engine {
                         &cwds,
                         cwd_unknown,
                         env_changed,
+                        ifs_changed,
                     ) {
                         Decision::Deny {
                             pack,
@@ -1136,6 +1125,67 @@ fn note(trace: AllowTrace, allow_trace: &mut Option<AllowTrace>, unjudged: &mut 
         }
         t => *allow_trace = Some(t),
     }
+}
+
+/// Does the command text name `IFS` (as a whole word: `IFS=:`,
+/// `export IFS`, `read -r IFS`, `${IFS:=x}`)?
+fn mentions_ifs(raw: &str) -> bool {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = raw.as_bytes();
+    raw.match_indices("IFS").any(|(i, _)| {
+        (i == 0 || !ident(bytes[i - 1])) && bytes.get(i + 3).is_none_or(|&b| !ident(b))
+    })
+}
+
+/// Words with their plain-data substitutions replaced by the values they
+/// print (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`), so they
+/// are judged like any literal word; the inner commands are judged
+/// separately. `targets_only`: only redirection targets (the words after a
+/// redirection operator); otherwise every word but the command name.
+/// - `"$(…)"` (the whole word one double-quoted substitution): one word.
+/// - With IFS changed anywhere on the line, nothing else is resolved.
+/// - An unquoted `$(…)`: split on blanks, each part globbed; as a
+///   redirection target only when it is exactly one part (bash refuses an
+///   ambiguous redirect).
+/// - A word mixing substitutions with text: one word, when no value holds
+///   blanks or glob characters (`literal_word`).
+fn resolve_values(words: &[Word], ifs_changed: bool, targets_only: bool) -> Vec<Word> {
+    let mut out = Vec::with_capacity(words.len());
+    for (i, w) in words.iter().enumerate() {
+        let target = i > 0 && words[i - 1].redirect;
+        let wanted = if targets_only { target } else { i > 0 };
+        let value = (wanted && w.has_substitution && !w.redirect)
+            .then(|| literal_word(&w.text))
+            .flatten();
+        let one = |text: String, glob: bool| Word {
+            text,
+            has_substitution: false,
+            glob,
+            ..w.clone()
+        };
+        match value {
+            Some((text, _)) if w.dq_substitution => out.push(one(text, false)),
+            None => out.push(w.clone()),
+            Some(_) if ifs_changed => out.push(w.clone()),
+            Some((text, true)) => {
+                let parts: Vec<&str> = text
+                    .split([' ', '\t', '\n'])
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                if target && parts.len() != 1 {
+                    out.push(w.clone());
+                } else {
+                    out.extend(
+                        parts
+                            .into_iter()
+                            .map(|p| one(p.to_string(), p.contains(['*', '?', '[']))),
+                    );
+                }
+            }
+            Some((text, false)) => out.push(one(text, w.glob)),
+        }
+    }
+    out
 }
 
 /// The redirections (operator and target) among the words peeled off in
