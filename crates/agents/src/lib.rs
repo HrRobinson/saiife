@@ -204,6 +204,29 @@ mod tests {
         assert_eq!(Agent::from_name("cursor"), None);
     }
 
+    /// Upgrading from plan 2: the Codex and Gemini entries (and so the
+    /// fingerprints in existing integrity records) are unchanged; only
+    /// Claude's entry changed (Glob and LS added to the matcher).
+    #[test]
+    fn entry_fingerprints_across_the_plan_3_upgrade() {
+        assert_eq!(
+            Agent::Codex.expected_entry(),
+            "fa6f54dd98db7026395fb5766d29801222517b6563855b94f93dbcf462755198"
+        );
+        assert_eq!(
+            Agent::Gemini.expected_entry(),
+            "d3f7042e8a85f8e053ae3864fdce1921d8e5620f542fb5ca8a1f5e1183eb53fc"
+        );
+        assert_eq!(
+            Agent::Claude.expected_entry(),
+            "96fb881e404f7fed07a75eff98c42bf1c31553d8678c5e36c7216caadc5e2dca"
+        );
+        assert_ne!(
+            Agent::Claude.expected_entry(),
+            "78ff3176c0d50b70275b537d4f8e7c52ebba6e0ce22f68c03d01d52fd86c5d76"
+        );
+    }
+
     #[test]
     fn hook_commands_use_hook_exit() {
         assert_eq!(
