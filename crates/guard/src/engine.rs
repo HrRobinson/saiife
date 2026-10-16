@@ -23,7 +23,7 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
-use crate::lexer::{find_all_substitutions, split_segments, Word};
+use crate::lexer::{find_all_substitutions, literal_substitution, split_segments, Word};
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
@@ -499,6 +499,29 @@ impl Engine {
             // Leading assignments and redirections (`LANG=C sort f`,
             // `2>/dev/null cat f`) are not the command either.
             let effective = effective_command(effective);
+            // An argument that is one substitution printing plain data
+            // (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`) is
+            // judged by its value, like any literal argument; its inner
+            // command was judged above.
+            let resolved: Vec<Word> = effective
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    match (i > 0 && w.has_substitution)
+                        .then(|| literal_substitution(&w.text))
+                        .flatten()
+                    {
+                        Some(text) => Word {
+                            text,
+                            has_substitution: false,
+                            glob: false,
+                            ..w.clone()
+                        },
+                        None => w.clone(),
+                    }
+                })
+                .collect();
+            let effective: &[Word] = &resolved;
             // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
             let reads: Vec<Operand> = wrapper_reads(&seg)
                 .into_iter()
@@ -1649,6 +1672,8 @@ reason = "other pack says no"
             "cd ~/.ssh; cat id_rsa",
             "python x.py < .env",
             "echo x > .locked/state",
+            // A substitution printing literal data is judged by its value.
+            "cat $(echo .env)",
         ] {
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }
@@ -1659,7 +1684,7 @@ reason = "other pack says no"
             "cd src && cat .env.example",
             "cat .locked/state",
             "echo x > notes.txt",
-            "cat $(echo .env)",
+            "cat $(ls -t | head -1)",
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }

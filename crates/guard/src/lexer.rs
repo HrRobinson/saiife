@@ -215,6 +215,8 @@ fn lex(input: &str) -> Vec<LexTok> {
     let mut pending_docs: Vec<PendingDoc> = Vec::new();
     // Between `[[` and `]]`, `<` and `>` compare strings.
     let mut in_test = false;
+    // `((` look-aheads done so far (each is bounded).
+    let mut arith_lookaheads = 0usize;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -388,9 +390,16 @@ fn lex(input: &str) -> Vec<LexTok> {
             // nested subshells: `((cat .env); true)`.
             '(' if !in_word && chars.peek() == Some(&'(') => {
                 chars.next();
-                let body = scan_paren_balanced(&mut chars);
-                if chars.peek() == Some(&')') {
-                    chars.next();
+                // Look ahead (bounded) for the real `))`; the subshell
+                // case is then lexed inline, sharing here-doc and test
+                // state with the rest of the line.
+                let arithmetic = arith_lookaheads < ARITH_LOOKAHEADS && {
+                    arith_lookaheads += 1;
+                    closes_arithmetic(&chars)
+                };
+                if arithmetic {
+                    let body = scan_paren_balanced(&mut chars);
+                    chars.next(); // the second `)`
                     in_word = true;
                     word_has_sub |= body.contains("$(") || body.contains('`');
                     word_text.push_str("((");
@@ -400,8 +409,6 @@ fn lex(input: &str) -> Vec<LexTok> {
                 } else {
                     toks.push(LexTok::Operator(Operator::LParen));
                     toks.push(LexTok::Operator(Operator::LParen));
-                    toks.extend(lex(&body));
-                    toks.push(LexTok::Operator(Operator::RParen));
                 }
             }
             '(' => {
@@ -622,6 +629,27 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
                 .collect();
             runs_stdin(&words)
         })
+}
+
+/// `((` look-aheads one command line may do; past it, `((` is two
+/// subshells (its contents are then judged as commands).
+const ARITH_LOOKAHEADS: usize = 64;
+/// Characters one `((` look-ahead reads at most.
+const ARITH_LOOKAHEAD_CHARS: usize = 4096;
+
+/// After `((`: does the balanced body end with a real `))`? Reads a copy
+/// of the input, at most `ARITH_LOOKAHEAD_CHARS` characters.
+fn closes_arithmetic(chars: &Chars) -> bool {
+    let ahead: String = chars.clone().take(ARITH_LOOKAHEAD_CHARS).collect();
+    let mut look = ahead.chars().peekable();
+    let body = scan_paren_balanced(&mut look);
+    // `scan_paren_balanced` stops after the `)` closing the body, or at
+    // the end (unterminated, or cut off).
+    let consumed = body.chars().count() + 1;
+    consumed <= ahead.chars().count() && look.peek() == Some(&')') && {
+        // It really ended on a `)` (not at the end of the text).
+        ahead.chars().nth(consumed - 1) == Some(')')
+    }
 }
 
 /// The words of the segment being lexed (after the last operator).
@@ -898,6 +926,109 @@ fn scan_backtick(chars: &mut Chars) -> String {
         }
     }
     out
+}
+
+/// The value of a word that is one command substitution printing plain
+/// data: `$(cat <<'EOF' … EOF)` (a quoted delimiter, or an unquoted one
+/// whose body has no `$`, backtick or backslash), `$(echo [-neE] ARGS)` or
+/// `$(printf FORMAT)` with literal arguments and a format without `%` or
+/// `\`. Trailing newlines are removed, as bash does. `None` for anything
+/// else (the value is then unknown).
+pub fn literal_substitution(text: &str) -> Option<String> {
+    let inner = pure_substitution_body(text)?;
+    let value = heredoc_cat_value(&inner).or_else(|| echo_value(&inner))?;
+    Some(value.trim_end_matches('\n').to_string())
+}
+
+/// `cat <<'X'` (or `<<-`) on the first line, the body, `X`, nothing more.
+fn heredoc_cat_value(inner: &str) -> Option<String> {
+    let inner = inner.trim_start_matches([' ', '\t']);
+    let (first, rest) = inner.split_once('\n')?;
+    let after_cat = first.strip_prefix("cat")?.trim_start();
+    let op = after_cat.strip_prefix("<<")?;
+    let (strip_tabs, op) = match op.strip_prefix('-') {
+        Some(o) => (true, o),
+        None => (false, op),
+    };
+    let delim_raw = op.trim();
+    let (delim, quoted) = if let Some(d) = delim_raw
+        .strip_prefix('\'')
+        .and_then(|d| d.strip_suffix('\''))
+        .or_else(|| {
+            delim_raw
+                .strip_prefix('"')
+                .and_then(|d| d.strip_suffix('"'))
+        })
+        .or_else(|| delim_raw.strip_prefix('\\'))
+    {
+        (d, true)
+    } else {
+        (delim_raw, false)
+    };
+    if delim.is_empty()
+        || !delim
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let mut body = String::new();
+    let mut lines = rest.split('\n');
+    loop {
+        let line = lines.next()?;
+        let cmp = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        if cmp == delim {
+            break;
+        }
+        body.push_str(if strip_tabs { cmp } else { line });
+        body.push('\n');
+    }
+    // Only blank space may follow the delimiter line.
+    if lines.any(|l| !l.trim().is_empty()) {
+        return None;
+    }
+    if !quoted && body.contains(['$', '`', '\\']) {
+        return None;
+    }
+    Some(body)
+}
+
+/// `echo [-neE…] ARGS` or `printf FORMAT`, all literal.
+fn echo_value(inner: &str) -> Option<String> {
+    let segs = split_segments(inner);
+    let [seg] = segs.as_slice() else {
+        return None;
+    };
+    if seg
+        .iter()
+        .any(|w| w.has_substitution || w.glob || w.redirect || w.brace_overflow)
+    {
+        return None;
+    }
+    let (cmd, args) = seg.split_first()?;
+    match cmd.text.as_str() {
+        "echo" => {
+            let args: Vec<&str> = args
+                .iter()
+                .map(|w| w.text.as_str())
+                .skip_while(|a| {
+                    a.len() > 1
+                        && a.starts_with('-')
+                        && a[1..].bytes().all(|b| matches!(b, b'n' | b'e' | b'E'))
+                })
+                .collect();
+            Some(args.join(" "))
+        }
+        "printf" => match args {
+            [format] if !format.text.contains(['%', '\\']) => Some(format.text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// If `text` (an already-resolved `Word`'s text, or a slice of one) is
@@ -1666,5 +1797,46 @@ mod tests {
         assert_eq!(words("[[ a < b ]]"), vec!["[[", "a", "<", "b", "]]"]);
         assert!(!split_segments("[[ a < b ]]")[0][2].redirect);
         assert!(split_segments("(( $(id) ))")[0][0].has_substitution);
+    }
+
+    #[test]
+    fn literal_substitution_values() {
+        let v = |t: &str| literal_substitution(t);
+        assert_eq!(
+            v("$(cat <<'EOF'\nfix: x\n\nbody\nEOF\n)").as_deref(),
+            Some("fix: x\n\nbody")
+        );
+        assert_eq!(v("$(cat <<\"EOF\"\na $b\nEOF\n)").as_deref(), Some("a $b"));
+        assert_eq!(v("$(cat <<-EOF\n\tx\n\tEOF\n)").as_deref(), Some("x"));
+        assert_eq!(v("$(cat <<EOF\nplain\nEOF\n)").as_deref(), Some("plain"));
+        assert_eq!(v("$(echo -n a b)").as_deref(), Some("a b"));
+        assert_eq!(v("$(printf 'fix: x')").as_deref(), Some("fix: x"));
+        for t in [
+            "$(cat <<EOF\n$(id)\nEOF\n)",
+            "$(cat <<'EOF' .env\nx\nEOF\n)",
+            "$(cat <<'EOF'\nx\nEOF\nrm -rf /\n)",
+            "$(cat .env)",
+            "$(echo a; rm -rf /)",
+            "$(echo $(id))",
+            "$(echo *)",
+            "$(printf '%s' x)",
+            "pre$(echo x)",
+        ] {
+            assert_eq!(v(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn many_double_parens_stay_fast() {
+        let t = std::time::Instant::now();
+        let _ = split_segments(&"((".repeat(20_000));
+        let _ = split_segments(&format!("{}x{}", "((".repeat(5_000), "))".repeat(5_000)));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(words("((i++))"), vec!["((i++))"]);
+        assert_eq!(segs("((cat a) )"), vec![vec!["cat", "a"]]);
     }
 }

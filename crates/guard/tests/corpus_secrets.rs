@@ -573,6 +573,9 @@ fn round_three_shapes() {
         "((cat .env); true)",
         "((cd src && cat .env) | head)",
         "((cat .env) )",
+        // Here-docs inside the subshells keep their consumer.
+        "((bash <<EOF) )\ncat .env\nEOF",
+        "((cat <<EOF) )\n$(cat .env)\nEOF",
         // `<(` is a process substitution, never arithmetic.
         "cat <((cat .env))",
         "diff <((cat .env) ) x",
@@ -590,11 +593,37 @@ fn round_three_shapes() {
             "[[ -f .env ]] && echo yes",
             "FOO=1 [[ a < b ]] && echo ok",
             "! [[ a < b ]]",
+            "((cat <<EOF) )\nrm -rf .claude\nEOF",
+            "((cat <<'EOF') )\n$(cat .env)\nEOF",
             "time [[ a < b ]]",
             "[[ -f x ]] && cat README.md",
             "(( i++ ))",
             "((i++)); echo $i",
             "while read l; do echo $l; done <<EOF\na\nEOF",
+        ],
+    );
+}
+
+#[test]
+fn substitution_values_that_are_plain_data() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "git commit -m \"$(cat .env)\"",
+        "cat \"$(cat <<'EOF'\n.env\nEOF\n)\"",
+        "cat $(echo .env)",
+    ] {
+        deny_pack(&e, cmd);
+    }
+    assert_allows(
+        &e,
+        &[
+            // Claude Code's commit shape.
+            "git commit -m \"$(cat <<'EOF'\nfix(guard): keep commits working\n\nBody line with .env and rm -rf mentioned.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\n  indented\n\tEOF\nEOF\n)\"",
+            "git commit -m \"$(echo fix: x)\"",
+            "git commit -m \"$(printf 'fix: x')\"",
+            "git tag -a v1 -m \"$(cat <<'EOF'\nrelease\nEOF\n)\"",
         ],
     );
 }
