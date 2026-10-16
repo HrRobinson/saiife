@@ -12,7 +12,11 @@ pub const SETTINGS_REL: &str = ".claude/settings.json";
 
 /// Shell, read and write tools (spec §5.2). Only `[A-Za-z0-9_|]`, so Claude
 /// Code reads it as an exact list of tool names.
-pub const MATCHER: &str = "Bash|Read|Grep|Write|Edit|MultiEdit|NotebookEdit";
+pub const MATCHER: &str = "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit";
+
+/// The matcher plan 2's saiife wrote. A project hooked by it is upgraded by
+/// running `saiife init` again (`status` reports the entry as out of date).
+pub const MATCHER_V1: &str = "Bash|Read|Grep|Write|Edit|MultiEdit|NotebookEdit";
 
 /// Seconds. No `onFailure: "block"`: v1 developer mode fails open (spec §1.2
 /// rule 4).
@@ -314,6 +318,51 @@ mod tests {
         );
         assert_eq!(remove(p.path(), true).unwrap(), Change::Deleted);
         assert!(!p.path().join(SETTINGS_REL).exists());
+    }
+
+    #[test]
+    fn matcher_covers_read_list_and_write_tools() {
+        let tools: Vec<&str> = MATCHER.split('|').collect();
+        for t in [
+            "Bash",
+            "Read",
+            "Grep",
+            "Glob",
+            "LS",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+        ] {
+            assert!(tools.contains(&t), "{t}");
+        }
+    }
+
+    /// The fingerprint `status` compares against the recorded one. Pinned so
+    /// a change of the entry is a deliberate act (and an upgrade for users).
+    #[test]
+    fn expected_entry_fingerprint_is_pinned() {
+        assert_eq!(
+            expected_entry(),
+            "96fb881e404f7fed07a75eff98c42bf1c31553d8678c5e36c7216caadc5e2dca"
+        );
+    }
+
+    /// An install from plan 2 (old matcher) is upgraded in place.
+    #[test]
+    fn an_older_entry_is_upgraded_by_install() {
+        let p = project_with(USER_SETTINGS);
+        install(p.path()).unwrap();
+        let old = read(p.path()).replace(MATCHER, MATCHER_V1);
+        fs::write(p.path().join(SETTINGS_REL), &old).unwrap();
+        assert_eq!(
+            entries(p.path()).unwrap(),
+            vec!["78ff3176c0d50b70275b537d4f8e7c52ebba6e0ce22f68c03d01d52fd86c5d76".to_string()]
+        );
+        assert_ne!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(install(p.path()).unwrap(), Change::Updated);
+        assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert!(read(p.path()).contains(MATCHER));
     }
 
     #[test]

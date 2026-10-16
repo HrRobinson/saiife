@@ -341,6 +341,15 @@ command = "docs-mcp"
         fs::read_to_string(p.join(CONFIG_REL)).unwrap()
     }
 
+    /// Spec §5.2: shell and file edits (`apply_patch`, which Codex's
+    /// `Edit`/`Write` aliases also match). The matcher is an anchored regex.
+    #[test]
+    fn matcher_covers_shell_and_apply_patch() {
+        let list = MATCHER.trim_start_matches("^(").trim_end_matches(")$");
+        let tools: Vec<&str> = list.split('|').collect();
+        assert_eq!(tools, ["Bash", "apply_patch"]);
+    }
+
     #[test]
     fn install_appends_our_group_and_keeps_comments() {
         let p = project_with(USER_CONFIG);
