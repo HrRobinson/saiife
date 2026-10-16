@@ -85,3 +85,23 @@ fn allows_ordinary_filesystem_commands() {
         );
     }
 }
+
+#[test]
+fn leading_redirections_and_assignments_are_still_judged() {
+    let e = engine();
+    for cmd in [
+        ">/dev/sda cat x",
+        ">/dev/sda",
+        "echo x >/dev/sda",
+        "2>&1 >/dev/sda echo x",
+        "A+=1 rm -rf /",
+        "a[0]=1 rm -rf /",
+        "a[i+1]+=x rm -rf /",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.filesystem", "{cmd}");
+    }
+    // A quoted word is never an assignment: this runs a command named
+    // `FOO=1`, not `rm`.
+    assert!(!e.evaluate(r#""FOO=1" rm -rf /"#).is_deny());
+    assert!(!e.evaluate(r#"FOO"=1" rm -rf /"#).is_deny());
+}

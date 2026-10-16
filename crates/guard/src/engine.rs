@@ -453,13 +453,17 @@ impl Engine {
             // Leading assignments and redirections (`LANG=C sort f`,
             // `2>/dev/null cat f`) are not the command either.
             let effective = effective_command(effective);
+            // The peeled-off redirections stay visible to the regex rules
+            // (`>/dev/sda cat x` is judged like `cat x > /dev/sda`).
+            let peeled = peeled_redirections(&seg[..seg.len() - effective.len()]);
             let argv = build_argv(effective);
             if argv.is_empty() || argv[0].is_empty() {
                 let segment_line = segment_line(&seg);
-                // A bare wrapper (`env`, `sudo -l`): only whole-segment
-                // rules and redirections can apply.
+                // A bare wrapper (`env`, `sudo -l`) or bare redirection
+                // (`>/dev/sda`): only whole-segment rules and the
+                // redirections can apply.
                 if self.combined.might_match(&segment_line) {
-                    match self.judge("", &segment_line, start) {
+                    match self.judge(&peeled, &segment_line, start) {
                         JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                         JudgeOutcome::TimedOut => {
                             return Decision::Allow {
@@ -504,7 +508,11 @@ impl Engine {
                 };
             }
 
-            let matching_line = argv.join(" ");
+            let mut matching_line = argv.join(" ");
+            if !peeled.is_empty() {
+                matching_line.push(' ');
+                matching_line.push_str(&peeled);
+            }
             // The whole segment's line differs only when a wrapper was
             // peeled off or the segment starts with an assignment.
             let whole = (effective.len() != seg.len() || is_env_assignment(&seg[0].text))
@@ -837,6 +845,25 @@ fn note(trace: AllowTrace, allow_trace: &mut Option<AllowTrace>, unjudged: &mut 
         }
         t => *allow_trace = Some(t),
     }
+}
+
+/// The redirections (operator and target) among the words peeled off in
+/// front of a command, as they appear on a matching line.
+fn peeled_redirections(prefix: &[Word]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (i, w) in prefix.iter().enumerate() {
+        if w.redirect {
+            out.push(w.text.clone());
+            if let Some(t) = prefix.get(i + 1) {
+                out.extend(
+                    build_argv(&[Word::default(), t.clone()])
+                        .into_iter()
+                        .skip(1),
+                );
+            }
+        }
+    }
+    out.join(" ")
 }
 
 /// The whole segment's matching line for `whole_segment` rules: like
@@ -1457,6 +1484,9 @@ reason = "other pack says no"
             "2>&1 FOO=1 sudo cat .env",
             "FOO=1 sudo BAR=2 cat .env",
             ">.claude/settings.json echo x",
+            "a[0]=1 cat .env",
+            "A+=1 cat .env",
+            "X[k]+=v cat .env",
         ] {
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }
@@ -1464,6 +1494,8 @@ reason = "other pack says no"
             "LANG=C sort notes.txt",
             "RUST_LOG=debug cargo test",
             "2>/dev/null cat README.md",
+            r#""FOO=1" cat .env"#,
+            "'A=1' cat .env",
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }

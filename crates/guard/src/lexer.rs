@@ -87,6 +87,10 @@ pub struct Word {
     /// Contains an unquoted glob character (`*`, `?`, `[`), so the shell
     /// would expand it against the filesystem.
     pub glob: bool,
+    /// A shell assignment word as bash sees it: an unquoted `NAME=`,
+    /// `NAME+=`, `NAME[…]=` or `NAME[…]+=` prefix. In front of a command
+    /// it sets a variable; it is not the command.
+    pub assignment: bool,
 }
 
 /// A single top-level command segment: the argv-order sequence of words
@@ -183,6 +187,9 @@ fn lex(input: &str) -> Vec<LexTok> {
     // word `2`, not descriptor 2), or an unquoted glob character.
     let mut word_quoted = false;
     let mut word_glob = false;
+    // The first unquoted `=` decides whether the word is an assignment.
+    let mut word_eq_seen = false;
+    let mut word_assignment = false;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -193,11 +200,14 @@ fn lex(input: &str) -> Vec<LexTok> {
                     has_substitution: word_has_sub,
                     redirect: false,
                     glob: word_glob,
+                    assignment: word_assignment,
                 }));
                 in_word = false;
                 word_has_sub = false;
                 word_quoted = false;
                 word_glob = false;
+                word_eq_seen = false;
+                word_assignment = false;
             }
         };
     }
@@ -339,6 +349,13 @@ fn lex(input: &str) -> Vec<LexTok> {
                 word_text.push_str(&scan_backtick(&mut chars));
                 word_text.push('`');
             }
+            '=' if !word_eq_seen => {
+                word_eq_seen = true;
+                word_assignment =
+                    in_word && !word_quoted && !word_has_sub && is_assignment_name(&word_text);
+                in_word = true;
+                word_text.push('=');
+            }
             other => {
                 in_word = true;
                 word_glob |= matches!(other, '*' | '?' | '[');
@@ -356,7 +373,23 @@ fn redirect_tok(text: String) -> LexTok {
         has_substitution: false,
         redirect: true,
         glob: false,
+        assignment: false,
     })
+}
+
+/// `NAME`, `NAME+`, `NAME[…]` or `NAME[…]+`: what may stand before the
+/// `=` of an assignment word.
+fn is_assignment_name(s: &str) -> bool {
+    let s = s.strip_suffix('+').unwrap_or(s);
+    let name = match s.find('[') {
+        Some(i) if s.ends_with(']') => &s[..i],
+        Some(_) => return false,
+        None => s,
+    };
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The rest of a redirection operator after its first `<`/`>`: `>>`,
@@ -1220,5 +1253,24 @@ mod tests {
             vec![false, false, false, false]
         );
         assert_eq!(g("cat a"), vec![false, false]);
+    }
+
+    #[test]
+    fn assignment_words_follow_bash() {
+        let a = |cmd: &str| -> Vec<bool> {
+            split_segments(cmd)
+                .into_iter()
+                .flatten()
+                .map(|w| w.assignment)
+                .collect()
+        };
+        assert_eq!(
+            a(r#"A=1 B+=2 c[0]=3 d[i+1]+=4 E="x y" cmd F=5"#),
+            vec![true, true, true, true, true, false, true]
+        );
+        assert_eq!(
+            a(r#""A=1" 'B=2' C"=3" \D=4 1A=5 =6 a-b=7 $(x)=8"#),
+            vec![false, false, false, false, false, false, false, false]
+        );
     }
 }

@@ -198,7 +198,7 @@ pub fn effective_command(seg: &[Word]) -> &[Word] {
         while let Some(w) = rest.first() {
             if w.redirect {
                 rest = &rest[rest.len().min(2)..];
-            } else if is_env_assignment(&w.text) {
+            } else if w.assignment {
                 rest = &rest[1..];
             } else {
                 break;
