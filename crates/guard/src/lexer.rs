@@ -75,10 +75,18 @@
 /// One resolved argv token (a word): the fully concatenated, quote/escape
 /// resolved text, plus whether it contains an opaque command-substitution
 /// region (`$(...)` or `` `...` ``) that the guard could not look inside.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Word {
     pub text: String,
     pub has_substitution: bool,
+    /// An unquoted redirection operator (`>`, `2>>`, `&>`, `<`, `<<<`,
+    /// `2>&`, …), split off even when written without spaces
+    /// (`echo x>f`); its target is the next word. A quoted `">"` is a
+    /// plain word.
+    pub redirect: bool,
+    /// Contains an unquoted glob character (`*`, `?`, `[`), so the shell
+    /// would expand it against the filesystem.
+    pub glob: bool,
 }
 
 /// A single top-level command segment: the argv-order sequence of words
@@ -171,6 +179,10 @@ fn lex(input: &str) -> Vec<LexTok> {
     let mut word_text = String::new();
     let mut word_has_sub = false;
     let mut in_word = false;
+    // The word so far has a quoted or escaped piece (so `"2">f` is the
+    // word `2`, not descriptor 2), or an unquoted glob character.
+    let mut word_quoted = false;
+    let mut word_glob = false;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -179,9 +191,13 @@ fn lex(input: &str) -> Vec<LexTok> {
                 toks.push(LexTok::Word(Word {
                     text: std::mem::take(&mut word_text),
                     has_substitution: word_has_sub,
+                    redirect: false,
+                    glob: word_glob,
                 }));
                 in_word = false;
                 word_has_sub = false;
+                word_quoted = false;
+                word_glob = false;
             }
         };
     }
@@ -192,6 +208,41 @@ fn lex(input: &str) -> Vec<LexTok> {
             '\n' => {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::Newline));
+            }
+            '&' if chars.peek() == Some(&'>') => {
+                // `&>f` / `&>>f`: stdout and stderr to a file.
+                flush_word!();
+                chars.next();
+                let mut op = String::from("&>");
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    op.push('>');
+                }
+                toks.push(redirect_tok(op));
+            }
+            '<' | '>' if chars.peek() == Some(&'(') => {
+                // Process substitution `<(cmd)` / `>(cmd)`: not a file; the
+                // `(` that follows opens its own segment.
+                flush_word!();
+            }
+            '<' | '>' => {
+                // A word of bare digits right before the operator is its
+                // descriptor (`2>f`); anything else ends the word (`x>f`).
+                let fd = in_word
+                    && !word_quoted
+                    && !word_has_sub
+                    && word_text.bytes().all(|b| b.is_ascii_digit());
+                let mut op = if fd {
+                    in_word = false;
+                    word_glob = false;
+                    std::mem::take(&mut word_text)
+                } else {
+                    flush_word!();
+                    String::new()
+                };
+                op.push(c);
+                scan_redirection(&mut chars, c, &mut op);
+                toks.push(redirect_tok(op));
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
@@ -235,14 +286,17 @@ fn lex(input: &str) -> Vec<LexTok> {
             }
             '\'' => {
                 in_word = true;
+                word_quoted = true;
                 scan_single_quoted(&mut chars, &mut word_text);
             }
             '"' => {
                 in_word = true;
+                word_quoted = true;
                 scan_double_quoted(&mut chars, &mut word_text, &mut word_has_sub);
             }
             '\\' => {
                 in_word = true;
+                word_quoted = true;
                 // Outside quotes, `\<char>` is a literal `<char>` — this is
                 // what keeps `\;` and `\&` from being read as operators. A
                 // trailing backslash with nothing after it is kept literal.
@@ -262,6 +316,7 @@ fn lex(input: &str) -> Vec<LexTok> {
             '$' if chars.peek() == Some(&'\'') => {
                 chars.next(); // consume the opening '\''
                 in_word = true;
+                word_quoted = true;
                 scan_ansi_c_quoted(&mut chars, &mut word_text);
             }
             '$' if chars.peek() == Some(&'{') => {
@@ -286,12 +341,42 @@ fn lex(input: &str) -> Vec<LexTok> {
             }
             other => {
                 in_word = true;
+                word_glob |= matches!(other, '*' | '?' | '[');
                 word_text.push(other);
             }
         }
     }
     flush_word!();
     toks
+}
+
+fn redirect_tok(text: String) -> LexTok {
+    LexTok::Word(Word {
+        text,
+        has_substitution: false,
+        redirect: true,
+        glob: false,
+    })
+}
+
+/// The rest of a redirection operator after its first `<`/`>`: `>>`,
+/// `>|`, `>&`, `<<`, `<<-`, `<<<`, `<>`, `<&`.
+fn scan_redirection(chars: &mut Chars, first: char, op: &mut String) {
+    let take = |chars: &mut Chars, c: char, op: &mut String| {
+        let hit = chars.peek() == Some(&c);
+        if hit {
+            chars.next();
+            op.push(c);
+        }
+        hit
+    };
+    if first == '>' {
+        let _ = take(chars, '>', op) || take(chars, '|', op) || take(chars, '&', op);
+    } else if take(chars, '<', op) {
+        let _ = take(chars, '<', op) || take(chars, '-', op);
+    } else {
+        let _ = take(chars, '>', op) || take(chars, '&', op);
+    }
 }
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
@@ -1047,5 +1132,93 @@ mod tests {
     #[test]
     fn dollar_single_quote_concatenates_adjacent_like_other_quotes() {
         assert_eq!(words(r"rm -rf $'/e'tc"), vec!["rm", "-rf", "/etc"]);
+    }
+
+    // ---- redirections -------------------------------------------------
+
+    fn flagged(cmd: &str) -> Vec<(String, bool)> {
+        split_segments(cmd)
+            .into_iter()
+            .flatten()
+            .map(|w| (w.text, w.redirect))
+            .collect()
+    }
+
+    #[test]
+    fn unspaced_redirections_are_their_own_tokens() {
+        assert_eq!(
+            words("echo x>.claude/settings.json"),
+            vec!["echo", "x", ">", ".claude/settings.json"]
+        );
+        assert_eq!(words("echo x>>f"), vec!["echo", "x", ">>", "f"]);
+        assert_eq!(words("cat .env>/tmp/x"), vec!["cat", ".env", ">", "/tmp/x"]);
+        assert_eq!(words("cat<.env"), vec!["cat", "<", ".env"]);
+        assert_eq!(words("cat<<<hi"), vec!["cat", "<<<", "hi"]);
+        assert_eq!(words("cat <<-EOF"), vec!["cat", "<<-", "EOF"]);
+        assert_eq!(words("make 2>err"), vec!["make", "2>", "err"]);
+        assert_eq!(words("make 2>&1"), vec!["make", "2>&", "1"]);
+        assert_eq!(words("make >&-"), vec!["make", ">&", "-"]);
+        assert_eq!(words("make &>log"), vec!["make", "&>", "log"]);
+        assert_eq!(words("make &>>log"), vec!["make", "&>>", "log"]);
+        assert_eq!(words("x 3<>f"), vec!["x", "3<>", "f"]);
+        assert_eq!(words("x >|f"), vec!["x", ">|", "f"]);
+        assert_eq!(words("x 0<&3"), vec!["x", "0<&", "3"]);
+        // Digits are a descriptor only when they are the whole word so far.
+        assert_eq!(words("echo a2>f"), vec!["echo", "a2", ">", "f"]);
+        assert_eq!(segs("a && b>f"), vec![vec!["a"], vec!["b", ">", "f"]]);
+        // `2>&1` is a redirection, not a background `&`.
+        assert_eq!(
+            segs("make 2>&1 | tee log"),
+            vec![vec!["make", "2>&", "1"], vec!["tee", "log"]]
+        );
+    }
+
+    #[test]
+    fn only_unquoted_redirections_are_flagged() {
+        let t = |s: &str, r: bool| (s.to_string(), r);
+        assert_eq!(
+            flagged(r#"grep ">" f"#),
+            vec![t("grep", false), t(">", false), t("f", false)]
+        );
+        assert_eq!(
+            flagged("echo x > f"),
+            vec![t("echo", false), t("x", false), t(">", true), t("f", false)]
+        );
+        assert_eq!(
+            flagged(r"echo \> f"),
+            vec![t("echo", false), t(">", false), t("f", false)]
+        );
+        // A quoted digit is not a descriptor number.
+        assert_eq!(
+            flagged(r#"echo "2">f"#),
+            vec![t("echo", false), t("2", false), t(">", true), t("f", false)]
+        );
+        assert_eq!(flagged("awk '$1>5' f")[1], t("$1>5", false));
+    }
+
+    #[test]
+    fn process_substitution_is_not_a_redirection() {
+        assert_eq!(
+            segs("diff <(a) b"),
+            vec![vec!["diff"], vec!["a"], vec!["b"]]
+        );
+        assert!(flagged("tee >(gzip)").iter().all(|(_, r)| !r));
+    }
+
+    #[test]
+    fn unquoted_glob_characters_are_flagged() {
+        let g = |cmd: &str| -> Vec<bool> {
+            split_segments(cmd)
+                .into_iter()
+                .flatten()
+                .map(|w| w.glob)
+                .collect()
+        };
+        assert_eq!(g("cat .env* .e?v .[e]nv"), vec![false, true, true, true]);
+        assert_eq!(
+            g(r#"cat ".env*" '.e?v' \*"#),
+            vec![false, false, false, false]
+        );
+        assert_eq!(g("cat a"), vec![false, false]);
     }
 }

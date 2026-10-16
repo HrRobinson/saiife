@@ -846,6 +846,16 @@ reason = "private key"
 glob = "$PROJECT/.locked/**"
 access = "write"
 reason = "locked"
+
+[[deny_path]]
+glob = "**/.claude/settings.json"
+access = "write"
+reason = "agent hook config"
+
+[[deny_path]]
+glob = "**/.saiife/**"
+access = "write"
+reason = "saiife config"
 "#;
 
     fn path_engine(vars: PathVars) -> Engine {
@@ -1014,6 +1024,33 @@ reason = "other pack says no"
         let e = shell_path_engine(&root);
         assert!(e.evaluate("cat notes.txt").is_deny());
         assert!(e.evaluate_path(Access::Read, "notes.txt").is_deny());
+    }
+
+    #[test]
+    fn unspaced_redirections_are_judged() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "echo x>.claude/settings.json",
+            "echo x>>.saiife/config.toml",
+            "cat .env>/tmp/x",
+            "cat<.env",
+            "python x.py<.env",
+            "echo x &>.claude/settings.json",
+            "echo x 2>.claude/settings.json",
+            "echo x >&.claude/settings.json",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            r#"grep ">" .claude/settings.json"#,
+            "cat .claude/settings.json",
+            "make 2>&1 | tee build.log",
+            "echo x >&2",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
     }
 
     const SEGMENT_PACK: &str = r#"

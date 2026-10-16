@@ -390,6 +390,7 @@ mod tests {
         Word {
             text: text.to_string(),
             has_substitution: false,
+            ..Default::default()
         }
     }
 

@@ -67,10 +67,10 @@ pub fn path_operands(
         .collect();
     let mut i = 1;
     while i < words.len() {
-        if let Some(takes_next) = words[i].and_then(redirection) {
+        if effective[i].redirect {
             words[i] = None;
-            if takes_next && i + 1 < words.len() {
-                words[i + 1] = None;
+            if let Some(next) = words.get_mut(i + 1) {
+                *next = None;
                 i += 1;
             }
         }
@@ -308,62 +308,52 @@ fn http_client(words: &[Option<&str>], out: &mut Vec<(String, Access)>) {
     }
 }
 
-/// `Some(takes_next)` if `t` is a redirection operator: `true` when its
-/// target is the next word (`>`, `2>`, `<<`), `false` when attached
-/// (`>f`, `2>&1`, `<<EOF`).
-fn redirection(t: &str) -> Option<bool> {
-    let body = t.trim_start_matches(|c: char| c.is_ascii_digit());
-    let body = body.strip_prefix('&').unwrap_or(body);
-    let op = body.trim_start_matches(['<', '>', '|', '-']);
-    if body.starts_with('<') || body.starts_with('>') {
-        Some(op.is_empty())
-    } else {
-        None
+/// What a redirection operator does with the word after it.
+enum Redirection {
+    Read,
+    Write,
+    ReadWrite,
+    /// `>&2` / `<&0` / `>&-` duplicate or close a descriptor; any other
+    /// target (`>&file`, `<&file`) is a path written / read.
+    Duplicate(Access),
+    /// Here-documents and here-strings (`<<`, `<<-`, `<<<`).
+    NotAPath,
+}
+
+/// The one parser for a lexed redirection operator (`2>>`, `&>`, `<`, …).
+fn redirection_kind(op: &str) -> Redirection {
+    match op.trim_start_matches(|c: char| c.is_ascii_digit()) {
+        "<" => Redirection::Read,
+        "<>" => Redirection::ReadWrite,
+        ">" | ">>" | ">|" | "&>" | "&>>" => Redirection::Write,
+        ">&" => Redirection::Duplicate(Access::Write),
+        "<&" => Redirection::Duplicate(Access::Read),
+        _ => Redirection::NotAPath,
     }
 }
 
-/// `> f`, `>> f`, `>| f`, `2> f`, `>f` (write) and `< f`, `<f` (read).
-/// Here-documents and here-strings (`<<`, `<<<`) and descriptor
-/// duplication (`2>&1`) are not paths.
+/// `> f`, `>> f`, `>| f`, `&> f`, `2> f`, `>&f` (write), `< f`, `<&f` (read),
+/// `<> f` (both). The lexer splits operators off their targets
+/// (`echo x>f` is `echo x > f`) and leaves a quoted `">"` a plain word.
 fn redirections(segment: &[Word], out: &mut Vec<(String, Access)>) {
-    let mut i = 0;
-    while i < segment.len() {
-        let w = &segment[i];
-        i += 1;
-        if w.has_substitution {
+    for (op, target) in segment.iter().zip(segment.iter().skip(1)) {
+        if !op.redirect || target.redirect || target.has_substitution {
             continue;
         }
-        let body = w.text.trim_start_matches(|c: char| c.is_ascii_digit());
-        let body = body.strip_prefix('&').unwrap_or(body);
-        if body.starts_with("<<") {
-            if matches!(body, "<<" | "<<-" | "<<<") {
-                i += 1; // the delimiter or string
+        let t = target.text.clone();
+        match redirection_kind(&op.text) {
+            Redirection::Read => out.push((t, Access::Read)),
+            Redirection::Write => out.push((t, Access::Write)),
+            Redirection::ReadWrite => {
+                out.push((t.clone(), Access::Read));
+                out.push((t, Access::Write));
             }
-            continue;
-        }
-        let (access, target) = if let Some(r) = body.strip_prefix(">>") {
-            (Access::Write, r)
-        } else if let Some(r) = body.strip_prefix(">|") {
-            (Access::Write, r)
-        } else if let Some(r) = body.strip_prefix('>') {
-            (Access::Write, r)
-        } else if let Some(r) = body.strip_prefix('<') {
-            (Access::Read, r)
-        } else {
-            continue;
-        };
-        let target = if target.is_empty() {
-            let next = segment.get(i);
-            i += 1;
-            match next {
-                Some(n) if !n.has_substitution => n.text.as_str(),
-                _ => continue,
+            Redirection::Duplicate(access) => {
+                if t != "-" && !t.bytes().all(|b| b.is_ascii_digit()) {
+                    out.push((t, access));
+                }
             }
-        } else {
-            target
-        };
-        if !target.is_empty() && !target.starts_with('&') {
-            out.push((target.to_string(), access));
+            Redirection::NotAPath => {}
         }
     }
 }
@@ -478,6 +468,31 @@ mod tests {
         assert_eq!(ops("cmd 1>>out"), vec![w("out")]);
         assert_eq!(ops("cat <<EOF"), vec![]);
         assert_eq!(ops("cat <<< hi"), vec![]);
+    }
+
+    #[test]
+    fn quoted_angle_brackets_are_not_redirections() {
+        assert_eq!(
+            ops(r#"grep ">" .claude/settings.json"#),
+            vec![r(".claude/settings.json")]
+        );
+        assert_eq!(ops("echo x>f"), vec![w("f")]);
+        assert_eq!(ops("cat<.env"), vec![r(".env")]);
+        assert_eq!(ops("echo x >&f"), vec![w("f")]);
+        assert_eq!(ops("echo x >&2 2>&-"), vec![]);
+        assert_eq!(ops("x 3<>f"), vec![r("f"), w("f")]);
+    }
+
+    #[test]
+    fn descriptor_duplication_only_for_digits_or_dash() {
+        assert_eq!(
+            ops("echo x >& .claude/settings.json"),
+            vec![w(".claude/settings.json")]
+        );
+        assert_eq!(ops("echo x &>f"), vec![w("f")]);
+        assert_eq!(ops("echo x 2>&1 >&2 <&0 >&-"), vec![]);
+        assert_eq!(ops("cat <&.env"), vec![r(".env")]);
+        assert_eq!(ops("cat 0<& .env"), vec![r(".env")]);
     }
 
     #[test]

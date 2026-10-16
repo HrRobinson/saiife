@@ -108,6 +108,7 @@ mod tests {
         Word {
             text: text.to_string(),
             has_substitution: text.contains("$(") || text.contains('`'),
+            ..Default::default()
         }
     }
 
