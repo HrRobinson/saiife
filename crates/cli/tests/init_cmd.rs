@@ -27,7 +27,9 @@ fn init_hooks_detected_agents_and_writes_the_config() {
     assert!(!env.root().join(".codex").exists(), "codex not on PATH");
     let cfg = env.read(".saiife/config.toml");
     assert!(
-        cfg.contains("packs = [\"core.filesystem\", \"core.git\"]"),
+        cfg.contains(
+            "packs = [\"core.filesystem\", \"core.git\", \"core.secrets\", \"core.self\"]"
+        ),
         "{cfg}"
     );
     assert!(cfg.contains("locked = false"), "{cfg}");

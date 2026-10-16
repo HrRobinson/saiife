@@ -38,6 +38,43 @@ fn untouched_project_passes() {
     assert!(text.contains("cannot stop a determined agent"), "{text}");
 }
 
+/// Upgrade path (plan 3): a hook written by plan 2's saiife (Claude matcher
+/// without Glob/LS) passes its own fingerprint but is out of date; status
+/// says so and `saiife init` brings it up to date.
+#[test]
+fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
+    use saiife_agents::claude::{MATCHER, MATCHER_V1};
+    let env = initialized(&["claude"]);
+    let old = env
+        .read(".claude/settings.json")
+        .replace(MATCHER, MATCHER_V1);
+    env.write(".claude/settings.json", &old);
+    let old_fp = saiife_agents::Agent::Claude.entries(env.root()).unwrap()[0].clone();
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["hooks"]["claude"]["sha256"] = old_fp.clone().into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains("was written by an older saiife and does not cover every tool"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Fix: run `saiife init` to update it"),
+        "{text}"
+    );
+
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    assert!(env.read(".claude/settings.json").contains(MATCHER));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+}
+
 #[test]
 fn not_initialized_fails() {
     let env = Env::new(&["claude"]);

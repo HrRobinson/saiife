@@ -7,7 +7,7 @@ fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     // core.filesystem is default-on, so the default profile suffices.
-    Engine::new(packs)
+    Engine::new(packs).with_budget(TEST_BUDGET)
 }
 
 fn deny_pack(e: &Engine, cmd: &str) -> String {
@@ -85,3 +85,50 @@ fn allows_ordinary_filesystem_commands() {
         );
     }
 }
+
+#[test]
+fn leading_redirections_and_assignments_are_still_judged() {
+    let e = engine();
+    for cmd in [
+        ">/dev/sda cat x",
+        ">/dev/sda",
+        "echo x >/dev/sda",
+        "2>&1 >/dev/sda echo x",
+        "A+=1 rm -rf /",
+        "a[0]=1 rm -rf /",
+        "a[i+1]+=x rm -rf /",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.filesystem", "{cmd}");
+    }
+    // A quoted word is never an assignment: this runs a command named
+    // `FOO=1`, not `rm`.
+    assert!(!e.evaluate(r#""FOO=1" rm -rf /"#).is_deny());
+    assert!(!e.evaluate(r#"FOO"=1" rm -rf /"#).is_deny());
+}
+
+#[test]
+fn heredoc_substitutions_are_judged() {
+    let e = engine();
+    assert_eq!(
+        deny_pack(&e, "cat <<EOF\n$(rm -rf /)\nEOF"),
+        "core.filesystem"
+    );
+    assert!(!e.evaluate("cat <<'EOF'\n$(rm -rf /)\nEOF").is_deny());
+}
+
+#[test]
+fn literal_substitution_values_are_judged() {
+    let e = engine();
+    for cmd in [
+        "rm -rf \"$(cat <<'EOF'\n/\nEOF\n)\"",
+        "rm -rf $(echo /)",
+        "rm -rf \"$(printf /)\"",
+        "rm -rf $(cat /tmp/list)",
+    ] {
+        deny_pack(&e, cmd);
+    }
+}
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

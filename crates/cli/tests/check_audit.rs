@@ -10,8 +10,11 @@ use std::process::{Command, Stdio};
 use saiife_audit::store::read_all;
 use saiife_audit::DecisionKind;
 
+/// `stdin` spells the fixture home `/home/u`; it is mapped to a real temp
+/// home (`common::FixtureHome`) that lives until `saiife` exits.
 fn check(audit_dir: &Path, args: &[&str], stdin: &str) -> i32 {
-    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let home = common::FixtureHome::new();
+    let stdin = home.real(stdin);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, audit_dir);
     let mut child = cmd
@@ -60,7 +63,7 @@ fn allow_is_audited_with_context() {
     assert_eq!(r.agent, "claude");
     assert_eq!(r.tool, "Bash");
     assert_eq!(r.session.as_deref(), Some("sess-1"));
-    assert_eq!(r.project, "/home/u/app");
+    assert!(r.project.ends_with("/u/app"), "{}", r.project);
     assert_eq!(r.input, "ls -la");
     assert_eq!(r.saiife, env!("CARGO_PKG_VERSION"));
 }
@@ -138,7 +141,7 @@ fn unwritable_audit_dir_keeps_verdict() {
 #[test]
 fn concurrent_checks_write_whole_lines() {
     let dir = tempfile::tempdir().unwrap();
-    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let home = common::FixtureHome::new();
     let mut sandboxes = Vec::new();
     let children: Vec<_> = (0..20)
         .map(|i| {
@@ -154,7 +157,10 @@ fn concurrent_checks_write_whole_lines() {
             c.stdin
                 .take()
                 .unwrap()
-                .write_all(payload(&format!("echo {i} {}", "🦀".repeat(20_000))).as_bytes())
+                .write_all(
+                    home.real(&payload(&format!("echo {i} {}", "🦀".repeat(20_000))))
+                        .as_bytes(),
+                )
                 .unwrap();
             c
         })
@@ -191,7 +197,7 @@ fn fifo_at_month_path_does_not_block_the_verdict() {
             assert!(Command::new("mkfifo").arg(&p).status().unwrap().success());
         }
     }
-    common::assert_no_host_config(Path::new(common::FIXTURE_CWD));
+    let home = common::FixtureHome::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
     let _sandbox = common::hermetic(&mut cmd, dir.path());
     let mut child = cmd
@@ -205,7 +211,7 @@ fn fifo_at_month_path_does_not_block_the_verdict() {
         .stdin
         .take()
         .unwrap()
-        .write_all(payload("rm -rf /").as_bytes())
+        .write_all(home.real(&payload("rm -rf /")).as_bytes())
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

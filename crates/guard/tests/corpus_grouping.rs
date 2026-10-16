@@ -16,7 +16,7 @@ use saiifeguard::profile::select_active;
 fn default_engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &[]))
+    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
 }
 
 #[test]
@@ -135,3 +135,7 @@ fn full_prior_corpus_spread_still_denies() {
         );
     }
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

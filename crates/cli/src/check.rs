@@ -7,29 +7,47 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
+use saiifeguard::canon::{expand_glob_partial, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
-    classify, context_from_hook_json_bounded, HookContext, PayloadError, ToolCall,
+    classify, context_from_hook_json_bounded, search_globs, HookContext, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
 use saiifeguard::profile::select_active;
 use saiifeguard::Pack;
 
+use crate::paths::path_vars;
 use crate::project::project_packs;
 use crate::warn;
 
-/// Payloads up to this size are still parsed. File tools (a `Write` of a big
-/// file) are handled normally; a shell command above `MAX_PAYLOAD_BYTES` is
-/// not judged but its command goes into the audit record. Bounded so parsing
-/// stays cheap.
-const PARSE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
+/// Memory-safety cap on what is read from stdin. Parsing skips the content
+/// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
+/// file calls are judged at any size up to this cap; a shell command above
+/// `MAX_PAYLOAD_BYTES` is not judged but its command goes into the audit
+/// record. Above this cap nothing is parsed: a recorded fail-open.
+const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// `packs`: every built-in pack; `cli_packs`: `--pack` ids. The project's
 /// own packs are added from the `.saiife/config.toml` at or above the
 /// payload's `cwd`.
 pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
+    let mut stdin = std::io::stdin().lock();
+    let read = (&mut stdin)
+        .take(PARSE_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut buf);
+    if read.is_ok() && buf.len() > PARSE_MAX_BYTES {
+        // Drain the rest so the agent gets no EPIPE.
+        let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+        let audit = Audit::new(agent, HookContext::default());
+        let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
+        warn(&format!("{reason}; failing open (allow)"));
+        audit.write("", DecisionKind::ErrorAllowed, None, Some(&reason));
+        return allow();
+    }
+    drop(stdin);
+    if read.is_err() {
         let audit = Audit::new(agent, HookContext::default());
         warn("could not read hook payload; failing open (allow)");
         audit.write(
@@ -42,22 +60,65 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
     }
     let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
     match classify(&buf, PARSE_MAX_BYTES) {
-        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => {
-            fail_open(&audit, &command, &PayloadError::TooLarge)
-        }
+        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => fail_open(
+            &audit,
+            &command,
+            &PayloadError::TooLarge {
+                limit: MAX_PAYLOAD_BYTES,
+            },
+        ),
         Ok(ToolCall::Shell { command }) => {
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config or building the engine fails open too.
             let cwd = audit.ctx.cwd.clone();
             decide(&audit, &command, hook_exit, |c| {
-                engine_for(packs, cli_packs, cwd.as_deref()).evaluate(c)
+                engine_for(packs, cli_packs, cwd.as_deref()).0.evaluate(c)
             })
         }
-        Ok(ToolCall::File { paths, .. }) => {
-            // Path rules arrive in plan 3; until then file tools are
-            // recorded, never judged.
-            audit.write(&paths.join("\n"), DecisionKind::Allow, None, None);
-            allow()
+        Ok(ToolCall::File {
+            tool,
+            mut paths,
+            write,
+        }) => {
+            if paths.is_empty() && !write {
+                // A search or list tool with neither `path` nor `cwd`
+                // reads the directory the hook runs in.
+                if let Ok(d) = std::env::current_dir() {
+                    paths.push(d.display().to_string());
+                }
+            }
+            if paths.is_empty() {
+                // A write (an apply_patch without file headers, an Edit
+                // without a path): allowed, but never recorded as a judged
+                // allow.
+                audit.write(
+                    "",
+                    DecisionKind::ErrorAllowed,
+                    None,
+                    Some("no path to judge"),
+                );
+                return allow();
+            }
+            let cwd = audit.ctx.cwd.clone();
+            let access = if write { Access::Write } else { Access::Read };
+            // Only search tools filter by `glob`/`include`, and only
+            // `read_many_files` names its files by pattern.
+            let filters = search_globs(&buf, PARSE_MAX_BYTES);
+            let expand_paths = tool == "read_many_files";
+            decide(&audit, &paths.join("\n"), hook_exit, |_| {
+                let (engine, vars) = engine_for(packs, cli_packs, cwd.as_deref());
+                let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
+                let d = judge_paths(&engine, access, &targets);
+                // A deny stays; so does a latency fail-open (it ranks above).
+                if overflow && !d.is_deny() && rank(&d) < 3 {
+                    return Decision::Allow {
+                        trace: AllowTrace::Unjudgeable {
+                            reason: "glob too large to judge".into(),
+                        },
+                    };
+                }
+                d
+            })
         }
         Ok(ToolCall::Other { .. }) => {
             audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
@@ -104,8 +165,10 @@ fn agent_from_args(args: &[String]) -> Option<&str> {
 }
 
 /// The engine for this call: default-on packs, `--pack` ids, and the packs
-/// of the project that `cwd` (or this process's directory) belongs to.
-fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engine {
+/// of the project that `cwd` (or this process's directory) belongs to,
+/// with path rules bound to that directory and this machine's saiife dirs
+/// (the bindings are returned too, for expanding globs).
+fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> (Engine, PathVars) {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
@@ -116,7 +179,92 @@ fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engi
     }
     let mut enabled = cli_packs.to_vec();
     enabled.extend(project.enabled);
-    Engine::new(select_active(packs, &enabled))
+    let vars = path_vars(Some(&start), project.root.as_deref());
+    let engine = Engine::new(select_active(packs, &enabled)).with_paths(vars.clone());
+    (engine, vars)
+}
+
+/// What a file call reads or writes: its paths, with the patterns of
+/// `read_many_files` (`expand_paths`) expanded, and every file a search
+/// tool's `filters` select under each of its paths (ripgrep semantics: a
+/// filter without `/` matches at any depth, one with `/` is relative to the
+/// root). A pattern that matches nothing is judged as spelled (the shell
+/// would pass it through). When a pattern is too large to expand, the
+/// matches found before the limit are judged along with the pattern as
+/// spelled, and the flag is set.
+fn expand_targets(
+    vars: &PathVars,
+    paths: &[String],
+    filters: &[String],
+    expand_paths: bool,
+) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut overflow = false;
+    let mut add = |word: &str, out: &mut Vec<String>| {
+        let (found, over) = expand_glob_partial(word, None, vars);
+        if over {
+            overflow = true;
+        }
+        if found.is_empty() || over {
+            out.push(word.to_string());
+        }
+        out.extend(found.iter().map(|p| p.display().to_string()));
+    };
+    for p in paths {
+        if expand_paths {
+            add(p, &mut out);
+        } else {
+            out.push(p.clone());
+        }
+    }
+    for p in paths {
+        for f in filters {
+            let root = p.trim_end_matches('/');
+            let word = if f.contains('/') {
+                format!("{root}/{f}")
+            } else {
+                format!("{root}/**/{f}")
+            };
+            add(&word, &mut out);
+        }
+    }
+    (out, overflow)
+}
+
+/// How much a file-call result matters when several paths are judged:
+/// a latency fail-open, an unjudgeable path, a carve-out, a plain allow.
+fn rank(d: &Decision) -> u8 {
+    match d {
+        Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        } => 3,
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { .. },
+        } => 2,
+        Decision::Allow {
+            trace: AllowTrace::AllowRule { .. },
+        } => 1,
+        _ => 0,
+    }
+}
+
+/// Judge every path of one file tool call: any deny denies the call.
+/// Otherwise the call is a fail-open if any path ran out of budget or could
+/// not be resolved, else an allow (by a carve-out, if one applied).
+fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
+    let mut result = Decision::Allow {
+        trace: AllowTrace::NoMatch,
+    };
+    for p in paths {
+        let d = engine.evaluate_path(access, p);
+        if d.is_deny() {
+            return d;
+        }
+        if rank(&d) > rank(&result) {
+            result = d;
+        }
+    }
+    result
 }
 
 /// The payload could not be judged: allow, and record why.
@@ -193,6 +341,9 @@ fn decide(
             None,
             Some("guard exceeded its latency budget"),
         ),
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { reason },
+        } => audit.write(command, DecisionKind::ErrorAllowed, None, Some(reason)),
     }
 
     match decision {

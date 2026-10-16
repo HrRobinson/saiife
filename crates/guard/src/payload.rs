@@ -17,7 +17,8 @@
 //! single-quoted outer argument containing a further-quoted inner command)
 //! is still caught once the inner string is lexed on its own.
 
-use serde_json::Value;
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Deserializer};
 
 /// Hard cap on hook-payload size. Anything larger is refused (fail open) rather
 /// than parsed — a guard must not become a memory amplifier.
@@ -25,12 +26,188 @@ pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PayloadError {
-    #[error("payload exceeds {MAX_PAYLOAD_BYTES} bytes")]
-    TooLarge,
+    #[error("payload exceeds {limit} bytes")]
+    TooLarge { limit: usize },
     #[error("payload is not valid JSON: {0}")]
     Json(String),
     #[error("no command found in hook payload")]
     NoCommand,
+    /// A file tool's `tool_input` is present but not a usable object.
+    #[error("malformed tool_input")]
+    MalformedToolInput,
+}
+
+/// A string field of the wrong type is absent, not an error.
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum L {
+        S(String),
+        Other(IgnoredAny),
+    }
+    Ok(match L::deserialize(d)? {
+        L::S(s) => Some(s),
+        L::Other(_) => None,
+    })
+}
+
+/// A list of strings; anything else is absent.
+fn lenient_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum L {
+        List(Vec<String>),
+        Other(IgnoredAny),
+    }
+    Ok(match L::deserialize(d)? {
+        L::List(v) => Some(v),
+        L::Other(_) => None,
+    })
+}
+
+/// An object field as found in the payload.
+#[derive(Debug, Default)]
+enum Field<T> {
+    /// Missing or `null`.
+    #[default]
+    Absent,
+    Obj(T),
+    /// Present but not a usable object (another type, duplicate keys).
+    Malformed,
+}
+
+impl<T> Field<T> {
+    fn as_obj(&self) -> Option<&T> {
+        match self {
+            Field::Obj(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// An object of the wrong type does not fail the whole payload: it is kept
+/// as `Malformed`, so a file tool can record it instead of judging nothing.
+fn lenient_object<'de, D, T>(d: D) -> Result<Field<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum L<T> {
+        // Before `Obj`: serde would also build a struct from a list.
+        #[allow(dead_code)] // matched for its shape only
+        List(Vec<IgnoredAny>),
+        Obj(T),
+        Null(()),
+        Other(IgnoredAny),
+    }
+    Ok(match L::<T>::deserialize(d)? {
+        L::Obj(t) => Field::Obj(t),
+        L::Null(()) => Field::Absent,
+        L::List(_) | L::Other(_) => Field::Malformed,
+    })
+}
+
+/// `include` is a string for Gemini `grep_search` and a list for
+/// `read_many_files`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Include {
+    One(String),
+    Many(Vec<String>),
+    Other(IgnoredAny),
+}
+
+impl Default for Include {
+    fn default() -> Self {
+        Include::Other(IgnoredAny)
+    }
+}
+
+/// The parts of `tool_input` the guard reads. Everything else (a `Write`'s
+/// `content`, an `Edit`'s `new_string`, `edits`, ...) is ignored, so the
+/// result does not depend on it; serde's untagged matching in
+/// `lenient_object` still buffers the object once while parsing.
+#[derive(Debug, Default, Deserialize)]
+struct ToolInput {
+    #[serde(default, deserialize_with = "lenient_string")]
+    command: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    input: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    file_path: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    notebook_path: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    path: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    dir_path: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    glob: Option<String>,
+    #[serde(default)]
+    include: Include,
+    #[serde(default, deserialize_with = "lenient_list")]
+    paths: Option<Vec<String>>,
+}
+
+/// The parts of a hook payload the guard reads.
+#[derive(Debug, Default, Deserialize)]
+struct Envelope {
+    #[serde(default, deserialize_with = "lenient_string")]
+    tool_name: Option<String>,
+    #[serde(default, rename = "toolName", deserialize_with = "lenient_string")]
+    tool_name_camel: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    session_id: Option<String>,
+    #[serde(default, rename = "sessionId", deserialize_with = "lenient_string")]
+    session_id_camel: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    command: Option<String>,
+    #[serde(default, deserialize_with = "lenient_object")]
+    tool_input: Field<ToolInput>,
+    #[serde(default, rename = "toolInput", deserialize_with = "lenient_object")]
+    tool_input_camel: Field<ToolInput>,
+    #[serde(default, deserialize_with = "lenient_object")]
+    input: Field<ToolInput>,
+    #[serde(default, deserialize_with = "lenient_object")]
+    params: Field<ToolInput>,
+}
+
+fn envelope(input: &str, max_bytes: usize) -> Result<Envelope, PayloadError> {
+    if input.len() > max_bytes {
+        return Err(PayloadError::TooLarge { limit: max_bytes });
+    }
+    serde_json::from_str(input).map_err(|e| PayloadError::Json(e.to_string()))
+}
+
+impl Envelope {
+    fn tool(&self) -> Option<&str> {
+        [&self.tool_name, &self.tool_name_camel]
+            .into_iter()
+            .find_map(|t| t.as_deref())
+            .filter(|t| !t.is_empty())
+    }
+
+    fn command(&self) -> Result<String, PayloadError> {
+        let containers = [
+            &self.tool_input,
+            &self.tool_input_camel,
+            &self.input,
+            &self.params,
+        ];
+        for c in containers.into_iter().filter_map(Field::as_obj) {
+            if let Some(cmd) = c.command.as_deref().filter(|c| !c.trim().is_empty()) {
+                return Ok(cmd.to_string());
+            }
+        }
+        match self.command.as_deref().filter(|c| !c.trim().is_empty()) {
+            Some(cmd) => Ok(cmd.to_string()),
+            None => Err(PayloadError::NoCommand),
+        }
+    }
 }
 
 /// Extract the command string from a PreToolUse-shaped hook payload.
@@ -39,28 +216,7 @@ pub enum PayloadError {
 /// `tool_input`/`toolInput`/`input`/`params`, then falls back to a top-level
 /// `command`. Anything it cannot find yields `NoCommand` (caller fails open).
 pub fn command_from_hook_json(input: &str, max_bytes: usize) -> Result<String, PayloadError> {
-    if input.len() > max_bytes {
-        return Err(PayloadError::TooLarge);
-    }
-    let v: Value = serde_json::from_str(input).map_err(|e| PayloadError::Json(e.to_string()))?;
-
-    for container in ["tool_input", "toolInput", "input", "params"] {
-        if let Some(cmd) = v
-            .get(container)
-            .and_then(|c| c.get("command"))
-            .and_then(Value::as_str)
-        {
-            if !cmd.trim().is_empty() {
-                return Ok(cmd.to_string());
-            }
-        }
-    }
-    if let Some(cmd) = v.get("command").and_then(Value::as_str) {
-        if !cmd.trim().is_empty() {
-            return Ok(cmd.to_string());
-        }
-    }
-    Err(PayloadError::NoCommand)
+    envelope(input, max_bytes)?.command()
 }
 
 /// What a hook call asks to do, by kind of tool. Shell commands go to the
@@ -88,6 +244,8 @@ const SHELL_TOOLS: &[&str] = &["Bash", "run_shell_command"];
 const READ_TOOLS: &[&str] = &[
     "Read",
     "Grep",
+    "Glob",
+    "LS",
     "read_file",
     "read_many_files",
     "list_directory",
@@ -121,36 +279,34 @@ const WRITE_TOOLS: &[&str] = &[
 /// Errors (oversize, not JSON, shell call without a command) make the caller
 /// fail open.
 pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError> {
-    if input.len() > max_bytes {
-        return Err(PayloadError::TooLarge);
-    }
-    let v: Value = serde_json::from_str(input).map_err(|e| PayloadError::Json(e.to_string()))?;
-    let tool = ["tool_name", "toolName"]
-        .iter()
-        .find_map(|k| v.get(*k).and_then(Value::as_str))
-        .filter(|t| !t.is_empty());
-    let Some(tool) = tool else {
-        return command_from_hook_json(input, max_bytes).map(|command| ToolCall::Shell { command });
+    let env = envelope(input, max_bytes)?;
+    let Some(tool) = env.tool() else {
+        return env.command().map(|command| ToolCall::Shell { command });
     };
-    let tool_input = v.get("tool_input").unwrap_or(&Value::Null);
     if SHELL_TOOLS.contains(&tool) {
-        return command_from_hook_json(input, max_bytes).map(|command| ToolCall::Shell { command });
+        return env.command().map(|command| ToolCall::Shell { command });
     }
+    let empty = ToolInput::default();
     let write = WRITE_TOOLS.contains(&tool);
+    if (write || READ_TOOLS.contains(&tool)) && matches!(env.tool_input, Field::Malformed) {
+        return Err(PayloadError::MalformedToolInput);
+    }
+    let tool_input = env.tool_input.as_obj().unwrap_or(&empty);
     if write || READ_TOOLS.contains(&tool) {
         let mut paths = if tool == "apply_patch" {
             let patch = tool_input
-                .get("command")
-                .or_else(|| tool_input.get("input"))
-                .and_then(Value::as_str)
+                .command
+                .as_deref()
+                .or(tool_input.input.as_deref())
                 .unwrap_or("");
             patch_paths(patch)
         } else {
-            tool_paths(tool_input)
+            tool_paths(tool_input, tool == "read_many_files")
         };
-        if paths.is_empty() && tool != "apply_patch" {
-            // Search and list tools default to the working directory.
-            if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+        if paths.is_empty() && !write {
+            // Search and list tools default to the working directory
+            // (what they read); a write with no path has nothing to judge.
+            if let Some(cwd) = env.cwd.as_deref().filter(|c| !c.is_empty()) {
                 paths.push(cwd.to_string());
             }
         }
@@ -160,7 +316,7 @@ pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError>
             write,
         });
     }
-    match tool_input.get("command").and_then(Value::as_str) {
+    match tool_input.command.as_deref() {
         Some(cmd) if !cmd.trim().is_empty() => Ok(ToolCall::Shell {
             command: cmd.to_string(),
         }),
@@ -170,23 +326,44 @@ pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError>
     }
 }
 
-/// Path fields of the Claude Code and Gemini CLI file tools, in a fixed order.
-fn tool_paths(tool_input: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for key in ["file_path", "notebook_path", "path", "dir_path"] {
-        if let Some(p) = tool_input.get(key).and_then(Value::as_str) {
-            if !p.is_empty() {
-                out.push(p.to_string());
-            }
-        }
+/// The file filter of a search tool (Claude `Grep` `glob`, Gemini
+/// `grep_search` `include`): a pattern relative to the search root that
+/// selects the files whose content is read. Empty when there is none.
+pub fn search_globs(input: &str, max_bytes: usize) -> Vec<String> {
+    let Ok(env) = envelope(input, max_bytes) else {
+        return Vec::new();
+    };
+    if !matches!(env.tool(), Some("Grep" | "grep_search")) {
+        return Vec::new();
     }
-    if let Some(list) = tool_input.get("include").and_then(Value::as_array) {
-        out.extend(
-            list.iter()
-                .filter_map(Value::as_str)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
-        );
+    let Some(ti) = env.tool_input.as_obj() else {
+        return Vec::new();
+    };
+    let include = match &ti.include {
+        Include::One(s) => Some(s.as_str()),
+        _ => None,
+    };
+    [ti.glob.as_deref(), include]
+        .into_iter()
+        .flatten()
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Path fields of the Claude Code and Gemini CLI file tools, in a fixed order.
+fn tool_paths(ti: &ToolInput, paths_list: bool) -> Vec<String> {
+    let mut out: Vec<String> = [&ti.file_path, &ti.notebook_path, &ti.path, &ti.dir_path]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .cloned()
+        .collect();
+    if let Include::Many(list) = &ti.include {
+        out.extend(list.iter().filter(|p| !p.is_empty()).cloned());
+    }
+    if paths_list {
+        out.extend(ti.paths.iter().flatten().filter(|p| !p.is_empty()).cloned());
     }
     out
 }
@@ -231,23 +408,20 @@ pub fn context_from_hook_json(input: &str) -> HookContext {
 /// still want the context of a payload above `MAX_PAYLOAD_BYTES` (a `Write`
 /// of a large file).
 pub fn context_from_hook_json_bounded(input: &str, max_bytes: usize) -> HookContext {
-    if input.len() > max_bytes {
-        return HookContext::default();
-    }
-    let Ok(v) = serde_json::from_str::<Value>(input) else {
+    let Ok(env) = envelope(input, max_bytes) else {
         return HookContext::default();
     };
-    let field = |names: &[&str]| {
-        names
-            .iter()
-            .find_map(|n| v.get(*n).and_then(Value::as_str))
+    let field = |a: &Option<String>, b: &Option<String>| {
+        [a, b]
+            .into_iter()
+            .find_map(|x| x.as_deref())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
     HookContext {
-        tool: field(&["tool_name", "toolName"]),
-        session: field(&["session_id", "sessionId"]),
-        cwd: field(&["cwd"]),
+        tool: field(&env.tool_name, &env.tool_name_camel),
+        session: field(&env.session_id, &env.session_id_camel),
+        cwd: env.cwd.clone().filter(|c| !c.is_empty()),
     }
 }
 
@@ -290,8 +464,49 @@ pub fn inline_payload(argv: &[String]) -> Option<String> {
             }
         }
     }
+    if SH_FAMILY.contains(&prog.as_str()) {
+        return sh_command_string(&argv[1..]);
+    }
     let idx = argv.iter().position(|a| a == "-c")?;
     argv.get(idx + 1).cloned()
+}
+
+/// POSIX shells: `-c` may sit in any short-option cluster (`-lc`, `-ec`,
+/// `-c -l`), and the command string is then the first operand.
+const SH_FAMILY: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
+
+/// The command string of `sh [options] -c STRING`: options (and the values
+/// of `-o`/`-O`/`+o`/`+O`, `--rcfile`, `--init-file`) are skipped; the first
+/// operand is the string when any cluster held `c`.
+fn sh_command_string(args: &[String]) -> Option<String> {
+    let mut has_c = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" || a == "-" {
+            i += 1;
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            if matches!(long, "rcfile" | "init-file") {
+                i += 1;
+            }
+        } else if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+            let cluster = &a[1..];
+            has_c |= a.starts_with('-') && cluster.contains('c');
+            if cluster.contains(['o', 'O']) {
+                i += 1; // the option name
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if has_c {
+        args.get(i).cloned()
+    } else {
+        None
+    }
 }
 
 /// If `argv` is a `watch [OPTIONS] COMMAND [ARG]…` invocation, return the
@@ -366,7 +581,7 @@ mod tests {
     fn oversize_is_refused() {
         let big = format!(r#"{{"command":"{}"}}"#, "a".repeat(100));
         let err = command_from_hook_json(&big, 20).unwrap_err();
-        assert!(matches!(err, PayloadError::TooLarge));
+        assert!(matches!(err, PayloadError::TooLarge { .. }));
     }
 
     #[test]
@@ -523,6 +738,42 @@ mod tests {
         classify(&json.to_string(), MAX_PAYLOAD_BYTES).unwrap()
     }
 
+    /// Final wave FW6: a file tool whose `tool_input` is not a usable
+    /// object (a string, a list, duplicate keys) is not judged as if it
+    /// named no path: the caller records it as a fail-open.
+    #[test]
+    fn malformed_file_tool_input_is_an_error() {
+        for raw in [
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":"oops"}"#,
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":["/p/.env"]}"#,
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":{"file_path":"/p/a","file_path":"/p/.env"}}"#,
+            r#"{"cwd":"/p","tool_name":"Glob","tool_input":7}"#,
+            r#"{"cwd":"/p","tool_name":"Write","tool_input":"oops"}"#,
+        ] {
+            let e = classify(raw, MAX_PAYLOAD_BYTES).expect_err(raw);
+            assert!(
+                matches!(e, PayloadError::MalformedToolInput),
+                "{raw}: {e:?}"
+            );
+            assert_eq!(e.to_string(), "malformed tool_input", "{raw}");
+        }
+        // Absent or null still means "no input": a search tool reads `cwd`.
+        for raw in [
+            r#"{"cwd":"/p","tool_name":"Glob"}"#,
+            r#"{"cwd":"/p","tool_name":"Glob","tool_input":null}"#,
+        ] {
+            assert_eq!(
+                classify(raw, MAX_PAYLOAD_BYTES).unwrap(),
+                ToolCall::File {
+                    tool: "Glob".into(),
+                    paths: vec!["/p".into()],
+                    write: false
+                },
+                "{raw}"
+            );
+        }
+    }
+
     #[test]
     fn classify_shell_tools() {
         for tool in ["Bash", "run_shell_command"] {
@@ -575,6 +826,130 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn classify_claude_glob_and_ls() {
+        let c = call(
+            serde_json::json!({"cwd": "/p", "tool_name": "Glob", "tool_input": {"pattern": "**/*.rs"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Glob".into(),
+                paths: vec!["/p".into()],
+                write: false
+            }
+        );
+        let c =
+            call(serde_json::json!({"tool_name": "LS", "tool_input": {"path": "/home/u/.ssh"}}));
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "LS".into(),
+                paths: vec!["/home/u/.ssh".into()],
+                write: false
+            }
+        );
+        // No path and no cwd: nothing to judge.
+        let c = call(serde_json::json!({"tool_name": "Glob", "tool_input": {"pattern": "*"}}));
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Glob".into(),
+                paths: vec![],
+                write: false
+            }
+        );
+    }
+
+    #[test]
+    fn huge_content_does_not_hide_the_path() {
+        let big = serde_json::json!({
+            "tool_name": "Write", "cwd": "/p", "session_id": "s",
+            "tool_input": {"file_path": "/p/a", "content": "x".repeat(3 * 1024 * 1024)}
+        })
+        .to_string();
+        let limit = 64 * 1024 * 1024;
+        assert_eq!(
+            classify(&big, limit).unwrap(),
+            ToolCall::File {
+                tool: "Write".into(),
+                paths: vec!["/p/a".into()],
+                write: true
+            }
+        );
+        let ctx = context_from_hook_json_bounded(&big, limit);
+        assert_eq!(ctx.cwd.as_deref(), Some("/p"));
+        let err = classify(&big, 1000).unwrap_err();
+        assert!(err.to_string().contains("1000"), "{err}");
+    }
+
+    #[test]
+    fn writes_without_a_path_have_no_cwd_default() {
+        let c = call(
+            serde_json::json!({"cwd": "/p", "tool_name": "Write", "tool_input": {"content": "x"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Write".into(),
+                paths: vec![],
+                write: true
+            }
+        );
+    }
+
+    #[test]
+    fn read_many_files_names_files_in_paths_too() {
+        let c = call(
+            serde_json::json!({"tool_name": "read_many_files", "tool_input": {"paths": ["a", ".env*"]}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "read_many_files".into(),
+                paths: vec!["a".into(), ".env*".into()],
+                write: false
+            }
+        );
+    }
+
+    #[test]
+    fn search_globs_only_for_grep_tools() {
+        let g = |t: &str| {
+            search_globs(
+                &serde_json::json!({"tool_name": t, "tool_input": {"glob": "*.rs", "include": "x"}}).to_string(),
+                MAX_PAYLOAD_BYTES,
+            )
+        };
+        assert!(!g("Grep").is_empty() && !g("grep_search").is_empty());
+        assert!(g("Read").is_empty() && g("LS").is_empty() && g("Glob").is_empty());
+    }
+
+    #[test]
+    fn search_globs_are_the_file_filters_of_grep_tools() {
+        let g = |v: serde_json::Value| search_globs(&v.to_string(), MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            g(
+                serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "glob": ".env*"}})
+            ),
+            vec![".env*".to_string()]
+        );
+        assert_eq!(
+            g(
+                serde_json::json!({"tool_name": "grep_search", "tool_input": {"pattern": "x", "include": "*.rs"}})
+            ),
+            vec!["*.rs".to_string()]
+        );
+        // read_many_files `include` is a list of paths, not a filter.
+        assert!(g(
+            serde_json::json!({"tool_name": "read_many_files", "tool_input": {"include": ["a"]}})
+        )
+        .is_empty());
+        assert!(
+            g(serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}})).is_empty()
+        );
     }
 
     #[test]
@@ -715,7 +1090,7 @@ mod tests {
         ));
         assert!(matches!(
             classify(r#"{"tool_name":"Bash"}"#, 10),
-            Err(PayloadError::TooLarge)
+            Err(PayloadError::TooLarge { .. })
         ));
         assert!(matches!(
             classify(

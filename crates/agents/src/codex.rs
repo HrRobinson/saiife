@@ -2,14 +2,18 @@
 //! (contract: docs/superpowers/research/2026-10-13-codex-hooks.md).
 //!
 //! Edited with `toml_edit`, so the user's comments, key order and
-//! formatting survive. saiife only reads and writes the array-of-tables
-//! form (`[[hooks.PreToolUse]]` with `[[hooks.PreToolUse.hooks]]`); any
-//! other layout of `hooks.PreToolUse` is reported, never rewritten.
+//! formatting survive. saiife writes the array-of-tables form
+//! (`[[hooks.PreToolUse]]` with `[[hooks.PreToolUse.hooks]]`). A user who
+//! wrote the inline form (`PreToolUse = [{ … }]` under `[hooks]`, or
+//! `hooks = { PreToolUse = [ … ] }`) keeps it: saiife's group is appended
+//! to that array as an inline table, since TOML cannot hold both forms of
+//! one key. Any other layout of `hooks.PreToolUse` is reported, never
+//! rewritten.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
 use crate::{fingerprint, fsutil, is_saiife_command, Agent, AgentError, Change, HookBlocker};
 
@@ -35,26 +39,26 @@ pub fn install(project: &Path) -> Result<Change, AgentError> {
         return Ok(Change::Unchanged);
     }
     strip_ours(&path, &mut doc)?;
-    let hooks = doc
-        .entry("hooks")
-        .or_insert_with(|| {
-            let mut t = Table::new();
-            t.set_implicit(true);
-            Item::Table(t)
-        })
-        .as_table_mut()
-        .ok_or_else(|| layout(&path, "`hooks` is not a table"))?;
-    let groups = hooks
-        .entry("PreToolUse")
-        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
-        .as_array_of_tables_mut()
-        .ok_or_else(|| {
-            layout(
-                &path,
-                "`hooks.PreToolUse` is not a list of [[hooks.PreToolUse]] tables",
-            )
-        })?;
-    groups.push(group());
+    match groups_mut(&mut doc) {
+        Some(GroupsMut::Tables(groups)) => groups.push(group()),
+        Some(GroupsMut::Inline(groups)) => groups.push(inline_group()),
+        None => {
+            let hooks = doc.entry("hooks").or_insert_with(|| {
+                let mut t = Table::new();
+                t.set_implicit(true);
+                Item::Table(t)
+            });
+            if let Some(t) = hooks.as_table_mut() {
+                let mut groups = ArrayOfTables::new();
+                groups.push(group());
+                t.insert("PreToolUse", Item::ArrayOfTables(groups));
+            } else if let Some(t) = hooks.as_inline_table_mut() {
+                t.insert("PreToolUse", Array::from_iter([inline_group()]).into());
+            } else {
+                return Err(layout(&path, "`hooks` is not a table"));
+            }
+        }
+    }
     let mut out = doc.to_string();
     if !out.ends_with('\n') {
         out.push('\n');
@@ -92,12 +96,8 @@ pub fn entries(project: &Path) -> Result<Vec<String>, AgentError> {
 }
 
 pub fn expected_entry() -> String {
-    let g = group();
-    let handler = g["hooks"]
-        .as_array_of_tables()
-        .and_then(|a| a.get(0))
-        .expect("group() has one handler");
-    entry_fingerprint(g.get("matcher"), handler)
+    let g = table_to_json(&group());
+    entry_fingerprint(g.get("matcher"), &g["hooks"][0])
 }
 
 /// `[features] hooks = false` in the project or user config turns every
@@ -168,6 +168,19 @@ fn group() -> Table {
     g
 }
 
+/// The same group as an inline table, for a user's inline array.
+fn inline_group() -> toml_edit::Value {
+    let mut handler = InlineTable::new();
+    handler.insert("type", "command".into());
+    handler.insert("command", Agent::Codex.hook_command().into());
+    handler.insert("timeout", TIMEOUT_SECS.into());
+    handler.insert("statusMessage", STATUS_MESSAGE.into());
+    let mut g = InlineTable::new();
+    g.insert("matcher", MATCHER.into());
+    g.insert("hooks", Array::from_iter([handler]).into());
+    g.into()
+}
+
 fn parse(path: &Path, text: &str) -> Result<DocumentMut, AgentError> {
     text.parse::<DocumentMut>().map_err(|e| AgentError::Parse {
         path: path.to_path_buf(),
@@ -176,56 +189,153 @@ fn parse(path: &Path, text: &str) -> Result<DocumentMut, AgentError> {
     })
 }
 
-/// `hooks.PreToolUse` as array-of-tables, `None` if absent.
-fn groups<'a>(path: &Path, doc: &'a DocumentMut) -> Result<Option<&'a ArrayOfTables>, AgentError> {
+/// `hooks.PreToolUse` in a layout saiife understands.
+enum Groups<'a> {
+    /// `[[hooks.PreToolUse]]` tables (what saiife writes).
+    Tables(&'a ArrayOfTables),
+    /// `PreToolUse = [{ … }]`, an inline array of inline tables.
+    Inline(&'a Array),
+}
+
+enum GroupsMut<'a> {
+    Tables(&'a mut ArrayOfTables),
+    Inline(&'a mut Array),
+}
+
+const BAD_LAYOUT: &str = "`hooks.PreToolUse` is not a list of hook groups ([[hooks.PreToolUse]] tables or an inline array of tables)";
+
+/// `hooks.PreToolUse`, `None` if absent; an error for any other layout.
+fn groups<'a>(path: &Path, doc: &'a DocumentMut) -> Result<Option<Groups<'a>>, AgentError> {
     let Some(hooks) = doc.get("hooks") else {
         return Ok(None);
     };
-    let Some(pre) = hooks.get("PreToolUse") else {
+    let Some(pre) = hooks.as_table_like().and_then(|h| h.get("PreToolUse")) else {
         return Ok(None);
     };
-    pre.as_array_of_tables().map(Some).ok_or_else(|| {
-        layout(
-            path,
-            "`hooks.PreToolUse` is not a list of [[hooks.PreToolUse]] tables",
-        )
-    })
+    if let Some(t) = pre.as_array_of_tables() {
+        return Ok(Some(Groups::Tables(t)));
+    }
+    match pre.as_array() {
+        Some(a) if a.iter().all(toml_edit::Value::is_inline_table) => Ok(Some(Groups::Inline(a))),
+        _ => Err(layout(path, BAD_LAYOUT)),
+    }
+}
+
+/// Mutable `hooks.PreToolUse` (call `groups` first for the layout check).
+fn groups_mut(doc: &mut DocumentMut) -> Option<GroupsMut<'_>> {
+    let pre = doc
+        .get_mut("hooks")?
+        .as_table_like_mut()?
+        .get_mut("PreToolUse")?;
+    if pre.is_array_of_tables() {
+        return pre.as_array_of_tables_mut().map(GroupsMut::Tables);
+    }
+    pre.as_array_mut().map(GroupsMut::Inline)
+}
+
+/// Every group as JSON: `{"matcher": …, "hooks": [handler, …]}`.
+fn group_values(groups: &Groups) -> Vec<Value> {
+    match groups {
+        Groups::Tables(t) => t.iter().map(table_to_json).collect(),
+        Groups::Inline(a) => a.iter().map(value_to_json).collect(),
+    }
+}
+
+/// The one test for "this handler is saiife's", on the JSON form.
+fn is_ours(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_saiife_command)
+}
+
+/// Indices of saiife's handlers in one group (JSON form).
+fn ours_in(group: &Value) -> Vec<usize> {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .map(|hs| {
+            hs.iter()
+                .enumerate()
+                .filter(|(_, h)| is_ours(h))
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn handler_count(group: &Value) -> usize {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn fingerprints(path: &Path, doc: &DocumentMut) -> Result<Vec<String>, AgentError> {
+    let Some(groups) = groups(path, doc)? else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::new();
-    for g in groups(path, doc)?.into_iter().flat_map(ArrayOfTables::iter) {
-        if let Some(handlers) = g.get("hooks").and_then(Item::as_array_of_tables) {
-            for h in handlers.iter().filter(|h| is_ours(h)) {
-                out.push(entry_fingerprint(g.get("matcher"), h));
-            }
+    for g in group_values(&groups) {
+        for i in ours_in(&g) {
+            out.push(entry_fingerprint(g.get("matcher"), &g["hooks"][i]));
         }
     }
     Ok(out)
 }
 
 /// Remove saiife handlers; drop groups left with none. Returns the count.
+/// Which handlers are ours is decided once, on the JSON form; only the
+/// removal differs per layout.
 fn strip_ours(path: &Path, doc: &mut DocumentMut) -> Result<usize, AgentError> {
-    groups(path, doc)?; // layout check
-    let Some(groups) = doc
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut("PreToolUse"))
-        .and_then(Item::as_array_of_tables_mut)
-    else {
+    let Some(found) = groups(path, doc)? else {
         return Ok(0);
     };
-    let mut removed = 0;
-    groups.retain(|g| {
-        let Some(handlers) = g.get("hooks").and_then(Item::as_array_of_tables) else {
-            return true;
-        };
-        let ours = handlers.iter().filter(|h| is_ours(h)).count();
-        removed += ours;
-        !(ours > 0 && ours == handlers.len())
-    });
-    for g in groups.iter_mut() {
-        if let Some(handlers) = g.get_mut("hooks").and_then(Item::as_array_of_tables_mut) {
-            handlers.retain(|h| !is_ours(h));
+    let plan: Vec<(Vec<usize>, bool)> = group_values(&found)
+        .iter()
+        .map(|g| {
+            let ours = ours_in(g);
+            let whole = !ours.is_empty() && ours.len() == handler_count(g);
+            (ours, whole)
+        })
+        .collect();
+    let removed = plan.iter().map(|(o, _)| o.len()).sum();
+    match groups_mut(doc) {
+        None => {}
+        Some(GroupsMut::Tables(groups)) => {
+            for (gi, (ours, whole)) in plan.iter().enumerate().rev() {
+                if *whole {
+                    groups.remove(gi);
+                } else if let Some(g) = groups.get_mut(gi) {
+                    match g.get_mut("hooks") {
+                        Some(Item::ArrayOfTables(hs)) => {
+                            ours.iter().rev().for_each(|&i| hs.remove(i));
+                        }
+                        Some(Item::Value(toml_edit::Value::Array(hs))) => {
+                            ours.iter().rev().for_each(|&i| {
+                                hs.remove(i);
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(GroupsMut::Inline(groups)) => {
+            for (gi, (ours, whole)) in plan.iter().enumerate().rev() {
+                if *whole {
+                    groups.remove(gi);
+                } else if let Some(hs) = groups
+                    .get_mut(gi)
+                    .and_then(toml_edit::Value::as_inline_table_mut)
+                    .and_then(|t| t.get_mut("hooks"))
+                    .and_then(toml_edit::Value::as_array_mut)
+                {
+                    ours.iter().rev().for_each(|&i| {
+                        hs.remove(i);
+                    });
+                }
+            }
         }
     }
     Ok(removed)
@@ -234,14 +344,14 @@ fn strip_ours(path: &Path, doc: &mut DocumentMut) -> Result<usize, AgentError> {
 /// Drop `hooks.PreToolUse` and then `hooks` if removing saiife left them
 /// empty.
 fn prune(doc: &mut DocumentMut) {
-    let Some(hooks) = doc.get_mut("hooks").and_then(Item::as_table_mut) else {
+    let Some(hooks) = doc.get_mut("hooks").and_then(Item::as_table_like_mut) else {
         return;
     };
-    if hooks
-        .get("PreToolUse")
-        .and_then(Item::as_array_of_tables)
-        .is_some_and(ArrayOfTables::is_empty)
-    {
+    let empty_groups = hooks.get("PreToolUse").is_some_and(|p| {
+        p.as_array_of_tables().is_some_and(ArrayOfTables::is_empty)
+            || p.as_array().is_some_and(Array::is_empty)
+    });
+    if empty_groups {
         hooks.remove("PreToolUse");
     }
     if hooks.is_empty() {
@@ -249,18 +359,12 @@ fn prune(doc: &mut DocumentMut) {
     }
 }
 
-fn is_ours(handler: &Table) -> bool {
-    handler
-        .get("command")
-        .and_then(Item::as_str)
-        .is_some_and(is_saiife_command)
-}
-
 /// Same scheme as the JSON agents: matcher + handler, as canonical JSON.
-fn entry_fingerprint(matcher: Option<&Item>, handler: &Table) -> String {
+/// The same entry fingerprints alike in either layout.
+fn entry_fingerprint(matcher: Option<&Value>, handler: &Value) -> String {
     fingerprint::of_json(&serde_json::json!({
-        "matcher": matcher.map(item_to_json).unwrap_or(Value::Null),
-        "handler": table_to_json(handler),
+        "matcher": matcher.cloned().unwrap_or(Value::Null),
+        "handler": handler,
     }))
 }
 
@@ -339,6 +443,15 @@ command = "docs-mcp"
 
     fn read(p: &Path) -> String {
         fs::read_to_string(p.join(CONFIG_REL)).unwrap()
+    }
+
+    /// Spec §5.2: shell and file edits (`apply_patch`, which Codex's
+    /// `Edit`/`Write` aliases also match). The matcher is an anchored regex.
+    #[test]
+    fn matcher_covers_shell_and_apply_patch() {
+        let list = MATCHER.trim_start_matches("^(").trim_end_matches(")$");
+        let tools: Vec<&str> = list.split('|').collect();
+        assert_eq!(tools, ["Bash", "apply_patch"]);
     }
 
     #[test]
@@ -437,9 +550,71 @@ timeout = 10
         assert_ne!(got, vec![expected_entry()]);
     }
 
+    const INLINE_IN_TABLE: &str = r#"model = "gpt-5-codex"
+
+[hooks]
+PreToolUse = [
+  { matcher = "^Bash$", hooks = [{ type = "command", command = "./audit-shell.sh" }] },
+]
+"#;
+
+    const INLINE_TABLE: &str = r#"hooks = { PreToolUse = [{ matcher = "^Bash$", hooks = [{ type = "command", command = "./audit-shell.sh" }] }] }
+"#;
+
+    /// Plan 2 carry-over: an inline layout the user wrote is kept; saiife's
+    /// group is appended to it as an inline table, recognized on the next
+    /// run, and removed again.
+    #[test]
+    fn inline_layouts_get_our_group_appended_inline() {
+        for user in [INLINE_IN_TABLE, INLINE_TABLE] {
+            let p = project_with(user);
+            assert_eq!(install(p.path()).unwrap(), Change::Updated, "{user}");
+            let text = read(p.path());
+            assert!(!text.contains("[[hooks.PreToolUse]]"), "{text}");
+            let doc: DocumentMut = text.parse().unwrap();
+            let groups = doc["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(groups.len(), 2, "{text}");
+            let first = groups.get(0).unwrap().as_inline_table().unwrap();
+            assert_eq!(first["matcher"].as_str(), Some("^Bash$"));
+            assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()], "{text}");
+            assert_eq!(install(p.path()).unwrap(), Change::Unchanged);
+            assert_eq!(remove(p.path(), false).unwrap(), Change::Updated);
+            assert_eq!(read(p.path()), user, "byte-for-byte");
+            assert!(entries(p.path()).unwrap().is_empty());
+        }
+    }
+
+    /// A saiife handler someone wrote into an inline layout by hand is
+    /// replaced like any changed entry, not duplicated.
+    #[test]
+    fn a_hand_written_inline_saiife_entry_is_replaced() {
+        let p = project_with(
+            "[hooks]\nPreToolUse = [{ matcher = \"^Bash$\", hooks = [{ type = \"command\", command = \"saiife check --agent codex\", timeout = 0 }] }]\n",
+        );
+        assert_eq!(entries(p.path()).unwrap().len(), 1);
+        assert_ne!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(install(p.path()).unwrap(), Change::Updated);
+        assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(remove(p.path(), true).unwrap(), Change::Deleted);
+    }
+
+    #[test]
+    fn inline_hooks_table_without_pre_tool_use_gains_it() {
+        let p = project_with("hooks = { Stop = [] }\n");
+        assert_eq!(install(p.path()).unwrap(), Change::Updated);
+        assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(remove(p.path(), false).unwrap(), Change::Updated);
+        assert_eq!(read(p.path()), "hooks = { Stop = [] }\n");
+    }
+
     #[test]
     fn other_layouts_and_bad_toml_are_left_untouched() {
-        for bad in ["hooks = { PreToolUse = [] }\n", "model = \n", "hooks = 3\n"] {
+        for bad in [
+            "hooks = { PreToolUse = 3 }\n",
+            "[hooks]\nPreToolUse = [1, 2]\n",
+            "model = \n",
+            "hooks = 3\n",
+        ] {
             let p = project_with(bad);
             assert!(install(p.path()).is_err(), "{bad:?}");
             assert_eq!(read(p.path()), bad, "{bad:?}");

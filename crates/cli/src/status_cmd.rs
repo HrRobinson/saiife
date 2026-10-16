@@ -91,6 +91,15 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                 what: format!("{} cannot be checked: {e}", agent.label()),
                 fix: format!("repair {rel}, then {RESTORE}"),
             }),
+            Ok(f) if f.contains(&rec.sha256) && rec.sha256 != agent.expected_entry() => {
+                problems.push(Problem {
+                    what: format!(
+                        "The saiife hook for {} in {rel} was written by an older saiife and does not cover every tool this version guards.",
+                        agent.label()
+                    ),
+                    fix: "run `saiife init` to update it".into(),
+                })
+            }
             Ok(f) if f.contains(&rec.sha256) => {
                 let last = last_calls
                     .iter()

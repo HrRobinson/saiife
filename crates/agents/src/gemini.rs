@@ -91,6 +91,24 @@ mod tests {
         fs::read_to_string(p.join(SETTINGS_REL)).unwrap()
     }
 
+    /// Spec §5.2: shell, read (incl. list/search) and write tools.
+    #[test]
+    fn matcher_covers_read_list_and_write_tools() {
+        let tools: Vec<&str> = MATCHER.split('|').collect();
+        for t in [
+            "run_shell_command",
+            "read_file",
+            "read_many_files",
+            "list_directory",
+            "glob",
+            "grep_search",
+            "write_file",
+            "replace",
+        ] {
+            assert!(tools.contains(&t), "{t}");
+        }
+    }
+
     #[test]
     fn install_writes_named_handler_with_ms_timeout() {
         let p = project_with(USER_SETTINGS);

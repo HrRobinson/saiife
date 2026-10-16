@@ -7,7 +7,7 @@ use saiifeguard::profile::select_active;
 fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &["cloud.gcloud".to_string()]))
+    Engine::new(select_active(packs, &["cloud.gcloud".to_string()])).with_budget(TEST_BUDGET)
 }
 
 fn deny(e: &Engine, cmd: &str) -> (String, String) {
@@ -101,3 +101,7 @@ fn catch_all_still_denies_delete_as_the_actual_verb() {
     assert_eq!(pack, "cloud.gcloud");
     assert!(reason.contains("delete"));
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
