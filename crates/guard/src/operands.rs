@@ -481,6 +481,7 @@ fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
 /// `gzip f` replaces `f` with `f.gz`; with `-c`/`-k`/`-l`/`-t` (or their
 /// long forms) the input is only read.
 fn compressor(words: &[Option<Tok>], out: &mut Out) {
+    // `-S SUFFIX` names no path.
     let spec = Spec {
         short: "S",
         optional: "",
@@ -515,6 +516,7 @@ fn compressor(words: &[Option<Tok>], out: &mut Out) {
 fn pattern_first(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
     let awk = cmd.ends_with("awk");
     let spec = Spec {
+        // awk `-v VAR=VAL` and `-F SEP` name no path.
         short: if awk { "fvF" } else { "ef" },
         optional: if cmd == "sed" { "i" } else { "" },
         long: &["regexp", "expression", "file", "from-file"],
@@ -551,6 +553,8 @@ fn pattern_first(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
 /// `perl`: the script file (without `-e`) is read; with `-n`/`-p`/`-i`
 /// the file operands are read, and with `-i` written.
 fn perl(words: &[Option<Tok>], out: &mut Out) {
+    // `-e`/`-E` take the script; the optional-attached letters (`-i.bak`,
+    // `-Idir`, `-Mmod`, `-l`, `-0`, `-F`, …) name no path judged here.
     let spec = Spec {
         short: "eE",
         optional: "iIMmdDxlC0F",
@@ -737,6 +741,12 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
 /// `-H @f`, `-K f`, `-b f` read; `-o f`, `-c f` write. Attached forms
 /// (`-d@f`, `-Ff=@f`, `-T.env`, `--data=@f`) and clusters (`-sSd@f`) too.
 fn curl(words: &[Option<Tok>], out: &mut Out) {
+    // Ignored values: `-u USER`, `-X METHOD`, `-A AGENT`, `-e REFERER`,
+    // `-r RANGE`, `-w FORMAT`, `-y`/`-Y` speed limits, `-z TIME`, `-m
+    // SECONDS`, `-U PROXYUSER`, `-Q COMMAND`, `-x PROXY`, `-C OFFSET`,
+    // `--url`, `--data-raw` and `--form-string` (literal data, never a
+    // file) name no path. `-E CERT` is a TLS client certificate curl uses,
+    // not data it sends.
     let spec = Spec {
         short: "dFTHoKbcuXAeErwyYzmUQxCD",
         optional: "",
@@ -795,6 +805,10 @@ fn curl(words: &[Option<Tok>], out: &mut Out) {
 /// `wget --post-file=f`, `--body-file=f`, `-i f` read; `-O f`, `-o f`,
 /// `-a f` write.
 fn wget(words: &[Option<Tok>], out: &mut Out) {
+    // Ignored values: `-e COMMAND`, `-U AGENT`, `-t TRIES`, `-T SECONDS`,
+    // `-w SECONDS`, `-Y on|off`, `-Q QUOTA` name no path; `-P DIR` is
+    // where downloads land under names the server picks, so only `-O`
+    // names a written path.
     let spec = Spec {
         short: "OoaiePUtTwYQ",
         optional: "",
