@@ -114,81 +114,111 @@ fn shell_fixtures_are_judged() {
 }
 
 #[test]
-fn file_tool_fixtures_are_recorded_with_their_paths_and_never_judged() {
-    for (name, agent, tool, input) in [
-        ("claude/read.json", "claude", "Read", "/home/u/app/.env"),
-        ("claude/grep-no-path.json", "claude", "Grep", "/home/u/app"),
+fn file_tool_fixtures_are_judged_by_path_rules() {
+    for (name, agent, tool, input, deny) in [
+        (
+            "claude/read.json",
+            "claude",
+            "Read",
+            "/home/u/app/.env",
+            true,
+        ),
+        (
+            "claude/grep-no-path.json",
+            "claude",
+            "Grep",
+            "/home/u/app",
+            false,
+        ),
         (
             "claude/write.json",
             "claude",
             "Write",
             "/home/u/app/notes.sh",
+            false,
         ),
         (
             "claude/edit.json",
             "claude",
             "Edit",
             "/home/u/app/src/main.rs",
+            false,
         ),
         (
             "claude/notebook-edit.json",
             "claude",
             "NotebookEdit",
             "/home/u/app/analysis.ipynb",
+            false,
         ),
         (
             "codex/apply-patch.json",
             "codex",
             "apply_patch",
             "docs/recovery.md\nscripts/reset.sh",
+            false,
         ),
         (
             "gemini/read-file.json",
             "gemini",
             "read_file",
             "/home/u/app/.env",
+            true,
         ),
         (
             "gemini/read-many-files.json",
             "gemini",
             "read_many_files",
             "src/**/*.rs\nREADME.md",
+            false,
         ),
         (
             "gemini/grep-search-no-path.json",
             "gemini",
             "grep_search",
             "/home/u/app",
+            false,
         ),
         (
             "gemini/list-directory.json",
             "gemini",
             "list_directory",
             "/home/u/app/src",
+            false,
         ),
         (
             "gemini/write-file.json",
             "gemini",
             "write_file",
             "/home/u/app/run.sh",
+            false,
         ),
         (
             "gemini/replace.json",
             "gemini",
             "replace",
             "/home/u/app/src/main.rs",
+            false,
         ),
     ] {
         let (out, rec) = run(name, agent);
-        assert_eq!(out.code, 0, "{name}: {}", out.stderr);
         assert!(out.stdout.is_empty(), "{name}: stdout must stay empty");
-        assert_eq!(rec.decision, DecisionKind::Allow, "{name}");
         assert_eq!(rec.tool, tool, "{name}");
         assert_eq!(rec.input, input, "{name}");
-        assert_eq!(
-            rec.pack, None,
-            "{name}: file tools are not judged by command packs"
-        );
+        if deny {
+            assert_eq!(out.code, 2, "{name}: {}", out.stderr);
+            assert!(
+                out.stderr.contains("BLOCKED by core.secrets"),
+                "{name}: {}",
+                out.stderr
+            );
+            assert_eq!(rec.decision, DecisionKind::Deny, "{name}");
+            assert_eq!(rec.pack.as_deref(), Some("core.secrets"), "{name}");
+        } else {
+            assert_eq!(out.code, 0, "{name}: {}", out.stderr);
+            assert_eq!(rec.decision, DecisionKind::Allow, "{name}");
+            assert_eq!(rec.pack, None, "{name}");
+        }
     }
 }
 
@@ -255,4 +285,319 @@ fn large_write_is_recorded_as_allow_with_its_path() {
     assert_eq!(rec.tool, "Write");
     assert_eq!(rec.input, "/home/u/app/big.txt");
     assert_eq!(rec.session.as_deref(), Some("c-1"));
+}
+
+/// A recorded fixture with `edit` applied to its JSON: the same payload
+/// shape, another tool input.
+fn variant(name: &str, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&fixture(name)).unwrap();
+    edit(&mut v);
+    v.to_string().into_bytes()
+}
+
+fn run_bytes(agent: &str, stdin: &[u8]) -> (Out, Record) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = check_bytes(dir.path(), agent, stdin);
+    let mut recs = read_all(dir.path()).records;
+    assert_eq!(recs.len(), 1, "exactly one record");
+    (out, recs.remove(0))
+}
+
+fn shell(name: &str, command: &str) -> Vec<u8> {
+    variant(name, |v| v["tool_input"]["command"] = command.into())
+}
+
+const CODEX_PATCH: &str = "*** Begin Patch\n*** Update File: .codex/config.toml\n@@\n-[[hooks.PreToolUse]]\n*** End Patch\n";
+
+/// Spec §10 / §12 demo: per agent, reading `.env` and removing the hook
+/// are blocked (exit 2 + reason on stderr) and audited as denies.
+#[test]
+fn secret_reads_and_hook_edits_are_blocked_for_every_agent() {
+    let cases: Vec<(&str, Vec<u8>, &str, &str)> = vec![
+        (
+            "claude",
+            fixture("claude/read.json"),
+            "core.secrets",
+            "/home/u/app/.env",
+        ),
+        (
+            "claude",
+            variant("claude/write.json", |v| {
+                v["tool_input"]["file_path"] = "/home/u/app/.claude/settings.json".into()
+            }),
+            "core.self",
+            "/home/u/app/.claude/settings.json",
+        ),
+        (
+            "codex",
+            shell("codex/bash-allow.json", "cat .env"),
+            "core.secrets",
+            "cat .env",
+        ),
+        (
+            "codex",
+            variant("codex/apply-patch.json", |v| {
+                v["tool_input"]["command"] = CODEX_PATCH.into()
+            }),
+            "core.self",
+            ".codex/config.toml",
+        ),
+        (
+            "gemini",
+            fixture("gemini/read-file.json"),
+            "core.secrets",
+            "/home/u/app/.env",
+        ),
+        (
+            "gemini",
+            variant("gemini/write-file.json", |v| {
+                v["tool_input"]["file_path"] = "/home/u/app/.gemini/settings.json".into()
+            }),
+            "core.self",
+            "/home/u/app/.gemini/settings.json",
+        ),
+    ];
+    for (agent, stdin, pack, input) in cases {
+        let (out, rec) = run_bytes(agent, &stdin);
+        assert_eq!(out.code, 2, "{agent} {input}: {}", out.stderr);
+        assert!(out.stdout.is_empty(), "{agent} {input}");
+        assert!(
+            out.stderr.contains(&format!("BLOCKED by {pack}")),
+            "{agent} {input}: {}",
+            out.stderr
+        );
+        assert_eq!(rec.decision, DecisionKind::Deny, "{agent} {input}");
+        assert_eq!(rec.pack.as_deref(), Some(pack), "{agent} {input}");
+        assert_eq!(rec.input, input, "{agent}");
+        assert_eq!(rec.agent, agent);
+    }
+}
+
+#[test]
+fn init_off_from_an_agent_is_blocked() {
+    for (agent, name) in [
+        ("claude", "claude/bash-allow.json"),
+        ("codex", "codex/bash-allow.json"),
+        ("gemini", "gemini/shell-allow.json"),
+    ] {
+        let (out, rec) = run_bytes(agent, &shell(name, "saiife init --off"));
+        assert_eq!(out.code, 2, "{agent}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("BLOCKED by core.self"),
+            "{}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("your own terminal"), "{}", out.stderr);
+        assert_eq!(rec.decision, DecisionKind::Deny);
+        assert_eq!(rec.input, "saiife init --off");
+    }
+}
+
+#[test]
+fn reading_saiife_and_agent_config_stays_allowed() {
+    for path in [
+        "/home/u/app/.saiife/config.toml",
+        "/home/u/app/.claude/settings.json",
+        "/home/u/app/.codex/config.toml",
+    ] {
+        let stdin = variant("claude/read.json", |v| {
+            v["tool_input"]["file_path"] = path.into()
+        });
+        let (out, rec) = run_bytes("claude", &stdin);
+        assert_eq!(out.code, 0, "{path}: {}", out.stderr);
+        assert_eq!(rec.decision, DecisionKind::Allow, "{path}");
+    }
+    let (out, rec) = run_bytes(
+        "gemini",
+        &shell("gemini/shell-allow.json", "cat .saiife/config.toml"),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::Allow);
+}
+
+/// Plan 2 carry-over: an `apply_patch` without file headers has nothing to
+/// judge: a fail-open, never a silent allow.
+#[test]
+fn apply_patch_without_headers_is_recorded_as_unjudged() {
+    let stdin = variant("codex/apply-patch.json", |v| {
+        v["tool_input"]["command"] = "*** Begin Patch\n*** End Patch\n".into()
+    });
+    let (out, rec) = run_bytes("codex", &stdin);
+    assert_eq!(out.code, 0);
+    assert!(out.stdout.is_empty());
+    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(rec.reason.as_deref(), Some("no path to judge"));
+}
+
+/// Controller ruling M1: a search tool with neither `path` nor `cwd`
+/// judges the hook's own directory (what it reads), not a fail-open.
+#[test]
+fn pathless_search_without_cwd_judges_the_hook_directory() {
+    let stdin = br#"{"session_id":"c-1","hook_event_name":"PreToolUse","tool_name":"Glob","tool_input":{"pattern":"**/*.rs"}}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let out = check_bytes(dir.path(), "claude", stdin);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let rec = read_all(dir.path()).records.remove(0);
+    assert_eq!(rec.decision, DecisionKind::Allow);
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&rec.input).unwrap(),
+        real,
+        "judged: {}",
+        rec.input
+    );
+}
+
+#[test]
+fn claude_glob_and_ls_are_read_tools() {
+    let ls = variant("claude/read.json", |v| {
+        v["tool_name"] = "LS".into();
+        v["tool_input"] = serde_json::json!({"path": "/home/u/app/src"});
+    });
+    let (out, rec) = run_bytes("claude", &ls);
+    assert_eq!(out.code, 0);
+    assert_eq!(rec.tool, "LS");
+    assert_eq!(rec.input, "/home/u/app/src");
+    assert_eq!(rec.decision, DecisionKind::Allow);
+    // A Glob rooted at a secret path is judged like a read of it.
+    let glob = variant("claude/read.json", |v| {
+        v["tool_name"] = "Glob".into();
+        v["tool_input"] = serde_json::json!({"pattern": "*", "path": "/home/u/app/.env"});
+    });
+    let (out, rec) = run_bytes("claude", &glob);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.pack.as_deref(), Some("core.secrets"));
+}
+
+/// Review Focus 3: a Write whose content is over the 256 KiB payload cap is
+/// still judged by its path: removing the hook this way is blocked.
+#[test]
+fn large_write_to_agent_settings_is_denied() {
+    let payload = serde_json::json!({
+        "session_id": "c-1",
+        "cwd": "/home/u/app",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/home/u/app/.claude/settings.json",
+            "content": "x".repeat(600 * 1024)
+        }
+    })
+    .to_string();
+    let (out, rec) = run_bytes("claude", payload.as_bytes());
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::Deny);
+    assert_eq!(rec.pack.as_deref(), Some("core.self"));
+}
+
+/// Review Focus 5: a payload without `cwd` resolves relative paths against
+/// the hook's own working directory (the agent starts hooks in the
+/// project), so `.env` is still judged, not waved through.
+#[test]
+fn relative_path_without_cwd_uses_the_hook_directory() {
+    let stdin = br#"{"session_id":"g-1","hook_event_name":"BeforeTool","tool_name":"read_many_files","tool_input":{"include":["README.md",".env"]}}"#;
+    let (out, rec) = run_bytes("gemini", stdin);
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.pack.as_deref(), Some("core.secrets"));
+    assert_eq!(rec.input, "README.md\n.env");
+}
+
+/// A project directory holding `.env` and `a.rs`, and a payload for
+/// `agent`'s search/read tool rooted there.
+fn project_with_env() -> tempfile::TempDir {
+    let p = tempfile::tempdir().unwrap();
+    std::fs::write(p.path().join(".env"), "TOKEN=1\n").unwrap();
+    std::fs::write(p.path().join("a.rs"), "fn main() {}\n").unwrap();
+    p
+}
+
+fn payload(tool: &str, cwd: &Path, input: serde_json::Value) -> Vec<u8> {
+    serde_json::json!({
+        "session_id": "x-1",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Controller ruling C2/I1: patterns are expanded and every match judged.
+#[test]
+fn glob_patterns_are_expanded_and_every_match_judged() {
+    let p = project_with_env();
+    for (agent, tool, input) in [
+        (
+            "claude",
+            "Grep",
+            serde_json::json!({"pattern": "TOKEN", "path": ".", "glob": ".env*"}),
+        ),
+        (
+            "claude",
+            "Grep",
+            serde_json::json!({"pattern": "TOKEN", "glob": ".env*"}),
+        ),
+        (
+            "gemini",
+            "grep_search",
+            serde_json::json!({"pattern": "TOKEN", "include": ".env*"}),
+        ),
+        (
+            "gemini",
+            "read_many_files",
+            serde_json::json!({"include": [".env*"]}),
+        ),
+    ] {
+        let (out, rec) = run_bytes(agent, &payload(tool, p.path(), input));
+        assert_eq!(out.code, 2, "{tool}: {}", out.stderr);
+        assert_eq!(rec.decision, DecisionKind::Deny, "{tool}");
+        assert_eq!(rec.pack.as_deref(), Some("core.secrets"), "{tool}");
+    }
+}
+
+#[test]
+fn glob_patterns_that_match_nothing_secret_are_allowed() {
+    let p = project_with_env();
+    for (agent, tool, input) in [
+        (
+            "claude",
+            "Grep",
+            serde_json::json!({"pattern": "main", "glob": "*.rs"}),
+        ),
+        (
+            "gemini",
+            "read_many_files",
+            serde_json::json!({"include": ["*.rs"]}),
+        ),
+        // Glob and glob_search patterns are listings: only the root is judged.
+        (
+            "claude",
+            "Glob",
+            serde_json::json!({"pattern": ".env*", "path": p.path()}),
+        ),
+    ] {
+        let (out, rec) = run_bytes(agent, &payload(tool, p.path(), input));
+        assert_eq!(out.code, 0, "{tool}: {}", out.stderr);
+        assert_eq!(rec.decision, DecisionKind::Allow, "{tool}");
+    }
+}
+
+#[test]
+fn a_glob_too_large_to_judge_is_a_recorded_fail_open() {
+    let p = tempfile::tempdir().unwrap();
+    for i in 0..4200 {
+        std::fs::write(p.path().join(format!("f{i}.txt")), "").unwrap();
+    }
+    let (out, rec) = run_bytes(
+        "gemini",
+        &payload(
+            "read_many_files",
+            p.path(),
+            serde_json::json!({"include": ["*.txt"]}),
+        ),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(rec.reason.as_deref(), Some("glob too large to judge"));
 }

@@ -7,14 +7,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
+use saiifeguard::canon::{expand_glob, GlobExpansion, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
-    classify, context_from_hook_json_bounded, HookContext, PayloadError, ToolCall,
+    classify, context_from_hook_json_bounded, search_globs, HookContext, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
 use saiifeguard::profile::select_active;
 use saiifeguard::Pack;
 
+use crate::paths::path_vars;
 use crate::project::project_packs;
 use crate::warn;
 
@@ -50,14 +53,51 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
             // the project config or building the engine fails open too.
             let cwd = audit.ctx.cwd.clone();
             decide(&audit, &command, hook_exit, |c| {
-                engine_for(packs, cli_packs, cwd.as_deref()).evaluate(c)
+                engine_for(packs, cli_packs, cwd.as_deref()).0.evaluate(c)
             })
         }
-        Ok(ToolCall::File { paths, .. }) => {
-            // Path rules arrive in plan 3; until then file tools are
-            // recorded, never judged.
-            audit.write(&paths.join("\n"), DecisionKind::Allow, None, None);
-            allow()
+        Ok(ToolCall::File {
+            tool,
+            mut paths,
+            write,
+        }) => {
+            if paths.is_empty() && tool != "apply_patch" {
+                // A search or list tool with neither `path` nor `cwd`
+                // reads the directory the hook runs in.
+                if let Ok(d) = std::env::current_dir() {
+                    paths.push(d.display().to_string());
+                }
+            }
+            if paths.is_empty() {
+                // An apply_patch without file headers: allowed, but never
+                // recorded as a judged allow.
+                audit.write(
+                    "",
+                    DecisionKind::ErrorAllowed,
+                    None,
+                    Some("no path to judge"),
+                );
+                return allow();
+            }
+            let cwd = audit.ctx.cwd.clone();
+            let access = if write { Access::Write } else { Access::Read };
+            // Only search tools filter by `glob`/`include`, and only
+            // `read_many_files` names its files by pattern.
+            let filters = search_globs(&buf, PARSE_MAX_BYTES);
+            let expand_paths = tool == "read_many_files";
+            decide(&audit, &paths.join("\n"), hook_exit, |_| {
+                let (engine, vars) = engine_for(packs, cli_packs, cwd.as_deref());
+                let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
+                let d = judge_paths(&engine, access, &targets);
+                if overflow && !d.is_deny() {
+                    return Decision::Allow {
+                        trace: AllowTrace::Unjudgeable {
+                            reason: "glob too large to judge".into(),
+                        },
+                    };
+                }
+                d
+            })
         }
         Ok(ToolCall::Other { .. }) => {
             audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
@@ -104,8 +144,10 @@ fn agent_from_args(args: &[String]) -> Option<&str> {
 }
 
 /// The engine for this call: default-on packs, `--pack` ids, and the packs
-/// of the project that `cwd` (or this process's directory) belongs to.
-fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engine {
+/// of the project that `cwd` (or this process's directory) belongs to,
+/// with path rules bound to that directory and this machine's saiife dirs
+/// (the bindings are returned too, for expanding globs).
+fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> (Engine, PathVars) {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
@@ -116,7 +158,74 @@ fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> Engi
     }
     let mut enabled = cli_packs.to_vec();
     enabled.extend(project.enabled);
-    Engine::new(select_active(packs, &enabled))
+    let vars = path_vars(Some(&start), project.root.as_deref());
+    let engine = Engine::new(select_active(packs, &enabled)).with_paths(vars.clone());
+    (engine, vars)
+}
+
+/// What a file call reads or writes: its paths, with the patterns of
+/// `read_many_files` (`expand_paths`) expanded, and every file a search
+/// tool's `filters` selects under each of its paths. A pattern that matches
+/// nothing is judged as spelled (the shell would pass it through). The flag
+/// is set when a pattern was too large to expand.
+fn expand_targets(
+    vars: &PathVars,
+    paths: &[String],
+    filters: &[String],
+    expand_paths: bool,
+) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut overflow = false;
+    let mut add = |word: &str, out: &mut Vec<String>| match expand_glob(word, None, vars) {
+        GlobExpansion::NotAGlob => out.push(word.to_string()),
+        GlobExpansion::Matches(m) if m.is_empty() => out.push(word.to_string()),
+        GlobExpansion::Matches(m) => out.extend(m.iter().map(|p| p.display().to_string())),
+        GlobExpansion::Overflow => overflow = true,
+    };
+    for p in paths {
+        if expand_paths {
+            add(p, &mut out);
+        } else {
+            out.push(p.clone());
+        }
+    }
+    for p in paths {
+        for f in filters {
+            add(&format!("{}/{f}", p.trim_end_matches('/')), &mut out);
+        }
+    }
+    (out, overflow)
+}
+
+/// Judge every path of one file tool call: any deny denies the call.
+/// Otherwise the call is a fail-open if any path ran out of budget or could
+/// not be resolved, else an allow (by a carve-out, if one applied).
+fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
+    let rank = |d: &Decision| match d {
+        Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        } => 3,
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { .. },
+        } => 2,
+        Decision::Allow {
+            trace: AllowTrace::AllowRule { .. },
+        } => 1,
+        _ => 0,
+    };
+    let mut result = Decision::Allow {
+        trace: AllowTrace::NoMatch,
+    };
+    for p in paths {
+        let d = engine.evaluate_path(access, p);
+        if d.is_deny() {
+            return d;
+        }
+        if rank(&d) > rank(&result) {
+            result = d;
+        }
+    }
+    result
 }
 
 /// The payload could not be judged: allow, and record why.

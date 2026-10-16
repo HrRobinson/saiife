@@ -88,6 +88,8 @@ const SHELL_TOOLS: &[&str] = &["Bash", "run_shell_command"];
 const READ_TOOLS: &[&str] = &[
     "Read",
     "Grep",
+    "Glob",
+    "LS",
     "read_file",
     "read_many_files",
     "list_directory",
@@ -168,6 +170,27 @@ pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError>
             tool: tool.to_string(),
         }),
     }
+}
+
+/// The file filter of a search tool (Claude `Grep` `glob`, Gemini
+/// `grep_search` `include`): a pattern relative to the search root that
+/// selects the files whose content is read. Empty when there is none.
+pub fn search_globs(input: &str, max_bytes: usize) -> Vec<String> {
+    if input.len() > max_bytes {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(input) else {
+        return Vec::new();
+    };
+    let Some(tool_input) = v.get("tool_input") else {
+        return Vec::new();
+    };
+    ["glob", "include"]
+        .iter()
+        .filter_map(|k| tool_input.get(*k).and_then(Value::as_str))
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Path fields of the Claude Code and Gemini CLI file tools, in a fixed order.
@@ -575,6 +598,66 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn classify_claude_glob_and_ls() {
+        let c = call(
+            serde_json::json!({"cwd": "/p", "tool_name": "Glob", "tool_input": {"pattern": "**/*.rs"}}),
+        );
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Glob".into(),
+                paths: vec!["/p".into()],
+                write: false
+            }
+        );
+        let c =
+            call(serde_json::json!({"tool_name": "LS", "tool_input": {"path": "/home/u/.ssh"}}));
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "LS".into(),
+                paths: vec!["/home/u/.ssh".into()],
+                write: false
+            }
+        );
+        // No path and no cwd: nothing to judge.
+        let c = call(serde_json::json!({"tool_name": "Glob", "tool_input": {"pattern": "*"}}));
+        assert_eq!(
+            c,
+            ToolCall::File {
+                tool: "Glob".into(),
+                paths: vec![],
+                write: false
+            }
+        );
+    }
+
+    #[test]
+    fn search_globs_are_the_file_filters_of_grep_tools() {
+        let g = |v: serde_json::Value| search_globs(&v.to_string(), MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            g(
+                serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "glob": ".env*"}})
+            ),
+            vec![".env*".to_string()]
+        );
+        assert_eq!(
+            g(
+                serde_json::json!({"tool_name": "grep_search", "tool_input": {"pattern": "x", "include": "*.rs"}})
+            ),
+            vec!["*.rs".to_string()]
+        );
+        // read_many_files `include` is a list of paths, not a filter.
+        assert!(g(
+            serde_json::json!({"tool_name": "read_many_files", "tool_input": {"include": ["a"]}})
+        )
+        .is_empty());
+        assert!(
+            g(serde_json::json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}})).is_empty()
+        );
     }
 
     #[test]

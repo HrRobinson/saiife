@@ -19,6 +19,7 @@ mod audit_cmd;
 mod check;
 mod init_cmd;
 mod packs_cmd;
+mod paths;
 mod project;
 mod status_cmd;
 
@@ -103,7 +104,16 @@ fn main() -> ExitCode {
     for w in &warnings {
         warn(&format!("pack warning ({}): {}", w.source, w.message));
     }
-    let engine = || Engine::new(select_active(packs.clone(), &cli.packs));
+    // `test`/`explain` resolve relative paths against this directory, like
+    // a hook resolves them against the agent's.
+    let cwd = std::env::current_dir().ok();
+    let project = cwd
+        .as_deref()
+        .and_then(saiife_agents::config::find_project_root);
+    let engine = || {
+        Engine::new(select_active(packs.clone(), &cli.packs))
+            .with_paths(paths::path_vars(cwd.as_deref(), project.as_deref()))
+    };
 
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine(), &command),
