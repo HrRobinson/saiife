@@ -405,6 +405,32 @@ fn sources_of(sources: &[Tok], contents: impl Fn(&Tok) -> bool, dir: Option<&str
         .collect()
 }
 
+/// rsync long options that take a value.
+const RSYNC_VALUES: [&str; 22] = [
+    "rsh",
+    "temp-dir",
+    "filter",
+    "exclude",
+    "include",
+    "chmod",
+    "chown",
+    "compare-dest",
+    "link-dest",
+    "copy-dest",
+    "partial-dir",
+    "backup-dir",
+    "rsync-path",
+    "suffix",
+    "files-from",
+    "exclude-from",
+    "include-from",
+    "password-file",
+    "log-file",
+    "write-batch",
+    "only-write-batch",
+    "read-batch",
+];
+
 /// `cp`, `scp`, `rsync`, `install`, `ln`: the target is written, the
 /// sources read. A single operand (`ln -s x`) is both.
 fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
@@ -414,30 +440,20 @@ fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
             short: "tSmog",
             ..TARGET_SPEC
         },
-        // rsync has no target-directory option (`-t` preserves times);
-        // `-e CMD`, `-B SIZE`, `-M OPT`, `--chmod`/`--chown`, `--filter`
-        // and `--exclude`/`--include` patterns name no path, the
-        // `--*-dest`/`--*-dir` directories are only consulted.
-        // `-T DIR`/`--temp-dir` holds rsync's own temp files.
+        // rsync has no target-directory option (`-t` preserves times).
+        // Judged: the lists and password file it reads (`--files-from`,
+        // `--exclude-from`, `--include-from`, `--password-file`,
+        // `--read-batch`) and the files and directories it writes
+        // (`--log-file`, `--write-batch`, `--only-write-batch`,
+        // `--backup-dir`, `--partial-dir`, `-T`/`--temp-dir`). Ignored:
+        // `-e CMD`, `-B SIZE`, `-M OPT`, `--chmod`/`--chown`, `--filter`,
+        // `--exclude`/`--include` patterns, `--rsync-path`, `--suffix`, and
+        // the `--compare-dest`/`--link-dest`/`--copy-dest` directories,
+        // which are only read to compare against.
         "rsync" => Spec {
             short: "eTfBM",
             optional: "",
-            long: &[
-                "rsh",
-                "temp-dir",
-                "filter",
-                "exclude",
-                "include",
-                "chmod",
-                "chown",
-                "compare-dest",
-                "link-dest",
-                "copy-dest",
-                "partial-dir",
-                "backup-dir",
-                "rsync-path",
-                "suffix",
-            ],
+            long: &RSYNC_VALUES,
         },
         // `-i IDENTITY` (a key ssh uses, not one copied), `-F CONFIG`,
         // `-o OPTION`, `-J JUMP`, `-c CIPHER`, `-l LIMIT`, `-P PORT`,
@@ -450,6 +466,28 @@ fn copier(cmd: &str, words: &[Option<Tok>], out: &mut Out) {
         _ => TARGET_SPEC,
     };
     let args = parse(words, &spec);
+    if cmd == "rsync" {
+        for a in &args {
+            match a {
+                Arg::Opt(
+                    Name::Long(
+                        "files-from" | "exclude-from" | "include-from" | "password-file"
+                        | "read-batch",
+                    ),
+                    Some(v),
+                ) => out.read(*v),
+                Arg::Opt(
+                    Name::Short('T')
+                    | Name::Long(
+                        "log-file" | "write-batch" | "only-write-batch" | "backup-dir"
+                        | "partial-dir" | "temp-dir",
+                    ),
+                    Some(v),
+                ) => out.write(*v),
+                _ => {}
+            }
+        }
+    }
     let ops = operands_of(&args);
     let (target, sources) = if cmd == "rsync" || cmd == "scp" {
         match ops.len() {
@@ -1213,6 +1251,35 @@ mod tests {
             full("rsync -a backup/ x conf")[0].into,
             vec![src("backup/", false, true), src("x", false, false)]
         );
+    }
+
+    #[test]
+    fn rsync_option_files_are_judged() {
+        let has = |cmd: &str, want: (String, &'static str)| {
+            let o = ops(cmd);
+            assert!(o.contains(&want), "{cmd}: {o:?}");
+            o
+        };
+        has("rsync --files-from .env a/ b", r(".env"));
+        has("rsync --exclude-from=list a b", r("list"));
+        has("rsync --include-from list a b", r("list"));
+        has("rsync --password-file .env a host::m", r(".env"));
+        has(
+            "rsync --log-file=.claude/settings.json a b",
+            w(".claude/settings.json"),
+        );
+        has(
+            "rsync --log-file .claude/settings.json a b",
+            w(".claude/settings.json"),
+        );
+        has("rsync -b --backup-dir=.saiife a b", w(".saiife"));
+        has("rsync --partial-dir .saiife a b", w(".saiife"));
+        has("rsync -T .claude a b", w(".claude"));
+        has("rsync --write-batch=x a b", w("x"));
+        has("rsync --read-batch=.env b", r(".env"));
+        // A space-separated value is not a source.
+        let o = ops("rsync --exclude-from list a b");
+        assert_eq!(o.iter().filter(|x| x.0 == "list").count(), 1, "{o:?}");
     }
 
     #[test]
