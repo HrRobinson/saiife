@@ -24,7 +24,7 @@ version = 1
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "claude", "codex", "gemini"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "claude", "codex", "gemini"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -38,7 +38,7 @@ reason = "an alias named saiife would replace the guard"
 # `PATH=/tmp/fake:$PATH claude …`, `env PATH=… codex …`: a nested agent
 # whose PATH can resolve `saiife` to something else. `HOME=` and
 # `XDG_DATA_HOME=` relocate the audit and integrity dirs the same way.
-pattern = '(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)'
+pattern = '(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home|gemini_cli_system_settings_path|gemini_cli_system_defaults_path)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)'
 reason = "starting an agent or saiife with a changed PATH, HOME or XDG_DATA_HOME can bypass the guard or hide its audit trail"
 whole_segment = true
 
@@ -54,10 +54,17 @@ pattern = '^claude\s+(?:\S+\s+)*--setting(?:s|-sources)(?:\s|=|$)'
 reason = "starting Claude Code with its own settings or setting sources can leave the saiife hook out"
 
 [[deny]]
-# Any `-c`/`--config` whose key starts with `features` or `hooks`, whatever
-# the value or quoting (`-c 'features.hooks = false'`, `-cfeatures.hooks=1`).
-pattern = '^codex\s+(?:\S+\s+)*(?:-c\s*|--config(?:\s+|=))["\x27]?\s*(?:features|hooks)'
+# `-c`/`--config` setting a key that starts with `features` or `hooks`,
+# whatever the value or quoting (`-c 'features.hooks = false'`,
+# `-cfeatures.hooks=1`). A key is followed by `=`, so a prompt that merely
+# mentions "-c hooks" is not matched.
+pattern = '^codex\s+(?:\S+\s+)*(?:-c\s*|--config(?:\s+|=))\s*(?:features|hooks)[\w.\-]*\s*='
 reason = "changing Codex's hook configuration from the command line can leave the saiife hook out"
+
+[[deny]]
+# `--enable`/`--disable` of a hooks feature flag (`hooks`, `codex_hooks`, …).
+pattern = '^codex\s+(?:\S+\s+)*--(?:enable|disable)(?:\s+|=)\S*hooks'
+reason = "enabling or disabling Codex's hooks from the command line can leave the saiife hook out"
 
 [[deny]]
 # `export PATH=/tmp/fake:$PATH; claude`, `HOME=/tmp/x; export HOME; codex`:

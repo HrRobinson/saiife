@@ -325,6 +325,7 @@ impl Engine {
         // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
         // rest of the command line (and for nested evaluations).
         let mut env_changed = env_changed;
+        let literal_path = has_literal_path_ref(raw_cmd);
 
         for seg in split_segments(raw_cmd) {
             if start.elapsed() > self.budget {
@@ -355,7 +356,20 @@ impl Engine {
             // recurse into the substitution's inner text and judge that
             // instead, the same structural re-entry already used for inline
             // `bash -c '...'` payloads below (same depth cap, same budget).
-            if let Some(inner) = command_position_substitution(effective) {
+            // A leading `NAME=$(…)` assignment in front of a real command
+            // (`FOO=$(date) git reset --hard`) is not the command: the
+            // command after it is judged below and the substitution by the
+            // embedded-substitution scan.
+            let substitution_is_the_command = {
+                let rest = effective_command(effective);
+                rest.is_empty()
+                    || rest.first().is_some_and(|w| {
+                        command_position_substitution(rest).is_some() && w.has_substitution
+                    })
+            };
+            if let Some(inner) =
+                command_position_substitution(effective).filter(|_| substitution_is_the_command)
+            {
                 if depth < MAX_INLINE_DEPTH {
                     if start.elapsed() > self.budget {
                         return Decision::Allow {
@@ -498,7 +512,7 @@ impl Engine {
                         _ => {}
                     }
                 }
-                env_changed |= effective_is_empty_assignments(&seg);
+                env_changed |= effective_is_empty_assignments(&seg, literal_path);
                 if let Some(d) = self.judge_operands(&seg, &[], &[], &cwds, cwd_unknown, start) {
                     match d {
                         Decision::Allow {
@@ -574,7 +588,60 @@ impl Engine {
                     d => return d,
                 }
             }
-            env_changed |= changes_environment(&argv, effective);
+            // `eval ARGS` runs its joined arguments as a command line in
+            // this shell. What a substitution inside it expands to cannot
+            // be judged: recorded, not silent.
+            if argv[0] == "eval" {
+                if effective.iter().any(|w| w.has_substitution) {
+                    unjudged.get_or_insert_with(|| {
+                        "eval of a command substitution cannot be judged".to_string()
+                    });
+                }
+                let inner = effective
+                    .iter()
+                    .skip(1)
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if depth < MAX_INLINE_DEPTH && !inner.trim().is_empty() {
+                    if start.elapsed() > self.budget {
+                        return Decision::Allow {
+                            trace: AllowTrace::FailedOpenTimeout,
+                        };
+                    }
+                    match self.evaluate_inner(
+                        &inner,
+                        start,
+                        depth + 1,
+                        &cwds,
+                        cwd_unknown,
+                        env_changed,
+                    ) {
+                        Decision::Deny {
+                            pack,
+                            pattern,
+                            reason,
+                            ..
+                        } => {
+                            return Decision::Deny {
+                                pack,
+                                pattern,
+                                reason,
+                                via_inline: Some(inner),
+                            }
+                        }
+                        Decision::Allow {
+                            trace: AllowTrace::FailedOpenTimeout,
+                        } => {
+                            return Decision::Allow {
+                                trace: AllowTrace::FailedOpenTimeout,
+                            }
+                        }
+                        Decision::Allow { trace } => note(trace, &mut allow_trace, &mut unjudged),
+                    }
+                }
+            }
+            env_changed |= changes_environment(&argv, effective, literal_path);
             if argv[0] == "cd" || argv[0] == "pushd" {
                 cwd_unknown |= self.cd(&argv, effective, &mut cwds);
             }
@@ -862,7 +929,7 @@ impl Engine {
                 Some(h) => (vec![h.to_path_buf()], false),
                 None => (Vec::new(), true),
             },
-            Some((a, w)) if a == "-" || w.has_substitution => (Vec::new(), true),
+            Some((a, w)) if a == "-" || w.has_substitution || a.contains('$') => (Vec::new(), true),
             Some((a, _)) => {
                 let anchors: Vec<Option<&Path>> = if cwds.is_empty() {
                     vec![None]
@@ -1000,10 +1067,48 @@ fn peeled_redirections(prefix: &[Word]) -> String {
     out.join(" ")
 }
 
+/// Variables whose change moves saiife's audit/integrity records, the
+/// binary lookup or the (admin) settings the hooks live in. Gemini's two
+/// are the only config-location variables the research docs name.
+const PROTECTED_ENV: &[&str] = &[
+    "HOME",
+    "XDG_DATA_HOME",
+    "PATH",
+    "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+    "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
+];
+
+/// Is `$PATH` / `${PATH` written literally anywhere in `raw` (inside single
+/// quotes or after a backslash)? Word texts are dequoted, so this is the
+/// only place that can tell `PATH='$PATH':x` (a literal directory) from an
+/// append.
+fn has_literal_path_ref(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    let is_ref = |i: usize| b[i..].starts_with(b"$PATH") || b[i..].starts_with(b"${PATH");
+    let (mut sq, mut dq, mut i) = (false, false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if !sq => {
+                if i + 1 < b.len() && is_ref(i + 1) {
+                    return true;
+                }
+                i += 1;
+            }
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b'$' if sq && is_ref(i) => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Does this assignment (`NAME=value`, `NAME+=value`) change what saiife
-/// relies on: `HOME`, `XDG_DATA_HOME`, or `PATH` unless it only appends to
-/// the old value (an exact `$PATH` / `${PATH}` first, then `:` or the end)?
-fn assignment_changes_environment(text: &str) -> bool {
+/// relies on: a protected variable, with `PATH` exempt only when it appends
+/// to the old value (an exact `$PATH` / `${PATH}` first, then `:` or the
+/// end) and `$PATH` is not written literally anywhere in the command?
+fn assignment_changes_environment(text: &str, literal_path: bool) -> bool {
     let Some((name, value)) = text.split_once('=') else {
         return false;
     };
@@ -1011,44 +1116,56 @@ fn assignment_changes_environment(text: &str) -> bool {
         Some(n) => (n, true),
         None => (name, false),
     };
-    match name {
-        "HOME" | "XDG_DATA_HOME" => true,
-        "PATH" => {
-            if plus {
-                return false;
-            }
-            let rest = value
-                .strip_prefix("${PATH}")
-                .or_else(|| value.strip_prefix("$PATH"));
-            !matches!(rest, Some(r) if r.is_empty() || r.starts_with(':'))
-        }
-        _ => false,
+    if !PROTECTED_ENV.contains(&name) {
+        return false;
     }
+    if name != "PATH" {
+        return true;
+    }
+    if literal_path {
+        return true;
+    }
+    if plus {
+        return false;
+    }
+    let rest = value
+        .strip_prefix("${PATH}")
+        .or_else(|| value.strip_prefix("$PATH"));
+    !matches!(rest, Some(r) if r.is_empty() || r.starts_with(':'))
 }
 
 /// A segment of bare assignments (`PATH=/x`, no command): they stay set.
-fn effective_is_empty_assignments(seg: &[Word]) -> bool {
+fn effective_is_empty_assignments(seg: &[Word], literal_path: bool) -> bool {
     seg.iter()
-        .any(|w| w.assignment && assignment_changes_environment(&w.text))
+        .any(|w| w.assignment && assignment_changes_environment(&w.text, literal_path))
         && seg.iter().all(|w| w.assignment || w.redirect)
 }
 
-/// `export` / `readonly` / `declare -x` / `typeset -x` with an assignment
-/// that changes PATH, HOME or XDG_DATA_HOME.
-fn changes_environment(argv: &[String], effective: &[Word]) -> bool {
-    let exports = match argv.first().map(String::as_str) {
-        Some("export" | "readonly") => true,
-        Some("declare" | "typeset") => effective
-            .iter()
-            .skip(1)
-            .any(|w| w.text.starts_with('-') && w.text.contains('x')),
-        _ => false,
+/// A builtin that sets or may set a protected variable of the running
+/// shell, in any form: `export`/`readonly`/`declare`/`typeset`/`local`
+/// assignments (quoted or not, with or without `-x`: HOME and PATH are
+/// already exported), `printf -v`, `read`/`mapfile`/`readarray` naming one,
+/// and `eval`/`source`/`.` (effect unknown, so assumed to change it). Over-
+/// denying a pipe or subshell (`export HOME=x | claude`) is harmless.
+fn changes_environment(argv: &[String], effective: &[Word], literal_path: bool) -> bool {
+    let skip = argv.iter().take_while(|a| *a == "builtin").count();
+    let (Some(cmd), Some(args)) = (argv.get(skip), effective.get(skip + 1..)) else {
+        return false;
     };
-    exports
-        && effective
+    let protected = |t: &str| PROTECTED_ENV.contains(&t);
+    match cmd.as_str() {
+        "eval" | "source" | "." => true,
+        "export" | "readonly" | "declare" | "typeset" | "local" => args
             .iter()
-            .skip(1)
-            .any(|w| w.assignment && assignment_changes_environment(&w.text))
+            .any(|w| assignment_changes_environment(&w.text, literal_path)),
+        "printf" => args
+            .windows(2)
+            .any(|p| p[0].text == "-v" && protected(p[1].text.split('[').next().unwrap_or(""))),
+        "read" | "mapfile" | "readarray" => args
+            .iter()
+            .any(|w| !w.text.starts_with('-') && protected(&w.text)),
+        _ => false,
+    }
 }
 
 /// The whole segment's matching line for `whole_segment` rules: like

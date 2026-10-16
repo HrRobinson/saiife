@@ -519,3 +519,180 @@ fn codex_config_keys_are_normalized() {
         assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
     }
 }
+
+fn assert_denied(e: &Engine, cmds: &[&str]) {
+    for cmd in cmds {
+        assert_eq!(deny_pack(e, cmd), "core.self", "{cmd}");
+    }
+}
+
+fn assert_allowed(e: &Engine, cmds: &[&str]) {
+    for cmd in cmds {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+#[test]
+fn every_assignment_form_counts_as_an_environment_change() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "declare HOME=/tmp/x; claude",
+            "typeset PATH=/tmp/x; claude",
+            "local HOME=/tmp/x; claude",
+            "builtin export HOME=/tmp/x; claude",
+            "printf -v HOME /tmp/x; claude",
+            "read HOME <<< /tmp/x; claude",
+            "read -r PATH; claude",
+            "mapfile HOME <<< x; claude",
+            "eval 'export HOME=/tmp/x'; claude",
+            "source env.sh; claude -p hi",
+            ". env.sh; codex exec x",
+            "{ export HOME=x; }; claude",
+            "eval 'export HOME=x; true' && claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "read -r line",
+            "declare -a arr; claude -p hi",
+            "local FOO=1; claude -p hi",
+            "printf -v msg hi; claude -p hi",
+            "export HOME=/tmp/x; cargo test",
+        ],
+    );
+}
+
+#[test]
+fn config_relocating_variables_are_environment_changes() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH=/tmp/x gemini",
+            "env GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/tmp/x gemini -p hi",
+            "export GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/tmp/x; gemini",
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH=/tmp/x; gemini",
+        ],
+    );
+    assert_allowed(&e, &["GEMINI_CLI_SYSTEM_SETTINGS_PATH=/tmp/x make"]);
+}
+
+#[test]
+fn codex_enable_disable_of_hooks_is_denied() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "codex --disable hooks exec x",
+            "codex --disable=codex_hooks exec x",
+            "codex --enable hooks exec x",
+            "codex exec x --disable=hooks_v2",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "codex --enable web_search exec x",
+            "codex -c model=x exec \"why does -c hooks fail\"",
+        ],
+    );
+}
+
+#[test]
+fn quoted_path_references_and_quoted_export_arguments() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "export PATH='$PATH':/usr/bin; claude",
+            "export PATH=\\$PATH:/x; claude",
+            "PATH='$PATH:/x'; claude",
+            "export 'HOME=/tmp/x'; claude",
+            "export \"HOME\"=/tmp/x; claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "export PATH=\"$PATH:./bin\"; claude -p hi",
+            "export PATH=$PATH:./bin; claude -p hi",
+            "echo '$PATH'; npm test",
+        ],
+    );
+}
+
+#[test]
+fn exec_xargs_and_eval_run_the_command_they_wrap() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "exec saiife init --off",
+            "exec -a foo saiife init --off",
+            "echo x | xargs rm .saiife/config.toml",
+            "xargs -n1 -I{} rm .claude/settings.json",
+            "sudo xargs saiife init --off",
+            "eval \"saiife init --off\"",
+            "eval 'rm -rf .saiife'",
+            "export HOME=x; exec claude",
+            "export HOME=x; eval claude",
+            "export HOME=x; echo | xargs claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "xargs -n1 echo",
+            "find . -name '*.rs' | xargs grep TODO",
+            "exec bash",
+            "eval \"$(direnv hook bash)\"",
+        ],
+    );
+    // An eval of a substitution cannot be judged: recorded, not silent.
+    match e.evaluate("eval \"$(direnv hook bash)\"") {
+        Decision::Allow {
+            trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
+        } => {}
+        d => panic!("{d:?}"),
+    }
+}
+
+#[test]
+fn a_leading_assignment_with_a_substitution_does_not_hide_the_command() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for (cmd, pack) in [
+        ("FOO=$(date) git reset --hard", "core.git"),
+        ("VERSION=$(git describe) rm -rf .claude", "core.self"),
+        ("TS=$(date +%s) cat .env", "core.secrets"),
+        ("A=$(echo 1) B=2 rm -rf .saiife", "core.self"),
+        ("FOO=$(rm -rf .saiife) true", "core.self"),
+    ] {
+        assert_eq!(deny_pack(&e, cmd), pack, "{cmd}");
+    }
+    assert_allowed(&e, &["TS=$(date +%s) make build", "FOO=$(date)"]);
+}
+
+#[test]
+fn cd_into_a_variable_is_an_unknown_directory() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_allowed(&e, &["cd \"$HOME/proj\" && cargo test"]);
+    for cmd in ["cd \"$D\" && cat notes.txt", "cd $D && cat notes.txt"] {
+        match e.evaluate(cmd) {
+            Decision::Allow {
+                trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
+            } => {}
+            d => panic!("{cmd}: {d:?}"),
+        }
+    }
+}

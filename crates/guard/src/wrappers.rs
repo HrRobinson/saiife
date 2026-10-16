@@ -29,9 +29,11 @@
 //! shell re-parses rather than a leading sub-slice (and `su`'s first operand
 //! is a username, which a blind prefix-skip would misread).
 //!
-//! Deliberately not exhaustive — two documented gaps remain: `xargs` (its
-//! catastrophic operand arrives on stdin from the producer, invisible to a
-//! static scan) and the `flock … -c 'STRING'` sub-form. See the design doc's
+//! `exec` and `xargs` are peeled too (xargs: the command and its fixed
+//! operands are judged; operands arriving on stdin stay invisible). `eval`
+//! is handled by the engine (its joined arguments are a nested command line).
+//!
+//! Deliberately not exhaustive — a documented gap remains: the `flock … -c 'STRING'` sub-form. See the design doc's
 //! "Known limitations".
 
 use crate::lexer::Word;
@@ -42,7 +44,7 @@ use crate::lexer::Word;
 /// filesystem means `COMMAND rm -rf /` finds the same binary as `command`).
 const TRANSPARENT_PREFIXES: &[&str] = &[
     "command", "env", "nohup", "nice", "stdbuf", "ionice", "sudo", "time", "timeout", "chroot",
-    "flock",
+    "flock", "exec", "xargs",
 ];
 
 /// `sudo` short options that take a value, e.g. `-u root`. Bundled/attached
@@ -178,6 +180,30 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
                     &['w', 'E'],
                     &["timeout", "conflict-exit-code"],
                     1,
+                    None,
+                );
+            }
+            "exec" => {
+                // `exec [-cl] [-a NAME] CMD`: replaces the shell with CMD.
+                rest = skip_options_then_positionals(rest, &['a'], &[], 0, None);
+            }
+            "xargs" => {
+                // `xargs [OPTIONS] CMD ARGS`: judge the command it runs
+                // (its operands arrive on stdin, but fixed operands and the
+                // command itself are visible).
+                rest = skip_options_then_positionals(
+                    rest,
+                    &['I', 'n', 'P', 'L', 's', 'd', 'E', 'a', 'R', 'S'],
+                    &[
+                        "max-args",
+                        "max-procs",
+                        "max-lines",
+                        "max-chars",
+                        "delimiter",
+                        "arg-file",
+                        "process-slot-var",
+                    ],
+                    0,
                     None,
                 );
             }
