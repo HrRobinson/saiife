@@ -51,7 +51,10 @@ mod tests {
         let real = std::fs::canonicalize(d.path()).unwrap();
         let v = path_vars(Some(d.path()), None);
         assert_eq!(v.cwd(), Some(real.as_path()));
-        assert_eq!(v.values("PROJECT"), vec![real.as_path()]);
+        // Both the spelled and the resolved value are bound (they differ on
+        // macOS, where the temp dir is `/var/…` -> `/private/var/…`).
+        assert!(v.values("PROJECT").contains(&real.as_path()));
+        assert!(v.values("PROJECT").contains(&d.path()));
         let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         assert!(v.values("SAIIFE_BIN").contains(&exe.as_path()));
         assert!(path_vars(None, None).cwd().is_none());
