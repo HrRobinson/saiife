@@ -49,15 +49,17 @@ impl Fixture {
     fn engine(&self) -> Engine {
         let (packs, warnings) = builtin_packs();
         assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-        Engine::new(select_active(packs, &[])).with_paths(
-            PathVars::new()
-                .with_cwd(self.root.join("home/app"))
-                .with_var("HOME", self.root.join("home"))
-                .with_var("PROJECT", self.root.join("home/app"))
-                .with_var("SAIIFE_DATA_DIR", self.root.join("data"))
-                .with_var("SAIIFE_AUDIT_DIR", self.root.join("data/audit"))
-                .with_var("SAIIFE_BIN", self.root.join("opt/saiife")),
-        )
+        Engine::new(select_active(packs, &[]))
+            .with_budget(TEST_BUDGET)
+            .with_paths(
+                PathVars::new()
+                    .with_cwd(self.root.join("home/app"))
+                    .with_var("HOME", self.root.join("home"))
+                    .with_var("PROJECT", self.root.join("home/app"))
+                    .with_var("SAIIFE_DATA_DIR", self.root.join("data"))
+                    .with_var("SAIIFE_AUDIT_DIR", self.root.join("data/audit"))
+                    .with_var("SAIIFE_BIN", self.root.join("opt/saiife")),
+            )
     }
 }
 
@@ -275,7 +277,9 @@ fn removing_a_parent_of_the_data_dir_or_binary_is_denied() {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
     let (packs, _) = builtin_packs();
-    let e = Engine::new(select_active(packs, &[])).with_paths(xdg_vars(&root));
+    let e = Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(xdg_vars(&root));
     let home = root.join("home");
     for cmd in [
         "rm -rf ~/.local/share".to_string(),
@@ -291,6 +295,7 @@ fn removing_a_parent_of_the_data_dir_or_binary_is_denied() {
     // here core.self alone must).
     let (packs, _) = builtin_packs();
     let only_self = Engine::new(packs.into_iter().filter(|p| p.id == "core.self").collect())
+        .with_budget(TEST_BUDGET)
         .with_paths(xdg_vars(&root));
     for path in ["~/.local/share", "~/.local/bin", "~/.local", "~", "/"] {
         for eng in [&e, &only_self] {
@@ -435,13 +440,15 @@ fn a_symlinked_data_dir_is_protected_by_both_names() {
     std::os::unix::fs::symlink(root.join("real/share"), home.join(".local/share")).unwrap();
     let spelled = home.join(".local/share/saiife");
     let (packs, _) = builtin_packs();
-    let e = Engine::new(packs.into_iter().filter(|p| p.id == "core.self").collect()).with_paths(
-        PathVars::new()
-            .with_cwd(home.join("app"))
-            .with_var("HOME", &home)
-            .with_var("SAIIFE_DATA_DIR", &spelled)
-            .with_var("SAIIFE_AUDIT_DIR", spelled.join("audit")),
-    );
+    let e = Engine::new(packs.into_iter().filter(|p| p.id == "core.self").collect())
+        .with_budget(TEST_BUDGET)
+        .with_paths(
+            PathVars::new()
+                .with_cwd(home.join("app"))
+                .with_var("HOME", &home)
+                .with_var("SAIIFE_DATA_DIR", &spelled)
+                .with_var("SAIIFE_AUDIT_DIR", spelled.join("audit")),
+        );
     for cmd in [
         "rm -rf ~/.local/share".to_string(),
         "rm -rf ~/.local".to_string(),
@@ -899,3 +906,7 @@ fn everyday_commands_from_the_round_4_brief_stay_allowed() {
         ],
     );
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

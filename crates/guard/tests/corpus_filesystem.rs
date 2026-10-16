@@ -7,7 +7,7 @@ fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     // core.filesystem is default-on, so the default profile suffices.
-    Engine::new(packs)
+    Engine::new(packs).with_budget(TEST_BUDGET)
 }
 
 fn deny_pack(e: &Engine, cmd: &str) -> String {
@@ -128,3 +128,7 @@ fn literal_substitution_values_are_judged() {
         deny_pack(&e, cmd);
     }
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

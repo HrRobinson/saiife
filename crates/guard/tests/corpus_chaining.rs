@@ -10,7 +10,7 @@ fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     // core.filesystem + core.git are default-on; both are exercised below.
-    Engine::new(packs)
+    Engine::new(packs).with_budget(TEST_BUDGET)
 }
 
 #[test]
@@ -68,3 +68,7 @@ fn does_not_split_a_separator_inside_quotes() {
         );
     }
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

@@ -11,7 +11,7 @@ use saiifeguard::profile::select_active;
 fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &["cloud.azure".to_string()]))
+    Engine::new(select_active(packs, &["cloud.azure".to_string()])).with_budget(TEST_BUDGET)
 }
 
 fn deny(e: &Engine, cmd: &str) -> (String, String) {
@@ -111,3 +111,7 @@ fn allows_safe_azure_commands() {
         );
     }
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

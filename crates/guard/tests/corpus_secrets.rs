@@ -59,12 +59,14 @@ impl Fixture {
     fn engine(&self) -> Engine {
         let (packs, warnings) = builtin_packs();
         assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-        Engine::new(select_active(packs, &[])).with_paths(
-            PathVars::new()
-                .with_cwd(self.app())
-                .with_var("HOME", self.home())
-                .with_var("PROJECT", self.app()),
-        )
+        Engine::new(select_active(packs, &[]))
+            .with_budget(TEST_BUDGET)
+            .with_paths(
+                PathVars::new()
+                    .with_cwd(self.app())
+                    .with_var("HOME", self.home())
+                    .with_var("PROJECT", self.app()),
+            )
     }
 }
 
@@ -725,3 +727,7 @@ fn arithmetic_too_long_to_judge_is_recorded() {
         d => panic!("expected error_allowed, got {d:?}"),
     }
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

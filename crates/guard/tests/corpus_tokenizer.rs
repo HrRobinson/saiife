@@ -15,14 +15,14 @@ use saiifeguard::profile::select_active;
 fn default_engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &[]))
+    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
 }
 
 /// cloud.gcloud is opt-in; the gcloud/gsutil corpus lines need it enabled.
 fn gcloud_engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &["cloud.gcloud".to_string()]))
+    Engine::new(select_active(packs, &["cloud.gcloud".to_string()])).with_budget(TEST_BUDGET)
 }
 
 #[test]
@@ -193,3 +193,7 @@ fn pathological_long_chain_still_catches_a_trailing_deny() {
         "3000-segment chain took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

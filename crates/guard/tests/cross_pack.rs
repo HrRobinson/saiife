@@ -7,13 +7,13 @@ use saiifeguard::profile::select_active;
 
 fn default_engine() -> Engine {
     let (packs, _) = builtin_packs();
-    Engine::new(select_active(packs, &[]))
+    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
 }
 
 fn engine_with(enabled: &[&str]) -> Engine {
     let (packs, _) = builtin_packs();
     let enabled: Vec<String> = enabled.iter().map(|s| s.to_string()).collect();
-    Engine::new(select_active(packs, &enabled))
+    Engine::new(select_active(packs, &enabled)).with_budget(TEST_BUDGET)
 }
 
 #[test]
@@ -51,3 +51,7 @@ fn enabling_an_opt_in_pack_activates_only_it() {
         "db.postgres still inactive"
     );
 }
+
+/// Generous budget so a loaded runner cannot turn a deny into a latency
+/// fail-open; the budget path itself is covered by dedicated tests.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

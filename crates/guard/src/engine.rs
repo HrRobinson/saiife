@@ -1410,6 +1410,11 @@ mod tests {
     use super::*;
     use crate::pack::load_pack_str;
 
+    /// Generous budget so a loaded runner cannot turn an exact trace into a
+    /// latency fail-open; `budget_overrun_fails_open_visibly` and
+    /// `evaluate_path_fails_open_over_budget` inject a zero budget instead.
+    const TEST_BUDGET: Duration = Duration::from_secs(5);
+
     fn test_engine() -> Engine {
         let toml = r#"
 [pack]
@@ -1430,7 +1435,7 @@ reason = "deletes untracked files"
 "#;
         let mut w = Vec::new();
         let pack = load_pack_str("<t>", toml, &mut w).unwrap();
-        Engine::new(vec![pack])
+        Engine::new(vec![pack]).with_budget(TEST_BUDGET)
     }
 
     #[test]
@@ -1601,7 +1606,9 @@ reason = "saiife config"
         let mut w = Vec::new();
         let pack = load_pack_str("<t>", PATH_PACK, &mut w).unwrap();
         assert!(w.is_empty(), "{w:?}");
-        Engine::new(vec![pack]).with_paths(vars)
+        Engine::new(vec![pack])
+            .with_budget(TEST_BUDGET)
+            .with_paths(vars)
     }
 
     fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
@@ -1703,7 +1710,9 @@ reason = "other pack says no"
             load_pack_str("<t>", PATH_PACK, &mut w).unwrap(),
             load_pack_str("<o>", other, &mut w).unwrap(),
         ];
-        let e = Engine::new(packs).with_paths(PathVars::new().with_cwd("/p"));
+        let e = Engine::new(packs)
+            .with_budget(TEST_BUDGET)
+            .with_paths(PathVars::new().with_cwd("/p"));
         match e.evaluate_path(Access::Read, ".env.example") {
             Decision::Deny { pack, .. } => assert_eq!(pack, "test.other"),
             d => panic!("expected deny, got {d:?}"),
@@ -1953,7 +1962,9 @@ reason = "other pack says no"
             load_pack_str("<t>", PATH_PACK, &mut w).unwrap(),
             test_engine().packs.remove(0),
         ];
-        let e = Engine::new(packs).with_paths(PathVars::new().with_cwd(root.join("app")));
+        let e = Engine::new(packs)
+            .with_budget(TEST_BUDGET)
+            .with_paths(PathVars::new().with_cwd(root.join("app")));
         assert!(e
             .evaluate("bash -c 'git reset --hard HEAD~1'; cat .env")
             .is_deny());
@@ -2272,7 +2283,8 @@ reason = "token"
     #[test]
     fn whole_segment_rules_see_wrappers_and_bare_wrappers() {
         let mut w = Vec::new();
-        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()]);
+        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()])
+            .with_budget(TEST_BUDGET);
         assert!(e.evaluate("env").is_deny());
         assert!(e.evaluate("sudo env").is_deny());
         assert!(e.evaluate("echo a; env | sort").is_deny());
@@ -2283,7 +2295,8 @@ reason = "token"
     #[test]
     fn substitution_failsafe_can_be_turned_off_per_pack() {
         let mut w = Vec::new();
-        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()]);
+        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()])
+            .with_budget(TEST_BUDGET);
         assert!(!e
             .evaluate("gh pr view $(git branch --show-current)")
             .is_deny());
