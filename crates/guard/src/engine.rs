@@ -22,12 +22,13 @@ use regex::Regex;
 use crate::canon::{canonicalize, path_forms, PathVars};
 use crate::lexer::{find_all_substitutions, split_segments};
 use crate::normalize::build_argv;
+use crate::operands::path_operands;
 use crate::pack::Pack;
 use crate::pathrule::{compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
-use crate::wrappers::unwrap_transparent_prefix;
+use crate::wrappers::{is_env_assignment, unwrap_transparent_prefix};
 
 /// Default latency budget for a single evaluation. Exceeding it yields
 /// `Allow { .. timed_out: true }` — continuity wins over a stalled guard.
@@ -124,7 +125,7 @@ impl Engine {
         let triggers: Vec<String> = packs.iter().flat_map(|p| p.triggers.clone()).collect();
         let guarded_commands = packs
             .iter()
-            .filter(|p| !p.deny.is_empty())
+            .filter(|p| !p.deny.is_empty() && p.substitution_failsafe)
             .flat_map(|p| p.triggers.iter())
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
@@ -273,11 +274,20 @@ impl Engine {
     /// Evaluate a raw command line and return the decision.
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         let start = Instant::now();
-        self.evaluate_inner(raw_cmd, start, 0)
+        self.evaluate_inner(raw_cmd, start, 0, self.vars.cwd())
     }
 
-    fn evaluate_inner(&self, raw_cmd: &str, start: Instant, depth: u32) -> Decision {
+    /// `cwd`: the working directory at the start of `raw_cmd`; a `cd` in
+    /// one segment moves it for the segments after it.
+    fn evaluate_inner(
+        &self,
+        raw_cmd: &str,
+        start: Instant,
+        depth: u32,
+        cwd: Option<&Path>,
+    ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
+        let mut cwd: Option<PathBuf> = cwd.map(Path::to_path_buf);
 
         for seg in split_segments(raw_cmd) {
             if start.elapsed() > self.budget {
@@ -310,7 +320,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1) {
+                    match self.evaluate_inner(&inner, start, depth + 1, cwd.as_deref()) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -381,7 +391,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1) {
+                    match self.evaluate_inner(&inner, start, depth + 1, cwd.as_deref()) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -411,6 +421,23 @@ impl Engine {
 
             let argv = build_argv(effective);
             if argv.is_empty() || argv[0].is_empty() {
+                let segment_line = segment_line(&seg);
+                // A bare wrapper (`env`, `sudo -l`): only whole-segment
+                // rules and redirections can apply.
+                if self.combined.might_match(&segment_line) {
+                    match self.judge("", &segment_line, start) {
+                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
+                        JudgeOutcome::TimedOut => {
+                            return Decision::Allow {
+                                trace: AllowTrace::FailedOpenTimeout,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(d) = self.judge_operands(&seg, &[], &[], cwd.as_deref(), start) {
+                    return d;
+                }
                 continue;
             }
 
@@ -437,8 +464,15 @@ impl Engine {
             }
 
             let matching_line = argv.join(" ");
-            if self.combined.might_match(&matching_line) {
-                match self.judge(&matching_line, start) {
+            // The whole segment's line differs only when a wrapper was
+            // peeled off or the segment starts with an assignment.
+            let whole = (effective.len() != seg.len() || is_env_assignment(&seg[0].text))
+                .then(|| segment_line(&seg));
+            let segment_line = whole.as_deref().unwrap_or(&matching_line);
+            if self.combined.might_match(&matching_line)
+                || (whole.is_some() && self.combined.might_match(segment_line))
+            {
+                match self.judge(&matching_line, segment_line, start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                     JudgeOutcome::Decided(Decision::Allow { trace }) => {
                         allow_trace = Some(trace);
@@ -450,6 +484,15 @@ impl Engine {
                     }
                     JudgeOutcome::Clean => {}
                 }
+            }
+
+            // Files the command reads or writes, judged by the path rules
+            // that also guard the agents' file tools.
+            if let Some(d) = self.judge_operands(&seg, effective, &argv, cwd.as_deref(), start) {
+                return d;
+            }
+            if argv[0] == "cd" || argv[0] == "pushd" {
+                cwd = self.cd_target(&argv, cwd.as_deref());
             }
 
             // Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`,
@@ -468,7 +511,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1) {
+                    match self.evaluate_inner(&inner, start, depth + 1, cwd.as_deref()) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -505,20 +548,77 @@ impl Engine {
         }
     }
 
-    /// Run allow-before-deny across all packs for one segment's matching
-    /// line (its argv, case-folded/dir-stripped/slash-collapsed, joined
-    /// with single spaces).
-    fn judge(&self, matching_line: &str, start: Instant) -> JudgeOutcome {
+    /// Judge every path the segment reads or writes; `Some` on a deny or
+    /// when the budget runs out. A path that cannot be made absolute is
+    /// skipped.
+    fn judge_operands(
+        &self,
+        seg: &[crate::lexer::Word],
+        effective: &[crate::lexer::Word],
+        argv: &[String],
+        cwd: Option<&Path>,
+        start: Instant,
+    ) -> Option<Decision> {
+        if self.path_rules.is_empty() {
+            return None;
+        }
+        for (raw, access) in path_operands(seg, effective, argv) {
+            for form in path_forms(&raw, cwd, &self.vars) {
+                match self.judge_path(access, &form, start) {
+                    JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                    JudgeOutcome::TimedOut => {
+                        return Some(Decision::Allow {
+                            trace: AllowTrace::FailedOpenTimeout,
+                        })
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Where `cd`/`pushd` leaves the shell: its operand resolved against
+    /// `cwd`, home without one, unknown (`None`) for `cd -`.
+    fn cd_target(&self, argv: &[String], cwd: Option<&Path>) -> Option<PathBuf> {
+        match argv
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-') || *a == "-")
+        {
+            None => self.vars.home().map(Path::to_path_buf),
+            Some(a) if a == "-" => None,
+            Some(a) => canonicalize(a, cwd, &self.vars),
+        }
+    }
+
+    /// Run allow-before-deny across all packs for one segment. Rules match
+    /// the effective command's line (its argv after wrappers like `sudo` are
+    /// peeled off, case-folded/dir-stripped/slash-collapsed, joined with
+    /// single spaces); `whole_segment` rules match the line of the whole
+    /// segment, wrappers and leading assignments included. An empty
+    /// `matching_line` (a bare wrapper) leaves only `whole_segment` rules.
+    fn judge(&self, matching_line: &str, segment_line: &str, start: Instant) -> JudgeOutcome {
+        let line = |rule: &crate::pack::Rule| -> Option<&str> {
+            if rule.whole_segment {
+                Some(segment_line)
+            } else if matching_line.is_empty() {
+                None
+            } else {
+                Some(matching_line)
+            }
+        };
         for pack in &self.packs {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
             }
-            if !pack.prefilter().might_match(matching_line) {
+            let pf = pack.prefilter();
+            if !pf.might_match(matching_line) && !pf.might_match(segment_line) {
                 continue;
             }
             // Allow rules first — a match short-circuits to ALLOW.
             for rule in &pack.allow {
-                if rule.regex.is_match(matching_line) {
+                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
                     return JudgeOutcome::Decided(Decision::Allow {
                         trace: AllowTrace::AllowRule {
                             pack: pack.id.clone(),
@@ -530,7 +630,7 @@ impl Engine {
             }
             // Then deny rules — first match wins.
             for rule in &pack.deny {
-                if rule.regex.is_match(matching_line) {
+                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
                     return JudgeOutcome::Decided(Decision::Deny {
                         pack: pack.id.clone(),
                         pattern: rule.pattern.clone(),
@@ -542,6 +642,19 @@ impl Engine {
         }
         JudgeOutcome::Clean
     }
+}
+
+/// The whole segment's matching line for `whole_segment` rules: like
+/// `build_argv`, but a leading `NAME=value` assignment is kept as written
+/// (`PATH=/tmp/x claude` must not become `x claude`).
+fn segment_line(seg: &[crate::lexer::Word]) -> String {
+    let mut argv = build_argv(seg);
+    if let (Some(first), Some(word)) = (argv.first_mut(), seg.first()) {
+        if is_env_assignment(&word.text) {
+            first.clone_from(&word.text);
+        }
+    }
+    argv.join(" ")
 }
 
 /// A trigger literal is treated as naming a guarded *command* only if it
@@ -846,6 +959,99 @@ reason = "other pack says no"
             Decision::Deny { pack, .. } => assert_eq!(pack, "test.other"),
             d => panic!("expected deny, got {d:?}"),
         }
+    }
+
+    fn shell_path_engine(root: &Path) -> Engine {
+        path_engine(
+            PathVars::new()
+                .with_cwd(root.join("app"))
+                .with_var("HOME", root.join("home"))
+                .with_var("PROJECT", root.join("app")),
+        )
+    }
+
+    #[test]
+    fn shell_commands_are_judged_by_path_rules() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        std::fs::create_dir_all(root.join("home/.ssh")).unwrap();
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "cat .env",
+            "cat ./src/../.env",
+            "sudo cat .env",
+            "bash -c 'head -5 .env'",
+            "echo hi | cat - .env",
+            "cat $HOME/.ssh/id_rsa",
+            "cp ~/.ssh/id_ed25519 /tmp/k",
+            "cd src && cat ../.env",
+            "cd ~/.ssh; cat id_rsa",
+            "python x.py < .env",
+            "echo x > .locked/state",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            "cat .env.example",
+            "cat README.md",
+            "grep -r TODO src",
+            "cd src && cat .env.example",
+            "cat .locked/state",
+            "echo x > notes.txt",
+            "cat $(echo .env)",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_path_through_a_symlink_is_caught() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/.env"), "K=v").unwrap();
+        std::os::unix::fs::symlink(root.join("app/.env"), root.join("app/notes.txt")).unwrap();
+        let e = shell_path_engine(&root);
+        assert!(e.evaluate("cat notes.txt").is_deny());
+        assert!(e.evaluate_path(Access::Read, "notes.txt").is_deny());
+    }
+
+    const SEGMENT_PACK: &str = r#"
+[pack]
+id = "test.segment"
+triggers = ["env", "gh"]
+substitution_failsafe = false
+
+[[deny]]
+pattern = '^(?:sudo\s+)?env$'
+reason = "env dump"
+whole_segment = true
+
+[[deny]]
+pattern = '^gh\s+auth\s+token\b'
+reason = "token"
+"#;
+
+    #[test]
+    fn whole_segment_rules_see_wrappers_and_bare_wrappers() {
+        let mut w = Vec::new();
+        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()]);
+        assert!(e.evaluate("env").is_deny());
+        assert!(e.evaluate("sudo env").is_deny());
+        assert!(e.evaluate("echo a; env | sort").is_deny());
+        assert!(!e.evaluate("env FOO=1 ls").is_deny());
+        assert!(e.evaluate("gh auth token").is_deny());
+    }
+
+    #[test]
+    fn substitution_failsafe_can_be_turned_off_per_pack() {
+        let mut w = Vec::new();
+        let e = Engine::new(vec![load_pack_str("<t>", SEGMENT_PACK, &mut w).unwrap()]);
+        assert!(!e
+            .evaluate("gh pr view $(git branch --show-current)")
+            .is_deny());
+        // The default stays on: test.git guards `git`.
+        assert!(test_engine().evaluate("git reset --hard $(x)").is_deny());
     }
 
     #[test]

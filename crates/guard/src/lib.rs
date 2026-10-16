@@ -17,6 +17,7 @@ pub mod canon;
 pub mod engine;
 pub mod lexer;
 pub mod normalize;
+pub mod operands;
 pub mod pack;
 pub mod pathrule;
 pub mod payload;

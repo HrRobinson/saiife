@@ -23,6 +23,10 @@ pub struct Rule {
     pub pattern: String,
     pub regex: Regex,
     pub reason: String,
+    /// Match against the whole segment (wrappers such as `env`/`sudo` and
+    /// leading `NAME=value` assignments included) instead of the effective
+    /// command after them.
+    pub whole_segment: bool,
 }
 
 /// A loaded, compiled pack.
@@ -34,18 +38,24 @@ pub struct Pack {
     pub default_on: bool,
     pub version: u32,
     pub triggers: Vec<String>,
+    /// A command this pack has deny rules for is blocked when an argument
+    /// is a command substitution (`rm -rf $(…)`). Packs whose triggers are
+    /// everyday tools (`gh`, `kubectl`) turn this off.
+    pub substitution_failsafe: bool,
     pub allow: Vec<Rule>,
     pub deny: Vec<Rule>,
     /// Path carve-outs: a path matching one is exempt from THIS pack's
     /// `deny_path` rules (never from another pack's).
     pub allow_path: Vec<PathRule>,
     pub deny_path: Vec<PathRule>,
+    /// Built once from `triggers` at load.
+    prefilter: Prefilter,
 }
 
 impl Pack {
     /// The pack's pre-filter, built from its literal triggers.
-    pub fn prefilter(&self) -> Prefilter {
-        Prefilter::new(self.triggers.clone())
+    pub fn prefilter(&self) -> &Prefilter {
+        &self.prefilter
     }
 
     /// Command rules plus path rules.
@@ -102,6 +112,8 @@ struct RawMeta {
     version: u32,
     #[serde(default)]
     triggers: Vec<String>,
+    #[serde(default = "default_true")]
+    substitution_failsafe: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +121,8 @@ struct RawRule {
     pattern: String,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    whole_segment: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +168,7 @@ fn compile_rules(
                 pattern: r.pattern,
                 regex,
                 reason: r.reason.unwrap_or_default(),
+                whole_segment: r.whole_segment,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
@@ -211,12 +226,14 @@ pub fn load_pack_str(
         return Err(PackError::NoRules);
     }
     Ok(Pack {
+        prefilter: Prefilter::new(raw.pack.triggers.clone()),
         id: raw.pack.id,
         name: raw.pack.name,
         description: raw.pack.description,
         default_on: raw.pack.default_on,
         version: raw.pack.version,
         triggers: raw.pack.triggers,
+        substitution_failsafe: raw.pack.substitution_failsafe,
         allow,
         deny,
         allow_path,

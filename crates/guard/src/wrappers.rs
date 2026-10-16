@@ -326,7 +326,7 @@ fn skip_options_then_positionals<'a>(
 
 /// True if `tok` looks like a `NAME=value` shell-assignment word (`env`'s
 /// leading-assignment syntax), not merely any token containing `=`.
-fn is_env_assignment(tok: &str) -> bool {
+pub(crate) fn is_env_assignment(tok: &str) -> bool {
     match tok.find('=') {
         Some(0) | None => false,
         Some(idx) => {
