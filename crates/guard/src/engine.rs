@@ -1799,6 +1799,34 @@ reason = "other pack says no"
             .is_deny());
     }
 
+    #[test]
+    fn heredoc_bodies_are_data_unless_a_shell_reads_them() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "cat > run.sh <<'EOF'\n#!/bin/sh\nsource .env\nnpm start\nEOF",
+            "cat > notes.md <<EOF\nrm -rf .claude\nEOF",
+            "cat <<-EOF > x\n\tcat .env\n\tEOF\necho done",
+            "python3 - <<EOF\nprint(open('.env').read())\nEOF",
+            "cat <<EOF\ncat .env",
+            "cat <<A <<B\ncat .env\nA\nrm -rf .claude\nB\necho ok",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+        for cmd in [
+            "bash <<'EOF'\ncat .env\nEOF",
+            "sh <<-EOF\n\tcat .env\n\tEOF",
+            "sudo bash <<EOF\ncat .env\nEOF",
+            "cat <<EOF | bash\ncat .env\nEOF",
+            "source /dev/stdin <<EOF\ncat .env\nEOF",
+            "cat <<EOF > x\nhi\nEOF\ncat .env",
+            "cat <<A; bash <<B\nsource .env\nA\ncat .env\nB",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+    }
+
     const SEGMENT_PACK: &str = r#"
 [pack]
 id = "test.segment"

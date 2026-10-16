@@ -62,12 +62,18 @@
 //!   not know (`\uXXXX`, `\UXXXXXXXX`, `\cX`, `\eE`, …) are kept literally
 //!   (backslash + character) rather than guessed at — see "known
 //!   limitations".
+//! - **Redirections** are their own tokens (`echo x>f` is `echo x > f`);
+//!   **assignment words** (`NAME=`, `NAME+=`, `NAME[…]=`) are flagged;
+//!   unquoted **brace expansions** (`{a,b}`) are expanded (bounded);
+//!   **here-document bodies** are skipped as data unless a shell on the
+//!   same line reads them (`bash <<EOF`), then they are lexed as commands.
 //!
 //! ## What it deliberately does not do
 //!
 //! No shell grammar beyond the above: no variable expansion (`$VAR`,
-//! `${VAR}` are left as literal, unevaluated text), no glob expansion, no
-//! here-docs, no evaluating what a substitution would actually output, and
+//! `${VAR}` are left as literal, unevaluated text), no glob expansion (the
+//! engine expands operand globs itself), no evaluating what a substitution
+//! would actually output, and
 //! grouping/keyword handling is a boundary heuristic, not a parser for `if`/
 //! `for`/`while`/`case` compound-command grammar. See the design doc's
 //! "known limitations" for the honest scope.
@@ -203,6 +209,10 @@ fn lex(input: &str) -> Vec<LexTok> {
     let mut brace_marks: Vec<usize> = Vec::new();
     // Unquoted `{` of this word not yet closed.
     let mut brace_depth = 0usize;
+    // Here-documents: the next word is a delimiter (`Some(strip_tabs)` after
+    // `<<`/`<<-`), and the delimiters whose bodies start after this line.
+    let mut expect_delim: Option<bool> = None;
+    let mut pending_docs: Vec<(String, bool)> = Vec::new();
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -219,6 +229,9 @@ fn lex(input: &str) -> Vec<LexTok> {
                 // Brace expansion happens before anything else looks at
                 // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
                 // the word stays as written, flagged for the engine.
+                if let Some(strip_tabs) = expect_delim.take() {
+                    pending_docs.push((word.text.clone(), strip_tabs));
+                }
                 if brace_marks.is_empty() {
                     toks.push(LexTok::Word(word));
                 } else {
@@ -255,6 +268,19 @@ fn lex(input: &str) -> Vec<LexTok> {
             '\n' => {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::Newline));
+                if !pending_docs.is_empty() {
+                    // The bodies are data, unless a shell on this line reads
+                    // them (`bash <<EOF`, `cat <<EOF | sh`): then they are
+                    // commands and are lexed as such.
+                    let commands = shell_on_line(&toks);
+                    for (delim, strip_tabs) in std::mem::take(&mut pending_docs) {
+                        let body = read_heredoc(&mut chars, &delim, strip_tabs);
+                        if commands {
+                            toks.extend(lex(&body));
+                            toks.push(LexTok::Operator(Operator::Newline));
+                        }
+                    }
+                }
             }
             '&' if chars.peek() == Some(&'>') => {
                 // `&>f` / `&>>f`: stdout and stderr to a file.
@@ -289,6 +315,11 @@ fn lex(input: &str) -> Vec<LexTok> {
                 };
                 op.push(c);
                 scan_redirection(&mut chars, c, &mut op);
+                match op.trim_start_matches(|c: char| c.is_ascii_digit()) {
+                    "<<" => expect_delim = Some(false),
+                    "<<-" => expect_delim = Some(true),
+                    _ => {}
+                }
                 toks.push(redirect_tok(op));
             }
             '&' => {
@@ -449,6 +480,66 @@ fn lex(input: &str) -> Vec<LexTok> {
     }
     flush_word!();
     toks
+}
+
+/// Commands that run what they read on stdin.
+const STDIN_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "source", "."];
+
+/// Does a segment of the current line (since the last newline) run a
+/// shell or `source` (wrappers and prefixes peeled)?
+fn shell_on_line(toks: &[LexTok]) -> bool {
+    let line_start = toks[..toks.len().saturating_sub(1)]
+        .iter()
+        .rposition(|t| matches!(t, LexTok::Operator(Operator::Newline)))
+        .map_or(0, |i| i + 1);
+    toks[line_start..]
+        .split(|t| matches!(t, LexTok::Operator(_)))
+        .any(|seg| {
+            let words: Vec<Word> = seg
+                .iter()
+                .filter_map(|t| match t {
+                    LexTok::Word(w) => Some(w.clone()),
+                    LexTok::Operator(_) => None,
+                })
+                .collect();
+            crate::wrappers::effective_command(&words)
+                .first()
+                .is_some_and(|w| {
+                    let name = w.text.to_ascii_lowercase();
+                    let name = name.rsplit('/').next().unwrap_or("");
+                    STDIN_SHELLS.contains(&name)
+                })
+        })
+}
+
+/// Consume a here-document body up to the line equal to `delim` (leading
+/// tabs ignored for `<<-`), or to the end; return it.
+fn read_heredoc(chars: &mut Chars, delim: &str, strip_tabs: bool) -> String {
+    let mut body = String::new();
+    loop {
+        let mut line = String::new();
+        let mut ended = true;
+        for c in chars.by_ref() {
+            if c == '\n' {
+                ended = false;
+                break;
+            }
+            line.push(c);
+        }
+        let cmp = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line.as_str()
+        };
+        if cmp == delim {
+            return body;
+        }
+        body.push_str(&line);
+        body.push('\n');
+        if ended {
+            return body;
+        }
+    }
 }
 
 fn redirect_tok(text: String) -> LexTok {
