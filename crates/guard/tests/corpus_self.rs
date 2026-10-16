@@ -330,3 +330,18 @@ fn the_off_switch_reason_points_to_the_users_own_terminal() {
         d => panic!("{d:?}"),
     }
 }
+
+#[test]
+fn leading_assignments_do_not_hide_the_command() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for (cmd, pack) in [
+        ("FOO=1 saiife init --off", "core.self"),
+        ("LANG=C rm -rf .claude", "core.self"),
+        ("FOO=1 sed -i /saiife/d .claude/settings.json", "core.self"),
+        ("2>/dev/null rm -rf .saiife", "core.self"),
+        ("FOO=1 rm -rf /", "core.filesystem"),
+    ] {
+        assert_eq!(deny_pack(&e, cmd), pack, "{cmd}");
+    }
+}

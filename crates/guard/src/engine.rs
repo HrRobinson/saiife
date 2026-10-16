@@ -28,7 +28,7 @@ use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
-use crate::wrappers::{is_env_assignment, unwrap_transparent_prefix};
+use crate::wrappers::{effective_command, is_env_assignment, unwrap_transparent_prefix};
 
 /// Default latency budget for a single evaluation. Exceeding it yields
 /// `Allow { .. timed_out: true }` — continuity wins over a stalled guard.
@@ -446,6 +446,9 @@ impl Engine {
                 }
             }
 
+            // Leading assignments and redirections (`LANG=C sort f`,
+            // `2>/dev/null cat f`) are not the command either.
+            let effective = effective_command(effective);
             let argv = build_argv(effective);
             if argv.is_empty() || argv[0].is_empty() {
                 let segment_line = segment_line(&seg);
@@ -1404,6 +1407,39 @@ reason = "other pack says no"
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }
+    }
+
+    #[test]
+    fn leading_assignments_and_redirections_do_not_hide_the_command() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let e = shell_path_engine(&root);
+        for cmd in [
+            "LANG=C sort .env",
+            "RUST_LOG=debug cat .env",
+            "A=1 B=2 cat .env",
+            "FOO=1 rm .claude/settings.json",
+            "2>/dev/null cat .env",
+            "</dev/null cat .env",
+            ">/tmp/out cat .env",
+            "2>&1 FOO=1 sudo cat .env",
+            "FOO=1 sudo BAR=2 cat .env",
+            ">.claude/settings.json echo x",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            "LANG=C sort notes.txt",
+            "RUST_LOG=debug cargo test",
+            "2>/dev/null cat README.md",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+        let g = test_engine();
+        assert!(g.evaluate("FOO=1 git reset --hard").is_deny());
+        assert!(g.evaluate("2>/dev/null git reset --hard").is_deny());
+        assert!(g.evaluate("A=1 2>/dev/null B=2 git clean -fd").is_deny());
+        assert!(!g.evaluate("FOO=1 git status").is_deny());
     }
 
     const SEGMENT_PACK: &str = r#"

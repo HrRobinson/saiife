@@ -186,6 +186,31 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
     }
 }
 
+/// The command a segment runs: transparent wrappers (`sudo`, `env`, …),
+/// leading `NAME=value` assignments (`LANG=C sort f`) and leading
+/// redirections with their targets (`2>/dev/null cat f`) peeled off, in
+/// any order and any number. The redirections stay in the segment, where
+/// `operands` judges them; whole-segment rules still see the assignments.
+pub fn effective_command(seg: &[Word]) -> &[Word] {
+    let mut rest = unwrap_transparent_prefix(seg);
+    loop {
+        let before = rest.len();
+        while let Some(w) = rest.first() {
+            if w.redirect {
+                rest = &rest[rest.len().min(2)..];
+            } else if is_env_assignment(&w.text) {
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        rest = unwrap_transparent_prefix(rest);
+        if rest.len() == before {
+            return rest;
+        }
+    }
+}
+
 /// Skip past `sudo`'s own leading `VAR=val` assignments and options —
 /// including arg-taking ones (`-u root`, `--user root`, `--user=root`, and
 /// the attached short form `-uroot`) — to reach the effective command.
