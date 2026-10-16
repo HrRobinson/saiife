@@ -351,3 +351,106 @@ fn leading_assignments_do_not_hide_the_command() {
         assert_eq!(deny_pack(&e, cmd), pack, "{cmd}");
     }
 }
+
+#[test]
+fn exported_or_assigned_environment_then_an_agent_later_is_denied() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "export PATH=/tmp/fake:$PATH; claude",
+        "export PATH=./bin:$PATH && codex exec fix",
+        "PATH=/tmp/x:$PATH && codex",
+        "PATH=/tmp/x; gemini",
+        "export HOME=/tmp/x; claude -p hi",
+        "export XDG_DATA_HOME=/tmp/x\nsaiife status",
+        "declare -x HOME=/tmp/x; claude",
+        "typeset -x XDG_DATA_HOME=/tmp/x; codex",
+        "readonly HOME=/tmp/x; saiife audit",
+        "HOME=/tmp/x; export HOME; claude",
+        "export HOME=/tmp/x; cd app && sudo claude",
+        "export PATH=/tmp/x; ls | /usr/bin/claude",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "export PATH=$PATH:./node_modules/.bin; npm test",
+        "export PATH=./bin:$PATH; npm test",
+        "export HOME=/tmp/x; cargo test",
+        "export PATH=$PATH:./bin; claude -p hi",
+        "export PATH=\"$PATH:./bin\"; claude -p hi",
+        "export PATH=${PATH}:./bin; codex exec fix",
+        "export FOO=1; claude -p hi",
+        "claude -p hi; export HOME=/tmp/x",
+        "echo claude; export HOME=/tmp/x",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+#[test]
+fn hook_config_flags_on_a_nested_agent_are_denied() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "claude --settings ./my.json -p hi",
+        "claude --settings=./my.json",
+        "claude -p hi --settings '{}'",
+        "claude --setting-sources user",
+        "claude --setting-sources=project -p hi",
+        "sudo claude --settings x.json",
+        "codex -c hooks.PreToolUse=[] exec fix",
+        "codex --config hooks.x=1 exec fix",
+        "codex -c features.hooks=true exec fix",
+        "codex -c 'features.hooks = false' exec fix",
+        "codex --config=features.hooks=0 exec fix",
+        "codex exec -c hooks=\"{}\" fix",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "claude --version",
+        "claude -p \"hi\"",
+        "claude --model opus -p hi",
+        "codex -c model=o3 exec fix",
+        "codex --config model_provider=x exec fix",
+        "codex exec 'explain features.hooks'",
+        "echo --settings",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_data_dir_is_protected_by_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(root.join("real/share/saiife/audit")).unwrap();
+    fs::create_dir_all(home.join("app")).unwrap();
+    fs::create_dir_all(home.join(".local")).unwrap();
+    // ~/.local/share -> <root>/real/share, SAIIFE_DATA_DIR spelled through it.
+    std::os::unix::fs::symlink(root.join("real/share"), home.join(".local/share")).unwrap();
+    let spelled = home.join(".local/share/saiife");
+    let (packs, _) = builtin_packs();
+    let e = Engine::new(packs.into_iter().filter(|p| p.id == "core.self").collect()).with_paths(
+        PathVars::new()
+            .with_cwd(home.join("app"))
+            .with_var("HOME", &home)
+            .with_var("SAIIFE_DATA_DIR", &spelled)
+            .with_var("SAIIFE_AUDIT_DIR", spelled.join("audit")),
+    );
+    for cmd in [
+        "rm -rf ~/.local/share".to_string(),
+        "rm -rf ~/.local".to_string(),
+        format!("rm -rf {}", root.join("real/share").display()),
+        format!("rm -rf {}", root.join("real").display()),
+        format!("rm -rf {}", spelled.display()),
+        "rm -rf ~/.local/share/saiife/audit".to_string(),
+    ] {
+        assert_eq!(deny_pack(&e, &cmd), "core.self", "{cmd}");
+    }
+    assert!(!e.evaluate("mkdir -p ~/.local/share/foo").is_deny());
+}

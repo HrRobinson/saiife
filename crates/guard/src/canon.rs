@@ -48,7 +48,11 @@ impl PathVars {
     pub fn with_var(mut self, name: &str, value: impl AsRef<Path>) -> Self {
         let value = value.as_ref();
         if value.is_absolute() {
-            if let Some(v) = resolve(value) {
+            // The resolved value first, then the value as spelled (`..`
+            // removed lexically): a symlinked directory is guarded under
+            // both names.
+            let spelled = push_lexical(PathBuf::from("/"), &value.components().collect::<Vec<_>>());
+            for v in resolve(value).into_iter().chain([spelled]) {
                 if !self.vars.iter().any(|(n, x)| n == name && *x == v) {
                     self.vars.push((name.to_string(), v));
                 }

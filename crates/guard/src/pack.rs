@@ -27,6 +27,9 @@ pub struct Rule {
     /// leading `NAME=value` assignments included) instead of the effective
     /// command after them.
     pub whole_segment: bool,
+    /// Match against the whole command line (every segment, as written),
+    /// for rules about what a later segment does after an earlier one.
+    pub whole_command: bool,
 }
 
 /// A loaded, compiled pack.
@@ -123,6 +126,8 @@ struct RawRule {
     reason: Option<String>,
     #[serde(default)]
     whole_segment: bool,
+    #[serde(default)]
+    whole_command: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +176,7 @@ fn compile_rules(
                 regex,
                 reason: r.reason.unwrap_or_default(),
                 whole_segment: r.whole_segment,
+                whole_command: r.whole_command,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),

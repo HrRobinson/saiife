@@ -48,12 +48,24 @@ reason = "moving saiife's audit or data directory hides decisions from the audit
 whole_segment = true
 
 [[deny]]
-pattern = '^claude\s+(?:\S+\s+)*--settings(?:\s+|=)\S*disableAllHooks'
-reason = "starting Claude Code with hooks disabled bypasses the guard"
+# `--settings <file>` / `--setting-sources` swap the hook configuration for
+# one the agent wrote.
+pattern = '^claude\s+(?:\S+\s+)*--setting(?:s|-sources)(?:\s|=|$)'
+reason = "starting Claude Code with its own settings or setting sources can leave the saiife hook out"
 
 [[deny]]
-pattern = '^codex\s+(?:\S+\s+)*(?:-c|--config)(?:\s+|=)features\.hooks\s*=\s*false'
-reason = "starting Codex with hooks disabled bypasses the guard"
+# Any `-c`/`--config` touching `features.hooks` or `hooks.*`, whatever the value.
+pattern = '^codex\s+(?:\S+\s+)*(?:-c|--config)(?:\s+|=)["\x27]?(?:features\.hooks|hooks)\b'
+reason = "changing Codex's hook configuration from the command line can leave the saiife hook out"
+
+[[deny]]
+# `export PATH=/tmp/fake:$PATH; claude`, `HOME=/tmp/x; export HOME; codex`:
+# the environment is changed in one segment and an agent or saiife started
+# in a later one. Matches the whole command line. PATH only counts when the
+# new value does not start with `$PATH` (`PATH=$PATH:./bin` is everyday).
+whole_command = true
+pattern = '(?s)(?:^|[;&|\n(])\s*(?:export\s+(?:-\S+\s+)*|(?:declare|typeset)\s+-\S*x\S*\s+|readonly\s+(?:-\S+\s+)*)?(?:(?:HOME|XDG_DATA_HOME)=|PATH=(?:["\x27]?[^$"\x27\s;&|]|["\x27]?\$[^P{"\x27]|["\x27]?\$\{[^P]|["\x27]?\$P[^A]))[^\n;&|]*[;&|\n](?:.*?[;&|\n])?\s*(?:(?:sudo|env|command|nohup|exec)\s+(?:-\S+\s+)*|\S+=\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:[\s;&|)]|$)'
+reason = "changing PATH, HOME or XDG_DATA_HOME and then starting an agent or saiife can bypass the guard or hide its audit trail"
 
 # --- write tools and shell writes ---------------------------------------------
 [[deny_path]]

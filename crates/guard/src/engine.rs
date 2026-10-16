@@ -470,7 +470,7 @@ impl Engine {
                 // (`>/dev/sda`): only whole-segment rules and the
                 // redirections can apply.
                 if self.combined.might_match(&segment_line) {
-                    match self.judge(&peeled, &segment_line, start) {
+                    match self.judge(&peeled, &segment_line, raw_cmd, start) {
                         JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                         JudgeOutcome::TimedOut => {
                             return Decision::Allow {
@@ -528,7 +528,7 @@ impl Engine {
             if self.combined.might_match(&matching_line)
                 || (whole.is_some() && self.combined.might_match(segment_line))
             {
-                match self.judge(&matching_line, segment_line, start) {
+                match self.judge(&matching_line, segment_line, raw_cmd, start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                     JudgeOutcome::Decided(Decision::Allow { trace }) => {
                         allow_trace = Some(trace);
@@ -869,9 +869,17 @@ impl Engine {
     /// single spaces); `whole_segment` rules match the line of the whole
     /// segment, wrappers and leading assignments included. An empty
     /// `matching_line` (a bare wrapper) leaves only `whole_segment` rules.
-    fn judge(&self, matching_line: &str, segment_line: &str, start: Instant) -> JudgeOutcome {
+    fn judge(
+        &self,
+        matching_line: &str,
+        segment_line: &str,
+        command_line: &str,
+        start: Instant,
+    ) -> JudgeOutcome {
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
-            if rule.whole_segment {
+            if rule.whole_command {
+                Some(command_line)
+            } else if rule.whole_segment {
                 Some(segment_line)
             } else if matching_line.is_empty() {
                 None
