@@ -394,35 +394,80 @@ fn find_marked(w: &str, m: &[usize]) -> Option<(usize, usize, Vec<usize>)> {
 /// in all. `~`, `$HOME` and relative words are anchored like
 /// `canonicalize` does; a word that cannot be anchored matches nothing.
 pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpansion {
+    match expand_glob_partial(word, cwd, vars) {
+        (_, true) => GlobExpansion::Overflow,
+        (m, false) if m.is_empty() && is_plain(word) => GlobExpansion::NotAGlob,
+        (m, false) => GlobExpansion::Matches(m),
+    }
+}
+
+/// Like `expand_glob`, but also tells what was found before the scan limit
+/// was hit: `(matches, overflowed)`. When it overflowed, the matches are
+/// those the first `GLOB_SCAN_LIMIT` entries led to, plus what the rest of
+/// the pattern matches below the directories seen so far (each stage gets
+/// a fresh budget), so a caller can judge what it can before giving up.
+/// A word without glob characters yields `([], false)`.
+pub fn expand_glob_partial(
+    word: &str,
+    cwd: Option<&Path>,
+    vars: &PathVars,
+) -> (Vec<PathBuf>, bool) {
     let Some(alternatives) = expand_braces(word) else {
-        return GlobExpansion::Overflow;
+        return (Vec::new(), true);
     };
     let has_meta = |w: &str| w.contains(['*', '?', '[']);
     if alternatives.len() == 1 && !has_meta(&alternatives[0]) {
-        return GlobExpansion::NotAGlob;
+        return (Vec::new(), false);
     }
     let mut scanned = 0usize;
     let mut all = Vec::new();
+    let mut overflow = false;
     for alt in &alternatives {
         let Some(abs) = absolute(alt, cwd, vars) else {
             continue;
         };
-        match expand_one(&abs, &mut scanned) {
+        let comps: Vec<Component> = abs.components().collect();
+        match expand_from(&comps, 0, vec![PathBuf::from("/")], &mut scanned, &mut all) {
             Some(m) => all.extend(m),
-            None => return GlobExpansion::Overflow,
+            None => {
+                overflow = true;
+                break;
+            }
         }
     }
     all.sort();
     all.dedup();
-    GlobExpansion::Matches(all)
+    (all, overflow)
 }
 
-/// One brace-free absolute pattern; `None` past the scan limit.
-fn expand_one(abs: &Path, scanned: &mut usize) -> Option<Vec<PathBuf>> {
-    let comps: Vec<Component> = abs.components().collect();
-    let mut bases = vec![PathBuf::from("/")];
+/// A word `expand_glob` leaves as it is: no glob characters after brace
+/// expansion (one alternative).
+fn is_plain(word: &str) -> bool {
+    matches!(expand_braces(word), Some(a) if a.len() == 1 && !a[0].contains(['*', '?', '[']))
+}
+
+/// The components of one brace-free absolute pattern from `start`, on
+/// `bases`; `None` past the scan limit, after the matches the rest of the
+/// pattern finds below what was seen so far went to `partial`.
+fn expand_from(
+    comps: &[Component],
+    start: usize,
+    mut bases: Vec<PathBuf>,
+    scanned: &mut usize,
+    partial: &mut Vec<PathBuf>,
+) -> Option<Vec<PathBuf>> {
+    // Out of budget at component `idx` with `seen` so far: the rest of the
+    // pattern is applied to those, with a fresh budget.
+    let give_up = |idx: usize, seen: Vec<PathBuf>, partial: &mut Vec<PathBuf>| {
+        let mut fresh = 0usize;
+        let mut sub = Vec::new();
+        if let Some(m) = expand_from(comps, idx + 1, seen, &mut fresh, &mut sub) {
+            partial.extend(m);
+        }
+        partial.extend(sub);
+    };
     let mut literal_tail = false;
-    for (idx, c) in comps.iter().enumerate() {
+    for (idx, c) in comps.iter().enumerate().skip(start) {
         match c {
             Component::Normal(name) => {
                 let text = name.to_string_lossy();
@@ -430,7 +475,10 @@ fn expand_one(abs: &Path, scanned: &mut usize) -> Option<Vec<PathBuf>> {
                     let last = idx + 1 == comps.len();
                     let mut next = Vec::new();
                     for b in &bases {
-                        descend(b, last, scanned, &mut next)?;
+                        if descend(b, last, scanned, &mut next).is_none() {
+                            give_up(idx, next, partial);
+                            return None;
+                        }
                     }
                     next.sort();
                     bases = next;
@@ -452,6 +500,7 @@ fn expand_one(abs: &Path, scanned: &mut usize) -> Option<Vec<PathBuf>> {
                     for e in entries.flatten() {
                         *scanned += 1;
                         if *scanned > GLOB_SCAN_LIMIT {
+                            give_up(idx, next, partial);
                             return None;
                         }
                         let n = e.file_name();
@@ -942,5 +991,32 @@ mod tests {
         }
         let v = PathVars::new().with_cwd(&root);
         assert_eq!(expand_glob("**/.env", None, &v), GlobExpansion::Overflow);
+    }
+
+    #[test]
+    fn partial_expansion_keeps_what_it_found_before_the_limit() {
+        let (_d, root) = tmp();
+        for i in 0..GLOB_SCAN_LIMIT + 50 {
+            fs::write(root.join(format!("f{i}.txt")), "").unwrap();
+        }
+        let v = PathVars::new();
+        let word = format!("{}/*.txt", root.display());
+        let (found, over) = expand_glob_partial(&word, None, &v);
+        assert!(over);
+        assert!(found.len() >= GLOB_SCAN_LIMIT - 10, "{}", found.len());
+        assert_eq!(expand_glob(&word, None, &v), GlobExpansion::Overflow);
+        assert_eq!(expand_glob_partial("plain", None, &v), (vec![], false));
+    }
+
+    #[test]
+    fn variables_keep_the_spelled_form_of_a_symlink() {
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/saiife"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("real/saiife"), root.join("link")).unwrap();
+        let v = PathVars::new().with_var("SAIIFE_BIN", root.join("link"));
+        let vals = v.values("SAIIFE_BIN");
+        assert!(vals.contains(&root.join("real/saiife").as_path()));
+        assert!(vals.contains(&root.join("link").as_path()));
     }
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
-use saiifeguard::canon::{expand_glob, GlobExpansion, PathVars};
+use saiifeguard::canon::{expand_glob_partial, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
@@ -21,18 +21,33 @@ use crate::paths::path_vars;
 use crate::project::project_packs;
 use crate::warn;
 
-/// Payloads up to this size are still parsed. File tools (a `Write` of a big
-/// file) are handled normally; a shell command above `MAX_PAYLOAD_BYTES` is
-/// not judged but its command goes into the audit record. Bounded so parsing
-/// stays cheap.
-const PARSE_MAX_BYTES: usize = 4 * MAX_PAYLOAD_BYTES;
+/// Memory-safety cap on what is read from stdin. Parsing skips the content
+/// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
+/// file calls are judged at any size up to this cap; a shell command above
+/// `MAX_PAYLOAD_BYTES` is not judged but its command goes into the audit
+/// record. Above this cap nothing is parsed: a recorded fail-open.
+const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// `packs`: every built-in pack; `cli_packs`: `--pack` ids. The project's
 /// own packs are added from the `.saiife/config.toml` at or above the
 /// payload's `cwd`.
 pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
+    let mut stdin = std::io::stdin().lock();
+    let read = (&mut stdin)
+        .take(PARSE_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut buf);
+    if read.is_ok() && buf.len() > PARSE_MAX_BYTES {
+        // Drain the rest so the agent gets no EPIPE.
+        let _ = std::io::copy(&mut stdin, &mut std::io::sink());
+        let audit = Audit::new(agent, HookContext::default());
+        let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
+        warn(&format!("{reason}; failing open (allow)"));
+        audit.write("", DecisionKind::ErrorAllowed, None, Some(&reason));
+        return allow();
+    }
+    drop(stdin);
+    if read.is_err() {
         let audit = Audit::new(agent, HookContext::default());
         warn("could not read hook payload; failing open (allow)");
         audit.write(
@@ -45,9 +60,13 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
     }
     let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
     match classify(&buf, PARSE_MAX_BYTES) {
-        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => {
-            fail_open(&audit, &command, &PayloadError::TooLarge)
-        }
+        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => fail_open(
+            &audit,
+            &command,
+            &PayloadError::TooLarge {
+                limit: MAX_PAYLOAD_BYTES,
+            },
+        ),
         Ok(ToolCall::Shell { command }) => {
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config or building the engine fails open too.
@@ -61,7 +80,7 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
             mut paths,
             write,
         }) => {
-            if paths.is_empty() && tool != "apply_patch" {
+            if paths.is_empty() && !write {
                 // A search or list tool with neither `path` nor `cwd`
                 // reads the directory the hook runs in.
                 if let Ok(d) = std::env::current_dir() {
@@ -69,8 +88,9 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
                 }
             }
             if paths.is_empty() {
-                // An apply_patch without file headers: allowed, but never
-                // recorded as a judged allow.
+                // A write (an apply_patch without file headers, an Edit
+                // without a path): allowed, but never recorded as a judged
+                // allow.
                 audit.write(
                     "",
                     DecisionKind::ErrorAllowed,
@@ -89,7 +109,8 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
                 let (engine, vars) = engine_for(packs, cli_packs, cwd.as_deref());
                 let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
                 let d = judge_paths(&engine, access, &targets);
-                if overflow && !d.is_deny() {
+                // A deny stays; so does a latency fail-open (it ranks above).
+                if overflow && !d.is_deny() && rank(&d) < 3 {
                     return Decision::Allow {
                         trace: AllowTrace::Unjudgeable {
                             reason: "glob too large to judge".into(),
@@ -165,9 +186,12 @@ fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> (Eng
 
 /// What a file call reads or writes: its paths, with the patterns of
 /// `read_many_files` (`expand_paths`) expanded, and every file a search
-/// tool's `filters` selects under each of its paths. A pattern that matches
-/// nothing is judged as spelled (the shell would pass it through). The flag
-/// is set when a pattern was too large to expand.
+/// tool's `filters` select under each of its paths (ripgrep semantics: a
+/// filter without `/` matches at any depth, one with `/` is relative to the
+/// root). A pattern that matches nothing is judged as spelled (the shell
+/// would pass it through). When a pattern is too large to expand, the
+/// matches found before the limit are judged along with the pattern as
+/// spelled, and the flag is set.
 fn expand_targets(
     vars: &PathVars,
     paths: &[String],
@@ -176,11 +200,15 @@ fn expand_targets(
 ) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut overflow = false;
-    let mut add = |word: &str, out: &mut Vec<String>| match expand_glob(word, None, vars) {
-        GlobExpansion::NotAGlob => out.push(word.to_string()),
-        GlobExpansion::Matches(m) if m.is_empty() => out.push(word.to_string()),
-        GlobExpansion::Matches(m) => out.extend(m.iter().map(|p| p.display().to_string())),
-        GlobExpansion::Overflow => overflow = true,
+    let mut add = |word: &str, out: &mut Vec<String>| {
+        let (found, over) = expand_glob_partial(word, None, vars);
+        if over {
+            overflow = true;
+        }
+        if found.is_empty() || over {
+            out.push(word.to_string());
+        }
+        out.extend(found.iter().map(|p| p.display().to_string()));
     };
     for p in paths {
         if expand_paths {
@@ -191,17 +219,22 @@ fn expand_targets(
     }
     for p in paths {
         for f in filters {
-            add(&format!("{}/{f}", p.trim_end_matches('/')), &mut out);
+            let root = p.trim_end_matches('/');
+            let word = if f.contains('/') {
+                format!("{root}/{f}")
+            } else {
+                format!("{root}/**/{f}")
+            };
+            add(&word, &mut out);
         }
     }
     (out, overflow)
 }
 
-/// Judge every path of one file tool call: any deny denies the call.
-/// Otherwise the call is a fail-open if any path ran out of budget or could
-/// not be resolved, else an allow (by a carve-out, if one applied).
-fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
-    let rank = |d: &Decision| match d {
+/// How much a file-call result matters when several paths are judged:
+/// a latency fail-open, an unjudgeable path, a carve-out, a plain allow.
+fn rank(d: &Decision) -> u8 {
+    match d {
         Decision::Allow {
             trace: AllowTrace::FailedOpenTimeout,
         } => 3,
@@ -212,7 +245,13 @@ fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
             trace: AllowTrace::AllowRule { .. },
         } => 1,
         _ => 0,
-    };
+    }
+}
+
+/// Judge every path of one file tool call: any deny denies the call.
+/// Otherwise the call is a fail-open if any path ran out of budget or could
+/// not be resolved, else an allow (by a carve-out, if one applied).
+fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
     let mut result = Decision::Allow {
         trace: AllowTrace::NoMatch,
     };

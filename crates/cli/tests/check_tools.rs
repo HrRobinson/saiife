@@ -601,3 +601,134 @@ fn a_glob_too_large_to_judge_is_a_recorded_fail_open() {
     assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
     assert_eq!(rec.reason.as_deref(), Some("glob too large to judge"));
 }
+
+/// Review Important 1: Review Focus 3 holds at any size. A `Write` far
+/// above every parse cap is still judged by its path.
+#[test]
+fn huge_write_is_judged_by_its_path() {
+    for tool in ["Write", "Edit", "MultiEdit"] {
+        let big = |path: &str| {
+            serde_json::json!({
+                "session_id": "c-1",
+                "cwd": "/home/u/app",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": {
+                    "file_path": path,
+                    "content": "x".repeat(2 * 1024 * 1024 + 5),
+                    "new_string": "y".repeat(100),
+                    "edits": [{"old_string": "a", "new_string": "b"}]
+                }
+            })
+            .to_string()
+        };
+        let (out, rec) = run_bytes(
+            "claude",
+            big("/home/u/app/.claude/settings.json").as_bytes(),
+        );
+        assert_eq!(out.code, 2, "{tool}: {}", out.stderr);
+        assert_eq!(rec.decision, DecisionKind::Deny, "{tool}");
+        assert_eq!(rec.pack.as_deref(), Some("core.self"), "{tool}");
+        assert_eq!(rec.input, "/home/u/app/.claude/settings.json");
+        assert!(!out.stderr.contains("262144"), "{}", out.stderr);
+        let (out, rec) = run_bytes("claude", big("/home/u/app/src/big.rs").as_bytes());
+        assert_eq!(out.code, 0, "{tool}: {}", out.stderr);
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{tool}");
+        assert_eq!(rec.decision, DecisionKind::Allow, "{tool}");
+        assert_eq!(rec.input, "/home/u/app/src/big.rs");
+    }
+}
+
+/// A shell command above the payload cap stays a recorded fail-open, and
+/// its reason names the real limit.
+#[test]
+fn oversize_shell_payload_names_its_real_limit() {
+    let stdin = serde_json::json!({
+        "tool_name": "Bash", "cwd": "/home/u/app",
+        "tool_input": {"command": format!("echo {}", "a".repeat(300 * 1024))}
+    })
+    .to_string();
+    let (out, rec) = run_bytes("claude", stdin.as_bytes());
+    assert_eq!(out.code, 0);
+    assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+    assert!(out.stderr.contains("262144"), "{}", out.stderr);
+}
+
+/// Minor 1: a write with no path is not a judged allow of the cwd.
+#[test]
+fn write_without_a_path_is_a_fail_open() {
+    for stdin in [
+        br#"{"tool_name":"Write","cwd":"/home/u/app","tool_input":{"content":"x"}}"#.as_slice(),
+        br#"{"tool_name":"Edit","tool_input":{"new_string":"x"}}"#.as_slice(),
+    ] {
+        let (out, rec) = run_bytes("claude", stdin);
+        assert_eq!(out.code, 0);
+        assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+        assert_eq!(rec.reason.as_deref(), Some("no path to judge"));
+    }
+}
+
+/// Minor 3: Gemini versions that name the files in `paths`.
+#[test]
+fn read_many_files_paths_are_judged() {
+    let p = project_with_env();
+    let (out, rec) = run_bytes(
+        "gemini",
+        &payload(
+            "read_many_files",
+            p.path(),
+            serde_json::json!({"paths": [".env*"]}),
+        ),
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.pack.as_deref(), Some("core.secrets"));
+}
+
+/// Extra finding 1: a search filter without `/` matches at any depth
+/// (ripgrep); one with `/` is relative to the root.
+#[test]
+fn search_filters_follow_ripgrep_semantics() {
+    let p = project_with_env();
+    std::fs::create_dir_all(p.path().join("sub/deep")).unwrap();
+    std::fs::write(p.path().join("sub/deep/.env.local"), "T=1").unwrap();
+    std::fs::remove_file(p.path().join(".env")).unwrap();
+    for (tool, key, filter, deny) in [
+        ("Grep", "glob", ".env*", true),
+        ("grep_search", "include", ".env.local", true),
+        ("Grep", "glob", "sub/deep/.env*", true),
+        ("Grep", "glob", "sub/.env*", false),
+        ("Grep", "glob", "*.rs", false),
+    ] {
+        let agent = if tool == "Grep" { "claude" } else { "gemini" };
+        let mut input = serde_json::json!({"pattern": "T"});
+        input[key] = filter.into();
+        let (out, rec) = run_bytes(agent, &payload(tool, p.path(), input));
+        if deny {
+            assert_eq!(out.code, 2, "{filter}: {}", out.stderr);
+            assert_eq!(rec.pack.as_deref(), Some("core.secrets"), "{filter}");
+        } else {
+            assert_eq!(out.code, 0, "{filter}: {}", out.stderr);
+        }
+    }
+}
+
+/// Extra finding 2: on overflow a secret among the entries seen is still
+/// denied; otherwise the call is a recorded fail-open.
+#[test]
+fn overflow_still_denies_what_it_found() {
+    let p = tempfile::tempdir().unwrap();
+    for i in 0..4200 {
+        std::fs::write(p.path().join(format!("f{i}.txt")), "").unwrap();
+    }
+    std::fs::write(p.path().join(".env"), "T=1").unwrap();
+    let (out, rec) = run_bytes(
+        "gemini",
+        &payload(
+            "read_many_files",
+            p.path(),
+            serde_json::json!({"include": ["*.txt", ".env"]}),
+        ),
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert_eq!(rec.decision, DecisionKind::Deny);
+}
