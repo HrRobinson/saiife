@@ -133,10 +133,25 @@ pub fn split_segments(cmd: &str) -> Vec<Segment> {
 /// or here-documents nested too deeply). The caller records it as a
 /// fail-open unless something else denies.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
+    split_noted(cmd, Ctx::new())
+}
+
+/// `split_segments_noted` for the body of a `$(…)` (the text between its
+/// parentheses): here-documents end as bash ends them inside one.
+pub fn split_substitution_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
+    split_noted(
+        cmd,
+        Ctx {
+            sub_body: true,
+            ..Ctx::new()
+        },
+    )
+}
+
+fn split_noted(cmd: &str, mut ctx: Ctx) -> (Vec<Segment>, Option<&'static str>) {
     let mut segments: Vec<Segment> = Vec::new();
     let mut current: Segment = Vec::new();
-    let mut ctx = Ctx::new();
-    let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false).toks;
+    let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false).toks;
 
     for tok in toks {
         match tok {
@@ -212,6 +227,8 @@ struct Ctx {
     arith_budget: usize,
     /// Why part of the line could not be lexed exactly (the first reason).
     note: Option<&'static str>,
+    /// The whole line is the body of a `$(…)`.
+    sub_body: bool,
 }
 
 impl Ctx {
@@ -219,6 +236,7 @@ impl Ctx {
         Ctx {
             arith_budget: ARITH_LOOKAHEAD_TOTAL,
             note: None,
+            sub_body: false,
         }
     }
 
@@ -250,9 +268,10 @@ const ARITH_TOO_LONG: &str = "arithmetic too long to judge";
 /// is lexed by a nested frame of this same state machine (`sub`), which
 /// ends at the `)` that closes it, so quotes, here-documents and comments
 /// inside a substitution are understood exactly as at the top level
-/// (`"$(cat <<'EOF'` / `it's` / `EOF` / `)"`).
+/// (`"$(cat <<'EOF'` / `it's` / `EOF` / `)"`). `flat_arith`: the frame
+/// starts inside a `$((` whose look-ahead was cut off (see `no_docs_above`).
 #[allow(unused_assignments)] // the final flush_word!() sets state that is never read again
-fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
+fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool, flat_arith: bool) -> Frame {
     let mut toks: Vec<LexTok> = Vec::new();
     // Open `(` operators of this frame; in a `$(…)` frame, a `)` with
     // none open closes the substitution.
@@ -288,6 +307,16 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
     let mut pending_docs: Vec<PendingDoc> = Vec::new();
     // Between `[[` and `]]`, `<` and `>` compare strings.
     let mut in_test = false;
+    // Inside a `((` whose look-ahead was cut off (lexed as the subshells
+    // it may be), while `parens` is above this level: it may be
+    // arithmetic, where `<<` is a shift, so `<<` opens no here-document.
+    let mut no_docs_above: Option<usize> = flat_arith.then_some(0);
+    // `case WORD in`: open `case` commands, whether the next word is the
+    // `in`, and whether a pattern is being read (after `in`, `;;`, `;&`,
+    // `;;&`), whose `)` ends the pattern and never closes a `$(…)`.
+    let mut case_depth = 0usize;
+    let mut case_await_in = false;
+    let mut case_pattern = false;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -316,6 +345,26 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
                         op: toks.len().saturating_sub(1),
                         commands: None,
                     });
+                }
+                if !word_quoted {
+                    match word.text.as_str() {
+                        "case" if starts_a_command(&current_segment(&toks)) => {
+                            case_depth += 1;
+                            case_await_in = true;
+                        }
+                        "in" if case_await_in => {
+                            case_await_in = false;
+                            case_pattern = true;
+                        }
+                        "esac"
+                            if case_depth > 0
+                                && (case_pattern || starts_a_command(&current_segment(&toks))) =>
+                        {
+                            case_depth -= 1;
+                            case_pattern = false;
+                        }
+                        _ => {}
+                    }
                 }
                 if !word_quoted && word.text == "[[" {
                     // A reserved word only where a command starts: first,
@@ -372,14 +421,20 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
                     // reads it (or that cannot be known); otherwise data,
                     // whose `$(…)`/backticks still run unless the delimiter
                     // was quoted.
-                    let body = read_heredoc(chars, &doc.delim, doc.strip_tabs);
+                    let body = read_heredoc(
+                        chars,
+                        &doc.delim,
+                        doc.strip_tabs,
+                        sub || ctx.sub_body,
+                        ctx.sub_body,
+                    );
                     let commands = doc
                         .commands
                         .unwrap_or_else(|| body_is_commands(&toks, doc.op));
                     if commands && depth + 1 >= MAX_FRAME_DEPTH {
                         ctx.note(TOO_DEEP);
                     } else if commands {
-                        let inner = lex_in(&mut Chars::new(&body), ctx, depth + 1, false);
+                        let inner = lex_in(&mut Chars::new(&body), ctx, depth + 1, false, false);
                         toks.extend(inner.toks);
                         toks.push(LexTok::Operator(Operator::Newline));
                     } else if !doc.quoted {
@@ -435,9 +490,10 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
                 };
                 op.push(c);
                 scan_redirection(chars, c, &mut op);
+                let docs_allowed = no_docs_above.is_none_or(|b| parens <= b);
                 match op.trim_start_matches(|c: char| c.is_ascii_digit()) {
-                    "<<" => expect_delim = Some(false),
-                    "<<-" => expect_delim = Some(true),
+                    "<<" if docs_allowed => expect_delim = Some(false),
+                    "<<-" if docs_allowed => expect_delim = Some(true),
                     _ => {}
                 }
                 toks.push(redirect_tok(op));
@@ -464,6 +520,10 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
             }
             ';' => {
                 flush_word!();
+                // `;;`, `;&`, `;;&` end a case arm: a pattern follows.
+                if case_depth > 0 && matches!(chars.peek(), Some(';' | '&')) {
+                    case_pattern = true;
+                }
                 toks.push(LexTok::Operator(Operator::Semi));
             }
             // `(( … ))`: arithmetic, where `<<` is a shift. One opaque word;
@@ -476,7 +536,10 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
                 // case is then lexed inline, sharing here-doc and test
                 // state with the rest of the line.
                 match arith_lookahead(chars, ctx, depth) {
-                    Arith::Closes(len) => {
+                    Arith::Closes(len, docs) => {
+                        // Here-documents opened in its substitutions are
+                        // read after this line, as in bash.
+                        pending_docs.extend(docs);
                         let body = &chars.rest()[..len - 2];
                         chars.skip_bytes(len);
                         in_word = true;
@@ -491,6 +554,7 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
                         // be, and recorded.
                         if other == Arith::TooLong {
                             ctx.note(ARITH_TOO_LONG);
+                            no_docs_above.get_or_insert(parens);
                         }
                         parens += 2;
                         toks.push(LexTok::Operator(Operator::LParen));
@@ -500,16 +564,28 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
             }
             '(' => {
                 flush_word!();
-                parens += 1;
+                // A pattern's optional leading `(` (`(a) cmd;;`) is not
+                // matched by the `)` that ends the pattern.
+                if !case_pattern {
+                    parens += 1;
+                }
                 toks.push(LexTok::Operator(Operator::LParen));
             }
             ')' => {
                 flush_word!();
+                if case_pattern {
+                    case_pattern = false;
+                    toks.push(LexTok::Operator(Operator::RParen));
+                    continue;
+                }
                 if sub && parens == 0 {
                     closed = true;
                     break;
                 }
                 parens = parens.saturating_sub(1);
+                if no_docs_above.is_some_and(|b| parens <= b) && !flat_arith {
+                    no_docs_above = None;
+                }
                 toks.push(LexTok::Operator(Operator::RParen));
             }
             // `{` alone (followed by a blank or the end) opens a group,
@@ -694,6 +770,7 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool) -> Frame {
 }
 
 /// A here-document whose body starts after the current line.
+#[derive(Debug, PartialEq, Eq)]
 struct PendingDoc {
     delim: String,
     strip_tabs: bool,
@@ -708,8 +785,10 @@ struct PendingDoc {
 /// Where a `((` (or `$((`) look-ahead ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Arith {
-    /// Arithmetic: the body and the closing `))` are this many bytes.
-    Closes(usize),
+    /// Arithmetic: the body and the closing `))` are this many bytes; the
+    /// here-documents its substitutions opened (their bodies follow the
+    /// line).
+    Closes(usize, Vec<PendingDoc>),
     /// Not arithmetic: nested subshells.
     Subshell,
     /// Not decided within the look-ahead's bounds.
@@ -732,10 +811,13 @@ fn arith_lookahead(chars: &Chars, ctx: &mut Ctx, depth: usize) -> Arith {
         cut -= 1;
     }
     let mut look = Chars::new(&rest[..cut]);
-    let closes = arith_body(&mut look, ctx, depth);
+    let mut docs = Vec::new();
+    let closes = arith_body(&mut look, ctx, depth, &mut docs);
     ctx.arith_budget = ctx.arith_budget.saturating_sub(look.pos.max(1));
     match closes {
-        Some(true) => Arith::Closes(look.pos),
+        // Only a complete look-ahead hands on here-documents: a cut-off
+        // one never decides that `<<` opens one.
+        Some(true) => Arith::Closes(look.pos, docs),
         Some(false) => Arith::Subshell,
         // Unterminated (bash rejects the line), or cut off.
         None if cut == rest.len() => Arith::Subshell,
@@ -745,13 +827,15 @@ fn arith_lookahead(chars: &Chars, ctx: &mut Ctx, depth: usize) -> Arith {
 
 /// Scan an arithmetic body after `((`: `Some(true)` after its `))`,
 /// `Some(false)` at a `)` closing it that is not followed by another,
-/// `None` at the end of the input.
-fn arith_body(look: &mut Chars, ctx: &mut Ctx, depth: usize) -> Option<bool> {
+/// `None` at the end of the input. Here-documents opened in substitutions
+/// of the body and still waiting for their bodies go to `docs`.
+fn arith_body(
+    look: &mut Chars,
+    ctx: &mut Ctx,
+    depth: usize,
+    docs: &mut Vec<PendingDoc>,
+) -> Option<bool> {
     let mut open = 0usize;
-    // Here-documents opened in substitutions of the body: their bodies
-    // were skipped by the frames that opened them, as far as the window
-    // shows.
-    let mut docs = Vec::new();
     while let Some(c) = look.next() {
         match c {
             '(' => open += 1,
@@ -770,18 +854,11 @@ fn arith_body(look: &mut Chars, ctx: &mut Ctx, depth: usize) -> Option<bool> {
             }
             '\'' => scan_single_quoted(look, &mut String::new()),
             '"' => {
-                scan_double_quoted(
-                    look,
-                    &mut String::new(),
-                    &mut false,
-                    ctx,
-                    depth + 1,
-                    &mut docs,
-                );
+                scan_double_quoted(look, &mut String::new(), &mut false, ctx, depth + 1, docs);
             }
             '$' if look.peek() == Some('(') => {
                 look.next();
-                scan_substitution(look, ctx, depth + 1, &mut docs);
+                scan_substitution(look, ctx, depth + 1, docs);
             }
             '`' => {
                 scan_backtick(look);
@@ -907,10 +984,22 @@ fn runs_stdin(words: &[Word]) -> bool {
 }
 
 /// Consume a here-document body up to the line equal to `delim` (leading
-/// tabs ignored for `<<-`), or to the end; return it.
-fn read_heredoc(chars: &mut Chars, delim: &str, strip_tabs: bool) -> String {
+/// tabs ignored for `<<-`), or to the end; return it. `in_sub`: read by a
+/// `$(…)` frame, where (as in bash 5.3) a line that starts with `delim`
+/// and holds a `)` also ends it (`EOF)`, `EOF cmd)`): the rest of that
+/// line is left to the lexer. `end_closes`: the input is a substitution
+/// body whose closing `)` was cut off, so its last line counts as holding
+/// one.
+fn read_heredoc(
+    chars: &mut Chars,
+    delim: &str,
+    strip_tabs: bool,
+    in_sub: bool,
+    end_closes: bool,
+) -> String {
     let mut body = String::new();
     loop {
+        let line_start = chars.pos;
         let mut line = String::new();
         let mut ended = true;
         for c in chars.by_ref() {
@@ -926,6 +1015,14 @@ fn read_heredoc(chars: &mut Chars, delim: &str, strip_tabs: bool) -> String {
             line.as_str()
         };
         if cmp == delim {
+            return body;
+        }
+        if in_sub
+            && !delim.is_empty()
+            && cmp.starts_with(delim)
+            && (cmp[delim.len()..].contains(')') || (end_closes && ended))
+        {
+            chars.pos = line_start + (line.len() - cmp.len()) + delim.len();
             return body;
         }
         body.push_str(&line);
@@ -1117,16 +1214,22 @@ fn scan_substitution<'a>(
         let mut look = chars.clone();
         look.next();
         match arith_lookahead(&look, ctx, depth + 1) {
-            Arith::Closes(len) => {
+            Arith::Closes(len, inner) => {
                 // `(` body `))`: the substitution's text is `(body)`.
+                docs.extend(inner);
                 chars.pos = look.pos + len;
                 return &chars.s[start..chars.pos - 1];
             }
-            Arith::TooLong => ctx.note(ARITH_TOO_LONG),
+            Arith::TooLong => {
+                ctx.note(ARITH_TOO_LONG);
+                let frame = lex_in(chars, ctx, depth + 1, true, true);
+                docs.extend(frame.pending);
+                return &chars.s[start..chars.pos - usize::from(frame.closed)];
+            }
             Arith::Subshell => {}
         }
     }
-    let frame = lex_in(chars, ctx, depth + 1, true);
+    let frame = lex_in(chars, ctx, depth + 1, true, false);
     docs.extend(frame.pending);
     &chars.s[start..chars.pos - usize::from(frame.closed)]
 }

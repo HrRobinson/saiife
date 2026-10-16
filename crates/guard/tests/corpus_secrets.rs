@@ -836,6 +836,64 @@ fn split_and_unsplit_values_are_judged_as_separate_commands() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Round 5 N-2, N-4 and the arithmetic here-document items (each shape
+/// checked against bash 5.3 with harmless `echo` lines).
+#[test]
+fn round_five_substitution_frames_follow_bash() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let mut wrong = Vec::new();
+    let long = "1 + ".repeat(2000);
+    let too_long_shift = format!("(( {long}1 << EOF ))\ncat .env");
+    let too_long_shift_sub = format!("echo $(( {long}1 << EOF ))\ncat .env");
+    for cmd in [
+        // N-2: a `case` pattern's `)` does not close the substitution.
+        "echo \"$(case a in a) cat .env;; esac)\"",
+        "x=\"$(case a in a) cat .env;; esac)\"",
+        "echo $(case a in a) cat .env;; esac)",
+        "echo $(case a in (a) cat .env;; esac)",
+        "echo $(case a in b) :;; a|c) cat .env;; esac)",
+        "echo $(case a in a) case b in b) cat .env;; esac;; esac)",
+        "echo $(case a in a) :;; esac; cat .env)",
+        // N-4: in a substitution, a line starting with the delimiter and
+        // holding a `)` ends the here-document; the rest is commands.
+        "echo \"$(cat <<'EOF'\nhi\nEOF)\"; cat .env",
+        "echo \"$(cat <<EOF\nhi\nEOF)\"\ncat .env",
+        "echo \"$(cat <<'EOF'\nhi\nEOF cat .env)\"",
+        "echo \"$(cat <<-EOF\nhi\n\tEOF)\"; cat .env",
+        "echo \"$( (cat <<EOF\nhi\nEOF) )\"; cat .env",
+        // Here-documents opened in arithmetic are read after the line.
+        "(( x = $(cat <<EOF) ))\n'\nEOF\ncat .env",
+        "echo $(( $(cat <<EOF) + 1 ))\n'\nEOF\ncat .env",
+        // A cut-off `((` look-ahead never makes `<<` a here-document.
+        &too_long_shift,
+        &too_long_shift_sub,
+    ] {
+        if !e.evaluate(cmd).is_deny() {
+            wrong.push(format!("expected DENY: {cmd:?}"));
+        }
+    }
+    let commits = [
+        claude_commit("EOF handling fixed\n\nEOF is now (really) handled"),
+        claude_commit("fix: case a) and b)\n\nesac"),
+    ];
+    let mut allowed: Vec<&str> = commits.iter().map(String::as_str).collect();
+    allowed.extend([
+        "x=$(case $1 in a) echo hi;; *) echo no;; esac); echo $x",
+        "echo \"$(case $x in (a|b) echo ab;; esac)\"",
+        "(( x = $(cat <<EOF) ))\n5\nEOF\necho $x",
+        "echo \"$(cat <<'EOF'\nhi\nEOF\n)\"",
+        "echo $(( 1 << 3 ))",
+    ]);
+    for cmd in allowed {
+        let d = e.evaluate(cmd);
+        if d.is_deny() {
+            wrong.push(format!("expected ALLOW: {cmd:?} -> {d:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

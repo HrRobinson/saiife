@@ -23,7 +23,9 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
-use crate::lexer::{find_all_substitutions, literal_word, split_segments_noted, Word};
+use crate::lexer::{
+    find_all_substitutions, literal_word, split_segments_noted, split_substitution_noted, Word,
+};
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
@@ -301,13 +303,15 @@ impl Engine {
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         let start = Instant::now();
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false, false)
+        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false, false, false)
     }
 
     /// `cwds`: the directories the shell may be in at the start of
     /// `raw_cmd`. A `cd` adds its target for the segments after it but
     /// never drops the old ones: it may fail (`cd /nonexistent; …`), run
     /// in a subshell (`(cd x); …`) or go somewhere unknown (`cd $(…)`).
+    /// `sub_body`: `raw_cmd` is the body of a `$(…)` (lexed as bash lexes
+    /// one: `split_substitution_noted`).
     // The shell state a nested evaluation inherits travels as arguments.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
@@ -319,6 +323,7 @@ impl Engine {
         cwd_unknown: bool,
         env_changed: bool,
         ifs_named: bool,
+        sub_body: bool,
     ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
         // Something could not be judged (a glob too large to expand): the
@@ -334,7 +339,11 @@ impl Engine {
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
         // comment): values are still judged, the unresolved words too.
         let ifs_named = ifs_named || mentions_ifs(raw_cmd);
-        let (segments, lex_note) = split_segments_noted(raw_cmd);
+        let (segments, lex_note) = if sub_body {
+            split_substitution_noted(raw_cmd)
+        } else {
+            split_segments_noted(raw_cmd)
+        };
         if let Some(reason) = lex_note {
             unjudged.get_or_insert_with(|| reason.to_string());
         }
@@ -398,6 +407,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
+                        true,
                     ) {
                         Decision::Deny {
                             pack,
@@ -486,6 +496,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
+                        true,
                     ) {
                         Decision::Deny {
                             pack,
@@ -754,6 +765,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
+                        false,
                     ) {
                         Decision::Deny {
                             pack,
@@ -812,6 +824,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
+                        false,
                     ) {
                         Decision::Deny {
                             pack,
