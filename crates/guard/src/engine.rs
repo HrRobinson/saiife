@@ -708,9 +708,16 @@ impl Engine {
                     let landing = if op.into.is_empty() {
                         vec![word]
                     } else {
-                        let (landing, err) = self.landing(&word, &op.into, *cwd);
+                        let (landing, forms, err) = self.landing(&word, &op.into, *cwd);
                         if let Some(reason) = err {
                             unjudged.get_or_insert(reason);
+                        }
+                        for form in &forms {
+                            match self.judge_path(op.access, form, start) {
+                                JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                                JudgeOutcome::TimedOut => return timed_out(),
+                                _ => {}
+                            }
                         }
                         landing
                     };
@@ -734,25 +741,45 @@ impl Engine {
         })
     }
 
-    /// The paths a copy/move into `target` writes: `target/<name>` for each
-    /// source when `target` is a directory (glob sources expanded first),
-    /// `target` itself otherwise, and for a `contents` source (`cp -T`,
-    /// `rsync dir/`) `target` plus `target/<entry>` for each top-level
-    /// entry. A reason when a glob or a source directory is too large to
-    /// list (the paths that are known are still returned).
+    /// What a copy/move into `target` writes. Paths to judge in full:
+    /// `target/<name>` for each source when `target` is a directory (glob
+    /// sources expanded first), `target` itself otherwise or when a source
+    /// is a `contents` copy. Forms to judge as they are: for a `contents`
+    /// source (`cp -T dir t`, `rsync dir/ t`, globs expanded first), each
+    /// top-level entry under each form of `target` (one resolution of
+    /// `target`, none per entry). A reason when a glob or a source directory
+    /// is too large to list; what was seen is still returned.
     fn landing(
         &self,
         target: &str,
         sources: &[Source],
         cwd: Option<&Path>,
-    ) -> (Vec<String>, Option<String>) {
+    ) -> (Vec<String>, Vec<PathBuf>, Option<String>) {
         let mut names = Vec::new();
         let mut entries = Vec::new();
         let mut err = None;
         let mut scanned = 0usize;
         for src in sources {
-            if src.contents {
-                let Some(dir) = canonicalize(&src.path, cwd, &self.vars) else {
+            let paths: Vec<String> = if src.glob {
+                match expand_glob(&src.path, cwd, &self.vars) {
+                    GlobExpansion::Matches(m) if !m.is_empty() => {
+                        m.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+                    }
+                    GlobExpansion::Overflow => {
+                        err = Some("glob too large to judge".to_string());
+                        vec![src.path.clone()]
+                    }
+                    _ => vec![src.path.clone()],
+                }
+            } else {
+                vec![src.path.clone()]
+            };
+            for path in paths {
+                if !src.contents {
+                    names.extend(base_name(&path));
+                    continue;
+                }
+                let Some(dir) = canonicalize(&path, cwd, &self.vars) else {
                     continue;
                 };
                 let Ok(list) = std::fs::read_dir(&dir) else {
@@ -761,36 +788,30 @@ impl Engine {
                 for e in list.flatten() {
                     scanned += 1;
                     if scanned > GLOB_SCAN_LIMIT {
-                        // Recorded as unjudgeable; judging thousands of
-                        // landing paths would only spend the budget.
                         err = Some("copy source too large to judge".to_string());
-                        entries.clear();
                         break;
                     }
-                    entries.push(e.file_name().to_string_lossy().into_owned());
+                    entries.push(e.file_name());
                 }
-            } else if src.glob {
-                match expand_glob(&src.path, cwd, &self.vars) {
-                    GlobExpansion::Matches(m) if !m.is_empty() => {
-                        names.extend(m.iter().filter_map(|p| base_name(&p.to_string_lossy())));
-                    }
-                    GlobExpansion::Overflow => err = Some("glob too large to judge".to_string()),
-                    _ => names.extend(base_name(&src.path)),
-                }
-            } else {
-                names.extend(base_name(&src.path));
             }
         }
         let is_dir = target.ends_with('/')
             || canonicalize(target, cwd, &self.vars).is_some_and(|p| p.is_dir());
-        let mut out = into_dir(target, &entries);
+        let mut full = Vec::new();
         if is_dir {
-            out.extend(into_dir(target, &names));
+            full.extend(into_dir(target, &names));
         }
-        if !is_dir || sources.iter().any(|s| s.contents) {
-            out.push(target.to_string());
+        let contents = sources.iter().any(|s| s.contents);
+        if !is_dir || contents {
+            full.push(target.to_string());
         }
-        (out, err)
+        let mut forms = Vec::new();
+        if !entries.is_empty() {
+            for base in path_forms(target, cwd, &self.vars) {
+                forms.extend(entries.iter().map(|e| base.join(e)));
+            }
+        }
+        (full, forms, err)
     }
 
     /// Add where `cd`/`pushd` may leave the shell to `cwds`: its operand
@@ -1702,6 +1723,11 @@ reason = "other pack says no"
             "cp -rT backup newdir/conf",
             "rsync -a backup/ conf",
             "rsync -a backup/ conf/",
+            "rsync -a back*/ conf",
+            "cp -rT back* conf",
+            "cp -rT backu? conf",
+            // Entries already read before an overflow are still judged.
+            "rsync -a backup/ big/ conf",
         ] {
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }
@@ -1710,6 +1736,8 @@ reason = "other pack says no"
             "cp -rT other conf",
             "rsync -a backup conf",
             "rsync -a other/ conf",
+            "rsync -a oth*/ conf",
+            "rsync -a nomatch*/ conf",
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }
