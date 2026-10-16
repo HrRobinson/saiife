@@ -512,9 +512,11 @@ pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpan
     }
 }
 
-/// Directory entries (and directory reads) one whole expansion may cost,
-/// the retry after an overflow included.
+/// Directory entries (and directory reads) one pattern (one brace
+/// alternative) may cost, the retry after an overflow included.
 pub const GLOB_TOTAL_LIMIT: usize = 2 * GLOB_SCAN_LIMIT;
+/// What all the brace alternatives of one word may cost together.
+pub const GLOB_ALL_LIMIT: usize = 8 * GLOB_SCAN_LIMIT;
 /// Components a pattern may have to be expanded at all.
 const GLOB_MAX_COMPONENTS: usize = 256;
 
@@ -522,8 +524,10 @@ const GLOB_MAX_COMPONENTS: usize = 256;
 /// was hit: `(matches, overflowed)`. When it overflowed, the matches are
 /// those the first `GLOB_SCAN_LIMIT` entries led to, plus what the rest of
 /// the pattern matches below the directories seen so far (one retry, from
-/// the same total budget of `GLOB_TOTAL_LIMIT`). With brace alternatives,
-/// every alternative is expanded even after one overflowed, and the
+/// the same budget of `GLOB_TOTAL_LIMIT`). With brace alternatives, each
+/// gets its own budget (all together at most `GLOB_ALL_LIMIT`; those whose
+/// last component starts with a literal `.` go first), so every
+/// alternative is expanded even after one overflowed, and the
 /// literal of each alternative that overflowed or matched nothing is in
 /// the list, so a caller judges every spelling. A pattern with more than
 /// 256 components or longer than `PATH_MAX` overflows without being read.
@@ -561,10 +565,14 @@ fn expand_alternatives(
         return (Vec::new(), false);
     }
     let several = alternatives.len() > 1;
+    // Dotfile alternatives (`.env*`) first: if the shared cap runs out,
+    // it runs out on the broad ones.
+    let mut ordered: Vec<&String> = alternatives.iter().collect();
+    ordered.sort_by_key(|a| !a.rsplit('/').next().is_some_and(|l| l.starts_with('.')));
     let mut budget = Budget::default();
     let mut all = Vec::new();
     let mut overflow = false;
-    for alt in alternatives {
+    for alt in ordered {
         let Some(abs) = absolute(alt, cwd, vars) else {
             continue;
         };
@@ -612,15 +620,20 @@ fn is_plain(word: &str) -> bool {
 /// Expand one brace-free absolute pattern: `(matches, overflowed)`. The
 /// first pass may spend `GLOB_SCAN_LIMIT`; when it runs out at a
 /// component, the rest of the pattern is applied once to what was seen so
-/// far, until `GLOB_TOTAL_LIMIT`. There is no retry of the retry.
+/// far, until `GLOB_TOTAL_LIMIT`, both counted from what the budget had
+/// spent before and never past `GLOB_ALL_LIMIT`. There is no retry of the
+/// retry.
 fn expand_from(
     comps: &[Component],
     bases: Vec<PathBuf>,
     budget: &mut Budget,
 ) -> (Vec<PathBuf>, bool) {
-    match walk(comps, 0, bases, budget, GLOB_SCAN_LIMIT) {
+    let base = budget.spent;
+    let first = (base + GLOB_SCAN_LIMIT).min(GLOB_ALL_LIMIT);
+    let total = (base + GLOB_TOTAL_LIMIT).min(GLOB_ALL_LIMIT);
+    match walk(comps, 0, bases, budget, first) {
         Walk::Done(m) => (m, false),
-        Walk::Stopped { at, seen } => match walk(comps, at + 1, seen, budget, GLOB_TOTAL_LIMIT) {
+        Walk::Stopped { at, seen } => match walk(comps, at + 1, seen, budget, total) {
             Walk::Done(m) => (m, true),
             Walk::Stopped { .. } => (Vec::new(), true),
         },
@@ -1316,5 +1329,25 @@ mod tests {
             expand_operand_glob("{a,b}x", None, &v),
             GlobExpansion::NotAGlob
         );
+    }
+
+    #[test]
+    fn each_brace_alternative_gets_its_own_scan_budget() {
+        let (_d, root) = tmp();
+        fs::create_dir_all(root.join("big")).unwrap();
+        for i in 0..GLOB_SCAN_LIMIT + 10 {
+            fs::write(root.join(format!("big/f{i}.txt")), "").unwrap();
+        }
+        fs::write(root.join(".env"), "K=v").unwrap();
+        let v = PathVars::new().with_cwd(&root);
+        for word in [
+            "{big/*.txt,.env*}",
+            "{.env*,big/*.txt}",
+            "{big/*,big/*,.e?v}",
+        ] {
+            let (found, over) = expand_glob_partial(word, None, &v);
+            assert!(over, "{word}");
+            assert!(found.contains(&root.join(".env")), "{word}");
+        }
     }
 }
