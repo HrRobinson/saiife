@@ -524,9 +524,32 @@ impl Engine {
             // Words in front of the command (wrappers, assignments,
             // redirections), counted before the arguments are resolved.
             let prefix_len = seg.len() - effective.len();
-            let resolved = resolve_values(effective, ifs_named, false);
+            let unresolved = effective;
+            let (mut forms, args_unquoted) = resolve_forms(effective, false);
             // Redirection targets are resolved the same way.
-            let seg_ops = resolve_values(&seg, ifs_named, true);
+            let (mut target_forms, targets_unquoted) = resolve_forms(&seg, true);
+            // A line naming IFS may split a value anywhere: what was judged
+            // is a guess, so a non-deny outcome is recorded.
+            if ifs_named && (args_unquoted || targets_unquoted) {
+                unjudged.get_or_insert_with(|| {
+                    "IFS is set on this line: substitution values may split differently".to_string()
+                });
+            }
+            // Other interpretations (the unsplit values) are judged as
+            // commands of their own after this one.
+            let alternatives: Vec<(Vec<Word>, Vec<Word>)> = {
+                let n = forms.len().max(target_forms.len());
+                (1..n)
+                    .map(|i| {
+                        (
+                            forms.get(i).unwrap_or(&forms[0]).clone(),
+                            target_forms.get(i).unwrap_or(&target_forms[0]).clone(),
+                        )
+                    })
+                    .collect()
+            };
+            let resolved = forms.swap_remove(0);
+            let seg_ops = target_forms.swap_remove(0);
             let effective: &[Word] = &resolved;
             // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
             let reads: Vec<Operand> = wrapper_reads(&seg)
@@ -568,19 +591,23 @@ impl Engine {
                     }
                 }
                 env_changed |= effective_is_empty_assignments(&seg, literal_path);
-                if let Some(d) = self.judge_operands(
-                    self.shell_ops(&seg_ops, &[], &[], reads),
-                    &cwds,
-                    cwd_unknown,
-                    start,
-                ) {
-                    match d {
-                        Decision::Allow {
-                            trace: AllowTrace::Unjudgeable { reason },
-                        } => {
-                            unjudged.get_or_insert(reason);
+                let alt_ops = alternatives
+                    .iter()
+                    .map(|(_, t)| self.shell_ops(t, &[], &[], reads.clone()));
+                let all_ops: Vec<Vec<Operand>> =
+                    std::iter::once(self.shell_ops(&seg_ops, &[], &[], reads.clone()))
+                        .chain(alt_ops)
+                        .collect();
+                for ops in all_ops {
+                    if let Some(d) = self.judge_operands(ops, &cwds, cwd_unknown, start) {
+                        match d {
+                            Decision::Allow {
+                                trace: AllowTrace::Unjudgeable { reason },
+                            } => {
+                                unjudged.get_or_insert(reason);
+                            }
+                            d => return d,
                         }
-                        d => return d,
                     }
                 }
                 continue;
@@ -594,7 +621,8 @@ impl Engine {
             // unguarded command with a substitution (`echo $(date)`) gains
             // no new scrutiny.
             if self.guarded_commands.contains(&argv[0])
-                && effective.iter().skip(1).any(|w| w.has_substitution)
+                && (effective.iter().skip(1).any(|w| w.has_substitution)
+                    || (ifs_named && unresolved.iter().skip(1).any(|w| w.has_substitution)))
             {
                 return Decision::Deny {
                     pack: SUBSTITUTION_GUARD_PACK.to_string(),
@@ -638,7 +666,7 @@ impl Engine {
             // Files the command reads or writes, judged by the path rules
             // that also guard the agents' file tools.
             if let Some(d) = self.judge_operands(
-                self.shell_ops(&seg_ops, effective, &argv, reads),
+                self.shell_ops(&seg_ops, effective, &argv, reads.clone()),
                 &cwds,
                 cwd_unknown,
                 start,
@@ -650,6 +678,45 @@ impl Engine {
                         unjudged.get_or_insert(reason);
                     }
                     d => return d,
+                }
+            }
+            // The other interpretations of the values (unsplit): the same
+            // rules and path rules on each as a command of its own.
+            for (alt_eff, alt_seg) in &alternatives {
+                let alt_argv = build_argv(alt_eff);
+                if alt_argv.is_empty() {
+                    continue;
+                }
+                let mut line = alt_argv.join(" ");
+                if !peeled.is_empty() {
+                    line.push(' ');
+                    line.push_str(&peeled);
+                }
+                if self.combined.might_match(&line) {
+                    match self.judge(&line, segment_line, seg_env_changed, start) {
+                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
+                        JudgeOutcome::TimedOut => {
+                            return Decision::Allow {
+                                trace: AllowTrace::FailedOpenTimeout,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(d) = self.judge_operands(
+                    self.shell_ops(alt_seg, alt_eff, &alt_argv, reads.clone()),
+                    &cwds,
+                    cwd_unknown,
+                    start,
+                ) {
+                    match d {
+                        Decision::Allow {
+                            trace: AllowTrace::Unjudgeable { reason },
+                        } => {
+                            unjudged.get_or_insert(reason);
+                        }
+                        d => return d,
+                    }
                 }
             }
             // `eval ARGS` runs its joined arguments as a command line in
@@ -1152,64 +1219,75 @@ fn mentions_ifs(raw: &str) -> bool {
 /// redirection operator); otherwise every word but the command name.
 /// - `"$(…)"` (the whole word one double-quoted substitution): one word.
 /// - An unquoted `$(…)`: how it splits depends on `IFS`, which may be set
-///   anywhere (or inherited), so both forms are judged: the default split
-///   (blanks; each part globbed) and the unsplit value. As a redirection
-///   target it is one word: the part when the split gives exactly one,
-///   else the unsplit value (bash refuses an ambiguous redirect under the
-///   default `IFS`, so this only over-judges).
+///   anywhere (or inherited), so two interpretations are returned, each a
+///   whole word list of its own (positions matter: `cp x $(…)` writes its
+///   last operand): `forms[0]` splits on blanks (each part globbed) and
+///   `forms[1]`, present only when some value splits, keeps every value
+///   one word. As a redirection target the split form takes the single
+///   part, else keeps the word unresolved (bash refuses an ambiguous
+///   redirect); the unsplit form takes the value.
 /// - A word mixing substitutions with text: one word, when no value holds
 ///   blanks or glob characters (`literal_word`).
-/// - `ifs_named`: the line names `IFS`, so it may split at other
-///   characters too: the unresolved word is kept as well, for the
-///   guarded-substitution fail-safe (`IFS=:; rm -f $(echo .saiife:x)`).
-fn resolve_values(words: &[Word], ifs_named: bool, targets_only: bool) -> Vec<Word> {
-    let mut out = Vec::with_capacity(words.len());
+///
+/// Also returned: whether an unquoted value was resolved at all (its
+/// splitting then depends on IFS).
+fn resolve_forms(words: &[Word], targets_only: bool) -> (Vec<Vec<Word>>, bool) {
+    let mut split_form = Vec::with_capacity(words.len());
+    let mut whole_form = Vec::with_capacity(words.len());
+    let mut splits = false;
+    let mut unquoted = false;
     for (i, w) in words.iter().enumerate() {
         let target = i > 0 && words[i - 1].redirect;
         let wanted = if targets_only { target } else { i > 0 };
         let value = (wanted && w.has_substitution && !w.redirect)
             .then(|| literal_word(&w.text))
             .flatten();
-        let one = |text: String, glob: bool| Word {
-            text,
+        let one = |text: &str, glob: bool| Word {
+            text: text.to_string(),
             has_substitution: false,
             glob,
             ..w.clone()
         };
         let globby = |t: &str| t.contains(['*', '?', '[']);
         match value {
-            Some((text, _)) if w.dq_substitution => out.push(one(text, false)),
-            None => out.push(w.clone()),
+            Some((text, _)) if w.dq_substitution => {
+                split_form.push(one(&text, false));
+                whole_form.push(one(&text, false));
+            }
+            None => {
+                split_form.push(w.clone());
+                whole_form.push(w.clone());
+            }
             Some((text, true)) => {
+                unquoted = true;
                 let parts: Vec<&str> = text
                     .split([' ', '\t', '\n'])
                     .filter(|p| !p.is_empty())
                     .collect();
-                if target {
-                    match parts.as_slice() {
-                        [p] => out.push(one(p.to_string(), globby(p))),
-                        _ => out.push(one(text.clone(), globby(&text))),
-                    }
+                splits |= parts.len() != 1 || parts[0] != text;
+                match parts.as_slice() {
+                    [p] => split_form.push(one(p, globby(p))),
+                    _ if target => split_form.push(w.clone()),
+                    _ => split_form.extend(parts.iter().map(|p| one(p, globby(p)))),
+                }
+                if text.trim().is_empty() && !target {
+                    // An empty value is no word at all.
                 } else {
-                    let split = parts.len() != 1 || parts[0] != text;
-                    out.extend(parts.iter().map(|p| one(p.to_string(), globby(p))));
-                    if split && !text.trim().is_empty() {
-                        out.push(one(text.clone(), globby(&text)));
-                    }
-                    if ifs_named {
-                        out.push(w.clone());
-                    }
+                    whole_form.push(one(&text, globby(&text)));
                 }
             }
             Some((text, false)) => {
-                out.push(one(text, w.glob));
-                if ifs_named && !target {
-                    out.push(w.clone());
-                }
+                unquoted = true;
+                split_form.push(one(&text, w.glob));
+                whole_form.push(one(&text, w.glob));
             }
         }
     }
-    out
+    let mut forms = vec![split_form];
+    if splits {
+        forms.push(whole_form);
+    }
+    (forms, unquoted)
 }
 
 /// The redirections (operator and target) among the words peeled off in

@@ -785,6 +785,57 @@ fn nesting_past_the_depth_cap_is_recorded() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Round 5 C, security review: the split and the unsplit value are two
+/// separate argvs (positions matter for copiers, movers and `-t DIR`), and
+/// a line naming IFS never turns a substituted value into a plain allow.
+#[test]
+fn split_and_unsplit_values_are_judged_as_separate_commands() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.app().join(".claude")).unwrap();
+    let e = f.engine();
+    let mut wrong = Vec::new();
+    for cmd in [
+        "cp x $(echo 'a .claude/settings.json')",
+        "mv x $(echo 'a .claude/settings.json')",
+        "tee $(echo 'a .claude/settings.json') < x",
+        "cp -t $(echo '.claude x') settings.json",
+        "cp $(echo 'x .claude/settings.json')",
+        "echo hi > $(echo .claude/settings.json)",
+        "IFS=x; echo hi > $(echo .claude/settings.json)",
+    ] {
+        if !e.evaluate(cmd).is_deny() {
+            wrong.push(format!("expected DENY: {cmd:?}"));
+        }
+    }
+    // A custom IFS may split where the default does not: deny, or a
+    // recorded fail-open, never a plain allow.
+    for cmd in [
+        "IFS=x; echo hi > $(echo .claude/settings.jsonx)",
+        "IFS=x; cat $(echo .envx)",
+        "IFS=x; cp README.md $(echo .claude/settings.jsonx)",
+    ] {
+        match e.evaluate(cmd) {
+            d if d.is_deny() => {}
+            Decision::Allow {
+                trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
+            } => {}
+            d => wrong.push(format!("expected DENY or error_allowed: {cmd:?} -> {d:?}")),
+        }
+    }
+    for cmd in [
+        "cp README.md $(echo 'notes a b')",
+        "mv $(echo 'a b') dir",
+        "cat $(echo 'README.md .env.example')",
+        "echo hi > $(echo notes.md)",
+    ] {
+        let d = e.evaluate(cmd);
+        if d.is_deny() {
+            wrong.push(format!("expected ALLOW: {cmd:?} -> {d:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
