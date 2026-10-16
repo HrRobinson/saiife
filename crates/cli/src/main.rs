@@ -1,11 +1,11 @@
 //! saiife CLI.
 //!
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
-//! - `saiife explain "<cmd>"` -> decision trace to stdout, always exit 0
+//! - `saiife explain "<cmd>"` / `--read <path>` / `--write <path>` -> decision trace to stdout, always exit 0
 //! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
 //! - `saiife init [--off]` -> hook the agents into this project (or remove exactly that)
 //! - `saiife status` -> tamper checks; exit 1 if any fails
-//! - `saiife packs` -> list packs and which are on here
+//! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
 
 #![forbid(unsafe_code)]
@@ -25,6 +25,7 @@ mod status_cmd;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::pathrule::Access;
 use saiifeguard::profile::select_active;
 
 #[derive(Parser)]
@@ -47,8 +48,18 @@ struct Cli {
 enum Cmd {
     /// Judge a command: exit 0 = allow, exit 1 = deny.
     Test { command: String },
-    /// Print the full decision trace for a command (always exit 0).
-    Explain { command: String },
+    /// Print the full decision trace for a command, or for a file tool
+    /// reading or writing a path (always exit 0).
+    #[command(group(clap::ArgGroup::new("what").required(true).args(["command", "read", "write"])))]
+    Explain {
+        command: Option<String>,
+        /// Explain a read tool (Read, read_file, …) opening this path.
+        #[arg(long, value_name = "PATH")]
+        read: Option<String>,
+        /// Explain a write tool (Write, Edit, apply_patch, …) changing this path.
+        #[arg(long, value_name = "PATH")]
+        write: Option<String>,
+    },
     /// Hook mode: read a pre-tool JSON payload on stdin, decide, audit, respond.
     Check {
         /// Deny via exit code 2 + stderr reason (universal agent contract)
@@ -72,8 +83,13 @@ enum Cmd {
     },
     /// Check that this project is still guarded; exit 1 if any check fails.
     Status,
-    /// List packs: id, on by default, on here, rule count, summary.
-    Packs,
+    /// List packs: id, on by default, on here, rule count, summary. With a
+    /// pack id: that pack's command and path rules.
+    Packs {
+        /// Show the rules of this pack.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+    },
     /// Show the audit log: every allowed, blocked and fail-open decision.
     Audit {
         /// Only records newer than this, e.g. 30m, 24h, 7d.
@@ -110,19 +126,31 @@ fn main() -> ExitCode {
     let project = cwd
         .as_deref()
         .and_then(saiife_agents::config::find_project_root);
-    let engine = || {
-        Engine::new(select_active(packs.clone(), &cli.packs))
-            .with_paths(paths::path_vars(cwd.as_deref(), project.as_deref()))
-    };
+    let vars = || paths::path_vars(cwd.as_deref(), project.as_deref());
+    let engine = || Engine::new(select_active(packs.clone(), &cli.packs)).with_paths(vars());
+
+    let active = || select_active(packs.clone(), &cli.packs);
 
     match cli.command {
         Cmd::Test { command } => cmd_test(&engine(), &command),
-        Cmd::Explain { command } => cmd_explain(&engine(), &command),
+        Cmd::Explain {
+            command,
+            read,
+            write,
+        } => match (command, read, write) {
+            (_, Some(path), _) => {
+                cmd_explain_path(&engine(), &active(), &vars(), Access::Read, &path)
+            }
+            (_, _, Some(path)) => {
+                cmd_explain_path(&engine(), &active(), &vars(), Access::Write, &path)
+            }
+            (command, _, _) => cmd_explain(&engine(), &command.unwrap_or_default()),
+        },
         Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Status => status_cmd::run(&packs),
-        Cmd::Packs => packs_cmd::run(&packs, &cli.packs),
+        Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
             since,
             project,
@@ -184,8 +212,34 @@ fn cmd_test(engine: &Engine, command: &str) -> ExitCode {
 
 fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
     let decision = engine.evaluate(command);
+    print!("command: {command}\n{}", trace(decision));
+    ExitCode::SUCCESS
+}
+
+fn cmd_explain_path(
+    engine: &Engine,
+    active: &[saiifeguard::Pack],
+    vars: &saiifeguard::canon::PathVars,
+    access: Access,
+    path: &str,
+) -> ExitCode {
+    let decision = engine.evaluate_path(access, path);
+    let resolved = engine
+        .resolve_path(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(cannot be resolved)".into());
+    print!(
+        "path:     {path}\nresolved: {resolved}\naccess:   {}\n{}{}",
+        access.label(),
+        trace(decision),
+        packs_cmd::inactive_summary(active, vars)
+    );
+    ExitCode::SUCCESS
+}
+
+/// The decision part of an `explain` trace.
+fn trace(decision: Decision) -> String {
     let mut out = String::new();
-    out.push_str(&format!("command: {command}\n"));
     match decision {
         Decision::Deny {
             pack,
@@ -225,8 +279,7 @@ fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
             }
         }
     }
-    print!("{out}");
-    ExitCode::SUCCESS
+    out
 }
 
 pub(crate) fn warn(msg: &str) {
