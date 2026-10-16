@@ -72,6 +72,10 @@ pub struct PathRule {
     pub glob: String,
     pub access: RuleAccess,
     pub reason: String,
+    /// Match the proper ancestors of the glob's paths instead (write rules
+    /// only, variable-rooted, no wildcards): `rm -rf ~/.local/share` removes
+    /// the data dir below it.
+    pub ancestors: bool,
 }
 
 /// Variables a glob may start with.
@@ -132,6 +136,57 @@ pub fn validate_glob(glob: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Check an `ancestors = true` rule: variable-rooted, wildcard-free, write.
+pub fn validate_ancestors(glob: &str, access: RuleAccess) -> Result<(), String> {
+    validate_glob(glob)?;
+    let (var, rest) = split_var(glob)?;
+    if var.is_none() || glob.contains(['*', '?']) || rest == "/**" {
+        return Err(format!(
+            "path glob {glob:?}: `ancestors = true` needs a variable-rooted glob without wildcards"
+        ));
+    }
+    if access != RuleAccess::Write {
+        return Err(format!(
+            "path glob {glob:?}: `ancestors = true` needs `access = \"write\"`"
+        ));
+    }
+    Ok(())
+}
+
+/// Like `compile_glob` for an `ancestors` rule: the regex matches every
+/// proper ancestor (including `/`) of each value the glob resolves to.
+pub fn compile_ancestors(
+    glob: &str,
+    vars: &PathVars,
+    case_insensitive: bool,
+) -> Result<Option<Regex>, String> {
+    validate_glob(glob)?;
+    let (var, rest) = split_var(glob)?;
+    let Some(name) = var else {
+        return Err(format!("path glob {glob:?}: ancestors need a variable"));
+    };
+    let mut alts: Vec<String> = vec![];
+    for v in vars.values(name) {
+        let Some(v) = v.to_str() else {
+            return Ok(None);
+        };
+        let full = format!("{}{}", v.trim_end_matches('/'), rest);
+        alts.push("/".to_string());
+        for (i, c) in full.char_indices() {
+            if c == '/' && i > 0 {
+                alts.push(regex::escape(&full[..i]));
+            }
+        }
+    }
+    if alts.is_empty() {
+        return Ok(None);
+    }
+    let flags = if case_insensitive { "(?is)" } else { "(?s)" };
+    Regex::new(&format!("{flags}^(?:{})$", alts.join("|")))
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Translate a glob into an anchored regex over canonical paths, with its
@@ -289,6 +344,45 @@ mod tests {
         for good in ["/etc/passwd", "~", "~/x", "$HOME", "**/.env", "/a/**"] {
             assert!(validate_glob(good).is_ok(), "{good}");
         }
+    }
+
+    #[test]
+    fn ancestors_match_proper_ancestors_only() {
+        let v = PathVars::new()
+            .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
+            .with_var("SAIIFE_BIN", "/usr/local/bin/saiife");
+        let r = compile_ancestors("$SAIIFE_DATA_DIR", &v, false)
+            .unwrap()
+            .unwrap();
+        for yes in [
+            "/",
+            "/home",
+            "/home/u",
+            "/home/u/.local",
+            "/home/u/.local/share",
+        ] {
+            assert!(r.is_match(yes), "{yes}");
+        }
+        for no in [
+            "/home/u/.local/share/saiife",
+            "/home/u/.local/share/saiife/audit",
+            "/home/u/.local/share/other",
+            "/home/u/.local/sharex",
+            "/home/u/.local/bin",
+            "/usr",
+        ] {
+            assert!(!r.is_match(no), "{no}");
+        }
+        let b = compile_ancestors("$SAIIFE_BIN", &v, false)
+            .unwrap()
+            .unwrap();
+        assert!(b.is_match("/usr/local/bin") && b.is_match("/usr") && b.is_match("/"));
+        assert!(!b.is_match("/usr/local/bin/saiife"));
+        let sub = compile_ancestors("$SAIIFE_DATA_DIR/audit", &v, false)
+            .unwrap()
+            .unwrap();
+        assert!(sub.is_match("/home/u/.local/share/saiife"));
+        assert!(compile_ancestors("$HOME", &v, false).unwrap().is_none());
     }
 
     #[test]

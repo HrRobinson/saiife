@@ -14,7 +14,7 @@ use std::path::Path;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::pathrule::{validate_glob, PathRule, RuleAccess};
+use crate::pathrule::{validate_ancestors, validate_glob, PathRule, RuleAccess};
 use crate::prefilter::Prefilter;
 
 /// A compiled matching rule: a regex plus the reason shown when it fires.
@@ -133,6 +133,8 @@ struct RawPathRule {
     access: RuleAccess,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    ancestors: bool,
 }
 
 fn default_access() -> RuleAccess {
@@ -192,11 +194,17 @@ fn check_path_rules(
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.glob));
         }
-        match validate_glob(&r.glob) {
+        let valid = if r.ancestors {
+            validate_ancestors(&r.glob, r.access)
+        } else {
+            validate_glob(&r.glob)
+        };
+        match valid {
             Ok(()) => out.push(PathRule {
                 glob: r.glob,
                 access: r.access,
                 reason: r.reason.unwrap_or_default(),
+                ancestors: r.ancestors,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
@@ -385,7 +393,8 @@ reason = "bad glob: dropped with a warning"
             vec![PathRule {
                 glob: "**/.env".into(),
                 access: RuleAccess::Read,
-                reason: "secrets".into()
+                reason: "secrets".into(),
+                ancestors: false,
             }]
         );
         assert_eq!(p.allow_path[0].access, RuleAccess::Any);
@@ -408,6 +417,44 @@ reason = "bad glob: dropped with a warning"
             load_pack_str("<t>", bad_access, &mut w),
             Err(PackError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn unknown_key_in_a_path_rule_fails_the_load() {
+        for table in ["deny_path", "allow_path"] {
+            let toml = format!(
+                "[pack]\nid = \"t\"\n[[{table}]]\nglob = \"/x\"\nreason = \"r\"\nacess = \"read\"\n"
+            );
+            let mut w = Vec::new();
+            assert!(
+                matches!(load_pack_str("<t>", &toml, &mut w), Err(PackError::Toml(_))),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn ancestors_flag_loads_only_on_variable_rooted_literal_write_globs() {
+        let ok = "[pack]\nid = \"t\"\n[[deny_path]]\nglob = \"$SAIIFE_DATA_DIR\"\naccess = \"write\"\nancestors = true\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", ok, &mut w).expect("loads");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(p.deny_path[0].ancestors);
+        for bad in [
+            "glob = \"/etc/x\"\naccess = \"write\"",
+            "glob = \"**/.env\"\naccess = \"write\"",
+            "glob = \"$SAIIFE_DATA_DIR/*\"\naccess = \"write\"",
+            "glob = \"$SAIIFE_DATA_DIR/**\"\naccess = \"write\"",
+            "glob = \"$SAIIFE_DATA_DIR\"\naccess = \"read\"",
+            "glob = \"$SAIIFE_DATA_DIR\"",
+        ] {
+            let t = format!("[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\n[[deny_path]]\n{bad}\nancestors = true\nreason = \"r\"\n");
+            let mut w = Vec::new();
+            let p = load_pack_str("<t>", &t, &mut w).expect("pack still loads");
+            assert!(p.deny_path.is_empty(), "{bad}");
+            assert_eq!(w.len(), 1, "{bad}: {w:?}");
+            assert!(w[0].message.contains("ancestors"), "{w:?}");
+        }
     }
 
     #[test]

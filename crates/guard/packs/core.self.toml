@@ -1,0 +1,134 @@
+# Core: self — default-on (spec §7.4).
+#
+# The guard protects itself from an agent that "helpfully" switches it off
+# after a block: turning saiife off, editing its project config, removing
+# the hook from an agent's settings, replacing the saiife binary, touching
+# the audit trail or the integrity records, and starting an agent with a
+# PATH that shadows saiife. Blocked through shell commands AND through the
+# agents' write tools; READING all of these stays allowed (an agent may
+# explain the setup).
+#
+# A human turns saiife off from their own terminal: `saiife init --off`
+# typed there is not an agent tool call, so no hook runs and nothing here
+# applies.
+#
+# Limits (stated, not hidden): a script the agent writes and runs can still
+# change these files (spec §7.3); `saiife status` reports the result.
+
+[pack]
+id = "core.self"
+name = "Core: self-protection"
+description = "Guards saiife itself: turning it off, editing its config, agent hook settings, binary, audit log and integrity records."
+default_on = true
+version = 1
+# `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
+# not block every agent or saiife command.
+substitution_failsafe = false
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "claude", "codex", "gemini"]
+
+[[deny]]
+pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
+reason = "an agent may not turn saiife off; run `saiife init --off` in your own terminal"
+
+[[deny]]
+pattern = '^alias\s+(?:\S+\s+)*saiife='
+reason = "an alias named saiife would replace the guard"
+
+[[deny]]
+# `PATH=/tmp/fake:$PATH claude …`, `env PATH=… codex …`: a nested agent
+# whose PATH can resolve `saiife` to something else. `HOME=` and
+# `XDG_DATA_HOME=` relocate the audit and integrity dirs the same way.
+pattern = '(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)'
+reason = "starting an agent or saiife with a changed PATH, HOME or XDG_DATA_HOME can bypass the guard or hide its audit trail"
+whole_segment = true
+
+[[deny]]
+pattern = '(?i)(?:^|\s)saiife_(?:audit|data)_dir='
+reason = "moving saiife's audit or data directory hides decisions from the audit trail"
+whole_segment = true
+
+[[deny]]
+pattern = '^claude\s+(?:\S+\s+)*--settings(?:\s+|=)\S*disableAllHooks'
+reason = "starting Claude Code with hooks disabled bypasses the guard"
+
+[[deny]]
+pattern = '^codex\s+(?:\S+\s+)*(?:-c|--config)(?:\s+|=)features\.hooks\s*=\s*false'
+reason = "starting Codex with hooks disabled bypasses the guard"
+
+# --- write tools and shell writes ---------------------------------------------
+[[deny_path]]
+glob = "**/.saiife/**"
+access = "write"
+reason = "the saiife project config may only be changed by you, with `saiife init`"
+
+[[deny_path]]
+glob = "**/.claude/settings.json"
+access = "write"
+reason = "Claude Code settings hold the saiife hook"
+
+[[deny_path]]
+glob = "**/.claude/settings.local.json"
+access = "write"
+reason = "Claude Code settings can switch hooks off"
+
+[[deny_path]]
+glob = "**/.codex/config.toml"
+access = "write"
+reason = "Codex config holds the saiife hook"
+
+[[deny_path]]
+glob = "**/.gemini/settings.json"
+access = "write"
+reason = "Gemini CLI settings hold the saiife hook"
+
+[[deny_path]]
+# Removing or moving the whole folder removes the hook with it. Files
+# inside other than the settings (`.claude/commands/…`) stay writable.
+glob = "**/.claude"
+access = "write"
+reason = "removing or moving the agent settings folder removes the saiife hook"
+
+[[deny_path]]
+glob = "**/.codex"
+access = "write"
+reason = "removing or moving the agent settings folder removes the saiife hook"
+
+[[deny_path]]
+glob = "**/.gemini"
+access = "write"
+reason = "removing or moving the agent settings folder removes the saiife hook"
+
+[[deny_path]]
+glob = "$SAIIFE_AUDIT_DIR/**"
+access = "write"
+reason = "the audit trail must outlive the agent"
+
+[[deny_path]]
+glob = "$SAIIFE_DATA_DIR/**"
+access = "write"
+reason = "saiife's data directory holds the audit trail and the integrity records"
+
+[[deny_path]]
+glob = "$SAIIFE_BIN"
+access = "write"
+reason = "replacing or removing the saiife binary switches the guard off"
+
+# --- ancestors: removing or moving a parent removes what is inside -----------
+[[deny_path]]
+glob = "$SAIIFE_DATA_DIR"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of saiife's data directory removes the audit trail"
+
+[[deny_path]]
+glob = "$SAIIFE_AUDIT_DIR"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the audit directory removes the audit trail"
+
+[[deny_path]]
+glob = "$SAIIFE_BIN"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the saiife binary removes the guard"
+

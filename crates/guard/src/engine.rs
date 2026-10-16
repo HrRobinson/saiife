@@ -24,7 +24,7 @@ use crate::lexer::{find_all_substitutions, split_segments, Word};
 use crate::normalize::build_argv;
 use crate::operands::operands;
 use crate::pack::Pack;
-use crate::pathrule::{compile_glob, Access, RuleAccess};
+use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
@@ -166,9 +166,12 @@ impl Engine {
                 .filter_map(|r| {
                     // Globs were validated at load; a rule whose variable
                     // has no value on this machine cannot apply.
-                    let regex = compile_glob(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
-                        .ok()
-                        .flatten()?;
+                    let compiled = if r.ancestors {
+                        compile_ancestors(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                    } else {
+                        compile_glob(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                    };
+                    let regex = compiled.ok().flatten()?;
                     Some(BoundPathRule {
                         glob: r.glob.clone(),
                         regex,

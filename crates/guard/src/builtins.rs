@@ -2,7 +2,7 @@
 //! no external pack files. At runtime saiife also loads `guard/packs/*.toml`
 //! from userData; the built-ins are the shipped defaults.
 //!
-//! Ships `core.filesystem`, `core.git`, `core.secrets` (default-on) and the opt-in packs
+//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self` (default-on) and the opt-in packs
 //! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
@@ -19,6 +19,10 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     (
         "<builtin>core.secrets",
         include_str!("../packs/core.secrets.toml"),
+    ),
+    (
+        "<builtin>core.self",
+        include_str!("../packs/core.self.toml"),
     ),
     (
         "<builtin>cloud.gcloud",
