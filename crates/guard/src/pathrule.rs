@@ -115,6 +115,11 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
     }
 }
 
+/// The variable a valid glob starts with (`~` is `HOME`), if any.
+pub fn glob_variable(glob: &str) -> Option<&'static str> {
+    split_var(glob).ok().and_then(|(v, _)| v)
+}
+
 /// Check a glob's syntax without binding it (used when a pack loads).
 pub fn validate_glob(glob: &str) -> Result<(), String> {
     let (_, rest) = split_var(glob)?;

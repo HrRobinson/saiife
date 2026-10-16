@@ -144,7 +144,9 @@ fn main() -> ExitCode {
             (_, _, Some(path)) => {
                 cmd_explain_path(&engine(), &active(), &vars(), Access::Write, &path)
             }
-            (command, _, _) => cmd_explain(&engine(), &command.unwrap_or_default()),
+            (command, _, _) => {
+                cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
+            }
         },
         Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
         Cmd::Init { off: true, .. } => init_cmd::off(),
@@ -210,9 +212,18 @@ fn cmd_test(engine: &Engine, command: &str) -> ExitCode {
     }
 }
 
-fn cmd_explain(engine: &Engine, command: &str) -> ExitCode {
+fn cmd_explain(
+    engine: &Engine,
+    active: &[saiifeguard::Pack],
+    vars: &saiifeguard::canon::PathVars,
+    command: &str,
+) -> ExitCode {
     let decision = engine.evaluate(command);
-    print!("command: {command}\n{}", trace(decision));
+    print!(
+        "command: {command}\n{}{}",
+        trace(decision),
+        packs_cmd::inactive_summary(active, vars)
+    );
     ExitCode::SUCCESS
 }
 

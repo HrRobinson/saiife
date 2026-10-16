@@ -5,7 +5,7 @@
 use std::process::ExitCode;
 
 use saiifeguard::canon::PathVars;
-use saiifeguard::pathrule::PathRule;
+use saiifeguard::pathrule::{glob_variable, PathRule};
 use saiifeguard::Pack;
 
 use crate::project::project_packs;
@@ -53,18 +53,9 @@ pub fn render(builtin: &[Pack], project: &[String], cli_packs: &[String]) -> Str
     out
 }
 
-/// The variable a path glob starts with, if any (`~` is `$HOME`).
-fn glob_var(glob: &str) -> Option<&str> {
-    if glob == "~" || glob.starts_with("~/") {
-        return Some("HOME");
-    }
-    let after = glob.strip_prefix('$')?;
-    Some(&after[..after.find('/').unwrap_or(after.len())])
-}
-
 /// The variable a rule needs that has no value on this machine.
-fn unbound_var<'a>(r: &'a PathRule, vars: &PathVars) -> Option<&'a str> {
-    glob_var(&r.glob).filter(|v| vars.values(v).is_empty())
+fn unbound_var(r: &PathRule, vars: &PathVars) -> Option<&'static str> {
+    glob_variable(&r.glob).filter(|v| vars.values(v).is_empty())
 }
 
 /// One line per unbound variable naming the active packs whose path rules
@@ -98,7 +89,7 @@ fn render_pack(p: &Pack, here: bool) -> String {
     render_pack_with(p, here, None)
 }
 
-/// Like `render_pack`; with `vars`, a path rule whose variable has no
+/// One pack in full; with `vars`, a path rule whose variable has no
 /// value on this machine is marked as inactive instead of looking live.
 pub fn render_pack_with(p: &Pack, here: bool, vars: Option<&PathVars>) -> String {
     let yes = |b: bool| if b { "yes" } else { "no" };

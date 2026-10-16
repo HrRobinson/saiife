@@ -113,6 +113,14 @@ fn rules_with_an_unbound_variable_are_listed_as_inactive() {
         "{text}"
     );
 
+    // Shell commands use the same path rules, so they report it too.
+    let out = run(&["explain", "cat relative/audit/x"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("inactive here: $SAIIFE_AUDIT_DIR is not set: core.self"),
+        "{text}"
+    );
+
     // Everything bound: nothing is reported.
     let text = stdout(&env.saiife(&["explain", "--write", ".claude/settings.json"]));
     assert!(!text.contains("inactive here"), "{text}");
