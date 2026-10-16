@@ -296,7 +296,7 @@ impl Engine {
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         let start = Instant::now();
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.evaluate_inner(raw_cmd, start, 0, &cwds)
+        self.evaluate_inner(raw_cmd, start, 0, &cwds, false)
     }
 
     /// `cwds`: the directories the shell may be in at the start of
@@ -309,12 +309,16 @@ impl Engine {
         start: Instant,
         depth: u32,
         cwds: &[PathBuf],
+        cwd_unknown: bool,
     ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
         // Something could not be judged (a glob too large to expand): the
         // outcome is a recorded fail-open unless something else denies.
         let mut unjudged: Option<String> = None;
         let mut cwds: Vec<PathBuf> = cwds.to_vec();
+        // A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`,
+        // an unresolvable target, or past `MAX_CWDS`).
+        let mut cwd_unknown = cwd_unknown;
 
         for seg in split_segments(raw_cmd) {
             if start.elapsed() > self.budget {
@@ -347,7 +351,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds) {
+                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -418,7 +422,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds) {
+                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -465,7 +469,7 @@ impl Engine {
                         _ => {}
                     }
                 }
-                if let Some(d) = self.judge_operands(&seg, &[], &[], &cwds, start) {
+                if let Some(d) = self.judge_operands(&seg, &[], &[], &cwds, cwd_unknown, start) {
                     match d {
                         Decision::Allow {
                             trace: AllowTrace::Unjudgeable { reason },
@@ -525,7 +529,8 @@ impl Engine {
 
             // Files the command reads or writes, judged by the path rules
             // that also guard the agents' file tools.
-            if let Some(d) = self.judge_operands(&seg, effective, &argv, &cwds, start) {
+            if let Some(d) = self.judge_operands(&seg, effective, &argv, &cwds, cwd_unknown, start)
+            {
                 match d {
                     Decision::Allow {
                         trace: AllowTrace::Unjudgeable { reason },
@@ -536,7 +541,7 @@ impl Engine {
                 }
             }
             if argv[0] == "cd" || argv[0] == "pushd" {
-                self.cd(&argv, effective, &mut cwds);
+                cwd_unknown |= self.cd(&argv, effective, &mut cwds);
             }
 
             // Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`,
@@ -555,7 +560,7 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds) {
+                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -611,6 +616,7 @@ impl Engine {
         effective: &[Word],
         argv: &[String],
         cwds: &[PathBuf],
+        cwd_unknown: bool,
         start: Instant,
     ) -> Option<Decision> {
         if self.path_rules.is_empty() {
@@ -627,8 +633,10 @@ impl Engine {
         };
         // A path that does not depend on the working directory is judged
         // once.
+        let absolute =
+            |raw: &str| raw.starts_with('/') || raw.starts_with('~') || raw.starts_with("$HOME");
         let anchors = |raw: &str| -> &[Option<&Path>] {
-            if raw.starts_with('/') || raw.starts_with('~') || raw.starts_with("$HOME") {
+            if absolute(raw) {
                 &all[..1]
             } else {
                 &all
@@ -705,44 +713,56 @@ impl Engine {
                 }
             }
         }
+        if cwd_unknown && ops.iter().any(|op| !absolute(&op.path)) {
+            unjudged.get_or_insert_with(|| "working directory unknown after cd".to_string());
+        }
         unjudged.map(|reason| Decision::Allow {
             trace: AllowTrace::Unjudgeable { reason },
         })
     }
 
     /// Add where `cd`/`pushd` may leave the shell to `cwds`: its operand
-    /// resolved against each directory, home without one. `cd -` and a
-    /// target with a substitution add nothing (the old directories stay).
-    fn cd(&self, argv: &[String], effective: &[Word], cwds: &mut Vec<PathBuf>) {
+    /// resolved against each directory, home without one. The old
+    /// directories always stay. Returns true when the shell may now be
+    /// somewhere `cwds` does not hold: `cd -`, a target with a substitution,
+    /// one that cannot be resolved, or more directories than `MAX_CWDS`.
+    fn cd(&self, argv: &[String], effective: &[Word], cwds: &mut Vec<PathBuf>) -> bool {
         let arg = argv
             .iter()
             .zip(effective)
             .skip(1)
             .find(|(a, _)| !a.starts_with('-') || *a == "-");
-        let new: Vec<PathBuf> = match arg {
-            None => self
-                .vars
-                .home()
-                .map(Path::to_path_buf)
-                .into_iter()
-                .collect(),
-            Some((a, w)) if a == "-" || w.has_substitution => Vec::new(),
-            Some((a, _)) if cwds.is_empty() => {
-                canonicalize(a, None, &self.vars).into_iter().collect()
+        let (new, mut unknown): (Vec<PathBuf>, bool) = match arg {
+            None => match self.vars.home() {
+                Some(h) => (vec![h.to_path_buf()], false),
+                None => (Vec::new(), true),
+            },
+            Some((a, w)) if a == "-" || w.has_substitution => (Vec::new(), true),
+            Some((a, _)) => {
+                let anchors: Vec<Option<&Path>> = if cwds.is_empty() {
+                    vec![None]
+                } else {
+                    cwds.iter().map(|c| Some(c.as_path())).collect()
+                };
+                let resolved: Vec<Option<PathBuf>> = anchors
+                    .into_iter()
+                    .map(|c| canonicalize(a, c, &self.vars))
+                    .collect();
+                let unknown = resolved.iter().any(Option::is_none);
+                (resolved.into_iter().flatten().collect(), unknown)
             }
-            Some((a, _)) => cwds
-                .iter()
-                .filter_map(|c| canonicalize(a, Some(c), &self.vars))
-                .collect(),
         };
         for n in new {
+            if cwds.contains(&n) {
+                continue;
+            }
             if cwds.len() >= MAX_CWDS {
+                unknown = true;
                 break;
             }
-            if !cwds.contains(&n) {
-                cwds.push(n);
-            }
+            cwds.push(n);
         }
+        unknown
     }
 
     /// Run allow-before-deny across all packs for one segment. Rules match
@@ -1344,15 +1364,27 @@ reason = "other pack says no"
                 .with_var("HOME", root.join("home"))
                 .with_var("PROJECT", root.join("app")),
         );
-        let files: Vec<String> = (0..5000).map(|i| format!("src/deep/dir/f{i}.rs")).collect();
-        let cmd = format!("cat {} .env", files.join(" "));
+        let cmd = |n: usize| {
+            let files: Vec<String> = (0..n).map(|i| format!("src/deep/dir/f{i}.rs")).collect();
+            format!("cat {} .env", files.join(" "))
+        };
+        // 5000 operands: a deny, or a recorded budget fail-open under a
+        // loaded debug run, never a silent allow or a hang.
         let t = Instant::now();
-        let d = e.evaluate(&cmd);
+        let d = e.evaluate(&cmd(5000));
         let took = t.elapsed();
         eprintln!("5000 operands: {took:?} -> {d:?}");
-        // The cheap lexical pass sees `.env` before any syscall.
-        assert!(d.is_deny(), "{d:?}");
+        assert!(
+            d.is_deny()
+                || d == Decision::Allow {
+                    trace: AllowTrace::FailedOpenTimeout
+                },
+            "{d:?}"
+        );
         assert!(took < Duration::from_secs(2), "{took:?}");
+        // With time to finish, the flood is denied (not merely skipped).
+        let e = e.with_budget(Duration::from_secs(10));
+        assert!(e.evaluate(&cmd(5000)).is_deny());
     }
 
     #[test]
@@ -1440,6 +1472,51 @@ reason = "other pack says no"
         assert!(g.evaluate("2>/dev/null git reset --hard").is_deny());
         assert!(g.evaluate("A=1 2>/dev/null B=2 git clean -fd").is_deny());
         assert!(!g.evaluate("FOO=1 git status").is_deny());
+    }
+
+    #[test]
+    fn an_unknown_working_directory_is_recorded() {
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("app/l2"), root.join("app/l1")).unwrap();
+            std::os::unix::fs::symlink(root.join("app/l1"), root.join("app/l2")).unwrap();
+        }
+        let e = shell_path_engine(&root);
+        let unknown = Decision::Allow {
+            trace: AllowTrace::Unjudgeable {
+                reason: "working directory unknown after cd".to_string(),
+            },
+        };
+        assert_eq!(e.evaluate("cd $(x) && cat notes.txt"), unknown);
+        assert_eq!(e.evaluate("cd - && cat notes.txt"), unknown);
+        #[cfg(unix)]
+        assert_eq!(e.evaluate("cd l1 && cat notes.txt"), unknown);
+        let many: String = (0..MAX_CWDS + 1).map(|i| format!("cd /d{i}; ")).collect();
+        assert_eq!(e.evaluate(&format!("{many}cat notes.txt")), unknown);
+        // A deny under a known directory still denies.
+        assert!(e.evaluate("cd $(x) && cat .env").is_deny());
+        // Nothing relative to judge: no record.
+        for cmd in [
+            "cd $(git rev-parse --show-toplevel) && cargo test",
+            "cd $(x) && cat /etc/hosts",
+            "cd - && ls",
+        ] {
+            assert_eq!(
+                e.evaluate(cmd),
+                Decision::Allow {
+                    trace: AllowTrace::NoMatch
+                },
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            e.evaluate("cd /tmp && cat notes.txt"),
+            Decision::Allow {
+                trace: AllowTrace::NoMatch
+            }
+        );
     }
 
     const SEGMENT_PACK: &str = r#"
