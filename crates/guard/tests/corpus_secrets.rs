@@ -915,8 +915,15 @@ fn residual_heredoc_frames_and_ifs_fail_safe() {
         // 3: a backtick body is a fresh shell text: exact delimiter lines.
         "echo \"`cat <<EOF\nEOF ')\nEOF\ncat .env\n`\"",
         "echo `cat <<EOF\nEOF ')\nEOF\ncat .env\n`",
-        // The `env --help` allow never hides a redirection target.
+        // `env --help` is no allow rule: another pack's deny and the
+        // redirection target still apply.
         "env --help > .claude/settings.json",
+        "env --help >/dev/sda",
+        "env --version > /dev/sda",
+        "env --help=x",
+        "env --helpx",
+        "env --ver2",
+        "env -i --hx",
     ] {
         if !e.evaluate(cmd).is_deny() {
             wrong.push(format!("expected DENY: {cmd:?}"));
@@ -938,6 +945,11 @@ fn residual_heredoc_frames_and_ifs_fail_safe() {
         "git commit -m \"$(echo fix IFS)\"",
         "env --help > x",
         "env --version >> notes.txt",
+        "env --version",
+        "env --help",
+        "env --h",
+        "env --vers",
+        "env -i --help",
         // 3: in a backtick body `EOF)` is body text, as in bash.
         "echo \"`cat <<EOF\nEOF)\nrm -rf .claude\nEOF\n`\"",
     ]);
