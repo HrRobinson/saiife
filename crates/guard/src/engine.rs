@@ -1771,6 +1771,34 @@ reason = "other pack says no"
         );
     }
 
+    #[test]
+    fn combined_shell_flags_with_c_are_inline_payloads() {
+        let g = test_engine();
+        for cmd in [
+            "bash -lc 'git reset --hard'",
+            "bash -c -l 'git reset --hard'",
+            "sh -ec 'git reset --hard'",
+            "bash -o pipefail -c 'git reset --hard'",
+            "zsh -ic 'git reset --hard'",
+            "bash --login -c 'git reset --hard'",
+            "dash -xc 'git reset --hard'",
+        ] {
+            assert!(g.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
+        }
+        for cmd in [
+            "bash -l script.sh",
+            "bash -lc 'git status'",
+            "bash -o pipefail x.sh",
+        ] {
+            assert!(!g.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        assert!(shell_path_engine(&root)
+            .evaluate("bash -lc 'cat .env'")
+            .is_deny());
+    }
+
     const SEGMENT_PACK: &str = r#"
 [pack]
 id = "test.segment"

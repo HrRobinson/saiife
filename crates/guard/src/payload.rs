@@ -313,8 +313,49 @@ pub fn inline_payload(argv: &[String]) -> Option<String> {
             }
         }
     }
+    if SH_FAMILY.contains(&prog.as_str()) {
+        return sh_command_string(&argv[1..]);
+    }
     let idx = argv.iter().position(|a| a == "-c")?;
     argv.get(idx + 1).cloned()
+}
+
+/// POSIX shells: `-c` may sit in any short-option cluster (`-lc`, `-ec`,
+/// `-c -l`), and the command string is then the first operand.
+const SH_FAMILY: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
+
+/// The command string of `sh [options] -c STRING`: options (and the values
+/// of `-o`/`-O`/`+o`/`+O`, `--rcfile`, `--init-file`) are skipped; the first
+/// operand is the string when any cluster held `c`.
+fn sh_command_string(args: &[String]) -> Option<String> {
+    let mut has_c = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" || a == "-" {
+            i += 1;
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            if matches!(long, "rcfile" | "init-file") {
+                i += 1;
+            }
+        } else if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
+            let cluster = &a[1..];
+            has_c |= a.starts_with('-') && cluster.contains('c');
+            if cluster.contains(['o', 'O']) {
+                i += 1; // the option name
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    if has_c {
+        args.get(i).cloned()
+    } else {
+        None
+    }
 }
 
 /// If `argv` is a `watch [OPTIONS] COMMAND [ARG]…` invocation, return the
