@@ -32,6 +32,9 @@ pub enum PayloadError {
     Json(String),
     #[error("no command found in hook payload")]
     NoCommand,
+    /// A file tool's `tool_input` is present but not a usable object.
+    #[error("malformed tool_input")]
+    MalformedToolInput,
 }
 
 /// A string field of the wrong type is absent, not an error.
@@ -62,8 +65,29 @@ fn lenient_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, 
     })
 }
 
-/// An object of the wrong type is absent, not an error.
-fn lenient_object<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+/// An object field as found in the payload.
+#[derive(Debug, Default)]
+enum Field<T> {
+    /// Missing or `null`.
+    #[default]
+    Absent,
+    Obj(T),
+    /// Present but not a usable object (another type, duplicate keys).
+    Malformed,
+}
+
+impl<T> Field<T> {
+    fn as_obj(&self) -> Option<&T> {
+        match self {
+            Field::Obj(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// An object of the wrong type does not fail the whole payload: it is kept
+/// as `Malformed`, so a file tool can record it instead of judging nothing.
+fn lenient_object<'de, D, T>(d: D) -> Result<Field<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -71,12 +95,17 @@ where
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum L<T> {
+        // Before `Obj`: serde would also build a struct from a list.
+        #[allow(dead_code)] // matched for its shape only
+        List(Vec<IgnoredAny>),
         Obj(T),
+        Null(()),
         Other(IgnoredAny),
     }
     Ok(match L::<T>::deserialize(d)? {
-        L::Obj(t) => Some(t),
-        L::Other(_) => None,
+        L::Obj(t) => Field::Obj(t),
+        L::Null(()) => Field::Absent,
+        L::List(_) | L::Other(_) => Field::Malformed,
     })
 }
 
@@ -97,8 +126,9 @@ impl Default for Include {
 }
 
 /// The parts of `tool_input` the guard reads. Everything else (a `Write`'s
-/// `content`, an `Edit`'s `new_string`, `edits`, ...) is skipped while
-/// parsing and never copied, so judging does not depend on how large it is.
+/// `content`, an `Edit`'s `new_string`, `edits`, ...) is ignored, so the
+/// result does not depend on it; serde's untagged matching in
+/// `lenient_object` still buffers the object once while parsing.
 #[derive(Debug, Default, Deserialize)]
 struct ToolInput {
     #[serde(default, deserialize_with = "lenient_string")]
@@ -137,13 +167,13 @@ struct Envelope {
     #[serde(default, deserialize_with = "lenient_string")]
     command: Option<String>,
     #[serde(default, deserialize_with = "lenient_object")]
-    tool_input: Option<ToolInput>,
+    tool_input: Field<ToolInput>,
     #[serde(default, rename = "toolInput", deserialize_with = "lenient_object")]
-    tool_input_camel: Option<ToolInput>,
+    tool_input_camel: Field<ToolInput>,
     #[serde(default, deserialize_with = "lenient_object")]
-    input: Option<ToolInput>,
+    input: Field<ToolInput>,
     #[serde(default, deserialize_with = "lenient_object")]
-    params: Option<ToolInput>,
+    params: Field<ToolInput>,
 }
 
 fn envelope(input: &str, max_bytes: usize) -> Result<Envelope, PayloadError> {
@@ -168,7 +198,7 @@ impl Envelope {
             &self.input,
             &self.params,
         ];
-        for c in containers.into_iter().flatten() {
+        for c in containers.into_iter().filter_map(Field::as_obj) {
             if let Some(cmd) = c.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 return Ok(cmd.to_string());
             }
@@ -257,8 +287,11 @@ pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError>
         return env.command().map(|command| ToolCall::Shell { command });
     }
     let empty = ToolInput::default();
-    let tool_input = env.tool_input.as_ref().unwrap_or(&empty);
     let write = WRITE_TOOLS.contains(&tool);
+    if (write || READ_TOOLS.contains(&tool)) && matches!(env.tool_input, Field::Malformed) {
+        return Err(PayloadError::MalformedToolInput);
+    }
+    let tool_input = env.tool_input.as_obj().unwrap_or(&empty);
     if write || READ_TOOLS.contains(&tool) {
         let mut paths = if tool == "apply_patch" {
             let patch = tool_input
@@ -303,7 +336,7 @@ pub fn search_globs(input: &str, max_bytes: usize) -> Vec<String> {
     if !matches!(env.tool(), Some("Grep" | "grep_search")) {
         return Vec::new();
     }
-    let Some(ti) = env.tool_input.as_ref() else {
+    let Some(ti) = env.tool_input.as_obj() else {
         return Vec::new();
     };
     let include = match &ti.include {
@@ -703,6 +736,42 @@ mod tests {
 
     fn call(json: serde_json::Value) -> ToolCall {
         classify(&json.to_string(), MAX_PAYLOAD_BYTES).unwrap()
+    }
+
+    /// Final wave FW6: a file tool whose `tool_input` is not a usable
+    /// object (a string, a list, duplicate keys) is not judged as if it
+    /// named no path: the caller records it as a fail-open.
+    #[test]
+    fn malformed_file_tool_input_is_an_error() {
+        for raw in [
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":"oops"}"#,
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":["/p/.env"]}"#,
+            r#"{"cwd":"/p","tool_name":"Read","tool_input":{"file_path":"/p/a","file_path":"/p/.env"}}"#,
+            r#"{"cwd":"/p","tool_name":"Glob","tool_input":7}"#,
+            r#"{"cwd":"/p","tool_name":"Write","tool_input":"oops"}"#,
+        ] {
+            let e = classify(raw, MAX_PAYLOAD_BYTES).expect_err(raw);
+            assert!(
+                matches!(e, PayloadError::MalformedToolInput),
+                "{raw}: {e:?}"
+            );
+            assert_eq!(e.to_string(), "malformed tool_input", "{raw}");
+        }
+        // Absent or null still means "no input": a search tool reads `cwd`.
+        for raw in [
+            r#"{"cwd":"/p","tool_name":"Glob"}"#,
+            r#"{"cwd":"/p","tool_name":"Glob","tool_input":null}"#,
+        ] {
+            assert_eq!(
+                classify(raw, MAX_PAYLOAD_BYTES).unwrap(),
+                ToolCall::File {
+                    tool: "Glob".into(),
+                    paths: vec!["/p".into()],
+                    write: false
+                },
+                "{raw}"
+            );
+        }
     }
 
     #[test]

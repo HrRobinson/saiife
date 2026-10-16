@@ -744,3 +744,26 @@ fn overflow_still_denies_what_it_found() {
     assert_eq!(out.code, 2, "{}", out.stderr);
     assert_eq!(rec.decision, DecisionKind::Deny);
 }
+
+/// Final wave FW6: a file tool whose `tool_input` is not a usable object
+/// is a recorded fail-open, never an `allow` of the payload's `cwd`.
+#[test]
+fn malformed_tool_input_is_error_allowed() {
+    for stdin in [
+        br#"{"cwd":"/home/u/app","tool_name":"Read","tool_input":"oops"}"#.as_slice(),
+        br#"{"cwd":"/home/u/app","tool_name":"Read","tool_input":{"file_path":"/home/u/app/a","file_path":"/home/u/app/.env"}}"#,
+    ] {
+        let (out, rec) = run_bytes("claude", stdin);
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.is_empty());
+        assert_eq!(rec.decision, DecisionKind::ErrorAllowed);
+        assert!(
+            rec.reason
+                .as_deref()
+                .unwrap()
+                .contains("malformed tool_input"),
+            "{:?}",
+            rec.reason
+        );
+    }
+}
