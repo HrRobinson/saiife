@@ -331,6 +331,11 @@ impl Engine {
             if seg.is_empty() {
                 continue;
             }
+            // A word whose brace expansion was too large is judged as
+            // written, and the command is recorded as not fully judged.
+            if seg.iter().any(|w| w.brace_overflow) {
+                unjudged.get_or_insert_with(|| "brace expansion too large to judge".to_string());
+            }
             // Peel off transparent wrapper commands (`command`, `env`,
             // `nohup`, `nice`, `stdbuf`, `ionice`, `sudo`) before judging —
             // the engine reasons about the *effective* command, not the
@@ -1686,6 +1691,10 @@ reason = "other pack says no"
             "cat {.env,x}",
             "cp {.env,/tmp/x}",
             "mv .claude/settings.json{,.bak}",
+            r#"cat {".env",x}"#,
+            "cat {'.env',x}",
+            r"cat {\.env,x}",
+            "cat {$HOME/.ssh/id_rsa,x}",
         ] {
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }
@@ -1697,6 +1706,17 @@ reason = "other pack says no"
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }
+        let big = "{a,b}".repeat(40);
+        assert_eq!(
+            e.evaluate(&format!("cat {big}")),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable {
+                    reason: "brace expansion too large to judge".to_string()
+                }
+            }
+        );
+        assert!(e.evaluate(&format!("cat {big} .env")).is_deny());
+        assert!(e.evaluate(&format!("cat {big}; cat .env")).is_deny());
         // Brace expansion in command position runs the expanded words.
         assert!(test_engine().evaluate("{git,reset,--hard}").is_deny());
         assert!(test_engine().evaluate("{ git reset --hard; }").is_deny());

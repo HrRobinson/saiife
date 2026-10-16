@@ -91,6 +91,9 @@ pub struct Word {
     /// `NAME+=`, `NAME[…]=` or `NAME[…]+=` prefix. In front of a command
     /// it sets a variable; it is not the command.
     pub assignment: bool,
+    /// Its brace expansion was too large to expand (kept as written); the
+    /// engine records the command as not fully judged.
+    pub brace_overflow: bool,
 }
 
 /// A single top-level command segment: the argv-order sequence of words
@@ -194,10 +197,11 @@ fn lex(input: &str) -> Vec<LexTok> {
     // quotes, substitutions and `=` there do not decide anything.
     let mut subscript_depth = 0usize;
     let mut word_subscripted = false;
-    // The word has an unquoted `{a,b}` brace expansion.
-    let mut word_brace = false;
-    // Open braces of the brace expansion being read: its `{`/`}` are word
-    // data, not grouping.
+    // Byte offsets in `word_text` of the word's unquoted brace-expansion
+    // `{`, `,` and `}`: only these separate alternatives (`{".env",x}`,
+    // `{a\,b,c}`, `"{a,b}"` behave as in bash).
+    let mut brace_marks: Vec<usize> = Vec::new();
+    // Unquoted `{` of this word not yet closed.
     let mut brace_depth = 0usize;
 
     // Flush the in-progress word (if any) as a completed token.
@@ -210,25 +214,29 @@ fn lex(input: &str) -> Vec<LexTok> {
                     redirect: false,
                     glob: word_glob,
                     assignment: word_assignment,
+                    brace_overflow: false,
                 };
                 // Brace expansion happens before anything else looks at
-                // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limit
-                // the word stays as written.
-                let expanded = if word_brace {
-                    crate::canon::expand_braces(&word.text)
+                // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
+                // the word stays as written, flagged for the engine.
+                if brace_marks.is_empty() {
+                    toks.push(LexTok::Word(word));
                 } else {
-                    None
-                };
-                match expanded {
-                    Some(words) => toks.extend(words.into_iter().map(|text| {
-                        LexTok::Word(Word {
-                            text,
-                            ..word.clone()
-                        })
-                    })),
-                    None => toks.push(LexTok::Word(word)),
+                    match crate::canon::expand_marked(&word.text, &brace_marks) {
+                        Some(words) => toks.extend(words.into_iter().map(|text| {
+                            LexTok::Word(Word {
+                                text,
+                                ..word.clone()
+                            })
+                        })),
+                        None => toks.push(LexTok::Word(Word {
+                            brace_overflow: true,
+                            ..word
+                        })),
+                    }
                 }
-                word_brace = false;
+                brace_marks.clear();
+                brace_depth = 0;
                 in_word = false;
                 word_has_sub = false;
                 word_quoted = false;
@@ -315,28 +323,33 @@ fn lex(input: &str) -> Vec<LexTok> {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::RParen));
             }
-            '{' if brace_depth > 0 => {
+            // `{` alone (followed by a blank or the end) opens a group,
+            // like bash's reserved word; otherwise it is part of a word,
+            // possibly a brace expansion.
+            '{' if !in_word
+                && chars
+                    .peek()
+                    .is_none_or(|n| matches!(n, ' ' | '\t' | '\r' | '\n')) =>
+            {
+                toks.push(LexTok::Operator(Operator::LBrace));
+            }
+            '{' => {
+                in_word = true;
                 brace_depth += 1;
+                brace_marks.push(word_text.len());
                 word_text.push('{');
+            }
+            ',' if brace_depth > 0 => {
+                brace_marks.push(word_text.len());
+                word_text.push(',');
             }
             '}' if brace_depth > 0 => {
                 brace_depth -= 1;
+                brace_marks.push(word_text.len());
                 word_text.push('}');
             }
-            '{' if brace_expansion_ahead(&chars) => {
-                brace_depth = 1;
-                // `{a,b}`: part of the word (expanded when it ends), not a
-                // grouping brace.
-                in_word = true;
-                word_brace = true;
-                word_text.push('{');
-            }
-            '{' => {
-                flush_word!();
-                toks.push(LexTok::Operator(Operator::LBrace));
-            }
-            '}' => {
-                flush_word!();
+            // `}` starting a word closes a group; inside a word it is data.
+            '}' if !in_word => {
                 toks.push(LexTok::Operator(Operator::RBrace));
             }
             '\'' => {
@@ -438,31 +451,6 @@ fn lex(input: &str) -> Vec<LexTok> {
     toks
 }
 
-/// After an unquoted `{`: does a brace expansion follow — a matching `}`
-/// with a top-level comma, and nothing in between that ends a word or
-/// quotes (whitespace, operators, quotes, backslashes, substitutions)?
-/// `{ cmd; }` (a group) and `{a}` (literal) are not.
-fn brace_expansion_ahead(chars: &Chars) -> bool {
-    let mut depth = 1usize;
-    let mut comma = false;
-    for c in chars.clone() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return comma;
-                }
-            }
-            ',' if depth == 1 => comma = true,
-            ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '\'' | '"'
-            | '\\' | '`' | '$' => return false,
-            _ => {}
-        }
-    }
-    false
-}
-
 fn redirect_tok(text: String) -> LexTok {
     LexTok::Word(Word {
         text,
@@ -470,6 +458,7 @@ fn redirect_tok(text: String) -> LexTok {
         redirect: true,
         glob: false,
         assignment: false,
+        brace_overflow: false,
     })
 }
 
@@ -1371,6 +1360,46 @@ mod tests {
         assert_eq!(
             a(r#""A=1" 'B=2' C"=3" \D=4 1A=5 =6 a-b=7 $(x)=8"#),
             vec![false, false, false, false, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn brace_expansion_respects_quoting() {
+        assert_eq!(words(r#"cat {".env",x}"#), vec!["cat", ".env", "x"]);
+        assert_eq!(words("cat {'.env',x}"), vec!["cat", ".env", "x"]);
+        assert_eq!(words(r"cat {\.env,x}"), vec!["cat", ".env", "x"]);
+        assert_eq!(
+            words("cat {$HOME/.ssh/id_rsa,x}"),
+            vec!["cat", "$HOME/.ssh/id_rsa", "x"]
+        );
+        assert_eq!(words(r#"cat {"a,b",c}"#), vec!["cat", "a,b", "c"]);
+        assert_eq!(words(r"cat {a\,b,c}"), vec!["cat", "a,b", "c"]);
+        assert_eq!(words(r#"echo "{a,b}""#), vec!["echo", "{a,b}"]);
+        assert_eq!(words("echo '{a,b}'"), vec!["echo", "{a,b}"]);
+        assert_eq!(
+            words("find . -exec cat {} ;"),
+            vec!["find", ".", "-exec", "cat", "{}"]
+        );
+        assert_eq!(segs("{ echo a; }"), vec![vec!["echo", "a"]]);
+    }
+
+    #[test]
+    fn brace_overflow_is_flagged_and_fast() {
+        let cmd = format!("cat {}", "{a,b}".repeat(40));
+        let t = std::time::Instant::now();
+        let seg = split_segments(&cmd).remove(0);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(seg.len(), 2);
+        assert!(seg[1].brace_overflow);
+        assert!(!split_segments("cat {a,b}").remove(0)[1].brace_overflow);
+        // Many braces in one line stay linear.
+        let many = "x{".repeat(20_000);
+        let t = std::time::Instant::now();
+        let _ = split_segments(&format!("echo {many}"));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t.elapsed()
         );
     }
 }

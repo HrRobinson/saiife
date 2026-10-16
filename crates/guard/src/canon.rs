@@ -263,79 +263,119 @@ pub enum GlobExpansion {
 /// Words one brace expansion may produce before it is refused.
 pub const BRACE_LIMIT: usize = 1024;
 
+/// Bytes one brace expansion may produce in all before it is refused.
+pub const BRACE_BYTES: usize = 64 * 1024;
+/// Brace characters (`{`, `,`, `}`) one word may hold.
+pub const BRACE_MARKS: usize = 512;
+
 /// Bash brace expansion of `word`: `a{b,c}d` is `abd acd`, nested and
 /// repeated braces too, empty alternatives allowed (`x{,.bak}`). A brace
 /// without a top-level comma (`{a}`, `${HOME}`) is literal. `None`: more
-/// than `BRACE_LIMIT` words.
+/// than `BRACE_LIMIT` words, `BRACE_BYTES` bytes or `BRACE_MARKS` braces.
 pub fn expand_braces(word: &str) -> Option<Vec<String>> {
-    let mut done = Vec::new();
-    let mut stack = vec![word.to_string()];
-    while let Some(w) = stack.pop() {
-        match find_brace(&w) {
-            None => done.push(w),
-            Some((open, close, commas)) => {
-                let mut cuts = vec![open];
-                cuts.extend(commas);
-                cuts.push(close);
-                let (prefix, suffix) = (&w[..open], &w[close + 1..]);
-                for k in (0..cuts.len() - 1).rev() {
-                    let alt = &w[cuts[k] + 1..cuts[k + 1]];
-                    stack.push(format!("{prefix}{alt}{suffix}"));
+    let b = word.as_bytes();
+    let mut marks = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            // `${…}` is parameter syntax, not a brace expansion.
+            b'$' if b.get(i + 1) == Some(&b'{') => {
+                let mut depth = 0usize;
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
                 }
             }
+            b'{' | b',' | b'}' => marks.push(i),
+            _ => {}
         }
-        if done.len() + stack.len() > BRACE_LIMIT {
+        i += 1;
+    }
+    expand_marked(word, &marks)
+}
+
+/// Brace expansion where only the `{`, `,` and `}` at byte offsets `marks`
+/// (ascending) are structural; the lexer passes the unquoted ones.
+pub fn expand_marked(text: &str, marks: &[usize]) -> Option<Vec<String>> {
+    if marks.len() > BRACE_MARKS {
+        return None;
+    }
+    let mut done: Vec<String> = Vec::new();
+    let mut bytes = text.len();
+    let mut stack = vec![(text.to_string(), marks.to_vec())];
+    while let Some((w, m)) = stack.pop() {
+        let Some((oi, ci, commas)) = find_marked(&w, &m) else {
+            done.push(w);
+            continue;
+        };
+        bytes -= w.len();
+        let (open, close) = (m[oi], m[ci]);
+        let mut cuts = vec![open];
+        cuts.extend(commas.iter().map(|&j| m[j]));
+        cuts.push(close);
+        let alts = cuts.len() - 1;
+        if done.len() + stack.len() + alts > BRACE_LIMIT {
             return None;
+        }
+        let (prefix, suffix) = (&w[..open], &w[close + 1..]);
+        for k in (0..alts).rev() {
+            let (a0, a1) = (cuts[k] + 1, cuts[k + 1]);
+            let alt = &w[a0..a1];
+            let mut nm: Vec<usize> = m[..oi].to_vec();
+            nm.extend(
+                m[oi + 1..ci]
+                    .iter()
+                    .filter(|&&x| x >= a0 && x < a1)
+                    .map(|&x| x - a0 + open),
+            );
+            let base = open + alt.len();
+            nm.extend(m[ci + 1..].iter().map(|&x| x - (close + 1) + base));
+            let next = format!("{prefix}{alt}{suffix}");
+            bytes += next.len();
+            if bytes > BRACE_BYTES {
+                return None;
+            }
+            stack.push((next, nm));
         }
     }
     Some(done)
 }
 
-/// The first `{…}` in `w` with a top-level comma: byte offsets of `{`,
-/// `}` and the commas. `${…}` is skipped.
-fn find_brace(w: &str) -> Option<(usize, usize, Vec<usize>)> {
+/// The first marked `{` with a matching marked `}` and a top-level comma:
+/// indices into `m` of `{`, `}` and the commas.
+fn find_marked(w: &str, m: &[usize]) -> Option<(usize, usize, Vec<usize>)> {
     let b = w.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'$' && b.get(i + 1) == Some(&b'{') {
-            i = matching_close(b, i + 1).map_or(b.len(), |c| c + 1);
+    for oi in 0..m.len() {
+        if b[m[oi]] != b'{' {
             continue;
         }
-        if b[i] == b'{' {
-            if let Some(close) = matching_close(b, i) {
-                let mut depth = 0;
-                let commas: Vec<usize> = (i + 1..close)
-                    .filter(|&k| {
-                        match b[k] {
-                            b'{' => depth += 1,
-                            b'}' => depth -= 1,
-                            _ => {}
+        let mut depth = 0usize;
+        let mut commas = Vec::new();
+        for (j, &x) in m.iter().enumerate().skip(oi) {
+            match b[x] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if !commas.is_empty() {
+                            return Some((oi, j, commas));
                         }
-                        b[k] == b',' && depth == 0
-                    })
-                    .collect();
-                if !commas.is_empty() {
-                    return Some((i, close, commas));
+                        break;
+                    }
                 }
+                _ if depth == 1 => commas.push(j),
+                _ => {}
             }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn matching_close(b: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (k, c) in b.iter().enumerate().skip(open) {
-        match c {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(k);
-                }
-            }
-            _ => {}
         }
     }
     None
@@ -840,8 +880,16 @@ mod tests {
             assert_eq!(b(w), vec![w.to_string()], "{w}");
         }
         assert_eq!(b("${HOME}/{a,b}"), vec!["${HOME}/a", "${HOME}/b"]);
-        // Too many results: refused, not truncated.
+        // Too many results: refused, not truncated, and quickly.
         assert!(expand_braces(&"{a,b}".repeat(12)).is_none());
+        let t = std::time::Instant::now();
+        assert!(expand_braces(&"{a,b}".repeat(40)).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        // Too many bytes.
+        let long = format!("{{{},b}}{}", "x".repeat(40_000), "{c,d}");
+        assert!(expand_braces(&long).is_none());
+        // Too many braces in one word.
+        assert!(expand_braces(&"{a}".repeat(1000)).is_none());
     }
 
     #[test]
