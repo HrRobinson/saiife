@@ -41,3 +41,8 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - **Status/init UX:** a failed agent's error entry in the integrity record cannot be cleared on its own (only by a successful `saiife init` for that agent, or `init --off`).
 - **Status/init UX:** a hook installed before plan 2 through a symlinked agent config that points outside the project can no longer be removed by `init --off` (now refused); add a cleanup hint naming the outside file.
 - **CI:** the M4 unhashable-binary test (`unhashable_binary_at_init_is_a_failed_check`) skips in the offline job (root in a user namespace can read an execute-only file); it is covered by the ubuntu and macOS jobs.
+
+## Carry-over from plan 3 (for the plans that own them)
+
+- **Accepted false positives (`core.self`, by design):** `eval` and `source`/`.` have an effect the guard cannot see, so they count as an environment change and a nested agent after them in the same command line is denied: `eval "$(ssh-agent -s)"; claude …`, `eval "$(direnv hook bash)" && codex …`, `source venv/bin/activate; claude …`. The agent can run the nested agent as a separate command.
+- **Known gaps (`core.self`):** `unset HOME` / `export -n HOME` / `declare +x PATH` before a nested agent are not treated as environment changes; a dynamic argv[0] (`$(echo saiife) init --off`) is not judged; a plain `$PATH` hidden in a here-document body or comment can offset one obfuscated `$PATH` spelling elsewhere on the line (adversarial only); `codex --profile` can select a user profile with other hook settings.

@@ -20,17 +20,20 @@ use std::time::{Duration, Instant};
 use regex::{Regex, RegexSet};
 
 use crate::canon::{
-    canonicalize, expand_glob, lexical_form, path_forms, GlobExpansion, PathVars, GLOB_SCAN_LIMIT,
+    canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
+    GLOB_SCAN_LIMIT,
 };
 use crate::lexer::{find_all_substitutions, split_segments, Word};
 use crate::normalize::build_argv;
-use crate::operands::{operands, Source};
+use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
 use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::command_position_substitution;
-use crate::wrappers::{effective_command, is_env_assignment, unwrap_transparent_prefix};
+use crate::wrappers::{
+    effective_command, is_env_assignment, unwrap_transparent_prefix, wrapper_reads,
+};
 
 /// Default latency budget for a single evaluation. Exceeding it yields
 /// `Allow { .. timed_out: true }` — continuity wins over a stalled guard.
@@ -325,9 +328,11 @@ impl Engine {
         // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
         // rest of the command line (and for nested evaluations).
         let mut env_changed = env_changed;
-        let literal_path = has_literal_path_ref(raw_cmd);
+        let segments = split_segments(raw_cmd);
+        let literal_path =
+            has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments);
 
-        for seg in split_segments(raw_cmd) {
+        for seg in segments {
             if start.elapsed() > self.budget {
                 return Decision::Allow {
                     trace: AllowTrace::FailedOpenTimeout,
@@ -409,6 +414,8 @@ impl Engine {
                         }
                     }
                 }
+                // A bare `HOME=$(mktemp -d)` stays set for what follows.
+                env_changed |= effective_is_empty_assignments(&seg, literal_path);
                 // Depth cap reached, or the recursion above resolved to a
                 // (non-timeout) allow: there is no literal argv[0] in this
                 // segment to judge against packs, so move on to the next
@@ -492,6 +499,25 @@ impl Engine {
             // Leading assignments and redirections (`LANG=C sort f`,
             // `2>/dev/null cat f`) are not the command either.
             let effective = effective_command(effective);
+            // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
+            let reads: Vec<Operand> = wrapper_reads(&seg)
+                .into_iter()
+                .map(|(path, glob)| Operand {
+                    path,
+                    access: Access::Read,
+                    glob,
+                    into: Vec::new(),
+                })
+                .collect();
+            // Assignments in front of this segment's own command
+            // (`HOME=$(mktemp -d -p /tmp x) claude`, `env CODEX_HOME=x codex`)
+            // change its environment too.
+            let seg_env_changed = env_changed
+                || seg[..seg.len() - effective.len()].iter().any(|w| {
+                    !w.redirect
+                        && (w.assignment || is_env_assignment(&w.text))
+                        && assignment_changes_environment(&w.text, literal_path)
+                });
             // The peeled-off redirections stay visible to the regex rules
             // (`>/dev/sda cat x` is judged like `cat x > /dev/sda`).
             let peeled = peeled_redirections(&seg[..seg.len() - effective.len()]);
@@ -502,7 +528,7 @@ impl Engine {
                 // (`>/dev/sda`): only whole-segment rules and the
                 // redirections can apply.
                 if self.combined.might_match(&segment_line) {
-                    match self.judge(&peeled, &segment_line, env_changed, start) {
+                    match self.judge(&peeled, &segment_line, seg_env_changed, start) {
                         JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                         JudgeOutcome::TimedOut => {
                             return Decision::Allow {
@@ -513,7 +539,12 @@ impl Engine {
                     }
                 }
                 env_changed |= effective_is_empty_assignments(&seg, literal_path);
-                if let Some(d) = self.judge_operands(&seg, &[], &[], &cwds, cwd_unknown, start) {
+                if let Some(d) = self.judge_operands(
+                    self.shell_ops(&seg, &[], &[], reads),
+                    &cwds,
+                    cwd_unknown,
+                    start,
+                ) {
                     match d {
                         Decision::Allow {
                             trace: AllowTrace::Unjudgeable { reason },
@@ -561,7 +592,7 @@ impl Engine {
             if self.combined.might_match(&matching_line)
                 || (whole.is_some() && self.combined.might_match(segment_line))
             {
-                match self.judge(&matching_line, segment_line, env_changed, start) {
+                match self.judge(&matching_line, segment_line, seg_env_changed, start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                     JudgeOutcome::Decided(Decision::Allow { trace }) => {
                         allow_trace = Some(trace);
@@ -577,8 +608,12 @@ impl Engine {
 
             // Files the command reads or writes, judged by the path rules
             // that also guard the agents' file tools.
-            if let Some(d) = self.judge_operands(&seg, effective, &argv, &cwds, cwd_unknown, start)
-            {
+            if let Some(d) = self.judge_operands(
+                self.shell_ops(&seg, effective, &argv, reads),
+                &cwds,
+                cwd_unknown,
+                start,
+            ) {
                 match d {
                     Decision::Allow {
                         trace: AllowTrace::Unjudgeable { reason },
@@ -597,13 +632,19 @@ impl Engine {
                         "eval of a command substitution cannot be judged".to_string()
                     });
                 }
-                let inner = effective
+                // `eval -- ARGS`: the `--` ends eval's (empty) options.
+                let args = match effective.get(1) {
+                    Some(w) if w.text == "--" => &effective[2..],
+                    _ => effective.get(1..).unwrap_or(&[]),
+                };
+                let inner = args
                     .iter()
-                    .skip(1)
                     .map(|w| w.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");
-                if depth < MAX_INLINE_DEPTH && !inner.trim().is_empty() {
+                if depth >= MAX_INLINE_DEPTH && !inner.trim().is_empty() {
+                    unjudged.get_or_insert_with(|| "eval nested too deeply to judge".to_string());
+                } else if !inner.trim().is_empty() {
                     if start.elapsed() > self.budget {
                         return Decision::Allow {
                             trace: AllowTrace::FailedOpenTimeout,
@@ -721,18 +762,12 @@ impl Engine {
     /// glob matches and copy targets that are directories.
     fn judge_operands(
         &self,
-        seg: &[Word],
-        effective: &[Word],
-        argv: &[String],
+        ops: Vec<Operand>,
         cwds: &[PathBuf],
         cwd_unknown: bool,
         start: Instant,
     ) -> Option<Decision> {
-        if self.path_rules.is_empty() {
-            return None;
-        }
-        let ops = operands(seg, effective, argv);
-        if ops.is_empty() {
+        if self.path_rules.is_empty() || ops.is_empty() {
             return None;
         }
         let all: Vec<Option<&Path>> = if cwds.is_empty() {
@@ -789,7 +824,7 @@ impl Engine {
                     return timed_out();
                 }
                 let words = if op.glob {
-                    match expand_glob(&op.path, *cwd, &self.vars) {
+                    match expand_operand_glob(&op.path, *cwd, &self.vars) {
                         GlobExpansion::Matches(m) if !m.is_empty() => m
                             .into_iter()
                             .map(|p| p.to_string_lossy().into_owned())
@@ -840,6 +875,23 @@ impl Engine {
         })
     }
 
+    /// The paths a shell segment touches (`operands`), plus `extra` (files
+    /// a peeled-off wrapper reads). Empty without path rules.
+    fn shell_ops(
+        &self,
+        seg: &[Word],
+        effective: &[Word],
+        argv: &[String],
+        extra: Vec<Operand>,
+    ) -> Vec<Operand> {
+        if self.path_rules.is_empty() {
+            return Vec::new();
+        }
+        let mut ops = operands(seg, effective, argv);
+        ops.extend(extra);
+        ops
+    }
+
     /// What a copy/move into `target` writes. Paths to judge in full:
     /// `target/<name>` for each source when `target` is a directory (glob
     /// sources expanded first), `target` itself otherwise or when a source
@@ -860,7 +912,7 @@ impl Engine {
         let mut scanned = 0usize;
         for src in sources {
             let paths: Vec<String> = if src.glob {
-                match expand_glob(&src.path, cwd, &self.vars) {
+                match expand_operand_glob(&src.path, cwd, &self.vars) {
                     GlobExpansion::Matches(m) if !m.is_empty() => {
                         m.iter().map(|p| p.to_string_lossy().into_owned()).collect()
                     }
@@ -1068,15 +1120,66 @@ fn peeled_redirections(prefix: &[Word]) -> String {
 }
 
 /// Variables whose change moves saiife's audit/integrity records, the
-/// binary lookup or the (admin) settings the hooks live in. Gemini's two
-/// are the only config-location variables the research docs name.
+/// binary lookup or the settings the hooks live in: Gemini's two system
+/// settings paths, Codex's `CODEX_HOME` and Claude Code's
+/// `CLAUDE_CONFIG_DIR` (each moves where that agent reads its hook config).
 const PROTECTED_ENV: &[&str] = &[
     "HOME",
     "XDG_DATA_HOME",
     "PATH",
     "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
     "GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
 ];
+
+/// Is every `$PATH` / `${PATH}` in the command line's words spelled
+/// plainly in `raw` (unquoted or inside double quotes, no backslash, no
+/// quote boundary inside it)? Word texts are dequoted, so `"$"PATH`,
+/// `$\PATH`, `$""PATH` and `$'\x24'PATH` all read `$PATH` there; then the
+/// words hold more references than `raw` spells plainly and every PATH
+/// assignment counts as a change (fail closed). A plain reference that
+/// does not reach a word (a comment, a here-document body) also fails
+/// closed: the counts must be equal.
+fn path_refs_are_plain(raw: &str, segments: &[Vec<Word>]) -> bool {
+    let in_words: usize = segments
+        .iter()
+        .flatten()
+        .map(|w| count_path_refs(w.text.as_bytes(), |_| true))
+        .sum();
+    if in_words == 0 {
+        return true;
+    }
+    // Plain references in `raw`: outside single quotes, not escaped.
+    let b = raw.as_bytes();
+    let mut plain_at = vec![false; b.len()];
+    let (mut sq, mut dq, mut i) = (false, false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if !sq => i += 1,
+            b'\'' if !dq => sq = !sq,
+            b'"' if !sq => dq = !dq,
+            b'$' if !sq => plain_at[i] = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    count_path_refs(b, |i| plain_at[i]) == in_words
+}
+
+/// Count `$PATH` (not followed by a name character) and `${PATH}` in `b`
+/// whose `$` sits at an index `ok` accepts.
+fn count_path_refs(b: &[u8], ok: impl Fn(usize) -> bool) -> usize {
+    let name = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    (0..b.len())
+        .filter(|&i| {
+            b[i] == b'$'
+                && ok(i)
+                && (b[i..].starts_with(b"${PATH}")
+                    || (b[i..].starts_with(b"$PATH") && !b.get(i + 5).is_some_and(|&c| name(c))))
+        })
+        .count()
+}
 
 /// Is `$PATH` / `${PATH` written literally anywhere in `raw` (inside single
 /// quotes or after a backslash)? Word texts are dequoted, so this is the
@@ -1155,12 +1258,26 @@ fn changes_environment(argv: &[String], effective: &[Word], literal_path: bool) 
     let protected = |t: &str| PROTECTED_ENV.contains(&t);
     match cmd.as_str() {
         "eval" | "source" | "." => true,
+        // `-n` makes a nameref: a later `ref=x` assigns whatever it names.
+        "declare" | "typeset" | "local"
+            if args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('n')
+            }) =>
+        {
+            true
+        }
         "export" | "readonly" | "declare" | "typeset" | "local" => args
             .iter()
             .any(|w| assignment_changes_environment(&w.text, literal_path)),
-        "printf" => args
-            .windows(2)
-            .any(|p| p[0].text == "-v" && protected(p[1].text.split('[').next().unwrap_or(""))),
+        // `printf -v NAME` and the attached `printf -vNAME`.
+        "printf" => args.iter().enumerate().any(|(i, w)| {
+            let name = match w.text.strip_prefix("-v") {
+                Some("") => args.get(i + 1).map_or("", |n| n.text.as_str()),
+                Some(attached) => attached,
+                None => return false,
+            };
+            protected(name.split('[').next().unwrap_or(""))
+        }),
         "read" | "mapfile" | "readarray" => args
             .iter()
             .any(|w| !w.text.starts_with('-') && protected(&w.text)),
@@ -1609,6 +1726,22 @@ reason = "other pack says no"
             assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
         }
         for cmd in ["cat *.md", "grep TODO *", "cat '.env*'", "cat nothing*"] {
+            assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
+        }
+    }
+
+    #[test]
+    fn operand_braces_are_expanded_once() {
+        // The lexer already brace-expanded unquoted braces; braces left in
+        // an operand were quoted and are literal, so `"{.e,x}{n,y}v"*`
+        // looks for names starting with `{.e,x}{n,y}v`, not for `.env*`.
+        let (_d, root) = canonical_tmp();
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join(".env"), "K=v").unwrap();
+        let e = shell_path_engine(&root);
+        assert!(e.evaluate("cat {.e,x}{n,y}v*").is_deny());
+        for cmd in ["cat \"{.e,x}{n,y}v\"*", "cp README.md \"{.e,x}{n,y}\"*"] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }
     }

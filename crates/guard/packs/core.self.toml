@@ -24,7 +24,7 @@ version = 1
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "claude", "codex", "gemini"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -37,9 +37,12 @@ reason = "an alias named saiife would replace the guard"
 [[deny]]
 # `PATH=/tmp/fake:$PATH claude …`, `env PATH=… codex …`: a nested agent
 # whose PATH can resolve `saiife` to something else. `HOME=` and
-# `XDG_DATA_HOME=` relocate the audit and integrity dirs the same way.
-pattern = '(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home|gemini_cli_system_settings_path|gemini_cli_system_defaults_path)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)'
-reason = "starting an agent or saiife with a changed PATH, HOME or XDG_DATA_HOME can bypass the guard or hide its audit trail"
+# `XDG_DATA_HOME=` relocate the audit and integrity dirs the same way;
+# `CODEX_HOME=`, `CLAUDE_CONFIG_DIR=` and Gemini's system settings paths
+# move where the agent reads its hook config. (The engine also catches
+# these assignments when the regex cannot, e.g. a value with spaces.)
+pattern = '(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home|gemini_cli_system_settings_path|gemini_cli_system_defaults_path|codex_home|claude_config_dir)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)'
+reason = "starting an agent or saiife with a changed PATH, HOME, XDG_DATA_HOME or agent config dir can bypass the guard or hide its audit trail"
 whole_segment = true
 
 [[deny]]
@@ -70,11 +73,18 @@ reason = "enabling or disabling Codex's hooks from the command line can leave th
 # `export PATH=/tmp/fake:$PATH; claude`, `HOME=/tmp/x; export HOME; codex`:
 # the engine notes that an earlier segment of this command line (or of an
 # enclosing one) exported or assigned PATH (anything but an append to
-# `$PATH`), HOME or XDG_DATA_HOME; this rule then fires on a command that
-# starts an agent or saiife (wrappers, quotes and assignments peeled).
+# `$PATH`), HOME, XDG_DATA_HOME, CODEX_HOME, CLAUDE_CONFIG_DIR or a Gemini
+# system settings path; this rule then fires on a command that starts an
+# agent or saiife (wrappers, quotes and assignments peeled).
+#
+# Accepted false positives, by design: `eval` and `source`/`.` have an
+# effect the guard cannot see, so they count as an environment change, and
+# a nested agent after them is denied: `eval "$(ssh-agent -s)"; claude …`,
+# `eval "$(direnv hook bash)" && codex …`, `source venv/bin/activate;
+# claude …`. Run the agent in a separate command instead.
 after_env_change = true
 pattern = '^(?:claude|codex|gemini|saiife)(?:\s|$)'
-reason = "changing PATH, HOME or XDG_DATA_HOME and then starting an agent or saiife can bypass the guard or hide its audit trail"
+reason = "changing PATH, HOME, XDG_DATA_HOME or an agent config dir (or running eval/source, whose effect cannot be seen) and then starting an agent or saiife can bypass the guard or hide its audit trail"
 
 # --- write tools and shell writes ---------------------------------------------
 [[deny_path]]

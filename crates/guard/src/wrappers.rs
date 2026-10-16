@@ -29,12 +29,18 @@
 //! shell re-parses rather than a leading sub-slice (and `su`'s first operand
 //! is a username, which a blind prefix-skip would misread).
 //!
-//! `exec` and `xargs` are peeled too (xargs: the command and its fixed
-//! operands are judged; operands arriving on stdin stay invisible). `eval`
-//! is handled by the engine (its joined arguments are a nested command line).
+//! `exec`, `builtin` and `xargs` are peeled too (xargs: the command and its
+//! fixed operands are judged; operands arriving on stdin stay invisible; an
+//! `-a FILE` it reads is reported by `wrapper_reads`). `eval` is handled by
+//! the engine (its joined arguments are a nested command line).
 //!
-//! Deliberately not exhaustive — a documented gap remains: the `flock … -c 'STRING'` sub-form. See the design doc's
-//! "Known limitations".
+//! Short options follow getopt: in a bundle (`-0I {}`, `-tn 1`), a letter
+//! that takes a value ends the bundle and takes the rest of the token, or
+//! the next token when nothing is attached.
+//!
+//! Deliberately not exhaustive. A documented gap remains: the
+//! `flock … -c 'STRING'` sub-form (see the design doc's "Known
+//! limitations").
 
 use crate::lexer::Word;
 
@@ -44,7 +50,7 @@ use crate::lexer::Word;
 /// filesystem means `COMMAND rm -rf /` finds the same binary as `command`).
 const TRANSPARENT_PREFIXES: &[&str] = &[
     "command", "env", "nohup", "nice", "stdbuf", "ionice", "sudo", "time", "timeout", "chroot",
-    "flock", "exec", "xargs",
+    "flock", "exec", "xargs", "builtin",
 ];
 
 /// `sudo` short options that take a value, e.g. `-u root`. Bundled/attached
@@ -75,140 +81,199 @@ const SUDO_ARG_TAKING_LONG: &[&str] = &[
 /// unboundedly on adversarial input (no risk to the latency budget).
 pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
     let mut rest = seg;
-    loop {
-        let Some(head) = rest.first() else {
-            return rest;
-        };
-        // Strip any leading directory (`/usr/bin/time` -> `time`) and
-        // case-fold before matching — the same canonicalization
-        // `normalize::build_argv` applies to argv[0], but done here because
-        // unwrapping runs on the raw segment *before* that normalization.
-        // Skip-only, so this can only ever catch more, never manufacture a
-        // false positive.
-        let lowered = head.text.to_ascii_lowercase();
-        let name = strip_program_dir(&lowered);
-        if !TRANSPARENT_PREFIXES.contains(&name) {
-            return rest;
+    while let Some((_, after)) = unwrap_one(rest) {
+        rest = after;
+    }
+    rest
+}
+
+/// xargs short options that take a value.
+const XARGS_VALUE_SHORT: &[char] = &['I', 'n', 'P', 'L', 's', 'd', 'E', 'a', 'R', 'S'];
+/// xargs long options that take a value.
+const XARGS_VALUE_LONG: &[&str] = &[
+    "max-args",
+    "max-procs",
+    "max-lines",
+    "max-chars",
+    "delimiter",
+    "arg-file",
+    "process-slot-var",
+];
+
+/// Peel one transparent wrapper off the front of `rest`: its (lowered,
+/// directory-stripped) name and the words after it and its options.
+fn unwrap_one(rest: &[Word]) -> Option<(String, &[Word])> {
+    let head = rest.first()?;
+    // Strip any leading directory (`/usr/bin/time` -> `time`) and
+    // case-fold before matching — the same canonicalization
+    // `normalize::build_argv` applies to argv[0], but done here because
+    // unwrapping runs on the raw segment *before* that normalization.
+    // Skip-only, so this can only ever catch more, never manufacture a
+    // false positive.
+    let lowered = head.text.to_ascii_lowercase();
+    let name = strip_program_dir(&lowered);
+    if !TRANSPARENT_PREFIXES.contains(&name) {
+        return None;
+    }
+    let mut rest = &rest[1..];
+    match name {
+        "env" => {
+            // `env FOO=bar -i rm -rf /` — skip leading assignments and
+            // env's own flags to reach the real command.
+            while rest
+                .first()
+                .map(|w| is_env_assignment(&w.text) || w.text.starts_with('-'))
+                .unwrap_or(false)
+            {
+                rest = &rest[1..];
+            }
         }
-        rest = &rest[1..];
-        match name {
-            "env" => {
-                // `env FOO=bar -i rm -rf /` — skip leading assignments and
-                // env's own flags to reach the real command.
-                while rest
-                    .first()
-                    .map(|w| is_env_assignment(&w.text) || w.text.starts_with('-'))
-                    .unwrap_or(false)
-                {
-                    rest = &rest[1..];
+        "nice" => {
+            if let Some(w) = rest.first() {
+                if w.text == "-n" {
+                    rest = &rest[1..]; // consume "-n"
+                    if !rest.is_empty() {
+                        rest = &rest[1..]; // consume its value
+                    }
+                } else if is_dash_numeric(&w.text) {
+                    rest = &rest[1..]; // consume "-<niceness>"
                 }
             }
-            "nice" => {
-                if let Some(w) = rest.first() {
-                    if w.text == "-n" {
-                        rest = &rest[1..]; // consume "-n"
-                        if !rest.is_empty() {
-                            rest = &rest[1..]; // consume its value
+        }
+        "stdbuf" | "ionice" | "command" => {
+            while rest
+                .first()
+                .map(|w| w.text.starts_with('-'))
+                .unwrap_or(false)
+            {
+                rest = &rest[1..];
+            }
+        }
+        "sudo" => rest = skip_sudo_options(rest),
+        "time" => {
+            // `time [-p] CMD` (shell builtin) and GNU `/usr/bin/time
+            // [OPTIONS] CMD` — value-taking `-o FILE`/`-f FMT` and their
+            // `--output`/`--format` long forms; no positionals precede
+            // the command.
+            rest = skip_options_then_positionals(rest, &['o', 'f'], &["output", "format"], 0, None);
+        }
+        "timeout" => {
+            // `timeout [OPTIONS] DURATION CMD` — value-taking
+            // `-s SIGNAL`/`-k DURATION` (and `--signal`/`--kill-after`),
+            // then exactly one DURATION positional gated by a duration
+            // shape so a malformed `timeout rm …` never eats a command.
+            rest = skip_options_then_positionals(
+                rest,
+                &['s', 'k'],
+                &["signal", "kill-after"],
+                1,
+                Some(is_duration_shape),
+            );
+        }
+        "chroot" => {
+            // `chroot [OPTIONS] NEWROOT [CMD]` — GNU chroot's `--userspec`
+            // and `--groups` accept their value either attached
+            // (`--userspec=root:root`) or as a separate following token
+            // (`--userspec root:root`); BSD/macOS chroot additionally has
+            // short value options `-u`/`-g`/`-G`/`-U`. Then exactly one
+            // NEWROOT positional precedes the command. (A recursive wipe
+            // of the chroot's own root is still the catastrophe class we
+            // block — see the design's DECISION 5.)
+            rest = skip_options_then_positionals(
+                rest,
+                &['u', 'g', 'G', 'U'],
+                &["userspec", "groups"],
+                1,
+                None,
+            );
+        }
+        "flock" => {
+            // `flock [OPTIONS] <LOCKFILE|DIR|FD> CMD` (the dominant prefix
+            // form) — value-taking `-w SECONDS`/`-E CODE` (and `--timeout`/
+            // `--conflict-exit-code`), then one lock-target positional.
+            // The `flock … -c 'STRING'` sub-form is deferred (design
+            // DECISION 4): it interleaves an inline payload after the
+            // positional and is a documented gap, not handled here.
+            rest = skip_options_then_positionals(
+                rest,
+                &['w', 'E'],
+                &["timeout", "conflict-exit-code"],
+                1,
+                None,
+            );
+        }
+        "exec" => {
+            // `exec [-cl] [-a NAME] CMD`: replaces the shell with CMD.
+            rest = skip_options_then_positionals(rest, &['a'], &[], 0, None);
+        }
+        "xargs" => {
+            // `xargs [OPTIONS] CMD ARGS`: judge the command it runs
+            // (its operands arrive on stdin, but fixed operands and the
+            // command itself are visible).
+            rest =
+                skip_options_then_positionals(rest, XARGS_VALUE_SHORT, XARGS_VALUE_LONG, 0, None);
+        }
+        _ => {}
+    }
+    Some((name.to_string(), rest))
+}
+
+/// Files the wrappers peeled off in front of a segment's command read
+/// themselves: `xargs -a FILE` / `--arg-file FILE` (also attached and
+/// bundled, `-0a FILE`, `-aFILE`, `--arg-file=FILE`). Follows the same
+/// peeling as `effective_command`.
+pub fn wrapper_reads(seg: &[Word]) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = seg;
+    loop {
+        while let Some(w) = rest.first() {
+            if w.redirect {
+                rest = &rest[rest.len().min(2)..];
+            } else if w.assignment {
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        let Some((name, after)) = unwrap_one(rest) else {
+            return out;
+        };
+        if name == "xargs" {
+            let opts = &rest[1..rest.len() - after.len()];
+            let mut i = 0;
+            while i < opts.len() {
+                let tok = opts[i].text.as_str();
+                if let Some(long) = tok.strip_prefix("--") {
+                    if long == "arg-file" {
+                        out.extend(opts.get(i + 1).map(|w| (w.text.clone(), w.glob)));
+                        i += 1;
+                    } else if let Some(file) = long.strip_prefix("arg-file=") {
+                        out.push((file.to_string(), opts[i].glob));
+                    } else if !long.contains('=') && XARGS_VALUE_LONG.contains(&long) {
+                        i += 1;
+                    }
+                } else if let Some(short) = tok.strip_prefix('-') {
+                    for (pos, c) in short.char_indices() {
+                        if !XARGS_VALUE_SHORT.contains(&c) {
+                            continue;
                         }
-                    } else if is_dash_numeric(&w.text) {
-                        rest = &rest[1..]; // consume "-<niceness>"
+                        let attached = pos + c.len_utf8() < short.len();
+                        if !attached {
+                            if c == 'a' {
+                                out.extend(opts.get(i + 1).map(|w| (w.text.clone(), w.glob)));
+                            }
+                            i += 1;
+                        } else if c == 'a' {
+                            let file = &short[pos + 1..];
+                            out.push((file.to_string(), opts[i].glob));
+                        }
+                        break;
                     }
                 }
+                i += 1;
             }
-            "stdbuf" | "ionice" | "command" => {
-                while rest
-                    .first()
-                    .map(|w| w.text.starts_with('-'))
-                    .unwrap_or(false)
-                {
-                    rest = &rest[1..];
-                }
-            }
-            "sudo" => rest = skip_sudo_options(rest),
-            "time" => {
-                // `time [-p] CMD` (shell builtin) and GNU `/usr/bin/time
-                // [OPTIONS] CMD` — value-taking `-o FILE`/`-f FMT` and their
-                // `--output`/`--format` long forms; no positionals precede
-                // the command.
-                rest = skip_options_then_positionals(
-                    rest,
-                    &['o', 'f'],
-                    &["output", "format"],
-                    0,
-                    None,
-                );
-            }
-            "timeout" => {
-                // `timeout [OPTIONS] DURATION CMD` — value-taking
-                // `-s SIGNAL`/`-k DURATION` (and `--signal`/`--kill-after`),
-                // then exactly one DURATION positional gated by a duration
-                // shape so a malformed `timeout rm …` never eats a command.
-                rest = skip_options_then_positionals(
-                    rest,
-                    &['s', 'k'],
-                    &["signal", "kill-after"],
-                    1,
-                    Some(is_duration_shape),
-                );
-            }
-            "chroot" => {
-                // `chroot [OPTIONS] NEWROOT [CMD]` — GNU chroot's `--userspec`
-                // and `--groups` accept their value either attached
-                // (`--userspec=root:root`) or as a separate following token
-                // (`--userspec root:root`); BSD/macOS chroot additionally has
-                // short value options `-u`/`-g`/`-G`/`-U`. Then exactly one
-                // NEWROOT positional precedes the command. (A recursive wipe
-                // of the chroot's own root is still the catastrophe class we
-                // block — see the design's DECISION 5.)
-                rest = skip_options_then_positionals(
-                    rest,
-                    &['u', 'g', 'G', 'U'],
-                    &["userspec", "groups"],
-                    1,
-                    None,
-                );
-            }
-            "flock" => {
-                // `flock [OPTIONS] <LOCKFILE|DIR|FD> CMD` (the dominant prefix
-                // form) — value-taking `-w SECONDS`/`-E CODE` (and `--timeout`/
-                // `--conflict-exit-code`), then one lock-target positional.
-                // The `flock … -c 'STRING'` sub-form is deferred (design
-                // DECISION 4): it interleaves an inline payload after the
-                // positional and is a documented gap, not handled here.
-                rest = skip_options_then_positionals(
-                    rest,
-                    &['w', 'E'],
-                    &["timeout", "conflict-exit-code"],
-                    1,
-                    None,
-                );
-            }
-            "exec" => {
-                // `exec [-cl] [-a NAME] CMD`: replaces the shell with CMD.
-                rest = skip_options_then_positionals(rest, &['a'], &[], 0, None);
-            }
-            "xargs" => {
-                // `xargs [OPTIONS] CMD ARGS`: judge the command it runs
-                // (its operands arrive on stdin, but fixed operands and the
-                // command itself are visible).
-                rest = skip_options_then_positionals(
-                    rest,
-                    &['I', 'n', 'P', 'L', 's', 'd', 'E', 'a', 'R', 'S'],
-                    &[
-                        "max-args",
-                        "max-procs",
-                        "max-lines",
-                        "max-chars",
-                        "delimiter",
-                        "arg-file",
-                        "process-slot-var",
-                    ],
-                    0,
-                    None,
-                );
-            }
-            _ => {}
         }
+        rest = after;
     }
 }
 
@@ -277,13 +342,10 @@ fn skip_sudo_options(mut rest: &[Word]) -> &[Word] {
             if short.is_empty() {
                 return rest; // bare "-": not a recognized option, stop here
             }
-            let first = short.chars().next().unwrap();
             rest = &rest[1..];
-            if SUDO_ARG_TAKING_SHORT.contains(&first) && short.len() == 1 {
-                // `-u root`: the value is a separate token.
-                if !rest.is_empty() {
-                    rest = &rest[1..];
-                }
+            if takes_separate_value(short, SUDO_ARG_TAKING_SHORT) && !rest.is_empty() {
+                // `-u root`, `-Eu root`: the value is a separate token.
+                rest = &rest[1..];
             }
             // Otherwise: a boolean flag, a bundle of boolean flags, or an
             // arg-taking flag with its value attached (`-uroot`) — the one
@@ -347,15 +409,13 @@ fn skip_options_then_positionals<'a>(
             if short.is_empty() {
                 break; // bare "-": start of operands, not an option.
             }
-            let first = short.chars().next().unwrap();
             rest = &rest[1..];
-            if short.len() == 1 && value_shorts.contains(&first) {
-                // `-w 5`: the value is a separate token. Bundled booleans and
-                // attached values (`-w5`) are the single token already
-                // consumed above.
-                if !rest.is_empty() {
-                    rest = &rest[1..];
-                }
+            if takes_separate_value(short, value_shorts) && !rest.is_empty() {
+                // `-w 5`, `-0I {}`: the bundle ends in a value letter with
+                // nothing attached, so the value is the next token.
+                // Bundled booleans and attached values (`-w5`, `-P4`) are
+                // the single token already consumed above.
+                rest = &rest[1..];
             }
             continue;
         }
@@ -373,6 +433,16 @@ fn skip_options_then_positionals<'a>(
         rest = &rest[1..];
     }
     rest
+}
+
+/// getopt on one short-option bundle (without its `-`): the first letter
+/// that takes a value ends the bundle; it takes the next token when
+/// nothing follows it in this one.
+fn takes_separate_value(bundle: &str, value_shorts: &[char]) -> bool {
+    bundle
+        .char_indices()
+        .find(|(_, c)| value_shorts.contains(c))
+        .is_some_and(|(pos, c)| pos + c.len_utf8() == bundle.len())
 }
 
 /// True if `tok` looks like a `NAME=value` shell-assignment word (`env`'s

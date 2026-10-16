@@ -696,3 +696,206 @@ fn cd_into_a_variable_is_an_unknown_directory() {
         }
     }
 }
+
+fn assert_unjudgeable(e: &Engine, cmd: &str) {
+    match e.evaluate(cmd) {
+        Decision::Allow {
+            trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
+        } => {}
+        d => panic!("expected error_allowed for {cmd:?}, got {d:?}"),
+    }
+}
+
+#[test]
+fn eval_behind_builtin_or_double_dash_is_still_judged() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "builtin eval \"saiife init --off\"",
+            "builtin eval 'rm -rf .saiife'",
+            "eval -- \"saiife init --off\"",
+            "eval -- saiife init --off",
+            "builtin exec saiife init --off",
+            "command eval 'saiife init --off'",
+            "export HOME=x; builtin eval claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &["builtin cd src", "builtin echo hi", "eval -- echo hi"],
+    );
+    // Past the nesting cap, eval is recorded as not judged, never silent.
+    let cmd = format!("{}saiife init --off", "eval ".repeat(12));
+    assert_unjudgeable(&e, &cmd);
+    assert_unjudgeable(&e, &format!("{}echo hi", "eval ".repeat(12)));
+}
+
+#[test]
+fn a_path_reference_counts_as_an_append_only_when_spelled_plainly() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "PATH=\"$\"PATH:/tmp/evil; claude",
+            "PATH=$\\PATH:/tmp/evil; claude",
+            "PATH=$\"\"PATH:/tmp/evil; claude",
+            "export PATH=$''PATH:/x; claude",
+            "MYPATH=$PATH:/x; PATH=\"$\"PATH:/evil; claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "export PATH=$PATH:./bin; claude --version",
+            "export PATH=\"$PATH:./bin\"; claude -p hi",
+            "export PATH=${PATH}:./bin; claude -p hi",
+            "export PATH=\"${PATH}\":./bin; claude -p hi",
+            "PATH=$PATH:./node_modules/.bin; claude -p hi",
+        ],
+    );
+}
+
+#[test]
+fn printf_attached_v_and_namerefs_change_the_environment() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "printf -vHOME /tmp; claude",
+            "printf -vPATH /tmp; codex exec x",
+            "declare -n ref=HOME; ref=/tmp/x; claude",
+            "typeset -n ref=PATH; ref=/x; claude",
+            "local -n r=HOME; claude",
+            "declare -gn r=HOME; claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "printf -vmsg hi; claude -p hi",
+            "declare -a arr; claude -p hi",
+            "local x=1; claude -p hi",
+        ],
+    );
+}
+
+#[test]
+fn xargs_bundled_value_options_do_not_hide_the_command() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "find . -print0 | xargs -0I {} rm .saiife/config.toml",
+            "xargs -tn 1 rm .saiife/config.toml",
+            "xargs -0n 1 rm .saiife/config.toml",
+            "xargs -P4 rm .saiife/config.toml",
+            "xargs -0P 4 rm .saiife/config.toml",
+            "xargs -L 1 rm .saiife/config.toml",
+            "xargs -rs 100 rm .saiife/config.toml",
+            "xargs -E eof rm .saiife/config.toml",
+            "xargs -d x rm .saiife/config.toml",
+            "xargs -0d x saiife init --off",
+            "sudo -Eu root rm -rf .saiife",
+        ],
+    );
+    // `-a FILE` reads FILE.
+    for cmd in [
+        "xargs -a .env echo",
+        "xargs -0a .env echo",
+        "xargs -a.env echo",
+        "xargs --arg-file .env echo",
+        "xargs --arg-file=.env echo",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    assert_allowed(
+        &e,
+        &[
+            "find . -name '*.rs' | xargs grep TODO",
+            "xargs -n1 echo",
+            "xargs -0 -I{} echo {}",
+            "find . -print0 | xargs -0I {} echo {}",
+            "xargs -tn 1 echo",
+            "xargs -a files.txt grep TODO",
+        ],
+    );
+}
+
+#[test]
+fn a_bare_assignment_of_a_substitution_changes_the_environment() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "HOME=$(mktemp -d); claude",
+            "PATH=$(pwd)/bin; claude",
+            "CLAUDE_CONFIG_DIR=$(mktemp -d); claude",
+            "HOME=$(mktemp -d -p /tmp x) claude -p hi",
+            "env HOME=$(mktemp -d -p /tmp x) claude -p hi",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "HOME=$(mktemp -d) cargo test",
+            "TS=$(date +%s); claude -p hi",
+            "HOME=$(mktemp -d); cargo test",
+        ],
+    );
+}
+
+#[test]
+fn codex_home_and_claude_config_dir_relocate_the_hook_config() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_denied(
+        &e,
+        &[
+            "CLAUDE_CONFIG_DIR=/tmp/x claude",
+            "env CLAUDE_CONFIG_DIR=/tmp/x claude -p hi",
+            "export CLAUDE_CONFIG_DIR=/tmp/x; claude",
+            "CODEX_HOME=/tmp/x codex exec x",
+            "export CODEX_HOME=/tmp/x; codex",
+            "CODEX_HOME=/tmp/x; codex",
+            "declare CLAUDE_CONFIG_DIR=/tmp/x; claude",
+        ],
+    );
+    assert_allowed(
+        &e,
+        &[
+            "CLAUDE_CONFIG_DIR=x ls",
+            "CODEX_HOME=/tmp/x cargo test",
+            "export CLAUDE_CONFIG_DIR=/tmp/x; ls",
+            "echo $CLAUDE_CONFIG_DIR",
+        ],
+    );
+}
+
+#[test]
+fn everyday_commands_from_the_round_4_brief_stay_allowed() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert_allowed(
+        &e,
+        &[
+            "find . -name '*.rs' | xargs grep TODO",
+            "xargs -n1 echo",
+            "xargs -0 -I{} echo {}",
+            "exec bash",
+            "builtin cd x",
+            "read -r line",
+            "local x=1",
+            "declare -a arr",
+            "export HOME=/tmp/x; cargo test",
+            "export PATH=$PATH:./bin; claude --version",
+            "HOME=$(mktemp -d) cargo test",
+            "CLAUDE_CONFIG_DIR=x ls",
+        ],
+    );
+}
