@@ -115,3 +115,16 @@ fn heredoc_substitutions_are_judged() {
     );
     assert!(!e.evaluate("cat <<'EOF'\n$(rm -rf /)\nEOF").is_deny());
 }
+
+#[test]
+fn literal_substitution_values_are_judged() {
+    let e = engine();
+    for cmd in [
+        "rm -rf \"$(cat <<'EOF'\n/\nEOF\n)\"",
+        "rm -rf $(echo /)",
+        "rm -rf \"$(printf /)\"",
+        "rm -rf $(cat /tmp/list)",
+    ] {
+        deny_pack(&e, cmd);
+    }
+}

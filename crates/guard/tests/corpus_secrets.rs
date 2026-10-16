@@ -556,3 +556,38 @@ fn heredocs_comments_arithmetic_and_sequences() {
         ],
     );
 }
+
+#[test]
+fn round_three_shapes() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        // `[[` is a test only where a command starts.
+        "echo [[ x; cat <.env",
+        "echo [[ x\ncat <.env",
+        // `((` without a real `))` is two subshells.
+        "((cat .env); true)",
+        "((cd src && cat .env) | head)",
+        "((cat .env) )",
+        // `<(` is a process substitution, never arithmetic.
+        "cat <((cat .env))",
+        "diff <((cat .env) ) x",
+        // A here-doc after a compound command's end feeds that command.
+        "while read l; do bash; done <<EOF\ncat .env\nEOF",
+        "if true; then bash; fi <<EOF\ncat .env\nEOF",
+        "{ bash; } <<EOF\ncat .env\nEOF",
+        "( bash ) <<EOF\ncat .env\nEOF",
+    ] {
+        deny_pack(&e, cmd);
+    }
+    assert_allows(
+        &e,
+        &[
+            "[[ -f .env ]] && echo yes",
+            "FOO=1 [[ a < b ]] && echo ok",
+            "(( i++ ))",
+            "((i++)); echo $i",
+            "while read l; do echo $l; done <<EOF\na\nEOF",
+        ],
+    );
+}

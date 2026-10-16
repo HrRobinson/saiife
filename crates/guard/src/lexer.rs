@@ -241,7 +241,10 @@ fn lex(input: &str) -> Vec<LexTok> {
                     });
                 }
                 if !word_quoted && word.text == "[[" {
-                    in_test = true;
+                    // A reserved word only where a command starts (after
+                    // assignments and wrappers): `echo [[` is an argument.
+                    let words = current_segment(&toks);
+                    in_test = crate::wrappers::effective_command(&words).is_empty();
                 } else if !word_quoted && word.text == "]]" {
                     in_test = false;
                 }
@@ -276,6 +279,10 @@ fn lex(input: &str) -> Vec<LexTok> {
     }
 
     while let Some(c) = chars.next() {
+        // A list or pipeline operator ends a `[[ … ]]` test.
+        if in_test && matches!(toks.last(), Some(LexTok::Operator(_))) {
+            in_test = false;
+        }
         match c {
             ' ' | '\t' | '\r' => flush_word!(),
             '\n' => {
@@ -319,9 +326,11 @@ fn lex(input: &str) -> Vec<LexTok> {
                 word_text.push(c);
             }
             '<' | '>' if chars.peek() == Some(&'(') => {
-                // Process substitution `<(cmd)` / `>(cmd)`: not a file; the
-                // `(` that follows opens its own segment.
+                // Process substitution `<(cmd)` / `>(cmd)`: not a file; its
+                // `(` opens its own segment (never arithmetic: `<((x))`).
                 flush_word!();
+                chars.next();
+                toks.push(LexTok::Operator(Operator::LParen));
             }
             '<' | '>' => {
                 // A word of bare digits right before the operator is its
@@ -373,19 +382,25 @@ fn lex(input: &str) -> Vec<LexTok> {
             }
             // `(( … ))`: arithmetic, where `<<` is a shift. One opaque word;
             // substitutions inside it are still found and judged.
+            // Only with a real closing `))`; otherwise, as in bash, two
+            // nested subshells: `((cat .env); true)`.
             '(' if !in_word && chars.peek() == Some(&'(') => {
                 chars.next();
                 let body = scan_paren_balanced(&mut chars);
-                in_word = true;
-                word_has_sub |= body.contains("$(") || body.contains('`');
-                word_text.push_str("((");
-                word_text.push_str(&body);
-                word_text.push(')');
                 if chars.peek() == Some(&')') {
                     chars.next();
-                    word_text.push(')');
+                    in_word = true;
+                    word_has_sub |= body.contains("$(") || body.contains('`');
+                    word_text.push_str("((");
+                    word_text.push_str(&body);
+                    word_text.push_str("))");
+                    flush_word!();
+                } else {
+                    toks.push(LexTok::Operator(Operator::LParen));
+                    toks.push(LexTok::Operator(Operator::LParen));
+                    toks.extend(lex(&body));
+                    toks.push(LexTok::Operator(Operator::RParen));
                 }
-                flush_word!();
             }
             '(' => {
                 flush_word!();
@@ -607,9 +622,32 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
         })
 }
 
+/// The words of the segment being lexed (after the last operator).
+fn current_segment(toks: &[LexTok]) -> Vec<Word> {
+    let start = toks
+        .iter()
+        .rposition(|t| matches!(t, LexTok::Operator(_)))
+        .map_or(0, |i| i + 1);
+    toks[start..]
+        .iter()
+        .filter_map(|t| match t {
+            LexTok::Word(w) => Some(w.clone()),
+            LexTok::Operator(_) => None,
+        })
+        .collect()
+}
+
 /// Does this command (one pipeline segment) run its stdin as commands, or
 /// is it unknown?
 fn runs_stdin(words: &[Word]) -> bool {
+    // After a compound command's end (`done <<EOF`, `fi <<EOF`): the body
+    // feeds the whole compound command; judge it as commands.
+    if words
+        .first()
+        .is_some_and(|w| matches!(w.text.as_str(), "done" | "fi" | "esac"))
+    {
+        return true;
+    }
     let mut rest = crate::wrappers::effective_command(words);
     // `exec [-cl] [-a NAME] cmd`.
     while rest.first().is_some_and(|w| w.text == "exec") {
