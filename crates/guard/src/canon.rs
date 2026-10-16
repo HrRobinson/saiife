@@ -309,7 +309,9 @@ pub fn expand_braces(word: &str) -> Option<Vec<String>> {
 }
 
 /// Brace expansion where only the `{`, `,` and `}` at byte offsets `marks`
-/// (ascending) are structural; the lexer passes the unquoted ones.
+/// (ascending) are structural; the lexer passes the unquoted ones. Both
+/// `{a,b}` alternatives and `{x..y[..step]}` sequences (integers or single
+/// letters) expand. Each produced word is searched once, in linear time.
 pub fn expand_marked(text: &str, marks: &[usize]) -> Option<Vec<String>> {
     if marks.len() > BRACE_MARKS {
         return None;
@@ -318,32 +320,42 @@ pub fn expand_marked(text: &str, marks: &[usize]) -> Option<Vec<String>> {
     let mut bytes = text.len();
     let mut stack = vec![(text.to_string(), marks.to_vec())];
     while let Some((w, m)) = stack.pop() {
-        let Some((oi, ci, commas)) = find_marked(&w, &m) else {
+        let Some(group) = find_marked(&w, &m) else {
             done.push(w);
             continue;
         };
         bytes -= w.len();
-        let (open, close) = (m[oi], m[ci]);
-        let mut cuts = vec![open];
-        cuts.extend(commas.iter().map(|&j| m[j]));
-        cuts.push(close);
-        let alts = cuts.len() - 1;
-        if done.len() + stack.len() + alts > BRACE_LIMIT {
+        let (open, close) = (m[group.open], m[group.close]);
+        // Each alternative: its text and the marks inside it (as offsets
+        // into that text).
+        let alts: Vec<(String, Vec<usize>)> = match &group.kind {
+            Group::Commas(commas) => {
+                let mut cuts = vec![open];
+                cuts.extend(commas.iter().map(|&j| m[j]));
+                cuts.push(close);
+                cuts.windows(2)
+                    .map(|c| {
+                        let (a0, a1) = (c[0] + 1, c[1]);
+                        let inner = m[group.open + 1..group.close]
+                            .iter()
+                            .filter(|&&x| x >= a0 && x < a1)
+                            .map(|&x| x - a0)
+                            .collect();
+                        (w[a0..a1].to_string(), inner)
+                    })
+                    .collect()
+            }
+            Group::Sequence(items) => items.iter().map(|i| (i.clone(), Vec::new())).collect(),
+        };
+        if done.len() + stack.len() + alts.len() > BRACE_LIMIT {
             return None;
         }
         let (prefix, suffix) = (&w[..open], &w[close + 1..]);
-        for k in (0..alts).rev() {
-            let (a0, a1) = (cuts[k] + 1, cuts[k + 1]);
-            let alt = &w[a0..a1];
-            let mut nm: Vec<usize> = m[..oi].to_vec();
-            nm.extend(
-                m[oi + 1..ci]
-                    .iter()
-                    .filter(|&&x| x >= a0 && x < a1)
-                    .map(|&x| x - a0 + open),
-            );
+        for (alt, inner) in alts.into_iter().rev() {
+            let mut nm: Vec<usize> = m[..group.open].to_vec();
+            nm.extend(inner.iter().map(|&x| x + open));
             let base = open + alt.len();
-            nm.extend(m[ci + 1..].iter().map(|&x| x - (close + 1) + base));
+            nm.extend(m[group.close + 1..].iter().map(|&x| x - (close + 1) + base));
             let next = format!("{prefix}{alt}{suffix}");
             bytes += next.len();
             if bytes > BRACE_BYTES {
@@ -355,34 +367,133 @@ pub fn expand_marked(text: &str, marks: &[usize]) -> Option<Vec<String>> {
     Some(done)
 }
 
-/// The first marked `{` with a matching marked `}` and a top-level comma:
-/// indices into `m` of `{`, `}` and the commas.
-fn find_marked(w: &str, m: &[usize]) -> Option<(usize, usize, Vec<usize>)> {
+/// A brace group that expands: indices into the marks of its `{` and `}`.
+struct BraceGroup {
+    open: usize,
+    close: usize,
+    kind: Group,
+}
+
+enum Group {
+    /// Indices into the marks of its top-level commas.
+    Commas(Vec<usize>),
+    /// The words of a `{x..y[..step]}` sequence.
+    Sequence(Vec<String>),
+}
+
+/// The leftmost brace group that expands (it then has no expanding group
+/// around it): one pass over the marks with a stack.
+fn find_marked(w: &str, m: &[usize]) -> Option<BraceGroup> {
     let b = w.as_bytes();
-    for oi in 0..m.len() {
-        if b[m[oi]] != b'{' {
-            continue;
-        }
-        let mut depth = 0usize;
-        let mut commas = Vec::new();
-        for (j, &x) in m.iter().enumerate().skip(oi) {
-            match b[x] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        if !commas.is_empty() {
-                            return Some((oi, j, commas));
-                        }
-                        break;
-                    }
+    // Open groups: (mark index of `{`, commas, has inner marks).
+    let mut open: Vec<(usize, Vec<usize>, bool)> = Vec::new();
+    let mut best: Option<BraceGroup> = None;
+    for (j, &x) in m.iter().enumerate() {
+        match b[x] {
+            b'{' => {
+                if let Some(top) = open.last_mut() {
+                    top.2 = true;
                 }
-                _ if depth == 1 => commas.push(j),
-                _ => {}
+                open.push((j, Vec::new(), false));
             }
+            b',' => {
+                if let Some(top) = open.last_mut() {
+                    top.1.push(j);
+                    top.2 = true;
+                }
+            }
+            b'}' => {
+                let Some((oi, commas, inner)) = open.pop() else {
+                    continue;
+                };
+                if let Some(top) = open.last_mut() {
+                    top.2 = true;
+                }
+                if best.as_ref().is_some_and(|g| g.open < oi) {
+                    continue;
+                }
+                let kind = if !commas.is_empty() {
+                    Some(Group::Commas(commas))
+                } else if !inner {
+                    sequence(&w[m[oi] + 1..x]).map(Group::Sequence)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    best = Some(BraceGroup {
+                        open: oi,
+                        close: j,
+                        kind,
+                    });
+                }
+            }
+            _ => {}
         }
     }
-    None
+    best
+}
+
+/// `x..y` or `x..y..step` with integers or single ASCII letters, as bash
+/// expands them (zero-padded when an end is written with a leading zero).
+/// `None` if not a sequence; a sequence over `BRACE_LIMIT` words is
+/// refused by the caller's limit through a too-long list.
+fn sequence(body: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = body.split("..").collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let step: i64 = match parts.get(2) {
+        Some(s) => s.parse::<i64>().ok()?.checked_abs()?.max(1),
+        None => 1,
+    };
+    let int = |s: &str| -> Option<i64> {
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        (!digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let (x, y, letters) = match (int(parts[0]), int(parts[1])) {
+        (Some(x), Some(y)) => (x, y, false),
+        _ => {
+            let one = |s: &str| -> Option<i64> {
+                let mut c = s.chars();
+                let ch = c.next()?;
+                (c.next().is_none() && ch.is_ascii_alphabetic()).then_some(ch as i64)
+            };
+            (one(parts[0])?, one(parts[1])?, true)
+        }
+    };
+    let count = (x - y).unsigned_abs() / step as u64 + 1;
+    if count > BRACE_LIMIT as u64 {
+        // Too many words: an over-limit list the caller refuses.
+        return Some(vec![String::new(); BRACE_LIMIT + 1]);
+    }
+    let padded = |s: &str| {
+        let d = s.strip_prefix('-').unwrap_or(s);
+        d.len() > 1 && d.starts_with('0')
+    };
+    let width = if !letters && (padded(parts[0]) || padded(parts[1])) {
+        parts[0].len().max(parts[1].len())
+    } else {
+        0
+    };
+    let dir = if y >= x { step } else { -step };
+    Some(
+        (0..count as i64)
+            .map(|k| x + k * dir)
+            .map(|v| {
+                if letters {
+                    char::from(v as u8).to_string()
+                } else if width > 0 {
+                    let sign = if v < 0 { "-" } else { "" };
+                    let w = width - sign.len();
+                    format!("{sign}{:0w$}", v.abs())
+                } else {
+                    v.to_string()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Expand `word` like the shell does (bash defaults plus globstar):
@@ -401,11 +512,21 @@ pub fn expand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpan
     }
 }
 
+/// Directory entries (and directory reads) one whole expansion may cost,
+/// the retry after an overflow included.
+pub const GLOB_TOTAL_LIMIT: usize = 2 * GLOB_SCAN_LIMIT;
+/// Components a pattern may have to be expanded at all.
+const GLOB_MAX_COMPONENTS: usize = 256;
+
 /// Like `expand_glob`, but also tells what was found before the scan limit
 /// was hit: `(matches, overflowed)`. When it overflowed, the matches are
 /// those the first `GLOB_SCAN_LIMIT` entries led to, plus what the rest of
-/// the pattern matches below the directories seen so far (each stage gets
-/// a fresh budget), so a caller can judge what it can before giving up.
+/// the pattern matches below the directories seen so far (one retry, from
+/// the same total budget of `GLOB_TOTAL_LIMIT`). With brace alternatives,
+/// every alternative is expanded even after one overflowed, and the
+/// literal of each alternative that overflowed or matched nothing is in
+/// the list, so a caller judges every spelling. A pattern with more than
+/// 256 components or longer than `PATH_MAX` overflows without being read.
 /// A word without glob characters yields `([], false)`.
 pub fn expand_glob_partial(
     word: &str,
@@ -415,29 +536,71 @@ pub fn expand_glob_partial(
     let Some(alternatives) = expand_braces(word) else {
         return (Vec::new(), true);
     };
+    expand_alternatives(&alternatives, cwd, vars)
+}
+
+/// `expand_glob` for a shell operand the lexer already brace-expanded:
+/// braces left in it were quoted, so they are literal here.
+pub fn expand_operand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpansion {
+    if !word.contains(['*', '?', '[']) {
+        return GlobExpansion::NotAGlob;
+    }
+    match expand_alternatives(&[word.to_string()], cwd, vars) {
+        (_, true) => GlobExpansion::Overflow,
+        (m, false) => GlobExpansion::Matches(m),
+    }
+}
+
+fn expand_alternatives(
+    alternatives: &[String],
+    cwd: Option<&Path>,
+    vars: &PathVars,
+) -> (Vec<PathBuf>, bool) {
     let has_meta = |w: &str| w.contains(['*', '?', '[']);
     if alternatives.len() == 1 && !has_meta(&alternatives[0]) {
         return (Vec::new(), false);
     }
-    let mut scanned = 0usize;
+    let several = alternatives.len() > 1;
+    let mut budget = Budget::default();
     let mut all = Vec::new();
     let mut overflow = false;
-    for alt in &alternatives {
+    for alt in alternatives {
         let Some(abs) = absolute(alt, cwd, vars) else {
             continue;
         };
         let comps: Vec<Component> = abs.components().collect();
-        match expand_from(&comps, 0, vec![PathBuf::from("/")], &mut scanned, &mut all) {
-            Some(m) => all.extend(m),
-            None => {
-                overflow = true;
-                break;
+        if comps.len() > GLOB_MAX_COMPONENTS || abs.as_os_str().len() > PATH_MAX {
+            overflow = true;
+            if several {
+                all.push(abs);
             }
+            continue;
         }
+        let (found, over) = expand_from(&comps, vec![PathBuf::from("/")], &mut budget);
+        overflow |= over;
+        if several && (over || found.is_empty()) {
+            all.push(push_lexical(PathBuf::from("/"), &comps));
+        }
+        all.extend(found);
     }
     all.sort();
     all.dedup();
     (all, overflow)
+}
+
+/// Directory reads and entries spent, against one stage limit and the
+/// total.
+#[derive(Default)]
+struct Budget {
+    spent: usize,
+}
+
+impl Budget {
+    /// Spend one; false past `limit`.
+    fn take(&mut self, limit: usize) -> bool {
+        self.spent += 1;
+        self.spent <= limit
+    }
 }
 
 /// A word `expand_glob` leaves as it is: no glob characters after brace
@@ -446,26 +609,41 @@ fn is_plain(word: &str) -> bool {
     matches!(expand_braces(word), Some(a) if a.len() == 1 && !a[0].contains(['*', '?', '[']))
 }
 
-/// The components of one brace-free absolute pattern from `start`, on
-/// `bases`; `None` past the scan limit, after the matches the rest of the
-/// pattern finds below what was seen so far went to `partial`.
+/// Expand one brace-free absolute pattern: `(matches, overflowed)`. The
+/// first pass may spend `GLOB_SCAN_LIMIT`; when it runs out at a
+/// component, the rest of the pattern is applied once to what was seen so
+/// far, until `GLOB_TOTAL_LIMIT`. There is no retry of the retry.
 fn expand_from(
+    comps: &[Component],
+    bases: Vec<PathBuf>,
+    budget: &mut Budget,
+) -> (Vec<PathBuf>, bool) {
+    match walk(comps, 0, bases, budget, GLOB_SCAN_LIMIT) {
+        Walk::Done(m) => (m, false),
+        Walk::Stopped { at, seen } => match walk(comps, at + 1, seen, budget, GLOB_TOTAL_LIMIT) {
+            Walk::Done(m) => (m, true),
+            Walk::Stopped { .. } => (Vec::new(), true),
+        },
+    }
+}
+
+enum Walk {
+    Done(Vec<PathBuf>),
+    /// Out of budget at component `at`, having matched `seen` there.
+    Stopped {
+        at: usize,
+        seen: Vec<PathBuf>,
+    },
+}
+
+/// Apply `comps[start..]` to `bases`, spending `budget` up to `limit`.
+fn walk(
     comps: &[Component],
     start: usize,
     mut bases: Vec<PathBuf>,
-    scanned: &mut usize,
-    partial: &mut Vec<PathBuf>,
-) -> Option<Vec<PathBuf>> {
-    // Out of budget at component `idx` with `seen` so far: the rest of the
-    // pattern is applied to those, with a fresh budget.
-    let give_up = |idx: usize, seen: Vec<PathBuf>, partial: &mut Vec<PathBuf>| {
-        let mut fresh = 0usize;
-        let mut sub = Vec::new();
-        if let Some(m) = expand_from(comps, idx + 1, seen, &mut fresh, &mut sub) {
-            partial.extend(m);
-        }
-        partial.extend(sub);
-    };
+    budget: &mut Budget,
+    limit: usize,
+) -> Walk {
     let mut literal_tail = false;
     for (idx, c) in comps.iter().enumerate().skip(start) {
         match c {
@@ -475,9 +653,11 @@ fn expand_from(
                     let last = idx + 1 == comps.len();
                     let mut next = Vec::new();
                     for b in &bases {
-                        if descend(b, last, scanned, &mut next).is_none() {
-                            give_up(idx, next, partial);
-                            return None;
+                        if descend(b, last, budget, limit, &mut next).is_none() {
+                            return Walk::Stopped {
+                                at: idx,
+                                seen: next,
+                            };
                         }
                     }
                     next.sort();
@@ -494,14 +674,21 @@ fn expand_from(
                 literal_tail = false;
                 let mut next = Vec::new();
                 for b in &bases {
+                    if !budget.take(limit) {
+                        return Walk::Stopped {
+                            at: idx,
+                            seen: next,
+                        };
+                    }
                     let Ok(entries) = std::fs::read_dir(b) else {
                         continue;
                     };
                     for e in entries.flatten() {
-                        *scanned += 1;
-                        if *scanned > GLOB_SCAN_LIMIT {
-                            give_up(idx, next, partial);
-                            return None;
+                        if !budget.take(limit) {
+                            return Walk::Stopped {
+                                at: idx,
+                                seen: next,
+                            };
                         }
                         let n = e.file_name();
                         let s: Vec<char> = n.to_string_lossy().chars().collect();
@@ -526,15 +713,17 @@ fn expand_from(
     if literal_tail {
         bases.retain(|b| std::fs::symlink_metadata(b).is_ok());
     }
-    Some(bases)
+    Walk::Done(bases)
 }
 
 /// `**`: `base` and every non-hidden directory below it (and, as the last
 /// component, every non-hidden file too), without following symlinks.
+/// `None` when the budget runs out.
 fn descend(
     base: &Path,
     files_too: bool,
-    scanned: &mut usize,
+    budget: &mut Budget,
+    limit: usize,
     out: &mut Vec<PathBuf>,
 ) -> Option<()> {
     if !base.is_dir() {
@@ -543,12 +732,14 @@ fn descend(
     out.push(base.to_path_buf());
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if !budget.take(limit) {
+            return None;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for e in entries.flatten() {
-            *scanned += 1;
-            if *scanned > GLOB_SCAN_LIMIT {
+            if !budget.take(limit) {
                 return None;
             }
             let n = e.file_name();
@@ -979,8 +1170,12 @@ mod tests {
             m("*.{env,toml}"),
             vec![app.join("x.toml"), app.join("y.env")]
         );
-        assert_eq!(m(".{env,nope}"), vec![app.join(".env")]);
-        assert_eq!(m("{sub,node}/**/*.rs"), vec![app.join("node/z.rs")]);
+        // Each brace alternative's spelling is judged too, existing or not.
+        assert_eq!(m(".{env,nope}"), vec![app.join(".env"), app.join(".nope")]);
+        assert_eq!(
+            m("{sub,node}/**/*.rs"),
+            vec![app.join("node/z.rs"), app.join("sub/**/*.rs")]
+        );
     }
 
     #[test]
@@ -1018,5 +1213,108 @@ mod tests {
         let vals = v.values("SAIIFE_BIN");
         assert!(vals.contains(&root.join("real/saiife").as_path()));
         assert!(vals.contains(&root.join("link").as_path()));
+    }
+
+    #[test]
+    fn brace_sequences_expand_like_bash() {
+        let b = |w: &str| expand_braces(w).unwrap();
+        assert_eq!(b("{1..3}"), vec!["1", "2", "3"]);
+        assert_eq!(b("{3..1}"), vec!["3", "2", "1"]);
+        assert_eq!(b("{-1..1}"), vec!["-1", "0", "1"]);
+        assert_eq!(b("{0..10..5}"), vec!["0", "5", "10"]);
+        assert_eq!(b("{01..03}"), vec!["01", "02", "03"]);
+        assert_eq!(b("{a..c}"), vec!["a", "b", "c"]);
+        assert_eq!(b("{a..e..2}"), vec!["a", "c", "e"]);
+        assert_eq!(b(".en{u..w}"), vec![".enu", ".env", ".enw"]);
+        assert_eq!(b("x{a,{1..2}}"), vec!["xa", "x1", "x2"]);
+        // Not sequences: literal.
+        for w in ["{a..}", "{..b}", "{a..bc}", "{1..x}", "{1...3}"] {
+            assert_eq!(b(w), vec![w.to_string()], "{w}");
+        }
+        // Too long: refused.
+        assert!(expand_braces("{1..100000}").is_none());
+    }
+
+    #[test]
+    fn brace_search_is_linear() {
+        // Deeply nested brace groups without commas plus a few real ones:
+        // every produced word is searched again.
+        let word = format!(
+            "{}x{}{}",
+            "{".repeat(240),
+            "}".repeat(240),
+            "{a,b}".repeat(7)
+        );
+        let t = std::time::Instant::now();
+        let out = expand_braces(&word).unwrap();
+        assert_eq!(out.len(), 128);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pathological_glob_shares_one_budget() {
+        // A directory over the scan limit that contains itself: every
+        // `*` component overflows again.
+        let (_d, root) = tmp();
+        let w = root.join("w");
+        fs::create_dir_all(&w).unwrap();
+        for i in 0..GLOB_SCAN_LIMIT {
+            fs::write(w.join(format!("f{i}")), "").unwrap();
+        }
+        std::os::unix::fs::symlink(&w, w.join("l")).unwrap();
+        let v = PathVars::new().with_cwd(&w);
+        let word = format!("{}x", "*/".repeat(200));
+        let t = std::time::Instant::now();
+        let (found, over) = expand_glob_partial(&word, None, &v);
+        let took = t.elapsed();
+        assert!(over);
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        let _ = found;
+        // Partial matches are still reported for a simple overflow.
+        let (found, over) = expand_glob_partial("*", None, &v);
+        assert!(over && found.len() >= GLOB_SCAN_LIMIT - 10);
+        // Too many components or too long: overflow without scanning.
+        let t = std::time::Instant::now();
+        assert!(expand_glob_partial(&"*/".repeat(5000), None, &v).1);
+        assert!(t.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn every_brace_alternative_is_judged_after_an_overflow() {
+        let (_d, root) = tmp();
+        for i in 0..GLOB_SCAN_LIMIT + 10 {
+            fs::write(root.join(format!("f{i}.txt")), "").unwrap();
+        }
+        fs::write(root.join(".env"), "K=v").unwrap();
+        let v = PathVars::new().with_cwd(&root);
+        for word in ["{*.txt,.env}", "{.env,*.txt}"] {
+            let (found, over) = expand_glob_partial(word, None, &v);
+            assert!(over, "{word}");
+            assert!(found.contains(&root.join(".env")), "{word}");
+        }
+        // The literal of an alternative that overflowed is judged too.
+        let (found, _) = expand_glob_partial("{*.txt,.env}", None, &v);
+        assert!(found.contains(&root.join("*.txt")));
+    }
+
+    #[test]
+    fn operand_globs_keep_quoted_braces_literal() {
+        let (_d, root) = tmp();
+        fs::write(root.join("{a,b}x"), "").unwrap();
+        fs::write(root.join("ax"), "").unwrap();
+        let v = PathVars::new().with_cwd(&root);
+        assert_eq!(
+            expand_operand_glob("{a,b}*", None, &v),
+            GlobExpansion::Matches(vec![root.join("{a,b}x")])
+        );
+        assert_eq!(
+            expand_operand_glob("{a,b}x", None, &v),
+            GlobExpansion::NotAGlob
+        );
     }
 }
