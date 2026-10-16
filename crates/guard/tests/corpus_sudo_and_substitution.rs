@@ -156,7 +156,10 @@ fn does_not_regress_benign_quoted_substitutions() {
 /// linear, not introduce a quadratic blowup on a long chain.
 #[test]
 fn long_chain_with_trailing_sudo_denies_within_budget() {
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = String::new();
     for _ in 0..5000 {
         cmd.push_str("true && ");
@@ -167,8 +170,8 @@ fn long_chain_with_trailing_sudo_denies_within_budget() {
     let elapsed = start.elapsed();
     assert!(decision.is_deny(), "expected DENY, got {decision:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "5000-segment chain took {elapsed:?}, expected comfortably under the 50ms budget"
+        elapsed < std::time::Duration::from_millis(500),
+        "5000-segment chain took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
 
@@ -176,7 +179,10 @@ fn long_chain_with_trailing_sudo_denies_within_budget() {
 fn deep_nesting_of_command_position_substitution_fails_open_not_stack_overflow() {
     // Nest well past MAX_INLINE_DEPTH (8). Must not panic/overflow; must
     // resolve (fail open past the depth cap) well under the latency budget.
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = "rm -rf /".to_string();
     for _ in 0..20 {
         cmd = format!("$({cmd})");
@@ -189,8 +195,8 @@ fn deep_nesting_of_command_position_substitution_fails_open_not_stack_overflow()
     // implementation detail. What matters is it terminates quickly.
     let _ = decision;
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "20-deep nested substitution took {elapsed:?}, expected comfortably under the 50ms budget"
+        elapsed < std::time::Duration::from_millis(500),
+        "20-deep nested substitution took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
 

@@ -1519,6 +1519,21 @@ reason = "other pack says no"
         );
     }
 
+    #[test]
+    fn budget_overrun_fails_open_visibly() {
+        // The budget path, taken by injecting a zero budget rather than a
+        // heavy input: recorded as a fail-open, never a silent allow.
+        let timeout = Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        };
+        let e = test_engine().with_budget(Duration::ZERO);
+        assert_eq!(e.evaluate("git reset --hard"), timeout);
+        let (_d, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let e = shell_path_engine(&root).with_budget(Duration::ZERO);
+        assert_eq!(e.evaluate("cat .env"), timeout);
+    }
+
     const SEGMENT_PACK: &str = r#"
 [pack]
 id = "test.segment"

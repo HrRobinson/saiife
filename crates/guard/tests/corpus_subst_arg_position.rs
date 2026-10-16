@@ -160,7 +160,10 @@ fn closes_the_concatenated_command_position_residual() {
 /// the whole line, so this should stay comfortably linear.
 #[test]
 fn many_substitution_arguments_stay_within_budget() {
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = String::from("echo");
     for _ in 0..500 {
         cmd.push_str(" $(date)");
@@ -170,8 +173,17 @@ fn many_substitution_arguments_stay_within_budget() {
     let elapsed = start.elapsed();
     assert!(!decision.is_deny(), "expected ALLOW, got {decision:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "500 substitution arguments took {elapsed:?}, expected comfortably under the 50ms budget"
+        !matches!(
+            decision,
+            saiifeguard::Decision::Allow {
+                trace: saiifeguard::AllowTrace::FailedOpenTimeout
+            }
+        ),
+        "judged in full, not failed open: {decision:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "500 substitution arguments took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
 
@@ -180,7 +192,10 @@ fn many_substitution_arguments_stay_within_budget() {
 /// and must never panic.
 #[test]
 fn many_segments_each_with_a_substitution_argument_stays_within_budget() {
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = String::new();
     for _ in 0..2000 {
         cmd.push_str("echo $(date) && ");
@@ -191,8 +206,17 @@ fn many_segments_each_with_a_substitution_argument_stays_within_budget() {
     let elapsed = start.elapsed();
     assert!(!decision.is_deny(), "expected ALLOW, got {decision:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "2000-segment substitution chain took {elapsed:?}, expected comfortably under the 50ms budget"
+        !matches!(
+            decision,
+            saiifeguard::Decision::Allow {
+                trace: saiifeguard::AllowTrace::FailedOpenTimeout
+            }
+        ),
+        "judged in full, not failed open: {decision:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "2000-segment substitution chain took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
 

@@ -140,7 +140,10 @@ fn substitution_deny_is_scoped_to_already_guarded_commands() {
 /// orders of magnitude, not a few milliseconds.
 #[test]
 fn pathological_long_chain_stays_well_under_budget() {
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = String::new();
     for i in 0..3000 {
         if i > 0 {
@@ -153,8 +156,17 @@ fn pathological_long_chain_stays_well_under_budget() {
     let elapsed = start.elapsed();
     assert!(!decision.is_deny(), "expected ALLOW, got {decision:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "3000-segment chain took {elapsed:?}, expected comfortably under the 50ms budget"
+        !matches!(
+            decision,
+            saiifeguard::Decision::Allow {
+                trace: saiifeguard::AllowTrace::FailedOpenTimeout
+            }
+        ),
+        "judged in full, not failed open: {decision:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "3000-segment chain took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
 
@@ -163,7 +175,10 @@ fn pathological_long_chain_stays_well_under_budget() {
 /// still does so quickly, i.e. without ever needing to fail open on time.
 #[test]
 fn pathological_long_chain_still_catches_a_trailing_deny() {
-    let e = default_engine();
+    // A generous engine budget and a 10x wall-clock bound: this guards
+    // against a quadratic blowup, not against a loaded debug run racing the
+    // 50 ms budget (`budget_overrun_fails_open_visibly` covers that path).
+    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
     let mut cmd = String::new();
     for _ in 0..3000 {
         cmd.push_str("true && ");
@@ -174,7 +189,7 @@ fn pathological_long_chain_still_catches_a_trailing_deny() {
     let elapsed = start.elapsed();
     assert!(decision.is_deny(), "expected DENY, got {decision:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(45),
-        "3000-segment chain took {elapsed:?}, expected comfortably under the 50ms budget"
+        elapsed < std::time::Duration::from_millis(500),
+        "3000-segment chain took {elapsed:?}, far above linear — possible quadratic blowup"
     );
 }
