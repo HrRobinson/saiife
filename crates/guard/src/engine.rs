@@ -503,21 +503,36 @@ impl Engine {
             // (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`) is
             // judged by its value, like any literal argument; its inner
             // command was judged above.
+            // Words in front of the command (wrappers, assignments,
+            // redirections), counted before the arguments are resolved.
+            let prefix_len = seg.len() - effective.len();
             let resolved: Vec<Word> = effective
                 .iter()
                 .enumerate()
-                .map(|(i, w)| {
-                    match (i > 0 && w.has_substitution)
+                .flat_map(|(i, w)| {
+                    let value = (i > 0 && w.has_substitution)
                         .then(|| literal_substitution(&w.text))
-                        .flatten()
-                    {
-                        Some(text) => Word {
+                        .flatten();
+                    match value {
+                        // `"$(…)"`: one word, as printed.
+                        Some(text) if w.quoted => vec![Word {
                             text,
                             has_substitution: false,
                             glob: false,
                             ..w.clone()
-                        },
-                        None => w.clone(),
+                        }],
+                        // Unquoted: split on blanks, each part globbed.
+                        Some(text) => text
+                            .split([' ', '\t', '\n'])
+                            .filter(|p| !p.is_empty())
+                            .map(|p| Word {
+                                text: p.to_string(),
+                                has_substitution: false,
+                                glob: p.contains(['*', '?', '[']),
+                                ..w.clone()
+                            })
+                            .collect(),
+                        None => vec![w.clone()],
                     }
                 })
                 .collect();
@@ -536,14 +551,14 @@ impl Engine {
             // (`HOME=$(mktemp -d -p /tmp x) claude`, `env CODEX_HOME=x codex`)
             // change its environment too.
             let seg_env_changed = env_changed
-                || seg[..seg.len() - effective.len()].iter().any(|w| {
+                || seg[..prefix_len].iter().any(|w| {
                     !w.redirect
                         && (w.assignment || is_env_assignment(&w.text))
                         && assignment_changes_environment(&w.text, literal_path)
                 });
             // The peeled-off redirections stay visible to the regex rules
             // (`>/dev/sda cat x` is judged like `cat x > /dev/sda`).
-            let peeled = peeled_redirections(&seg[..seg.len() - effective.len()]);
+            let peeled = peeled_redirections(&seg[..prefix_len]);
             let argv = build_argv(effective);
             if argv.is_empty() || argv[0].is_empty() {
                 let segment_line = segment_line(&seg);
@@ -609,8 +624,8 @@ impl Engine {
             }
             // The whole segment's line differs only when a wrapper was
             // peeled off or the segment starts with an assignment.
-            let whole = (effective.len() != seg.len() || is_env_assignment(&seg[0].text))
-                .then(|| segment_line(&seg));
+            let whole =
+                (prefix_len > 0 || is_env_assignment(&seg[0].text)).then(|| segment_line(&seg));
             let segment_line = whole.as_deref().unwrap_or(&matching_line);
             if self.combined.might_match(&matching_line)
                 || (whole.is_some() && self.combined.might_match(segment_line))

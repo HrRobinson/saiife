@@ -100,6 +100,9 @@ pub struct Word {
     /// Its brace expansion was too large to expand (kept as written); the
     /// engine records the command as not fully judged.
     pub brace_overflow: bool,
+    /// Some part of it was quoted or escaped (`"$(…)"` is one word, not
+    /// split on blanks or globbed).
+    pub quoted: bool,
 }
 
 /// A single top-level command segment: the argv-order sequence of words
@@ -229,6 +232,7 @@ fn lex(input: &str) -> Vec<LexTok> {
                     glob: word_glob,
                     assignment: word_assignment,
                     brace_overflow: false,
+                    quoted: word_quoted,
                 };
                 // Brace expansion happens before anything else looks at
                 // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
@@ -740,6 +744,7 @@ fn redirect_tok(text: String) -> LexTok {
         glob: false,
         assignment: false,
         brace_overflow: false,
+        quoted: false,
     })
 }
 
@@ -930,7 +935,8 @@ fn scan_backtick(chars: &mut Chars) -> String {
 
 /// The value of a word that is one command substitution printing plain
 /// data: `$(cat <<'EOF' … EOF)` (a quoted delimiter, or an unquoted one
-/// whose body has no `$`, backtick or backslash), `$(echo [-neE] ARGS)` or
+/// whose body has no `$`, backtick or backslash), `$(echo [-n] ARGS)`
+/// without backslashes, or
 /// `$(printf FORMAT)` with literal arguments and a format without `%` or
 /// `\`. Trailing newlines are removed, as bash does. `None` for anything
 /// else (the value is then unknown).
@@ -1012,16 +1018,20 @@ fn echo_value(inner: &str) -> Option<String> {
     let (cmd, args) = seg.split_first()?;
     match cmd.text.as_str() {
         "echo" => {
-            let args: Vec<&str> = args
-                .iter()
-                .map(|w| w.text.as_str())
-                .skip_while(|a| {
-                    a.len() > 1
-                        && a.starts_with('-')
-                        && a[1..].bytes().all(|b| matches!(b, b'n' | b'e' | b'E'))
-                })
-                .collect();
-            Some(args.join(" "))
+            // Escapes (sh, dash and xpg_echo interpret them even without
+            // `-e`) and `-e`/`-E` make the output depend on the shell.
+            if args.iter().any(|w| w.text.contains('\\')) {
+                return None;
+            }
+            let mut words = args.iter().map(|w| w.text.as_str()).peekable();
+            while let Some(flag) = words.next_if(|a| {
+                a.len() > 1 && a.starts_with('-') && a[1..].bytes().all(|b| b"neE".contains(&b))
+            }) {
+                if flag.contains(['e', 'E']) {
+                    return None;
+                }
+            }
+            Some(words.collect::<Vec<_>>().join(" "))
         }
         "printf" => match args {
             [format] if !format.text.contains(['%', '\\']) => Some(format.text.clone()),
@@ -1821,6 +1831,11 @@ mod tests {
             "$(echo *)",
             "$(printf '%s' x)",
             "pre$(echo x)",
+            // Escapes (sh, dash and xpg_echo interpret them) or -e.
+            r"$(echo -e '.\x65nv')",
+            r"$(echo '.\x65nv')",
+            r"$(echo -ne x)",
+            r"$(echo -E x)",
         ] {
             assert_eq!(v(t), None, "{t}");
         }

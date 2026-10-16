@@ -612,6 +612,10 @@ fn substitution_values_that_are_plain_data() {
         "git commit -m \"$(cat .env)\"",
         "cat \"$(cat <<'EOF'\n.env\nEOF\n)\"",
         "cat $(echo .env)",
+        // Unquoted: the value is split into words and globbed.
+        "cat $(echo '.e*')",
+        "cat $(echo '.env x')",
+        "cat $(printf '.env x')",
     ] {
         deny_pack(&e, cmd);
     }
