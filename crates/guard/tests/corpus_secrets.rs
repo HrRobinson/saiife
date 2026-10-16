@@ -924,6 +924,16 @@ fn residual_heredoc_frames_and_ifs_fail_safe() {
         "env --helpx",
         "env --ver2",
         "env -i --hx",
+        // An option may take `--help` as its value: only a FIRST
+        // `--help`/`--version` is exempt.
+        "env --u --help",
+        "env --uns --help",
+        "env -0u --help",
+        "env --ch / --help",
+        "env -i --help",
+        "env -0u FOO",
+        "env --unset=FOO",
+        "env --u FOO",
     ] {
         if !e.evaluate(cmd).is_deny() {
             wrong.push(format!("expected DENY: {cmd:?}"));
@@ -949,7 +959,6 @@ fn residual_heredoc_frames_and_ifs_fail_safe() {
         "env --help",
         "env --h",
         "env --vers",
-        "env -i --help",
         // 3: in a backtick body `EOF)` is body text, as in bash.
         "echo \"`cat <<EOF\nEOF)\nrm -rf .claude\nEOF\n`\"",
     ]);
