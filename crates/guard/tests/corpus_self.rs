@@ -454,3 +454,68 @@ fn a_symlinked_data_dir_is_protected_by_both_names() {
     }
     assert!(!e.evaluate("mkdir -p ~/.local/share/foo").is_deny());
 }
+
+#[test]
+fn environment_change_then_agent_is_tracked_by_the_engine() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "export PATH=${PWD}/bin:$PATH; claude",
+        "export FOO=1 HOME=/tmp/x; claude",
+        "export HOME=x; 'claude'",
+        "export HOME=x; \"claude\"",
+        "export HOME=x; (claude)",
+        "export HOME=x; bash -c 'claude'",
+        "export HOME=x; bash -c 'echo hi; codex exec fix'",
+        "export HOME=x; ( cd app && gemini )",
+        "export PATH=$PATHX:/bin; claude",
+        "export PATH=${PATH%%:*}; claude",
+        "PATH=/tmp/x\ncodex",
+        "export HOME=x; env FOO=1 saiife status",
+        "export HOME=x; /usr/bin/claude",
+        "export HOME=x; true && sudo -E claude",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "echo \"a; export HOME=x; claude\"",
+        "git commit -m \"export HOME=x; claude\"",
+        "export PATH=$PATH:./node_modules/.bin; npm test",
+        "export PATH=${PATH}:./bin; claude -p hi",
+        "export PATH=\"$PATH:./bin\"; codex exec fix",
+        "PATH+=:./bin; claude -p hi",
+        "export HOME=/tmp/x; cargo test",
+        "export HOME=x; echo claude",
+        "export HOME=x; grep claude notes.txt",
+        "claude -p hi; export HOME=x",
+        "export FOO=1; claude -p hi",
+        "bash -c 'export HOME=x'; claude -p hi",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+#[test]
+fn codex_config_keys_are_normalized() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "codex -cfeatures.hooks=false exec fix",
+        "codex -c 'features.hooks = false' exec fix",
+        "codex -c ' features.hooks=1' exec fix",
+        "codex --config 'hooks.PreToolUse=[]' exec fix",
+        "codex -c features.web=true exec fix",
+        "codex -c\"hooks=1\" exec fix",
+        "codex exec fix -c hooks.x=1",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "codex -c model=o3 exec fix",
+        "codex -c sandbox_mode=read-only exec x",
+        "codex exec 'set features.hooks'",
+    ] {
+        assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+    }
+}

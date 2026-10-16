@@ -7,6 +7,27 @@
 //! the failure: an uncompilable regex drops that *rule* (with a warning), a
 //! malformed or duplicate-id file drops that *pack* (with a warning) — neither
 //! aborts the load of the rest.
+//!
+//! Pack file schema (unknown keys are a load error):
+//!
+//! ```toml
+//! [pack]        # id, name, description, default_on, version, triggers,
+//!               # substitution_failsafe
+//! [[allow]] / [[deny]]
+//! pattern = "regex"           # matched against the effective command line
+//! reason = "..."              # required for deny
+//! whole_segment = true        # match the whole segment instead: wrappers
+//!                             # (`env`, `sudo`) and leading `NAME=value`
+//!                             # assignments included
+//! after_env_change = true     # only after an earlier segment of the same
+//!                             # command line changed PATH/HOME/XDG_DATA_HOME
+//! [[allow_path]] / [[deny_path]]
+//! glob = "~/.ssh/id_*"        # see `crate::pathrule`
+//! access = "read|write|any"
+//! ancestors = true            # deny_path only: match the proper ancestors
+//!                             # of a variable-rooted, wildcard-free glob
+//!                             # (write access), e.g. `rm -rf ~/.local/share`
+//! ```
 
 use std::fs;
 use std::path::Path;
@@ -27,9 +48,10 @@ pub struct Rule {
     /// leading `NAME=value` assignments included) instead of the effective
     /// command after them.
     pub whole_segment: bool,
-    /// Match against the whole command line (every segment, as written),
-    /// for rules about what a later segment does after an earlier one.
-    pub whole_command: bool,
+    /// Applies only to a command that comes after an earlier segment of the
+    /// same command line exported or assigned `PATH` (other than appending
+    /// to it), `HOME` or `XDG_DATA_HOME`; matches the effective command.
+    pub after_env_change: bool,
 }
 
 /// A loaded, compiled pack.
@@ -120,6 +142,7 @@ struct RawMeta {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRule {
     pattern: String,
     #[serde(default)]
@@ -127,7 +150,7 @@ struct RawRule {
     #[serde(default)]
     whole_segment: bool,
     #[serde(default)]
-    whole_command: bool,
+    after_env_change: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,7 +199,7 @@ fn compile_rules(
                 regex,
                 reason: r.reason.unwrap_or_default(),
                 whole_segment: r.whole_segment,
-                whole_command: r.whole_command,
+                after_env_change: r.after_env_change,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
@@ -423,6 +446,24 @@ reason = "bad glob: dropped with a warning"
             load_pack_str("<t>", bad_access, &mut w),
             Err(PackError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn unknown_key_in_a_rule_fails_the_load() {
+        for table in ["deny", "allow"] {
+            let toml = format!(
+                "[pack]\nid = \"t\"\n[[{table}]]\npattern = \"x\"\nreason = \"r\"\nwhole_comand = true\n"
+            );
+            let mut w = Vec::new();
+            assert!(
+                matches!(load_pack_str("<t>", &toml, &mut w), Err(PackError::Toml(_))),
+                "{table}"
+            );
+        }
+        let ok = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nwhole_segment = true\nafter_env_change = true\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", ok, &mut w).expect("known keys load");
+        assert!(p.deny[0].whole_segment && p.deny[0].after_env_change);
     }
 
     #[test]

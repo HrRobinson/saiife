@@ -298,7 +298,7 @@ impl Engine {
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         let start = Instant::now();
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.evaluate_inner(raw_cmd, start, 0, &cwds, false)
+        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false)
     }
 
     /// `cwds`: the directories the shell may be in at the start of
@@ -312,6 +312,7 @@ impl Engine {
         depth: u32,
         cwds: &[PathBuf],
         cwd_unknown: bool,
+        env_changed: bool,
     ) -> Decision {
         let mut allow_trace: Option<AllowTrace> = None;
         // Something could not be judged (a glob too large to expand): the
@@ -321,6 +322,9 @@ impl Engine {
         // A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`,
         // an unresolvable target, or past `MAX_CWDS`).
         let mut cwd_unknown = cwd_unknown;
+        // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
+        // rest of the command line (and for nested evaluations).
+        let mut env_changed = env_changed;
 
         for seg in split_segments(raw_cmd) {
             if start.elapsed() > self.budget {
@@ -358,7 +362,14 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
+                    match self.evaluate_inner(
+                        &inner,
+                        start,
+                        depth + 1,
+                        &cwds,
+                        cwd_unknown,
+                        env_changed,
+                    ) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -429,7 +440,14 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
+                    match self.evaluate_inner(
+                        &inner,
+                        start,
+                        depth + 1,
+                        &cwds,
+                        cwd_unknown,
+                        env_changed,
+                    ) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -470,7 +488,7 @@ impl Engine {
                 // (`>/dev/sda`): only whole-segment rules and the
                 // redirections can apply.
                 if self.combined.might_match(&segment_line) {
-                    match self.judge(&peeled, &segment_line, raw_cmd, start) {
+                    match self.judge(&peeled, &segment_line, env_changed, start) {
                         JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                         JudgeOutcome::TimedOut => {
                             return Decision::Allow {
@@ -480,6 +498,7 @@ impl Engine {
                         _ => {}
                     }
                 }
+                env_changed |= effective_is_empty_assignments(&seg);
                 if let Some(d) = self.judge_operands(&seg, &[], &[], &cwds, cwd_unknown, start) {
                     match d {
                         Decision::Allow {
@@ -528,7 +547,7 @@ impl Engine {
             if self.combined.might_match(&matching_line)
                 || (whole.is_some() && self.combined.might_match(segment_line))
             {
-                match self.judge(&matching_line, segment_line, raw_cmd, start) {
+                match self.judge(&matching_line, segment_line, env_changed, start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
                     JudgeOutcome::Decided(Decision::Allow { trace }) => {
                         allow_trace = Some(trace);
@@ -555,6 +574,7 @@ impl Engine {
                     d => return d,
                 }
             }
+            env_changed |= changes_environment(&argv, effective);
             if argv[0] == "cd" || argv[0] == "pushd" {
                 cwd_unknown |= self.cd(&argv, effective, &mut cwds);
             }
@@ -575,7 +595,14 @@ impl Engine {
                             trace: AllowTrace::FailedOpenTimeout,
                         };
                     }
-                    match self.evaluate_inner(&inner, start, depth + 1, &cwds, cwd_unknown) {
+                    match self.evaluate_inner(
+                        &inner,
+                        start,
+                        depth + 1,
+                        &cwds,
+                        cwd_unknown,
+                        env_changed,
+                    ) {
                         Decision::Deny {
                             pack,
                             pattern,
@@ -873,12 +900,12 @@ impl Engine {
         &self,
         matching_line: &str,
         segment_line: &str,
-        command_line: &str,
+        env_changed: bool,
         start: Instant,
     ) -> JudgeOutcome {
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
-            if rule.whole_command {
-                Some(command_line)
+            if rule.after_env_change {
+                (env_changed && !matching_line.is_empty()).then_some(matching_line)
             } else if rule.whole_segment {
                 Some(segment_line)
             } else if matching_line.is_empty() {
@@ -971,6 +998,57 @@ fn peeled_redirections(prefix: &[Word]) -> String {
         }
     }
     out.join(" ")
+}
+
+/// Does this assignment (`NAME=value`, `NAME+=value`) change what saiife
+/// relies on: `HOME`, `XDG_DATA_HOME`, or `PATH` unless it only appends to
+/// the old value (an exact `$PATH` / `${PATH}` first, then `:` or the end)?
+fn assignment_changes_environment(text: &str) -> bool {
+    let Some((name, value)) = text.split_once('=') else {
+        return false;
+    };
+    let (name, plus) = match name.strip_suffix('+') {
+        Some(n) => (n, true),
+        None => (name, false),
+    };
+    match name {
+        "HOME" | "XDG_DATA_HOME" => true,
+        "PATH" => {
+            if plus {
+                return false;
+            }
+            let rest = value
+                .strip_prefix("${PATH}")
+                .or_else(|| value.strip_prefix("$PATH"));
+            !matches!(rest, Some(r) if r.is_empty() || r.starts_with(':'))
+        }
+        _ => false,
+    }
+}
+
+/// A segment of bare assignments (`PATH=/x`, no command): they stay set.
+fn effective_is_empty_assignments(seg: &[Word]) -> bool {
+    seg.iter()
+        .any(|w| w.assignment && assignment_changes_environment(&w.text))
+        && seg.iter().all(|w| w.assignment || w.redirect)
+}
+
+/// `export` / `readonly` / `declare -x` / `typeset -x` with an assignment
+/// that changes PATH, HOME or XDG_DATA_HOME.
+fn changes_environment(argv: &[String], effective: &[Word]) -> bool {
+    let exports = match argv.first().map(String::as_str) {
+        Some("export" | "readonly") => true,
+        Some("declare" | "typeset") => effective
+            .iter()
+            .skip(1)
+            .any(|w| w.text.starts_with('-') && w.text.contains('x')),
+        _ => false,
+    };
+    exports
+        && effective
+            .iter()
+            .skip(1)
+            .any(|w| w.assignment && assignment_changes_environment(&w.text))
 }
 
 /// The whole segment's matching line for `whole_segment` rules: like
