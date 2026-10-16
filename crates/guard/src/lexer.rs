@@ -212,7 +212,9 @@ fn lex(input: &str) -> Vec<LexTok> {
     // Here-documents: the next word is a delimiter (`Some(strip_tabs)` after
     // `<<`/`<<-`), and the delimiters whose bodies start after this line.
     let mut expect_delim: Option<bool> = None;
-    let mut pending_docs: Vec<(String, bool)> = Vec::new();
+    let mut pending_docs: Vec<PendingDoc> = Vec::new();
+    // Between `[[` and `]]`, `<` and `>` compare strings.
+    let mut in_test = false;
 
     // Flush the in-progress word (if any) as a completed token.
     macro_rules! flush_word {
@@ -230,7 +232,18 @@ fn lex(input: &str) -> Vec<LexTok> {
                 // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
                 // the word stays as written, flagged for the engine.
                 if let Some(strip_tabs) = expect_delim.take() {
-                    pending_docs.push((word.text.clone(), strip_tabs));
+                    pending_docs.push(PendingDoc {
+                        delim: word.text.clone(),
+                        strip_tabs,
+                        // `<<'EOF'`, `<<"EOF"`, `<<\EOF`: no expansion.
+                        quoted: word_quoted,
+                        op: toks.len().saturating_sub(1),
+                    });
+                }
+                if !word_quoted && word.text == "[[" {
+                    in_test = true;
+                } else if !word_quoted && word.text == "]]" {
+                    in_test = false;
                 }
                 if brace_marks.is_empty() {
                     toks.push(LexTok::Word(word));
@@ -268,15 +281,22 @@ fn lex(input: &str) -> Vec<LexTok> {
             '\n' => {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::Newline));
-                if !pending_docs.is_empty() {
-                    // The bodies are data, unless a shell on this line reads
-                    // them (`bash <<EOF`, `cat <<EOF | sh`): then they are
-                    // commands and are lexed as such.
-                    let commands = shell_on_line(&toks);
-                    for (delim, strip_tabs) in std::mem::take(&mut pending_docs) {
-                        let body = read_heredoc(&mut chars, &delim, strip_tabs);
-                        if commands {
-                            toks.extend(lex(&body));
+                for doc in std::mem::take(&mut pending_docs) {
+                    // The body is commands when a shell in its pipeline
+                    // reads it (or that cannot be known); otherwise data,
+                    // whose `$(…)`/backticks still run unless the delimiter
+                    // was quoted.
+                    let body = read_heredoc(&mut chars, &doc.delim, doc.strip_tabs);
+                    if body_is_commands(&toks, doc.op) {
+                        toks.extend(lex(&body));
+                        toks.push(LexTok::Operator(Operator::Newline));
+                    } else if !doc.quoted {
+                        for inner in find_all_substitutions(&body) {
+                            toks.push(LexTok::Word(Word {
+                                text: format!("$({inner})"),
+                                has_substitution: true,
+                                ..Word::default()
+                            }));
                             toks.push(LexTok::Operator(Operator::Newline));
                         }
                     }
@@ -292,6 +312,11 @@ fn lex(input: &str) -> Vec<LexTok> {
                     op.push('>');
                 }
                 toks.push(redirect_tok(op));
+            }
+            // `[[ a < b ]]` compares strings.
+            '<' | '>' if in_test => {
+                in_word = true;
+                word_text.push(c);
             }
             '<' | '>' if chars.peek() == Some(&'(') => {
                 // Process substitution `<(cmd)` / `>(cmd)`: not a file; the
@@ -345,6 +370,22 @@ fn lex(input: &str) -> Vec<LexTok> {
             ';' => {
                 flush_word!();
                 toks.push(LexTok::Operator(Operator::Semi));
+            }
+            // `(( … ))`: arithmetic, where `<<` is a shift. One opaque word;
+            // substitutions inside it are still found and judged.
+            '(' if !in_word && chars.peek() == Some(&'(') => {
+                chars.next();
+                let body = scan_paren_balanced(&mut chars);
+                in_word = true;
+                word_has_sub |= body.contains("$(") || body.contains('`');
+                word_text.push_str("((");
+                word_text.push_str(&body);
+                word_text.push(')');
+                if chars.peek() == Some(&')') {
+                    chars.next();
+                    word_text.push(')');
+                }
+                flush_word!();
             }
             '(' => {
                 flush_word!();
@@ -402,6 +443,33 @@ fn lex(input: &str) -> Vec<LexTok> {
                 match chars.next() {
                     Some(n) => word_text.push(n),
                     None => word_text.push('\\'),
+                }
+            }
+            // `$[ … ]`: old-style arithmetic, opaque like `$(( … ))`.
+            '$' if chars.peek() == Some(&'[') => {
+                chars.next();
+                in_word = true;
+                word_text.push_str("$[");
+                let mut depth = 1usize;
+                for n in chars.by_ref() {
+                    word_text.push(n);
+                    match n {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                word_has_sub |= word_text.contains("$(") || word_text.contains('`');
+            }
+            // `#` starting a word comments out the rest of the line.
+            '#' if !in_word => {
+                while chars.peek().is_some_and(|&n| n != '\n') {
+                    chars.next();
                 }
             }
             '$' if chars.peek() == Some(&'(') => {
@@ -482,17 +550,50 @@ fn lex(input: &str) -> Vec<LexTok> {
     toks
 }
 
-/// Commands that run what they read on stdin.
-const STDIN_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "source", "."];
+/// A here-document whose body starts after the current line.
+struct PendingDoc {
+    delim: String,
+    strip_tabs: bool,
+    quoted: bool,
+    /// Index in the tokens of its `<<` operator.
+    op: usize,
+}
 
-/// Does a segment of the current line (since the last newline) run a
-/// shell or `source` (wrappers and prefixes peeled)?
-fn shell_on_line(toks: &[LexTok]) -> bool {
-    let line_start = toks[..toks.len().saturating_sub(1)]
+/// Commands that run what they read on stdin as commands (or pass it to
+/// something that does).
+const STDIN_RUNNERS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "mksh", "busybox", "eval", "su", "ssh",
+    "xargs", "source", ".",
+];
+
+/// Is the body of the here-document whose `<<` is `toks[op]` run as
+/// commands? Yes when the line ends in an unfinished `|`, `&&` or `||`
+/// (its consumer comes later), or when a command of its pipeline, with
+/// wrappers, assignments, redirections and `exec` peeled, is a shell (see
+/// `STDIN_RUNNERS`) or cannot be known (none left: `sudo -s`; a variable
+/// or substitution: `$SHELL`).
+fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
+    // A list operator ends the pipeline; `|` does not.
+    let ends_pipeline = |t: &LexTok| matches!(t, LexTok::Operator(o) if *o != Operator::Pipe);
+    // `toks` ends with the newline of the heredoc's line.
+    let end = toks.len().saturating_sub(1);
+    if matches!(
+        toks[..end].last(),
+        Some(LexTok::Operator(
+            Operator::Pipe | Operator::AndAnd | Operator::OrOr
+        ))
+    ) {
+        return true;
+    }
+    let start = toks[..op]
         .iter()
-        .rposition(|t| matches!(t, LexTok::Operator(Operator::Newline)))
+        .rposition(ends_pipeline)
         .map_or(0, |i| i + 1);
-    toks[line_start..]
+    let stop = toks[op..end]
+        .iter()
+        .position(ends_pipeline)
+        .map_or(end, |i| op + i);
+    toks[start..stop]
         .split(|t| matches!(t, LexTok::Operator(_)))
         .any(|seg| {
             let words: Vec<Word> = seg
@@ -502,14 +603,35 @@ fn shell_on_line(toks: &[LexTok]) -> bool {
                     LexTok::Operator(_) => None,
                 })
                 .collect();
-            crate::wrappers::effective_command(&words)
-                .first()
-                .is_some_and(|w| {
-                    let name = w.text.to_ascii_lowercase();
-                    let name = name.rsplit('/').next().unwrap_or("");
-                    STDIN_SHELLS.contains(&name)
-                })
+            runs_stdin(&words)
         })
+}
+
+/// Does this command (one pipeline segment) run its stdin as commands, or
+/// is it unknown?
+fn runs_stdin(words: &[Word]) -> bool {
+    let mut rest = crate::wrappers::effective_command(words);
+    // `exec [-cl] [-a NAME] cmd`.
+    while rest.first().is_some_and(|w| w.text == "exec") {
+        rest = &rest[1..];
+        while let Some(w) = rest.first() {
+            match w.text.as_str() {
+                "-a" => rest = &rest[rest.len().min(2)..],
+                t if t.starts_with('-') => rest = &rest[1..],
+                _ => break,
+            }
+        }
+        rest = crate::wrappers::effective_command(rest);
+    }
+    let Some(first) = rest.first() else {
+        return true;
+    };
+    if first.has_substitution || first.text.starts_with('$') {
+        return true;
+    }
+    let name = first.text.to_ascii_lowercase();
+    let name = name.rsplit('/').next().unwrap_or("");
+    STDIN_RUNNERS.contains(&name)
 }
 
 /// Consume a here-document body up to the line equal to `delim` (leading
@@ -1492,5 +1614,17 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    #[test]
+    fn comments_and_arithmetic() {
+        assert_eq!(words("echo hi # note <<EOF"), vec!["echo", "hi"]);
+        assert_eq!(segs("# c\ncat x"), vec![vec!["cat", "x"]]);
+        assert_eq!(words("echo a#b '#x'"), vec!["echo", "a#b", "#x"]);
+        assert_eq!(words("(( x = 1<<2 ))"), vec!["(( x = 1<<2 ))"]);
+        assert_eq!(words("y=$[1<<2]"), vec!["y=$[1<<2]"]);
+        assert_eq!(words("[[ a < b ]]"), vec!["[[", "a", "<", "b", "]]"]);
+        assert!(!split_segments("[[ a < b ]]")[0][2].redirect);
+        assert!(split_segments("(( $(id) ))")[0][0].has_substitution);
     }
 }

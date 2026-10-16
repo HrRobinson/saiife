@@ -105,3 +105,13 @@ fn leading_redirections_and_assignments_are_still_judged() {
     assert!(!e.evaluate(r#""FOO=1" rm -rf /"#).is_deny());
     assert!(!e.evaluate(r#"FOO"=1" rm -rf /"#).is_deny());
 }
+
+#[test]
+fn heredoc_substitutions_are_judged() {
+    let e = engine();
+    assert_eq!(
+        deny_pack(&e, "cat <<EOF\n$(rm -rf /)\nEOF"),
+        "core.filesystem"
+    );
+    assert!(!e.evaluate("cat <<'EOF'\n$(rm -rf /)\nEOF").is_deny());
+}

@@ -494,3 +494,65 @@ fn case_follows_the_platform() {
         "cat .ENV"
     );
 }
+
+#[test]
+fn heredocs_comments_arithmetic_and_sequences() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        // Arithmetic `<<` is a shift, not a here-document.
+        "(( x = 1<<2 ))\ncat .env",
+        "(( x = 1<<2 )); cat .env",
+        "echo $(( 1<<2 ))\ncat .env",
+        "x=$[1<<2]\ncat .env",
+        "[[ a < b ]]\ncat .env",
+        // A shell (wrappers peeled, wider set) reads the body.
+        "sudo bash <<'EOF'\ncat .env\nEOF",
+        "env bash <<EOF\ncat .env\nEOF",
+        "cat <<EOF | bash\ncat .env\nEOF",
+        "cat <<EOF | exec bash\ncat .env\nEOF",
+        "cat <<EOF |\ncat .env\nEOF\nbash",
+        "cat <<EOF &&\ncat .env\nEOF\ntrue",
+        "fish <<EOF\ncat .env\nEOF",
+        "ash <<EOF\ncat .env\nEOF",
+        "busybox sh <<EOF\ncat .env\nEOF",
+        "su <<EOF\ncat .env\nEOF",
+        "sudo -s <<EOF\ncat .env\nEOF",
+        "sudo -i <<EOF\ncat .env\nEOF",
+        "ssh host <<EOF\ncat .env\nEOF",
+        "xargs <<EOF\ncat .env\nEOF",
+        "eval \"$(cat)\" <<EOF\ncat .env\nEOF",
+        "nohup timeout 5 bash <<EOF\ncat .env\nEOF",
+        // A consumer that cannot be known: the body is commands.
+        "$SHELL <<EOF\ncat .env\nEOF",
+        // Substitutions in an unquoted-delimiter body run.
+        "cat <<EOF\n$(cat .env)\nEOF",
+        "cat <<EOF > out.txt\n`cat .env`\nEOF",
+        // Comments do not start here-documents.
+        "echo hi # <<EOF\ncat .env",
+        "# <<EOF\ncat .env",
+        // Brace sequences.
+        "cat .en{a..z}",
+    ] {
+        deny_pack(&e, cmd);
+    }
+    assert_allows(
+        &e,
+        &[
+            "cat > f <<'EOF'\nhello world\ncat .env\nEOF",
+            "cat <<EOF > f\nhome is $HOME\nEOF",
+            "cat <<'EOF'\n$(cat .env)\nEOF",
+            "cat <<\"EOF\"\n$(cat .env)\nEOF",
+            "cat <<\\EOF\n$(cat .env)\nEOF",
+            "python3 <<EOF\nprint(open('.env').read())\nEOF",
+            "(( i++ ))",
+            "echo $((1<<3))",
+            "# comment",
+            "# cat .env",
+            "git log --format='%H # x'",
+            "echo a#b",
+            "echo {1..3}",
+            "cat > notes.md <<EOF\nrun: cat .env\nEOF",
+        ],
+    );
+}
