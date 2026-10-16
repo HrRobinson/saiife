@@ -894,6 +894,62 @@ fn round_five_substitution_frames_follow_bash() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Residual fix (security review of N-4, re-review N-A). Shapes checked
+/// against bash 5.3 by running echo-only scripts in a temp dir.
+#[test]
+fn residual_heredoc_frames_and_ifs_fail_safe() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let mut wrong = Vec::new();
+    for cmd in [
+        // 1: in a `$(…)` body, bash 5.3 ends the here-document at a line
+        // that starts with the delimiter and holds a `)` anywhere
+        // (`EOFx) "` runs `x`, closes the substitution and the quote; the
+        // next line is a command).
+        "echo \"[$(cat <<'EOF'\nEOFx) \"\ncat .env\nEOF\n)]\"",
+        "echo \"[$(cat <<EOF\nEOF ')\n'\ncat .env\nEOF\n)]\"",
+        "echo \"[$(cat <<EOF\nEOF#)\ncat .env\nEOF\n)]\"",
+        // 2: a here-document inside a here-document read as commands is
+        // read by that inner shell: exact delimiter lines only.
+        "echo \"$(bash <<X\ncat <<EOF\nEOF ')\nEOF\ncat .env\nX\n)\"",
+        // 3: a backtick body is a fresh shell text: exact delimiter lines.
+        "echo \"`cat <<EOF\nEOF ')\nEOF\ncat .env\n`\"",
+        "echo `cat <<EOF\nEOF ')\nEOF\ncat .env\n`",
+        // The `env --help` allow never hides a redirection target.
+        "env --help > .claude/settings.json",
+    ] {
+        if !e.evaluate(cmd).is_deny() {
+            wrong.push(format!("expected DENY: {cmd:?}"));
+        }
+    }
+    let commits = [
+        claude_commit(
+            "fix(guard): IFS lines are recorded\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+        ),
+        claude_commit("docs: mention IFS in the roadmap"),
+    ];
+    let pushed = format!(
+        "git add -A && {} && git push",
+        claude_commit("docs: mention IFS")
+    );
+    let mut allowed: Vec<&str> = commits.iter().map(String::as_str).collect();
+    allowed.extend([
+        pushed.as_str(),
+        "git commit -m \"$(echo fix IFS)\"",
+        "env --help > x",
+        "env --version >> notes.txt",
+        // 3: in a backtick body `EOF)` is body text, as in bash.
+        "echo \"`cat <<EOF\nEOF)\nrm -rf .claude\nEOF\n`\"",
+    ]);
+    for cmd in allowed {
+        let d = e.evaluate(cmd);
+        if d.is_deny() {
+            wrong.push(format!("expected ALLOW: {cmd:?} -> {d:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

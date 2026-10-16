@@ -133,25 +133,20 @@ pub fn split_segments(cmd: &str) -> Vec<Segment> {
 /// or here-documents nested too deeply). The caller records it as a
 /// fail-open unless something else denies.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    split_noted(cmd, Ctx::new())
+    split_noted(cmd, false)
 }
 
 /// `split_segments_noted` for the body of a `$(…)` (the text between its
 /// parentheses): here-documents end as bash ends them inside one.
 pub fn split_substitution_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    split_noted(
-        cmd,
-        Ctx {
-            sub_body: true,
-            ..Ctx::new()
-        },
-    )
+    split_noted(cmd, true)
 }
 
-fn split_noted(cmd: &str, mut ctx: Ctx) -> (Vec<Segment>, Option<&'static str>) {
+fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>) {
+    let mut ctx = Ctx::new();
     let mut segments: Vec<Segment> = Vec::new();
     let mut current: Segment = Vec::new();
-    let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false).toks;
+    let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false, body_top).toks;
 
     for tok in toks {
         match tok {
@@ -227,8 +222,6 @@ struct Ctx {
     arith_budget: usize,
     /// Why part of the line could not be lexed exactly (the first reason).
     note: Option<&'static str>,
-    /// The whole line is the body of a `$(…)`.
-    sub_body: bool,
 }
 
 impl Ctx {
@@ -236,7 +229,6 @@ impl Ctx {
         Ctx {
             arith_budget: ARITH_LOOKAHEAD_TOTAL,
             note: None,
-            sub_body: false,
         }
     }
 
@@ -270,8 +262,20 @@ const ARITH_TOO_LONG: &str = "arithmetic too long to judge";
 /// inside a substitution are understood exactly as at the top level
 /// (`"$(cat <<'EOF'` / `it's` / `EOF` / `)"`). `flat_arith`: the frame
 /// starts inside a `$((` whose look-ahead was cut off (see `no_docs_above`).
+/// `body_top`: the frame is the whole body of a `$(…)` whose parentheses
+/// were cut off (`split_substitution_noted`). Only here-documents read by
+/// a `$(…)` body frame itself (`sub` or `body_top`) end at a `delim…)`
+/// line; a here-document read as commands, or a backtick body, is a fresh
+/// shell text where only an exact delimiter line ends one.
 #[allow(unused_assignments)] // the final flush_word!() sets state that is never read again
-fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool, flat_arith: bool) -> Frame {
+fn lex_in(
+    chars: &mut Chars,
+    ctx: &mut Ctx,
+    depth: usize,
+    sub: bool,
+    flat_arith: bool,
+    body_top: bool,
+) -> Frame {
     let mut toks: Vec<LexTok> = Vec::new();
     // Open `(` operators of this frame; in a `$(…)` frame, a `)` with
     // none open closes the substitution.
@@ -421,20 +425,16 @@ fn lex_in(chars: &mut Chars, ctx: &mut Ctx, depth: usize, sub: bool, flat_arith:
                     // reads it (or that cannot be known); otherwise data,
                     // whose `$(…)`/backticks still run unless the delimiter
                     // was quoted.
-                    let body = read_heredoc(
-                        chars,
-                        &doc.delim,
-                        doc.strip_tabs,
-                        sub || ctx.sub_body,
-                        ctx.sub_body,
-                    );
+                    let body =
+                        read_heredoc(chars, &doc.delim, doc.strip_tabs, sub || body_top, body_top);
                     let commands = doc
                         .commands
                         .unwrap_or_else(|| body_is_commands(&toks, doc.op));
                     if commands && depth + 1 >= MAX_FRAME_DEPTH {
                         ctx.note(TOO_DEEP);
                     } else if commands {
-                        let inner = lex_in(&mut Chars::new(&body), ctx, depth + 1, false, false);
+                        let inner =
+                            lex_in(&mut Chars::new(&body), ctx, depth + 1, false, false, false);
                         toks.extend(inner.toks);
                         toks.push(LexTok::Operator(Operator::Newline));
                     } else if !doc.quoted {
@@ -1222,14 +1222,14 @@ fn scan_substitution<'a>(
             }
             Arith::TooLong => {
                 ctx.note(ARITH_TOO_LONG);
-                let frame = lex_in(chars, ctx, depth + 1, true, true);
+                let frame = lex_in(chars, ctx, depth + 1, true, true, false);
                 docs.extend(frame.pending);
                 return &chars.s[start..chars.pos - usize::from(frame.closed)];
             }
             Arith::Subshell => {}
         }
     }
-    let frame = lex_in(chars, ctx, depth + 1, true, false);
+    let frame = lex_in(chars, ctx, depth + 1, true, false, false);
     docs.extend(frame.pending);
     &chars.s[start..chars.pos - usize::from(frame.closed)]
 }
@@ -1486,8 +1486,29 @@ pub(crate) fn pure_substitution_body(text: &str) -> Option<String> {
 /// inside a substitution are delimited identically here and during the
 /// original tokenization — there is no second, drifting notion of
 /// "balanced".
+#[cfg(test)]
 pub(crate) fn find_all_substitutions(text: &str) -> Vec<String> {
     find_subs(text, &mut Ctx::new(), 0)
+}
+
+/// `find_all_substitutions`, each body paired with whether it is a
+/// `$(…)` (true) or a backtick body (false).
+pub(crate) fn find_all_substitution_kinds(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut ctx = Ctx::new();
+    let mut chars = Chars::new(text);
+    while let Some(c) = chars.next() {
+        match c {
+            '$' if chars.peek() == Some('(') => {
+                chars.next();
+                let body = scan_substitution(&mut chars, &mut ctx, 0, &mut Vec::new());
+                out.push((body.to_string(), true));
+            }
+            '`' => out.push((scan_backtick(&mut chars), false)),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn find_subs(text: &str, ctx: &mut Ctx, depth: usize) -> Vec<String> {

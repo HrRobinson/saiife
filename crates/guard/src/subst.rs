@@ -51,11 +51,18 @@ use crate::lexer::{pure_substitution_body, Word};
 /// (`sudo`, `env`, `command`, …) peeled off, so `sudo $(rm -rf /)` and
 /// `env FOO=bar $(rm -rf /)` are covered the same as the bare form.
 pub fn command_position_substitution(seg: &[Word]) -> Option<String> {
+    command_position_substitution_kind(seg).map(|(inner, _)| inner)
+}
+
+/// `command_position_substitution`, with whether the substitution is a
+/// `$(…)` (true) or a backtick body (false).
+pub fn command_position_substitution_kind(seg: &[Word]) -> Option<(String, bool)> {
+    let kind = |text: &str| pure_substitution_body(text).map(|b| (b, !text.starts_with('`')));
     for word in seg {
         match assignment_value(&word.text) {
             Some(value) => {
-                if let Some(inner) = pure_substitution_body(value) {
-                    return Some(inner);
+                if let Some(found) = kind(value) {
+                    return Some(found);
                 }
                 // A plain `NAME=val` assignment (or a shape more complex
                 // than a pure substitution value, e.g. `NAME=pre$(x)post`,
@@ -70,7 +77,7 @@ pub fn command_position_substitution(seg: &[Word]) -> Option<String> {
                 // command name (nothing to recurse into) — either way, the
                 // search ends here; a substitution can never occupy command
                 // position *behind* a real command word.
-                return pure_substitution_body(&word.text);
+                return kind(&word.text);
             }
         }
     }

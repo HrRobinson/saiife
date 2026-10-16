@@ -24,7 +24,7 @@ use crate::canon::{
     GLOB_SCAN_LIMIT,
 };
 use crate::lexer::{
-    find_all_substitutions, literal_word, split_segments_noted, split_substitution_noted, Word,
+    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
 };
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
@@ -32,7 +32,7 @@ use crate::pack::Pack;
 use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
-use crate::subst::command_position_substitution;
+use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::wrappers::{
     effective_command, is_env_assignment, unwrap_transparent_prefix, wrapper_reads,
 };
@@ -390,8 +390,8 @@ impl Engine {
                         command_position_substitution(rest).is_some() && w.has_substitution
                     })
             };
-            if let Some(inner) =
-                command_position_substitution(effective).filter(|_| substitution_is_the_command)
+            if let Some((inner, dollar)) = command_position_substitution_kind(effective)
+                .filter(|_| substitution_is_the_command)
             {
                 if depth < MAX_INLINE_DEPTH {
                     if start.elapsed() > self.budget {
@@ -407,7 +407,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
-                        true,
+                        dollar,
                     ) {
                         Decision::Deny {
                             pack,
@@ -473,7 +473,7 @@ impl Engine {
                 if !word.has_substitution {
                     continue;
                 }
-                for inner in find_all_substitutions(&word.text) {
+                for (inner, dollar) in find_all_substitution_kinds(&word.text) {
                     if depth >= MAX_INLINE_DEPTH {
                         // Depth cap reached: fail open (recorded) on this
                         // one substitution and keep scanning the rest of
@@ -496,7 +496,7 @@ impl Engine {
                         cwd_unknown,
                         env_changed,
                         ifs_named,
-                        true,
+                        dollar,
                     ) {
                         Decision::Deny {
                             pack,
@@ -633,7 +633,11 @@ impl Engine {
             // no new scrutiny.
             if self.guarded_commands.contains(&argv[0])
                 && (effective.iter().skip(1).any(|w| w.has_substitution)
-                    || (ifs_named && unresolved.iter().skip(1).any(|w| w.has_substitution)))
+                    || (ifs_named
+                        && unresolved
+                            .iter()
+                            .skip(1)
+                            .any(|w| w.has_substitution && !w.dq_substitution)))
             {
                 return Decision::Deny {
                     pack: SUBSTITUTION_GUARD_PACK.to_string(),
