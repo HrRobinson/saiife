@@ -1,7 +1,7 @@
 //! The directories the guard's path rules are bound to (spec §7.2, §7.4):
 //! the working directory relative paths are resolved against, and the
 //! values of the rule variables (`~`, `$PROJECT`, `$SAIIFE_DATA_DIR`,
-//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`).
+//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`).
 
 use std::path::Path;
 
@@ -20,6 +20,18 @@ pub fn path_vars(cwd: Option<&Path>, project: Option<&Path>) -> PathVars {
     }
     if let Some(h) = dirs::home_dir() {
         v = v.with_var("HOME", h);
+    }
+    // The agents' config dirs: the variable when set (and absolute), else
+    // the default under HOME, so the rules naming them are always active.
+    for (name, default) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+        match std::env::var_os(name) {
+            Some(d) if Path::new(&d).is_absolute() => v = v.with_var(name, d),
+            _ => {
+                if let Some(h) = dirs::home_dir() {
+                    v = v.with_var(name, h.join(default));
+                }
+            }
+        }
     }
     if let Some(p) = project.or(cwd) {
         v = v.with_var("PROJECT", p);

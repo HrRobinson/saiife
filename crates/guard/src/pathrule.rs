@@ -5,7 +5,7 @@
 //! Glob syntax (deliberately small):
 //!
 //! - a glob starts with `/`, `~/`, `**/` or a variable (`$HOME`, `$PROJECT`,
-//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`), which stands
+//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`), which stands
 //!   alone or is followed by `/`;
 //! - `*` matches within one path component, `?` one character of it;
 //! - `**` is a whole component: `**/x` matches `x` in any directory,
@@ -84,6 +84,8 @@ pub const VARIABLES: &[&str] = &[
     "PROJECT",
     "SAIIFE_DATA_DIR",
     "SAIIFE_AUDIT_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
     "SAIIFE_BIN",
 ];
 
