@@ -683,3 +683,51 @@ fn status_stops_after_12_months_for_an_unused_agent() {
     );
     assert!(!text.contains("audit log"), "{text}");
 }
+
+/// Plan 2 carry-over: with the config removed, `status` run from a
+/// subdirectory finds the project through the integrity record.
+#[test]
+fn status_in_subdir_after_config_removed() {
+    let env = initialized(&["claude"]);
+    std::fs::create_dir(env.root().join("src")).unwrap();
+    std::fs::remove_file(env.root().join(".saiife/config.toml")).unwrap();
+    let out = env.saiife_in(&env.root().join("src"), &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let canonical = std::fs::canonicalize(env.root()).unwrap();
+    assert!(
+        text.contains(&format!("saiife status for {}", canonical.display()))
+            || text.contains(&format!("saiife status for {}", env.root().display())),
+        "{text}"
+    );
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
+    assert!(!text.contains("not set up for this project"), "{text}");
+}
+
+/// A failed agent's error entry is cleared by a later successful init for
+/// that agent.
+#[test]
+fn failed_agent_entry_clears_on_success() {
+    let env = initialized(&["claude", "codex"]);
+    // Stand in for an earlier failed codex init.
+    let rec_dir = env.data.path().join("projects");
+    let rec = std::fs::read_dir(&rec_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+    v["hooks"]["codex"]["sha256"] = "".into();
+    v["hooks"]["codex"]["error"] = "disk full".into();
+    std::fs::write(&rec, v.to_string()).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("could not set up Codex"), "{text}");
+    let out = env.saiife(&["init", "--agent", "codex"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("could not set up"), "{text}");
+}

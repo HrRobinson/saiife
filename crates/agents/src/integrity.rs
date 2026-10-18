@@ -123,6 +123,15 @@ impl Integrity {
             builder.mode(0o700);
         }
         builder.create(dir).map_err(io_err(dir))?;
+        // An older or hand-made directory may be wider than 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir).map_err(io_err(dir))?.permissions().mode();
+            if mode & 0o777 != 0o700 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
+            }
+        }
         let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_err(dir))?;
         let mut body = serde_json::to_string_pretty(self).expect("integrity serializes");
         body.push('\n');

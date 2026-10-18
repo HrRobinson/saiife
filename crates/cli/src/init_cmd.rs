@@ -305,6 +305,8 @@ pub fn off() -> ExitCode {
         .map(|r| r.created.clone())
         .unwrap_or_default();
     let mut lines = Vec::new();
+    // Agents whose hook could not be removed, with the reason.
+    let mut failed_agents: Vec<(Agent, String)> = Vec::new();
 
     for agent in Agent::ALL {
         let ours = created.iter().any(|c| c == agent.config_rel());
@@ -322,7 +324,17 @@ pub fn off() -> ExitCode {
             )),
             Err(e) => {
                 failed = true;
-                lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
+                let mut line = format!("  {:<7} FAILED: {e}", agent.name());
+                if let saiife_agents::AgentError::Layout { detail, .. } = &e {
+                    if detail.contains("outside the project") {
+                        line.push_str(
+                            "\n          saiife did not change that file. To finish, remove the \
+                             saiife hook entry (the `saiife check` command) from it by hand.",
+                        );
+                    }
+                }
+                lines.push(line);
+                failed_agents.push((agent, e.to_string()));
             }
         }
     }
@@ -362,6 +374,29 @@ pub fn off() -> ExitCode {
                 failed = true;
                 lines.push(format!("  integrity record FAILED: {e}"));
             }
+        }
+    } else if let (Some(mut rec), Some(p), false) = (record, &record_path, failed_agents.is_empty())
+    {
+        // Partly off: keep the record for the agents still hooked, so
+        // `status` warns about them and nothing else.
+        rec.hooks = failed_agents
+            .iter()
+            .map(|(a, e)| {
+                (
+                    a.name().to_string(),
+                    HookRecord {
+                        file: a.config_rel().to_string(),
+                        sha256: String::new(),
+                        error: Some(format!(
+                            "`saiife init --off` could not remove its hook: {e}"
+                        )),
+                    },
+                )
+            })
+            .collect();
+        rec.created.retain(|rel| root.join(rel).exists());
+        if let Err(e) = rec.save(p) {
+            lines.push(format!("  integrity record FAILED: {e}"));
         }
     }
 

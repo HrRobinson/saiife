@@ -37,7 +37,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
     };
-    let root = project_root(&cwd);
+    let root = status_root(&cwd);
     println!("saiife status for {}", root.display());
 
     let record = match integrity::record_path(&root) {
@@ -178,7 +178,8 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         }
     }
 
-    if !record.hooks.values().any(|h| h.error.is_none()) {
+    // A recorded failure already says why nothing is hooked.
+    if record.hooks.is_empty() {
         problems.push(Problem {
             what: "no agent is hooked in this project, so saiife guards nothing here.".into(),
             fix: "run `saiife init --agent <claude|codex|gemini>`".into(),
@@ -207,6 +208,25 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         println!("{} check(s) failed.", problems.len());
         ExitCode::from(1)
     }
+}
+
+/// The project `status` reports on. Without a `.saiife/config.toml` at or
+/// above `cwd` (it was removed), the nearest ancestor with an integrity
+/// record is the project, so the removal is named instead of "not set up".
+fn status_root(cwd: &Path) -> PathBuf {
+    let found = project_root(cwd);
+    if found != cwd || cwd.join(CONFIG_REL).is_file() {
+        return found;
+    }
+    cwd.ancestors()
+        .find(|d| {
+            integrity::record_path(d)
+                .ok()
+                .flatten()
+                .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
+        })
+        .unwrap_or(cwd)
+        .to_path_buf()
 }
 
 /// Audit records of this project (by its literal and canonical path).

@@ -287,3 +287,102 @@ fn symlinked_config_outside_the_project_is_refused() {
     assert!(env.read(".claude/settings.json").contains("saiife check"));
     assert!(env.read(".gemini/settings.json").contains("saiife check"));
 }
+
+/// A mode-0500 directory still writable (root) means permissions cannot
+/// make a write fail here; tests that need that skip.
+#[cfg(unix)]
+fn dir_stays_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".probe");
+    let ok = std::fs::write(&probe, "x").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// `init --off` with one agent config unwritable keeps the record for that
+/// agent only, so a later `status` warns about it alone.
+#[cfg(unix)]
+#[test]
+fn partial_off_keeps_record_for_failed_agent() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&["claude", "gemini"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let claude_dir = env.root().join(".claude");
+    std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if dir_stays_writable(&claude_dir) {
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: running as root, permissions do not stop writes");
+        return;
+    }
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let rec = std::fs::read_dir(env.data.path().join("projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+    let hooks = v["hooks"].as_object().unwrap();
+    assert_eq!(hooks.keys().collect::<Vec<_>>(), ["claude"], "{v}");
+    assert!(hooks["claude"]["error"].is_string(), "{v}");
+
+    let st = env.saiife(&["status"]);
+    let text = stdout(&st);
+    assert_eq!(code(&st), 1, "{text}");
+    assert!(text.contains("could not set up Claude Code"), "{text}");
+    assert!(!text.contains("Gemini"), "{text}");
+    assert!(!text.contains("no agent is hooked"), "{text}");
+    std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn integrity_dir_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&["claude"]);
+    let dir = env.data.path().join("projects");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_agent_config_symlink_is_explained() {
+    let env = Env::new(&["claude"]);
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    let link = env.root().join(".claude/settings.json");
+    std::os::unix::fs::symlink("gone/settings.json", &link).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains(link.to_str().unwrap()), "{line}");
+    assert!(line.contains("gone/settings.json"), "{line}");
+    assert!(line.contains("does not exist"), "{line}");
+    assert!(!line.contains("No such file"), "{line}");
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_gives_cleanup_hint() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("settings.json");
+    std::fs::write(&target, "{}\n").unwrap();
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".claude/settings.json")).unwrap();
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let target_name = std::fs::canonicalize(&target).unwrap();
+    assert!(text.contains(target_name.to_str().unwrap()), "{text}");
+    assert!(text.contains("by hand"), "{text}");
+    assert!(text.contains("hook entry"), "{text}");
+}
