@@ -298,6 +298,18 @@ fn dir_stays_writable(dir: &std::path::Path) -> bool {
     ok
 }
 
+/// Gives a directory back its mode 0755 when dropped, also on a failed assert.
+#[cfg(unix)]
+struct RestoreMode(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 /// `init --off` with one agent config unwritable keeps the record for that
 /// agent only, so a later `status` warns about it alone.
 #[cfg(unix)]
@@ -308,8 +320,8 @@ fn partial_off_keeps_record_for_failed_agent() {
     assert_eq!(code(&env.saiife(&["init"])), 0);
     let claude_dir = env.root().join(".claude");
     std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestoreMode(claude_dir.clone());
     if dir_stays_writable(&claude_dir) {
-        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         eprintln!("skipped: running as root, permissions do not stop writes");
         return;
     }
@@ -330,10 +342,22 @@ fn partial_off_keeps_record_for_failed_agent() {
     let st = env.saiife(&["status"]);
     let text = stdout(&st);
     assert_eq!(code(&st), 1, "{text}");
-    assert!(text.contains("could not set up Claude Code"), "{text}");
-    assert!(!text.contains("Gemini"), "{text}");
+    eprintln!("SECOND STATUS:\n{text}");
+    assert!(
+        text.contains("`saiife init --off` could not remove its hook from .claude/settings.json: "),
+        "{text}"
+    );
+    assert!(
+        text.contains(". Fix the file's permissions and run `saiife init --off` again."),
+        "{text}"
+    );
+    assert!(!text.contains("run `saiife init` "), "{text}");
+    // Exactly one warning: the failed agent. Nothing else.
+    assert_eq!(text.matches("WARNING").count(), 1, "{text}");
+    assert!(!text.contains("was removed"), "{text}");
     assert!(!text.contains("no agent is hooked"), "{text}");
-    std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!text.contains("Gemini"), "{text}");
+    assert!(env.root().join(".saiife/config.toml").is_file());
 }
 
 #[cfg(unix)]

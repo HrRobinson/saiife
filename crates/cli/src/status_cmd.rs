@@ -90,6 +90,15 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             }
             continue;
         };
+        if let (Some(e), true) = (&rec.error, rec.off_failed) {
+            problems.push(Problem {
+                what: format!(
+                    "`saiife init --off` could not remove its hook from {rel}: {e}. Fix the file's permissions and run `saiife init --off` again."
+                ),
+                fix: String::new(),
+            });
+            continue;
+        }
         if let Some(e) = &rec.error {
             problems.push(Problem {
                 what: format!("`saiife init` could not set up {}: {e}", agent.label()),
@@ -178,8 +187,13 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         }
     }
 
-    // A recorded failure already says why nothing is hooked.
-    if record.hooks.is_empty() {
+    // A hook `init --off` could not remove may still guard; otherwise no
+    // successful hook means nothing is protected, failed entries or not.
+    if !record
+        .hooks
+        .values()
+        .any(|h| h.error.is_none() || h.off_failed)
+    {
         problems.push(Problem {
             what: "no agent is hooked in this project, so saiife guards nothing here.".into(),
             fix: "run `saiife init --agent <claude|codex|gemini>`".into(),
@@ -195,7 +209,11 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         }
     }
     for p in &problems {
-        println!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
+        if p.fix.is_empty() {
+            println!("\nWARNING: {}", p.what);
+        } else {
+            println!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
+        }
     }
     println!(
         "\nsaiife v1 catches mistakes and makes a switched-off guard visible; it cannot stop a \

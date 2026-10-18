@@ -158,6 +158,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         file: agent.config_rel().to_string(),
                         sha256: agent.expected_entry(),
                         error: None,
+                        off_failed: false,
                     },
                 );
                 installed.push(*agent);
@@ -178,6 +179,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         file: agent.config_rel().to_string(),
                         sha256: String::new(),
                         error: Some(e.to_string()),
+                        off_failed: false,
                     },
                 );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
@@ -340,7 +342,11 @@ pub fn off() -> ExitCode {
     }
 
     let config_path = root.join(CONFIG_REL);
-    if config_path.exists() {
+    if config_path.exists() && !failed_agents.is_empty() {
+        lines.push(format!(
+            "  config  {CONFIG_REL} kept (saiife is still on for the agent(s) above)"
+        ));
+    } else if config_path.exists() {
         let unchanged = record.as_ref().is_some_and(|r| {
             !r.config_written_sha256.is_empty()
                 && std::fs::read(&config_path)
@@ -387,9 +393,8 @@ pub fn off() -> ExitCode {
                     HookRecord {
                         file: a.config_rel().to_string(),
                         sha256: String::new(),
-                        error: Some(format!(
-                            "`saiife init --off` could not remove its hook: {e}"
-                        )),
+                        error: Some(e.clone()),
+                        off_failed: true,
                     },
                 )
             })

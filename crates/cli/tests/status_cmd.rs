@@ -482,6 +482,25 @@ fn record_without_any_hooked_agent_is_a_failed_check() {
     assert!(text.contains("no agent is hooked"), "{text}");
 }
 
+/// A record whose only entries are failed agents still says nothing is
+/// protected.
+#[test]
+fn record_with_only_failed_agents_says_nothing_is_guarded() {
+    let env = initialized(&["claude"]);
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["hooks"]["claude"]["sha256"] = "".into();
+        v["hooks"]["claude"]["error"] = "disk full".into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("could not set up Claude Code"), "{text}");
+    assert!(text.contains("no agent is hooked"), "{text}");
+}
+
 /// M3: an agent that reports its cwd through a symlink to the project
 /// still counts as a hook call of this project.
 #[cfg(unix)]

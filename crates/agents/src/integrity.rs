@@ -64,6 +64,10 @@ pub struct HookRecord {
     /// `status` reports such an agent as a failed check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// With `error`: the failure was `init --off` not removing the hook (it
+    /// may still be in place), not `init` failing to add it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub off_failed: bool,
 }
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
@@ -164,6 +168,7 @@ mod tests {
                 file: ".claude/settings.json".into(),
                 sha256: "ab".repeat(32),
                 error: None,
+                off_failed: false,
             },
         );
         Integrity {
