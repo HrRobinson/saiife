@@ -1,6 +1,12 @@
 //! `saiife audit`: the audit log as a terminal table.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use crate::{report, report_html};
+use saiifeguard::Pack;
 
 use crate::text::sanitize;
 use saiife_audit::store::{self, Filter};
@@ -80,12 +86,59 @@ fn one_line(s: &str) -> String {
     }
 }
 
+/// `saiife-report-YYYY-MM-DD.html` for the UTC date of `now`.
+pub fn default_report_name(now: OffsetDateTime) -> String {
+    format!("saiife-report-{}.html", now.date())
+}
+
+/// Write `html` to `path` without ever following or clobbering anything but
+/// a regular file: only `.html`/`.htm` names, no symlinks or directories as
+/// the target, and a temp file in the same folder renamed into place.
+pub fn write_report(path: &Path, html: &str) -> Result<(), String> {
+    let ok_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+    if !ok_ext {
+        return Err("the report file name must end in .html or .htm".to_string());
+    }
+    let shown = path.display();
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() => {
+            return Err(format!(
+                "{shown} is not a regular file; refusing to write the report"
+            ));
+        }
+        _ => {}
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let tmp_name = format!(
+        ".{}.saiife-report-{}.tmp",
+        name.unwrap_or_default(),
+        std::process::id()
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let result = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(html.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    result.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {shown}: {e}")
+    })
+}
+
 pub fn run(
     since: Option<&str>,
     project: Option<&str>,
     agent: Option<&str>,
     blocked: bool,
+    report: Option<&str>,
+    packs: &[Pack],
 ) -> ExitCode {
+    let since_arg = since;
     let since = match since.map(parse_since).transpose() {
         Ok(d) => d.map(|d| OffsetDateTime::now_utc() - d),
         Err(e) => {
@@ -112,6 +165,43 @@ pub fn run(
         return ExitCode::from(1);
     }
     let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
+    if let Some(target) = report {
+        let now = OffsetDateTime::now_utc();
+        let mut filters = Vec::new();
+        if let Some(s) = since_arg {
+            filters.push(format!("last {s}"));
+        }
+        if let Some(p) = project {
+            filters.push(format!("project: {p}"));
+        }
+        if let Some(a) = agent {
+            filters.push(format!("agent: {}", report::agent_label(a)));
+        }
+        if blocked {
+            filters.push("only blocked actions".to_string());
+        }
+        let html = report_html::render(&report::build(&shown, packs, filters, since, now));
+        let path = if target.is_empty() {
+            PathBuf::from(default_report_name(now))
+        } else {
+            PathBuf::from(target)
+        };
+        return match write_report(&path, &html) {
+            Ok(()) => {
+                let abs = std::path::absolute(&path).unwrap_or(path);
+                println!(
+                    "Report written: {} ({} decisions)",
+                    abs.display(),
+                    shown.len()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if shown.is_empty() {
         println!("No audit records found in {}.", dir.display());
     } else {
