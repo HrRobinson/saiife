@@ -63,18 +63,13 @@ pub struct ReadResult {
     pub dir_error: Option<String>,
 }
 
-/// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
-/// first. Lines are parsed one by one from raw bytes, so one bad line never
-/// hides the rest of its file. Other file names are ignored.
-pub fn read_all(dir: &Path) -> ReadResult {
-    let mut out = ReadResult::default();
+/// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
+/// empty list; any other failure to list it is the error text.
+fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
-        Err(e) => {
-            out.dir_error = Some(e.to_string());
-            return out;
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -85,19 +80,61 @@ pub fn read_all(dir: &Path) -> ReadResult {
         })
         .collect();
     files.sort();
-    for p in &files {
-        let Some(body) = read_regular(p) else {
-            out.unreadable_files += 1;
+    Ok(files)
+}
+
+/// Parse `p` line by line into `out`, counting what it had to skip.
+fn read_month_file(p: &Path, out: &mut ReadResult) {
+    let Some(body) = read_regular(p) else {
+        out.unreadable_files += 1;
+        return;
+    };
+    for line in body.split(|&b| b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
-        };
-        for line in body.split(|&b| b == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            match serde_json::from_slice::<Record>(line) {
-                Ok(r) => out.records.push(r),
-                Err(_) => out.skipped_lines += 1,
-            }
+        }
+        match serde_json::from_slice::<Record>(line) {
+            Ok(r) => out.records.push(r),
+            Err(_) => out.skipped_lines += 1,
+        }
+    }
+}
+
+/// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
+/// first. Lines are parsed one by one from raw bytes, so one bad line never
+/// hides the rest of its file. Other file names are ignored.
+pub fn read_all(dir: &Path) -> ReadResult {
+    let mut out = ReadResult::default();
+    match month_files(dir) {
+        Ok(files) => files.iter().for_each(|p| read_month_file(p, &mut out)),
+        Err(e) => out.dir_error = Some(e),
+    }
+    out
+}
+
+/// Read the month files newest first. `want` sees every record of each file
+/// and returns `true` while it still needs older data; after the first file
+/// in which it returned `false` the older files are not opened (so their
+/// problems are not counted). Records come back newest file first, each file
+/// in its own order.
+pub fn read_recent(dir: &Path, mut want: impl FnMut(&Record) -> bool) -> ReadResult {
+    let mut out = ReadResult::default();
+    let files = match month_files(dir) {
+        Ok(files) => files,
+        Err(e) => {
+            out.dir_error = Some(e);
+            return out;
+        }
+    };
+    for p in files.iter().rev() {
+        let start = out.records.len();
+        read_month_file(p, &mut out);
+        let mut more = true;
+        for r in &out.records[start..] {
+            more &= want(r);
+        }
+        if !more {
+            break;
         }
     }
     out
@@ -215,6 +252,31 @@ mod tests {
         assert!(dir.path().join("2026-09.jsonl").exists());
         assert!(dir.path().join("2026-10.jsonl").exists());
         assert_eq!(read_all(dir.path()).records, vec![a, b]);
+    }
+
+    #[test]
+    fn read_recent_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |m: u8| {
+            OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::from(m) * 3_000_000).unwrap()
+        };
+        let old = rec("/p", "claude", DecisionKind::Allow, at(0));
+        let new = rec("/p", "claude", DecisionKind::Allow, at(6));
+        append(dir.path(), &old).unwrap();
+        append(dir.path(), &new).unwrap();
+        // A directory named like the oldest month file: unreadable if opened.
+        let months = [old.month(), new.month()];
+        assert_ne!(months[0], months[1]);
+        fs::remove_file(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
+        fs::create_dir(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
+
+        let stopped = read_recent(dir.path(), |_| false);
+        assert_eq!(stopped.records, vec![new.clone()]);
+        assert_eq!(stopped.unreadable_files, 0);
+
+        let all = read_recent(dir.path(), |_| true);
+        assert_eq!(all.records, vec![new]);
+        assert_eq!(all.unreadable_files, 1);
     }
 
     #[test]

@@ -613,3 +613,76 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
         .unwrap();
     assert!(claude.contains("never"), "{claude}");
 }
+
+/// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
+fn audit_line(project: &str, agent: &str, ts: &str) -> String {
+    format!(
+        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":\"{project}\",\"tool\":\"Bash\",\
+         \"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}}\n"
+    )
+}
+
+#[test]
+fn status_reads_recent_months_only() {
+    let env = initialized(&["claude", "codex"]);
+    let project = std::fs::canonicalize(env.root()).unwrap();
+    let project = project.to_str().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let this_month = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
+    // The records of the newest month: one recent call per hooked agent.
+    let mut recent = String::new();
+    for a in ["claude", "codex"] {
+        let ts = format!(
+            "{:04}-{:02}-{:02}T00:00:00.000Z",
+            now.year(),
+            u8::from(now.month()),
+            now.day()
+        );
+        recent.push_str(&audit_line(project, a, &ts));
+    }
+    std::fs::write(env.audit.path().join(format!("{this_month}.jsonl")), recent).unwrap();
+    // 23 older months, 60 000 records in all, from other projects.
+    let filler = audit_line("/elsewhere", "claude", "2020-01-01T00:00:00.000Z");
+    let body = filler.repeat(60_000 / 23);
+    for m in 0..23u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2023 + m / 12, 1 + m % 12);
+        std::fs::write(env.audit.path().join(name), &body).unwrap();
+    }
+    let start = std::time::Instant::now();
+    let (c, text) = status(&env);
+    let took = start.elapsed();
+    assert_eq!(c, 0, "{text}");
+    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    for a in ["claude", "codex"] {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("never")),
+            "{a}: {text}"
+        );
+    }
+}
+
+#[test]
+fn status_names_inactive_path_rules() {
+    let env = initialized(&["claude"]);
+    // A relative audit dir is not bound as $SAIIFE_AUDIT_DIR; the other
+    // variables keep their values.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("status")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", "relative-audit")
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    let packs = lines.iter().position(|l| l.contains("packs   ")).unwrap();
+    assert!(
+        lines[packs + 1].starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),
+        "{text}"
+    );
+    assert!(lines[packs + 1].contains("core.self"), "{text}");
+}
