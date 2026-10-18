@@ -21,7 +21,10 @@ mod init_cmd;
 mod packs_cmd;
 mod paths;
 mod project;
+mod report;
+mod report_html;
 mod status_cmd;
+mod text;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -104,6 +107,9 @@ enum Cmd {
         /// Only blocked actions.
         #[arg(long)]
         blocked: bool,
+        /// Write a self-contained HTML report instead of the table (default name: saiife-report-YYYY-MM-DD.html here).
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        report: Option<String>,
     },
 }
 
@@ -158,11 +164,14 @@ fn main() -> ExitCode {
             project,
             agent,
             blocked,
+            report,
         } => audit_cmd::run(
             since.as_deref(),
             project.as_deref(),
             agent.as_deref(),
             blocked,
+            report.as_deref(),
+            &packs,
         ),
     }
 }

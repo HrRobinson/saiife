@@ -1,7 +1,14 @@
 //! `saiife audit`: the audit log as a terminal table.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::{report, report_html};
+use saiifeguard::Pack;
+
+use crate::text::sanitize;
 use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
@@ -67,25 +74,6 @@ pub fn render_table(records: &[&Record]) -> String {
     out
 }
 
-/// Make log text safe to print: the log is written from agent-controlled
-/// input, so terminal escapes (C0, DEL, C1 incl. CSI U+009B) and bidi
-/// overrides must not reach the terminal. Newlines become `⏎`; every other
-/// such char becomes a visible `\xNN` / `\u{NNNN}` escape.
-fn sanitize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push('⏎'),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
-                out.push_str(&format!("\\u{{{:04X}}}", c as u32))
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// `sanitize`, then anything longer than `INPUT_WIDTH` is cut with `…`.
 fn one_line(s: &str) -> String {
     let flat = sanitize(s);
@@ -98,12 +86,72 @@ fn one_line(s: &str) -> String {
     }
 }
 
+/// `saiife-report-YYYY-MM-DD.html` for the UTC date of `now`.
+pub fn default_report_name(now: OffsetDateTime) -> String {
+    format!("saiife-report-{}.html", now.date())
+}
+
+/// Write `html` to `path` without ever following or clobbering anything but
+/// a regular file: only `.html`/`.htm` names, no symlinks or directories as
+/// the target, and a temp file in the same folder renamed into place.
+pub fn write_report(path: &Path, html: &str) -> Result<(), String> {
+    let ok_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"));
+    if !ok_ext {
+        return Err("the report file name must end in .html or .htm".to_string());
+    }
+    let shown = path.display();
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() => {
+            return Err(format!(
+                "{shown} is not a regular file; refusing to write the report"
+            ));
+        }
+        _ => {}
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let tmp = path.with_file_name(format!(
+        ".{}.saiife-report-{}.tmp",
+        name.unwrap_or_default(),
+        std::process::id()
+    ));
+    write_via_temp(path, html, &tmp).map_err(|e| format!("cannot write {shown}: {e}"))
+}
+
+/// Create `tmp` (never an existing path), fill it, rename it over `path`.
+/// The temp file is removed on failure only if this call created it.
+fn write_via_temp(path: &Path, html: &str, tmp: &Path) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Same sensitivity as the 0600 audit log.
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    let result = (|| {
+        f.write_all(html.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
 pub fn run(
     since: Option<&str>,
     project: Option<&str>,
     agent: Option<&str>,
     blocked: bool,
+    report: Option<&str>,
+    packs: &[Pack],
 ) -> ExitCode {
+    let since_arg = since;
     let since = match since.map(parse_since).transpose() {
         Ok(d) => d.map(|d| OffsetDateTime::now_utc() - d),
         Err(e) => {
@@ -130,6 +178,60 @@ pub fn run(
         return ExitCode::from(1);
     }
     let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
+    if let Some(target) = report {
+        let now = OffsetDateTime::now_utc();
+        let mut filters = Vec::new();
+        if let Some(s) = since_arg {
+            filters.push(format!("last {s}"));
+        }
+        if let Some(p) = project {
+            filters.push(format!("project: {p}"));
+        }
+        if let Some(a) = agent {
+            filters.push(format!("agent: {}", report::agent_label(a)));
+        }
+        if blocked {
+            filters.push("only blocked actions".to_string());
+        }
+        let mut model = report::build(&shown, packs, filters, since, now);
+        model.blocked_only = blocked;
+        if all.skipped_lines > 0 {
+            model.log_problems.push(format!(
+                "{} unreadable log lines were skipped; the log may be damaged or edited.",
+                all.skipped_lines
+            ));
+        }
+        if all.unreadable_files > 0 {
+            model.log_problems.push(format!(
+                "{} log files could not be read.",
+                all.unreadable_files
+            ));
+        }
+        let html = report_html::render(&model);
+        let path = if target.is_empty() {
+            PathBuf::from(default_report_name(now))
+        } else {
+            PathBuf::from(target)
+        };
+        return match write_report(&path, &html) {
+            Ok(()) => {
+                let abs = std::path::absolute(&path).unwrap_or(path);
+                println!(
+                    "Report written: {} ({} decisions)",
+                    abs.display(),
+                    shown.len()
+                );
+                for problem in &model.log_problems {
+                    println!("{problem}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if shown.is_empty() {
         println!("No audit records found in {}.", dir.display());
     } else {
@@ -166,6 +268,17 @@ mod tests {
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
         )
+    }
+
+    #[test]
+    fn a_planted_temp_file_is_never_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let tmp = d.path().join(".r.html.saiife-report-1.tmp");
+        std::fs::write(&tmp, "planted").unwrap();
+        let target = d.path().join("r.html");
+        assert!(write_via_temp(&target, "x", &tmp).is_err());
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "planted");
+        assert!(!target.exists());
     }
 
     #[test]

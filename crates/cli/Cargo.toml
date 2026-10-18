@@ -16,7 +16,7 @@ saiife-audit = { path = "../audit" }
 saiife-agents = { path = "../agents" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-time = "0.3"
+time = { version = "0.3", features = ["formatting", "macros"] }
 dirs = "5"
 
 [dev-dependencies]

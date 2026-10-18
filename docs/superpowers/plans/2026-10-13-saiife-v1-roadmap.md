@@ -10,7 +10,7 @@ real code instead of guesses.
 | 1 | Foundation + audit log | §3, §4, §6.1–6.3, §8 (CI offline), §11 | `saiife` binary in the new repo; every decision audited and masked; `saiife audit` table; CI incl. offline run | written: `2026-10-13-plan-1-foundation-audit.md` |
 | 2 | Agents + project config + tamper detection | §5, §5.1, §5.2, §7.5, §9.1 (reserved field) | `.saiife/config.toml`; `init`, `init --off`, `status` with integrity checks, `packs`; hooks (shell, read and write tools) for Claude Code, Codex, Gemini, verified against live installs and recorded fixtures | written: `2026-10-13-plan-2-agents-config-tamper.md` |
 | 3 | Secret and self protection | §7.1–7.4 | `core.secrets` (incl. cloud secret reads), `core.self`; `evaluate_path` for read and write tools | written: `2026-10-13-plan-3-secret-self-protection.md` |
-| 4 | HTML report | §6.4 | `saiife audit --report`, self-contained, DPO-readable | to write after plan 3 |
+| 4 | HTML report | §6.4 | `saiife audit --report`, self-contained, DPO-readable | written: `2026-10-18-plan-4-html-report.md` |
 | 5 | Release, docs, demo | §8, §10 (pack docs), §12 (incl. threat-coverage docs per §1.1) | release CI for 4 targets, `install.sh`, one docs page per pack, Codex + Ollama recipe, demo script | to write after plan 4 |
 
 Order rationale: plan 2 needs plan 1's `check --agent`; plan 3 needs plan 2's
@@ -24,7 +24,7 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 - ~~**Plan 2:** `saiife check` answers Claude Code with `permissionDecision: "allow"`~~ — done in plan 2: allow is silent for every agent.
 - ~~**Plan 2 (`status`):** `read_all` returns an empty result with no signal when the audit dir itself is unreadable~~ — done in plan 2: `ReadResult::dir_error`; `status` and `audit` report it.
-- **Plan 4 (report):** escape LRM/RLM/ALM (U+200E/U+200F/U+061C) too; show a project column; mask `mysql -pPASS`; stop the URL rule over-masking across `"`/`'`/`,` (e.g. `https://h","email":"a@b.c`).
+- ~~**Plan 4 (report):** escape LRM/RLM/ALM (U+200E/U+200F/U+061C) too; show a project column; mask `mysql -pPASS`; stop the URL rule over-masking across `"`/`'`/`,` (e.g. `https://h","email":"a@b.c`).~~ — done in plan 4: `saiife audit --report` writes the HTML report with a project column; the escaping and masking fixes landed earlier in plan 4.
 - **Any plan touching `check`:** payloads over 1 MiB are still logged with empty input; engine abort/stack overflow is not caught (only panics).
 - **Housekeeping:** audit dir 0700, checked arithmetic for `--since`, `time` macros as cli dev-dependency, clean up `/tmp/saiife-test-audit-*` in tests.
 
@@ -55,3 +55,20 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - **Plan 5 (deferred from the plan-3 final review, with reasons):** split `evaluate_inner`/`lex_in` (a `ShellState` struct and one `recurse` helper; plan 5's first task, not a refactor of the security core right before merge); Codex `init --off` keeps a user's own empty `PreToolUse = []` (an empty array has no effect, no setting is lost); CRLF in `.codex/config.toml` is kept (pre-existing on main, needs a `toml_edit` rewrite); Codex inline-layout tests for comments in the array, a shared matcher, array-of-tables plus inline and `status` after an inline install (verified by hand); `xargs` long options by unique prefix (`--arg=.env`; an abbreviated option is a deliberate spelling, §7.3); the raw `$PATH` scanner reading comments and here-document bodies (adversarial decoy only, see Known gaps); audit `reason` not masked (it holds paths, not secret values); write targets from an unresolved substitution (`cp /bin/true $(command -v saiife)`) are skipped (needs audit-noise data first); glob expansion for file tools runs outside the 50 ms budget (bounded per pattern); per-call fixed cost about 33 ms against 18 ms on main (profile, lazy path rules); `source .env && npm start` / `set -a; . ./.env` denied (document, decide on live use); `git restore --staged .claude/settings.json` denied (rare); `rm -rf target` denied when the `saiife` on PATH is a build inside it (document for dogfooding); agents' own credential files (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`) are readable (one path rule each).
 - **Plan 5 (docs, from the final wave):** a line that names `IFS` records unquoted substitution values as `error_allowed` unless something denies (a custom `IFS` may split where neither the default split nor the unsplit value does); a here-document inside `$(…)` ends at a line that starts with its delimiter and holds a `)`, as in bash 5.3 (older bash and zsh may differ).
 - Fixed in the plan-3 final wave (listed so the record is complete): the macOS CI job (the `PROJECT` binding test now accepts both the spelled and the resolved temp dir; the `check` fixtures that spell `/home/u` run in a real temp home, since `/home` is an autofs mount on macOS and resolving through it ran past the budget; CI runs `cargo test --no-fail-fast`); corpus and exact-trace tests use a 5 s budget (`DEFAULT_BUDGET` unchanged, the budget path keeps its own tests); `aws configure get` with any flag before the key; `kubectl get --raw` of any path naming `secrets` (query strings) or holding a `%` escape; `env --version`/`--help` no longer denied; a file tool's malformed `tool_input` is `error_allowed` "malformed tool_input" (and the buffering comment is corrected); every nested-evaluation depth cap records "… nested too deeply to judge"; unquoted substitution values are judged both split and unsplit, each as its own argv, instead of being skipped when `IFS` appears on the line; `case` patterns inside `$(…)` no longer close it; an `EOF)` delimiter line inside `$(…)` ends the here-document; here-documents opened in arithmetic are read after the line; a cut-off `((` look-ahead never opens a here-document.
+
+## Carry-over from plan 4 (for the plans that own them)
+
+- **Plan 5 (masking, `mysql -p`):** `mysql -psecret;ls` masks `secret;ls` (over-masks, safe side). A URL userinfo password with a quote directly followed by `,` `}` `]` `)` `;` `&` `|` or a space is not masked: that is the trade-off that stops the rule from masking across JSON (`https://h","email":"a@b.c`).
+- **Plan 5 (report):**
+  - A relative project string (only possible in a hand-edited log) resolves against the cwd.
+  - The "could not be read" note says "in this folder" even when the unreadable config belongs to a parent folder.
+  - The report file is 0600, like the audit log: run `chmod` to share it with another local account.
+  - The report shows packs as configured today, not as they were during the period. v2's tamper-evident log could record the active packs per decision.
+- **Plan 5 (report tests and polish):**
+  - The summary count asserts are weak: assert `<dd>N</dd>`. The order test should match `<h2>`.
+  - The print CSS for a closed `<details>` has no effect. `<h4>` is unstyled. An empty projects or agents list gives a blank `<dd>`. "Show all 1 decisions" needs a plural.
+  - Untested: the "log files could not be read" string; cleanup after a write or rename failure; equal-timestamp order.
+  - The no-config test assumes there is no `.saiife/config.toml` above the temp dir.
+  - The 10 s wall-clock limit on the 20 000-record test may be tight on a slow macOS runner.
+- **Plan 5 (housekeeping):** in `audit_cmd::run`, the `report` parameter shadows the `report` module, and the names `since_arg`/`since` are confusing. Unix-only test code has no `cfg(unix)`; there is no Windows CI.
+- **Plan 5 (manual check):** look at the report at phone width and in print preview in a real browser. During plan 4 it was checked as HTML only.
