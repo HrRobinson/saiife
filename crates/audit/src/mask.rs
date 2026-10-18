@@ -15,11 +15,11 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)", MASK),
         // Whole userinfo, greedy up to the last '@' before the path/query
         // (`user:p@ss@host`, token-only `TOKEN@host`).
-        (r#"([A-Za-z][A-Za-z0-9+.-]*://)(?:[^/?#\s"'`<>]|["'`<>]+[^/?#\s"'`<>,}\]);&|])+@"#, "${1}[MASKED]@"),
+        (r#"([A-Za-z][A-Za-z0-9+.-]*://)(?:(?:[^/?#\s"'`<>]|["'`<>]+[^/?#\s"'`<>,}\]);&|])+["'`<>]*|["'`<>]+)@"#, "${1}[MASKED]@"),
         (r#"(?i)(authorization:\s*(?:bearer\s+|basic\s+|token\s+)?)[^\s'"]+"#, "${1}[MASKED]"),
         (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+", "${1}[MASKED]"),
         (r#"(?i)(--(?:[a-z0-9]+-)*(?:password|passwd|token|secret|secret-key|api-key|apikey)(?:=|\s+))(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
-        (r#"(\b(?i:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b(?:'[^']*'|"[^"]*"|[^|;&\n'"])*?\s-p)(?:'[^']*'|"[^"]*"|[^\s'"])+"#, "${1}[MASKED]"),
+        (r#"(\b(?i:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b(?:'[^']*'|"(?:\\.|[^"\\])*"|[^|;&\n])*?\s-p)(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|\S)+"#, "${1}[MASKED]"),
         (r#"(?i)(\baws\s+configure\s+set\s+(?:[A-Za-z0-9_-]+\.)*(?:aws_secret_access_key|aws_session_token)\s+)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
         (r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY)[A-Z0-9_]*=)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
         // No leading `\b`: a token glued to an identifier (`X_ghp_…`) still counts.
@@ -242,6 +242,25 @@ mod tests {
             mask("mysql -e 'x|y' -pS db"),
             "mysql -e 'x|y' -p[MASKED] db"
         );
+    }
+
+    #[test]
+    fn mysql_unpaired_quotes_and_escapes() {
+        assert_eq!(
+            mask(r#"mysql -e "a \" ; b" -pSECRET"#),
+            r#"mysql -e "a \" ; b" -p[MASKED]"#
+        );
+        assert_eq!(
+            mask("mysql -e 'unterminated -pSECRET"),
+            "mysql -e 'unterminated -p[MASKED]"
+        );
+        assert_eq!(mask(r"mysql -pab\'cd db"), "mysql -p[MASKED] db");
+    }
+
+    #[test]
+    fn url_password_ending_in_quote() {
+        assert_eq!(mask("curl https://u:p'@h/x"), "curl https://[MASKED]@h/x");
+        assert_eq!(mask("curl https://u:p\"@h/x"), "curl https://[MASKED]@h/x");
     }
 
     #[test]
