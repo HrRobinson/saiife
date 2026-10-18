@@ -2,6 +2,7 @@
 
 use std::process::ExitCode;
 
+use crate::text::sanitize;
 use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
@@ -64,25 +65,6 @@ pub fn render_table(records: &[&Record]) -> String {
         "{} decisions · {blocked} blocked · {fail_open} fail-open\n",
         records.len()
     ));
-    out
-}
-
-/// Make log text safe to print: the log is written from agent-controlled
-/// input, so terminal escapes (C0, DEL, C1 incl. CSI U+009B) and bidi
-/// overrides must not reach the terminal. Newlines become `⏎`; every other
-/// such char becomes a visible `\xNN` / `\u{NNNN}` escape.
-fn sanitize(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => out.push('⏎'),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
-                out.push_str(&format!("\\u{{{:04X}}}", c as u32))
-            }
-            c => out.push(c),
-        }
-    }
     out
 }
 

@@ -22,6 +22,7 @@ mod packs_cmd;
 mod paths;
 mod project;
 mod status_cmd;
+mod text;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
