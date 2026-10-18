@@ -28,6 +28,10 @@
 //!                             # of a variable-rooted, wildcard-free glob
 //!                             # (write access), e.g. `rm -rf ~/.local/share`
 //! ```
+//!
+//! An `[[allow]]` match exempts the command only from its own pack's
+//! `[[deny]]` rules (as `[[allow_path]]` does for paths); other packs still
+//! judge it, and their first deny wins.
 
 use std::fs;
 use std::path::Path;

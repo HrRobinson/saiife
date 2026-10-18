@@ -1009,7 +1009,9 @@ impl Engine {
         unknown
     }
 
-    /// Run allow-before-deny across all packs for one segment. Rules match
+    /// Run allow-before-deny per pack, across all packs, for one segment: a
+    /// pack whose allow rule matches skips only its own deny rules, so the
+    /// first deny of any other pack still wins over an allow. Rules match
     /// the effective command's line (its argv after wrappers like `sudo` are
     /// peeled off, case-folded/dir-stripped/slash-collapsed, joined with
     /// single spaces); `whole_segment` rules match the line of the whole
@@ -1033,6 +1035,7 @@ impl Engine {
                 Some(matching_line)
             }
         };
+        let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
@@ -1041,19 +1044,21 @@ impl Engine {
             if !pf.might_match(matching_line) && !pf.might_match(segment_line) {
                 continue;
             }
-            // Allow rules first — a match short-circuits to ALLOW.
-            for rule in &pack.allow {
-                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
-                    return JudgeOutcome::Decided(Decision::Allow {
-                        trace: AllowTrace::AllowRule {
-                            pack: pack.id.clone(),
-                            pattern: rule.pattern.clone(),
-                            reason: rule.reason.clone(),
-                        },
-                    });
-                }
+            // An allow match exempts only this pack's own deny rules (as
+            // `allow_path` does); later packs still judge the command.
+            if let Some(rule) = pack
+                .allow
+                .iter()
+                .find(|r| line(r).is_some_and(|l| r.regex.is_match(l)))
+            {
+                allowed.get_or_insert_with(|| AllowTrace::AllowRule {
+                    pack: pack.id.clone(),
+                    pattern: rule.pattern.clone(),
+                    reason: rule.reason.clone(),
+                });
+                continue;
             }
-            // Then deny rules — first match wins.
+            // Deny rules — first match wins.
             for rule in &pack.deny {
                 if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
                     return JudgeOutcome::Decided(Decision::Deny {
@@ -1064,6 +1069,9 @@ impl Engine {
                     });
                 }
             }
+        }
+        if let Some(trace) = allowed {
+            return JudgeOutcome::Decided(Decision::Allow { trace });
         }
         JudgeOutcome::Clean
     }
@@ -1681,6 +1689,41 @@ reason = "deletes untracked files"
             }
             _ => panic!("expected deny, got {d:?}"),
         }
+    }
+
+    #[test]
+    fn allow_in_one_pack_does_not_hide_another_packs_deny() {
+        let a = "[pack]\nid = \"test.a\"\n[[allow]]\npattern = '^foo'\n";
+        let b = "[pack]\nid = \"test.b\"\n[[deny]]\npattern = '^foo bar'\nreason = \"b says no\"\n";
+        let mut w = Vec::new();
+        let packs = vec![
+            load_pack_str("<a>", a, &mut w).unwrap(),
+            load_pack_str("<b>", b, &mut w).unwrap(),
+        ];
+        let e = Engine::new(packs).with_budget(TEST_BUDGET);
+        match e.evaluate("foo bar") {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "test.b"),
+            d => panic!("expected deny, got {d:?}"),
+        }
+        assert!(matches!(
+            e.evaluate("foo baz"),
+            Decision::Allow {
+                trace: AllowTrace::AllowRule { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn own_pack_allow_still_allows() {
+        let (packs, _) = crate::builtins::builtin_packs();
+        let e = Engine::new(crate::profile::select_active(packs, &[])).with_budget(TEST_BUDGET);
+        match e.evaluate("git reset --hard HEAD~1") {
+            Decision::Allow {
+                trace: AllowTrace::AllowRule { pack, .. },
+            } => assert_eq!(pack, "core.git"),
+            d => panic!("expected core.git allow rule, got {d:?}"),
+        }
+        assert!(!e.evaluate("git push --force-with-lease").is_deny());
     }
 
     #[test]
