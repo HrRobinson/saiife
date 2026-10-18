@@ -30,7 +30,7 @@ fn untouched_project_passes() {
     for a in ["claude", "codex", "gemini"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("never")),
+                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call in")),
             "{a}: {text}"
         );
     }
@@ -239,7 +239,7 @@ fn last_hook_call_is_shown_per_agent() {
         .lines()
         .find(|l| l.trim_start().starts_with("codex"))
         .unwrap();
-    assert!(codex.contains("never"), "{codex}");
+    assert!(codex.contains("no call in"), "{codex}");
 }
 
 #[test]
@@ -611,7 +611,7 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
         .lines()
         .find(|l| l.trim_start().starts_with("claude"))
         .unwrap();
-    assert!(claude.contains("never"), "{claude}");
+    assert!(claude.contains("no call in"), "{claude}");
 }
 
 /// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
@@ -631,13 +631,13 @@ fn status_reads_recent_months_only() {
     let this_month = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
     // The records of the newest month: one recent call per hooked agent.
     let mut recent = String::new();
+    let ts = format!(
+        "{:04}-{:02}-{:02}T00:00:00.000Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
     for a in ["claude", "codex"] {
-        let ts = format!(
-            "{:04}-{:02}-{:02}T00:00:00.000Z",
-            now.year(),
-            u8::from(now.month()),
-            now.day()
-        );
         recent.push_str(&audit_line(project, a, &ts));
     }
     std::fs::write(env.audit.path().join(format!("{this_month}.jsonl")), recent).unwrap();
@@ -656,33 +656,30 @@ fn status_reads_recent_months_only() {
     for a in ["claude", "codex"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("never")),
+                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call in")),
             "{a}: {text}"
         );
     }
 }
 
 #[test]
-fn status_names_inactive_path_rules() {
+fn status_stops_after_12_months_for_an_unused_agent() {
     let env = initialized(&["claude"]);
-    // A relative audit dir is not bound as $SAIIFE_AUDIT_DIR; the other
-    // variables keep their values.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_saiife"))
-        .arg("status")
-        .current_dir(env.root())
-        .env("PATH", env.bin.path())
-        .env("HOME", env.home.path())
-        .env("SAIIFE_DATA_DIR", env.data.path())
-        .env("SAIIFE_AUDIT_DIR", "relative-audit")
-        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
-        .output()
-        .unwrap();
-    let text = stdout(&out);
-    let lines: Vec<&str> = text.lines().collect();
-    let packs = lines.iter().position(|l| l.contains("packs   ")).unwrap();
+    let dir = env.audit.path();
+    // 14 month files; the oldest is a directory, so opening it would be a
+    // failed check. Only the newest 12 may be opened.
+    let filler = audit_line("/elsewhere", "claude", "2020-01-01T00:00:00.000Z");
+    for m in 1..=13u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2024 + (m - 1) / 12, 1 + (m - 1) % 12);
+        std::fs::write(dir.join(name), &filler).unwrap();
+    }
+    std::fs::create_dir(dir.join("2020-01.jsonl")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
     assert!(
-        lines[packs + 1].starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),
+        text.lines()
+            .any(|l| l.contains("claude") && l.contains("no call in the last 12 months")),
         "{text}"
     );
-    assert!(lines[packs + 1].contains("core.self"), "{text}");
+    assert!(!text.contains("audit log"), "{text}");
 }

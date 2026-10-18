@@ -14,11 +14,15 @@ use saiife_agents::integrity::{self, Integrity};
 use saiife_agents::Agent;
 use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
+use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
 use crate::init_cmd::project_root;
 use crate::project::project_packs;
+
+/// Month files `status` reads at most when looking for each agent's last call.
+const SCAN_MONTHS: usize = 12;
 
 const RESTORE: &str = "run `saiife init` to restore it";
 
@@ -60,7 +64,12 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     let mut problems = Vec::new();
     let mut notes = Vec::new();
     // Only a hooked agent can have a last call to look for.
-    let hooked: Vec<&str> = record.hooks.keys().map(String::as_str).collect();
+    let hooked: Vec<&str> = record
+        .hooks
+        .iter()
+        .filter(|(_, h)| h.error.is_none())
+        .map(|(a, _)| a.as_str())
+        .collect();
     let last_calls = last_calls(&root, &hooked, &mut problems, &mut notes);
     let home = dirs::home_dir();
 
@@ -111,7 +120,8 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                 println!(
                     "  {:<7} hooked   {rel:<22} last hook call: {}",
                     agent.name(),
-                    last.map(ago).unwrap_or_else(|| "never".into())
+                    last.map(ago)
+                        .unwrap_or_else(|| format!("no call in the last {SCAN_MONTHS} months"))
                 );
             }
             Ok(f) if f.is_empty() => problems.push(Problem {
@@ -251,7 +261,10 @@ fn last_calls(
     };
     // Newest month files first; stop once every hooked agent has a call.
     let mut missing: Vec<&str> = hooked.to_vec();
-    let all = store::read_recent(&dir, |r| {
+    let all = store::read_recent(&dir, SCAN_MONTHS, |r| {
+        if missing.is_empty() {
+            return false;
+        }
         if is_ours(r) {
             missing.retain(|a| *a != r.agent);
         }
@@ -313,7 +326,13 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
     let ids: Vec<&str> = active.iter().map(|p| p.id.as_str()).collect();
     println!("  packs   {}", ids.join(", "));
     let vars = crate::paths::path_vars(Some(root), Some(root));
-    print!("{}", crate::packs_cmd::inactive_summary(&active, &vars));
+    print!("{}", inactive_lines(&active, &vars));
+}
+
+/// The `inactive here: …` lines under the packs line (empty when every path
+/// rule of the active packs has a value on this machine).
+fn inactive_lines(active: &[Pack], vars: &PathVars) -> String {
+    crate::packs_cmd::inactive_summary(active, vars)
 }
 
 /// The `saiife` on PATH must be the binary that ran `init` (path + version).
@@ -424,5 +443,31 @@ fn ago(t: OffsetDateTime) -> String {
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_lines_name_the_unbound_variable_and_its_packs() {
+        let (packs, _) = saiifeguard::builtins::builtin_packs();
+        let active: Vec<Pack> = packs.into_iter().filter(|p| p.default_on).collect();
+        let bound = PathVars::new()
+            .with_var("HOME", "/home/u")
+            .with_var("PROJECT", "/home/u/app")
+            .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
+            .with_var("CLAUDE_CONFIG_DIR", "/home/u/.claude")
+            .with_var("CODEX_HOME", "/home/u/.codex")
+            .with_var("SAIIFE_BIN", "/usr/bin/saiife");
+        let text = inactive_lines(&active, &bound);
+        assert!(
+            text.starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),
+            "{text}"
+        );
+        assert!(text.contains("core.self"), "{text}");
+        let all = bound.with_var("SAIIFE_AUDIT_DIR", "/home/u/.local/share/saiife/audit");
+        assert_eq!(inactive_lines(&active, &all), "");
     }
 }

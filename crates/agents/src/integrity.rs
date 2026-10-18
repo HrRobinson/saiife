@@ -68,8 +68,14 @@ pub struct HookRecord {
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
 pub fn data_dir() -> Option<PathBuf> {
-    match std::env::var_os(DATA_DIR_ENV) {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+    data_dir_from(std::env::var_os(DATA_DIR_ENV))
+}
+
+/// A relative `SAIIFE_DATA_DIR` is ignored: it would resolve against the
+/// caller's working directory, usually the project.
+fn data_dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match var {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
         _ => dirs::data_dir().map(|d| d.join("saiife")),
     }
 }
@@ -196,6 +202,17 @@ mod tests {
         let path = d.path().join("x.json");
         fs::write(&path, "{").unwrap();
         assert!(Integrity::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_relative_data_dir_is_ignored() {
+        let default = data_dir_from(None);
+        assert!(default.as_ref().unwrap().ends_with("saiife"));
+        assert_eq!(data_dir_from(Some("rel-data".into())), default);
+        assert_eq!(
+            data_dir_from(Some("/abs/data".into())),
+            Some(PathBuf::from("/abs/data"))
+        );
     }
 
     /// Review Focus 3: the same project through a symlink or `..` has one

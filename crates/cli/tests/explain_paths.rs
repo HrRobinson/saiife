@@ -79,49 +79,12 @@ fn packs_with_an_id_shows_its_rules() {
     assert!(stderr(&out).contains("unknown pack"), "{}", stderr(&out));
 }
 
-/// A relative SAIIFE_AUDIT_DIR is dropped, so the audit-dir rules cannot
-/// apply: both commands say so instead of hiding the rules.
+/// With every variable bound, no command reports inactive rules. (The
+/// unbound case is a unit test in `packs_cmd`: no environment can leave a
+/// variable unbound any more.)
 #[test]
-fn rules_with_an_unbound_variable_are_listed_as_inactive() {
+fn nothing_is_reported_inactive_when_everything_is_bound() {
     let env = Env::new(&[]);
-    let run = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_saiife"))
-            .args(args)
-            .current_dir(env.root())
-            .env("PATH", env.bin.path())
-            .env("HOME", env.home.path())
-            .env("SAIIFE_DATA_DIR", env.data.path())
-            .env("SAIIFE_AUDIT_DIR", "relative/audit")
-            .output()
-            .unwrap()
-    };
-    let out = run(&["packs", "core.self"]);
-    let text = stdout(&out);
-    assert!(
-        text.contains(
-            "  deny   write  $SAIIFE_AUDIT_DIR/**  (inactive here: $SAIIFE_AUDIT_DIR is not set)\n"
-        ),
-        "{text}"
-    );
-    assert!(!text.contains("$SAIIFE_BIN  (inactive"), "{text}");
-
-    let out = run(&["explain", "--write", ".claude/settings.json"]);
-    let text = stdout(&out);
-    assert!(text.contains("decision: DENY\n"), "{text}");
-    assert!(
-        text.contains("inactive here: $SAIIFE_AUDIT_DIR is not set: core.self"),
-        "{text}"
-    );
-
-    // Shell commands use the same path rules, so they report it too.
-    let out = run(&["explain", "cat relative/audit/x"]);
-    let text = stdout(&out);
-    assert!(
-        text.contains("inactive here: $SAIIFE_AUDIT_DIR is not set: core.self"),
-        "{text}"
-    );
-
-    // Everything bound: nothing is reported.
     let text = stdout(&env.saiife(&["explain", "--write", ".claude/settings.json"]));
     assert!(!text.contains("inactive here"), "{text}");
 }

@@ -226,3 +226,31 @@ fn fifo_at_month_path_does_not_block_the_verdict() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A relative `SAIIFE_AUDIT_DIR` must not make `check` write a log under
+/// the hook's working directory (spec §6.1: never inside the project).
+#[test]
+fn relative_audit_dir_is_ignored() {
+    let project = tempfile::tempdir().unwrap();
+    let home = common::FixtureHome::new();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let audit = tempfile::tempdir().unwrap();
+    let _sandbox = common::hermetic(&mut cmd, audit.path());
+    let mut child = cmd
+        .env("SAIIFE_AUDIT_DIR", "rel-audit")
+        .current_dir(project.path())
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(home.real(&payload("ls")).as_bytes())
+        .unwrap();
+    child.wait().unwrap();
+    assert!(!project.path().join("rel-audit").exists());
+}

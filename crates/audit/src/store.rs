@@ -11,9 +11,17 @@ use crate::record::{DecisionKind, Record};
 /// Environment variable that overrides the audit directory (tests, admins).
 pub const DIR_ENV: &str = "SAIIFE_AUDIT_DIR";
 
+/// The audit dir: `SAIIFE_AUDIT_DIR` when it is an absolute path, else the
+/// default under the user's data dir. A relative value is ignored: it would
+/// put the log under the hook's working directory, usually the project
+/// (spec §6.1: never inside the project).
 pub fn default_dir() -> Option<PathBuf> {
-    match std::env::var_os(DIR_ENV) {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+    dir_from(std::env::var_os(DIR_ENV))
+}
+
+fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match var {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
         _ => dirs::data_dir().map(|d| d.join("saiife").join("audit")),
     }
 }
@@ -112,12 +120,16 @@ pub fn read_all(dir: &Path) -> ReadResult {
     out
 }
 
-/// Read the month files newest first. `want` sees every record of each file
+/// Read at most `max_files` month files, newest first. `want` sees every record of each file
 /// and returns `true` while it still needs older data; after the first file
 /// in which it returned `false` the older files are not opened (so their
 /// problems are not counted). Records come back newest file first, each file
 /// in its own order.
-pub fn read_recent(dir: &Path, mut want: impl FnMut(&Record) -> bool) -> ReadResult {
+pub fn read_recent(
+    dir: &Path,
+    max_files: usize,
+    mut want: impl FnMut(&Record) -> bool,
+) -> ReadResult {
     let mut out = ReadResult::default();
     let files = match month_files(dir) {
         Ok(files) => files,
@@ -126,7 +138,7 @@ pub fn read_recent(dir: &Path, mut want: impl FnMut(&Record) -> bool) -> ReadRes
             return out;
         }
     };
-    for p in files.iter().rev() {
+    for p in files.iter().rev().take(max_files) {
         let start = out.records.len();
         read_month_file(p, &mut out);
         let mut more = true;
@@ -270,11 +282,11 @@ mod tests {
         fs::remove_file(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
         fs::create_dir(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
 
-        let stopped = read_recent(dir.path(), |_| false);
+        let stopped = read_recent(dir.path(), usize::MAX, |_| false);
         assert_eq!(stopped.records, vec![new.clone()]);
         assert_eq!(stopped.unreadable_files, 0);
 
-        let all = read_recent(dir.path(), |_| true);
+        let all = read_recent(dir.path(), usize::MAX, |_| true);
         assert_eq!(all.records, vec![new]);
         assert_eq!(all.unreadable_files, 1);
     }
@@ -491,6 +503,28 @@ mod tests {
         std::env::set_var(DIR_ENV, "");
         assert!(default_dir().unwrap().ends_with("saiife/audit"));
         std::env::remove_var(DIR_ENV);
+    }
+
+    #[test]
+    fn read_recent_reads_at_most_max_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "not json\n").unwrap();
+        }
+        let got = read_recent(dir.path(), 2, |_| true);
+        assert_eq!(got.skipped_lines, 2);
+    }
+
+    #[test]
+    fn a_relative_audit_dir_is_ignored() {
+        let default = dir_from(None);
+        assert!(default.as_ref().unwrap().ends_with("saiife/audit"));
+        assert_eq!(dir_from(Some("rel-audit".into())), default);
+        assert_eq!(dir_from(Some("".into())), default);
+        assert_eq!(
+            dir_from(Some("/abs/audit".into())),
+            Some(PathBuf::from("/abs/audit"))
+        );
     }
 
     #[test]

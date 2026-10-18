@@ -138,6 +138,25 @@ mod tests {
     use saiifeguard::builtins::builtin_packs;
 
     #[test]
+    fn a_path_rule_with_an_unbound_variable_is_marked_inactive() {
+        let (packs, _) = builtin_packs();
+        let core_self = packs.iter().find(|p| p.id == "core.self").unwrap();
+        let vars = PathVars::new().with_var("HOME", "/home/u");
+        let text = render_pack_with(core_self, true, Some(&vars));
+        assert!(
+            text.contains(
+                "  deny   write  $SAIIFE_AUDIT_DIR/**  (inactive here: $SAIIFE_AUDIT_DIR is not set)\n"
+            ),
+            "{text}"
+        );
+        let summary = inactive_summary(std::slice::from_ref(core_self), &vars);
+        assert!(
+            summary.contains("inactive here: $SAIIFE_AUDIT_DIR is not set: core.self\n"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn lists_every_pack_with_default_and_here() {
         let (packs, _) = builtin_packs();
         let out = render(&packs, &["db.postgres".to_string()], &[]);
