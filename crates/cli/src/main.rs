@@ -21,6 +21,9 @@ mod init_cmd;
 mod packs_cmd;
 mod paths;
 mod project;
+// Task 4 wires `saiife audit --report`; until then nothing calls it.
+#[allow(dead_code)]
+mod report;
 mod status_cmd;
 mod text;
 
