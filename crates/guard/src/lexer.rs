@@ -267,7 +267,6 @@ const ARITH_TOO_LONG: &str = "arithmetic too long to judge";
 /// a `$(…)` body frame itself (`sub` or `body_top`) end at a `delim…)`
 /// line; a here-document read as commands, or a backtick body, is a fresh
 /// shell text where only an exact delimiter line ends one.
-#[allow(unused_assignments)] // the final flush_word!() sets state that is never read again
 fn lex_in(
     chars: &mut Chars,
     ctx: &mut Ctx,
@@ -276,387 +275,504 @@ fn lex_in(
     flat_arith: bool,
     body_top: bool,
 ) -> Frame {
-    let mut toks: Vec<LexTok> = Vec::new();
-    // Open `(` operators of this frame; in a `$(…)` frame, a `)` with
-    // none open closes the substitution.
-    let mut parens = 0usize;
-    let mut closed = false;
-    // End (in `word_text`) of a double-quoted region that was exactly one
-    // substitution and the word's first piece: `"$(…)"`.
-    let mut dq_sub_end: Option<usize> = None;
-
-    let mut word_text = String::new();
-    let mut word_has_sub = false;
-    let mut in_word = false;
-    // The word so far has a quoted or escaped piece (so `"2">f` is the
-    // word `2`, not descriptor 2), or an unquoted glob character.
-    let mut word_quoted = false;
-    let mut word_glob = false;
-    // The first unquoted `=` decides whether the word is an assignment.
-    let mut word_eq_seen = false;
-    let mut word_assignment = false;
-    // Inside the `[…]` subscript of a would-be `NAME[…]=` assignment:
-    // quotes, substitutions and `=` there do not decide anything.
-    let mut subscript_depth = 0usize;
-    let mut word_subscripted = false;
-    // Byte offsets in `word_text` of the word's unquoted brace-expansion
-    // `{`, `,` and `}`: only these separate alternatives (`{".env",x}`,
-    // `{a\,b,c}`, `"{a,b}"` behave as in bash).
-    let mut brace_marks: Vec<usize> = Vec::new();
-    // Unquoted `{` of this word not yet closed.
-    let mut brace_depth = 0usize;
-    // Here-documents: the next word is a delimiter (`Some(strip_tabs)` after
-    // `<<`/`<<-`), and the delimiters whose bodies start after this line.
-    let mut expect_delim: Option<bool> = None;
-    let mut pending_docs: Vec<PendingDoc> = Vec::new();
-    // Between `[[` and `]]`, `<` and `>` compare strings.
-    let mut in_test = false;
-    // Inside a `((` whose look-ahead was cut off (lexed as the subshells
-    // it may be), while `parens` is above this level: it may be
-    // arithmetic, where `<<` is a shift, so `<<` opens no here-document.
-    let mut no_docs_above: Option<usize> = flat_arith.then_some(0);
-    // `case WORD in`: open `case` commands, whether the next word is the
-    // `in`, and whether a pattern is being read (after `in`, `;;`, `;&`,
-    // `;;&`), whose `)` ends the pattern and never closes a `$(…)`.
-    let mut case_depth = 0usize;
-    let mut case_await_in = false;
-    let mut case_pattern = false;
-
-    // Flush the in-progress word (if any) as a completed token.
-    macro_rules! flush_word {
-        () => {
-            if in_word {
-                let dq_substitution = dq_sub_end == Some(word_text.len());
-                let word = Word {
-                    text: std::mem::take(&mut word_text),
-                    has_substitution: word_has_sub,
-                    redirect: false,
-                    glob: word_glob,
-                    assignment: word_assignment,
-                    brace_overflow: false,
-                    quoted: word_quoted,
-                    dq_substitution,
-                };
-                // Brace expansion happens before anything else looks at
-                // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
-                // the word stays as written, flagged for the engine.
-                if let Some(strip_tabs) = expect_delim.take() {
-                    pending_docs.push(PendingDoc {
-                        delim: word.text.clone(),
-                        strip_tabs,
-                        // `<<'EOF'`, `<<"EOF"`, `<<\EOF`: no expansion.
-                        quoted: word_quoted,
-                        op: toks.len().saturating_sub(1),
-                        commands: None,
-                    });
-                }
-                if !word_quoted {
-                    match word.text.as_str() {
-                        "case" if starts_a_command(&current_segment(&toks)) => {
-                            case_depth += 1;
-                            case_await_in = true;
-                        }
-                        "in" if case_await_in => {
-                            case_await_in = false;
-                            case_pattern = true;
-                        }
-                        "esac"
-                            if case_depth > 0
-                                && (case_pattern || starts_a_command(&current_segment(&toks))) =>
-                        {
-                            case_depth -= 1;
-                            case_pattern = false;
-                        }
-                        _ => {}
-                    }
-                }
-                if !word_quoted && word.text == "[[" {
-                    // A reserved word only where a command starts: first,
-                    // or after reserved words that start one (`if`, `!`,
-                    // `time`, …). `echo [[`, `env [[`, `sudo [[` and (as
-                    // in bash) `FOO=1 [[` are a command and its arguments.
-                    in_test = starts_a_command(&current_segment(&toks));
-                } else if !word_quoted && word.text == "]]" {
-                    in_test = false;
-                }
-                if brace_marks.is_empty() {
-                    toks.push(LexTok::Word(word));
-                } else {
-                    match crate::canon::expand_marked(&word.text, &brace_marks) {
-                        Some(words) => toks.extend(words.into_iter().map(|text| {
-                            LexTok::Word(Word {
-                                text,
-                                ..word.clone()
-                            })
-                        })),
-                        None => toks.push(LexTok::Word(Word {
-                            brace_overflow: true,
-                            ..word
-                        })),
-                    }
-                }
-                brace_marks.clear();
-                brace_depth = 0;
-                dq_sub_end = None;
-                in_word = false;
-                word_has_sub = false;
-                word_quoted = false;
-                word_glob = false;
-                word_eq_seen = false;
-                word_assignment = false;
-                subscript_depth = 0;
-                word_subscripted = false;
-            }
-        };
+    let mut lx = Lexer {
+        chars,
+        ctx,
+        depth,
+        sub,
+        flat_arith,
+        body_top,
+        toks: Vec::new(),
+        parens: 0,
+        closed: false,
+        word: WordState::default(),
+        expect_delim: None,
+        pending_docs: Vec::new(),
+        in_test: false,
+        no_docs_above: flat_arith.then_some(0),
+        case_depth: 0,
+        case_await_in: false,
+        case_pattern: false,
+    };
+    while let Some(c) = lx.chars.next() {
+        if !lx.step(c) {
+            break;
+        }
     }
+    lx.finish()
+}
 
-    while let Some(c) = chars.next() {
+/// The word being read by a lexer frame.
+#[derive(Default)]
+struct WordState {
+    text: String,
+    has_sub: bool,
+    /// A word is in progress (possibly still empty, as after `""`).
+    in_word: bool,
+    /// The word so far has a quoted or escaped piece (so `"2">f` is the
+    /// word `2`, not descriptor 2).
+    quoted: bool,
+    /// The word so far has an unquoted glob character.
+    glob: bool,
+    /// The first unquoted `=` decides whether the word is an assignment.
+    eq_seen: bool,
+    assignment: bool,
+    /// Inside the `[…]` subscript of a would-be `NAME[…]=` assignment:
+    /// quotes, substitutions and `=` there do not decide anything.
+    subscript_depth: usize,
+    subscripted: bool,
+    /// Byte offsets in `text` of the word's unquoted brace-expansion
+    /// `{`, `,` and `}`: only these separate alternatives (`{".env",x}`,
+    /// `{a\,b,c}`, `"{a,b}"` behave as in bash).
+    brace_marks: Vec<usize>,
+    /// Unquoted `{` of this word not yet closed.
+    brace_depth: usize,
+    /// End (in `text`) of a double-quoted region that was exactly one
+    /// substitution and the word's first piece: `"$(…)"`.
+    dq_sub_end: Option<usize>,
+}
+
+/// The state of one lexer frame (see `lex_in`). Each token-class helper
+/// returns whether the main loop continues.
+struct Lexer<'s, 'c> {
+    chars: &'s mut Chars<'c>,
+    ctx: &'s mut Ctx,
+    depth: usize,
+    sub: bool,
+    flat_arith: bool,
+    body_top: bool,
+    toks: Vec<LexTok>,
+    /// Open `(` operators of this frame; in a `$(…)` frame, a `)` with
+    /// none open closes the substitution.
+    parens: usize,
+    closed: bool,
+    word: WordState,
+    /// Here-documents: the next word is a delimiter (`Some(strip_tabs)`
+    /// after `<<`/`<<-`), and the delimiters whose bodies start after
+    /// this line.
+    expect_delim: Option<bool>,
+    pending_docs: Vec<PendingDoc>,
+    /// Between `[[` and `]]`, `<` and `>` compare strings.
+    in_test: bool,
+    /// Inside a `((` whose look-ahead was cut off (lexed as the subshells
+    /// it may be), while `parens` is above this level: it may be
+    /// arithmetic, where `<<` is a shift, so `<<` opens no here-document.
+    no_docs_above: Option<usize>,
+    /// `case WORD in`: open `case` commands, whether the next word is the
+    /// `in`, and whether a pattern is being read (after `in`, `;;`, `;&`,
+    /// `;;&`), whose `)` ends the pattern and never closes a `$(…)`.
+    case_depth: usize,
+    case_await_in: bool,
+    case_pattern: bool,
+}
+
+impl Lexer<'_, '_> {
+    /// Lex one character `c` (already consumed) by its token class.
+    fn step(&mut self, c: char) -> bool {
         // A list or pipeline operator ends a `[[ … ]]` test.
-        if in_test && matches!(toks.last(), Some(LexTok::Operator(_))) {
-            in_test = false;
+        if self.in_test && matches!(self.toks.last(), Some(LexTok::Operator(_))) {
+            self.in_test = false;
         }
         match c {
-            ' ' | '\t' | '\r' => flush_word!(),
-            '\n' => {
-                flush_word!();
-                toks.push(LexTok::Operator(Operator::Newline));
-                for doc in std::mem::take(&mut pending_docs) {
-                    // The body is commands when a shell in its pipeline
-                    // reads it (or that cannot be known); otherwise data,
-                    // whose `$(…)`/backticks still run unless the delimiter
-                    // was quoted.
-                    let body =
-                        read_heredoc(chars, &doc.delim, doc.strip_tabs, sub || body_top, body_top);
-                    let commands = doc
-                        .commands
-                        .unwrap_or_else(|| body_is_commands(&toks, doc.op));
-                    if commands && depth + 1 >= MAX_FRAME_DEPTH {
-                        ctx.note(TOO_DEEP);
-                    } else if commands {
-                        let inner =
-                            lex_in(&mut Chars::new(&body), ctx, depth + 1, false, false, false);
-                        toks.extend(inner.toks);
-                        toks.push(LexTok::Operator(Operator::Newline));
-                    } else if !doc.quoted {
-                        for inner in find_subs(&body, ctx, depth) {
-                            toks.push(LexTok::Word(Word {
-                                text: format!("$({inner})"),
-                                has_substitution: true,
-                                ..Word::default()
-                            }));
-                            toks.push(LexTok::Operator(Operator::Newline));
-                        }
-                    }
-                }
+            ' ' | '\t' | '\r' | '\n' | '|' | ';' => self.operator(c),
+            '&' if self.chars.peek() == Some('>') => self.redirection(c),
+            '&' => self.operator(c),
+            '<' | '>' => self.redirection(c),
+            '(' | ')' | '{' | '}' | ',' => self.grouping(c),
+            '\'' | '"' | '\\' => self.quote(c),
+            '$' | '`' => self.dollar(c),
+            '#' => self.comment(c),
+            other => self.word_char(other),
+        }
+    }
+
+    /// Flush the in-progress word (if any) as a completed token.
+    fn flush_word(&mut self) {
+        if !self.word.in_word {
+            return;
+        }
+        let w = std::mem::take(&mut self.word);
+        let dq_substitution = w.dq_sub_end == Some(w.text.len());
+        let word = Word {
+            text: w.text,
+            has_substitution: w.has_sub,
+            redirect: false,
+            glob: w.glob,
+            assignment: w.assignment,
+            brace_overflow: false,
+            quoted: w.quoted,
+            dq_substitution,
+        };
+        // Brace expansion happens before anything else looks at
+        // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
+        // the word stays as written, flagged for the engine.
+        if let Some(strip_tabs) = self.expect_delim.take() {
+            self.pending_docs.push(PendingDoc {
+                delim: word.text.clone(),
+                strip_tabs,
+                // `<<'EOF'`, `<<"EOF"`, `<<\EOF`: no expansion.
+                quoted: w.quoted,
+                op: self.toks.len().saturating_sub(1),
+                commands: None,
+            });
+        }
+        if !w.quoted {
+            self.keyword(&word.text);
+        }
+        if w.brace_marks.is_empty() {
+            self.toks.push(LexTok::Word(word));
+        } else {
+            match crate::canon::expand_marked(&word.text, &w.brace_marks) {
+                Some(words) => self.toks.extend(words.into_iter().map(|text| {
+                    LexTok::Word(Word {
+                        text,
+                        ..word.clone()
+                    })
+                })),
+                None => self.toks.push(LexTok::Word(Word {
+                    brace_overflow: true,
+                    ..word
+                })),
             }
-            '&' if chars.peek() == Some('>') => {
-                // `&>f` / `&>>f`: stdout and stderr to a file.
-                flush_word!();
-                chars.next();
-                let mut op = String::from("&>");
-                if chars.peek() == Some('>') {
-                    chars.next();
-                    op.push('>');
-                }
-                toks.push(redirect_tok(op));
+        }
+    }
+
+    /// An unquoted word just completed: track `case … in … esac` and
+    /// `[[ … ]]`.
+    fn keyword(&mut self, text: &str) {
+        match text {
+            "case" if starts_a_command(&current_segment(&self.toks)) => {
+                self.case_depth += 1;
+                self.case_await_in = true;
             }
-            // `[[ a < b ]]` compares strings.
-            '<' | '>' if in_test => {
-                in_word = true;
-                word_text.push(c);
+            "in" if self.case_await_in => {
+                self.case_await_in = false;
+                self.case_pattern = true;
             }
-            '<' | '>' if chars.peek() == Some('(') => {
-                // Process substitution `<(cmd)` / `>(cmd)`: not a file; its
-                // `(` opens its own segment (never arithmetic: `<((x))`).
-                flush_word!();
-                chars.next();
-                parens += 1;
-                toks.push(LexTok::Operator(Operator::LParen));
+            "esac"
+                if self.case_depth > 0
+                    && (self.case_pattern || starts_a_command(&current_segment(&self.toks))) =>
+            {
+                self.case_depth -= 1;
+                self.case_pattern = false;
             }
-            '<' | '>' => {
-                // A word of bare digits right before the operator is its
-                // descriptor (`2>f`); anything else ends the word (`x>f`).
-                let fd = in_word
-                    && !word_quoted
-                    && !word_has_sub
-                    && word_text.bytes().all(|b| b.is_ascii_digit());
-                let mut op = if fd {
-                    in_word = false;
-                    word_glob = false;
-                    std::mem::take(&mut word_text)
-                } else {
-                    flush_word!();
-                    String::new()
-                };
-                op.push(c);
-                scan_redirection(chars, c, &mut op);
-                let docs_allowed = no_docs_above.is_none_or(|b| parens <= b);
-                match op.trim_start_matches(|c: char| c.is_ascii_digit()) {
-                    "<<" if docs_allowed => expect_delim = Some(false),
-                    "<<-" if docs_allowed => expect_delim = Some(true),
-                    _ => {}
-                }
-                toks.push(redirect_tok(op));
-            }
+            _ => {}
+        }
+        if text == "[[" {
+            // A reserved word only where a command starts: first,
+            // or after reserved words that start one (`if`, `!`,
+            // `time`, …). `echo [[`, `env [[`, `sudo [[` and (as
+            // in bash) `FOO=1 [[` are a command and its arguments.
+            self.in_test = starts_a_command(&current_segment(&self.toks));
+        } else if text == "]]" {
+            self.in_test = false;
+        }
+    }
+
+    /// Blanks, newlines and the list/pipeline operators `&&`, `&`, `||`,
+    /// `|`, `;`.
+    fn operator(&mut self, c: char) -> bool {
+        match c {
+            ' ' | '\t' | '\r' => self.flush_word(),
+            '\n' => self.newline(),
             '&' => {
-                if chars.peek() == Some('&') {
-                    chars.next();
-                    flush_word!();
-                    toks.push(LexTok::Operator(Operator::AndAnd));
+                if self.chars.peek() == Some('&') {
+                    self.chars.next();
+                    self.flush_word();
+                    self.toks.push(LexTok::Operator(Operator::AndAnd));
                 } else {
-                    flush_word!();
-                    toks.push(LexTok::Operator(Operator::Amp));
+                    self.flush_word();
+                    self.toks.push(LexTok::Operator(Operator::Amp));
                 }
             }
             '|' => {
-                if chars.peek() == Some('|') {
-                    chars.next();
-                    flush_word!();
-                    toks.push(LexTok::Operator(Operator::OrOr));
+                if self.chars.peek() == Some('|') {
+                    self.chars.next();
+                    self.flush_word();
+                    self.toks.push(LexTok::Operator(Operator::OrOr));
                 } else {
-                    flush_word!();
-                    toks.push(LexTok::Operator(Operator::Pipe));
+                    self.flush_word();
+                    self.toks.push(LexTok::Operator(Operator::Pipe));
                 }
             }
-            ';' => {
-                flush_word!();
+            _ => {
+                self.flush_word();
                 // `;;`, `;&`, `;;&` end a case arm: a pattern follows.
-                if case_depth > 0 && matches!(chars.peek(), Some(';' | '&')) {
-                    case_pattern = true;
+                if self.case_depth > 0 && matches!(self.chars.peek(), Some(';' | '&')) {
+                    self.case_pattern = true;
                 }
-                toks.push(LexTok::Operator(Operator::Semi));
+                self.toks.push(LexTok::Operator(Operator::Semi));
             }
-            // `(( … ))`: arithmetic, where `<<` is a shift. One opaque word;
-            // substitutions inside it are still found and judged.
-            // Only with a real closing `))`; otherwise, as in bash, two
-            // nested subshells: `((cat .env); true)`.
-            '(' if !in_word && chars.peek() == Some('(') => {
-                chars.next();
-                // Look ahead (bounded) for the real `))`; the subshell
-                // case is then lexed inline, sharing here-doc and test
-                // state with the rest of the line.
-                match arith_lookahead(chars, ctx, depth) {
-                    Arith::Closes(len, docs) => {
-                        // Here-documents opened in its substitutions are
-                        // read after this line, as in bash.
-                        pending_docs.extend(docs);
-                        let body = &chars.rest()[..len - 2];
-                        chars.skip_bytes(len);
-                        in_word = true;
-                        word_has_sub |= body.contains("$(") || body.contains('`');
-                        word_text.push_str("((");
-                        word_text.push_str(body);
-                        word_text.push_str("))");
-                        flush_word!();
-                    }
-                    other => {
-                        // Too long to tell: judged as the subshells it may
-                        // be, and recorded.
-                        if other == Arith::TooLong {
-                            ctx.note(ARITH_TOO_LONG);
-                            no_docs_above.get_or_insert(parens);
-                        }
-                        parens += 2;
-                        toks.push(LexTok::Operator(Operator::LParen));
-                        toks.push(LexTok::Operator(Operator::LParen));
-                    }
+        }
+        true
+    }
+
+    /// A newline ends the segment; the bodies of the here-documents
+    /// opened on the line follow it.
+    fn newline(&mut self) {
+        self.flush_word();
+        self.toks.push(LexTok::Operator(Operator::Newline));
+        for doc in std::mem::take(&mut self.pending_docs) {
+            // The body is commands when a shell in its pipeline
+            // reads it (or that cannot be known); otherwise data,
+            // whose `$(…)`/backticks still run unless the delimiter
+            // was quoted.
+            let body = read_heredoc(
+                self.chars,
+                &doc.delim,
+                doc.strip_tabs,
+                self.sub || self.body_top,
+                self.body_top,
+            );
+            let commands = doc
+                .commands
+                .unwrap_or_else(|| body_is_commands(&self.toks, doc.op));
+            if commands && self.depth + 1 >= MAX_FRAME_DEPTH {
+                self.ctx.note(TOO_DEEP);
+            } else if commands {
+                let inner = lex_in(
+                    &mut Chars::new(&body),
+                    self.ctx,
+                    self.depth + 1,
+                    false,
+                    false,
+                    false,
+                );
+                self.toks.extend(inner.toks);
+                self.toks.push(LexTok::Operator(Operator::Newline));
+            } else if !doc.quoted {
+                for inner in find_subs(&body, self.ctx, self.depth) {
+                    self.toks.push(LexTok::Word(Word {
+                        text: format!("$({inner})"),
+                        has_substitution: true,
+                        ..Word::default()
+                    }));
+                    self.toks.push(LexTok::Operator(Operator::Newline));
                 }
             }
+        }
+    }
+
+    /// `&>`, `<`/`>` redirections (and the `<<`/`<<-` that open a
+    /// here-document), process substitution, and `<`/`>` in `[[ … ]]`.
+    fn redirection(&mut self, c: char) -> bool {
+        if c == '&' {
+            // `&>f` / `&>>f`: stdout and stderr to a file.
+            self.flush_word();
+            self.chars.next();
+            let mut op = String::from("&>");
+            if self.chars.peek() == Some('>') {
+                self.chars.next();
+                op.push('>');
+            }
+            self.toks.push(redirect_tok(op));
+        } else if self.in_test {
+            // `[[ a < b ]]` compares strings.
+            self.word.in_word = true;
+            self.word.text.push(c);
+        } else if self.chars.peek() == Some('(') {
+            // Process substitution `<(cmd)` / `>(cmd)`: not a file; its
+            // `(` opens its own segment (never arithmetic: `<((x))`).
+            self.flush_word();
+            self.chars.next();
+            self.parens += 1;
+            self.toks.push(LexTok::Operator(Operator::LParen));
+        } else {
+            // A word of bare digits right before the operator is its
+            // descriptor (`2>f`); anything else ends the word (`x>f`).
+            let w = &mut self.word;
+            let fd =
+                w.in_word && !w.quoted && !w.has_sub && w.text.bytes().all(|b| b.is_ascii_digit());
+            let mut op = if fd {
+                w.in_word = false;
+                w.glob = false;
+                std::mem::take(&mut w.text)
+            } else {
+                self.flush_word();
+                String::new()
+            };
+            op.push(c);
+            scan_redirection(self.chars, c, &mut op);
+            let docs_allowed = self.no_docs_above.is_none_or(|b| self.parens <= b);
+            match op.trim_start_matches(|c: char| c.is_ascii_digit()) {
+                "<<" if docs_allowed => self.expect_delim = Some(false),
+                "<<-" if docs_allowed => self.expect_delim = Some(true),
+                _ => {}
+            }
+            self.toks.push(redirect_tok(op));
+        }
+        true
+    }
+
+    /// `(`, `)`, `{`, `}` as grouping operators, `((…))` arithmetic, and
+    /// the unquoted `{`, `,`, `}` of a brace expansion.
+    fn grouping(&mut self, c: char) -> bool {
+        match c {
+            '(' if !self.word.in_word && self.chars.peek() == Some('(') => self.double_paren(),
             '(' => {
-                flush_word!();
+                self.flush_word();
                 // A pattern's optional leading `(` (`(a) cmd;;`) is not
                 // matched by the `)` that ends the pattern.
-                if !case_pattern {
-                    parens += 1;
+                if !self.case_pattern {
+                    self.parens += 1;
                 }
-                toks.push(LexTok::Operator(Operator::LParen));
+                self.toks.push(LexTok::Operator(Operator::LParen));
             }
-            ')' => {
-                flush_word!();
-                if case_pattern {
-                    case_pattern = false;
-                    toks.push(LexTok::Operator(Operator::RParen));
-                    continue;
-                }
-                if sub && parens == 0 {
-                    closed = true;
-                    break;
-                }
-                parens = parens.saturating_sub(1);
-                if no_docs_above.is_some_and(|b| parens <= b) && !flat_arith {
-                    no_docs_above = None;
-                }
-                toks.push(LexTok::Operator(Operator::RParen));
-            }
+            ')' => return self.close_paren(),
             // `{` alone (followed by a blank or the end) opens a group,
             // like bash's reserved word; otherwise it is part of a word,
             // possibly a brace expansion.
-            '{' if !in_word
-                && chars
+            '{' if !self.word.in_word
+                && self
+                    .chars
                     .peek()
                     .is_none_or(|n| matches!(n, ' ' | '\t' | '\r' | '\n')) =>
             {
-                toks.push(LexTok::Operator(Operator::LBrace));
+                self.toks.push(LexTok::Operator(Operator::LBrace));
             }
             '{' => {
-                in_word = true;
-                brace_depth += 1;
-                brace_marks.push(word_text.len());
-                word_text.push('{');
+                let w = &mut self.word;
+                w.in_word = true;
+                w.brace_depth += 1;
+                w.brace_marks.push(w.text.len());
+                w.text.push('{');
             }
-            ',' if brace_depth > 0 => {
-                brace_marks.push(word_text.len());
-                word_text.push(',');
-            }
-            '}' if brace_depth > 0 => {
-                brace_depth -= 1;
-                brace_marks.push(word_text.len());
-                word_text.push('}');
+            ',' | '}' if self.word.brace_depth > 0 => {
+                let w = &mut self.word;
+                if c == '}' {
+                    w.brace_depth -= 1;
+                }
+                w.brace_marks.push(w.text.len());
+                w.text.push(c);
             }
             // `}` starting a word closes a group; inside a word it is data.
-            '}' if !in_word => {
-                toks.push(LexTok::Operator(Operator::RBrace));
+            '}' if !self.word.in_word => {
+                self.toks.push(LexTok::Operator(Operator::RBrace));
             }
+            other => return self.word_char(other),
+        }
+        true
+    }
+
+    /// `((` at the start of a word: arithmetic, where `<<` is a shift.
+    /// One opaque word; substitutions inside it are still found and
+    /// judged. Only with a real closing `))`; otherwise, as in bash, two
+    /// nested subshells: `((cat .env); true)`.
+    fn double_paren(&mut self) {
+        self.chars.next();
+        // Look ahead (bounded) for the real `))`; the subshell
+        // case is then lexed inline, sharing here-doc and test
+        // state with the rest of the line.
+        match arith_lookahead(self.chars, self.ctx, self.depth) {
+            Arith::Closes(len, docs) => {
+                // Here-documents opened in its substitutions are
+                // read after this line, as in bash.
+                self.pending_docs.extend(docs);
+                let body = &self.chars.rest()[..len - 2];
+                self.chars.skip_bytes(len);
+                let w = &mut self.word;
+                w.in_word = true;
+                w.has_sub |= body.contains("$(") || body.contains('`');
+                w.text.push_str("((");
+                w.text.push_str(body);
+                w.text.push_str("))");
+                self.flush_word();
+            }
+            other => {
+                // Too long to tell: judged as the subshells it may
+                // be, and recorded.
+                if other == Arith::TooLong {
+                    self.ctx.note(ARITH_TOO_LONG);
+                    self.no_docs_above.get_or_insert(self.parens);
+                }
+                self.parens += 2;
+                self.toks.push(LexTok::Operator(Operator::LParen));
+                self.toks.push(LexTok::Operator(Operator::LParen));
+            }
+        }
+    }
+
+    /// `)`: ends a case pattern, closes this `$(…)` frame, or closes a
+    /// subshell.
+    fn close_paren(&mut self) -> bool {
+        self.flush_word();
+        if self.case_pattern {
+            self.case_pattern = false;
+            self.toks.push(LexTok::Operator(Operator::RParen));
+            return true;
+        }
+        if self.sub && self.parens == 0 {
+            self.closed = true;
+            return false;
+        }
+        self.parens = self.parens.saturating_sub(1);
+        if self.no_docs_above.is_some_and(|b| self.parens <= b) && !self.flat_arith {
+            self.no_docs_above = None;
+        }
+        self.toks.push(LexTok::Operator(Operator::RParen));
+        true
+    }
+
+    /// Single quotes, double quotes, and backslash escapes.
+    fn quote(&mut self, c: char) -> bool {
+        let w = &mut self.word;
+        match c {
             '\'' => {
-                in_word = true;
-                word_quoted = true;
-                scan_single_quoted(chars, &mut word_text);
+                w.in_word = true;
+                w.quoted = true;
+                scan_single_quoted(self.chars, &mut w.text);
             }
             '"' => {
-                let first = !in_word;
-                in_word = true;
-                word_quoted = true;
+                let first = !w.in_word;
+                w.in_word = true;
+                w.quoted = true;
                 let only_sub = scan_double_quoted(
-                    chars,
-                    &mut word_text,
-                    &mut word_has_sub,
-                    ctx,
-                    depth,
-                    &mut pending_docs,
+                    self.chars,
+                    &mut w.text,
+                    &mut w.has_sub,
+                    self.ctx,
+                    self.depth,
+                    &mut self.pending_docs,
                 );
                 if first && only_sub {
-                    dq_sub_end = Some(word_text.len());
+                    w.dq_sub_end = Some(w.text.len());
                 }
             }
-            '\\' => {
-                in_word = true;
-                word_quoted = true;
+            _ => {
+                w.in_word = true;
+                w.quoted = true;
                 // Outside quotes, `\<char>` is a literal `<char>` — this is
                 // what keeps `\;` and `\&` from being read as operators. A
                 // trailing backslash with nothing after it is kept literal.
-                match chars.next() {
-                    Some(n) => word_text.push(n),
-                    None => word_text.push('\\'),
+                match self.chars.next() {
+                    Some(n) => w.text.push(n),
+                    None => w.text.push('\\'),
                 }
             }
+        }
+        true
+    }
+
+    /// `$`-forms: `$[…]` and `$(…)` (arithmetic and substitution), `$'…'`
+    /// (ANSI-C), `${…}`, and backtick substitution.
+    fn dollar(&mut self, c: char) -> bool {
+        let w = &mut self.word;
+        match (c, self.chars.peek()) {
+            ('`', _) => {
+                w.in_word = true;
+                w.has_sub = true;
+                w.text.push('`');
+                w.text.push_str(&scan_backtick(self.chars));
+                w.text.push('`');
+            }
             // `$[ … ]`: old-style arithmetic, opaque like `$(( … ))`.
-            '$' if chars.peek() == Some('[') => {
-                chars.next();
-                in_word = true;
-                word_text.push_str("$[");
+            (_, Some('[')) => {
+                self.chars.next();
+                w.in_word = true;
+                w.text.push_str("$[");
                 let mut depth = 1usize;
-                for n in chars.by_ref() {
-                    word_text.push(n);
+                for n in self.chars.by_ref() {
+                    w.text.push(n);
                     match n {
                         '[' => depth += 1,
                         ']' => {
@@ -668,104 +784,125 @@ fn lex_in(
                         _ => {}
                     }
                 }
-                word_has_sub |= word_text.contains("$(") || word_text.contains('`');
+                w.has_sub |= w.text.contains("$(") || w.text.contains('`');
             }
-            // `#` starting a word comments out the rest of the line.
-            '#' if !in_word => {
-                while chars.peek().is_some_and(|n| n != '\n') {
-                    chars.next();
-                }
+            (_, Some('(')) => {
+                self.chars.next(); // consume '('
+                w.in_word = true;
+                w.has_sub = true;
+                w.text.push_str("$(");
+                w.text.push_str(scan_substitution(
+                    self.chars,
+                    self.ctx,
+                    self.depth,
+                    &mut self.pending_docs,
+                ));
+                w.text.push(')');
             }
-            '$' if chars.peek() == Some('(') => {
-                chars.next(); // consume '('
-                in_word = true;
-                word_has_sub = true;
-                word_text.push_str("$(");
-                word_text.push_str(scan_substitution(chars, ctx, depth, &mut pending_docs));
-                word_text.push(')');
+            (_, Some('\'')) => {
+                self.chars.next(); // consume the opening '\''
+                w.in_word = true;
+                w.quoted = true;
+                scan_ansi_c_quoted(self.chars, &mut w.text);
             }
-            '$' if chars.peek() == Some('\'') => {
-                chars.next(); // consume the opening '\''
-                in_word = true;
-                word_quoted = true;
-                scan_ansi_c_quoted(chars, &mut word_text);
-            }
-            '$' if chars.peek() == Some('{') => {
+            (_, Some('{')) => {
                 // `${...}` parameter expansion: not evaluated (no variable
                 // expansion, per the design doc's scope), but its `{`/`}`
                 // are NOT a grouping boundary the way a bare `{`/`}` is —
                 // real bash doesn't treat them as one either, and pack rules
                 // like `\$\{HOME\}` depend on `${HOME}` surviving as one
                 // contiguous literal token.
-                chars.next(); // consume '{'
-                in_word = true;
-                word_text.push_str("${");
-                word_text.push_str(&scan_brace_balanced(chars));
-                word_text.push('}');
+                self.chars.next(); // consume '{'
+                w.in_word = true;
+                w.text.push_str("${");
+                w.text.push_str(&scan_brace_balanced(self.chars));
+                w.text.push('}');
             }
-            '`' => {
-                in_word = true;
-                word_has_sub = true;
-                word_text.push('`');
-                word_text.push_str(&scan_backtick(chars));
-                word_text.push('`');
+            _ => return self.word_char(c),
+        }
+        true
+    }
+
+    /// `#` starting a word comments out the rest of the line.
+    fn comment(&mut self, c: char) -> bool {
+        if self.word.in_word {
+            return self.word_char(c);
+        }
+        while self.chars.peek().is_some_and(|n| n != '\n') {
+            self.chars.next();
+        }
+        true
+    }
+
+    /// Any other character is part of the word: the subscript and `=` of
+    /// an assignment, glob characters, plain text.
+    fn word_char(&mut self, c: char) -> bool {
+        let w = &mut self.word;
+        match c {
+            '[' if w.subscript_depth > 0 => {
+                w.subscript_depth += 1;
+                w.text.push('[');
             }
-            '[' if subscript_depth > 0 => {
-                subscript_depth += 1;
-                word_text.push('[');
-            }
-            ']' if subscript_depth > 0 => {
-                subscript_depth -= 1;
-                word_text.push(']');
-                if subscript_depth == 0 {
+            ']' if w.subscript_depth > 0 => {
+                w.subscript_depth -= 1;
+                w.text.push(']');
+                if w.subscript_depth == 0 {
                     // The name before `[` was unquoted (checked on entry).
-                    word_quoted = false;
-                    word_subscripted = true;
+                    w.quoted = false;
+                    w.subscripted = true;
                 }
             }
-            '[' if in_word
-                && !word_eq_seen
-                && !word_quoted
-                && !word_has_sub
-                && !word_subscripted
-                && is_assignment_name(&word_text) =>
+            '[' if w.in_word
+                && !w.eq_seen
+                && !w.quoted
+                && !w.has_sub
+                && !w.subscripted
+                && is_assignment_name(&w.text) =>
             {
-                subscript_depth = 1;
-                word_glob = true;
-                word_text.push('[');
+                w.subscript_depth = 1;
+                w.glob = true;
+                w.text.push('[');
             }
-            '=' if !word_eq_seen && subscript_depth == 0 => {
-                word_eq_seen = true;
-                word_assignment = in_word
-                    && !word_quoted
-                    && (!word_has_sub || word_subscripted)
-                    && is_assignment_name(&word_text);
-                in_word = true;
-                word_text.push('=');
+            '=' if !w.eq_seen && w.subscript_depth == 0 => {
+                w.eq_seen = true;
+                w.assignment = w.in_word
+                    && !w.quoted
+                    && (!w.has_sub || w.subscripted)
+                    && is_assignment_name(&w.text);
+                w.in_word = true;
+                w.text.push('=');
             }
             other => {
-                in_word = true;
-                word_glob |= matches!(other, '*' | '?' | '[');
-                word_text.push(other);
+                w.in_word = true;
+                w.glob |= matches!(other, '*' | '?' | '[');
+                w.text.push(other);
             }
         }
+        true
     }
-    flush_word!();
-    // Here-documents still waiting for their body leave with the frame,
-    // their consumer decided from this frame's tokens.
-    if !pending_docs.is_empty() {
-        toks.push(LexTok::Operator(Operator::Newline));
-        for doc in &mut pending_docs {
-            if doc.commands.is_none() {
-                doc.commands = Some(body_is_commands(&toks, doc.op));
+
+    /// End of input (or of this `$(…)` frame): flush the last word and
+    /// hand back the tokens.
+    fn finish(mut self) -> Frame {
+        self.flush_word();
+        let mut toks = self.toks;
+        let mut pending_docs = self.pending_docs;
+        // Here-documents still waiting for their body leave with the frame,
+        // their consumer decided from this frame's tokens.
+        if !pending_docs.is_empty() {
+            toks.push(LexTok::Operator(Operator::Newline));
+            for doc in &mut pending_docs {
+                if doc.commands.is_none() {
+                    doc.commands = Some(body_is_commands(&toks, doc.op));
+                }
             }
+            toks.pop();
         }
-        toks.pop();
-    }
-    Frame {
-        toks,
-        pending: pending_docs,
-        closed,
+        Frame {
+            toks,
+            pending: pending_docs,
+            closed: self.closed,
+        }
     }
 }
 
