@@ -179,6 +179,21 @@ pub enum AgentError {
     },
     #[error("{path}: {detail}; saiife did not change it")]
     Layout { path: PathBuf, detail: String },
+    /// The config (or a directory on its way) is a symlink that resolves
+    /// outside the project, so saiife will not touch it.
+    #[error("{path}: it is a symlink to {resolved}, outside the project; saiife only writes inside the project; saiife did not change it")]
+    OutsideProject { path: PathBuf, resolved: PathBuf },
+}
+
+impl AgentError {
+    /// The file this error is about, when it is a symlink out of the
+    /// project (the by-hand cleanup case of `init --off`).
+    pub fn outside_target(&self) -> Option<&Path> {
+        match self {
+            AgentError::OutsideProject { resolved, .. } => Some(resolved),
+            _ => None,
+        }
+    }
 }
 
 /// True when `command` runs `saiife check` (any path to the binary). This is

@@ -58,13 +58,7 @@ pub fn ensure_inside(project: &Path, rel: &str) -> Result<(), AgentError> {
     if resolved.starts_with(&canon_project) {
         return Ok(());
     }
-    Err(AgentError::Layout {
-        path,
-        detail: format!(
-            "it is a symlink to {}, outside the project; saiife only writes inside the project",
-            resolved.display()
-        ),
-    })
+    Err(AgentError::OutsideProject { path, resolved })
 }
 
 /// Write `contents` to `<project>/<rel>` atomically (temp file in the same

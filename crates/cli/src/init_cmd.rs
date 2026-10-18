@@ -159,6 +159,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         sha256: agent.expected_entry(),
                         error: None,
                         off_failed: false,
+                        off_outside: None,
                     },
                 );
                 installed.push(*agent);
@@ -180,6 +181,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         sha256: String::new(),
                         error: Some(e.to_string()),
                         off_failed: false,
+                        off_outside: None,
                     },
                 );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
@@ -308,9 +310,19 @@ pub fn off() -> ExitCode {
         .unwrap_or_default();
     let mut lines = Vec::new();
     // Agents whose hook could not be removed, with the reason.
-    let mut failed_agents: Vec<(Agent, String)> = Vec::new();
+    // (agent, reason, the outside file when the config symlinks out)
+    let mut failed_agents: Vec<(Agent, String, Option<String>)> = Vec::new();
 
     for agent in Agent::ALL {
+        // Only agents saiife hooked (recorded, or a saiife entry in the
+        // config). The config of any other agent is not ours: leave it
+        // alone, whatever it is (an outside or dangling symlink included).
+        let recorded = record
+            .as_ref()
+            .is_some_and(|r| r.hooks.contains_key(agent.name()));
+        if !recorded && !agent.entries(&root).is_ok_and(|e| !e.is_empty()) {
+            continue;
+        }
         let ours = created.iter().any(|c| c == agent.config_rel());
         match agent.remove(&root, ours) {
             Ok(Change::Unchanged) => {}
@@ -327,16 +339,15 @@ pub fn off() -> ExitCode {
             Err(e) => {
                 failed = true;
                 let mut line = format!("  {:<7} FAILED: {e}", agent.name());
-                if let saiife_agents::AgentError::Layout { detail, .. } = &e {
-                    if detail.contains("outside the project") {
-                        line.push_str(
-                            "\n          saiife did not change that file. To finish, remove the \
-                             saiife hook entry (the `saiife check` command) from it by hand.",
-                        );
-                    }
+                let outside = e.outside_target().map(|p| p.display().to_string());
+                if outside.is_some() {
+                    line.push_str(
+                        "\n          saiife did not change that file. To finish, remove the \
+                         saiife hook entry (the `saiife check` command) from it by hand.",
+                    );
                 }
                 lines.push(line);
-                failed_agents.push((agent, e.to_string()));
+                failed_agents.push((agent, e.to_string(), outside));
             }
         }
     }
@@ -387,7 +398,7 @@ pub fn off() -> ExitCode {
         // `status` warns about them and nothing else.
         rec.hooks = failed_agents
             .iter()
-            .map(|(a, e)| {
+            .map(|(a, e, outside)| {
                 (
                     a.name().to_string(),
                     HookRecord {
@@ -395,6 +406,7 @@ pub fn off() -> ExitCode {
                         sha256: String::new(),
                         error: Some(e.clone()),
                         off_failed: true,
+                        off_outside: outside.clone(),
                     },
                 )
             })

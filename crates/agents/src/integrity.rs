@@ -68,6 +68,10 @@ pub struct HookRecord {
     /// may still be in place), not `init` failing to add it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub off_failed: bool,
+    /// With `off_failed`: the config is a symlink to this file outside the
+    /// project, which saiife will not edit; the user removes the hook there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_outside: Option<String>,
 }
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
@@ -169,6 +173,7 @@ mod tests {
                 sha256: "ab".repeat(32),
                 error: None,
                 off_failed: false,
+                off_outside: None,
             },
         );
         Integrity {

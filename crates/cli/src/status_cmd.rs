@@ -91,6 +91,17 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             continue;
         };
         if let (Some(e), true) = (&rec.error, rec.off_failed) {
+            if let Some(target) = &rec.off_outside {
+                problems.push(Problem {
+                    what: format!(
+                        "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it and the saiife hook is still in place."
+                    ),
+                    fix: format!(
+                        "remove the saiife hook entry (the `saiife check` command) from {target} by hand"
+                    ),
+                });
+                continue;
+            }
             problems.push(Problem {
                 what: format!(
                     "`saiife init --off` could not remove its hook from {rel}: {e}. Fix the file's permissions and run `saiife init --off` again."
