@@ -72,7 +72,8 @@ pub fn agent_label(id: &str) -> String {
 }
 
 fn fmt_minute(t: OffsetDateTime) -> String {
-    t.format(MINUTE_FMT)
+    t.to_offset(time::UtcOffset::UTC)
+        .format(MINUTE_FMT)
         .map(|s| format!("{s} UTC"))
         .unwrap_or_default()
 }
@@ -150,19 +151,31 @@ fn project_view(project: &str, packs: &[Pack]) -> ProjectPacksView {
     let path = Path::new(project);
     let found = project_packs(path, packs);
     let own_config = found.root.as_deref().is_some_and(|r| same_dir(r, path));
-    let (enabled, note) = if own_config {
+    let readable = found
+        .root
+        .as_deref()
+        .is_some_and(|r| saiife_agents::config::load(r).is_ok());
+    let (enabled, note) = if own_config && readable {
         (found.enabled, None)
     } else {
-        let msg = if path.exists() {
-            "No saiife config in this folder now; the default packs are shown.".to_string()
+        let msg = if own_config {
+            "The saiife config in this folder could not be read; the default packs are shown."
+        } else if path.exists() {
+            "No saiife config in this folder now; the default packs are shown."
         } else {
-            "This folder no longer exists; the default packs are shown.".to_string()
+            "This folder no longer exists; the default packs are shown."
         };
-        (Vec::new(), Some(msg))
+        (Vec::new(), Some(msg.to_string()))
     };
+    // Default-on packs in built-in order, then enabled opt-ins in built-in order.
     let active = packs
         .iter()
-        .filter(|p| p.default_on || enabled.contains(&p.id))
+        .filter(|p| p.default_on)
+        .chain(
+            packs
+                .iter()
+                .filter(|p| !p.default_on && enabled.contains(&p.id)),
+        )
         .map(pack_view)
         .collect();
     ProjectPacksView {
@@ -401,12 +414,16 @@ mod tests {
         assert_eq!(view.note, None);
         let mut want: Vec<String> = packs
             .iter()
-            .filter(|p| p.default_on || p.id == "db.postgres")
+            .filter(|p| p.default_on)
             .map(|p| p.name.clone())
             .collect();
-        let mut got: Vec<String> = view.packs.iter().map(|p| p.name.clone()).collect();
-        want.sort();
-        got.sort();
+        want.extend(
+            packs
+                .iter()
+                .filter(|p| p.id == "db.postgres")
+                .map(|p| p.name.clone()),
+        );
+        let got: Vec<String> = view.packs.iter().map(|p| p.name.clone()).collect();
         assert_eq!(got, want);
         let secrets = view
             .packs
@@ -480,5 +497,49 @@ mod tests {
         let refs: Vec<&Record> = rs.iter().collect();
         let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
         assert_eq!(r.all_rows[0].input, "<script>alert(1)</script>");
+    }
+
+    #[test]
+    fn broken_config_shows_defaults_with_note() {
+        let (packs, _) = builtin_packs();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".saiife")).unwrap();
+        std::fs::write(dir.path().join(CONFIG_REL), "packs = [\n").unwrap();
+        let rs = [rec(
+            dir.path().to_str().unwrap(),
+            "x",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        )];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(
+            r.packs[0].note.as_deref(),
+            Some(
+                "The saiife config in this folder could not be read; the default packs are shown."
+            )
+        );
+        let n = packs.iter().filter(|p| p.default_on).count();
+        assert_eq!(r.packs[0].packs.len(), n);
+    }
+
+    #[test]
+    fn unknown_pack_id_and_empty_input() {
+        let (packs, _) = builtin_packs();
+        let at = datetime!(2026-10-13 08:00:00 UTC);
+        let rs = [rec("/p", "", DecisionKind::Deny, Some("zzz.unknown"), at)];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(r.all_rows[0].pack, "zzz.unknown");
+        assert_eq!(r.all_rows[0].input, "(no input recorded)");
+    }
+
+    #[test]
+    fn non_utc_times_are_converted() {
+        let (packs, _) = builtin_packs();
+        let now = datetime!(2026-10-18 11:00 +02:00);
+        let r = build(&[], &packs, vec![], None, now);
+        assert_eq!(r.generated, "2026-10-18 09:00 UTC");
     }
 }
