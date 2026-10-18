@@ -99,3 +99,4 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
   - The `--since` error text is duplicated; no test that an ordinary path in a reason stays unmasked; the 16 KB check measures the re-serialized record.
   - The pack loader words a valid-header, broken-rules enabled pack as "failed to load"; `load_active` copies `select_active`'s filter (pinned by a test); warnings show only on shell and file calls (R17).
 - **Plan 5c (release, bench, CI):** `scripts/bench-check.sh` hard-codes `$repo/target/release/saiife` and ignores `CARGO_TARGET_DIR`.
+- **Plan 5b (status wording):** an agent whose earlier `init` failed and whose config sits behind an outside symlink can get the "hook is still in place" text on `--off`, which may be untrue (`status_cmd.rs`).
