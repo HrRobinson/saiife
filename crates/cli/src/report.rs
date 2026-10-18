@@ -31,6 +31,8 @@ pub struct Report {
     pub fail_open_rows: Vec<Row>,
     pub all_rows: Vec<Row>,
     pub packs: Vec<ProjectPacksView>,
+    /// Gaps in the audit trail (unreadable lines or files); set by the caller.
+    pub log_problems: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +241,7 @@ pub fn build(
         fail_open_rows,
         all_rows,
         packs: projects.iter().map(|p| project_view(p, packs)).collect(),
+        log_problems: vec![],
     }
 }
 

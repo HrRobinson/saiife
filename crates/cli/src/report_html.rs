@@ -136,6 +136,12 @@ fn summary(r: &Report) -> String {
         item("Other", r.other.to_string());
     }
     out.push_str("</dl>\n");
+    for problem in &r.log_problems {
+        out.push_str(&format!(
+            "<p class=\"warn\">Warning: {}</p>\n",
+            escape(problem)
+        ));
+    }
     if !r.filters.is_empty() {
         out.push_str(&format!(
             "<p>Filters: {}</p>\n",
@@ -291,7 +297,20 @@ mod tests {
             fail_open_rows: vec![],
             all_rows: vec![],
             packs: vec![],
+            log_problems: vec![],
         }
+    }
+
+    #[test]
+    fn log_problems_show_as_escaped_warnings_or_nothing() {
+        let clean = render(&empty());
+        assert!(!clean.contains("Warning:"));
+        let r = Report {
+            log_problems: vec!["3 <b>lines</b> skipped".into()],
+            ..empty()
+        };
+        let html = render(&r);
+        assert!(html.contains("<p class=\"warn\">Warning: 3 &lt;b&gt;lines&lt;/b&gt; skipped</p>"));
     }
 
     fn full(rows: Vec<Row>) -> Report {

@@ -112,22 +112,35 @@ pub fn write_report(path: &Path, html: &str) -> Result<(), String> {
         _ => {}
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-    let tmp_name = format!(
+    let tmp = path.with_file_name(format!(
         ".{}.saiife-report-{}.tmp",
         name.unwrap_or_default(),
         std::process::id()
-    );
-    let tmp = path.with_file_name(tmp_name);
-    let result = (|| -> std::io::Result<()> {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    ));
+    write_via_temp(path, html, &tmp).map_err(|e| format!("cannot write {shown}: {e}"))
+}
+
+/// Create `tmp` (never an existing path), fill it, rename it over `path`.
+/// The temp file is removed on failure only if this call created it.
+fn write_via_temp(path: &Path, html: &str, tmp: &Path) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Same sensitivity as the 0600 audit log.
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    let result = (|| {
         f.write_all(html.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp, path)
     })();
-    result.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("cannot write {shown}: {e}")
-    })
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }
 
 pub fn run(
@@ -180,7 +193,20 @@ pub fn run(
         if blocked {
             filters.push("only blocked actions".to_string());
         }
-        let html = report_html::render(&report::build(&shown, packs, filters, since, now));
+        let mut model = report::build(&shown, packs, filters, since, now);
+        if all.skipped_lines > 0 {
+            model.log_problems.push(format!(
+                "{} unreadable log lines were skipped; the log may be damaged or edited.",
+                all.skipped_lines
+            ));
+        }
+        if all.unreadable_files > 0 {
+            model.log_problems.push(format!(
+                "{} log files could not be read.",
+                all.unreadable_files
+            ));
+        }
+        let html = report_html::render(&model);
         let path = if target.is_empty() {
             PathBuf::from(default_report_name(now))
         } else {
@@ -194,6 +220,9 @@ pub fn run(
                     abs.display(),
                     shown.len()
                 );
+                for problem in &model.log_problems {
+                    println!("{problem}");
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -238,6 +267,17 @@ mod tests {
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
         )
+    }
+
+    #[test]
+    fn a_planted_temp_file_is_never_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let tmp = d.path().join(".r.html.saiife-report-1.tmp");
+        std::fs::write(&tmp, "planted").unwrap();
+        let target = d.path().join("r.html");
+        assert!(write_via_temp(&target, "x", &tmp).is_err());
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "planted");
+        assert!(!target.exists());
     }
 
     #[test]

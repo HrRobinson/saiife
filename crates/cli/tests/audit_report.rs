@@ -167,6 +167,68 @@ fn overwrites_existing_regular_report() {
 }
 
 #[test]
+fn report_is_mode_0600_even_over_an_existing_0644_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new();
+    s.cmd()
+        .args(["audit", "--report", "a.html"])
+        .assert()
+        .success();
+    let mode = |n: &str| std::fs::metadata(s.path(n)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode("a.html"), 0o600);
+    std::fs::write(s.path("b.html"), "old").unwrap();
+    std::fs::set_permissions(s.path("b.html"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    s.cmd()
+        .args(["audit", "--report", "b.html"])
+        .assert()
+        .success();
+    assert_eq!(mode("b.html"), 0o600);
+}
+
+#[test]
+fn uppercase_extension_is_accepted() {
+    let s = Sandbox::new();
+    s.cmd()
+        .args(["audit", "--report", "R.HTM"])
+        .assert()
+        .success();
+    assert!(s.path("R.HTM").exists());
+}
+
+#[test]
+fn project_and_agent_filter_labels() {
+    let s = Sandbox::new();
+    s.cmd()
+        .args([
+            "audit",
+            "--project",
+            "/home/u/app",
+            "--agent",
+            "codex",
+            "--report",
+            "f.html",
+        ])
+        .assert()
+        .success();
+    assert!(read(&s.path("f.html")).contains("Filters: project: /home/u/app, agent: Codex"));
+}
+
+#[test]
+fn damaged_log_is_reported_in_file_and_stdout() {
+    let s = Sandbox::new();
+    std::fs::write(s.audit.path().join("1999-01.jsonl"), "{\"v\":1,\"ts\":").unwrap();
+    s.cmd()
+        .args(["audit", "--report", "d.html"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 unreadable log lines were skipped; the log may be damaged or edited.",
+        ));
+    assert!(read(&s.path("d.html"))
+        .contains("1 unreadable log lines were skipped; the log may be damaged or edited."));
+}
+
+#[test]
 fn missing_parent_dir_is_an_error() {
     let s = Sandbox::new();
     s.cmd()
@@ -174,6 +236,8 @@ fn missing_parent_dir_is_an_error() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot write"));
+    let tmps = std::fs::read_dir(s.work.path()).unwrap().count();
+    assert_eq!(tmps, 0);
 }
 
 #[test]
