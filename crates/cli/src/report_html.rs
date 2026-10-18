@@ -11,6 +11,7 @@ body{font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;backgrou
 h1{font-size:1.6rem;margin:0 0 4px}
 h2{font-size:1.25rem;margin:32px 0 4px;border-bottom:1px solid var(--line);padding-bottom:4px}
 h3{font-size:1.05rem;margin:20px 0 4px}
+h4{font-size:.95rem;margin:14px 0 2px}
 p.lead,p.note,footer{color:var(--muted)}
 p.lead{margin:0 0 12px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}
@@ -25,7 +26,7 @@ td{word-break:break-word}
 .warn{color:var(--warn);font-weight:600}
 details>summary{cursor:pointer;margin:8px 0;font-weight:600}
 footer{margin-top:40px;border-top:1px solid var(--line);padding-top:8px;font-size:13px}
-@media print{body{max-width:none;padding:0}details:not([open])>*:not(summary){display:block}h2{break-after:avoid}tr{break-inside:avoid}}
+@media print{body{max-width:none;padding:0}h2{break-after:avoid}tr{break-inside:avoid}}
 ";
 
 /// Make text safe for HTML: sanitize control/invisible characters, then
@@ -121,8 +122,15 @@ fn summary(r: &Report) -> String {
     let mut out = String::from("<dl>\n");
     let mut item = |k: &str, v: String| out.push_str(&format!("<dt>{k}</dt><dd>{v}</dd>\n"));
     item("Period", escape(&r.period));
-    item("Projects", escape(&r.projects.join(", ")));
-    item("Agents", escape(&r.agents.join(", ")));
+    let joined = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            escape(&v.join(", "))
+        }
+    };
+    item("Projects", joined(&r.projects));
+    item("Agents", joined(&r.agents));
     item("Decisions", r.total.to_string());
     item(
         "Blocked",
@@ -206,8 +214,13 @@ pub fn render(r: &Report) -> String {
         r.packs.iter().map(project).collect()
     };
     let all = format!(
-        "<details>\n<summary>Show all {} decisions</summary>\n{}</details>\n",
+        "<details>\n<summary>Show all {} {}</summary>\n{}</details>\n",
         r.all_rows.len(),
+        if r.all_rows.len() == 1 {
+            "decision"
+        } else {
+            "decisions"
+        },
         table(
             &[
                 "Time (UTC)",
@@ -391,11 +404,14 @@ mod tests {
             "Protection rules in use",
             "Every decision",
         ] {
-            let i = html[at..].find(h).unwrap_or_else(|| panic!("missing {h}"));
-            at += i + h.len();
+            let tag = format!("<h2>{h}</h2>");
+            let i = html[at..]
+                .find(&tag)
+                .unwrap_or_else(|| panic!("missing or out of order: {tag}"));
+            at += i + tag.len();
         }
         assert!(html.contains("<details>"));
-        assert!(html.contains("<summary>Show all 1 decisions</summary>"));
+        assert!(html.contains("<summary>Show all 1 decision</summary>"));
     }
 
     #[test]
@@ -430,9 +446,31 @@ mod tests {
         let html = render(&full(vec![]));
         assert!(html.contains("2026-10-11 08:14 UTC to 2026-10-18 09:00 UTC"));
         assert!(html.contains("Filters: only blocked actions"));
-        for n in ["41", "7", "3"] {
-            assert!(html.contains(n));
-        }
+        assert!(html.contains("<dd>41</dd>"));
+        assert!(html.contains("<dd><span class=\"bad\">7</span></dd>"));
+        assert!(html.contains("<dd><span class=\"warn\">3</span></dd>"));
+    }
+
+    #[test]
+    fn show_all_is_plural_only_for_many() {
+        let two = render(&full(vec![row("a", "r"), row("b", "r")]));
+        assert!(two.contains("<summary>Show all 2 decisions</summary>"));
+        let none = render(&empty());
+        assert!(none.contains("<summary>Show all 0 decisions</summary>"));
+    }
+
+    #[test]
+    fn empty_projects_and_agents_say_none() {
+        let html = render(&empty());
+        assert!(html.contains("<dt>Projects</dt><dd>none</dd>"));
+        assert!(html.contains("<dt>Agents</dt><dd>none</dd>"));
+    }
+
+    #[test]
+    fn css_styles_h4_and_has_no_dead_print_rule() {
+        let html = render(&empty());
+        assert!(html.contains("\nh4{"));
+        assert!(!html.contains("details:not([open])"));
     }
 
     #[test]

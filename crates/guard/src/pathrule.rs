@@ -5,8 +5,9 @@
 //! Glob syntax (deliberately small):
 //!
 //! - a glob starts with `/`, `~/`, `**/` or a variable (`$HOME`, `$PROJECT`,
-//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`), which stands
-//!   alone or is followed by `/`;
+//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`,
+//!   `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`), which stands alone or is followed
+//!   by `/`;
 //! - `*` matches within one path component, `?` one character of it;
 //! - `**` is a whole component: `**/x` matches `x` in any directory,
 //!   `a/**/b` any depth between, and a trailing `/**` matches the directory

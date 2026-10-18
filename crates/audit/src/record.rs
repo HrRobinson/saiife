@@ -55,8 +55,9 @@ pub struct Record {
 /// The caller-supplied part of a record. `Record::new` adds the timestamp,
 /// version, masking and truncation so no caller can forget them.
 ///
-/// Only `input` is masked. `reason`, `rule` and `project` are written as
-/// given and must never contain command text.
+/// `input` and `reason` are masked (a reason can quote a path with a
+/// token-shaped segment). `rule` and `project` are written as given and must
+/// never contain command text.
 #[derive(Debug, Clone, Copy)]
 pub struct NewRecord<'a> {
     pub agent: &'a str,
@@ -91,7 +92,7 @@ impl Record {
             decision: r.decision,
             pack: r.pack.map(str::to_string),
             rule: r.rule.map(str::to_string),
-            reason: r.reason.map(str::to_string),
+            reason: r.reason.map(mask),
             saiife: saiife_version.to_string(),
         }
     }
@@ -163,6 +164,18 @@ mod tests {
         let tok = format!("ghp_{}", "a".repeat(36));
         let r = Record::new(base(&format!("echo {tok}")), "0.1.0");
         assert_eq!(r.input, "echo [MASKED]");
+    }
+
+    #[test]
+    fn unjudgeable_reason_is_masked() {
+        let tok = format!("ghp_{}", "a".repeat(36));
+        let mut nr = base("x");
+        let reason = format!("cannot judge /home/u/{tok}/f");
+        nr.reason = Some(&reason);
+        let r = Record::new(nr, "0.1.0");
+        let got = r.reason.unwrap();
+        assert!(!got.contains(&tok), "{got}");
+        assert!(got.contains("[MASKED]"), "{got}");
     }
 
     #[test]

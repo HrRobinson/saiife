@@ -105,6 +105,18 @@ fn bad_since_exits_2() {
 }
 
 #[test]
+fn since_overflow_exits_2_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["audit", "--since", "99999999999d"])
+        .env(DIR_ENV, dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --since"));
+}
+
+#[test]
 fn invalid_utf8_does_not_hide_a_month_and_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());

@@ -36,7 +36,7 @@ fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// month path fails instead of blocking or redirecting the write), and
 /// anything that is not a regular file is refused.
 pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -52,6 +52,19 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     let mut line = serde_json::to_string(rec).map_err(io::Error::other)?;
     line.push('\n');
     file.write_all(line.as_bytes())
+}
+
+/// `create_dir_all`, with owner-only (0700) permissions on unix for the
+/// directories it creates: the log reveals what people work on.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
 }
 
 /// What `read_all` found: the parseable records plus how much it had to skip,
@@ -397,6 +410,23 @@ mod tests {
         let got = read_all(&file);
         assert!(got.records.is_empty());
         assert!(got.dir_error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("a").join("audit");
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&dir, &r).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[cfg(unix)]

@@ -156,7 +156,7 @@ fn project_view(project: &str, packs: &[Pack]) -> ProjectPacksView {
     // Same nearest-parent lookup as the guard (`check`, `status`). An empty
     // project never resolves against the reader's working directory, and a
     // folder that is gone is not walked upward.
-    let (enabled, note) = if project.is_empty() {
+    let (enabled, note) = if project.is_empty() || path.is_relative() {
         (
             Vec::new(),
             Some("Unknown project folder; the default packs are shown.".to_string()),
@@ -171,14 +171,16 @@ fn project_view(project: &str, packs: &[Pack]) -> ProjectPacksView {
         match found.root.as_deref() {
             None => (
                 Vec::new(),
-                Some("No saiife config in this folder now; the default packs are shown.".to_string()),
+                Some(
+                    "No saiife config in this folder now; the default packs are shown.".to_string(),
+                ),
             ),
             Some(root) if saiife_agents::config::load(root).is_err() => (
                 Vec::new(),
-                Some(
-                    "The saiife config in this folder could not be read; the default packs are shown."
-                        .to_string(),
-                ),
+                Some(format!(
+                    "The saiife config in {} could not be read; the default packs are shown.",
+                    root.display()
+                )),
             ),
             Some(root) if same_dir(root, path) => (found.enabled, None),
             Some(root) => (
@@ -563,6 +565,24 @@ mod tests {
     }
 
     #[test]
+    fn relative_project_is_treated_like_an_empty_one() {
+        let (packs, _) = builtin_packs();
+        let rs = [rec(
+            "some/relative",
+            "x",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        )];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(
+            r.packs[0].note.as_deref(),
+            Some("Unknown project folder; the default packs are shown.")
+        );
+    }
+
+    #[test]
     fn hostile_text_is_inert() {
         let (packs, _) = builtin_packs();
         let rs = [rec(
@@ -595,7 +615,11 @@ mod tests {
         assert_eq!(
             r.packs[0].note.as_deref(),
             Some(
-                "The saiife config in this folder could not be read; the default packs are shown."
+                format!(
+                    "The saiife config in {} could not be read; the default packs are shown.",
+                    dir.path().display()
+                )
+                .as_str()
             )
         );
         let n = packs.iter().filter(|p| p.default_on).count();

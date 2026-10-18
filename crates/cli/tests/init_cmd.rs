@@ -342,7 +342,6 @@ fn partial_off_keeps_record_for_failed_agent() {
     let st = env.saiife(&["status"]);
     let text = stdout(&st);
     assert_eq!(code(&st), 1, "{text}");
-    eprintln!("SECOND STATUS:\n{text}");
     assert!(
         text.contains("`saiife init --off` could not remove its hook from .claude/settings.json: "),
         "{text}"

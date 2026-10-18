@@ -256,6 +256,19 @@ fn damaged_log_is_reported_in_file_and_stdout() {
 }
 
 #[test]
+fn unreadable_log_files_are_counted_in_file_and_stdout() {
+    let s = Sandbox::new();
+    // A directory where a month file should be: listed, but not readable.
+    std::fs::create_dir(s.audit.path().join("1999-02.jsonl")).unwrap();
+    s.cmd()
+        .args(["audit", "--report", "u.html"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 log files could not be read."));
+    assert!(read(&s.path("u.html")).contains("1 log files could not be read."));
+}
+
+#[test]
 fn missing_parent_dir_is_an_error() {
     let s = Sandbox::new();
     s.cmd()
