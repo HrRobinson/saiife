@@ -1,9 +1,11 @@
 //! Differential check: the guard's here-document handling versus the shells
-//! actually installed. For each case, "the shell ran the marker command" must
-//! equal "the engine denies the line". The marker is a harmless `touch ran`
-//! executed with a tempdir as the working directory.
+//! actually installed. Every shell must satisfy "no bypass": if it ran the
+//! marker command, the engine must deny the line. For bash (any version),
+//! exact agreement is required too: ran == denied. For other shells an
+//! over-deny (engine denies, shell did not run the marker) is tolerated only
+//! for the cases in `KNOWN_NON_BASH_OVER_DENIES`. The marker is a harmless
+//! `touch ran` executed with a tempdir as the working directory.
 
-use std::path::Path;
 use std::process::Command;
 
 use saiifeguard::engine::{Decision, Engine};
@@ -71,18 +73,27 @@ fn cases() -> Vec<String> {
 }
 
 fn candidate_shells() -> Vec<String> {
-    let mut out: Vec<String> = ["/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/zsh"]
-        .iter()
-        .filter(|p| Path::new(p).exists())
-        .map(|p| p.to_string())
-        .collect();
-    // `bash` on PATH, resolved to a path.
+    let mut paths: Vec<std::path::PathBuf> = [
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+    ]
+    .iter()
+    .map(std::path::PathBuf::from)
+    .collect();
+    // `bash` on PATH.
     if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("bash");
-            if p.is_file() {
+        paths.extend(std::env::split_paths(&path).map(|d| d.join("bash")));
+    }
+    // One run per real binary.
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for p in paths {
+        if let Ok(real) = p.canonicalize() {
+            if real.is_file() && seen.insert(real) {
                 out.push(p.to_string_lossy().into_owned());
-                break;
             }
         }
     }
@@ -117,12 +128,15 @@ fn heredoc_matches_installed_shells() {
         let is_bash = version.contains("bash");
         for (n, case) in cases().into_iter().enumerate() {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let _ = Command::new(shell)
+            if let Err(err) = Command::new(shell)
                 .arg("-c")
                 .arg(&case)
                 .current_dir(tmp.path())
                 .output()
-                .expect("shell runs");
+            {
+                println!("note: {shell} cannot be executed ({err}); skipped");
+                break;
+            }
             let ran = tmp.path().join("ran").exists();
             let denied = matches!(e.evaluate(&case), Decision::Deny { .. });
             if ran && !denied {
@@ -136,8 +150,13 @@ fn heredoc_matches_installed_shells() {
                         "{shell} ({version}): bash over-deny\n  case: {case:?}"
                     ));
                 } else {
-                    let known = KNOWN_NON_BASH_OVER_DENIES.contains(&case.as_str());
-                    println!("note: {shell} over-denies case {n} (known: {known}): {case:?}");
+                    if KNOWN_NON_BASH_OVER_DENIES.contains(&case.as_str()) {
+                        println!("note: {shell} over-denies case {n}: {case:?}");
+                    } else {
+                        failures.push(format!(
+                            "{shell} ({version}): unlisted non-bash over-deny\n  case: {case:?}"
+                        ));
+                    }
                 }
             }
         }
