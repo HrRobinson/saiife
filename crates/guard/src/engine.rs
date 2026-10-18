@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexSet};
@@ -29,7 +30,7 @@ use crate::lexer::{
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
-use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
+use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
@@ -104,8 +105,11 @@ pub struct Engine {
     guarded_commands: HashSet<String>,
     /// Directories paths are resolved against and rule variables bound to.
     vars: PathVars,
-    /// Each pack's path rules, bound to `vars`.
-    path_rules: Vec<PackPaths>,
+    /// Each pack's path rules, bound to `vars` on first use (compiling the
+    /// globs is a large part of a hook call's fixed cost).
+    path_rules: OnceLock<Vec<PackPaths>>,
+    /// Some active pack has `deny_path` rules: `path_rules` is not empty.
+    has_path_rules: bool,
 }
 
 /// One pack's path rules with their globs compiled for this machine.
@@ -119,13 +123,28 @@ struct PackPaths {
     deny_set: Option<RegexSet>,
 }
 
-fn rule_set(rules: &[BoundPathRule]) -> Option<RegexSet> {
-    RegexSet::new(rules.iter().map(|r| r.regex.as_str())).ok()
+/// `rules` with their automaton. Each regex is compiled on its own only if
+/// the set does not compile; then a rule whose regex does not compile is
+/// dropped.
+fn rule_set(mut rules: Vec<BoundPathRule>) -> (Vec<BoundPathRule>, Option<RegexSet>) {
+    match RegexSet::new(rules.iter().map(|r| r.source.as_str())) {
+        Ok(set) => (rules, Some(set)),
+        Err(_) => {
+            rules.retain_mut(|r| {
+                r.regex = Regex::new(&r.source).ok();
+                r.regex.is_some()
+            });
+            (rules, None)
+        }
+    }
 }
 
 struct BoundPathRule {
     glob: String,
-    regex: Regex,
+    /// The glob as a regex over canonical paths.
+    source: String,
+    /// `source` compiled; only when the list has no `RegexSet`.
+    regex: Option<Regex>,
     access: RuleAccess,
     reason: String,
 }
@@ -145,16 +164,15 @@ impl Engine {
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
             .collect();
-        let mut engine = Self {
+        Self {
             combined: Prefilter::new(triggers),
+            has_path_rules: packs.iter().any(|p| !p.deny_path.is_empty()),
             packs,
             budget: DEFAULT_BUDGET,
             guarded_commands,
             vars: PathVars::default(),
-            path_rules: Vec::new(),
-        };
-        engine.bind_paths();
-        engine
+            path_rules: OnceLock::new(),
+        }
     }
 
     /// Resolve paths against these directories and bind the path rules'
@@ -162,48 +180,53 @@ impl Engine {
     /// without variables apply and relative paths cannot be judged.
     pub fn with_paths(mut self, vars: PathVars) -> Self {
         self.vars = vars;
-        self.bind_paths();
+        self.path_rules = OnceLock::new();
         self
     }
 
-    fn bind_paths(&mut self) {
+    /// The path rules bound to `vars`. Called before an evaluation starts
+    /// its latency clock, so binding never spends the budget.
+    fn path_rules(&self) -> &[PackPaths] {
+        self.path_rules.get_or_init(|| self.bind_paths())
+    }
+
+    fn bind_paths(&self) -> Vec<PackPaths> {
         let bind = |rules: &[crate::pathrule::PathRule]| -> Vec<BoundPathRule> {
             rules
                 .iter()
                 .filter_map(|r| {
                     // Globs were validated at load; a rule whose variable
                     // has no value on this machine cannot apply.
-                    let compiled = if r.ancestors {
-                        compile_ancestors(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                    let source = if r.ancestors {
+                        ancestors_source(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
                     } else {
-                        compile_glob(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                        glob_source(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
                     };
-                    let regex = compiled.ok().flatten()?;
                     Some(BoundPathRule {
                         glob: r.glob.clone(),
-                        regex,
+                        source: source.ok().flatten()?,
+                        regex: None,
                         access: r.access,
                         reason: r.reason.clone(),
                     })
                 })
                 .collect()
         };
-        self.path_rules = self
-            .packs
+        self.packs
             .iter()
             .filter(|p| !p.deny_path.is_empty())
             .map(|p| {
-                let allow = bind(&p.allow_path);
-                let deny = bind(&p.deny_path);
+                let (allow, allow_set) = rule_set(bind(&p.allow_path));
+                let (deny, deny_set) = rule_set(bind(&p.deny_path));
                 PackPaths {
                     pack: p.id.clone(),
-                    allow_set: rule_set(&allow),
-                    deny_set: rule_set(&deny),
                     allow,
                     deny,
+                    allow_set,
+                    deny_set,
                 }
             })
-            .collect();
+            .collect()
     }
 
     /// `path` as the path rules see it: absolute, symlinks and `..`
@@ -215,6 +238,7 @@ impl Engine {
     /// Judge a file tool's access to `path` against the active packs' path
     /// rules (spec §7.2). Same budget and fail-open rules as `evaluate`.
     pub fn evaluate_path(&self, access: Access, path: &str) -> Decision {
+        self.path_rules();
         let start = Instant::now();
         let forms = path_forms(path, None, &self.vars);
         if forms.is_empty() {
@@ -248,7 +272,7 @@ impl Engine {
     fn judge_path(&self, access: Access, real: &Path, start: Instant) -> JudgeOutcome {
         let text = real.to_string_lossy();
         let mut carved: Option<Decision> = None;
-        for pp in &self.path_rules {
+        for pp in self.path_rules() {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
             }
@@ -257,9 +281,9 @@ impl Engine {
                     .matches(&text)
                     .into_iter()
                     .find(|&i| rules[i].access.covers(access)),
-                None => rules
-                    .iter()
-                    .position(|r| r.access.covers(access) && r.regex.is_match(&text)),
+                None => rules.iter().position(|r| {
+                    r.access.covers(access) && r.regex.as_ref().is_some_and(|re| re.is_match(&text))
+                }),
             };
             if let Some(i) = hit(&pp.allow, &pp.allow_set) {
                 let r = &pp.allow[i];
@@ -301,6 +325,7 @@ impl Engine {
 
     /// Evaluate a raw command line and return the decision.
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
+        self.path_rules();
         let start = Instant::now();
         let state = ShellState {
             cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
@@ -767,7 +792,7 @@ impl Engine {
         cwd_unknown: bool,
         start: Instant,
     ) -> Option<Decision> {
-        if self.path_rules.is_empty() || ops.is_empty() {
+        if !self.has_path_rules || ops.is_empty() {
             return None;
         }
         let all: Vec<Option<&Path>> = if cwds.is_empty() {
@@ -884,7 +909,7 @@ impl Engine {
         argv: &[String],
         extra: Vec<Operand>,
     ) -> Vec<Operand> {
-        if self.path_rules.is_empty() {
+        if !self.has_path_rules {
             return Vec::new();
         }
         let mut ops = operands(seg, effective, argv);

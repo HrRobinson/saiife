@@ -20,6 +20,11 @@ pub struct ProjectPacks {
 /// Find the project config at or above `start` and read its packs. Unknown
 /// pack ids are warned about and ignored.
 pub fn project_packs(start: &Path, known: &[Pack]) -> ProjectPacks {
+    project_packs_known(start, |id| known.iter().any(|p| p.id == id))
+}
+
+/// `project_packs` with `known` telling which pack ids exist.
+pub fn project_packs_known(start: &Path, known: impl Fn(&str) -> bool) -> ProjectPacks {
     let Some(root) = config::find_project_root(start) else {
         return ProjectPacks::default();
     };
@@ -30,7 +35,7 @@ pub fn project_packs(start: &Path, known: &[Pack]) -> ProjectPacks {
     match config::load(&root) {
         Ok(cfg) => {
             for id in cfg.packs {
-                if known.iter().any(|p| p.id == id) {
+                if known(&id) {
                     out.enabled.push(id);
                 } else {
                     out.warnings.push(format!(

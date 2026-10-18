@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
+use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::{expand_glob_partial, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
@@ -14,11 +15,9 @@ use saiifeguard::payload::{
     classify, context_from_hook_json_bounded, search_globs, HookContext, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
-use saiifeguard::profile::select_active;
-use saiifeguard::Pack;
 
 use crate::paths::path_vars;
-use crate::project::project_packs;
+use crate::project::project_packs_known;
 use crate::warn;
 
 /// Memory-safety cap on what is read from stdin. Parsing skips the content
@@ -28,10 +27,10 @@ use crate::warn;
 /// record. Above this cap nothing is parsed: a recorded fail-open.
 const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// `packs`: every built-in pack; `cli_packs`: `--pack` ids. The project's
-/// own packs are added from the `.saiife/config.toml` at or above the
-/// payload's `cwd`.
-pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
+/// `cli_packs`: `--pack` ids. The project's own packs are added from the
+/// `.saiife/config.toml` at or above the payload's `cwd`. Only the active
+/// built-in packs are compiled.
+pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     let mut buf = String::new();
     let mut stdin = std::io::stdin().lock();
     let read = (&mut stdin)
@@ -72,7 +71,7 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
             // the project config or building the engine fails open too.
             let cwd = audit.ctx.cwd.clone();
             decide(&audit, &command, hook_exit, |c| {
-                engine_for(packs, cli_packs, cwd.as_deref()).0.evaluate(c)
+                active_engine(cli_packs, cwd.as_deref()).0.evaluate(c)
             })
         }
         Ok(ToolCall::File {
@@ -106,7 +105,7 @@ pub fn run(packs: Vec<Pack>, cli_packs: &[String], hook_exit: bool, agent: &str)
             let filters = search_globs(&buf, PARSE_MAX_BYTES);
             let expand_paths = tool == "read_many_files";
             decide(&audit, &paths.join("\n"), hook_exit, |_| {
-                let (engine, vars) = engine_for(packs, cli_packs, cwd.as_deref());
+                let (engine, vars) = active_engine(cli_packs, cwd.as_deref());
                 let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
                 let d = judge_paths(&engine, access, &targets);
                 // A deny stays; so does a latency fail-open (it ranks above).
@@ -164,24 +163,42 @@ fn agent_from_args(args: &[String]) -> Option<&str> {
     })
 }
 
+/// `engine_for` the built-in packs, its warnings printed.
+fn active_engine(cli_packs: &[String], cwd: Option<&str>) -> (Engine, PathVars) {
+    let (engine, vars, warnings) = engine_for(&Catalog::builtin(), cli_packs, cwd);
+    for w in &warnings {
+        warn(w);
+    }
+    (engine, vars)
+}
+
 /// The engine for this call: default-on packs, `--pack` ids, and the packs
 /// of the project that `cwd` (or this process's directory) belongs to,
 /// with path rules bound to that directory and this machine's saiife dirs
-/// (the bindings are returned too, for expanding globs).
-fn engine_for(packs: Vec<Pack>, cli_packs: &[String], cwd: Option<&str>) -> (Engine, PathVars) {
+/// (the bindings are returned too, for expanding globs). Only these packs
+/// of `catalog` are compiled. Also returns the warnings to print: broken
+/// packs among those compiled, and problems with the project config.
+fn engine_for(
+    catalog: &Catalog,
+    cli_packs: &[String],
+    cwd: Option<&str>,
+) -> (Engine, PathVars, Vec<String>) {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
     };
-    let project = project_packs(&start, &packs);
-    for w in &project.warnings {
-        warn(w);
-    }
+    let project = project_packs_known(&start, |id| catalog.knows(id));
     let mut enabled = cli_packs.to_vec();
     enabled.extend(project.enabled);
+    let (packs, pack_warnings) = catalog.load_active(&enabled);
+    let mut warnings: Vec<String> = pack_warnings
+        .iter()
+        .map(|w| format!("pack warning ({}): {}", w.source, w.message))
+        .collect();
+    warnings.extend(project.warnings);
     let vars = path_vars(Some(&start), project.root.as_deref());
-    let engine = Engine::new(select_active(packs, &enabled)).with_paths(vars.clone());
-    (engine, vars)
+    let engine = Engine::new(packs).with_paths(vars.clone());
+    (engine, vars, warnings)
 }
 
 /// What a file call reads or writes: its paths, with the patterns of
@@ -478,6 +495,60 @@ mod tests {
             ctx: HookContext::default(),
             project: "/p".into(),
         }
+    }
+
+    const BROKEN_CORE: &str = r#"
+[pack]
+id = "core.broken"
+triggers = ["thing"]
+[[deny]]
+pattern = '('
+reason = "bad regex"
+[[deny]]
+pattern = '^thing\s+wipe'
+reason = "wipes the thing"
+"#;
+    const OPT_IN: &str = r#"
+[pack]
+id = "opt.thing"
+default_on = false
+triggers = ["thing"]
+[[deny]]
+pattern = '^thing\s+drop'
+reason = "drops the thing"
+"#;
+
+    /// `check` compiles only the active packs, yet still reports a broken
+    /// built-in's warning and judges exactly as before: the default-on pack
+    /// denies, the opt-in pack applies only once the project enables it.
+    #[test]
+    fn lazy_packs_keep_warnings() {
+        let cat =
+            Catalog::from_sources(&[("<t>core.broken", BROKEN_CORE), ("<t>opt.thing", OPT_IN)]);
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let (engine, _, warnings) = engine_for(&cat, &[], Some(cwd));
+        assert!(
+            warnings.iter().any(
+                |w| w.starts_with("pack warning (<t>core.broken): skipping uncompilable regex")
+            ),
+            "{warnings:?}"
+        );
+        assert!(engine.evaluate("thing wipe").is_deny());
+        assert!(!engine.evaluate("thing drop").is_deny());
+
+        std::fs::create_dir(p.path().join(".saiife")).unwrap();
+        std::fs::write(
+            p.path().join(".saiife/config.toml"),
+            "packs = [\"opt.thing\"]\n",
+        )
+        .unwrap();
+        let (engine, _, warnings) = engine_for(&cat, &[], Some(cwd));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(engine.evaluate("thing wipe").is_deny());
+        assert!(engine.evaluate("thing drop").is_deny());
+        let (engine, _, _) = engine_for(&cat, &["opt.thing".into()], None);
+        assert!(engine.evaluate("thing drop").is_deny());
     }
 
     #[test]
