@@ -24,6 +24,9 @@ mod project;
 // Task 4 wires `saiife audit --report`; until then nothing calls it.
 #[allow(dead_code)]
 mod report;
+// Task 4 wires `saiife audit --report`; until then nothing calls it.
+#[allow(dead_code)]
+mod report_html;
 mod status_cmd;
 mod text;
 
