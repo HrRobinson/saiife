@@ -33,6 +33,8 @@ pub struct Report {
     pub packs: Vec<ProjectPacksView>,
     /// Gaps in the audit trail (unreadable lines or files); set by the caller.
     pub log_problems: Vec<String>,
+    /// True when `--blocked` filtered the records, so fail-open events are not shown.
+    pub blocked_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,23 +153,39 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 fn project_view(project: &str, packs: &[Pack]) -> ProjectPacksView {
     let path = Path::new(project);
-    let found = project_packs(path, packs);
-    let own_config = found.root.as_deref().is_some_and(|r| same_dir(r, path));
-    let readable = found
-        .root
-        .as_deref()
-        .is_some_and(|r| saiife_agents::config::load(r).is_ok());
-    let (enabled, note) = if own_config && readable {
-        (found.enabled, None)
+    // Same nearest-parent lookup as the guard (`check`, `status`). An empty
+    // project never resolves against the reader's working directory, and a
+    // folder that is gone is not walked upward.
+    let (enabled, note) = if project.is_empty() {
+        (
+            Vec::new(),
+            Some("Unknown project folder; the default packs are shown.".to_string()),
+        )
+    } else if !path.exists() {
+        (
+            Vec::new(),
+            Some("This folder no longer exists; the default packs are shown.".to_string()),
+        )
     } else {
-        let msg = if own_config {
-            "The saiife config in this folder could not be read; the default packs are shown."
-        } else if path.exists() {
-            "No saiife config in this folder now; the default packs are shown."
-        } else {
-            "This folder no longer exists; the default packs are shown."
-        };
-        (Vec::new(), Some(msg.to_string()))
+        let found = project_packs(path, packs);
+        match found.root.as_deref() {
+            None => (
+                Vec::new(),
+                Some("No saiife config in this folder now; the default packs are shown.".to_string()),
+            ),
+            Some(root) if saiife_agents::config::load(root).is_err() => (
+                Vec::new(),
+                Some(
+                    "The saiife config in this folder could not be read; the default packs are shown."
+                        .to_string(),
+                ),
+            ),
+            Some(root) if same_dir(root, path) => (found.enabled, None),
+            Some(root) => (
+                found.enabled,
+                Some(format!("Uses the saiife config in {}.", root.display())),
+            ),
+        }
     };
     // Default-on packs in built-in order, then enabled opt-ins in built-in order.
     let active = packs
@@ -242,6 +260,7 @@ pub fn build(
         all_rows,
         packs: projects.iter().map(|p| project_view(p, packs)).collect(),
         log_problems: vec![],
+        blocked_only: false,
     }
 }
 
@@ -458,14 +477,17 @@ mod tests {
     fn missing_project_config_shows_defaults() {
         let (packs, _) = builtin_packs();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".saiife")).unwrap();
-        std::fs::write(dir.path().join(CONFIG_REL), "packs = [\"db.postgres\"]\n").unwrap();
-        let child = dir.path().join("child");
-        std::fs::create_dir(&child).unwrap();
         let gone = dir.path().join("gone");
+        let bare = tempfile::tempdir().unwrap();
         let at = datetime!(2026-10-13 08:00:00 UTC);
         let rs = [
-            rec(child.to_str().unwrap(), "x", DecisionKind::Allow, None, at),
+            rec(
+                bare.path().to_str().unwrap(),
+                "x",
+                DecisionKind::Allow,
+                None,
+                at,
+            ),
             rec(gone.to_str().unwrap(), "x", DecisionKind::Allow, None, at),
         ];
         let refs: Vec<&Record> = rs.iter().collect();
@@ -485,6 +507,59 @@ mod tests {
             };
             assert_eq!(v.note.as_deref(), Some(note));
         }
+    }
+
+    #[test]
+    fn parent_config_is_used_with_a_note() {
+        let (packs, _) = builtin_packs();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".saiife")).unwrap();
+        std::fs::write(dir.path().join(CONFIG_REL), "packs = [\"db.postgres\"]\n").unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let rs = [rec(
+            child.to_str().unwrap(),
+            "x",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        )];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        let v = &r.packs[0];
+        assert_eq!(
+            v.note,
+            Some(format!(
+                "Uses the saiife config in {}.",
+                dir.path().display()
+            ))
+        );
+        assert!(v
+            .packs
+            .iter()
+            .any(|p| p.name.to_lowercase().contains("postgres")));
+        let defaults = packs.iter().filter(|p| p.default_on).count();
+        assert_eq!(v.packs.len(), defaults + 1);
+    }
+
+    #[test]
+    fn empty_project_gets_defaults_not_the_cwd_config() {
+        let (packs, _) = builtin_packs();
+        let rs = [rec(
+            "",
+            "x",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        )];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(
+            r.packs[0].note.as_deref(),
+            Some("Unknown project folder; the default packs are shown.")
+        );
+        let defaults = packs.iter().filter(|p| p.default_on).count();
+        assert_eq!(r.packs[0].packs.len(), defaults);
     }
 
     #[test]

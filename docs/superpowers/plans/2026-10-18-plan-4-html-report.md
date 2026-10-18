@@ -27,7 +27,7 @@
 1. **Agent-controlled text in the report** (`<script>`, `</td>`, `"onload=`, bidi overrides, LRM/RLM/ALM, NUL, a 4096-char input): it must render as inert, visible text. Owned by Task 2 (`hostile_text_is_inert`) and Task 3 (`escape_*`).
 2. **Choosing a dangerous output path** (an agent runs `saiife audit --report .claude/settings.json`, or a symlink named `r.html` that points at a hook config): it must be refused, and the target must stay byte-for-byte unchanged. Owned by Task 4 (`refuses_non_html_path`, `refuses_symlink_target`).
 3. **Empty, filtered or huge logs** (no records; `--blocked` only; 20 000 records): you get a valid report that says "None in this period" where a section is empty, names the filters used, and shows the full list collapsed. Owned by Task 2 (`empty_report`) and Task 4 (`large_log_renders`).
-4. **A project folder that no longer exists, or has no `.saiife/config.toml`**: the packs section says the default packs are shown and why, without crashing or using a parent folder's config. Owned by Task 2 (`missing_project_config_shows_defaults`).
+4. **A project folder that no longer exists, has no config, or has an empty path**: the packs section uses the same nearest-parent config lookup as the guard (`project_packs`). A parent's config is used with the note "Uses the saiife config in {root}.". A missing folder, no config anywhere above, an unreadable config, or an empty project path shows the default packs with a note saying why, without crashing and never resolving against the process cwd. Owned by Task 2 (`missing_project_config_shows_defaults`).
 5. **Unknown decision values from a newer saiife** (`error_denied`): counted as "Other" and listed in the full list, never dropped. Owned by Task 2 (`unknown_decision_is_listed`).
 
 ---
@@ -168,10 +168,10 @@ Build records with `Record::at(NewRecord{..}, "0.1.0", datetime!(…))`, as in `
   - `empty_report`: zero records gives every count 0, empty row vecs and empty `packs`.
   - `unknown_decision_is_listed`: an `error_denied` record parsed from JSON gives `other == 1` and appears in `all_rows` with decision `"Other"`.
   - `active_packs_per_project`: a tempdir project whose `.saiife/config.toml` has `packs = ["db.postgres"]`. Its view lists every default-on pack name plus `db.postgres`'s name, `note == None`, and `core.secrets` `blocks` includes the `.env` reason text. Assert that no `blocks` or `exceptions` string equals any rule's `pattern` or `glob`.
-  - `missing_project_config_shows_defaults`:
+  - `missing_project_config_shows_defaults` (plus `parent_config_is_used_with_a_note` and `empty_project_gets_defaults_not_the_cwd_config`):
     - a project path that does not exist gives `note == Some("This folder no longer exists; the default packs are shown.")`;
-    - an existing folder with no config, inside a parent that has one, gives `note == Some("No saiife config in this folder now; the default packs are shown.")`, and the parent's opt-in packs are not used;
-    - in both cases `packs` are the default-on packs.
+    - an existing folder with no config anywhere above gives `note == Some("No saiife config in this folder now; the default packs are shown.")`; an existing folder inside a parent that has a config uses the parent's packs with `note == Some("Uses the saiife config in {root}.")`; an empty project string gives `note == Some("Unknown project folder; the default packs are shown.")`;
+    - in the missing-folder, no-config and empty-project cases `packs` are the default-on packs.
   - `hostile_text_is_inert`: an input of `<script>alert(1)</script>` is stored unchanged in `Row.input`. Escaping is Task 3's job, and this test pins that the model does not pre-escape, which would double-escape.
 
 - [ ] **Step 2: Run `cargo test -p saiife report::`.** Expected: FAIL (module missing).
@@ -179,7 +179,7 @@ Build records with `Record::at(NewRecord{..}, "0.1.0", datetime!(…))`, as in `
 - [ ] **Step 3: Implement `build` and `agent_label`.** Decisions the tests do not fix:
   - Decision labels: Allow → `"Allowed"`, Deny → `"Blocked"`, ErrorAllowed → `"Allowed unchecked (fail-open)"`, Unknown → `"Other"`.
   - Time formats use `[year]-[month]-[day] [hour]:[minute]` plus `" UTC"` for `generated`/`period`, and `ts[..19]` with `T` → space for rows (the same as the terminal table). A record whose `ts` does not parse keeps its raw `ts` and sorts last.
-  - Projects view: for each distinct project, `project_packs(Path::new(p), packs)`. Its config counts only if `root == Some(p)`; otherwise use the defaults with the note from Step 1. Active = `default_on` packs in built-in order, plus enabled opt-in packs in built-in order. Precede the packs section with one fixed sentence in Task 3: "Packs as configured today; they may have differed during the period."
+  - Projects view: for each distinct project, an empty string gets the defaults and the note "Unknown project folder; the default packs are shown."; a folder that does not exist gets the defaults and the note from Step 1 with no upward walk; otherwise `project_packs(Path::new(p), packs)` decides. A config above the project is used, with the note "Uses the saiife config in {root}."; the project's own config has no note; no config anywhere, or an unreadable one, gives the defaults and the matching note. Active = `default_on` packs in built-in order, plus enabled opt-in packs in built-in order. Precede the packs section with one fixed sentence in Task 3: "Packs as configured today; they may have differed during the period."
   - Filters: `audit_cmd` passes the strings in (Task 4). `build` stores them as given.
 
 - [ ] **Step 4: Run `cargo test -p saiife report::`.** Expected: PASS.

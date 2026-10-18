@@ -194,6 +194,7 @@ pub fn run(
             filters.push("only blocked actions".to_string());
         }
         let mut model = report::build(&shown, packs, filters, since, now);
+        model.blocked_only = blocked;
         if all.skipped_lines > 0 {
             model.log_problems.push(format!(
                 "{} unreadable log lines were skipped; the log may be damaged or edited.",

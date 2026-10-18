@@ -19,7 +19,7 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r#"(?i)(authorization:\s*(?:bearer\s+|basic\s+|token\s+)?)[^\s'"]+"#, "${1}[MASKED]"),
         (r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+", "${1}[MASKED]"),
         (r#"(?i)(--(?:[a-z0-9]+-)*(?:password|passwd|token|secret|secret-key|api-key|apikey)(?:=|\s+))(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
-        (r#"(\b(?i:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b(?:'[^']*'|"(?:\\.|[^"\\])*"|[^|;&\n])*?\s-p)(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|\S)+"#, "${1}[MASKED]"),
+        (r#"(\b(?i:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b(?:'[^']*'|"(?:\\.|[^"\\])*"|\\\n|[^|;&\n])*?\s-p)(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|\S)+"#, "${1}[MASKED]"),
         (r#"(?i)(\baws\s+configure\s+set\s+(?:[A-Za-z0-9_-]+\.)*(?:aws_secret_access_key|aws_session_token)\s+)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
         (r#"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY)[A-Z0-9_]*=)(?:'[^']*'|"[^"]*"|\S+)"#, "${1}[MASKED]"),
         // No leading `\b`: a token glued to an identifier (`X_ghp_…`) still counts.
@@ -241,6 +241,14 @@ mod tests {
         assert_eq!(
             mask("mysql -e 'x|y' -pS db"),
             "mysql -e 'x|y' -p[MASKED] db"
+        );
+    }
+
+    #[test]
+    fn mysql_backslash_newline_continuation() {
+        assert_eq!(
+            mask("mysql -h db \\\n -u admin \\\n -pS3cret db"),
+            "mysql -h db \\\n -u admin \\\n -p[MASKED] db"
         );
     }
 

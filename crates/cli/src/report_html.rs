@@ -130,7 +130,11 @@ fn summary(r: &Report) -> String {
     );
     item(
         "Allowed without a check",
-        format!("<span class=\"warn\">{}</span>", r.fail_open),
+        if r.blocked_only {
+            "not counted (only blocked actions shown)".to_string()
+        } else {
+            format!("<span class=\"warn\">{}</span>", r.fail_open)
+        },
     );
     if r.other > 0 {
         item("Other", r.other.to_string());
@@ -176,22 +180,26 @@ pub fn render(r: &Report) -> String {
             },
         ),
     );
-    let fail_open = or_none(
-        &r.fail_open_rows,
-        table(
-            &["Time (UTC)", "Agent", "Project", "Action", "Why"],
+    let fail_open = if r.blocked_only {
+        "<p>Not included: this report shows only blocked actions.</p>\n".to_string()
+    } else {
+        or_none(
             &r.fail_open_rows,
-            |x| {
-                vec![
-                    cell(None, &x.time),
-                    cell(None, &x.agent),
-                    cell(None, &x.project),
-                    cell(Some("input"), &x.input),
-                    cell(None, &x.reason),
-                ]
-            },
-        ),
-    );
+            table(
+                &["Time (UTC)", "Agent", "Project", "Action", "Why"],
+                &r.fail_open_rows,
+                |x| {
+                    vec![
+                        cell(None, &x.time),
+                        cell(None, &x.agent),
+                        cell(None, &x.project),
+                        cell(Some("input"), &x.input),
+                        cell(None, &x.reason),
+                    ]
+                },
+            ),
+        )
+    };
     let packs = if r.packs.is_empty() {
         "<p>No projects in this period.</p>\n".to_string()
     } else {
@@ -298,6 +306,7 @@ mod tests {
             all_rows: vec![],
             packs: vec![],
             log_problems: vec![],
+            blocked_only: false,
         }
     }
 
@@ -387,6 +396,25 @@ mod tests {
         }
         assert!(html.contains("<details>"));
         assert!(html.contains("<summary>Show all 1 decisions</summary>"));
+    }
+
+    #[test]
+    fn blocked_only_does_not_claim_no_fail_open() {
+        let r = Report {
+            blocked_only: true,
+            ..empty()
+        };
+        let html = render(&r);
+        assert!(html.contains("Not included: this report shows only blocked actions."));
+        assert!(html.contains("not counted (only blocked actions shown)"));
+        assert_eq!(html.matches("None in this period.").count(), 1);
+        let r = Report {
+            blocked_only: true,
+            ..full(vec![row("rm -rf /", "r")])
+        };
+        let html = render(&r);
+        assert!(html.contains("Not included: this report shows only blocked actions."));
+        assert!(!html.contains("<dd><span class=\"warn\">3</span></dd>"));
     }
 
     #[test]

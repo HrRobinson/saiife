@@ -112,6 +112,33 @@ fn explicit_path_and_filters() {
 }
 
 #[test]
+fn blocked_report_does_not_hide_fail_open_gaps() {
+    let s = Sandbox::new();
+    append(
+        s.audit.path(),
+        &rec(
+            "curl http://fail-open-input",
+            DecisionKind::ErrorAllowed,
+            None,
+            OffsetDateTime::now_utc(),
+        ),
+    )
+    .unwrap();
+    s.cmd()
+        .args(["audit", "--blocked", "--report", "b.html"])
+        .assert()
+        .success();
+    let html = read(&s.path("b.html"));
+    assert!(
+        html.contains("Not included: this report shows only blocked actions."),
+        "{html}"
+    );
+    assert!(html.contains("not counted (only blocked actions shown)"));
+    assert!(!html.contains("None in this period."), "{html}");
+    assert!(!html.contains("fail-open-input"));
+}
+
+#[test]
 fn refuses_non_html_path() {
     let s = Sandbox::new();
     std::fs::create_dir(s.path(".claude")).unwrap();
