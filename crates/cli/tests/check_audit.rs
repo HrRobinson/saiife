@@ -168,15 +168,18 @@ fn concurrent_checks_write_whole_lines() {
     for mut c in children {
         c.wait().unwrap();
     }
-    let body: String = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
-        .collect();
-    assert_eq!(body.lines().count(), 20);
+    // Read through the store: a short write (e.g. a disk quota) shows up as a
+    // skipped line instead of a UTF-8 panic.
+    let got = read_all(dir.path());
+    assert_eq!(got.skipped_lines, 0, "every line is whole");
+    assert_eq!(got.unreadable_files, 0);
+    assert_eq!(got.records.len(), 20, "every line parses");
     // Records keep 4096 chars of input; 4-byte chars push every line past
     // 16 KB, well beyond PIPE_BUF-sized writes.
-    assert!(body.lines().all(|l| l.len() > 16 * 1024));
-    assert_eq!(read_all(dir.path()).records.len(), 20, "every line parses");
+    assert!(got
+        .records
+        .iter()
+        .all(|r| serde_json::to_string(r).unwrap().len() > 16 * 1024));
 }
 
 /// A FIFO planted at the month file must not hang the hook: the verdict
@@ -225,4 +228,32 @@ fn fifo_at_month_path_does_not_block_the_verdict() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A relative `SAIIFE_AUDIT_DIR` must not make `check` write a log under
+/// the hook's working directory (spec §6.1: never inside the project).
+#[test]
+fn relative_audit_dir_is_ignored() {
+    let project = tempfile::tempdir().unwrap();
+    let home = common::FixtureHome::new();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let audit = tempfile::tempdir().unwrap();
+    let _sandbox = common::hermetic(&mut cmd, audit.path());
+    let mut child = cmd
+        .env("SAIIFE_AUDIT_DIR", "rel-audit")
+        .current_dir(project.path())
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(home.real(&payload("ls")).as_bytes())
+        .unwrap();
+    child.wait().unwrap();
+    assert!(!project.path().join("rel-audit").exists());
 }

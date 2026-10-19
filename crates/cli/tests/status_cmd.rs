@@ -30,7 +30,7 @@ fn untouched_project_passes() {
     for a in ["claude", "codex", "gemini"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("never")),
+                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call in")),
             "{a}: {text}"
         );
     }
@@ -239,7 +239,7 @@ fn last_hook_call_is_shown_per_agent() {
         .lines()
         .find(|l| l.trim_start().starts_with("codex"))
         .unwrap();
-    assert!(codex.contains("never"), "{codex}");
+    assert!(codex.contains("no call in"), "{codex}");
 }
 
 #[test]
@@ -482,6 +482,25 @@ fn record_without_any_hooked_agent_is_a_failed_check() {
     assert!(text.contains("no agent is hooked"), "{text}");
 }
 
+/// A record whose only entries are failed agents still says nothing is
+/// protected.
+#[test]
+fn record_with_only_failed_agents_says_nothing_is_guarded() {
+    let env = initialized(&["claude"]);
+    for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
+        let p = e.unwrap().path();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["hooks"]["claude"]["sha256"] = "".into();
+        v["hooks"]["claude"]["error"] = "disk full".into();
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("could not set up Claude Code"), "{text}");
+    assert!(text.contains("no agent is hooked"), "{text}");
+}
+
 /// M3: an agent that reports its cwd through a symlink to the project
 /// still counts as a hook call of this project.
 #[cfg(unix)]
@@ -611,5 +630,123 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
         .lines()
         .find(|l| l.trim_start().starts_with("claude"))
         .unwrap();
-    assert!(claude.contains("never"), "{claude}");
+    assert!(claude.contains("no call in"), "{claude}");
+}
+
+/// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
+fn audit_line(project: &str, agent: &str, ts: &str) -> String {
+    format!(
+        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":\"{project}\",\"tool\":\"Bash\",\
+         \"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}}\n"
+    )
+}
+
+#[test]
+fn status_reads_recent_months_only() {
+    let env = initialized(&["claude", "codex"]);
+    let project = std::fs::canonicalize(env.root()).unwrap();
+    let project = project.to_str().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let this_month = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
+    // The records of the newest month: one recent call per hooked agent.
+    let mut recent = String::new();
+    let ts = format!(
+        "{:04}-{:02}-{:02}T00:00:00.000Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
+    for a in ["claude", "codex"] {
+        recent.push_str(&audit_line(project, a, &ts));
+    }
+    std::fs::write(env.audit.path().join(format!("{this_month}.jsonl")), recent).unwrap();
+    // 23 older months, 60 000 records in all, from other projects.
+    let filler = audit_line("/elsewhere", "claude", "2020-01-01T00:00:00.000Z");
+    let body = filler.repeat(60_000 / 23);
+    for m in 0..23u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2023 + m / 12, 1 + m % 12);
+        std::fs::write(env.audit.path().join(name), &body).unwrap();
+    }
+    let start = std::time::Instant::now();
+    let (c, text) = status(&env);
+    let took = start.elapsed();
+    assert_eq!(c, 0, "{text}");
+    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    for a in ["claude", "codex"] {
+        assert!(
+            text.lines()
+                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call in")),
+            "{a}: {text}"
+        );
+    }
+}
+
+#[test]
+fn status_stops_after_12_months_for_an_unused_agent() {
+    let env = initialized(&["claude"]);
+    let dir = env.audit.path();
+    // 14 month files; the oldest is a directory, so opening it would be a
+    // failed check. Only the newest 12 may be opened.
+    let filler = audit_line("/elsewhere", "claude", "2020-01-01T00:00:00.000Z");
+    for m in 1..=13u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2024 + (m - 1) / 12, 1 + (m - 1) % 12);
+        std::fs::write(dir.join(name), &filler).unwrap();
+    }
+    std::fs::create_dir(dir.join("2020-01.jsonl")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("claude") && l.contains("no call in the last 12 months")),
+        "{text}"
+    );
+    assert!(!text.contains("audit log"), "{text}");
+}
+
+/// Plan 2 carry-over: with the config removed, `status` run from a
+/// subdirectory finds the project through the integrity record.
+#[test]
+fn status_in_subdir_after_config_removed() {
+    let env = initialized(&["claude"]);
+    std::fs::create_dir(env.root().join("src")).unwrap();
+    std::fs::remove_file(env.root().join(".saiife/config.toml")).unwrap();
+    let out = env.saiife_in(&env.root().join("src"), &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let canonical = std::fs::canonicalize(env.root()).unwrap();
+    assert!(
+        text.contains(&format!("saiife status for {}", canonical.display()))
+            || text.contains(&format!("saiife status for {}", env.root().display())),
+        "{text}"
+    );
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
+    assert!(!text.contains("not set up for this project"), "{text}");
+}
+
+/// A failed agent's error entry is cleared by a later successful init for
+/// that agent.
+#[test]
+fn failed_agent_entry_clears_on_success() {
+    let env = initialized(&["claude", "codex"]);
+    // Stand in for an earlier failed codex init.
+    let rec_dir = env.data.path().join("projects");
+    let rec = std::fs::read_dir(&rec_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+    v["hooks"]["codex"]["sha256"] = "".into();
+    v["hooks"]["codex"]["error"] = "disk full".into();
+    std::fs::write(&rec, v.to_string()).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("could not set up Codex"), "{text}");
+    let out = env.saiife(&["init", "--agent", "codex"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("could not set up"), "{text}");
 }

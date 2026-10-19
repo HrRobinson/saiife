@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::{Regex, RegexSet};
@@ -29,7 +30,7 @@ use crate::lexer::{
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::Pack;
-use crate::pathrule::{compile_ancestors, compile_glob, Access, RuleAccess};
+use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
@@ -100,12 +101,15 @@ pub struct Engine {
     budget: Duration,
     /// Case-folded command names that at least one active pack has a deny
     /// rule for. Used only to scope the command-substitution-in-a-guarded-
-    /// position policy — see `evaluate_segment`.
+    /// position policy — see `command_rules_phase`.
     guarded_commands: HashSet<String>,
     /// Directories paths are resolved against and rule variables bound to.
     vars: PathVars,
-    /// Each pack's path rules, bound to `vars`.
-    path_rules: Vec<PackPaths>,
+    /// Each pack's path rules, bound to `vars` on first use (compiling the
+    /// globs is a large part of a hook call's fixed cost).
+    path_rules: OnceLock<Vec<PackPaths>>,
+    /// Some active pack has `deny_path` rules: `path_rules` is not empty.
+    has_path_rules: bool,
 }
 
 /// One pack's path rules with their globs compiled for this machine.
@@ -119,13 +123,28 @@ struct PackPaths {
     deny_set: Option<RegexSet>,
 }
 
-fn rule_set(rules: &[BoundPathRule]) -> Option<RegexSet> {
-    RegexSet::new(rules.iter().map(|r| r.regex.as_str())).ok()
+/// `rules` with their automaton. Each regex is compiled on its own only if
+/// the set does not compile; then a rule whose regex does not compile is
+/// dropped.
+fn rule_set(mut rules: Vec<BoundPathRule>) -> (Vec<BoundPathRule>, Option<RegexSet>) {
+    match RegexSet::new(rules.iter().map(|r| r.source.as_str())) {
+        Ok(set) => (rules, Some(set)),
+        Err(_) => {
+            rules.retain_mut(|r| {
+                r.regex = Regex::new(&r.source).ok();
+                r.regex.is_some()
+            });
+            (rules, None)
+        }
+    }
 }
 
 struct BoundPathRule {
     glob: String,
-    regex: Regex,
+    /// The glob as a regex over canonical paths.
+    source: String,
+    /// `source` compiled; only when the list has no `RegexSet`.
+    regex: Option<Regex>,
     access: RuleAccess,
     reason: String,
 }
@@ -145,16 +164,15 @@ impl Engine {
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
             .collect();
-        let mut engine = Self {
+        Self {
             combined: Prefilter::new(triggers),
+            has_path_rules: packs.iter().any(|p| !p.deny_path.is_empty()),
             packs,
             budget: DEFAULT_BUDGET,
             guarded_commands,
             vars: PathVars::default(),
-            path_rules: Vec::new(),
-        };
-        engine.bind_paths();
-        engine
+            path_rules: OnceLock::new(),
+        }
     }
 
     /// Resolve paths against these directories and bind the path rules'
@@ -162,48 +180,53 @@ impl Engine {
     /// without variables apply and relative paths cannot be judged.
     pub fn with_paths(mut self, vars: PathVars) -> Self {
         self.vars = vars;
-        self.bind_paths();
+        self.path_rules = OnceLock::new();
         self
     }
 
-    fn bind_paths(&mut self) {
+    /// The path rules bound to `vars`. Called before an evaluation starts
+    /// its latency clock, so binding never spends the budget.
+    fn path_rules(&self) -> &[PackPaths] {
+        self.path_rules.get_or_init(|| self.bind_paths())
+    }
+
+    fn bind_paths(&self) -> Vec<PackPaths> {
         let bind = |rules: &[crate::pathrule::PathRule]| -> Vec<BoundPathRule> {
             rules
                 .iter()
                 .filter_map(|r| {
                     // Globs were validated at load; a rule whose variable
                     // has no value on this machine cannot apply.
-                    let compiled = if r.ancestors {
-                        compile_ancestors(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                    let source = if r.ancestors {
+                        ancestors_source(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
                     } else {
-                        compile_glob(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
+                        glob_source(&r.glob, &self.vars, PATHS_CASE_INSENSITIVE)
                     };
-                    let regex = compiled.ok().flatten()?;
                     Some(BoundPathRule {
                         glob: r.glob.clone(),
-                        regex,
+                        source: source.ok().flatten()?,
+                        regex: None,
                         access: r.access,
                         reason: r.reason.clone(),
                     })
                 })
                 .collect()
         };
-        self.path_rules = self
-            .packs
+        self.packs
             .iter()
             .filter(|p| !p.deny_path.is_empty())
             .map(|p| {
-                let allow = bind(&p.allow_path);
-                let deny = bind(&p.deny_path);
+                let (allow, allow_set) = rule_set(bind(&p.allow_path));
+                let (deny, deny_set) = rule_set(bind(&p.deny_path));
                 PackPaths {
                     pack: p.id.clone(),
-                    allow_set: rule_set(&allow),
-                    deny_set: rule_set(&deny),
                     allow,
                     deny,
+                    allow_set,
+                    deny_set,
                 }
             })
-            .collect();
+            .collect()
     }
 
     /// `path` as the path rules see it: absolute, symlinks and `..`
@@ -215,6 +238,7 @@ impl Engine {
     /// Judge a file tool's access to `path` against the active packs' path
     /// rules (spec §7.2). Same budget and fail-open rules as `evaluate`.
     pub fn evaluate_path(&self, access: Access, path: &str) -> Decision {
+        self.path_rules();
         let start = Instant::now();
         let forms = path_forms(path, None, &self.vars);
         if forms.is_empty() {
@@ -248,7 +272,7 @@ impl Engine {
     fn judge_path(&self, access: Access, real: &Path, start: Instant) -> JudgeOutcome {
         let text = real.to_string_lossy();
         let mut carved: Option<Decision> = None;
-        for pp in &self.path_rules {
+        for pp in self.path_rules() {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
             }
@@ -257,9 +281,9 @@ impl Engine {
                     .matches(&text)
                     .into_iter()
                     .find(|&i| rules[i].access.covers(access)),
-                None => rules
-                    .iter()
-                    .position(|r| r.access.covers(access) && r.regex.is_match(&text)),
+                None => rules.iter().position(|r| {
+                    r.access.covers(access) && r.regex.as_ref().is_some_and(|re| re.is_match(&text))
+                }),
             };
             if let Some(i) = hit(&pp.allow, &pp.allow_set) {
                 let r = &pp.allow[i];
@@ -301,573 +325,455 @@ impl Engine {
 
     /// Evaluate a raw command line and return the decision.
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
+        self.path_rules();
         let start = Instant::now();
-        let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.evaluate_inner(raw_cmd, start, 0, &cwds, false, false, false, false)
+        let state = ShellState {
+            cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
+            cwd_unknown: false,
+            env_changed: false,
+            ifs_named: false,
+        };
+        self.evaluate_inner(raw_cmd, start, 0, &state, false)
     }
 
-    /// `cwds`: the directories the shell may be in at the start of
-    /// `raw_cmd`. A `cd` adds its target for the segments after it but
-    /// never drops the old ones: it may fail (`cd /nonexistent; …`), run
-    /// in a subshell (`(cd x); …`) or go somewhere unknown (`cd $(…)`).
-    /// `sub_body`: `raw_cmd` is the body of a `$(…)` (lexed as bash lexes
-    /// one: `split_substitution_noted`).
-    // The shell state a nested evaluation inherits travels as arguments.
-    #[allow(clippy::too_many_arguments)]
+    /// `state`: the shell state at the start of `raw_cmd`; a nested
+    /// evaluation inherits it. `sub_body`: `raw_cmd` is the body of a
+    /// `$(…)` (lexed as bash lexes one: `split_substitution_noted`).
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
         start: Instant,
         depth: u32,
-        cwds: &[PathBuf],
-        cwd_unknown: bool,
-        env_changed: bool,
-        ifs_named: bool,
+        state: &ShellState,
         sub_body: bool,
     ) -> Decision {
-        let mut allow_trace: Option<AllowTrace> = None;
-        // Something could not be judged (a glob too large to expand): the
-        // outcome is a recorded fail-open unless something else denies.
-        let mut unjudged: Option<String> = None;
-        let mut cwds: Vec<PathBuf> = cwds.to_vec();
-        // A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`,
-        // an unresolvable target, or past `MAX_CWDS`).
-        let mut cwd_unknown = cwd_unknown;
-        // An earlier segment changed PATH, HOME or XDG_DATA_HOME for the
-        // rest of the command line (and for nested evaluations).
-        let mut env_changed = env_changed;
+        let mut state = state.clone();
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
         // comment): values are still judged, the unresolved words too.
-        let ifs_named = ifs_named || mentions_ifs(raw_cmd);
+        state.ifs_named |= mentions_ifs(raw_cmd);
+        let mut found = Findings::default();
         let (segments, lex_note) = if sub_body {
             split_substitution_noted(raw_cmd)
         } else {
             split_segments_noted(raw_cmd)
         };
         if let Some(reason) = lex_note {
-            unjudged.get_or_insert_with(|| reason.to_string());
+            found.unjudged(reason);
         }
-        let literal_path =
-            has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments);
+        let cx = Ctx {
+            start,
+            depth,
+            literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
+        };
 
         for seg in segments {
             if start.elapsed() > self.budget {
-                return Decision::Allow {
-                    trace: AllowTrace::FailedOpenTimeout,
-                };
+                return timed_out();
             }
             if seg.is_empty() {
                 continue;
             }
-            // A word whose brace expansion was too large is judged as
-            // written, and the command is recorded as not fully judged.
-            if seg.iter().any(|w| w.brace_overflow) {
-                unjudged.get_or_insert_with(|| "brace expansion too large to judge".to_string());
-            }
-            // Peel off transparent wrapper commands (`command`, `env`,
-            // `nohup`, `nice`, `stdbuf`, `ionice`, `sudo`) before judging —
-            // the engine reasons about the *effective* command, not the
-            // wrapper, so packs never need to know these wrappers exist.
-            let effective = unwrap_transparent_prefix(&seg);
-
-            // Command substitution occupying *command position* — the
-            // whole (unwrapped) segment, or the value of a leading
-            // `NAME=$(...)` assignment word: a real shell evaluates
-            // `$(...)`/`` `...` `` eagerly, so `$(rm -rf /)` runs `rm -rf /`
-            // for real regardless of what (if anything) consumes its
-            // output. There's no argv[0] here for a pack to match against —
-            // recurse into the substitution's inner text and judge that
-            // instead, the same structural re-entry already used for inline
-            // `bash -c '...'` payloads below (same depth cap, same budget).
-            // A leading `NAME=$(…)` assignment in front of a real command
-            // (`FOO=$(date) git reset --hard`) is not the command: the
-            // command after it is judged below and the substitution by the
-            // embedded-substitution scan.
-            let substitution_is_the_command = {
-                let rest = effective_command(effective);
-                rest.is_empty()
-                    || rest.first().is_some_and(|w| {
-                        command_position_substitution(rest).is_some() && w.has_substitution
-                    })
-            };
-            if let Some((inner, dollar)) = command_position_substitution_kind(effective)
-                .filter(|_| substitution_is_the_command)
-            {
-                if depth < MAX_INLINE_DEPTH {
-                    if start.elapsed() > self.budget {
-                        return Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        };
-                    }
-                    match self.evaluate_inner(
-                        &inner,
-                        start,
-                        depth + 1,
-                        &cwds,
-                        cwd_unknown,
-                        env_changed,
-                        ifs_named,
-                        dollar,
-                    ) {
-                        Decision::Deny {
-                            pack,
-                            pattern,
-                            reason,
-                            ..
-                        } => {
-                            return Decision::Deny {
-                                pack,
-                                pattern,
-                                reason,
-                                via_inline: Some(inner),
-                            }
-                        }
-                        Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        } => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        Decision::Allow { trace } => {
-                            note(trace, &mut allow_trace, &mut unjudged);
-                        }
-                    }
-                } else {
-                    unjudged.get_or_insert_with(|| {
-                        "command substitution nested too deeply to judge".to_string()
-                    });
-                }
-                // A bare `HOME=$(mktemp -d)` stays set for what follows.
-                env_changed |= effective_is_empty_assignments(&seg, literal_path);
-                // Depth cap reached, or the recursion above resolved to a
-                // (non-timeout) allow: there is no literal argv[0] in this
-                // segment to judge against packs, so move on to the next
-                // segment rather than trying to match "$(...)" as if it
-                // were a literal command name.
-                continue;
-            }
-
-            // Command substitution embedded ANYWHERE else in this segment —
-            // not filling the whole command position (handled above), but
-            // sitting inside an argument, inside a wrapper's own words (e.g.
-            // an `env FOO=$(...)` assignment later peeled off by
-            // unwrapping), or only part of a larger concatenated word
-            // (`$(cmd)suffix`). A real shell evaluates every `$(...)`/
-            // `` `...` `` eagerly wherever it appears, before deciding what
-            // the surrounding word means — so leaving any of these
-            // unjudged is a full, silent bypass regardless of position,
-            // quoting, or whether the outer command is one a pack guards.
-            // Scanned over the *original* (pre-unwrap) segment so a
-            // substitution hiding in a word a wrapper's unwrapping would
-            // otherwise consume is not missed either. Recurse into each one
-            // found — same depth cap and budget as every other structural
-            // re-entry in this function; a deny in any of them denies the
-            // whole segment. A benign inner (`echo $(date)`) still resolves
-            // to ALLOW here; only a guarded/destructive inner denies. This
-            // does not replace the guarded-argument fail-safe below, which
-            // covers a different risk (a *benign* inner whose result is
-            // still an unknowable, dynamic target for an already-guarded
-            // command, e.g. `rm -rf $(echo /)`).
-            for word in &seg {
-                if !word.has_substitution {
-                    continue;
-                }
-                for (inner, dollar) in find_all_substitution_kinds(&word.text) {
-                    if depth >= MAX_INLINE_DEPTH {
-                        // Depth cap reached: fail open (recorded) on this
-                        // one substitution and keep scanning the rest of
-                        // the segment rather than recursing unboundedly.
-                        unjudged.get_or_insert_with(|| {
-                            "command substitution nested too deeply to judge".to_string()
-                        });
-                        continue;
-                    }
-                    if start.elapsed() > self.budget {
-                        return Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        };
-                    }
-                    match self.evaluate_inner(
-                        &inner,
-                        start,
-                        depth + 1,
-                        &cwds,
-                        cwd_unknown,
-                        env_changed,
-                        ifs_named,
-                        dollar,
-                    ) {
-                        Decision::Deny {
-                            pack,
-                            pattern,
-                            reason,
-                            ..
-                        } => {
-                            return Decision::Deny {
-                                pack,
-                                pattern,
-                                reason,
-                                via_inline: Some(inner),
-                            }
-                        }
-                        Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        } => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        Decision::Allow { trace } => {
-                            note(trace, &mut allow_trace, &mut unjudged);
-                        }
-                    }
-                }
-            }
-
-            // Leading assignments and redirections (`LANG=C sort f`,
-            // `2>/dev/null cat f`) are not the command either.
-            let effective = effective_command(effective);
-            // An argument that is one substitution printing plain data
-            // (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`) is
-            // judged by its value, like any literal argument; its inner
-            // command was judged above.
-            // Words in front of the command (wrappers, assignments,
-            // redirections), counted before the arguments are resolved.
-            let prefix_len = seg.len() - effective.len();
-            let unresolved = effective;
-            let (mut forms, args_unquoted) = resolve_forms(effective, false);
-            // Redirection targets are resolved the same way.
-            let (mut target_forms, targets_unquoted) = resolve_forms(&seg, true);
-            // A line naming IFS may split a value anywhere: what was judged
-            // is a guess, so a non-deny outcome is recorded.
-            if ifs_named && (args_unquoted || targets_unquoted) {
-                unjudged.get_or_insert_with(|| {
-                    "IFS is set on this line: substitution values may split differently".to_string()
-                });
-            }
-            // Other interpretations (the unsplit values) are judged as
-            // commands of their own after this one.
-            let alternatives: Vec<(Vec<Word>, Vec<Word>)> = {
-                let n = forms.len().max(target_forms.len());
-                (1..n)
-                    .map(|i| {
-                        (
-                            forms.get(i).unwrap_or(&forms[0]).clone(),
-                            target_forms.get(i).unwrap_or(&target_forms[0]).clone(),
-                        )
-                    })
-                    .collect()
-            };
-            let resolved = forms.swap_remove(0);
-            let seg_ops = target_forms.swap_remove(0);
-            let effective: &[Word] = &resolved;
-            // Files a peeled-off wrapper reads itself (`xargs -a FILE`).
-            let reads: Vec<Operand> = wrapper_reads(&seg)
-                .into_iter()
-                .map(|(path, glob)| Operand {
-                    path,
-                    access: Access::Read,
-                    glob,
-                    into: Vec::new(),
-                })
-                .collect();
-            // Assignments in front of this segment's own command
-            // (`HOME=$(mktemp -d -p /tmp x) claude`, `env CODEX_HOME=x codex`)
-            // change its environment too.
-            let seg_env_changed = env_changed
-                || seg[..prefix_len].iter().any(|w| {
-                    !w.redirect
-                        && (w.assignment || is_env_assignment(&w.text))
-                        && assignment_changes_environment(&w.text, literal_path)
-                });
-            // The peeled-off redirections stay visible to the regex rules
-            // (`>/dev/sda cat x` is judged like `cat x > /dev/sda`).
-            let peeled = peeled_redirections(&seg[..prefix_len]);
-            let argv = build_argv(effective);
-            if argv.is_empty() || argv[0].is_empty() {
-                let segment_line = segment_line(&seg);
-                // A bare wrapper (`env`, `sudo -l`) or bare redirection
-                // (`>/dev/sda`): only whole-segment rules and the
-                // redirections can apply.
-                if self.combined.might_match(&segment_line) {
-                    match self.judge(&peeled, &segment_line, seg_env_changed, start) {
-                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
-                        JudgeOutcome::TimedOut => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                env_changed |= effective_is_empty_assignments(&seg, literal_path);
-                let alt_ops = alternatives
-                    .iter()
-                    .map(|(_, t)| self.shell_ops(t, &[], &[], reads.clone()));
-                let all_ops: Vec<Vec<Operand>> =
-                    std::iter::once(self.shell_ops(&seg_ops, &[], &[], reads.clone()))
-                        .chain(alt_ops)
-                        .collect();
-                for ops in all_ops {
-                    if let Some(d) = self.judge_operands(ops, &cwds, cwd_unknown, start) {
-                        match d {
-                            Decision::Allow {
-                                trace: AllowTrace::Unjudgeable { reason },
-                            } => {
-                                unjudged.get_or_insert(reason);
-                            }
-                            d => return d,
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Fail-safe: a guarded command (one an active pack has a deny
-            // rule for) with a command-substitution argument can't be
-            // proven safe — we don't evaluate `$(...)`/`` `...` ``, so we
-            // don't know what it resolves to. Scoped to arguments only
-            // (never argv[0] itself) and to already-guarded commands, so an
-            // unguarded command with a substitution (`echo $(date)`) gains
-            // no new scrutiny.
-            if self.guarded_commands.contains(&argv[0])
-                && (effective.iter().skip(1).any(|w| w.has_substitution)
-                    || (ifs_named
-                        && unresolved
-                            .iter()
-                            .skip(1)
-                            .any(|w| w.has_substitution && !w.dq_substitution)))
-            {
-                return Decision::Deny {
-                    pack: SUBSTITUTION_GUARD_PACK.to_string(),
-                    pattern: "guarded-command-substitution-argument".to_string(),
-                    reason: format!(
-                        "{} has a command-substitution argument; the guard cannot see \
-                         what it expands to, so it fails safe and blocks",
-                        argv[0]
-                    ),
-                    via_inline: None,
-                };
-            }
-
-            let mut matching_line = argv.join(" ");
-            if !peeled.is_empty() {
-                matching_line.push(' ');
-                matching_line.push_str(&peeled);
-            }
-            // The whole segment's line differs only when a wrapper was
-            // peeled off or the segment starts with an assignment.
-            let whole =
-                (prefix_len > 0 || is_env_assignment(&seg[0].text)).then(|| segment_line(&seg));
-            let segment_line = whole.as_deref().unwrap_or(&matching_line);
-            if self.combined.might_match(&matching_line)
-                || (whole.is_some() && self.combined.might_match(segment_line))
-            {
-                match self.judge(&matching_line, segment_line, seg_env_changed, start) {
-                    JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
-                    JudgeOutcome::Decided(Decision::Allow { trace }) => {
-                        allow_trace = Some(trace);
-                    }
-                    JudgeOutcome::TimedOut => {
-                        return Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        }
-                    }
-                    JudgeOutcome::Clean => {}
-                }
-            }
-
-            // Files the command reads or writes, judged by the path rules
-            // that also guard the agents' file tools.
-            if let Some(d) = self.judge_operands(
-                self.shell_ops(&seg_ops, effective, &argv, reads.clone()),
-                &cwds,
-                cwd_unknown,
-                start,
-            ) {
-                match d {
-                    Decision::Allow {
-                        trace: AllowTrace::Unjudgeable { reason },
-                    } => {
-                        unjudged.get_or_insert(reason);
-                    }
-                    d => return d,
-                }
-            }
-            // The other interpretations of the values (unsplit): the same
-            // rules and path rules on each as a command of its own.
-            for (alt_eff, alt_seg) in &alternatives {
-                let alt_argv = build_argv(alt_eff);
-                if alt_argv.is_empty() {
-                    continue;
-                }
-                let mut line = alt_argv.join(" ");
-                if !peeled.is_empty() {
-                    line.push(' ');
-                    line.push_str(&peeled);
-                }
-                if self.combined.might_match(&line) {
-                    match self.judge(&line, segment_line, seg_env_changed, start) {
-                        JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return d,
-                        JudgeOutcome::TimedOut => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(d) = self.judge_operands(
-                    self.shell_ops(alt_seg, alt_eff, &alt_argv, reads.clone()),
-                    &cwds,
-                    cwd_unknown,
-                    start,
-                ) {
-                    match d {
-                        Decision::Allow {
-                            trace: AllowTrace::Unjudgeable { reason },
-                        } => {
-                            unjudged.get_or_insert(reason);
-                        }
-                        d => return d,
-                    }
-                }
-            }
-            // `eval ARGS` runs its joined arguments as a command line in
-            // this shell. What a substitution inside it expands to cannot
-            // be judged: recorded, not silent.
-            if argv[0] == "eval" {
-                if effective.iter().any(|w| w.has_substitution) {
-                    unjudged.get_or_insert_with(|| {
-                        "eval of a command substitution cannot be judged".to_string()
-                    });
-                }
-                // `eval -- ARGS`: the `--` ends eval's (empty) options.
-                let args = match effective.get(1) {
-                    Some(w) if w.text == "--" => &effective[2..],
-                    _ => effective.get(1..).unwrap_or(&[]),
-                };
-                let inner = args
-                    .iter()
-                    .map(|w| w.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if depth >= MAX_INLINE_DEPTH && !inner.trim().is_empty() {
-                    unjudged.get_or_insert_with(|| "eval nested too deeply to judge".to_string());
-                } else if !inner.trim().is_empty() {
-                    if start.elapsed() > self.budget {
-                        return Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        };
-                    }
-                    match self.evaluate_inner(
-                        &inner,
-                        start,
-                        depth + 1,
-                        &cwds,
-                        cwd_unknown,
-                        env_changed,
-                        ifs_named,
-                        false,
-                    ) {
-                        Decision::Deny {
-                            pack,
-                            pattern,
-                            reason,
-                            ..
-                        } => {
-                            return Decision::Deny {
-                                pack,
-                                pattern,
-                                reason,
-                                via_inline: Some(inner),
-                            }
-                        }
-                        Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        } => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        Decision::Allow { trace } => note(trace, &mut allow_trace, &mut unjudged),
-                    }
-                }
-            }
-            env_changed |= changes_environment(&argv, effective, literal_path);
-            if argv[0] == "cd" || argv[0] == "pushd" {
-                cwd_unknown |= self.cd(&argv, effective, &mut cwds);
-            }
-
-            // Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`,
-            // and `watch CMD …` (which joins its remaining args and runs them
-            // via `sh -c`). Not gated behind the pre-filter above — the
-            // payload may only resolve to something trigger-bearing once it is
-            // *re-lexed* on its own (a nested quote inside an outer
-            // single-quoted `-c` argument is invisible to the outer scan by
-            // design; the recursive call re-tokenizes it correctly). The two
-            // extractors are mutually exclusive on argv[0], so trying one then
-            // the other never double-recurses the same segment.
-            if let Some(inner) = inline_payload(&argv).or_else(|| watch_payload(&argv)) {
-                if depth >= MAX_INLINE_DEPTH {
-                    unjudged.get_or_insert_with(|| {
-                        "inline command nested too deeply to judge".to_string()
-                    });
-                } else {
-                    if start.elapsed() > self.budget {
-                        return Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        };
-                    }
-                    match self.evaluate_inner(
-                        &inner,
-                        start,
-                        depth + 1,
-                        &cwds,
-                        cwd_unknown,
-                        env_changed,
-                        ifs_named,
-                        false,
-                    ) {
-                        Decision::Deny {
-                            pack,
-                            pattern,
-                            reason,
-                            ..
-                        } => {
-                            return Decision::Deny {
-                                pack,
-                                pattern,
-                                reason,
-                                via_inline: Some(inner),
-                            }
-                        }
-                        Decision::Allow {
-                            trace: AllowTrace::FailedOpenTimeout,
-                        } => {
-                            return Decision::Allow {
-                                trace: AllowTrace::FailedOpenTimeout,
-                            }
-                        }
-                        // An allowed payload does not end the evaluation:
-                        // later segments still get judged.
-                        Decision::Allow { trace } => {
-                            note(trace, &mut allow_trace, &mut unjudged);
-                        }
-                    }
-                }
+            if let Some(d) = self.evaluate_segment(&seg, &cx, &mut state, &mut found) {
+                return d;
             }
         }
+        found.finish()
+    }
 
-        if let Some(reason) = unjudged {
-            return Decision::Allow {
+    /// Judge one segment, phase by phase. `Some` ends the whole evaluation
+    /// with that decision (a deny, or the budget ran out).
+    fn evaluate_segment(
+        &self,
+        seg: &[Word],
+        cx: &Ctx,
+        state: &mut ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        // A word whose brace expansion was too large is judged as
+        // written, and the command is recorded as not fully judged.
+        if seg.iter().any(|w| w.brace_overflow) {
+            found.unjudged("brace expansion too large to judge");
+        }
+        // Peel off transparent wrapper commands (`command`, `env`,
+        // `nohup`, `nice`, `stdbuf`, `ionice`, `sudo`) before judging —
+        // the engine reasons about the *effective* command, not the
+        // wrapper, so packs never need to know these wrappers exist.
+        let effective = unwrap_transparent_prefix(seg);
+        match self.command_position_phase(seg, effective, cx, state, found) {
+            Flow::Proceed => {}
+            Flow::NextSegment => return None,
+            Flow::Done(d) => return Some(d),
+        }
+        if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
+            return Some(d);
+        }
+        let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
+        if view.argv.is_empty() || view.argv[0].is_empty() {
+            return self.bare_segment_phase(&view, cx, state, found);
+        }
+        if let Some(d) = self.command_rules_phase(&view, cx, state, found) {
+            return Some(d);
+        }
+        if let Some(d) = self.operands_phase(&view, cx, state, found) {
+            return Some(d);
+        }
+        if let Some(d) = self.eval_phase(&view, cx, state, found) {
+            return Some(d);
+        }
+        self.environment_phase(&view, cx, state);
+        self.cd_phase(&view, state);
+        self.inline_payload_phase(&view, cx, state, found)
+    }
+
+    /// The one place that enforces `MAX_INLINE_DEPTH`, the budget, and the
+    /// "… nested too deeply to judge" note: judge `inner` as a command line
+    /// of its own, one level deeper, with the shell state it inherits.
+    /// `what` names the construct in that note.
+    fn recurse(
+        &self,
+        inner: &str,
+        start: Instant,
+        depth: u32,
+        state: &ShellState,
+        sub_body: bool,
+        what: &str,
+    ) -> Nested {
+        // Fail open (recorded) beyond the cap rather than recursing
+        // unboundedly on adversarial nesting.
+        if depth >= MAX_INLINE_DEPTH {
+            return Nested::Unjudged(format!("{what} nested too deeply to judge"));
+        }
+        if start.elapsed() > self.budget {
+            return Nested::TimedOut;
+        }
+        match self.evaluate_inner(inner, start, depth + 1, state, sub_body) {
+            Decision::Deny {
+                pack,
+                pattern,
+                reason,
+                ..
+            } => Nested::Deny(Decision::Deny {
+                pack,
+                pattern,
+                reason,
+                via_inline: Some(inner.to_string()),
+            }),
+            Decision::Allow {
+                trace: AllowTrace::FailedOpenTimeout,
+            } => Nested::TimedOut,
+            Decision::Allow {
                 trace: AllowTrace::Unjudgeable { reason },
-            };
+            } => Nested::Unjudged(reason),
+            Decision::Allow { trace } => Nested::Clean(trace),
         }
-        Decision::Allow {
-            trace: allow_trace.unwrap_or(AllowTrace::NoMatch),
+    }
+
+    /// Command substitution occupying *command position* — the whole
+    /// (unwrapped) segment, or the value of a leading `NAME=$(...)`
+    /// assignment word: a real shell evaluates `$(...)`/`` `...` ``
+    /// eagerly, so `$(rm -rf /)` runs `rm -rf /` for real regardless of
+    /// what (if anything) consumes its output. There's no argv[0] here for
+    /// a pack to match against — recurse into the substitution's inner text
+    /// and judge that instead, the same structural re-entry used for inline
+    /// `bash -c '...'` payloads (same depth cap, same budget).
+    fn command_position_phase(
+        &self,
+        seg: &[Word],
+        effective: &[Word],
+        cx: &Ctx,
+        state: &mut ShellState,
+        found: &mut Findings,
+    ) -> Flow {
+        // A leading `NAME=$(…)` assignment in front of a real command
+        // (`FOO=$(date) git reset --hard`) is not the command: the
+        // command after it is judged below and the substitution by the
+        // embedded-substitution scan.
+        let substitution_is_the_command = {
+            let rest = effective_command(effective);
+            rest.is_empty()
+                || rest.first().is_some_and(|w| {
+                    command_position_substitution(rest).is_some() && w.has_substitution
+                })
+        };
+        let Some((inner, dollar)) =
+            command_position_substitution_kind(effective).filter(|_| substitution_is_the_command)
+        else {
+            return Flow::Proceed;
+        };
+        let nested = self.recurse(
+            &inner,
+            cx.start,
+            cx.depth,
+            state,
+            dollar,
+            "command substitution",
+        );
+        if let Some(d) = found.nested(nested) {
+            return Flow::Done(d);
         }
+        // A bare `HOME=$(mktemp -d)` stays set for what follows.
+        state.env_changed |= effective_is_empty_assignments(seg, cx.literal_path);
+        // Depth cap reached, or the recursion above resolved to a
+        // (non-timeout) allow: there is no literal argv[0] in this segment
+        // to judge against packs, so move on to the next segment rather
+        // than trying to match "$(...)" as if it were a literal command
+        // name.
+        Flow::NextSegment
+    }
+
+    /// Command substitution embedded ANYWHERE else in this segment — not
+    /// filling the whole command position (handled above), but sitting
+    /// inside an argument, inside a wrapper's own words (e.g. an
+    /// `env FOO=$(...)` assignment later peeled off by unwrapping), or only
+    /// part of a larger concatenated word (`$(cmd)suffix`). A real shell
+    /// evaluates every `$(...)`/`` `...` `` eagerly wherever it appears,
+    /// before deciding what the surrounding word means — so leaving any of
+    /// these unjudged is a full, silent bypass regardless of position,
+    /// quoting, or whether the outer command is one a pack guards.
+    /// Scanned over the *original* (pre-unwrap) segment so a substitution
+    /// hiding in a word a wrapper's unwrapping would otherwise consume is
+    /// not missed either. Recurse into each one found — same depth cap and
+    /// budget as every other structural re-entry; a deny in any of them
+    /// denies the whole segment. A benign inner (`echo $(date)`) still
+    /// resolves to ALLOW here; only a guarded/destructive inner denies.
+    /// This does not replace the guarded-argument fail-safe in
+    /// `command_rules_phase`, which covers a different risk (a *benign*
+    /// inner whose result is still an unknowable, dynamic target for an
+    /// already-guarded command, e.g. `rm -rf $(echo /)`).
+    fn embedded_substitutions_phase(
+        &self,
+        seg: &[Word],
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        for word in seg {
+            if !word.has_substitution {
+                continue;
+            }
+            for (inner, dollar) in find_all_substitution_kinds(&word.text) {
+                // Past the depth cap: recorded on this one substitution,
+                // and the rest of the segment is still scanned.
+                let nested = self.recurse(
+                    &inner,
+                    cx.start,
+                    cx.depth,
+                    state,
+                    dollar,
+                    "command substitution",
+                );
+                if let Some(d) = found.nested(nested) {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+
+    /// A bare wrapper (`env`, `sudo -l`) or bare redirection
+    /// (`>/dev/sda`): only whole-segment rules, the redirections and the
+    /// path rules can apply.
+    fn bare_segment_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &mut ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        let segment_line = segment_line(view.seg);
+        if self.combined.might_match(&segment_line) {
+            match self.judge(&view.peeled, &segment_line, view.env_changed, cx.start) {
+                JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                JudgeOutcome::TimedOut => return Some(timed_out()),
+                _ => {}
+            }
+        }
+        state.env_changed |= effective_is_empty_assignments(view.seg, cx.literal_path);
+        let alt_ops = view
+            .alternatives
+            .iter()
+            .map(|(_, t)| self.shell_ops(t, &[], &[], view.reads.clone()));
+        let all_ops: Vec<Vec<Operand>> =
+            std::iter::once(self.shell_ops(&view.seg_ops, &[], &[], view.reads.clone()))
+                .chain(alt_ops)
+                .collect();
+        for ops in all_ops {
+            let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+            if let Some(d) = found.operands(judged) {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    /// The pack rules on the effective command. `Some` on a deny or when
+    /// the budget runs out; an allow rule that carved it out is noted.
+    fn command_rules_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        let argv = &view.argv;
+        // Fail-safe: a guarded command (one an active pack has a deny
+        // rule for) with a command-substitution argument can't be
+        // proven safe — we don't evaluate `$(...)`/`` `...` ``, so we
+        // don't know what it resolves to. Scoped to arguments only
+        // (never argv[0] itself) and to already-guarded commands, so an
+        // unguarded command with a substitution (`echo $(date)`) gains
+        // no new scrutiny.
+        if self.guarded_commands.contains(&argv[0])
+            && (view.resolved.iter().skip(1).any(|w| w.has_substitution)
+                || (state.ifs_named
+                    && view
+                        .unresolved
+                        .iter()
+                        .skip(1)
+                        .any(|w| w.has_substitution && !w.dq_substitution)))
+        {
+            return Some(Decision::Deny {
+                pack: SUBSTITUTION_GUARD_PACK.to_string(),
+                pattern: "guarded-command-substitution-argument".to_string(),
+                reason: format!(
+                    "{} has a command-substitution argument; the guard cannot see \
+                     what it expands to, so it fails safe and blocks",
+                    argv[0]
+                ),
+                via_inline: None,
+            });
+        }
+        let matching_line = &view.matching_line;
+        let segment_line = view.segment_line();
+        if !self.combined.might_match(matching_line)
+            && !(view.whole.is_some() && self.combined.might_match(segment_line))
+        {
+            return None;
+        }
+        match self.judge(matching_line, segment_line, view.env_changed, cx.start) {
+            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
+            JudgeOutcome::Decided(Decision::Allow { trace }) => {
+                found.allow_trace = Some(trace);
+                None
+            }
+            JudgeOutcome::TimedOut => Some(timed_out()),
+            JudgeOutcome::Clean => None,
+        }
+    }
+
+    /// Files the command reads or writes, judged by the path rules that
+    /// also guard the agents' file tools; then the other interpretations of
+    /// the values (unsplit): the same rules and path rules on each as a
+    /// command of its own.
+    fn operands_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        let ops = self.shell_ops(
+            &view.seg_ops,
+            &view.resolved,
+            &view.argv,
+            view.reads.clone(),
+        );
+        let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+        if let Some(d) = found.operands(judged) {
+            return Some(d);
+        }
+        for (alt_eff, alt_seg) in &view.alternatives {
+            let alt_argv = build_argv(alt_eff);
+            if alt_argv.is_empty() {
+                continue;
+            }
+            let mut line = alt_argv.join(" ");
+            if !view.peeled.is_empty() {
+                line.push(' ');
+                line.push_str(&view.peeled);
+            }
+            if self.combined.might_match(&line) {
+                match self.judge(&line, view.segment_line(), view.env_changed, cx.start) {
+                    JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                    JudgeOutcome::TimedOut => return Some(timed_out()),
+                    _ => {}
+                }
+            }
+            let ops = self.shell_ops(alt_seg, alt_eff, &alt_argv, view.reads.clone());
+            let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+            if let Some(d) = found.operands(judged) {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    /// `eval ARGS` runs its joined arguments as a command line in this
+    /// shell. What a substitution inside it expands to cannot be judged:
+    /// recorded, not silent.
+    fn eval_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        if view.argv[0] != "eval" {
+            return None;
+        }
+        let effective = &view.resolved;
+        if effective.iter().any(|w| w.has_substitution) {
+            found.unjudged("eval of a command substitution cannot be judged");
+        }
+        // `eval -- ARGS`: the `--` ends eval's (empty) options.
+        let args = match effective.get(1) {
+            Some(w) if w.text == "--" => &effective[2..],
+            _ => effective.get(1..).unwrap_or(&[]),
+        };
+        let inner = args
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if inner.trim().is_empty() {
+            return None;
+        }
+        found.nested(self.recurse(&inner, cx.start, cx.depth, state, false, "eval"))
+    }
+
+    /// A builtin that changes PATH, HOME or XDG_DATA_HOME changes them for
+    /// the rest of the command line (and for nested evaluations).
+    fn environment_phase(&self, view: &SegmentView, cx: &Ctx, state: &mut ShellState) {
+        state.env_changed |= changes_environment(&view.argv, &view.resolved, cx.literal_path);
+    }
+
+    /// `cd`/`pushd`: the later segments may run in its target too.
+    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) {
+        if view.argv[0] == "cd" || view.argv[0] == "pushd" {
+            state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
+        }
+    }
+
+    /// Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`, and
+    /// `watch CMD …` (which joins its remaining args and runs them via
+    /// `sh -c`). Not gated behind the pre-filter — the payload may only
+    /// resolve to something trigger-bearing once it is *re-lexed* on its
+    /// own (a nested quote inside an outer single-quoted `-c` argument is
+    /// invisible to the outer scan by design; the recursive call
+    /// re-tokenizes it correctly). The two extractors are mutually
+    /// exclusive on argv[0], so trying one then the other never
+    /// double-recurses the same segment. An allowed payload does not end
+    /// the evaluation: later segments still get judged.
+    fn inline_payload_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        let inner = inline_payload(&view.argv).or_else(|| watch_payload(&view.argv))?;
+        let nested = self.recurse(&inner, cx.start, cx.depth, state, false, "inline command");
+        found.nested(nested)
     }
 
     /// Judge every path the segment reads or writes, against every
@@ -886,7 +792,7 @@ impl Engine {
         cwd_unknown: bool,
         start: Instant,
     ) -> Option<Decision> {
-        if self.path_rules.is_empty() || ops.is_empty() {
+        if !self.has_path_rules || ops.is_empty() {
             return None;
         }
         let all: Vec<Option<&Path>> = if cwds.is_empty() {
@@ -1003,7 +909,7 @@ impl Engine {
         argv: &[String],
         extra: Vec<Operand>,
     ) -> Vec<Operand> {
-        if self.path_rules.is_empty() {
+        if !self.has_path_rules {
             return Vec::new();
         }
         let mut ops = operands(seg, effective, argv);
@@ -1128,7 +1034,9 @@ impl Engine {
         unknown
     }
 
-    /// Run allow-before-deny across all packs for one segment. Rules match
+    /// Run allow-before-deny per pack, across all packs, for one segment: a
+    /// pack whose allow rule matches skips only its own deny rules, so the
+    /// first deny of any other pack still wins over an allow. Rules match
     /// the effective command's line (its argv after wrappers like `sudo` are
     /// peeled off, case-folded/dir-stripped/slash-collapsed, joined with
     /// single spaces); `whole_segment` rules match the line of the whole
@@ -1152,6 +1060,7 @@ impl Engine {
                 Some(matching_line)
             }
         };
+        let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
@@ -1160,19 +1069,21 @@ impl Engine {
             if !pf.might_match(matching_line) && !pf.might_match(segment_line) {
                 continue;
             }
-            // Allow rules first — a match short-circuits to ALLOW.
-            for rule in &pack.allow {
-                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
-                    return JudgeOutcome::Decided(Decision::Allow {
-                        trace: AllowTrace::AllowRule {
-                            pack: pack.id.clone(),
-                            pattern: rule.pattern.clone(),
-                            reason: rule.reason.clone(),
-                        },
-                    });
-                }
+            // An allow match exempts only this pack's own deny rules (as
+            // `allow_path` does); later packs still judge the command.
+            if let Some(rule) = pack
+                .allow
+                .iter()
+                .find(|r| line(r).is_some_and(|l| r.regex.is_match(l)))
+            {
+                allowed.get_or_insert_with(|| AllowTrace::AllowRule {
+                    pack: pack.id.clone(),
+                    pattern: rule.pattern.clone(),
+                    reason: rule.reason.clone(),
+                });
+                continue;
             }
-            // Then deny rules — first match wins.
+            // Deny rules — first match wins.
             for rule in &pack.deny {
                 if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
                     return JudgeOutcome::Decided(Decision::Deny {
@@ -1183,6 +1094,9 @@ impl Engine {
                     });
                 }
             }
+        }
+        if let Some(trace) = allowed {
+            return JudgeOutcome::Decided(Decision::Allow { trace });
         }
         JudgeOutcome::Clean
     }
@@ -1205,18 +1119,6 @@ fn base_name(path: &str) -> Option<String> {
 fn into_dir(dir: &str, names: &[String]) -> Vec<String> {
     let dir = dir.trim_end_matches('/');
     names.iter().map(|n| format!("{dir}/{n}")).collect()
-}
-
-/// Record a recursive evaluation's allow: an unjudgeable part makes the
-/// whole command unjudgeable (unless something denies), otherwise the
-/// latest trace wins.
-fn note(trace: AllowTrace, allow_trace: &mut Option<AllowTrace>, unjudged: &mut Option<String>) {
-    match trace {
-        AllowTrace::Unjudgeable { reason } => {
-            unjudged.get_or_insert(reason);
-        }
-        t => *allow_trace = Some(t),
-    }
 }
 
 /// Does the command text name `IFS` (as a whole word: `IFS=:`,
@@ -1518,6 +1420,245 @@ fn looks_like_bare_command_name(trigger: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// The shell state a command line starts in; a nested evaluation inherits
+/// it, and its segments update their own copy.
+#[derive(Clone)]
+struct ShellState {
+    /// The directories the shell may be in. A `cd` adds its target for the
+    /// segments after it but never drops the old ones: it may fail
+    /// (`cd /nonexistent; …`), run in a subshell (`(cd x); …`) or go
+    /// somewhere unknown (`cd $(…)`).
+    cwds: Vec<PathBuf>,
+    /// A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`, an
+    /// unresolvable target, or past `MAX_CWDS`).
+    cwd_unknown: bool,
+    /// An earlier segment changed PATH, HOME or XDG_DATA_HOME for the rest
+    /// of the command line (and for nested evaluations).
+    env_changed: bool,
+    /// The line names IFS somewhere: values are still judged, the
+    /// unresolved words too.
+    ifs_named: bool,
+}
+
+/// The outcome of a nested evaluation (`Engine::recurse`).
+enum Nested {
+    /// Denied; `via_inline` names the nested text.
+    Deny(Decision),
+    /// Not judged (past the depth cap, or the nested line was not fully
+    /// judged): a recorded fail-open unless something else denies.
+    Unjudged(String),
+    /// The budget ran out.
+    TimedOut,
+    /// Allowed, with the nested trace (no match, or an allow rule).
+    Clean(AllowTrace),
+}
+
+/// What the command-position phase tells the segment loop.
+enum Flow {
+    /// Judge the rest of this segment.
+    Proceed,
+    /// Nothing more to judge in this segment.
+    NextSegment,
+    /// End the evaluation with this decision.
+    Done(Decision),
+}
+
+/// Fixed for one evaluation of one command line.
+struct Ctx {
+    start: Instant,
+    depth: u32,
+    /// The line holds a path reference spelled out literally (see
+    /// `has_literal_path_ref`, `path_refs_are_plain`).
+    literal_path: bool,
+}
+
+/// What the segments of one command line found short of a deny.
+#[derive(Default)]
+struct Findings {
+    /// The trace of the latest allow (an allow rule, or a nested no-match).
+    allow_trace: Option<AllowTrace>,
+    /// Something could not be judged (a glob too large to expand): the
+    /// outcome is a recorded fail-open unless something else denies. The
+    /// first reason is kept.
+    unjudged: Option<String>,
+}
+
+impl Findings {
+    fn unjudged(&mut self, reason: impl Into<String>) {
+        if self.unjudged.is_none() {
+            self.unjudged = Some(reason.into());
+        }
+    }
+
+    /// Record a nested evaluation; `Some` when it ends this one. An
+    /// unjudgeable part makes the whole command unjudgeable (unless
+    /// something denies), otherwise the latest trace wins.
+    fn nested(&mut self, nested: Nested) -> Option<Decision> {
+        match nested {
+            Nested::Deny(d) => Some(d),
+            Nested::TimedOut => Some(timed_out()),
+            Nested::Unjudged(reason) => {
+                self.unjudged(reason);
+                None
+            }
+            Nested::Clean(trace) => {
+                self.allow_trace = Some(trace);
+                None
+            }
+        }
+    }
+
+    /// Note the path rules' verdict on a segment's operands; `Some` when it
+    /// ends the evaluation.
+    fn operands(&mut self, judged: Option<Decision>) -> Option<Decision> {
+        match judged? {
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { reason },
+            } => {
+                self.unjudged(reason);
+                None
+            }
+            d => Some(d),
+        }
+    }
+
+    fn finish(self) -> Decision {
+        if let Some(reason) = self.unjudged {
+            return Decision::Allow {
+                trace: AllowTrace::Unjudgeable { reason },
+            };
+        }
+        Decision::Allow {
+            trace: self.allow_trace.unwrap_or(AllowTrace::NoMatch),
+        }
+    }
+}
+
+fn timed_out() -> Decision {
+    Decision::Allow {
+        trace: AllowTrace::FailedOpenTimeout,
+    }
+}
+
+/// A segment with its leading words peeled off and its arguments resolved,
+/// as the rule and path-rule phases judge it.
+struct SegmentView<'a> {
+    seg: &'a [Word],
+    /// The effective command before its arguments were resolved.
+    unresolved: &'a [Word],
+    /// The effective command, plain-data substitutions replaced by their
+    /// values.
+    resolved: Vec<Word>,
+    argv: Vec<String>,
+    /// The segment with its redirection targets resolved.
+    seg_ops: Vec<Word>,
+    /// Other interpretations (the unsplit values): (effective command,
+    /// segment) pairs judged as commands of their own.
+    alternatives: Vec<(Vec<Word>, Vec<Word>)>,
+    /// Files a peeled-off wrapper reads itself (`xargs -a FILE`).
+    reads: Vec<Operand>,
+    /// The environment of this segment's own command changed.
+    env_changed: bool,
+    /// The peeled-off redirections.
+    peeled: String,
+    /// What the rules match: argv plus the peeled-off redirections.
+    matching_line: String,
+    /// The whole segment's line, when it differs.
+    whole: Option<String>,
+}
+
+impl<'a> SegmentView<'a> {
+    fn new(
+        seg: &'a [Word],
+        effective: &'a [Word],
+        state: &ShellState,
+        literal_path: bool,
+        found: &mut Findings,
+    ) -> Self {
+        // Leading assignments and redirections (`LANG=C sort f`,
+        // `2>/dev/null cat f`) are not the command either.
+        let effective = effective_command(effective);
+        // An argument that is one substitution printing plain data
+        // (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`) is
+        // judged by its value, like any literal argument; its inner
+        // command was judged above.
+        // Words in front of the command (wrappers, assignments,
+        // redirections), counted before the arguments are resolved.
+        let prefix_len = seg.len() - effective.len();
+        let (mut forms, args_unquoted) = resolve_forms(effective, false);
+        // Redirection targets are resolved the same way.
+        let (mut target_forms, targets_unquoted) = resolve_forms(seg, true);
+        // A line naming IFS may split a value anywhere: what was judged
+        // is a guess, so a non-deny outcome is recorded.
+        if state.ifs_named && (args_unquoted || targets_unquoted) {
+            found.unjudged("IFS is set on this line: substitution values may split differently");
+        }
+        // Other interpretations (the unsplit values) are judged as
+        // commands of their own after this one.
+        let alternatives: Vec<(Vec<Word>, Vec<Word>)> = {
+            let n = forms.len().max(target_forms.len());
+            (1..n)
+                .map(|i| {
+                    (
+                        forms.get(i).unwrap_or(&forms[0]).clone(),
+                        target_forms.get(i).unwrap_or(&target_forms[0]).clone(),
+                    )
+                })
+                .collect()
+        };
+        let resolved = forms.swap_remove(0);
+        let seg_ops = target_forms.swap_remove(0);
+        let reads: Vec<Operand> = wrapper_reads(seg)
+            .into_iter()
+            .map(|(path, glob)| Operand {
+                path,
+                access: Access::Read,
+                glob,
+                into: Vec::new(),
+            })
+            .collect();
+        // Assignments in front of this segment's own command
+        // (`HOME=$(mktemp -d -p /tmp x) claude`, `env CODEX_HOME=x codex`)
+        // change its environment too.
+        let env_changed = state.env_changed
+            || seg[..prefix_len].iter().any(|w| {
+                !w.redirect
+                    && (w.assignment || is_env_assignment(&w.text))
+                    && assignment_changes_environment(&w.text, literal_path)
+            });
+        // The peeled-off redirections stay visible to the regex rules
+        // (`>/dev/sda cat x` is judged like `cat x > /dev/sda`).
+        let peeled = peeled_redirections(&seg[..prefix_len]);
+        let argv = build_argv(&resolved);
+        let mut matching_line = argv.join(" ");
+        if !peeled.is_empty() {
+            matching_line.push(' ');
+            matching_line.push_str(&peeled);
+        }
+        // The whole segment's line differs only when a wrapper was
+        // peeled off or the segment starts with an assignment.
+        let whole = (prefix_len > 0 || is_env_assignment(&seg[0].text)).then(|| segment_line(seg));
+        SegmentView {
+            seg,
+            unresolved: effective,
+            resolved,
+            argv,
+            seg_ops,
+            alternatives,
+            reads,
+            env_changed,
+            peeled,
+            matching_line,
+            whole,
+        }
+    }
+
+    /// The line `whole_segment` rules match.
+    fn segment_line(&self) -> &str {
+        self.whole.as_deref().unwrap_or(&self.matching_line)
+    }
+}
+
 enum JudgeOutcome {
     Decided(Decision),
     Clean,
@@ -1573,6 +1714,41 @@ reason = "deletes untracked files"
             }
             _ => panic!("expected deny, got {d:?}"),
         }
+    }
+
+    #[test]
+    fn allow_in_one_pack_does_not_hide_another_packs_deny() {
+        let a = "[pack]\nid = \"test.a\"\n[[allow]]\npattern = '^foo'\n";
+        let b = "[pack]\nid = \"test.b\"\n[[deny]]\npattern = '^foo bar'\nreason = \"b says no\"\n";
+        let mut w = Vec::new();
+        let packs = vec![
+            load_pack_str("<a>", a, &mut w).unwrap(),
+            load_pack_str("<b>", b, &mut w).unwrap(),
+        ];
+        let e = Engine::new(packs).with_budget(TEST_BUDGET);
+        match e.evaluate("foo bar") {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "test.b"),
+            d => panic!("expected deny, got {d:?}"),
+        }
+        assert!(matches!(
+            e.evaluate("foo baz"),
+            Decision::Allow {
+                trace: AllowTrace::AllowRule { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn own_pack_allow_still_allows() {
+        let (packs, _) = crate::builtins::builtin_packs();
+        let e = Engine::new(crate::profile::select_active(packs, &[])).with_budget(TEST_BUDGET);
+        match e.evaluate("git reset --hard HEAD~1") {
+            Decision::Allow {
+                trace: AllowTrace::AllowRule { pack, .. },
+            } => assert_eq!(pack, "core.git"),
+            d => panic!("expected core.git allow rule, got {d:?}"),
+        }
+        assert!(!e.evaluate("git push --force-with-lease").is_deny());
     }
 
     #[test]

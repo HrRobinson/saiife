@@ -119,6 +119,11 @@ fn main() -> ExitCode {
         Err(e) => return arg_error(e),
     };
 
+    // Hook mode compiles only the packs it needs (it runs on every agent
+    // tool call); every other command lists or judges across all packs.
+    if let Cmd::Check { hook_exit, agent } = &cli.command {
+        return check::run(&cli.packs, *hook_exit, agent);
+    }
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
     // `--pack <id>` additively enables opt-in packs.
@@ -154,7 +159,7 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { hook_exit, agent } => check::run(packs, &cli.packs, hook_exit, &agent),
+        Cmd::Check { hook_exit, agent } => check::run(&cli.packs, hook_exit, &agent),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Status => status_cmd::run(&packs),

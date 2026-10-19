@@ -26,12 +26,16 @@ pub fn parse_since(s: &str) -> Result<Duration, String> {
     if n <= 0 {
         return Err(err());
     }
-    match unit {
-        "m" => Ok(Duration::minutes(n)),
-        "h" => Ok(Duration::hours(n)),
-        "d" => Ok(Duration::days(n)),
-        _ => Err(err()),
-    }
+    let unit_secs: i64 = match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return Err(err()),
+    };
+    // Checked: `Duration::days(n)` panics on overflow.
+    n.checked_mul(unit_secs)
+        .map(Duration::seconds)
+        .ok_or_else(err)
 }
 
 pub fn render_table(records: &[&Record]) -> String {
@@ -143,17 +147,25 @@ fn write_via_temp(path: &Path, html: &str, tmp: &Path) -> std::io::Result<()> {
     result
 }
 
+/// The cutoff time for `--since`; an amount too large for the calendar is
+/// the same error as any other bad value.
+fn since_cutoff(s: &str) -> Result<OffsetDateTime, String> {
+    let d = parse_since(s)?;
+    OffsetDateTime::now_utc().checked_sub(d).ok_or_else(|| {
+        format!("invalid --since {s:?}: use a whole number with m, h or d, e.g. 30m, 24h, 7d")
+    })
+}
+
 pub fn run(
-    since: Option<&str>,
+    since_text: Option<&str>,
     project: Option<&str>,
     agent: Option<&str>,
     blocked: bool,
-    report: Option<&str>,
+    report_path: Option<&str>,
     packs: &[Pack],
 ) -> ExitCode {
-    let since_arg = since;
-    let since = match since.map(parse_since).transpose() {
-        Ok(d) => d.map(|d| OffsetDateTime::now_utc() - d),
+    let since_time = match since_text.map(since_cutoff).transpose() {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("saiife: {e}");
             return ExitCode::from(2);
@@ -164,7 +176,7 @@ pub fn run(
         return ExitCode::from(2);
     };
     let filter = Filter {
-        since,
+        since: since_time,
         project: project.map(str::to_string),
         agent: agent.map(str::to_string),
         blocked_only: blocked,
@@ -178,10 +190,10 @@ pub fn run(
         return ExitCode::from(1);
     }
     let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
-    if let Some(target) = report {
+    if let Some(target) = report_path {
         let now = OffsetDateTime::now_utc();
         let mut filters = Vec::new();
-        if let Some(s) = since_arg {
+        if let Some(s) = since_text {
             filters.push(format!("last {s}"));
         }
         if let Some(p) = project {
@@ -193,7 +205,7 @@ pub fn run(
         if blocked {
             filters.push("only blocked actions".to_string());
         }
-        let mut model = report::build(&shown, packs, filters, since, now);
+        let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
         if all.skipped_lines > 0 {
             model.log_problems.push(format!(
@@ -286,6 +298,14 @@ mod tests {
         assert_eq!(parse_since("30m"), Ok(Duration::minutes(30)));
         assert_eq!(parse_since("24h"), Ok(Duration::hours(24)));
         assert_eq!(parse_since("7d"), Ok(Duration::days(7)));
+    }
+
+    #[test]
+    fn since_overflow_is_an_error() {
+        for bad in ["99999999999d", "9223372036854775807d", "99999999999999h"] {
+            let e = since_cutoff(bad).unwrap_err();
+            assert!(e.contains("invalid --since"), "{bad}: {e}");
+        }
     }
 
     #[test]

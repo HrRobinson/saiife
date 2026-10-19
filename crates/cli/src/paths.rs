@@ -1,14 +1,27 @@
 //! The directories the guard's path rules are bound to (spec §7.2, §7.4):
 //! the working directory relative paths are resolved against, and the
 //! values of the rule variables (`~`, `$PROJECT`, `$SAIIFE_DATA_DIR`,
-//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`).
+//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use saiife_agents::detect::which;
 use saiife_agents::integrity;
 use saiife_audit::store;
 use saiifeguard::canon::PathVars;
+
+/// An agent config dir: `value` when set and absolute, else `default` under
+/// `home` (`None` when neither is known).
+fn config_dir(
+    value: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    default: &str,
+) -> Option<PathBuf> {
+    match value {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
+        _ => home.map(|h| h.join(default)),
+    }
+}
 
 /// `cwd`: where relative paths start (the hook payload's `cwd`); `project`:
 /// the saiife project root, `cwd` if there is none. Every value the
@@ -20,6 +33,13 @@ pub fn path_vars(cwd: Option<&Path>, project: Option<&Path>) -> PathVars {
     }
     if let Some(h) = dirs::home_dir() {
         v = v.with_var("HOME", h);
+    }
+    // The agents' config dirs: the variable when set (and absolute), else
+    // the default under HOME, so the rules naming them are always active.
+    for (name, default) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+        if let Some(d) = config_dir(std::env::var_os(name), dirs::home_dir(), default) {
+            v = v.with_var(name, d);
+        }
     }
     if let Some(p) = project.or(cwd) {
         v = v.with_var("PROJECT", p);
@@ -44,6 +64,21 @@ pub fn path_vars(cwd: Option<&Path>, project: Option<&Path>) -> PathVars {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn config_dir_falls_back_to_the_default_under_home() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let want = Some(PathBuf::from("/home/u/.claude"));
+        assert_eq!(config_dir(None, home(), ".claude"), want);
+        assert_eq!(config_dir(Some(OsString::new()), home(), ".claude"), want);
+        assert_eq!(config_dir(Some("rel/dir".into()), home(), ".claude"), want);
+        assert_eq!(
+            config_dir(Some("/opt/claude".into()), home(), ".claude"),
+            Some(PathBuf::from("/opt/claude"))
+        );
+        assert_eq!(config_dir(None, None, ".claude"), None);
+    }
 
     #[test]
     fn binds_cwd_project_and_the_running_binary() {

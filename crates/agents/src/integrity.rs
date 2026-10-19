@@ -64,12 +64,26 @@ pub struct HookRecord {
     /// `status` reports such an agent as a failed check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// With `error`: the failure was `init --off` not removing the hook (it
+    /// may still be in place), not `init` failing to add it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub off_failed: bool,
+    /// With `off_failed`: the config is a symlink to this file outside the
+    /// project, which saiife will not edit; the user removes the hook there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_outside: Option<String>,
 }
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
 pub fn data_dir() -> Option<PathBuf> {
-    match std::env::var_os(DATA_DIR_ENV) {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+    data_dir_from(std::env::var_os(DATA_DIR_ENV))
+}
+
+/// A relative `SAIIFE_DATA_DIR` is ignored: it would resolve against the
+/// caller's working directory, usually the project.
+fn data_dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match var {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
         _ => dirs::data_dir().map(|d| d.join("saiife")),
     }
 }
@@ -117,6 +131,15 @@ impl Integrity {
             builder.mode(0o700);
         }
         builder.create(dir).map_err(io_err(dir))?;
+        // An older or hand-made directory may be wider than 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir).map_err(io_err(dir))?.permissions().mode();
+            if mode & 0o777 != 0o700 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(io_err(dir))?;
+            }
+        }
         let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io_err(dir))?;
         let mut body = serde_json::to_string_pretty(self).expect("integrity serializes");
         body.push('\n');
@@ -149,6 +172,8 @@ mod tests {
                 file: ".claude/settings.json".into(),
                 sha256: "ab".repeat(32),
                 error: None,
+                off_failed: false,
+                off_outside: None,
             },
         );
         Integrity {
@@ -196,6 +221,17 @@ mod tests {
         let path = d.path().join("x.json");
         fs::write(&path, "{").unwrap();
         assert!(Integrity::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_relative_data_dir_is_ignored() {
+        let default = data_dir_from(None);
+        assert!(default.as_ref().unwrap().ends_with("saiife"));
+        assert_eq!(data_dir_from(Some("rel-data".into())), default);
+        assert_eq!(
+            data_dir_from(Some("/abs/data".into())),
+            Some(PathBuf::from("/abs/data"))
+        );
     }
 
     /// Review Focus 3: the same project through a symlink or `..` has one

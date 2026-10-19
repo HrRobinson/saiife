@@ -28,6 +28,10 @@
 //!                             # of a variable-rooted, wildcard-free glob
 //!                             # (write access), e.g. `rm -rf ~/.local/share`
 //! ```
+//!
+//! An `[[allow]]` match exempts the command only from its own pack's
+//! `[[deny]]` rules (as `[[allow_path]]` does for paths); other packs still
+//! judge it, and their first deny wins.
 
 use std::fs;
 use std::path::Path;
@@ -244,6 +248,37 @@ fn check_path_rules(
     Ok(out)
 }
 
+#[derive(Deserialize)]
+struct RawHeader {
+    pack: RawHeaderMeta,
+}
+
+#[derive(Deserialize)]
+struct RawHeaderMeta {
+    id: String,
+    #[serde(default = "default_true")]
+    default_on: bool,
+}
+
+/// A pack's `id` and `default_on` without compiling any of its rules, so a
+/// caller can decide whether the pack is needed. `None` if the TOML or its
+/// `[pack]` table cannot be read (a full load reports why).
+pub(crate) fn peek_header(toml_str: &str) -> Option<(String, bool)> {
+    let h: RawHeader = toml::from_str(toml_str).ok()?;
+    (!h.pack.id.trim().is_empty()).then_some((h.pack.id, h.pack.default_on))
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many packs `load_pack_str` was asked to compile on this thread.
+#[cfg(test)]
+pub(crate) fn compiled_packs() -> usize {
+    COMPILED.with(|c| c.get())
+}
+
 /// Load and compile a single pack from a TOML string. `source` labels the pack
 /// in any warnings (a filename, or `"<builtin>"`).
 pub fn load_pack_str(
@@ -251,6 +286,8 @@ pub fn load_pack_str(
     toml_str: &str,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Pack, PackError> {
+    #[cfg(test)]
+    COMPILED.with(|c| c.set(c.get() + 1));
     let raw: RawPackFile = toml::from_str(toml_str).map_err(|e| PackError::Toml(e.to_string()))?;
     if raw.pack.id.trim().is_empty() {
         return Err(PackError::MissingId);

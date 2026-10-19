@@ -974,3 +974,74 @@ fn residual_heredoc_frames_and_ifs_fail_safe() {
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The agents' own login tokens: an agent that reads its own token can act
+/// as the user elsewhere. The config dirs are bound the way the CLI binds
+/// `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, here outside the fake home.
+fn agent_engine(f: &Fixture) -> (Engine, PathBuf, PathBuf) {
+    let claude = f.root.join("custom-claude");
+    let codex = f.root.join("custom-codex");
+    let (packs, warnings) = builtin_packs();
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    let e = Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(
+            PathVars::new()
+                .with_cwd(f.app())
+                .with_var("HOME", f.home())
+                .with_var("PROJECT", f.app())
+                .with_var("CLAUDE_CONFIG_DIR", &claude)
+                .with_var("CODEX_HOME", &codex),
+        );
+    (e, claude, codex)
+}
+
+#[test]
+fn agent_credential_files_are_secret() {
+    let f = Fixture::new();
+    let (e, claude, codex) = agent_engine(&f);
+    let home = f.home();
+    for path in [
+        "~/.claude/.credentials.json".to_string(),
+        "~/.codex/auth.json".to_string(),
+        "~/.gemini/oauth_creds.json".to_string(),
+        home.join(".claude/.credentials.json").display().to_string(),
+        claude.join(".credentials.json").display().to_string(),
+        codex.join("auth.json").display().to_string(),
+    ] {
+        match e.evaluate_path(Access::Read, &path) {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "core.secrets", "{path}"),
+            d => panic!("expected DENY for read of {path:?}, got {d:?}"),
+        }
+        let cmd = format!("cat {path}");
+        assert_eq!(deny_pack(&e, &cmd), "core.secrets", "{cmd}");
+    }
+    // Without the variables bound, the default locations stay guarded.
+    let bare = f.engine();
+    for path in [
+        "~/.claude/.credentials.json",
+        "~/.codex/auth.json",
+        "~/.gemini/oauth_creds.json",
+    ] {
+        assert!(bare.evaluate_path(Access::Read, path).is_deny(), "{path}");
+    }
+}
+
+#[test]
+fn agent_settings_stay_readable() {
+    let f = Fixture::new();
+    let (e, claude, codex) = agent_engine(&f);
+    for path in [
+        "~/.claude/settings.json".to_string(),
+        "~/.codex/config.toml".to_string(),
+        "~/.gemini/settings.json".to_string(),
+        claude.join("settings.json").display().to_string(),
+        codex.join("config.toml").display().to_string(),
+    ] {
+        let d = e.evaluate_path(Access::Read, &path);
+        assert!(
+            !d.is_deny(),
+            "expected ALLOW for read of {path:?}, got {d:?}"
+        );
+    }
+}

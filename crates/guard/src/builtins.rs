@@ -7,7 +7,7 @@
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
 
-use crate::pack::{load_pack_str, Pack, PackWarning};
+use crate::pack::{load_pack_str, peek_header, Pack, PackWarning};
 
 /// `(source_label, toml)` for every embedded pack.
 const BUILTIN_SOURCES: &[(&str, &str)] = &[
@@ -59,23 +59,179 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
 /// Load and compile the embedded built-in packs (fail-open: a bad built-in is
 /// skipped with a warning, never fatal — though built-ins are covered by tests).
 pub fn builtin_packs() -> (Vec<Pack>, Vec<PackWarning>) {
-    let mut packs = Vec::new();
-    let mut warnings = Vec::new();
-    for (source, toml) in BUILTIN_SOURCES {
-        match load_pack_str(source, toml, &mut warnings) {
-            Ok(p) => packs.push(p),
-            Err(e) => warnings.push(PackWarning {
-                source: source.to_string(),
-                message: format!("built-in pack failed to load: {e}"),
-            }),
-        }
+    Catalog::builtin().load_all()
+}
+
+/// Pack sources whose headers (`id`, `default_on`) are read up front and
+/// whose rules are compiled only on request. Compiling every rule regex is
+/// most of a hook call's fixed cost, and a hook needs only the active packs.
+pub struct Catalog {
+    entries: Vec<Entry>,
+}
+
+struct Entry {
+    source: &'static str,
+    toml: &'static str,
+    /// `(id, default_on)`; `None` if the header cannot be read. Such an
+    /// entry is always loaded (and fails), so its failure is still reported.
+    header: Option<(String, bool)>,
+}
+
+impl Catalog {
+    /// The embedded built-in packs.
+    pub fn builtin() -> Self {
+        Self::from_sources(BUILTIN_SOURCES)
     }
-    (packs, warnings)
+
+    /// `(source_label, toml)` pairs, in load order.
+    pub fn from_sources(sources: &[(&'static str, &'static str)]) -> Self {
+        let entries = sources
+            .iter()
+            .map(|&(source, toml)| Entry {
+                source,
+                toml,
+                header: peek_header(toml),
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// True if a pack with this id is in the catalog.
+    pub fn knows(&self, id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.header.as_ref().is_some_and(|(i, _)| i == id))
+    }
+
+    /// Compile every pack.
+    pub fn load_all(&self) -> (Vec<Pack>, Vec<PackWarning>) {
+        self.load(|_| true)
+    }
+
+    /// Compile the packs `select_active` would keep: every default-on pack
+    /// plus those whose id is in `enabled`. The others are never compiled.
+    pub fn load_active(&self, enabled: &[String]) -> (Vec<Pack>, Vec<PackWarning>) {
+        self.load(|(id, default_on)| *default_on || enabled.iter().any(|e| e == id))
+    }
+
+    fn load(&self, wanted: impl Fn(&(String, bool)) -> bool) -> (Vec<Pack>, Vec<PackWarning>) {
+        let mut packs = Vec::new();
+        let mut warnings = Vec::new();
+        for e in &self.entries {
+            if e.header.as_ref().is_some_and(|h| !wanted(h)) {
+                continue;
+            }
+            match load_pack_str(e.source, e.toml, &mut warnings) {
+                Ok(p) => packs.push(p),
+                Err(err) => warnings.push(PackWarning {
+                    source: e.source.to_string(),
+                    message: format!("built-in pack failed to load: {err}"),
+                }),
+            }
+        }
+        (packs, warnings)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BROKEN_CORE: &str = r#"
+[pack]
+id = "core.broken"
+default_on = true
+triggers = ["rm"]
+[[deny]]
+pattern = '('
+reason = "bad regex"
+[[deny]]
+pattern = '^rm\s+-rf\s+/$'
+reason = "wipes the disk"
+"#;
+    const OPT_IN: &str = r#"
+[pack]
+id = "opt.thing"
+default_on = false
+triggers = ["thing"]
+[[deny]]
+pattern = '^thing\s+drop'
+reason = "drops the thing"
+"#;
+    const BAD_TOML: &str = "[pack\nid = 'x'";
+
+    fn catalog() -> Catalog {
+        Catalog::from_sources(&[
+            ("<t>core.broken", BROKEN_CORE),
+            ("<t>opt.thing", OPT_IN),
+            ("<t>bad", BAD_TOML),
+        ])
+    }
+
+    /// Only the active packs are compiled, and loading them reports the
+    /// same warnings an eager load does.
+    #[test]
+    fn inactive_opt_in_pack_is_never_compiled() {
+        let cat = catalog();
+        let before = crate::pack::compiled_packs();
+        let (packs, warnings) = cat.load_active(&[]);
+        // core.broken compiled, the bad file attempted, opt.thing never.
+        assert_eq!(crate::pack::compiled_packs() - before, 2);
+        assert_eq!(
+            packs.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["core.broken"]
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.source == "<t>core.broken" && w.message.contains("uncompilable regex")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.source == "<t>bad"
+                && w.message.contains("built-in pack failed to load")),
+            "{warnings:?}"
+        );
+        let (all, all_warnings) = cat.load_all();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all_warnings.len(), warnings.len());
+    }
+
+    #[test]
+    fn enabled_opt_in_pack_is_compiled_in_source_order() {
+        let cat = catalog();
+        let (packs, _) = cat.load_active(&["opt.thing".to_string()]);
+        assert_eq!(
+            packs.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["core.broken", "opt.thing"]
+        );
+        assert!(cat.knows("opt.thing") && cat.knows("core.broken"));
+        assert!(!cat.knows("bad") && !cat.knows("db.oracle"));
+    }
+
+    /// The lazy load of the shipped packs is the eager load filtered by
+    /// `select_active`, for every single opt-in pack.
+    #[test]
+    fn builtin_lazy_load_matches_select_active() {
+        let (all, _) = builtin_packs();
+        let cat = Catalog::builtin();
+        let ids = |v: &[Pack]| v.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        let mut cases = vec![vec![]];
+        cases.extend(
+            all.iter()
+                .filter(|p| !p.default_on)
+                .map(|p| vec![p.id.clone()]),
+        );
+        for enabled in cases {
+            let (lazy, w) = cat.load_active(&enabled);
+            assert!(w.is_empty(), "{w:?}");
+            assert_eq!(
+                ids(&lazy),
+                ids(&crate::profile::select_active(all.clone(), &enabled)),
+                "{enabled:?}"
+            );
+        }
+    }
 
     #[test]
     fn all_builtins_load_clean() {

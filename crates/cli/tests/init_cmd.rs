@@ -287,3 +287,186 @@ fn symlinked_config_outside_the_project_is_refused() {
     assert!(env.read(".claude/settings.json").contains("saiife check"));
     assert!(env.read(".gemini/settings.json").contains("saiife check"));
 }
+
+/// A mode-0500 directory still writable (root) means permissions cannot
+/// make a write fail here; tests that need that skip.
+#[cfg(unix)]
+fn dir_stays_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".probe");
+    let ok = std::fs::write(&probe, "x").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// Gives a directory back its mode 0755 when dropped, also on a failed assert.
+#[cfg(unix)]
+struct RestoreMode(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// `init --off` with one agent config unwritable keeps the record for that
+/// agent only, so a later `status` warns about it alone.
+#[cfg(unix)]
+#[test]
+fn partial_off_keeps_record_for_failed_agent() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&["claude", "gemini"]);
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let claude_dir = env.root().join(".claude");
+    std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestoreMode(claude_dir.clone());
+    if dir_stays_writable(&claude_dir) {
+        eprintln!("skipped: running as root, permissions do not stop writes");
+        return;
+    }
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let rec = std::fs::read_dir(env.data.path().join("projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+    let hooks = v["hooks"].as_object().unwrap();
+    assert_eq!(hooks.keys().collect::<Vec<_>>(), ["claude"], "{v}");
+    assert!(hooks["claude"]["error"].is_string(), "{v}");
+
+    let st = env.saiife(&["status"]);
+    let text = stdout(&st);
+    assert_eq!(code(&st), 1, "{text}");
+    assert!(
+        text.contains("`saiife init --off` could not remove its hook from .claude/settings.json: "),
+        "{text}"
+    );
+    assert!(
+        text.contains(". Fix the file's permissions and run `saiife init --off` again."),
+        "{text}"
+    );
+    assert!(!text.contains("run `saiife init` "), "{text}");
+    // Exactly one warning: the failed agent. Nothing else.
+    assert_eq!(text.matches("WARNING").count(), 1, "{text}");
+    assert!(!text.contains("was removed"), "{text}");
+    assert!(!text.contains("no agent is hooked"), "{text}");
+    assert!(!text.contains("Gemini"), "{text}");
+    assert!(env.root().join(".saiife/config.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn integrity_dir_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(&["claude"]);
+    let dir = env.data.path().join("projects");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code(&env.saiife(&["init"])), 0);
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_agent_config_symlink_is_explained() {
+    let env = Env::new(&["claude"]);
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    let link = env.root().join(".claude/settings.json");
+    std::os::unix::fs::symlink("gone/settings.json", &link).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains(link.to_str().unwrap()), "{line}");
+    assert!(line.contains("gone/settings.json"), "{line}");
+    assert!(line.contains("does not exist"), "{line}");
+    assert!(!line.contains("No such file"), "{line}");
+}
+
+/// Hook claude for real, then move its settings outside the project and
+/// leave a symlink in its place.
+#[cfg(unix)]
+fn hooked_then_symlinked_outside(env: &Env, outside: &std::path::Path) -> std::path::PathBuf {
+    assert_eq!(code(&env.saiife(&["init", "--agent", "claude"])), 0);
+    let link = env.root().join(".claude/settings.json");
+    let target = outside.join("settings.json");
+    std::fs::rename(&link, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::fs::canonicalize(&target).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_gives_cleanup_hint() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = hooked_then_symlinked_outside(&env, outside.path());
+    let before = std::fs::read(&target).unwrap();
+    assert!(String::from_utf8_lossy(&before).contains("saiife check"));
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains(target.to_str().unwrap()), "{text}");
+    assert!(text.contains("by hand"), "{text}");
+    assert!(text.contains("hook entry"), "{text}");
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+
+    // `status` repeats the by-hand hint, never the permissions advice.
+    let st = env.saiife(&["status"]);
+    let text = stdout(&st);
+    assert_eq!(code(&st), 1, "{text}");
+    assert!(text.contains(target.to_str().unwrap()), "{text}");
+    assert!(text.contains("by hand"), "{text}");
+    assert!(!text.to_lowercase().contains("permissions"), "{text}");
+    assert!(!text.contains("fix"), "{text}");
+}
+
+/// Final review F1: an agent saiife never hooked is left alone, even when
+/// its config is a symlink out of the project.
+#[cfg(unix)]
+#[test]
+fn off_ignores_outside_symlink_of_an_agent_never_hooked() {
+    let env = Env::new(&["claude", "codex"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("settings.json");
+    std::fs::write(&target, "{}\n").unwrap();
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".claude/settings.json")).unwrap();
+    assert_eq!(code(&env.saiife(&["init", "--agent", "codex"])), 0);
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(!text.contains("FAILED"), "{text}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"{}\n");
+    let st = env.saiife(&["status"]);
+    let text = stdout(&st);
+    // Fully off: the same clean "not set up" state as after any other off.
+    assert!(text.contains("no integrity record"), "{text}");
+    assert!(!text.contains("could not remove"), "{text}");
+    assert!(!text.contains("settings.json"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn off_ignores_dangling_symlink_of_an_agent_never_hooked() {
+    let env = Env::new(&["claude", "codex"]);
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(
+        "gone/settings.json",
+        env.root().join(".claude/settings.json"),
+    )
+    .unwrap();
+    assert_eq!(code(&env.saiife(&["init", "--agent", "codex"])), 0);
+    let out = env.saiife(&["init", "--off"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(!stdout(&out).contains("FAILED"), "{}", stdout(&out));
+}

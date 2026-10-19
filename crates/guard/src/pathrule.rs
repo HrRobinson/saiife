@@ -5,8 +5,9 @@
 //! Glob syntax (deliberately small):
 //!
 //! - a glob starts with `/`, `~/`, `**/` or a variable (`$HOME`, `$PROJECT`,
-//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`), which stands
-//!   alone or is followed by `/`;
+//!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`,
+//!   `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`), which stands alone or is followed
+//!   by `/`;
 //! - `*` matches within one path component, `?` one character of it;
 //! - `**` is a whole component: `**/x` matches `x` in any directory,
 //!   `a/**/b` any depth between, and a trailing `/**` matches the directory
@@ -84,6 +85,8 @@ pub const VARIABLES: &[&str] = &[
     "PROJECT",
     "SAIIFE_DATA_DIR",
     "SAIIFE_AUDIT_DIR",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
     "SAIIFE_BIN",
 ];
 
@@ -167,6 +170,21 @@ pub fn compile_ancestors(
     vars: &PathVars,
     case_insensitive: bool,
 ) -> Result<Option<Regex>, String> {
+    compile(ancestors_source(glob, vars, case_insensitive)?)
+}
+
+fn compile(source: Option<String>) -> Result<Option<Regex>, String> {
+    source
+        .map(|re| Regex::new(&re).map_err(|e| e.to_string()))
+        .transpose()
+}
+
+/// The regex source `compile_ancestors` compiles.
+pub fn ancestors_source(
+    glob: &str,
+    vars: &PathVars,
+    case_insensitive: bool,
+) -> Result<Option<String>, String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
     let Some(name) = var else {
@@ -189,9 +207,7 @@ pub fn compile_ancestors(
         return Ok(None);
     }
     let flags = if case_insensitive { "(?is)" } else { "(?s)" };
-    Regex::new(&format!("{flags}^(?:{})$", alts.join("|")))
-        .map(Some)
-        .map_err(|e| e.to_string())
+    Ok(Some(format!("{flags}^(?:{})$", alts.join("|"))))
 }
 
 /// Translate a glob into an anchored regex over canonical paths, with its
@@ -202,6 +218,15 @@ pub fn compile_glob(
     vars: &PathVars,
     case_insensitive: bool,
 ) -> Result<Option<Regex>, String> {
+    compile(glob_source(glob, vars, case_insensitive)?)
+}
+
+/// The regex source `compile_glob` compiles.
+pub fn glob_source(
+    glob: &str,
+    vars: &PathVars,
+    case_insensitive: bool,
+) -> Result<Option<String>, String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
     let mut re = String::from(if case_insensitive { "(?is)^" } else { "(?s)^" });
@@ -253,7 +278,7 @@ pub fn compile_glob(
         }
     }
     re.push('$');
-    Regex::new(&re).map(Some).map_err(|e| e.to_string())
+    Ok(Some(re))
 }
 
 #[cfg(test)]

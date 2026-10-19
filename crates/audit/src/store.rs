@@ -11,9 +11,17 @@ use crate::record::{DecisionKind, Record};
 /// Environment variable that overrides the audit directory (tests, admins).
 pub const DIR_ENV: &str = "SAIIFE_AUDIT_DIR";
 
+/// The audit dir: `SAIIFE_AUDIT_DIR` when it is an absolute path, else the
+/// default under the user's data dir. A relative value is ignored: it would
+/// put the log under the hook's working directory, usually the project
+/// (spec §6.1: never inside the project).
 pub fn default_dir() -> Option<PathBuf> {
-    match std::env::var_os(DIR_ENV) {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+    dir_from(std::env::var_os(DIR_ENV))
+}
+
+fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match var {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
         _ => dirs::data_dir().map(|d| d.join("saiife").join("audit")),
     }
 }
@@ -28,7 +36,7 @@ pub fn default_dir() -> Option<PathBuf> {
 /// month path fails instead of blocking or redirecting the write), and
 /// anything that is not a regular file is refused.
 pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -44,6 +52,19 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     let mut line = serde_json::to_string(rec).map_err(io::Error::other)?;
     line.push('\n');
     file.write_all(line.as_bytes())
+}
+
+/// `create_dir_all`, with owner-only (0700) permissions on unix for the
+/// directories it creates: the log reveals what people work on.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
 }
 
 /// What `read_all` found: the parseable records plus how much it had to skip,
@@ -63,18 +84,13 @@ pub struct ReadResult {
     pub dir_error: Option<String>,
 }
 
-/// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
-/// first. Lines are parsed one by one from raw bytes, so one bad line never
-/// hides the rest of its file. Other file names are ignored.
-pub fn read_all(dir: &Path) -> ReadResult {
-    let mut out = ReadResult::default();
+/// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
+/// empty list; any other failure to list it is the error text.
+fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return out,
-        Err(e) => {
-            out.dir_error = Some(e.to_string());
-            return out;
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -85,19 +101,65 @@ pub fn read_all(dir: &Path) -> ReadResult {
         })
         .collect();
     files.sort();
-    for p in &files {
-        let Some(body) = read_regular(p) else {
-            out.unreadable_files += 1;
+    Ok(files)
+}
+
+/// Parse `p` line by line into `out`, counting what it had to skip.
+fn read_month_file(p: &Path, out: &mut ReadResult) {
+    let Some(body) = read_regular(p) else {
+        out.unreadable_files += 1;
+        return;
+    };
+    for line in body.split(|&b| b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
-        };
-        for line in body.split(|&b| b == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            match serde_json::from_slice::<Record>(line) {
-                Ok(r) => out.records.push(r),
-                Err(_) => out.skipped_lines += 1,
-            }
+        }
+        match serde_json::from_slice::<Record>(line) {
+            Ok(r) => out.records.push(r),
+            Err(_) => out.skipped_lines += 1,
+        }
+    }
+}
+
+/// Every parseable record from every `YYYY-MM.jsonl` in `dir`, oldest file
+/// first. Lines are parsed one by one from raw bytes, so one bad line never
+/// hides the rest of its file. Other file names are ignored.
+pub fn read_all(dir: &Path) -> ReadResult {
+    let mut out = ReadResult::default();
+    match month_files(dir) {
+        Ok(files) => files.iter().for_each(|p| read_month_file(p, &mut out)),
+        Err(e) => out.dir_error = Some(e),
+    }
+    out
+}
+
+/// Read at most `max_files` month files, newest first. `want` sees every record of each file
+/// and returns `true` while it still needs older data; after the first file
+/// in which it returned `false` the older files are not opened (so their
+/// problems are not counted). Records come back newest file first, each file
+/// in its own order.
+pub fn read_recent(
+    dir: &Path,
+    max_files: usize,
+    mut want: impl FnMut(&Record) -> bool,
+) -> ReadResult {
+    let mut out = ReadResult::default();
+    let files = match month_files(dir) {
+        Ok(files) => files,
+        Err(e) => {
+            out.dir_error = Some(e);
+            return out;
+        }
+    };
+    for p in files.iter().rev().take(max_files) {
+        let start = out.records.len();
+        read_month_file(p, &mut out);
+        let mut more = true;
+        for r in &out.records[start..] {
+            more &= want(r);
+        }
+        if !more {
+            break;
         }
     }
     out
@@ -218,6 +280,31 @@ mod tests {
     }
 
     #[test]
+    fn read_recent_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |m: u8| {
+            OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::from(m) * 3_000_000).unwrap()
+        };
+        let old = rec("/p", "claude", DecisionKind::Allow, at(0));
+        let new = rec("/p", "claude", DecisionKind::Allow, at(6));
+        append(dir.path(), &old).unwrap();
+        append(dir.path(), &new).unwrap();
+        // A directory named like the oldest month file: unreadable if opened.
+        let months = [old.month(), new.month()];
+        assert_ne!(months[0], months[1]);
+        fs::remove_file(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
+        fs::create_dir(dir.path().join(format!("{}.jsonl", months[0]))).unwrap();
+
+        let stopped = read_recent(dir.path(), usize::MAX, |_| false);
+        assert_eq!(stopped.records, vec![new.clone()]);
+        assert_eq!(stopped.unreadable_files, 0);
+
+        let all = read_recent(dir.path(), usize::MAX, |_| true);
+        assert_eq!(all.records, vec![new]);
+        assert_eq!(all.unreadable_files, 1);
+    }
+
+    #[test]
     fn append_creates_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b");
@@ -327,6 +414,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn audit_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("a").join("audit");
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&dir, &r).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn new_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -429,6 +533,28 @@ mod tests {
         std::env::set_var(DIR_ENV, "");
         assert!(default_dir().unwrap().ends_with("saiife/audit"));
         std::env::remove_var(DIR_ENV);
+    }
+
+    #[test]
+    fn read_recent_reads_at_most_max_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "not json\n").unwrap();
+        }
+        let got = read_recent(dir.path(), 2, |_| true);
+        assert_eq!(got.skipped_lines, 2);
+    }
+
+    #[test]
+    fn a_relative_audit_dir_is_ignored() {
+        let default = dir_from(None);
+        assert!(default.as_ref().unwrap().ends_with("saiife/audit"));
+        assert_eq!(dir_from(Some("rel-audit".into())), default);
+        assert_eq!(dir_from(Some("".into())), default);
+        assert_eq!(
+            dir_from(Some("/abs/audit".into())),
+            Some(PathBuf::from("/abs/audit"))
+        );
     }
 
     #[test]

@@ -35,17 +35,30 @@ pub fn ensure_inside(project: &Path, rel: &str) -> Result<(), AgentError> {
         .ancestors()
         .find(|p| fs::symlink_metadata(p).is_ok())
         .unwrap_or(project);
-    let resolved = fs::canonicalize(existing).map_err(io_err(existing))?;
+    let resolved = match fs::canonicalize(existing) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // A dangling symlink: say what it points at, not a raw I/O error.
+            if let Ok(target) = fs::read_link(existing) {
+                let missing = existing
+                    .parent()
+                    .map_or(target.clone(), |d| d.join(&target));
+                return Err(AgentError::Layout {
+                    path: existing.to_path_buf(),
+                    detail: format!(
+                        "it is a symlink to {}, which does not exist",
+                        missing.display()
+                    ),
+                });
+            }
+            return Err(io_err(existing)(e));
+        }
+        Err(e) => return Err(io_err(existing)(e)),
+    };
     if resolved.starts_with(&canon_project) {
         return Ok(());
     }
-    Err(AgentError::Layout {
-        path,
-        detail: format!(
-            "it is a symlink to {}, outside the project; saiife only writes inside the project",
-            resolved.display()
-        ),
-    })
+    Err(AgentError::OutsideProject { path, resolved })
 }
 
 /// Write `contents` to `<project>/<rel>` atomically (temp file in the same

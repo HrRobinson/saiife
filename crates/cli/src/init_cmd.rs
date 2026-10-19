@@ -158,6 +158,8 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         file: agent.config_rel().to_string(),
                         sha256: agent.expected_entry(),
                         error: None,
+                        off_failed: false,
+                        off_outside: None,
                     },
                 );
                 installed.push(*agent);
@@ -178,6 +180,8 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         file: agent.config_rel().to_string(),
                         sha256: String::new(),
                         error: Some(e.to_string()),
+                        off_failed: false,
+                        off_outside: None,
                     },
                 );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
@@ -305,8 +309,20 @@ pub fn off() -> ExitCode {
         .map(|r| r.created.clone())
         .unwrap_or_default();
     let mut lines = Vec::new();
+    // Agents whose hook could not be removed, with the reason.
+    // (agent, reason, the outside file when the config symlinks out)
+    let mut failed_agents: Vec<(Agent, String, Option<String>)> = Vec::new();
 
     for agent in Agent::ALL {
+        // Only agents saiife hooked (recorded, or a saiife entry in the
+        // config). The config of any other agent is not ours: leave it
+        // alone, whatever it is (an outside or dangling symlink included).
+        let recorded = record
+            .as_ref()
+            .is_some_and(|r| r.hooks.contains_key(agent.name()));
+        if !recorded && !agent.entries(&root).is_ok_and(|e| !e.is_empty()) {
+            continue;
+        }
         let ours = created.iter().any(|c| c == agent.config_rel());
         match agent.remove(&root, ours) {
             Ok(Change::Unchanged) => {}
@@ -322,13 +338,26 @@ pub fn off() -> ExitCode {
             )),
             Err(e) => {
                 failed = true;
-                lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
+                let mut line = format!("  {:<7} FAILED: {e}", agent.name());
+                let outside = e.outside_target().map(|p| p.display().to_string());
+                if outside.is_some() {
+                    line.push_str(
+                        "\n          saiife did not change that file. To finish, remove the \
+                         saiife hook entry (the `saiife check` command) from it by hand.",
+                    );
+                }
+                lines.push(line);
+                failed_agents.push((agent, e.to_string(), outside));
             }
         }
     }
 
     let config_path = root.join(CONFIG_REL);
-    if config_path.exists() {
+    if config_path.exists() && !failed_agents.is_empty() {
+        lines.push(format!(
+            "  config  {CONFIG_REL} kept (saiife is still on for the agent(s) above)"
+        ));
+    } else if config_path.exists() {
         let unchanged = record.as_ref().is_some_and(|r| {
             !r.config_written_sha256.is_empty()
                 && std::fs::read(&config_path)
@@ -362,6 +391,29 @@ pub fn off() -> ExitCode {
                 failed = true;
                 lines.push(format!("  integrity record FAILED: {e}"));
             }
+        }
+    } else if let (Some(mut rec), Some(p), false) = (record, &record_path, failed_agents.is_empty())
+    {
+        // Partly off: keep the record for the agents still hooked, so
+        // `status` warns about them and nothing else.
+        rec.hooks = failed_agents
+            .iter()
+            .map(|(a, e, outside)| {
+                (
+                    a.name().to_string(),
+                    HookRecord {
+                        file: a.config_rel().to_string(),
+                        sha256: String::new(),
+                        error: Some(e.clone()),
+                        off_failed: true,
+                        off_outside: outside.clone(),
+                    },
+                )
+            })
+            .collect();
+        rec.created.retain(|rel| root.join(rel).exists());
+        if let Err(e) = rec.save(p) {
+            lines.push(format!("  integrity record FAILED: {e}"));
         }
     }
 
