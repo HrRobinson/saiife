@@ -14,6 +14,7 @@
 
 pub mod builtins;
 pub mod canon;
+mod cdtrack;
 pub mod engine;
 pub mod lexer;
 pub mod normalize;

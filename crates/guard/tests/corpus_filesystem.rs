@@ -1,7 +1,7 @@
 //! Golden corpus for `core.filesystem` (default-on, catastrophic-only).
 
 use saiifeguard::builtins::builtin_packs;
-use saiifeguard::engine::{Decision, Engine};
+use saiifeguard::engine::{AllowTrace, Decision, Engine};
 
 fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
@@ -54,6 +54,9 @@ fn denies_catastrophic_filesystem_commands() {
         "rm / --recursive",
         "rm ~ -fr",
         "sudo rm /etc -rf",
+        // The home folder's dotfiles (`.ssh`, `.config`, …).
+        "rm -rf ~/.*",
+        "rm -rf $HOME/.*",
     ];
     for cmd in deny {
         assert_eq!(deny_pack(&e, cmd), "core.filesystem", "for {cmd:?}");
@@ -127,6 +130,73 @@ fn literal_substitution_values_are_judged() {
     ] {
         deny_pack(&e, cmd);
     }
+}
+
+#[test]
+fn rm_targets_are_judged_against_an_earlier_cd() {
+    let e = engine();
+    for cmd in [
+        "cd / && rm -rf *",
+        "cd /; rm -rf *",
+        "cd ~ && rm -rf *",
+        "cd $HOME && rm -rf .",
+        "cd ~ || exit; rm -rf .*",
+        "(cd / && rm -rf *)",
+        "bash -c 'cd / && rm -rf *'",
+        "cd /usr && cd .. && rm -rf *",
+        // Also: a newline, `pushd`, `cd` with no operand (home), options.
+        "cd /\nrm -rf *",
+        "pushd / && rm -rf *",
+        "cd && rm -rf *",
+        "cd -P -- / && rm -rf ./*",
+        "cd ${HOME} && rm -rf *",
+        "cd / && chmod -R 777 .",
+        "cd / && chown -R root:root .",
+        "cd / && sudo rm -rf *",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.filesystem", "for {cmd:?}");
+    }
+}
+
+#[test]
+fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
+    let e = engine();
+    for cmd in [
+        "cd /tmp && rm -rf ./build",
+        // A relative cd into a project subdirectory.
+        "cd build && rm -rf *",
+        // A subshell's cd ends at its `)`.
+        "(cd / && ls) && rm -rf ./dist",
+        "(cd /); rm -rf *",
+        // Unknown working directory: judged as written (today's verdict).
+        "cd \"$(mktemp -d)\" && rm -rf *",
+        "cd - && rm -rf *",
+        "cd $TMPDIR && rm -rf *",
+        "cd ~other && rm -rf *",
+        // A piped or backgrounded cd runs in a subshell of its own.
+        "cd / | rm -rf *",
+        "cd / & rm -rf *",
+        "popd && rm -rf *",
+        // `..` above an unknown home is unknown.
+        "cd ~ && cd .. && rm -rf ./x",
+        // The mode / owner operand is not a path.
+        "cd /tmp && chown -R -v root ./x",
+        // Other packs see the command unchanged.
+        "cd / && git status",
+    ] {
+        let got = e.evaluate(cmd);
+        assert!(!got.is_deny(), "expected ALLOW for {cmd:?}, got {got:?}");
+    }
+    // An unknown cwd keeps today's verdict exactly (pinned before cd
+    // tracking judged rm targets).
+    assert_eq!(
+        e.evaluate("cd \"$(mktemp -d)\" && rm -rf *"),
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable {
+                reason: "working directory unknown after cd".into()
+            }
+        }
+    );
 }
 
 /// Generous budget so a loaded runner cannot turn a deny into a latency

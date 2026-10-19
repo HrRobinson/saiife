@@ -24,8 +24,9 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
+use crate::cdtrack::RuleCwd;
 use crate::lexer::{
-    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
+    find_all_substitution_kinds, literal_word, split_segments_with_separators, Operator, Word,
 };
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
@@ -53,6 +54,12 @@ const MAX_INLINE_DEPTH: u32 = 8;
 /// (command substitution in a guarded argument position), as opposed to a
 /// decision that came from a loaded pack's regex rule.
 const SUBSTITUTION_GUARD_PACK: &str = "saiifeguard.core";
+
+/// The pack whose rules also judge a destructive command's relative
+/// operands joined onto the directory an earlier `cd` on the line moved to
+/// (`cd / && rm -rf *` is matched as `rm -rf /*`); see `crate::cdtrack`.
+/// Other packs see the command as written.
+const CD_RESOLVED_PACK: &str = "core.filesystem";
 
 /// The engine's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +340,7 @@ impl Engine {
         let state = ShellState {
             cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
             cwd_unknown: false,
+            rule_cwd: RuleCwd::start(self.vars.cwd()),
             env_changed: false,
             ifs_named: false,
         };
@@ -355,11 +363,7 @@ impl Engine {
         // comment): values are still judged, the unresolved words too.
         state.ifs_named |= mentions_ifs(raw_cmd);
         let mut found = Findings::default();
-        let (segments, lex_note) = if sub_body {
-            split_substitution_noted(raw_cmd)
-        } else {
-            split_segments_noted(raw_cmd)
-        };
+        let (segments, seps, lex_note) = split_segments_with_separators(raw_cmd, sub_body);
         if let Some(reason) = lex_note {
             found.unjudged(reason);
         }
@@ -369,15 +373,36 @@ impl Engine {
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
         };
 
-        for seg in segments {
+        // The rule cwd at each open `(`: a subshell's `cd` ends at its `)`.
+        let mut subshells: Vec<RuleCwd> = Vec::new();
+        for (i, seg) in segments.iter().enumerate() {
             if start.elapsed() > self.budget {
                 return timed_out();
+            }
+            for op in &seps[i] {
+                match op {
+                    Operator::LParen => subshells.push(state.rule_cwd.clone()),
+                    Operator::RParen => {
+                        if let Some(outer) = subshells.pop() {
+                            state.rule_cwd = outer;
+                        }
+                    }
+                    _ => {}
+                }
             }
             if seg.is_empty() {
                 continue;
             }
-            if let Some(d) = self.evaluate_segment(&seg, &cx, &mut state, &mut found) {
+            // A piped or backgrounded command runs in a subshell of its
+            // own: its `cd` moves nothing after it.
+            let own_subshell = seps[i].last() == Some(&Operator::Pipe)
+                || matches!(seps[i + 1].first(), Some(Operator::Pipe | Operator::Amp));
+            let rule_cwd = own_subshell.then(|| state.rule_cwd.clone());
+            if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found) {
                 return d;
+            }
+            if let Some(rule_cwd) = rule_cwd {
+                state.rule_cwd = rule_cwd;
             }
         }
         found.finish()
@@ -654,13 +679,42 @@ impl Engine {
             return None;
         }
         match self.judge(matching_line, segment_line, view.env_changed, cx.start) {
-            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
+            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
             JudgeOutcome::Decided(Decision::Allow { trace }) => {
                 found.allow_trace = Some(trace);
-                None
             }
+            JudgeOutcome::TimedOut => return Some(timed_out()),
+            JudgeOutcome::Clean => {}
+        }
+        self.cd_resolved_phase(view, cx, state)
+    }
+
+    /// A destructive command's relative operands after a `cd` on the same
+    /// line, joined onto its target (`cd / && rm -rf *` is `rm -rf /*`),
+    /// judged by `CD_RESOLVED_PACK` alone. `Some` on a deny or when the
+    /// budget runs out.
+    fn cd_resolved_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+    ) -> Option<Decision> {
+        let argv = state.rule_cwd.rewrite(&view.argv, self.vars.home())?;
+        let mut line = argv.join(" ");
+        if !view.peeled.is_empty() {
+            line.push(' ');
+            line.push_str(&view.peeled);
+        }
+        match self.judge_in(
+            Some(CD_RESOLVED_PACK),
+            &line,
+            &line,
+            view.env_changed,
+            cx.start,
+        ) {
+            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
             JudgeOutcome::TimedOut => Some(timed_out()),
-            JudgeOutcome::Clean => None,
+            _ => None,
         }
     }
 
@@ -752,6 +806,9 @@ impl Engine {
 
     /// `cd`/`pushd`: the later segments may run in its target too.
     fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) {
+        state
+            .rule_cwd
+            .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
             state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
         }
@@ -1052,6 +1109,18 @@ impl Engine {
         env_changed: bool,
         start: Instant,
     ) -> JudgeOutcome {
+        self.judge_in(None, matching_line, segment_line, env_changed, start)
+    }
+
+    /// `judge`, over the pack `only` names when it is set.
+    fn judge_in(
+        &self,
+        only: Option<&str>,
+        matching_line: &str,
+        segment_line: &str,
+        env_changed: bool,
+        start: Instant,
+    ) -> JudgeOutcome {
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
             if rule.after_env_change {
                 (env_changed && !matching_line.is_empty()).then_some(matching_line)
@@ -1067,6 +1136,9 @@ impl Engine {
         for pack in &self.packs {
             if start.elapsed() > self.budget {
                 return JudgeOutcome::TimedOut;
+            }
+            if only.is_some_and(|id| id != pack.id) {
+                continue;
             }
             let pf = pack.prefilter();
             if !pf.might_match(matching_line) && !pf.might_match(segment_line) {
@@ -1435,6 +1507,9 @@ struct ShellState {
     /// A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`, an
     /// unresolvable target, or past `MAX_CWDS`).
     cwd_unknown: bool,
+    /// Where the regex rules of `CD_RESOLVED_PACK` place relative
+    /// operands: the directory an earlier `cd` on the line moved to.
+    rule_cwd: RuleCwd,
     /// An earlier segment changed PATH, HOME or XDG_DATA_HOME for the rest
     /// of the command line (and for nested evaluations).
     env_changed: bool,

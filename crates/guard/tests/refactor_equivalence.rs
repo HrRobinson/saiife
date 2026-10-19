@@ -217,7 +217,7 @@ const DENY_COUNT: usize = 58;
 const DENY_RULES: &[(&str, &str)] = &[
     (
         "core.filesystem",
-        r"^(?:sudo\s+)?rm\s+(?:\S+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+(?:\S+\s+)*(?:/\*|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users|Volumes)/?\*?|/)(?:\s|$)",
+        r"^(?:sudo\s+)?rm\s+(?:\S+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+(?:\S+\s+)*(?:/\*|(?:~|\$HOME|\$\{HOME\})(?:/\.\*|/?\*?)|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users|Volumes)/?\*?|/)(?:\s|$)",
     ),
     ("core.git", r"^git\s+reset\s+--hard\b"),
     ("core.secrets", "**/.env"),

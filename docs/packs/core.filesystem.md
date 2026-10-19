@@ -26,6 +26,13 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   breaks the system's permissions or ownership.
 - An `rm` whose target is hidden inside `$(...)` (for example
   `rm -rf $(cat list.txt)`). saiife cannot see the target, so it blocks.
+- A delete that lands on one of these folders because of an earlier `cd` on
+  the same line: `cd / && rm -rf *`, `cd ~ && rm -rf .*`,
+  `cd /usr && cd .. && rm -rf *`. saiife follows `cd` and `pushd` to `/`, `~`,
+  `$HOME` or another absolute folder, and relative `cd`s from there (`..`
+  included). The relative targets of `rm`, `chmod -R` and `chown -R` are
+  judged as if they were written from that folder. A `cd` inside `( ... )`
+  ends at the `)`.
 
 These rules also apply when the command runs through `sudo`, `bash -c '...'`
 or after `cd`.
@@ -48,8 +55,15 @@ or after `cd`.
   by this pack.
 - A deep folder under a system folder is not treated as catastrophic. For
   example `rm -rf /var/folders/xy/tmp` is allowed.
-- `cd / && rm -rf *` is allowed. The guard does not track `cd`, so it does not
-  know the delete runs in the root folder.
+- A `cd` to a folder saiife cannot work out is not followed: `cd -`,
+  `cd "$(mktemp -d)"`, `cd $SOME_VAR`, `cd ~otheruser`, `popd`. The delete
+  after it is judged as written, so `cd "$(...)" && rm -rf *` is allowed. A
+  relative `cd` (`cd build`) is followed only from a folder saiife knows.
+- `cd` is followed by its text alone. saiife does not check that the folder
+  exists or follow symlinks, and it assumes the `cd` worked. A `cd` in a
+  pipeline (`cd / | ...`) or in the background (`cd / &`) is not followed.
+  Neither is a `cd` written as an `if` or `while` condition
+  (`if cd /; then ...`).
 - Protection of saiife's own files is in the `core.self` pack, not here.
 
 ## Examples
@@ -63,8 +77,18 @@ deny dd if=/dev/zero of=/dev/sda
 deny mkfs.ext4 /dev/sdb
 deny chmod -R 777 /
 deny rm -rf $(cat /tmp/list)
+deny cd / && rm -rf *
+deny cd ~ && rm -rf *
+deny cd ~ || exit; rm -rf .*
+deny (cd / && rm -rf *)
+deny bash -c 'cd / && rm -rf *'
+deny cd /usr && cd .. && rm -rf *
 allow rm -rf node_modules
 allow rm -rf /tmp/scratch
 allow rm file.txt
 allow chmod -R 755 ./assets
+allow cd /tmp && rm -rf ./build
+allow cd build && rm -rf *
+allow (cd / && ls) && rm -rf ./dist
+allow cd "$(mktemp -d)" && rm -rf *
 ```

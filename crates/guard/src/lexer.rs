@@ -133,36 +133,57 @@ pub fn split_segments(cmd: &str) -> Vec<Segment> {
 /// or here-documents nested too deeply). The caller records it as a
 /// fail-open unless something else denies.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    split_noted(cmd, false)
+    let (segments, _, note) = split_noted(cmd, false);
+    (segments, note)
 }
 
 /// `split_segments_noted` for the body of a `$(…)` (the text between its
 /// parentheses): here-documents end as bash ends them inside one.
 pub fn split_substitution_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    split_noted(cmd, true)
+    let (segments, _, note) = split_noted(cmd, true);
+    (segments, note)
 }
 
-fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>) {
+/// The operators around each segment: `seps[i]` are the operators between
+/// segment `i - 1` and segment `i` (in order), so there is one more entry
+/// than there are segments (the last holds the trailing operators).
+pub type Separators = Vec<Vec<Operator>>;
+
+/// `split_segments_noted` (or, with `body_top`, `split_substitution_noted`)
+/// that also returns the operators around each segment (`Separators`).
+pub fn split_segments_with_separators(
+    cmd: &str,
+    body_top: bool,
+) -> (Vec<Segment>, Separators, Option<&'static str>) {
+    split_noted(cmd, body_top)
+}
+
+fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Separators, Option<&'static str>) {
     let mut ctx = Ctx::new();
     let mut segments: Vec<Segment> = Vec::new();
+    let mut seps: Separators = vec![Vec::new()];
     let mut current: Segment = Vec::new();
     let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false, body_top).toks;
 
     for tok in toks {
         match tok {
             LexTok::Word(w) => current.push(w),
-            LexTok::Operator(_) => {
+            LexTok::Operator(op) => {
                 if !current.is_empty() {
                     segments.push(std::mem::take(&mut current));
+                    seps.push(Vec::new());
                 }
+                seps.last_mut().expect("never empty").push(op);
             }
         }
     }
     if !current.is_empty() {
         segments.push(current);
+        seps.push(Vec::new());
     }
     (
         segments.into_iter().map(strip_leading_keywords).collect(),
+        seps,
         ctx.note,
     )
 }
