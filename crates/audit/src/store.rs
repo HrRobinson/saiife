@@ -55,7 +55,9 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
 }
 
 /// `create_dir_all`, with owner-only (0700) permissions on unix for the
-/// directories it creates: the log reveals what people work on.
+/// directories it creates: the log reveals what people work on. An existing
+/// loose directory is tightened to 0700 too, best-effort, and only when it is
+/// a real directory (not a symlink); a failed chmod (e.g. not the owner) is ignored.
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
@@ -69,9 +71,13 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(dir)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        if let Ok(md) = fs::symlink_metadata(dir) {
+            // No owner check (this crate forbids unsafe, so no geteuid): a
+            // directory owned by someone else makes chmod fail with EPERM,
+            // which is ignored.
+            if md.is_dir() && md.permissions().mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
         }
     }
     Ok(())
@@ -447,6 +453,27 @@ mod tests {
         append(&dir, &r).unwrap();
         let mode = fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_audit_dir_target_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("real");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&link, &r).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     /// The size that matters is the serialized line, not the field lengths:

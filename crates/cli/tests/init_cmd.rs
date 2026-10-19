@@ -412,6 +412,26 @@ fn dangling_symlink_chain_names_last_link() {
     assert!(line.contains("does not exist"), "{line}");
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_cycle_in_agent_config_keeps_loop_wording() {
+    let env = Env::new(&["claude"]);
+    let dir = env.root().join(".claude");
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink("b.json", dir.join("a.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("b.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("settings.json")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!line.contains("does not exist"), "{line}");
+    assert!(line.contains("Too many levels of symbolic links"), "{line}");
+}
+
 /// Hook claude for real, then move its settings outside the project and
 /// leave a symlink in its place.
 #[cfg(unix)]
