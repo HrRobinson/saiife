@@ -68,8 +68,9 @@ make_release() {
     rm -rf "$stage"
   done
   : >"$dir/SHA256SUMS"
-  for f in $(cd "$dir" && ls saiife-*.tar.gz | sort); do
-    printf '%s  %s\n' "$(sha256 "$dir/$f")" "$f" >>"$dir/SHA256SUMS"
+  # The glob expands sorted, like the old `ls | sort`.
+  for f in "$dir"/saiife-*.tar.gz; do
+    printf '%s  %s\n' "$(sha256 "$f")" "$(basename "$f")" >>"$dir/SHA256SUMS"
   done
 }
 

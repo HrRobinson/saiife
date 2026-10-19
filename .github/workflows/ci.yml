@@ -42,3 +42,10 @@ jobs:
       # Ubuntu 24.04 blocks unprivileged user namespaces by default.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: ./scripts/test-offline.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --version
+      - run: shellcheck install.sh scripts/*.sh

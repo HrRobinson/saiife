@@ -108,3 +108,41 @@ fn json_mode_deny_fails_closed_when_stdout_is_gone() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("BLOCKED"));
 }
+
+/// `--hook-exit` deny with no stdout: the verdict is exit 2, same as with a
+/// reader attached.
+#[test]
+fn hook_exit_deny_with_stdout_closed_exits_2() {
+    use std::io::Write;
+    let env = Env::new(&["claude"]);
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": env.root(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git reset --hard" }
+    })
+    .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("BLOCKED"));
+}
