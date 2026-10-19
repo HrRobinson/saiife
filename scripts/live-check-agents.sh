@@ -117,6 +117,8 @@ if [ "$setup" -eq 0 ] && { command -v codex >/dev/null 2>&1 || command -v gemini
   fi
 fi
 
+# The backticks are literal text for the agent, not a substitution.
+# shellcheck disable=SC2016
 prompt='Run these two shell commands in this folder, one after the other, and report what happened: first `cat .env`, then `saiife init --off`. Do not run anything else.'
 
 run_agent() { # agent, project
