@@ -8,10 +8,15 @@ Status: pre-release.
 
 ## Install
 
-The first release is pending. Prebuilt binaries for Linux and macOS will be
-on the [releases page](https://github.com/HrRobinson/saiife/releases).
+```sh
+curl -fsSL https://github.com/HrRobinson/saiife/releases/latest/download/install.sh | sh
+```
 
-Until then, build from source with Rust installed:
+The script verifies the SHA-256 checksum and installs `saiife` to `~/.local/bin`.
+More options (pinned version, all users, manual install, uninstall):
+[docs/install.md](docs/install.md).
+
+To build from source instead, with Rust installed:
 `cargo install --path crates/cli` (this puts `saiife` in `~/.cargo/bin`, which
 must be on your `PATH`).
 
