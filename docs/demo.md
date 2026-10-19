@@ -74,6 +74,14 @@ Before anything else runs, the script points `HOME`, `SAIIFE_DATA_DIR`,
 never read or written. The sandbox is removed on exit, also when the script
 fails.
 
+One exception: when the script builds saiife itself (no `SAIIFE_BIN`),
+`cargo` uses your real `~/.cargo` and `~/.rustup` (toolchain and crate
+cache), as any `cargo build` does.
+
+It also stops if a folder above the sandbox already has
+`.saiife/config.toml`, since `saiife init` would act on that project
+instead. Point `TMPDIR` somewhere else if that happens.
+
 ## Live check with real agents
 
 `scripts/live-check-agents.sh` is the same idea with real Codex and Gemini
@@ -84,8 +92,24 @@ bash scripts/live-check-agents.sh --setup   # once: prints how to trust each tes
 bash scripts/live-check-agents.sh
 ```
 
+**How the agents run.** Gemini CLI runs with `--approval-mode yolo`: no
+sandbox, every tool call is approved automatically and runs as you, with
+access to your files. Codex runs with `exec --full-auto`: inside its
+workspace-write sandbox (writes limited to the project folder and temp).
+The prompt asks only for two harmless commands in a throwaway project, but
+the model is not forced to stick to it. The script prints this warning and
+asks you to type `yes` before starting any agent; `--yes` skips the
+question (and is required when stdin is not a terminal).
+
 For each agent on `PATH` it asks the agent to `cat .env` and to run
 `saiife init --off`, then prints PASS or FAIL for each block (or
 `SKIP <agent>: not installed`). The summary, with the agent versions, is
 written to `~/.cache/saiife-live/result.txt`. It copies no credentials; the
-test projects and its temporary audit log are deleted when it ends.
+test projects and its temporary audit log are deleted when it ends. Like the
+demo, it refuses to run if a folder above `~/.cache/saiife-live` has
+`.saiife/config.toml`.
+
+If a check fails with no hook call recorded, either the test folder or hook
+is not trusted yet (run `--setup`), or the agent does not pass saiife's
+`SAIIFE_*` settings on to the hook, so the records went to your default
+audit log (`saiife audit --agent codex` or `--agent gemini`).

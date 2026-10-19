@@ -83,6 +83,18 @@ export PATH="$sandbox/bin:$PATH"
 
 # --- 3. A project with a secret, hooked up. ---------------------------------
 project="$sandbox/home/app"
+# saiife init walks up to the nearest .saiife/config.toml. If TMPDIR sits
+# inside a saiife project, init (and the hook) would act on that project.
+d="$sandbox"
+while :; do
+  if [ -e "$d/.saiife/config.toml" ]; then
+    echo "demo: $d/.saiife/config.toml exists above the sandbox; saiife would act on" >&2
+    echo "  that project instead. Set TMPDIR to a folder outside any saiife project." >&2
+    exit 1
+  fi
+  [ "$d" = "/" ] && break
+  d="$(dirname "$d")"
+done
 mkdir -p "$project"
 printf 'API_KEY=demo-not-a-real-key\n' >"$project/.env"
 cd "$project"
