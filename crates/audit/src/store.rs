@@ -64,7 +64,17 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(dir)
+    b.create(dir)?;
+    // `create_dir_all` leaves an existing directory alone: tighten a loose one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 /// What `read_all` found: the parseable records plus how much it had to skip,
@@ -418,6 +428,45 @@ mod tests {
         let got = read_all(&file);
         assert!(got.records.is_empty());
         assert!(got.dir_error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_loose_audit_dir_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("audit");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&dir, &r).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// The size that matters is the serialized line, not the field lengths:
+    /// multibyte input stays within 4096 chars but is several times that in
+    /// bytes, and the file holds exactly the serialized bytes plus a newline.
+    #[test]
+    fn record_size_check_measures_serialized_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        r.input = "\u{1F600}".repeat(5000);
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(line.len() > 16 * 1024);
+        append(dir.path(), &r).unwrap();
+        let file = dir.path().join(format!("{}.jsonl", r.month()));
+        assert_eq!(fs::metadata(file).unwrap().len() as usize, line.len() + 1);
     }
 
     #[cfg(unix)]

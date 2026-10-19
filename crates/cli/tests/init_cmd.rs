@@ -392,6 +392,26 @@ fn dangling_agent_config_symlink_is_explained() {
     assert!(!line.contains("No such file"), "{line}");
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_chain_names_last_link() {
+    let env = Env::new(&["claude"]);
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    let dir = env.root().join(".claude");
+    std::os::unix::fs::symlink("b.json", dir.join("a.json")).unwrap();
+    std::os::unix::fs::symlink("missing.json", dir.join("b.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("settings.json")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains("missing.json"), "{line}");
+    assert!(line.contains("does not exist"), "{line}");
+}
+
 /// Hook claude for real, then move its settings outside the project and
 /// leave a symlink in its place.
 #[cfg(unix)]

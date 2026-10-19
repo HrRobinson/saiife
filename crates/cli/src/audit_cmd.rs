@@ -15,9 +15,13 @@ use time::{Duration, OffsetDateTime};
 
 const INPUT_WIDTH: usize = 60;
 
+/// The one error text for a bad `--since` value.
+fn since_error(s: &str) -> String {
+    format!("invalid --since {s:?}: use a whole number with m, h or d, e.g. 30m, 24h, 7d")
+}
+
 pub fn parse_since(s: &str) -> Result<Duration, String> {
-    let err =
-        || format!("invalid --since {s:?}: use a whole number with m, h or d, e.g. 30m, 24h, 7d");
+    let err = || since_error(s);
     if !s.is_ascii() || s.len() < 2 {
         return Err(err());
     }
@@ -151,9 +155,9 @@ fn write_via_temp(path: &Path, html: &str, tmp: &Path) -> std::io::Result<()> {
 /// the same error as any other bad value.
 fn since_cutoff(s: &str) -> Result<OffsetDateTime, String> {
     let d = parse_since(s)?;
-    OffsetDateTime::now_utc().checked_sub(d).ok_or_else(|| {
-        format!("invalid --since {s:?}: use a whole number with m, h or d, e.g. 30m, 24h, 7d")
-    })
+    OffsetDateTime::now_utc()
+        .checked_sub(d)
+        .ok_or_else(|| since_error(s))
 }
 
 pub fn run(
@@ -298,6 +302,15 @@ mod tests {
         assert_eq!(parse_since("30m"), Ok(Duration::minutes(30)));
         assert_eq!(parse_since("24h"), Ok(Duration::hours(24)));
         assert_eq!(parse_since("7d"), Ok(Duration::days(7)));
+    }
+
+    #[test]
+    fn both_since_paths_share_one_text() {
+        assert_eq!(parse_since("0x").unwrap_err(), since_error("0x"));
+        assert_eq!(
+            since_cutoff("99999999999999d").unwrap_err(),
+            since_error("99999999999999d")
+        );
     }
 
     #[test]
