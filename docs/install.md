@@ -30,7 +30,8 @@ To use another folder, set `SAIIFE_INSTALL_DIR`.
 
 ## Install for all users
 
-Pass `--system` to install to `/usr/local/bin`. This needs `sudo`.
+Pass `--system` to install to `/usr/local/bin`. It asks for `sudo` only if that folder
+is not writable.
 
 ```sh
 curl -fsSL https://github.com/HrRobinson/saiife/releases/latest/download/install.sh | sh -s -- --system
@@ -53,6 +54,7 @@ If you do not want to pipe a script into your shell:
 
    ```sh
    tar xzf saiife-0.1.0-x86_64-unknown-linux-musl.tar.gz
+   mkdir -p ~/.local/bin
    cp saiife-0.1.0-x86_64-unknown-linux-musl/saiife ~/.local/bin/
    ```
 
@@ -82,13 +84,19 @@ This puts `saiife` in `~/.cargo/bin`.
 1. In each project where you ran `saiife init`, run `saiife init --off`.
    This removes the hooks from your agent settings.
 2. Delete the binary, for example `rm ~/.local/bin/saiife`.
-3. Optional: delete saiife's data. It holds the integrity records and the audit log.
-   If `SAIIFE_DATA_DIR` is set to an absolute path, that folder is used.
-   Otherwise the default is:
-   - Linux: `~/.local/share/saiife`
-   - macOS: `~/Library/Application Support/saiife`
+3. Optional: delete saiife's data. There are two folders.
+   - The data folder holds the integrity records. If `SAIIFE_DATA_DIR` is set to an
+     absolute path, that folder is used. Otherwise the default is:
+     - Linux: `~/.local/share/saiife` (or `$XDG_DATA_HOME/saiife` if that is set)
+     - macOS: `~/Library/Application Support/saiife`
+   - The audit log has its own setting. If `SAIIFE_AUDIT_DIR` is set to an absolute
+     path, that folder is used. Otherwise the default is:
+     - Linux: `~/.local/share/saiife/audit` (or `$XDG_DATA_HOME/saiife/audit`)
+     - macOS: `~/Library/Application Support/saiife/audit`
 
-   The audit log is in the `audit` folder inside it, unless `SAIIFE_AUDIT_DIR` is set.
+     `SAIIFE_DATA_DIR` does not move the audit log. If you set only `SAIIFE_DATA_DIR`,
+     the log stays at the default path.
+
    The log is your record of what the agents did. Keep it if you may need it.
 4. Optional: delete the `.saiife` folder in each project.
 

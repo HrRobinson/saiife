@@ -157,6 +157,59 @@ else
   bad missing_sums_line_installs_nothing "status=$status; $(cat "$c/out")"
 fi
 
+# --- symlink_member_installs_nothing -----------------------------------------
+# The tarball's saiife is a symlink to a private file outside the release, and
+# SHA256SUMS matches it (whoever controls the tarball controls the sums too).
+c="$scratch/symlink-member"
+mkdir -p "$c/rel" "$c/stage/saiife-0.1.0-$target"
+printf 'secret\n' >"$c/victim"
+chmod 0600 "$c/victim"
+ln -s "$c/victim" "$c/stage/saiife-0.1.0-$target/saiife"
+tar -czf "$c/rel/saiife-0.1.0-$target.tar.gz" -C "$c/stage" "saiife-0.1.0-$target"
+printf '%s  %s\n' "$(sha256 "$c/rel/saiife-0.1.0-$target.tar.gz")" \
+  "saiife-0.1.0-$target.tar.gz" >"$c/rel/SHA256SUMS"
+run_install "$c" "$c/rel" SAIIFE_VERSION=0.1.0
+perms="$(find "$c/victim" -perm 0600 -print)"
+if [ "$status" -eq 1 ] && grep -q "not a regular file" "$c/out" &&
+  [ ! -e "$c/home/.local/bin/saiife" ] && [ ! -L "$c/home/.local/bin/saiife" ] &&
+  [ "$perms" = "$c/victim" ]; then
+  ok symlink_member_installs_nothing
+else
+  bad symlink_member_installs_nothing "status=$status victim-still-0600=${perms:-no}; $(cat "$c/out")"
+fi
+
+# --- substring_sums_line_installs_nothing -------------------------------------
+# The only line for the host tarball names x<filename>: no exact match.
+for mode in pinned latest; do
+  c="$scratch/substring-$mode"
+  make_release "$c/rel" 0.1.0
+  sed "s/  saiife-0.1.0-$target.tar.gz\$/  xsaiife-0.1.0-$target.tar.gz/" \
+    "$c/rel/SHA256SUMS" >"$c/rel/SHA256SUMS.new"
+  mv "$c/rel/SHA256SUMS.new" "$c/rel/SHA256SUMS"
+  if [ "$mode" = pinned ]; then
+    run_install "$c" "$c/rel" SAIIFE_VERSION=0.1.0
+  else
+    run_install "$c" "$c/rel"
+  fi
+  if [ "$status" -eq 1 ] && grep -q "saiife: checksum verification failed" "$c/out" &&
+    [ ! -e "$c/home/.local/bin/saiife" ]; then
+    ok "substring_sums_line_installs_nothing ($mode)"
+  else
+    bad "substring_sums_line_installs_nothing ($mode)" "status=$status; $(cat "$c/out")"
+  fi
+done
+
+# --- bad_version_rejected -----------------------------------------------------
+c="$scratch/bad-version"
+make_release "$c/rel" 0.1.0
+run_install "$c" "$c/rel" SAIIFE_VERSION='1.0/../x'
+if [ "$status" -eq 1 ] && grep -q "saiife: invalid version" "$c/out" &&
+  [ ! -e "$c/home/.local/bin/saiife" ]; then
+  ok bad_version_rejected
+else
+  bad bad_version_rejected "status=$status; $(cat "$c/out")"
+fi
+
 # --- unsupported_platform -----------------------------------------------------
 # uname reports FreeBSD; curl/wget stubs record any download attempt.
 c="$scratch/unsupported"

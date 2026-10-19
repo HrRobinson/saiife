@@ -16,7 +16,7 @@ set -eu
 REPO_URL="https://github.com/HrRobinson/saiife"
 
 err() {
-  echo "saiife: $*" >&2
+  printf 'saiife: %s\n' "$*" >&2
 }
 
 die() {
@@ -63,14 +63,11 @@ pick_downloader() {
 download() {
   case "$downloader" in
     curl)
-      if [ -n "${SAIIFE_DOWNLOAD_BASE:-}" ]; then
-        curl -fsSL -o "$2" "$1"
-      else
-        curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
-      fi
+      # file:// is allowed for offline tests and local mirrors; never http.
+      curl -fsSL --proto '=https,file' --tlsv1.2 -o "$2" "$1"
       ;;
     wget)
-      wget -q -O "$2" "$1"
+      wget -q --https-only -O "$2" "$1"
       ;;
   esac
 }
@@ -95,8 +92,28 @@ as_root() {
   fi
 }
 
+# check_version <version>: non-empty, only [0-9A-Za-z.+-].
+check_version() {
+  case "$1" in
+    "" | *[!0-9A-Za-z.+-]*) die "invalid version: '$1'" ;;
+  esac
+}
+
+# cleanup: the download dir, and a half-installed staging file.
+cleanup() {
+  if [ -n "${tmp:-}" ]; then
+    rm -rf "$tmp"
+  fi
+  if [ -n "${staged:-}" ] && [ -e "$staged" ]; then
+    as_root rm -f "$staged" 2>/dev/null || true
+  fi
+}
+
 main() {
   system=0
+  tmp=""
+  staged=""
+  sudo=""
   for arg in "$@"; do
     case "$arg" in
       --system) system=1 ;;
@@ -126,6 +143,9 @@ main() {
 
   version="${SAIIFE_VERSION:-}"
   version="${version#v}"
+  if [ -n "$version" ]; then
+    check_version "$version"
+  fi
   if [ -n "${SAIIFE_DOWNLOAD_BASE:-}" ]; then
     base="$SAIIFE_DOWNLOAD_BASE"
   elif [ -n "$version" ]; then
@@ -137,9 +157,15 @@ main() {
     */) ;;
     *) base="$base/" ;;
   esac
+  if [ "$downloader" = wget ]; then
+    case "$base" in
+      https://*) ;;
+      *) die "wget can only download over https; install curl or use an https base: $base" ;;
+    esac
+  fi
 
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
@@ -157,9 +183,7 @@ main() {
     [ "$count" -eq 1 ] || die "checksum verification failed"
     version="${matches#saiife-}"
     version="${version%-"$target".tar.gz}"
-    case "$version" in
-      "" | */* | *" "*) die "checksum verification failed" ;;
-    esac
+    check_version "$version"
   fi
 
   name="saiife-$version-$target"
@@ -177,12 +201,16 @@ main() {
   (cd "$tmp" && sha256_check SHA256SUMS.target) ||
     die "checksum verification failed"
 
-  tar -xzf "$tmp/$tarball" -C "$tmp" || die "could not extract $tarball"
-  [ -f "$tmp/$name/saiife" ] || die "$tarball does not contain $name/saiife"
+  # Extract only the binary, and only accept a regular file: a symlink
+  # member must never be followed by chmod or cp (least of all under sudo).
+  tar -xzf "$tmp/$tarball" -C "$tmp" "$name/saiife" ||
+    die "could not extract $name/saiife from $tarball"
+  if [ -h "$tmp/$name/saiife" ] || [ ! -f "$tmp/$name/saiife" ]; then
+    die "$name/saiife in $tarball is not a regular file"
+  fi
   chmod 0755 "$tmp/$name/saiife"
 
   # sudo only for the final step, and only when the directory needs it.
-  sudo=""
   if [ "$system" -eq 1 ]; then
     mkdir -p "$install_dir" 2>/dev/null || true
     if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
@@ -196,14 +224,14 @@ main() {
   if ! { as_root cp "$tmp/$name/saiife" "$staged" &&
     as_root chmod 0755 "$staged" &&
     as_root mv -f "$staged" "$install_dir/saiife"; }; then
-    as_root rm -f "$staged" 2>/dev/null || true
     die "could not install to $install_dir/saiife"
   fi
+  staged=""
 
-  echo "saiife $version installed to $install_dir/saiife"
+  printf 'saiife %s installed to %s\n' "$version" "$install_dir/saiife"
   case ":${PATH:-}:" in
     *":$install_dir:"*) ;;
-    *) echo "Add it to your PATH: export PATH=\"$install_dir:\$PATH\"" ;;
+    *) printf 'Add it to your PATH: export PATH="%s:%s"\n' "$install_dir" "\$PATH" ;;
   esac
 }
 
