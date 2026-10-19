@@ -1,0 +1,84 @@
+# Threat coverage
+
+This page says which risks saiife v1 covers and which it does not, for each
+way of working. It is meant for anyone who decides whether an AI coding agent
+may run on a company machine, including people who do not write code.
+
+## The three threats
+
+saiife looks at three kinds of agent behavior, from easiest to hardest to
+stop:
+
+| Threat | Example | Stopped by |
+| --- | --- | --- |
+| **Mistake** | Agent runs `rm -rf` on the wrong path, force-pushes, reads `.env` while debugging | v1 guard packs |
+| **Helpful bypass** | Agent on auto mode sees a block and "fixes" it by turning saiife off or editing its config | v1 `core.self` + tamper detection; fully in v2 admin lock |
+| **Determined bypass** | Agent writes and runs a script that reads secrets, or calls an API directly with a key it found | v2 connector gateway (agent never holds keys) + v3 isolated runner |
+
+Only v1 exists today. v2 and v3 are designed but not built.
+
+## How v1 works, in short
+
+- Before the agent runs a command or touches a file, it asks saiife. saiife
+  blocks known-dangerous actions and lets everything else run.
+- Every decision, allowed or blocked, goes into an audit log outside the
+  project. `saiife audit --report report.html` turns it into a page you can
+  read and share.
+- `saiife status` checks that the guard is still in place and says how to
+  fix it if not.
+- If saiife breaks or is too slow, the agent's action runs anyway ("fails
+  open"). This is on purpose while a person is nearby: a broken guard should
+  not stop work. Such cases are recorded as `error_allowed` in the audit log
+  where saiife can record them.
+- saiife runs as your own user. Anything you can do, the agent can do, so a
+  determined agent can get around it.
+
+## Setup 1: v1 with a person nearby
+
+You use the agent and watch what it does, and confirm risky steps when the
+agent asks. This is what v1 is built for.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Covered** | The packs block the common destructive and secret-reading actions. Each pack lists what it does not catch. |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways to turn saiife off. `saiife status` shows a removed or changed hook. You are there to notice. |
+| Determined bypass | **Not covered** | An agent that writes and runs its own script, or uses a key it found, is not seen. |
+
+## Setup 2: v1 on auto mode or unattended
+
+The agent runs commands without asking you, or runs while nobody watches.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Partly covered** | The packs still block known-dangerous actions. But if saiife fails, the action runs and nobody sees it until someone reads the audit log. |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways, but an agent that keeps trying may find a way the pack does not know. `saiife status` shows it only when someone runs it. |
+| Determined bypass | **Not covered** | As above. |
+
+For agents that run unattended, v1 is not enough on its own. That needs v2
+(an admin lock the agent cannot remove, and keys the agent never sees),
+which is not built yet. Until then, run `saiife status` and read the audit
+report regularly.
+
+## Not covered by v1
+
+- **A determined agent running as your user.** It can write and run a script
+  that reads a secret or rewrites the hook settings. saiife cannot stop this.
+  `saiife status` shows changed hooks and settings afterwards.
+- **External services.** saiife cannot tell what an HTTP call does, so it has
+  no per-service rules (Shopify, HubSpot and so on). It does block reading
+  secrets out of cloud tools and secret managers.
+- **Tools the hook does not cover**, such as web fetch and MCP tools. Each
+  agent page lists which tools are judged:
+  [Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
+  [Gemini CLI](agents/gemini.md).
+- **Other agents.** Only Claude Code, Codex and Gemini CLI are supported.
+- **Gaps in each pack.** Every pack page has a "Not covered" section. The
+  ones that matter most for this page:
+  - [core.secrets: not covered](packs/core.secrets.md#not-covered) (for
+    example a recursive read of a folder, or `git show HEAD:.env`)
+  - [core.self: not covered](packs/core.self.md#not-covered) (for example a
+    shell function named `saiife`)
+  - [Limits of the guard as a whole](packs/core.secrets.md#limits-of-the-guard-as-a-whole)
+
+Codex and Gemini CLI support is not yet verified on a live install; see the
+"Not yet verified live" section on each agent page.

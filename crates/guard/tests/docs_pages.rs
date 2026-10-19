@@ -137,3 +137,74 @@ fn index_lists_every_pack() {
         );
     }
 }
+
+/// Every `.md` file under `dir`, skipping `docs/superpowers/` (plans, specs
+/// and research are working notes, not user docs).
+fn markdown_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) != Some("superpowers") {
+                markdown_files(&path, out);
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+}
+
+/// The targets of every inline Markdown link `[text](target)` outside fenced
+/// code blocks.
+fn link_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(at) = rest.find("](") {
+            let after = &rest[at + 2..];
+            let Some(end) = after.find(')') else { break };
+            // Drop an optional title: `(file.md "Title")`.
+            let target = after[..end].split_whitespace().next().unwrap_or("");
+            out.push(target.to_string());
+            rest = &after[end + 1..];
+        }
+    }
+    out
+}
+
+#[test]
+fn docs_links_resolve() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = vec![root.join("README.md")];
+    markdown_files(&root.join("docs"), &mut files);
+    let mut broken = Vec::new();
+    for file in &files {
+        let text =
+            std::fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let base = file.parent().expect("file has a parent");
+        for target in link_targets(&text) {
+            if target.is_empty()
+                || target.starts_with('#')
+                || target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+            {
+                continue;
+            }
+            // Check the file part only; `#anchor` suffixes are not checked.
+            let file_part = target.split('#').next().unwrap_or("");
+            if !base.join(file_part).exists() {
+                broken.push(format!("{}: {target}", file.display()));
+            }
+        }
+    }
+    assert!(broken.is_empty(), "broken links:\n{}", broken.join("\n"));
+}
