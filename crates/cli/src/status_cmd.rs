@@ -18,7 +18,6 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
-use crate::init_cmd::project_root;
 use crate::project::project_packs;
 
 /// Month files `status` reads at most when looking for each agent's last call.
@@ -70,7 +69,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         .filter(|(_, h)| h.error.is_none())
         .map(|(a, _)| a.as_str())
         .collect();
-    let (last_calls, cut_short) = last_calls(&root, &hooked, &mut problems, &mut notes);
+    let (last_calls, scan) = last_calls(&root, &hooked, &mut problems, &mut notes);
     let home = dirs::home_dir();
 
     for agent in Agent::ALL {
@@ -92,13 +91,25 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         };
         if let (Some(e), true) = (&rec.error, rec.off_failed) {
             if let Some(target) = &rec.off_outside {
-                problems.push(Problem {
-                    what: format!(
-                        "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it and the saiife hook is still in place."
-                    ),
-                    fix: format!(
-                        "remove the saiife hook entry (the `saiife check` command) from {target} by hand"
-                    ),
+                problems.push(if rec.init_failed {
+                    Problem {
+                        what: format!(
+                            "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it. The earlier `saiife init` for {} failed, so the saiife hook may still be in place.",
+                            agent.label()
+                        ),
+                        fix: format!(
+                            "check {target} by hand and remove the saiife hook entry (the `saiife check` command) if it is there"
+                        ),
+                    }
+                } else {
+                    Problem {
+                        what: format!(
+                            "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it and the saiife hook is still in place."
+                        ),
+                        fix: format!(
+                            "remove the saiife hook entry (the `saiife check` command) from {target} by hand"
+                        ),
+                    }
                 });
                 continue;
             }
@@ -140,10 +151,10 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                 println!(
                     "  {:<7} hooked   {rel:<22} last hook call: {}",
                     agent.name(),
-                    last.map(ago).unwrap_or_else(|| if cut_short {
-                        format!("no call in the last {SCAN_MONTHS} months")
-                    } else {
-                        "no call yet".into()
+                    last.map(ago).unwrap_or_else(|| match scan {
+                        Scan::Unreadable => "unknown (audit log could not be read)".into(),
+                        Scan::CutShort => format!("no call in the last {SCAN_MONTHS} months"),
+                        Scan::Complete => "no call yet".into(),
                     })
                 );
             }
@@ -243,47 +254,48 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
 }
 
 /// The project `status` reports on: the nearest directory at or above `cwd`
-/// holding a `.saiife/` directory, even when its config was removed (so the
-/// removal is named, not a guarded parent project). With no `.saiife/`
-/// anywhere above, the nearest ancestor with an integrity record is the
-/// project, so the removal is named instead of "not set up".
+/// that holds `.saiife/config.toml` as a file or has an integrity record.
+/// A project whose config was removed is still found (by its record), so
+/// the removal is named instead of "not set up" or a parent project; a
+/// stray `.saiife/` with neither does not count. Neither anywhere: `cwd`.
 fn status_root(cwd: &Path) -> PathBuf {
-    let saiife_dir = Path::new(CONFIG_REL)
-        .parent()
-        .unwrap_or(Path::new(".saiife"));
-    if let Some(d) = cwd.ancestors().find(|d| d.join(saiife_dir).is_dir()) {
-        return d.to_path_buf();
-    }
-    let found = project_root(cwd);
-    if found != cwd || cwd.join(CONFIG_REL).is_file() {
-        return found;
-    }
     cwd.ancestors()
         .find(|d| {
-            integrity::record_path(d)
-                .ok()
-                .flatten()
-                .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
+            d.join(CONFIG_REL).is_file()
+                || integrity::record_path(d)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
         })
         .unwrap_or(cwd)
         .to_path_buf()
 }
 
+/// How far `last_calls` got through the audit log.
+#[derive(Clone, Copy)]
+enum Scan {
+    /// Every month file was read: no record means no call yet.
+    Complete,
+    /// Older month files were left unread (`ReadResult::cut_short`).
+    CutShort,
+    /// The audit dir could not be determined or listed.
+    Unreadable,
+}
+
 /// Audit records of this project (by its literal and canonical path).
-/// An unreadable audit trail is a failed check (spec §1.2 rule 5). The flag
-/// is set when older month files were left unread (see `ReadResult::cut_short`).
+/// An unreadable audit trail is a failed check (spec §1.2 rule 5).
 fn last_calls(
     root: &Path,
     hooked: &[&str],
     problems: &mut Vec<Problem>,
     notes: &mut Vec<String>,
-) -> (Vec<Record>, bool) {
+) -> (Vec<Record>, Scan) {
     let Some(dir) = store::default_dir() else {
         problems.push(Problem {
             what: "the audit directory cannot be determined, so no decision is recorded".into(),
             fix: format!("set {}", store::DIR_ENV),
         });
-        return (Vec::new(), false);
+        return (Vec::new(), Scan::Unreadable);
     };
     let canonical_root = integrity::canonical_project(root).ok();
     let mut roots = vec![root.display().to_string()];
@@ -353,8 +365,15 @@ fn last_calls(
             all.skipped_lines
         ));
     }
+    let scan = if all.dir_error.is_some() {
+        Scan::Unreadable
+    } else if all.cut_short {
+        Scan::CutShort
+    } else {
+        Scan::Complete
+    };
     let ours = all.records.into_iter().filter(|r| is_ours(r)).collect();
-    (ours, all.cut_short)
+    (ours, scan)
 }
 
 fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {

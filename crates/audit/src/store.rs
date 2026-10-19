@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn read_recent_with_no_wanted_records_short_circuits() {
+    fn read_recent_reads_past_empty_month_files() {
         let dir = tempfile::tempdir().unwrap();
         for m in ["2026-01", "2026-02", "2026-03"] {
             fs::write(dir.path().join(format!("{m}.jsonl")), "").unwrap();

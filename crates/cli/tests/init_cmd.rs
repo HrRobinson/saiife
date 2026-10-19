@@ -430,6 +430,49 @@ fn outside_symlink_off_gives_cleanup_hint() {
     assert!(!text.contains("fix"), "{text}");
 }
 
+/// Plan 5b (status wording): the agent's earlier `init` failed (its config
+/// already pointed outside the project), so after `--off` the hook "may
+/// still be" in the outside file, not "is still"; status names the file
+/// to check by hand. A second `--off` keeps that.
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_after_failed_init_says_may_still_be_in_place() {
+    let env = Env::new(&["claude", "codex"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("config.toml");
+    std::fs::write(&target, "model = \"x\"\n").unwrap();
+    std::fs::create_dir(env.root().join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".codex/config.toml")).unwrap();
+    assert_eq!(code(&env.saiife(&["init"])), 1, "codex init fails");
+    let target = std::fs::canonicalize(&target).unwrap();
+    let target = target.to_str().unwrap();
+    for _ in 0..2 {
+        let out = env.saiife(&["init", "--off"]);
+        let text = stdout(&out);
+        assert_eq!(code(&out), 1, "{text}");
+        assert!(text.contains("may still be there"), "{text}");
+        let st = env.saiife(&["status"]);
+        let text = stdout(&st);
+        assert_eq!(code(&st), 1, "{text}");
+        assert!(text.contains("may still be in place"), "{text}");
+        assert!(!text.contains("is still in place"), "{text}");
+        assert!(text.contains(target), "{text}");
+        assert!(text.contains("by hand"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_after_good_init_says_still_in_place() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    hooked_then_symlinked_outside(&env, outside.path());
+    assert_eq!(code(&env.saiife(&["init", "--off"])), 1);
+    let text = stdout(&env.saiife(&["status"]));
+    assert!(text.contains("is still in place"), "{text}");
+    assert!(!text.contains("may still be"), "{text}");
+}
+
 /// Final review F1: an agent saiife never hooked is left alone, even when
 /// its config is a symlink out of the project.
 #[cfg(unix)]

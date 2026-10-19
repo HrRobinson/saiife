@@ -160,6 +160,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         error: None,
                         off_failed: false,
                         off_outside: None,
+                        init_failed: false,
                     },
                 );
                 installed.push(*agent);
@@ -182,6 +183,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         error: Some(e.to_string()),
                         off_failed: false,
                         off_outside: None,
+                        init_failed: false,
                     },
                 );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
@@ -310,8 +312,9 @@ pub fn off() -> ExitCode {
         .unwrap_or_default();
     let mut lines = Vec::new();
     // Agents whose hook could not be removed, with the reason.
-    // (agent, reason, the outside file when the config symlinks out)
-    let mut failed_agents: Vec<(Agent, String, Option<String>)> = Vec::new();
+    // (agent, reason, the outside file when the config symlinks out,
+    // whether the agent's earlier init had failed)
+    let mut failed_agents: Vec<(Agent, String, Option<String>, bool)> = Vec::new();
 
     for agent in Agent::ALL {
         // Only agents saiife hooked (recorded, or a saiife entry in the
@@ -340,14 +343,27 @@ pub fn off() -> ExitCode {
                 failed = true;
                 let mut line = format!("  {:<7} FAILED: {e}", agent.name());
                 let outside = e.outside_target().map(|p| p.display().to_string());
-                if outside.is_some() {
+                // The earlier `init` for this agent failed (or an earlier
+                // `--off` already knew it had): the hook may never have
+                // been written.
+                let init_failed = record
+                    .as_ref()
+                    .and_then(|r| r.hooks.get(agent.name()))
+                    .is_some_and(|h| h.init_failed || (h.error.is_some() && !h.off_failed));
+                if outside.is_some() && init_failed {
+                    line.push_str(
+                        "\n          saiife did not change that file. Its earlier `saiife init` \
+                         failed, so the saiife hook may still be there: check it by hand and \
+                         remove the saiife hook entry (the `saiife check` command) if it is.",
+                    );
+                } else if outside.is_some() {
                     line.push_str(
                         "\n          saiife did not change that file. To finish, remove the \
                          saiife hook entry (the `saiife check` command) from it by hand.",
                     );
                 }
                 lines.push(line);
-                failed_agents.push((agent, e.to_string(), outside));
+                failed_agents.push((agent, e.to_string(), outside, init_failed));
             }
         }
     }
@@ -398,7 +414,7 @@ pub fn off() -> ExitCode {
         // `status` warns about them and nothing else.
         rec.hooks = failed_agents
             .iter()
-            .map(|(a, e, outside)| {
+            .map(|(a, e, outside, init_failed)| {
                 (
                     a.name().to_string(),
                     HookRecord {
@@ -407,6 +423,7 @@ pub fn off() -> ExitCode {
                         error: Some(e.clone()),
                         off_failed: true,
                         off_outside: outside.clone(),
+                        init_failed: *init_failed,
                     },
                 )
             })

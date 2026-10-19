@@ -813,3 +813,49 @@ fn nearer_project_with_removed_config_is_named() {
     assert!(first.ends_with("/child"), "{text}");
     assert!(text.contains(".saiife/config.toml was removed"), "{text}");
 }
+
+/// Review I-1: a stray empty `.saiife/` in a subdirectory (no config, no
+/// integrity record) does not hide the parent project's tampered config.
+#[test]
+fn empty_saiife_dir_in_subdir_does_not_hide_parent_tamper() {
+    let env = initialized(&["claude"]);
+    env.write(".saiife/config.toml", "version = 1\npacks = []\n");
+    std::fs::create_dir_all(env.root().join("src/.saiife")).unwrap();
+    let out = env.saiife_in(&env.root().join("src"), &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    assert!(
+        text.contains(".saiife/config.toml was changed since `saiife init`"),
+        "{text}"
+    );
+    assert!(!text.contains("not set up for this project"), "{text}");
+}
+
+#[test]
+fn unreadable_audit_dir_says_last_call_unknown() {
+    let env = initialized(&["claude"]);
+    // A file where the audit directory should be: cannot be listed.
+    let audit = env.audit.path().join("audit");
+    std::fs::write(&audit, "x").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("status")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", &audit)
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(
+        claude.contains("unknown (audit log could not be read)"),
+        "{claude}"
+    );
+    assert!(!claude.contains("no call"), "{claude}");
+}
