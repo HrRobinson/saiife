@@ -175,9 +175,12 @@ impl Engine {
         }
     }
 
-    /// Resolve paths against these directories and bind the path rules'
-    /// variables (`~`, `$SAIIFE_BIN`, …) to them. Without this, only rules
-    /// without variables apply and relative paths cannot be judged.
+    /// Resolve paths against these directories and supply the variables
+    /// (`~`, `$SAIIFE_BIN`, …) the path rules use. The rules are bound to
+    /// them on the first evaluation, not here; the gain is that each glob
+    /// is compiled once per engine rather than on every call. Without
+    /// this, only rules without variables apply and relative paths cannot
+    /// be judged.
     pub fn with_paths(mut self, vars: PathVars) -> Self {
         self.vars = vars;
         self.path_rules = OnceLock::new();
@@ -420,7 +423,7 @@ impl Engine {
         if let Some(d) = self.eval_phase(&view, cx, state, found) {
             return Some(d);
         }
-        self.environment_phase(&view, cx, state);
+        Self::environment_phase(&view, cx, state);
         self.cd_phase(&view, state);
         self.inline_payload_phase(&view, cx, state, found)
     }
@@ -486,8 +489,8 @@ impl Engine {
     ) -> Flow {
         // A leading `NAME=$(…)` assignment in front of a real command
         // (`FOO=$(date) git reset --hard`) is not the command: the
-        // command after it is judged below and the substitution by the
-        // embedded-substitution scan.
+        // command after it is judged by `command_rules_phase` and
+        // `operands_phase`, the substitution by `embedded_substitutions_phase`.
         let substitution_is_the_command = {
             let rest = effective_command(effective);
             rest.is_empty()
@@ -743,7 +746,7 @@ impl Engine {
 
     /// A builtin that changes PATH, HOME or XDG_DATA_HOME changes them for
     /// the rest of the command line (and for nested evaluations).
-    fn environment_phase(&self, view: &SegmentView, cx: &Ctx, state: &mut ShellState) {
+    fn environment_phase(view: &SegmentView, cx: &Ctx, state: &mut ShellState) {
         state.env_changed |= changes_environment(&view.argv, &view.resolved, cx.literal_path);
     }
 
@@ -1581,7 +1584,8 @@ impl<'a> SegmentView<'a> {
         // An argument that is one substitution printing plain data
         // (`git commit -m "$(cat <<'EOF' … EOF)"`, `$(echo x)`) is
         // judged by its value, like any literal argument; its inner
-        // command was judged above.
+        // command was already judged by
+        // `embedded_substitutions_phase`.
         // Words in front of the command (wrappers, assignments,
         // redirections), counted before the arguments are resolved.
         let prefix_len = seg.len() - effective.len();
