@@ -11,7 +11,7 @@ real code instead of guesses.
 | 2 | Agents + project config + tamper detection | §5, §5.1, §5.2, §7.5, §9.1 (reserved field) | `.saiife/config.toml`; `init`, `init --off`, `status` with integrity checks, `packs`; hooks (shell, read and write tools) for Claude Code, Codex, Gemini, verified against live installs and recorded fixtures | written: `2026-10-13-plan-2-agents-config-tamper.md` |
 | 3 | Secret and self protection | §7.1–7.4 | `core.secrets` (incl. cloud secret reads), `core.self`; `evaluate_path` for read and write tools | written: `2026-10-13-plan-3-secret-self-protection.md` |
 | 4 | HTML report | §6.4 | `saiife audit --report`, self-contained, DPO-readable | written: `2026-10-18-plan-4-html-report.md` |
-| 5 | Release, docs, demo | §8, §10 (pack docs), §12 (incl. threat-coverage docs per §1.1) | release CI for 4 targets, `install.sh`, one docs page per pack, Codex + Ollama recipe, demo script | 5a, 5b merged; 5c in PR |
+| 5 | Release, docs, demo | §8, §10 (pack docs), §12 (incl. threat-coverage docs per §1.1) | release CI for 4 targets, `install.sh`, one docs page per pack, Codex + Ollama recipe, demo script | done (v0.1.0) |
 
 Order rationale: plan 2 needs plan 1's `check --agent`; plan 3 needs plan 2's
 read-tool hook wiring; plan 4 needs the final record shape; plan 5 packages
@@ -113,8 +113,8 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 ## Carry-over from plan 5c (for the plans that own them)
 
-- Pin `Swatinem/rust-cache` in `ci.yml` to a SHA (checkout and rust-toolchain are pinned; the cache SHA could not be looked up offline).
-- `release.yml` has never run. Its `pull_request` trigger dry-runs the build matrix on the PR; check that run (4 artifacts) before tagging. The draft → install-test → publish flow first runs on the tag.
+- ~~Pin `Swatinem/rust-cache` in `ci.yml` to a SHA (checkout and rust-toolchain are pinned; the cache SHA could not be looked up offline).~~ — done in plan 6.
+- ~~`release.yml` has never run. Its `pull_request` trigger dry-runs the build matrix on the PR; check that run (4 artifacts) before tagging. The draft → install-test → publish flow first runs on the tag.~~ — done: v0.1.0 was released 2026-10-19 through the full draft → install-test → publish flow.
 - JSON-mode `check` with fd 1 closed (`>&-`) still exits 0 on deny (Rust discards the EBADF write); no installed hook uses JSON mode.
 
 ## User checks (plan 5c gate)

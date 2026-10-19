@@ -124,3 +124,8 @@ allow kubectl get secrets
 allow aws configure get region
 allow aws secretsmanager list-secrets
 ```
+- A home directory that is unknown or not an absolute path. saiife takes it
+  from `HOME`, or from the user database when `HOME` is unset or empty; if the
+  result is still not absolute (for example `HOME=.`), the rules for `~/...`
+  paths (SSH keys, cloud logins, the agents' login tokens) are inactive, and
+  `saiife status` lists them as inactive. The `.env` rules still apply.

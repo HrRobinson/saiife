@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 — YYYY-MM-DD
+
+- Guard: `rm` targets are judged against a `cd` earlier in the same command line (`cd / && rm -rf *` is now blocked).
+- status: warns about nested `.saiife/config.toml` files that `saiife init` did not create.
+
 ## 0.1.0 — 2026-10-19
 
 First release.
