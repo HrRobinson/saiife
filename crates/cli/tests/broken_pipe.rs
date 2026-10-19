@@ -1,5 +1,5 @@
 //! `saiife <cmd> | head -1` closes our stdout early. That must end quietly:
-//! no panic message, exit 0.
+//! no panic message, the work is still done and the real exit code returned.
 
 mod common;
 
@@ -45,4 +45,66 @@ fn commands_exit_quietly_when_the_reader_goes_away() {
         assert!(!err.contains("panicked"), "{args:?}: {err}");
         assert_eq!(c, Some(0), "{args:?}: {err}");
     }
+}
+
+#[test]
+fn status_still_exits_1_on_problems_with_a_closed_pipe() {
+    let env = Env::new(&["claude"]);
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    env.write(".claude/settings.json", "{}");
+    let (c, err) = run_with_closed_stdout(&env, &["status"]);
+    assert!(!err.contains("panicked"), "{err}");
+    assert_eq!(c, Some(1), "{err}");
+}
+
+#[test]
+fn init_still_restores_the_hook_with_a_closed_pipe() {
+    let env = Env::new(&["claude"]);
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    env.write(".claude/settings.json", "{}");
+    let (c, err) = run_with_closed_stdout(&env, &["init"]);
+    assert!(!err.contains("panicked"), "{err}");
+    assert_eq!(c, Some(0), "{err}");
+    assert!(env.read(".claude/settings.json").contains("saiife"));
+    let out = env.saiife(&["status"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+}
+
+/// JSON mode deny with no stdout to carry it: fail closed (stderr + exit 2).
+#[test]
+fn json_mode_deny_fails_closed_when_stdout_is_gone() {
+    use std::io::Write;
+    let env = Env::new(&["claude"]);
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": env.root(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git reset --hard" }
+    })
+    .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["check", "--agent", "claude"])
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("BLOCKED"));
 }

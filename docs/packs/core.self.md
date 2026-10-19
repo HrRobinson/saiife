@@ -84,19 +84,8 @@ It also blocks too much in a few cases. This is the safe direction:
 - `rm -rf target` is blocked when the `saiife` program on `PATH` is a build
   inside that folder (this affects only people who build saiife).
 
-### Limits of the guard as a whole
-
-These apply to every pack:
-
-- When a command line names `IFS` (the shell setting for how text is split
-  into words), saiife cannot be sure how values from `$(...)` split. It allows
-  the command unless a rule blocks it, and records it in the audit log as
-  `error_allowed`.
-- A here-document inside `$(...)` ends at a line that starts with its end word
-  and holds a `)`, as in bash 5.3. Older bash and zsh may end it elsewhere.
-- zsh 5.9 and dash read three such here-document shapes differently from
-  bash. There, saiife may block a command that those shells would treat as
-  plain text. This is the safe direction.
+The limits that apply to every pack are in
+[Limits of the guard as a whole](../threats.md#limits-of-the-guard-as-a-whole).
 
 ## Examples
 

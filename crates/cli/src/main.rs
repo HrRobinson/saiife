@@ -15,6 +15,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+#[macro_use]
+mod out;
+
 mod audit_cmd;
 mod check;
 mod init_cmd;
@@ -113,27 +116,7 @@ enum Cmd {
     },
 }
 
-/// Rust ignores SIGPIPE, so `saiife status | head -1` makes `println!`
-/// panic with "Broken pipe". The reader leaving early is not an error:
-/// exit quietly. Any other panic keeps the normal report.
-fn quiet_on_broken_pipe() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let msg = info
-            .payload()
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| info.payload().downcast_ref::<&str>().copied())
-            .unwrap_or("");
-        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
-            std::process::exit(0);
-        }
-        default(info);
-    }));
-}
-
 fn main() -> ExitCode {
-    quiet_on_broken_pipe();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return arg_error(e),
@@ -253,7 +236,7 @@ fn cmd_explain(
     command: &str,
 ) -> ExitCode {
     let decision = engine.evaluate(command);
-    print!(
+    out!(
         "command: {command}\n{}{}",
         trace(decision),
         packs_cmd::inactive_summary(active, vars)
@@ -273,7 +256,7 @@ fn cmd_explain_path(
         .resolve_path(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(cannot be resolved)".into());
-    print!(
+    out!(
         "path:     {path}\nresolved: {resolved}\naccess:   {}\n{}{}",
         access.label(),
         trace(decision),

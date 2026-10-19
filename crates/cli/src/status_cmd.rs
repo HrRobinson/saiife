@@ -41,7 +41,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         return ExitCode::from(2);
     };
     let root = project_root(&cwd);
-    println!("saiife status for {}", root.display());
+    outln!("saiife status for {}", root.display());
 
     let record = match integrity::record_path(&root) {
         Ok(Some(p)) => Integrity::load(&p).map_err(|e| e.to_string()),
@@ -51,7 +51,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     let record = match record {
         Ok(Some(r)) => r,
         Ok(None) => {
-            println!(
+            outln!(
                 "\nWARNING: saiife is not set up for this project on this machine \
                  (no integrity record).\n  Fix: run `saiife init` in {}",
                 root.display()
@@ -59,7 +59,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             return ExitCode::from(1);
         }
         Err(e) => {
-            println!("\nWARNING: the integrity record cannot be read: {e}\n  Fix: run `saiife init` to write a new one");
+            outln!("\nWARNING: the integrity record cannot be read: {e}\n  Fix: run `saiife init` to write a new one");
             return ExitCode::from(1);
         }
     };
@@ -89,7 +89,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     fix: "run `saiife init` to record it".into(),
                 });
             } else {
-                println!("  {:<7} not set up", agent.name());
+                outln!("  {:<7} not set up", agent.name());
             }
             continue;
         };
@@ -152,7 +152,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     .filter(|r| r.agent == agent.name())
                     .filter_map(Record::timestamp)
                     .max();
-                println!(
+                outln!(
                     "  {:<7} hooked   {rel:<22} last hook call: {}",
                     agent.name(),
                     last.map(ago).unwrap_or_else(|| match scan {
@@ -232,27 +232,27 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     check_binary(&record, &mut problems);
 
     if !notes.is_empty() {
-        println!();
+        outln!();
         for n in &notes {
-            println!("Note: {n}");
+            outln!("Note: {n}");
         }
     }
     for p in &problems {
         if p.fix.is_empty() {
-            println!("\nWARNING: {}", p.what);
+            outln!("\nWARNING: {}", p.what);
         } else {
-            println!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
+            outln!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
         }
     }
-    println!(
+    outln!(
         "\nsaiife v1 catches mistakes and makes a switched-off guard visible; it cannot stop a \
          determined agent running as your user."
     );
     if problems.is_empty() {
-        println!("All checks passed.");
+        outln!("All checks passed.");
         ExitCode::SUCCESS
     } else {
-        println!("{} check(s) failed.", problems.len());
+        outln!("{} check(s) failed.", problems.len());
         ExitCode::from(1)
     }
 }
@@ -391,9 +391,9 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
         .cloned()
         .collect();
     let ids: Vec<&str> = active.iter().map(|p| p.id.as_str()).collect();
-    println!("{}", packs_line(root, project.root.as_deref(), &ids));
+    outln!("{}", packs_line(root, project.root.as_deref(), &ids));
     let vars = crate::paths::path_vars(Some(root), Some(root));
-    print!("{}", inactive_lines(&active, &vars));
+    out!("{}", inactive_lines(&active, &vars));
 }
 
 /// The `packs …` line. When the config it was read from sits in another
@@ -446,7 +446,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             fix: "make the saiife binary readable, then run `saiife init`".into(),
         });
     } else if record.saiife_sha256.is_empty() {
-        println!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
+        outln!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
     } else {
         match std::fs::read(&on_path) {
             Ok(b) if sha256_hex(&b) == record.saiife_sha256 => {}
@@ -474,7 +474,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
     }
     match binary_version(&on_path) {
         Some(v) if v == record.saiife_version => {
-            println!("  binary  {} ({v})", on_path.display());
+            outln!("  binary  {} ({v})", on_path.display());
         }
         Some(v) => problems.push(Problem {
             what: format!(

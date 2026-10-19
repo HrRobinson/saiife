@@ -109,6 +109,7 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - `dollar()` keeps its `_ =>` arm as a real fallback.
 - The docs link test does not check `#anchors` or `~~~` fences.
 - `shellcheck` is not run on the scripts (not installed here). Add it to CI in plan 5c.
+- `status` could warn about nested `.saiife/config.toml` files that have no integrity record. A stray nested config with `packs = []` turns opt-in packs off for hooks run from that directory. Only a script can create one (`core.self` blocks shell and write tools).
 
 ## User checks (plan 5c gate)
 

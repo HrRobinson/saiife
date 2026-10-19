@@ -232,13 +232,13 @@ pub fn run(
         return match write_report(&path, &html) {
             Ok(()) => {
                 let abs = std::path::absolute(&path).unwrap_or(path);
-                println!(
+                outln!(
                     "Report written: {} ({} decisions)",
                     abs.display(),
                     shown.len()
                 );
                 for problem in &model.log_problems {
-                    println!("{problem}");
+                    outln!("{problem}");
                 }
                 ExitCode::SUCCESS
             }
@@ -249,15 +249,15 @@ pub fn run(
         };
     }
     if shown.is_empty() {
-        println!("No audit records found in {}.", dir.display());
+        outln!("No audit records found in {}.", dir.display());
     } else {
-        print!("{}", render_table(&shown));
+        out!("{}", render_table(&shown));
     }
     if all.skipped_lines > 0 {
-        println!("{} unreadable lines skipped", all.skipped_lines);
+        outln!("{} unreadable lines skipped", all.skipped_lines);
     }
     if all.unreadable_files > 0 {
-        println!("{} unreadable files skipped", all.unreadable_files);
+        outln!("{} unreadable files skipped", all.unreadable_files);
     }
     ExitCode::SUCCESS
 }

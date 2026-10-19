@@ -83,8 +83,10 @@ export PATH="$sandbox/bin:$PATH"
 
 # --- 3. A project with a secret, hooked up. ---------------------------------
 project="$sandbox/home/app"
-# saiife init walks up to the nearest .saiife/config.toml. If TMPDIR sits
-# inside a saiife project, init (and the hook) would act on that project.
+# saiife init finds its project by the nearest .saiife/config.toml or by an
+# integrity record in the data dir. The data dir here is the sandbox's own,
+# so only a config file can pull init (and the hook) to another project:
+# refuse if TMPDIR sits inside one.
 d="$sandbox"
 while :; do
   if [ -e "$d/.saiife/config.toml" ]; then

@@ -61,8 +61,10 @@ fi
 base="$HOME/.cache/saiife-live"
 mkdir -p "$base"
 base="$(cd "$base" && pwd -P)"
-# saiife init walks up to the nearest .saiife/config.toml: refuse if one sits
-# above the test projects, so neither init nor init --off can touch it.
+# saiife init finds its project by the nearest .saiife/config.toml or by an
+# integrity record in the data dir. The data dir here is this script's own
+# (SAIIFE_DATA_DIR below), so only a config file can pull init to another
+# project: refuse if one sits above the test projects.
 d="$base"
 while :; do
   if [ -e "$d/.saiife/config.toml" ]; then
@@ -150,6 +152,10 @@ for agent in codex gemini; do
   projects+=("$project")
   printf 'API_KEY=saiife-live-check-not-a-real-key\n' >"$project/.env"
   (cd "$project" && saiife init --agent "$agent" >/dev/null)
+  if [ ! -e "$project/.saiife/config.toml" ]; then
+    echo "live-check: init did not create $project/.saiife/config.toml (it picked another project). Aborting." >&2
+    exit 1
+  fi
 
   if [ "$setup" -eq 1 ]; then
     case "$agent" in

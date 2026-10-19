@@ -465,7 +465,17 @@ fn emit_deny(reason: &str) -> ExitCode {
             "permissionDecisionReason": reason,
         }
     });
-    println!("{payload}");
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    // The deny only works if the agent can read it. When stdout is gone,
+    // fail closed: the reason on stderr and exit 2 (the universal block).
+    if writeln!(out, "{payload}")
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        eprintln!("saiife: BLOCKED: {reason}");
+        return ExitCode::from(2);
+    }
     ExitCode::SUCCESS
 }
 

@@ -19,7 +19,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     };
     let root = project_root(&cwd);
     if root != cwd {
-        println!("Using the saiife project at {}", root.display());
+        outln!("Using the saiife project at {}", root.display());
     }
 
     // Which agents.
@@ -230,9 +230,9 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         lines.push(format!("  integrity record FAILED: {e}"));
     }
 
-    println!("saiife is on for {}", root.display());
+    outln!("saiife is on for {}", root.display());
     for l in &lines {
-        println!("{l}");
+        outln!("{l}");
     }
     if let Ok(cfg) = config::load(&root) {
         let active: Vec<&str> = builtin
@@ -240,19 +240,19 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             .filter(|p| p.default_on || cfg.packs.contains(&p.id))
             .map(|p| p.id.as_str())
             .collect();
-        println!("  packs   {}", active.join(", "));
+        outln!("  packs   {}", active.join(", "));
     }
     for w in &warnings {
-        println!("\n{w}");
+        outln!("\n{w}");
     }
     path_warning(&exe);
     if !installed.is_empty() {
-        println!("\nNext steps:");
+        outln!("\nNext steps:");
         for agent in &installed {
-            println!("  - {}: {}", agent.label(), agent.next_step());
+            outln!("  - {}: {}", agent.label(), agent.next_step());
         }
     }
-    println!("Check the setup any time with `saiife status`.");
+    outln!("Check the setup any time with `saiife status`.");
     if failed {
         ExitCode::from(1)
     } else {
@@ -264,12 +264,12 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
 /// nothing, or a different binary.
 fn path_warning(exe: &Path) {
     match which("saiife").map(|p| std::fs::canonicalize(&p).unwrap_or(p)) {
-        None => println!(
+        None => outln!(
             "\nWARNING: `saiife` is not on your PATH, so the agents cannot run the hook and \
              their actions are NOT guarded. Put saiife in a PATH directory (e.g. ~/.local/bin), \
              then run `saiife init` again."
         ),
-        Some(p) if p != exe => println!(
+        Some(p) if p != exe => outln!(
             "\nWARNING: the hooks will run {} (the saiife on your PATH), not this binary ({}). \
              Run `saiife init` with the saiife on your PATH.",
             p.display(),
@@ -430,12 +430,12 @@ pub fn off() -> ExitCode {
         }
     }
 
-    println!("saiife is off for {}", root.display());
+    outln!("saiife is off for {}", root.display());
     if lines.is_empty() {
-        println!("  nothing to remove");
+        outln!("  nothing to remove");
     }
     for l in &lines {
-        println!("{l}");
+        outln!("{l}");
     }
     if failed {
         ExitCode::from(1)
