@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*",
+        "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ],
+    "ConfigChange": [
+      { "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude --event config-change",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ]
+  },
+  "disableAllHooks": false
+}
