@@ -1,15 +1,39 @@
 # saiife v2: design (locked + brokered)
 
 **Date:** 2026-10-19
-**Status:** draft for owner review
+**Status:** approved for planning, pending the owner's read-through
+(amended 2026-10-19 with the owner's decisions and the builder's answers, §0)
 **Builds on:** v0.1.0 (v1: guard + audit), released 2026-10-19
 **Parent spec:** `2026-10-13-saiife-cli-v1-design.md` (§1.1 product ladder,
 §1.2 principles, §7, §9). Section references like "v1 §9.2" point there.
 **License:** FSL-1.1-ALv2, unchanged.
 
 Items marked **(proposed addition)** go beyond v1 §9.1–9.3 and §9.5. Each one
-gives a one-line reason, so the owner can veto it. Everything else either
-implements v1 §9 or is a design detail it needs.
+gives a one-line reason, so the owner can veto it. §16.1 says which of them
+ship in v2.0 and which come later. Everything else either implements v1 §9
+or is a design detail it needs.
+
+## 0. Decisions after review (2026-10-19)
+
+The owner answered the open questions of the first draft, and the controller
+answered a builder check. Both are binding on this spec. The sections they
+touch say so where they apply.
+
+| # | Decision | Label | Applies in |
+|---|---|---|---|
+| 1 | v2.0 includes these proposed additions: `saiife doctor`, the `core.lock` pack, command approvals (`[guard] ask`), notifications, `saiife lockdown`, amount caps, `saiife policy check`/`test`. These come **after v2.0**: `saiife mcp`, the MCP gateway, fleet packages and MDM recipes. Response field redaction and the egress recipe were left to the designer: both stay in v2.0, because each fits into an existing plan for about one evening (redaction is one more step in the masking pass of plan 10; the recipe is one docs page in plan 12). | Owner decision (2026-10-19); last sentence: designer's call | §6, §15, §16.1 |
+| 2 | Linux first. In v2.0, locked mode is **Linux only**. macOS locked mode (Developer ID, hardened runtime, notarization, launchd, `LOCAL_PEERCRED`, macOS re-authentication) moves to **v2.1**. Macs keep v1 developer mode in v2.0. | Owner decision (2026-10-19) | §1.1, §5.3, §14, §15 |
+| 3 | Same-user approvals: re-authentication through polkit ships in v2.0. Without polkit, only a second uid can approve, and `doctor` says so. | Owner decision (2026-10-19) | §6.10.2, §6.16 |
+| 4 | First-wave connectors stay Shopify, HubSpot, GitHub and generic HTTP. Writes are allowed under policy, with `ask` and amount caps available. | Owner decision (2026-10-19) | §6.8.3 |
+| 5 | The model-provider key is **not brokered** in v2. The agent holds its own model login, or uses a local model (for example Ollama). "The agent never holds a credential" excludes the model login, and the docs say so. | Owner decision (2026-10-19) | §1, §1.3, §10 |
+| 6 | One `[[scope]]` per uid. A uid that matches two scopes is a config error: `policy check` fails and the daemon refuses to load the policy. `projects` is attribution only and never selects an environment or a scope. | Builder's call (controller) | §6.9.1, §6.11, §8.1 |
+| 7 | Personal broker mode moves after v2.0. It stays designed (§6.6) as a later item. | Builder's call (controller) | §1.1, §15 |
+| 8 | Supported systems for v2.0 locked mode: Ubuntu 22.04+, Debian 12+, RHEL 9+, with systemd required. With systemd older than 250 (no `LoadCredentialEncrypted`; Ubuntu 22.04 ships 249), the vault key is a root-owned file that only the daemon user can read. `SO_PEERPIDFD` is optional, with `SO_PEERCRED` as the fallback. A TPM is optional. Alpine and containers get developer mode only. | Builder's call (controller) | §1.1, §5.2, §5.4.1, §6.3 |
+| 9 | Plan 7 gate rule: an agent that fails the live lock checks is labelled **"not lockable"**, and v2.0 ships for the others. Gemini CLI's label follows the same rule. | Builder's call (controller) | §6.1.3, §14 |
+| 10 | MCP before the gateway exists: locked mode allows only MCP servers the admin lists in policy. These are not brokered, and `status` and `doctor` warn that they bypass saiife. | Builder's call (controller) | §6.1.4, §6.16, §9.2 |
+
+The v1 track already uses "plan 6" (v0.1.1, v1 gaps), so the v2 plans start
+at plan 7 (§15).
 
 ## 1. Purpose
 
@@ -24,7 +48,10 @@ guard. In v1 §1.1 terms:
 - **Brokered:** the agent never holds a credential for an external service.
   It reaches HubSpot, Shopify, GitHub, clouds and the rest only through the
   saiife gateway, and only under per-service rules (deny by default). Every
-  request is audited.
+  request is audited. **One exception, by design:** the agent's own login to
+  its model provider (Anthropic, OpenAI, Google) is not brokered in v2. The
+  agent holds it, or the company runs a local model such as Ollama and there
+  is no key (owner decision 5, §0).
 
 v2 also brings back every localflow feature that v1 §9.5 puts in v2:
 connectors, the agent-facing API client with collections, per-session cloud
@@ -32,12 +59,18 @@ credentials, and environments.
 
 ### 1.1 Setups v2 supports
 
-| Setup | Who installs | Agent runs as | Meant for |
-|---|---|---|---|
-| **Developer** (v1 mode, still the default) | the developer, no root | the developer | a person nearby; same guarantees as v1 plus a hash-chained log |
-| **Personal broker** | the developer, no root | the developer | trying connectors on your own machine; **not a security boundary** (§10) |
-| **Locked** | an admin, as root | the person's own account | company laptops and workstations, attended or unattended |
-| **Locked, dedicated agent account** (recommended for unattended) | an admin, as root | an OS account that exists only for agents (for example `agent-shop`) | unattended agents on servers or shared machines |
+| Setup | Who installs | Agent runs as | Meant for | Platforms |
+|---|---|---|---|---|
+| **Developer** (v1 mode, still the default) | the developer, no root | the developer | a person nearby; same guarantees as v1 plus a hash-chained log | v2.0: Linux (any, including Alpine and containers) and macOS |
+| **Personal broker** (after v2.0, decision 7) | the developer, no root | the developer | trying connectors on your own machine; **not a security boundary** (§10) | later |
+| **Locked** | an admin, as root | the person's own account | company laptops and workstations, attended or unattended | v2.0: Linux only (Ubuntu 22.04+, Debian 12+, RHEL 9+, systemd required). macOS in v2.1. |
+| **Locked, dedicated agent account** (recommended for unattended) | an admin, as root | an OS account that exists only for agents (for example `agent-shop`) | unattended agents on servers or shared machines | as Locked |
+
+Alpine, other non-systemd Linux systems and containers get developer mode
+only (decision 8). `saiife system install` refuses them with a clear message.
+Macs keep v1 developer mode in v2.0 (decision 2). macOS-specific parts of
+this spec (§5.3, the macOS halves of §6.3 and §6.10.2) are designed now and
+built in v2.1.
 
 The last setup is not v3 isolation: saiife does not start or sandbox the
 agent, and there is no egress control. It is an admin choice that v2
@@ -53,7 +86,7 @@ full per-setup table):
 |---|---|---|
 | Mistake | covered by packs; fails open | covered by packs; **fails closed** |
 | Helpful bypass (agent turns saiife off or edits its config) | discouraged by `core.self`, detected by `status` | **prevented**: hook config, binary, policy, audit and vault are not writable by the agent's OS user |
-| Determined bypass: get a credential | not covered | **covered for brokered services**: the credential is not on the machine in a form the agent's user can read (once migrated, §12) |
+| Determined bypass: get a credential | not covered | **covered for brokered services**: the credential is not on the machine in a form the agent's user can read (once migrated, §12). **Not** the agent's own model-provider login, which it keeps (owner decision 5). |
 | Determined bypass: use an external service beyond the rules | not covered | **covered**: no key outside the gateway, so the only working path goes through policy, limits and approval |
 | Determined bypass: erase or rewrite the audit trail | not covered | **covered** against the agent's user; detected against root once logs are forwarded |
 | Determined bypass: run local code outside the hook (script, patched or nested agent) | not covered | **still not covered.** That code has no keys, cannot touch saiife and is not audited. This is v3 (isolated runner). |
@@ -71,8 +104,10 @@ the agent's *own* code. That is v3.
    replace file permissions.
 2. **The agent never holds what it must not misuse.** Credentials live in a
    vault owned by a separate OS user. The two places where the agent still
-   holds a credential are opt-in and labelled: `saiife run --secret` (§6.14)
-   and STS mode for cloud credentials (§6.13).
+   holds a service credential are opt-in and labelled: `saiife run --secret`
+   (§6.14) and STS mode for cloud credentials (§6.13). The agent's own
+   model-provider login is outside this rule in v2 (owner decision 5): it
+   holds that login, or uses a local model.
 3. **Deny by default for capabilities.** Connector operations, MCP tools in
    locked mode, approvers and scopes are all denied unless allowed. Commands
    stay allow-by-default (the guard), as in v1.
@@ -99,6 +134,12 @@ the agent's *own* code. That is v3.
 - Windows.
 - Signed policy bundles, a local web dashboard and transcript redaction:
   considered and cut (§16.2).
+- Brokering the agent's model-provider key (owner decision 5).
+
+Designed here, but shipped after v2.0 (§15): macOS locked mode (v2.1),
+personal broker mode, `saiife mcp`, the MCP gateway, fleet packages and MDM
+recipes, connector waves 2 and 3, cloud connectors, environments and
+collections.
 
 ## 2. Decisions
 
@@ -109,14 +150,15 @@ the agent's *own* code. That is v3.
 | D10 | Where guard decisions are made | In the hook process, as in v1. The daemon writes the record and acknowledges it before the hook answers. | Path checks need the agent user's view of the filesystem. A forged client gains nothing it could not get by skipping the hook (§9.4). Keeps the 50 ms budget. |
 | D11 | Locked-mode failure | Fail closed: any error, missing acknowledgement from the daemon, or exceeded budget means deny and `error_denied`. | v1 §1.2 rule 4. |
 | D12 | Lock location | Hooks go into each agent's system-level policy file (managed settings). The binary goes in `/opt/saiife/bin/saiife`, and the hook calls it by absolute path. | v1 §9.1. On macOS with Homebrew, `/usr/local/bin` is often owned by the user, so it cannot hold a locked binary. |
-| D13 | Vault | A file encrypted at rest, owned by the daemon user (locked mode). The OS keychain is used in personal broker mode. | The OS keychain's per-user model cannot keep a secret from the same user's processes. |
+| D13 | Vault | A file encrypted at rest, owned by the daemon user (locked mode). The OS keychain is used in personal broker mode (after v2.0). | The OS keychain's per-user model cannot keep a secret from the same user's processes. |
 | D14 | Connector shape | Declarative TOML manifests embedded in the binary (like packs). Operations are typed and map to capabilities (`orders:read`). A generic HTTP connector covers the rest. | Manifests are reviewable, testable without network, and cheap to add (about 1 evening each for most services). |
-| D15 | Agent access to connectors | `saiife api` on the command line, an HTTP gateway on a Unix socket (`curl --unix-socket`, SDKs via proxy paths), and an MCP server **(proposed addition)**. | The CLI works for every agent today. HTTP lets existing SDKs work. MCP is how agents prefer to call tools. |
+| D15 | Agent access to connectors | v2.0: `saiife api` on the command line and an HTTP gateway on a Unix socket (`curl --unix-socket`, SDKs via proxy paths). After v2.0: an MCP server **(proposed addition)**. | The CLI works for every agent today. HTTP lets existing SDKs work. MCP is how agents prefer to call tools. |
 | D16 | Approvals | `ask` rules create a request. The agent gets "pending #N" right away and never waits inside a hook. Only an approver identity the agent's user cannot be can decide (§6.10). | Hooks have timeouts. An approval the agent could give itself is worthless. |
 | D17 | Audit format | JSONL, `v = 2`, one global hash chain per machine (`seq`, `prev`), signed checkpoints, v1 fields kept so 0.1.0 readers still work. | v1 §9.3. |
 | D18 | State store | Files only (JSON and JSONL), no database. Rate-limit counters are rebuilt from the audit log at startup. | Keeps the static musl build and the "one binary" rule (v1 D4). The audit log is the source of truth. |
 | D19 | One binary | Still one `saiife` binary. `saiife daemon` is a subcommand. | v1 D4. Install and upgrade stay one file. |
-| D20 | Scope of a caller | Authorization is by **OS user** (uid). Project paths and agent sessions are used for attribution and limits only. | uid is the only identity the kernel vouches for in v2. v3 adds runner-issued session identity. |
+| D20 | Scope of a caller | Authorization is by **OS user** (uid), through exactly one `[[scope]]` per uid (decision 6). Project paths and agent sessions are used for attribution and limits only; they never select a scope or an environment. | uid is the only identity the kernel vouches for in v2. v3 adds runner-issued session identity. |
+| D21 | Platforms for locked mode | v2.0: Linux with systemd (Ubuntu 22.04+, Debian 12+, RHEL 9+). v2.1: macOS. | Owner decision 2, builder's call 8. One service manager and one peer-credential API to get right first. |
 
 ## 3. What exists today (v0.1.0)
 
@@ -139,14 +181,14 @@ Open carry-over items from the v1 roadmap that v2 takes over:
 |---|---|
 | Engine abort or stack overflow is not caught (only panics) | Locked mode runs the evaluation in a worker process (§6.1). |
 | Payloads over 1 MiB are logged with empty input (shell fields) | Locked mode denies a payload it cannot read in full, as `error_denied` (§6.1). |
-| Codex `requirements.toml` path and `allow_managed_hooks_only` not checked | Plan 6 checks this live; `doctor` and `status` check it (§6.16). |
-| Gemini hooks on/off setting unknown | Plan 6 checks this live. Until it is known, Gemini is "lockable with caveats" (§6.1.3). |
-| Codex and Gemini not run against a live install | Plan 6 is a gate for all of v2: managed settings for all three agents verified live and stored as fixtures. |
+| Codex `requirements.toml` path and `allow_managed_hooks_only` not checked | Plan 7 checks this live; `doctor` and `status` check it (§6.16). |
+| Gemini hooks on/off setting unknown | Plan 7 checks this live. Gemini's lock label follows the gate rule (§6.1.3, decision 9). |
+| Codex and Gemini not run against a live install | Plan 7 is a gate for all of v2: managed settings for all three agents verified live and stored as fixtures. |
 | The report shows packs as configured today, not as they were | Each record carries `policy` (a hash of the effective policy), plus a `policy` record whenever it changes (§8.5). |
 | The report file is 0600 | Auditors group and `saiife audit` through the daemon (§6.4.5). |
 | Claude Code `ConfigChange` hook not used | Used in the managed hook set, to record and block settings changes made outside tool calls (§6.1.1). |
 | A nested `.saiife/config.toml` with `packs = []` turns opt-in packs off | In locked mode, project config can only add (§8.2). |
-| `off()` wording; `time` macros as a cli dev-dependency; pin `Swatinem/rust-cache` to a SHA; check the first `release.yml` dry-run | Plan 6 housekeeping. |
+| `off()` wording; `time` macros as a cli dev-dependency; pin `Swatinem/rust-cache` to a SHA; check the first `release.yml` dry-run | Plan 7 housekeeping. |
 | `cd` is not tracked (`cd / && rm -rf *`) | Unchanged in v2. Listed in §10. |
 
 ## 4. Architecture
@@ -239,6 +281,7 @@ uid can never approve requests created by itself, unless
 | `/etc/saiife/config.toml` | root:root | 0644 | system config (§8.1) |
 | `/etc/saiife/policy.d/*.toml` | root:root | 0644 | drop-ins, read in name order (one per service is the convention) |
 | `/etc/saiife/ca/*.pem` | root:root | 0644 | optional company CA certificates for upstream and SIEM TLS |
+| `/etc/saiife/credstore/vault-key` | root:root (systemd ≥ 250) / root:saiife (systemd < 250) | 0600 / 0640 | vault key: an encrypted systemd credential, or a plain key only the daemon user can read (note below) |
 | `/etc/saiife/installed.toml` | root:root | 0644 | what `system install` wrote, with SHA-256 fingerprints (managed hook files, unit file, binary) |
 | `/etc/systemd/system/saiifed.service` | root:root | 0644 | unit (§5.4.1) |
 | `/var/lib/saiife/` | saiife:saiife | 0700 | daemon state (systemd `StateDirectory`) |
@@ -252,18 +295,29 @@ uid can never approve requests created by itself, unless
 | `/run/saiife/saiife.sock` | saiife:saiife | 0666 | control socket; access decided per uid by the daemon |
 | `/run/saiife/gateway.sock` | saiife:saiife | 0666 | HTTP gateway socket |
 | `/etc/claude-code/managed-settings.d/50-saiife.json` | root:root | 0644 | Claude Code managed hooks (§8.3) |
-| `/etc/codex/requirements.toml` | root:root | 0644 | Codex managed hooks; path verified live in plan 6 |
+| `/etc/codex/requirements.toml` | root:root | 0644 | Codex managed hooks; path verified live in plan 7 |
 | `/etc/gemini-cli/settings.json` | root:root | 0644 | Gemini CLI system settings |
 
-The vault key is passed in by systemd as an encrypted credential
-(`LoadCredentialEncrypted=vault-key`, bound to the TPM when there is one).
-Without systemd-creds, it is `/var/lib/saiife/keys/vault.key` (0400). The
-encryption protects backups and disk images. On a running machine, the file
-permissions are the barrier.
+The vault key (builder's call 8):
 
-### 5.3 Files and permissions: macOS
+- **systemd 250 or later** (Debian 12, RHEL 9, Ubuntu 24.04): systemd passes
+  it in as an encrypted credential (`LoadCredentialEncrypted=vault-key`,
+  from `/etc/saiife/credstore/vault-key`). It is bound to the TPM when there
+  is one, and to the host key otherwise. A TPM is optional.
+- **systemd older than 250** (Ubuntu 22.04 ships 249): a plain key file,
+  `/etc/saiife/credstore/vault-key`, owned by root, group `saiife`, mode
+  0640. The `saiife` group has no other member, so only root and the daemon
+  user can read it. The unit uses `LoadCredential=` (systemd 247+) instead.
+  `doctor` reports which of the two is in use.
 
-Same layout, with these differences:
+The encryption protects backups and disk images. On a running machine, the
+file permissions are the barrier.
+
+### 5.3 Files and permissions: macOS (v2.1)
+
+Not built in v2.0 (owner decision 2): Macs run developer mode until v2.1.
+The layout is fixed now so that v2.0 does not block it. Same layout as
+Linux, with these differences:
 
 | Linux | macOS |
 |---|---|
@@ -274,7 +328,7 @@ Same layout, with these differences:
 | `LoadCredentialEncrypted` | `/var/db/saiife/keys/vault.key` (0400 `_saiife`) |
 | Claude managed settings | `/Library/Application Support/ClaudeCode/managed-settings.json` (and `managed-settings.d/` if live check confirms drop-ins on macOS) |
 | Gemini system settings | `/Library/Application Support/GeminiCli/settings.json` |
-| Codex | `/etc/codex/requirements.toml` (unverified on macOS; plan 6) |
+| Codex | `/etc/codex/requirements.toml` (unverified on macOS; plan 7) |
 | peer credentials | `getsockopt(LOCAL_PEERCRED)` for the uid, `LOCAL_PEERPID` for the pid |
 | process ancestry | `sysctl(KERN_PROC_PID)` (readable for all users) |
 
@@ -285,7 +339,7 @@ macOS release binaries must be signed with a Developer ID and the hardened
 runtime, and notarized. The hardened runtime makes the binary ignore
 `DYLD_INSERT_LIBRARIES` (an agent could otherwise inject code into a nested
 hook process), and Gatekeeper and MDM tools expect signed launch daemons.
-See open question 3.
+This is v2.1 work (owner decision 2).
 
 ### 5.4 How the lock holds
 
@@ -305,7 +359,7 @@ The lock rests on four facts the kernel enforces, not on the guard:
    Managed settings outrank user, project and command-line settings in all
    three agents (Claude Code: verified in research; Codex: managed
    requirements pin `[features] hooks = true`; Gemini CLI: system settings
-   win in code). Plan 6 confirms each against a live install, including that
+   win in code). Plan 7 confirms each against a live install, including that
    a user-level `disableAllHooks` cannot switch off a managed hook.
 
 Everything the guard does in locked mode (`core.self`, `core.lock`) is the
@@ -335,6 +389,7 @@ LogsDirectory=saiife/audit
 LogsDirectoryMode=2750
 UMask=0027
 LoadCredentialEncrypted=vault-key:/etc/saiife/credstore/vault-key
+# systemd < 250: LoadCredential=vault-key:/etc/saiife/credstore/vault-key (§5.2)
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -445,9 +500,20 @@ bench machine (v1 is about 16 ms).
 
 | Agent | Managed location | Can the user switch the managed hook off? | Fail closed on saiife error | v2 status |
 |---|---|---|---|---|
-| Claude Code | `managed-settings.d/50-saiife.json` | No, managed outranks all (confirm for `disableAllHooks` in plan 6) | Yes (`onFailure: "block"`, ≥ 2.1.295) | **lockable** |
+| Claude Code | `managed-settings.d/50-saiife.json` | No, managed outranks all (confirm for `disableAllHooks` in plan 7) | Yes (`onFailure: "block"`, ≥ 2.1.295) | **lockable** |
 | Codex | `requirements.toml` | No, `[features] hooks = true` pin; managed hooks skip trust review | Only for errors saiife reports (exit 2 + stderr). Timeout, crash or missing binary fail open in Codex. | **lockable, fail-open gaps listed** |
-| Gemini CLI | system `settings.json` | No by settings, but `GEMINI_CLI_SYSTEM_SETTINGS_PATH` lets a **new** Gemini process skip the system file | Exit 2 blocks; a timeout fails open | **lockable with caveats** (see open question 6) |
+| Gemini CLI | system `settings.json` | No by settings, but `GEMINI_CLI_SYSTEM_SETTINGS_PATH` lets a **new** Gemini process skip the system file | Exit 2 blocks; a timeout fails open | **lockable with caveats** if it passes the plan 7 checks, otherwise "not lockable" (decision 9) |
+
+**Gate rule (builder's call 9).** Plan 7 runs the live lock checks for each
+agent on a supported Linux system: the managed hook fires; user, project and
+command-line settings cannot switch it off; and the fail-closed cells of §9.3
+marked "blocked" hold. An agent that fails any of them is labelled **"not
+lockable"** in `status`, `doctor` and its docs page, and v2.0 ships for the
+others. A "not lockable" agent still gets its managed hook (it records and
+denies what it can), but no lock claim is made for it. Gemini CLI follows the
+same rule. Its known environment override is a caveat, not a failure, because
+it needs a new process started by a script (the A21 class), not a change to
+the running session.
 
 A nested agent started with a different system-settings path is the
 "nested or patched agent" case in §10: the running session stays hooked, and
@@ -460,15 +526,27 @@ MCP tools (`mcp__<server>__<tool>` in Claude Code and Codex,
 default in locked mode (principle 3):
 
 ```toml
-[guard.tools]
-allow = ["mcp__saiife__*"]       # saiife's own MCP server (proposed, §6.15)
-# deny everything else named mcp__* / mcp_*; built-in tools stay allowed and audited
+[guard.mcp]
+# Builder's call 10: in v2.0, only MCP servers listed here may be used.
+# They are NOT brokered: each keeps its own credentials and talks to its
+# service directly, outside saiife's policy, limits and audit of requests.
+allow_servers = ["linear", "sentry"]
+# Every tool call to them is still hooked and audited as a guard record.
+# Tools of any other server (mcp__<server>__* / mcp_<server>_*) are denied.
 ```
+
+Each listed server is an explicit gap. `status` prints one warning per
+listed server ("MCP server linear bypasses saiife: its requests are not
+brokered or limited"), and `doctor` reports it as a warning, with the config
+file that holds the server's token if it can find one. After v2.0, the MCP
+gateway (§6.15) lets an admin move a server behind the broker, and the
+warning goes away for that server.
 
 Admins can also restrict which MCP servers an agent may configure, through
 the agents' own managed settings (Claude Code managed MCP settings, Codex
-requirements). `system install --mcp-allow saiife` writes them where the
-live check in plan 6 confirms the keys.
+requirements). `system install --mcp-allow <list>` writes them where the
+live check in plan 7 confirms the keys, so the list in `[guard.mcp]` and the
+agents' own lists agree.
 
 ### 6.2 Daemon (`saiifed`)
 
@@ -503,9 +581,12 @@ The client checks before sending anything that the socket and its directory
 are owned by the daemon user named in `/etc/saiife/config.toml`. In locked
 mode the socket path is fixed (`SAIIFE_SOCKET` is ignored).
 
-The daemon reads the peer's uid and pid from the kernel (`SO_PEERCRED`, and
-`SO_PEERPIDFD` on Linux ≥ 6.5 to avoid pid reuse; `LOCAL_PEERCRED` and
-`LOCAL_PEERPID` on macOS). The uid is the only authenticated fact. The pid is
+The daemon reads the peer's uid and pid from the kernel: `SO_PEERCRED` on
+every supported Linux, plus `SO_PEERPIDFD` where the kernel has it (6.5+) to
+avoid pid reuse during the process-tree walk. Without it, the daemon falls
+back to `SO_PEERCRED` alone and checks the pid's start time before and after
+the walk (builder's call 8). macOS (v2.1) uses `LOCAL_PEERCRED` and
+`LOCAL_PEERPID`. The uid is the only authenticated fact. The pid is
 used for attribution only.
 
 Gateway socket `gateway.sock`: plain HTTP/1.1 (§8.8). An optional loopback
@@ -612,7 +693,7 @@ least once, to each target. Targets:
   `azure_sp`), the secret fields, `created_by` (uid), `created`,
   `last_used`, `rotate_after` (optional), and `allowed_services`. A secret
   can only be used by services named in that list.
-- **Personal broker mode:** each secret is one item in the OS keychain
+- **Personal broker mode (after v2.0):** each secret is one item in the OS keychain
   (macOS Keychain with an access list that names the saiife binary; Linux
   Secret Service). The docs say plainly that any process of the same user can
   read these on Linux, and on macOS after one click the user may give.
@@ -639,8 +720,9 @@ For every request, from any entry point (`saiife api`, HTTP, MCP):
 1. **Identify:** uid from peer credentials; agent session by attribution
    (§6.9.3); the project as reported by the client (attribution only).
 2. **Lockdown:** if lockdown is on (proposed, §6.18), deny.
-3. **Scope:** the uid must be in a `[[scope]]` that lists the service.
-   Otherwise deny, with `rule = "no_scope"`.
+3. **Scope:** the uid's single `[[scope]]` (decision 6) must list the
+   service. A uid with no scope, or whose scope does not list the service,
+   is denied with `rule = "no_scope"`.
 4. **Resolve the operation:** named operations directly; proxy paths by
    matching `method` and the path against the manifest's templates. No match
    means deny (`unknown_operation`). Paths are normalized first, and `..`,
@@ -685,7 +767,11 @@ and a one-line summary on stderr.
 For example, `saiife api shopify orders.list status=open limit=50` prints the
 orders as JSON.
 
-#### 6.7.3 Response field redaction (proposed addition)
+#### 6.7.3 Response field redaction (proposed addition; in v2.0)
+
+Kept in v2.0 by the designer's call under owner decision 1. It is one more
+step in the response masking pass that plan 10 builds anyway: field paths
+are matched on the parsed JSON before the value scan.
 
 ```toml
 [services.shopify.redact]
@@ -738,10 +824,18 @@ from v1 §9.5: a `POST` operation to a fixed URL.
 
 | Wave | Connectors | Plan |
 |---|---|---|
-| 1 | Shopify, HubSpot, GitHub, generic HTTP (includes outbound webhooks) | 9 |
-| 2 | Stripe, Slack, Linear, Sentry, GitLab, PagerDuty, Discord | 12 |
-| 3 | Salesforce (OAuth2), Intercom, Zendesk, Airtable, Segment, WooCommerce, Email (SMTP send; IMAP read) | 12 |
-| Cloud | AWS, GCP, Azure (§6.13) | 13 |
+| 1 (v2.0) | Shopify, HubSpot, GitHub, generic HTTP (includes outbound webhooks) | 10 |
+| 2 | Stripe, Slack, Linear, Sentry, GitLab, PagerDuty, Discord | 14 |
+| 3 | Salesforce (OAuth2), Intercom, Zendesk, Airtable, Segment, WooCommerce, Email (SMTP send; IMAP read) | 14 |
+| Cloud | AWS, GCP, Azure (§6.13) | 15 |
+
+Wave 1 is unchanged by review (owner decision 4). Its manifests include the
+write operations, not only reads: for example Shopify `products.update`,
+`refunds.create` and `discounts.create`, HubSpot `contacts.update` and
+`deals.update`, GitHub `issues.create` and `pulls.create`. Like every
+operation, writes are denied until the policy allows them, and an admin can
+put them under `ask` and amount caps (§6.9.4). The suggested policy on each
+docs page puts every write under `ask`.
 
 Each connector ships with a docs page (operations, capabilities, a
 suggested read-only policy) and an offline test suite against a mock server
@@ -814,7 +908,7 @@ The process name can be faked by the same user, which is why sessions are
 used only for attribution and finer limits. v3 replaces this with a session
 identity issued by the runner.
 
-#### 6.9.4 Amount caps (proposed addition)
+#### 6.9.4 Amount caps (proposed addition; in v2.0, owner decision 1)
 
 Manifests mark operations that move money with `amount = { field =
 "amount", currency_field = "currency", unit = "minor" }` (Stripe refunds,
@@ -850,23 +944,37 @@ that does not depend on the agent's judgment.
   uid that created the request.
 - On a dedicated agent account this is natural: the human logs in as
   themself (locally or over SSH) and approves.
-- On a developer's own machine the requester and the human share a uid. The
-  default is `same_user = "deny"`: someone else approves, or the developer
-  uses a second, approver-only account. `same_user = "reauth"` allows the
-  same uid if it proves a human is present:
-  - Linux: the daemon runs `pkcheck --action-id com.saiife.approve --process
-    <pid>,<start>,<uid> --allow-user-interaction`. The polkit action is
-    `auth_self` with no retained authorization, so the polkit agent asks for
-    the user's password. An agent process cannot answer that prompt without
-    the password.
-  - macOS: the CLI gets the authorization right `com.saiife.approve` (rule
-    `authenticate-session-owner`, `timeout = 0`, so Touch ID or the password
-    each time) and passes the external form to the daemon, which checks it.
-    (Plan 10 confirms the daemon user can verify a client's authorization.)
-- Personal broker mode allows any approval from the same user. The docs say
-  this is a workflow aid, not a control.
+- On a developer's own machine the requester and the human share a uid.
+  Re-authentication ships in v2.0 (owner decision 3). `same_user = "reauth"`
+  allows the same uid if it proves a human is present:
+  - Linux (v2.0): the daemon runs `pkcheck --action-id com.saiife.approve
+    --process <pid>,<start>,<uid> --allow-user-interaction`. `system install`
+    writes the action file
+    `/usr/share/polkit-1/actions/com.saiife.approve.policy` with
+    `allow_any`, `allow_inactive` and `allow_active` all set to `auth_self`
+    (never `auth_self_keep`), so the polkit agent asks for the user's
+    password every time. An agent process cannot answer that prompt without
+    the password. In a session with no polkit agent (for example SSH), the
+    CLI starts `pkttyagent` on the approver's terminal.
+  - macOS (v2.1): the CLI gets the authorization right `com.saiife.approve`
+    (rule `authenticate-session-owner`, `timeout = 0`, so Touch ID or the
+    password each time) and passes the external form to the daemon, which
+    checks it. (The v2.1 plan confirms the daemon user can verify a client's
+    authorization.)
+- **Fallback without polkit** (owner decision 3). When `pkcheck` or the
+  polkit daemon is missing (common on minimal servers), `same_user =
+  "reauth"` behaves as `same_user = "deny"`: only a second uid in
+  `approvers` can approve. A same-uid `saiife approve` is refused with that
+  reason and recorded. `doctor` reports "re-authentication unavailable:
+  approvals need a second account" as a warning, and `system install` prints
+  it too.
+- `same_user = "deny"` (the strict choice) can still be set by an admin who
+  wants approvals from a second account only. `system install` writes
+  `"reauth"` when polkit is present and `"deny"` otherwise.
+- Personal broker mode (after v2.0) allows any approval from the same user.
+  The docs say this is a workflow aid, not a control.
 
-#### 6.10.3 Notifications (proposed addition)
+#### 6.10.3 Notifications (proposed addition; in v2.0, owner decision 1)
 
 ```toml
 [notify]
@@ -888,7 +996,7 @@ Why: with nobody watching, an `ask` rule without a notification turns into a
 silent stall, and limit hits or chain breaks go unseen until someone reads
 the log.
 
-#### 6.10.4 Approval for commands (proposed addition)
+#### 6.10.4 Approval for commands (proposed addition; in v2.0, owner decision 1)
 
 Admins can turn chosen guard rules from `deny` into `ask`:
 
@@ -908,7 +1016,7 @@ Why: without it, an unattended agent that hits a rule like a force-push
 either gives up or looks for a way around it. With it, a human can say yes
 once to the exact command, and nothing waits inside a hook.
 
-### 6.11 Environments (v1 §9.5)
+### 6.11 Environments (v1 §9.5; after v2.0, plan 14)
 
 ```toml
 [environments.staging]
@@ -924,14 +1032,17 @@ services.shopify.ask = ["products:write"]
   parameters, rule lists, limits) on top of the base config. It cannot turn
   off a default-on pack.
 - Locked mode: an environment is bound to a scope by the admin
-  (`[[scope]] env = "prod"`). `saiife env use` needs admin rights. The
-  current environment is part of the effective-policy hash, so every record
-  shows which environment was in force.
+  (`[[scope]] env = "prod"`). Since each uid has exactly one scope
+  (decision 6), each uid has exactly one environment. The project path never
+  chooses it. `saiife env use <name> --scope <scope>` needs admin rights and
+  rewrites that binding. The current environment is part of the
+  effective-policy hash, so every record shows which environment was in
+  force.
 - Developer and personal broker modes: `saiife env use <name>` writes
   `env = "<name>"` into `.saiife/config.toml`.
 - `saiife env list` shows the environments and which one applies here.
 
-### 6.12 Collections (v1 §9.5 "agent-facing API client + collections")
+### 6.12 Collections (v1 §9.5 "agent-facing API client + collections"; after v2.0, plan 14)
 
 Saved requests in the project, `.saiife/collections/<name>.toml`:
 
@@ -948,7 +1059,7 @@ full pipeline, so a collection cannot do more than its steps could one by
 one. `saiife api collection run <name> [k=v …]` fills `{{var}}` placeholders.
 They are named requests, not a flow engine (flows are v3).
 
-### 6.13 Cloud credentials (v1 §9.5 "per-session cloud credentials")
+### 6.13 Cloud credentials (v1 §9.5 "per-session cloud credentials"; after v2.0, plan 15)
 
 Two modes per cloud service:
 
@@ -990,7 +1101,11 @@ interpreter may be listed (the config check refuses `sh`, `bash`, `python`,
 socket. The client execs the command with the variable set. Each use is a
 record. The docs recommend a connector instead wherever one exists.
 
-### 6.15 MCP (proposed additions)
+### 6.15 MCP (proposed additions, after v2.0)
+
+Both parts ship after v2.0 (owner decision 1). Until then, locked mode
+allows only the unbrokered MCP servers an admin lists, with warnings
+(§6.1.4).
 
 **`saiife mcp`: connectors as MCP tools.** A stdio MCP server that the agent
 config starts (`saiife mcp`). It lists each allowed operation as a tool
@@ -1007,7 +1122,7 @@ daemon user, and `saiife mcp` also lists their tools, prefixed by server
 Why: MCP servers configured by users keep their tokens in the user's config
 files, which is exactly the credential leak v2 closes elsewhere.
 
-### 6.16 `saiife doctor` (proposed addition)
+### 6.16 `saiife doctor` (proposed addition; in v2.0, owner decision 1)
 
 Checks the host preconditions of §5.6, the files and fingerprints in
 `installed.toml`, the daemon's health, the chain head and the last
@@ -1020,6 +1135,27 @@ under the scoped project paths, `~/.aws/credentials`, `~/.config/gcloud`,
 the path, never the value. Run as root it checks every scoped user; run as a
 user it checks that user.
 
+Further checks that come from the review decisions (§0):
+
+- The lock label of each agent, from the plan 7 gate: "locked", "locked
+  with caveats" or "not lockable" (decision 9).
+- Re-authentication: whether `pkcheck` and the polkit daemon are present and
+  the `com.saiife.approve` action is installed. If not, a warning:
+  "re-authentication unavailable: approvals need a second account"
+  (decision 3).
+- One warning per MCP server in `[guard.mcp] allow_servers`: it bypasses the
+  broker (decision 10).
+- How the vault key is held: an encrypted systemd credential (TPM or host
+  key) or a plain key file (systemd < 250), and whether `SO_PEERPIDFD` is
+  available (decision 8).
+- The system is a supported one for locked mode (Ubuntu 22.04+, Debian 12+,
+  RHEL 9+, systemd). On anything else, a failure: developer mode only.
+- The scopes do not overlap for any current user or group member
+  (decision 6).
+- The agent's model login is reported as information, not a failure: "the
+  agent holds its own model-provider login (not brokered in v2)", or "local
+  model" when the agent's config points to a local endpoint (decision 5).
+
 `--json` gives machine-readable output, and the exit code is 0 (all pass),
 1 (a warning), or 2 (a failure). Fleet tools can run it on a schedule.
 
@@ -1027,7 +1163,7 @@ Why: the lock holds only when the host preconditions hold, and "never sees
 credentials" holds only once the credentials are gone from the agent's
 reach. `status` checks hooks. `doctor` checks the machine.
 
-### 6.17 `core.lock` pack (proposed addition)
+### 6.17 `core.lock` pack (proposed addition; in v2.0, owner decision 1)
 
 On by default in locked mode, and opt-in elsewhere. It denies:
 
@@ -1047,7 +1183,7 @@ Why: most of these would fail on permissions anyway, but a clear denial
 stops a helpful agent from looping on them, and the persistence rules close
 the cheapest way to run code later with no hook around it.
 
-### 6.18 Lockdown (proposed addition)
+### 6.18 Lockdown (proposed addition; in v2.0, owner decision 1)
 
 `saiife lockdown on [--scope all|connectors] [--reason "…"]` and `saiife
 lockdown off`, for admins and approvers. `connectors` denies every connector
@@ -1069,7 +1205,10 @@ resources as before:
   plan 4 carry-over).
 - Mode per host: developer, personal broker or locked.
 
-### 6.20 Egress recipe for dedicated agent accounts (proposed addition, docs only)
+### 6.20 Egress recipe for dedicated agent accounts (proposed addition, docs only; in v2.0)
+
+Kept in v2.0 by the designer's call under owner decision 1: it is one docs
+page plus one `doctor` check in plan 12.
 
 A documented, tested `nftables` rule set (Linux) that drops outbound traffic
 for the agent account's uid (`meta skuid agent-shop`), except to the model
@@ -1083,15 +1222,18 @@ unattended setup, years before v3's egress control, at the cost of one page.
 
 ## 7. Commands
 
-New and changed commands. v1 commands not listed are unchanged.
+New and changed commands. v1 commands not listed are unchanged. Not in
+v2.0: `saiife daemon --user`, the personal-broker side of `secret` and
+`connect` (decision 7), `saiife mcp` (decision 1), `saiife env` and
+`saiife api collection` (plan 14), `saiife run --cloud` (plan 15).
 
 | Command | Who | Behavior |
 |---|---|---|
 | `saiife system install [--config <file>] [--agents claude,codex,gemini] [--approvers <list>] [--non-interactive]` | root | Create users and groups, install the binary to `/opt/saiife/bin`, write `/etc/saiife` (from `--config` or a commented default), the unit or plist, and the managed hooks for the chosen agents; start the daemon; write `installed.toml`; run `doctor`. Idempotent. |
 | `saiife system uninstall [--keep-audit]` | root | Remove exactly what `installed.toml` lists. The audit and vault are kept unless `--purge`. |
-| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`). |
-| `saiife doctor [--user <name>] [--json]` | anyone (more checks as root) | §6.16 (proposed). |
-| `saiife status` | anyone | v1 checks, plus mode, daemon health, chain head, pending approvals for this user, lockdown state. |
+| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. |
+| `saiife doctor [--user <name>] [--json]` | anyone (more checks as root) | §6.16 (proposed; in v2.0). |
+| `saiife status` | anyone | v1 checks, plus mode, daemon health, chain head, pending approvals for this user, lockdown state, each agent's lock label (decision 9), and one warning per unbrokered MCP server allowed in policy (decision 10). |
 | `saiife check --managed …` | managed hooks | §6.1.2. |
 | `saiife init` | user | In locked mode: writes the project config, adds packs only, writes no hooks for agents that have managed hooks. |
 | `saiife init --off` | user / admin | In locked mode: removes leftover project hooks only. It cannot touch managed hooks (those need `system uninstall`). |
@@ -1105,13 +1247,13 @@ New and changed commands. v1 commands not listed are unchanged.
 | `saiife approve <id> [--note]` / `saiife reject <id> [--note]` | approver | §6.10.2. |
 | `saiife env list\|use <name>` | user (developer) / admin (locked) | §6.11. |
 | `saiife policy show [--effective] [--user <u>]` | anyone (own scope); admin (any) | Print the merged policy and its hash. |
-| `saiife policy check <file>` | anyone | Validate a config file without loading it (proposed, with `test`). |
+| `saiife policy check <file>` | anyone | Validate a config file without loading it, including overlapping scopes (decision 6) (proposed, with `test`; in v2.0). |
 | `saiife policy test <file>` | anyone | Run `[[example]]` cases (§8.1) against a policy: "this request → allow/ask/deny", "this command → deny". Exit 1 on any mismatch (proposed addition: policies in git need a CI check, like `saiife-examples` blocks for packs). |
 | `saiife policy reload` | admin | Same as SIGHUP. |
 | `saiife audit verify [--external <path>]` | auditor / admin; developer mode: the user | §6.4.3. |
 | `saiife audit [filters]` | anyone | Through the daemon for non-auditors (§6.4.5). New filters: `--kind connector\|approval\|guard`, `--service <s>`. |
-| `saiife lockdown on\|off` | admin / approver | §6.18 (proposed). |
-| `saiife mcp` | agent config | §6.15 (proposed). |
+| `saiife lockdown on\|off` | admin / approver | §6.18 (proposed; in v2.0). |
+| `saiife mcp` | agent config | §6.15 (proposed; after v2.0). |
 
 ## 8. Config and data formats
 
@@ -1135,8 +1277,8 @@ ask = ["core.git/force-push"]    # proposed (§6.10.4)
 budget_ms = 50
 fail = "closed"                  # forced "closed" when locked = true; "open" | "closed" otherwise
 
-[guard.tools]
-allow = ["mcp__saiife__*"]       # MCP tools allowed in locked mode (§6.1.4)
+[guard.mcp]
+allow_servers = []               # MCP servers allowed in locked mode, unbrokered (§6.1.4)
 
 [audit]
 dir = "/var/log/saiife/audit"
@@ -1172,9 +1314,13 @@ upstream_timeout = "30s"
 [[scope]]
 name = "shop-agent"
 users = ["agent-shop"]           # OS users or "group:<name>"
-projects = ["/srv/agents/shop/**"]   # attribution and env choice only (client-reported)
+projects = ["/srv/agents/shop/**"]   # attribution only (client-reported); never selects scope or env
 services = ["shopify", "hubspot"]
 env = "prod"
+# Builder's call 6: each uid matches at most one scope. A user listed in two
+# scopes, directly or through a group, is a config error: `policy check`
+# fails and the daemon refuses to load the policy (it keeps the last good one,
+# or starts with connectors denied).
 
 [[example]]                      # used by `saiife policy test` (proposed)
 user = "agent-shop"
@@ -1211,7 +1357,11 @@ fields = ["customer.email", "customer.phone"]
 Arrays under `[guard]` are joined. A service may be defined in one file only:
 a second definition is a config error. The daemon then refuses the new
 policy and keeps the old one (or starts with connectors denied). Unknown keys
-are errors, to catch typos in a security config. The effective policy (merged
+are errors, to catch typos in a security config. Overlapping scopes are an
+error at load time. Because group membership can change after a load, the
+daemon also checks each request: a uid that matches two scopes at that
+moment is denied with `rule = "scope_conflict"`, and the denial is recorded
+(fail closed). The effective policy (merged
 config, environment, active packs and their versions) is written as
 canonical JSON with sorted keys, and its SHA-256 is the `policy` hash.
 
@@ -1258,7 +1408,7 @@ a secret, or change the environment. A v1 file (`version = 1`) stays valid.
 company's and users' other hooks. `system install --managed-hooks-only` sets
 it when the admin asks.
 
-**Codex** `requirements.toml` (managed dir verified in plan 6):
+**Codex** `requirements.toml` (managed dir verified in plan 7):
 
 ```toml
 [features]
@@ -1287,7 +1437,7 @@ of saiife's entry, not of the whole file.
 ```
 
 (The matcher is left out, which means all tools. The hooks on/off key is
-added once plan 6 finds it.)
+added once plan 7 finds it.)
 
 ### 8.4 Connector manifest
 
@@ -1489,10 +1639,10 @@ is out of scope (§9.5).
 
 | # | Attack (as the agent's user) | v2 response |
 |---|---|---|
-| A1 | Delete or edit the hook in the agent's settings | Managed files are root-owned (`EACCES`). User and project files cannot turn off managed hooks (verified in plan 6). `ConfigChange` records the attempt (Claude Code). |
-| A2 | `disableAllHooks` / `--settings` / `codex -c features.hooks=false` | Managed settings outrank them. `core.self` denies the command lines. Plan 6 test per agent. |
+| A1 | Delete or edit the hook in the agent's settings | Managed files are root-owned (`EACCES`). User and project files cannot turn off managed hooks (verified in plan 7). `ConfigChange` records the attempt (Claude Code). |
+| A2 | `disableAllHooks` / `--settings` / `codex -c features.hooks=false` | Managed settings outrank them. `core.self` denies the command lines. Plan 7 test per agent. |
 | A3 | Replace or shadow the `saiife` binary (`PATH`, alias, a file named `saiife`) | The hook uses an absolute path under root-owned directories. `PATH` is not used. |
-| A4 | Inject code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | Linux binary is static musl (ignores `LD_PRELOAD`). macOS binary uses the hardened runtime (ignores `DYLD_*`). A running session's environment cannot be changed by a script. |
+| A4 | Inject code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | Linux binary is static musl (ignores `LD_PRELOAD`). macOS (v2.1) binary uses the hardened runtime (ignores `DYLD_*`). A running session's environment cannot be changed by a script. |
 | A5 | Stop or kill the daemon | Another uid: `EPERM`. systemd/launchd restart it if it crashes. While it is down, hooks deny. |
 | A6 | Fake the daemon (own socket) | The socket directory belongs to the daemon user; the client checks the owner; the path is fixed in locked mode. |
 | A7 | Edit, delete or truncate the audit | Files belong to the daemon user (0640, dir 2750). The agent's user cannot write them. Root edits are caught by `verify` with forwarded checkpoints. |
@@ -1507,7 +1657,8 @@ is out of scope (§9.5).
 | A16 | Become root (`sudo`), or join a root-equivalent group | Host precondition (§5.6), checked by `doctor`. `core.lock` denies the command lines (proposed). |
 | A17 | Switch to a looser environment | `env use` needs admin in locked mode; the environment is bound per scope. |
 | A18 | Edit the project config to drop packs or allow services | Project config is add-only in locked mode (§8.2). `core.self` still blocks the write. |
-| A19 | Use an MCP server with its own token | MCP tools are denied by default in locked mode. With the MCP gateway (proposed), tokens move into the vault. |
+| A19 | Use an MCP server with its own token | v2.0: tools of MCP servers not listed in `[guard.mcp] allow_servers` are denied. Listed servers are an admin-accepted, unbrokered gap: their calls are hooked and audited, and `status` and `doctor` warn about them (decision 10). After v2.0, the MCP gateway (proposed) moves their tokens into the vault. |
+| A24 | Use the agent's own model-provider login (read it, or call the provider directly) | **Not prevented, by design** (owner decision 5). `core.secrets` still blocks the obvious reads of the login files (v1). The answer for companies that need it is a local model. |
 | A20 | Read the response of a request with secrets in it | The response is masked for vault values and v1 patterns before it leaves the daemon. |
 | A21 | Run its own code outside the hook (script, patched agent, nested agent with other settings) | **Not prevented in v2.** That code runs as the user with no keys, cannot touch saiife, and is not audited. v3. `doctor` warns when agent binaries are user-writable. |
 | A22 | Send data it can read to any host | **Not prevented in v2.** v3 egress control. Egress recipe (proposed, §6.20) for dedicated accounts on Linux. |
@@ -1552,7 +1703,15 @@ against root, provided logs are forwarded.
 
 Legend: **covered**, **partly**, **not covered**.
 
-| Threat | Developer | Personal broker | Locked (person's account) | Locked (dedicated account) |
+Platforms in v2.0: the two locked columns apply to supported Linux systems
+only (Ubuntu 22.04+, Debian 12+, RHEL 9+). Macs, Alpine and containers are
+in the Developer column until v2.1 (macOS) or for good (Alpine,
+containers). The Personal broker column describes the mode that ships after
+v2.0 (decision 7). An agent labelled "not lockable" by the plan 7 gate
+(decision 9) falls back to the Developer column for the first two rows,
+even on a locked machine.
+
+| Threat | Developer | Personal broker (after v2.0) | Locked (person's account) | Locked (dedicated account) |
 |---|---|---|---|---|
 | Mistake (destructive or secret-reading command) | covered by packs; fails open | same as developer | **covered**; fails closed (gaps in §9.3) | **covered**; fails closed |
 | Helpful bypass (turn saiife off, edit config) | partly (`core.self`, `status`) | partly | **covered** | **covered** |
@@ -1563,7 +1722,8 @@ Legend: **covered**, **partly**, **not covered**.
 | Agent reads the person's other files and logins (SSH keys, browser data, git credentials) | not covered | not covered | **not covered** beyond `core.secrets` | **covered by setup**: the account does not have them |
 | Data exfiltration to arbitrary hosts | not covered | not covered | not covered | **partly** with the egress recipe (Linux); otherwise not covered |
 | Nested or patched agent without hooks | not covered | not covered | not covered (no keys, no audit) | not covered (no keys, no audit) |
-| Model-provider key used by the agent (its own login) | not covered | not covered | not covered (see open question 5) | not covered unless the agent uses a local model |
+| Model-provider login used or copied by the agent | not covered | not covered | **not covered, by design** (owner decision 5): the agent holds its own model login | **not covered, by design**, unless the agent uses a local model (Ollama, vLLM): then there is no key |
+| MCP servers an admin allowed in locked mode | not covered | not covered | **not covered**: unbrokered, but hooked, audited and warned about (decision 10) | same |
 | Attacker with root | not covered | not covered | detected with forwarding | detected with forwarding |
 | Tools that the agent runs inside its own process without a hook (Codex hosted web search) | not covered | not covered | not covered (not visible to any hook) | not covered |
 
@@ -1573,7 +1733,12 @@ dynamic program names, and recursive reads of folders.
 
 `docs/threats.md` gets one section per setup, generated from this table, and
 each agent page gets a "Locked mode" section with its row from §6.1.3 and
-§9.3.
+§9.3 and its lock label from the plan 7 gate.
+
+Wording rule for every docs page, the README and `status` (owner decision
+5): never "the agent never holds a credential" on its own. Always "the agent
+never holds a credential for a brokered service; it holds its own
+model-provider login unless you run a local model".
 
 ## 11. Changes to v1 behavior
 
@@ -1584,7 +1749,7 @@ each agent page gets a "Locked mode" section with its row from §6.1.3 and
 | `SAIIFE_AUDIT_DIR`, `SAIIFE_DATA_DIR` change locations | Ignored in locked mode | The agent's user controls its environment. |
 | Audit in the user's data dir, written by the hook | Locked: written by the daemon to `/var/log/saiife/audit`; `saiife audit` reads through the daemon | v1 §1.2 rule 6. |
 | Record `v = 1` | `v = 2` with `seq`, `prev`, `kind`, `policy`, …; v1 fields kept | v1 §9.3. 0.1.0 readers still show v2 files. |
-| Hooks match a fixed list of tools | Locked: all tools, MCP denied by default | Principle 3; full audit visibility. |
+| Hooks match a fixed list of tools | Locked: all tools; MCP tools denied unless their server is in `[guard.mcp] allow_servers` | Principle 3; full audit visibility. |
 | Project `locked` key reserved | Project `locked` ignored; `/etc/saiife/config.toml` `locked = true` decides | A project must not lock or unlock itself. |
 | Project config sets the opt-in packs | Locked: add-only | v1 §9.1. |
 | `init --off` removes hooks | Locked: removes leftover project hooks only; managed hooks need `system uninstall` (root) | v1 §9.1. |
@@ -1597,7 +1762,8 @@ Developer mode keeps every other v1 behavior unchanged.
 
 1. **Upgrade the binary.** Developer setups keep working. New records are
    `v = 2` (chained, in the same user folder). Old files stay as they are.
-2. **Go locked:** `sudo saiife system install --agents claude,codex,gemini
+2. **Go locked** (supported Linux in v2.0; macOS from v2.1):
+   `sudo saiife system install --agents claude,codex,gemini
    --approvers group:saiife-approvers`. Then:
    - v1 project hooks stay in place but go quiet for agents that now have a
      managed hook (§6.1.1). `saiife init --off` in each project removes them
@@ -1614,9 +1780,10 @@ Developer mode keeps every other v1 behavior unchanged.
    been copied). `doctor` reminds you.
 4. **Recommended for unattended use:** create a dedicated agent account,
    run the agent there, scope it, and apply the egress recipe (Linux).
-5. **Fleets:** run `system install --non-interactive --config <file>` from
-   the MDM or configuration tool (Ansible, Jamf, Intune). Packages
-   (proposed, §15 plan 15) make this a standard install.
+5. **Fleets:** in v2.0, run `system install --non-interactive --config
+   <file>` from the configuration tool (for example Ansible). Packages and
+   MDM recipes (proposed, after v2.0, §15 plan 18) make this a standard
+   install.
 
 ## 13. Testing
 
@@ -1630,15 +1797,28 @@ Developer mode keeps every other v1 behavior unchanged.
   reported as unchained; 0.1.0's reader (pinned test binary) reads a v2 file
   without errors.
 - **Daemon integration:** CI creates a real daemon user and an agent user
-  (GitHub Actions Ubuntu and macOS runners have sudo), installs with
-  `system install`, and runs the suite as the agent user.
+  (GitHub Actions Ubuntu runners have sudo), installs with `system install`,
+  and runs the suite as the agent user. v2.0 runs it on Ubuntu 22.04 and
+  24.04 runners (covering systemd 249 with the plain key file and systemd
+  255 with `LoadCredentialEncrypted`), plus Debian 12 and RHEL 9 (UBI with
+  systemd, or Rocky) in a VM job before each release. The macOS job joins in
+  v2.1. Macs keep running the developer-mode suite in v2.0.
 - **Red-team suite (core acceptance test):** a scripted attacker running as
-  the agent user tries every attack in §9.2 (A1–A20) by script, not by tool
-  call: edit managed files, kill the daemon, fake the socket, write the audit,
-  read the vault, self-approve, double-fork past session limits, path tricks
-  on the proxy, and so on. Every attempt must fail, and the ones the daemon
-  can see must be recorded. A21–A23 are asserted as "known not covered", so
-  the docs and the tests agree.
+  the agent user tries every attack in §9.2 by script, not by tool call. For
+  v2.0 that is A1–A18 and A20, plus these cases for the v2.0 additions:
+  self-approving a command grant (`[guard] ask`), reusing a used or expired
+  grant, turning lockdown off as a non-approver, changing the amount cap by
+  splitting one refund into many, reading or editing the polkit action file,
+  using an MCP server not in `allow_servers`, and being listed in two
+  scopes (policy refused). Every attempt must fail, and the ones the daemon
+  can see must be recorded. For A19 the suite checks that unlisted MCP
+  servers are denied and listed ones are warned about. A21–A24 are asserted
+  as "known not covered", so the docs and the tests agree.
+- **Re-authentication fallback:** with `pkcheck` removed, `same_user =
+  "reauth"` refuses a same-uid approval, a second uid can still approve, and
+  `doctor` warns (decision 3).
+- **Supported-system check:** `system install` refuses on Alpine and inside a
+  container (developer mode only), with a clear message (decision 8).
 - **Fail-closed:** daemon stopped → each agent's fixture payload gets
   exit 2; worker killed with SIGSEGV/SIGKILL → deny; budget exceeded →
   deny; disk-floor reached → deny.
@@ -1647,97 +1827,130 @@ Developer mode keeps every other v1 behavior unchanged.
   effective-policy hash stability, refusal of invalid reloads.
 - **Connectors:** every manifest loads; per operation, request building
   (path, query, headers, auth placement) against a golden file; pagination;
-  masking of vault values in responses; redaction (proposed); amount caps
-  (proposed).
+  masking of vault values in responses; redaction (proposed; in v2.0);
+  amount caps (proposed; in v2.0).
 - **Fuzzing (`cargo fuzz`):** IPC frame decoder, proxy path matcher,
   manifest parameter validation, HTTP request parser. Run in CI for a fixed
   time on each PR, longer nightly.
 - **Approvals:** create, approve, reject, expire; the stored request is sent
-  unchanged; the same uid is refused; reauth on Linux with a polkit test
-  agent (CI), on macOS by hand (manual gate).
+  unchanged; the same uid is refused without reauth; reauth on Linux with a
+  polkit test agent (CI). macOS reauth is tested by hand in v2.1.
 - **Agents, live:** `scripts/live-check-locked.sh` per agent: a managed hook
   fires; user/project/command-line attempts to disable it fail; the
   fail-closed matrix (§9.3) cells marked "blocked" hold. Run by hand before
-  each release (like the v1 live checks), and recorded as fixtures.
+  each release (like the v1 live checks), and recorded as fixtures. Its
+  result sets each agent's lock label (decision 9).
 - **Performance:** `scripts/bench-check.sh` extended for locked mode: p95 of
   a full hook call (worker + ack) under 40 ms.
 
 ## 14. Definition of done (v2.0)
 
-1. `sudo saiife system install` works on Linux (x86_64, arm64; systemd) and
-   macOS (Intel, Apple Silicon), and `system uninstall` removes exactly what
-   it installed.
-2. Claude Code and Codex are locked on both platforms, and Gemini CLI with
-   its documented caveats. Each passes the live check script.
-3. The red-team suite passes: every attack A1–A20 fails when run as the
-   agent's user.
+1. `sudo saiife system install` works on Ubuntu 22.04 and 24.04, Debian 12
+   and RHEL 9 (x86_64 and arm64, systemd), using `LoadCredentialEncrypted`
+   where systemd is 250 or later and the plain key file otherwise.
+   `system uninstall` removes exactly what it installed. On Alpine, in
+   containers and on macOS, `system install` refuses with a clear message,
+   and developer mode works as in v0.1.0, plus the chained log.
+2. Each of Claude Code, Codex and Gemini CLI has a lock label from the plan 7
+   gate (decision 9). Every agent labelled "locked" or "locked with caveats"
+   passes the live check script on Linux. Any agent labelled "not lockable"
+   is labelled so in `status`, `doctor` and its docs page, and no lock claim
+   is made for it.
+3. The red-team suite passes: every attack and every v2.0-addition case in
+   §13 fails when run as the agent's user, and A21–A24 are documented as not
+   covered.
 4. Locked mode fails closed in every case §9.3 marks "blocked", and the
    fail-open cells are documented per agent.
 5. `saiife audit verify` detects every tamper type in §13, including a
    cut-off tail with a forwarded copy. Forwarding to syslog, file and HTTPS
    works and survives an outage without gaps.
 6. Connectors: Shopify, HubSpot, GitHub and generic HTTP work through the
-   CLI and the HTTP gateway, with deny-by-default policies, limits and masked
-   responses, and no credential readable by the agent's user.
-7. `ask` works end to end: request, notification (proposed), approval by
-   another uid, daemon sends the stored request, result picked up by the
-   agent.
-8. The report shows chain status, connector activity, approvals and the
-   policy in force.
-9. `docs/threats.md` states, per setup in §10, what is and is not covered.
-   Each connector and agent page has its locked-mode section.
-10. A 5-minute demo runs end to end: install locked → agent tries to remove
-    the hook, kill the daemon and read the Shopify token (all fail) → agent
-    lists orders (allowed) → agent edits a product (pending, approved by a
-    second user) → `audit verify` → report.
-11. Full test suite passes with networking disabled.
+   CLI and the HTTP gateway, reads and writes, with deny-by-default policies,
+   limits, amount caps, field redaction and masked responses. No connector
+   credential is readable by the agent's user.
+7. `ask` works end to end, for connector requests and for commands: request,
+   notification, approval by a second uid or by the same uid with polkit
+   re-authentication, daemon sends the stored request (or the grant is used),
+   result picked up by the agent. Without polkit, only a second uid can
+   approve, and `doctor` says so.
+8. `saiife doctor`, `core.lock`, `saiife lockdown`, `saiife policy check` and
+   `policy test` work as specified, including overlapping-scope refusal.
+9. In locked mode, MCP tools are denied unless their server is listed, and
+   `status` and `doctor` warn about each listed server.
+10. The report shows chain status, connector activity, approvals and the
+    policy in force.
+11. `docs/threats.md` states, per setup in §10, what is and is not covered,
+    including that the agent keeps its own model-provider login. Each
+    connector and agent page has its locked-mode section. The egress recipe
+    page is published and tested on one supported system.
+12. A 5-minute demo runs end to end on Linux: install locked → agent tries
+    to remove the hook, kill the daemon and read the Shopify token (all
+    fail) → agent lists orders (allowed) → agent edits a product (pending,
+    approved by a second user) → `audit verify` → report.
+13. Full test suite passes with networking disabled.
 
-The full v2 series is done when every v1 §9.5 v2 row has shipped: all
-connector waves, collections, cloud credentials and environments (plans
-12–13).
+**v2.1** is done when locked mode meets points 1–4 and 7 on macOS (Intel and
+Apple Silicon), with a signed and notarized binary. The full v2 series is
+done when every v1 §9.5 v2 row has shipped: all connector waves,
+collections, cloud credentials and environments (plans 14–15), plus the
+after-v2.0 items in §15.
 
 ## 15. Delivery plans
 
+The v1 track already uses plan 6 (v0.1.1, v1 gaps), so v2 starts at plan 7.
 Each plan ends with working, tested software, and is written in full only
 when the one before is done (as in v1). Estimates are in weeks of evenings,
 as in v1.
 
+### 15.1 v2.0 (release 0.2.0, locked mode on Linux)
+
 | # | Plan | Spec sections | Delivers | Estimate |
 |---|---|---|---|---|
-| 6 | Live verification + housekeeping (gate) | §3 carry-over, §6.1.3, §8.3 | Managed settings verified live for all three agents on Linux and macOS, as fixtures: precedence, `disableAllHooks` vs managed hooks, `onFailure`, `ConfigChange`, Codex `requirements.toml` path and `[features]` pin, Gemini system settings, hooks toggle and env override, MCP restriction keys. Housekeeping carry-overs. Updated research docs. | 1 |
-| 7 | Audit v2 + chain (developer mode) | §6.4, §8.5, §8.6, §6.19 (chain status, policy per decision) | Record v2, flock chain, `audit verify`, `policy` hash per record, 0.1.0 reader compatibility test, report additions | 1 |
-| 8 | Daemon + locked mode | §4, §5, §6.1–6.3, §6.16, §6.17, §7 (system, daemon, doctor), §11 | `crates/ipc`, `crates/policy`, `crates/daemon` (control server, audit writer, checkpoints), `system install`/`uninstall` for systemd and launchd, managed hooks, fail-closed `check` with worker, add-only project merge, `doctor` (proposed), `core.lock` (proposed), red-team suite A1–A10, A15–A18 | 2.5 |
-| 9 | Vault + gateway + connector wave 1 | §6.6–6.9, §6.12–6.14 (`run --secret`), §8.4, §8.8, §8.9 | `crates/broker`, vault, `secret`, `connect`, `api`, HTTP gateway, policy and limits, sessions, masking, redaction (proposed), Shopify, HubSpot, GitHub, generic HTTP, `secret import`, red-team A11–A14, A19–A20, fuzzing | 3 |
-| 10 | Approvals + notifications + lockdown | §6.10, §6.18, §8.10 | `ask` for connectors, approvers and reauth (polkit, macOS authorization), notifications (proposed), command approval (proposed), lockdown (proposed), amount caps (proposed) | 1.5 |
-| 11 | Forwarding + auditor access + release v2.0 | §6.4.5, §6.5, §14 | syslog/file/HTTPS forwarding, `verify --external`, auditor group, `audit.query`, docs (threats, agents, connectors), `policy test` (proposed), demo, release 0.2.0 | 1.5 |
-| 12 | Connector waves 2 and 3 + environments | §6.8.3, §6.11, §6.12 | 14 connectors (about 1 evening each; Salesforce OAuth2 and Email take longer), environments, collections | 3 |
-| 13 | Cloud connectors | §6.13 | AWS SigV4 signing and STS mode, GCP and Azure tokens, cloud docs pages | 2 |
-| 14 | MCP (proposed) | §6.15 | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions | 1.5 |
-| 15 | Fleet packaging (proposed) | §12 step 5 | `.deb`, `.rpm` and a signed, notarized macOS `.pkg`; MDM recipes (Jamf, Intune, Ansible); egress recipe page (proposed) | 1 |
+| 7 | Live lock verification gate + housekeeping | §3 carry-over, §6.1.3, §8.3 | Managed settings verified live for all three agents on a supported Linux system, as fixtures: precedence, `disableAllHooks` vs managed hooks, `onFailure`, `ConfigChange`, Codex `requirements.toml` path and `[features]` pin, Gemini system settings, hooks toggle and env override, MCP restriction keys. Sets each agent's lock label (decision 9). Housekeeping carry-overs. Updated research docs. | 1 |
+| 8 | Audit v2 + chain (developer mode) | §6.4, §8.5, §8.6, §6.19 (chain status, policy per decision) | Record v2, flock chain, `audit verify`, `policy` hash per record, 0.1.0 reader compatibility test, report additions. Works on Linux and macOS. | 1 |
+| 9 | Daemon + locked mode (Linux) | §4, §5.1–5.2, §5.4–5.6, §6.1–6.3, §6.16, §6.17, §7 (system, daemon, doctor), §11 | `crates/ipc`, `crates/policy` (incl. one scope per uid), `crates/daemon` (control server, audit writer, checkpoints), `system install`/`uninstall` for systemd (both vault-key variants, supported-system check), managed hooks, fail-closed `check` with worker, add-only project merge, `[guard.mcp]` allow list with warnings, `doctor`, `core.lock`, red-team A1–A10, A16–A18 | 2 |
+| 10 | Vault + gateway + connector wave 1 | §6.6–6.9, §6.14 (`run --secret`), §8.4, §8.8, §8.9 | `crates/broker`, vault, `secret`, `connect`, `api`, HTTP gateway, policy and limits, amount caps, sessions, masking, field redaction, Shopify, HubSpot, GitHub (reads and writes), generic HTTP, `secret import`, red-team A11–A14, A20, fuzzing | 3 |
+| 11 | Approvals + notifications + lockdown | §6.10, §6.18, §8.10 | `ask` for connectors and commands, approvers, polkit re-authentication and its fallback, notifications, lockdown, red-team A15 and the addition cases | 1.5 |
+| 12 | Forwarding + auditor access + release 0.2.0 | §6.4.5, §6.5, §6.20, §14 | syslog/file/HTTPS forwarding, `verify --external`, auditor group, `audit.query`, `policy check`/`test`, docs (threats, agents, connectors, egress recipe), demo, release 0.2.0 | 1.5 |
 
-**v2.0 (plans 6–11): about 10–11 weeks of evenings.** The full v2 series
-(plans 6–15): about 17–18 weeks. Plans 12–15 can be reordered by customer
-demand. Plan 14 can move before plan 12 if MCP matters more than the long
-tail of connectors (open question 4).
+**v2.0 (plans 7–12): about 10 weeks of evenings.** Moving macOS locked mode
+out saves about half a week in plan 9 and half a week in plan 11. Adding
+amount caps, redaction, `policy check`/`test` and the egress page to v2.0
+costs about the same, so the total stays close to the first draft.
+
+### 15.2 After v2.0
+
+| # | Plan | Release | Delivers | Estimate |
+|---|---|---|---|---|
+| 13 | macOS locked mode | v2.1 | §5.3: `_saiife` user, launchd daemon, `LOCAL_PEERCRED`/`LOCAL_PEERPID`, Developer ID signing, hardened runtime, notarization in release CI, macOS authorization re-authentication, macOS live lock checks and CI job | 2 |
+| 14 | Connector waves 2 and 3 + environments + collections | v2.x | 14 connectors (about 1 evening each; Salesforce OAuth2 and Email take longer), environments, collections | 3 |
+| 15 | Cloud connectors | v2.x | AWS SigV4 signing and STS mode, GCP and Azure tokens, cloud docs pages | 2 |
+| 16 | Personal broker mode | v2.x | `saiife daemon --user`, keychain vault (macOS Keychain, Secret Service), developer-mode `connect`/`secret` (decision 7) | 1 |
+| 17 | MCP (proposed) | v2.x | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions moved behind the broker | 1.5 |
+| 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible) | 1 |
+
+**Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
+can be reordered by customer demand. Plan 13 comes first after v2.0 because
+it was promised as v2.1.
 
 ## 16. Proposed additions and cuts
 
-### 16.1 Proposed additions (each can be vetoed on its own)
+### 16.1 Proposed additions and where they ship
 
-| Addition | Section | Why, in one line |
-|---|---|---|
-| `saiife doctor` | §6.16 | The lock holds only when host preconditions hold, and someone has to check them. |
-| `core.lock` pack | §6.17 | Clear denials for sudo, service control and persistence, instead of an agent looping on permission errors. |
-| Approval for commands (`[guard] ask`) | §6.10.4 | An unattended agent blocked by a rule otherwise gives up or looks for a way around. |
-| Notifications (webhook, SMTP, command) | §6.10.3 | Without them, `ask` stalls silently and limit hits and chain breaks go unseen. |
-| Lockdown kill switch | §6.18 | One command for the person on call to stop a misbehaving unattended agent. |
-| Amount caps for money-moving operations | §6.9.4 | A refund ceiling that does not depend on the agent's judgment. |
-| Response field redaction | §6.7.3 | Data minimization for the DPO: the agent gets only the fields the task needs. |
-| `saiife policy check` / `policy test` with `[[example]]` | §7, §8.1 | Policies kept in git need a CI check, like pack examples. |
-| `saiife mcp` (connectors as MCP tools) | §6.15 | Agents call typed MCP tools more reliably than CLI lines. |
-| MCP gateway (third-party MCP servers run by the daemon) | §6.15 | MCP servers keep tokens in user config, which is the leak v2 closes elsewhere. |
-| Fleet packages (.deb/.rpm/.pkg) + MDM recipes | §15 plan 15 | Companies roll out through MDM, which expects packages. |
-| Egress recipe for dedicated agent accounts (docs only) | §6.20 | Narrows the exfiltration gap for the recommended unattended setup at the cost of a page. |
+| Addition | Section | Ships | Why, in one line |
+|---|---|---|---|
+| `saiife doctor` | §6.16 | v2.0 (owner decision 1) | The lock holds only when host preconditions hold, and someone has to check them. |
+| `core.lock` pack | §6.17 | v2.0 (owner decision 1) | Clear denials for sudo, service control and persistence, instead of an agent looping on permission errors. |
+| Approval for commands (`[guard] ask`) | §6.10.4 | v2.0 (owner decision 1) | An unattended agent blocked by a rule otherwise gives up or looks for a way around. |
+| Notifications (webhook, SMTP, command) | §6.10.3 | v2.0 (owner decision 1) | Without them, `ask` stalls silently and limit hits and chain breaks go unseen. |
+| Lockdown kill switch | §6.18 | v2.0 (owner decision 1) | One command for the person on call to stop a misbehaving unattended agent. |
+| Amount caps for money-moving operations | §6.9.4 | v2.0 (owner decision 1) | A refund ceiling that does not depend on the agent's judgment. |
+| `saiife policy check` / `policy test` with `[[example]]` | §7, §8.1 | v2.0 (owner decision 1) | Policies kept in git need a CI check, like pack examples. |
+| Response field redaction | §6.7.3 | v2.0 (designer's call: about one evening inside plan 10's masking pass) | Data minimization for the DPO: the agent gets only the fields the task needs. |
+| Egress recipe for dedicated agent accounts (docs only) | §6.20 | v2.0 (designer's call: one docs page in plan 12) | Narrows the exfiltration gap for the recommended unattended setup at the cost of a page. |
+| `saiife mcp` (connectors as MCP tools) | §6.15 | after v2.0 (owner decision 1), plan 17 | Agents call typed MCP tools more reliably than CLI lines. |
+| MCP gateway (third-party MCP servers run by the daemon) | §6.15 | after v2.0 (owner decision 1), plan 17 | MCP servers keep tokens in user config, which is the leak v2 closes elsewhere. |
+| Fleet packages (.deb/.rpm/.pkg) + MDM recipes | §15.2 | after v2.0 (owner decision 1), plan 18 | Companies roll out through MDM, which expects packages. |
 
 ### 16.2 Considered and cut
 
@@ -1748,31 +1961,17 @@ tail of connectors (open question 4).
 | Redacting secrets in the agent's own context or transcript | Hooks cannot reliably rewrite tool output in all three agents. The broker masks responses instead, and the agent never gets keys in the first place. |
 | Approval by clicking a link in a notification | Needs inbound network or a hosted relay. Approvals stay on the machine. The hosted relay is v3. |
 | Daemon-side guard evaluation | Needs the agent user's view of the filesystem, and gains nothing against an agent that skips the hook (§9.4). |
-| Model-provider key brokering | Valuable but agent-specific (`ANTHROPIC_BASE_URL`, provider proxies). Left as open question 5 rather than built by default. |
+| Model-provider key brokering | Not in v2 (owner decision 5). The agent holds its own model login, or the company runs a local model. |
 
-## 17. Open questions for the owner
+## 17. Open questions
 
-1. **Same-user approvals on developer machines.** Should `same_user =
-   "reauth"` (password or Touch ID each time) ship in v2.0, or should v2.0
-   require a separate approver account, with reauth later? Reauth makes
-   locked mode practical on single-person laptops. It also adds the
-   polkit/macOS authorization work in plan 10, and a phishing-style risk (a
-   fake prompt).
-2. **First-wave connectors.** Shopify, HubSpot, GitHub and generic HTTP are
-   proposed for v2.0. Which services do the first customers need, and is a
-   read-only first release acceptable for any of them?
-3. **macOS signing.** Locked mode on macOS needs a Developer ID certificate,
-   hardened runtime and notarization (about 99 USD a year, plus CI secrets).
-   Go ahead, or ship locked mode as Linux-only first?
-4. **MCP priority.** Do target companies use MCP servers enough to move plan
-   14 (MCP gateway) into v2.0, ahead of connector waves 2–3?
-5. **The agent's own model key.** Should v2 broker the model-provider
-   credential too (the agent talks to the provider through the daemon), or
-   is "use a local model, or accept that the agent holds its provider login"
-   the honest v2 answer?
-6. **Gemini CLI in locked mode.** Ship it as "lockable with caveats" (a
-   script can start a Gemini process without the system settings), or label
-   it "not lockable" until Gemini closes the environment override?
+All six questions of the first draft are answered (§0, decisions 1–5 and 9).
+None is open for v2.0. These remain, for later plans:
+
+1. **macOS minimum version for v2.1** (plan 13). The proposal is the oldest
+   macOS that Apple still updates when plan 13 starts.
+2. **Which wave-2 and wave-3 connectors come first** (plan 14), by customer
+   demand.
 
 ## 18. v3 compatibility
 
