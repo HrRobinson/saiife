@@ -129,5 +129,5 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 - `chmod -R`/`chown -R` folder lists lack `/Volumes` (the `rm` list has it).
 - `CDPATH` and `cd ~user` are not followed by the cd tracking (documented in `core.filesystem`).
-- A `cd` inside a function body is followed even if the function is never called (blocking direction).
-- Other paths `status` prints (e.g. the "saiife status for <root>" header) are not passed through `text::sanitize`.
+- ~~A `cd` inside a function body is followed even if the function is never called (blocking direction).~~ — done in plan 6 final fix: function bodies only add possible directories
+- ~~Other paths `status` prints (e.g. the "saiife status for <root>" header) are not passed through `text::sanitize`.~~ — done in plan 6 final fix: every path `status` prints is sanitized

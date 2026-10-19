@@ -33,12 +33,19 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   included). The relative targets of `rm`, `chmod -R` and `chown -R` are
   judged as if they were written from that folder. A `cd` inside `( ... )`
   ends at the `)`.
-- A `cd` that may be skipped (after `||` or `&&`, or inside an `if`, a loop
-  or a `case` branch) adds a folder instead of replacing one. The delete is
-  then judged against every folder the shell may be in, so
-  `cd / || cd /tmp; rm -rf *` is blocked. A `cd` used as a condition
-  (`if cd /; then rm -rf *; fi`, `while cd /; do ...`, `! cd /`) and a `cd`
-  run through `eval` are followed too.
+- A `cd` may fail or be skipped, so it usually adds a folder instead of
+  replacing one. The delete is then judged against every folder the shell
+  may be in, so `cd /; cd /missing; rm -rf *` and
+  `cd / || cd /tmp; rm -rf *` are blocked. A `cd` replaces the folder only
+  for what runs when it worked: the commands after `cd X &&`, and the body
+  of `if cd X; then ...` or `while cd X; do ...`. A `cd` inside an `if`
+  body, a loop, a `case` branch, a function definition or a group after
+  `&&`/`||` only adds. A `cd` after `!`, `time` or `time -p`, a `cd` used as
+  a condition, and a `cd` run through `eval` are followed too.
+- An `rm`, `chmod` or `chown` with a relative target on a line whose `cd`s
+  leave more than 16 possible folders. saiife cannot judge it against all of
+  them, so it blocks ("too many possible working directories to judge
+  safely"). A line without such a command is judged as before.
 
 These rules also apply when the command runs through `sudo`, `bash -c '...'`
 or after `cd`.
@@ -69,11 +76,12 @@ or after `cd`.
 - `CDPATH` is ignored. With `CDPATH` set, `cd usr` may go to `/usr`, but
   saiife treats it as a relative `cd` from the current folder.
 - `cd` is followed by its text alone. saiife does not check that the folder
-  exists or follow symlinks. A `cd` that always runs is assumed to work, so
-  `cd /missing; rm -rf *` is judged as if it ran in `/missing`. A `cd` in a
-  pipeline (`cd / | ...`) or in the background (`cd / &`) is not followed,
-  since it runs in a shell of its own. With more than 16 possible folders at
-  once, the delete is judged as written.
+  exists or follow symlinks. A `cd` in a pipeline (`cd / | ...`) or in the
+  background (`cd / &`) is not followed, since it runs in a shell of its own.
+- Because a `cd` that is not followed by `&&` may have failed, the folder
+  the line started in stays possible: run from your home folder,
+  `cd proj; rm -rf *` is blocked (if `proj` is missing it would empty your
+  home). Write `cd proj && rm -rf *` instead.
 - A quoted `*` after a `cd` is read as a glob: `cd /usr && rm -rf "*"` is
   blocked, although it would delete only a file named `*`.
 - Protection of saiife's own files is in the `core.self` pack, not here.
@@ -101,6 +109,14 @@ deny if cd /; then rm -rf *; fi
 deny while cd /; do rm -rf *; done
 deny ! cd /; rm -rf *
 deny eval cd /; rm -rf *
+deny cd /; cd /nonexistent; rm -rf *
+deny cd /; cd /a || cd /b; rm -rf *
+deny cd /; { cd /tmp; } || true; rm -rf *
+deny cd /; f() { cd /tmp; }; rm -rf *
+deny cd /; function f { cd /tmp; }; rm -rf *
+deny time if cd /; then rm -rf *; fi
+deny time -p cd / && rm -rf *
+deny true && cd /a; true && cd /b; true && cd /c; true && cd /d; true && cd /e; true && cd /f; true && cd /g; true && cd /h; true && cd /i; true && cd /j; true && cd /k; true && cd /l; true && cd /m; true && cd /n; true && cd /o; true && cd /p; cd /etc; rm -rf *
 deny chmod -R 777 /*
 deny cd / && chmod -R 777 *
 deny cd / && chown -R root *
@@ -114,4 +130,6 @@ allow (cd / && ls) && rm -rf ./dist
 allow cd "$(mktemp -d)" && rm -rf *
 allow cd /tmp || exit; rm -rf *
 allow if cd build; then rm -rf *; fi
+allow cd /tmp && rm -rf *
+allow cd /tmp; rm -rf *
 ```

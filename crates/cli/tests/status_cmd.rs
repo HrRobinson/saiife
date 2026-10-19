@@ -1141,3 +1141,17 @@ fn nested_config_path_is_sanitized() {
         "{text}"
     );
 }
+
+/// The project path in the header (and the fix that names it) is printed
+/// sanitized too.
+#[cfg(unix)]
+#[test]
+fn header_path_is_sanitized() {
+    let env = Env::new(&["claude"]);
+    let dir = env.root().join("evil\x1b[2J\nx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = env.saiife_in(&dir, &["status"]);
+    let text = stdout(&out);
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(text.contains("evil\\x1b[2J⏎x"), "{text}");
+}

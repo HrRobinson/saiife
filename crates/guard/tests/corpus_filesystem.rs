@@ -170,6 +170,57 @@ fn rm_targets_are_judged_against_an_earlier_cd() {
         "eval cd /; rm -rf *",
         // `pushd -n` only edits the stack.
         "cd / && pushd -n /tmp && rm -rf *",
+        // `!` / `time [-p]` in front of a block head or a cd.
+        "time if cd /; then rm -rf *; fi",
+        "! time cd /; rm -rf *",
+        "time -p cd / && rm -rf *",
+        "! if cd /; then rm -rf *; fi",
+        // A function body may never run.
+        "cd /; f() { cd /tmp; }; rm -rf *",
+        "cd /; f () ( cd /tmp ); rm -rf *",
+        "cd /; function f { cd /tmp; }; rm -rf *",
+        "cd /; function f() { cd /tmp; }; rm -rf *",
+        // A cd not followed by `&&` may fail: it only adds.
+        "cd /; cd /nonexistent; rm -rf *",
+        "cd /; cd /a || cd /b; rm -rf *",
+        "cd /; { cd /tmp; } || true; rm -rf *",
+        "cd / && cd /tmp && true || rm -rf *",
+        "cd /; false && cd /tmp && true; rm -rf *",
+        "cd /; if cd /tmp; then :; fi; rm -rf *",
+        // Past the bound of possible directories, the held ones are kept.
+        &*format!(
+            "cd /; {}rm -rf *",
+            (b'a'..=b'q')
+                .map(|c| format!("true && cd /{}; ", c as char))
+                .collect::<String>()
+        ),
+        &*format!("cd /; {}rm -rf *", "true && cd x; ".repeat(18)),
+        &*format!(
+            "cd /; if false; then {}fi; rm -rf *",
+            (b'a'..=b'q')
+                .map(|c| format!("cd /{}; ", c as char))
+                .collect::<String>()
+        ),
+        &*format!(
+            "cd ~; {}rm -rf .",
+            (b'a'..=b'q')
+                .map(|c| format!("true && cd /{}; ", c as char))
+                .collect::<String>()
+        ),
+        &*format!("{}cd /; rm -rf *", "cd /tmp; ".repeat(17)),
+        // Past the bound a relative destructive target cannot be judged.
+        &*format!(
+            "{}cd /etc; rm -rf *",
+            (b'a'..=b'p')
+                .map(|c| format!("true && cd /{}; ", c as char))
+                .collect::<String>()
+        ),
+        &*format!(
+            "{}rm -rf ./build",
+            (b'a'..=b'q')
+                .map(|c| format!("true && cd /{}; ", c as char))
+                .collect::<String>()
+        ),
         // chmod / chown on everything under the root.
         "chmod -R 777 /*",
         "cd / && chmod -R 777 *",
@@ -209,8 +260,23 @@ fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
         "eval cd /tmp; rm -rf *",
         "chmod -R u+w ./build",
         "cd /tmp && chmod -R 777 *",
+        "cd /tmp; rm -rf *",
+        "cd /tmp && cd build && rm -rf *",
+        "if cd /tmp; then rm -rf *; fi",
+        "while cd /tmp; do rm -rf *; done",
+        "f() { cd /; }; rm -rf ./x",
     ] {
         let got = e.evaluate(cmd);
+        assert!(!got.is_deny(), "expected ALLOW for {cmd:?}, got {got:?}");
+    }
+    // Past the bound, a line without a relative destructive target is
+    // judged as before.
+    let many: String = (b'a'..=b'q')
+        .map(|c| format!("true && cd /{}; ", c as char))
+        .collect();
+    for tail in ["ls", "rm -rf /tmp/x", "cat notes.txt"] {
+        let cmd = format!("{many}{tail}");
+        let got = e.evaluate(&cmd);
         assert!(!got.is_deny(), "expected ALLOW for {cmd:?}, got {got:?}");
     }
     // An unknown cwd keeps today's verdict exactly (pinned before cd

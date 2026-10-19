@@ -30,10 +30,16 @@ const SCAN_LIMIT: usize = 20_000;
 /// Directories the nested-config scan never enters.
 const SCAN_SKIP: [&str; 3] = [".git", "target", "node_modules"];
 
+/// A path as status prints it: sanitized, since directory names (and the
+/// paths built from them) are anything anyone can create.
+fn shown(path: &Path) -> String {
+    sanitize(&path.display().to_string())
+}
+
 /// The fix for a removed or changed hook or config: `init` in the project
 /// status reported on (`project_root`, the same rule `init` uses).
 fn restore(root: &Path) -> String {
-    format!("run `saiife init` in {} to restore it", root.display())
+    format!("run `saiife init` in {} to restore it", shown(root))
 }
 
 /// The integrity record of `dir`: `Ok(None)` when there is none, `Err`
@@ -58,7 +64,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         return ExitCode::from(2);
     };
     let root = project_root(&cwd);
-    outln!("saiife status for {}", root.display());
+    outln!("saiife status for {}", shown(&root));
 
     let record = match load_record(&root) {
         Ok(Some(r)) => r,
@@ -66,7 +72,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             outln!(
                 "\nWARNING: saiife is not set up for this project on this machine \
                  (no integrity record).\n  Fix: run `saiife init` in {}",
-                root.display()
+                shown(&root)
             );
             return ExitCode::from(1);
         }
@@ -194,13 +200,13 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                 problems.push(Problem {
                     what: format!(
                         "{} cannot be read, so saiife cannot tell whether it switches off {}'s hooks: {e}",
-                        b.path.display(),
+                        shown(&b.path),
                         agent.label()
                     ),
                     fix: if b.managed {
                         format!(
                             "ask your administrator to make {} (managed settings) a readable JSON object",
-                            b.path.display()
+                            shown(&b.path)
                         )
                     } else {
                         "make it readable so saiife can check it".into()
@@ -214,12 +220,12 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     b.setting
                 )
             } else {
-                format!("remove `{}` from {}", b.setting, b.path.display())
+                format!("remove `{}` from {}", b.setting, shown(&b.path))
             };
             problems.push(Problem {
                 what: format!(
                     "{} sets {}, which stops {}'s hooks: saiife does not run there.",
-                    b.path.display(),
+                    shown(&b.path),
                     b.setting,
                     agent.label()
                 ),
@@ -344,7 +350,7 @@ fn last_calls(
     });
     if let Some(e) = &all.dir_error {
         problems.push(Problem {
-            what: format!("the audit log at {} cannot be read: {e}", dir.display()),
+            what: format!("the audit log at {} cannot be read: {e}", shown(&dir)),
             fix: "make the directory readable by your user again".into(),
         });
     }
@@ -353,7 +359,7 @@ fn last_calls(
             what: format!(
                 "{} file(s) in the audit log at {} are not regular files or cannot be read",
                 all.unreadable_files,
-                dir.display()
+                shown(&dir)
             ),
             fix: "check the audit directory for files you did not create".into(),
         });
@@ -547,7 +553,7 @@ fn packs_line(root: &Path, config_root: Option<&Path>, ids: &[&str]) -> String {
     match config_root {
         Some(dir) if dir != root => format!(
             "  packs (from {}/{CONFIG_REL}): {}",
-            dir.display(),
+            shown(dir),
             ids.join(", ")
         ),
         _ => format!("  packs   {}", ids.join(", ")),
@@ -576,8 +582,8 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
         problems.push(Problem {
             what: format!(
                 "the saiife on PATH ({}) is not the one that ran `saiife init` ({}).",
-                on_path.display(),
-                record.saiife_path
+                shown(&on_path),
+                sanitize(&record.saiife_path)
             ),
             fix: fix.into(),
         });
@@ -599,7 +605,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
                 problems.push(Problem {
                     what: format!(
                         "the saiife binary at {} was replaced since `saiife init` (its contents changed).",
-                        on_path.display()
+                        shown(&on_path)
                     ),
                     fix: fix.into(),
                 });
@@ -609,7 +615,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
                 problems.push(Problem {
                     what: format!(
                         "the saiife binary at {} cannot be read: {e}",
-                        on_path.display()
+                        shown(&on_path)
                     ),
                     fix: fix.into(),
                 });
@@ -619,7 +625,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
     }
     match binary_version(&on_path) {
         Some(v) if v == record.saiife_version => {
-            outln!("  binary  {} ({v})", on_path.display());
+            outln!("  binary  {} ({v})", shown(&on_path));
         }
         Some(v) => problems.push(Problem {
             what: format!(
@@ -629,7 +635,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             fix: fix.into(),
         }),
         None => problems.push(Problem {
-            what: format!("could not read the version of {}.", on_path.display()),
+            what: format!("could not read the version of {}.", shown(&on_path)),
             fix: fix.into(),
         }),
     }

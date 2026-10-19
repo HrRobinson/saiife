@@ -1040,6 +1040,21 @@ fn arith_body(
     None
 }
 
+/// How many leading words of a segment are `!`, `time` or the `-p` of
+/// `time -p` (unquoted): reserved words in front of a pipeline, after which
+/// a compound command (`if`, `while`, …) or a command still starts.
+pub fn pipeline_prefix_len(words: &[Word]) -> usize {
+    let mut n = 0;
+    while let Some(w) = words.get(n) {
+        let after_time = n > 0 && words[n - 1].text == "time";
+        if w.quoted || !(w.text == "!" || w.text == "time" || (after_time && w.text == "-p")) {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
 /// Does a `[[` after these words (the current command so far) start a
 /// test? Only in a reserved word's position: first, or after reserved
 /// words that are themselves in one (`if`, `while`, `!`, `time [-p]`, …).

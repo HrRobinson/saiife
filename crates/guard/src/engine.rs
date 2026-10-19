@@ -24,7 +24,7 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
-use crate::cdtrack::RuleCwd;
+use crate::cdtrack::{LineFlow, RuleCwd};
 use crate::lexer::{
     find_all_substitution_kinds, literal_word, split_segments_with_separators, Operator, Word,
 };
@@ -376,60 +376,22 @@ impl Engine {
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
         };
 
-        // Open `(` / `{` groups: the rule cwd to restore at a subshell's
-        // `)`, and whether the group may be skipped (`a && { cd x; }`).
-        let mut groups: Vec<(Option<RuleCwd>, bool)> = Vec::new();
-        // Open `if`/`while`/`until`/`for`/`select`/`case` bodies, which
-        // may run zero times.
-        let mut blocks = 0usize;
+        // How the line's structure moves the rule cwd (see `LineFlow`).
+        let mut flow = LineFlow::new(&state.rule_cwd);
         for (i, seg) in segments.iter().enumerate() {
             if start.elapsed() > self.budget {
                 return timed_out();
             }
-            let mut last = None;
-            for op in &seps[i] {
-                match op {
-                    Operator::LParen | Operator::LBrace => {
-                        let skip = blocks > 0
-                            || groups.iter().any(|g| g.1)
-                            || matches!(last, Some(Operator::AndAnd | Operator::OrOr));
-                        let saved = (*op == Operator::LParen).then(|| state.rule_cwd.clone());
-                        groups.push((saved, skip));
-                    }
-                    Operator::RParen | Operator::RBrace => {
-                        if let Some((Some(outer), _)) = groups.pop() {
-                            state.rule_cwd = outer;
-                        }
-                    }
-                    _ => {}
-                }
-                last = Some(*op);
-            }
+            let last = flow.operators(&seps[i], &mut state.rule_cwd);
             if seg.is_empty() {
                 continue;
             }
-            let head = seg.first().filter(|w| !w.quoted).map(|w| w.text.as_str());
-            if matches!(head, Some("fi" | "done" | "esac")) {
-                blocks = blocks.saturating_sub(1);
-            }
-            // The segment may not run: it follows `&&`/`||` or a case
-            // pattern, or sits in a block or group that may be skipped.
-            let may_skip = blocks > 0
-                || groups.iter().any(|g| g.1)
-                || matches!(
-                    last,
-                    Some(
-                        Operator::AndAnd
-                            | Operator::OrOr
-                            | Operator::CaseParen
-                            | Operator::RParen
-                            | Operator::RBrace
-                    )
-                );
+            let next = seps[i + 1].first().copied();
+            let may_skip = flow.segment(seg, last, next, &mut state.rule_cwd);
             // A piped or backgrounded command runs in a subshell of its
             // own: its `cd` moves nothing after it.
             let own_subshell = last == Some(Operator::Pipe)
-                || matches!(seps[i + 1].first(), Some(Operator::Pipe | Operator::Amp));
+                || matches!(next, Some(Operator::Pipe | Operator::Amp));
             let rule_cwd = own_subshell.then(|| state.rule_cwd.clone());
             if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found, may_skip) {
                 return d;
@@ -437,14 +399,10 @@ impl Engine {
             if let Some(rule_cwd) = rule_cwd {
                 state.rule_cwd = rule_cwd;
             }
-            if matches!(
-                head,
-                Some("if" | "while" | "until" | "for" | "select" | "case")
-            ) {
-                blocks += 1;
-            }
+            flow.after_segment();
         }
         if let Some(out) = out {
+            flow.finish(&mut state.rule_cwd);
             *out = state.rule_cwd.clone();
         }
         found.finish()
@@ -729,6 +687,14 @@ impl Engine {
         cx: &Ctx,
         state: &ShellState,
     ) -> Option<Decision> {
+        if state.rule_cwd.too_many_dirs_for(&view.argv) {
+            return Some(Decision::Deny {
+                pack: CD_RESOLVED_PACK.to_string(),
+                pattern: "cd-tracking-overflow".to_string(),
+                reason: "too many possible working directories to judge safely".to_string(),
+                via_inline: None,
+            });
+        }
         for argv in state.rule_cwd.rewrite(&view.argv, self.vars.home()) {
             let mut line = argv.join(" ");
             if !view.peeled.is_empty() {
