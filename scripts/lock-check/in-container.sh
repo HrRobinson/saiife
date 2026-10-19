@@ -33,7 +33,8 @@ usage() {
 }
 
 if [[ -n "${LC_ROOT:-}" ]]; then
-  if [[ "$LC_ROOT" == / || ! -d "$LC_ROOT" ]]; then
+  root_real="$(realpath -e -- "$LC_ROOT" 2>/dev/null || true)"
+  if [[ -z "$root_real" || "$root_real" == / || ! -d "$root_real" ]]; then
     echo "in-container.sh: LC_ROOT must be an existing directory other than /" >&2
     exit 2
   fi
@@ -107,7 +108,7 @@ LC_RESULTS="$LC_ROOT/out/$agent-$stamp.tsv"
 LC_LOG="$LC_ROOT/out/$agent-$stamp.log"
 : >"$LC_LOG"
 
-version="$(agent_version 2>/dev/null | head -n1 || true)"
+version="$(lc_agent_call agent_version 2>/dev/null | head -n1 || true)"
 node_version="$(node --version 2>/dev/null || true)"
 {
   printf '# agent=%s\n' "$agent"
@@ -121,10 +122,22 @@ node_version="$(node --version 2>/dev/null || true)"
 
 cleanup() {
   lc_restore_snapshot || true
-  rm -rf "$LC_HOME/alt"
+  rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"
+  # Hand the results to the host user (rootful Docker writes them as root).
+  if [[ -z "$LC_ROOT" && -n "${LOCKCHECK_HOST_UID:-}" ]]; then
+    chown "$LOCKCHECK_HOST_UID:${LOCKCHECK_HOST_GID:-$LOCKCHECK_HOST_UID}" "$LC_RESULTS" "$LC_LOG" || true
+  fi
 }
-lc_snapshot
+# The snapshot lives in the home volume: a run cut off by `docker kill`
+# leaves it behind, and its settings are put back before this run starts.
+if [[ -f "$LC_SNAPSHOT/list" ]]; then
+  echo "[lockcheck] restoring settings left by an interrupted run"
+  lc_restore_snapshot
+fi
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+lc_snapshot
 
 echo "[lockcheck] $agent: ${version:-unknown}, results in $LC_RESULTS"
 agent_checks

@@ -60,6 +60,7 @@ case "$mode" in
     # Offline tests (LC_ROOT set) only simulate the exit status: a real
     # SIGSEGV on a desktop host triggers core dumps and crash reporters.
     if [[ -z "${LC_ROOT:-}" ]]; then
+      ulimit -c 0 || true
       kill -SEGV $$
     fi
     exit 139

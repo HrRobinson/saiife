@@ -65,6 +65,26 @@
 #   lc_calls_tool_names <nonce>      tool_name values in calls.log for nonce
 #   lc_snapshot / lc_reset / lc_restore_snapshot   see below
 #   lc_as_agent_write <path> <content>   write a file as `agent` (with parents)
+#   lc_agent_call <fn> [args...]  run a self-contained fn as `agent` with the
+#                            agent env (used for agent_version); prints its output
+#   lc_require_path <path>   exit 0 iff path may be written by the harness:
+#                            under $LC_ROOT/ offline, under /home/agent/ or
+#                            /work/ in the container (settings, login files and
+#                            lc_as_agent_write are checked with it)
+#
+# Safety (offline): sourcing lib.sh with LC_ROOT set canonicalizes LC_ROOT
+# (realpath; `/` refused), exports HOME=$LC_ROOT/root so a stray `~` cannot
+# reach the real home, and agent runs get a PATH of $LC_ROOT/usr/local/bin
+# plus $LC_ROOT/.lc-hostbin, which links only basic tools (no claude, codex,
+# gemini, node). Sourcing it with LC_ROOT empty outside a container aborts.
+#
+# Evidence: `blocked` needs a witness.log line holding both the nonce and
+# $LC_WITNESS_TOOL_KEY (default "tool_name"), so register the witness on
+# pre-tool events only, never on prompt/model events. Each row's detail
+# also says stub=seen|unseen (the stub's calls.log had the nonce).
+# Threat assumption: calls.log and witness.log are owned by `agent` (the
+# hooks run as agent), so a hostile agent could forge them; the checks
+# assume the model is not adversarial.
 #
 # Per-agent contract: checks-<agent>.sh defines
 #   agent_version          print the agent's version (one line)
@@ -80,7 +100,17 @@
 # ---------------------------------------------------------------------------
 
 LC_ROOT="${LC_ROOT:-}"
-LC_ROOT="${LC_ROOT%/}"
+if [[ -n "$LC_ROOT" ]]; then
+  if ! LC_ROOT="$(realpath -e -- "$LC_ROOT" 2>/dev/null)" || [[ ! -d "$LC_ROOT" || "$LC_ROOT" == / ]]; then
+    echo "lib.sh: LC_ROOT must be an existing directory other than /" >&2
+    return 2
+  fi
+  HOME="$LC_ROOT/root"
+  export HOME
+elif [[ ! -e /.dockerenv ]]; then
+  echo "lib.sh: LC_ROOT is empty and this is not the lock-check container; refusing" >&2
+  return 2
+fi
 LC_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LC_MANAGED="${LC_MANAGED:-$LC_ROOT/lockcheck-managed}"
 LC_HOME="$LC_ROOT/home/agent"
@@ -100,6 +130,10 @@ LC_FIRED_EVENT=""
 LC_POST=""
 LC_NONCE=""
 LC_LAST_EXIT=0
+LC_SNAPSHOT="$LC_HOME/.lockcheck-snapshot"
+LC_WITNESS_TOOL_KEY="${LC_WITNESS_TOOL_KEY:-\"tool_name\"}"
+# Host tools the offline agent env may use (linked into $LC_ROOT/.lc-hostbin).
+LC_HOSTBIN_TOOLS=(bash sh env cat touch mkdir rm cp mv ln chmod grep sed awk tr date sleep head tail cut sort tee dirname basename id od jq)
 export LC_ROOT LC_MANAGED
 
 # --- result rows -------------------------------------------------------------
@@ -233,8 +267,21 @@ lc_chown_agent() {
   fi
 }
 
+lc_require_path() {
+  local path="$1" real
+  real="$(realpath -m -- "$path")"
+  if [[ -n "$LC_ROOT" ]]; then
+    [[ "$real" == "$LC_ROOT/"* ]] && return 0
+  else
+    [[ "$real" == /home/agent/* || "$real" == /work/* ]] && return 0
+  fi
+  echo "lib.sh: refusing path outside the lock-check root: $path" >&2
+  return 1
+}
+
 lc_as_agent_write() {
   local path="$1" content="$2"
+  lc_require_path "$path" || return 1
   if [[ -n "$LC_ROOT" ]]; then
     mkdir -p "$(dirname "$path")"
     printf '%s\n' "$content" >"$path"
@@ -258,10 +305,16 @@ lc_set_mode() {
 }
 
 lc_snapshot() {
-  local dir="$LC_RUN/snapshot" i=0 f login
+  local dir="$LC_SNAPSHOT" i=0 f login
+  while IFS= read -r f; do
+    if [[ -n "$f" ]] && ! lc_require_path "$f"; then
+      return 1
+    fi
+  done < <(agent_settings_files; agent_login_files)
   rm -rf "$dir"
   mkdir -p "$dir"
-  : >"$dir/list"
+  chmod 0700 "$dir"
+  : >"$dir/list.tmp"
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     while IFS= read -r login; do
@@ -273,17 +326,19 @@ lc_snapshot() {
     i=$((i + 1))
     if [[ -e "$f" || -L "$f" ]]; then
       cp -a "$f" "$dir/$i"
-      printf '%s\t%s\n' "$i" "$f" >>"$dir/list"
+      printf '%s\t%s\n' "$i" "$f" >>"$dir/list.tmp"
     else
-      printf -- '-\t%s\n' "$f" >>"$dir/list"
+      printf -- '-\t%s\n' "$f" >>"$dir/list.tmp"
     fi
   done < <(agent_settings_files)
+  mv "$dir/list.tmp" "$dir/list"
 }
 
 lc_restore_snapshot() {
-  local dir="$LC_RUN/snapshot" i f
+  local dir="$LC_SNAPSHOT" i f
   [[ -f "$dir/list" ]] || return 0
   while IFS=$'\t' read -r i f; do
+    lc_require_path "$f" || continue
     rm -f "$f"
     if [[ "$i" != - ]]; then
       mkdir -p "$(dirname "$f")"
@@ -328,18 +383,48 @@ lc_prompt_touch() {
     "$LC_MARKERS" "$1"
 }
 
+# Offline only: a bin dir with links to the basic host tools in
+# LC_HOSTBIN_TOOLS, so an offline agent run can never find a real agent CLI.
+lc_hostbin() {
+  local dir="$LC_ROOT/.lc-hostbin" tool path
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir"
+    for tool in "${LC_HOSTBIN_TOOLS[@]}"; do
+      if path="$(command -v "$tool")" && [[ "$path" == /* ]]; then
+        ln -sf "$path" "$dir/$tool"
+      fi
+    done
+  fi
+  printf '%s\n' "$dir"
+}
+
+# The command prefix that runs something as the agent, into array `LC_CMD`.
+lc_agent_cmd() {
+  if [[ -n "$LC_ROOT" ]]; then
+    LC_CMD=(env -i "HOME=$LC_HOME" "PATH=$LC_ROOT/usr/local/bin:$(lc_hostbin)" TERM=dumb
+      "LC_ROOT=$LC_ROOT" "${LC_AGENT_ENV[@]}")
+  else
+    LC_CMD=(setpriv --reuid=agent --regid=agent --init-groups --
+      env -i HOME=/home/agent "PATH=$LC_AGENT_PATH" TERM=dumb "${LC_AGENT_ENV[@]}")
+  fi
+}
+
+lc_agent_call() {
+  local fn="$1" script
+  shift
+  # shellcheck disable=SC2016 # "$@" is for the agent's shell
+  script="$(declare -f "$fn")"$'\n'"$fn"' "$@"'
+  lc_agent_cmd
+  (cd "$LC_PROJECT" 2>/dev/null || cd /; "${LC_CMD[@]}" bash -c "$script" lc-agent "$@") </dev/null
+}
+
 lc_run_agent() {
   local prompt="$1" out="$LC_RUN/last-output" rc=0 script
   local -a cmd
   # shellcheck disable=SC2016 # "$@" is for the agent's shell
   script="$(declare -f agent_invoke)"$'\nagent_invoke "$@"'
-  if [[ -n "$LC_ROOT" ]]; then
-    cmd=(env -i "HOME=$LC_HOME" "PATH=$LC_ROOT/usr/local/bin:$PATH" TERM=dumb
-      "LC_ROOT=$LC_ROOT" "${LC_AGENT_ENV[@]}")
-  else
-    cmd=(setpriv --reuid=agent --regid=agent --init-groups --
-      env -i HOME=/home/agent "PATH=$LC_AGENT_PATH" TERM=dumb "${LC_AGENT_ENV[@]}")
-  fi
+  lc_agent_cmd
+  cmd=("${LC_CMD[@]}")
   {
     printf '\n===== %s =====\n' "${LC_CURRENT:-agent run}"
     printf 'prompt: %s\n' "$prompt"
@@ -375,8 +460,12 @@ lc_hook_fired() {
     END { exit !found }' "$LC_RUN/calls.log"
 }
 
+# A witness line counts only if it holds the nonce and the tool key: the
+# nonce in a prompt or model event is not a tool call.
 lc_witness_saw() {
-  [[ -f "$LC_RUN/witness.log" ]] && grep -qF -- "$1" "$LC_RUN/witness.log"
+  [[ -f "$LC_RUN/witness.log" ]] || return 1
+  awk -v n="$1" -v k="$LC_WITNESS_TOOL_KEY" 'index($0, n) && index($0, k) { found = 1 } END { exit !found }' \
+    "$LC_RUN/witness.log"
 }
 
 lc_last_unsupported() {
@@ -456,6 +545,11 @@ lc_check() {
     *) observed="$(lc_observe "$nonce" "$control")" ;;
   esac
   detail="mode=$mode exit=$LC_LAST_EXIT"
+  if lc_hook_fired "$nonce"; then
+    detail+=" stub=seen"
+  else
+    detail+=" stub=unseen"
+  fi
   if [[ "$LC_LAST_EXIT" == 124 || "$LC_LAST_EXIT" == 137 ]]; then
     detail+=" (agent timed out after ${AGENT_TIMEOUT:-240}s)"
   fi

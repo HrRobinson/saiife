@@ -25,6 +25,10 @@ REPO="$(cd "$HERE/../.." && pwd)"
 TESTDATA="$HERE/testdata"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
+# Nothing here may touch the real home: tests get a throwaway HOME.
+REAL_HOME="${HOME:-}"
+export HOME="$SCRATCH/home"
+mkdir -p "$HOME"
 
 # --- helpers -----------------------------------------------------------------
 
@@ -198,8 +202,21 @@ test_observe_ran() {
 
 test_observe_blocked() {
   observe_root
-  printf '1\t{"command":"touch /work/project/markers/0123456789ab"}\n' >>"$LC_RUN/witness.log"
+  printf '1\t{"tool_name":"Bash","tool_input":{"command":"touch /work/project/markers/0123456789ab"}}\n' \
+    >>"$LC_RUN/witness.log"
   assert_eq "$(lc_observe 0123456789ab)" blocked
+}
+
+# The nonce in a prompt or model event (no tool key) is not a tool call.
+test_witness_needs_tool_key() {
+  observe_root
+  printf '1\t{"prompt":"touch /work/project/markers/0123456789ab"}\n' >>"$LC_RUN/witness.log"
+  assert_eq "$(lc_observe 0123456789ab)" inconclusive
+  printf '2\t{"tool_name":"Bash","tool_input":{"command":"echo hi"}}\n' >>"$LC_RUN/witness.log"
+  assert_eq "$(lc_observe 0123456789ab)" inconclusive "nonce and key on different lines"
+  assert_eq "$(LC_WITNESS_TOOL_KEY='"toolName"' lc_observe 0123456789ab)" inconclusive
+  printf '3\t{"toolName":"x","args":"0123456789ab"}\n' >>"$LC_RUN/witness.log"
+  assert_eq "$(LC_WITNESS_TOOL_KEY='"toolName"' lc_observe 0123456789ab)" blocked "custom tool key"
 }
 
 test_observe_without_witness_is_inconclusive() {
@@ -240,6 +257,7 @@ test_fake_end_to_end() {
   assert_eq "$(row_of "$f" fake.disabled)" "gate blocked ran FAIL"
   assert_eq "$(row_of "$f" fake.version)" "info - found INFO"
   assert_eq "$(sed -n 's/^# label=//p' "$f")" not-lockable
+  grep -q $'^fake.deny\t.*stub=seen' "$f" || fail "deny detail: $(cat "$f")"
   [[ -s "${f%.tsv}.log" ]] || fail "no agent log next to $f"
   grep -q 'label: not lockable' "$LC_ROOT/run.out" || fail "summary not printed"
 }
@@ -283,6 +301,63 @@ EOF
   assert_eq "$(row_of "$f" snap.capture)" "gate blocked blocked PASS"
   assert_eq "$(cat "$LC_HOME/.fake/settings.json")" original "settings after the run"
   [[ ! -e "$LC_ROOT/etc/fake/disabled" ]] || fail "absent settings file left behind"
+}
+
+test_missing_stub_detail_says_unseen() {
+  new_root
+  local dir f
+  dir="$(custom_checks miss <<'EOF'
+agent_checks() {
+  lc_check miss.control control ran allow
+  lc_check miss.missing gate blocked missing fake_fail_closed
+}
+EOF
+)"
+  f="$(run_fake miss "$dir")"
+  assert_eq "$(row_of "$f" miss.missing)" "gate blocked blocked PASS"
+  grep -q $'^miss.missing\t.*stub=unseen' "$f" || fail "detail: $(cat "$f")"
+  grep -q $'^miss.control\t.*stub=seen' "$f" || fail "control detail: $(cat "$f")"
+}
+
+# A run killed mid-check leaves a mutated settings file and the snapshot in
+# the home volume; the next run restores it before snapshotting.
+test_interrupted_run_is_restored_next_time() {
+  new_root
+  local f
+  mkdir -p "$LC_HOME/.fake"
+  printf 'original\n' >"$LC_HOME/.fake/settings.json"
+  (
+    # shellcheck source=/dev/null
+    source "$TESTDATA/checks-fake.sh"
+    lc_snapshot
+  )
+  printf '{"disabled": true}\n' >"$LC_HOME/.fake/settings.json"
+  f="$(run_fake fake "$TESTDATA")"
+  assert_eq "$(row_of "$f" fake.deny)" "gate blocked blocked PASS"
+  assert_eq "$(cat "$LC_HOME/.fake/settings.json")" original "settings after the run"
+  [[ ! -e "$LC_SNAPSHOT" ]] || fail "snapshot left in the home volume"
+  grep -q 'interrupted run' "$LC_ROOT/run.out" || fail "no restore message"
+}
+
+test_term_restores_settings() {
+  new_root
+  local dir rc=0
+  mkdir -p "$LC_HOME/.fake"
+  printf 'original\n' >"$LC_HOME/.fake/settings.json"
+  dir="$(custom_checks term <<'EOF'
+mutate_and_die() {
+  lc_as_agent_write "$LC_HOME/.fake/settings.json" '{"disabled": true}'
+  kill -TERM $$
+}
+agent_checks() {
+  lc_check term.control control ran allow
+  lc_check term.cut gate blocked deny mutate_and_die
+}
+EOF
+)"
+  LC_CHECKS_DIR="$dir" bash "$HERE/in-container.sh" run term >"$LC_ROOT/run.out" 2>&1 || rc=$?
+  assert_eq "$rc" 143 "exit code after TERM"
+  assert_eq "$(cat "$LC_HOME/.fake/settings.json")" original "settings after TERM"
 }
 
 test_reset_keeps_login_files() {
@@ -335,6 +410,69 @@ EOF
   ((SECONDS - start < 15)) || fail "run took $((SECONDS - start))s"
 }
 
+test_lib_refuses_bad_roots() {
+  local r rc
+  for r in / // /. /tmp/.. "$SCRATCH/does-not-exist"; do
+    rc=0
+    LC_ROOT="$r" bash -c 'source "$1"' lib "$HERE/lib.sh" >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" 2 "lib.sh with LC_ROOT=$r"
+    rc=0
+    LC_ROOT="$r" bash "$HERE/in-container.sh" run fake >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" 2 "in-container.sh with LC_ROOT=$r"
+  done
+  if [[ ! -e /.dockerenv ]]; then
+    rc=0
+    env -u LC_ROOT bash -c 'source "$1"' lib "$HERE/lib.sh" >/dev/null 2>&1 || rc=$?
+    assert_eq "$rc" 2 "lib.sh with no LC_ROOT on the host"
+  fi
+  new_root
+  assert_eq "$HOME" "$LC_ROOT/root" "HOME after sourcing lib.sh"
+}
+
+test_paths_outside_root_are_refused() {
+  new_root
+  local outside="$SCRATCH/outside.json" rc
+  printf 'owner\n' >"$outside"
+  lc_require_path "$LC_HOME/.fake/settings.json" || fail "path inside refused"
+  for p in "$outside" /etc/passwd "$LC_ROOT/../outside.json" "$REAL_HOME/.claude/settings.json"; do
+    if lc_require_path "$p" 2>/dev/null; then fail "accepted $p"; fi
+  done
+  rc=0
+  (lc_as_agent_write "$outside" changed) 2>/dev/null || rc=$?
+  [[ "$rc" != 0 ]] || fail "lc_as_agent_write outside LC_ROOT succeeded"
+  # A checks script whose settings path escapes LC_ROOT: snapshot refuses
+  # before touching anything.
+  agent_settings_files() { printf '%s\n' "$outside"; }
+  agent_login_files() { :; }
+  rc=0
+  (lc_snapshot) 2>/dev/null || rc=$?
+  [[ "$rc" != 0 ]] || fail "lc_snapshot accepted an outside path"
+  assert_eq "$(cat "$outside")" owner "outside file"
+}
+
+# Offline agent runs must never find a real agent CLI, even one on PATH.
+test_offline_env_has_no_agents() {
+  new_root
+  local bin="$SCRATCH/realbin" out
+  mkdir -p "$bin" "$LC_PROJECT" "$LC_RUN"
+  for out in claude codex gemini node; do
+    printf '#!/bin/sh\necho REAL\n' >"$bin/$out"
+    chmod +x "$bin/$out"
+  done
+  PATH="$bin:$PATH"
+  LC_LOG="$LC_ROOT/agent.log"
+  agent_invoke() {
+    for c in claude codex gemini node; do
+      if command -v "$c" >/dev/null 2>&1; then echo "FOUND $c"; fi
+    done
+    echo "HOME=$HOME"
+  }
+  lc_run_agent "x"
+  out="$(cat "$LC_RUN/last-output")"
+  [[ "$out" != *FOUND* ]] || fail "agent CLI reachable offline: $out"
+  [[ "$out" == *"HOME=$LC_HOME"* ]] || fail "agent HOME: $out"
+}
+
 test_in_container_refuses_on_host() {
   if [[ -e /.dockerenv ]]; then
     echo "skip: /.dockerenv exists"
@@ -366,7 +504,7 @@ $REPO/crates/agents/tests/fixtures/managed:/lockcheck-managed:ro
 $REPO/target/lock-check:/out
 saiife-lockcheck-home:/home/agent" "mounts"
   while IFS= read -r item; do
-    if [[ "$item" == "$HOME/"* && "$item" != "$REPO/"* ]]; then
+    if [[ -n "$REAL_HOME" && "$item" == "$REAL_HOME/"* && "$item" != "$REPO/"* ]]; then
       fail "argv item under \$HOME outside the repo: $item"
     fi
     case "$item" in
@@ -381,6 +519,11 @@ saiife-lockcheck-home:/home/agent" "mounts"
   printf '%s\n' "$out" | grep -qx -- '--name' || fail "no --name"
   printf '%s\n' "$out" | grep -qx 'saiife-lockcheck-claude' || fail "container name"
   printf '%s\n' "$out" | grep -qx '/lockcheck/in-container.sh' || fail "entrypoint script"
+  printf '%s\n' "$out" | awk 'prev == "--ulimit" && $0 == "core=0" { f = 1 } { prev = $0 } END { exit !f }' ||
+    fail "no --ulimit core=0"
+  printf '%s\n' "$out" | awk 'prev == "--security-opt" && $0 == "no-new-privileges" { f = 1 } { prev = $0 } END { exit !f }' ||
+    fail "no --security-opt no-new-privileges"
+  printf '%s\n' "$out" | grep -qx "LOCKCHECK_HOST_UID=$(id -u)" || fail "no host uid"
   # No docker on PATH: refuse.
   local rc=0 nobin
   nobin="$(mktemp -d "$SCRATCH/nobin.XXXXXX")"

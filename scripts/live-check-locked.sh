@@ -95,6 +95,7 @@ run_argv() {
   local agent="$1" image_id="$2" commit name
   commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
   argv=(docker run -it --rm --name "saiife-lockcheck-$agent"
+    --ulimit core=0 --security-opt no-new-privileges
     -v "$repo/scripts/lock-check:/lockcheck:ro"
     -v "$repo/crates/agents/tests/fixtures/managed:/lockcheck-managed:ro"
     -v "$out:/out"
@@ -102,6 +103,11 @@ run_argv() {
     -e "SAIIFE_COMMIT=$commit"
     -e "LOCKCHECK_IMAGE=$image_id"
     -e AGENT_TIMEOUT)
+  # in-container.sh chowns the result files to these (not with rootless
+  # Docker, where container root already is the host user).
+  if [[ "$host_owner" == 1 ]]; then
+    argv+=(-e "LOCKCHECK_HOST_UID=$(id -u)" -e "LOCKCHECK_HOST_GID=$(id -g)")
+  fi
   # Optional per-agent knobs (Tasks 4-5); passed only when set on the host.
   for name in LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_GEMINI_TOGGLE; do
     if [[ -n "${!name+x}" ]]; then
@@ -116,6 +122,11 @@ if [[ "$target" == all ]]; then
   agents=(claude codex gemini)
 fi
 
+host_owner=1
+if [[ "$action" == run ]] && docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+  host_owner=0
+fi
+
 if [[ "$action" == print ]]; then
   for agent in "${agents[@]}"; do
     run_argv "$agent" "<image id>"
@@ -128,6 +139,7 @@ build_image
 
 if [[ "$action" == setup ]]; then
   exec docker run -it --rm --name saiife-lockcheck-setup \
+    --ulimit core=0 --security-opt no-new-privileges \
     -v "$repo/scripts/lock-check:/lockcheck:ro" \
     -v "$volume:/home/agent" \
     "$image" bash /lockcheck/in-container.sh setup

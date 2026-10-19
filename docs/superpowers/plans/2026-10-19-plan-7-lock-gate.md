@@ -76,6 +76,8 @@ Style models: `scripts/live-check-agents.sh`, `scripts/demo.sh`.
 4. An agent version without a flag the check uses (`--setting-sources`, `--disable hooks`, `--profile`) — must be `SKIP`, not `FAIL` and not `blocked` (Task 2 test `unknown_flag_is_unsupported`).
 5. `hang` longer than the per-run `AGENT_TIMEOUT`, or a hung agent — the run is cut by `timeout`, the row is still written, and later checks still run (Task 2 test `agent_timeout_still_records_row`).
 
+**Threat assumptions (harness).** The model under test is assumed not to be adversarial. `calls.log` and `witness.log` are owned by `agent`, because the hooks run as `agent`, so an agent could edit its own evidence. The same goes for the settings snapshot, which sits in the agent's home volume (`~/.lockcheck-snapshot`, root 0700): the agent cannot read it, but it can rename or delete it. Results therefore show what a cooperating agent's hook pipeline does. They are not proof against a hostile agent; plan 9's real `check --managed` keeps its evidence out of the agent's reach. `blocked` counts only a witness line that holds both the nonce and the tool key (`"tool_name"`), so the witness must be registered on pre-tool events only.
+
 ---
 
 ### Task 1: Managed config fixtures (§8.3 verbatim)
