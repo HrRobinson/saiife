@@ -21,6 +21,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       - run: cargo test --workspace --no-fail-fast
+      # End-to-end demo in a sandboxed HOME: three recorded Claude Code calls
+      # must be blocked and the HTML report written (docs/demo.md).
+      - name: demo
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo build --release --quiet
+          SAIIFE_BIN="$PWD/target/release/saiife" bash scripts/demo.sh
 
   offline:
     runs-on: ubuntu-latest
