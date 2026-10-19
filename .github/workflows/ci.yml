@@ -12,8 +12,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -21,6 +21,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       - run: cargo test --workspace --no-fail-fast
+      # install.sh against a fake file:// release: checksums, latest lookup,
+      # unsupported platform, PATH hint. No network.
+      - name: install.sh
+        run: bash scripts/test-install.sh
       # End-to-end demo in a sandboxed HOME: three recorded Claude Code calls
       # must be blocked and the HTML report written (docs/demo.md).
       - name: demo
@@ -32,9 +36,16 @@ jobs:
   offline:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@v2
       # Ubuntu 24.04 blocks unprivileged user namespaces by default.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: ./scripts/test-offline.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: shellcheck --version
+      - run: shellcheck install.sh scripts/*.sh

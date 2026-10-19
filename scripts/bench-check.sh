@@ -11,7 +11,7 @@ N="${1:-50}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
 cargo build --release --quiet --manifest-path "$repo/Cargo.toml" -p saiife
-bin="$repo/target/release/saiife"
+bin="${CARGO_TARGET_DIR:-$repo/target}/release/saiife"
 
 # /tmp can have a tight per-user quota: keep scratch next to the repo.
 tmp="$(mktemp -d -p "$(dirname "$repo")" saiife-bench.XXXXXX)"

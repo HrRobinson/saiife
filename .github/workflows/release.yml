@@ -1,0 +1,258 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Dry-run the build matrix on PRs that touch the release path. publish,
+  # install-test and release only run for a pushed v* tag.
+  pull_request:
+    paths: ['.github/workflows/release.yml', 'install.sh']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - id: version
+        name: tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "saiife") | .version')"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" = "null" ]; then
+            echo "::error::could not read the saiife version from cargo metadata"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+              exit 1
+            fi
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+          echo "release version: $cargo_version"
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            file_arch: x86-64
+            run: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            file_arch: ARM aarch64
+            run: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            lipo_arch: x86_64
+            # macos-latest is Apple silicon; do not depend on Rosetta.
+            run: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            lipo_arch: arm64
+            run: true
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      # rust-toolchain.toml selects the toolchain; make sure it has the target.
+      - run: rustup target add "$TARGET"
+      - name: install musl-tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target "$TARGET" -p saiife
+      - name: verify architecture (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          FILE_ARCH: ${{ matrix.file_arch }}
+        run: |
+          set -euo pipefail
+          desc="$(file -b "target/$TARGET/release/saiife")"
+          echo "$desc"
+          case "$desc" in
+            *"$FILE_ARCH"*) ;;
+            *) echo "::error::expected architecture '$FILE_ARCH'"; exit 1 ;;
+          esac
+          # Rust's musl targets emit static PIE, which newer file(1) reports as
+          # "static-pie linked" rather than "statically linked".
+          case "$desc" in
+            *"statically linked"*|*"static-pie linked"*) ;;
+            *) echo "::error::binary is not statically linked"; exit 1 ;;
+          esac
+      - name: verify architecture (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          LIPO_ARCH: ${{ matrix.lipo_arch }}
+        run: |
+          set -euo pipefail
+          archs="$(lipo -archs "target/$TARGET/release/saiife")"
+          echo "$archs"
+          if [ "$archs" != "$LIPO_ARCH" ]; then
+            echo "::error::expected exactly '$LIPO_ARCH', got '$archs'"
+            exit 1
+          fi
+      - name: saiife --version
+        if: matrix.run
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$("target/$TARGET/release/saiife" --version)"
+          echo "$out"
+          case "$out" in
+            *"$VERSION"*) ;;
+            *) echo "::error::--version does not report $VERSION"; exit 1 ;;
+          esac
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="saiife-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/saiife" LICENSE README.md "dist/$name/"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar -tzf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [check-version, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          count="$(ls -1 saiife-*.tar.gz | wc -l)"
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 tarballs, found $count"
+            exit 1
+          fi
+          sha256sum saiife-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - name: release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > notes.md
+          : > heading.txt
+          if [ -f CHANGELOG.md ]; then
+            # The section body goes to notes.md, without its "## <version>"
+            # heading: the release title already carries the version.
+            awk -v v="$VERSION" '
+              /^## / { if (found) exit; if ($2 == v) { found = 1; print > "heading.txt"; next } }
+              found { print }
+            ' CHANGELOG.md > notes.md
+          fi
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for version $VERSION; add '## $VERSION' release notes before tagging"
+            exit 1
+          fi
+          if grep -q 'YYYY-MM-DD' heading.txt notes.md; then
+            echo "::error::CHANGELOG.md still has the YYYY-MM-DD placeholder; set the release date before tagging"
+            exit 1
+          fi
+          cat notes.md
+      # Draft first: nothing is public (or "latest") until install-test passes.
+      - name: create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "saiife $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/*.tar.gz dist/SHA256SUMS install.sh
+
+  install-test:
+    needs: [check-version, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Draft releases are only visible to tokens with push access, so reading
+    # the draft's assets needs contents: write even though nothing is written.
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - name: download the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D rel
+      - name: install from the draft assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l rel
+          SAIIFE_DOWNLOAD_BASE="file://$PWD/rel/" SAIIFE_VERSION="$VERSION" sh rel/install.sh
+      - name: saiife --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$("$HOME/.local/bin/saiife" --version)"
+          echo "$out"
+          case "$out" in
+            *"$VERSION"*) ;;
+            *) echo "::error::installed saiife does not report $VERSION"; exit 1 ;;
+          esac
+
+  release:
+    needs: install-test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft=false
