@@ -70,7 +70,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         .filter(|(_, h)| h.error.is_none())
         .map(|(a, _)| a.as_str())
         .collect();
-    let last_calls = last_calls(&root, &hooked, &mut problems, &mut notes);
+    let (last_calls, cut_short) = last_calls(&root, &hooked, &mut problems, &mut notes);
     let home = dirs::home_dir();
 
     for agent in Agent::ALL {
@@ -140,8 +140,11 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                 println!(
                     "  {:<7} hooked   {rel:<22} last hook call: {}",
                     agent.name(),
-                    last.map(ago)
-                        .unwrap_or_else(|| format!("no call in the last {SCAN_MONTHS} months"))
+                    last.map(ago).unwrap_or_else(|| if cut_short {
+                        format!("no call in the last {SCAN_MONTHS} months")
+                    } else {
+                        "no call yet".into()
+                    })
                 );
             }
             Ok(f) if f.is_empty() => problems.push(Problem {
@@ -239,10 +242,18 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     }
 }
 
-/// The project `status` reports on. Without a `.saiife/config.toml` at or
-/// above `cwd` (it was removed), the nearest ancestor with an integrity
-/// record is the project, so the removal is named instead of "not set up".
+/// The project `status` reports on: the nearest directory at or above `cwd`
+/// holding a `.saiife/` directory, even when its config was removed (so the
+/// removal is named, not a guarded parent project). With no `.saiife/`
+/// anywhere above, the nearest ancestor with an integrity record is the
+/// project, so the removal is named instead of "not set up".
 fn status_root(cwd: &Path) -> PathBuf {
+    let saiife_dir = Path::new(CONFIG_REL)
+        .parent()
+        .unwrap_or(Path::new(".saiife"));
+    if let Some(d) = cwd.ancestors().find(|d| d.join(saiife_dir).is_dir()) {
+        return d.to_path_buf();
+    }
     let found = project_root(cwd);
     if found != cwd || cwd.join(CONFIG_REL).is_file() {
         return found;
@@ -259,19 +270,20 @@ fn status_root(cwd: &Path) -> PathBuf {
 }
 
 /// Audit records of this project (by its literal and canonical path).
-/// An unreadable audit trail is a failed check (spec §1.2 rule 5).
+/// An unreadable audit trail is a failed check (spec §1.2 rule 5). The flag
+/// is set when older month files were left unread (see `ReadResult::cut_short`).
 fn last_calls(
     root: &Path,
     hooked: &[&str],
     problems: &mut Vec<Problem>,
     notes: &mut Vec<String>,
-) -> Vec<Record> {
+) -> (Vec<Record>, bool) {
     let Some(dir) = store::default_dir() else {
         problems.push(Problem {
             what: "the audit directory cannot be determined, so no decision is recorded".into(),
             fix: format!("set {}", store::DIR_ENV),
         });
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let canonical_root = integrity::canonical_project(root).ok();
     let mut roots = vec![root.display().to_string()];
@@ -341,7 +353,8 @@ fn last_calls(
             all.skipped_lines
         ));
     }
-    all.records.into_iter().filter(|r| is_ours(r)).collect()
+    let ours = all.records.into_iter().filter(|r| is_ours(r)).collect();
+    (ours, all.cut_short)
 }
 
 fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {

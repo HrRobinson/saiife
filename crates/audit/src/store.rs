@@ -82,6 +82,10 @@ pub struct ReadResult {
     /// (permissions, not a directory). A missing directory is not an error:
     /// it only means nothing was recorded yet.
     pub dir_error: Option<String>,
+    /// `read_recent` only: it stopped (at `max_files`, or because `want`
+    /// asked it to) with older month files left unread, so "no record
+    /// found" means "none in the files read", not "none at all".
+    pub cut_short: bool,
 }
 
 /// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
@@ -133,7 +137,8 @@ pub fn read_all(dir: &Path) -> ReadResult {
     out
 }
 
-/// Read at most `max_files` month files, newest first. `want` sees every record of each file
+/// Read at most `max_files` month files, newest first (`cut_short` says
+/// whether older ones were left unread). `want` sees every record of each file
 /// and returns `true` while it still needs older data; after the first file
 /// in which it returned `false` the older files are not opened (so their
 /// problems are not counted). Records come back newest file first, each file
@@ -151,9 +156,11 @@ pub fn read_recent(
             return out;
         }
     };
+    let mut unread = files.len();
     for p in files.iter().rev().take(max_files) {
         let start = out.records.len();
         read_month_file(p, &mut out);
+        unread -= 1;
         let mut more = true;
         for r in &out.records[start..] {
             more &= want(r);
@@ -162,6 +169,7 @@ pub fn read_recent(
             break;
         }
     }
+    out.cut_short = unread > 0;
     out
 }
 
@@ -543,6 +551,58 @@ mod tests {
         }
         let got = read_recent(dir.path(), 2, |_| true);
         assert_eq!(got.skipped_lines, 2);
+    }
+
+    #[test]
+    fn read_recent_with_no_wanted_records_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "").unwrap();
+        }
+        let mut calls = 0;
+        let got = read_recent(dir.path(), 12, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 0, "empty files have no records to show");
+        assert_eq!(got, ReadResult::default(), "every existing file was read");
+        assert!(!got.cut_short, "nothing was left unread");
+    }
+
+    #[test]
+    fn read_recent_is_cut_short_only_with_files_left_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "not json\n").unwrap();
+        }
+        assert!(
+            read_recent(dir.path(), 2, |_| true).cut_short,
+            "max_files hit"
+        );
+        assert!(!read_recent(dir.path(), 3, |_| true).cut_short, "all read");
+        assert!(!read_recent(dir.path(), 12, |_| true).cut_short);
+        assert!(!read_recent(&dir.path().join("nope"), 12, |_| true).cut_short);
+
+        let a = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-01-02 00:00:00 UTC),
+        );
+        let b = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-03-02 00:00:00 UTC),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &a).unwrap();
+        append(dir.path(), &b).unwrap();
+        let stopped = read_recent(dir.path(), 12, |_| false);
+        assert_eq!(stopped.records, vec![b]);
+        assert!(stopped.cut_short, "want stopped with an older file unread");
+        let one = read_recent(dir.path(), 12, |r| r.ts.starts_with("2026-03"));
+        assert!(!one.cut_short, "want stopped on the last file");
     }
 
     #[test]

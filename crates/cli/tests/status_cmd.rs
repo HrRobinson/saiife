@@ -30,7 +30,7 @@ fn untouched_project_passes() {
     for a in ["claude", "codex", "gemini"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call in")),
+                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call yet")),
             "{a}: {text}"
         );
     }
@@ -239,7 +239,7 @@ fn last_hook_call_is_shown_per_agent() {
         .lines()
         .find(|l| l.trim_start().starts_with("codex"))
         .unwrap();
-    assert!(codex.contains("no call in"), "{codex}");
+    assert!(codex.contains("no call yet"), "{codex}");
 }
 
 #[test]
@@ -630,7 +630,7 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
         .lines()
         .find(|l| l.trim_start().starts_with("claude"))
         .unwrap();
-    assert!(claude.contains("no call in"), "{claude}");
+    assert!(claude.contains("no call yet"), "{claude}");
 }
 
 /// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
@@ -648,14 +648,14 @@ fn status_reads_recent_months_only() {
     let project = project.to_str().unwrap();
     let now = time::OffsetDateTime::now_utc();
     let this_month = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
-    // The records of the newest month: one recent call per hooked agent.
-    let mut recent = String::new();
     let ts = format!(
         "{:04}-{:02}-{:02}T00:00:00.000Z",
         now.year(),
         u8::from(now.month()),
         now.day()
     );
+    // The records of the newest month: one recent call per hooked agent.
+    let mut recent = String::new();
     for a in ["claude", "codex"] {
         recent.push_str(&audit_line(project, a, &ts));
     }
@@ -675,7 +675,7 @@ fn status_reads_recent_months_only() {
     for a in ["claude", "codex"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call in")),
+                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call")),
             "{a}: {text}"
         );
     }
@@ -749,4 +749,67 @@ fn failed_agent_entry_clears_on_success() {
     let (c, text) = status(&env);
     assert_eq!(c, 0, "{text}");
     assert!(!text.contains("could not set up"), "{text}");
+}
+
+#[test]
+fn fresh_install_says_no_call_yet() {
+    let env = initialized(&["claude"]);
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("no call yet"), "{claude}");
+    assert!(!claude.contains("12 months"), "{claude}");
+}
+
+#[test]
+fn old_log_says_last_12_months() {
+    let env = initialized(&["claude"]);
+    let project = std::fs::canonicalize(env.root()).unwrap();
+    let project = project.to_str().unwrap();
+    // 13 month files; only the oldest (never read) holds this project's call.
+    for m in 1..=13u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2024 + (m - 1) / 12, 1 + (m - 1) % 12);
+        let body = if m == 1 {
+            audit_line(project, "claude", "2024-01-15T00:00:00.000Z")
+        } else {
+            String::new()
+        };
+        std::fs::write(env.audit.path().join(name), body).unwrap();
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("no call in the last 12 months"), "{claude}");
+}
+
+/// A nearer `.saiife/` wins over a guarded parent project: its removed
+/// config is named instead of the parent's status.
+#[test]
+fn nearer_project_with_removed_config_is_named() {
+    let env = initialized(&["claude"]);
+    let child = env.root().join("child");
+    // A config of its own makes `child` a project (init works on it, not
+    // on the parent).
+    std::fs::create_dir_all(child.join(".saiife")).unwrap();
+    std::fs::copy(
+        env.root().join(".saiife/config.toml"),
+        child.join(".saiife/config.toml"),
+    )
+    .unwrap();
+    let out = env.saiife_in(&child, &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    std::fs::remove_file(child.join(".saiife/config.toml")).unwrap();
+    assert!(child.join(".saiife").is_dir());
+    let out = env.saiife_in(&child, &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let first = text.lines().next().unwrap();
+    assert!(first.ends_with("/child"), "{text}");
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
 }
