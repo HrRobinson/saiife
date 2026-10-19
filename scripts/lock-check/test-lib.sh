@@ -135,6 +135,8 @@ test_stub_modes() {
   new_root
   local run="$LC_ROOT/run/lockcheck" mode want rc start elapsed n=0
   mkdir -p "$run"
+  # LC_ROOT is set, so segv/kill9 only exit 139/137: no real signal, no core
+  # dump on the host. The real signals run only inside the container.
   ulimit -c 0
   for mode in allow:0 deny:2 exit1:1 exit3:3 panic:101 segv:139 kill9:137 hang:0; do
     want="${mode#*:}"

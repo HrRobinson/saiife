@@ -14,6 +14,8 @@
 #   exit1  exit 1                exit3  exit 3, no output
 #   panic  Rust-like panic, 101  segv   SIGSEGV itself
 #   kill9  SIGKILL itself        hang   sleep LOCKCHECK_HANG_SECS (60), exit 0
+# segv/kill9 send the real signal only in the container; with LC_ROOT set
+# (offline tests on a host) they just exit 139/137, the status bash reports.
 # It touches nothing else. With LC_ROOT set (offline tests) the
 # /run/lockcheck paths are under $LC_ROOT.
 #
@@ -55,11 +57,17 @@ case "$mode" in
     exit 101
     ;;
   segv)
-    kill -SEGV $$
+    # Offline tests (LC_ROOT set) only simulate the exit status: a real
+    # SIGSEGV on a desktop host triggers core dumps and crash reporters.
+    if [[ -z "${LC_ROOT:-}" ]]; then
+      kill -SEGV $$
+    fi
     exit 139
     ;;
   kill9)
-    kill -KILL $$
+    if [[ -z "${LC_ROOT:-}" ]]; then
+      kill -KILL $$
+    fi
     exit 137
     ;;
   hang)
