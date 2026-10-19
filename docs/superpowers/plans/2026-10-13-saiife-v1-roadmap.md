@@ -133,3 +133,6 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - A function's arguments are not followed by the cd tracking (`f() { cd "$1"; }; f /; rm -rf *`, documented).
 - ~~A `cd` inside a function body is followed even if the function is never called (blocking direction).~~ — done in plan 6 final fix: function bodies only add possible directories
 - ~~Other paths `status` prints (e.g. the "saiife status for <root>" header) are not passed through `text::sanitize`.~~ — done in plan 6 final fix: every path `status` prints is sanitized
+- cd tracking: a relative `cd` in a loop is applied once (`for …; do cd ..; done; rm -rf *` allowed); glob `cd` targets (`cd /e*`) are literal; obfuscated `cd` (`cd${IFS}/`, `$(echo cd)`, aliases, `trap … DEBUG`) is not seen — all documented in `core.filesystem`. Idea: treat a loop body's relative cd or a glob target as overflow.
+- `chown root -R *` / `chown root -R /` allowed: the pattern needs `-R` before the owner.
+- A ~1000-distinct-`cd` line (~15 KB) reaches the 50 ms budget and fails open (recorded as a timeout); the cost is path-rule resolution of each target against up to 16 cwds.

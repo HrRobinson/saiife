@@ -69,6 +69,13 @@ or after `cd`.
   `popd`. The delete after it is judged as written, so
   `cd "$(...)" && rm -rf *` is allowed. A relative `cd` (`cd build`) is
   followed only from a folder saiife knows.
+- A relative `cd` repeated by a loop is followed once:
+  `for i in 1 2 3; do cd ..; done; rm -rf *` is allowed.
+- A `cd` target with a wildcard (`cd /e*`) is taken literally, so the delete
+  after it is judged as written.
+- A `cd` hidden by shell tricks (`cd${IFS}/`, `$(echo cd) /`, aliases,
+  `trap 'cd /' DEBUG`) is not seen. The same tricks also hide `rm` itself;
+  this is a deliberate bypass (see [threats](../threats.md)).
 - `CDPATH` is ignored. With `CDPATH` set, `cd usr` may go to `/usr`, but
   saiife treats it as a relative `cd` from the current folder.
 - `cd` is followed by its text alone. saiife does not check that the folder
