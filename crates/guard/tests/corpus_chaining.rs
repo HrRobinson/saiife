@@ -27,6 +27,10 @@ fn denies_a_destructive_command_hidden_in_a_chain() {
         "npm test && git push origin main --force",
         // deny in the middle of a longer chain, not just the last segment
         "echo a && rm -rf / && echo b",
+        // a `cd` earlier in the chain moves where a relative target lands
+        "cd / && rm -rf *",
+        "echo hi; cd /\nrm -rf *",
+        "cd /tmp && cd / || true; rm -rf *",
     ];
     for cmd in deny {
         assert!(e.evaluate(cmd).is_deny(), "expected DENY for {cmd:?}");
@@ -44,6 +48,9 @@ fn allows_benign_chained_commands() {
         "make || true",
         "cat a.txt | grep foo",
         "npm install && npm test",
+        "cd /tmp && rm -rf ./build",
+        "(cd / && ls) && rm -rf ./dist",
+        "{ cd / ; } | rm -rf ./x",
     ];
     for cmd in allow {
         assert!(

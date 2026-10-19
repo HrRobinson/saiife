@@ -956,3 +956,202 @@ fn packs_line_names_a_config_from_another_directory() {
     let want = format!("packs (from {}/.saiife/config.toml):", root.display());
     assert!(text.contains(&want), "{text}");
 }
+
+/// A `.saiife/config.toml` below the project root that `saiife init` did
+/// not set up: hooks run under it use it instead of the project's config.
+fn nested_warning(rel: &str) -> String {
+    format!(
+        "WARNING: {rel}/.saiife/config.toml is a separate saiife config that was not set up with saiife init; hooks run in {rel} use it instead of this project's config.\n  Fix: delete it, or run saiife init in {rel}"
+    )
+}
+
+#[test]
+fn nested_config_without_record_fails_status() {
+    let env = initialized(&["claude"]);
+    env.write("sub/deep/.saiife/config.toml", "packs = []\n");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains(&nested_warning("sub/deep")), "{text}");
+    assert!(text.contains("1 check(s) failed."), "{text}");
+}
+
+#[test]
+fn nested_config_with_record_is_fine() {
+    let env = initialized(&["claude"]);
+    env.write("sub/.saiife/config.toml", "packs = []\n");
+    let out = env.saiife_in(&env.root().join("sub"), &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("separate saiife config"), "{text}");
+}
+
+#[test]
+fn scan_skips_node_modules_and_git() {
+    let env = initialized(&["claude"]);
+    for d in [
+        "node_modules/pkg",
+        ".git/x",
+        "target/debug",
+        "a/node_modules",
+    ] {
+        env.write(&format!("{d}/.saiife/config.toml"), "packs = []\n");
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("separate saiife config"), "{text}");
+}
+
+#[test]
+fn scan_stops_at_limit() {
+    let env = initialized(&["claude"]);
+    for i in 0..10 {
+        env.write(&format!("a{i:02}.txt"), "x");
+    }
+    env.write("zz/.saiife/config.toml", "packs = []\n");
+    // SAIIFE_SCAN_LIMIT is read only in debug builds (tests run those).
+    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("status")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", env.audit.path())
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .env("SAIIFE_SCAN_LIMIT", "5")
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(
+        text.contains("Note: nested-config scan stopped after 5 entries"),
+        "{text}"
+    );
+    assert!(!text.contains("separate saiife config"), "{text}");
+    // The default limit is not reached in a small project.
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(!text.contains("nested-config scan stopped"), "{text}");
+    assert!(text.contains(&nested_warning("zz")), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_dir_not_followed() {
+    let env = initialized(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("x/.saiife")).unwrap();
+    std::fs::write(outside.path().join("x/.saiife/config.toml"), "packs = []\n").unwrap();
+    std::fs::create_dir_all(outside.path().join(".saiife")).unwrap();
+    std::fs::write(outside.path().join(".saiife/config.toml"), "packs = []\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), env.root().join("link")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("separate saiife config"), "{text}");
+}
+
+/// A nested project `saiife init` set up is held to its recorded config
+/// hash, like the main project's config.
+fn nested_initialized() -> Env {
+    let env = initialized(&["claude"]);
+    env.write("sub/.saiife/config.toml", "packs = []\n");
+    let out = env.saiife_in(&env.root().join("sub"), &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    env
+}
+
+#[test]
+fn nested_recorded_config_untouched_is_fine() {
+    let env = nested_initialized();
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    assert!(!text.contains("sub/.saiife/config.toml"), "{text}");
+}
+
+#[test]
+fn nested_recorded_config_tampered_fails_status() {
+    let env = nested_initialized();
+    env.write("sub/.saiife/config.toml", "packs = []\n# swapped\n");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains(
+            "WARNING: sub/.saiife/config.toml was changed since `saiife init`.\n  Fix: if you made this change, run `saiife init` in sub to record it; otherwise restore the file and run `saiife init` in sub"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("1 check(s) failed."), "{text}");
+}
+
+#[test]
+fn nested_recorded_config_removed_fails_status() {
+    let env = nested_initialized();
+    std::fs::remove_file(env.root().join("sub/.saiife/config.toml")).unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains(
+            "WARNING: sub/.saiife/config.toml was removed.\n  Fix: run `saiife init` in sub to restore it"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn nested_unreadable_record_fails_status() {
+    let env = nested_initialized();
+    let sub = std::fs::canonicalize(env.root().join("sub")).unwrap();
+    let key = saiife_sha256(sub.as_os_str().as_encoded_bytes());
+    let rec = env.data.path().join("projects").join(format!("{key}.json"));
+    assert!(rec.is_file(), "{}", rec.display());
+    std::fs::write(&rec, "{not json").unwrap();
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains("WARNING: the integrity record for sub cannot be read"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Fix: run `saiife init` in sub to restore it"),
+        "{text}"
+    );
+}
+
+fn saiife_sha256(bytes: &[u8]) -> String {
+    saiife_agents::fingerprint::sha256_hex(bytes)
+}
+
+/// Directory names are attacker-chosen: escapes and newlines in them must
+/// not reach the terminal raw.
+#[cfg(unix)]
+#[test]
+fn nested_config_path_is_sanitized() {
+    let env = initialized(&["claude"]);
+    env.write("evil\x1b[2J\nx/.saiife/config.toml", "packs = []\n");
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(!text.contains("[2J\n"), "{text:?}");
+    assert!(
+        text.contains("WARNING: evil\\x1b[2J⏎x/.saiife/config.toml is a separate saiife config"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Fix: delete it, or run saiife init in evil\\x1b[2J⏎x"),
+        "{text}"
+    );
+}
+
+/// The project path in the header (and the fix that names it) is printed
+/// sanitized too.
+#[cfg(unix)]
+#[test]
+fn header_path_is_sanitized() {
+    let env = Env::new(&["claude"]);
+    let dir = env.root().join("evil\x1b[2J\nx");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = env.saiife_in(&dir, &["status"]);
+    let text = stdout(&out);
+    assert!(!text.contains('\x1b'), "{text:?}");
+    assert!(text.contains("evil\\x1b[2J⏎x"), "{text}");
+}
