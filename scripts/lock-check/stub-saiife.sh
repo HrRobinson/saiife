@@ -11,6 +11,7 @@
 #   <epoch> TAB <event: pre-tool|config-change> TAB <mode> TAB <stdin, newlines removed>
 # then acts out the mode:
 #   allow  exit 0, silent        deny   stderr "blocked by stub", exit 2
+#   deny-silent  exit 2 with empty stderr (Codex: a failed hook, not a block)
 #   exit1  exit 1                exit3  exit 3, no output
 #   panic  Rust-like panic, 101  segv   SIGSEGV itself
 #   kill9  SIGKILL itself        hang   sleep LOCKCHECK_HANG_SECS (60), exit 0
@@ -50,6 +51,7 @@ case "$mode" in
     echo "saiife-lockcheck: blocked by stub" >&2
     exit 2
     ;;
+  deny-silent) exit 2 ;;
   exit1) exit 1 ;;
   exit3) exit 3 ;;
   panic)

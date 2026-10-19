@@ -142,7 +142,7 @@ test_stub_modes() {
   # LC_ROOT is set, so segv/kill9 only exit 139/137: no real signal, no core
   # dump on the host. The real signals run only inside the container.
   ulimit -c 0
-  for mode in allow:0 deny:2 exit1:1 exit3:3 panic:101 segv:139 kill9:137 hang:0; do
+  for mode in allow:0 deny:2 deny-silent:2 exit1:1 exit3:3 panic:101 segv:139 kill9:137 hang:0; do
     want="${mode#*:}"
     mode="${mode%%:*}"
     printf '%s\n' "$mode" >"$run/mode"
@@ -156,6 +156,9 @@ test_stub_modes() {
     assert_eq "$rc" "$want" "exit code of mode $mode"
     if [[ "$mode" == deny ]]; then
       grep -q 'blocked by stub' "$LC_ROOT/err" || fail "deny stderr: $(cat "$LC_ROOT/err")"
+    fi
+    if [[ "$mode" == deny-silent && -s "$LC_ROOT/err" ]]; then
+      fail "deny-silent wrote stderr: $(cat "$LC_ROOT/err")"
     fi
     if [[ "$mode" == hang ]] && ((elapsed < 1000)); then
       fail "hang returned after ${elapsed}ms"
@@ -579,6 +582,236 @@ test_mcp_marker_server() {
     fail "bad name not refused: $out"
   [[ ! -e "$dir/x" ]] || fail "../x created"
   assert_eq "$(find "$dir/markers" -mindepth 1 -printf '%f\n')" 0123456789ab "markers"
+}
+
+# --- Codex checks (checks-codex.sh) -------------------------------------------
+
+CODEX_IDS="codex.control codex.managed.path-probe codex.managed.fires codex.deny
+codex.features-off.user codex.features-off.project codex.features-off.cli
+codex.features-off.disable-flag codex.profile codex.hooks-empty.user
+codex.codex-home codex.pin-needed codex.managed-only codex.fail.exit2-empty
+codex.fail.exit101 codex.fail.segv codex.fail.timeout codex.fail.missing
+codex.fail.exit1 codex.mcp.control codex.mcp.hooked codex.mcp.allowlist"
+
+# Source checks-codex.sh against a fresh LC_ROOT, with lc_check and lc_record
+# replaced by recorders writing "id class expect mode setup control" (TAB) to
+# $LC_ROOT/rec.
+codex_static_root() {
+  new_root
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  # shellcheck source=/dev/null
+  source "$HERE/checks-codex.sh"
+  lc_check() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:--}" "${6:-}" >>"$LC_ROOT/rec"
+  }
+  lc_record() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" probe - "${5:-}" >>"$LC_ROOT/rec"
+  }
+  : >"$LC_ROOT/rec"
+}
+
+have_tomllib() {
+  python3 -c 'import tomllib' >/dev/null 2>&1
+}
+
+# toml_eval <file> <python expr over `d`>: print the value. The expression is
+# always a literal written in this file (eval is test-only, never on input).
+toml_eval() {
+  python3 -c 'import sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+print(eval(sys.argv[2]))' "$1" "$2"
+}
+
+test_codex_checks_static() {
+  codex_static_root
+  local fixture="$LC_MANAGED/codex/requirements.toml" req size total
+  agent_checks
+  assert_eq "$(cut -f1 "$LC_ROOT/rec" | paste -sd' ' -)" "$(printf '%s\n' "$CODEX_IDS" | paste -sd' ' -)" "check ids"
+  assert_eq "$(awk -F'\t' '$2 == "gate" && $3 != "blocked" && $3 != "fired"' "$LC_ROOT/rec")" "" "gate expects"
+  assert_eq "$(awk -F'\t' '$2 == "control" { print $1 }' "$LC_ROOT/rec")" codex.control "control row"
+  assert_eq "$(awk -F'\t' '$1 == "codex.mcp.allowlist" { print $3, $6 }' "$LC_ROOT/rec")" \
+    "unavailable codex.mcp.control" "allowlist row"
+  assert_eq "$(awk -F'\t' '$1 == "codex.fail.exit2-empty" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
+    "info blocked deny-silent" "exit2-empty row"
+  awk -F'\t' '$2 == "gap" && $3 != "ran" { bad = 1 } END { exit bad }' "$LC_ROOT/rec" || fail "gap expects"
+  agent_baseline
+  req="$LC_ROOT/etc/codex/requirements.toml"
+  [[ -f "$req" ]] || fail "no managed file at $req"
+  assert_eq "$(stat -c %a "$req")" 644 "managed file mode"
+  size="$(stat -c %s "$fixture")"
+  total="$(stat -c %s "$req")"
+  # Witness group first (so a blocking stub cannot hide the call from it),
+  # then the fixture bytes unchanged.
+  cmp -s <(tail -c "$size" "$req") "$fixture" || fail "managed file does not end with the fixture bytes"
+  head -c "$((total - size))" "$req" >"$LC_ROOT/witness-part"
+  head -n1 "$LC_ROOT/witness-part" | grep -qx '\[\[hooks.PreToolUse\]\]' || fail "no witness group first"
+  grep -qF "command = \"$LC_WITNESS\"" "$LC_ROOT/witness-part" || fail "witness command"
+  grep -qF "[projects.\"$LC_PROJECT\"]" "$LC_HOME/.codex/config.toml" || fail "user trust table"
+  if ! have_tomllib; then
+    echo "skip: python3 tomllib not available"
+    return 0
+  fi
+  assert_eq "$(toml_eval "$req" 'd["features"]["hooks"]')" True
+  assert_eq "$(toml_eval "$req" 'len(d["hooks"]["PreToolUse"])')" 2
+  assert_eq "$(toml_eval "$req" 'd["hooks"]["PreToolUse"][0]["matcher"]')" ".*"
+  assert_eq "$(toml_eval "$req" 'd["hooks"]["PreToolUse"][0]["hooks"][0]["command"]')" "$LC_WITNESS"
+  assert_eq "$(toml_eval "$req" 'd["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]')" 10
+  assert_eq "$(toml_eval "$req" 'd["hooks"]["PreToolUse"][1]["hooks"][0]["command"]')" \
+    "/opt/saiife/bin/saiife check --managed --hook-exit --agent codex"
+  assert_eq "$(toml_eval "$req" 'list(d["hooks"])')" "['PreToolUse']" "only PreToolUse hooks"
+  assert_eq "$(toml_eval "$LC_HOME/.codex/config.toml" "d['projects']['$LC_PROJECT']['trust_level']")" trusted
+}
+
+# Every setup fn leaves TOML that parses, with the keys its check is about.
+test_codex_setups() {
+  codex_static_root
+  if ! have_tomllib; then
+    echo "skip: python3 tomllib not available"
+    return 0
+  fi
+  local id setup req="$LC_ROOT/etc/codex/requirements.toml" user="$LC_HOME/.codex/config.toml" f
+  local project="$LC_PROJECT/.codex/config.toml" alt="$LC_HOME/alt/config.toml" base
+  agent_checks
+  lc_snapshot
+  while IFS=$'\t' read -r id _ _ _ setup _; do
+    [[ "$setup" != - ]] || continue
+    lc_reset
+    LC_NONCE=0123456789ab
+    "$setup"
+    for f in "$req" "$user" "$project" "$alt"; do
+      [[ -f "$f" ]] || continue
+      toml_eval "$f" 1 >/dev/null || fail "$id: $f does not parse: $(cat "$f")"
+    done
+    case "$id" in
+      codex.features-off.user | codex.pin-needed)
+        assert_eq "$(toml_eval "$user" 'd["features"]["hooks"]')" False "$id user hooks"
+        ;;
+      codex.features-off.project)
+        assert_eq "$(toml_eval "$project" 'd["features"]["hooks"]')" False "$id"
+        ;;
+      codex.features-off.cli) assert_eq "${LC_AGENT_ARGS[*]}" "-c features.hooks=false" "$id" ;;
+      codex.features-off.disable-flag) assert_eq "${LC_AGENT_ARGS[*]}" "--disable hooks" "$id" ;;
+      codex.profile)
+        assert_eq "$(toml_eval "$user" 'd["profiles"]["off"]["features"]["hooks"]')" False "$id"
+        assert_eq "${LC_AGENT_ARGS[*]}" "--profile off" "$id args"
+        ;;
+      codex.hooks-empty.user) assert_eq "$(toml_eval "$user" 'd["hooks"]["PreToolUse"]')" "[]" "$id" ;;
+      codex.codex-home)
+        assert_eq "$(toml_eval "$alt" 'd["features"]["hooks"]')" False "$id"
+        assert_eq "$(readlink "$LC_HOME/alt/auth.json")" "$LC_HOME/.codex/auth.json" "$id symlink"
+        assert_eq "${LC_AGENT_ENV[*]}" "CODEX_HOME=$LC_HOME/alt" "$id env"
+        ;;
+      codex.managed-only)
+        assert_eq "$(toml_eval "$req" 'd["allow_managed_hooks_only"]')" True "$id"
+        assert_eq "$(toml_eval "$req" 'len(d["hooks"]["PreToolUse"])')" 2 "$id managed hooks"
+        assert_eq "$(toml_eval "$user" 'd["hooks"]["PreToolUse"][0]["hooks"][0]["command"]')" \
+          "touch $LC_MARKERS/0123456789ab" "$id user hook"
+        [[ "$LC_PROMPT" == *"echo 0123456789ab"* ]] || fail "$id prompt: $LC_PROMPT"
+        ;;
+      codex.mcp.*)
+        assert_eq "$(toml_eval "$user" 'd["mcp_servers"]["lockcheck"]["args"][0]')" "$LC_SRC/mcp-marker.js" "$id"
+        [[ "$LC_PROMPT" == *"touch_marker"*"0123456789ab"* ]] || fail "$id prompt: $LC_PROMPT"
+        ;;
+    esac
+    case "$id" in
+      codex.pin-needed)
+        assert_eq "$(toml_eval "$req" '"features" in d')" False "$id managed pin"
+        assert_eq "$(toml_eval "$req" 'len(d["hooks"]["PreToolUse"])')" 2 "$id managed hooks"
+        ;;
+      codex.mcp.hooked) assert_eq "$LC_POST" codex_mcp_tool_names "$id post" ;;
+      codex.mcp.allowlist)
+        assert_eq "$(toml_eval "$req" 'd["mcp_servers"]["other"]["identity"]["command"]')" other "$id"
+        ;;
+    esac
+  done <"$LC_ROOT/rec"
+  # The overrides.
+  lc_reset
+  LC_NONCE=0123456789ab
+  LOCKCHECK_CODEX_MHO_TABLE=hooks codex_managed_only
+  assert_eq "$(toml_eval "$req" 'd["hooks"]["allow_managed_hooks_only"]')" True "MHO under [hooks]"
+  assert_eq "$(toml_eval "$req" 'len(d["hooks"]["PreToolUse"])')" 2 "MHO table keeps hooks"
+  lc_reset
+  LOCKCHECK_CODEX_MCP_SNIPPET=$'[mcp_servers.lockcheck]\nenabled = false' codex_mcp_allowlist
+  grep -qx 'enabled = false' "$req" || fail "MCP snippet override not written"
+  # Reset brings back the baseline managed file and the snapshot.
+  lc_reset
+  base="$(cat "$req")"
+  lc_reset
+  assert_eq "$(cat "$req")" "$base" "managed file after reset"
+  lc_restore_snapshot
+  [[ ! -e "$user" && ! -e "$project" ]] || fail "settings files left after restore"
+}
+
+test_codex_managed_path_override() {
+  new_root
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  LOCKCHECK_CODEX_REQUIREMENTS=/etc/codex/managed_config.toml
+  # shellcheck source=/dev/null
+  source "$HERE/checks-codex.sh"
+  agent_baseline
+  [[ -f "$LC_ROOT/etc/codex/managed_config.toml" ]] || fail "override path not written"
+  [[ ! -e "$LC_ROOT/etc/codex/requirements.toml" ]] || fail "default path written"
+}
+
+# A stand-in `codex` for the end-to-end run: runs every hook command in the
+# managed file, in order (stub path mapped under LC_ROOT), with a Bash tool
+# call that touches the prompt's marker; a hook exit 2 with stderr blocks it,
+# any other failure is ignored (Codex fails open). Hooks get 1 s (Codex: 10).
+write_fake_codex() {
+  mkdir -p "$LC_ROOT/usr/local/bin"
+  cat >"$LC_ROOT/usr/local/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+root="${LC_ROOT:?}"
+if [[ "${1:-}" == --version ]]; then echo "codex-cli 0.0.0-fake"; exit 0; fi
+[[ "${1:-}" == exec ]] || exit 2
+prompt="${!#}"
+nonce="$(grep -oE '[0-9a-f]{12}' <<<"$prompt" | tail -n1 || true)"
+[[ -n "$nonce" ]] || exit 0
+marker="$root/work/project/markers/$nonce"
+payload="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"touch $marker\"}}"
+blocked=0
+while IFS= read -r cmd; do
+  cmd="${cmd/#\/opt\/saiife\//$root/opt/saiife/}"
+  rc=0
+  err="$(printf '%s\n' "$payload" | timeout 1 bash -c "$cmd" 2>&1 >/dev/null)" || rc=$?
+  if [[ "$rc" == 2 && -n "$err" ]]; then blocked=1; fi
+done < <(sed -n 's/^command = "\(.*\)"$/\1/p' "$root/etc/codex/requirements.toml")
+if ((blocked == 0)); then touch "$marker"; fi
+echo DONE
+EOF
+  chmod 0755 "$LC_ROOT/usr/local/bin/codex"
+}
+
+test_codex_end_to_end_with_fake() {
+  new_root
+  local f vendor="$LC_ROOT/usr/local/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex"
+  export LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  write_fake_codex
+  mkdir -p "$vendor" "$LC_HOME/.codex"
+  printf 'x/etc/codex/requirements.toml\0y/etc/codex/managed_config.toml\0/etc/codex/requirements.toml' \
+    >"$vendor/codex"
+  head -c 64 /dev/urandom >"$LC_HOME/.codex/auth.json"
+  cp -p "$LC_HOME/.codex/auth.json" "$LC_ROOT/auth.orig"
+  f="$(run_fake codex "$HERE")"
+  lc_validate "$f" || fail "result does not validate: $(cat "$f")"
+  assert_eq "$(awk -F'\t' '!/^#/ { print $1 }' "$f" | paste -sd' ' -)" \
+    "$(printf '%s\n' "$CODEX_IDS" | paste -sd' ' -)" "row ids"
+  assert_eq "$(row_of "$f" codex.control)" "control ran ran PASS"
+  assert_eq "$(row_of "$f" codex.managed.path-probe)" "info - found INFO"
+  grep -qF $'\t/etc/codex/managed_config.toml /etc/codex/requirements.toml' "$f" ||
+    fail "probe detail: $(cat "$f")"
+  assert_eq "$(row_of "$f" codex.managed.fires)" "gate fired fired PASS"
+  assert_eq "$(row_of "$f" codex.deny)" "gate blocked blocked PASS"
+  assert_eq "$(row_of "$f" codex.fail.exit2-empty)" "info blocked ran INFO"
+  assert_eq "$(row_of "$f" codex.fail.timeout)" "gap ran ran PASS"
+  assert_eq "$(row_of "$f" codex.fail.missing)" "gap ran ran PASS"
+  grep -q $'^codex.mcp.hooked\t.*tool_name=Bash' "$f" || fail "mcp.hooked detail: $(cat "$f")"
+  assert_eq "$(sed -n 's/^# label=//p' "$f")" lockable-with-gaps
+  [[ ! -e "$LC_HOME/.codex/config.toml" && ! -e "$LC_PROJECT/.codex/config.toml" ]] ||
+    fail "settings files left behind"
+  [[ ! -e "$LC_HOME/alt" ]] || fail "alt home left behind"
+  cmp -s "$LC_HOME/.codex/auth.json" "$LC_ROOT/auth.orig" || fail "auth.json changed"
 }
 
 # --- runner ------------------------------------------------------------------
