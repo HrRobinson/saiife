@@ -952,6 +952,7 @@ fn packs_line_names_a_config_from_another_directory() {
     env.write(".saiife/config.toml", "packs = []\n");
     let out = env.saiife_in(&proj, &["status"]);
     let text = stdout(&out);
-    let want = format!("packs (from {}/.saiife/config.toml):", env.root().display());
+    let root = std::fs::canonicalize(env.root()).unwrap();
+    let want = format!("packs (from {}/.saiife/config.toml):", root.display());
     assert!(text.contains(&want), "{text}");
 }
