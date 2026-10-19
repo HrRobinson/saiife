@@ -103,13 +103,13 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 ## Carry-over from plan 5b (for the plans that own them)
 
-- The guard does not block `cd / && rm -rf *`: `cd` is not tracked. It is listed as not covered in `docs/packs/core.filesystem.md`.
+- ~~The guard does not block `cd / && rm -rf *`: `cd` is not tracked. It is listed as not covered in `docs/packs/core.filesystem.md`.~~ — done in plan 6 (cd/pushd/eval tracked as a bounded set of possible directories).
 - The hook's project lookup is config-only, while `status` and `init` also accept an integrity record (minor; `core.self` denies writes to `**/.saiife/**`).
 - Audit directory tightening chmods any loose real directory that the user owns and set through `SAIIFE_AUDIT_DIR`.
 - `dollar()` keeps its `_ =>` arm as a real fallback.
 - The docs link test does not check `#anchors` or `~~~` fences.
 - ~~`shellcheck` is not run on the scripts (not installed here). Add it to CI in plan 5c.~~ — done in plan 5c
-- `status` could warn about nested `.saiife/config.toml` files that have no integrity record. A stray nested config with `packs = []` turns opt-in packs off for hooks run from that directory. Only a script can create one (`core.self` blocks shell and write tools).
+- ~~`status` could warn about nested `.saiife/config.toml` files that have no integrity record. A stray nested config with `packs = []` turns opt-in packs off for hooks run from that directory. Only a script can create one (`core.self` blocks shell and write tools).~~ — done in plan 6 (status checks nested configs: unrecorded, changed or removed).
 
 ## Carry-over from plan 5c (for the plans that own them)
 
@@ -124,3 +124,10 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - Look at the HTML report at phone width and in print preview.
 - ~~`scripts/bench-check.sh` must honour `CARGO_TARGET_DIR` (plan 5c).~~ — done in plan 5c
 - ~~**Plan 5c (tests):** add a `broken_pipe.rs` case for `check --hook-exit` deny with stdout closed (`>&-`) — verified by hand in the plan-5b final re-review (exit 2). JSON-mode `check` with stdout closed outright (`>&-`, not a broken pipe) still exits 0 on deny, since Rust discards the write; no installed hook uses JSON mode.~~ — done in plan 5c: `hook_exit_deny_with_broken_stdout_pipe_exits_2` covers the broken pipe (EPIPE) and `hook_exit_deny_with_stdout_fd_closed_exits_2` covers a closed fd 1 (`sh -c 'exec … >&-'`, EBADF).
+
+## Carry-over from plan 6 (for the plans that own them)
+
+- `chmod -R`/`chown -R` folder lists lack `/Volumes` (the `rm` list has it).
+- `CDPATH` and `cd ~user` are not followed by the cd tracking (documented in `core.filesystem`).
+- A `cd` inside a function body is followed even if the function is never called (blocking direction).
+- Other paths `status` prints (e.g. the "saiife status for <root>" header) are not passed through `text::sanitize`.
