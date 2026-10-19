@@ -79,6 +79,10 @@ cannot run `saiife init --off`: [core.self](../packs/core.self.md) blocks it.
 - For every agent: `.saiife/config.toml` is unchanged, and the `saiife` on
   your `PATH` is the same program, at the same version, that ran
   `saiife init`.
+- For every agent: no `.saiife/config.toml` below the project that
+  `saiife init` did not set up. Hooks run in that folder would use it
+  instead of the project's config. The search skips `.git`, `target` and
+  `node_modules`, does not follow symlinks, and stops after 20 000 entries.
 
 Each failed check prints what is wrong and how to fix it, and `status` exits
 with code 1.

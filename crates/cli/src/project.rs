@@ -18,15 +18,18 @@ use saiifeguard::Pack;
 /// `config::find_project_root`.)
 pub fn project_root(cwd: &Path) -> PathBuf {
     cwd.ancestors()
-        .find(|d| {
-            d.join(CONFIG_REL).is_file()
-                || integrity::record_path(d)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
-        })
+        .find(|d| d.join(CONFIG_REL).is_file() || has_record(d))
         .unwrap_or(cwd)
         .to_path_buf()
+}
+
+/// `dir` has a loadable integrity record on this machine (`saiife init`
+/// ran there).
+pub fn has_record(dir: &Path) -> bool {
+    integrity::record_path(dir)
+        .ok()
+        .flatten()
+        .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

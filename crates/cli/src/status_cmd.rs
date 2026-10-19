@@ -18,10 +18,16 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
-use crate::project::{project_packs, project_root};
+use crate::project::{has_record, project_packs, project_root};
 
 /// Month files `status` reads at most when looking for each agent's last call.
 const SCAN_MONTHS: usize = 12;
+
+/// Directory entries the nested-config scan reads at most.
+const SCAN_LIMIT: usize = 20_000;
+
+/// Directories the nested-config scan never enters.
+const SCAN_SKIP: [&str; 3] = [".git", "target", "node_modules"];
 
 /// The fix for a removed or changed hook or config: `init` in the project
 /// status reported on (`project_root`, the same rule `init` uses).
@@ -229,6 +235,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         });
     }
     check_config(&root, &record, builtin, &mut problems);
+    check_nested_configs(&root, &mut problems, &mut notes);
     check_binary(&record, &mut problems);
 
     if !notes.is_empty() {
@@ -394,6 +401,95 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
     outln!("{}", packs_line(root, project.root.as_deref(), &ids));
     let vars = crate::paths::path_vars(Some(root), Some(root));
     out!("{}", inactive_lines(&active, &vars));
+}
+
+/// `SCAN_LIMIT`; debug builds (tests) may lower it with `SAIIFE_SCAN_LIMIT`.
+fn scan_limit() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("SAIIFE_SCAN_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return n;
+    }
+    SCAN_LIMIT
+}
+
+/// Find `.saiife/config.toml` files below `root` that `saiife init` did not
+/// set up (no integrity record for their directory): the hook's own lookup
+/// takes the nearest config, so hooks run under them ignore this project's.
+fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>) {
+    let limit = scan_limit();
+    let scan = nested_configs(root, limit);
+    for dir in scan.found {
+        if has_record(&root.join(&dir)) {
+            continue;
+        }
+        let rel = dir.display();
+        problems.push(Problem {
+            what: format!(
+                "{rel}/{CONFIG_REL} is a separate saiife config that was not set up with saiife init; hooks run in {rel} use it instead of this project's config."
+            ),
+            fix: format!("delete it, or run saiife init in {rel}"),
+        });
+    }
+    if scan.cut_short {
+        notes.push(format!("nested-config scan stopped after {limit} entries"));
+    }
+}
+
+struct NestedScan {
+    /// Directories below the root (relative to it) holding a config file.
+    found: Vec<PathBuf>,
+    /// The walk stopped at the entry limit.
+    cut_short: bool,
+}
+
+/// Breadth-first walk of `root`'s subdirectories (sorted, so the output is
+/// stable), reading at most `limit` directory entries. Symlinks are never
+/// followed, `SCAN_SKIP` directories and unreadable ones are skipped. The
+/// root's own config is not nested.
+fn nested_configs(root: &Path, limit: usize) -> NestedScan {
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([PathBuf::new()]);
+    let mut seen = 0usize;
+    while let Some(rel) = queue.pop_front() {
+        let dir = root.join(&rel);
+        if !rel.as_os_str().is_empty() && dir.join(CONFIG_REL).is_file() {
+            found.push(rel.clone());
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut subdirs = Vec::new();
+        for e in entries {
+            if seen == limit {
+                found.sort();
+                return NestedScan {
+                    found,
+                    cut_short: true,
+                };
+            }
+            seen += 1;
+            let Ok(e) = e else { continue };
+            // `DirEntry::file_type` does not follow symlinks.
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name();
+            if SCAN_SKIP.iter().any(|s| name == *s) {
+                continue;
+            }
+            subdirs.push(rel.join(name));
+        }
+        subdirs.sort();
+        queue.extend(subdirs);
+    }
+    found.sort();
+    NestedScan {
+        found,
+        cut_short: false,
+    }
 }
 
 /// The `packs …` line. When the config it was read from sits in another
