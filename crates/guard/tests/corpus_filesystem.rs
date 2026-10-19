@@ -153,6 +153,27 @@ fn rm_targets_are_judged_against_an_earlier_cd() {
         "cd / && chmod -R 777 .",
         "cd / && chown -R root:root .",
         "cd / && sudo rm -rf *",
+        // A cd that may be skipped adds a directory, never replaces one.
+        "cd / || cd /tmp; rm -rf *",
+        "cd /; false && cd /tmp; rm -rf *",
+        "cd /; if false; then cd /tmp; fi; rm -rf *",
+        "cd /; false && { cd /tmp; }; rm -rf *",
+        "cd /; case x in a) cd /tmp;; esac; rm -rf *",
+        "cd / ; (case x in a) ;; esac; cd /tmp) ; rm -rf *",
+        // A cd used as a condition still runs.
+        "if cd /; then rm -rf *; fi",
+        "while cd /; do rm -rf *; done",
+        "until cd /; do :; done; rm -rf *",
+        "! cd /; rm -rf *",
+        "if cd /; then :; fi; rm -rf *",
+        // eval runs in this shell.
+        "eval cd /; rm -rf *",
+        // `pushd -n` only edits the stack.
+        "cd / && pushd -n /tmp && rm -rf *",
+        // chmod / chown on everything under the root.
+        "chmod -R 777 /*",
+        "cd / && chmod -R 777 *",
+        "cd / && chown -R root *",
     ] {
         assert_eq!(deny_pack(&e, cmd), "core.filesystem", "for {cmd:?}");
     }
@@ -183,6 +204,11 @@ fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
         "cd /tmp && chown -R -v root ./x",
         // Other packs see the command unchanged.
         "cd / && git status",
+        "cd /tmp || exit; rm -rf *",
+        "if cd build; then rm -rf *; fi",
+        "eval cd /tmp; rm -rf *",
+        "chmod -R u+w ./build",
+        "cd /tmp && chmod -R 777 *",
     ] {
         let got = e.evaluate(cmd);
         assert!(!got.is_deny(), "expected ALLOW for {cmd:?}, got {got:?}");

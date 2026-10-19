@@ -61,10 +61,11 @@ pattern = '>\s*/dev/(?:sd|hd|vd|disk|rdisk|nvme|mmcblk)'
 reason = "redirecting output onto a raw block device overwrites the disk"
 
 # --- recursive permission changes on a system root ---------------------------
+# Targets: the root (`/`, `/*`) or a top-level system directory.
 [[deny]]
-pattern = '^(?:sudo\s+)?chmod\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*(?:/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
+pattern = '^(?:sudo\s+)?chmod\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*(?:/\*|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
 reason = "recursive chmod on a filesystem root or system directory breaks the system"
 
 [[deny]]
-pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+\s+(?:/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
+pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+\s+(?:/\*|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
 reason = "recursive chown on a filesystem root or system directory breaks ownership system-wide"

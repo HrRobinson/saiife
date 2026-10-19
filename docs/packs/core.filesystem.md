@@ -33,6 +33,12 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   included). The relative targets of `rm`, `chmod -R` and `chown -R` are
   judged as if they were written from that folder. A `cd` inside `( ... )`
   ends at the `)`.
+- A `cd` that may be skipped (after `||` or `&&`, or inside an `if`, a loop
+  or a `case` branch) adds a folder instead of replacing one. The delete is
+  then judged against every folder the shell may be in, so
+  `cd / || cd /tmp; rm -rf *` is blocked. A `cd` used as a condition
+  (`if cd /; then rm -rf *; fi`, `while cd /; do ...`, `! cd /`) and a `cd`
+  run through `eval` are followed too.
 
 These rules also apply when the command runs through `sudo`, `bash -c '...'`
 or after `cd`.
@@ -56,14 +62,20 @@ or after `cd`.
 - A deep folder under a system folder is not treated as catastrophic. For
   example `rm -rf /var/folders/xy/tmp` is allowed.
 - A `cd` to a folder saiife cannot work out is not followed: `cd -`,
-  `cd "$(mktemp -d)"`, `cd $SOME_VAR`, `cd ~otheruser`, `popd`. The delete
-  after it is judged as written, so `cd "$(...)" && rm -rf *` is allowed. A
-  relative `cd` (`cd build`) is followed only from a folder saiife knows.
+  `cd "$(mktemp -d)"`, `cd $SOME_VAR`, `cd ~otheruser` (another user's home),
+  `popd`. The delete after it is judged as written, so
+  `cd "$(...)" && rm -rf *` is allowed. A relative `cd` (`cd build`) is
+  followed only from a folder saiife knows.
+- `CDPATH` is ignored. With `CDPATH` set, `cd usr` may go to `/usr`, but
+  saiife treats it as a relative `cd` from the current folder.
 - `cd` is followed by its text alone. saiife does not check that the folder
-  exists or follow symlinks, and it assumes the `cd` worked. A `cd` in a
-  pipeline (`cd / | ...`) or in the background (`cd / &`) is not followed.
-  Neither is a `cd` written as an `if` or `while` condition
-  (`if cd /; then ...`).
+  exists or follow symlinks. A `cd` that always runs is assumed to work, so
+  `cd /missing; rm -rf *` is judged as if it ran in `/missing`. A `cd` in a
+  pipeline (`cd / | ...`) or in the background (`cd / &`) is not followed,
+  since it runs in a shell of its own. With more than 16 possible folders at
+  once, the delete is judged as written.
+- A quoted `*` after a `cd` is read as a glob: `cd /usr && rm -rf "*"` is
+  blocked, although it would delete only a file named `*`.
 - Protection of saiife's own files is in the `core.self` pack, not here.
 
 ## Examples
@@ -83,6 +95,15 @@ deny cd ~ || exit; rm -rf .*
 deny (cd / && rm -rf *)
 deny bash -c 'cd / && rm -rf *'
 deny cd /usr && cd .. && rm -rf *
+deny cd / || cd /tmp; rm -rf *
+deny cd /; false && cd /tmp; rm -rf *
+deny if cd /; then rm -rf *; fi
+deny while cd /; do rm -rf *; done
+deny ! cd /; rm -rf *
+deny eval cd /; rm -rf *
+deny chmod -R 777 /*
+deny cd / && chmod -R 777 *
+deny cd / && chown -R root *
 allow rm -rf node_modules
 allow rm -rf /tmp/scratch
 allow rm file.txt
@@ -91,4 +112,6 @@ allow cd /tmp && rm -rf ./build
 allow cd build && rm -rf *
 allow (cd / && ls) && rm -rf ./dist
 allow cd "$(mktemp -d)" && rm -rf *
+allow cd /tmp || exit; rm -rf *
+allow if cd build; then rm -rf *; fi
 ```

@@ -344,12 +344,14 @@ impl Engine {
             env_changed: false,
             ifs_named: false,
         };
-        self.evaluate_inner(raw_cmd, start, 0, &state, false)
+        self.evaluate_inner(raw_cmd, start, 0, &state, false, None)
     }
 
     /// `state`: the shell state at the start of `raw_cmd`; a nested
     /// evaluation inherits it. `sub_body`: `raw_cmd` is the body of a
     /// `$(…)` (lexed as bash lexes one: `split_substitution_noted`).
+    /// `out`: receives where the line's `cd`s leave the shell (for a line
+    /// that runs in the calling shell: `eval`), unless it is denied.
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
@@ -357,6 +359,7 @@ impl Engine {
         depth: u32,
         state: &ShellState,
         sub_body: bool,
+        out: Option<&mut RuleCwd>,
     ) -> Decision {
         let mut state = state.clone();
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
@@ -373,37 +376,76 @@ impl Engine {
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
         };
 
-        // The rule cwd at each open `(`: a subshell's `cd` ends at its `)`.
-        let mut subshells: Vec<RuleCwd> = Vec::new();
+        // Open `(` / `{` groups: the rule cwd to restore at a subshell's
+        // `)`, and whether the group may be skipped (`a && { cd x; }`).
+        let mut groups: Vec<(Option<RuleCwd>, bool)> = Vec::new();
+        // Open `if`/`while`/`until`/`for`/`select`/`case` bodies, which
+        // may run zero times.
+        let mut blocks = 0usize;
         for (i, seg) in segments.iter().enumerate() {
             if start.elapsed() > self.budget {
                 return timed_out();
             }
+            let mut last = None;
             for op in &seps[i] {
                 match op {
-                    Operator::LParen => subshells.push(state.rule_cwd.clone()),
-                    Operator::RParen => {
-                        if let Some(outer) = subshells.pop() {
+                    Operator::LParen | Operator::LBrace => {
+                        let skip = blocks > 0
+                            || groups.iter().any(|g| g.1)
+                            || matches!(last, Some(Operator::AndAnd | Operator::OrOr));
+                        let saved = (*op == Operator::LParen).then(|| state.rule_cwd.clone());
+                        groups.push((saved, skip));
+                    }
+                    Operator::RParen | Operator::RBrace => {
+                        if let Some((Some(outer), _)) = groups.pop() {
                             state.rule_cwd = outer;
                         }
                     }
                     _ => {}
                 }
+                last = Some(*op);
             }
             if seg.is_empty() {
                 continue;
             }
+            let head = seg.first().filter(|w| !w.quoted).map(|w| w.text.as_str());
+            if matches!(head, Some("fi" | "done" | "esac")) {
+                blocks = blocks.saturating_sub(1);
+            }
+            // The segment may not run: it follows `&&`/`||` or a case
+            // pattern, or sits in a block or group that may be skipped.
+            let may_skip = blocks > 0
+                || groups.iter().any(|g| g.1)
+                || matches!(
+                    last,
+                    Some(
+                        Operator::AndAnd
+                            | Operator::OrOr
+                            | Operator::CaseParen
+                            | Operator::RParen
+                            | Operator::RBrace
+                    )
+                );
             // A piped or backgrounded command runs in a subshell of its
             // own: its `cd` moves nothing after it.
-            let own_subshell = seps[i].last() == Some(&Operator::Pipe)
+            let own_subshell = last == Some(Operator::Pipe)
                 || matches!(seps[i + 1].first(), Some(Operator::Pipe | Operator::Amp));
             let rule_cwd = own_subshell.then(|| state.rule_cwd.clone());
-            if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found) {
+            if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found, may_skip) {
                 return d;
             }
             if let Some(rule_cwd) = rule_cwd {
                 state.rule_cwd = rule_cwd;
             }
+            if matches!(
+                head,
+                Some("if" | "while" | "until" | "for" | "select" | "case")
+            ) {
+                blocks += 1;
+            }
+        }
+        if let Some(out) = out {
+            *out = state.rule_cwd.clone();
         }
         found.finish()
     }
@@ -416,6 +458,7 @@ impl Engine {
         cx: &Ctx,
         state: &mut ShellState,
         found: &mut Findings,
+        may_skip: bool,
     ) -> Option<Decision> {
         // A word whose brace expansion was too large is judged as
         // written, and the command is recorded as not fully judged.
@@ -445,11 +488,11 @@ impl Engine {
         if let Some(d) = self.operands_phase(&view, cx, state, found) {
             return Some(d);
         }
-        if let Some(d) = self.eval_phase(&view, cx, state, found) {
+        if let Some(d) = self.eval_phase(&view, cx, state, found, may_skip) {
             return Some(d);
         }
         Self::environment_phase(&view, cx, state);
-        self.cd_phase(&view, state);
+        self.cd_phase(&view, state, may_skip);
         self.inline_payload_phase(&view, cx, state, found)
     }
 
@@ -460,12 +503,13 @@ impl Engine {
     fn recurse(
         &self,
         inner: &str,
-        start: Instant,
-        depth: u32,
+        cx: &Ctx,
         state: &ShellState,
         sub_body: bool,
         what: &str,
+        out: Option<&mut RuleCwd>,
     ) -> Nested {
+        let (start, depth) = (cx.start, cx.depth);
         // Fail open (recorded) beyond the cap rather than recursing
         // unboundedly on adversarial nesting.
         if depth >= MAX_INLINE_DEPTH {
@@ -474,7 +518,7 @@ impl Engine {
         if start.elapsed() > self.budget {
             return Nested::TimedOut;
         }
-        match self.evaluate_inner(inner, start, depth + 1, state, sub_body) {
+        match self.evaluate_inner(inner, start, depth + 1, state, sub_body, out) {
             Decision::Deny {
                 pack,
                 pattern,
@@ -528,14 +572,7 @@ impl Engine {
         else {
             return Flow::Proceed;
         };
-        let nested = self.recurse(
-            &inner,
-            cx.start,
-            cx.depth,
-            state,
-            dollar,
-            "command substitution",
-        );
+        let nested = self.recurse(&inner, cx, state, dollar, "command substitution", None);
         if let Some(d) = found.nested(nested) {
             return Flow::Done(d);
         }
@@ -582,14 +619,7 @@ impl Engine {
             for (inner, dollar) in find_all_substitution_kinds(&word.text) {
                 // Past the depth cap: recorded on this one substitution,
                 // and the rest of the segment is still scanned.
-                let nested = self.recurse(
-                    &inner,
-                    cx.start,
-                    cx.depth,
-                    state,
-                    dollar,
-                    "command substitution",
-                );
+                let nested = self.recurse(&inner, cx, state, dollar, "command substitution", None);
                 if let Some(d) = found.nested(nested) {
                     return Some(d);
                 }
@@ -699,23 +729,25 @@ impl Engine {
         cx: &Ctx,
         state: &ShellState,
     ) -> Option<Decision> {
-        let argv = state.rule_cwd.rewrite(&view.argv, self.vars.home())?;
-        let mut line = argv.join(" ");
-        if !view.peeled.is_empty() {
-            line.push(' ');
-            line.push_str(&view.peeled);
+        for argv in state.rule_cwd.rewrite(&view.argv, self.vars.home()) {
+            let mut line = argv.join(" ");
+            if !view.peeled.is_empty() {
+                line.push(' ');
+                line.push_str(&view.peeled);
+            }
+            match self.judge_in(
+                Some(CD_RESOLVED_PACK),
+                &line,
+                &line,
+                view.env_changed,
+                cx.start,
+            ) {
+                JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
+                JudgeOutcome::TimedOut => return Some(timed_out()),
+                _ => {}
+            }
         }
-        match self.judge_in(
-            Some(CD_RESOLVED_PACK),
-            &line,
-            &line,
-            view.env_changed,
-            cx.start,
-        ) {
-            JudgeOutcome::Decided(d @ Decision::Deny { .. }) => Some(d),
-            JudgeOutcome::TimedOut => Some(timed_out()),
-            _ => None,
-        }
+        None
     }
 
     /// Files the command reads or writes, judged by the path rules that
@@ -772,8 +804,9 @@ impl Engine {
         &self,
         view: &SegmentView,
         cx: &Ctx,
-        state: &ShellState,
+        state: &mut ShellState,
         found: &mut Findings,
+        may_skip: bool,
     ) -> Option<Decision> {
         if view.argv[0] != "eval" {
             return None;
@@ -795,7 +828,11 @@ impl Engine {
         if inner.trim().is_empty() {
             return None;
         }
-        found.nested(self.recurse(&inner, cx.start, cx.depth, state, false, "eval"))
+        // eval runs in this shell: its `cd`s move the rest of the line.
+        let mut after = state.rule_cwd.clone();
+        let nested = self.recurse(&inner, cx, state, false, "eval", Some(&mut after));
+        state.rule_cwd.then(after, may_skip);
+        found.nested(nested)
     }
 
     /// A builtin that changes PATH, HOME or XDG_DATA_HOME changes them for
@@ -805,10 +842,10 @@ impl Engine {
     }
 
     /// `cd`/`pushd`: the later segments may run in its target too.
-    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) {
+    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState, may_skip: bool) {
         state
             .rule_cwd
-            .command(&view.argv, &view.resolved, self.vars.home());
+            .command(&view.argv, &view.resolved, self.vars.home(), may_skip);
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
             state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
         }
@@ -832,7 +869,7 @@ impl Engine {
         found: &mut Findings,
     ) -> Option<Decision> {
         let inner = inline_payload(&view.argv).or_else(|| watch_payload(&view.argv))?;
-        let nested = self.recurse(&inner, cx.start, cx.depth, state, false, "inline command");
+        let nested = self.recurse(&inner, cx, state, false, "inline command", None);
         found.nested(nested)
     }
 

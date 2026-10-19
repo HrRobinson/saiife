@@ -227,6 +227,9 @@ pub enum Operator {
     RParen,
     LBrace,
     RBrace,
+    /// The `)` that ends a `case` pattern, or a pattern's optional leading
+    /// `(`: not a subshell boundary.
+    CaseParen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,10 +638,13 @@ impl Lexer<'_, '_> {
                 self.flush_word();
                 // A pattern's optional leading `(` (`(a) cmd;;`) is not
                 // matched by the `)` that ends the pattern.
-                if !self.case_pattern {
+                let op = if self.case_pattern {
+                    Operator::CaseParen
+                } else {
                     self.parens += 1;
-                }
-                self.toks.push(LexTok::Operator(Operator::LParen));
+                    Operator::LParen
+                };
+                self.toks.push(LexTok::Operator(op));
             }
             ')' => return self.close_paren(),
             // `{` alone (followed by a blank or the end) opens a group,
@@ -725,7 +731,7 @@ impl Lexer<'_, '_> {
         self.flush_word();
         if self.case_pattern {
             self.case_pattern = false;
-            self.toks.push(LexTok::Operator(Operator::RParen));
+            self.toks.push(LexTok::Operator(Operator::CaseParen));
             return true;
         }
         if self.sub && self.parens == 0 {
