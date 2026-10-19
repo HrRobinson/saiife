@@ -814,6 +814,195 @@ test_codex_end_to_end_with_fake() {
   cmp -s "$LC_HOME/.codex/auth.json" "$LC_ROOT/auth.orig" || fail "auth.json changed"
 }
 
+# --- Gemini CLI checks -------------------------------------------------------
+
+# Source checks-gemini.sh under a fresh LC_ROOT with lc_check/lc_record
+# replaced by recorders, run agent_checks and leave the recorded rows in
+# $LC_ROOT/rec as "id class expect mode setup control key" (tab-separated).
+gemini_record_checks() {
+  export LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  new_root
+  # shellcheck source=/dev/null
+  source "$HERE/checks-gemini.sh"
+  LC_RESULTS="$LC_ROOT/results.tsv"
+  : >"$LC_RESULTS"
+  : >"$LC_ROOT/rec"
+  lc_check() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:--}" "${6:--}" \
+      "${GEMINI_KEY:--}" >>"$LC_ROOT/rec"
+    if [[ "$2" == control ]]; then
+      printf '%s\tcontrol\tran\tran\tPASS\t-\n' "$1" >>"$LC_RESULTS"
+    fi
+  }
+  lc_record() {
+    printf '%s\t%s\t%s\t%s\t-\t-\t-\n' "$1" "$2" "$3" "$4" >>"$LC_ROOT/rec"
+    printf '%s\t%s\t%s\t%s\t-\t%s\n' "$1" "$2" "$3" "$4" "${5:--}" >>"$LC_RESULTS"
+  }
+  agent_checks
+}
+
+# The fixture with the witness handler first in its group, as `jq -S` prints it.
+gemini_fixture_plus_witness() {
+  jq -S --arg w "$LC_WITNESS" '.hooks.BeforeTool[0].hooks =
+    [{type: "command", command: $w, name: "lockcheck-witness", timeout: 10000}] + .hooks.BeforeTool[0].hooks' \
+    "$LC_MANAGED/gemini/settings.json"
+}
+
+test_gemini_checks_static() {
+  local fixture managed ids want id setup key mode
+  export LOCKCHECK_GEMINI_TOGGLE="hooksConfig.enabled"
+  gemini_record_checks
+  fixture="$LC_MANAGED/gemini/settings.json"
+  managed="$LC_ROOT/etc/gemini-cli/settings.json"
+  ids="$(cut -f1 "$LC_ROOT/rec" | tr '\n' ' ')"
+  want="gemini.control gemini.toggle.probe gemini.system.fires gemini.deny"
+  want+=" gemini.toggle-off.user.hooksConfig.enabled gemini.toggle-off.project.hooksConfig.enabled"
+  want+=" gemini.pin-needed.hooksConfig.enabled gemini.hooks-empty.user gemini.hooks-empty.project"
+  want+=" gemini.gemini-home gemini.system-path-env gemini.fail.exit3 gemini.fail.exit101"
+  want+=" gemini.fail.segv gemini.fail.timeout gemini.fail.missing gemini.fail.exit1"
+  want+=" gemini.mcp.control gemini.mcp.hooked gemini.mcp.excluded gemini.mcp.allowlist "
+  assert_eq "$ids" "$want" "check ids"
+  assert_eq "$(awk -F'\t' '$2 == "gate" && $3 != "blocked" && $3 != "fired"' "$LC_ROOT/rec")" "" \
+    "gate rows expecting something other than blocked/fired"
+  assert_eq "$(awk -F'\t' '$1 == "gemini.toggle.probe" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
+    "info - found"
+  assert_eq "$(awk -F'\t' '$1 == "gemini.system-path-env" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
+    "caveat ran deny"
+  assert_eq "$(awk -F'\t' '$1 == "gemini.fail.timeout" { print $2, $3, $4 }' "$LC_ROOT/rec")" "gap ran hang"
+  assert_eq "$(awk -F'\t' '$1 ~ /^gemini\.mcp\.(excluded|allowlist)$/ { print $3, $6 }' "$LC_ROOT/rec")" \
+    "unavailable gemini.mcp.control
+unavailable gemini.mcp.control" "MCP rows' control"
+  assert_eq "$(awk -F'\t' '$1 ~ /toggle-off|pin-needed/ { print $7 }' "$LC_ROOT/rec" | sort -u)" \
+    hooksConfig.enabled "toggle key passed to setup"
+
+  # Baseline: fixture + witness + pin, trust for the project.
+  agent_baseline
+  jq -e . "$managed" >/dev/null || fail "managed settings do not parse"
+  assert_eq "$(jq -c '.hooks.BeforeTool[0].hooks[1]' "$managed")" \
+    "$(jq -c '.hooks.BeforeTool[0].hooks[0]' "$fixture")" "saiife handler"
+  assert_eq "$(jq -r '.hooks.BeforeTool[0].hooks[0].command' "$managed")" "$LC_WITNESS" "witness first"
+  assert_eq "$(jq '.hooks | keys | length' "$managed")" 1 "witness only on BeforeTool"
+  assert_eq "$(jq -r '.hooksConfig.enabled' "$managed")" true "pinned toggle"
+  assert_eq "$(jq -S 'del(.hooksConfig)' "$managed")" "$(gemini_fixture_plus_witness)" "rest of baseline"
+  assert_eq "$(stat -c %a "$managed")" 644 "managed file mode"
+  assert_eq "$(jq -r --arg p "$LC_PROJECT" '.[$p]' "$LC_HOME/.gemini/trustedFolders.json")" TRUST_FOLDER
+
+  # Every setup fn runs under LC_ROOT and keeps the user's other settings.
+  while IFS=$'\t' read -r id _ _ mode setup _ key; do
+    [[ "$setup" != - ]] || continue
+    declare -F "$setup" >/dev/null || fail "$id: setup fn $setup not defined"
+    mkdir -p "$LC_HOME/.gemini"
+    printf '{"security": {"auth": {"selectedType": "oauth-personal"}}}\n' >"$LC_HOME/.gemini/settings.json"
+    touch "$LC_HOME/.gemini/oauth_creds.json" "$LC_HOME/.gemini/google_accounts.json"
+    rm -rf "$LC_HOME/alt"
+    agent_baseline
+    LC_AGENT_ENV=()
+    LC_AGENT_ARGS=()
+    LC_PROMPT=""
+    LC_POST=""
+    LC_NONCE=0123456789ab
+    GEMINI_KEY="$key"
+    "$setup"
+    assert_eq "$(jq -r '.security.auth.selectedType' "$LC_HOME/.gemini/settings.json")" oauth-personal \
+      "$id: user auth setting kept"
+    case "$id" in
+      *.toggle-off.user.*)
+        assert_eq "$(jq -r '.hooksConfig.enabled' "$LC_HOME/.gemini/settings.json")" false "$id" ;;
+      *.toggle-off.project.*)
+        assert_eq "$(jq -r '.hooksConfig.enabled' "$LC_PROJECT/.gemini/settings.json")" false "$id" ;;
+      *.pin-needed.*)
+        assert_eq "$(jq -r '.hooksConfig.enabled' "$LC_HOME/.gemini/settings.json")" false "$id"
+        assert_eq "$(jq -S . "$managed")" "$(gemini_fixture_plus_witness)" "$id: managed without pin" ;;
+      *.hooks-empty.user)
+        assert_eq "$(jq -c '.hooks' "$LC_HOME/.gemini/settings.json")" '{"BeforeTool":[]}' "$id" ;;
+      *.hooks-empty.project)
+        assert_eq "$(jq -c '.hooks' "$LC_PROJECT/.gemini/settings.json")" '{"BeforeTool":[]}' "$id" ;;
+      *.gemini-home)
+        assert_eq "${LC_AGENT_ENV[*]}" "GEMINI_CLI_HOME=$LC_HOME/alt" "$id env"
+        assert_eq "$(jq -r '.hooksConfig.enabled' "$LC_HOME/alt/.gemini/settings.json")" false "$id"
+        assert_eq "$(jq -r '.security.auth.selectedType' "$LC_HOME/alt/.gemini/settings.json")" \
+          oauth-personal "$id: alt keeps auth"
+        assert_eq "$(readlink "$LC_HOME/alt/.gemini/oauth_creds.json")" \
+          "$LC_HOME/.gemini/oauth_creds.json" "$id: login symlink" ;;
+      *.system-path-env)
+        assert_eq "${LC_AGENT_ENV[*]}" "GEMINI_CLI_SYSTEM_SETTINGS_PATH=$LC_ROOT/work/empty-settings.json" "$id"
+        assert_eq "$(jq -c . "$LC_ROOT/work/empty-settings.json")" '{}' "$id: empty settings" ;;
+      *.mcp.*)
+        assert_eq "$(jq -r '.mcpServers.lockcheck.args[0]' "$LC_HOME/.gemini/settings.json")" \
+          "$HERE/mcp-marker.js" "$id: server"
+        [[ "$LC_PROMPT" == *0123456789ab* && "$LC_PROMPT" == *touch_marker* ]] || fail "$id prompt: $LC_PROMPT"
+        case "$id" in
+          *.excluded) assert_eq "$(jq -c '.mcp.excluded' "$managed")" '["lockcheck"]' "$id" ;;
+          *.allowlist) assert_eq "$(jq -c '.mcp.allowed' "$managed")" '["other"]' "$id" ;;
+          *.hooked) [[ -n "$LC_POST" ]] || fail "$id: no LC_POST" ;;
+        esac ;;
+      *) fail "$id: unexpected setup $setup (mode $mode)" ;;
+    esac
+  done <"$LC_ROOT/rec"
+  # Credentials were never touched.
+  [[ -f "$LC_HOME/.gemini/oauth_creds.json" && ! -L "$LC_HOME/.gemini/oauth_creds.json" ]] ||
+    fail "login file replaced"
+}
+
+test_gemini_checks_static_no_toggle() {
+  export LOCKCHECK_GEMINI_TOGGLE=""
+  gemini_record_checks
+  if grep -qE 'toggle-off|pin-needed' "$LC_ROOT/rec"; then
+    fail "toggle rows without a toggle: $(cut -f1 "$LC_ROOT/rec")"
+  fi
+  assert_eq "$(awk -F'\t' '$1 == "gemini.toggle.probe" { print $4 }' "$LC_ROOT/rec")" not-found
+  grep -q $'^gemini.toggle.probe\t.*\tno hooks toggle in schema' "$LC_RESULTS" ||
+    fail "probe detail: $(cat "$LC_RESULTS")"
+  agent_baseline
+  assert_eq "$(jq -S . "$LC_ROOT/etc/gemini-cli/settings.json")" "$(gemini_fixture_plus_witness)" \
+    "baseline without toggle"
+}
+
+test_gemini_toggle_probe_reads_schema() {
+  local pkg
+  export LOCKCHECK_GEMINI_TOGGLE=""
+  export LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  new_root
+  pkg="$LC_ROOT/usr/local/lib/node_modules/@google/gemini-cli/dist/src/config"
+  mkdir -p "$pkg"
+  cat >"$pkg/settingsSchema.js" <<'EOF'
+const OTHER = { hookDecoy: { type: 'boolean', default: true } };
+export const SETTINGS_SCHEMA = {
+    general: { type: 'object', default: {}, properties: {
+        vimMode: { type: 'boolean', default: false },
+    } },
+    hooksConfig: {
+        type: 'object',
+        label: 'Hooks {config}', // a comment with { brace
+        default: {},
+        properties: {
+            enabled: { type: 'boolean', label: 'Enable', default: true,
+                description: `Turn hooks "on" or 'off' {}.` },
+            disabled: { type: 'array', default: [], items: { type: 'string' } },
+            notifications: { type: 'boolean', default: true },
+            options: { type: 'enum', default: 'a', options: [{ value: 'a', label: 'A' }] },
+        },
+    },
+    tools: { type: 'object', properties: {
+        enableHooks: { type: "boolean", default: false },
+        sandbox: { type: 'boolean', default: false },
+        hookTimeout: { type: 'number', default: 5 },
+    } },
+};
+const LATER = { lateHook: { type: 'boolean', default: true } };
+EOF
+  # shellcheck source=/dev/null
+  source "$HERE/checks-gemini.sh"
+  assert_eq "$(gemini_toggle_keys | tr '\n' ' ')" \
+    "hooksConfig.enabled hooksConfig.notifications tools.enableHooks " "toggle keys from schema"
+  LOCKCHECK_GEMINI_TOGGLE="a.hooks b.disableHooks"
+  GEMINI_TOGGLES_LOADED=""
+  assert_eq "$(gemini_toggle_keys | tr '\n' ' ')" "a.hooks b.disableHooks " "override"
+  agent_baseline
+  assert_eq "$(jq -c '[.a.hooks, .b.disableHooks]' "$LC_ROOT/etc/gemini-cli/settings.json")" \
+    '[true,false]' "pin polarity (a disable* key is pinned false)"
+}
+
 # --- runner ------------------------------------------------------------------
 
 main() {
