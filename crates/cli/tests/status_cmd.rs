@@ -938,3 +938,20 @@ fn init_from_subdir_after_config_removed_restores_the_project() {
     let (c, text) = status(&env);
     assert_eq!(c, 0, "{text}");
 }
+
+/// The packs line says where the config came from when that is not the
+/// project shown in the header.
+#[test]
+fn packs_line_names_a_config_from_another_directory() {
+    let env = Env::new(&["claude"]);
+    let proj = env.root().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let out = env.saiife_in(&proj, &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    std::fs::remove_file(proj.join(".saiife/config.toml")).unwrap();
+    env.write(".saiife/config.toml", "packs = []\n");
+    let out = env.saiife_in(&proj, &["status"]);
+    let text = stdout(&out);
+    let want = format!("packs (from {}/.saiife/config.toml):", env.root().display());
+    assert!(text.contains(&want), "{text}");
+}

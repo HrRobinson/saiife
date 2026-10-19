@@ -391,9 +391,22 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
         .cloned()
         .collect();
     let ids: Vec<&str> = active.iter().map(|p| p.id.as_str()).collect();
-    println!("  packs   {}", ids.join(", "));
+    println!("{}", packs_line(root, project.root.as_deref(), &ids));
     let vars = crate::paths::path_vars(Some(root), Some(root));
     print!("{}", inactive_lines(&active, &vars));
+}
+
+/// The `packs …` line. When the config it was read from sits in another
+/// directory than the project in the header, the line says where from.
+fn packs_line(root: &Path, config_root: Option<&Path>, ids: &[&str]) -> String {
+    match config_root {
+        Some(dir) if dir != root => format!(
+            "  packs (from {}/{CONFIG_REL}): {}",
+            dir.display(),
+            ids.join(", ")
+        ),
+        _ => format!("  packs   {}", ids.join(", ")),
+    }
 }
 
 /// The `inactive here: …` lines under the packs line (empty when every path
