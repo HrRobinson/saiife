@@ -3,6 +3,10 @@ name: release
 on:
   push:
     tags: ['v*']
+  # Dry-run the build matrix on PRs that touch the release path. publish,
+  # install-test and release only run for a pushed v* tag.
+  pull_request:
+    paths: ['.github/workflows/release.yml', 'install.sh']
   workflow_dispatch:
 
 permissions:
@@ -176,9 +180,12 @@ jobs:
         run: |
           set -euo pipefail
           : > notes.md
+          : > heading.txt
           if [ -f CHANGELOG.md ]; then
+            # The section body goes to notes.md, without its "## <version>"
+            # heading: the release title already carries the version.
             awk -v v="$VERSION" '
-              /^## / { if (found) exit; if ($2 == v) found = 1 }
+              /^## / { if (found) exit; if ($2 == v) { found = 1; print > "heading.txt"; next } }
               found { print }
             ' CHANGELOG.md > notes.md
           fi
@@ -186,12 +193,18 @@ jobs:
             echo "::error::CHANGELOG.md has no section for version $VERSION; add '## $VERSION' release notes before tagging"
             exit 1
           fi
+          if grep -q 'YYYY-MM-DD' heading.txt notes.md; then
+            echo "::error::CHANGELOG.md still has the YYYY-MM-DD placeholder; set the release date before tagging"
+            exit 1
+          fi
           cat notes.md
-      - name: create release
+      # Draft first: nothing is public (or "latest") until install-test passes.
+      - name: create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
             --title "saiife $GITHUB_REF_NAME" \
             --notes-file notes.md \
             dist/*.tar.gz dist/SHA256SUMS install.sh
@@ -204,26 +217,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Draft releases are only visible to tokens with push access, so reading
+    # the draft's assets needs contents: write even though nothing is written.
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
     steps:
-      - name: install from the release
+      - name: download the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D rel
+      - name: install from the draft assets
         shell: bash
         run: |
           set -euo pipefail
-          url="https://github.com/HrRobinson/saiife/releases/download/$GITHUB_REF_NAME/install.sh"
-          # The release can take a moment to become visible.
-          for attempt in 1 2 3 4 5; do
-            if curl -fsSL "$url" -o install.sh; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::install.sh not downloadable after 5 attempts"
-              exit 1
-            fi
-            sleep 10
-          done
-          SAIIFE_VERSION="$VERSION" sh install.sh
+          ls -l rel
+          SAIIFE_DOWNLOAD_BASE="file://$PWD/rel/" SAIIFE_VERSION="$VERSION" sh rel/install.sh
       - name: saiife --version
         shell: bash
         run: |
@@ -234,3 +244,15 @@ jobs:
             *"$VERSION"*) ;;
             *) echo "::error::installed saiife does not report $VERSION"; exit 1 ;;
           esac
+
+  release:
+    needs: install-test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft=false

@@ -54,6 +54,10 @@ pick_downloader() {
     downloader=curl
   elif command -v wget >/dev/null 2>&1; then
     downloader=wget
+    wget_https_only=0
+    if wget --help 2>&1 | grep -q -- '--https-only'; then
+      wget_https_only=1
+    fi
   else
     die "curl or wget is required to download saiife"
   fi
@@ -67,7 +71,13 @@ download() {
       curl -fsSL --proto '=https,file' --tlsv1.2 -o "$2" "$1"
       ;;
     wget)
-      wget -q --https-only -O "$2" "$1"
+      # https is enforced on the base URL in main; --https-only also limits
+      # redirects, but BusyBox wget (Alpine) does not know it.
+      if [ "$wget_https_only" -eq 1 ]; then
+        wget -q --https-only -O "$2" "$1"
+      else
+        wget -q -O "$2" "$1"
+      fi
       ;;
   esac
 }
@@ -132,6 +142,9 @@ main() {
   detect_target
   pick_downloader
 
+  if [ "$system" -eq 1 ] && [ -n "${SAIIFE_INSTALL_DIR:-}" ]; then
+    die "--system and SAIIFE_INSTALL_DIR conflict; use one or the other"
+  fi
   if [ "$system" -eq 1 ]; then
     install_dir=/usr/local/bin
   elif [ -n "${SAIIFE_INSTALL_DIR:-}" ]; then

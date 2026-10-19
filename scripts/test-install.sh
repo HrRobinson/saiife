@@ -17,7 +17,7 @@ installer="$repo/install.sh"
 
 if [ -z "${SAIIFE_BIN:-}" ]; then
   (cd "$repo" && cargo build --release --quiet)
-  SAIIFE_BIN="$repo/target/release/saiife"
+  SAIIFE_BIN="${CARGO_TARGET_DIR:-$repo/target}/release/saiife"
 fi
 if [ ! -x "$SAIIFE_BIN" ]; then
   echo "test-install: no executable saiife binary at $SAIIFE_BIN" >&2
@@ -130,6 +130,27 @@ if [ "$status" -eq 0 ] && [ -x "$c/opt/bin/saiife" ] &&
   ok install_dir_override
 else
   bad install_dir_override "status=$status; $(cat "$c/out")"
+fi
+
+# --- system_and_install_dir_conflict -----------------------------------------
+c="$scratch/system-conflict"
+make_release "$c/rel" 0.1.0
+set +e
+env -i \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  HOME="$c/home" \
+  TMPDIR="$c" \
+  SAIIFE_DOWNLOAD_BASE="file://$c/rel/" \
+  SAIIFE_VERSION=0.1.0 \
+  SAIIFE_INSTALL_DIR="$c/opt/bin" \
+  sh "$installer" --system >"$c/out" 2>&1
+status=$?
+set -e
+if [ "$status" -eq 1 ] && grep -q "saiife: --system and SAIIFE_INSTALL_DIR conflict" "$c/out" &&
+  [ ! -e "$c/opt/bin/saiife" ] && [ ! -e "$c/home/.local/bin/saiife" ]; then
+  ok system_and_install_dir_conflict
+else
+  bad system_and_install_dir_conflict "status=$status; $(cat "$c/out")"
 fi
 
 # --- checksum_mismatch_installs_nothing ---------------------------------------

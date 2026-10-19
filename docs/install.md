@@ -31,7 +31,8 @@ To use another folder, set `SAIIFE_INSTALL_DIR`.
 ## Install for all users
 
 Pass `--system` to install to `/usr/local/bin`. It asks for `sudo` only if that folder
-is not writable.
+is not writable. `--system` cannot be combined with `SAIIFE_INSTALL_DIR`; the script
+stops with an error if both are set.
 
 ```sh
 curl -fsSL https://github.com/HrRobinson/saiife/releases/latest/download/install.sh | sh -s -- --system
