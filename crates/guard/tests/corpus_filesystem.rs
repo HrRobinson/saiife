@@ -170,6 +170,28 @@ fn rm_targets_are_judged_against_an_earlier_cd() {
         "eval cd /; rm -rf *",
         // `pushd -n` only edits the stack.
         "cd / && pushd -n /tmp && rm -rf *",
+        // A cd whose failure runs the next command (re-review N2).
+        "cd /; ! cd /tmp && rm -rf *",
+        "cd /; ! cd /nonexistent && rm -rf *",
+        "cd /etc; ! cd /tmp && rm -rf *",
+        "cd /; time ! cd /tmp && rm -rf *",
+        "cd /; until cd /tmp; do rm -rf *; done",
+        "cd /; while ! cd /tmp; do rm -rf *; done",
+        "cd /; if ! cd /tmp; then rm -rf *; fi",
+        "cd /; if cd /tmp; then :; else rm -rf *; fi",
+        "cd /; if cd /tmp; then :; elif true; then rm -rf *; fi",
+        // A `cd` shell function (re-review N3): its body's cd counts.
+        "function cd { builtin cd /; }; cd /tmp && rm -rf *",
+        "cd() { builtin cd /; }; cd /tmp && rm -rf *",
+        // Overflow is sticky (re-review N1).
+        &*format!(
+            "{}cd /etc; cd . && rm -rf *",
+            (0..16).map(|i| format!("cd /t{i}; ")).collect::<String>()
+        ),
+        &*format!(
+            "{}cd /etc; cd x && cd .. && rm -rf *",
+            (0..16).map(|i| format!("cd /t{i}; ")).collect::<String>()
+        ),
         // `!` / `time [-p]` in front of a block head or a cd.
         "time if cd /; then rm -rf *; fi",
         "! time cd /; rm -rf *",
@@ -230,6 +252,23 @@ fn rm_targets_are_judged_against_an_earlier_cd() {
     }
 }
 
+/// Every `cd` target adds to the directories a later target is judged
+/// against: whether the `cd` worked, ran, or ran in a subshell is not
+/// modelled. These are blocked although they are safe (accepted).
+#[test]
+fn every_cd_target_counts_even_when_bash_would_not_be_there() {
+    let e = engine();
+    for cmd in [
+        "(cd /); rm -rf *",
+        "cd / | rm -rf *",
+        "cd / & rm -rf *",
+        "cd /; cd proj && rm -rf *",
+        "cd / && cd /tmp && rm -rf *",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.filesystem", "for {cmd:?}");
+    }
+}
+
 #[test]
 fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
     let e = engine();
@@ -237,17 +276,12 @@ fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
         "cd /tmp && rm -rf ./build",
         // A relative cd into a project subdirectory.
         "cd build && rm -rf *",
-        // A subshell's cd ends at its `)`.
         "(cd / && ls) && rm -rf ./dist",
-        "(cd /); rm -rf *",
         // Unknown working directory: judged as written (today's verdict).
         "cd \"$(mktemp -d)\" && rm -rf *",
         "cd - && rm -rf *",
         "cd $TMPDIR && rm -rf *",
         "cd ~other && rm -rf *",
-        // A piped or backgrounded cd runs in a subshell of its own.
-        "cd / | rm -rf *",
-        "cd / & rm -rf *",
         "popd && rm -rf *",
         // `..` above an unknown home is unknown.
         "cd ~ && cd .. && rm -rf ./x",
@@ -294,3 +328,26 @@ fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// cd tracking stops after a bounded number of `cd`s, so a long chain of
+/// them costs time linear in its length (re-review N5).
+#[test]
+fn a_long_cd_chain_stays_cheap() {
+    let e = engine();
+    let time = |n: usize| {
+        let line = format!("true{} && rm -rf *", " && cd x".repeat(n));
+        let t = std::time::Instant::now();
+        let got = e.evaluate(&line);
+        (t.elapsed(), got)
+    };
+    let (small, _) = time(1_000);
+    let (large, got) = time(10_000);
+    eprintln!("1k: {small:?}, 10k: {large:?}");
+    // Past the bound the relative target is denied, not timed out.
+    assert!(got.is_deny(), "{got:?}");
+    // Linear: ten times the cds, well under a hundred times the time.
+    assert!(
+        large < small * 30 + std::time::Duration::from_millis(20),
+        "1k {small:?}, 10k {large:?}"
+    );
+}

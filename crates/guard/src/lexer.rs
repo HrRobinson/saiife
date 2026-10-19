@@ -133,57 +133,36 @@ pub fn split_segments(cmd: &str) -> Vec<Segment> {
 /// or here-documents nested too deeply). The caller records it as a
 /// fail-open unless something else denies.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    let (segments, _, note) = split_noted(cmd, false);
-    (segments, note)
+    split_noted(cmd, false)
 }
 
 /// `split_segments_noted` for the body of a `$(…)` (the text between its
 /// parentheses): here-documents end as bash ends them inside one.
 pub fn split_substitution_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    let (segments, _, note) = split_noted(cmd, true);
-    (segments, note)
+    split_noted(cmd, true)
 }
 
-/// The operators around each segment: `seps[i]` are the operators between
-/// segment `i - 1` and segment `i` (in order), so there is one more entry
-/// than there are segments (the last holds the trailing operators).
-pub type Separators = Vec<Vec<Operator>>;
-
-/// `split_segments_noted` (or, with `body_top`, `split_substitution_noted`)
-/// that also returns the operators around each segment (`Separators`).
-pub fn split_segments_with_separators(
-    cmd: &str,
-    body_top: bool,
-) -> (Vec<Segment>, Separators, Option<&'static str>) {
-    split_noted(cmd, body_top)
-}
-
-fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Separators, Option<&'static str>) {
+fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>) {
     let mut ctx = Ctx::new();
     let mut segments: Vec<Segment> = Vec::new();
-    let mut seps: Separators = vec![Vec::new()];
     let mut current: Segment = Vec::new();
     let toks = lex_in(&mut Chars::new(cmd), &mut ctx, 0, false, false, body_top).toks;
 
     for tok in toks {
         match tok {
             LexTok::Word(w) => current.push(w),
-            LexTok::Operator(op) => {
+            LexTok::Operator(_) => {
                 if !current.is_empty() {
                     segments.push(std::mem::take(&mut current));
-                    seps.push(Vec::new());
                 }
-                seps.last_mut().expect("never empty").push(op);
             }
         }
     }
     if !current.is_empty() {
         segments.push(current);
-        seps.push(Vec::new());
     }
     (
         segments.into_iter().map(strip_leading_keywords).collect(),
-        seps,
         ctx.note,
     )
 }
@@ -227,9 +206,6 @@ pub enum Operator {
     RParen,
     LBrace,
     RBrace,
-    /// The `)` that ends a `case` pattern, or a pattern's optional leading
-    /// `(`: not a subshell boundary.
-    CaseParen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,13 +614,10 @@ impl Lexer<'_, '_> {
                 self.flush_word();
                 // A pattern's optional leading `(` (`(a) cmd;;`) is not
                 // matched by the `)` that ends the pattern.
-                let op = if self.case_pattern {
-                    Operator::CaseParen
-                } else {
+                if !self.case_pattern {
                     self.parens += 1;
-                    Operator::LParen
-                };
-                self.toks.push(LexTok::Operator(op));
+                }
+                self.toks.push(LexTok::Operator(Operator::LParen));
             }
             ')' => return self.close_paren(),
             // `{` alone (followed by a blank or the end) opens a group,
@@ -731,7 +704,7 @@ impl Lexer<'_, '_> {
         self.flush_word();
         if self.case_pattern {
             self.case_pattern = false;
-            self.toks.push(LexTok::Operator(Operator::CaseParen));
+            self.toks.push(LexTok::Operator(Operator::RParen));
             return true;
         }
         if self.sub && self.parens == 0 {
@@ -1038,21 +1011,6 @@ fn arith_body(
         }
     }
     None
-}
-
-/// How many leading words of a segment are `!`, `time` or the `-p` of
-/// `time -p` (unquoted): reserved words in front of a pipeline, after which
-/// a compound command (`if`, `while`, …) or a command still starts.
-pub fn pipeline_prefix_len(words: &[Word]) -> usize {
-    let mut n = 0;
-    while let Some(w) = words.get(n) {
-        let after_time = n > 0 && words[n - 1].text == "time";
-        if w.quoted || !(w.text == "!" || w.text == "time" || (after_time && w.text == "-p")) {
-            break;
-        }
-        n += 1;
-    }
-    n
 }
 
 /// Does a `[[` after these words (the current command so far) start a

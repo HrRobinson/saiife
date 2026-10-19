@@ -13,7 +13,7 @@
 
 use std::path::{Component, Path};
 
-use crate::lexer::{pipeline_prefix_len, Operator, Word};
+use crate::lexer::Word;
 
 /// A directory spelled lexically: from `/`, or from the home directory
 /// (`~`), so the rules' `~` / `$HOME` targets match it.
@@ -94,16 +94,17 @@ impl Dir {
     }
 }
 
-/// Directories the regex rules are judged against at most. Past it a new
-/// directory is dropped (the set is marked incomplete: `unknown`) and the
-/// ones already held are kept, except that `/` and `~` are always added.
+/// Distinct directories, and `cd` segments, followed in one command line at
+/// most. Past either the set is incomplete for the rest of the line (sticky)
+/// and stops changing, so the work per line stays small and linear.
 const MAX_DIRS: usize = 16;
+const MAX_CDS: usize = 64;
 
-/// Where a command line's earlier `cd`s may have left the shell, for the
-/// regex rules over the rest of it (`ShellState`). A `cd` that always runs
-/// replaces the set; one that may be skipped (`a || cd x`, `a && cd x`, an
-/// `if`/loop body) adds to it, so a target is judged against every
-/// directory the shell may be in.
+/// Every directory a command line's `cd`s may have left the shell in, for
+/// the regex rules over the rest of it (`ShellState`). Each `cd`/`pushd`
+/// target only adds to the set: whether a `cd` worked, ran at all, or ran in
+/// a subshell is not modelled, so a target is judged against every directory
+/// named before it (over-denying `cd /; cd proj && rm -rf *`).
 #[derive(Clone, Debug)]
 pub(crate) struct RuleCwd {
     /// The known directories the shell may be in.
@@ -113,8 +114,10 @@ pub(crate) struct RuleCwd {
     /// A `cd` ran earlier on the line: only then are operands rewritten
     /// (a line without one is judged exactly as before).
     moved: bool,
-    /// A directory was dropped past `MAX_DIRS`: a relative destructive
-    /// target can no longer be judged against every possible directory.
+    /// `cd` segments seen.
+    cds: usize,
+    /// Past `MAX_DIRS` / `MAX_CDS`: a relative destructive target can no
+    /// longer be judged against every possible directory.
     overflowed: bool,
 }
 
@@ -146,108 +149,69 @@ impl RuleCwd {
             unknown: dirs.is_empty(),
             dirs,
             moved: false,
+            cds: 0,
             overflowed: false,
         }
     }
 
-    /// A segment ran: a `cd`/`pushd`/`popd` (`argv` normalized, `words`
-    /// the resolved words in the same positions) moves the set; any other
-    /// command is ignored. `may_skip`: the segment may not run at all.
-    pub(crate) fn command(
-        &mut self,
-        argv: &[String],
-        words: &[Word],
-        home: Option<&Path>,
-        may_skip: bool,
-    ) {
+    /// A segment ran: the target of a `cd`/`pushd` (`argv` normalized,
+    /// `words` the resolved words in the same positions) is added to the
+    /// set from each directory in it; `popd` adds an unknown one. Any other
+    /// command is ignored.
+    pub(crate) fn command(&mut self, argv: &[String], words: &[Word], home: Option<&Path>) {
         let lead = condition_prefix_len(argv, words);
         let (argv, words) = (&argv[lead..], words.get(lead..).unwrap_or(&[]));
-        let next = match argv.first().map(String::as_str) {
-            Some("cd") => self.targets(argv, words, false, home),
-            Some("pushd") => {
-                // `pushd -n DIR` only edits the directory stack.
-                if argv.iter().skip(1).any(|a| a == "-n") {
-                    return;
-                }
-                self.targets(argv, words, true, home)
+        let pushd = match argv.first().map(String::as_str) {
+            Some("cd") => false,
+            // `pushd -n DIR` only edits the directory stack.
+            Some("pushd") if !argv.iter().skip(1).any(|a| a == "-n") => true,
+            Some("popd") => {
+                self.moved = true;
+                self.unknown = true;
+                return;
             }
-            Some("popd") => RuleCwd {
-                dirs: Vec::new(),
-                unknown: true,
-                moved: true,
-                overflowed: false,
-            },
             _ => return,
         };
-        self.then(next, may_skip);
-    }
-
-    /// The state after something that ran in this shell and left it in
-    /// `next` (a `cd`, an `eval`): replaces this one, or adds to it when
-    /// it may have been skipped.
-    pub(crate) fn then(&mut self, next: RuleCwd, may_skip: bool) {
-        if may_skip {
-            self.unknown |= next.unknown;
-            self.moved |= next.moved;
-            self.overflowed |= next.overflowed;
-            for d in next.dirs {
-                self.add(d);
-            }
-        } else {
-            *self = next;
+        self.moved = true;
+        self.cds += 1;
+        if self.cds > MAX_CDS {
+            self.overflowed = true;
         }
-    }
-
-    /// Add `d` to the set. Past `MAX_DIRS` the directories already held
-    /// are kept and `d` is dropped (the set is then incomplete), unless it
-    /// is `/` or `~` itself.
-    fn add(&mut self, d: Dir) {
-        if self.dirs.contains(&d) {
+        if self.overflowed {
             return;
         }
-        if self.dirs.len() < MAX_DIRS || d.parts.is_empty() {
+        let froms: Vec<Option<Dir>> = self
+            .dirs
+            .iter()
+            .cloned()
+            .map(Some)
+            .chain(self.unknown.then_some(None))
+            .collect();
+        for from in froms {
+            match target(from.as_ref(), argv, words, pushd, home) {
+                Some(d) => self.add(d),
+                None => self.unknown = true,
+            }
+        }
+    }
+
+    /// Add `d` to the set; past `MAX_DIRS` the set is incomplete.
+    fn add(&mut self, d: Dir) {
+        if self.overflowed || self.dirs.contains(&d) {
+            return;
+        }
+        if self.dirs.len() < MAX_DIRS {
             self.dirs.push(d);
         } else {
-            self.unknown = true;
             self.overflowed = true;
         }
     }
 
     /// Too many possible directories were seen to judge `argv`: it is a
     /// destructive command (`rm`, `chmod`, `chown`) with a relative path
-    /// operand, and a directory it may run in was dropped past `MAX_DIRS`.
+    /// operand, and the set overflowed earlier on the line.
     pub(crate) fn too_many_dirs_for(&self, argv: &[String]) -> bool {
         self.overflowed && rewrite_in(&Dir::root(), argv, None).is_some()
-    }
-
-    /// Where `cd`/`pushd` `argv` leaves the shell, from each directory it
-    /// may be in now.
-    fn targets(
-        &self,
-        argv: &[String],
-        words: &[Word],
-        pushd: bool,
-        home: Option<&Path>,
-    ) -> RuleCwd {
-        let mut next = RuleCwd {
-            dirs: Vec::new(),
-            unknown: false,
-            moved: true,
-            overflowed: false,
-        };
-        let froms: Vec<Option<&Dir>> = self
-            .dirs
-            .iter()
-            .map(Some)
-            .chain(self.unknown.then_some(None))
-            .collect();
-        for from in froms {
-            match target(from, argv, words, pushd, home) {
-                Some(d) => next.add(d),
-                None => next.unknown = true,
-            }
-        }
-        next
     }
 
     /// `argv` with the path operands of a filesystem-destructive command
@@ -351,165 +315,6 @@ fn rewrite_in(dir: &Dir, argv: &[String], home: Option<&Path>) -> Option<Vec<Str
     changed.then_some(out)
 }
 
-/// How a command line's structure moves `RuleCwd` between its segments.
-///
-/// A `cd` replaces the set only when what follows depends on it having
-/// worked: the next operator is `&&`, or it is the condition of the
-/// `if`/`while`/`until` whose body follows. Every other `cd` may fail or
-/// be skipped and only adds to the set. Within an and-or list a replaced
-/// set holds until the list ends (`;`, newline, `&`, a group's close) or
-/// reaches `||`; there every set the list passed through (its start and
-/// each `&&`) is added back, since any command in it may have failed. After a block (`fi`, `done`,
-/// `esac`) the set from before it is added back. Bodies of blocks,
-/// function definitions and groups opened after `&&`/`||` may be skipped.
-pub(crate) struct LineFlow {
-    /// Open `(` / `{` groups.
-    groups: Vec<Group>,
-    /// The sets the current and-or list has passed through (at its start
-    /// and at each `&&`): where the shell is when a command in it fails.
-    list_pre: RuleCwd,
-    /// The set before each open block.
-    blocks: Vec<RuleCwd>,
-    /// A block head just started: (the set before it, it has a condition).
-    opening: Option<(RuleCwd, bool)>,
-    /// The next group is a function body (`f()`, `function f`).
-    fn_pending: bool,
-    /// The previous segment was an `if`/`while`/`until` condition: the
-    /// `;` after it does not end its list.
-    cond_head: bool,
-}
-
-struct Group {
-    /// The set to restore at a subshell's `)`.
-    saved: Option<RuleCwd>,
-    /// The group may not run.
-    skip: bool,
-    /// The enclosing list's `list_pre`.
-    outer_pre: RuleCwd,
-}
-
-/// A segment's first word after `!` / `time [-p]`, if unquoted: a block
-/// keyword when it is one.
-fn block_head(seg: &[Word]) -> Option<&str> {
-    seg.get(pipeline_prefix_len(seg))
-        .filter(|w| !w.quoted)
-        .map(|w| w.text.as_str())
-}
-
-impl LineFlow {
-    pub(crate) fn new(cwd: &RuleCwd) -> LineFlow {
-        LineFlow {
-            groups: Vec::new(),
-            list_pre: cwd.clone(),
-            blocks: Vec::new(),
-            opening: None,
-            fn_pending: false,
-            cond_head: false,
-        }
-    }
-
-    fn skipping(&self) -> bool {
-        !self.blocks.is_empty() || self.groups.iter().any(|g| g.skip)
-    }
-
-    /// The operators in front of a segment move `cwd`; returns the last.
-    pub(crate) fn operators(&mut self, ops: &[Operator], cwd: &mut RuleCwd) -> Option<Operator> {
-        let mut last = None;
-        let mut k = 0;
-        while let Some(&op) = ops.get(k) {
-            k += 1;
-            match op {
-                // `f()`: a function definition; its body follows.
-                Operator::LParen if ops.get(k) == Some(&Operator::RParen) => {
-                    self.fn_pending = true;
-                    k += 1;
-                    last = Some(Operator::RParen);
-                    continue;
-                }
-                Operator::LParen | Operator::LBrace => {
-                    let skip = self.fn_pending
-                        || self.skipping()
-                        || matches!(last, Some(Operator::AndAnd | Operator::OrOr));
-                    self.fn_pending = false;
-                    let outer_pre = std::mem::replace(&mut self.list_pre, cwd.clone());
-                    self.groups.push(Group {
-                        saved: (op == Operator::LParen).then(|| cwd.clone()),
-                        skip,
-                        outer_pre,
-                    });
-                }
-                Operator::RParen | Operator::RBrace => {
-                    cwd.then(self.list_pre.clone(), true);
-                    if let Some(g) = self.groups.pop() {
-                        self.list_pre = g.outer_pre;
-                        if let Some(saved) = g.saved {
-                            *cwd = saved;
-                        }
-                    }
-                }
-                Operator::OrOr => cwd.then(self.list_pre.clone(), true),
-                Operator::Semi | Operator::Newline | Operator::Amp | Operator::CaseParen => {
-                    if !std::mem::take(&mut self.cond_head) {
-                        cwd.then(self.list_pre.clone(), true);
-                    }
-                    self.list_pre = cwd.clone();
-                }
-                // The command before `&&` may be the one that fails.
-                Operator::AndAnd => self.list_pre.then(cwd.clone(), true),
-                Operator::Pipe => {}
-            }
-            last = Some(op);
-        }
-        last
-    }
-
-    /// A segment is about to run, between `last` and `next`: closes the
-    /// block it ends and says whether a `cd` in it only adds to the set.
-    pub(crate) fn segment(
-        &mut self,
-        seg: &[Word],
-        last: Option<Operator>,
-        next: Option<Operator>,
-        cwd: &mut RuleCwd,
-    ) -> bool {
-        let head = block_head(seg);
-        if matches!(head, Some("fi" | "done" | "esac")) {
-            if let Some(pre) = self.blocks.pop() {
-                cwd.then(pre, true);
-            }
-        }
-        let condition = matches!(head, Some("if" | "while" | "until"));
-        if condition || matches!(head, Some("for" | "select" | "case")) {
-            self.opening = Some((cwd.clone(), condition));
-        }
-        if head == Some("function") {
-            self.fn_pending = true;
-        }
-        if condition {
-            return self.skipping();
-        }
-        self.skipping()
-            || next != Some(Operator::AndAnd)
-            || matches!(
-                last,
-                Some(Operator::OrOr | Operator::CaseParen | Operator::RParen | Operator::RBrace)
-            )
-    }
-
-    /// The segment ran: a block it heads is now open.
-    pub(crate) fn after_segment(&mut self) {
-        if let Some((pre, condition)) = self.opening.take() {
-            self.blocks.push(pre);
-            self.cond_head = condition;
-        }
-    }
-
-    /// The line ended: what it leaves `cwd` as (for `eval`).
-    pub(crate) fn finish(&self, cwd: &mut RuleCwd) {
-        cwd.then(self.list_pre.clone(), true);
-    }
-}
-
 /// The rest of a path spelled from the home directory (`~`, `~/x`,
 /// `$HOME/x`, `${HOME}`), without its leading `/`.
 fn home_prefixed(a: &str) -> Option<&str> {
@@ -531,19 +336,15 @@ mod tests {
         line.split(' ').map(str::to_string).collect()
     }
 
-    /// The rewritten lines after `cds` (a leading `?` marks one that may
-    /// be skipped), joined with ` | `; `None` when nothing is rewritten.
+    /// The rewritten lines after `cds`, joined with ` | `; `None` when
+    /// nothing is rewritten.
     fn after(cds: &[&str], start: Option<&str>, home: Option<&str>, cmd: &str) -> Option<String> {
         let home = home.map(Path::new);
         let mut cwd = RuleCwd::start(start.map(Path::new));
         for cd in cds {
-            let (cd, may_skip) = match cd.strip_prefix('?') {
-                Some(rest) => (rest, true),
-                None => (*cd, false),
-            };
             let a = argv(cd);
             let words: Vec<Word> = a.iter().map(|_| Word::default()).collect();
-            cwd.command(&a, &words, home, may_skip);
+            cwd.command(&a, &words, home);
         }
         let lines: Vec<String> = cwd
             .rewrite(&argv(cmd), home)
@@ -567,10 +368,6 @@ mod tests {
             Some("rm -rf ~")
         );
         assert_eq!(
-            r(&["cd /usr", "cd .."], "rm -rf *").as_deref(),
-            Some("rm -rf /*")
-        );
-        assert_eq!(
             r(&["cd /usr/../.."], "rm -rf *").as_deref(),
             Some("rm -rf /*")
         );
@@ -587,6 +384,38 @@ mod tests {
             r(&["cd /"], "chmod -R 777 *").as_deref(),
             Some("chmod -R 777 /*")
         );
+        assert_eq!(r(&["if cd /"], "rm -rf *").as_deref(), Some("rm -rf /*"));
+        assert_eq!(
+            r(&["! time -p cd /"], "rm -rf *").as_deref(),
+            Some("rm -rf /*")
+        );
+    }
+
+    #[test]
+    fn every_target_adds_to_the_set() {
+        let r = |cds: &[&str], cmd| after(cds, None, None, cmd);
+        assert_eq!(
+            r(&["cd /usr", "cd .."], "rm -rf *").as_deref(),
+            Some("rm -rf /usr/* | rm -rf /*")
+        );
+        assert_eq!(
+            r(&["cd /", "cd /tmp"], "rm -rf *").as_deref(),
+            Some("rm -rf /* | rm -rf /tmp/*")
+        );
+        // Unknown targets keep the known directories.
+        assert_eq!(
+            r(&["cd /", "cd -"], "rm -rf *").as_deref(),
+            Some("rm -rf /*")
+        );
+        assert_eq!(
+            r(&["cd /", "popd"], "rm -rf *").as_deref(),
+            Some("rm -rf /*")
+        );
+        // `pushd -n` is not a move.
+        assert_eq!(
+            r(&["cd /tmp", "pushd -n /"], "rm -rf *").as_deref(),
+            Some("rm -rf /tmp/*")
+        );
     }
 
     #[test]
@@ -597,16 +426,9 @@ mod tests {
         assert_eq!(r(&["cd $TMP"], "rm -rf *"), None);
         assert_eq!(r(&["cd ~bob"], "rm -rf *"), None);
         assert_eq!(r(&["cd build"], "rm -rf *"), None);
-        assert_eq!(r(&["cd ~", "cd .."], "rm -rf *"), None);
-        assert_eq!(r(&["cd /", "popd"], "rm -rf *"), None);
-        assert_eq!(r(&["cd /", "cd -"], "rm -rf *"), None);
-        // A skipped cd to somewhere unknown keeps the known directory.
-        assert_eq!(
-            r(&["cd /", "?cd -"], "rm -rf *").as_deref(),
-            Some("rm -rf /*")
-        );
         assert_eq!(r(&["pushd"], "rm -rf *"), None);
         assert_eq!(r(&["pushd +1"], "rm -rf *"), None);
+        assert_eq!(r(&["popd"], "rm -rf *"), None);
         assert_eq!(r(&["cd /"], "rm -rf /x ~/y $D"), None);
         assert_eq!(r(&["cd /"], "ls *"), None);
     }
@@ -619,58 +441,59 @@ mod tests {
         assert_eq!(r(&[], "rm -rf *"), None);
         assert_eq!(
             r(&["cd build"], "rm -rf *").as_deref(),
-            Some("rm -rf ~/proj/build/*")
+            Some("rm -rf ~/proj/* | rm -rf ~/proj/build/*")
         );
-        assert_eq!(r(&["cd .."], "rm -rf *").as_deref(), Some("rm -rf ~/*"));
         assert_eq!(
             r(&["cd ../.."], "rm -rf *").as_deref(),
-            Some("rm -rf /home/*")
+            Some("rm -rf ~/proj/* | rm -rf /home/*")
         );
-        assert_eq!(r(&["cd /home/u"], "rm -rf .").as_deref(), Some("rm -rf ~"));
+        assert_eq!(
+            after(&["cd /home/u"], None, home, "rm -rf .").as_deref(),
+            Some("rm -rf ~")
+        );
         assert_eq!(
             after(&["cd ~", "cd .."], None, home, "rm -rf *").as_deref(),
-            Some("rm -rf /home/*")
+            Some("rm -rf ~/* | rm -rf /home/*")
         );
     }
 
     #[test]
-    fn skipped_and_condition_cds() {
-        let r = |cds: &[&str], cmd| after(cds, None, None, cmd);
-        assert_eq!(
-            r(&["cd /usr", "?cd .."], "rm -rf *").as_deref(),
-            Some("rm -rf /usr/* | rm -rf /*")
-        );
-        assert_eq!(r(&["if cd /"], "rm -rf *").as_deref(), Some("rm -rf /*"));
-        assert_eq!(r(&["! cd /"], "rm -rf *").as_deref(), Some("rm -rf /*"));
-        assert_eq!(
-            r(&["! time -p cd /"], "rm -rf *").as_deref(),
-            Some("rm -rf /*")
-        );
-        assert_eq!(
-            r(&["cd /", "pushd -n /tmp"], "rm -rf *").as_deref(),
-            Some("rm -rf /*")
-        );
-    }
+    fn overflow_is_sticky_and_stops_tracking() {
+        let cd = |a: &str| {
+            let a = argv(a);
+            let words: Vec<Word> = a.iter().map(|_| Word::default()).collect();
+            (a, words)
+        };
+        let mut cwd = RuleCwd::start(None);
+        for i in 0..MAX_DIRS {
+            let (a, w) = cd(&format!("cd /d{i}"));
+            cwd.command(&a, &w, None);
+        }
+        assert!(!cwd.too_many_dirs_for(&argv("rm -rf *")));
+        let (a, w) = cd("cd /etc");
+        cwd.command(&a, &w, None);
+        assert!(cwd.too_many_dirs_for(&argv("rm -rf *")));
+        assert!(cwd.too_many_dirs_for(&argv("rm -rf ./build")));
+        assert!(!cwd.too_many_dirs_for(&argv("rm -rf /tmp/x")));
+        assert!(!cwd.too_many_dirs_for(&argv("ls *")));
+        // Nothing after the overflow is tracked, and it stays set.
+        let (a, w) = cd("cd /");
+        cwd.command(&a, &w, None);
+        assert!(!cwd
+            .rewrite(&argv("rm -rf *"), None)
+            .iter()
+            .any(|v| v[2] == "/*"));
+        assert!(cwd.too_many_dirs_for(&argv("rm -rf *")));
 
-    #[test]
-    fn past_the_bound_held_directories_are_kept() {
-        let r = |cds: &[&str], cmd| after(cds, None, None, cmd);
-        let many: Vec<String> = (0..=MAX_DIRS).map(|i| format!("?cd /d{i}")).collect();
-        let mut cds: Vec<&str> = vec!["cd /"];
-        cds.extend(many.iter().map(String::as_str));
-        let got = r(&cds, "rm -rf *").unwrap();
-        assert!(got.starts_with("rm -rf /* | "), "{got}");
-        // `/` plus MAX_DIRS - 1 others; the rest were dropped.
-        assert_eq!(got.matches(" | ").count(), MAX_DIRS - 1, "{got}");
-        // `/` and `~` are added even past the bound.
-        let mut cds: Vec<&str> = many.iter().map(String::as_str).collect();
-        cds.push("?cd ~");
-        cds.push("?cd /");
-        let got = r(&cds, "rm -rf *").unwrap();
-        assert!(
-            got.contains("rm -rf ~/*") && got.contains("rm -rf /*"),
-            "{got}"
-        );
+        // Past MAX_CDS segments, even repeating one directory.
+        let mut cwd = RuleCwd::start(None);
+        let (a, w) = cd("cd /tmp");
+        for _ in 0..MAX_CDS {
+            cwd.command(&a, &w, None);
+        }
+        assert!(!cwd.too_many_dirs_for(&argv("rm -rf *")));
+        cwd.command(&a, &w, None);
+        assert!(cwd.too_many_dirs_for(&argv("rm -rf *")));
     }
 
     #[test]
@@ -684,7 +507,7 @@ mod tests {
                 ..Word::default()
             },
         ];
-        cwd.command(&a, &words, None, false);
+        cwd.command(&a, &words, None);
         assert!(cwd.rewrite(&argv("rm -rf *"), None).is_empty());
     }
 }

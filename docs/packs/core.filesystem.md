@@ -30,22 +30,18 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   the same line: `cd / && rm -rf *`, `cd ~ && rm -rf .*`,
   `cd /usr && cd .. && rm -rf *`. saiife follows `cd` and `pushd` to `/`, `~`,
   `$HOME` or another absolute folder, and relative `cd`s from there (`..`
-  included). The relative targets of `rm`, `chmod -R` and `chown -R` are
-  judged as if they were written from that folder. A `cd` inside `( ... )`
-  ends at the `)`.
-- A `cd` may fail or be skipped, so it usually adds a folder instead of
-  replacing one. The delete is then judged against every folder the shell
-  may be in, so `cd /; cd /missing; rm -rf *` and
-  `cd / || cd /tmp; rm -rf *` are blocked. A `cd` replaces the folder only
-  for what runs when it worked: the commands after `cd X &&`, and the body
-  of `if cd X; then ...` or `while cd X; do ...`. A `cd` inside an `if`
-  body, a loop, a `case` branch, a function definition or a group after
-  `&&`/`||` only adds. A `cd` after `!`, `time` or `time -p`, a `cd` used as
-  a condition, and a `cd` run through `eval` are followed too.
-- An `rm`, `chmod` or `chown` with a relative target on a line whose `cd`s
-  leave more than 16 possible folders. saiife cannot judge it against all of
-  them, so it blocks ("too many possible working directories to judge
-  safely"). A line without such a command is judged as before.
+  included), also after `!`, `time`, `if`, `while` or `until`, and through
+  `eval`. The relative targets of `rm`, `chmod -R` and `chown -R` are judged
+  as if they were written from each folder a `cd` on the line named.
+- Every `cd` target adds a folder; none is ever forgotten. saiife does not
+  work out whether a `cd` worked, ran at all, or ran in a subshell, so
+  `cd /; cd /missing; rm -rf *`, `cd / || cd /tmp; rm -rf *` and
+  `cd /; if cd /tmp; then :; else rm -rf *; fi` are all blocked.
+- An `rm`, `chmod` or `chown` with a relative target on a line with more than
+  16 different `cd` targets, or more than 64 `cd`s. saiife stops following
+  them there, cannot judge the target against all of them, and blocks ("too
+  many possible working directories to judge safely"). A line without such
+  a command is judged as before.
 
 These rules also apply when the command runs through `sudo`, `bash -c '...'`
 or after `cd`.
@@ -76,12 +72,16 @@ or after `cd`.
 - `CDPATH` is ignored. With `CDPATH` set, `cd usr` may go to `/usr`, but
   saiife treats it as a relative `cd` from the current folder.
 - `cd` is followed by its text alone. saiife does not check that the folder
-  exists or follow symlinks. A `cd` in a pipeline (`cd / | ...`) or in the
-  background (`cd / &`) is not followed, since it runs in a shell of its own.
-- Because a `cd` that is not followed by `&&` may have failed, the folder
-  the line started in stays possible: run from your home folder,
-  `cd proj; rm -rf *` is blocked (if `proj` is missing it would empty your
-  home). Write `cd proj && rm -rf *` instead.
+  exists or follow symlinks.
+- A function's arguments are not followed: `f() { cd "$1"; }; f /; rm -rf *`
+  is allowed (the `cd "$1"` target is unknown).
+- Blocked although safe: since every `cd` target counts for the rest of the
+  line, a delete after a later `cd` is still judged against the earlier
+  folders. `cd /; cd proj && rm -rf *`, `(cd /); rm -rf *` and
+  `cd / | rm -rf *` are blocked. Run from your home folder,
+  `cd proj; rm -rf *` is blocked too (if `proj` is missing it would empty
+  your home). Split such a line, or name the target in full
+  (`rm -rf proj/*`).
 - A quoted `*` after a `cd` is read as a glob: `cd /usr && rm -rf "*"` is
   blocked, although it would delete only a file named `*`.
 - Protection of saiife's own files is in the `core.self` pack, not here.
@@ -117,6 +117,9 @@ deny cd /; function f { cd /tmp; }; rm -rf *
 deny time if cd /; then rm -rf *; fi
 deny time -p cd / && rm -rf *
 deny true && cd /a; true && cd /b; true && cd /c; true && cd /d; true && cd /e; true && cd /f; true && cd /g; true && cd /h; true && cd /i; true && cd /j; true && cd /k; true && cd /l; true && cd /m; true && cd /n; true && cd /o; true && cd /p; cd /etc; rm -rf *
+deny cd /; if cd /tmp; then :; else rm -rf *; fi
+deny cd /; ! cd /tmp && rm -rf *
+deny cd /; cd proj && rm -rf *
 deny chmod -R 777 /*
 deny cd / && chmod -R 777 *
 deny cd / && chown -R root *

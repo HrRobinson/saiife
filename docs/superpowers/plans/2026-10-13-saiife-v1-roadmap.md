@@ -129,5 +129,7 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 
 - `chmod -R`/`chown -R` folder lists lack `/Volumes` (the `rm` list has it).
 - `CDPATH` and `cd ~user` are not followed by the cd tracking (documented in `core.filesystem`).
+- Pre-existing `core.filesystem` gaps found in the plan-6 re-review (allowed with or without a `cd`): glob roots `rm -rf /?*`, `/e*`, `/[a-z]*`; `doas rm` is not unwrapped like `sudo`; a here-string fed to a shell (`bash <<< 'rm -rf /'`) is not judged; the `chmod -R`/`chown -R` patterns lack `~`/`$HOME` (`chmod -R 777 ~`); `/Volumes` (above).
+- A function's arguments are not followed by the cd tracking (`f() { cd "$1"; }; f /; rm -rf *`, documented).
 - ~~A `cd` inside a function body is followed even if the function is never called (blocking direction).~~ — done in plan 6 final fix: function bodies only add possible directories
 - ~~Other paths `status` prints (e.g. the "saiife status for <root>" header) are not passed through `text::sanitize`.~~ — done in plan 6 final fix: every path `status` prints is sanitized

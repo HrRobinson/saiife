@@ -24,9 +24,9 @@ use crate::canon::{
     canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
     GLOB_SCAN_LIMIT,
 };
-use crate::cdtrack::{LineFlow, RuleCwd};
+use crate::cdtrack::RuleCwd;
 use crate::lexer::{
-    find_all_substitution_kinds, literal_word, split_segments_with_separators, Operator, Word,
+    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
 };
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
@@ -366,7 +366,11 @@ impl Engine {
         // comment): values are still judged, the unresolved words too.
         state.ifs_named |= mentions_ifs(raw_cmd);
         let mut found = Findings::default();
-        let (segments, seps, lex_note) = split_segments_with_separators(raw_cmd, sub_body);
+        let (segments, lex_note) = if sub_body {
+            split_substitution_noted(raw_cmd)
+        } else {
+            split_segments_noted(raw_cmd)
+        };
         if let Some(reason) = lex_note {
             found.unjudged(reason);
         }
@@ -376,33 +380,18 @@ impl Engine {
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
         };
 
-        // How the line's structure moves the rule cwd (see `LineFlow`).
-        let mut flow = LineFlow::new(&state.rule_cwd);
-        for (i, seg) in segments.iter().enumerate() {
+        for seg in segments {
             if start.elapsed() > self.budget {
                 return timed_out();
             }
-            let last = flow.operators(&seps[i], &mut state.rule_cwd);
             if seg.is_empty() {
                 continue;
             }
-            let next = seps[i + 1].first().copied();
-            let may_skip = flow.segment(seg, last, next, &mut state.rule_cwd);
-            // A piped or backgrounded command runs in a subshell of its
-            // own: its `cd` moves nothing after it.
-            let own_subshell = last == Some(Operator::Pipe)
-                || matches!(next, Some(Operator::Pipe | Operator::Amp));
-            let rule_cwd = own_subshell.then(|| state.rule_cwd.clone());
-            if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found, may_skip) {
+            if let Some(d) = self.evaluate_segment(&seg, &cx, &mut state, &mut found) {
                 return d;
             }
-            if let Some(rule_cwd) = rule_cwd {
-                state.rule_cwd = rule_cwd;
-            }
-            flow.after_segment();
         }
         if let Some(out) = out {
-            flow.finish(&mut state.rule_cwd);
             *out = state.rule_cwd.clone();
         }
         found.finish()
@@ -416,7 +405,6 @@ impl Engine {
         cx: &Ctx,
         state: &mut ShellState,
         found: &mut Findings,
-        may_skip: bool,
     ) -> Option<Decision> {
         // A word whose brace expansion was too large is judged as
         // written, and the command is recorded as not fully judged.
@@ -446,11 +434,11 @@ impl Engine {
         if let Some(d) = self.operands_phase(&view, cx, state, found) {
             return Some(d);
         }
-        if let Some(d) = self.eval_phase(&view, cx, state, found, may_skip) {
+        if let Some(d) = self.eval_phase(&view, cx, state, found) {
             return Some(d);
         }
         Self::environment_phase(&view, cx, state);
-        self.cd_phase(&view, state, may_skip);
+        self.cd_phase(&view, state);
         self.inline_payload_phase(&view, cx, state, found)
     }
 
@@ -772,7 +760,6 @@ impl Engine {
         cx: &Ctx,
         state: &mut ShellState,
         found: &mut Findings,
-        may_skip: bool,
     ) -> Option<Decision> {
         if view.argv[0] != "eval" {
             return None;
@@ -794,10 +781,11 @@ impl Engine {
         if inner.trim().is_empty() {
             return None;
         }
-        // eval runs in this shell: its `cd`s move the rest of the line.
+        // eval runs in this shell: the targets of its `cd`s (added to the
+        // set it started from) hold for the rest of the line.
         let mut after = state.rule_cwd.clone();
         let nested = self.recurse(&inner, cx, state, false, "eval", Some(&mut after));
-        state.rule_cwd.then(after, may_skip);
+        state.rule_cwd = after;
         found.nested(nested)
     }
 
@@ -808,10 +796,10 @@ impl Engine {
     }
 
     /// `cd`/`pushd`: the later segments may run in its target too.
-    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState, may_skip: bool) {
+    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) {
         state
             .rule_cwd
-            .command(&view.argv, &view.resolved, self.vars.home(), may_skip);
+            .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
             state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
         }
