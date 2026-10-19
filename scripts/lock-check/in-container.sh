@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Container entrypoint for the live lock checks (scripts/live-check-locked.sh).
+#
+# Runs as root inside the disposable saiife-lockcheck container, never on the
+# host: it refuses (exit 2) unless /.dockerenv exists, or LC_ROOT is set to a
+# directory other than / (the offline tests, where every path below is under
+# $LC_ROOT and nothing runs as another user).
+#
+#   setup        create the `agent` user if needed, print the login steps and
+#                open a login shell as `agent`. Logins are stored in
+#                /home/agent, the named volume saiife-lockcheck-home.
+#   run <agent>  source lib.sh and /lockcheck/checks-<agent>.sh (or
+#                $LC_CHECKS_DIR/checks-<agent>.sh), write the result header
+#                to /out/<agent>-<UTC time>.tsv, snapshot the agent's
+#                settings files, run agent_checks, append the label and print
+#                the summary. Agent output goes to the sibling .log. The
+#                settings snapshot is restored on exit, also on failure.
+#
+# What it touches (container only): /etc (managed agent settings, via the
+# agent script), /opt/saiife, /opt/lockcheck, /run/lockcheck, /work/project,
+# /out, and the settings files under /home/agent that it snapshots and
+# restores. Login files are never touched.
+#
+#   bash /lockcheck/in-container.sh setup
+#   bash /lockcheck/in-container.sh run <claude|codex|gemini>
+#   env: SAIIFE_COMMIT, LOCKCHECK_IMAGE (header values), AGENT_TIMEOUT
+#        (seconds per agent run, default 240)
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 setup | run <agent>" >&2
+  exit 2
+}
+
+if [[ -n "${LC_ROOT:-}" ]]; then
+  if [[ "$LC_ROOT" == / || ! -d "$LC_ROOT" ]]; then
+    echo "in-container.sh: LC_ROOT must be an existing directory other than /" >&2
+    exit 2
+  fi
+elif [[ ! -e /.dockerenv ]]; then
+  echo "in-container.sh: refusing to run outside the lock-check container" >&2
+  echo "  (no /.dockerenv); use scripts/live-check-locked.sh on the host." >&2
+  exit 2
+fi
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+action="${1:-}"
+
+ensure_agent_user() {
+  if [[ -n "${LC_ROOT:-}" ]]; then
+    return 0
+  fi
+  if ! id agent >/dev/null 2>&1; then
+    useradd -m -u 1001 agent
+  fi
+  mkdir -p /home/agent
+  chown agent:agent /home/agent
+}
+
+case "$action" in
+  setup)
+    [[ $# -eq 1 ]] || usage
+    ensure_agent_user
+    cat <<'EOF'
+Log in to each agent once; the logins stay in the saiife-lockcheck-home
+volume (remove it with `live-check-locked.sh --forget`).
+  Claude Code:  claude      then type /login, follow it, then /exit
+  Codex:        codex login --device-auth
+  Gemini CLI:   gemini      and choose "Login with Google", then /quit
+Then type `exit` to leave the container.
+EOF
+    if [[ -n "${LC_ROOT:-}" ]]; then
+      exit 0
+    fi
+    exec setpriv --reuid=agent --regid=agent --init-groups -- \
+      env -i HOME=/home/agent PATH=/usr/local/bin:/usr/bin:/bin "TERM=${TERM:-xterm}" bash -l
+    ;;
+  run)
+    [[ $# -eq 2 ]] || usage
+    agent="$2"
+    ;;
+  *) usage ;;
+esac
+
+if [[ ! "$agent" =~ ^[a-z0-9]+$ ]]; then
+  echo "in-container.sh: bad agent name '$agent'" >&2
+  exit 2
+fi
+checks="${LC_CHECKS_DIR:-$here}/checks-$agent.sh"
+if [[ ! -f "$checks" ]]; then
+  echo "in-container.sh: no checks for '$agent' ($checks)" >&2
+  exit 2
+fi
+
+ensure_agent_user
+# shellcheck source=/dev/null
+source "$here/lib.sh"
+# shellcheck source=/dev/null
+source "$checks"
+
+mkdir -p "$LC_MARKERS" "$LC_RUN" "$LC_ROOT/out"
+chmod 0755 "$LC_RUN"
+lc_chown_agent "$LC_PROJECT" "$LC_MARKERS"
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+LC_RESULTS="$LC_ROOT/out/$agent-$stamp.tsv"
+LC_LOG="$LC_ROOT/out/$agent-$stamp.log"
+: >"$LC_LOG"
+
+version="$(agent_version 2>/dev/null | head -n1 || true)"
+node_version="$(node --version 2>/dev/null || true)"
+{
+  printf '# agent=%s\n' "$agent"
+  printf '# agent_version=%s\n' "${version:-unknown}"
+  printf '# node_version=%s\n' "${node_version:-none}"
+  printf '# image=%s\n' "${LOCKCHECK_IMAGE:-unknown}"
+  printf '# saiife_commit=%s\n' "${SAIIFE_COMMIT:-unknown}"
+  printf '# kernel=%s\n' "$(uname -r)"
+  printf '# date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$LC_RESULTS"
+
+cleanup() {
+  lc_restore_snapshot || true
+  rm -rf "$LC_HOME/alt"
+}
+lc_snapshot
+trap cleanup EXIT
+
+echo "[lockcheck] $agent: ${version:-unknown}, results in $LC_RESULTS"
+agent_checks
+echo
+lc_summarize "$LC_RESULTS"
+echo "results: $LC_RESULTS"
+echo "agent output: $LC_LOG"
