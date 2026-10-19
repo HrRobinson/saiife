@@ -48,6 +48,8 @@ or after `cd`.
   by this pack.
 - A deep folder under a system folder is not treated as catastrophic. For
   example `rm -rf /var/folders/xy/tmp` is allowed.
+- `cd / && rm -rf *` is allowed. The guard does not track `cd`, so it does not
+  know the delete runs in the root folder.
 - Protection of saiife's own files is in the `core.self` pack, not here.
 
 ## Examples

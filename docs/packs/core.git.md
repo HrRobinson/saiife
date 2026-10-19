@@ -13,7 +13,8 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
 
 - `git reset --hard` (except the rewind below). It discards all uncommitted
   changes, and they cannot be recovered.
-- `git clean -f` (also `-fd`, `-xfd`). It permanently deletes untracked files.
+- `git clean` with the short `-f` flag, alone or joined with others (`-f`, `-fd`,
+  `-xfd`). It permanently deletes untracked files.
 - `git push --force` or `git push -f`. A force-push can overwrite the history
   of a shared branch.
 - `git branch -D`. It force-deletes a branch even if it was never merged.
@@ -36,6 +37,8 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   `git restore .`, `git stash drop` or `git checkout -- <file>`.
 - `git push --force` to a branch name with a `+` prefix
   (`git push origin +main`) is not judged.
+- The long spellings `git clean --force` and `git branch --delete --force` are
+  allowed. The rules look only for the short flags `-f` and `-D`.
 - Rewriting history with `git rebase` or `git filter-branch` is allowed.
 - Reading a secret from git history (`git show HEAD:.env`) is a `core.secrets`
   topic and is not seen there either.

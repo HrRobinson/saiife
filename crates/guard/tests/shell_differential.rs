@@ -123,6 +123,12 @@ fn heredoc_matches_installed_shells() {
     }
     let e = engine();
     let cases = cases();
+    for tolerated in KNOWN_NON_BASH_OVER_DENIES {
+        assert!(
+            cases.iter().any(|c| c == tolerated),
+            "KNOWN_NON_BASH_OVER_DENIES entry is not in cases(): {tolerated:?}"
+        );
+    }
     // Tolerated cases must stay in the safe (over-deny) direction.
     for tolerated in KNOWN_NON_BASH_OVER_DENIES {
         assert!(

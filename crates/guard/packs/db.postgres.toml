@@ -2,8 +2,9 @@
 #
 # Blocks irreversible PostgreSQL statements, whether typed as raw SQL, passed to
 # `psql -c "..."`, or issued via the `dropdb` CLI. Rules are case-insensitive
-# ((?i)) since SQL keywords may be upper or lower case. DELETE/UPDATE guards fire
-# only when there is NO WHERE clause (the "empties the whole table" footgun).
+# ((?i)), but the triggers below are not (see there). The DELETE guard fires only
+# when there is NO WHERE clause (the "empties the whole table" footgun). There is
+# no UPDATE rule.
 # Opt-in per environment (guard.packs).
 
 [pack]

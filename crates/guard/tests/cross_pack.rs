@@ -97,7 +97,10 @@ fn allow_in_one_pack_does_not_hide_deny_in_another() {
         Decision::Deny { pack, .. } => assert_eq!(pack, "test.b"),
         other => panic!("expected deny from test.b, got {other:?}"),
     }
-    assert!(!e.evaluate("foo ok").is_deny());
+    assert!(
+        matches!(e.evaluate("foo ok"), Decision::Allow { .. }),
+        "foo ok must be allowed"
+    );
 }
 
 #[test]

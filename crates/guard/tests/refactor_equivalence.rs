@@ -210,7 +210,7 @@ fn matches(want: &Want, got: &Decision) -> bool {
 }
 
 /// Number of corpus lines that must be denied (`Deny` and `DenyInline`).
-// Recorded from the corpus as run when this pin was added.
+/// Recorded from the corpus as run when this pin was added.
 const DENY_COUNT: usize = 58;
 
 /// The distinct `(pack, pattern)` pairs those denials come from, sorted.

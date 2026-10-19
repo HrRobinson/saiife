@@ -5,8 +5,9 @@
 > your versions.
 
 This recipe runs Codex CLI against a model on your own machine (through
-Ollama) and guards it with saiife. No prompt or code leaves your machine for
-a model provider.
+Ollama) and guards it with saiife. If Codex is set to use only the local
+provider, no prompt or code leaves your machine for a model provider. Check
+your Codex settings for this.
 
 saiife hooks into the agent (Codex), not into the model. So the guard works
 the same whether Codex talks to a cloud model or to a local one.

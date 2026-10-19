@@ -94,7 +94,7 @@ install:
   our research).
 - The `CLAUDE_CONFIG_DIR` setting, which saiife's rules use for Claude Code's
   own folder. It comes from product docs, not from our research.
-- Tool inputs over 1 MiB: file paths in them are read in full; this needs a
-  recheck on a live install.
+- Very large tool inputs (over 1 MiB): saiife should still find every file
+  path in them. We have not checked this on a live install.
 - A recursive `Grep` of a whole folder without a file pattern: whether Claude
   Code's search skips hidden and git-ignored files as expected.

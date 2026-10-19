@@ -96,7 +96,8 @@ not running.
   handling of git-ignored files.
 - Gemini CLI's `GEMINI_CLI_HOME` folder is not covered.
 - Company-wide Gemini CLI settings (`/etc/gemini-cli/settings.json` on Linux)
-  take priority over the project file; `status` does not read them.
+  may take priority over the project file. Gemini CLI's docs and code disagree
+  on this. `status` does not read them.
 - A determined agent running as your user can get around the guard, for
   example with a script it writes and runs. See [threat coverage](../threats.md).
 - Limits of each pack are listed on its page, for example
@@ -114,5 +115,5 @@ It has not yet been run against a live Gemini CLI install. Still to check:
   "If saiife is missing").
 - The Gemini CLI setting that switches hooks on or off, so `status` can
   check it.
-- Tool inputs over 1 MiB: file paths in them are read in full; this needs a
-  recheck on a live install.
+- Very large tool inputs (over 1 MiB): saiife should still find every file
+  path in them. We have not checked this on a live install.

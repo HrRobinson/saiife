@@ -54,6 +54,8 @@ agent's file tools and through shell commands (`rm`, `mv`, `cp`, `sed -i`,
 
 ## Not covered
 
+- `saiife init --off` in your own terminal works. That terminal is not hooked,
+  so saiife does not judge it.
 - A shell function named `saiife` is not detected (an alias is).
 - `unset HOME`, `export -n HOME` or `declare +x PATH` before starting an agent
   are not treated as a change of setting.

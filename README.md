@@ -28,7 +28,8 @@ saiife audit --report report.html   # the same as one HTML file to share
 
 `saiife init` finds the agents installed on your machine and tells you one
 last step to do in each agent (accepting a trust prompt). `saiife init --off`
-removes exactly what `init` added.
+removes exactly what `init` added. It keeps `.saiife/config.toml` if you edited
+it.
 
 ## What it covers
 

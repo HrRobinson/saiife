@@ -44,7 +44,8 @@ Codex asks again.
 
 Codex reads files with shell commands, so reads are judged as shell commands
 (for example `cat .env` is blocked by
-[core.secrets](../packs/core.secrets.md)).
+[core.secrets](../packs/core.secrets.md)). This is unverified: we have not
+checked it on a live install.
 
 The timeout is 10 seconds. If saiife does not answer in time, or cannot
 start, Codex runs the tool anyway (it "fails open"). This is on purpose for
@@ -101,5 +102,5 @@ yet been run against a live Codex install. Still to check:
   `/etc/codex/`), so `status` can check them.
 - The `CODEX_HOME` setting, which saiife's rules use for Codex's own folder.
   It comes from product docs, not from our research.
-- Tool inputs over 1 MiB: file paths in them are read in full; this needs a
-  recheck on a live install.
+- Very large tool inputs (over 1 MiB): saiife should still find every file
+  path in them. We have not checked this on a live install.
