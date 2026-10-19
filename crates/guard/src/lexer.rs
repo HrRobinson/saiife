@@ -495,7 +495,7 @@ impl Lexer<'_, '_> {
                     self.toks.push(LexTok::Operator(Operator::Pipe));
                 }
             }
-            _ => {
+            ';' => {
                 self.flush_word();
                 // `;;`, `;&`, `;;&` end a case arm: a pattern follows.
                 if self.case_depth > 0 && matches!(self.chars.peek(), Some(';' | '&')) {
@@ -503,6 +503,7 @@ impl Lexer<'_, '_> {
                 }
                 self.toks.push(LexTok::Operator(Operator::Semi));
             }
+            _ => unreachable!("routed by step()"),
         }
         true
     }
@@ -637,19 +638,24 @@ impl Lexer<'_, '_> {
                 w.brace_marks.push(w.text.len());
                 w.text.push('{');
             }
-            ',' | '}' if self.word.brace_depth > 0 => {
+            ',' if self.word.brace_depth > 0 => {
                 let w = &mut self.word;
-                if c == '}' {
-                    w.brace_depth -= 1;
-                }
                 w.brace_marks.push(w.text.len());
-                w.text.push(c);
+                w.text.push(',');
+            }
+            '}' if self.word.brace_depth > 0 => {
+                let w = &mut self.word;
+                w.brace_depth -= 1;
+                w.brace_marks.push(w.text.len());
+                w.text.push('}');
             }
             // `}` starting a word closes a group; inside a word it is data.
             '}' if !self.word.in_word => {
                 self.toks.push(LexTok::Operator(Operator::RBrace));
             }
-            other => return self.word_char(other),
+            // A `,` outside braces, or a `}` inside a word, is data.
+            ',' | '}' => return self.word_char(c),
+            _ => unreachable!("routed by step()"),
         }
         true
     }
@@ -738,7 +744,7 @@ impl Lexer<'_, '_> {
                     w.dq_sub_end = Some(w.text.len());
                 }
             }
-            _ => {
+            '\\' => {
                 w.in_word = true;
                 w.quoted = true;
                 // Outside quotes, `\<char>` is a literal `<char>` — this is
@@ -749,6 +755,7 @@ impl Lexer<'_, '_> {
                     None => w.text.push('\\'),
                 }
             }
+            _ => unreachable!("routed by step()"),
         }
         true
     }

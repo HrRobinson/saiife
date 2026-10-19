@@ -122,23 +122,43 @@ fn heredoc_matches_installed_shells() {
         return;
     }
     let e = engine();
+    let cases = cases();
+    for tolerated in KNOWN_NON_BASH_OVER_DENIES {
+        assert!(
+            cases.iter().any(|c| c == tolerated),
+            "KNOWN_NON_BASH_OVER_DENIES entry is not in cases(): {tolerated:?}"
+        );
+    }
+    // Tolerated cases must stay in the safe (over-deny) direction.
+    for tolerated in KNOWN_NON_BASH_OVER_DENIES {
+        assert!(
+            matches!(e.evaluate(tolerated), Decision::Deny { .. }),
+            "tolerated case no longer denied by the engine: {tolerated:?}"
+        );
+    }
+    // Startup files must never run from the real home.
+    let home = tempfile::tempdir().expect("home tempdir");
     let mut failures = Vec::new();
     for shell in &shells {
         let version = version_line(shell);
         let is_bash = version.contains("bash");
-        for (n, case) in cases().into_iter().enumerate() {
+        for (n, case) in cases.iter().enumerate() {
             let tmp = tempfile::tempdir().expect("tempdir");
             if let Err(err) = Command::new(shell)
                 .arg("-c")
-                .arg(&case)
+                .arg(case)
                 .current_dir(tmp.path())
+                .env("HOME", home.path())
+                .env("ZDOTDIR", home.path())
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
                 .output()
             {
                 println!("note: {shell} cannot be executed ({err}); skipped");
                 break;
             }
             let ran = tmp.path().join("ran").exists();
-            let denied = matches!(e.evaluate(&case), Decision::Deny { .. });
+            let denied = matches!(e.evaluate(case), Decision::Deny { .. });
             if ran && !denied {
                 // Hard invariant on every shell: no bypass.
                 failures.push(format!(
@@ -149,14 +169,12 @@ fn heredoc_matches_installed_shells() {
                     failures.push(format!(
                         "{shell} ({version}): bash over-deny\n  case: {case:?}"
                     ));
+                } else if KNOWN_NON_BASH_OVER_DENIES.contains(&case.as_str()) {
+                    println!("note: {shell} over-denies case {n}: {case:?}");
                 } else {
-                    if KNOWN_NON_BASH_OVER_DENIES.contains(&case.as_str()) {
-                        println!("note: {shell} over-denies case {n}: {case:?}");
-                    } else {
-                        failures.push(format!(
-                            "{shell} ({version}): unlisted non-bash over-deny\n  case: {case:?}"
-                        ));
-                    }
+                    failures.push(format!(
+                        "{shell} ({version}): unlisted non-bash over-deny\n  case: {case:?}"
+                    ));
                 }
             }
         }

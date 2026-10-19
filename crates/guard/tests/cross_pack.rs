@@ -2,7 +2,8 @@
 //! (`core.*`) packs only; opt-in packs stay INACTIVE until explicitly enabled.
 
 use saiifeguard::builtins::builtin_packs;
-use saiifeguard::engine::Engine;
+use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::pack::load_pack_str;
 use saiifeguard::profile::select_active;
 
 fn default_engine() -> Engine {
@@ -50,6 +51,67 @@ fn enabling_an_opt_in_pack_activates_only_it() {
         !e.evaluate(r#"psql -c "DROP DATABASE prod""#).is_deny(),
         "db.postgres still inactive"
     );
+}
+
+fn pack(toml: &str) -> saiifeguard::pack::Pack {
+    let mut w = Vec::new();
+    let p = load_pack_str("<t>", toml, &mut w).unwrap();
+    assert!(w.is_empty(), "{w:?}");
+    p
+}
+
+const PACK_A_ALLOWS: &str = r#"
+[pack]
+id = "test.a"
+triggers = ["foo"]
+
+[[allow]]
+pattern = '^foo\b'
+reason = "a allows foo"
+"#;
+
+const PACK_B_DENIES: &str = r#"
+[pack]
+id = "test.b"
+triggers = ["foo"]
+
+[[deny]]
+pattern = '^foo\s+--bad'
+reason = "b denies --bad"
+"#;
+
+const PACK_B_ALLOWS: &str = r#"
+[pack]
+id = "test.b"
+triggers = ["foo"]
+
+[[allow]]
+pattern = '^foo'
+reason = "b allows foo"
+"#;
+
+#[test]
+fn allow_in_one_pack_does_not_hide_deny_in_another() {
+    let e = Engine::new(vec![pack(PACK_A_ALLOWS), pack(PACK_B_DENIES)]).with_budget(TEST_BUDGET);
+    match e.evaluate("foo --bad") {
+        Decision::Deny { pack, .. } => assert_eq!(pack, "test.b"),
+        other => panic!("expected deny from test.b, got {other:?}"),
+    }
+    assert!(
+        matches!(e.evaluate("foo ok"), Decision::Allow { .. }),
+        "foo ok must be allowed"
+    );
+}
+
+#[test]
+fn two_allowing_packs_return_first_trace() {
+    let e = Engine::new(vec![pack(PACK_A_ALLOWS), pack(PACK_B_ALLOWS)]).with_budget(TEST_BUDGET);
+    match e.evaluate("foo x") {
+        Decision::Allow {
+            trace: AllowTrace::AllowRule { pack, .. },
+        } => assert_eq!(pack, "test.a", "load order decides the trace"),
+        other => panic!("expected an allow-rule trace, got {other:?}"),
+    }
 }
 
 /// Generous budget so a loaded runner cannot turn a deny into a latency

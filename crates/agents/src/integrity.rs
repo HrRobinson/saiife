@@ -72,6 +72,11 @@ pub struct HookRecord {
     /// project, which saiife will not edit; the user removes the hook there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off_outside: Option<String>,
+    /// With `off_failed`: the agent's `init` before that `--off` had failed,
+    /// so the hook may never have been written (status says "may still be
+    /// in place", not "is still in place").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_failed: bool,
 }
 
 /// `$SAIIFE_DATA_DIR`, else `<data dir>/saiife`.
@@ -174,6 +179,7 @@ mod tests {
                 error: None,
                 off_failed: false,
                 off_outside: None,
+                init_failed: false,
             },
         );
         Integrity {

@@ -55,7 +55,9 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
 }
 
 /// `create_dir_all`, with owner-only (0700) permissions on unix for the
-/// directories it creates: the log reveals what people work on.
+/// directories it creates: the log reveals what people work on. An existing
+/// loose directory is tightened to 0700 too, best-effort, and only when it is
+/// a real directory (not a symlink); a failed chmod (e.g. not the owner) is ignored.
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
@@ -64,7 +66,21 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(dir)
+    b.create(dir)?;
+    // `create_dir_all` leaves an existing directory alone: tighten a loose one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = fs::symlink_metadata(dir) {
+            // No owner check (this crate forbids unsafe, so no geteuid): a
+            // directory owned by someone else makes chmod fail with EPERM,
+            // which is ignored.
+            if md.is_dir() && md.permissions().mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What `read_all` found: the parseable records plus how much it had to skip,
@@ -82,6 +98,10 @@ pub struct ReadResult {
     /// (permissions, not a directory). A missing directory is not an error:
     /// it only means nothing was recorded yet.
     pub dir_error: Option<String>,
+    /// `read_recent` only: it stopped (at `max_files`, or because `want`
+    /// asked it to) with older month files left unread, so "no record
+    /// found" means "none in the files read", not "none at all".
+    pub cut_short: bool,
 }
 
 /// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
@@ -133,7 +153,8 @@ pub fn read_all(dir: &Path) -> ReadResult {
     out
 }
 
-/// Read at most `max_files` month files, newest first. `want` sees every record of each file
+/// Read at most `max_files` month files, newest first (`cut_short` says
+/// whether older ones were left unread). `want` sees every record of each file
 /// and returns `true` while it still needs older data; after the first file
 /// in which it returned `false` the older files are not opened (so their
 /// problems are not counted). Records come back newest file first, each file
@@ -151,9 +172,11 @@ pub fn read_recent(
             return out;
         }
     };
+    let mut unread = files.len();
     for p in files.iter().rev().take(max_files) {
         let start = out.records.len();
         read_month_file(p, &mut out);
+        unread -= 1;
         let mut more = true;
         for r in &out.records[start..] {
             more &= want(r);
@@ -162,6 +185,7 @@ pub fn read_recent(
             break;
         }
     }
+    out.cut_short = unread > 0;
     out
 }
 
@@ -414,6 +438,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn existing_loose_audit_dir_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("audit");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&dir, &r).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_audit_dir_target_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("real");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        append(&link, &r).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    /// The size that matters is the serialized line, not the field lengths:
+    /// multibyte input stays within 4096 chars but is several times that in
+    /// bytes, and the file holds exactly the serialized bytes plus a newline.
+    #[test]
+    fn record_size_check_measures_serialized_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        r.input = "\u{1F600}".repeat(5000);
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(line.len() > 16 * 1024);
+        append(dir.path(), &r).unwrap();
+        let file = dir.path().join(format!("{}.jsonl", r.month()));
+        assert_eq!(fs::metadata(file).unwrap().len() as usize, line.len() + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn audit_dir_is_0700() {
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::tempdir().unwrap();
@@ -543,6 +627,58 @@ mod tests {
         }
         let got = read_recent(dir.path(), 2, |_| true);
         assert_eq!(got.skipped_lines, 2);
+    }
+
+    #[test]
+    fn read_recent_reads_past_empty_month_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "").unwrap();
+        }
+        let mut calls = 0;
+        let got = read_recent(dir.path(), 12, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 0, "empty files have no records to show");
+        assert_eq!(got, ReadResult::default(), "every existing file was read");
+        assert!(!got.cut_short, "nothing was left unread");
+    }
+
+    #[test]
+    fn read_recent_is_cut_short_only_with_files_left_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        for m in ["2026-01", "2026-02", "2026-03"] {
+            fs::write(dir.path().join(format!("{m}.jsonl")), "not json\n").unwrap();
+        }
+        assert!(
+            read_recent(dir.path(), 2, |_| true).cut_short,
+            "max_files hit"
+        );
+        assert!(!read_recent(dir.path(), 3, |_| true).cut_short, "all read");
+        assert!(!read_recent(dir.path(), 12, |_| true).cut_short);
+        assert!(!read_recent(&dir.path().join("nope"), 12, |_| true).cut_short);
+
+        let a = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-01-02 00:00:00 UTC),
+        );
+        let b = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-03-02 00:00:00 UTC),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &a).unwrap();
+        append(dir.path(), &b).unwrap();
+        let stopped = read_recent(dir.path(), 12, |_| false);
+        assert_eq!(stopped.records, vec![b]);
+        assert!(stopped.cut_short, "want stopped with an older file unread");
+        let one = read_recent(dir.path(), 12, |r| r.ts.starts_with("2026-03"));
+        assert!(!one.cut_short, "want stopped on the last file");
     }
 
     #[test]

@@ -30,7 +30,7 @@ fn untouched_project_passes() {
     for a in ["claude", "codex", "gemini"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call in")),
+                .any(|l| l.contains(a) && l.contains("hooked") && l.contains("no call yet")),
             "{a}: {text}"
         );
     }
@@ -94,7 +94,10 @@ fn hook_removed_by_hand_is_reported_with_the_fix() {
         "{text}"
     );
     assert!(
-        text.contains("Fix: run `saiife init` to restore it"),
+        text.contains(&format!(
+            "Fix: run `saiife init` in {} to restore it",
+            std::fs::canonicalize(env.root()).unwrap().display()
+        )),
         "{text}"
     );
     // ...and init does restore it.
@@ -239,7 +242,7 @@ fn last_hook_call_is_shown_per_agent() {
         .lines()
         .find(|l| l.trim_start().starts_with("codex"))
         .unwrap();
-    assert!(codex.contains("no call in"), "{codex}");
+    assert!(codex.contains("no call yet"), "{codex}");
 }
 
 #[test]
@@ -630,7 +633,7 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
         .lines()
         .find(|l| l.trim_start().starts_with("claude"))
         .unwrap();
-    assert!(claude.contains("no call in"), "{claude}");
+    assert!(claude.contains("no call yet"), "{claude}");
 }
 
 /// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
@@ -648,14 +651,14 @@ fn status_reads_recent_months_only() {
     let project = project.to_str().unwrap();
     let now = time::OffsetDateTime::now_utc();
     let this_month = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
-    // The records of the newest month: one recent call per hooked agent.
-    let mut recent = String::new();
     let ts = format!(
         "{:04}-{:02}-{:02}T00:00:00.000Z",
         now.year(),
         u8::from(now.month()),
         now.day()
     );
+    // The records of the newest month: one recent call per hooked agent.
+    let mut recent = String::new();
     for a in ["claude", "codex"] {
         recent.push_str(&audit_line(project, a, &ts));
     }
@@ -667,15 +670,17 @@ fn status_reads_recent_months_only() {
         let name = format!("{:04}-{:02}.jsonl", 2023 + m / 12, 1 + m % 12);
         std::fs::write(env.audit.path().join(name), &body).unwrap();
     }
-    let start = std::time::Instant::now();
+    // The next-newest month is a directory: opening it would be a failed
+    // check, so exit 0 proves status stopped after the newest file instead
+    // of scanning the log (deterministic, unlike a wall-clock bound).
+    std::fs::create_dir(env.audit.path().join("2025-06.jsonl")).unwrap();
     let (c, text) = status(&env);
-    let took = start.elapsed();
     assert_eq!(c, 0, "{text}");
-    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    assert!(!text.contains("audit log"), "{text}");
     for a in ["claude", "codex"] {
         assert!(
             text.lines()
-                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call in")),
+                .any(|l| l.contains(a) && l.contains("hooked") && !l.contains("no call")),
             "{a}: {text}"
         );
     }
@@ -749,4 +754,205 @@ fn failed_agent_entry_clears_on_success() {
     let (c, text) = status(&env);
     assert_eq!(c, 0, "{text}");
     assert!(!text.contains("could not set up"), "{text}");
+}
+
+#[test]
+fn fresh_install_says_no_call_yet() {
+    let env = initialized(&["claude"]);
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("no call yet"), "{claude}");
+    assert!(!claude.contains("12 months"), "{claude}");
+}
+
+#[test]
+fn old_log_says_last_12_months() {
+    let env = initialized(&["claude"]);
+    let project = std::fs::canonicalize(env.root()).unwrap();
+    let project = project.to_str().unwrap();
+    // 13 month files; only the oldest (never read) holds this project's call.
+    for m in 1..=13u32 {
+        let name = format!("{:04}-{:02}.jsonl", 2024 + (m - 1) / 12, 1 + (m - 1) % 12);
+        let body = if m == 1 {
+            audit_line(project, "claude", "2024-01-15T00:00:00.000Z")
+        } else {
+            String::new()
+        };
+        std::fs::write(env.audit.path().join(name), body).unwrap();
+    }
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(claude.contains("no call in the last 12 months"), "{claude}");
+}
+
+/// A nearer `.saiife/` wins over a guarded parent project: its removed
+/// config is named instead of the parent's status.
+#[test]
+fn nearer_project_with_removed_config_is_named() {
+    let env = initialized(&["claude"]);
+    let child = env.root().join("child");
+    // A config of its own makes `child` a project (init works on it, not
+    // on the parent).
+    std::fs::create_dir_all(child.join(".saiife")).unwrap();
+    std::fs::copy(
+        env.root().join(".saiife/config.toml"),
+        child.join(".saiife/config.toml"),
+    )
+    .unwrap();
+    let out = env.saiife_in(&child, &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    std::fs::remove_file(child.join(".saiife/config.toml")).unwrap();
+    assert!(child.join(".saiife").is_dir());
+    let out = env.saiife_in(&child, &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let first = text.lines().next().unwrap();
+    assert!(first.ends_with("/child"), "{text}");
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
+}
+
+/// Review I-1: a stray empty `.saiife/` in a subdirectory (no config, no
+/// integrity record) does not hide the parent project's tampered config.
+#[test]
+fn empty_saiife_dir_in_subdir_does_not_hide_parent_tamper() {
+    let env = initialized(&["claude"]);
+    env.write(".saiife/config.toml", "version = 1\npacks = []\n");
+    std::fs::create_dir_all(env.root().join("src/.saiife")).unwrap();
+    let out = env.saiife_in(&env.root().join("src"), &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    assert!(
+        text.contains(".saiife/config.toml was changed since `saiife init`"),
+        "{text}"
+    );
+    assert!(!text.contains("not set up for this project"), "{text}");
+}
+
+#[test]
+fn unreadable_audit_dir_says_last_call_unknown() {
+    let env = initialized(&["claude"]);
+    // A file where the audit directory should be: cannot be listed.
+    let audit = env.audit.path().join("audit");
+    std::fs::write(&audit, "x").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("status")
+        .current_dir(env.root())
+        .env("PATH", env.bin.path())
+        .env("HOME", env.home.path())
+        .env("SAIIFE_DATA_DIR", env.data.path())
+        .env("SAIIFE_AUDIT_DIR", &audit)
+        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+        .output()
+        .unwrap();
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    let claude = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("claude"))
+        .unwrap();
+    assert!(
+        claude.contains("unknown (audit log could not be read)"),
+        "{claude}"
+    );
+    assert!(!claude.contains("no call"), "{claude}");
+}
+
+/// Re-review I-2 (nested): outer config tampered, inner `.saiife/` removed.
+/// Status from inner names inner and says where to run init; init from
+/// inner restores inner (it has a record) and never re-baselines outer's
+/// tampered config, so status from outer still fails.
+#[test]
+fn init_from_inner_with_removed_saiife_restores_inner_not_outer() {
+    let env = initialized(&["claude"]);
+    let inner = env.root().join("inner");
+    std::fs::create_dir_all(inner.join(".saiife")).unwrap();
+    std::fs::copy(
+        env.root().join(".saiife/config.toml"),
+        inner.join(".saiife/config.toml"),
+    )
+    .unwrap();
+    assert_eq!(code(&env.saiife_in(&inner, &["init"])), 0);
+    env.write(".saiife/config.toml", "version = 1\npacks = []\n");
+    std::fs::remove_dir_all(inner.join(".saiife")).unwrap();
+
+    let out = env.saiife_in(&inner, &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "run `saiife init` in {}",
+            std::fs::canonicalize(&inner).unwrap().display()
+        )),
+        "{text}"
+    );
+
+    let out = env.saiife_in(&inner, &["init"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(!text.contains("Using the saiife project at"), "{text}");
+    assert!(inner.join(".saiife/config.toml").is_file());
+    assert_eq!(code(&env.saiife_in(&inner, &["status"])), 0);
+
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains(".saiife/config.toml was changed since `saiife init`"),
+        "{text}"
+    );
+}
+
+/// Re-review I-2 (single): p's config removed; status from p/sub names p
+/// in its fix, and init from p/sub restores p instead of starting a new
+/// project at p/sub.
+#[test]
+fn init_from_subdir_after_config_removed_restores_the_project() {
+    let env = initialized(&["claude"]);
+    let sub = env.root().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::remove_file(env.root().join(".saiife/config.toml")).unwrap();
+
+    let text = stdout(&env.saiife_in(&sub, &["status"]));
+    assert!(
+        text.contains(&format!(
+            "run `saiife init` in {} to restore it",
+            std::fs::canonicalize(env.root()).unwrap().display()
+        )),
+        "{text}"
+    );
+
+    let out = env.saiife_in(&sub, &["init"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(text.contains("Using the saiife project at"), "{text}");
+    assert!(!sub.join(".saiife").exists());
+    assert!(env.root().join(".saiife/config.toml").is_file());
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
+}
+
+/// The packs line says where the config came from when that is not the
+/// project shown in the header.
+#[test]
+fn packs_line_names_a_config_from_another_directory() {
+    let env = Env::new(&["claude"]);
+    let proj = env.root().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let out = env.saiife_in(&proj, &["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    std::fs::remove_file(proj.join(".saiife/config.toml")).unwrap();
+    env.write(".saiife/config.toml", "packs = []\n");
+    let out = env.saiife_in(&proj, &["status"]);
+    let text = stdout(&out);
+    let root = std::fs::canonicalize(env.root()).unwrap();
+    let want = format!("packs (from {}/.saiife/config.toml):", root.display());
+    assert!(text.contains(&want), "{text}");
 }

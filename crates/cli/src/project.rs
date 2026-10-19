@@ -5,7 +5,29 @@
 use std::path::{Path, PathBuf};
 
 use saiife_agents::config::{self, CONFIG_REL};
+use saiife_agents::integrity::{self, Integrity};
 use saiifeguard::Pack;
+
+/// The saiife project `status`, `init` and `init --off` work on: the
+/// nearest directory at or above `cwd` that holds `.saiife/config.toml` as a
+/// file or has an integrity record on this machine; `cwd` if none does.
+/// A project whose config was removed is still found by its record, so
+/// `init` restores that project instead of re-baselining a parent's config
+/// or starting a new project below it. A stray `.saiife/` with neither does
+/// not count. (The hook's own lookup is config-only:
+/// `config::find_project_root`.)
+pub fn project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|d| {
+            d.join(CONFIG_REL).is_file()
+                || integrity::record_path(d)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
+        })
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ProjectPacks {

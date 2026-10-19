@@ -24,14 +24,14 @@ pub fn run(builtin: &[Pack], cli_packs: &[String], vars: &PathVars, id: Option<&
         };
         let here =
             pack.default_on || project.enabled.contains(&pack.id) || cli_packs.contains(&pack.id);
-        print!("{}", render_pack_with(pack, here, Some(vars)));
+        out!("{}", render_pack_with(pack, here, Some(vars)));
         return ExitCode::SUCCESS;
     }
     match &project.root {
-        Some(r) => println!("Project: {}", r.display()),
-        None => println!("No .saiife/config.toml here or above; showing the defaults."),
+        Some(r) => outln!("Project: {}", r.display()),
+        None => outln!("No .saiife/config.toml here or above; showing the defaults."),
     }
-    print!("{}", render(builtin, &project.enabled, cli_packs));
+    out!("{}", render(builtin, &project.enabled, cli_packs));
     ExitCode::SUCCESS
 }
 

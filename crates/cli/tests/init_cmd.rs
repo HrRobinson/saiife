@@ -392,6 +392,46 @@ fn dangling_agent_config_symlink_is_explained() {
     assert!(!line.contains("No such file"), "{line}");
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_chain_names_last_link() {
+    let env = Env::new(&["claude"]);
+    std::fs::create_dir(env.root().join(".claude")).unwrap();
+    let dir = env.root().join(".claude");
+    std::os::unix::fs::symlink("b.json", dir.join("a.json")).unwrap();
+    std::os::unix::fs::symlink("missing.json", dir.join("b.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("settings.json")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains("missing.json"), "{line}");
+    assert!(line.contains("does not exist"), "{line}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_cycle_in_agent_config_keeps_loop_wording() {
+    let env = Env::new(&["claude"]);
+    let dir = env.root().join(".claude");
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink("b.json", dir.join("a.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("b.json")).unwrap();
+    std::os::unix::fs::symlink("a.json", dir.join("settings.json")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|l| l.contains("FAILED") && l.contains("claude"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(!line.contains("does not exist"), "{line}");
+    assert!(line.contains("Too many levels of symbolic links"), "{line}");
+}
+
 /// Hook claude for real, then move its settings outside the project and
 /// leave a symlink in its place.
 #[cfg(unix)]
@@ -428,6 +468,49 @@ fn outside_symlink_off_gives_cleanup_hint() {
     assert!(text.contains("by hand"), "{text}");
     assert!(!text.to_lowercase().contains("permissions"), "{text}");
     assert!(!text.contains("fix"), "{text}");
+}
+
+/// Plan 5b (status wording): the agent's earlier `init` failed (its config
+/// already pointed outside the project), so after `--off` the hook "may
+/// still be" in the outside file, not "is still"; status names the file
+/// to check by hand. A second `--off` keeps that.
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_after_failed_init_says_may_still_be_in_place() {
+    let env = Env::new(&["claude", "codex"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("config.toml");
+    std::fs::write(&target, "model = \"x\"\n").unwrap();
+    std::fs::create_dir(env.root().join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".codex/config.toml")).unwrap();
+    assert_eq!(code(&env.saiife(&["init"])), 1, "codex init fails");
+    let target = std::fs::canonicalize(&target).unwrap();
+    let target = target.to_str().unwrap();
+    for _ in 0..2 {
+        let out = env.saiife(&["init", "--off"]);
+        let text = stdout(&out);
+        assert_eq!(code(&out), 1, "{text}");
+        assert!(text.contains("may still be there"), "{text}");
+        let st = env.saiife(&["status"]);
+        let text = stdout(&st);
+        assert_eq!(code(&st), 1, "{text}");
+        assert!(text.contains("may still be in place"), "{text}");
+        assert!(!text.contains("is still in place"), "{text}");
+        assert!(text.contains(target), "{text}");
+        assert!(text.contains("by hand"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_symlink_off_after_good_init_says_still_in_place() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    hooked_then_symlinked_outside(&env, outside.path());
+    assert_eq!(code(&env.saiife(&["init", "--off"])), 1);
+    let text = stdout(&env.saiife(&["status"]));
+    assert!(text.contains("is still in place"), "{text}");
+    assert!(!text.contains("may still be"), "{text}");
 }
 
 /// Final review F1: an agent saiife never hooked is left alone, even when

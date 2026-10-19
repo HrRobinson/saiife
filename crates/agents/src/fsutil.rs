@@ -24,6 +24,25 @@ pub fn read_optional(path: &Path) -> Result<Option<String>, AgentError> {
     }
 }
 
+/// Follow the symlink chain starting at `start` (at most 40 hops) and return
+/// the first target that does not exist. `None` if `start` is not a symlink,
+/// or the chain is a loop or too long.
+fn dangling_end(start: &Path) -> Option<PathBuf> {
+    fs::read_link(start).ok()?;
+    let mut cur = start.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&cur) else {
+            return None;
+        };
+        let next = cur.parent().map_or(target.clone(), |d| d.join(&target));
+        if fs::symlink_metadata(&next).is_err() {
+            return Some(next);
+        }
+        cur = next;
+    }
+    None
+}
+
 /// Refuse `<project>/<rel>` when it resolves outside the project: a
 /// symlinked agent config (or config directory) pointing elsewhere, e.g. a
 /// user-wide file, must not be rewritten by a per-project `init`. A missing
@@ -39,10 +58,7 @@ pub fn ensure_inside(project: &Path, rel: &str) -> Result<(), AgentError> {
         Ok(r) => r,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // A dangling symlink: say what it points at, not a raw I/O error.
-            if let Ok(target) = fs::read_link(existing) {
-                let missing = existing
-                    .parent()
-                    .map_or(target.clone(), |d| d.join(&target));
+            if let Some(missing) = dangling_end(existing) {
                 return Err(AgentError::Layout {
                     path: existing.to_path_buf(),
                     detail: format!(

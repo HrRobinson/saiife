@@ -15,6 +15,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+#[macro_use]
+mod out;
+
 mod audit_cmd;
 mod check;
 mod init_cmd;
@@ -233,7 +236,7 @@ fn cmd_explain(
     command: &str,
 ) -> ExitCode {
     let decision = engine.evaluate(command);
-    print!(
+    out!(
         "command: {command}\n{}{}",
         trace(decision),
         packs_cmd::inactive_summary(active, vars)
@@ -253,7 +256,7 @@ fn cmd_explain_path(
         .resolve_path(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(cannot be resolved)".into());
-    print!(
+    out!(
         "path:     {path}\nresolved: {resolved}\naccess:   {}\n{}{}",
         access.label(),
         trace(decision),

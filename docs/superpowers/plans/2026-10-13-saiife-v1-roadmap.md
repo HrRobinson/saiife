@@ -77,26 +77,44 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 ## Carry-over from plan 5a (for the plans that own them)
 
 - **Done in plan 5a (PR #2 follow-up):** an allow rule now exempts only its own pack. A deny from any other pack still wins.
-- **Plan 5b (docs, known over-denies):** zsh 5.9 and dash over-deny three here-document-in-`$(…)` shapes. This is the safe direction. They are listed in `KNOWN_NON_BASH_OVER_DENIES` (`shell_differential` test); document them.
-- **Plan 5b (guard engine):**
-  - Stale "judged above/below" comments in `SegmentView::new` and `command_position_phase` (`engine.rs`): name the phase methods. `environment_phase` has an unused `&self`.
-  - `refactor_equivalence`: the `CORPUS.len() >= 60` assert is constant, and denies are matched by pack only, not by pattern.
-  - Cross-pack allow scoping: no test in `cross_pack.rs`, and no test that two allowing packs return the first trace. An allow no longer short-circuits (small perf cost). An early allow followed by a later-pack timeout is now a timeout fail-open (still recorded, not a bypass).
-  - "Bind path rules lazily" oversells: the rules are bound on every call, and the gain is compiling each glob once. Fix the `with_paths` doc comment.
-- **Plan 5b (guard lexer):** `_ =>` arms in the operator and quote handling rely on `step()` routing (use explicit arms and `unreachable!()`); the merged `,`/`}` brace arm; some helpers return `()`.
+- ~~**Plan 5b (docs, known over-denies):** zsh 5.9 and dash over-deny three here-document-in-`$(…)` shapes. This is the safe direction. They are listed in `KNOWN_NON_BASH_OVER_DENIES` (`shell_differential` test); document them.~~ — done in plan 5b
+- **Plan 5b (guard engine):** — done in plan 5b
+  - ~~Stale "judged above/below" comments in `SegmentView::new` and `command_position_phase` (`engine.rs`): name the phase methods. `environment_phase` has an unused `&self`.~~ — done in plan 5b
+  - ~~`refactor_equivalence`: the `CORPUS.len() >= 60` assert is constant, and denies are matched by pack only, not by pattern.~~ — done in plan 5b
+  - ~~Cross-pack allow scoping: no test in `cross_pack.rs`, and no test that two allowing packs return the first trace. An allow no longer short-circuits (small perf cost). An early allow followed by a later-pack timeout is now a timeout fail-open (still recorded, not a bypass).~~ — done in plan 5b
+  - ~~"Bind path rules lazily" oversells: the rules are bound on every call, and the gain is compiling each glob once. Fix the `with_paths` doc comment.~~ — done in plan 5b
+- ~~**Plan 5b (guard lexer):** `_ =>` arms in the operator and quote handling rely on `step()` routing (use explicit arms and `unreachable!()`); the merged `,`/`}` brace arm; some helpers return `()`.~~ — done in plan 5b
 - **Plan 5b (docs, `core.secrets` and paths):**
-  - A relative `CLAUDE_CONFIG_DIR` used by the agent is not resolved against the hook's cwd; inline `CLAUDE_CONFIG_DIR=/x cat /x/.credentials.json` is not covered; Gemini `GEMINI_CLI_HOME` is not covered.
+  - ~~A relative `CLAUDE_CONFIG_DIR` used by the agent is not resolved against the hook's cwd; inline `CLAUDE_CONFIG_DIR=/x cat /x/.credentials.json` is not covered; Gemini `GEMINI_CLI_HOME` is not covered.~~ — done in plan 5b
   - The `core.secrets` comment wording and the HOME-unknown case.
-- **Plan 5b (shell differential tests):** the shell list and `cases()` are rebuilt per shell; the tolerance list is keyed to the zsh version; shell startup files (`~/.zshenv`, `BASH_ENV`) run with the real HOME; one collapsible else-if.
-- **Plan 5b (status and audit):**
-  - "no call in the last 12 months" also shows on a brand-new install and for an agent hooked yesterday: "no call yet" fits when the scan was not cut short.
-  - `store::read_recent`: an empty month file leaves `more = true`, so with no hooked agent `status` reads up to 12 files for nothing; short-circuit first.
-  - The CLI wiring of the inactive note in `packs <id>`/`explain` is only unit-tested (render and `inactive_summary`); hoist `ts` in the `read_recent` test; `read_recent_stops_early` had no RED run.
-  - `status_root`: a parent's `.saiife/config.toml` hides a nearer project whose config was removed (pre-existing in shape).
-- **Plan 5b (init and housekeeping):**
-  - A symlink chain with a dangling end reports the first link's target.
-  - An existing looser audit dir is not tightened (new dirs are 0700; files are 0600 anyway).
-  - The `--since` error text is duplicated; no test that an ordinary path in a reason stays unmasked; the 16 KB check measures the re-serialized record.
-  - The pack loader words a valid-header, broken-rules enabled pack as "failed to load"; `load_active` copies `select_active`'s filter (pinned by a test); warnings show only on shell and file calls (R17).
+- ~~**Plan 5b (shell differential tests):** the shell list and `cases()` are rebuilt per shell; the tolerance list is keyed to the zsh version; shell startup files (`~/.zshenv`, `BASH_ENV`) run with the real HOME; one collapsible else-if.~~ — done in plan 5b
+- **Plan 5b (status and audit):** — done in plan 5b
+  - ~~"no call in the last 12 months" also shows on a brand-new install and for an agent hooked yesterday: "no call yet" fits when the scan was not cut short.~~ — done in plan 5b
+  - ~~`store::read_recent`: an empty month file leaves `more = true`, so with no hooked agent `status` reads up to 12 files for nothing; short-circuit first.~~ — done in plan 5b
+  - ~~The CLI wiring of the inactive note in `packs <id>`/`explain` is only unit-tested (render and `inactive_summary`); hoist `ts` in the `read_recent` test; `read_recent_stops_early` had no RED run.~~ — done in plan 5b
+  - ~~`status_root`: a parent's `.saiife/config.toml` hides a nearer project whose config was removed (pre-existing in shape).~~ — done in plan 5b
+- **Plan 5b (init and housekeeping):** — done in plan 5b
+  - ~~A symlink chain with a dangling end reports the first link's target.~~ — done in plan 5b
+  - ~~An existing looser audit dir is not tightened (new dirs are 0700; files are 0600 anyway).~~ — done in plan 5b
+  - ~~The `--since` error text is duplicated; no test that an ordinary path in a reason stays unmasked; the 16 KB check measures the re-serialized record.~~ — done in plan 5b
+  - ~~The pack loader words a valid-header, broken-rules enabled pack as "failed to load"; `load_active` copies `select_active`'s filter (pinned by a test); warnings show only on shell and file calls (R17).~~ — done in plan 5b
 - **Plan 5c (release, bench, CI):** `scripts/bench-check.sh` hard-codes `$repo/target/release/saiife` and ignores `CARGO_TARGET_DIR`.
-- **Plan 5b (status wording):** an agent whose earlier `init` failed and whose config sits behind an outside symlink can get the "hook is still in place" text on `--off`, which may be untrue (`status_cmd.rs`).
+- ~~**Plan 5b (status wording):** an agent whose earlier `init` failed and whose config sits behind an outside symlink can get the "hook is still in place" text on `--off`, which may be untrue (`status_cmd.rs`).~~ — done in plan 5b
+
+## Carry-over from plan 5b (for the plans that own them)
+
+- The guard does not block `cd / && rm -rf *`: `cd` is not tracked. It is listed as not covered in `docs/packs/core.filesystem.md`.
+- The hook's project lookup is config-only, while `status` and `init` also accept an integrity record (minor; `core.self` denies writes to `**/.saiife/**`).
+- Audit directory tightening chmods any loose real directory that the user owns and set through `SAIIFE_AUDIT_DIR`.
+- `dollar()` keeps its `_ =>` arm as a real fallback.
+- The docs link test does not check `#anchors` or `~~~` fences.
+- `shellcheck` is not run on the scripts (not installed here). Add it to CI in plan 5c.
+- `status` could warn about nested `.saiife/config.toml` files that have no integrity record. A stray nested config with `packs = []` turns opt-in packs off for hooks run from that directory. Only a script can create one (`core.self` blocks shell and write tools).
+
+## User checks (plan 5c gate)
+
+- Run `scripts/live-check-agents.sh` (Codex, Gemini).
+- Verify the Codex + Ollama recipe and the `[model_providers.ollama]` key.
+- Look at the HTML report at phone width and in print preview.
+- `scripts/bench-check.sh` must honour `CARGO_TARGET_DIR` (plan 5c).
+- **Plan 5c (tests):** add a `broken_pipe.rs` case for `check --hook-exit` deny with stdout closed (`>&-`) — verified by hand in the plan-5b final re-review (exit 2). JSON-mode `check` with stdout closed outright (`>&-`, not a broken pipe) still exits 0 on deny, since Rust discards the write; no installed hook uses JSON mode.

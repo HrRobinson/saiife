@@ -209,18 +209,52 @@ fn matches(want: &Want, got: &Decision) -> bool {
     }
 }
 
+/// Number of corpus lines that must be denied (`Deny` and `DenyInline`).
+/// Recorded from the corpus as run when this pin was added.
+const DENY_COUNT: usize = 58;
+
+/// The distinct `(pack, pattern)` pairs those denials come from, sorted.
+const DENY_RULES: &[(&str, &str)] = &[
+    (
+        "core.filesystem",
+        r"^(?:sudo\s+)?rm\s+(?:\S+\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\s+(?:\S+\s+)*(?:/\*|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users|Volumes)/?\*?|/)(?:\s|$)",
+    ),
+    ("core.git", r"^git\s+reset\s+--hard\b"),
+    ("core.secrets", "**/.env"),
+    ("core.secrets", "**/.ssh/id_*"),
+    (
+        "core.self",
+        r"(?i)^(?:(?:sudo|env|command|nohup|exec)\s+|-\S*\s+|\S+=\S*\s+)*(?:path|home|xdg_data_home|gemini_cli_system_settings_path|gemini_cli_system_defaults_path|codex_home|claude_config_dir)=\S*\s+(?:\S+=\S*\s+|-\S*\s+)*(?:\S*/)?(?:claude|codex|gemini|saiife)(?:\s|$)",
+    ),
+    ("core.self", "**/.claude/settings.json"),
+    ("core.self", r"^(?:claude|codex|gemini|saiife)(?:\s|$)"),
+    ("saiifeguard.core", "guarded-command-substitution-argument"),
+];
+
 #[test]
 fn refactor_equivalence_corpus() {
-    assert!(CORPUS.len() >= 60);
     let dir = tempfile::tempdir().unwrap();
     let root: PathBuf = fs::canonicalize(dir.path()).unwrap();
     let e = engine(&root);
-    let wrong: Vec<String> = CORPUS
-        .iter()
-        .filter_map(|(cmd, want)| {
-            let got = e.evaluate(cmd);
-            (!matches(want, &got)).then(|| format!("{cmd:?}: want {want:?}, got {got:?}"))
-        })
-        .collect();
+    let mut wrong = Vec::new();
+    let mut denies = 0;
+    let mut rules = std::collections::BTreeSet::new();
+    for (cmd, want) in CORPUS {
+        let got = e.evaluate(cmd);
+        if !matches(want, &got) {
+            wrong.push(format!("{cmd:?}: want {want:?}, got {got:?}"));
+        }
+        if let Decision::Deny { pack, pattern, .. } = got {
+            denies += 1;
+            rules.insert((pack, pattern));
+        }
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let rules: Vec<(String, String)> = rules.into_iter().collect();
+    assert_eq!(denies, DENY_COUNT, "deny count drifted");
+    let pinned: Vec<(String, String)> = DENY_RULES
+        .iter()
+        .map(|(p, r)| (p.to_string(), r.to_string()))
+        .collect();
+    assert_eq!(rules, pinned, "denying (pack, pattern) pairs drifted");
 }

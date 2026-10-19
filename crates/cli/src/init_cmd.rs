@@ -1,6 +1,6 @@
 //! `saiife init` and `saiife init --off` (spec §5, §5.1, §5.2, §7.5).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use saiife_agents::config::{self, CONFIG_REL};
@@ -10,11 +10,7 @@ use saiife_agents::integrity::{self, HookRecord, Integrity, INTEGRITY_VERSION};
 use saiife_agents::{Agent, Change};
 use saiifeguard::Pack;
 
-/// The project `init`, `--off` and `status` work on: the nearest directory
-/// at or above `cwd` with `.saiife/config.toml`, else `cwd` itself.
-pub fn project_root(cwd: &Path) -> PathBuf {
-    config::find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
-}
+use crate::project::project_root;
 
 pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> ExitCode {
     let Ok(cwd) = std::env::current_dir() else {
@@ -23,7 +19,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     };
     let root = project_root(&cwd);
     if root != cwd {
-        println!("Using the saiife project at {}", root.display());
+        outln!("Using the saiife project at {}", root.display());
     }
 
     // Which agents.
@@ -160,6 +156,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         error: None,
                         off_failed: false,
                         off_outside: None,
+                        init_failed: false,
                     },
                 );
                 installed.push(*agent);
@@ -182,6 +179,7 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
                         error: Some(e.to_string()),
                         off_failed: false,
                         off_outside: None,
+                        init_failed: false,
                     },
                 );
                 lines.push(format!("  {:<7} FAILED: {e}", agent.name()));
@@ -232,9 +230,9 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         lines.push(format!("  integrity record FAILED: {e}"));
     }
 
-    println!("saiife is on for {}", root.display());
+    outln!("saiife is on for {}", root.display());
     for l in &lines {
-        println!("{l}");
+        outln!("{l}");
     }
     if let Ok(cfg) = config::load(&root) {
         let active: Vec<&str> = builtin
@@ -242,19 +240,19 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
             .filter(|p| p.default_on || cfg.packs.contains(&p.id))
             .map(|p| p.id.as_str())
             .collect();
-        println!("  packs   {}", active.join(", "));
+        outln!("  packs   {}", active.join(", "));
     }
     for w in &warnings {
-        println!("\n{w}");
+        outln!("\n{w}");
     }
     path_warning(&exe);
     if !installed.is_empty() {
-        println!("\nNext steps:");
+        outln!("\nNext steps:");
         for agent in &installed {
-            println!("  - {}: {}", agent.label(), agent.next_step());
+            outln!("  - {}: {}", agent.label(), agent.next_step());
         }
     }
-    println!("Check the setup any time with `saiife status`.");
+    outln!("Check the setup any time with `saiife status`.");
     if failed {
         ExitCode::from(1)
     } else {
@@ -266,12 +264,12 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
 /// nothing, or a different binary.
 fn path_warning(exe: &Path) {
     match which("saiife").map(|p| std::fs::canonicalize(&p).unwrap_or(p)) {
-        None => println!(
+        None => outln!(
             "\nWARNING: `saiife` is not on your PATH, so the agents cannot run the hook and \
              their actions are NOT guarded. Put saiife in a PATH directory (e.g. ~/.local/bin), \
              then run `saiife init` again."
         ),
-        Some(p) if p != exe => println!(
+        Some(p) if p != exe => outln!(
             "\nWARNING: the hooks will run {} (the saiife on your PATH), not this binary ({}). \
              Run `saiife init` with the saiife on your PATH.",
             p.display(),
@@ -310,8 +308,9 @@ pub fn off() -> ExitCode {
         .unwrap_or_default();
     let mut lines = Vec::new();
     // Agents whose hook could not be removed, with the reason.
-    // (agent, reason, the outside file when the config symlinks out)
-    let mut failed_agents: Vec<(Agent, String, Option<String>)> = Vec::new();
+    // (agent, reason, the outside file when the config symlinks out,
+    // whether the agent's earlier init had failed)
+    let mut failed_agents: Vec<(Agent, String, Option<String>, bool)> = Vec::new();
 
     for agent in Agent::ALL {
         // Only agents saiife hooked (recorded, or a saiife entry in the
@@ -340,14 +339,27 @@ pub fn off() -> ExitCode {
                 failed = true;
                 let mut line = format!("  {:<7} FAILED: {e}", agent.name());
                 let outside = e.outside_target().map(|p| p.display().to_string());
-                if outside.is_some() {
+                // The earlier `init` for this agent failed (or an earlier
+                // `--off` already knew it had): the hook may never have
+                // been written.
+                let init_failed = record
+                    .as_ref()
+                    .and_then(|r| r.hooks.get(agent.name()))
+                    .is_some_and(|h| h.init_failed || (h.error.is_some() && !h.off_failed));
+                if outside.is_some() && init_failed {
+                    line.push_str(
+                        "\n          saiife did not change that file. Its earlier `saiife init` \
+                         failed, so the saiife hook may still be there: check it by hand and \
+                         remove the saiife hook entry (the `saiife check` command) if it is.",
+                    );
+                } else if outside.is_some() {
                     line.push_str(
                         "\n          saiife did not change that file. To finish, remove the \
                          saiife hook entry (the `saiife check` command) from it by hand.",
                     );
                 }
                 lines.push(line);
-                failed_agents.push((agent, e.to_string(), outside));
+                failed_agents.push((agent, e.to_string(), outside, init_failed));
             }
         }
     }
@@ -398,7 +410,7 @@ pub fn off() -> ExitCode {
         // `status` warns about them and nothing else.
         rec.hooks = failed_agents
             .iter()
-            .map(|(a, e, outside)| {
+            .map(|(a, e, outside, init_failed)| {
                 (
                     a.name().to_string(),
                     HookRecord {
@@ -407,6 +419,7 @@ pub fn off() -> ExitCode {
                         error: Some(e.clone()),
                         off_failed: true,
                         off_outside: outside.clone(),
+                        init_failed: *init_failed,
                     },
                 )
             })
@@ -417,12 +430,12 @@ pub fn off() -> ExitCode {
         }
     }
 
-    println!("saiife is off for {}", root.display());
+    outln!("saiife is off for {}", root.display());
     if lines.is_empty() {
-        println!("  nothing to remove");
+        outln!("  nothing to remove");
     }
     for l in &lines {
-        println!("{l}");
+        outln!("{l}");
     }
     if failed {
         ExitCode::from(1)

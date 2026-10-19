@@ -18,13 +18,16 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
-use crate::init_cmd::project_root;
-use crate::project::project_packs;
+use crate::project::{project_packs, project_root};
 
 /// Month files `status` reads at most when looking for each agent's last call.
 const SCAN_MONTHS: usize = 12;
 
-const RESTORE: &str = "run `saiife init` to restore it";
+/// The fix for a removed or changed hook or config: `init` in the project
+/// status reported on (`project_root`, the same rule `init` uses).
+fn restore(root: &Path) -> String {
+    format!("run `saiife init` in {} to restore it", root.display())
+}
 
 /// One failed check: what is wrong, and what to do.
 struct Problem {
@@ -37,8 +40,8 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
     };
-    let root = status_root(&cwd);
-    println!("saiife status for {}", root.display());
+    let root = project_root(&cwd);
+    outln!("saiife status for {}", root.display());
 
     let record = match integrity::record_path(&root) {
         Ok(Some(p)) => Integrity::load(&p).map_err(|e| e.to_string()),
@@ -48,7 +51,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     let record = match record {
         Ok(Some(r)) => r,
         Ok(None) => {
-            println!(
+            outln!(
                 "\nWARNING: saiife is not set up for this project on this machine \
                  (no integrity record).\n  Fix: run `saiife init` in {}",
                 root.display()
@@ -56,7 +59,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             return ExitCode::from(1);
         }
         Err(e) => {
-            println!("\nWARNING: the integrity record cannot be read: {e}\n  Fix: run `saiife init` to write a new one");
+            outln!("\nWARNING: the integrity record cannot be read: {e}\n  Fix: run `saiife init` to write a new one");
             return ExitCode::from(1);
         }
     };
@@ -70,7 +73,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         .filter(|(_, h)| h.error.is_none())
         .map(|(a, _)| a.as_str())
         .collect();
-    let last_calls = last_calls(&root, &hooked, &mut problems, &mut notes);
+    let (last_calls, scan) = last_calls(&root, &hooked, &mut problems, &mut notes);
     let home = dirs::home_dir();
 
     for agent in Agent::ALL {
@@ -86,19 +89,31 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     fix: "run `saiife init` to record it".into(),
                 });
             } else {
-                println!("  {:<7} not set up", agent.name());
+                outln!("  {:<7} not set up", agent.name());
             }
             continue;
         };
         if let (Some(e), true) = (&rec.error, rec.off_failed) {
             if let Some(target) = &rec.off_outside {
-                problems.push(Problem {
-                    what: format!(
-                        "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it and the saiife hook is still in place."
-                    ),
-                    fix: format!(
-                        "remove the saiife hook entry (the `saiife check` command) from {target} by hand"
-                    ),
+                problems.push(if rec.init_failed {
+                    Problem {
+                        what: format!(
+                            "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it. The earlier `saiife init` for {} failed, so the saiife hook may still be in place.",
+                            agent.label()
+                        ),
+                        fix: format!(
+                            "check {target} by hand and remove the saiife hook entry (the `saiife check` command) if it is there"
+                        ),
+                    }
+                } else {
+                    Problem {
+                        what: format!(
+                            "{rel} is a symlink to {target}, outside the project, so `saiife init --off` did not change it and the saiife hook is still in place."
+                        ),
+                        fix: format!(
+                            "remove the saiife hook entry (the `saiife check` command) from {target} by hand"
+                        ),
+                    }
                 });
                 continue;
             }
@@ -120,7 +135,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         match found {
             Err(e) => problems.push(Problem {
                 what: format!("{} cannot be checked: {e}", agent.label()),
-                fix: format!("repair {rel}, then {RESTORE}"),
+                fix: format!("repair {rel}, then {}", restore(&root)),
             }),
             Ok(f) if f.contains(&rec.sha256) && rec.sha256 != agent.expected_entry() => {
                 problems.push(Problem {
@@ -137,11 +152,14 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     .filter(|r| r.agent == agent.name())
                     .filter_map(Record::timestamp)
                     .max();
-                println!(
+                outln!(
                     "  {:<7} hooked   {rel:<22} last hook call: {}",
                     agent.name(),
-                    last.map(ago)
-                        .unwrap_or_else(|| format!("no call in the last {SCAN_MONTHS} months"))
+                    last.map(ago).unwrap_or_else(|| match scan {
+                        Scan::Unreadable => "unknown (audit log could not be read)".into(),
+                        Scan::CutShort => format!("no call in the last {SCAN_MONTHS} months"),
+                        Scan::Complete => "no call yet".into(),
+                    })
                 );
             }
             Ok(f) if f.is_empty() => problems.push(Problem {
@@ -149,14 +167,14 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     "The saiife hook for {} was removed from {rel}.",
                     agent.label()
                 ),
-                fix: RESTORE.into(),
+                fix: restore(&root),
             }),
             Ok(_) => problems.push(Problem {
                 what: format!(
                     "The saiife hook for {} in {rel} was changed.",
                     agent.label()
                 ),
-                fix: RESTORE.into(),
+                fix: restore(&root),
             }),
         }
         for b in agent.blockers(&root, home.as_deref()) {
@@ -214,48 +232,40 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     check_binary(&record, &mut problems);
 
     if !notes.is_empty() {
-        println!();
+        outln!();
         for n in &notes {
-            println!("Note: {n}");
+            outln!("Note: {n}");
         }
     }
     for p in &problems {
         if p.fix.is_empty() {
-            println!("\nWARNING: {}", p.what);
+            outln!("\nWARNING: {}", p.what);
         } else {
-            println!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
+            outln!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
         }
     }
-    println!(
+    outln!(
         "\nsaiife v1 catches mistakes and makes a switched-off guard visible; it cannot stop a \
          determined agent running as your user."
     );
     if problems.is_empty() {
-        println!("All checks passed.");
+        outln!("All checks passed.");
         ExitCode::SUCCESS
     } else {
-        println!("{} check(s) failed.", problems.len());
+        outln!("{} check(s) failed.", problems.len());
         ExitCode::from(1)
     }
 }
 
-/// The project `status` reports on. Without a `.saiife/config.toml` at or
-/// above `cwd` (it was removed), the nearest ancestor with an integrity
-/// record is the project, so the removal is named instead of "not set up".
-fn status_root(cwd: &Path) -> PathBuf {
-    let found = project_root(cwd);
-    if found != cwd || cwd.join(CONFIG_REL).is_file() {
-        return found;
-    }
-    cwd.ancestors()
-        .find(|d| {
-            integrity::record_path(d)
-                .ok()
-                .flatten()
-                .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
-        })
-        .unwrap_or(cwd)
-        .to_path_buf()
+/// How far `last_calls` got through the audit log.
+#[derive(Clone, Copy)]
+enum Scan {
+    /// Every month file was read: no record means no call yet.
+    Complete,
+    /// Older month files were left unread (`ReadResult::cut_short`).
+    CutShort,
+    /// The audit dir could not be determined or listed.
+    Unreadable,
 }
 
 /// Audit records of this project (by its literal and canonical path).
@@ -265,13 +275,13 @@ fn last_calls(
     hooked: &[&str],
     problems: &mut Vec<Problem>,
     notes: &mut Vec<String>,
-) -> Vec<Record> {
+) -> (Vec<Record>, Scan) {
     let Some(dir) = store::default_dir() else {
         problems.push(Problem {
             what: "the audit directory cannot be determined, so no decision is recorded".into(),
             fix: format!("set {}", store::DIR_ENV),
         });
-        return Vec::new();
+        return (Vec::new(), Scan::Unreadable);
     };
     let canonical_root = integrity::canonical_project(root).ok();
     let mut roots = vec![root.display().to_string()];
@@ -341,14 +351,22 @@ fn last_calls(
             all.skipped_lines
         ));
     }
-    all.records.into_iter().filter(|r| is_ours(r)).collect()
+    let scan = if all.dir_error.is_some() {
+        Scan::Unreadable
+    } else if all.cut_short {
+        Scan::CutShort
+    } else {
+        Scan::Complete
+    };
+    let ours = all.records.into_iter().filter(|r| is_ours(r)).collect();
+    (ours, scan)
 }
 
 fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {
     match std::fs::read(root.join(CONFIG_REL)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => problems.push(Problem {
             what: format!("{CONFIG_REL} was removed."),
-            fix: RESTORE.into(),
+            fix: restore(root),
         }),
         Err(e) => problems.push(Problem {
             what: format!("{CONFIG_REL} cannot be read: {e}"),
@@ -373,9 +391,22 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
         .cloned()
         .collect();
     let ids: Vec<&str> = active.iter().map(|p| p.id.as_str()).collect();
-    println!("  packs   {}", ids.join(", "));
+    outln!("{}", packs_line(root, project.root.as_deref(), &ids));
     let vars = crate::paths::path_vars(Some(root), Some(root));
-    print!("{}", inactive_lines(&active, &vars));
+    out!("{}", inactive_lines(&active, &vars));
+}
+
+/// The `packs …` line. When the config it was read from sits in another
+/// directory than the project in the header, the line says where from.
+fn packs_line(root: &Path, config_root: Option<&Path>, ids: &[&str]) -> String {
+    match config_root {
+        Some(dir) if dir != root => format!(
+            "  packs (from {}/{CONFIG_REL}): {}",
+            dir.display(),
+            ids.join(", ")
+        ),
+        _ => format!("  packs   {}", ids.join(", ")),
+    }
 }
 
 /// The `inactive here: …` lines under the packs line (empty when every path
@@ -415,7 +446,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             fix: "make the saiife binary readable, then run `saiife init`".into(),
         });
     } else if record.saiife_sha256.is_empty() {
-        println!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
+        outln!("  note: this record has no binary hash (made by an older saiife); run `saiife init` to add it");
     } else {
         match std::fs::read(&on_path) {
             Ok(b) if sha256_hex(&b) == record.saiife_sha256 => {}
@@ -443,7 +474,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
     }
     match binary_version(&on_path) {
         Some(v) if v == record.saiife_version => {
-            println!("  binary  {} ({v})", on_path.display());
+            outln!("  binary  {} ({v})", on_path.display());
         }
         Some(v) => problems.push(Problem {
             what: format!(

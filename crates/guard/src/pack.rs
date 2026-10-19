@@ -100,6 +100,13 @@ pub struct PackWarning {
     pub message: String,
 }
 
+impl PackError {
+    /// The TOML and `[pack]` header were fine; a rule is what broke the pack.
+    pub fn is_broken_rule(&self) -> bool {
+        matches!(self, Self::MissingReason(_) | Self::NoRules)
+    }
+}
+
 /// A fatal problem for a single pack file (the file is skipped; others load).
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {

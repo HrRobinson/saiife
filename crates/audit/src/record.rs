@@ -179,6 +179,15 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_path_in_reason_stays_unmasked() {
+        let mut nr = base("x");
+        let reason = "cannot resolve /home/u/project/src/main.rs";
+        nr.reason = Some(reason);
+        let r = Record::new(nr, "0.1.0");
+        assert_eq!(r.reason.as_deref(), Some(reason));
+    }
+
+    #[test]
     fn long_input_is_truncated_on_char_boundary() {
         let input = "a".repeat(MAX_INPUT_CHARS + 10);
         let r = Record::new(base(&input), "0.1.0");

@@ -123,10 +123,17 @@ impl Catalog {
             }
             match load_pack_str(e.source, e.toml, &mut warnings) {
                 Ok(p) => packs.push(p),
-                Err(err) => warnings.push(PackWarning {
-                    source: e.source.to_string(),
-                    message: format!("built-in pack failed to load: {err}"),
-                }),
+                Err(err) => {
+                    let what = if err.is_broken_rule() {
+                        "built-in pack has a broken rule"
+                    } else {
+                        "built-in pack failed to load"
+                    };
+                    warnings.push(PackWarning {
+                        source: e.source.to_string(),
+                        message: format!("{what}: {err}"),
+                    });
+                }
             }
         }
         (packs, warnings)
@@ -157,6 +164,15 @@ triggers = ["thing"]
 [[deny]]
 pattern = '^thing\s+drop'
 reason = "drops the thing"
+"#;
+    const ALL_RULES_BROKEN: &str = r#"
+[pack]
+id = "opt.allbroken"
+default_on = true
+triggers = ["x"]
+[[deny]]
+pattern = '('
+reason = "bad regex"
 "#;
     const BAD_TOML: &str = "[pack\nid = 'x'";
 
@@ -195,6 +211,24 @@ reason = "drops the thing"
         let (all, all_warnings) = cat.load_all();
         assert_eq!(all.len(), 2);
         assert_eq!(all_warnings.len(), warnings.len());
+    }
+
+    #[test]
+    fn broken_rule_is_not_reported_as_failed_to_load() {
+        let cat = Catalog::from_sources(&[("<t>allbroken", ALL_RULES_BROKEN)]);
+        let (_, warnings) = cat.load_all();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.starts_with("built-in pack has a broken rule: ")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.message.contains("failed to load")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
