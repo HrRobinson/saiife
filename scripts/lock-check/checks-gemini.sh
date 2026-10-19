@@ -39,6 +39,17 @@ agent_invoke() {
   gemini --approval-mode yolo "${@:2}" -p "$1"
 }
 
+# A system.fires row that reads not-fired most likely means hooks are off by
+# default and the probe missed the enable key.
+agent_fires_hint() {
+  echo "check LOCKCHECK_GEMINI_TOGGLE / enable key (probed: ${GEMINI_TOGGLES[*]:-none})"
+}
+
+# Self-contained (run as agent through lc_agent_call).
+gemini_help() {
+  gemini --help 2>&1
+}
+
 agent_settings_files() {
   printf '%s\n' "$LC_HOME/.gemini/settings.json" "$LC_HOME/.gemini/trustedFolders.json" \
     "$LC_PROJECT/.gemini/settings.json"
@@ -321,6 +332,23 @@ gemini_mcp_allowlist() {
   gemini_update_managed jq '.mcp.allowed = ["other"]'
 }
 
+# §6.1.3 also names "command-line settings". Gemini CLI has no flag that
+# loads a settings file or switches hooks (research
+# 2026-10-13-gemini-hooks.md lists only the settings files and the
+# GEMINI_CLI_SYSTEM_SETTINGS_PATH / GEMINI_CLI_HOME environment overrides),
+# so there is no command-line gate row. This probe re-checks that claim
+# against the installed version's --help: `found` means a gate row is due.
+gemini_cli_settings_probe() {
+  local flags
+  flags="$(lc_agent_call gemini_help 2>/dev/null | grep -oE -- '--[A-Za-z][A-Za-z0-9-]*' |
+    grep -iE 'setting|hook' | sort -u | paste -sd' ' - || true)"
+  if [[ -n "$flags" ]]; then
+    lc_probe gemini.cli.settings-flag found "$flags: a command-line gate row is due"
+  else
+    lc_probe gemini.cli.settings-flag not-found "gemini --help lists no settings/hooks flag"
+  fi
+}
+
 # --- the checks --------------------------------------------------------------
 
 agent_checks() {
@@ -332,8 +360,15 @@ agent_checks() {
   else
     lc_probe gemini.toggle.probe not-found "no hooks toggle in schema ($GEMINI_TOGGLE_SRC)"
   fi
+  gemini_cli_settings_probe
   lc_check gemini.system.fires gate fired allow -
   lc_check gemini.deny gate blocked deny -
+  # No toggle key found: the main "user settings switch hooks off" vector
+  # would go untested, so a gate row says so and the label is `unverified`.
+  if ((${#GEMINI_TOGGLES[@]} == 0)); then
+    lc_record gemini.toggle-off.user gate blocked inconclusive \
+      "no hooks toggle found ($GEMINI_TOGGLE_SRC); rerun with LOCKCHECK_GEMINI_TOGGLE=<key>"
+  fi
   for k in "${GEMINI_TOGGLES[@]}"; do
     GEMINI_KEY="$k"
     lc_check "gemini.toggle-off.user.$k" gate blocked deny gemini_toggle_off_user

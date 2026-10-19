@@ -44,6 +44,8 @@ it.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).
 - Recipe: [Codex with a local Ollama model](docs/recipes/codex-ollama.md).
+- [Live lock checks](docs/lock-check.md): the harness that tests whether a
+  managed hook can lock each agent (run by the owner, not CI).
 
 Design: `docs/superpowers/specs/2026-10-13-saiife-cli-v1-design.md`.
 

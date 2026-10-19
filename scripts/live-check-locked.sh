@@ -32,13 +32,37 @@
 #   LOCKCHECK_CODEX_MCP_SNIPPET / LOCKCHECK_GEMINI_TOGGLE (overrides for
 #   unverified agent keys; see checks-codex.sh and checks-gemini.sh)
 #
+# Guide: docs/lock-check.md (logins, reading results, the knobs, --forget).
+# The three `*.fail.segv` checks crash a bash in the container with a real
+# SIGSEGV. core_pattern is global, so the host's crash handler (e.g.
+# systemd-coredump, a desktop crash reporter) may log or pop up up to 3
+# entries for /usr/bin/bash during a run; no core file is written
+# (--ulimit core=0).
+#
 # Exit 0 only if no agent's label is `not-lockable` or `unverified`.
 set -euo pipefail
 
 usage() {
   echo "usage: $0 [--setup | --forget | --print] [--rebuild] <claude|codex|gemini|all>" >&2
-  echo "       (--setup and --forget take no agent)" >&2
+  echo "       (--setup and --forget take no agent; --help for more)" >&2
   exit 2
+}
+
+show_help() {
+  cat <<'EOF'
+usage: live-check-locked.sh [--setup | --forget | --print] [--rebuild] <claude|codex|gemini|all>
+
+  --setup     open a shell in the container as `agent`; log in to each agent
+  <agent>     run the lock checks for claude, codex, gemini or all
+  --rebuild   rebuild the image first (CLAUDE_VERSION, CODEX_VERSION, ...)
+  --print     print the docker run argv only
+  --forget    delete the volume that holds the agents' logins
+
+Results: target/lock-check/<agent>-<time>.tsv (+ .log).
+Guide (what it touches, logins, reading results, LOCKCHECK_* knobs):
+  docs/lock-check.md
+EOF
+  exit 0
 }
 
 action=run
@@ -46,6 +70,7 @@ rebuild=0
 target=""
 for arg in "$@"; do
   case "$arg" in
+    -h | --help) show_help ;;
     --setup | --forget | --print)
       [[ "$action" == run ]] || usage
       action="${arg#--}"
@@ -93,11 +118,18 @@ build_image() {
   fi
 }
 
+# Agent runs read /dev/null: they need a TTY only for live colour output,
+# and `-it` fails when the output is piped (`... all | tee run.txt`).
+tty_flags=()
+if [[ -t 0 && -t 1 ]]; then
+  tty_flags=(-it)
+fi
+
 # docker run argv for one agent, into the array `argv`.
 run_argv() {
   local agent="$1" image_id="$2" commit name
   commit="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)"
-  argv=(docker run -it --rm --name "saiife-lockcheck-$agent"
+  argv=(docker run ${tty_flags[@]+"${tty_flags[@]}"} --rm --name "saiife-lockcheck-$agent"
     --ulimit core=0 --security-opt no-new-privileges
     -v "$repo/scripts/lock-check:/lockcheck:ro"
     -v "$repo/crates/agents/tests/fixtures/managed:/lockcheck-managed:ro"

@@ -120,13 +120,20 @@ node_version="$(node --version 2>/dev/null || true)"
   printf '# date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$LC_RESULTS"
 
-cleanup() {
-  lc_restore_snapshot || true
-  rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"
-  # Hand the results to the host user (rootful Docker writes them as root).
+# Hand the results to the host user (rootful Docker writes them as root).
+# Done as soon as they exist, again after the summary rewrites the .tsv, and
+# at exit: a `docker kill` mid-run (no EXIT trap) still leaves them editable.
+hand_results() {
   if [[ -z "$LC_ROOT" && -n "${LOCKCHECK_HOST_UID:-}" ]]; then
     chown "$LOCKCHECK_HOST_UID:${LOCKCHECK_HOST_GID:-$LOCKCHECK_HOST_UID}" "$LC_RESULTS" "$LC_LOG" || true
   fi
+}
+hand_results
+
+cleanup() {
+  lc_restore_snapshot || true
+  rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"
+  hand_results
 }
 # The snapshot lives in the home volume: a run cut off by `docker kill`
 # leaves it behind, and its settings are put back before this run starts.
@@ -143,5 +150,6 @@ echo "[lockcheck] $agent: ${version:-unknown}, results in $LC_RESULTS"
 agent_checks
 echo
 lc_summarize "$LC_RESULTS"
+hand_results
 echo "results: $LC_RESULTS"
 echo "agent output: $LC_LOG"

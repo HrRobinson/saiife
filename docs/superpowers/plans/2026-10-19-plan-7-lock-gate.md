@@ -63,7 +63,7 @@ Style models: `scripts/live-check-agents.sh`, `scripts/demo.sh`.
 
 **Result file** `/out/<agent>-<UTC %Y%m%dT%H%M%SZ>.tsv`: header lines `# agent=`, `# agent_version=`, `# node_version=`, `# image=` (image id), `# saiife_commit=` (host `git rev-parse HEAD`, passed in), `# kernel=`, `# date=`; then one row per check, tab-separated: `id class expect observed status detail`; then `# label=<machine id>` from the summarizer. Agent output per check goes to the sibling `.log`.
 - `class`: `control` · `gate` (§6.1.3 gate rule) · `gap` (§9.3 cell the spec says "runs") · `caveat` (known bypass the label tolerates) · `design` (answers a plan 9 design question; never affects the label) · `info`.
-- `expect`/`observed`: `-` (expect of a probe row, which runs no agent) · `found`/`not-found` (observed of a probe row) · `ran` (marker exists) · `blocked` (no marker, witness saw the nonce) · `fired` (stub `calls.log` has the nonce, or, when the setup fn set `LC_FIRED_EVENT=config-change`, any `config-change` line) · `not-fired` · `unavailable` (MCP: no marker, no witness, and the named control row `ran`) · `inconclusive` (no marker, no witness) · `unsupported` (agent exited non-zero, output matches `/unknown (option|argument)|unexpected argument|unrecognized|invalid option/i`, no witness).
+- `expect`/`observed`: `-` (expect of a probe row, which runs no agent) · `found`/`not-found` (observed of a probe row) · `ran` (marker exists) · `blocked` (no marker, witness saw the nonce; for mode `deny` the stub must have been called too, else `inconclusive`) · `fired` (stub `calls.log` has the nonce, or, when the setup fn set `LC_FIRED_EVENT=config-change`, any `config-change` line) · `not-fired` · `unavailable` (MCP: no marker, no witness, and the named control row `ran`) · `inconclusive` (no marker, no witness) · `unsupported` (agent exited non-zero, output matches `/unknown (option|argument)|unexpected argument|unrecognized|invalid option/i`, no witness).
 - `status`: `info` class → `INFO`; observed `unsupported` → `SKIP`; observed `inconclusive` → `ERROR`; observed = expect → `PASS`; else `FAIL`.
 
 **Label rule** (`lc_label`, first match wins): any `gate` FAIL → `not-lockable`; no `gate` rows, any `gate` ERROR, or `control` not PASS → `unverified`; any `caveat` row observed `ran` → `lockable-with-caveats`; any `gap` row observed `ran` → `lockable-with-gaps`; else `lockable`.
@@ -251,7 +251,8 @@ Hooks toggle: a probe finds the key, then the baseline pins it. `gemini_toggle_k
 | toggle.probe | info | - | — | `lc_probe`: `found` + keys, or `not-found` with detail `no hooks toggle in schema` |
 | system.fires | gate | fired | allow | — |
 | deny | gate | blocked | deny | — |
-| toggle-off.user.<key> | gate | blocked | deny | user `<key>: false` (one row per key found; none found → no rows) |
+| cli.settings-flag | info | - | — | `lc_probe` on `gemini --help` (run as agent): `found` + flags matching `setting\|hook`, else `not-found` (final review #9) |
+| toggle-off.user.<key> | gate | blocked | deny | user `<key>: false` (one row per key found; none found → one `toggle-off.user` gate row, observed `inconclusive`, detail names `LOCKCHECK_GEMINI_TOGGLE`, so the label is `unverified`; final review #1) |
 | toggle-off.project.<key> | gate | blocked | deny | project same |
 | pin-needed.<key> | design | blocked | deny | baseline without the pin + user `<key>: false` |
 | hooks-empty.user | gate | blocked | deny | user `{"hooks": {"BeforeTool": []}}` |
@@ -268,6 +269,8 @@ Hooks toggle: a probe finds the key, then the baseline pins it. `gemini_toggle_k
 | mcp.hooked | design | fired | allow | as mcp.control; detail = `tool_name` seen (`mcp_lockcheck_touch_marker` expected by §6.1.4) |
 | mcp.excluded | design | unavailable (control `gemini.mcp.control`) | allow | as mcp.control plus system `mcp.excluded: ["lockcheck"]` |
 | mcp.allowlist | design | unavailable (control `gemini.mcp.control`) | allow | as mcp.control plus system `mcp.allowed: ["other"]` |
+
+No command-line gate row, on purpose: §6.1.3 names "command-line settings", but Gemini CLI has no flag that loads a settings file or switches hooks (the research doc lists only the settings files and the `GEMINI_CLI_SYSTEM_SETTINGS_PATH` / `GEMINI_CLI_HOME` env overrides, which the `system-path-env` and `gemini-home` rows cover). The `cli.settings-flag` probe rechecks this against the installed `--help`; `found` means a gate row is due.
 
 - [ ] **Step 1:** `gemini_checks_static` as in Task 3, with `LOCKCHECK_GEMINI_TOGGLE="hooksConfig.enabled"`: ids include `toggle-off.user.hooksConfig.enabled`; baseline parses with `jq`, keeps the fixture's saiife handler unchanged, has the witness handler and `hooksConfig.enabled == true`. A second run with `LOCKCHECK_GEMINI_TOGGLE=""` and no package present: no `toggle-off` rows, baseline equals the fixture plus the witness only. Run → FAIL.
 - [ ] **Step 2:** Implement. Rerun → ok; `bash -n`.

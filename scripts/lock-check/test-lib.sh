@@ -333,6 +333,57 @@ EOF
   grep -q $'^miss.control\t.*stub=seen' "$f" || fail "control detail: $(cat "$f")"
 }
 
+# Mode deny: a call the witness saw but the stub never denied (something
+# else stopped it) is no evidence of the lock: inconclusive, not blocked.
+test_deny_needs_the_stub() {
+  new_root
+  local dir f
+  dir="$(custom_checks nostub <<'EOF'
+nostub() { fake_fail_closed; rm -f "$LC_STUB"; }
+agent_checks() {
+  lc_check nostub.control control ran allow
+  lc_check nostub.deny gate blocked deny nostub
+  lc_check nostub.real gate blocked deny
+}
+EOF
+)"
+  f="$(run_fake nostub "$dir")"
+  lc_validate "$f" || fail "result does not validate: $(cat "$f")"
+  assert_eq "$(row_of "$f" nostub.deny)" "gate blocked inconclusive ERROR"
+  grep -q $'^nostub.deny	.*stub=unseen (blocked, but the stub never ran' "$f" || fail "detail: $(cat "$f")"
+  assert_eq "$(row_of "$f" nostub.real)" "gate blocked blocked PASS"
+  assert_eq "$(sed -n 's/^# label=//p' "$f")" unverified
+}
+
+# Rows carry witness=seen|unseen; a control the witness missed and a fires
+# gate that read not-fired get a hint, repeated after the summary.
+test_hints_in_detail_and_summary() {
+  new_root
+  local dir f
+  dir="$(custom_checks hint <<'EOF'
+nowitness() { printf '%s\n' "$LC_STUB check --managed --hook-exit --agent fake" >"$LC_ROOT/etc/fake/hooks"; }
+agent_fires_hint() { echo "check LOCKCHECK_FAKE_PATH"; }
+agent_checks() {
+  lc_check hint.control control ran allow nowitness
+  lc_check hint.fires gate fired allow fake_disable_user
+  lc_check hint.deny gate blocked deny
+}
+EOF
+)"
+  f="$(run_fake hint "$dir")"
+  lc_validate "$f" || fail "result does not validate: $(cat "$f")"
+  assert_eq "$(row_of "$f" hint.control)" "control ran ran PASS"
+  grep -q $'^hint.control	.*witness=unseen hint: the witness hook did not log' "$f" ||
+    fail "control detail: $(cat "$f")"
+  assert_eq "$(row_of "$f" hint.fires)" "gate fired not-fired FAIL"
+  grep -q $'^hint.fires	.*witness=unseen hint: check LOCKCHECK_FAKE_PATH$' "$f" || fail "fires detail: $(cat "$f")"
+  grep -q $'^hint.deny	.*witness=seen$' "$f" || fail "deny detail: $(cat "$f")"
+  grep -qx 'hint: hint.fires: check LOCKCHECK_FAKE_PATH' "$LC_ROOT/run.out" ||
+    fail "summary hint: $(cat "$LC_ROOT/run.out")"
+  grep -q '^hint: hint.control: the witness hook did not log' "$LC_ROOT/run.out" ||
+    fail "summary control hint: $(cat "$LC_ROOT/run.out")"
+}
+
 # A run killed mid-check leaves a mutated settings file and the snapshot in
 # the home volume; the next run restores it before snapshotting.
 test_interrupted_run_is_restored_next_time() {
@@ -538,6 +589,12 @@ saiife-lockcheck-home:/home/agent" "mounts"
   printf '%s\n' "$out" | awk 'prev == "--security-opt" && $0 == "no-new-privileges" { f = 1 } { prev = $0 } END { exit !f }' ||
     fail "no --security-opt no-new-privileges"
   printf '%s\n' "$out" | grep -qx "LOCKCHECK_HOST_UID=$(id -u)" || fail "no host uid"
+  # Output is a pipe here: no TTY flags (they break `... | tee`).
+  if printf '%s\n' "$out" | grep -qxE -- '-it|-t|--tty|-i|--interactive'; then
+    fail "TTY flags without a TTY"
+  fi
+  PATH="$bin:$PATH" bash "$REPO/scripts/live-check-locked.sh" --help | grep -q 'docs/lock-check.md' ||
+    fail "--help does not point at docs/lock-check.md"
   # The per-agent knobs the check scripts read pass through only when set.
   local knob
   for knob in LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_CODEX_MCP_SNIPPET \
@@ -776,6 +833,8 @@ test_codex_managed_path_override() {
   source "$HERE/checks-codex.sh"
   agent_baseline
   [[ -f "$LC_ROOT/etc/codex/managed_config.toml" ]] || fail "override path not written"
+  assert_eq "$(agent_fires_hint)" \
+    "check LOCKCHECK_CODEX_REQUIREMENTS (see path-probe row; now /etc/codex/managed_config.toml)" "fires hint"
   [[ ! -e "$LC_ROOT/etc/codex/requirements.toml" ]] || fail "default path written"
   # Overrides that leave /etc (or LC_ROOT) are refused before anything is written.
   local bad
@@ -874,7 +933,8 @@ gemini_record_checks() {
   }
   lc_record() {
     printf '%s\t%s\t%s\t%s\t-\t-\t-\n' "$1" "$2" "$3" "$4" >>"$LC_ROOT/rec"
-    printf '%s\t%s\t%s\t%s\t-\t%s\n' "$1" "$2" "$3" "$4" "${5:--}" >>"$LC_RESULTS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$(lc_status "$2" "$3" "$4")" "${5:--}" \
+      >>"$LC_RESULTS"
   }
   agent_checks
 }
@@ -893,7 +953,7 @@ test_gemini_checks_static() {
   fixture="$LC_MANAGED/gemini/settings.json"
   managed="$LC_ROOT/etc/gemini-cli/settings.json"
   ids="$(cut -f1 "$LC_ROOT/rec" | tr '\n' ' ')"
-  want="gemini.control gemini.toggle.probe gemini.system.fires gemini.deny"
+  want="gemini.control gemini.toggle.probe gemini.cli.settings-flag gemini.system.fires gemini.deny"
   want+=" gemini.toggle-off.user.hooksConfig.enabled gemini.toggle-off.project.hooksConfig.enabled"
   want+=" gemini.pin-needed.hooksConfig.enabled gemini.hooks-empty.user gemini.hooks-empty.project"
   want+=" gemini.gemini-home gemini.system-path-env gemini.fail.exit3 gemini.fail.exit101"
@@ -904,6 +964,8 @@ test_gemini_checks_static() {
     "gate rows expecting something other than blocked/fired"
   assert_eq "$(awk -F'\t' '$1 == "gemini.toggle.probe" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
     "info - found"
+  assert_eq "$(agent_fires_hint)" "check LOCKCHECK_GEMINI_TOGGLE / enable key (probed: hooksConfig.enabled)" \
+    "fires hint"
   assert_eq "$(awk -F'\t' '$1 == "gemini.system-path-env" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
     "caveat ran deny"
   assert_eq "$(awk -F'\t' '$1 == "gemini.fail.timeout" { print $2, $3, $4 }' "$LC_ROOT/rec")" "gap ran hang"
@@ -985,9 +1047,15 @@ unavailable gemini.mcp.control" "MCP rows' control"
 test_gemini_checks_static_no_toggle() {
   export LOCKCHECK_GEMINI_TOGGLE=""
   gemini_record_checks
-  if grep -qE 'toggle-off|pin-needed' "$LC_ROOT/rec"; then
+  if grep -qE 'pin-needed|toggle-off\.project|toggle-off\.user\.' "$LC_ROOT/rec"; then
     fail "toggle rows without a toggle: $(cut -f1 "$LC_ROOT/rec")"
   fi
+  # Instead one gate row that cannot pass: the label is unverified.
+  assert_eq "$(awk -F'\t' '$1 == "gemini.toggle-off.user" { print $2, $3, $4 }' "$LC_ROOT/rec")" \
+    "gate blocked inconclusive"
+  grep -q $'^gemini.toggle-off.user\tgate\tblocked\tinconclusive\tERROR\tno hooks toggle found .*LOCKCHECK_GEMINI_TOGGLE=<key>' \
+    "$LC_RESULTS" || fail "no-toggle row: $(cat "$LC_RESULTS")"
+  assert_eq "$(lc_label "$LC_RESULTS")" unverified "label without a toggle"
   assert_eq "$(awk -F'\t' '$1 == "gemini.toggle.probe" { print $4 }' "$LC_ROOT/rec")" not-found
   grep -q $'^gemini.toggle.probe\t.*\tno hooks toggle in schema' "$LC_RESULTS" ||
     fail "probe detail: $(cat "$LC_RESULTS")"
@@ -1104,6 +1172,8 @@ test_gemini_end_to_end_with_fake() {
   lc_validate "$f" || fail "result does not validate: $(cat "$f")"
   assert_eq "$(row_of "$f" gemini.control)" "control ran ran PASS"
   assert_eq "$(row_of "$f" gemini.toggle.probe)" "info - found INFO"
+  assert_eq "$(row_of "$f" gemini.cli.settings-flag)" "info - not-found INFO"
+  grep -q $'^gemini.control\t.*stub=seen witness=seen$' "$f" || fail "control detail: $(cat "$f")"
   assert_eq "$(row_of "$f" gemini.system.fires)" "gate fired fired PASS"
   assert_eq "$(row_of "$f" gemini.deny)" "gate blocked blocked PASS"
   assert_eq "$(row_of "$f" gemini.toggle-off.user.hooksConfig.enabled)" "gate blocked blocked PASS"

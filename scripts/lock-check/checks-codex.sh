@@ -41,6 +41,12 @@ agent_invoke() {
   codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "${@:2}" "$1"
 }
 
+# A managed.fires row that reads not-fired most likely means Codex does not
+# read the managed file at this path (unverified; see the path-probe row).
+agent_fires_hint() {
+  echo "check LOCKCHECK_CODEX_REQUIREMENTS (see path-probe row; now $CODEX_REQ_PATH)"
+}
+
 agent_settings_files() {
   printf '%s\n' "$CODEX_USER_CONFIG" "$CODEX_PROJECT_CONFIG"
 }

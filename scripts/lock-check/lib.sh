@@ -81,7 +81,9 @@
 # Evidence: `blocked` needs a witness.log line holding both the nonce and
 # $LC_WITNESS_TOOL_KEY (default "tool_name"), so register the witness on
 # pre-tool events only, never on prompt/model events. Each row's detail
-# also says stub=seen|unseen (the stub's calls.log had the nonce).
+# also says stub=seen|unseen (the stub's calls.log had the nonce) and
+# witness=seen|unseen. A mode `deny` row reads `blocked` only when the stub
+# was called too; witness without stub reads `inconclusive`.
 # Threat assumption: calls.log and witness.log are owned by `agent` (the
 # hooks run as agent), so a hostile agent could forge them; the checks
 # assume the model is not adversarial.
@@ -97,6 +99,9 @@
 #                          restored before every check and at exit
 #   agent_login_files      absolute paths reset must never touch
 #   agent_checks           the lc_check / lc_probe calls, control first
+#   agent_fires_hint       (optional) one line, appended as "hint: ..." to a
+#                          gate row that expected `fired` and read
+#                          `not-fired` (which knob names the managed file)
 # ---------------------------------------------------------------------------
 
 LC_ROOT="${LC_ROOT:-}"
@@ -208,6 +213,9 @@ lc_summarize() {
   printf '# label=%s\n' "$label" >>"$f"
   awk -F'\t' '!/^#/ && NF { printf "%-5s %s  expect=%s observed=%s  %s\n", $5, $1, $3, $4, $6 }' "$f"
   printf 'label: %s\n' "$(lc_label_text "$label")"
+  # Rows whose detail carries a hint (a harness setting to check) are
+  # repeated at the end, so they are not lost in the table.
+  awk -F'\t' '!/^#/ && NF && index($6, "hint: ") { printf "hint: %s: %s\n", $1, substr($6, index($6, "hint: ") + 6) }' "$f"
 }
 
 lc_validate() {
@@ -549,6 +557,25 @@ lc_check() {
     detail+=" stub=seen"
   else
     detail+=" stub=unseen"
+    # A deny only counts if the stub was asked: a call stopped by anything
+    # else (trust prompt, sandbox, approval mode) is no evidence of the lock.
+    if [[ "$mode" == deny && "$observed" == blocked ]]; then
+      observed=inconclusive
+      detail+=" (blocked, but the stub never ran: something else stopped the call)"
+    fi
+  fi
+  if lc_witness_saw "$nonce"; then
+    detail+=" witness=seen"
+  else
+    detail+=" witness=unseen"
+    if [[ "$class" == control ]]; then
+      detail+=" hint: the witness hook did not log this call (not registered, or its"
+      detail+=" payload lacks $LC_WITNESS_TOOL_KEY); blocked rows will read inconclusive"
+    fi
+  fi
+  if [[ "$class" == gate && "$expect" == fired && "$observed" == not-fired ]] &&
+    declare -F agent_fires_hint >/dev/null; then
+    detail+=" hint: $(agent_fires_hint)"
   fi
   if [[ "$LC_LAST_EXIT" == 124 || "$LC_LAST_EXIT" == 137 ]]; then
     detail+=" (agent timed out after ${AGENT_TIMEOUT:-240}s)"
