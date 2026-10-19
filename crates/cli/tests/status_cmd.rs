@@ -94,7 +94,10 @@ fn hook_removed_by_hand_is_reported_with_the_fix() {
         "{text}"
     );
     assert!(
-        text.contains("Fix: run `saiife init` to restore it"),
+        text.contains(&format!(
+            "Fix: run `saiife init` in {} to restore it",
+            std::fs::canonicalize(env.root()).unwrap().display()
+        )),
         "{text}"
     );
     // ...and init does restore it.
@@ -667,11 +670,13 @@ fn status_reads_recent_months_only() {
         let name = format!("{:04}-{:02}.jsonl", 2023 + m / 12, 1 + m % 12);
         std::fs::write(env.audit.path().join(name), &body).unwrap();
     }
-    let start = std::time::Instant::now();
+    // The next-newest month is a directory: opening it would be a failed
+    // check, so exit 0 proves status stopped after the newest file instead
+    // of scanning the log (deterministic, unlike a wall-clock bound).
+    std::fs::create_dir(env.audit.path().join("2025-06.jsonl")).unwrap();
     let (c, text) = status(&env);
-    let took = start.elapsed();
     assert_eq!(c, 0, "{text}");
-    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    assert!(!text.contains("audit log"), "{text}");
     for a in ["claude", "codex"] {
         assert!(
             text.lines()
@@ -858,4 +863,78 @@ fn unreadable_audit_dir_says_last_call_unknown() {
         "{claude}"
     );
     assert!(!claude.contains("no call"), "{claude}");
+}
+
+/// Re-review I-2 (nested): outer config tampered, inner `.saiife/` removed.
+/// Status from inner names inner and says where to run init; init from
+/// inner restores inner (it has a record) and never re-baselines outer's
+/// tampered config, so status from outer still fails.
+#[test]
+fn init_from_inner_with_removed_saiife_restores_inner_not_outer() {
+    let env = initialized(&["claude"]);
+    let inner = env.root().join("inner");
+    std::fs::create_dir_all(inner.join(".saiife")).unwrap();
+    std::fs::copy(
+        env.root().join(".saiife/config.toml"),
+        inner.join(".saiife/config.toml"),
+    )
+    .unwrap();
+    assert_eq!(code(&env.saiife_in(&inner, &["init"])), 0);
+    env.write(".saiife/config.toml", "version = 1\npacks = []\n");
+    std::fs::remove_dir_all(inner.join(".saiife")).unwrap();
+
+    let out = env.saiife_in(&inner, &["status"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    assert!(text.contains(".saiife/config.toml was removed"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "run `saiife init` in {}",
+            std::fs::canonicalize(&inner).unwrap().display()
+        )),
+        "{text}"
+    );
+
+    let out = env.saiife_in(&inner, &["init"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(!text.contains("Using the saiife project at"), "{text}");
+    assert!(inner.join(".saiife/config.toml").is_file());
+    assert_eq!(code(&env.saiife_in(&inner, &["status"])), 0);
+
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(
+        text.contains(".saiife/config.toml was changed since `saiife init`"),
+        "{text}"
+    );
+}
+
+/// Re-review I-2 (single): p's config removed; status from p/sub names p
+/// in its fix, and init from p/sub restores p instead of starting a new
+/// project at p/sub.
+#[test]
+fn init_from_subdir_after_config_removed_restores_the_project() {
+    let env = initialized(&["claude"]);
+    let sub = env.root().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::remove_file(env.root().join(".saiife/config.toml")).unwrap();
+
+    let text = stdout(&env.saiife_in(&sub, &["status"]));
+    assert!(
+        text.contains(&format!(
+            "run `saiife init` in {} to restore it",
+            std::fs::canonicalize(env.root()).unwrap().display()
+        )),
+        "{text}"
+    );
+
+    let out = env.saiife_in(&sub, &["init"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(text.contains("Using the saiife project at"), "{text}");
+    assert!(!sub.join(".saiife").exists());
+    assert!(env.root().join(".saiife/config.toml").is_file());
+    let (c, text) = status(&env);
+    assert_eq!(c, 0, "{text}");
 }

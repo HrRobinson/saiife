@@ -18,12 +18,16 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
-use crate::project::project_packs;
+use crate::project::{project_packs, project_root};
 
 /// Month files `status` reads at most when looking for each agent's last call.
 const SCAN_MONTHS: usize = 12;
 
-const RESTORE: &str = "run `saiife init` to restore it";
+/// The fix for a removed or changed hook or config: `init` in the project
+/// status reported on (`project_root`, the same rule `init` uses).
+fn restore(root: &Path) -> String {
+    format!("run `saiife init` in {} to restore it", root.display())
+}
 
 /// One failed check: what is wrong, and what to do.
 struct Problem {
@@ -36,7 +40,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
     };
-    let root = status_root(&cwd);
+    let root = project_root(&cwd);
     println!("saiife status for {}", root.display());
 
     let record = match integrity::record_path(&root) {
@@ -131,7 +135,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         match found {
             Err(e) => problems.push(Problem {
                 what: format!("{} cannot be checked: {e}", agent.label()),
-                fix: format!("repair {rel}, then {RESTORE}"),
+                fix: format!("repair {rel}, then {}", restore(&root)),
             }),
             Ok(f) if f.contains(&rec.sha256) && rec.sha256 != agent.expected_entry() => {
                 problems.push(Problem {
@@ -163,14 +167,14 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
                     "The saiife hook for {} was removed from {rel}.",
                     agent.label()
                 ),
-                fix: RESTORE.into(),
+                fix: restore(&root),
             }),
             Ok(_) => problems.push(Problem {
                 what: format!(
                     "The saiife hook for {} in {rel} was changed.",
                     agent.label()
                 ),
-                fix: RESTORE.into(),
+                fix: restore(&root),
             }),
         }
         for b in agent.blockers(&root, home.as_deref()) {
@@ -251,24 +255,6 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
         println!("{} check(s) failed.", problems.len());
         ExitCode::from(1)
     }
-}
-
-/// The project `status` reports on: the nearest directory at or above `cwd`
-/// that holds `.saiife/config.toml` as a file or has an integrity record.
-/// A project whose config was removed is still found (by its record), so
-/// the removal is named instead of "not set up" or a parent project; a
-/// stray `.saiife/` with neither does not count. Neither anywhere: `cwd`.
-fn status_root(cwd: &Path) -> PathBuf {
-    cwd.ancestors()
-        .find(|d| {
-            d.join(CONFIG_REL).is_file()
-                || integrity::record_path(d)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|p| matches!(Integrity::load(&p), Ok(Some(_))))
-        })
-        .unwrap_or(cwd)
-        .to_path_buf()
 }
 
 /// How far `last_calls` got through the audit log.
@@ -380,7 +366,7 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
     match std::fs::read(root.join(CONFIG_REL)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => problems.push(Problem {
             what: format!("{CONFIG_REL} was removed."),
-            fix: RESTORE.into(),
+            fix: restore(root),
         }),
         Err(e) => problems.push(Problem {
             what: format!("{CONFIG_REL} cannot be read: {e}"),

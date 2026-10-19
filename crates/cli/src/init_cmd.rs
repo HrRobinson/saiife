@@ -1,6 +1,6 @@
 //! `saiife init` and `saiife init --off` (spec §5, §5.1, §5.2, §7.5).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use saiife_agents::config::{self, CONFIG_REL};
@@ -10,11 +10,7 @@ use saiife_agents::integrity::{self, HookRecord, Integrity, INTEGRITY_VERSION};
 use saiife_agents::{Agent, Change};
 use saiifeguard::Pack;
 
-/// The project `init`, `--off` and `status` work on: the nearest directory
-/// at or above `cwd` with `.saiife/config.toml`, else `cwd` itself.
-pub fn project_root(cwd: &Path) -> PathBuf {
-    config::find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
-}
+use crate::project::project_root;
 
 pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> ExitCode {
     let Ok(cwd) = std::env::current_dir() else {
