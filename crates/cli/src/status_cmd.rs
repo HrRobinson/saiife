@@ -18,7 +18,8 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
 
-use crate::project::{has_record, project_packs, project_root};
+use crate::project::{project_packs, project_root};
+use crate::text::sanitize;
 
 /// Month files `status` reads at most when looking for each agent's last call.
 const SCAN_MONTHS: usize = 12;
@@ -35,6 +36,16 @@ fn restore(root: &Path) -> String {
     format!("run `saiife init` in {} to restore it", root.display())
 }
 
+/// The integrity record of `dir`: `Ok(None)` when there is none, `Err`
+/// (the reason) when it cannot be located or read.
+fn load_record(dir: &Path) -> Result<Option<Integrity>, String> {
+    match integrity::record_path(dir) {
+        Ok(Some(p)) => Integrity::load(&p).map_err(|e| e.to_string()),
+        Ok(None) => Err("could not determine the data directory".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// One failed check: what is wrong, and what to do.
 struct Problem {
     what: String,
@@ -49,12 +60,7 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
     let root = project_root(&cwd);
     outln!("saiife status for {}", root.display());
 
-    let record = match integrity::record_path(&root) {
-        Ok(Some(p)) => Integrity::load(&p).map_err(|e| e.to_string()),
-        Ok(None) => Err("could not determine the data directory".to_string()),
-        Err(e) => Err(e.to_string()),
-    };
-    let record = match record {
+    let record = match load_record(&root) {
         Ok(Some(r)) => r,
         Ok(None) => {
             outln!(
@@ -369,22 +375,43 @@ fn last_calls(
     (ours, scan)
 }
 
-fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {
-    match std::fs::read(root.join(CONFIG_REL)) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => problems.push(Problem {
-            what: format!("{CONFIG_REL} was removed."),
-            fix: restore(root),
+/// Compare the config in `dir` with the hash `init` recorded. `shown` is
+/// the config path as printed, `init` the init command to suggest (both
+/// already safe to print), `restore_fix` the fix for a removed config.
+fn config_drift(
+    dir: &Path,
+    recorded: &str,
+    shown: &str,
+    init: &str,
+    restore_fix: String,
+) -> Option<Problem> {
+    match std::fs::read(dir.join(CONFIG_REL)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Problem {
+            what: format!("{shown} was removed."),
+            fix: restore_fix,
         }),
-        Err(e) => problems.push(Problem {
-            what: format!("{CONFIG_REL} cannot be read: {e}"),
+        Err(e) => Some(Problem {
+            what: format!("{shown} cannot be read: {}", sanitize(&e.to_string())),
             fix: "make it readable so saiife can check it".into(),
         }),
-        Ok(bytes) if sha256_hex(&bytes) != record.config_sha256 => problems.push(Problem {
-            what: format!("{CONFIG_REL} was changed since `saiife init`."),
-            fix: "if you made this change, run `saiife init` to record it; otherwise restore the file and run `saiife init`".into(),
+        Ok(bytes) if sha256_hex(&bytes) != recorded => Some(Problem {
+            what: format!("{shown} was changed since `saiife init`."),
+            fix: format!(
+                "if you made this change, run {init} to record it; otherwise restore the file and run {init}"
+            ),
         }),
-        Ok(_) => {}
+        Ok(_) => None,
     }
+}
+
+fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mut Vec<Problem>) {
+    problems.extend(config_drift(
+        root,
+        &record.config_sha256,
+        CONFIG_REL,
+        "`saiife init`",
+        restore(root),
+    ));
     let project = project_packs(root, builtin);
     for w in project.warnings {
         problems.push(Problem {
@@ -415,23 +442,43 @@ fn scan_limit() -> usize {
     SCAN_LIMIT
 }
 
-/// Find `.saiife/config.toml` files below `root` that `saiife init` did not
-/// set up (no integrity record for their directory): the hook's own lookup
-/// takes the nearest config, so hooks run under them ignore this project's.
+/// Check `.saiife/` directories below `root`: the hook's own lookup takes
+/// the nearest config, so hooks run under a nested one ignore this
+/// project's. A config `saiife init` did not set up (no integrity record)
+/// fails; one with a record is held to its recorded hash like the project's
+/// own (changed, removed, or a record that cannot be read all fail). Paths
+/// are directory names anyone can create, so they are printed sanitized.
 fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Vec<String>) {
     let limit = scan_limit();
     let scan = nested_configs(root, limit);
     for dir in scan.found {
-        if has_record(&root.join(&dir)) {
-            continue;
+        let abs = root.join(&dir);
+        let rel = sanitize(&dir.display().to_string());
+        let has_config = abs.join(CONFIG_REL).is_file();
+        match load_record(&abs) {
+            Ok(Some(record)) => problems.extend(config_drift(
+                &abs,
+                &record.config_sha256,
+                &format!("{rel}/{CONFIG_REL}"),
+                &format!("`saiife init` in {rel}"),
+                format!("run `saiife init` in {rel} to restore it"),
+            )),
+            // A stray `.saiife/` without a config or a record is harmless.
+            Ok(None) if !has_config => {}
+            Ok(None) => problems.push(Problem {
+                what: format!(
+                    "{rel}/{CONFIG_REL} is a separate saiife config that was not set up with saiife init; hooks run in {rel} use it instead of this project's config."
+                ),
+                fix: format!("delete it, or run saiife init in {rel}"),
+            }),
+            Err(e) => problems.push(Problem {
+                what: format!(
+                    "the integrity record for {rel} cannot be read, so {rel}/{CONFIG_REL} cannot be checked: {}",
+                    sanitize(&e)
+                ),
+                fix: format!("run `saiife init` in {rel} to restore it"),
+            }),
         }
-        let rel = dir.display();
-        problems.push(Problem {
-            what: format!(
-                "{rel}/{CONFIG_REL} is a separate saiife config that was not set up with saiife init; hooks run in {rel} use it instead of this project's config."
-            ),
-            fix: format!("delete it, or run saiife init in {rel}"),
-        });
     }
     if scan.cut_short {
         notes.push(format!("nested-config scan stopped after {limit} entries"));
@@ -439,7 +486,8 @@ fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Ve
 }
 
 struct NestedScan {
-    /// Directories below the root (relative to it) holding a config file.
+    /// Directories below the root (relative to it) holding a `.saiife/`
+    /// directory (with or without a config file in it).
     found: Vec<PathBuf>,
     /// The walk stopped at the entry limit.
     cut_short: bool,
@@ -455,7 +503,8 @@ fn nested_configs(root: &Path, limit: usize) -> NestedScan {
     let mut seen = 0usize;
     while let Some(rel) = queue.pop_front() {
         let dir = root.join(&rel);
-        if !rel.as_os_str().is_empty() && dir.join(CONFIG_REL).is_file() {
+        // Followed like the hook's own lookup (a `.saiife` symlink counts).
+        if !rel.as_os_str().is_empty() && dir.join(".saiife").is_dir() {
             found.push(rel.clone());
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
