@@ -553,3 +553,42 @@ fn off_ignores_dangling_symlink_of_an_agent_never_hooked() {
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
     assert!(!stdout(&out).contains("FAILED"), "{}", stdout(&out));
 }
+
+/// Plan 7 (wording): when a step failed, the header must not claim saiife
+/// is off.
+#[cfg(unix)]
+#[test]
+fn off_partial_failure_header_says_not_completely_off() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    hooked_then_symlinked_outside(&env, outside.path());
+    let out = env.saiife(&["init", "--off"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 1, "{text}");
+    assert!(
+        text.starts_with("saiife could not be turned off completely for"),
+        "{text}"
+    );
+    assert!(text.contains("FAILED"), "{text}");
+    assert!(!text.contains("saiife is off for"), "{text}");
+}
+
+#[test]
+fn off_success_header_unchanged() {
+    let env = Env::new(&["claude"]);
+    assert_eq!(code(&env.saiife(&["init", "--agent", "claude"])), 0);
+    let out = env.saiife(&["init", "--off"]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(text.starts_with("saiife is off for"), "{text}");
+}
+
+#[test]
+fn off_header_sanitizes_root() {
+    let env = Env::new(&["claude"]);
+    let dir = env.root().join("evil\x1b[31m");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = env.saiife_in(&dir, &["init", "--off"]);
+    assert!(!out.stdout.contains(&0x1b), "{:?}", stdout(&out));
+    assert!(stdout(&out).contains("evil\\x1b[31m"), "{}", stdout(&out));
+}
