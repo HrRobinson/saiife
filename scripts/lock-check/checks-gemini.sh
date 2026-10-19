@@ -306,6 +306,8 @@ gemini_system_path_env() {
 }
 
 gemini_mcp() {
+  # jq program: $js is a jq variable, not a shell one.
+  # shellcheck disable=SC2016
   gemini_update_as_agent "$LC_HOME/.gemini/settings.json" \
     jq --arg js "$LC_SRC/mcp-marker.js" '.mcpServers.lockcheck = {command: "node", args: [$js]}'
   LC_PROMPT="$(printf 'Call the tool touch_marker of the MCP server lockcheck with the argument name set to %s. Do not use any other tool. Then reply DONE.' "$LC_NONCE")"

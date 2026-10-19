@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Fake agents and setup functions here are called indirectly (by name or via
+# declare -f), jq/awk programs use literal $ in single quotes, and some
+# variables are read by the sourced lib.sh.
+# shellcheck disable=SC2317,SC2016,SC2034
 # Offline tests for the live lock-check harness (scripts/lock-check/).
 #
 # Runs everything that can be checked without Docker, network, agent logins
