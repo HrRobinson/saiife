@@ -117,3 +117,4 @@ runner) are designed in spec §9 and get their own specs after v1 ships.
 - Verify the Codex + Ollama recipe and the `[model_providers.ollama]` key.
 - Look at the HTML report at phone width and in print preview.
 - `scripts/bench-check.sh` must honour `CARGO_TARGET_DIR` (plan 5c).
+- **Plan 5c (tests):** add a `broken_pipe.rs` case for `check --hook-exit` deny with stdout closed (`>&-`) — verified by hand in the plan-5b final re-review (exit 2). JSON-mode `check` with stdout closed outright (`>&-`, not a broken pipe) still exits 0 on deny, since Rust discards the write; no installed hook uses JSON mode.

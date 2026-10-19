@@ -473,7 +473,7 @@ fn emit_deny(reason: &str) -> ExitCode {
         .and_then(|()| out.flush())
         .is_err()
     {
-        eprintln!("saiife: BLOCKED: {reason}");
+        crate::warn(&format!("BLOCKED: {reason}"));
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS

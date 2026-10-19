@@ -72,6 +72,8 @@ report regularly.
   [Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
   [Gemini CLI](agents/gemini.md).
 - **Other agents.** Only Claude Code, Codex and Gemini CLI are supported.
+  Codex and Gemini CLI support is not yet verified on a live install; see the
+  "Not yet verified live" section on each agent page.
 - **Gaps in each pack.** Every pack page has a "Not covered" section. The
   ones that matter most for this page:
   - [core.secrets: not covered](packs/core.secrets.md#not-covered) (for
@@ -93,6 +95,3 @@ These apply to every pack:
 - zsh 5.9 and dash read three such here-document shapes differently from
   bash. There, saiife may block a command that those shells would treat as
   plain text. This is the safe direction.
-
-Codex and Gemini CLI support is not yet verified on a live install; see the
-"Not yet verified live" section on each agent page.
