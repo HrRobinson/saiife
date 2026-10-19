@@ -3,8 +3,11 @@
 #
 # Runs everything that can be checked without Docker, network, agent logins
 # or root: the summarizer and label rule, result-file validation, the stub
-# saiife modes, the observation rules, and a full `in-container.sh run`
-# against a fake agent (testdata/fake-agent.sh, checks-fake.sh). Each test
+# saiife modes, the observation rules, a full `in-container.sh run`
+# against a fake agent (testdata/fake-agent.sh, checks-fake.sh), the check
+# tables and setup fns of checks-claude.sh, checks-codex.sh and
+# checks-gemini.sh, and full runs of the Codex and Gemini checks against
+# stand-in `codex`/`gemini` scripts under $LC_ROOT/usr/local/bin. Each test
 # gets its own `mktemp -d` dir as LC_ROOT, so every container path (/etc,
 # /run/lockcheck, /work/project, /home/agent, /out) lands under that dir.
 # Nothing outside TMPDIR is written; the host wrapper is only run with
@@ -14,8 +17,7 @@
 #
 # Prints `ok <name>` / `FAIL <name>` (with the test's output indented) and
 # exits 1 if any test failed. Tests are the functions named `test_<name>`;
-# later tasks add theirs (e.g. `test_claude_checks_static`) and they are
-# picked up automatically.
+# new ones are picked up automatically.
 set -euo pipefail
 # Tests are called by name ("test_$name"), never directly.
 # shellcheck disable=SC2317,SC2329
@@ -66,6 +68,15 @@ run_fake() {
   f="$(find "$LC_ROOT/out" -maxdepth 1 -name "$agent-*.tsv" 2>/dev/null | head -n1)"
   [[ -n "$f" ]] || fail "no result file for $agent: $(cat "$LC_ROOT/run.out")"
   printf '%s\n' "$f"
+}
+
+# Offline agent runs see only $LC_ROOT/usr/local/bin and the host tools in
+# LC_HOSTBIN_TOOLS. A fake agent that needs more (e.g. `timeout`) gets them
+# here, before the first run builds $LC_ROOT/.lc-hostbin (lc_hostbin builds
+# it once; in-container.sh reuses it).
+hostbin_with() {
+  LC_HOSTBIN_TOOLS+=("$@")
+  lc_hostbin >/dev/null
 }
 
 # A checks dir holding checks-<name>.sh that sources the fake's contract and
@@ -527,6 +538,21 @@ saiife-lockcheck-home:/home/agent" "mounts"
   printf '%s\n' "$out" | awk 'prev == "--security-opt" && $0 == "no-new-privileges" { f = 1 } { prev = $0 } END { exit !f }' ||
     fail "no --security-opt no-new-privileges"
   printf '%s\n' "$out" | grep -qx "LOCKCHECK_HOST_UID=$(id -u)" || fail "no host uid"
+  # The per-agent knobs the check scripts read pass through only when set.
+  local knob
+  for knob in LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_CODEX_MCP_SNIPPET \
+    LOCKCHECK_GEMINI_TOGGLE; do
+    if printf '%s\n' "$out" | grep -q "$knob"; then
+      fail "$knob passed while unset"
+    fi
+  done
+  out="$(LOCKCHECK_CODEX_REQUIREMENTS=/etc/codex/x.toml LOCKCHECK_CODEX_MHO_TABLE=hooks \
+    LOCKCHECK_CODEX_MCP_SNIPPET='[x]' LOCKCHECK_GEMINI_TOGGLE=a.b PATH="$bin:$PATH" \
+    bash "$REPO/scripts/live-check-locked.sh" --print codex)" || fail "wrapper --print codex failed"
+  assert_eq "$(printf '%s\n' "$out" | awk 'prev == "-e" && /^LOCKCHECK_(CODEX|GEMINI)_/ { print } { prev = $0 }' |
+    paste -sd' ' -)" \
+    "LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_CODEX_MCP_SNIPPET LOCKCHECK_GEMINI_TOGGLE" \
+    "knobs passed by name (values stay in the env)"
   # No docker on PATH: refuse.
   local rc=0 nobin
   nobin="$(mktemp -d "$SCRATCH/nobin.XXXXXX")"
@@ -751,6 +777,17 @@ test_codex_managed_path_override() {
   agent_baseline
   [[ -f "$LC_ROOT/etc/codex/managed_config.toml" ]] || fail "override path not written"
   [[ ! -e "$LC_ROOT/etc/codex/requirements.toml" ]] || fail "default path written"
+  # Overrides that leave /etc (or LC_ROOT) are refused before anything is written.
+  local bad
+  for bad in /etc/../../escaped /etc/codex/../../../escaped /tmp/escaped etc/codex/x.toml '/etc/codex/a b'; do
+    LOCKCHECK_CODEX_REQUIREMENTS="$bad"
+    # shellcheck source=/dev/null
+    source "$HERE/checks-codex.sh"
+    if (agent_baseline) 2>/dev/null; then
+      fail "override $bad accepted"
+    fi
+  done
+  [[ ! -e "$SCRATCH/escaped" && ! -e "$LC_ROOT/escaped" ]] || fail "file written outside /etc"
 }
 
 # A stand-in `codex` for the end-to-end run: runs every hook command in the
@@ -774,7 +811,7 @@ blocked=0
 while IFS= read -r cmd; do
   cmd="${cmd/#\/opt\/saiife\//$root/opt/saiife/}"
   rc=0
-  err="$(printf '%s\n' "$payload" | timeout 1 bash -c "$cmd" 2>&1 >/dev/null)" || rc=$?
+  err="$(printf '%s\n' "$payload" | LOCKCHECK_HANG_SECS=2 timeout 1 bash -c "$cmd" 2>&1 >/dev/null)" || rc=$?
   if [[ "$rc" == 2 && -n "$err" ]]; then blocked=1; fi
 done < <(sed -n 's/^command = "\(.*\)"$/\1/p' "$root/etc/codex/requirements.toml")
 if ((blocked == 0)); then touch "$marker"; fi
@@ -788,6 +825,7 @@ test_codex_end_to_end_with_fake() {
   local f vendor="$LC_ROOT/usr/local/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex"
   export LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
   write_fake_codex
+  hostbin_with timeout
   mkdir -p "$vendor" "$LC_HOME/.codex"
   printf 'x/etc/codex/requirements.toml\0y/etc/codex/managed_config.toml\0/etc/codex/requirements.toml' \
     >"$vendor/codex"
@@ -1001,6 +1039,262 @@ EOF
   agent_baseline
   assert_eq "$(jq -c '[.a.hooks, .b.disableHooks]' "$LC_ROOT/etc/gemini-cli/settings.json")" \
     '[true,false]' "pin polarity (a disable* key is pinned false)"
+}
+
+# A stand-in `gemini` for the end-to-end run: reads the system settings
+# (GEMINI_CLI_SYSTEM_SETTINGS_PATH, else /etc/gemini-cli/settings.json under
+# LC_ROOT) and runs every BeforeTool hook command in order (stub path mapped
+# under LC_ROOT) with a tool call that touches the prompt's marker. Exit 0, 1
+# or a timeout lets the call run; any other exit blocks it (Gemini: exit 2
+# blocks, other failures are listed as gate/info rows). MCP prompts are
+# refused when the system file excludes `lockcheck` or allows only others.
+# User and project settings are ignored (a lock that holds).
+write_fake_gemini() {
+  mkdir -p "$LC_ROOT/usr/local/bin"
+  cat >"$LC_ROOT/usr/local/bin/gemini" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+root="${LC_ROOT:?}"
+if [[ "${1:-}" == --version ]]; then echo "0.0.0-fake"; exit 0; fi
+prompt=""
+while (($#)); do
+  if [[ "$1" == -p ]]; then prompt="${2:-}"; shift; fi
+  shift
+done
+nonce="$(grep -oE '[0-9a-f]{12}' <<<"$prompt" | tail -n1 || true)"
+[[ -n "$nonce" ]] || exit 0
+sys="${GEMINI_CLI_SYSTEM_SETTINGS_PATH:-$root/etc/gemini-cli/settings.json}"
+marker="$root/work/project/markers/$nonce"
+tool=run_shell_command
+if [[ "$prompt" == *"MCP server lockcheck"* ]]; then
+  tool=mcp_lockcheck_touch_marker
+  if jq -e '(.mcp.excluded // [] | index("lockcheck")) or (.mcp.allowed and (.mcp.allowed | index("lockcheck") | not))' \
+    "$sys" >/dev/null; then
+    echo "tool touch_marker not found"
+    exit 0
+  fi
+fi
+payload="{\"hook_event_name\":\"BeforeTool\",\"tool_name\":\"$tool\",\"tool_input\":{\"command\":\"touch $marker\"}}"
+blocked=0
+while IFS= read -r cmd; do
+  cmd="${cmd/#\/opt\/saiife\//$root/opt/saiife/}"
+  rc=0
+  printf '%s\n' "$payload" | LOCKCHECK_HANG_SECS=2 timeout 1 bash -c "$cmd" >/dev/null 2>&1 || rc=$?
+  case "$rc" in 0 | 1 | 124) ;; *) blocked=1 ;; esac
+done < <(jq -r '.hooks.BeforeTool[]?.hooks[]?.command' "$sys")
+if ((blocked == 0)); then touch "$marker"; fi
+echo DONE
+EOF
+  chmod 0755 "$LC_ROOT/usr/local/bin/gemini"
+}
+
+test_gemini_end_to_end_with_fake() {
+  new_root
+  local f
+  export LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  export LOCKCHECK_GEMINI_TOGGLE=hooksConfig.enabled
+  write_fake_gemini
+  hostbin_with timeout
+  mkdir -p "$LC_HOME/.gemini"
+  head -c 64 /dev/urandom >"$LC_HOME/.gemini/oauth_creds.json"
+  cp -p "$LC_HOME/.gemini/oauth_creds.json" "$LC_ROOT/creds.orig"
+  printf '{"security": {"auth": {"selectedType": "oauth-personal"}}}\n' >"$LC_HOME/.gemini/settings.json"
+  cp -p "$LC_HOME/.gemini/settings.json" "$LC_ROOT/settings.orig"
+  f="$(run_fake gemini "$HERE")"
+  lc_validate "$f" || fail "result does not validate: $(cat "$f")"
+  assert_eq "$(row_of "$f" gemini.control)" "control ran ran PASS"
+  assert_eq "$(row_of "$f" gemini.toggle.probe)" "info - found INFO"
+  assert_eq "$(row_of "$f" gemini.system.fires)" "gate fired fired PASS"
+  assert_eq "$(row_of "$f" gemini.deny)" "gate blocked blocked PASS"
+  assert_eq "$(row_of "$f" gemini.toggle-off.user.hooksConfig.enabled)" "gate blocked blocked PASS"
+  assert_eq "$(row_of "$f" gemini.gemini-home)" "gate blocked blocked PASS"
+  assert_eq "$(row_of "$f" gemini.system-path-env)" "caveat ran ran PASS"
+  assert_eq "$(row_of "$f" gemini.fail.exit3)" "gate blocked blocked PASS"
+  assert_eq "$(row_of "$f" gemini.fail.timeout)" "gap ran ran PASS"
+  assert_eq "$(row_of "$f" gemini.fail.missing)" "info blocked blocked INFO"
+  assert_eq "$(row_of "$f" gemini.fail.exit1)" "info ran ran INFO"
+  assert_eq "$(row_of "$f" gemini.mcp.control)" "design ran ran PASS"
+  assert_eq "$(row_of "$f" gemini.mcp.excluded)" "design unavailable unavailable PASS"
+  assert_eq "$(row_of "$f" gemini.mcp.allowlist)" "design unavailable unavailable PASS"
+  grep -q $'^gemini.mcp.hooked\t.*tool_name=mcp_lockcheck_touch_marker' "$f" ||
+    fail "mcp.hooked detail: $(cat "$f")"
+  assert_eq "$(awk -F'\t' '!/^#/ && $5 != "PASS" && $5 != "INFO"' "$f")" "" "rows not PASS/INFO"
+  assert_eq "$(sed -n 's/^# label=//p' "$f")" lockable-with-caveats
+  [[ ! -e "$LC_PROJECT/.gemini/settings.json" && ! -e "$LC_HOME/alt" ]] ||
+    fail "settings files left behind"
+  cmp -s "$LC_HOME/.gemini/settings.json" "$LC_ROOT/settings.orig" || fail "user settings not restored"
+  cmp -s "$LC_HOME/.gemini/oauth_creds.json" "$LC_ROOT/creds.orig" || fail "oauth_creds.json changed"
+}
+
+# --- Claude Code checks (checks-claude.sh) ------------------------------------
+
+# Loads checks-claude.sh with lc_check and lc_record replaced by recorders,
+# runs agent_checks, and inspects what each setup fn left behind. lc_check's
+# recorder runs the real lc_reset and the setup fn (nonce 0123456789ab) and
+# saves the resulting state under $LC_ROOT/state/<id>/; no agent is run.
+test_claude_checks_static() {
+  new_root
+  export HOME="$LC_ROOT/host-home"
+  mkdir -p "$HOME" "$LC_ROOT/usr/local/bin"
+  printf '#!/usr/bin/env bash\necho "2.1.300 (Claude Code)"\n' >"$LC_ROOT/usr/local/bin/claude"
+  chmod 0755 "$LC_ROOT/usr/local/bin/claude"
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  LC_RESULTS="$LC_ROOT/results.tsv"
+  : >"$LC_RESULTS"
+  # shellcheck source=/dev/null
+  source "$HERE/checks-claude.sh"
+  local rec="$LC_ROOT/checks.rec" state="$LC_ROOT/state" managed
+  managed="$LC_ROOT/etc/claude-code/managed-settings.d"
+  : >"$rec"
+  lc_record() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" - "${5:-}" >>"$rec"
+  }
+  lc_check() {
+    local id="$1" setup="${5:--}" d="$state/$1" f
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$setup" "${6:-}" >>"$rec"
+    lc_reset
+    LC_NONCE=0123456789ab
+    if [[ "$setup" != - ]]; then
+      "$setup"
+    fi
+    mkdir -p "$d"
+    printf '%s\n' "${LC_AGENT_ARGS[@]}" >"$d/args"
+    printf '%s\n' "${LC_AGENT_ENV[@]}" >"$d/env"
+    printf '%s' "$LC_PROMPT" >"$d/prompt"
+    printf '%s' "$LC_FIRED_EVENT" >"$d/fired-event"
+    printf '%s' "$LC_POST" >"$d/post"
+    find "$managed" -mindepth 1 -printf '%f\n' | sort >"$d/managed"
+    cp "$LC_RUN/mode.config-change" "$d/mode.config-change"
+    local i=0
+    while IFS= read -r f; do
+      i=$((i + 1))
+      if [[ -e "$f" ]]; then
+        cp "$f" "$d/settings-$i"
+      fi
+    done < <(agent_settings_files)
+    if [[ -d "$LC_HOME/alt" ]]; then
+      cp -a "$LC_HOME/alt" "$d/alt"
+    fi
+    return 0
+  }
+  lc_snapshot
+  agent_checks
+
+  # Ids, in the order of the plan's table.
+  assert_eq "$(cut -f1 "$rec" | paste -sd' ' -)" "claude.control claude.managed.fires \
+claude.deny claude.disable.user claude.disable.project claude.disable.local claude.disable.cli \
+claude.hooks-empty.user claude.config-dir claude.setting-sources claude.fail.exit101 \
+claude.fail.segv claude.fail.kill9 claude.fail.timeout claude.fail.missing claude.fail.exit1 \
+claude.configchange.fires claude.configchange.control claude.configchange.blocks \
+claude.managed-only claude.mcp.control claude.mcp.hooked claude.mcp.denied claude.mcp.allowlist \
+claude.version.onfailure" "check ids"
+  # Class, expect, mode, control.
+  assert_eq "$(awk -F'\t' '$2 == "gate" && $3 != "blocked" && $3 != "fired"' "$rec")" "" \
+    "gate rows that expect neither blocked nor fired"
+  assert_eq "$(awk -F'\t' '{ print $1, $2, $3, $4 }' "$rec" | paste -sd'|' -)" \
+    "claude.control control ran allow|claude.managed.fires gate fired allow|\
+claude.deny gate blocked deny|claude.disable.user gate blocked deny|\
+claude.disable.project gate blocked deny|claude.disable.local gate blocked deny|\
+claude.disable.cli gate blocked deny|claude.hooks-empty.user gate blocked deny|\
+claude.config-dir gate blocked deny|claude.setting-sources gate blocked deny|\
+claude.fail.exit101 gate blocked panic|claude.fail.segv gate blocked segv|\
+claude.fail.kill9 gate blocked kill9|claude.fail.timeout gate blocked hang|\
+claude.fail.missing gate blocked missing|claude.fail.exit1 design blocked exit1|\
+claude.configchange.fires design fired allow|claude.configchange.control design ran allow|\
+claude.configchange.blocks design blocked allow|claude.managed-only design blocked allow|\
+claude.mcp.control design ran allow|claude.mcp.hooked design fired allow|\
+claude.mcp.denied design unavailable allow|claude.mcp.allowlist design unavailable allow|\
+claude.version.onfailure info - found" "class, expect, mode"
+  assert_eq "$(awk -F'\t' '$3 == "unavailable" { print $6 }' "$rec" | sort -u)" claude.mcp.control \
+    "control of the unavailable rows"
+  assert_eq "$(awk -F'\t' '$1 == "claude.version.onfailure" { print $6 }' "$rec")" \
+    "2.1.300 (Claude Code)" "version probe detail"
+
+  # Baseline: fixture byte-identical, witness drop-in parses, nothing else.
+  cmp -s "$managed/50-saiife.json" "$LC_MANAGED/claude/50-saiife.json" ||
+    fail "50-saiife.json differs from the fixture"
+  assert_eq "$(jq -r '.hooks.PreToolUse[0] | "\(.matcher) \(.hooks[0].command) \(.hooks[0].timeout)"' \
+    "$managed/60-lockcheck-witness.json")" "* $LC_WITNESS 10" "witness drop-in"
+  assert_eq "$(stat -c %a "$managed" "$managed/50-saiife.json" "$managed/60-lockcheck-witness.json" |
+    paste -sd' ' -)" "755 644 644" "managed modes"
+  [[ ! -e "$LC_ROOT/etc/claude-code/managed-settings.json" ]] || fail "managed-settings.json exists"
+  assert_eq "$(paste -sd' ' "$state/claude.control/managed")" \
+    "50-saiife.json 60-lockcheck-witness.json" "baseline drop-ins"
+  assert_eq "$(paste -sd' ' "$state/claude.mcp.allowlist/managed")" \
+    "50-saiife.json 60-lockcheck-witness.json 70-lockcheck-mcp.json" "allowlist drop-ins"
+  [[ ! -e "$state/claude.version.onfailure" ]] || fail "the probe ran a check"
+
+  # Settings and login files all live under LC_ROOT; login files are not settings.
+  while IFS= read -r f; do
+    [[ "$f" == "$LC_ROOT/"* ]] || fail "path outside LC_ROOT: $f"
+  done < <(agent_settings_files; agent_login_files)
+  assert_eq "$(agent_settings_files | paste -sd' ' -)" "$LC_HOME/.claude/settings.json \
+$LC_PROJECT/.claude/settings.json $LC_PROJECT/.claude/settings.local.json" "settings files"
+  assert_eq "$(agent_login_files | paste -sd' ' -)" \
+    "$LC_HOME/.claude/.credentials.json $LC_HOME/.claude.json" "login files"
+
+  # Setups.
+  local s="$state"
+  assert_eq "$(jq -c . "$s/claude.disable.user/settings-1")" '{"disableAllHooks":true}'
+  assert_eq "$(jq -c . "$s/claude.disable.project/settings-2")" '{"disableAllHooks":true}'
+  assert_eq "$(jq -c . "$s/claude.disable.local/settings-3")" '{"disableAllHooks":true}'
+  [[ ! -e "$s/claude.disable.local/settings-1" && ! -e "$s/claude.disable.local/settings-2" ]] ||
+    fail "reset left settings behind"
+  assert_eq "$(paste -sd' ' "$s/claude.disable.cli/args")" '--settings {"disableAllHooks":true}'
+  assert_eq "$(jq -c . "$s/claude.hooks-empty.user/settings-1")" '{"hooks":{"PreToolUse":[]}}'
+  assert_eq "$(cat "$s/claude.config-dir/env")" "CLAUDE_CONFIG_DIR=$LC_HOME/alt"
+  assert_eq "$(jq -c . "$s/claude.config-dir/alt/settings.json")" '{"disableAllHooks":true}'
+  assert_eq "$(readlink "$s/claude.config-dir/alt/.credentials.json")" "$LC_HOME/.claude/.credentials.json"
+  assert_eq "$(readlink "$s/claude.config-dir/alt/.claude.json")" "$LC_HOME/.claude.json"
+  [[ ! -e "$LC_HOME/alt" ]] || fail "alt dir left after the last reset"
+  assert_eq "$(paste -sd' ' "$s/claude.setting-sources/args")" "--setting-sources user"
+  assert_eq "$(cat "$s/claude.configchange.fires/fired-event")" config-change
+  grep -qF "$LC_PROJECT/.claude/settings.local.json" "$s/claude.configchange.fires/prompt" ||
+    fail "configchange.fires prompt: $(cat "$s/claude.configchange.fires/prompt")"
+  grep -qF "$LC_MARKERS/0123456789ab" "$s/claude.configchange.fires/prompt" || fail "fires marker"
+  assert_eq "$(cat "$s/claude.configchange.control/mode.config-change")" allow
+  assert_eq "$(cat "$s/claude.configchange.blocks/mode.config-change")" deny
+  assert_eq "$(cat "$s/claude.configchange.blocks/prompt")" "$(cat "$s/claude.configchange.control/prompt")" \
+    "configchange prompts"
+  grep -qF "$LC_HOME/.claude/settings.json" "$s/claude.configchange.control/prompt" || fail "control prompt"
+  grep -qF "touch $LC_MARKERS/0123456789ab" "$s/claude.configchange.control/prompt" || fail "control hook"
+  grep -qF "echo 0123456789ab" "$s/claude.configchange.control/prompt" || fail "control echo"
+  assert_eq "$(paste -sd' ' "$s/claude.managed-only/managed")" \
+    "50-saiife.json 60-lockcheck-witness.json 70-lockcheck-only.json" "managed-only drop-ins"
+  assert_eq "$(jq -r '.hooks.PreToolUse[0] | "\(.matcher) \(.hooks[0].command)"' \
+    "$s/claude.managed-only/settings-1")" "* touch $LC_MARKERS/0123456789ab" "user hook"
+  grep -qF "echo 0123456789ab" "$s/claude.managed-only/prompt" || fail "managed-only prompt"
+  local m
+  for m in control hooked denied allowlist; do
+    assert_eq "$(paste -sd' ' "$s/claude.mcp.$m/args")" "--mcp-config $LC_ROOT/work/lockcheck-mcp.json" \
+      "mcp.$m args"
+    grep -qF touch_marker "$s/claude.mcp.$m/prompt" || fail "mcp.$m prompt"
+    grep -qF 0123456789ab "$s/claude.mcp.$m/prompt" || fail "mcp.$m nonce"
+  done
+  [[ -n "$(cat "$s/claude.mcp.hooked/post")" ]] || fail "mcp.hooked has no LC_POST"
+  [[ -z "$(cat "$s/claude.mcp.control/post")" ]] || fail "mcp.control has LC_POST"
+  printf '1\tpre-tool\tallow\t{"tool_name":"mcp__lockcheck__touch_marker","n":"0123456789ab"}\n' \
+    >"$LC_RUN/calls.log"
+  assert_eq "$("$(cat "$s/claude.mcp.hooked/post")" 0123456789ab)" \
+    "tool_name=mcp__lockcheck__touch_marker" "mcp.hooked detail"
+  assert_eq "$(jq -c . "$LC_ROOT/work/lockcheck-mcp.json")" \
+    "$(jq -nc --arg js "$LC_SRC/mcp-marker.js" --arg m "$LC_MARKERS" \
+      '{mcpServers:{lockcheck:{command:"node",args:[$js],env:{LOCKCHECK_MARKERS:$m}}}}')" "mcp config"
+  # The denied/allowlist drop-ins (state saved before the next reset).
+  lc_reset
+  LC_NONCE=0123456789ab
+  claude_setup_mcp_denied
+  assert_eq "$(jq -c . "$managed/70-lockcheck-mcp.json")" '{"deniedMcpServers":[{"serverName":"lockcheck"}]}'
+  lc_reset
+  claude_setup_mcp_allowlist
+  assert_eq "$(jq -c . "$managed/70-lockcheck-mcp.json")" '{"allowedMcpServers":[{"serverName":"other"}]}'
+  lc_reset
+  [[ ! -e "$managed/70-lockcheck-mcp.json" ]] || fail "reset kept 70-lockcheck-mcp.json"
+
+  # agent_invoke is self-contained (shipped with declare -f).
+  declare -f agent_invoke | grep -qE 'claude -p "\$1" --dangerously-skip-permissions --output-format text "\$\{@:2\}"' ||
+    fail "agent_invoke: $(declare -f agent_invoke)"
+  assert_eq "$(find "$HOME" -mindepth 1)" "" "files written to HOME"
 }
 
 # --- runner ------------------------------------------------------------------

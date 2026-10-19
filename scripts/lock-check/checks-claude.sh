@@ -114,6 +114,7 @@ claude_setup_config_dir() {
   local alt="$LC_HOME/alt" f
   lc_as_agent_write "$alt/settings.json" "$claude_disable_json"
   while IFS= read -r f; do
+    lc_require_path "$alt/$(basename "$f")" || return 1
     ln -sfn "$f" "$alt/$(basename "$f")"
     lc_chown_agent -h "$alt/$(basename "$f")"
   done < <(agent_login_files)
@@ -150,6 +151,7 @@ claude_setup_managed_only() {
 }
 
 claude_setup_mcp_control() {
+  lc_require_path "$CLAUDE_MCP_CONFIG" || return 1
   jq -n --arg js "$LC_SRC/mcp-marker.js" --arg m "$LC_MARKERS" \
     '{mcpServers: {lockcheck: {command: "node", args: [$js], env: {LOCKCHECK_MARKERS: $m}}}}' \
     >"$CLAUDE_MCP_CONFIG"
@@ -182,7 +184,7 @@ claude_setup_mcp_allowlist() {
 # `found` if this Claude Code has onFailure (>= 2.1.295).
 claude_probe_onfailure() {
   local out v
-  out="$(agent_version 2>/dev/null | head -n1 || true)"
+  out="$(lc_agent_call agent_version 2>/dev/null | head -n1 || true)"
   v="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$out" | head -n1 || true)"
   if [[ -n "$v" && "$(printf '%s\n' "$CLAUDE_MIN_ONFAILURE" "$v" | sort -V | head -n1)" == "$CLAUDE_MIN_ONFAILURE" ]]; then
     lc_probe claude.version.onfailure found "${out:-?}"

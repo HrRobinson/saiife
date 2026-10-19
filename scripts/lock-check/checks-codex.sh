@@ -16,7 +16,8 @@
 #
 # Unverified keys can be overridden from the host (live-check-locked.sh
 # passes these through):
-#   LOCKCHECK_CODEX_REQUIREMENTS  managed file (default /etc/codex/requirements.toml)
+#   LOCKCHECK_CODEX_REQUIREMENTS  managed file (default /etc/codex/requirements.toml;
+#                                 must be under /etc, no `..`)
 #   LOCKCHECK_CODEX_MHO_TABLE     table holding allow_managed_hooks_only
 #                                 (default: top level; e.g. `hooks`)
 #   LOCKCHECK_CODEX_MCP_SNIPPET   managed TOML for the MCP allowlist check
@@ -59,8 +60,21 @@ codex_user_config() {
   lc_as_agent_write "$CODEX_USER_CONFIG" "$body"
 }
 
+# The managed file must stay a plain path under /etc (it is written as root),
+# and offline under $LC_ROOT: an override with `..` could leave either.
+codex_require_managed_path() {
+  if [[ ! "$CODEX_REQ_PATH" =~ ^/etc/[A-Za-z0-9._/-]+$ || "/$CODEX_REQ_PATH/" == */../* ]]; then
+    echo "checks-codex.sh: LOCKCHECK_CODEX_REQUIREMENTS must be a path under /etc without '..': $CODEX_REQ_PATH" >&2
+    return 1
+  fi
+  if [[ -n "$LC_ROOT" ]]; then
+    lc_require_path "$CODEX_REQUIREMENTS" || return 1
+  fi
+}
+
 agent_baseline() {
   local dir
+  codex_require_managed_path || return 1
   dir="$(dirname "$CODEX_REQUIREMENTS")"
   mkdir -p "$dir"
   chmod 0755 "$dir"
@@ -131,10 +145,9 @@ codex_hooks_empty_user() {
 codex_home() {
   lc_as_agent_write "$CODEX_ALT/config.toml" \
     $'[features]\nhooks = false\n\n'"[projects.\"$LC_PROJECT\"]"$'\ntrust_level = "trusted"'
+  lc_require_path "$CODEX_ALT/auth.json" || return 1
   ln -sfn "$LC_HOME/.codex/auth.json" "$CODEX_ALT/auth.json"
-  if [[ -z "$LC_ROOT" ]]; then
-    chown -h agent:agent "$CODEX_ALT/auth.json"
-  fi
+  lc_chown_agent -h "$CODEX_ALT/auth.json"
   LC_AGENT_ENV=("CODEX_HOME=$CODEX_ALT")
 }
 

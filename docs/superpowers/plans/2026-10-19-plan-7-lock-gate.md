@@ -57,7 +57,7 @@ Style models: `scripts/live-check-agents.sh`, `scripts/demo.sh`.
 - Agent user `agent` (uid 1001), home `/home/agent` on the named volume.
 
 **Stub modes** (`stub-saiife.sh` reads `mode.config-change` when its args contain `--event config-change`, else `mode`; it first appends one line `"<epoch>\t<event>\t<mode>\t<stdin with newlines removed>"` to `calls.log`, event `pre-tool` or `config-change`):
-`allow` exit 0 silent · `deny` stderr `saiife-lockcheck: blocked by stub`, exit 2 · `exit1` exit 1 · `exit3` exit 3, no output · `panic` stderr `thread 'main' panicked at stub`, exit 101 · `segv` `kill -SEGV $$` · `kill9` `kill -KILL $$` · `hang` `sleep "${LOCKCHECK_HANG_SECS:-60}"` then exit 0. The harness's `missing` mode removes the stub file instead (restored by reset).
+`allow` exit 0 silent · `deny` stderr `saiife-lockcheck: blocked by stub`, exit 2 · `deny-silent` exit 2 with empty stderr (Codex: a failed hook, not a block) · `exit1` exit 1 · `exit3` exit 3, no output · `panic` stderr `thread 'main' panicked at stub`, exit 101 · `segv` `kill -SEGV $$` · `kill9` `kill -KILL $$` · `hang` `sleep "${LOCKCHECK_HANG_SECS:-60}"` then exit 0. The harness's `missing` mode removes the stub file instead (restored by reset).
 
 **Witness** (`witness.sh`): appends `"<epoch>\t<stdin with newlines removed>"` to `witness.log`, exit 0 silent. It is a second managed hook on every tool (Claude: drop-in `60-lockcheck-witness.json`; Codex/Gemini: a second hook group appended to the managed file at baseline time).
 

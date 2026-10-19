@@ -278,13 +278,16 @@ gemini_home() {
     "$(gemini_read_json "$LC_HOME/.gemini/trustedFolders.json")"
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
+    lc_require_path "$alt/$(basename "$f")" || return 1
     ln -sfn "$f" "$alt/$(basename "$f")"
+    lc_chown_agent -h "$alt/$(basename "$f")"
   done < <(agent_login_files)
   LC_AGENT_ENV=("GEMINI_CLI_HOME=$LC_HOME/alt")
 }
 
 gemini_system_path_env() {
   local f="$LC_ROOT/work/empty-settings.json"
+  lc_require_path "$f" || return 1
   mkdir -p "$(dirname "$f")"
   printf '{}\n' >"$f"
   chmod 0644 "$f"

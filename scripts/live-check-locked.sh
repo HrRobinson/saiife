@@ -28,6 +28,9 @@
 #   bash scripts/live-check-locked.sh --forget
 #   AGENT_TIMEOUT=240 (seconds per agent run), CLAUDE_VERSION / CODEX_VERSION
 #   / GEMINI_VERSION / NODE_VERSION (image build args, with --rebuild)
+#   LOCKCHECK_CODEX_REQUIREMENTS / LOCKCHECK_CODEX_MHO_TABLE /
+#   LOCKCHECK_CODEX_MCP_SNIPPET / LOCKCHECK_GEMINI_TOGGLE (overrides for
+#   unverified agent keys; see checks-codex.sh and checks-gemini.sh)
 #
 # Exit 0 only if no agent's label is `not-lockable` or `unverified`.
 set -euo pipefail
@@ -108,8 +111,10 @@ run_argv() {
   if [[ "$host_owner" == 1 ]]; then
     argv+=(-e "LOCKCHECK_HOST_UID=$(id -u)" -e "LOCKCHECK_HOST_GID=$(id -g)")
   fi
-  # Optional per-agent knobs (Tasks 4-5); passed only when set on the host.
-  for name in LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_GEMINI_TOGGLE; do
+  # Optional per-agent knobs (every LOCKCHECK_* that checks-codex.sh and
+  # checks-gemini.sh read); passed only when set on the host.
+  for name in LOCKCHECK_CODEX_REQUIREMENTS LOCKCHECK_CODEX_MHO_TABLE LOCKCHECK_CODEX_MCP_SNIPPET \
+    LOCKCHECK_GEMINI_TOGGLE; do
     if [[ -n "${!name+x}" ]]; then
       argv+=(-e "$name")
     fi
