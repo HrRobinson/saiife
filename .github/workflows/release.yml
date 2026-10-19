@@ -8,14 +8,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - id: version
         name: tag matches Cargo.toml version
         shell: bash
@@ -65,15 +71,14 @@ jobs:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.check-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       # rust-toolchain.toml selects the toolchain; make sure it has the target.
       - run: rustup target add "$TARGET"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - name: install musl-tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -128,9 +133,9 @@ jobs:
           name="saiife-$VERSION-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/saiife" LICENSE README.md "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
           tar -tzf "dist/$name.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
           path: dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
@@ -138,15 +143,17 @@ jobs:
 
   publish:
     needs: [check-version, build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
           path: dist
@@ -176,7 +183,8 @@ jobs:
             ' CHANGELOG.md > notes.md
           fi
           if ! grep -q '[^[:space:]]' notes.md; then
-            echo "saiife $GITHUB_REF_NAME" > notes.md
+            echo "::error::CHANGELOG.md has no section for version $VERSION; add '## $VERSION' release notes before tagging"
+            exit 1
           fi
           cat notes.md
       - name: create release
@@ -190,6 +198,7 @@ jobs:
 
   install-test:
     needs: [check-version, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
