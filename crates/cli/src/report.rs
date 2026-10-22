@@ -87,6 +87,11 @@ fn decision_label(d: DecisionKind) -> &'static str {
         DecisionKind::Allow => "Allowed",
         DecisionKind::Deny => "Blocked",
         DecisionKind::ErrorAllowed => "Allowed unchecked (fail-open)",
+        DecisionKind::ErrorDenied => "Blocked (error)",
+        DecisionKind::Ask => "Asked",
+        DecisionKind::Approved => "Approved",
+        DecisionKind::Rejected => "Rejected",
+        DecisionKind::Expired => "Expired",
         DecisionKind::Unknown => "Other",
     }
 }
@@ -292,6 +297,9 @@ mod tests {
                 pack,
                 rule: None,
                 reason: Some("why"),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             at,
@@ -404,7 +412,7 @@ mod tests {
         );
         let json = serde_json::to_string(&base)
             .unwrap()
-            .replace("\"deny\"", "\"error_denied\"");
+            .replace("\"deny\"", "\"later\"");
         let parsed: Record = serde_json::from_str(&json).unwrap();
         let r = build(
             &[&parsed],

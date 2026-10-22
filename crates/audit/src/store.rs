@@ -232,6 +232,9 @@ pub struct Filter {
 
 impl Filter {
     pub fn matches(&self, r: &Record) -> bool {
+        if r.is_bookkeeping() {
+            return false;
+        }
         if let Some(since) = self.since {
             match r.timestamp() {
                 Some(t) if t >= since => {}
@@ -275,6 +278,9 @@ mod tests {
                 pack: None,
                 rule: None,
                 reason: None,
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             at,
@@ -749,5 +755,18 @@ mod tests {
             !f.matches(&broken),
             "unparseable ts is excluded when --since is set"
         );
+    }
+
+    #[test]
+    fn filter_hides_bookkeeping() {
+        let mut g = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-13 12:00:00 UTC),
+        );
+        assert!(Filter::default().matches(&g));
+        g.kind = Some("genesis".into());
+        assert!(!Filter::default().matches(&g));
     }
 }

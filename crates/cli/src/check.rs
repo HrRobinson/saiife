@@ -438,6 +438,9 @@ impl Audit {
                 pack: rule.map(|(p, _)| p.as_str()),
                 rule: rule.map(|(_, r)| r.as_str()),
                 reason,
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             env!("CARGO_PKG_VERSION"),
         );

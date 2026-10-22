@@ -59,6 +59,11 @@ pub fn render_table(records: &[&Record]) -> String {
                 fail_open += 1;
                 "FAIL-OPEN"
             }
+            DecisionKind::ErrorDenied => "blocked (error)",
+            DecisionKind::Ask => "asked",
+            DecisionKind::Approved => "approved",
+            DecisionKind::Rejected => "rejected",
+            DecisionKind::Expired => "expired",
             DecisionKind::Unknown => "OTHER",
         };
         let time = sanitize(r.ts.get(..19).unwrap_or(&r.ts)).replace('T', " ");
@@ -280,6 +285,9 @@ mod tests {
                 pack,
                 rule: None,
                 reason: Some("why"),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
@@ -372,6 +380,9 @@ mod tests {
                 pack: Some(&format!("pk{evil}")),
                 rule: None,
                 reason: Some(&format!("why{evil}\u{2066}")),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
