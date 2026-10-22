@@ -1,0 +1,11 @@
+[features]
+hooks = true
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/opt/saiife/bin/saiife check --managed --hook-exit --agent codex"
+timeout = 10
+statusMessage = "saiife guard (locked)"

@@ -1,0 +1,10 @@
+# agent=gemini
+# agent_version=0.40.0
+# node_version=v22.14.0
+# image=sha256:0000000000000000000000000000000000000000000000000000000000000000
+# saiife_commit=0000000000000000000000000000000000000000
+# kernel=6.8.0-test
+# date=2026-10-19T00:00:00Z
+gemini.system.fires	gate	fired	fired	PASS	mode=allow exit=0
+gemini.deny	gate	blocked	blocked	PASS	mode=deny exit=0
+# label=unverified

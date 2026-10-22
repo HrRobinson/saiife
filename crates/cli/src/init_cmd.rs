@@ -430,7 +430,12 @@ pub fn off() -> ExitCode {
         }
     }
 
-    outln!("saiife is off for {}", root.display());
+    let shown = crate::text::sanitize(&root.display().to_string());
+    if failed {
+        outln!("saiife could not be turned off completely for {shown}; see FAILED below");
+    } else {
+        outln!("saiife is off for {shown}");
+    }
     if lines.is_empty() {
         outln!("  nothing to remove");
     }

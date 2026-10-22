@@ -1,0 +1,15 @@
+# agent=codex
+# agent_version=codex-cli 0.200.0
+# node_version=v22.14.0
+# image=sha256:0000000000000000000000000000000000000000000000000000000000000000
+# saiife_commit=0000000000000000000000000000000000000000
+# kernel=6.8.0-test
+# date=2026-10-19T00:00:00Z
+codex.control	control	ran	ran	PASS	mode=allow exit=0
+codex.managed.path-probe	info	-	found	INFO	requirements.toml
+codex.managed.fires	gate	fired	fired	PASS	mode=allow exit=0
+codex.deny	gate	blocked	blocked	PASS	mode=deny exit=0
+codex.fail.exit101	gap	ran	ran	PASS	mode=panic exit=0
+codex.fail.timeout	gap	ran	blocked	FAIL	mode=hang exit=0
+codex.fail.exit1	info	ran	ran	INFO	mode=exit1 exit=0
+# label=lockable-with-gaps
