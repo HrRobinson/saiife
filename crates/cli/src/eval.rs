@@ -414,7 +414,7 @@ pub fn fault() -> String {
 /// Test seam, debug builds only:
 /// `SAIIFE_EVAL_FAULT=abort|segv|hang|overflow|flood` makes the worker fail
 /// the way a broken engine could (`noread`: it never reads its request;
-/// `parent_hang` is the parent's).
+/// `parent_hang` and `watchdog_spawn` are the parent's).
 #[cfg(debug_assertions)]
 fn fault_seam() {
     match fault().as_str() {

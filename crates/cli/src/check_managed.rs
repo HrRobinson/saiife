@@ -39,9 +39,14 @@ pub fn run_bad_args(args: &[String], error: &str) -> ExitCode {
     guarded(|| imp::run_with(agent, Path::new(config), Some(reason.clone())))
 }
 
-/// Starts the watchdog, then runs `f` inside `catch_unwind`.
+/// Starts the watchdog, then runs `f` inside `catch_unwind`. Without a
+/// watchdog there is no overall deadline, and an agent that lets the call
+/// run on hook timeout (Codex, Gemini CLI) would get it through: deny
+/// before reading stdin.
 fn guarded(f: impl FnOnce() -> ExitCode) -> ExitCode {
-    imp::start_watchdog();
+    if !imp::start_watchdog() {
+        return blocked("cannot start the watchdog");
+    }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(code) => code,
         Err(_) => blocked("saiife crashed"),
@@ -63,12 +68,14 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 mod imp {
     use super::*;
 
-    pub fn start_watchdog() {}
+    pub fn start_watchdog() -> bool {
+        true
+    }
 
     pub fn run_with(_agent: &str, _config: &Path, _forced: Option<String>) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-        eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+        crate::warn("locked mode needs Linux in this version (macOS: v2.1)");
         ExitCode::from(2)
     }
 }
@@ -123,9 +130,14 @@ mod imp {
     /// After `OVERALL_TIMEOUT`, kill the worker if one runs, say why on
     /// stderr and exit 2, wherever the main thread is stuck. The message is
     /// written to the stderr fd directly: a main thread blocked while
-    /// holding the stderr lock cannot stop it.
-    pub fn start_watchdog() {
-        let _ = std::thread::Builder::new()
+    /// holding the stderr lock cannot stop it. `false`: the thread could
+    /// not be started (`RLIMIT_NPROC`, `pids.max`).
+    pub fn start_watchdog() -> bool {
+        #[cfg(debug_assertions)]
+        if eval::fault() == "watchdog_spawn" {
+            return false;
+        }
+        std::thread::Builder::new()
             .name("saiife-watchdog".into())
             .spawn(|| {
                 std::thread::sleep(OVERALL_TIMEOUT);
@@ -137,7 +149,8 @@ mod imp {
                 let msg = b"saiife: BLOCKED (fail closed): saiife took too long\n";
                 let _ = rustix::io::write(std::io::stderr().as_fd(), msg);
                 std::process::exit(2);
-            });
+            })
+            .is_ok()
     }
 
     /// How the call is answered.
@@ -271,7 +284,7 @@ mod imp {
         match judged.outcome {
             Outcome::Allow => ExitCode::SUCCESS,
             Outcome::Deny(msg) => {
-                eprintln!("{msg}");
+                let _ = writeln!(std::io::stderr(), "{msg}");
                 ExitCode::from(2)
             }
             Outcome::Error(reason) => blocked(&reason),
@@ -326,6 +339,13 @@ mod imp {
                 return Err(format!("cannot reach the audit daemon ({})", describe(&e)));
             }
         };
+        // Only a daemon in locked mode may take the record.
+        if c.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
+            if let Some(Ok(w)) = &mut worker {
+                w.kill();
+            }
+            return Err("the audit daemon is not in locked mode".into());
+        }
         *client = Some(c);
 
         if let Some(reason) = failed {

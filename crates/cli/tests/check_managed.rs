@@ -200,7 +200,11 @@ fn daemon_not_acking_denies() {
     std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         let h = read_frame(&mut s).unwrap();
-        write_frame(&mut s, &json!({"id": h["id"], "ok": true, "proto": 1})).unwrap();
+        write_frame(
+            &mut s,
+            &json!({"id": h["id"], "ok": true, "proto": 1, "mode": "locked"}),
+        )
+        .unwrap();
         // Read the append and never answer it.
         let _ = read_frame(&mut s);
         std::thread::sleep(Duration::from_secs(10));
@@ -223,7 +227,11 @@ fn daemon_closes_after_hello_denies() {
     std::thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         let h = read_frame(&mut s).unwrap();
-        write_frame(&mut s, &json!({"id": h["id"], "ok": true, "proto": 1})).unwrap();
+        write_frame(
+            &mut s,
+            &json!({"id": h["id"], "ok": true, "proto": 1, "mode": "locked"}),
+        )
+        .unwrap();
         drop(s);
     });
     let home = common::FixtureHome::new();
@@ -231,6 +239,64 @@ fn daemon_closes_after_hello_denies() {
     assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
     assert!(stderr(&o).contains("fail closed"), "{}", stderr(&o));
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert!(sb.is_untouched());
+}
+
+/// A daemon whose hello does not say `mode: "locked"` is not trusted
+/// with the call (M6): deny at once, nothing appended.
+#[test]
+fn hello_without_locked_mode_denies() {
+    for hello in [
+        json!({"ok": true, "proto": 1}),
+        json!({"ok": true, "proto": 1, "mode": "developer"}),
+    ] {
+        let d = TestDaemon::prepare(&Opts::default());
+        let l = fake_socket_dir(&d);
+        let appended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = appended.clone();
+        let fake = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let h = read_frame(&mut s).unwrap();
+            let mut a = hello.clone();
+            a["id"] = h["id"].clone();
+            write_frame(&mut s, &a).unwrap();
+            if let Ok(m) = read_frame(&mut s) {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = write_frame(&mut s, &json!({"id": m["id"], "ok": true, "seq": 1}));
+            }
+        });
+        let home = common::FixtureHome::new();
+        let (o, elapsed, sb) = managed(&d.config(), &home.real(&fixture("claude/bash-allow.json")));
+        fake.join().unwrap();
+        assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+        let err = stderr(&o);
+        assert!(err.contains("fail closed"), "{err}");
+        assert!(err.contains("not in locked mode"), "{err}");
+        assert!(!appended.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(sb.is_untouched());
+    }
+}
+
+/// No watchdog, no overall deadline: deny before reading stdin (I1).
+#[test]
+fn watchdog_spawn_failure_denies() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let (o, elapsed, sb) = managed_with(
+        &d.config(),
+        &home.real(&fixture("claude/bash-allow.json")),
+        &[("SAIIFE_EVAL_FAULT", "watchdog_spawn")],
+        &[],
+    );
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("saiife: BLOCKED (fail closed): cannot start the watchdog"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert!(guard_records(&d).is_empty());
     assert!(sb.is_untouched());
 }
 
