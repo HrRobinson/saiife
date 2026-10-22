@@ -92,6 +92,24 @@ with code 1.
   [core.secrets](../packs/core.secrets.md#not-covered) and
   [core.self](../packs/core.self.md#not-covered).
 
+## Locked mode (v2)
+
+Lock label: **lockable** (checked live with Claude Code 2.1.308 on
+2026-10-22, see [lock-check](../lock-check.md); results in
+`crates/agents/tests/fixtures/lock-check/claude.tsv`).
+
+With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
+
+- The hook cannot be turned off: `disableAllHooks` in user, project or local
+  settings or on the command line, empty user `hooks`, `CLAUDE_CONFIG_DIR`
+  and `--setting-sources user` all still ran it.
+- If saiife fails (crash, `kill -9`, hang past the timeout, exit 1, or the
+  binary is missing), the tool call is blocked.
+- An edit to a settings file during a session is caught by the
+  `ConfigChange` hook and blocked.
+- MCP tool calls go through the hook, and managed settings can block MCP
+  servers outright.
+
 ## Not yet verified live
 
 These come from product docs or research and still need a check on a live

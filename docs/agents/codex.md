@@ -97,6 +97,12 @@ is not running.
   [core.secrets](../packs/core.secrets.md#not-covered) and
   [core.self](../packs/core.self.md#not-covered).
 
+## Locked mode (v2)
+
+Lock label: **unverified**. The [lock-check](../lock-check.md) for Codex has
+not been run with a logged-in account yet, so we do not know whether
+Codex can be locked.
+
 ## Not yet verified live
 
 saiife's Codex support is built from Codex's docs and source code. It has not

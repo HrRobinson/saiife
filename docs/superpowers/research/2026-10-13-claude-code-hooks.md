@@ -28,7 +28,7 @@ tool_input: Bash `command` (+description, timeout, run_in_background); Read `fil
 - → Guard must NEVER emit allow. Pass = exit 0 silent; deny = exit 2 + stderr (or JSON deny + exit 0).
 
 ## Failure
-Timeout, can't start (exit 127), crash (non-2) → fail open (proceeds), unless `onFailure: "block"` (v2.1.295+). v1 developer mode keeps fail-open (spec §1.2 rule 4); locked mode (v2) sets onFailure block.
+Timeout, can't start (exit 127), crash (non-2) → fail open (proceeds), unless `onFailure: "block"` (v2.1.295+). v1 developer mode keeps fail-open (spec §1.2 rule 4); locked mode (v2) sets onFailure block. Live-verified 2026-10-22 on 2.1.308 (lock-check, label lockable): exit 1, panic, SIGSEGV, SIGKILL, timeout and missing binary all block with onFailure block.
 
 ## Trust and reload
 - Interactive sessions hold back ALL hooks until the workspace trust dialog is accepted; `-p`/SDK sessions treat folder as trusted.
