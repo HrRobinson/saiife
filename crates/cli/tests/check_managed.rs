@@ -182,6 +182,43 @@ fn managed_deny_exit_2() {
 }
 
 #[test]
+fn managed_write_to_daemon_audit_dir_denied() {
+    let d = TestDaemon::start(Opts::default());
+    let target = d.audit_dir().join("x.jsonl");
+    let (o, _, _sb) = managed(
+        &d.config(),
+        &file_call("Write", &target.display().to_string()),
+    );
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.lock"),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["pack"], "core.lock");
+    assert!(!target.exists());
+}
+
+#[test]
+fn managed_sudo_denied() {
+    let d = TestDaemon::start(Opts::default());
+    let cwd = tempfile::tempdir().unwrap();
+    let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), "sudo ls"));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.lock"),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["pack"], "core.lock");
+    assert_eq!(r["input"], "sudo ls");
+}
+
+#[test]
 fn daemon_down_denies() {
     let d = TestDaemon::prepare(&Opts::default());
     let home = common::FixtureHome::new();

@@ -2,12 +2,13 @@
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
+use saiifeguard::profile::select_active;
 
 fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     // core.filesystem is default-on, so the default profile suffices.
-    Engine::new(packs).with_budget(TEST_BUDGET)
+    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
 }
 
 fn deny_pack(e: &Engine, cmd: &str) -> String {

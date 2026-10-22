@@ -1,9 +1,13 @@
 //! The directories the guard's path rules are bound to (spec §7.2, §7.4):
 //! the working directory relative paths are resolved against, and the
 //! values of the rule variables (`~`, `$PROJECT`, `$SAIIFE_DATA_DIR`,
-//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`).
+//! `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`,
+//! and locked mode's system paths `$SAIIFE_ETC`, `$SAIIFE_STATE`,
+//! `$SAIIFE_LOG`, `$SAIIFE_RUN`, `$SAIIFE_OPT`, `$SAIIFE_UNIT`).
 
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use saiife_agents::detect::which;
 use saiife_agents::integrity;
@@ -23,10 +27,45 @@ fn config_dir(
     }
 }
 
+/// Locked mode's system paths (spec §5.2), at their defaults. Always bound:
+/// only `core.lock` uses them, and it is on only in locked mode (or when a
+/// project turns it on).
+const SYSTEM_PATHS: [(&str, &str); 6] = [
+    ("SAIIFE_ETC", "/etc/saiife"),
+    ("SAIIFE_STATE", "/var/lib/saiife"),
+    ("SAIIFE_LOG", "/var/log/saiife"),
+    ("SAIIFE_RUN", "/run/saiife"),
+    ("SAIIFE_OPT", "/opt/saiife"),
+    ("SAIIFE_UNIT", "/etc/systemd/system/saiifed.service"),
+];
+
+/// Where a locked host's system config puts saiife's paths, when they are
+/// not the §5.2 defaults: bound as extra values of the rule variables.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LockedPaths {
+    /// The directory holding the system config (`/etc/saiife`).
+    pub etc: PathBuf,
+    /// `[audit] dir`.
+    pub audit_dir: PathBuf,
+    /// `[daemon] socket_dir`.
+    pub socket_dir: PathBuf,
+}
+
 /// `cwd`: where relative paths start (the hook payload's `cwd`); `project`:
 /// the saiife project root, `cwd` if there is none. Every value the
 /// process cannot determine is left out, so rules that need it do not apply.
 pub fn path_vars(cwd: Option<&Path>, project: Option<&Path>) -> PathVars {
+    path_vars_locked(cwd, project, None)
+}
+
+/// `path_vars`, plus the paths a locked host's system config names
+/// (`locked`) as extra values of `$SAIIFE_ETC`, `$SAIIFE_AUDIT_DIR` and
+/// `$SAIIFE_RUN`.
+pub fn path_vars_locked(
+    cwd: Option<&Path>,
+    project: Option<&Path>,
+    locked: Option<&LockedPaths>,
+) -> PathVars {
     let mut v = PathVars::new();
     if let Some(c) = cwd {
         v = v.with_cwd(c);
@@ -57,6 +96,15 @@ pub fn path_vars(cwd: Option<&Path>, project: Option<&Path>) -> PathVars {
     }
     if let Some(p) = which("saiife") {
         v = v.with_var("SAIIFE_BIN", p);
+    }
+    for (name, default) in SYSTEM_PATHS {
+        v = v.with_var(name, default);
+    }
+    if let Some(l) = locked {
+        v = v
+            .with_var("SAIIFE_ETC", &l.etc)
+            .with_var("SAIIFE_AUDIT_DIR", &l.audit_dir)
+            .with_var("SAIIFE_RUN", &l.socket_dir);
     }
     v
 }
@@ -93,5 +141,48 @@ mod tests {
         let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         assert!(v.values("SAIIFE_BIN").contains(&exe.as_path()));
         assert!(path_vars(None, None).cwd().is_none());
+    }
+
+    #[test]
+    fn locked_paths_add_values() {
+        let d = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(d.path()).unwrap();
+        let locked = LockedPaths {
+            etc: real.join("etc"),
+            audit_dir: real.join("audit"),
+            socket_dir: real.join("run"),
+        };
+        let v = path_vars_locked(Some(&real), None, Some(&locked));
+        let audit = v.values("SAIIFE_AUDIT_DIR");
+        assert!(audit.contains(&real.join("audit").as_path()), "{audit:?}");
+        if let Some(d) = store::default_dir() {
+            assert!(audit.contains(&d.as_path()), "{audit:?}");
+        }
+        let etc = v.values("SAIIFE_ETC");
+        assert!(etc.contains(&Path::new("/etc/saiife")), "{etc:?}");
+        assert!(etc.contains(&real.join("etc").as_path()), "{etc:?}");
+        let run = v.values("SAIIFE_RUN");
+        assert!(run.contains(&Path::new("/run/saiife")), "{run:?}");
+        assert!(run.contains(&real.join("run").as_path()), "{run:?}");
+    }
+
+    #[test]
+    fn system_paths_are_always_bound_to_their_defaults() {
+        let v = path_vars(None, None);
+        for (name, want) in [
+            ("SAIIFE_ETC", "/etc/saiife"),
+            ("SAIIFE_STATE", "/var/lib/saiife"),
+            ("SAIIFE_LOG", "/var/log/saiife"),
+            ("SAIIFE_RUN", "/run/saiife"),
+            ("SAIIFE_OPT", "/opt/saiife"),
+            ("SAIIFE_UNIT", "/etc/systemd/system/saiifed.service"),
+        ] {
+            assert!(
+                v.values(name).contains(&Path::new(want)),
+                "{name}: {:?}",
+                v.values(name)
+            );
+        }
+        assert!(v.values("SAIIFE_ETC").len() <= 2);
     }
 }

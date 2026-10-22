@@ -21,7 +21,7 @@ use saiifeguard::payload::{
     MAX_PAYLOAD_BYTES,
 };
 
-use crate::paths::path_vars;
+use crate::paths::{path_vars_locked, LockedPaths};
 
 /// Memory-safety cap on what is read from stdin. Parsing skips the content
 /// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
@@ -62,6 +62,9 @@ pub struct EvalRequest {
     pub packs: Vec<String>,
     /// The engine's latency budget (`[guard] budget_ms`).
     pub budget_ms: u64,
+    /// The system config's paths, bound as extra rule-variable values.
+    #[serde(default)]
+    pub locked: Option<LockedPaths>,
 }
 
 /// What the worker answers on stdout.
@@ -260,10 +263,22 @@ pub fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decisio
     result
 }
 
-/// Judge one hook payload with exactly `packs` compiled and `budget` for
-/// the engine. A tool the guard does not judge is an `Allow` with reason
-/// `tool not judged` (§6.1.1).
+/// `judge_with` on a host with the default system paths.
+#[cfg(test)]
 pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
+    judge_with(payload, packs, budget, None)
+}
+
+/// Judge one hook payload with exactly `packs` compiled and `budget` for
+/// the engine, and a locked host's system paths (`locked`) bound as extra
+/// rule-variable values. A tool the guard does not judge is an `Allow` with
+/// reason `tool not judged` (§6.1.1).
+pub fn judge_with(
+    payload: &str,
+    packs: &[String],
+    budget: Duration,
+    locked: Option<&LockedPaths>,
+) -> EvalAnswer {
     let ctx = context_from_hook_json_bounded(payload, PARSE_MAX_BYTES);
     let answer = |verdict, input: String, reason: &str| EvalAnswer {
         verdict,
@@ -276,7 +291,7 @@ pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
     if let Err(reason) = check_cwd(ctx.cwd.as_deref()) {
         return answer(Verdict::Unjudged, String::new(), &reason);
     }
-    let engine = || engine_for(packs, ctx.cwd.as_deref(), budget);
+    let engine = || engine_for(packs, ctx.cwd.as_deref(), budget, locked);
     match plan(payload) {
         Plan::TooLarge { command } => {
             let e = PayloadError::TooLarge {
@@ -310,8 +325,13 @@ pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
 
 /// The engine with exactly `packs` compiled (every default-on pack is
 /// compiled as well), path rules bound to `cwd` (else this process's
-/// directory) and its project.
-fn engine_for(packs: &[String], cwd: Option<&str>, budget: Duration) -> (Engine, PathVars) {
+/// directory), its project and the locked host's system paths.
+fn engine_for(
+    packs: &[String],
+    cwd: Option<&str>,
+    budget: Duration,
+    locked: Option<&LockedPaths>,
+) -> (Engine, PathVars) {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
@@ -319,7 +339,7 @@ fn engine_for(packs: &[String], cwd: Option<&str>, budget: Duration) -> (Engine,
     let project = saiife_agents::config::find_project_root(&start);
     // Broken built-ins are skipped; their rules are not in force.
     let (packs, _warnings) = Catalog::builtin().load_active(packs);
-    let vars = path_vars(Some(&start), project.as_deref());
+    let vars = path_vars_locked(Some(&start), project.as_deref(), locked);
     let engine = Engine::new(packs)
         .with_paths(vars.clone())
         .with_budget(budget);
@@ -389,10 +409,11 @@ pub fn worker_main() -> ExitCode {
     drop(buf);
     #[cfg(debug_assertions)]
     fault_seam();
-    let answer = judge(
+    let answer = judge_with(
         &req.payload,
         &req.packs,
         Duration::from_millis(req.budget_ms),
+        req.locked.as_ref(),
     );
     let mut out = std::io::stdout().lock();
     if serde_json::to_writer(&mut out, &answer)
@@ -459,6 +480,7 @@ fn overflow(n: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::path_vars;
     use saiifeguard::builtins::builtin_packs;
     use saiifeguard::profile::select_active;
 

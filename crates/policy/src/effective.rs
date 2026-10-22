@@ -13,7 +13,11 @@ pub struct PackInfo {
     pub default_on: bool,
 }
 
-/// Default-on packs, plus `[guard] packs`, plus project packs, sorted by id.
+/// The pack locked mode always turns on.
+pub const LOCK_PACK: &str = "core.lock";
+
+/// Default-on packs, plus `core.lock` when `locked = true` (and the catalog
+/// has it), plus `[guard] packs`, plus project packs, sorted by id.
 /// Unknown ids produce a warning each and are skipped.
 pub fn active_packs(
     cfg: &SystemConfig,
@@ -25,6 +29,10 @@ pub fn active_packs(
         .filter(|p| p.default_on)
         .map(|p| p.id.as_str())
         .collect();
+    // Locked mode protects saiife's own install (spec §6.17).
+    if cfg.locked && catalog.iter().any(|p| p.id == LOCK_PACK) {
+        ids.insert(LOCK_PACK);
+    }
     let mut warnings = Vec::new();
     let requested = cfg
         .guard
@@ -280,5 +288,25 @@ mod tests {
         assert_eq!(packs.len(), 2);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("db.oracle"), "{w:?}");
+    }
+
+    #[test]
+    fn locked_adds_core_lock() {
+        let mut cat = catalog();
+        cat.push(PackInfo {
+            id: "core.lock".into(),
+            version: 1,
+            default_on: false,
+        });
+        let ids = |text: &str, cat: &[PackInfo]| -> Vec<String> {
+            let (packs, w) = active_packs(&cfg(text), cat, None);
+            assert!(w.is_empty(), "{w:?}");
+            packs.into_iter().map(|p| p.id).collect()
+        };
+        assert!(ids("version = 2\nlocked = true\n", &cat).contains(&"core.lock".to_string()));
+        assert!(!ids("version = 2\nlocked = false\n", &cat).contains(&"core.lock".to_string()));
+        assert!(!ids("version = 2\n", &cat).contains(&"core.lock".to_string()));
+        // A catalog without it: nothing is added, and no warning.
+        assert!(!ids("version = 2\nlocked = true\n", &catalog()).contains(&"core.lock".to_string()));
     }
 }

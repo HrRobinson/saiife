@@ -106,6 +106,7 @@ mod imp {
 
     use crate::eval::PARSE_MAX_BYTES;
     use crate::eval::{self, EvalAnswer, EvalRequest, Plan, Verdict, MAX_EVAL_BYTES};
+    use crate::paths::LockedPaths;
     use crate::warn;
 
     /// The worker's deadline, from its spawn (§6.1.2).
@@ -268,7 +269,7 @@ mod imp {
         let mut policy: Option<String> = None;
         let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judge_call(
-                &cfg,
+                (&cfg, config),
                 daemon_uid,
                 &ctx,
                 input,
@@ -316,9 +317,10 @@ mod imp {
 
     /// Steps 3 to 7: the project, the policy, the worker and the daemon
     /// connection (made while the worker runs). `Err` is a reason for
-    /// stderr only: the daemon could not be reached.
+    /// stderr only: the daemon could not be reached. `cfg` was loaded from
+    /// `config`.
     fn judge_call(
-        cfg: &SystemConfig,
+        (cfg, config): (&SystemConfig, &Path),
         daemon_uid: u32,
         ctx: &HookContext,
         input: Result<String, String>,
@@ -344,6 +346,7 @@ mod imp {
                 payload,
                 packs,
                 budget_ms: cfg.guard.budget_ms,
+                locked: Some(locked_paths(cfg, config)),
             })),
             _ => None,
         };
@@ -415,6 +418,16 @@ mod imp {
         }
         read.map(|_| buf)
             .map_err(|_| "could not read hook payload".to_string())
+    }
+
+    /// The paths `core.lock` guards beyond the §5.2 defaults: the system
+    /// config's own dir, the audit dir and the socket dir it names.
+    fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
+        LockedPaths {
+            etc: config.parent().unwrap_or(Path::new("/")).to_path_buf(),
+            audit_dir: cfg.audit.dir.clone(),
+            socket_dir: cfg.daemon.socket_dir.clone(),
+        }
     }
 
     /// `load_system`, which must say `locked = true`.

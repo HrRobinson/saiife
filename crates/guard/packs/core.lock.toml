@@ -1,0 +1,216 @@
+# Core: lock — on in locked mode, opt-in elsewhere (spec §6.17).
+#
+# In locked mode the guard also protects saiife's own system install from
+# the agent: privilege changes, saiife's service, persistence that runs
+# code later with no hook around it, turning off an agent's safety switches
+# on the command line, and writes to saiife's system paths (§5.2) and the
+# managed agent settings (§8.3).
+#
+# Why: most of these would fail on permissions anyway, but a clear denial
+# stops a helpful agent from looping on them, and the persistence rules
+# close the cheapest way to run code later with no hook around it.
+#
+# Command rules match the whole segment (`whole_segment = true`), so a
+# wrapper such as `sudo`, `env` or a leading `NAME=value` stays visible.
+# READING saiife's config and the managed settings stays allowed; only its
+# state dir (the audit signing key) is closed to reads as well.
+
+[pack]
+id = "core.lock"
+name = "Core: lock"
+description = "Locked mode: privilege changes, saiife's service, persistence, agent safety switches, saiife's system paths and the managed agent settings."
+default_on = false
+version = 1
+# `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
+# substitution argument must not block every `kill` or `systemctl`.
+substitution_failsafe = false
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "systemctl", "launchctl", "kill", "pkill", "killall", "crontab", "at", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+
+# --- privilege changes --------------------------------------------------------
+[[deny]]
+# The segment's first word, after `env`/`nohup`/`exec`-style wrappers and
+# leading assignments.
+pattern = '^(?:(?:env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:sudo|su|doas|pkexec|run0)(?:\s|$)'
+reason = "an agent may not change privileges in locked mode; root could switch saiife off"
+whole_segment = true
+
+[[deny]]
+pattern = '(?i)^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*osascript\s.*with\s+administrator\s+privileges'
+reason = "an agent may not ask for administrator privileges in locked mode; root could switch saiife off"
+whole_segment = true
+
+# --- saiife's service ---------------------------------------------------------
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*systemctl\s+(?:\S+\s+)*\S*saiifed'
+reason = "saiifed records every agent call; an agent may not control the service"
+whole_segment = true
+
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*launchctl\s+(?:\S+\s+)*(?:\S*/)?com\.saiife\.'
+reason = "saiifed records every agent call; an agent may not control the service"
+whole_segment = true
+
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:kill|pkill|killall)\s+(?:\S+\s+)*\S*saiifed'
+reason = "saiifed records every agent call; stopping it would leave agents unrecorded"
+whole_segment = true
+
+# --- persistence --------------------------------------------------------------
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:crontab|at)(?:\s|$)'
+reason = "a scheduled job runs later outside any agent session, with no hook around it"
+whole_segment = true
+
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*systemd-run\s+(?:\S+\s+)*--user(?:\s|=|$)'
+reason = "a user service runs later outside any agent session, with no hook around it"
+whole_segment = true
+
+[[deny]]
+pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*launchctl\s+(?:-\S+\s+)*(?:load|bootstrap)(?:\s|$)'
+reason = "a launch agent runs later outside any agent session, with no hook around it"
+whole_segment = true
+
+# --- agent safety switches ----------------------------------------------------
+[[deny]]
+pattern = '(?:^|\s)--dangerously-bypass-hook-trust(?:\s|=|$)'
+reason = "bypassing hook trust can run hooks other than saiife's"
+whole_segment = true
+
+[[deny]]
+# Also caught by core.self when it starts Gemini CLI; this one catches the
+# assignment alone (`export …`).
+pattern = '(?i)(?:^|\s)gemini_cli_system_(?:settings|defaults)_path='
+reason = "Gemini CLI's system settings hold the managed saiife hook; moving them leaves the hook out"
+whole_segment = true
+
+# --- persistence through files ------------------------------------------------
+[[deny_path]]
+glob = "~/.config/systemd/user/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/Library/LaunchAgents/**"
+access = "write"
+reason = "a launch agent runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/.config/autostart/**"
+access = "write"
+reason = "an autostart entry runs later outside any agent session, with no hook around it"
+
+# --- saiife's system paths (§5.2) ---------------------------------------------
+[[deny_path]]
+glob = "$SAIIFE_ETC/**"
+access = "write"
+reason = "saiife's system config sets the locked policy; only an admin changes it"
+
+[[deny_path]]
+glob = "$SAIIFE_ETC"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of saiife's system config removes the locked policy"
+
+[[deny_path]]
+glob = "$SAIIFE_OPT/**"
+access = "write"
+reason = "replacing or removing saiife's installed program switches the guard off"
+
+[[deny_path]]
+glob = "$SAIIFE_OPT"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of saiife's installed program switches the guard off"
+
+[[deny_path]]
+glob = "$SAIIFE_LOG/**"
+access = "write"
+reason = "the system audit trail must outlive the agent"
+
+[[deny_path]]
+glob = "$SAIIFE_LOG"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the system audit trail removes it"
+
+[[deny_path]]
+glob = "$SAIIFE_AUDIT_DIR/**"
+access = "write"
+reason = "the audit trail must outlive the agent"
+
+[[deny_path]]
+glob = "$SAIIFE_AUDIT_DIR"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the audit directory removes the audit trail"
+
+[[deny_path]]
+glob = "$SAIIFE_RUN/**"
+access = "write"
+reason = "saiife's socket connects every hook to the audit daemon"
+
+[[deny_path]]
+glob = "$SAIIFE_RUN"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of saiife's socket dir cuts every hook off from the audit daemon"
+
+[[deny_path]]
+glob = "$SAIIFE_UNIT"
+access = "write"
+reason = "the saiifed unit starts the audit daemon; changing it can switch the daemon off"
+
+[[deny_path]]
+glob = "$SAIIFE_UNIT"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the saiifed unit can switch the audit daemon off"
+
+[[deny_path]]
+# The audit signing key: reading it lets an agent forge the audit trail.
+glob = "$SAIIFE_STATE/**"
+access = "any"
+reason = "saiife's state holds the audit signing key; reading it lets the audit trail be forged"
+
+[[deny_path]]
+glob = "$SAIIFE_STATE"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of saiife's state removes the audit signing key"
+
+# --- the managed agent settings (§8.3) ----------------------------------------
+[[deny_path]]
+glob = "/etc/claude-code/managed-settings.d/**"
+access = "write"
+reason = "Claude Code's managed settings hold the saiife hook"
+
+[[deny_path]]
+glob = "/etc/claude-code/managed-settings.d"
+access = "write"
+reason = "removing or moving Claude Code's managed settings removes the saiife hook"
+
+[[deny_path]]
+glob = "/etc/claude-code/managed-settings.json"
+access = "write"
+reason = "Claude Code's managed settings take precedence over the saiife hook's"
+
+[[deny_path]]
+glob = "/etc/codex/requirements.toml"
+access = "write"
+reason = "Codex's managed requirements hold the saiife hook"
+
+[[deny_path]]
+glob = "/etc/codex"
+access = "write"
+reason = "removing or moving Codex's managed config removes the saiife hook"
+
+[[deny_path]]
+glob = "/etc/gemini-cli/settings.json"
+access = "write"
+reason = "Gemini CLI's system settings hold the saiife hook"
+
+[[deny_path]]
+glob = "/etc/gemini-cli"
+access = "write"
+reason = "removing or moving Gemini CLI's system settings removes the saiife hook"

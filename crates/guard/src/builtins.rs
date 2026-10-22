@@ -2,7 +2,8 @@
 //! no external pack files. At runtime saiife also loads `guard/packs/*.toml`
 //! from userData; the built-ins are the shipped defaults.
 //!
-//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self` (default-on) and the opt-in packs
+//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self` (default-on),
+//! `core.lock` (on in locked mode, opt-in elsewhere) and the opt-in packs
 //! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
@@ -19,6 +20,14 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     (
         "<builtin>core.secrets",
         include_str!("../packs/core.secrets.toml"),
+    ),
+    // Before core.self (the first deny wins): in locked mode a write to the
+    // system audit dir, bound to `$SAIIFE_AUDIT_DIR` for both packs, is
+    // named core.lock. After the other core packs, so their verdicts on
+    // `sudo rm -rf /` and the like stay theirs.
+    (
+        "<builtin>core.lock",
+        include_str!("../packs/core.lock.toml"),
     ),
     (
         "<builtin>core.self",
@@ -307,11 +316,12 @@ reason = "bad regex"
 
     /// Naming convention: `core.*` packs are default-on; other namespaces
     /// (`cloud.*`, `db.*`) are opt-in. Holds for whatever subset is registered.
+    /// `core.lock` is the exception: locked mode turns it on (spec §6.17).
     #[test]
     fn core_packs_default_on_others_opt_in() {
         let (packs, _) = builtin_packs();
         for p in &packs {
-            let is_core = p.id.starts_with("core.");
+            let is_core = p.id.starts_with("core.") && p.id != "core.lock";
             assert_eq!(
                 p.default_on, is_core,
                 "pack {} default_on={} but is_core={}",
