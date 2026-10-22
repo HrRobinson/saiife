@@ -113,7 +113,7 @@ pub fn parse_since(s: &str) -> Result<Duration, String> {
 
 pub fn render_table(records: &[&Record]) -> String {
     let row = |time: &str, agent: &str, decision: &str, pack: &str, input: &str| {
-        format!("{time:<19}  {agent:<7}  {decision:<9}  {pack:<16}  {input}\n")
+        format!("{time:<19}  {agent:<7}  {decision:<15}  {pack:<16}  {input}\n")
     };
     let mut out = row("TIME", "AGENT", "DECISION", "PACK", "INPUT");
     let (mut blocked, mut fail_open) = (0, 0);
@@ -128,7 +128,10 @@ pub fn render_table(records: &[&Record]) -> String {
                 fail_open += 1;
                 "FAIL-OPEN"
             }
-            DecisionKind::ErrorDenied => "blocked (error)",
+            DecisionKind::ErrorDenied => {
+                blocked += 1;
+                "blocked (error)"
+            }
             DecisionKind::Ask => "asked",
             DecisionKind::Approved => "approved",
             DecisionKind::Rejected => "rejected",
@@ -285,6 +288,8 @@ pub fn run(
         }
         let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
+        model.chain = report::chain_line(&saiife_audit::verify(&dir));
+        model.last_checkpoint = report::last_checkpoint(&all.records);
         if all.skipped_lines > 0 {
             model.log_problems.push(format!(
                 "{} unreadable log lines were skipped; the log may be damaged or edited.",
@@ -486,5 +491,19 @@ mod tests {
         let input_part = out.lines().nth(1).unwrap().rsplit("  ").next().unwrap();
         assert_eq!(input_part.chars().count(), INPUT_WIDTH);
         assert!(input_part.starts_with("\\x1b\\x1b"));
+    }
+
+    #[test]
+    fn error_denied_is_blocked_and_the_table_stays_aligned() {
+        let d = rec("curl x", DecisionKind::ErrorDenied, Some("core.network"));
+        let a = rec("ls", DecisionKind::Allow, Some("core.network"));
+        let out = render_table(&[&d, &a]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains("blocked (error)"));
+        assert_eq!(lines[3], "2 decisions · 1 blocked · 0 fail-open");
+        let col = |l: &str, needle: &str| l.find(needle).unwrap();
+        let pack = col(lines[0], "PACK");
+        assert_eq!(col(lines[1], "core.network"), pack);
+        assert_eq!(col(lines[2], "core.network"), pack);
     }
 }

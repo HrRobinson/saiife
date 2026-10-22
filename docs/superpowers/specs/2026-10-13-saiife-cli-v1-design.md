@@ -194,10 +194,16 @@ starting reference.
 ### 6.2 Record
 
 ```json
-{"v":1,"ts":"2026-10-13T08:14:02.381Z","agent":"claude","project":"/home/u/app",
- "session":"…","tool":"Bash","input":"rm -rf [MASKED]","decision":"deny",
- "pack":"core.filesystem","rule":"rm-root","reason":"…","saiife":"1.0.0"}
+{"v":2,"seq":2,"prev":"e02eaeebda13ea68d13c18a48bb6e115dc61586b53f44bf231d385f6a2105cca",
+ "ts":"2026-10-13T08:14:02.381Z","kind":"guard","mode":"developer",
+ "agent":"claude","project":"/home/u/app","session":"…","tool":"Bash",
+ "input":"rm -rf [MASKED]","decision":"deny","pack":"core.filesystem",
+ "rule":"rm-root","reason":"…","saiife":"0.2.0"}
 ```
+
+Records written by 0.1.x are `"v":1` lines without `seq`, `prev`, `kind` and
+`mode`; readers accept both. From v2 on, each record carries the SHA-256 of the
+line before it in `prev` (a hash chain, checked by `saiife audit verify`).
 
 - `decision` ∈ `allow` | `deny` | `error_allowed`. `error_allowed` records a
   fail-open (crash, parse failure, budget exceeded), so an auditor can see when

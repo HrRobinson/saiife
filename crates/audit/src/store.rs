@@ -267,7 +267,8 @@ impl Filter {
                 return false;
             }
         }
-        !(self.blocked_only && r.decision != DecisionKind::Deny)
+        !(self.blocked_only
+            && !matches!(r.decision, DecisionKind::Deny | DecisionKind::ErrorDenied))
     }
 }
 
@@ -755,6 +756,9 @@ mod tests {
             ..Default::default()
         };
         assert!(f.matches(&deny) && !f.matches(&allow));
+        let mut err_denied = deny.clone();
+        err_denied.decision = DecisionKind::ErrorDenied;
+        assert!(f.matches(&err_denied), "error_denied is blocked too");
 
         let mut broken = deny.clone();
         broken.ts = "garbage".into();

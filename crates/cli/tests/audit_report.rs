@@ -314,3 +314,32 @@ fn large_log_renders() {
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     assert!(read(&s.path("big.html")).contains("Show all 20000 decisions"));
 }
+
+#[test]
+fn html_report_has_chain_policy_mode_sections() {
+    let s = Sandbox::new();
+    // Start from a clean chained log: the seeded lines are unchained.
+    for e in std::fs::read_dir(s.audit.path()).unwrap() {
+        std::fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    let mut r = rec(
+        "echo hi",
+        DecisionKind::Allow,
+        None,
+        OffsetDateTime::now_utc(),
+    );
+    r.policy = Some("<script>alert(1)</script>".into());
+    saiife_audit::chain::append_chained(s.audit.path(), r).unwrap();
+    s.cmd()
+        .args(["audit", "--report", "c.html"])
+        .assert()
+        .success();
+    let html = read(&s.path("c.html"));
+    for h in ["Audit chain", "Policy in force", "Mode per host"] {
+        assert!(html.contains(&format!("<h2>{h}</h2>")), "{h}");
+    }
+    assert!(html.contains("intact ("), "{html}");
+    assert!(!html.contains("<script>alert(1)"), "hostile policy escaped");
+    assert!(html.contains("&lt;script&gt;"));
+    assert!(!html.contains("http://") && !html.contains("https://"));
+}

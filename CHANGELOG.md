@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Audit records are now v2: each carries a sequence number and the SHA-256 of the previous line (a hash chain), plus kind, mode, host and policy. 0.1.0 can still read them.
+- New `saiife audit verify` checks the chain (exit 0 intact, 1 broken, 2 unreadable).
+- `saiife audit --report` gains Audit chain, Policy in force and Mode per host sections.
+- `error_denied` now counts as blocked in `saiife audit`, `--blocked` and the report.
+
 ## 0.1.1 — 2026-10-19
 
 - Guard: `rm` targets are judged against a `cd` earlier in the same command line (`cd / && rm -rf *` is now blocked).
