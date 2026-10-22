@@ -184,7 +184,7 @@ fn oversized_config_does_not_delay_hook() {
     assert!(policy.starts_with("sha256:"), "{policy:?}");
 }
 
-/// A symlinked config is followed, for the packs and the policy hash
+/// A symlinked config (staying inside the project) is followed, for the packs and the policy hash
 /// alike: the policy is that of a plain file with the target's bytes. A
 /// link to an oversized file is refused unread, without delay.
 #[cfg(unix)]
@@ -192,13 +192,17 @@ fn oversized_config_does_not_delay_hook() {
 fn symlinked_config_is_followed_for_policy() {
     let audit = tempfile::tempdir().unwrap();
     let p = tempfile::tempdir().unwrap();
+    // Targets inside the project (a link leading outside is refused).
+    let inside = p.path().join("other");
+    std::fs::create_dir(&inside).unwrap();
     let outside = tempfile::tempdir().unwrap();
+    let _ = &outside;
     let a = "packs = [\"db.postgres\"]\n";
-    std::fs::write(outside.path().join("a.toml"), a).unwrap();
-    std::fs::write(outside.path().join("b.toml"), "packs = []\n").unwrap();
+    std::fs::write(inside.join("a.toml"), a).unwrap();
+    std::fs::write(inside.join("b.toml"), "packs = []\n").unwrap();
     std::fs::create_dir(p.path().join(".saiife")).unwrap();
     let link = p.path().join(".saiife/config.toml");
-    std::os::unix::fs::symlink(outside.path().join("a.toml"), &link).unwrap();
+    std::os::unix::fs::symlink(inside.join("a.toml"), &link).unwrap();
     let (code, took, via_a) = timed_check(audit.path(), p.path(), DROP);
     assert_eq!(code, 2, "the linked config's opt-in pack is loaded");
     assert!(
@@ -213,11 +217,11 @@ fn symlinked_config_is_followed_for_policy() {
     assert_eq!(via_a, plain_a, "the target's bytes are hashed");
 
     std::fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("b.toml"), &link).unwrap();
+    std::os::unix::fs::symlink(inside.join("b.toml"), &link).unwrap();
     let (_, _, via_b) = timed_check(audit.path(), p.path(), DROP);
     assert_ne!(via_a, via_b, "another target, another policy");
 
-    let big = outside.path().join("big.toml");
+    let big = inside.join("big.toml");
     std::fs::File::create(&big)
         .unwrap()
         .set_len(64 * 1024 + 1)
@@ -237,4 +241,23 @@ fn symlinked_config_is_followed_for_policy() {
         .unwrap();
     let (_, _, plain_big) = timed_check(audit.path(), p.path(), DROP);
     assert_eq!(via_big, plain_big, "one marker for every unreadable config");
+}
+
+/// A config symlinked to a file outside the project is never opened: its
+/// content (here a parse-failing canary) reaches neither stderr nor the
+/// packs, and the hook still answers.
+#[cfg(unix)]
+#[test]
+fn symlink_outside_project_is_refused_without_leaking() {
+    let audit = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("id_rsa");
+    std::fs::write(&secret, "SECRET-CANARY-not-toml = = =\n").unwrap();
+    std::fs::create_dir(p.path().join(".saiife")).unwrap();
+    std::os::unix::fs::symlink(&secret, p.path().join(".saiife/config.toml")).unwrap();
+    let (code, stderr) = check(audit.path(), p.path(), "ls");
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("SECRET-CANARY"), "{stderr}");
+    assert!(stderr.contains("outside the project"), "{stderr}");
 }

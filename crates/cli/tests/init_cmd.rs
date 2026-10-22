@@ -288,6 +288,26 @@ fn symlinked_config_outside_the_project_is_refused() {
     assert!(env.read(".gemini/settings.json").contains("saiife check"));
 }
 
+/// A project config symlinked outside the project is refused by init, and
+/// the target is left untouched.
+#[cfg(unix)]
+#[test]
+fn symlinked_project_config_outside_the_project_is_refused() {
+    let env = Env::new(&["claude"]);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("creds");
+    let original = "SECRET-CANARY-not-toml = = =\n";
+    std::fs::write(&target, original).unwrap();
+    std::fs::create_dir(env.root().join(".saiife")).unwrap();
+    std::os::unix::fs::symlink(&target, env.root().join(".saiife/config.toml")).unwrap();
+    let out = env.saiife(&["init"]);
+    assert_ne!(code(&out), 0, "{}", stdout(&out));
+    let all = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(all.contains("outside the project"), "{all}");
+    assert!(!all.contains("SECRET-CANARY"), "{all}");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+}
+
 /// A mode-0500 directory still writable (root) means permissions cannot
 /// make a write fail here; tests that need that skip.
 #[cfg(unix)]

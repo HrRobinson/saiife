@@ -7,6 +7,7 @@
 - `saiife audit --report` gains Audit chain, Policy in force and Mode per host sections.
 - `error_denied` now counts as blocked in `saiife audit`, `--blocked` and the report.
 - A project `.saiife/config.toml` that is not a regular file (a FIFO or device, also when reached through a symlink) or is over 64 KiB is not read: the default packs apply, with a warning.
+- A project `.saiife/config.toml` symlinked to a file outside the project is refused (never opened or quoted), by the hook and by `saiife init`; links that stay inside the project still work.
 
 ## 0.1.1 — 2026-10-19
 
