@@ -284,3 +284,22 @@ fn fixture_verifies() {
     assert_eq!(r.exit_code(), 0, "{r:?}");
     assert_eq!(r.chained, 6);
 }
+
+/// The fixture has the shape `append_chained` writes, with stand-ins for
+/// this machine's identity (never a real machine id or user name).
+#[test]
+fn fixture_has_the_written_shape() {
+    let body = include_str!("fixtures/v2/2026-11.jsonl");
+    let host = saiife_audit::chain::sha256_hex(b"fixture-host");
+    for (i, line) in body.lines().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["host"], host.as_str(), "line {}", i + 1);
+        assert_eq!(v["uid"], 1000, "line {}", i + 1);
+        assert_eq!(v["user"], "fixture", "line {}", i + 1);
+        assert_eq!(v["mode"], "developer", "line {}", i + 1);
+        if i > 0 {
+            assert!(v["policy"].as_str().unwrap().starts_with("sha256:"));
+            assert_eq!(v["permission_mode"], "default", "line {}", i + 1);
+        }
+    }
+}

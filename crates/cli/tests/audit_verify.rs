@@ -84,7 +84,7 @@ fn parallel_hooks_then_verify_is_intact() {
     let (code, out) = verify(dir.path());
     assert_eq!(code, 0, "{out}");
     assert!(out.starts_with("audit chain: intact"), "{out}");
-    assert!(out.contains("30") || out.contains("31"), "{out}");
+    assert!(out.contains("records: 31 chained "), "{out}");
 }
 
 #[test]

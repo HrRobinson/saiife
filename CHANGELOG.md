@@ -6,6 +6,7 @@
 - New `saiife audit verify` checks the chain (exit 0 intact, 1 broken, 2 unreadable).
 - `saiife audit --report` gains Audit chain, Policy in force and Mode per host sections.
 - `error_denied` now counts as blocked in `saiife audit`, `--blocked` and the report.
+- A project `.saiife/config.toml` that is a symlink or not a regular file is no longer read: the default packs apply, with a warning.
 
 ## 0.1.1 — 2026-10-19
 
