@@ -74,10 +74,10 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
         ),
         Ok(ToolCall::Shell { command }) => {
             // Built inside `decide`'s unwind guard: a panic while reading
-            // the project config or building the engine fails open too.
-            let cwd = audit.ctx.cwd.clone();
+            // the project config, building the engine or hashing the policy
+            // fails open too.
             decide(&audit, &command, hook_exit, |c| {
-                active_engine(cli_packs, cwd.as_deref()).0.evaluate(c)
+                active_engine(&audit, cli_packs).0.evaluate(c)
             })
         }
         Ok(ToolCall::File {
@@ -104,14 +104,13 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
                 );
                 return allow();
             }
-            let cwd = audit.ctx.cwd.clone();
             let access = if write { Access::Write } else { Access::Read };
             // Only search tools filter by `glob`/`include`, and only
             // `read_many_files` names its files by pattern.
             let filters = search_globs(&buf, PARSE_MAX_BYTES);
             let expand_paths = tool == "read_many_files";
             decide(&audit, &paths.join("\n"), hook_exit, |_| {
-                let (engine, vars) = active_engine(cli_packs, cwd.as_deref());
+                let (engine, vars) = active_engine(&audit, cli_packs);
                 let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
                 let d = judge_paths(&engine, access, &targets);
                 // A deny stays; so does a latency fail-open (it ranks above).
@@ -173,26 +172,37 @@ fn agent_from_args(args: &[String]) -> Option<&str> {
     })
 }
 
-/// `engine_for` the built-in packs, its warnings printed.
-fn active_engine(cli_packs: &[String], cwd: Option<&str>) -> (Engine, PathVars) {
-    let (engine, vars, warnings) = engine_for(&Catalog::builtin(), cli_packs, cwd);
-    for w in &warnings {
+/// `engine_for` the built-in packs and the payload's `cwd`: its warnings
+/// printed, its policy hash handed to `audit` for the records of this call.
+fn active_engine(audit: &Audit, cli_packs: &[String]) -> (Engine, PathVars) {
+    let active = engine_for(&Catalog::builtin(), cli_packs, audit.ctx.cwd.as_deref());
+    for w in &active.warnings {
         warn(w);
     }
-    (engine, vars)
+    let _ = audit.policy.set(active.policy);
+    (active.engine, active.vars)
+}
+
+/// What `engine_for` built.
+struct Active {
+    engine: Engine,
+    /// The path bindings, for expanding globs.
+    vars: PathVars,
+    /// Broken packs among those compiled, and problems with the project
+    /// config.
+    warnings: Vec<String>,
+    /// `policy_hash` of exactly the packs compiled and the config bytes
+    /// they were chosen from.
+    policy: String,
 }
 
 /// The engine for this call: default-on packs, `--pack` ids, and the packs
 /// of the project that `cwd` (or this process's directory) belongs to,
-/// with path rules bound to that directory and this machine's saiife dirs
-/// (the bindings are returned too, for expanding globs). Only these packs
-/// of `catalog` are compiled. Also returns the warnings to print: broken
-/// packs among those compiled, and problems with the project config.
-fn engine_for(
-    catalog: &Catalog,
-    cli_packs: &[String],
-    cwd: Option<&str>,
-) -> (Engine, PathVars, Vec<String>) {
+/// with path rules bound to that directory and this machine's saiife dirs.
+/// Only these packs of `catalog` are compiled. The project root is looked
+/// up once and its config read once (bounded), for the packs and the
+/// policy hash alike.
+fn engine_for(catalog: &Catalog, cli_packs: &[String], cwd: Option<&str>) -> Active {
     let start = match cwd {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir().unwrap_or_default(),
@@ -206,9 +216,21 @@ fn engine_for(
         .map(|w| format!("pack warning ({}): {}", w.source, w.message))
         .collect();
     warnings.extend(project.warnings);
+    let config = match (&project.root, &project.config_sha256) {
+        (None, _) => CONFIG_NONE,
+        (Some(_), Some(hash)) => hash.as_str(),
+        (Some(_), None) => CONFIG_UNAVAILABLE,
+    };
+    let ids: Vec<&str> = packs.iter().map(|p| p.id.as_str()).collect();
+    let policy = policy_hash(env!("CARGO_PKG_VERSION"), &ids, config);
     let vars = path_vars(Some(&start), project.root.as_deref());
     let engine = Engine::new(packs).with_paths(vars.clone());
-    (engine, vars, warnings)
+    Active {
+        engine,
+        vars,
+        warnings,
+        policy,
+    }
 }
 
 /// What a file call reads or writes: its paths, with the patterns of
@@ -405,9 +427,10 @@ struct Audit {
     agent: String,
     ctx: HookContext,
     project: String,
-    /// `--pack` ids, for the policy hash.
+    /// `--pack` ids, for the policy hash of a call that built no engine.
     cli_packs: Vec<String>,
-    /// Computed on the first write: one config read per hook call.
+    /// Set by `active_engine` from the engine it built; a call that built
+    /// none gets the `--pack` ids with the config `unavailable` marker.
     policy: OnceCell<String>,
 }
 
@@ -432,23 +455,12 @@ impl Audit {
         }
     }
 
-    /// `sha256:<hex>` of the rules in force for this call.
+    /// `sha256:<hex>` of the rules in force for this call. Never reads a
+    /// file: without an engine nothing is known beyond the `--pack` ids.
     fn policy(&self) -> &str {
         self.policy.get_or_init(|| {
-            let start = match self.ctx.cwd.as_deref() {
-                Some(c) => PathBuf::from(c),
-                None => std::env::current_dir().unwrap_or_default(),
-            };
-            let catalog = Catalog::builtin();
-            let project = project_packs_known(&start, |id| catalog.knows(id));
-            let mut enabled = self.cli_packs.clone();
-            enabled.extend(project.enabled);
-            let ids = catalog.active_ids(&enabled);
-            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let config = project
-                .root
-                .and_then(|r| std::fs::read(r.join(saiife_agents::config::CONFIG_REL)).ok());
-            policy_hash(env!("CARGO_PKG_VERSION"), &ids, config.as_deref())
+            let ids: Vec<&str> = self.cli_packs.iter().map(String::as_str).collect();
+            policy_hash(env!("CARGO_PKG_VERSION"), &ids, CONFIG_UNAVAILABLE)
         })
     }
 
@@ -486,13 +498,19 @@ impl Audit {
     }
 }
 
+/// The policy's config part when there is no project config.
+const CONFIG_NONE: &str = "none";
+/// The policy's config part when the config could not be read (refused,
+/// too large, a symlink) or no engine was built for the call.
+const CONFIG_UNAVAILABLE: &str = "unavailable";
+
 /// `sha256:<hex>` over the saiife version, the sorted unique active pack ids
-/// and the hash of the project config (`none` without one).
-fn policy_hash(version: &str, active_pack_ids: &[&str], project_config: Option<&[u8]>) -> String {
+/// and `config`: the hex SHA-256 of the project config's bytes, or
+/// `CONFIG_NONE` / `CONFIG_UNAVAILABLE`.
+fn policy_hash(version: &str, active_pack_ids: &[&str], config: &str) -> String {
     let mut ids: Vec<&str> = active_pack_ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
-    let config = project_config.map_or_else(|| "none".to_string(), sha256_hex);
     let text = format!(
         "saiife-policy-v1\nsaiife {version}\npacks {}\nconfig {config}\n",
         ids.join(",")
@@ -592,7 +610,9 @@ reason = "drops the thing"
             Catalog::from_sources(&[("<t>core.broken", BROKEN_CORE), ("<t>opt.thing", OPT_IN)]);
         let p = tempfile::tempdir().unwrap();
         let cwd = p.path().to_str().unwrap();
-        let (engine, _, warnings) = engine_for(&cat, &[], Some(cwd));
+        let Active {
+            engine, warnings, ..
+        } = engine_for(&cat, &[], Some(cwd));
         assert!(
             warnings.iter().any(
                 |w| w.starts_with("pack warning (<t>core.broken): skipping uncompilable regex")
@@ -608,11 +628,13 @@ reason = "drops the thing"
             "packs = [\"opt.thing\"]\n",
         )
         .unwrap();
-        let (engine, _, warnings) = engine_for(&cat, &[], Some(cwd));
+        let Active {
+            engine, warnings, ..
+        } = engine_for(&cat, &[], Some(cwd));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(engine.evaluate("thing wipe").is_deny());
         assert!(engine.evaluate("thing drop").is_deny());
-        let (engine, _, _) = engine_for(&cat, &["opt.thing".into()], None);
+        let engine = engine_for(&cat, &["opt.thing".into()], None).engine;
         assert!(engine.evaluate("thing drop").is_deny());
     }
 
@@ -645,9 +667,65 @@ reason = "drops the thing"
         );
     }
 
+    /// The policy hash names the packs actually compiled (a broken
+    /// default-on pack still counts, an opt-in one only once enabled) and
+    /// the exact config bytes they were chosen from.
+    #[test]
+    fn policy_names_the_compiled_packs_and_config() {
+        let cat =
+            Catalog::from_sources(&[("<t>core.broken", BROKEN_CORE), ("<t>opt.thing", OPT_IN)]);
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            engine_for(&cat, &[], Some(cwd)).policy,
+            policy_hash(v, &["core.broken"], CONFIG_NONE)
+        );
+        std::fs::create_dir(p.path().join(".saiife")).unwrap();
+        let cfg = "packs = [\"opt.thing\"]\n";
+        std::fs::write(p.path().join(".saiife/config.toml"), cfg).unwrap();
+        assert_eq!(
+            engine_for(&cat, &[], Some(cwd)).policy,
+            policy_hash(
+                v,
+                &["core.broken", "opt.thing"],
+                &sha256_hex(cfg.as_bytes())
+            )
+        );
+        // Unparseable bytes are still the config in force: hashed as read.
+        std::fs::write(p.path().join(".saiife/config.toml"), "packs = [\n").unwrap();
+        assert_eq!(
+            engine_for(&cat, &[], Some(cwd)).policy,
+            policy_hash(v, &["core.broken"], &sha256_hex(b"packs = [\n"))
+        );
+    }
+
+    /// A call that built no engine never reads the config: its policy is
+    /// the `--pack` ids with the `unavailable` marker.
+    #[test]
+    fn policy_without_engine_is_the_unavailable_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = audit_in(dir.path());
+        a.cli_packs = vec!["db.postgres".into()];
+        assert_eq!(
+            a.policy(),
+            policy_hash(
+                env!("CARGO_PKG_VERSION"),
+                &["db.postgres"],
+                CONFIG_UNAVAILABLE
+            )
+        );
+    }
+
     #[test]
     fn policy_hash_changes_with_config() {
-        let h = |v: &str, ids: &[&str], cfg: Option<&[u8]>| policy_hash(v, ids, cfg);
+        let h = |v: &str, ids: &[&str], cfg: Option<&[u8]>| {
+            policy_hash(
+                v,
+                ids,
+                &cfg.map_or_else(|| CONFIG_NONE.to_string(), sha256_hex),
+            )
+        };
         let base = h("0.1.0", &["a", "b"], Some(b"x"));
         assert!(base.starts_with("sha256:") && base.len() == 7 + 64);
         assert_eq!(base, h("0.1.0", &["a", "b"], Some(b"x")));
@@ -655,6 +733,7 @@ reason = "drops the thing"
         assert_ne!(base, h("0.1.0", &["a", "b"], None));
         assert_ne!(base, h("0.1.0", &["a", "b", "c"], Some(b"x")));
         assert_ne!(base, h("0.2.0", &["a", "b"], Some(b"x")));
+        assert_ne!(base, policy_hash("0.1.0", &["a", "b"], CONFIG_UNAVAILABLE));
         assert_eq!(base, h("0.1.0", &["b", "a", "a"], Some(b"x")));
     }
 
@@ -664,6 +743,11 @@ reason = "drops the thing"
             "sha256:{}",
             sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a,b\nconfig none\n")
         );
-        assert_eq!(policy_hash("1", &["b", "a"], None), want);
+        assert_eq!(policy_hash("1", &["b", "a"], CONFIG_NONE), want);
+        let want = format!(
+            "sha256:{}",
+            sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a\nconfig unavailable\n")
+        );
+        assert_eq!(policy_hash("1", &["a"], CONFIG_UNAVAILABLE), want);
     }
 }

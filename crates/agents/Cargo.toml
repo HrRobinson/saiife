@@ -19,3 +19,7 @@ sha2 = "0.10.9"
 dirs = "5"
 thiserror = "1"
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
+libc = "0.2"

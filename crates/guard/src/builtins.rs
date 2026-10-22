@@ -103,18 +103,6 @@ impl Catalog {
             .any(|e| e.header.as_ref().is_some_and(|(i, _)| i == id))
     }
 
-    /// Ids of the packs `load_active` would compile, read from the headers
-    /// alone (nothing is compiled). Entries with an unreadable header have
-    /// no id and are left out.
-    pub fn active_ids(&self, enabled: &[String]) -> Vec<String> {
-        self.entries
-            .iter()
-            .filter_map(|e| e.header.as_ref())
-            .filter(|(id, default_on)| *default_on || enabled.iter().any(|e| e == id))
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
-
     /// Compile every pack.
     pub fn load_all(&self) -> (Vec<Pack>, Vec<PackWarning>) {
         self.load(|_| true)

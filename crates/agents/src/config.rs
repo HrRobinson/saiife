@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item};
 
+use crate::fingerprint::sha256_hex;
 use crate::{fsutil, AgentError, Change};
 
 pub const CONFIG_REL: &str = ".saiife/config.toml";
@@ -40,14 +41,44 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 
 /// Read `<project>/.saiife/config.toml`.
 pub fn load(project: &Path) -> Result<ProjectConfig, AgentError> {
+    load_hashed(project).config
+}
+
+/// The project config and the hash of the exact bytes it was read from.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    /// Lowercase hex SHA-256 of the file's bytes; `None` when the file could
+    /// not be read (missing, refused or an I/O error). Set even when the
+    /// bytes do not parse.
+    pub sha256: Option<String>,
+    pub config: Result<ProjectConfig, AgentError>,
+}
+
+/// `load`, plus the hash of what was read: one bounded read serves both.
+pub fn load_hashed(project: &Path) -> LoadedConfig {
     let path = project.join(CONFIG_REL);
-    let text = read_bounded(&path)?;
-    let doc = parse(&path, &text)?;
+    let text = match read_bounded(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return LoadedConfig {
+                sha256: None,
+                config: Err(e),
+            }
+        }
+    };
+    LoadedConfig {
+        sha256: Some(sha256_hex(text.as_bytes())),
+        config: parse_config(&path, &text),
+    }
+}
+
+fn parse_config(path: &Path, text: &str) -> Result<ProjectConfig, AgentError> {
+    let doc = parse(path, text)?;
     let packs = match doc.get("packs") {
         None => Vec::new(),
         Some(item) => item
             .as_array()
-            .ok_or_else(|| layout(&path, "`packs` is not a list"))?
+            .ok_or_else(|| layout(path, "`packs` is not a list"))?
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
@@ -63,18 +94,40 @@ pub fn load(project: &Path) -> Result<ProjectConfig, AgentError> {
 /// hostile tree cannot make every hook call slow or exhaust memory.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
+/// The config's text, read at most `MAX_CONFIG_BYTES` (+1 to detect more).
+/// The hook reads this file on every call, so on unix it is opened without
+/// following a symlink and without blocking (a FIFO swapped in after
+/// `find_project_root` looked cannot hang the open), and anything but a
+/// regular file is refused before a byte is read.
 fn read_bounded(path: &Path) -> Result<String, AgentError> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(fsutil::io_err(path))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path).map_err(fsutil::io_err(path))?;
+    let meta = file.metadata().map_err(fsutil::io_err(path))?;
+    if !meta.is_file() {
+        return Err(layout(path, "not a regular file"));
+    }
+    let too_big = || {
+        layout(
+            path,
+            &format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024),
+        )
+    };
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(too_big());
+    }
     let mut text = String::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(fsutil::io_err(path))?;
     if text.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(layout(
-            path,
-            &format!("larger than {} KiB", MAX_CONFIG_BYTES / 1024),
-        ));
+        return Err(too_big());
     }
     Ok(text)
 }
@@ -222,6 +275,52 @@ mod tests {
         fs::write(p.path().join(CONFIG_REL), &big).unwrap();
         assert!(load(p.path()).is_err());
         assert_eq!(fs::read_to_string(p.path().join(CONFIG_REL)).unwrap(), big);
+    }
+
+    #[test]
+    fn load_hashed_hashes_the_bytes_read() {
+        let p = tempfile::tempdir().unwrap();
+        assert_eq!(load_hashed(p.path()).sha256, None, "no config");
+        fs::create_dir(p.path().join(".saiife")).unwrap();
+        for body in ["packs = [\"core.git\"]\n", "packs = [\n"] {
+            fs::write(p.path().join(CONFIG_REL), body).unwrap();
+            assert_eq!(
+                load_hashed(p.path()).sha256,
+                Some(sha256_hex(body.as_bytes())),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_refused() {
+        let p = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("c.toml"), "packs = [\"db.mysql\"]\n").unwrap();
+        fs::create_dir(p.path().join(".saiife")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("c.toml"), p.path().join(CONFIG_REL))
+            .unwrap();
+        let got = load_hashed(p.path());
+        assert!(got.config.is_err());
+        assert_eq!(got.sha256, None);
+    }
+
+    /// A FIFO at the config path neither blocks the open nor gets read.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_config_does_not_block() {
+        let p = tempfile::tempdir().unwrap();
+        fs::create_dir(p.path().join(".saiife")).unwrap();
+        let fifo = p.path().join(CONFIG_REL);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let got = load_hashed(p.path());
+        assert!(got.config.is_err());
+        assert_eq!(got.sha256, None);
     }
 
     #[test]

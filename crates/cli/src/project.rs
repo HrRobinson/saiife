@@ -40,6 +40,9 @@ pub struct ProjectPacks {
     pub enabled: Vec<String>,
     /// Plain-language problems (unknown ids, unreadable config). Never fatal.
     pub warnings: Vec<String>,
+    /// Hex SHA-256 of the config's bytes, from the same read as `enabled`;
+    /// `None` without a config or when it could not be read.
+    pub config_sha256: Option<String>,
 }
 
 /// Find the project config at or above `start` and read its packs. Unknown
@@ -57,7 +60,9 @@ pub fn project_packs_known(start: &Path, known: impl Fn(&str) -> bool) -> Projec
         root: Some(root.clone()),
         ..Default::default()
     };
-    match config::load(&root) {
+    let loaded = config::load_hashed(&root);
+    out.config_sha256 = loaded.sha256;
+    match loaded.config {
         Ok(cfg) => {
             for id in cfg.packs {
                 if known(&id) {
