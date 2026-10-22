@@ -32,6 +32,8 @@
 //! command_long_options = ["full|f", "queue=|q", "eof[=]"] # options
 //!                             # (`name=` takes a value, `name[=]` an
 //!                             # attached one; `|c` is the short alias)
+//! command_signal_word = true  # the first `-SIGNAL` word is not options
+//! command_long_only = true    # `-name` may be a long option too
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
 //! access = "read|write|any"
@@ -89,17 +91,66 @@ pub struct WhenOption {
     pub spec: OwnedSpec,
     /// `-f` (short) and `--full` (long, full name) spellings.
     pub names: Vec<String>,
+    /// The command takes its signal as a `-SIGNAL` word before reading its
+    /// options (`pkill -TERM`, `killall -9`): the first such word is not
+    /// read as options (`command_signal_word = true`).
+    pub signal_word: bool,
+    /// The command reads options with `getopt_long_only`: `-name` may be a
+    /// long option too (`killall -regexp`; `command_long_only = true`).
+    pub long_only: bool,
+}
+
+/// Linux signal names (`/usr/include/bits/signum-generic.h` and
+/// `signum-arch.h`; the `signal(7)` list), without `SIG`.
+const SIGNAL_NAMES: &[&str] = &[
+    "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE", "KILL", "USR1", "SEGV",
+    "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD", "CLD", "CONT", "STOP", "TSTP", "TTIN",
+    "TTOU", "URG", "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "POLL", "PWR", "SYS", "RTMIN",
+    "RTMAX",
+];
+
+/// Is `word` a `-SIGNAL` word: `-` and a signal number, or a signal name
+/// (any case, optional `SIG` prefix, `RTMIN+n`/`RTMAX-n`)?
+pub fn is_signal_word(word: &str) -> bool {
+    let Some(sig) = word.strip_prefix('-') else {
+        return false;
+    };
+    if !sig.is_empty() && sig.len() <= 3 && sig.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let upper = sig.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    let name = match name.split_once(['+', '-']) {
+        Some((base @ ("RTMIN" | "RTMAX"), n))
+            if !n.is_empty() && n.len() <= 2 && n.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        Some(_) => return false,
+        None => name,
+    };
+    SIGNAL_NAMES.contains(&name)
 }
 
 impl WhenOption {
     /// Was one of the options given? Options are read anywhere among the
-    /// arguments (getopt permutes), up to `--`. A long option the command
-    /// does not know, or an ambiguous prefix, counts as given: the command
-    /// refuses it, and a newer version may know it.
+    /// arguments (getopt permutes), up to `--`. Fails closed:
+    /// - a long option the command does not know, or an ambiguous prefix,
+    ///   counts as given (the command refuses it; a newer one may know it);
+    /// - a value word that starts with `-` is also read as options
+    ///   (`pkill -IO -f`: whatever `-IO` means, `-f` is seen);
+    /// - with `long_only`, a `-word` is read both as a long option and as
+    ///   a short bundle.
     pub fn given(&self, args: &[String]) -> bool {
+        let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
+        if self.signal_word {
+            if let Some(i) = words.iter().position(|w| is_signal_word(w)) {
+                words.remove(i);
+            }
+        }
         self.spec.with(|spec| {
             let mut hit = false;
-            spec.all(args, &mut |o| match o {
+            let mut seen = |o: Opt<'_, '_>| match o {
                 Opt::Known { short, long, .. } => {
                     hit |= self.names.iter().any(|n| match n.strip_prefix("--") {
                         Some(l) => long == Some(l),
@@ -111,7 +162,42 @@ impl WhenOption {
                     });
                 }
                 Opt::Unknown { .. } => hit = true,
-            });
+            };
+            let mut i = 0;
+            while i < words.len() {
+                let w = words[i];
+                if w == "--" {
+                    break;
+                }
+                if self.long_only && w.len() > 2 && !w.starts_with("--") && w.starts_with('-') {
+                    let name = w[1..].split('=').next().unwrap_or("");
+                    if let crate::getopt::Resolved::Known(o) = spec.resolve_long(name) {
+                        seen(Opt::Known {
+                            short: o.short,
+                            long: Some(o.name),
+                            value: None,
+                            word: i,
+                            separate: false,
+                        });
+                    }
+                }
+                let mut dash_value = false;
+                match spec.option_at(&words, i, &mut |o| {
+                    if let Opt::Known {
+                        value: Some(v),
+                        separate: true,
+                        ..
+                    } = o
+                    {
+                        dash_value |= v.starts_with('-');
+                    }
+                    seen(o)
+                }) {
+                    Some(next) if dash_value => i = next - 1,
+                    Some(next) => i = next,
+                    None => i += 1,
+                }
+            }
             hit
         })
     }
@@ -396,6 +482,10 @@ struct RawRule {
     command_options: Option<String>,
     #[serde(default)]
     command_long_options: Vec<String>,
+    #[serde(default)]
+    command_signal_word: bool,
+    #[serde(default)]
+    command_long_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,6 +561,8 @@ fn compile_rules(
                     Ok(spec) if names_ok => Some(WhenOption {
                         spec,
                         names: r.when_option,
+                        signal_word: r.command_signal_word,
+                        long_only: r.command_long_only,
                     }),
                     Ok(_) => {
                         warnings.push(PackWarning {
@@ -796,22 +888,94 @@ mod tests {
             )
             .unwrap(),
             names: vec!["-f".into(), "--full".into()],
+            signal_word: true,
+            long_only: false,
         };
         let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in [
-            "-f x", "--full x", "--f x", "--fu x", "--ful x", "x -f", "-9f x", "-ef x", "--e x",
+            "-f x",
+            "--full x",
+            "--f x",
+            "--fu x",
+            "--ful x",
+            "x -f",
+            "-9f x",
+            "-ef x",
+            "--e x",
             "--zz x",
+            // Fix round 5 (B1): a `-SIGNAL` word is not read as options,
+            // and a value starting with `-` is read as options too.
+            "-IO -f x",
+            "-TRAP -f x",
+            "-TSTP -f x",
+            "-SIGIO -f x",
+            "-9 -f x",
+            "-RTMIN+1 -f x",
+            "-u -f x",
+            "--signal -f x",
+            "--eu -f x",
+            "-qp -f x",
         ] {
             assert!(given(yes), "{yes}");
         }
         for no in [
             "x",
-            "-u -f x",
             "-qf x",
-            "--signal -f x",
             "x -- -f",
-            "--eu -f x",
+            "-TERM x",
+            "-q 1 x",
+            "--signal HUP x",
         ] {
+            assert!(!given(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn signal_words() {
+        for yes in [
+            "-9",
+            "-0",
+            "-64",
+            "-TERM",
+            "-term",
+            "-SIGIO",
+            "-sigterm",
+            "-RTMIN+1",
+            "-RTMAX-2",
+            "-SIGRTMIN",
+            "-IOT",
+        ] {
+            assert!(is_signal_word(yes), "{yes}");
+        }
+        for no in [
+            "-f", "-IOX", "-RTMIN+", "-HUP+1", "TERM", "-", "-1234", "-SIG",
+        ] {
+            assert!(!is_signal_word(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn long_only_reads_dash_words_as_long_options() {
+        let w = WhenOption {
+            spec: OwnedSpec::parse(
+                "eIgy:o:ilqrs:u:vVwn:Z:",
+                &[
+                    "regexp|r".into(),
+                    "verbose|v".into(),
+                    "version|V".into(),
+                    "signal=|s".into(),
+                ],
+            )
+            .unwrap(),
+            names: vec!["-r".into(), "--regexp".into()],
+            signal_word: true,
+            long_only: true,
+        };
+        let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        for yes in ["-regexp x", "-reg x", "-XFSZ -r x", "-Ir x", "-verbose x"] {
+            assert!(given(yes), "{yes}");
+        }
+        for no in ["x", "-s r x", "-I x"] {
             assert!(!given(no), "{no}");
         }
     }

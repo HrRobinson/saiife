@@ -81,12 +81,16 @@ reason = "saiifed records every agent call; stopping it would leave agents unrec
 # counts as a match.
 [[deny]]
 # `pkill -f` matches the full command line too (any part of it). The
-# option is read with getopt from pkill's own table (procps-ng 4.0.7:
-# `pkill --help`), so `--f`, `--ful`, `-9f` and `x -f` count and `-qf`
-# (`-q f`) does not; an unknown or ambiguous long option counts as given.
+# option is read with getopt from pkill's own table (procps-ng 4.0.7,
+# pgrep(1) / pkill(1) man page), so `--f`, `--ful`, `-9f` and `x -f` count
+# and `-qf` (`-q f`) does not; an unknown or ambiguous long option counts
+# as given. pkill takes a `-SIGNAL` word (`-TERM`, `-9`) before getopt: it
+# is not read as options; a value word starting with `-` is read as
+# options too (`pkill -IO -f`).
 pattern = '^pkill\s'
 reason = "this pattern matches saiifed's command line; stopping it would leave agents unrecorded"
 when_option = ["-f", "--full"]
+command_signal_word = true
 command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
 command_long_options = [
     "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
@@ -108,11 +112,15 @@ operand_match = "regex"
 operand_targets = ["saiifed"]
 
 [[deny]]
-# `killall -r`: the option read with getopt from killall's table (psmisc
-# 23.7: `killall --help`), so `--reg` and `-Ir` count.
+# `killall -r`: the option read from killall's table (psmisc 23.7,
+# killall(1) man page), so `--reg` and `-Ir` count. killall takes a
+# `-SIGNAL` word (`-HUP`, `-9`) and reads options with getopt_long_only,
+# so `-regexp` is a long option: a `-word` is read both ways.
 pattern = '^killall\s'
 reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
 when_option = ["-r", "--regexp"]
+command_signal_word = true
+command_long_only = true
 command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
 command_long_options = [
     "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",

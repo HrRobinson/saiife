@@ -25,7 +25,9 @@ too (`nice --adj 5`, `flock --wai 5`), short options can be bundled
 (`xargs -0a FILE`), and `--` ends the options (`nohup -- sudo ls`). The
 same goes for the file `xargs -a` reads (`xargs --arg FILE` reading the
 audit signing key is blocked), for `pkill -f` (`--f`, `--ful`, `-9f`, or
-`-f` after the pattern) and for `killall -r` (`--reg`, `-Ir`). The command in
+`-f` after the pattern) and for `killall -r` (`--reg`, `-Ir`, `-regexp`).
+A signal word in front (`pkill -IO -f`, `killall -XFSZ -r`) does not hide
+the option. The command in
 `env -S '...'` is judged as a command of its own. An `env -S` string with
 env's own escapes (`\_`, `\c`), a `${NAME}` or a `#` is blocked outright:
 saiife does not read those.
@@ -142,7 +144,12 @@ It also blocks too much in a few cases. This is the safe direction:
   further pattern counts as a match, so a line full of costly patterns is
   blocked rather than left unjudged.
 - A `pkill` long option that pkill does not know or cannot tell apart
-  (`pkill --e`) counts as `-f`.
+  (`pkill --e`) counts as `-f`. An option value that starts with `-` is
+  also read as options, so `pkill -u -f x` counts as `-f`.
+- `killall` reads `-word` both as a long option (it uses
+  `getopt_long_only`, so `-regexp` is `--regexp`) and as short letters,
+  so a word that holds an `r` counts as `-r`: `killall -verbose x` is read
+  as `-r` too.
 - Creating `~/.config/systemd` or moving `~/.config`, since they are
   parents of the user service folder.
 
@@ -164,6 +171,9 @@ deny nice --adj 5 sudo ls
 deny pkill -f 'bin/saiife daemon'
 deny pkill --f 'opt/s.*e'
 deny killall --reg '^sai'
+deny pkill -IO -f 'opt/s.*e'
+deny killall -XFSZ -r '^sai'
+allow pkill -TERM node
 deny flock --wai 5 /tmp/l crontab /tmp/c
 deny flock --wait 5 /tmp/l sudo ls
 deny nohup -- sudo ls

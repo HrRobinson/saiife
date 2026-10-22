@@ -693,10 +693,46 @@ fn full_and_regexp_options_are_read_with_getopt() {
         "pkill -f node",
         "pkill --full 'python app.py'",
         "pkill -qf 'opt/s.*e'",
-        "pkill --signal -f 'opt/s.*e'",
         "pkill 'opt/s.*e' -- -f",
         "killall -s r '^sai'",
         "killall -I '^node'",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+/// Fix round 5 (B1): pkill and killall take a `-SIGNAL` word before
+/// getopt; it must not hide `-f`/`-r`. A value word starting with `-` is
+/// read as options too, and killall's `-word` as a long option.
+#[test]
+fn signal_words_do_not_hide_options() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "pkill -IO -f 'opt/s.*e'",
+        "pkill -TRAP -f 'opt/s.*e'",
+        "pkill -TSTP -f 'opt/s.*e'",
+        "pkill -SIGIO -f 'opt/s.*e'",
+        "pkill -9 -f 'opt/s.*e'",
+        "pkill -RTMIN+1 -f 'opt/s.*e'",
+        "pkill -sigio -f 'opt/s.*e'",
+        "pkill --signal -f 'opt/s.*e'",
+        "killall -XFSZ -r '^sai'",
+        "killall -TRAP -r '^sai'",
+        "killall -9 -r '^sai'",
+        "killall -regexp '^sai'",
+        "killall -reg '^sai'",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "pkill -f node",
+        "pkill -TERM node",
+        "pkill -9 node",
+        "pkill -HUP -f 'python app.py'",
+        "killall -HUP node",
+        "killall -9 -r '^node'",
     ] {
         let d = e.evaluate(cmd);
         assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
