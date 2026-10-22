@@ -116,16 +116,6 @@ fn oversized_project_config_fails_open_to_default_packs() {
     assert_eq!(code, 0, "opt-in pack from the oversized file is not loaded");
 }
 
-/// A project dir for the sparse-file tests: under the workspace's parent,
-/// never /tmp (quota; a sparse file uses no blocks, but stay off /tmp).
-fn big_tempdir() -> tempfile::TempDir {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    tempfile::Builder::new()
-        .prefix("saiife-test-")
-        .tempdir_in(base)
-        .unwrap()
-}
-
 /// Run the hook in `cwd`, killing it after 30 s; returns its exit code, how
 /// long it took, and the `policy` of the guard record it wrote.
 fn timed_check(audit: &Path, cwd: &Path, cmd: &str) -> (i32, std::time::Duration, String) {
@@ -174,15 +164,16 @@ fn timed_check(audit: &Path, cwd: &Path, cmd: &str) -> (i32, std::time::Duration
     (status.code().unwrap_or(-1), took, policy)
 }
 
-/// A sparse 2 GB config must not be read for the policy hash: the hook
-/// answers well inside its budget and still records a policy.
+/// An oversized config is refused by its size before a byte is read (so
+/// any size costs the same): the hook answers well inside its budget and
+/// still records a policy.
 #[test]
 fn oversized_config_does_not_delay_hook() {
     let audit = tempfile::tempdir().unwrap();
-    let p = big_tempdir();
+    let p = tempfile::tempdir().unwrap();
     std::fs::create_dir(p.path().join(".saiife")).unwrap();
     let f = std::fs::File::create(p.path().join(".saiife/config.toml")).unwrap();
-    f.set_len(2 * 1024 * 1024 * 1024).unwrap();
+    f.set_len(64 * 1024 + 1).unwrap();
     drop(f);
     let (code, took, policy) = timed_check(audit.path(), p.path(), "rm -rf /");
     assert_eq!(code, 2, "default-on packs still deny");
@@ -193,40 +184,57 @@ fn oversized_config_does_not_delay_hook() {
     assert!(policy.starts_with("sha256:"), "{policy:?}");
 }
 
-/// A symlinked config is not followed: neither for the packs nor for the
-/// policy hash, which is the same stable "config unavailable" hash whatever
-/// the link points at (and the same as for a config too large to read).
+/// A symlinked config is followed, for the packs and the policy hash
+/// alike: the policy is that of a plain file with the target's bytes. A
+/// link to an oversized file is refused unread, without delay.
 #[cfg(unix)]
 #[test]
-fn symlinked_config_is_not_followed_for_policy() {
+fn symlinked_config_is_followed_for_policy() {
     let audit = tempfile::tempdir().unwrap();
-    let p = big_tempdir();
+    let p = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("a.toml"), "packs = [\"db.postgres\"]\n").unwrap();
+    let a = "packs = [\"db.postgres\"]\n";
+    std::fs::write(outside.path().join("a.toml"), a).unwrap();
     std::fs::write(outside.path().join("b.toml"), "packs = []\n").unwrap();
     std::fs::create_dir(p.path().join(".saiife")).unwrap();
     let link = p.path().join(".saiife/config.toml");
     std::os::unix::fs::symlink(outside.path().join("a.toml"), &link).unwrap();
     let (code, took, via_a) = timed_check(audit.path(), p.path(), DROP);
-    assert_eq!(code, 0, "the linked config's opt-in pack is not loaded");
+    assert_eq!(code, 2, "the linked config's opt-in pack is loaded");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "hook took {took:?}"
+    );
+    assert!(via_a.starts_with("sha256:"), "{via_a:?}");
+
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, a).unwrap();
+    let (_, _, plain_a) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(via_a, plain_a, "the target's bytes are hashed");
+
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("b.toml"), &link).unwrap();
+    let (_, _, via_b) = timed_check(audit.path(), p.path(), DROP);
+    assert_ne!(via_a, via_b, "another target, another policy");
+
+    let big = outside.path().join("big.toml");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&big, &link).unwrap();
+    let (code, took, via_big) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(code, 0, "an oversized target is not loaded");
     assert!(
         took < std::time::Duration::from_secs(2),
         "hook took {took:?}"
     );
     std::fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("b.toml"), &link).unwrap();
-    let (_, _, via_b) = timed_check(audit.path(), p.path(), DROP);
-    assert!(via_a.starts_with("sha256:"), "{via_a:?}");
-    assert_eq!(via_a, via_b, "the link target does not reach the policy");
-
-    std::fs::remove_file(&link).unwrap();
-    let f = std::fs::File::create(&link).unwrap();
-    f.set_len(2 * 1024 * 1024 * 1024).unwrap();
-    drop(f);
-    let (_, _, oversized) = timed_check(audit.path(), p.path(), DROP);
-    assert_eq!(via_a, oversized, "one marker for every unreadable config");
-
-    std::fs::write(&link, "packs = []\n").unwrap();
-    let (_, _, real) = timed_check(audit.path(), p.path(), DROP);
-    assert_ne!(via_a, real, "a readable config is hashed");
+    std::fs::File::create(&link)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    let (_, _, plain_big) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(via_big, plain_big, "one marker for every unreadable config");
 }

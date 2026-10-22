@@ -96,9 +96,10 @@ pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// The config's text, read at most `MAX_CONFIG_BYTES` (+1 to detect more).
 /// The hook reads this file on every call, so on unix it is opened without
-/// following a symlink and without blocking (a FIFO swapped in after
-/// `find_project_root` looked cannot hang the open), and anything but a
-/// regular file is refused before a byte is read.
+/// blocking (a FIFO swapped in after `find_project_root` looked cannot hang
+/// the open), and anything the opened handle does not show as a regular
+/// file, or as larger than the cap, is refused before a byte is read. A
+/// symlink is followed: what counts is the file it reaches.
 fn read_bounded(path: &Path) -> Result<String, AgentError> {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
@@ -106,7 +107,7 @@ fn read_bounded(path: &Path) -> Result<String, AgentError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NONBLOCK);
     }
     let file = opts.open(path).map_err(fsutil::io_err(path))?;
     let meta = file.metadata().map_err(fsutil::io_err(path))?;
@@ -294,16 +295,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_config_is_refused() {
+    fn symlinked_config_is_followed() {
         let p = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("c.toml"), "packs = [\"db.mysql\"]\n").unwrap();
+        let body = "packs = [\"db.mysql\"]\n";
+        fs::write(outside.path().join("c.toml"), body).unwrap();
         fs::create_dir(p.path().join(".saiife")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("c.toml"), p.path().join(CONFIG_REL))
             .unwrap();
         let got = load_hashed(p.path());
-        assert!(got.config.is_err());
-        assert_eq!(got.sha256, None);
+        assert_eq!(got.config.unwrap().packs, ids(&["db.mysql"]));
+        assert_eq!(got.sha256, Some(sha256_hex(body.as_bytes())));
+    }
+
+    /// A symlink is followed only to a regular file within the cap: one to
+    /// a FIFO is refused without blocking, one to an oversized file unread.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_fifo_or_oversized_file_is_refused() {
+        let p = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let fifo = outside.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let big = outside.path().join("big.toml");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        fs::create_dir(p.path().join(".saiife")).unwrap();
+        for target in [&fifo, &big] {
+            let _ = fs::remove_file(p.path().join(CONFIG_REL));
+            std::os::unix::fs::symlink(target, p.path().join(CONFIG_REL)).unwrap();
+            let got = load_hashed(p.path());
+            assert!(got.config.is_err(), "{}", target.display());
+            assert_eq!(got.sha256, None, "{}", target.display());
+        }
     }
 
     /// A FIFO at the config path neither blocks the open nor gets read.
