@@ -51,6 +51,9 @@ pub trait Host: Send + Sync {
     fn user(&self, name: &str) -> Option<UserInfo>;
     /// The group id from `/etc/group`.
     fn group_id(&self, name: &str) -> Option<u32>;
+    /// The supplementary members of the group from `/etc/group` (primary
+    /// members are not listed there); `None` when the group does not exist.
+    fn group_members(&self, name: &str) -> Option<Vec<String>>;
     fn create_system_group(&self, name: &str) -> io::Result<()>;
     /// A system user with primary group `group`, no home and no login shell.
     fn create_system_user(&self, name: &str, group: &str) -> io::Result<()>;
@@ -137,6 +140,10 @@ impl Host for RealHost {
 
     fn group_id(&self, name: &str) -> Option<u32> {
         find_group(&std::fs::read_to_string("/etc/group").ok()?, name)
+    }
+
+    fn group_members(&self, name: &str) -> Option<Vec<String>> {
+        find_group_members(&std::fs::read_to_string("/etc/group").ok()?, name)
     }
 
     fn create_system_group(&self, name: &str) -> io::Result<()> {
@@ -451,6 +458,22 @@ pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
     })
 }
 
+/// The member list of `name` in `/etc/group` text.
+pub(crate) fn find_group_members(text: &str, name: &str) -> Option<Vec<String>> {
+    text.lines().find_map(|line| {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 4 || f[0] != name || f[2].parse::<u32>().is_err() {
+            return None;
+        }
+        Some(
+            f[3].split(',')
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    })
+}
+
 // ---------------------------------------------------------------- FakeHost
 
 const STATE_FILE: &str = ".fakehost.json";
@@ -667,6 +690,12 @@ impl Host for FakeHost {
 
     fn group_id(&self, name: &str) -> Option<u32> {
         self.read().ok()?.group_id(name)
+    }
+
+    fn group_members(&self, name: &str) -> Option<Vec<String>> {
+        let s = self.read().ok()?;
+        s.group_id(name)?;
+        Some(s.members.get(name).cloned().unwrap_or_default())
     }
 
     fn create_system_group(&self, name: &str) -> io::Result<()> {
@@ -1211,6 +1240,29 @@ mod tests {
             Some(996)
         );
         assert_eq!(find_group("root:x:0:\n", "saiife"), None);
+        let group = "root:x:0:\nsaiife-audit:x:996:saiife,alice\nempty:x:5:\n";
+        assert_eq!(
+            find_group_members(group, "saiife-audit"),
+            Some(vec!["saiife".to_string(), "alice".to_string()])
+        );
+        assert_eq!(find_group_members(group, "empty"), Some(vec![]));
+        assert_eq!(find_group_members(group, "nogroup"), None);
+    }
+
+    #[test]
+    fn fake_group_members_follow_add_to_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(h.group_members(AUDIT_GROUP), None);
+        h.create_system_group(DAEMON_GROUP).unwrap();
+        h.create_system_group(AUDIT_GROUP).unwrap();
+        h.create_system_user(DAEMON_USER, DAEMON_GROUP).unwrap();
+        assert_eq!(h.group_members(AUDIT_GROUP), Some(vec![]));
+        h.add_to_group(DAEMON_USER, AUDIT_GROUP).unwrap();
+        assert_eq!(
+            h.group_members(AUDIT_GROUP),
+            Some(vec![DAEMON_USER.to_string()])
+        );
     }
 
     #[test]

@@ -189,10 +189,10 @@ pub fn load_or_create_owned(path: &Path, owner: u32) -> io::Result<(AuditKey, bo
     }
 }
 
-/// What `judge` checks a path as.
+/// What [`judge`] checks a path as.
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
-enum Kind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
     /// The key dir's parent: a directory not writable by group or others.
     StateDir,
     /// `keys/`: a directory of the owner, no group or other access.
@@ -204,9 +204,9 @@ enum Kind {
 /// Whether a `kind` with this `uid` and `st_mode` is acceptable for
 /// `owner`: a pure decision, so the owner checks can be tested for owners
 /// a test cannot be. The error names the path, and what was wanted and
-/// found.
+/// found. `saiife doctor` reports with the same rules the daemon starts by.
 #[cfg(unix)]
-fn judge(path: &Path, kind: Kind, uid: u32, mode: u32, owner: u32) -> io::Result<()> {
+pub fn judge(path: &Path, kind: Kind, uid: u32, mode: u32, owner: u32) -> io::Result<()> {
     const S_IFMT: u32 = 0o170000;
     const S_IFDIR: u32 = 0o040000;
     const S_IFREG: u32 = 0o100000;

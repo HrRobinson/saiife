@@ -10,6 +10,7 @@
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
+//! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,7 @@ mod out;
 mod audit_cmd;
 mod check;
 mod check_managed;
+mod doctor_cmd;
 mod eval;
 mod init_cmd;
 mod packs_cmd;
@@ -145,6 +147,19 @@ enum Cmd {
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
     },
+    /// Check the machine locked mode relies on: exit 0 all pass, 1 a
+    /// warning, 2 a failure.
+    Doctor {
+        /// Check this agent user (root only, unless it is you).
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Check the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
+    },
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
@@ -199,6 +214,9 @@ fn main() -> ExitCode {
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
+    if let Cmd::Doctor { user, json, root } = cli.command {
+        return doctor_cmd::run(user, json, root);
+    }
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
     // `--pack <id>` additively enables opt-in packs.
@@ -234,7 +252,11 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } | Cmd::System { .. } => {
+        Cmd::Check { .. }
+        | Cmd::Eval
+        | Cmd::Daemon { .. }
+        | Cmd::System { .. }
+        | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }
         Cmd::Init { off: true, .. } => init_cmd::off(),

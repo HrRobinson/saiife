@@ -13,11 +13,14 @@
 #![forbid(unsafe_code)]
 
 pub mod default_config;
+pub mod doctor;
 pub mod fsops;
 pub mod host;
 pub mod install;
 pub mod layout;
 pub mod supported;
+#[doc(hidden)]
+pub mod testing;
 pub mod uninstall;
 pub mod unit;
 
