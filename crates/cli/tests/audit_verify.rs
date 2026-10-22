@@ -136,3 +136,17 @@ fn verify_prints_no_record_content() {
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(!out.contains("secretword"), "{out}");
 }
+
+#[test]
+fn verify_prints_last_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../audit/tests/fixtures/v2-locked/2026-11.jsonl");
+    std::fs::copy(src, dir.path().join("2026-11.jsonl")).unwrap();
+    let (code, out) = verify(dir.path());
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("audit chain: intact"), "{out}");
+    assert!(out.contains("last checkpoint: seq 6"), "{out}");
+    assert!(out.contains("key ed25519:"), "{out}");
+    assert!(!out.contains("developer mode:"), "{out}");
+}

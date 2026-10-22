@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::record::{DecisionKind, NewRecord, Record};
+use crate::sign::{checkpoint_message, fingerprint_of, key_rotate_message, AuditKey};
 use crate::store;
+use crate::verify::{State, VerifyReport};
 
 /// `prev` of a genesis record: 64 zeros.
 pub const ZERO_PREV: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -206,6 +208,9 @@ struct Tail {
     /// The `chain` id of the genesis the last chained line belongs to; only
     /// looked for when the caller asks (`find_tail(.., want_chain: true)`).
     chain: Option<String>,
+    /// The signing key in force at the tail: the `new_key` of the newest
+    /// `key_rotate` or the genesis `key` (`want_chain` only).
+    key: Option<String>,
 }
 
 impl Tail {
@@ -230,6 +235,10 @@ struct TailLine {
     prev: Option<String>,
     kind: Option<String>,
     chain: Option<String>,
+    /// A genesis `key`.
+    key: Option<String>,
+    /// A `key_rotate`'s `new_key`.
+    new_key: Option<String>,
 }
 
 impl TailLine {
@@ -254,6 +263,8 @@ impl TailLine {
             prev: text("prev"),
             kind: text("kind"),
             chain: text("chain"),
+            key: text("key"),
+            new_key: text("new_key"),
         })
     }
 
@@ -473,6 +484,7 @@ fn find_tail(files: &[PathBuf], mut budget: u64, want_chain: bool) -> io::Result
     let mut prev = None;
     let mut last: Option<TailLine> = None;
     let mut chain = None;
+    let mut key: Option<Option<String>> = None;
     for path in non_empty.iter().rev() {
         let found = scan_back(path, &mut budget, |line| {
             if prev.is_none() {
@@ -487,6 +499,13 @@ fn find_tail(files: &[PathBuf], mut budget: u64, want_chain: bool) -> io::Result
             if genesis {
                 chain.clone_from(&t.chain);
             }
+            if key.is_none() {
+                match t.kind.as_deref() {
+                    Some("genesis") => key = Some(t.key.clone()),
+                    Some("key_rotate") => key = Some(t.new_key.clone()),
+                    _ => {}
+                }
+            }
             if last.is_none() {
                 last = Some(t);
                 return (!want_chain || genesis).then_some(Found::Stop);
@@ -497,7 +516,12 @@ fn find_tail(files: &[PathBuf], mut budget: u64, want_chain: bool) -> io::Result
             break;
         }
     }
-    Ok(prev.map(|prev| Tail { prev, last, chain }))
+    Ok(prev.map(|prev| Tail {
+        prev,
+        last,
+        chain,
+        key: key.flatten(),
+    }))
 }
 
 /// Add a `\n` to `path` unless it already ends with one.
@@ -607,14 +631,25 @@ fn genesis(spec: &GenesisSpec<'_>) -> io::Result<Record> {
 }
 
 /// How a `ChainWriter` starts a new chain.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WriterOptions {
     /// `mode` of the genesis record (`"locked"` for the daemon).
     pub mode: String,
     /// Version of the saiife binary, for the genesis record.
     pub saiife: String,
-    /// `ed25519:<spki b64>`, written as the genesis `key` when set.
-    pub genesis_key: Option<String>,
+    /// The checkpoint signing key; its `spki()` is the genesis `key`.
+    pub key: Option<AuditKey>,
+}
+
+/// What `ChainWriter::startup_check` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupCheck {
+    /// The first break among the recent lines, described.
+    pub recent: Result<(), String>,
+    /// `seq` of the newest checkpoint among them.
+    pub last_checkpoint: Option<u64>,
+    /// The last non-checkpoint record is a `daemon` `stop`.
+    pub last_clean_stop: bool,
 }
 
 /// The single long-lived writer of the hash chain (locked mode): it holds
@@ -631,9 +666,12 @@ pub struct ChainWriter {
     head: Option<(u64, String)>,
     chain_id: Option<String>,
     host: Option<String>,
+    /// `ed25519:<spki b64>` of the key in force on disk (genesis `key` or
+    /// the newest `key_rotate`'s `new_key`).
+    key_in_force: Option<String>,
     /// The newest month file, with an append handle on it.
     current: Option<Current>,
-    /// Records appended since the last checkpoint (Task 5 writes those).
+    /// Records appended since the last checkpoint.
     since_checkpoint: u64,
     /// The cached head may not match the disk (a failed write, a foreign
     /// line): re-read the tail before the next append.
@@ -690,12 +728,72 @@ impl ChainWriter {
             head: None,
             chain_id: None,
             host: None,
+            key_in_force: None,
             current: None,
             since_checkpoint: 0,
             stale: true,
         };
         w.load()?;
+        w.adopt_key()?;
         Ok(w)
+    }
+
+    /// Make this writer's key the key in force of an existing chain. When
+    /// the chain names another key (the key file was lost or replaced) or
+    /// none (a chain started without one), write a `key_rotate` to it with
+    /// `sig: null`: there is no old key to sign the change with. A new
+    /// chain needs nothing: its genesis will carry the key.
+    fn adopt_key(&mut self) -> io::Result<()> {
+        let Some(spki) = self.opts.key.as_ref().map(AuditKey::spki) else {
+            return Ok(());
+        };
+        if self.head.is_none() || self.key_in_force.as_deref() == Some(spki.as_str()) {
+            return Ok(());
+        }
+        let old = self.key_in_force.as_deref().and_then(fingerprint_of);
+        let mut rec = self.bookkeeping("key_rotate", time::OffsetDateTime::now_utc());
+        rec.reason = Some(if self.key_in_force.is_some() {
+            "previous signing key missing".into()
+        } else {
+            "chain had no signing key".into()
+        });
+        self.append_with(rec, |r, h, _| {
+            r.extra
+                .insert("head_seq".into(), h.seq.saturating_sub(1).into());
+            r.extra.insert("head".into(), h.prev.into());
+            r.extra.insert("key".into(), old.clone().into());
+            r.extra.insert("new_key".into(), spki.clone().into());
+            r.extra.insert("sig".into(), serde_json::Value::Null);
+        })?;
+        self.key_in_force = Some(spki);
+        Ok(())
+    }
+
+    /// A bookkeeping record (`checkpoint`, `key_rotate`) of this writer:
+    /// `tool` = kind, empty `agent`/`project`/`input`, `decision` allow.
+    fn bookkeeping(&self, kind: &str, ts: time::OffsetDateTime) -> Record {
+        let mut r = Record::at(
+            NewRecord {
+                agent: "",
+                project: "",
+                session: None,
+                tool: kind,
+                input: "",
+                decision: DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: &self.opts.mode,
+                policy: None,
+                permission_mode: None,
+            },
+            &self.opts.saiife,
+            ts,
+        );
+        r.kind = Some(kind.into());
+        r.uid = own_uid();
+        r.user = own_user();
+        r
     }
 
     /// Read the chain's state from disk (tail, chain id, newest file). A
@@ -705,16 +803,19 @@ impl ChainWriter {
     fn load(&mut self) -> io::Result<()> {
         let files = regular_month_files(&self.dir)?;
         let tail = find_tail(&files, u64::MAX, true)?;
-        let (head, chain_id, host) = match tail {
+        let (head, chain_id, host, key) = match tail {
             Some(t) => match (t.head(), t.chain) {
-                (Some(head), Some(chain)) => (Some(head), Some(chain), t.last.and_then(|l| l.host)),
-                _ => (None, None, None),
+                (Some(head), Some(chain)) => {
+                    (Some(head), Some(chain), t.last.and_then(|l| l.host), t.key)
+                }
+                _ => (None, None, None, None),
             },
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         self.head = head;
         self.chain_id = chain_id;
         self.host = host;
+        self.key_in_force = key;
         self.current = files.last().map(|p| Current::open(p)).transpose()?;
         self.stale = false;
         Ok(())
@@ -755,7 +856,18 @@ impl ChainWriter {
     /// later: the writer owns the dir, so the newest file is the chain's.
     /// A line someone else added to the file since the last append is
     /// noticed (by the file's length) and chained on from.
-    pub fn append(&mut self, mut rec: Record) -> io::Result<u64> {
+    pub fn append(&mut self, rec: Record) -> io::Result<u64> {
+        self.append_with(rec, |_, _, _| {})
+    }
+
+    /// `append`, with `fill` called on the record once its place in the
+    /// chain is known (after `seq`, `prev` and `host` are set), with this
+    /// writer's key: what a checkpoint or key rotation signs.
+    fn append_with(
+        &mut self,
+        mut rec: Record,
+        fill: impl FnOnce(&mut Record, &Place<'_>, Option<&AuditKey>),
+    ) -> io::Result<u64> {
         let own = format!("{}.jsonl", rec.month());
         if !store::is_month_file(&own) {
             return Err(io::Error::other(format!(
@@ -774,11 +886,12 @@ impl ChainWriter {
         {
             Some((seq, h)) => (seq, h.clone()),
             None => {
+                let spki = self.opts.key.as_ref().map(AuditKey::spki);
                 let g = genesis(&GenesisSpec {
                     saiife: &self.opts.saiife,
                     ts: &rec.ts,
                     mode: &self.opts.mode,
-                    key: self.opts.genesis_key.as_deref(),
+                    key: spki.as_deref(),
                     uid: own_uid(),
                     user: own_user(),
                 })?;
@@ -788,16 +901,26 @@ impl ChainWriter {
                     .get("chain")
                     .and_then(|c| c.as_str())
                     .map(String::from);
-                started = Some((chain, g.host));
+                started = Some((chain, g.host, spki));
                 (1, prev)
             }
         };
         rec.seq = Some(seq);
-        rec.prev = Some(prev);
+        rec.prev = Some(prev.clone());
         rec.host = match &started {
-            Some((_, host)) => host.clone(),
+            Some((_, host, _)) => host.clone(),
             None => self.host.clone(),
         };
+        let chain = match &started {
+            Some((chain, _, _)) => chain.as_deref(),
+            None => self.chain_id.as_deref(),
+        };
+        let place = Place {
+            seq,
+            prev: &prev,
+            chain: chain.unwrap_or_default(),
+        };
+        fill(&mut rec, &place, self.opts.key.as_ref());
         let hash = push_line(&mut out, &rec)?;
         let c = self.current.as_mut().expect("current file set by prepare");
         if let Err(e) = c.file.write_all(&out) {
@@ -806,9 +929,10 @@ impl ChainWriter {
             return Err(e);
         }
         c.end += out.len() as u64;
-        if let Some((chain, host)) = started {
+        if let Some((chain, host, key)) = started {
             self.chain_id = chain;
             self.host = host;
+            self.key_in_force = key;
         }
         self.head = Some((seq, hash));
         self.since_checkpoint += 1;
@@ -831,8 +955,138 @@ impl ChainWriter {
     }
 
     /// Records appended since the last checkpoint.
-    pub fn since_checkpoint(&self) -> u64 {
+    pub fn records_since_checkpoint(&self) -> u64 {
         self.since_checkpoint
+    }
+
+    /// Write a signed checkpoint over the current head (spec §6.4.2) and
+    /// return its `seq`; `None` when nothing was appended since the last
+    /// one. The signature covers the record's own `ts` string.
+    pub fn checkpoint(&mut self, ts: time::OffsetDateTime) -> io::Result<Option<u64>> {
+        if self.opts.key.is_none() {
+            return Err(io::Error::other(
+                "audit checkpoint needs a signing key, and this chain writer has none",
+            ));
+        }
+        if self.since_checkpoint == 0 {
+            return Ok(None);
+        }
+        let rec = self.bookkeeping("checkpoint", ts);
+        let seq = self.append_with(rec, |r, h, key| {
+            let key = key.expect("checked above");
+            let head_seq = h.seq.saturating_sub(1);
+            let msg = checkpoint_message(h.chain, head_seq, h.prev, &r.ts);
+            r.extra.insert("head_seq".into(), head_seq.into());
+            r.extra.insert("head".into(), h.prev.into());
+            r.extra.insert("key".into(), key.fingerprint().into());
+            r.extra
+                .insert("sig".into(), key.sign_b64(msg.as_bytes()).into());
+        })?;
+        self.since_checkpoint = 0;
+        Ok(Some(seq))
+    }
+
+    /// Switch to the signing key `new`: write a `key_rotate` naming it
+    /// (`new_key`, its SPKI), signed by the current key, and return its
+    /// `seq`. The old key is dropped (and zeroized) once it is written.
+    pub fn rotate_key(&mut self, new: AuditKey) -> io::Result<u64> {
+        if self.opts.key.is_none() {
+            return Err(io::Error::other(
+                "audit key rotation needs the current signing key, and this chain writer has none",
+            ));
+        }
+        let new_spki = new.spki();
+        let rec = self.bookkeeping("key_rotate", time::OffsetDateTime::now_utc());
+        let seq = self.append_with(rec, |r, h, key| {
+            let key = key.expect("checked above");
+            let head_seq = h.seq.saturating_sub(1);
+            let msg = key_rotate_message(h.chain, head_seq, h.prev, &new_spki, &r.ts);
+            r.extra.insert("head_seq".into(), head_seq.into());
+            r.extra.insert("head".into(), h.prev.into());
+            r.extra.insert("key".into(), key.fingerprint().into());
+            r.extra.insert("new_key".into(), new_spki.clone().into());
+            r.extra
+                .insert("sig".into(), key.sign_b64(msg.as_bytes()).into());
+        })?;
+        self.opts.key = Some(new);
+        self.key_in_force = Some(new_spki);
+        Ok(seq)
+    }
+
+    /// Re-verify the last `records` chained lines (by the rules of
+    /// `verify`, signatures included), for the daemon's start. The key in
+    /// force before them is found by reading further back, to the newest
+    /// `key_rotate` or the genesis (as `open` already did).
+    pub fn startup_check(&self, records: usize) -> StartupCheck {
+        match self.recent_window(records) {
+            Ok(w) => w.check(self.chain_id.clone()),
+            Err(e) => StartupCheck {
+                recent: Err(format!("cannot read the audit log: {e}")),
+                last_checkpoint: None,
+                last_clean_stop: false,
+            },
+        }
+    }
+
+    /// The last `records` chained lines (and the lines between them), oldest
+    /// first, with what is needed to check them on their own.
+    fn recent_window(&self, records: usize) -> io::Result<Window> {
+        let mut files = regular_month_files(&self.dir)?;
+        files.retain(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0));
+        let mut w = Window {
+            lines: Vec::new(),
+            before: None,
+        };
+        if records == 0 {
+            return Ok(w);
+        }
+        let mut chained = 0;
+        // `Some(hash of the line before the window)` once the window is full.
+        let mut before: Option<String> = None;
+        // The key in force before the window, once a line names it.
+        let mut key: Option<Option<String>> = None;
+        let mut budget = u64::MAX;
+        'files: for path in files.iter().rev() {
+            let name = file_name(path)?;
+            let found = scan_back(path, &mut budget, |line| {
+                let t = TailLine::parse(line);
+                if before.is_none() {
+                    if t.as_ref().is_some_and(|t| t.v >= 2 && t.seq.is_some()) {
+                        if chained == records {
+                            before = Some(sha256_hex(line));
+                        } else {
+                            chained += 1;
+                        }
+                    } else if t.as_ref().is_some_and(|t| t.v < 2) {
+                        // The chain starts after a v1 line: check from there.
+                        w.lines.push((name.clone(), line.to_vec()));
+                        return Some(Found::Stop);
+                    }
+                    if before.is_none() {
+                        w.lines.push((name.clone(), line.to_vec()));
+                        return None;
+                    }
+                }
+                // Before the window: look for the key in force there.
+                let t = t?;
+                if t.v < 2 {
+                    key = Some(None);
+                    return Some(Found::Stop);
+                }
+                match t.kind.as_deref() {
+                    Some("genesis") => key = Some(t.key),
+                    Some("key_rotate") => key = Some(t.new_key),
+                    _ => return None,
+                }
+                Some(Found::Stop)
+            })?;
+            if let Found::Stop = found {
+                break 'files;
+            }
+        }
+        w.lines.reverse();
+        w.before = before.map(|hash| (hash, key.flatten()));
+        Ok(w)
     }
 
     /// `fdatasync` the current month file.
@@ -840,6 +1094,69 @@ impl ChainWriter {
         match &self.current {
             Some(c) => c.file.sync_data(),
             None => Ok(()),
+        }
+    }
+}
+
+/// Where a record goes in the chain, for `ChainWriter::append_with`.
+struct Place<'a> {
+    seq: u64,
+    /// Hash of the line before it: `head` of the record `seq - 1`.
+    prev: &'a str,
+    chain: &'a str,
+}
+
+/// The recent lines `startup_check` re-verifies.
+struct Window {
+    /// `(file name, line)`, oldest first.
+    lines: Vec<(String, Vec<u8>)>,
+    /// When the window starts inside the chain: the hash of the line before
+    /// it and the key in force there. `None` when it starts at the
+    /// beginning of the log (or after a v1 line).
+    before: Option<(String, Option<String>)>,
+}
+
+impl Window {
+    fn check(&self, chain: Option<String>) -> StartupCheck {
+        let mut report = VerifyReport::default();
+        let mut state = match &self.before {
+            Some((hash, key)) => {
+                let first = self
+                    .lines
+                    .iter()
+                    .find_map(|(_, l)| TailLine::parse(l).filter(|t| t.v >= 2)?.seq);
+                State::resume(Some(hash.clone()), first.unwrap_or(0), chain, key.clone())
+            }
+            None => State::default(),
+        };
+        let mut last_checkpoint = None;
+        let mut last_clean_stop = false;
+        for (file, line) in &self.lines {
+            state.check(line, file, 0, &mut report);
+            let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(line) else {
+                continue;
+            };
+            let Some(seq) = obj.get("seq").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let field = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
+            if field("kind") == Some("checkpoint") {
+                last_checkpoint = Some(seq);
+            } else {
+                last_clean_stop = field("kind") == Some("daemon") && field("event") == Some("stop");
+            }
+        }
+        let recent = match report.first_break() {
+            None => Ok(()),
+            Some(b) => Err(match b.seq {
+                Some(seq) => format!("{} seq {seq}: {}", b.file, b.kind.describe()),
+                None => format!("{}: {}", b.file, b.kind.describe()),
+            }),
+        };
+        StartupCheck {
+            recent,
+            last_checkpoint,
+            last_clean_stop,
         }
     }
 }
@@ -1420,11 +1737,11 @@ mod tests {
         assert_eq!(parse(&ls[1]).kind.as_deref(), Some("genesis"));
     }
 
-    fn opts(mode: &str, key: Option<&str>) -> WriterOptions {
+    fn opts(mode: &str, key: Option<AuditKey>) -> WriterOptions {
         WriterOptions {
             mode: mode.into(),
             saiife: "0.2.0".into(),
-            genesis_key: key.map(str::to_string),
+            key,
         }
     }
 
@@ -1444,7 +1761,9 @@ mod tests {
     #[test]
     fn writer_genesis_carries_key_and_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = ChainWriter::open(dir.path(), opts("locked", Some("ed25519:abc"))).unwrap();
+        let key = AuditKey::generate().unwrap();
+        let spki = key.spki();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", Some(key))).unwrap();
         assert_eq!(w.head(), None);
         assert_eq!(w.chain_id(), None);
         let seq = w
@@ -1455,7 +1774,7 @@ mod tests {
         assert_eq!(ls.len(), 2);
         let text = String::from_utf8(ls[0].clone()).unwrap();
         assert!(text.contains("\"mode\":\"locked\""), "{text}");
-        assert!(text.contains("\"key\":\"ed25519:abc\""), "{text}");
+        assert!(text.contains(&format!("\"key\":\"{spki}\"")), "{text}");
         let g = parse(&ls[0]);
         assert_eq!(g.kind(), "genesis");
         assert_eq!(g.seq, Some(0));
