@@ -265,14 +265,16 @@ struct RawHeaderMeta {
     id: String,
     #[serde(default = "default_true")]
     default_on: bool,
+    #[serde(default = "default_version")]
+    version: u32,
 }
 
-/// A pack's `id` and `default_on` without compiling any of its rules, so a
-/// caller can decide whether the pack is needed. `None` if the TOML or its
-/// `[pack]` table cannot be read (a full load reports why).
-pub(crate) fn peek_header(toml_str: &str) -> Option<(String, bool)> {
+/// A pack's `id`, `default_on` and `version` without compiling any of its
+/// rules, so a caller can decide whether the pack is needed. `None` if the
+/// TOML or its `[pack]` table cannot be read (a full load reports why).
+pub(crate) fn peek_header(toml_str: &str) -> Option<(String, bool, u32)> {
     let h: RawHeader = toml::from_str(toml_str).ok()?;
-    (!h.pack.id.trim().is_empty()).then_some((h.pack.id, h.pack.default_on))
+    (!h.pack.id.trim().is_empty()).then_some((h.pack.id, h.pack.default_on, h.pack.version))
 }
 
 #[cfg(test)]

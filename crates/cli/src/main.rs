@@ -3,6 +3,7 @@
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` / `--read <path>` / `--write <path>` -> decision trace to stdout, always exit 0
 //! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
+//! - `saiife check --managed` -> locked mode: guard in a worker, record through the daemon; FAIL CLOSED on error.
 //! - `saiife init [--off]` -> hook the agents into this project (or remove exactly that)
 //! - `saiife status` -> tamper checks; exit 1 if any fails
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
@@ -21,6 +22,8 @@ mod out;
 
 mod audit_cmd;
 mod check;
+mod check_managed;
+mod eval;
 mod init_cmd;
 mod packs_cmd;
 mod paths;
@@ -76,6 +79,13 @@ enum Cmd {
         /// Which agent is calling (claude, codex, gemini); recorded in the audit log.
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
+        /// Locked mode (Linux): judge in a worker process, record through
+        /// the saiife daemon, fail closed on every error. Implies --hook-exit.
+        #[arg(long)]
+        managed: bool,
+        /// The system config for --managed (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, requires = "managed")]
+        system_config: Option<std::path::PathBuf>,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -133,6 +143,9 @@ enum Cmd {
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
     },
+    /// The locked-mode guard worker (`check --managed` spawns it).
+    #[command(name = "__eval", hide = true)]
+    Eval,
 }
 
 #[derive(Subcommand)]
@@ -149,8 +162,23 @@ fn main() -> ExitCode {
 
     // Hook mode compiles only the packs it needs (it runs on every agent
     // tool call); every other command lists or judges across all packs.
-    if let Cmd::Check { hook_exit, agent } = &cli.command {
+    if let Cmd::Check {
+        hook_exit,
+        agent,
+        managed,
+        system_config,
+    } = &cli.command
+    {
+        if *managed {
+            let config = system_config
+                .as_deref()
+                .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
+            return check_managed::run(agent, config);
+        }
         return check::run(&cli.packs, *hook_exit, agent);
+    }
+    if let Cmd::Eval = cli.command {
+        return eval::worker_main();
     }
     if let Cmd::Daemon {
         system,
@@ -196,8 +224,7 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { hook_exit, agent } => check::run(&cli.packs, hook_exit, &agent),
-        Cmd::Daemon { .. } => unreachable!("handled above"),
+        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } => unreachable!("handled above"),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Status => status_cmd::run(&packs),
@@ -279,12 +306,17 @@ fn arg_error(e: clap::Error) -> ExitCode {
             .next()
             .unwrap_or("")
             .trim_start_matches("error: ");
-        warn(&format!(
-            "bad hook arguments ({first}); failing open (allow)"
-        ));
         let args: Vec<String> = std::env::args_os()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        // Locked mode never falls back to allow, not even on a flag this
+        // binary does not know.
+        if args.iter().any(|a| a == "--managed") {
+            return check_managed::run_bad_args(&args, first);
+        }
+        warn(&format!(
+            "bad hook arguments ({first}); failing open (allow)"
+        ));
         check::record_arg_error(&args, first);
         return ExitCode::SUCCESS;
     }

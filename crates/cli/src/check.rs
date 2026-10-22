@@ -10,24 +10,16 @@ use std::process::ExitCode;
 use saiife_audit::chain::{append_chained, sha256_hex, written_unchained};
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
-use saiifeguard::canon::{expand_glob_partial, PathVars};
+use saiifeguard::canon::PathVars;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
-use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
-    classify, context_from_hook_json_bounded, search_globs, HookContext, PayloadError, ToolCall,
-    MAX_PAYLOAD_BYTES,
+    context_from_hook_json_bounded, HookContext, PayloadError, MAX_PAYLOAD_BYTES,
 };
 
+use crate::eval::{self, Plan, PARSE_MAX_BYTES};
 use crate::paths::path_vars;
 use crate::project::project_packs_known;
 use crate::warn;
-
-/// Memory-safety cap on what is read from stdin. Parsing skips the content
-/// of a `Write`/`Edit` while it extracts the tool, `cwd` and path fields, so
-/// file calls are judged at any size up to this cap; a shell command above
-/// `MAX_PAYLOAD_BYTES` is not judged but its command goes into the audit
-/// record. Above this cap nothing is parsed: a recorded fail-open.
-const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// `cli_packs`: `--pack` ids. The project's own packs are added from the
 /// `.saiife/config.toml` at or above the payload's `cwd`. Only the active
@@ -64,15 +56,15 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
         cli_packs,
     );
-    match classify(&buf, PARSE_MAX_BYTES) {
-        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => fail_open(
+    match eval::plan(&buf) {
+        Plan::TooLarge { command } => fail_open(
             &audit,
             &command,
             &PayloadError::TooLarge {
                 limit: MAX_PAYLOAD_BYTES,
             },
         ),
-        Ok(ToolCall::Shell { command }) => {
+        Plan::Shell { command } => {
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config, building the engine or hashing the policy
             // fails open too.
@@ -80,55 +72,27 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
                 active_engine(&audit, cli_packs).0.evaluate(c)
             })
         }
-        Ok(ToolCall::File {
-            tool,
-            mut paths,
-            write,
-        }) => {
-            if paths.is_empty() && !write {
-                // A search or list tool with neither `path` nor `cwd`
-                // reads the directory the hook runs in.
-                if let Ok(d) = std::env::current_dir() {
-                    paths.push(d.display().to_string());
-                }
-            }
-            if paths.is_empty() {
-                // A write (an apply_patch without file headers, an Edit
-                // without a path): allowed, but never recorded as a judged
-                // allow.
-                audit.write(
-                    "",
-                    DecisionKind::ErrorAllowed,
-                    None,
-                    Some("no path to judge"),
-                );
-                return allow();
-            }
-            let access = if write { Access::Write } else { Access::Read };
-            // Only search tools filter by `glob`/`include`, and only
-            // `read_many_files` names its files by pattern.
-            let filters = search_globs(&buf, PARSE_MAX_BYTES);
-            let expand_paths = tool == "read_many_files";
-            decide(&audit, &paths.join("\n"), hook_exit, |_| {
-                let (engine, vars) = active_engine(&audit, cli_packs);
-                let (targets, overflow) = expand_targets(&vars, &paths, &filters, expand_paths);
-                let d = judge_paths(&engine, access, &targets);
-                // A deny stays; so does a latency fail-open (it ranks above).
-                if overflow && !d.is_deny() && rank(&d) < 3 {
-                    return Decision::Allow {
-                        trace: AllowTrace::Unjudgeable {
-                            reason: "glob too large to judge".into(),
-                        },
-                    };
-                }
-                d
-            })
+        Plan::Files(call) => decide(&audit, &call.input(), hook_exit, |_| {
+            let (engine, vars) = active_engine(&audit, cli_packs);
+            eval::judge_files(&engine, &vars, &call)
+        }),
+        Plan::NoPath => {
+            // A write (an apply_patch without file headers, an Edit
+            // without a path): allowed, but never recorded as a judged
+            // allow.
+            audit.write(
+                "",
+                DecisionKind::ErrorAllowed,
+                None,
+                Some("no path to judge"),
+            );
+            allow()
         }
-        Ok(ToolCall::Other { .. }) => {
+        Plan::Other => {
             audit.write("", DecisionKind::Allow, None, Some("tool not guarded"));
             allow()
         }
-        Err(e) => fail_open(&audit, "", &e),
+        Plan::Unusable(e) => fail_open(&audit, "", &e),
     }
 }
 
@@ -162,7 +126,7 @@ pub fn record_arg_error(args: &[String], error: &str) {
 }
 
 /// The value of `--agent <name>` or `--agent=<name>`.
-fn agent_from_args(args: &[String]) -> Option<&str> {
+pub(crate) fn agent_from_args(args: &[String]) -> Option<&str> {
     args.iter().enumerate().find_map(|(i, a)| {
         if a == "--agent" {
             args.get(i + 1).map(String::as_str)
@@ -231,89 +195,6 @@ fn engine_for(catalog: &Catalog, cli_packs: &[String], cwd: Option<&str>) -> Act
         warnings,
         policy,
     }
-}
-
-/// What a file call reads or writes: its paths, with the patterns of
-/// `read_many_files` (`expand_paths`) expanded, and every file a search
-/// tool's `filters` select under each of its paths (ripgrep semantics: a
-/// filter without `/` matches at any depth, one with `/` is relative to the
-/// root). A pattern that matches nothing is judged as spelled (the shell
-/// would pass it through). When a pattern is too large to expand, the
-/// matches found before the limit are judged along with the pattern as
-/// spelled, and the flag is set.
-fn expand_targets(
-    vars: &PathVars,
-    paths: &[String],
-    filters: &[String],
-    expand_paths: bool,
-) -> (Vec<String>, bool) {
-    let mut out = Vec::new();
-    let mut overflow = false;
-    let mut add = |word: &str, out: &mut Vec<String>| {
-        let (found, over) = expand_glob_partial(word, None, vars);
-        if over {
-            overflow = true;
-        }
-        if found.is_empty() || over {
-            out.push(word.to_string());
-        }
-        out.extend(found.iter().map(|p| p.display().to_string()));
-    };
-    for p in paths {
-        if expand_paths {
-            add(p, &mut out);
-        } else {
-            out.push(p.clone());
-        }
-    }
-    for p in paths {
-        for f in filters {
-            let root = p.trim_end_matches('/');
-            let word = if f.contains('/') {
-                format!("{root}/{f}")
-            } else {
-                format!("{root}/**/{f}")
-            };
-            add(&word, &mut out);
-        }
-    }
-    (out, overflow)
-}
-
-/// How much a file-call result matters when several paths are judged:
-/// a latency fail-open, an unjudgeable path, a carve-out, a plain allow.
-fn rank(d: &Decision) -> u8 {
-    match d {
-        Decision::Allow {
-            trace: AllowTrace::FailedOpenTimeout,
-        } => 3,
-        Decision::Allow {
-            trace: AllowTrace::Unjudgeable { .. },
-        } => 2,
-        Decision::Allow {
-            trace: AllowTrace::AllowRule { .. },
-        } => 1,
-        _ => 0,
-    }
-}
-
-/// Judge every path of one file tool call: any deny denies the call.
-/// Otherwise the call is a fail-open if any path ran out of budget or could
-/// not be resolved, else an allow (by a carve-out, if one applied).
-fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decision {
-    let mut result = Decision::Allow {
-        trace: AllowTrace::NoMatch,
-    };
-    for p in paths {
-        let d = engine.evaluate_path(access, p);
-        if d.is_deny() {
-            return d;
-        }
-        if rank(&d) > rank(&result) {
-            result = d;
-        }
-    }
-    result
 }
 
 /// The payload could not be judged: allow, and record why.
