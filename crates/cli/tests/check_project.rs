@@ -63,7 +63,8 @@ fn opt_in_pack_from_project_config_applies_in_subdirectories() {
     let (code, stderr) = check(audit.path(), &p.path().join("src/deep"), DROP);
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("BLOCKED by db.postgres"), "{stderr}");
-    let rec = &read_all(audit.path()).records[0];
+    let recs = read_all(audit.path()).records;
+    let rec = recs.iter().find(|r| !r.is_bookkeeping()).unwrap();
     assert_eq!(rec.decision, DecisionKind::Deny);
     assert_eq!(rec.pack.as_deref(), Some("db.postgres"));
 }
@@ -113,4 +114,150 @@ fn oversized_project_config_fails_open_to_default_packs() {
     assert!(stderr.contains("default packs only"), "{stderr}");
     let (code, _) = check(audit.path(), p.path(), DROP);
     assert_eq!(code, 0, "opt-in pack from the oversized file is not loaded");
+}
+
+/// Run the hook in `cwd`, killing it after 30 s; returns its exit code, how
+/// long it took, and the `policy` of the guard record it wrote.
+fn timed_check(audit: &Path, cwd: &Path, cmd: &str) -> (i32, std::time::Duration, String) {
+    let payload = serde_json::json!({
+        "session_id": "s",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": cmd }
+    })
+    .to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut command, audit);
+    let start = std::time::Instant::now();
+    let mut child = command
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let took = start.elapsed();
+    let policy = read_all(audit)
+        .records
+        .iter()
+        .rev()
+        .find(|r| !r.is_bookkeeping())
+        .and_then(|r| r.policy.clone())
+        .unwrap_or_default();
+    (status.code().unwrap_or(-1), took, policy)
+}
+
+/// An oversized config is refused by its size before a byte is read (so
+/// any size costs the same): the hook answers well inside its budget and
+/// still records a policy.
+#[test]
+fn oversized_config_does_not_delay_hook() {
+    let audit = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    std::fs::create_dir(p.path().join(".saiife")).unwrap();
+    let f = std::fs::File::create(p.path().join(".saiife/config.toml")).unwrap();
+    f.set_len(64 * 1024 + 1).unwrap();
+    drop(f);
+    let (code, took, policy) = timed_check(audit.path(), p.path(), "rm -rf /");
+    assert_eq!(code, 2, "default-on packs still deny");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "hook took {took:?}"
+    );
+    assert!(policy.starts_with("sha256:"), "{policy:?}");
+}
+
+/// A symlinked config (staying inside the project) is followed, for the packs and the policy hash
+/// alike: the policy is that of a plain file with the target's bytes. A
+/// link to an oversized file is refused unread, without delay.
+#[cfg(unix)]
+#[test]
+fn symlinked_config_is_followed_for_policy() {
+    let audit = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    // Targets inside the project (a link leading outside is refused).
+    let inside = p.path().join("other");
+    std::fs::create_dir(&inside).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let _ = &outside;
+    let a = "packs = [\"db.postgres\"]\n";
+    std::fs::write(inside.join("a.toml"), a).unwrap();
+    std::fs::write(inside.join("b.toml"), "packs = []\n").unwrap();
+    std::fs::create_dir(p.path().join(".saiife")).unwrap();
+    let link = p.path().join(".saiife/config.toml");
+    std::os::unix::fs::symlink(inside.join("a.toml"), &link).unwrap();
+    let (code, took, via_a) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(code, 2, "the linked config's opt-in pack is loaded");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "hook took {took:?}"
+    );
+    assert!(via_a.starts_with("sha256:"), "{via_a:?}");
+
+    std::fs::remove_file(&link).unwrap();
+    std::fs::write(&link, a).unwrap();
+    let (_, _, plain_a) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(via_a, plain_a, "the target's bytes are hashed");
+
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(inside.join("b.toml"), &link).unwrap();
+    let (_, _, via_b) = timed_check(audit.path(), p.path(), DROP);
+    assert_ne!(via_a, via_b, "another target, another policy");
+
+    let big = inside.join("big.toml");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&big, &link).unwrap();
+    let (code, took, via_big) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(code, 0, "an oversized target is not loaded");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "hook took {took:?}"
+    );
+    std::fs::remove_file(&link).unwrap();
+    std::fs::File::create(&link)
+        .unwrap()
+        .set_len(64 * 1024 + 1)
+        .unwrap();
+    let (_, _, plain_big) = timed_check(audit.path(), p.path(), DROP);
+    assert_eq!(via_big, plain_big, "one marker for every unreadable config");
+}
+
+/// A config symlinked to a file outside the project is never opened: its
+/// content (here a parse-failing canary) reaches neither stderr nor the
+/// packs, and the hook still answers.
+#[cfg(unix)]
+#[test]
+fn symlink_outside_project_is_refused_without_leaking() {
+    let audit = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("id_rsa");
+    std::fs::write(&secret, "SECRET-CANARY-not-toml = = =\n").unwrap();
+    std::fs::create_dir(p.path().join(".saiife")).unwrap();
+    std::os::unix::fs::symlink(&secret, p.path().join(".saiife/config.toml")).unwrap();
+    let (code, stderr) = check(audit.path(), p.path(), "ls");
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("SECRET-CANARY"), "{stderr}");
+    assert!(stderr.contains("outside the project"), "{stderr}");
 }

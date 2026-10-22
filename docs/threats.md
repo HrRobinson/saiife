@@ -95,3 +95,10 @@ These apply to every pack:
 - zsh 5.9 and dash read three such here-document shapes differently from
   bash. There, saiife may block a command that those shells would treat as
   plain text. This is the safe direction.
+- In developer mode the audit chain has no signing key. Anyone with your user's
+  rights can rewrite the whole log and its chain consistently, and
+  `saiife audit verify` will call it intact. It catches accidental edits and
+  clumsy tampering, not a deliberate rewrite.
+- Cutting off the newest records cannot be detected without a checkpoint kept
+  somewhere the agent cannot write. That needs locked mode (v2) with a forwarded
+  checkpoint; developer mode has none.

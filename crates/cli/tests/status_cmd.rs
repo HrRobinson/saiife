@@ -621,6 +621,9 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
                 pack: None,
                 rule: None,
                 reason: None,
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
         );

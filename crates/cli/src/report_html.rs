@@ -1,7 +1,7 @@
 //! Render a [`Report`] as one self-contained HTML page: inline CSS, no
 //! script, no external resource. Every printed field goes through [`escape`].
 
-use crate::report::{PackView, ProjectPacksView, Report, Row};
+use crate::report::{HostMode, PackView, PolicyPeriod, ProjectPacksView, Report, Row};
 use crate::text::sanitize;
 
 const CSS: &str = "\
@@ -163,6 +163,69 @@ fn summary(r: &Report) -> String {
     out
 }
 
+fn chain_section(r: &Report) -> String {
+    let class = if r.chain.starts_with("intact") || r.chain.starts_with("no chained") {
+        ""
+    } else {
+        " class=\"bad\""
+    };
+    format!(
+        "<p><span{class}>{}</span></p>\n<p>Last checkpoint: {}</p>\n",
+        escape(&r.chain),
+        escape(&r.last_checkpoint)
+    )
+}
+
+fn simple_table(cols: &[&str], rows: Vec<Vec<String>>) -> String {
+    let mut out = String::from("<table>\n<thead><tr>");
+    for c in cols {
+        out.push_str(&format!("<th>{}</th>", escape(c)));
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for r in rows {
+        out.push_str(&format!("<tr>{}</tr>\n", r.concat()));
+    }
+    out.push_str("</tbody>\n</table>\n");
+    out
+}
+
+fn policy_section(p: &[PolicyPeriod]) -> String {
+    if p.is_empty() {
+        return "<p>No policy recorded in this period.</p>\n".to_string();
+    }
+    simple_table(
+        &["Policy", "From (UTC)", "To (UTC)", "Records"],
+        p.iter()
+            .map(|x| {
+                vec![
+                    cell(None, &x.policy),
+                    cell(None, &x.from),
+                    cell(None, &x.to),
+                    cell(None, &x.records.to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn mode_section(m: &[HostMode]) -> String {
+    if m.is_empty() {
+        return "<p>No records in this period.</p>\n".to_string();
+    }
+    simple_table(
+        &["Host", "Mode", "Records"],
+        m.iter()
+            .map(|x| {
+                vec![
+                    cell(None, &x.host),
+                    cell(None, &x.mode),
+                    cell(None, &x.records.to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
 pub fn render(r: &Report) -> String {
     let blocked = or_none(
         &r.blocked_rows,
@@ -273,6 +336,21 @@ pub fn render(r: &Report) -> String {
         &packs,
     ));
     out.push_str(&section(
+        "Audit chain",
+        "Whether the log still hashes together as written. In developer mode this catches accidental edits, not deliberate rewrites.",
+        &chain_section(r),
+    ));
+    out.push_str(&section(
+        "Policy in force",
+        "The policy each run of records was made under, oldest first.",
+        &policy_section(&r.policies),
+    ));
+    out.push_str(&section(
+        "Mode per host",
+        "Which mode each machine recorded under. Older records do not say.",
+        &mode_section(&r.modes),
+    ));
+    out.push_str(&section(
         "Every decision",
         "The complete list, newest first.",
         &all,
@@ -320,6 +398,10 @@ mod tests {
             packs: vec![],
             log_problems: vec![],
             blocked_only: false,
+            chain: String::new(),
+            last_checkpoint: String::new(),
+            policies: vec![],
+            modes: vec![],
         }
     }
 

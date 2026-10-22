@@ -5,8 +5,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chain;
 pub mod mask;
 pub mod record;
 pub mod store;
+pub mod verify;
 
 pub use record::{DecisionKind, NewRecord, Record};
+pub use verify::{verify, Break, BreakKind, VerifyReport};

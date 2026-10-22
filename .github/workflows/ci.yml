@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -55,3 +58,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
       - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh
+
+  # The released 0.1.0 binary must still read a v2 (chained) log: no skipped
+  # lines, one row per fixture line. 0.1.0 ignores a relative SAIIFE_AUDIT_DIR,
+  # so the path is absolute.
+  compat-v010:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 0.1.0 reads a v2 log
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          asset=saiife-0.1.0-x86_64-unknown-linux-musl
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$work/$asset.tar.gz" \
+            "https://github.com/HrRobinson/saiife/releases/download/v0.1.0/$asset.tar.gz"
+          echo "3f5b0d344794d880f87a62c4c30d96166d885046d688e7d09e9312b09a6e1e93  $work/$asset.tar.gz" | sha256sum -c -
+          tar -xzf "$work/$asset.tar.gz" -C "$work" --strip-components=1 "$asset/saiife"
+          status=0
+          SAIIFE_AUDIT_DIR="$PWD/crates/audit/tests/fixtures/v2" HOME="$(mktemp -d)" \
+            "$work/saiife" audit >"$work/out" 2>"$work/err" || status=$?
+          cat "$work/out"; cat "$work/err"
+          test "$status" -eq 0
+          # 0.1.0 wording: "N unreadable lines skipped" (stdout) and
+          # "... unreadable log lines were skipped ..." (stderr).
+          if grep -q unreadable "$work/out" "$work/err"; then
+            echo "0.1.0 reported unreadable lines"
+            exit 1
+          fi
+          rows="$(grep -c '^2026-' "$work/out")"
+          lines="$(wc -l < crates/audit/tests/fixtures/v2/2026-11.jsonl)"
+          test "$rows" -eq "$lines"

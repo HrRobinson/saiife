@@ -18,7 +18,7 @@ sandbox="$(mktemp -d)"
 sandbox="$(cd "$sandbox" && pwd -P)"
 real_home="${HOME:-}"
 # Called from the EXIT trap below.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
     echo "sandbox kept: $sandbox"

@@ -35,6 +35,104 @@ pub struct Report {
     pub log_problems: Vec<String>,
     /// True when `--blocked` filtered the records, so fail-open events are not shown.
     pub blocked_only: bool,
+    /// One-line chain status; set by the caller from `verify`.
+    pub chain: String,
+    /// Minute time of the newest checkpoint record, or `none`.
+    pub last_checkpoint: String,
+    pub policies: Vec<PolicyPeriod>,
+    pub modes: Vec<HostMode>,
+}
+
+/// A run of consecutive records under one policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyPeriod {
+    pub policy: String,
+    pub from: String,
+    pub to: String,
+    pub records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMode {
+    pub host: String,
+    pub mode: String,
+    pub records: usize,
+}
+
+/// The one-line chain status for the report.
+pub fn chain_line(v: &saiife_audit::VerifyReport) -> String {
+    if !v.read_errors.is_empty() {
+        return "could not be read".to_string();
+    }
+    if let Some(b) = v.first_break() {
+        return format!("broken: {} line {}: {}", b.file, b.line, b.kind.describe());
+    }
+    if v.chained == 0 {
+        return "no chained records yet".to_string();
+    }
+    format!("intact ({} records)", v.chained)
+}
+
+/// Time of the newest checkpoint record among `records` (all kinds).
+pub fn last_checkpoint(records: &[Record]) -> String {
+    records
+        .iter()
+        .filter(|r| r.kind() == "checkpoint")
+        .filter_map(|r| r.timestamp())
+        .max()
+        .map_or_else(|| "none".to_string(), fmt_minute)
+}
+
+fn short_policy(p: &str) -> String {
+    let hex = p.strip_prefix("sha256:").unwrap_or(p);
+    format!("sha256:{}", hex.chars().take(12).collect::<String>())
+}
+
+fn policy_periods(sorted_asc: &[&Record]) -> Vec<PolicyPeriod> {
+    let mut out: Vec<PolicyPeriod> = Vec::new();
+    for r in sorted_asc {
+        let Some(p) = r.policy.as_deref() else {
+            continue;
+        };
+        let p = short_policy(p);
+        let at = r.timestamp().map(fmt_minute).unwrap_or_default();
+        match out.last_mut() {
+            Some(last) if last.policy == p => {
+                last.to = at;
+                last.records += 1;
+            }
+            _ => out.push(PolicyPeriod {
+                policy: p,
+                from: at.clone(),
+                to: at,
+                records: 1,
+            }),
+        }
+    }
+    out
+}
+
+fn host_modes(records: &[&Record]) -> Vec<HostMode> {
+    let mut map: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for r in records {
+        let host = r
+            .host
+            .as_deref()
+            .map_or_else(|| "unknown".to_string(), |h| h.chars().take(12).collect());
+        let mode = r.mode.clone().unwrap_or_else(|| "unknown".to_string());
+        *map.entry((host, mode)).or_default() += 1;
+    }
+    map.into_iter()
+        .map(|((host, mode), records)| HostMode {
+            host,
+            mode,
+            records,
+        })
+        .collect()
+}
+
+fn is_blocked(d: DecisionKind) -> bool {
+    matches!(d, DecisionKind::Deny | DecisionKind::ErrorDenied)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +185,11 @@ fn decision_label(d: DecisionKind) -> &'static str {
         DecisionKind::Allow => "Allowed",
         DecisionKind::Deny => "Blocked",
         DecisionKind::ErrorAllowed => "Allowed unchecked (fail-open)",
+        DecisionKind::ErrorDenied => "Blocked (error)",
+        DecisionKind::Ask => "Asked",
+        DecisionKind::Approved => "Approved",
+        DecisionKind::Rejected => "Rejected",
+        DecisionKind::Expired => "Expired",
         DecisionKind::Unknown => "Other",
     }
 }
@@ -230,16 +333,21 @@ pub fn build(
     };
 
     let all_rows: Vec<Row> = sorted.iter().map(|r| row(r, packs)).collect();
-    let rows_of = |kind: DecisionKind| -> Vec<Row> {
+    let rows_of = |want: fn(DecisionKind) -> bool| -> Vec<Row> {
         sorted
             .iter()
             .zip(&all_rows)
-            .filter(|(r, _)| r.decision == kind)
+            .filter(|(r, _)| want(r.decision))
             .map(|(_, row)| row.clone())
             .collect()
     };
-    let blocked_rows = rows_of(DecisionKind::Deny);
-    let fail_open_rows = rows_of(DecisionKind::ErrorAllowed);
+    let blocked_rows = rows_of(is_blocked);
+    let fail_open_rows = rows_of(|d| d == DecisionKind::ErrorAllowed);
+
+    let mut ascending: Vec<&Record> = sorted.clone();
+    ascending.reverse();
+    let policies = policy_periods(&ascending);
+    let modes = host_modes(records);
 
     let projects: BTreeSet<&str> = records.iter().map(|r| r.project.as_str()).collect();
     let agents: BTreeSet<String> = records.iter().map(|r| agent_label(&r.agent)).collect();
@@ -263,6 +371,10 @@ pub fn build(
         packs: projects.iter().map(|p| project_view(p, packs)).collect(),
         log_problems: vec![],
         blocked_only: false,
+        chain: "no chained records yet".to_string(),
+        last_checkpoint: "none".to_string(),
+        policies,
+        modes,
     }
 }
 
@@ -292,6 +404,9 @@ mod tests {
                 pack,
                 rule: None,
                 reason: Some("why"),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             at,
@@ -404,7 +519,7 @@ mod tests {
         );
         let json = serde_json::to_string(&base)
             .unwrap()
-            .replace("\"deny\"", "\"error_denied\"");
+            .replace("\"deny\"", "\"later\"");
         let parsed: Record = serde_json::from_str(&json).unwrap();
         let r = build(
             &[&parsed],
@@ -643,5 +758,183 @@ mod tests {
         let now = datetime!(2026-10-18 11:00 +02:00);
         let r = build(&[], &packs, vec![], None, now);
         assert_eq!(r.generated, "2026-10-18 09:00 UTC");
+    }
+
+    fn with(mut r: Record, policy: Option<&str>, host: Option<&str>, mode: Option<&str>) -> Record {
+        r.policy = policy.map(str::to_string);
+        r.host = host.map(str::to_string);
+        r.mode = mode.map(str::to_string);
+        r
+    }
+
+    #[test]
+    fn report_shows_chain_status() {
+        use saiife_audit::chain::append_chained;
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            chain_line(&saiife_audit::verify(dir.path())),
+            "no chained records yet"
+        );
+        for i in 0..3 {
+            let r = rec(
+                "/p",
+                &format!("echo secret-{i}"),
+                DecisionKind::Allow,
+                None,
+                datetime!(2026-10-13 08:00:00 UTC),
+            );
+            append_chained(dir.path(), r).unwrap();
+        }
+        let line = chain_line(&saiife_audit::verify(dir.path()));
+        assert!(line.starts_with("intact ("), "{line}");
+        assert!(line.contains("records)"), "{line}");
+        let f = dir.path().join("2026-10.jsonl");
+        let text = std::fs::read_to_string(&f).unwrap();
+        std::fs::write(&f, text.replace("echo secret-1", "echo edited-1")).unwrap();
+        let line = chain_line(&saiife_audit::verify(dir.path()));
+        assert!(line.starts_with("broken: 2026-10.jsonl line "), "{line}");
+        assert!(!line.contains("echo"), "no record content: {line}");
+        let bad = saiife_audit::VerifyReport {
+            read_errors: vec!["x".into()],
+            ..Default::default()
+        };
+        assert_eq!(chain_line(&bad), "could not be read");
+    }
+
+    #[test]
+    fn last_checkpoint_defaults_to_none() {
+        let mut c = rec(
+            "/p",
+            "",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:05:09 UTC),
+        );
+        c.kind = Some("checkpoint".into());
+        let g = rec(
+            "/p",
+            "x",
+            DecisionKind::Allow,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        );
+        assert_eq!(last_checkpoint(std::slice::from_ref(&g)), "none");
+        assert_eq!(last_checkpoint(&[g, c]), "2026-10-13 08:05 UTC");
+    }
+
+    #[test]
+    fn policy_periods_split_on_change() {
+        let (packs, _) = builtin_packs();
+        let a = "sha256:aaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let b = "sha256:cccccccccccc0000000000000000000000000000000000000000000000000000";
+        let rs = [
+            with(
+                rec(
+                    "/p",
+                    "1",
+                    DecisionKind::Allow,
+                    None,
+                    datetime!(2026-10-13 08:00:00 UTC),
+                ),
+                Some(a),
+                None,
+                None,
+            ),
+            with(
+                rec(
+                    "/p",
+                    "2",
+                    DecisionKind::Allow,
+                    None,
+                    datetime!(2026-10-13 09:00:00 UTC),
+                ),
+                Some(a),
+                None,
+                None,
+            ),
+            with(
+                rec(
+                    "/p",
+                    "3",
+                    DecisionKind::Allow,
+                    None,
+                    datetime!(2026-10-13 10:00:00 UTC),
+                ),
+                Some(b),
+                None,
+                None,
+            ),
+            with(
+                rec(
+                    "/p",
+                    "4",
+                    DecisionKind::Allow,
+                    None,
+                    datetime!(2026-10-13 11:00:00 UTC),
+                ),
+                Some(a),
+                None,
+                None,
+            ),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(r.policies.len(), 3);
+        assert_eq!(r.policies[0].policy, "sha256:aaaaaaaaaaaa");
+        assert_eq!(r.policies[0].from, "2026-10-13 08:00 UTC");
+        assert_eq!(r.policies[0].to, "2026-10-13 09:00 UTC");
+        assert_eq!(r.policies[0].records, 2);
+        assert_eq!(r.policies[1].policy, "sha256:cccccccccccc");
+        assert_eq!(r.policies[2].policy, "sha256:aaaaaaaaaaaa");
+        assert_eq!(r.policies[2].from, "2026-10-13 11:00 UTC");
+    }
+
+    #[test]
+    fn modes_per_host() {
+        let (packs, _) = builtin_packs();
+        let at = datetime!(2026-10-13 08:00:00 UTC);
+        let rs = [
+            with(
+                rec("/p", "1", DecisionKind::Allow, None, at),
+                None,
+                None,
+                None,
+            ),
+            with(
+                rec("/p", "2", DecisionKind::Allow, None, at),
+                None,
+                None,
+                None,
+            ),
+            with(
+                rec("/p", "3", DecisionKind::Allow, None, at),
+                None,
+                Some("0123456789abcdef"),
+                Some("developer"),
+            ),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!(r.modes.len(), 2);
+        let unknown = r.modes.iter().find(|m| m.host == "unknown").unwrap();
+        assert_eq!((unknown.mode.as_str(), unknown.records), ("unknown", 2));
+        let known = r.modes.iter().find(|m| m.host == "0123456789ab").unwrap();
+        assert_eq!((known.mode.as_str(), known.records), ("developer", 1));
+    }
+
+    #[test]
+    fn error_denied_counts_as_blocked() {
+        let (packs, _) = builtin_packs();
+        let rs = [rec(
+            "/p",
+            "curl x",
+            DecisionKind::ErrorDenied,
+            None,
+            datetime!(2026-10-13 08:00:00 UTC),
+        )];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
+        assert_eq!((r.blocked, r.blocked_rows.len()), (1, 1));
+        assert_eq!(r.blocked_rows[0].decision, "Blocked (error)");
     }
 }

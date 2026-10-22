@@ -46,6 +46,7 @@ fn check_bytes(audit_dir: &Path, agent: &str, stdin: &[u8]) -> (Out, Vec<Record>
     let recs = read_all(audit_dir)
         .records
         .into_iter()
+        .filter(|r| !r.is_bookkeeping())
         .map(|r| home.spelled_record(r))
         .collect();
     (out, recs)

@@ -13,6 +13,75 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
 
+/// `saiife audit verify`: exit 0 intact, 1 broken, 2 unreadable. Prints
+/// counts and file names only, never record content.
+pub fn verify() -> ExitCode {
+    let Some(dir) = store::default_dir() else {
+        outln!("audit chain: could not read the log: no audit directory");
+        return ExitCode::from(2);
+    };
+    let report = saiife_audit::verify(&dir);
+    outln!("{}", render_verify(&report));
+    ExitCode::from(report.exit_code())
+}
+
+pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
+    const MAX_BREAKS: usize = 20;
+    if !r.read_errors.is_empty() {
+        let errs: Vec<String> = r.read_errors.iter().map(|e| sanitize(e)).collect();
+        return format!("audit chain: could not read the log: {}", errs.join("; "));
+    }
+    let mut out = String::new();
+    if r.breaks.is_empty() {
+        out.push_str("audit chain: intact\n");
+    } else {
+        let n = r.breaks.len();
+        let s = if n == 1 { "" } else { "s" };
+        out.push_str(&format!("audit chain: BROKEN ({n} problem{s})\n"));
+        for b in r.breaks.iter().take(MAX_BREAKS) {
+            let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
+            out.push_str(&format!(
+                "  {} line {}{}: {}\n",
+                sanitize(&b.file),
+                b.line,
+                seq,
+                b.kind.describe()
+            ));
+        }
+        if n > MAX_BREAKS {
+            out.push_str(&format!("  \u{2026} and {} more\n", n - MAX_BREAKS));
+        }
+    }
+    if r.chained > 0 {
+        let head = r.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
+        let chain = r
+            .chain
+            .as_deref()
+            .map(|c| {
+                format!(
+                    ", chain {}\u{2026}",
+                    sanitize(&c.chars().take(6).collect::<String>())
+                )
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  records: {} chained (seq 0\u{2013}{head}){chain}\n",
+            r.chained
+        ));
+    }
+    if !r.v1_files.is_empty() {
+        let files: Vec<String> = r.v1_files.iter().map(|f| sanitize(f)).collect();
+        out.push_str(&format!("  not chained (v1): {}\n", files.join(", ")));
+    }
+    if r.breaks.is_empty() && r.checkpoints == 0 {
+        out.push_str(
+            "  developer mode: no signing key, so this catches accidental edits, not deliberate rewrites.\n",
+        );
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 const INPUT_WIDTH: usize = 60;
 
 /// The one error text for a bad `--since` value.
@@ -44,7 +113,7 @@ pub fn parse_since(s: &str) -> Result<Duration, String> {
 
 pub fn render_table(records: &[&Record]) -> String {
     let row = |time: &str, agent: &str, decision: &str, pack: &str, input: &str| {
-        format!("{time:<19}  {agent:<7}  {decision:<9}  {pack:<16}  {input}\n")
+        format!("{time:<19}  {agent:<7}  {decision:<15}  {pack:<16}  {input}\n")
     };
     let mut out = row("TIME", "AGENT", "DECISION", "PACK", "INPUT");
     let (mut blocked, mut fail_open) = (0, 0);
@@ -59,6 +128,14 @@ pub fn render_table(records: &[&Record]) -> String {
                 fail_open += 1;
                 "FAIL-OPEN"
             }
+            DecisionKind::ErrorDenied => {
+                blocked += 1;
+                "blocked (error)"
+            }
+            DecisionKind::Ask => "asked",
+            DecisionKind::Approved => "approved",
+            DecisionKind::Rejected => "rejected",
+            DecisionKind::Expired => "expired",
             DecisionKind::Unknown => "OTHER",
         };
         let time = sanitize(r.ts.get(..19).unwrap_or(&r.ts)).replace('T', " ");
@@ -211,6 +288,8 @@ pub fn run(
         }
         let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
+        model.chain = report::chain_line(&saiife_audit::verify(&dir));
+        model.last_checkpoint = report::last_checkpoint(&all.records);
         if all.skipped_lines > 0 {
             model.log_problems.push(format!(
                 "{} unreadable log lines were skipped; the log may be damaged or edited.",
@@ -280,6 +359,9 @@ mod tests {
                 pack,
                 rule: None,
                 reason: Some("why"),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
@@ -372,6 +454,9 @@ mod tests {
                 pack: Some(&format!("pk{evil}")),
                 rule: None,
                 reason: Some(&format!("why{evil}\u{2066}")),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
@@ -406,5 +491,19 @@ mod tests {
         let input_part = out.lines().nth(1).unwrap().rsplit("  ").next().unwrap();
         assert_eq!(input_part.chars().count(), INPUT_WIDTH);
         assert!(input_part.starts_with("\\x1b\\x1b"));
+    }
+
+    #[test]
+    fn error_denied_is_blocked_and_the_table_stays_aligned() {
+        let d = rec("curl x", DecisionKind::ErrorDenied, Some("core.network"));
+        let a = rec("ls", DecisionKind::Allow, Some("core.network"));
+        let out = render_table(&[&d, &a]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].contains("blocked (error)"));
+        assert_eq!(lines[3], "2 decisions · 1 blocked · 0 fail-open");
+        let col = |l: &str, needle: &str| l.find(needle).unwrap();
+        let pack = col(lines[0], "PACK");
+        assert_eq!(col(lines[1], "core.network"), pack);
+        assert_eq!(col(lines[2], "core.network"), pack);
     }
 }

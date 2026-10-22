@@ -97,7 +97,10 @@ enum Cmd {
         id: Option<String>,
     },
     /// Show the audit log: every allowed, blocked and fail-open decision.
+    #[command(args_conflicts_with_subcommands = true)]
     Audit {
+        #[command(subcommand)]
+        action: Option<AuditAction>,
         /// Only records newer than this, e.g. 30m, 24h, 7d.
         #[arg(long)]
         since: Option<String>,
@@ -114,6 +117,12 @@ enum Cmd {
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Check that the audit log has not been edited, reordered or cut.
+    Verify,
 }
 
 fn main() -> ExitCode {
@@ -168,6 +177,11 @@ fn main() -> ExitCode {
         Cmd::Status => status_cmd::run(&packs),
         Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
+            action: Some(AuditAction::Verify),
+            ..
+        } => audit_cmd::verify(),
+        Cmd::Audit {
+            action: None,
             since,
             project,
             agent,

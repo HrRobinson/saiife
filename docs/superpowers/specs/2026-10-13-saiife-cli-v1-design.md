@@ -194,15 +194,27 @@ starting reference.
 ### 6.2 Record
 
 ```json
-{"v":1,"ts":"2026-10-13T08:14:02.381Z","agent":"claude","project":"/home/u/app",
- "session":"…","tool":"Bash","input":"rm -rf [MASKED]","decision":"deny",
- "pack":"core.filesystem","rule":"rm-root","reason":"…","saiife":"1.0.0"}
+{"v":2,"seq":2,"prev":"e02eaeebda13ea68d13c18a48bb6e115dc61586b53f44bf231d385f6a2105cca",
+ "ts":"2026-10-13T08:14:02.381Z","kind":"guard",
+ "host":"a3b5bcb8ac41efac99df55fb3706b0a81ee27d5765626a60004c981aad009345",
+ "uid":1000,"user":"u","mode":"developer","policy":"sha256:e5f8…",
+ "agent":"claude","project":"/home/u/app","session":"…","tool":"Bash",
+ "input":"rm -rf [MASKED]","decision":"deny","pack":"core.filesystem",
+ "rule":"rm-root","reason":"…","permission_mode":"default","saiife":"0.2.0"}
 ```
 
-- `decision` ∈ `allow` | `deny` | `error_allowed`. `error_allowed` records a
+Records written by 0.1.x are `"v":1` lines without `seq`, `prev`, `kind`,
+`host`, `uid`, `user`, `mode`, `policy` and `permission_mode`; readers accept
+both. The v2 fields are defined in the v2 spec §8.5. From v2 on, each record carries the SHA-256 of the
+line before it in `prev` (a hash chain, checked by `saiife audit verify`).
+
+- `decision` ∈ `allow` | `deny` | `error_allowed` | `error_denied` | `ask` |
+  `approved` | `rejected` | `expired` (v2 spec §8.5). `error_allowed` records a
   fail-open (crash, parse failure, budget exceeded), so an auditor can see when
-  protection was not effective. (v2 locked mode adds `error_denied`, §9.1;
-  readers must tolerate unknown decision values.)
+  protection was not effective; `error_denied` is its fail-closed counterpart
+  in v2 locked mode (§9.1); `ask` … `expired` are the approval flow (v2).
+  Developer mode writes `allow`, `deny` and `error_allowed`. Readers must
+  tolerate unknown decision values.
 - `input` is the command for shell tools and the path for read tools.
 
 ### 6.3 Masking

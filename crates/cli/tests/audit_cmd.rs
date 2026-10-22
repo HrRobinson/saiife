@@ -18,6 +18,9 @@ fn seed(dir: &std::path::Path) {
                 pack,
                 rule: None,
                 reason: Some("r"),
+                mode: "developer",
+                policy: None,
+                permission_mode: None,
             },
             "0.1.0",
             at,
@@ -153,7 +156,7 @@ fn unknown_decision_is_shown_as_other() {
         now.day()
     );
     let line = format!(
-        r#"{{"v":1,"ts":"{ts}","agent":"claude","project":"/p","tool":"Bash","input":"curl evil","decision":"error_denied","saiife":"2.0.0"}}"#
+        r#"{{"v":1,"ts":"{ts}","agent":"claude","project":"/p","tool":"Bash","input":"curl evil","decision":"later","saiife":"2.0.0"}}"#
     );
     std::fs::write(dir.path().join(format!("{}.jsonl", &ts[..7])), line + "\n").unwrap();
     Command::cargo_bin("saiife")
