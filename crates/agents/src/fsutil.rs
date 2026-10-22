@@ -138,6 +138,81 @@ pub fn remove(project: &Path, rel: &str) -> Result<(), AgentError> {
     }
 }
 
+/// A machine-wide managed config (locked mode, spec §8.3): its text, or
+/// `None` if it does not exist. The open does not follow a symlink, and only
+/// a regular file is read, so a planted link cannot redirect saiife.
+pub fn read_managed(path: &Path) -> Result<Option<String>, AgentError> {
+    use std::io::Read;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+    }
+    let mut f = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(not_regular(path));
+            }
+            return Err(io_err(path)(e));
+        }
+    };
+    let meta = f.metadata().map_err(io_err(path))?;
+    if !meta.is_file() {
+        return Err(not_regular(path));
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text).map_err(io_err(path))?;
+    Ok(Some(text))
+}
+
+fn not_regular(path: &Path) -> AgentError {
+    AgentError::Layout {
+        path: path.to_path_buf(),
+        detail: "not a regular file (symlinks are not followed)".to_string(),
+    }
+}
+
+/// Writes a managed config: a temp file next to it at mode 0644 (set on the
+/// open handle), synced, then renamed over the old one. A symlink at `path`
+/// is refused, never followed. The directory must exist.
+pub fn write_managed(path: &Path, contents: &str) -> Result<Change, AgentError> {
+    let existed = match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => true,
+        Ok(_) => return Err(not_regular(path)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(io_err(path)(e)),
+    };
+    let parent = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_err(parent))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .map_err(io_err(path))?;
+    }
+    tmp.write_all(contents.as_bytes()).map_err(io_err(path))?;
+    tmp.as_file().sync_all().map_err(io_err(path))?;
+    tmp.persist(path).map_err(|e| io_err(path)(e.error))?;
+    sync_dir(parent);
+    Ok(if existed {
+        Change::Updated
+    } else {
+        Change::Created {
+            created_dirs: Vec::new(),
+        }
+    })
+}
+
 /// Create `dir` and its missing ancestors; return the ones created, relative
 /// to `project`, outermost first.
 fn create_dirs(project: &Path, dir: &Path) -> Result<Vec<String>, AgentError> {

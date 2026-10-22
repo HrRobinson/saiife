@@ -12,9 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod default_config;
+pub mod fsops;
 pub mod host;
+pub mod install;
 pub mod layout;
 pub mod supported;
+pub mod uninstall;
 pub mod unit;
 
 pub use host::{

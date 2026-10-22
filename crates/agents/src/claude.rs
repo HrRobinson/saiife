@@ -30,6 +30,31 @@ pub const MANAGED_DIRS: &[&str] = &[
     "/Library/Application Support/ClaudeCode",
 ];
 
+/// The managed drop-in `/etc/claude-code/managed-settings.d/50-saiife.json`
+/// (locked mode), byte for byte spec §8.3.
+const MANAGED_SETTINGS: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*",
+        "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ],
+    "ConfigChange": [
+      { "hooks": [ { "type": "command",
+                     "command": "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude --event config-change",
+                     "timeout": 10, "onFailure": "block" } ] }
+    ]
+  },
+  "disableAllHooks": false
+}
+"#;
+
+/// The whole managed drop-in saiife writes for Claude Code (spec §8.3).
+pub fn managed_settings() -> &'static str {
+    MANAGED_SETTINGS
+}
+
 fn group() -> Value {
     json!({
         "matcher": MATCHER,

@@ -57,6 +57,14 @@ pub struct ManagedAgent {
     pub created_file: bool,
 }
 
+/// `user` was added to the supplementary group `group`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Membership {
+    pub user: String,
+    pub group: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Installed {
@@ -71,6 +79,11 @@ pub struct Installed {
     pub users: Vec<String>,
     /// Only what install created, in creation order.
     pub groups: Vec<String>,
+    /// Supplementary group memberships install added (`saiife` in
+    /// `saiife-audit`), only when install created the user or the group, so
+    /// the membership is known to be new.
+    #[serde(default)]
+    pub memberships: Vec<Membership>,
     /// Only what install created, in creation order.
     pub dirs: Vec<PathBuf>,
     pub files: Vec<InstalledFile>,
@@ -203,6 +216,10 @@ mod tests {
             vault_key: VaultKeyMode::File,
             users: vec!["saiife".into()],
             groups: vec!["saiife".into(), "saiife-audit".into()],
+            memberships: vec![Membership {
+                user: "saiife".into(),
+                group: "saiife-audit".into(),
+            }],
             dirs: vec!["/opt/saiife".into(), "/opt/saiife/bin".into()],
             files: vec![
                 InstalledFile {
@@ -247,6 +264,7 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("vault_key = \"file\""), "{text}");
         assert!(text.contains("kind = \"vault_key\""), "{text}");
+        assert!(text.contains("[[memberships]]"), "{text}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

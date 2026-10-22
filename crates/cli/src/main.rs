@@ -9,6 +9,7 @@
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
+//! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +32,7 @@ mod project;
 mod report;
 mod report_html;
 mod status_cmd;
+mod system_cmd;
 mod text;
 
 use saiifeguard::builtins::builtin_packs;
@@ -146,6 +148,11 @@ enum Cmd {
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
+    /// Locked mode on Linux: install or uninstall the system setup (root).
+    System {
+        #[command(subcommand)]
+        action: system_cmd::SystemAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,6 +196,9 @@ fn main() -> ExitCode {
     {
         return cmd_daemon(system, user, config, state_dir);
     }
+    if let Cmd::System { action } = cli.command {
+        return system_cmd::run(action);
+    }
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
     // `--pack <id>` additively enables opt-in packs.
@@ -224,7 +234,9 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } => unreachable!("handled above"),
+        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } | Cmd::System { .. } => {
+            unreachable!("handled above")
+        }
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Status => status_cmd::run(&packs),

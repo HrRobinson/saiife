@@ -1,0 +1,1236 @@
+//! `saiife system install` (spec §7): users and groups, the binary under
+//! `/opt/saiife`, `/etc/saiife`, the vault key, the unit, the managed hooks,
+//! `installed.toml`, then the daemon is started.
+//!
+//! Every step is idempotent. Whatever a step creates is recorded in
+//! `installed.toml` before the next step runs, so a failure part-way leaves
+//! an accurate list for `uninstall`.
+
+use crate::default_config::default_config;
+use crate::fsops;
+use crate::host::{valid_name, Host};
+use crate::layout::*;
+use crate::supported::{check_supported, Support};
+use crate::unit::{unit_text, vault_key_mode};
+use saiife_agents::{claude, codex, gemini, Agent, AgentError, Change};
+use saiife_policy::installed::{
+    read_installed, write_installed, FileKind, Installed, InstalledFile, ManagedAgent, Membership,
+    VaultKeyMode, INSTALLED_VERSION,
+};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
+
+pub struct InstallOptions {
+    pub config: Option<PathBuf>,
+    pub agents: Vec<Agent>,
+    pub approvers: Vec<String>,
+    pub non_interactive: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallReport {
+    /// What this run created or changed (user, group and path names).
+    pub changed: Vec<String>,
+    /// What was already as it should be.
+    pub unchanged: Vec<String>,
+    pub started: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    #[error("needs root")]
+    NotRoot,
+    #[error("{0}")]
+    Unsupported(String),
+    #[error("{}: {detail}", path.display())]
+    Refused { path: PathBuf, detail: String },
+    #[error("{step}: {detail}")]
+    Step { step: String, detail: String },
+}
+
+/// Shells that mean "no login" for an existing `saiife` user.
+const NOLOGIN_SHELLS: &[&str] = &[
+    "/usr/sbin/nologin",
+    "/sbin/nologin",
+    "/bin/false",
+    "/usr/bin/false",
+];
+
+/// A managed writer and its fingerprint (Codex, Gemini CLI).
+type InstallFn = fn(&Path) -> Result<Change, AgentError>;
+type EntryFn = fn(&Path) -> Result<Option<String>, AgentError>;
+
+/// How long a system install waits for the daemon's socket.
+const SOCKET_WAIT: Duration = Duration::from_secs(10);
+
+pub(crate) fn step(name: &str) -> impl Fn(io::Error) -> InstallError + '_ {
+    move |e| InstallError::Step {
+        step: name.to_string(),
+        detail: e.to_string(),
+    }
+}
+
+fn agent_step(name: &str) -> impl Fn(AgentError) -> InstallError + '_ {
+    move |e| InstallError::Step {
+        step: name.to_string(),
+        detail: e.to_string(),
+    }
+}
+
+fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
+    InstallError::Refused {
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+pub fn install(
+    layout: &Layout,
+    host: &dyn Host,
+    opts: &InstallOptions,
+    binary: &Path,
+) -> Result<InstallReport, InstallError> {
+    // 1. Root, then the supported-system check. Nothing runs before these.
+    if layout.is_system() && host.euid() != 0 {
+        return Err(InstallError::NotRoot);
+    }
+    let systemd = match check_supported(layout, host) {
+        Support::Supported { systemd, .. } => systemd,
+        Support::Refused(why) => return Err(InstallError::Unsupported(why)),
+    };
+
+    // 2. Refusals, before anything is created.
+    let previous =
+        read_installed(&layout.at(INSTALLED)).map_err(|e| refused(&layout.at(INSTALLED), e))?;
+    check_state_paths(layout, host)?;
+    check_daemon_user(host, previous.as_ref())?;
+    for a in &opts.approvers {
+        let name = a.strip_prefix("group:").unwrap_or(a);
+        if !valid_name(name) {
+            return Err(refused(
+                &layout.at(CONFIG),
+                format!("approver {a:?} is not a user name or group:<name>"),
+            ));
+        }
+    }
+    let new_config = match &opts.config {
+        Some(p) => Some(validated_config(p)?),
+        None => None,
+    };
+
+    let vault_key_exists = fsops::lstat(&layout.at(VAULT_KEY))
+        .map_err(step("vault-key"))?
+        .is_some();
+    let key_mode = match &previous {
+        Some(p) if vault_key_exists => p.vault_key,
+        _ => vault_key_mode(systemd),
+    };
+    let rec = previous.clone().unwrap_or_else(|| Installed {
+        version: INSTALLED_VERSION,
+        saiife: env!("CARGO_PKG_VERSION").to_string(),
+        installed_at: now(),
+        systemd,
+        vault_key: key_mode,
+        users: Vec::new(),
+        groups: Vec::new(),
+        memberships: Vec::new(),
+        dirs: Vec::new(),
+        files: Vec::new(),
+        agents: Vec::new(),
+    });
+    let mut run = Run {
+        layout,
+        host,
+        saved: previous,
+        rec,
+        report: InstallReport::default(),
+    };
+    run.rec.systemd = systemd;
+    run.rec.vault_key = key_mode;
+    run.rec.saiife = env!("CARGO_PKG_VERSION").to_string();
+
+    // `/etc/saiife` first: installed.toml lives there.
+    run.dir(ETC_DIR, 0o755, true)?;
+
+    // 3. Groups, the user, the audit-group membership.
+    run.users()?;
+    // 4. The binary.
+    let binary_changed = run.binary(binary)?;
+    // 5. /etc/saiife, policy.d, config.toml.
+    run.config(new_config.as_deref(), &opts.approvers)?;
+    // 6. The vault key.
+    run.vault_key(key_mode)?;
+    // 7. The unit.
+    let unit_changed = run.unit(key_mode, systemd)?;
+    // 8. Managed hooks.
+    let mut agents = opts.agents.clone();
+    agents.sort();
+    agents.dedup();
+    for a in agents {
+        run.managed(a)?;
+    }
+    run.save()?;
+    // 9. Start (or restart) the daemon.
+    run.start(binary_changed || unit_changed)?;
+    // 10. Wait for the socket on the real machine.
+    if layout.is_system() {
+        let sock = layout.at(SOCKET);
+        let deadline = Instant::now() + SOCKET_WAIT;
+        while !sock.exists() {
+            if Instant::now() >= deadline {
+                return Err(InstallError::Step {
+                    step: "start".into(),
+                    detail: format!(
+                        "the daemon did not open {SOCKET} within 10 s (see: journalctl -u saiifed)"
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    run.report.started = true;
+    Ok(run.report)
+}
+
+fn now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// An existing `saiife` user must be a system account without a login,
+/// unless an earlier install created it.
+fn check_daemon_user(host: &dyn Host, previous: Option<&Installed>) -> Result<(), InstallError> {
+    let Some(u) = host.user(DAEMON_USER) else {
+        return Ok(());
+    };
+    if previous.is_some_and(|p| p.users.iter().any(|n| n == DAEMON_USER)) {
+        return Ok(());
+    }
+    if u.uid >= 1000 || !NOLOGIN_SHELLS.contains(&u.shell.as_str()) {
+        return Err(refused(
+            Path::new("/etc/passwd"),
+            format!(
+                "a user {DAEMON_USER} already exists with uid {} and shell {}; \
+                 saiife never adopts a login account as its daemon user \
+                 (it needs a system uid below 1000 and a nologin shell)",
+                u.uid, u.shell
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// An existing state dir, key dir or audit key must be the daemon user's,
+/// with the spec modes. They are never adopted otherwise.
+fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let saiife_uid = host.user(DAEMON_USER).map(|u| u.uid);
+    for (abs, want, is_dir) in [
+        (STATE_DIR, 0o700, true),
+        (KEYS_DIR, 0o700, true),
+        (AUDIT_KEY, 0o600, false),
+    ] {
+        let p = layout.at(abs);
+        let m = match fsops::lstat(&p) {
+            Ok(None) => continue,
+            Ok(Some(m)) => m,
+            Err(e) => return Err(refused(&p, e.to_string())),
+        };
+        if m.is_dir() != is_dir || (!is_dir && !m.is_file()) {
+            return Err(refused(
+                &p,
+                format!(
+                    "exists but is not a {}; saiife does not adopt it",
+                    if is_dir { "directory" } else { "regular file" }
+                ),
+            ));
+        }
+        if Some(m.uid()) != saiife_uid {
+            return Err(refused(
+                &p,
+                format!(
+                    "exists and is owned by uid {}, not by the {DAEMON_USER} user; \
+                     saiife does not adopt it (move it away first)",
+                    m.uid()
+                ),
+            ));
+        }
+        let mode = m.mode() & 0o7777;
+        if mode != want {
+            return Err(refused(
+                &p,
+                format!(
+                    "exists with mode {mode:o}, not {want:o}; saiife does not adopt it \
+                     (move it away first)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `--config` file: it loads and checks (unknown keys, scopes) and says
+/// `locked = true`. Returns its text.
+fn validated_config(path: &Path) -> Result<String, InstallError> {
+    let text = std::fs::read_to_string(path).map_err(|e| refused(path, e.to_string()))?;
+    let loaded = saiife_policy::load_and_check(path, &saiife_policy::Getent)
+        .map_err(|e| refused(path, e.to_string()))?;
+    if !loaded.config.locked {
+        return Err(refused(
+            path,
+            "it must say `locked = true` for system install",
+        ));
+    }
+    // The text loaded is the text written: a file changed in between is refused.
+    if std::fs::read_to_string(path).map_err(|e| refused(path, e.to_string()))? != text {
+        return Err(refused(path, "it changed while it was being checked"));
+    }
+    Ok(text)
+}
+
+/// One install run: the record so far and what was written last.
+struct Run<'a> {
+    layout: &'a Layout,
+    host: &'a dyn Host,
+    saved: Option<Installed>,
+    rec: Installed,
+    report: InstallReport,
+}
+
+impl Run<'_> {
+    fn at(&self, abs: &str) -> PathBuf {
+        self.layout.at(abs)
+    }
+
+    /// Writes installed.toml when the record changed (root:root 0644).
+    fn save(&mut self) -> Result<(), InstallError> {
+        if self.saved.as_ref() == Some(&self.rec) {
+            return Ok(());
+        }
+        let p = self.at(INSTALLED);
+        write_installed(&p, &self.rec).map_err(step("installed.toml"))?;
+        self.chown_root(&p, "installed.toml")?;
+        self.saved = Some(self.rec.clone());
+        Ok(())
+    }
+
+    fn root_ids(&self) -> Result<(u32, u32), InstallError> {
+        let uid = self.host.user("root").map(|u| u.uid);
+        let gid = self.host.group_id("root");
+        match (uid, gid) {
+            (Some(u), Some(g)) => Ok((u, g)),
+            _ => Err(InstallError::Step {
+                step: "owners".into(),
+                detail: "user or group root not found".into(),
+            }),
+        }
+    }
+
+    fn chown_root(&self, p: &Path, step_name: &str) -> Result<(), InstallError> {
+        let (u, g) = self.root_ids()?;
+        self.host.chown(p, u, g).map_err(step(step_name))
+    }
+
+    fn changed(&mut self, what: impl Into<String>) {
+        self.report.changed.push(what.into());
+    }
+
+    fn unchanged(&mut self, what: impl Into<String>) {
+        self.report.unchanged.push(what.into());
+    }
+
+    /// Ensures the directory `abs` (and its missing ancestors, 0755) exists,
+    /// root:root. Created ones are recorded. With `own` (saiife's own dirs)
+    /// an existing `abs` also gets `mode` and root:root.
+    fn dir(&mut self, abs: &str, mode: u32, own: bool) -> Result<(), InstallError> {
+        let mut logical = PathBuf::from("/");
+        let target = Path::new(abs);
+        for comp in target.components().skip(1) {
+            logical.push(comp);
+            let p = self
+                .layout
+                .try_at(&logical)
+                .map_err(|e| refused(&logical, e.to_string()))?;
+            let is_target = logical == target;
+            let m = if is_target { mode } else { 0o755 };
+            let created = fsops::create_dir_mode(&p, m).map_err(|e| refused(&p, e.to_string()))?;
+            if created {
+                self.chown_root(&p, "dirs")?;
+                if !self.rec.dirs.contains(&logical) {
+                    self.rec.dirs.push(logical.clone());
+                }
+                self.changed(logical.display().to_string());
+                self.save()?;
+            } else if is_target && own {
+                let before = fsops::mode_of(&p).map_err(step("dirs"))?;
+                fsops::set_dir_mode(&p, mode).map_err(|e| refused(&p, e.to_string()))?;
+                self.chown_root(&p, "dirs")?;
+                if before != Some(mode) {
+                    self.changed(format!("{} (mode {mode:o})", logical.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn users(&mut self) -> Result<(), InstallError> {
+        for g in [DAEMON_GROUP, AUDIT_GROUP] {
+            if self.host.group_id(g).is_none() {
+                self.host.create_system_group(g).map_err(step("users"))?;
+                if !self.rec.groups.iter().any(|x| x == g) {
+                    self.rec.groups.push(g.to_string());
+                }
+                self.changed(format!("group {g}"));
+                self.save()?;
+            }
+        }
+        if self.host.user(DAEMON_USER).is_none() {
+            self.host
+                .create_system_user(DAEMON_USER, DAEMON_GROUP)
+                .map_err(step("users"))?;
+            if !self.rec.users.iter().any(|x| x == DAEMON_USER) {
+                self.rec.users.push(DAEMON_USER.to_string());
+            }
+            self.changed(format!("user {DAEMON_USER}"));
+            self.save()?;
+        }
+        // The daemon regroups the audit dir at start: it must be a member.
+        self.host
+            .add_to_group(DAEMON_USER, AUDIT_GROUP)
+            .map_err(step("users"))?;
+        // Recorded only when install made the user or the group, so the
+        // membership is known to be install's own.
+        let ours = self.rec.users.iter().any(|u| u == DAEMON_USER)
+            || self.rec.groups.iter().any(|g| g == AUDIT_GROUP);
+        let m = Membership {
+            user: DAEMON_USER.to_string(),
+            group: AUDIT_GROUP.to_string(),
+        };
+        if ours && !self.rec.memberships.contains(&m) {
+            self.rec.memberships.push(m);
+            self.changed(format!("{DAEMON_USER} in group {AUDIT_GROUP}"));
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Records (or refreshes) a file. `created` sticks from the first record.
+    fn record_file(&mut self, abs: &str, kind: FileKind, sha256: String, created: bool) {
+        let path = PathBuf::from(abs);
+        match self.rec.files.iter_mut().find(|f| f.path == path) {
+            Some(f) => {
+                f.sha256 = sha256;
+                f.kind = kind;
+            }
+            None => self.rec.files.push(InstalledFile {
+                path,
+                sha256,
+                kind,
+                created,
+            }),
+        }
+    }
+
+    /// Writes `bytes` to `abs` at `mode` unless it already holds them, then
+    /// sets mode and root:root. True when written.
+    fn file(
+        &mut self,
+        abs: &str,
+        bytes: &[u8],
+        mode: u32,
+        kind: FileKind,
+        step_name: &str,
+    ) -> Result<bool, InstallError> {
+        let p = self.at(abs);
+        let current = fsops::sha256_file(&p).map_err(|e| refused(&p, e.to_string()))?;
+        let want = fsops::sha256_hex(bytes);
+        let write = current.as_deref() != Some(want.as_str());
+        if write {
+            fsops::write_file_atomic(&p, bytes, mode).map_err(step(step_name))?;
+            self.changed(abs);
+        } else {
+            fsops::set_file_mode(&p, mode).map_err(step(step_name))?;
+            self.unchanged(abs);
+        }
+        self.chown_root(&p, step_name)?;
+        self.record_file(abs, kind, want, current.is_none());
+        self.save()?;
+        Ok(write)
+    }
+
+    fn binary(&mut self, binary: &Path) -> Result<bool, InstallError> {
+        self.dir(OPT_DIR, 0o755, true)?;
+        self.dir(BIN_DIR, 0o755, true)?;
+        let bytes = std::fs::read(binary).map_err(|e| InstallError::Step {
+            step: "binary".into(),
+            detail: format!("{}: {e}", binary.display()),
+        })?;
+        self.file(BINARY, &bytes, 0o755, FileKind::Binary, "binary")
+    }
+
+    fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<(), InstallError> {
+        self.dir(ETC_DIR, 0o755, true)?;
+        self.dir(POLICY_D, 0o755, true)?;
+        let p = self.at(CONFIG);
+        let text = match new {
+            Some(t) => t.to_string(),
+            None => match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
+                // An existing config is kept as it is.
+                Some(_) => {
+                    let current = std::fs::read(&p).map_err(step("config"))?;
+                    return self
+                        .file(CONFIG, &current, 0o644, FileKind::Config, "config")
+                        .map(|_| ());
+                }
+                None => default_config(self.layout, approvers),
+            },
+        };
+        self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
+            .map(|_| ())
+    }
+
+    fn vault_key(&mut self, mode: VaultKeyMode) -> Result<(), InstallError> {
+        self.dir(CREDSTORE, 0o700, true)?;
+        let p = self.at(VAULT_KEY);
+        let exists = fsops::lstat(&p)
+            .map_err(|e| refused(&p, e.to_string()))?
+            .is_some();
+        let (uid, root_gid) = self.root_ids()?;
+        let (file_mode, gid) = match mode {
+            VaultKeyMode::Credential => (0o600, root_gid),
+            VaultKeyMode::File => (
+                0o640,
+                self.host
+                    .group_id(DAEMON_GROUP)
+                    .ok_or_else(|| InstallError::Step {
+                        step: "vault-key".into(),
+                        detail: format!("group {DAEMON_GROUP} not found"),
+                    })?,
+            ),
+        };
+        if !exists {
+            let mut key = Zeroizing::new([0u8; 32]);
+            getrandom::fill(&mut key[..]).map_err(|e| InstallError::Step {
+                step: "vault-key".into(),
+                detail: e.to_string(),
+            })?;
+            match mode {
+                VaultKeyMode::Credential => self
+                    .host
+                    .encrypt_credential("vault-key", &key[..], &p)
+                    .map_err(step("vault-key"))?,
+                VaultKeyMode::File => {
+                    fsops::write_new_file(&p, &key[..], file_mode).map_err(step("vault-key"))?
+                }
+            }
+            self.changed(VAULT_KEY);
+        } else {
+            self.unchanged(VAULT_KEY);
+        }
+        // Never rotated: an existing key only gets its mode and owner.
+        fsops::set_file_mode(&p, file_mode).map_err(step("vault-key"))?;
+        self.host.chown(&p, uid, gid).map_err(step("vault-key"))?;
+        let sha = fsops::sha256_file(&p)
+            .map_err(step("vault-key"))?
+            .unwrap_or_default();
+        self.record_file(VAULT_KEY, FileKind::VaultKey, sha, !exists);
+        self.save()
+    }
+
+    fn unit(&mut self, key_mode: VaultKeyMode, systemd: u32) -> Result<bool, InstallError> {
+        // The unit follows the key on disk, not only the systemd version: a
+        // plain key from before a systemd upgrade keeps `LoadCredential=`.
+        let text = match key_mode {
+            VaultKeyMode::File => unit_text(systemd.min(249)),
+            VaultKeyMode::Credential => unit_text(systemd.max(250)),
+        };
+        let unit_dir = Path::new(UNIT)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("/");
+        self.dir(unit_dir, 0o755, false)?;
+        self.file(UNIT, text.as_bytes(), 0o644, FileKind::Unit, "unit")
+    }
+
+    fn managed(&mut self, a: Agent) -> Result<(), InstallError> {
+        let (dir_abs, file_abs) = match a {
+            Agent::Claude => (CLAUDE_MANAGED_DIR, CLAUDE_MANAGED),
+            Agent::Codex => (CODEX_DIR, CODEX_REQUIREMENTS),
+            Agent::Gemini => (GEMINI_DIR, GEMINI_SETTINGS),
+        };
+        self.dir(dir_abs, 0o755, false)?;
+        let p = self.at(file_abs);
+        let existed = fsops::lstat(&p)
+            .map_err(|e| refused(&p, e.to_string()))?
+            .is_some();
+        let (sha, whole) = match a {
+            Agent::Claude => {
+                let bytes = claude::managed_settings().as_bytes();
+                let current = fsops::sha256_file(&p).map_err(|e| refused(&p, e.to_string()))?;
+                let want = fsops::sha256_hex(bytes);
+                if current.as_deref() != Some(want.as_str()) {
+                    fsops::write_file_atomic(&p, bytes, 0o644).map_err(step("managed"))?;
+                    self.changed(file_abs);
+                } else {
+                    self.unchanged(file_abs);
+                }
+                (want, true)
+            }
+            Agent::Codex | Agent::Gemini => {
+                let (install, entry): (InstallFn, EntryFn) = if a == Agent::Codex {
+                    (codex::install_managed, codex::managed_entry)
+                } else {
+                    (gemini::install_managed, gemini::managed_entry)
+                };
+                match install(&p).map_err(agent_step("managed"))? {
+                    Change::Unchanged => self.unchanged(file_abs),
+                    _ => self.changed(file_abs),
+                }
+                let sha = entry(&p).map_err(agent_step("managed"))?.ok_or_else(|| {
+                    InstallError::Step {
+                        step: "managed".into(),
+                        detail: format!("{file_abs}: saiife's entry is missing after the write"),
+                    }
+                })?;
+                (sha, false)
+            }
+        };
+        fsops::set_file_mode(&p, 0o644).map_err(step("managed"))?;
+        self.chown_root(&p, "managed")?;
+        let path = PathBuf::from(file_abs);
+        match self.rec.agents.iter_mut().find(|m| m.agent == a.name()) {
+            Some(m) => {
+                m.sha256 = sha;
+                m.path = path;
+                m.whole_file = whole;
+            }
+            None => self.rec.agents.push(ManagedAgent {
+                agent: a.name().to_string(),
+                path,
+                sha256: sha,
+                whole_file: whole,
+                created_file: !existed,
+            }),
+        }
+        self.save()
+    }
+
+    fn start(&mut self, changed: bool) -> Result<(), InstallError> {
+        let fail = |detail: String| InstallError::Step {
+            step: "start".into(),
+            detail: format!("{detail} (see: journalctl -u saiifed)"),
+        };
+        let reload = self
+            .host
+            .systemctl(&["daemon-reload"])
+            .map_err(|e| fail(e.to_string()))?;
+        if reload.status != 0 {
+            return Err(fail(reload.stderr.trim().to_string()));
+        }
+        let active = self
+            .host
+            .systemctl(&["is-active", UNIT_NAME])
+            .is_ok_and(|o| o.status == 0 && o.stdout.trim() == "active");
+        let args: &[&str] = if changed && active {
+            &["restart", UNIT_NAME]
+        } else {
+            &["enable", "--now", UNIT_NAME]
+        };
+        let out = self.host.systemctl(args).map_err(|e| fail(e.to_string()))?;
+        if out.status != 0 {
+            let msg = out.stderr.trim();
+            return Err(fail(if msg.is_empty() {
+                format!("systemctl {} exited {}", args.join(" "), out.status)
+            } else {
+                msg.to_string()
+            }));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::host::{CmdOutput, FakeHost, UserInfo};
+    use saiife_policy::installed::{read_installed, FileKind, Installed, VaultKeyMode};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    pub(crate) struct Env {
+        /// Keeps the root alive.
+        pub _dir: tempfile::TempDir,
+        pub src: tempfile::TempDir,
+        pub layout: Layout,
+        pub host: FakeHost,
+        pub binary: PathBuf,
+    }
+
+    impl Env {
+        pub fn at(&self, abs: &str) -> PathBuf {
+            self.layout.at(abs)
+        }
+        pub fn installed(&self) -> Installed {
+            read_installed(&self.at(INSTALLED)).unwrap().unwrap()
+        }
+        pub fn run(&self, opts: &InstallOptions) -> Result<InstallReport, InstallError> {
+            install(&self.layout, &self.host, opts, &self.binary)
+        }
+        pub fn install(&self) -> InstallReport {
+            self.run(&all_agents()).unwrap()
+        }
+        /// Every path below the root, relative, dirs included.
+        pub fn tree(&self) -> BTreeSet<String> {
+            fn walk(base: &Path, d: &Path, out: &mut BTreeSet<String>) {
+                for e in fs::read_dir(d).unwrap() {
+                    let p = e.unwrap().path();
+                    out.insert(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                    if p.symlink_metadata().unwrap().is_dir() {
+                        walk(base, &p, out);
+                    }
+                }
+            }
+            let mut out = BTreeSet::new();
+            walk(self.layout.root(), self.layout.root(), &mut out);
+            out
+        }
+    }
+
+    pub(crate) const UBUNTU_2404: &str =
+        "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
+
+    pub(crate) fn env(systemd: u32) -> Env {
+        env_with(systemd, UBUNTU_2404)
+    }
+
+    pub(crate) fn env_with(systemd: u32, os_release: &str) -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("etc")).unwrap();
+        fs::write(dir.path().join("etc/os-release"), os_release).unwrap();
+        fs::create_dir_all(dir.path().join("run/systemd/system")).unwrap();
+        let layout = Layout::under(dir.path());
+        let host = FakeHost::open(layout.root()).unwrap();
+        host.set(|s| s.systemd = systemd);
+        let src = tempfile::tempdir().unwrap();
+        let binary = src.path().join("saiife");
+        fs::write(&binary, b"\x7fELF saiife v1").unwrap();
+        Env {
+            _dir: dir,
+            src,
+            layout,
+            host,
+            binary,
+        }
+    }
+
+    pub(crate) fn all_agents() -> InstallOptions {
+        InstallOptions {
+            config: None,
+            agents: Agent::ALL.to_vec(),
+            approvers: Vec::new(),
+            non_interactive: true,
+        }
+    }
+
+    fn mode(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn root_ids(h: &FakeHost) -> (u32, u32) {
+        (h.user("root").unwrap().uid, h.group_id("root").unwrap())
+    }
+
+    fn chowned(h: &FakeHost, p: &Path) -> Vec<(u32, u32)> {
+        h.state()
+            .chowns
+            .iter()
+            .filter(|c| c.path == p)
+            .map(|c| (c.uid, c.gid))
+            .collect()
+    }
+
+    const ROOT_OWNED: &[(&str, u32)] = &[
+        ("/opt/saiife", 0o755),
+        ("/opt/saiife/bin", 0o755),
+        ("/opt/saiife/bin/saiife", 0o755),
+        ("/etc/saiife", 0o755),
+        ("/etc/saiife/policy.d", 0o755),
+        ("/etc/saiife/config.toml", 0o644),
+        ("/etc/saiife/installed.toml", 0o644),
+        ("/etc/saiife/credstore", 0o700),
+        ("/etc/saiife/credstore/vault-key", 0o600),
+        ("/etc/systemd/system/saiifed.service", 0o644),
+        ("/etc/claude-code/managed-settings.d", 0o755),
+        ("/etc/claude-code/managed-settings.d/50-saiife.json", 0o644),
+        ("/etc/codex", 0o755),
+        ("/etc/codex/requirements.toml", 0o644),
+        ("/etc/gemini-cli", 0o755),
+        ("/etc/gemini-cli/settings.json", 0o644),
+    ];
+
+    #[test]
+    fn fresh_install_writes_every_path_with_spec_modes() {
+        let e = env(255);
+        let r = e.install();
+        assert!(r.started);
+        let root = root_ids(&e.host);
+        for (abs, want) in ROOT_OWNED {
+            let p = e.at(abs);
+            assert!(p.exists(), "{abs} missing");
+            assert_eq!(mode(&p), *want, "{abs} mode {:o}", mode(&p));
+            let c = chowned(&e.host, &p);
+            assert!(
+                !c.is_empty() && c.iter().all(|x| *x == root),
+                "{abs}: {c:?}"
+            );
+        }
+        assert_eq!(fs::read(e.at(BINARY)).unwrap(), b"\x7fELF saiife v1");
+        assert_eq!(
+            fs::read_to_string(e.at(UNIT)).unwrap(),
+            crate::unit_text(255)
+        );
+        assert_eq!(
+            fs::read_to_string(e.at(CLAUDE_MANAGED)).unwrap(),
+            saiife_agents::claude::managed_settings()
+        );
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.starts_with("version = 2\nlocked = true\n"));
+        saiife_policy::load_system(&e.at(CONFIG)).unwrap();
+        // systemd creates the state, run and log dirs.
+        for abs in [STATE_DIR, RUN_DIR, LOG_DIR] {
+            assert!(!e.at(abs).exists(), "{abs}");
+        }
+        // Users, groups and the audit-group membership.
+        let s = e.host.state();
+        assert!(s.users.contains_key(DAEMON_USER));
+        assert!(s.groups.contains_key(DAEMON_GROUP) && s.groups.contains_key(AUDIT_GROUP));
+        assert_eq!(s.members[AUDIT_GROUP], vec![DAEMON_USER.to_string()]);
+        assert!(s.calls.contains(&"systemctl daemon-reload".to_string()));
+        assert!(s
+            .calls
+            .contains(&"systemctl enable --now saiifed.service".to_string()));
+        assert!(r
+            .changed
+            .iter()
+            .any(|c| c.contains("/opt/saiife/bin/saiife")));
+    }
+
+    #[test]
+    fn systemd_249_writes_plain_vault_key_and_load_credential() {
+        let e = env(249);
+        e.install();
+        let vk = e.at(VAULT_KEY);
+        assert_eq!(mode(&vk), 0o640);
+        assert_eq!(fs::read(&vk).unwrap().len(), 32);
+        let want = (
+            e.host.user("root").unwrap().uid,
+            e.host.group_id(DAEMON_GROUP).unwrap(),
+        );
+        assert_eq!(chowned(&e.host, &vk), vec![want]);
+        let unit = fs::read_to_string(e.at(UNIT)).unwrap();
+        assert!(unit.contains("\nLoadCredential=vault-key:"), "{unit}");
+        assert!(!unit.contains("LoadCredentialEncrypted"));
+        assert_eq!(e.installed().vault_key, VaultKeyMode::File);
+        assert!(!e
+            .host
+            .state()
+            .calls
+            .iter()
+            .any(|c| c.contains("systemd-creds")));
+    }
+
+    #[test]
+    fn systemd_255_encrypts_vault_key() {
+        let e = env(255);
+        e.install();
+        assert!(e
+            .host
+            .state()
+            .calls
+            .iter()
+            .any(|c| c.starts_with("systemd-creds encrypt --name=vault-key")));
+        assert_eq!(mode(&e.at(VAULT_KEY)), 0o600);
+        assert_eq!(e.installed().vault_key, VaultKeyMode::Credential);
+        assert!(fs::read_to_string(e.at(UNIT))
+            .unwrap()
+            .contains("\nLoadCredentialEncrypted=vault-key:"));
+    }
+
+    #[test]
+    fn vault_key_is_never_rotated() {
+        let e = env(249);
+        e.install();
+        let before = fs::read(e.at(VAULT_KEY)).unwrap();
+        e.install();
+        assert_eq!(fs::read(e.at(VAULT_KEY)).unwrap(), before);
+    }
+
+    #[test]
+    fn installed_toml_lists_everything_with_fingerprints() {
+        let e = env(255);
+        e.install();
+        let i = e.installed();
+        assert_eq!(i.systemd, 255);
+        assert_eq!(i.users, ["saiife"]);
+        assert_eq!(i.groups, ["saiife", "saiife-audit"]);
+        assert_eq!(i.memberships.len(), 1);
+        assert_eq!(
+            (
+                i.memberships[0].user.as_str(),
+                i.memberships[0].group.as_str()
+            ),
+            ("saiife", "saiife-audit")
+        );
+        let file = |k: FileKind| i.files.iter().find(|f| f.kind == k).unwrap().clone();
+        for (k, abs) in [
+            (FileKind::Binary, BINARY),
+            (FileKind::Unit, UNIT),
+            (FileKind::Config, CONFIG),
+            (FileKind::VaultKey, VAULT_KEY),
+        ] {
+            let f = file(k);
+            assert_eq!(f.path, Path::new(abs));
+            assert!(f.created);
+            assert_eq!(
+                f.sha256,
+                crate::fsops::sha256_file(&e.at(abs)).unwrap().unwrap(),
+                "{abs}"
+            );
+        }
+        assert_eq!(i.agents.len(), 3);
+        for a in &i.agents {
+            let p = e.layout.try_at(&a.path).unwrap();
+            let want = match a.agent.as_str() {
+                "claude" => crate::fsops::sha256_file(&p).unwrap().unwrap(),
+                "codex" => saiife_agents::codex::managed_entry(&p).unwrap().unwrap(),
+                "gemini" => saiife_agents::gemini::managed_entry(&p).unwrap().unwrap(),
+                o => panic!("{o}"),
+            };
+            assert_eq!(a.sha256, want, "{}", a.agent);
+            assert!(a.created_file);
+            assert_eq!(a.whole_file, a.agent == "claude");
+        }
+        // Dirs are logical paths, in creation order, parents first.
+        let pos = |d: &str| i.dirs.iter().position(|x| x == Path::new(d)).unwrap();
+        assert!(pos("/opt/saiife") < pos("/opt/saiife/bin"));
+        assert!(pos("/etc/saiife") < pos("/etc/saiife/policy.d"));
+        assert!(i
+            .dirs
+            .iter()
+            .all(|d| d.is_absolute() && !d.starts_with(e.layout.root())));
+    }
+
+    #[test]
+    fn second_install_is_unchanged_and_keeps_config() {
+        let e = env(255);
+        e.install();
+        let edited = "version = 2\nlocked = true\n\n[guard]\nbudget_ms = 40\n";
+        fs::write(e.at(CONFIG), edited).unwrap();
+        let before = e.installed();
+        e.host.set(|s| s.calls.clear());
+        let r = e.install();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert!(r.started);
+        assert_eq!(fs::read_to_string(e.at(CONFIG)).unwrap(), edited);
+        let calls = e.host.state().calls;
+        assert!(calls.contains(&"systemctl enable --now saiifed.service".to_string()));
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+        let after = e.installed();
+        assert_eq!(after.users, before.users);
+        assert_eq!(after.dirs, before.dirs);
+        assert!(after.files.iter().all(|f| f.created));
+        assert!(after.agents.iter().all(|a| a.created_file));
+    }
+
+    fn set_active(h: &FakeHost) {
+        h.set(|s| {
+            s.run.insert(
+                "systemctl is-active saiifed.service".into(),
+                CmdOutput {
+                    status: 0,
+                    stdout: "active\n".into(),
+                    stderr: String::new(),
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn binary_change_restarts() {
+        let e = env(255);
+        e.install();
+        set_active(&e.host);
+        // Same binary while active: no restart.
+        e.host.set(|s| s.calls.clear());
+        e.install();
+        assert!(!e.host.state().calls.iter().any(|c| c.contains("restart")));
+        fs::write(&e.binary, b"\x7fELF saiife v2").unwrap();
+        e.host.set(|s| s.calls.clear());
+        let r = e.install();
+        let calls = e.host.state().calls;
+        assert!(
+            calls.contains(&"systemctl restart saiifed.service".to_string()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("enable --now")));
+        assert_eq!(fs::read(e.at(BINARY)).unwrap(), b"\x7fELF saiife v2");
+        assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
+    }
+
+    #[test]
+    fn config_flag_validated() {
+        let e = env(255);
+        let bad = e.src.path().join("bad.toml");
+        fs::write(&bad, "version = 2\nlocked = true\nsurprise = 1\n").unwrap();
+        let mut o = all_agents();
+        o.config = Some(bad.clone());
+        match e.run(&o) {
+            Err(InstallError::Refused { path, detail }) => {
+                assert_eq!(path, bad);
+                assert!(detail.contains("surprise"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!e.at(ETC_DIR).exists() || fs::read_dir(e.at(ETC_DIR)).unwrap().count() == 0);
+        // Not locked.
+        let unlocked = e.src.path().join("unlocked.toml");
+        fs::write(&unlocked, "version = 2\n").unwrap();
+        o.config = Some(unlocked);
+        assert!(matches!(e.run(&o), Err(InstallError::Refused { .. })));
+        // A good one replaces the current file.
+        let good = e.src.path().join("good.toml");
+        let text = "version = 2\nlocked = true\n\n[guard]\nbudget_ms = 30\n";
+        fs::write(&good, text).unwrap();
+        o.config = Some(good);
+        e.run(&o).unwrap();
+        assert_eq!(fs::read_to_string(e.at(CONFIG)).unwrap(), text);
+        assert_eq!(mode(&e.at(CONFIG)), 0o644);
+    }
+
+    #[test]
+    fn approvers_are_checked_and_written() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.approvers = vec!["alice".into(), "group:ops".into()];
+        e.run(&o).unwrap();
+        let c = saiife_policy::load_system(&e.at(CONFIG)).unwrap().config;
+        assert_eq!(c.approval.approvers, ["alice", "group:ops"]);
+        let e = env(255);
+        o.approvers = vec!["bad name\"".into()];
+        assert!(matches!(e.run(&o), Err(InstallError::Refused { .. })));
+    }
+
+    #[test]
+    fn existing_human_saiife_user_refused() {
+        let e = env(255);
+        e.host.set(|s| {
+            s.users.insert(
+                DAEMON_USER.into(),
+                UserInfo {
+                    uid: 1001,
+                    gid: 1001,
+                    home: "/home/saiife".into(),
+                    shell: "/bin/bash".into(),
+                },
+            );
+        });
+        let err = e.run(&all_agents()).unwrap_err();
+        assert!(matches!(err, InstallError::Refused { .. }), "{err:?}");
+        assert!(err.to_string().contains("1001"), "{err}");
+        assert!(!e.at(ETC_DIR).exists());
+        assert!(e.host.state().groups.is_empty());
+    }
+
+    #[test]
+    fn existing_system_saiife_user_with_nologin_is_used() {
+        let e = env(255);
+        e.host.set(|s| {
+            s.groups.insert(DAEMON_GROUP.into(), 990);
+            s.users.insert(
+                DAEMON_USER.into(),
+                UserInfo {
+                    uid: 990,
+                    gid: 990,
+                    home: "/nonexistent".into(),
+                    shell: "/usr/sbin/nologin".into(),
+                },
+            );
+        });
+        e.install();
+        let i = e.installed();
+        assert!(i.users.is_empty());
+        assert_eq!(i.groups, ["saiife-audit"]);
+        // The group is new, so the membership is install's.
+        assert_eq!(i.memberships.len(), 1);
+    }
+
+    /// A system `saiife` user that owns what the test user owns.
+    fn system_saiife_user(h: &FakeHost) {
+        h.set(|s| {
+            s.users.insert(
+                DAEMON_USER.into(),
+                UserInfo {
+                    uid: rustix::process::getuid().as_raw(),
+                    gid: rustix::process::getgid().as_raw(),
+                    home: "/nonexistent".into(),
+                    shell: "/usr/sbin/nologin".into(),
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn existing_state_dir_not_owned_by_saiife_refused() {
+        let e = env(255);
+        let st = e.at(STATE_DIR);
+        fs::create_dir_all(&st).unwrap();
+        fs::set_permissions(&st, fs::Permissions::from_mode(0o700)).unwrap();
+        // No saiife user yet: nobody can own it as saiife.
+        let err = e.run(&all_agents()).unwrap_err();
+        assert!(err.to_string().contains("not by the saiife user"), "{err}");
+        assert!(!e.at(ETC_DIR).exists());
+    }
+
+    #[test]
+    fn existing_state_dir_wrong_mode_refused() {
+        let e = env(255);
+        system_saiife_user(&e.host);
+        let st = e.at(STATE_DIR);
+        fs::create_dir_all(&st).unwrap();
+        fs::set_permissions(&st, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = e.run(&all_agents()).unwrap_err();
+        match &err {
+            InstallError::Refused { path, detail } => {
+                assert_eq!(path, &st);
+                assert!(detail.contains("755"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!e.at(ETC_DIR).exists());
+    }
+
+    #[test]
+    fn existing_key_dir_symlink_refused() {
+        let e = env(255);
+        fs::create_dir_all(e.at(STATE_DIR)).unwrap();
+        fs::set_permissions(e.at(STATE_DIR), fs::Permissions::from_mode(0o700)).unwrap();
+        // The state dir is owned by the test user, which the fake `saiife`
+        // user resolves to.
+        system_saiife_user(&e.host);
+        std::os::unix::fs::symlink(e.src.path(), e.at(KEYS_DIR)).unwrap();
+        assert!(matches!(
+            e.run(&all_agents()),
+            Err(InstallError::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn start_failure_still_writes_installed_and_exits_2() {
+        let e = env(255);
+        e.host.set(|s| {
+            s.run.insert(
+                "systemctl enable --now saiifed.service".into(),
+                CmdOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Job for saiifed.service failed.\n".into(),
+                },
+            );
+        });
+        match e.run(&all_agents()) {
+            Err(InstallError::Step { step, detail }) => {
+                assert_eq!(step, "start");
+                assert!(
+                    detail.contains("Job for saiifed.service failed."),
+                    "{detail}"
+                );
+                assert!(
+                    detail.ends_with(" (see: journalctl -u saiifed)"),
+                    "{detail}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let i = e.installed();
+        assert_eq!(i.users, ["saiife"]);
+        assert_eq!(i.groups, ["saiife", "saiife-audit"]);
+        assert_eq!(i.files.len(), 4);
+        assert_eq!(i.agents.len(), 3);
+    }
+
+    #[test]
+    fn unsupported_writes_nothing() {
+        let e = env_with(255, "NAME=\"Alpine Linux\"\nID=alpine\nVERSION_ID=3.20.0\n");
+        match e.run(&all_agents()) {
+            Err(InstallError::Unsupported(why)) => assert!(why.contains("Alpine"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let files: BTreeSet<String> = e
+            .tree()
+            .into_iter()
+            .filter(|p| !e.layout.root().join(p).is_dir())
+            .collect();
+        assert_eq!(
+            files,
+            BTreeSet::from([".fakehost.json".to_string(), "etc/os-release".to_string()])
+        );
+        assert!(e.host.state().calls.is_empty());
+    }
+
+    #[test]
+    fn only_named_agents_are_written_and_others_kept() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = vec![Agent::Codex];
+        e.run(&o).unwrap();
+        assert!(e.at(CODEX_REQUIREMENTS).exists());
+        assert!(!e.at(CLAUDE_MANAGED).exists());
+        assert!(!e.at(GEMINI_SETTINGS).exists());
+        o.agents = vec![Agent::Gemini];
+        e.run(&o).unwrap();
+        let names: Vec<String> = e.installed().agents.into_iter().map(|a| a.agent).collect();
+        assert_eq!(names, ["codex", "gemini"]);
+        assert!(e.at(CODEX_REQUIREMENTS).exists());
+    }
+
+    #[test]
+    fn existing_codex_file_is_edited_not_replaced() {
+        let e = env(255);
+        fs::create_dir_all(e.at(CODEX_DIR)).unwrap();
+        fs::write(e.at(CODEX_REQUIREMENTS), "[features]\nweb_search = true\n").unwrap();
+        e.install();
+        let text = fs::read_to_string(e.at(CODEX_REQUIREMENTS)).unwrap();
+        assert!(text.contains("web_search = true"));
+        let i = e.installed();
+        let a = i.agents.iter().find(|a| a.agent == "codex").unwrap();
+        assert!(!a.created_file && !a.whole_file);
+        assert!(!i.dirs.contains(&PathBuf::from(CODEX_DIR)));
+    }
+
+    #[test]
+    fn symlinked_managed_file_is_refused() {
+        let e = env(255);
+        fs::create_dir_all(e.at(GEMINI_DIR)).unwrap();
+        let elsewhere = e.src.path().join("elsewhere.json");
+        fs::write(&elsewhere, "{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, e.at(GEMINI_SETTINGS)).unwrap();
+        assert!(e.run(&all_agents()).is_err());
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "{}");
+    }
+
+    #[test]
+    fn missing_binary_is_a_step_error() {
+        let e = env(255);
+        fs::remove_file(&e.binary).unwrap();
+        match e.run(&all_agents()) {
+            Err(InstallError::Step { step, .. }) => assert_eq!(step, "binary"),
+            other => panic!("{other:?}"),
+        }
+        // What was created so far is listed.
+        assert_eq!(e.installed().users, ["saiife"]);
+    }
+}
