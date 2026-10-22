@@ -94,6 +94,15 @@ fn setsid_and_wrapper_values_now_deny() {
             "env --un FOO rm -rf /",
             "timeout --sig KILL 5 rm -rf /",
             "sudo --us root rm -rf /",
+            // Fix round 4: every wrapper table follows the installed tool.
+            "flock --wait 5 /tmp/l rm -rf /",
+            "flock --wai 5 /tmp/l rm -rf /",
+            "flock --start 0 --length 1 /tmp/l rm -rf /",
+            "flock --fcntl /tmp/l rm -rf /",
+            "nohup -- rm -rf /",
+            "sudo -a x rm -rf /",
+            "sudo --login-class x rm -rf /",
+            "xargs -J % rm -rf /",
         ],
     );
     for cmd in ["setsid rm -rf /", "nice -n5 rm -rf /", "env -S 'rm -rf /'"] {

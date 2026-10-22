@@ -112,6 +112,12 @@ pub struct Word {
     pub dq_substitution: bool,
 }
 
+impl AsRef<str> for Word {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
 /// A single top-level command segment: the argv-order sequence of words
 /// between chaining operators (`&&`, `||`, `;`, `|`, `&`, newline).
 pub type Segment = Vec<Word>;

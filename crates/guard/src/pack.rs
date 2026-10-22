@@ -27,6 +27,11 @@
 //!                             # `timeout sudo`); never matches without one
 //! operand_match = "regex|glob" # also require an operand, read as a
 //! operand_targets = ["x"]     # pattern of this syntax, to match a target
+//! when_option = ["-f", "--full"] # also require one of these options,
+//! command_options = "fq:"     # read with getopt from the command's own
+//! command_long_options = ["full|f", "queue=|q", "eof[=]"] # options
+//!                             # (`name=` takes a value, `name[=]` an
+//!                             # attached one; `|c` is the short alias)
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
 //! access = "read|write|any"
@@ -39,12 +44,15 @@
 //! `[[deny]]` rules (as `[[allow_path]]` does for paths); other packs still
 //! judge it, and their first deny wins.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::getopt::{Opt, OwnedSpec};
 use crate::pathrule::{validate_ancestors, validate_glob, PathRule, RuleAccess};
 use crate::prefilter::Prefilter;
 
@@ -69,6 +77,44 @@ pub struct Rule {
     /// Also required: an operand of the command, read as a pattern, matches
     /// one of the targets (`pkill 'sa.*fed'` names `saiifed`).
     pub operands: Option<OperandMatch>,
+    /// Also required: the command was given one of these options, read
+    /// with getopt from the command's own option table (`pkill -f`,
+    /// `--full`, `--f`, `-9f`).
+    pub when_option: Option<WhenOption>,
+}
+
+/// `when_option`, `command_options` and `command_long_options` of a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenOption {
+    pub spec: OwnedSpec,
+    /// `-f` (short) and `--full` (long, full name) spellings.
+    pub names: Vec<String>,
+}
+
+impl WhenOption {
+    /// Was one of the options given? Options are read anywhere among the
+    /// arguments (getopt permutes), up to `--`. A long option the command
+    /// does not know, or an ambiguous prefix, counts as given: the command
+    /// refuses it, and a newer version may know it.
+    pub fn given(&self, args: &[String]) -> bool {
+        self.spec.with(|spec| {
+            let mut hit = false;
+            spec.all(args, &mut |o| match o {
+                Opt::Known { short, long, .. } => {
+                    hit |= self.names.iter().any(|n| match n.strip_prefix("--") {
+                        Some(l) => long == Some(l),
+                        None => {
+                            short != '\0'
+                                && n.strip_prefix('-')
+                                    .is_some_and(|s| s.chars().eq(std::iter::once(short)))
+                        }
+                    });
+                }
+                Opt::Unknown { .. } => hit = true,
+            });
+            hit
+        })
+    }
 }
 
 /// How a command reads its operands as patterns.
@@ -89,12 +135,20 @@ pub struct OperandMatch {
     pub targets: Vec<String>,
 }
 
-/// Largest compiled operand pattern; a bigger one counts as a match.
-const OPERAND_REGEX_LIMIT: usize = 1 << 20;
+/// Largest compiled operand pattern (the regex NFA size limit); a bigger
+/// one counts as a match. Patterns are compiled without Unicode (`\w`, `.`
+/// and classes are ASCII or bytes; the targets are ASCII), which keeps a
+/// 256-byte pattern far below this and its compile cheap.
+const OPERAND_REGEX_LIMIT: usize = 64 << 10;
 /// Most pattern operands compiled for one command; more count as a match.
 pub const MAX_PATTERN_OPERANDS: usize = 32;
 /// Longest pattern operand compiled; a longer one counts as a match.
 pub const MAX_PATTERN_BYTES: usize = 256;
+/// Most time spent compiling operand patterns in one evaluation (one
+/// command line, nested lines included); once it is spent, every further
+/// pattern counts as a match. Keeps hostile patterns well inside the
+/// engine budget.
+pub const MAX_PATTERN_COMPILE: Duration = Duration::from_millis(5);
 
 /// Regex metacharacters: an operand without any is a plain substring.
 const REGEX_META: &[char] = &[
@@ -120,9 +174,15 @@ impl OperandMatch {
     /// them is unknown or too costly to find out: a pattern that does not
     /// compile, a glob with `\` or `[:` (escapes and classes are not
     /// modelled), a pattern longer than `MAX_PATTERN_BYTES`, and more than
-    /// `MAX_PATTERN_OPERANDS` patterns. `over_budget` is checked before
-    /// each compile.
-    pub fn hits(&self, operands: &[String], over_budget: &dyn Fn() -> bool) -> Hit {
+    /// `MAX_PATTERN_OPERANDS` patterns, and any pattern once `spent` (the
+    /// evaluation's compile time so far) exceeds `MAX_PATTERN_COMPILE`.
+    /// `over_budget` is checked before each compile.
+    pub fn hits(
+        &self,
+        operands: &[String],
+        over_budget: &dyn Fn() -> bool,
+        spent: &Cell<Duration>,
+    ) -> Hit {
         let mut compiled = 0;
         for o in operands
             .iter()
@@ -153,18 +213,27 @@ impl OperandMatch {
                 OperandSyntax::Glob => glob_regex(o),
             };
             compiled += 1;
-            if compiled > MAX_PATTERN_OPERANDS || o.len() > MAX_PATTERN_BYTES {
+            if compiled > MAX_PATTERN_OPERANDS
+                || o.len() > MAX_PATTERN_BYTES
+                || spent.get() > MAX_PATTERN_COMPILE
+            {
                 return Hit::Yes;
             }
             if over_budget() {
                 return Hit::OutOfBudget;
             }
-            match regex::RegexBuilder::new(&source)
+            let t0 = Instant::now();
+            let built = regex::bytes::RegexBuilder::new(&source)
+                .unicode(false)
                 .case_insensitive(true)
                 .size_limit(OPERAND_REGEX_LIMIT)
-                .build()
-            {
-                Ok(re) if self.targets.iter().any(|t| re.is_match(t)) => return Hit::Yes,
+                .dfa_size_limit(OPERAND_REGEX_LIMIT)
+                .build();
+            spent.set(spent.get() + t0.elapsed());
+            match built {
+                Ok(re) if self.targets.iter().any(|t| re.is_match(t.as_bytes())) => {
+                    return Hit::Yes
+                }
                 Ok(_) => {}
                 Err(_) => return Hit::Yes,
             }
@@ -321,6 +390,12 @@ struct RawRule {
     operand_match: Option<OperandSyntax>,
     #[serde(default)]
     operand_targets: Vec<String>,
+    #[serde(default)]
+    when_option: Vec<String>,
+    #[serde(default)]
+    command_options: Option<String>,
+    #[serde(default)]
+    command_long_options: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,8 +455,57 @@ fn compile_rules(
                 continue;
             }
         };
+        let has_table = r.command_options.is_some() || !r.command_long_options.is_empty();
+        let when_option = match (r.when_option.is_empty(), has_table) {
+            (true, false) => None,
+            (false, true) => {
+                let names_ok = r.when_option.iter().all(|n| {
+                    n.strip_prefix("--").is_some_and(|l| !l.is_empty())
+                        || n.strip_prefix('-').is_some_and(|s| s.chars().count() == 1)
+                });
+                let spec = OwnedSpec::parse(
+                    r.command_options.as_deref().unwrap_or(""),
+                    &r.command_long_options,
+                );
+                match spec {
+                    Ok(spec) if names_ok => Some(WhenOption {
+                        spec,
+                        names: r.when_option,
+                    }),
+                    Ok(_) => {
+                        warnings.push(PackWarning {
+                            source: source.to_string(),
+                            message: format!(
+                                "skipping rule {:?}: when_option names are `-x` or `--name`",
+                                r.pattern
+                            ),
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        warnings.push(PackWarning {
+                            source: source.to_string(),
+                            message: format!("skipping rule {:?}: {e}", r.pattern),
+                        });
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                warnings.push(PackWarning {
+                    source: source.to_string(),
+                    message: format!(
+                        "skipping rule {:?}: when_option needs command_options or \
+                         command_long_options, and they need it",
+                        r.pattern
+                    ),
+                });
+                continue;
+            }
+        };
         match Regex::new(&r.pattern) {
             Ok(regex) => out.push(Rule {
+                when_option,
                 pattern: r.pattern,
                 regex,
                 reason: r.reason.unwrap_or_default(),
@@ -582,6 +706,7 @@ mod tests {
             .hits(
                 &ops.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &|| false,
+                &Cell::default(),
             ) == Hit::Yes
         };
         assert!(m(OperandSyntax::Regex, &["sa.*fed"]));
@@ -614,7 +739,90 @@ mod tests {
             syntax: OperandSyntax::Regex,
             targets: vec!["saiifed".into()],
         };
-        assert_eq!(om.hits(&["x.".to_string()], &|| true), Hit::OutOfBudget);
+        assert_eq!(
+            om.hits(&["x.".to_string()], &|| true, &Cell::default()),
+            Hit::OutOfBudget
+        );
+        // The evaluation's compile time is spent: any pattern is a match.
+        let spent = Cell::new(MAX_PATTERN_COMPILE + Duration::from_millis(1));
+        assert_eq!(om.hits(&["zz.".to_string()], &|| false, &spent), Hit::Yes);
+        assert_eq!(
+            om.hits(&["zz.".to_string()], &|| false, &Cell::default()),
+            Hit::No
+        );
+    }
+
+    /// Hostile sub-cap patterns compile quickly without Unicode classes:
+    /// 32 of `\w{1,10}\dN` (which took milliseconds each with Unicode).
+    #[test]
+    fn hostile_patterns_compile_quickly() {
+        let om = OperandMatch {
+            syntax: OperandSyntax::Regex,
+            targets: vec!["saiifed".into()],
+        };
+        let ops: Vec<String> = (0..31).map(|i| format!("\\w{{1,10}}\\d{i}")).collect();
+        let spent = Cell::default();
+        let t = Instant::now();
+        let hit = om.hits(&ops, &|| false, &spent);
+        eprintln!("31 patterns: {:?} (compile {:?})", t.elapsed(), spent.get());
+        // None matches; only a loaded runner (compile allowance spent)
+        // turns that into a match, never into a miss.
+        assert!(
+            hit == Hit::No || spent.get() > MAX_PATTERN_COMPILE,
+            "{hit:?}"
+        );
+        // A size-limited pattern fails to compile: a match.
+        assert_eq!(
+            om.hits(
+                &["(?:a{1,100}){1,100}x".into()],
+                &|| false,
+                &Cell::default()
+            ),
+            Hit::Yes
+        );
+    }
+
+    #[test]
+    fn when_option_reads_options_with_getopt() {
+        let w = WhenOption {
+            spec: OwnedSpec::parse(
+                "Hq:emcfg:G:inoO:p:P:s:t:u:U:xF:Lr:AQhV",
+                &[
+                    "full|f".into(),
+                    "signal=".into(),
+                    "echo|e".into(),
+                    "euid=|u".into(),
+                ],
+            )
+            .unwrap(),
+            names: vec!["-f".into(), "--full".into()],
+        };
+        let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        for yes in [
+            "-f x", "--full x", "--f x", "--fu x", "--ful x", "x -f", "-9f x", "-ef x", "--e x",
+            "--zz x",
+        ] {
+            assert!(given(yes), "{yes}");
+        }
+        for no in [
+            "x",
+            "-u -f x",
+            "-qf x",
+            "--signal -f x",
+            "x -- -f",
+            "--eu -f x",
+        ] {
+            assert!(!given(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn when_option_needs_its_table() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nwhen_option = [\"-f\"]\n[[deny]]\npattern = \"y\"\nreason = \"r\"\nwhen_option = [\"f\"]\ncommand_options = \"f\"\n[[deny]]\npattern = \"z\"\nreason = \"r\"\nwhen_option = [\"-f\"]\ncommand_options = \"f\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", toml, &mut w).unwrap();
+        assert_eq!(p.deny.len(), 1);
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]

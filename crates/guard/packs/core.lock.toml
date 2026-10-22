@@ -80,9 +80,24 @@ reason = "saiifed records every agent call; stopping it would leave agents unrec
 # globs (`systemctl stop '*fed'`). An operand that is not a valid pattern
 # counts as a match.
 [[deny]]
-# `pkill -f` matches the full command line too (any part of it).
-pattern = '^pkill\s(?:.*\s)?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--fu(?:l|ll)?)(?:\s|$)'
+# `pkill -f` matches the full command line too (any part of it). The
+# option is read with getopt from pkill's own table (procps-ng 4.0.7:
+# `pkill --help`), so `--f`, `--ful`, `-9f` and `x -f` count and `-qf`
+# (`-q f`) does not; an unknown or ambiguous long option counts as given.
+pattern = '^pkill\s'
 reason = "this pattern matches saiifed's command line; stopping it would leave agents unrecorded"
+when_option = ["-f", "--full"]
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
 operand_match = "regex"
 operand_targets = ["saiifed", "/opt/saiife/bin/saiife daemon --system"]
 
@@ -93,8 +108,18 @@ operand_match = "regex"
 operand_targets = ["saiifed"]
 
 [[deny]]
-pattern = '^killall\s(?:.*\s)?(?:--regexp|-[A-Za-z]*r[A-Za-z]*)(?:\s|$)'
+# `killall -r`: the option read with getopt from killall's table (psmisc
+# 23.7: `killall --help`), so `--reg` and `-Ir` count.
+pattern = '^killall\s'
 reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
+when_option = ["-r", "--regexp"]
+command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
+command_long_options = [
+    "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",
+    "older-than=|o", "interactive|i", "list|l", "quiet|q", "regexp|r",
+    "signal=|s", "user=|u", "verbose|v", "version|V", "wait|w", "ns=|n",
+    "context=|Z", "help",
+]
 operand_match = "regex"
 operand_targets = ["saiifed"]
 

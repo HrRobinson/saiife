@@ -13,6 +13,7 @@
 //! (`a&&rm -rf /`) is never missed and a quoted one (`echo "a && b"`) is
 //! never manufactured.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -345,7 +346,11 @@ impl Engine {
             env_changed: false,
             ifs_named: false,
         };
-        self.evaluate_inner(raw_cmd, start, 0, &state, false, None)
+        let clock = Clock {
+            start,
+            spent: Cell::default(),
+        };
+        self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None)
     }
 
     /// `state`: the shell state at the start of `raw_cmd`; a nested
@@ -356,12 +361,13 @@ impl Engine {
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
-        start: Instant,
+        clock: &Clock,
         depth: u32,
         state: &ShellState,
         sub_body: bool,
         out: Option<&mut RuleCwd>,
     ) -> Decision {
+        let start = clock.start;
         let mut state = state.clone();
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
         // comment): values are still judged, the unresolved words too.
@@ -379,6 +385,7 @@ impl Engine {
             start,
             depth,
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
+            clock,
         };
 
         for seg in segments {
@@ -490,7 +497,7 @@ impl Engine {
         if start.elapsed() > self.budget {
             return Nested::TimedOut;
         }
-        match self.evaluate_inner(inner, start, depth + 1, state, sub_body, out) {
+        match self.evaluate_inner(inner, cx.clock, depth + 1, state, sub_body, out) {
             Decision::Deny {
                 pack,
                 pattern,
@@ -618,7 +625,7 @@ impl Engine {
                 wrappers: &view.wrappers,
                 operands: &[],
             };
-            match self.judge(lines, view.env_changed, cx.start) {
+            match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
                 _ => {}
@@ -692,7 +699,7 @@ impl Engine {
             wrappers: &view.wrappers,
             operands: &argv[1..],
         };
-        match self.judge(lines, view.env_changed, cx.start) {
+        match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
             JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
             JudgeOutcome::Decided(Decision::Allow { trace }) => {
                 found.allow_trace = Some(trace);
@@ -733,7 +740,13 @@ impl Engine {
                 wrappers: &view.wrappers,
                 operands: &[],
             };
-            match self.judge_in(Some(CD_RESOLVED_PACK), lines, view.env_changed, cx.start) {
+            match self.judge_in(
+                Some(CD_RESOLVED_PACK),
+                lines,
+                view.env_changed,
+                cx.start,
+                &cx.clock.spent,
+            ) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
                 _ => {}
@@ -780,7 +793,7 @@ impl Engine {
                     wrappers: &view.wrappers,
                     operands: &alt_argv[1..],
                 };
-                match self.judge(lines, view.env_changed, cx.start) {
+                match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                     JudgeOutcome::TimedOut => return Some(timed_out()),
                     _ => {}
@@ -1137,8 +1150,14 @@ impl Engine {
     /// single spaces); `whole_segment` rules match the line of the whole
     /// segment, wrappers and leading assignments included. An empty
     /// `matching_line` (a bare wrapper) leaves only `whole_segment` rules.
-    fn judge(&self, lines: Lines, env_changed: bool, start: Instant) -> JudgeOutcome {
-        self.judge_in(None, lines, env_changed, start)
+    fn judge(
+        &self,
+        lines: Lines,
+        env_changed: bool,
+        start: Instant,
+        spent: &Cell<Duration>,
+    ) -> JudgeOutcome {
+        self.judge_in(None, lines, env_changed, start, spent)
     }
 
     /// `judge`, over the pack `only` names when it is set.
@@ -1148,6 +1167,7 @@ impl Engine {
         lines: Lines,
         env_changed: bool,
         start: Instant,
+        spent: &Cell<Duration>,
     ) -> JudgeOutcome {
         let Lines {
             matching: matching_line,
@@ -1168,16 +1188,24 @@ impl Engine {
                 Some(matching_line)
             }
         };
-        // The rule's line matches, and an operand names a target when the
-        // rule asks for one.
+        // The rule's line matches, the command was given the option the
+        // rule asks for, and an operand names a target when the rule asks
+        // for one.
         let over_budget = || start.elapsed() > self.budget;
         let matches = |rule: &crate::pack::Rule| -> Hit {
             if !line(rule).is_some_and(|l| rule.regex.is_match(l)) {
                 return Hit::No;
             }
+            if rule
+                .when_option
+                .as_ref()
+                .is_some_and(|w| !w.given(operands))
+            {
+                return Hit::No;
+            }
             match &rule.operands {
                 None => Hit::Yes,
-                Some(m) => m.hits(operands, &over_budget),
+                Some(m) => m.hits(operands, &over_budget, spent),
             }
         };
         let mut allowed: Option<AllowTrace> = None;
@@ -1601,12 +1629,21 @@ enum Flow {
 }
 
 /// Fixed for one evaluation of one command line.
-struct Ctx {
+struct Ctx<'a> {
     start: Instant,
     depth: u32,
     /// The line holds a path reference spelled out literally (see
     /// `has_literal_path_ref`, `path_refs_are_plain`).
     literal_path: bool,
+    clock: &'a Clock,
+}
+
+/// One evaluation's clock, shared by its nested lines.
+struct Clock {
+    start: Instant,
+    /// Time spent compiling operand patterns so far
+    /// (`pack::MAX_PATTERN_COMPILE`).
+    spent: Cell<Duration>,
 }
 
 /// What the segments of one command line found short of a deny.

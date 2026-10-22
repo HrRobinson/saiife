@@ -19,8 +19,13 @@ Commands are judged after the wrappers saiife sees through, with their
 options: `sudo`, `env`, `timeout`, `time`, `nice`, `nohup`, `setsid`,
 `stdbuf`, `ionice`, `xargs`, `flock`, `chroot`, `command`, `builtin` and
 `exec`. So `timeout 5 crontab -e` and `nice -n 5 sudo ls` are blocked like
-`crontab -e` and `sudo ls`. Long options are read the way the wrappers
-read them, so a shortened one counts too (`nice --adj 5`). The command in
+`crontab -e` and `sudo ls`. Options are read the way the wrappers read
+them, from each wrapper's own option list: a shortened long option counts
+too (`nice --adj 5`, `flock --wai 5`), short options can be bundled
+(`xargs -0a FILE`), and `--` ends the options (`nohup -- sudo ls`). The
+same goes for the file `xargs -a` reads (`xargs --arg FILE` reading the
+audit signing key is blocked), for `pkill -f` (`--f`, `--ful`, `-9f`, or
+`-f` after the pattern) and for `killall -r` (`--reg`, `-Ir`). The command in
 `env -S '...'` is judged as a command of its own. An `env -S` string with
 env's own escapes (`\_`, `\c`), a `${NAME}` or a `#` is blocked outright:
 saiife does not read those.
@@ -131,7 +136,13 @@ It also blocks too much in a few cases. This is the safe direction:
   such as `\x2d`) or a class like `[[:alpha:]]`, outside the read-only
   queries: saiife does not read these.
 - A pattern longer than 256 characters, and more than 32 pattern operands
-  on one command (`systemctl restart` with 33 globs).
+  on one command (`systemctl restart` with 33 globs). Patterns are read
+  without Unicode classes, and a pattern too large to compile counts as a
+  match. Once one command line has spent 5 ms compiling patterns, every
+  further pattern counts as a match, so a line full of costly patterns is
+  blocked rather than left unjudged.
+- A `pkill` long option that pkill does not know or cannot tell apart
+  (`pkill --e`) counts as `-f`.
 - Creating `~/.config/systemd` or moving `~/.config`, since they are
   parents of the user service folder.
 
@@ -151,6 +162,11 @@ deny env -S 'sudo ls'
 deny env -S 'sudo\_ls'
 deny nice --adj 5 sudo ls
 deny pkill -f 'bin/saiife daemon'
+deny pkill --f 'opt/s.*e'
+deny killall --reg '^sai'
+deny flock --wai 5 /tmp/l crontab /tmp/c
+deny flock --wait 5 /tmp/l sudo ls
+deny nohup -- sudo ls
 deny pkill 'sa.*fed'
 deny systemctl stop '*fed'
 deny su -
@@ -174,6 +190,7 @@ allow systemctl status saiifed
 allow crontab -l
 allow atq
 allow pkill -f sain
+allow flock --fcntl /tmp/l make
 allow systemctl restart saint
 allow env -S 'ls -la'
 allow env -S 'node --inspect' app.js

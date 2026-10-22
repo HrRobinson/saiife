@@ -20,6 +20,8 @@
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Deserializer};
 
+use crate::getopt::{flag, opt, req, Opt, Spec};
+
 /// Hard cap on hook-payload size. Anything larger is refused (fail open) rather
 /// than parsed — a guard must not become a memory amplifier.
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -460,14 +462,20 @@ pub fn inline_payload(argv: &[String]) -> Option<String> {
         return None;
     }
     if prog == "su" {
-        for (i, a) in argv.iter().enumerate() {
-            if let Some(val) = a.strip_prefix("--command=") {
-                return Some(val.to_string());
+        // getopt over su's own table: `--comm X`, `-lc X`, `-C X`
+        // (`--session-command`) all name the command.
+        let mut command = None;
+        SU.all(&argv[1..], &mut |o| {
+            if let Opt::Known {
+                short: 'c' | 'C',
+                value: Some(v),
+                ..
+            } = o
+            {
+                command.get_or_insert_with(|| v.to_string());
             }
-            if a == "--command" {
-                return argv.get(i + 1).cloned();
-            }
-        }
+        });
+        return command;
     }
     if SH_FAMILY.contains(&prog.as_str()) {
         return sh_command_string(&argv[1..]);
@@ -475,6 +483,51 @@ pub fn inline_payload(argv: &[String]) -> Option<String> {
     let idx = argv.iter().position(|a| a == "-c")?;
     argv.get(idx + 1).cloned()
 }
+
+/// util-linux 2.42 `su` (`c:fg:G:lmpPs:hVw:`, permuting): `-c` and `-C`
+/// (`--session-command`) take the command.
+const SU: Spec<'static> = Spec::new(
+    "c:C:fg:G:lmpPs:hVw:",
+    &[
+        req("command", 'c'),
+        req("session-command", 'C'),
+        flag("fast", 'f'),
+        req("group", 'g'),
+        req("supp-group", 'G'),
+        flag("login", 'l'),
+        flag("preserve-environment", 'p'),
+        flag("pty", 'P'),
+        req("shell", 's'),
+        req("whitelist-environment", 'w'),
+        flag("help", 'h'),
+        flag("version", 'V'),
+    ],
+);
+
+/// procps-ng 4.0.7 `watch` (`watch --help`; `-n`, `-q`, `-s` take a value,
+/// checked with `watch -x` alone; `--differences` takes it attached only).
+const WATCH: Spec<'static> = Spec::new(
+    "+bCcd::efgq:n:prs:twxhv",
+    &[
+        flag("beep", 'b'),
+        flag("color", 'c'),
+        flag("no-color", 'C'),
+        opt("differences", 'd'),
+        flag("errexit", 'e'),
+        flag("follow", 'f'),
+        flag("chgexit", 'g'),
+        req("equexit", 'q'),
+        req("interval", 'n'),
+        flag("precise", 'p'),
+        flag("no-rerun", 'r'),
+        req("shotsdir", 's'),
+        flag("no-title", 't'),
+        flag("no-wrap", 'w'),
+        flag("exec", 'x'),
+        flag("help", 'h'),
+        flag("version", 'v'),
+    ],
+);
 
 /// POSIX shells: `-c` may sit in any short-option cluster (`-lc`, `-ec`,
 /// `-c -l`), and the command string is then the first operand.
@@ -529,27 +582,8 @@ pub fn watch_payload(argv: &[String]) -> Option<String> {
     if argv.first().map(String::as_str) != Some("watch") {
         return None;
     }
-    let mut rest = &argv[1..];
-    while let Some(tok) = rest.first() {
-        if !tok.starts_with('-') || tok == "-" {
-            break; // start of the command.
-        }
-        if tok == "--" {
-            rest = &rest[1..];
-            break;
-        }
-        if tok == "-n" || tok == "--interval" {
-            // Separate-token value form: consume the flag and its value.
-            rest = &rest[1..];
-            if !rest.is_empty() {
-                rest = &rest[1..];
-            }
-            continue;
-        }
-        // Any other option (boolean, bundled, or attached value like `-n5`)
-        // is a single token.
-        rest = &rest[1..];
-    }
+    let args = &argv[1..];
+    let rest = &args[WATCH.leading(args, &mut |_| {}).min(args.len())..];
     if rest.is_empty() {
         return None;
     }
@@ -728,6 +762,42 @@ mod tests {
         assert_eq!(watch_payload(&argv(&["git", "status"])), None);
         assert_eq!(watch_payload(&argv(&["watch"])), None);
         assert_eq!(watch_payload(&argv(&["watch", "-n", "5"])), None);
+    }
+
+    /// Fix round 4: su's and watch's options are read with getopt from
+    /// their own tables (abbreviations, bundles, every value option).
+    #[test]
+    fn su_and_watch_options_follow_getopt() {
+        for args in [
+            &["su", "--comm", "rm -rf /"][..],
+            &["su", "--c=rm -rf /"],
+            &["su", "-lc", "rm -rf /"],
+            &["su", "-C", "rm -rf /"],
+            &["su", "--session-c", "rm -rf /"],
+            &["su", "-s", "/bin/sh", "root", "-c", "rm -rf /"],
+        ] {
+            assert_eq!(
+                inline_payload(&argv(args)).as_deref(),
+                Some("rm -rf /"),
+                "{args:?}"
+            );
+        }
+        // `-s` takes `-c` as its value: no command.
+        assert_eq!(inline_payload(&argv(&["su", "-s", "-c", "root"])), None);
+        for args in [
+            &["watch", "-q", "5", "rm", "-rf", "/"][..],
+            &["watch", "--int", "5", "rm", "-rf", "/"],
+            &["watch", "-s", "/tmp", "rm", "-rf", "/"],
+            &["watch", "--equ", "3", "rm", "-rf", "/"],
+            &["watch", "-d", "rm", "-rf", "/"],
+            &["watch", "-tn", "1", "rm", "-rf", "/"],
+        ] {
+            assert_eq!(
+                watch_payload(&argv(args)).as_deref(),
+                Some("rm -rf /"),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

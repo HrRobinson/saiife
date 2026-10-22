@@ -666,3 +666,143 @@ fn extra_locked_values_are_guarded() {
         assert_lock_denies_path(&e, Access::Write, path);
     }
 }
+
+/// Fix round 4 (F1): `pkill -f` and `killall -r` are read with getopt
+/// from the tool's own option table, abbreviations and bundles included.
+#[test]
+fn full_and_regexp_options_are_read_with_getopt() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "pkill --f 'opt/s.*e'",
+        "pkill --fu 'opt/s.*e'",
+        "pkill --ful 'opt/s.*e'",
+        "pkill --full 'opt/s.*e'",
+        "pkill 'opt/s.*e' -f",
+        "pkill -ef 'n/s.*e d'",
+        "pkill --signal KILL -f 'opt/s.*e'",
+        "pkill --e 'opt/s.*e'",
+        "killall --reg '^sai'",
+        "killall --r '^sai'",
+        "killall -Ir '^sai'",
+        "killall -w --regex '^sai'",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "pkill -f node",
+        "pkill --full 'python app.py'",
+        "pkill -qf 'opt/s.*e'",
+        "pkill --signal -f 'opt/s.*e'",
+        "pkill 'opt/s.*e' -- -f",
+        "killall -s r '^sai'",
+        "killall -I '^node'",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+/// Fix round 4 (F2): the file `xargs` reads is found whatever the
+/// spelling of `--arg-file`.
+#[test]
+fn xargs_arg_file_abbreviations_are_read() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "xargs --arg-f /var/lib/saiife/keys/audit.ed25519 echo",
+        "xargs --arg /var/lib/saiife/keys/audit.ed25519 echo",
+        "xargs --a /var/lib/saiife/keys/audit.ed25519 echo",
+        "xargs --ar=/var/lib/saiife/keys/audit.ed25519 echo",
+        "xargs -0ta /var/lib/saiife/keys/audit.ed25519 echo",
+        "timeout 5 xargs --arg-file /var/lib/saiife/keys/audit.ed25519 echo",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    // `-I` takes `a` as its value: no file is read.
+    let d = e.evaluate("xargs -I a echo a");
+    assert!(!d.is_deny(), "{d:?}");
+}
+
+/// Fix round 4 (F3): the wrapper option tables follow the installed tools
+/// (`--wait` takes a value, `--fcntl` and `--nonblocking` are flags,
+/// `nohup --` ends options, xargs' `--max-lines` value is attached only).
+/// `wrappers.rs` pins every table.
+#[test]
+fn wrapper_tables_follow_the_tools() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "flock --wait 5 /tmp/l sudo ls",
+        "flock --wai 5 /tmp/l crontab /tmp/c",
+        "flock --start 0 /tmp/l crontab /tmp/c",
+        "flock --length 1 /tmp/l sudo ls",
+        "flock --fcntl /tmp/l sudo ls",
+        "flock --nonblocking /tmp/l crontab /tmp/c",
+        "nohup -- sudo ls",
+        "nohup -- crontab /tmp/c",
+        "xargs --max-lines=1 sudo ls",
+        "sudo --no-update crontab /tmp/c",
+        "sudo --login-class x crontab /tmp/c",
+        "env --block-signal crontab /tmp/c",
+        "ionice --ignore crontab /tmp/c",
+        "time --append -o /tmp/t crontab /tmp/c",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "flock --fcntl /tmp/l make",
+        "flock --nonblocking /tmp/l make",
+        "flock --nb /tmp/l make",
+        "flock --wait 5 /tmp/l make",
+        "xargs --max-lines=1 echo",
+        "env --block-signal=INT make",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(
+            matches!(
+                d,
+                Decision::Allow {
+                    trace: AllowTrace::NoMatch
+                }
+            ),
+            "expected a clean ALLOW for {cmd:?}, got {d:?}"
+        );
+    }
+}
+
+/// Fix round 4 (F4): hostile sub-cap patterns compile quickly, and what
+/// follows them is judged in developer mode with core.lock opted in, at
+/// the production budget.
+#[test]
+fn hostile_patterns_do_not_exhaust_the_budget() {
+    let f = Fixture::new();
+    let (packs, _) = builtin_packs();
+    let active = saiifeguard::profile::select_active(packs, &["core.lock".to_string()]);
+    let e = Engine::new(active)
+        .with_budget(std::time::Duration::from_millis(50))
+        .with_paths(f.vars());
+    for width in [10, 20] {
+        let pats: Vec<String> = (0..=30)
+            .map(|i| format!("'\\w{{1,{width}}}\\d{i}'"))
+            .collect();
+        let cmd = format!("pkill {}; rm -rf ~", pats.join(" "));
+        let t = std::time::Instant::now();
+        let d = e.evaluate(&cmd);
+        let elapsed = t.elapsed();
+        assert!(d.is_deny(), "{width}: {d:?}");
+        eprintln!("width {width}: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "{elapsed:?}"
+        );
+    }
+    // Many pkill segments share one compile allowance per command line.
+    let seg: Vec<String> = (0..32).map(|i| format!("'[a-z]{{1,9}}\\d{i}'")).collect();
+    let cmd = format!(
+        "{}rm -rf ~",
+        format!("pkill {}; ", seg.join(" ")).repeat(20)
+    );
+    let d = e.evaluate(&cmd);
+    assert!(d.is_deny(), "{d:?}");
+}
