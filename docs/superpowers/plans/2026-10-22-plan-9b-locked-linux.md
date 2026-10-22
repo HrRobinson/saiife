@@ -705,3 +705,19 @@
 15. **Supported RHEL family:** `ID_LIKE` containing `rhel` with major ≥ 9 (Rocky, Alma) counts as RHEL 9+. systemd < 247 (no `LoadCredential`) is refused.
 16. **`installed.toml` format** (the spec gives only its purpose): Task 1's `Installed`. It lists only what install created, with fingerprints for the binary, unit, config and managed files or entries.
 17. **Deferred §11 and §7 items:** `saiife audit` reading through the daemon goes to plan 12 (§6.4.5). Pending approvals and lockdown in `status` go to plan 11.
+
+### Task 9: `core.process` pack — broad process kills  [added 2026-10-22 by the owner; after Task 3, before the final review]
+
+**Why:** during this plan's build a subagent ran `pkill -n` / `pkill -o`, which killed the owner's newest and oldest processes and crashed the machine. `saiife test` allowed both. No pack covers "kill everything / the session".
+
+**Files:** `crates/guard/packs/core.process.toml` (new, `default_on = true`), `crates/guard/tests/corpus_process.rs` (new), `docs/packs/core.process.md` (new, examples checked by `docs_pages`), `crates/guard/src/builtins.rs` (register).
+
+**Behaviour:** deny commands that signal processes without naming a specific target, judged on the effective command after wrapper peeling and with the same getopt/signal-word handling Task 3 built for pkill/killall:
+- `pkill`/`pgrep`-kill with `-n`/`--newest` or `-o`/`--oldest` and no pattern; `pkill`/`killall` with only `-u`/`-U`/`-g`/`-G`/`-s`/`-P`/`-t` selectors and no pattern;
+- `kill` with pid `-1` (all processes), `0`/`-0` (own process group), or `1` (init); `killall5`;
+- `killall` with `-u <user>` and no name; `pkill .` / `pkill ''` / `pkill -f .` (pattern matching everything).
+Allowed: `kill 12345`, `kill %1`, `pkill node`, `pkill -f 'npm run dev'`, `killall -HUP nginx`, `kill -l`, `pgrep -a node`.
+
+**Steps:** failing corpus tests (deny and allow lists above, each behind `timeout`/`setsid`/`nice` wrappers too) → implement → `cargo test -p saiife-guard` (all corpora + docs_pages) → full workspace + clippy + fmt + darwin check → commit `feat(guard): core.process pack blocks broad process kills`.
+
+**Safety (binding for implementer and reviewer):** never execute kill, pkill, killall, killall5, pgrep or any process-control tool; verify only through the engine (judges text) and man pages.
