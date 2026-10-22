@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 const NOT_INSTALLED: &str = "locked mode is not installed: developer mode checks only";
 const NOT_CHECKED: &str = "not checked (run as root)";
+/// Largest file `files.installed` fingerprints (16 MiB).
+const MAX_FINGERPRINT: u64 = 16 * 1024 * 1024;
 /// The audit key seed length.
 const KEY_LEN: u64 = 32;
 
@@ -252,27 +254,43 @@ fn paths_owner(ctx: &Ctx) -> Check {
         t.bad("user root is not in /etc/passwd".into());
         return t.check(ID, TITLE);
     };
-    let mut paths: Vec<String> = Path::new(BINARY)
+    // (shown, path under the root)
+    let fixed = |p: &str| (p.to_string(), ctx.layout.at(p));
+    let mut paths: Vec<(String, PathBuf)> = Path::new(BINARY)
         .ancestors()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|p| p.display().to_string())
+        .map(|p| fixed(&p.display().to_string()))
         .collect();
-    paths.extend([ETC_DIR, CONFIG, POLICY_D].map(String::from));
-    if let Ok(rd) = fs::read_dir(ctx.layout.at(POLICY_D)) {
-        let mut names: Vec<String> = rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".toml"))
-            .collect();
-        names.sort();
-        paths.extend(names.into_iter().map(|n| format!("{POLICY_D}/{n}")));
+    paths.extend([ETC_DIR, CONFIG, POLICY_D].map(fixed));
+    let policy_d = ctx.layout.at(POLICY_D);
+    match fs::read_dir(&policy_d) {
+        Ok(rd) => {
+            let mut names = Vec::new();
+            for e in rd {
+                match e {
+                    Ok(e) => names.push(e.file_name()),
+                    Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
+                }
+            }
+            // Every drop-in the loader reads, whatever its name's encoding.
+            names.retain(|n| Path::new(n).extension().is_some_and(|x| x == "toml"));
+            names.sort();
+            paths.extend(names.into_iter().map(|n| {
+                let shown = format!("{POLICY_D}/{}", n.to_string_lossy());
+                (shown, policy_d.join(n))
+            }));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+            t.unchecked.push(format!("{POLICY_D}/*.toml"))
+        }
+        Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
     }
-    paths.extend([INSTALLED, CREDSTORE].map(String::from));
-    for shown in &paths {
-        let at = ctx.layout.at(shown);
-        let Stat::Found(m) = lstat(ctx, shown, &at, &mut t) else {
+    paths.extend([INSTALLED, CREDSTORE].map(fixed));
+    for (shown, at) in &paths {
+        let Stat::Found(m) = lstat(ctx, shown, at, &mut t) else {
             // A missing path is reported by the checks that need it.
             continue;
         };
@@ -302,15 +320,23 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let mut f = fs::File::from(fd);
-    if !f.metadata()?.is_file() {
+    let f = fs::File::from(fd);
+    let md = f.metadata()?;
+    if !md.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
+    let too_large = || io::Error::new(io::ErrorKind::InvalidData, "file too large to fingerprint");
+    if md.len() > MAX_FINGERPRINT {
+        return Err(too_large());
+    }
     let mut h = Sha256::new();
-    io::copy(&mut f, &mut h)?;
+    // Bounded even when the file grows after the size check.
+    if io::copy(&mut io::Read::take(f, MAX_FINGERPRINT + 1), &mut h)? > MAX_FINGERPRINT {
+        return Err(too_large());
+    }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -337,6 +363,7 @@ fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, t: &mut Tally) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
             t.unchecked.push(shown)
         }
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => t.bad(format!("{shown}: {e}")),
         Err(e) => t.bad(format!("{shown}: cannot read: {e}")),
     }
 }
@@ -854,6 +881,54 @@ mod tests {
     }
 
     #[test]
+    fn hostile_policy_drop_in_name_is_named_safely() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = T::installed();
+        let raw = std::ffi::OsStr::from_bytes(b"\x1b[31mevil\n\xff.toml");
+        let p = t.at(POLICY_D).join(raw);
+        fs::write(&p, "").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).unwrap();
+        let r = t.doctor();
+        assert_status(&r, "paths.owner", Status::Fail);
+        assert!(get(&r, "paths.owner").detail.contains("evil"));
+        let text = r.to_text();
+        assert!(!text.contains('\x1b') && !text.contains("evil\n"), "{text}");
+        let json = serde_json::to_string(&r.to_json()).unwrap();
+        assert!(
+            !json.contains('\x1b') && json.contains("\\u001b[31mevil\\n"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn unlistable_policy_dir_is_reported() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let t = T::installed();
+        t.chmod(POLICY_D, 0o000);
+        let r = t.doctor();
+        t.chmod(POLICY_D, 0o755);
+        // A dir its owner (here: "root") cannot list is not checked.
+        let d = &get(&r, "paths.owner").detail;
+        assert!(d.contains("/etc/saiife/policy.d/*.toml"), "{d}");
+    }
+
+    #[test]
+    fn oversized_file_is_not_fingerprinted() {
+        let t = T::installed();
+        let f = fs::File::options().write(true).open(t.at(BINARY)).unwrap();
+        f.set_len(super::MAX_FINGERPRINT + 1).unwrap();
+        let r = t.doctor();
+        assert_status(&r, "files.installed", Status::Fail);
+        let d = &get(&r, "files.installed").detail;
+        assert!(
+            d.contains(&format!("{BINARY}: file too large to fingerprint")),
+            "{d}"
+        );
+    }
+
+    #[test]
     fn ancestor_owned_by_other_uid_fails() {
         let t = T::installed();
         let uid = rustix::process::getuid().as_raw() + 1;
@@ -960,6 +1035,9 @@ mod tests {
 
     #[test]
     fn unreadable_key_dir_is_info_when_not_root() {
+        if rustix::process::geteuid().is_root() {
+            return; // root reads through the 0000 dir
+        }
         let t = T::installed();
         t.chmod(STATE_DIR, 0o000);
         let r = t.doctor();

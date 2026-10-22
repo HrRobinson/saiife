@@ -1,6 +1,7 @@
 //! What `saiife doctor` found: one [`Check`] per line, the exit code, and
 //! the text and JSON forms (spec §6.16).
 
+use saiife_audit::text::sanitize;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -79,18 +80,21 @@ impl Report {
         })
     }
 
-    /// One line per check, then `doctor: <n> failures, <m> warnings`.
+    /// One line per check, then `doctor: <n> failures, <m> warnings`. Ids,
+    /// titles and details carry host-derived text (file names, config
+    /// errors, server names), so control and invisible characters are
+    /// escaped and every check stays on one line.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for c in &self.checks {
             out.push_str(c.status.tag());
             out.push_str("  ");
-            out.push_str(&c.id);
+            out.push_str(&sanitize(&c.id));
             out.push_str("  ");
-            out.push_str(&c.title);
+            out.push_str(&sanitize(&c.title));
             if !c.detail.is_empty() {
                 out.push_str(": ");
-                out.push_str(&c.detail);
+                out.push_str(&sanitize(&c.detail));
             }
             out.push('\n');
         }
@@ -150,6 +154,25 @@ mod tests {
         assert_eq!(serde_json::to_value(&info).unwrap()["status"], "info");
         let fail = Check::new("f", Status::Fail, "t", "");
         assert_eq!(serde_json::to_value(&fail).unwrap()["status"], "fail");
+    }
+
+    #[test]
+    fn text_escapes_control_characters() {
+        let r = Report {
+            checks: vec![Check::new(
+                "mcp.\x1b[31mx",
+                Status::Warn,
+                "title\u{202E}",
+                "a\nb\x07",
+            )],
+        };
+        let text = r.to_text();
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("\\x1b[31m"), "{text}");
+        let json = serde_json::to_string(&r.to_json()).unwrap();
+        assert!(!json.contains('\x1b') && json.contains("\\u001b"), "{json}");
     }
 
     #[test]

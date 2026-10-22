@@ -16,7 +16,8 @@ use saiife_policy::{load_and_check, Directory, LoadedPolicy};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoctorOptions {
     /// Check this agent user (`--user`); the caller, or every scoped user
-    /// as root, when `None`.
+    /// as root, when `None`. Read by the per-user host checks (Task 7);
+    /// the system checks here do not depend on it.
     pub user: Option<String>,
 }
 

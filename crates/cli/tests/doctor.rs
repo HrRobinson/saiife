@@ -101,3 +101,40 @@ fn doctor_user_other_than_self_needs_root() {
     );
     assert!(out.stdout.is_empty());
 }
+
+#[test]
+fn doctor_output_escapes_hostile_names() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    saiife_system::testing::fake_install(tmp.path());
+    let p = tmp.path().join("etc/saiife/policy.d/\x1b[31mevil\n.toml");
+    std::fs::write(&p, "").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let out = doctor(tmp.path(), &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!out.stdout.contains(&0x1b), "raw ESC in text output");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let line = text.lines().find(|l| l.contains("paths.owner")).unwrap();
+    assert!(line.contains("\\x1b[31mevil⏎.toml"), "{line}");
+
+    let out = doctor(tmp.path(), &["--json"]);
+    assert!(!out.stdout.contains(&0x1b), "raw ESC in JSON output");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let detail = check(&report, "paths.owner")["detail"].as_str().unwrap();
+    assert!(detail.contains("\x1b[31mevil\n.toml"), "{detail}");
+}
+
+#[test]
+fn doctor_user_name_is_escaped() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out = doctor(tmp.path(), &["--user", "x\x1b[2Jy"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "saiife: --user x\\x1b[2Jy needs root\n"
+    );
+}

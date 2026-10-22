@@ -10,6 +10,7 @@ pub mod mask;
 pub mod record;
 pub mod sign;
 pub mod store;
+pub mod text;
 pub mod verify;
 
 pub use chain::{ChainWriter, StartupCheck, WriterOptions};

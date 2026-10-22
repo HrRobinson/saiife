@@ -9,12 +9,14 @@ use saiife_policy::{Directory, Getent};
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::{host_for, Layout};
 
+use crate::text::sanitize;
+
 pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode {
     let layout = root.map(Layout::under).unwrap_or_else(Layout::system);
     let host = match host_for(&layout) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("saiife: doctor: {e}");
+            eprintln!("saiife: doctor: {}", sanitize(&e.to_string()));
             return ExitCode::from(2);
         }
     };
@@ -22,7 +24,7 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
     if let Some(name) = &user {
         let me = dir.name_of(rustix::process::getuid().as_raw());
         if me.as_deref() != Some(name.as_str()) && host.euid() != 0 {
-            eprintln!("saiife: --user {name} needs root");
+            eprintln!("saiife: --user {} needs root", sanitize(name));
             return ExitCode::from(2);
         }
     }
