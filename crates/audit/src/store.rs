@@ -37,6 +37,15 @@ fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// anything that is not a regular file is refused.
 pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
     create_private_dir(dir)?;
+    let mut file = open_append(&dir.join(format!("{}.jsonl", rec.month())))?;
+    let mut line = serde_json::to_string(rec).map_err(io::Error::other)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())
+}
+
+/// Open (creating 0600) `path` for appending, refusing a symlink, FIFO or
+/// anything else that is not a regular file.
+pub(crate) fn open_append(path: &Path) -> io::Result<fs::File> {
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -45,20 +54,18 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
         opts.mode(0o600)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let mut file = opts.open(dir.join(format!("{}.jsonl", rec.month())))?;
+    let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("audit log path is not a regular file"));
     }
-    let mut line = serde_json::to_string(rec).map_err(io::Error::other)?;
-    line.push('\n');
-    file.write_all(line.as_bytes())
+    Ok(file)
 }
 
 /// `create_dir_all`, with owner-only (0700) permissions on unix for the
 /// directories it creates: the log reveals what people work on. An existing
 /// loose directory is tightened to 0700 too, best-effort, and only when it is
 /// a real directory (not a symlink); a failed chmod (e.g. not the owner) is ignored.
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -106,7 +113,7 @@ pub struct ReadResult {
 
 /// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
 /// empty list; any other failure to list it is the error text.
-fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -191,8 +198,17 @@ pub fn read_recent(
 
 /// The file's bytes if it is a regular file. Never follows a symlink and
 /// never blocks on a FIFO: checked before opening and again on the handle.
-fn read_regular(p: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_regular(p: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
+    let mut f = open_regular(p)?;
+    let mut body = Vec::new();
+    f.read_to_end(&mut body).ok()?;
+    Some(body)
+}
+
+/// `p` opened for reading if it is a regular file, with the same checks as
+/// `read_regular`.
+pub(crate) fn open_regular(p: &Path) -> Option<fs::File> {
     if !fs::symlink_metadata(p).ok()?.is_file() {
         return None;
     }
@@ -203,17 +219,12 @@ fn read_regular(p: &Path) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let mut f = opts.open(p).ok()?;
-    if !f.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut body = Vec::new();
-    f.read_to_end(&mut body).ok()?;
-    Some(body)
+    let f = opts.open(p).ok()?;
+    f.metadata().ok()?.is_file().then_some(f)
 }
 
 /// `YYYY-MM.jsonl`
-fn is_month_file(name: &str) -> bool {
+pub(crate) fn is_month_file(name: &str) -> bool {
     let b = name.as_bytes();
     name.len() == 13
         && name.ends_with(".jsonl")
