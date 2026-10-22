@@ -64,16 +64,43 @@ impl Env {
     }
 
     pub fn saiife_in(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_saiife"))
-            .args(args)
+        self.command_in(dir, args).output().unwrap()
+    }
+
+    fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+        cmd.args(args)
             .current_dir(dir)
             .env("PATH", self.bin.path())
             .env("HOME", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .env("SAIIFE_AUDIT_DIR", self.audit.path())
-            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path())
-            .output()
-            .unwrap()
+            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path());
+        cmd
+    }
+
+    /// `saiife` in the project root, killed after `limit`: `None` if it was
+    /// still running then (it hung). Output is small, so the pipes are read
+    /// after the exit without risk of a full-pipe deadlock.
+    pub fn saiife_within(&self, args: &[&str], limit: std::time::Duration) -> Option<Output> {
+        use std::process::Stdio;
+        let mut child = self
+            .command_in(self.root(), args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + limit;
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Some(child.wait_with_output().unwrap())
     }
 
     pub fn read(&self, rel: &str) -> String {

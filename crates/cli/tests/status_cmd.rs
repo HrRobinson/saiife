@@ -1158,3 +1158,29 @@ fn header_path_is_sanitized() {
     assert!(!text.contains('\x1b'), "{text:?}");
     assert!(text.contains("evil\\x1b[2J⏎x"), "{text}");
 }
+
+/// Carry-over 2: status reads the config through the bounded reader.
+#[test]
+fn status_with_oversized_config_reports_it() {
+    let env = initialized(&["claude"]);
+    let big = format!("# {}\npacks = []\n", "x".repeat(65 * 1024));
+    env.write(".saiife/config.toml", &big);
+    let (c, text) = status(&env);
+    assert_eq!(c, 1, "{text}");
+    assert!(text.contains("cannot be read"), "{text}");
+    assert!(text.contains("larger than 64 KiB"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_with_fifo_config_does_not_hang() {
+    let env = initialized(&["claude"]);
+    let cfg = env.root().join(".saiife/config.toml");
+    std::fs::remove_file(&cfg).unwrap();
+    assert!(Command::new("mkfifo").arg(&cfg).status().unwrap().success());
+    let out = env
+        .saiife_within(&["status"], std::time::Duration::from_secs(5))
+        .expect("saiife status hung on a FIFO config");
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(stdout(&out).contains("cannot be read"), "{}", stdout(&out));
+}

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
-use saiife_agents::config::CONFIG_REL;
+use saiife_agents::config::{self, CONFIG_REL};
 use saiife_agents::detect::which;
 use saiife_agents::fingerprint::sha256_hex;
 use saiife_agents::integrity::{self, Integrity};
@@ -391,8 +391,8 @@ fn config_drift(
     init: &str,
     restore_fix: String,
 ) -> Option<Problem> {
-    match std::fs::read(dir.join(CONFIG_REL)) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Problem {
+    match config::read_config_bytes(dir) {
+        Ok(None) => Some(Problem {
             what: format!("{shown} was removed."),
             fix: restore_fix,
         }),
@@ -400,7 +400,7 @@ fn config_drift(
             what: format!("{shown} cannot be read: {}", sanitize(&e.to_string())),
             fix: "make it readable so saiife can check it".into(),
         }),
-        Ok(bytes) if sha256_hex(&bytes) != recorded => Some(Problem {
+        Ok(Some(bytes)) if sha256_hex(&bytes) != recorded => Some(Problem {
             what: format!("{shown} was changed since `saiife init`."),
             fix: format!(
                 "if you made this change, run {init} to record it; otherwise restore the file and run {init}"

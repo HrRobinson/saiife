@@ -612,3 +612,27 @@ fn off_header_sanitizes_root() {
     assert!(!out.stdout.contains(&0x1b), "{:?}", stdout(&out));
     assert!(stdout(&out).contains("evil\\x1b[31m"), "{}", stdout(&out));
 }
+
+/// Carry-over 2: a FIFO at the project config must not hang a re-run of
+/// init (the "was it ours" hash read used to be a blocking `fs::read`).
+#[cfg(unix)]
+#[test]
+fn init_with_fifo_config_does_not_hang() {
+    let env = Env::new(&["claude"]);
+    let out = env.saiife(&["init", "--agent", "claude"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let cfg = env.root().join(".saiife/config.toml");
+    std::fs::remove_file(&cfg).unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&cfg)
+        .status()
+        .unwrap()
+        .success());
+    let out = env
+        .saiife_within(
+            &["init", "--agent", "claude"],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("saiife init hung on a FIFO config");
+    assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+}
