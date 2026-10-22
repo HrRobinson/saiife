@@ -14,12 +14,15 @@ path = "src/main.rs"
 saiife-guard = { path = "../guard" }
 saiife-audit = { path = "../audit" }
 saiife-agents = { path = "../agents" }
+saiife-daemon = { path = "../daemon" }
+saiife-policy = { path = "../policy" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 dirs = "5"
 
 [dev-dependencies]
+saiife-ipc = { path = "../ipc" }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

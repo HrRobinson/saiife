@@ -4,6 +4,9 @@
 //! under test. Nothing touches the real user's directories.
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+pub mod daemon;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
