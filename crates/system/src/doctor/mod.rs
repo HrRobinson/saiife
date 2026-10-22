@@ -3,7 +3,11 @@
 //! reads: it changes nothing on the host. Programs run through [`Host`]
 //! from absolute paths only.
 
+/// Per-user host checks: locked mode is Linux-only (macOS in v2.1).
+#[cfg(target_os = "linux")]
+pub mod host;
 pub mod report;
+pub mod secrets;
 pub mod system;
 
 pub use report::{Check, Report, Status};
@@ -16,9 +20,12 @@ use saiife_policy::{load_and_check, Directory, LoadedPolicy};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoctorOptions {
     /// Check this agent user (`--user`); the caller, or every scoped user
-    /// as root, when `None`. Read by the per-user host checks (Task 7);
-    /// the system checks here do not depend on it.
+    /// as root, when `None`. Read by the per-user host checks
+    /// ([`host::checks`]); the system checks do not depend on it.
     pub user: Option<String>,
+    /// The caller's home (`$HOME`) for a self-check. Ignored as root, where
+    /// every home comes from `/etc/passwd`.
+    pub home: Option<std::path::PathBuf>,
 }
 
 /// What every check reads.
@@ -60,7 +67,9 @@ pub fn run(layout: &Layout, host: &dyn Host, dir: &dyn Directory, opts: &DoctorO
         as_root: host.euid() == 0,
         opts,
     };
-    Report {
-        checks: system::checks(&ctx),
-    }
+    #[allow(unused_mut)]
+    let mut checks = system::checks(&ctx);
+    #[cfg(target_os = "linux")]
+    checks.extend(host::checks(&ctx));
+    Report { checks }
 }

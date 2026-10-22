@@ -54,7 +54,8 @@ pub fn fake_config(layout: &Layout) -> String {
 /// (config, `policy.d`, credstore with an encrypted vault key), the unit,
 /// the Claude Code managed file, the state, keys (with a 32-byte key), audit
 /// and run dirs systemd and the daemon make, an Ubuntu 24.04 `os-release`
-/// and `/run/systemd/system`. The [`FakeHost`] of `root` gets the users and
+/// `/run/systemd/system`, and an `/etc/passwd` with root, the daemon user
+/// and the calling user. The [`FakeHost`] of `root` gets the users and
 /// groups (`saiife` in `saiife-audit`). Returns the `installed.toml` it
 /// wrote. Panics on any error.
 #[doc(hidden)]
@@ -81,6 +82,25 @@ pub fn fake_install(root: &Path) -> Installed {
         0o644,
     );
     dir(&l("/run/systemd/system"), 0o755);
+    // `/etc/passwd` with root, the calling user (copied from the machine's,
+    // so `doctor` finds the caller local) and the daemon user. The fake
+    // daemon user shares the caller's uid, so the caller comes first.
+    let mut passwd = "root:x:0:0:root:/root:/bin/sh\n".to_string();
+    let uid = rustix::process::getuid().as_raw().to_string();
+    if let Some(line) = fs::read_to_string("/etc/passwd").ok().and_then(|t| {
+        t.lines()
+            .find(|l| l.split(':').nth(2) == Some(uid.as_str()))
+            .map(str::to_string)
+    }) {
+        passwd.push_str(&line);
+        passwd.push('\n');
+    }
+    let daemon = host.user(DAEMON_USER).unwrap();
+    passwd.push_str(&format!(
+        "{DAEMON_USER}:x:{}:{}::/nonexistent:/usr/sbin/nologin\n",
+        daemon.uid, daemon.gid
+    ));
+    file(&l("/etc/passwd"), passwd.as_bytes(), 0o644);
 
     for d in [OPT_DIR, BIN_DIR, ETC_DIR, POLICY_D, "/etc/systemd/system"] {
         dir(&l(d), 0o755);

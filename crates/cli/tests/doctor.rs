@@ -138,3 +138,56 @@ fn doctor_user_name_is_escaped() {
         "saiife: --user x\\x1b[2Jy needs root\n"
     );
 }
+
+#[test]
+fn doctor_as_user_checks_self() {
+    let tmp = tempfile::tempdir().unwrap();
+    saiife_system::testing::fake_install(tmp.path());
+    let home = tempfile::tempdir().unwrap();
+    let netrc = home.path().join(".netrc");
+    std::fs::write(
+        &netrc,
+        "machine example.com login me password hunter2-s3cr3t\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["doctor", "--json", "--root"])
+        .arg(tmp.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains("hunter2-s3cr3t"), "{stdout}");
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    let found: Vec<&Value> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| {
+            c["id"].as_str().is_some_and(|id| id.ends_with(".secrets"))
+                && c["status"] == "warn"
+                && c["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(&netrc.display().to_string()))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{report:#}");
+
+    let out = Command::cargo_bin("saiife")
+        .unwrap()
+        .args(["doctor", "--root"])
+        .arg(tmp.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("hunter2-s3cr3t"), "{text}");
+    assert!(
+        text.contains(&format!("{}: holds a password", netrc.display())),
+        "{text}"
+    );
+}

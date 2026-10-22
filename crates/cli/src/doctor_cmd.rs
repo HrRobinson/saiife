@@ -28,7 +28,10 @@ pub fn run(user: Option<String>, json: bool, root: Option<PathBuf>) -> ExitCode 
             return ExitCode::from(2);
         }
     }
-    let report = doctor::run(&layout, host.as_ref(), &dir, &DoctorOptions { user });
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
+    let report = doctor::run(&layout, host.as_ref(), &dir, &DoctorOptions { user, home });
     if json {
         outln!(
             "{}",
