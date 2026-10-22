@@ -160,8 +160,15 @@ fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
     let tail = find_tail(&files)?;
 
     let mut out = Vec::new();
-    let (seq, prev, host) = match tail.and_then(|t| t.last.map(|r| (r, t.prev))) {
-        Some((last, prev)) => (last.seq.unwrap_or(0) + 1, prev, last.host),
+    let next = tail
+        .and_then(|t| t.last.map(|r| (r, t.prev)))
+        .and_then(|(last, prev)| {
+            // A last seq of u64::MAX cannot be followed: start a new chain.
+            let seq = last.seq.unwrap_or(0).checked_add(1)?;
+            Some((seq, prev, last.host))
+        });
+    let (seq, prev, host) = match next {
+        Some(n) => n,
         None => {
             let g = genesis(&rec)?;
             let line = serde_json::to_vec(&g).map_err(io::Error::other)?;
@@ -804,5 +811,19 @@ mod tests {
             );
         }
         assert_eq!(g.host, host_id());
+    }
+
+    #[test]
+    fn seq_max_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!(
+            "{{\"v\":2,\"seq\":{},\"prev\":\"{ZERO_PREV}\",\"ts\":\"x\"}}\n",
+            u64::MAX
+        );
+        fs::write(dir.path().join("2026-10.jsonl"), line).unwrap();
+        let seq = append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        assert_eq!(seq, 1);
+        let ls = lines(&dir.path().join("2026-10.jsonl"));
+        assert_eq!(parse(&ls[1]).kind.as_deref(), Some("genesis"));
     }
 }

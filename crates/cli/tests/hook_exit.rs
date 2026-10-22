@@ -162,7 +162,11 @@ fn check_fails_open_on_unknown_arguments() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("failing open"), "{stderr}");
     // Failing open is always recorded (spec §1.2 rule 5).
-    let recs = saiife_audit::store::read_all(audit.path()).records;
+    let recs: Vec<_> = saiife_audit::store::read_all(audit.path())
+        .records
+        .into_iter()
+        .filter(|r| !r.is_bookkeeping())
+        .collect();
     assert_eq!(recs.len(), 1, "{recs:?}");
     let r = &recs[0];
     assert_eq!(r.decision, saiife_audit::DecisionKind::ErrorAllowed);

@@ -63,7 +63,8 @@ fn opt_in_pack_from_project_config_applies_in_subdirectories() {
     let (code, stderr) = check(audit.path(), &p.path().join("src/deep"), DROP);
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("BLOCKED by db.postgres"), "{stderr}");
-    let rec = &read_all(audit.path()).records[0];
+    let recs = read_all(audit.path()).records;
+    let rec = recs.iter().find(|r| !r.is_bookkeeping()).unwrap();
     assert_eq!(rec.decision, DecisionKind::Deny);
     assert_eq!(rec.pack.as_deref(), Some("db.postgres"));
 }

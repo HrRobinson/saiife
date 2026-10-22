@@ -1,11 +1,13 @@
 //! `saiife check`: hook mode. Read the agent's pre-tool JSON on stdin, decide,
 //! audit, and answer in the agent's contract. FAIL OPEN on every error.
 
+use std::cell::OnceCell;
 use std::io::Read;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use saiife_audit::chain::{append_chained, sha256_hex};
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::{expand_glob_partial, PathVars};
@@ -39,7 +41,7 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     if read.is_ok() && buf.len() > PARSE_MAX_BYTES {
         // Drain the rest so the agent gets no EPIPE.
         let _ = std::io::copy(&mut stdin, &mut std::io::sink());
-        let audit = Audit::new(agent, HookContext::default());
+        let audit = Audit::new(agent, HookContext::default(), cli_packs);
         let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
         warn(&format!("{reason}; failing open (allow)"));
         audit.write("", DecisionKind::ErrorAllowed, None, Some(&reason));
@@ -47,7 +49,7 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
     }
     drop(stdin);
     if read.is_err() {
-        let audit = Audit::new(agent, HookContext::default());
+        let audit = Audit::new(agent, HookContext::default(), cli_packs);
         warn("could not read hook payload; failing open (allow)");
         audit.write(
             "",
@@ -57,7 +59,11 @@ pub fn run(cli_packs: &[String], hook_exit: bool, agent: &str) -> ExitCode {
         );
         return allow();
     }
-    let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+    let audit = Audit::new(
+        agent,
+        context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
+        cli_packs,
+    );
     match classify(&buf, PARSE_MAX_BYTES) {
         Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => fail_open(
             &audit,
@@ -142,7 +148,11 @@ pub fn record_arg_error(args: &[String], error: &str) {
             .read_to_end(&mut bytes);
         let _ = std::io::copy(&mut stdin, &mut std::io::sink());
         let buf = String::from_utf8_lossy(&bytes);
-        let audit = Audit::new(agent, context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES));
+        let audit = Audit::new(
+            agent,
+            context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
+            &[],
+        );
         audit.write(
             "",
             DecisionKind::ErrorAllowed,
@@ -395,10 +405,14 @@ struct Audit {
     agent: String,
     ctx: HookContext,
     project: String,
+    /// `--pack` ids, for the policy hash.
+    cli_packs: Vec<String>,
+    /// Computed on the first write: one config read per hook call.
+    policy: OnceCell<String>,
 }
 
 impl Audit {
-    fn new(agent: &str, ctx: HookContext) -> Self {
+    fn new(agent: &str, ctx: HookContext, cli_packs: &[String]) -> Self {
         let project = ctx.cwd.clone().unwrap_or_else(|| {
             std::env::current_dir()
                 .map(|d| d.display().to_string())
@@ -413,7 +427,29 @@ impl Audit {
             agent: agent.to_string(),
             ctx,
             project,
+            cli_packs: cli_packs.to_vec(),
+            policy: OnceCell::new(),
         }
+    }
+
+    /// `sha256:<hex>` of the rules in force for this call.
+    fn policy(&self) -> &str {
+        self.policy.get_or_init(|| {
+            let start = match self.ctx.cwd.as_deref() {
+                Some(c) => PathBuf::from(c),
+                None => std::env::current_dir().unwrap_or_default(),
+            };
+            let catalog = Catalog::builtin();
+            let project = project_packs_known(&start, |id| catalog.knows(id));
+            let mut enabled = self.cli_packs.clone();
+            enabled.extend(project.enabled);
+            let ids = catalog.active_ids(&enabled);
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let config = project
+                .root
+                .and_then(|r| std::fs::read(r.join(saiife_agents::config::CONFIG_REL)).ok());
+            policy_hash(env!("CARGO_PKG_VERSION"), &ids, config.as_deref())
+        })
     }
 
     /// Best-effort: a failed write is reported on stderr and otherwise ignored.
@@ -439,15 +475,29 @@ impl Audit {
                 rule: rule.map(|(_, r)| r.as_str()),
                 reason,
                 mode: "developer",
-                policy: None,
-                permission_mode: None,
+                policy: Some(self.policy()),
+                permission_mode: self.ctx.permission_mode.as_deref(),
             },
             env!("CARGO_PKG_VERSION"),
         );
-        if let Err(e) = store::append(dir, &rec) {
+        if let Err(e) = append_chained(dir, rec) {
             warn(&format!("audit write failed ({e}); decision unaffected"));
         }
     }
+}
+
+/// `sha256:<hex>` over the saiife version, the sorted unique active pack ids
+/// and the hash of the project config (`none` without one).
+fn policy_hash(version: &str, active_pack_ids: &[&str], project_config: Option<&[u8]>) -> String {
+    let mut ids: Vec<&str> = active_pack_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let config = project_config.map_or_else(|| "none".to_string(), sha256_hex);
+    let text = format!(
+        "saiife-policy-v1\nsaiife {version}\npacks {}\nconfig {config}\n",
+        ids.join(",")
+    );
+    format!("sha256:{}", sha256_hex(text.as_bytes()))
 }
 
 /// Allow = exit 0 with NOTHING on stdout, for every agent and both modes.
@@ -507,6 +557,8 @@ mod tests {
             agent: "claude".into(),
             ctx: HookContext::default(),
             project: "/p".into(),
+            cli_packs: Vec::new(),
+            policy: OnceCell::new(),
         }
     }
 
@@ -572,10 +624,12 @@ reason = "drops the thing"
         });
         assert_eq!(code, ExitCode::SUCCESS);
         let recs = store::read_all(dir.path()).records;
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].decision, DecisionKind::ErrorAllowed);
-        assert_eq!(recs[0].input, "rm -rf /tmp/x");
-        assert_eq!(recs[0].reason.as_deref(), Some("guard crashed"));
+        // Genesis line, then the record.
+        assert_eq!(recs.len(), 2);
+        let r = &recs[1];
+        assert_eq!(r.decision, DecisionKind::ErrorAllowed);
+        assert_eq!(r.input, "rm -rf /tmp/x");
+        assert_eq!(r.reason.as_deref(), Some("guard crashed"));
     }
 
     #[test]
@@ -586,8 +640,30 @@ reason = "drops the thing"
         });
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(
-            store::read_all(dir.path()).records[0].decision,
+            store::read_all(dir.path()).records[1].decision,
             DecisionKind::Allow
         );
+    }
+
+    #[test]
+    fn policy_hash_changes_with_config() {
+        let h = |v: &str, ids: &[&str], cfg: Option<&[u8]>| policy_hash(v, ids, cfg);
+        let base = h("0.1.0", &["a", "b"], Some(b"x"));
+        assert!(base.starts_with("sha256:") && base.len() == 7 + 64);
+        assert_eq!(base, h("0.1.0", &["a", "b"], Some(b"x")));
+        assert_ne!(base, h("0.1.0", &["a", "b"], Some(b"y")));
+        assert_ne!(base, h("0.1.0", &["a", "b"], None));
+        assert_ne!(base, h("0.1.0", &["a", "b", "c"], Some(b"x")));
+        assert_ne!(base, h("0.2.0", &["a", "b"], Some(b"x")));
+        assert_eq!(base, h("0.1.0", &["b", "a", "a"], Some(b"x")));
+    }
+
+    #[test]
+    fn policy_hash_text_is_exact() {
+        let want = format!(
+            "sha256:{}",
+            sha256_hex(b"saiife-policy-v1\nsaiife 1\npacks a,b\nconfig none\n")
+        );
+        assert_eq!(policy_hash("1", &["b", "a"], None), want);
     }
 }

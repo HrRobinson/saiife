@@ -13,6 +13,75 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
 
+/// `saiife audit verify`: exit 0 intact, 1 broken, 2 unreadable. Prints
+/// counts and file names only, never record content.
+pub fn verify() -> ExitCode {
+    let Some(dir) = store::default_dir() else {
+        outln!("audit chain: could not read the log: no audit directory");
+        return ExitCode::from(2);
+    };
+    let report = saiife_audit::verify(&dir);
+    outln!("{}", render_verify(&report));
+    ExitCode::from(report.exit_code())
+}
+
+pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
+    const MAX_BREAKS: usize = 20;
+    if !r.read_errors.is_empty() {
+        let errs: Vec<String> = r.read_errors.iter().map(|e| sanitize(e)).collect();
+        return format!("audit chain: could not read the log: {}", errs.join("; "));
+    }
+    let mut out = String::new();
+    if r.breaks.is_empty() {
+        out.push_str("audit chain: intact\n");
+    } else {
+        let n = r.breaks.len();
+        let s = if n == 1 { "" } else { "s" };
+        out.push_str(&format!("audit chain: BROKEN ({n} problem{s})\n"));
+        for b in r.breaks.iter().take(MAX_BREAKS) {
+            let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
+            out.push_str(&format!(
+                "  {} line {}{}: {}\n",
+                sanitize(&b.file),
+                b.line,
+                seq,
+                b.kind.describe()
+            ));
+        }
+        if n > MAX_BREAKS {
+            out.push_str(&format!("  \u{2026} and {} more\n", n - MAX_BREAKS));
+        }
+    }
+    if r.chained > 0 {
+        let head = r.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
+        let chain = r
+            .chain
+            .as_deref()
+            .map(|c| {
+                format!(
+                    ", chain {}\u{2026}",
+                    sanitize(&c.chars().take(6).collect::<String>())
+                )
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  records: {} chained (seq 0\u{2013}{head}){chain}\n",
+            r.chained
+        ));
+    }
+    if !r.v1_files.is_empty() {
+        let files: Vec<String> = r.v1_files.iter().map(|f| sanitize(f)).collect();
+        out.push_str(&format!("  not chained (v1): {}\n", files.join(", ")));
+    }
+    if r.breaks.is_empty() && r.checkpoints == 0 {
+        out.push_str(
+            "  developer mode: no signing key, so this catches accidental edits, not deliberate rewrites.\n",
+        );
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 const INPUT_WIDTH: usize = 60;
 
 /// The one error text for a bad `--since` value.

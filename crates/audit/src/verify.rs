@@ -217,10 +217,30 @@ impl State {
             if kind_field == Some("checkpoint") {
                 report.checkpoints += 1;
             }
-            self.expected = Some(seq + 1);
+            self.expected = seq.checked_add(1);
         }
         report.chained += 1;
         report.head = Some((seq, hash.to_string()));
         (Some(seq), brk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seq_max_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{{\"v\":2,\"seq\":0,\"kind\":\"genesis\",\"prev\":\"{ZERO_PREV}\"}}\n\
+             {{\"v\":2,\"seq\":{},\"prev\":\"x\"}}\n\
+             {{\"v\":2,\"seq\":3,\"prev\":\"x\"}}\n",
+            u64::MAX
+        );
+        std::fs::write(dir.path().join("2026-10.jsonl"), body).unwrap();
+        let r = verify(dir.path());
+        assert!(!r.breaks.is_empty());
+        assert_eq!(r.exit_code(), 1);
     }
 }

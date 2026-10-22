@@ -165,6 +165,8 @@ struct Envelope {
     #[serde(default, deserialize_with = "lenient_string")]
     cwd: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")]
+    permission_mode: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
     command: Option<String>,
     #[serde(default, deserialize_with = "lenient_object")]
     tool_input: Field<ToolInput>,
@@ -398,6 +400,8 @@ pub struct HookContext {
     pub tool: Option<String>,
     pub session: Option<String>,
     pub cwd: Option<String>,
+    /// The agent's permission mode (`default`, `plan`, ...), when it sends one.
+    pub permission_mode: Option<String>,
 }
 
 pub fn context_from_hook_json(input: &str) -> HookContext {
@@ -422,6 +426,7 @@ pub fn context_from_hook_json_bounded(input: &str, max_bytes: usize) -> HookCont
         tool: field(&env.tool_name, &env.tool_name_camel),
         session: field(&env.session_id, &env.session_id_camel),
         cwd: env.cwd.clone().filter(|c| !c.is_empty()),
+        permission_mode: env.permission_mode.clone().filter(|c| !c.is_empty()),
     }
 }
 
@@ -1130,5 +1135,14 @@ mod tests {
         assert_eq!(context_from_hook_json("{not json"), HookContext::default());
         let huge = "a".repeat(MAX_PAYLOAD_BYTES + 1);
         assert_eq!(context_from_hook_json(&huge), HookContext::default());
+    }
+
+    #[test]
+    fn permission_mode_is_read() {
+        let json = include_str!("../../cli/tests/fixtures/claude/bash-deny.json");
+        let ctx = context_from_hook_json(json);
+        assert_eq!(ctx.permission_mode.as_deref(), Some("default"));
+        let none = context_from_hook_json(r#"{"tool_name":"Bash"}"#);
+        assert_eq!(none.permission_mode, None);
     }
 }

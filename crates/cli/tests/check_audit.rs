@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 
 use saiife_audit::store::read_all;
 use saiife_audit::DecisionKind;
+use saiife_audit::Record;
 
 /// `stdin` spells the fixture home `/home/u`; it is mapped to a real temp
 /// home (`common::FixtureHome`) that lives until `saiife` exits.
@@ -34,6 +35,15 @@ fn check(audit_dir: &Path, args: &[&str], stdin: &str) -> i32 {
     child.wait().unwrap().code().unwrap_or(-1)
 }
 
+/// The guard decisions in `dir`, without the chain's genesis line.
+fn guard_records(dir: &Path) -> Vec<Record> {
+    read_all(dir)
+        .records
+        .into_iter()
+        .filter(|r| r.kind() == "guard")
+        .collect()
+}
+
 fn payload(cmd: &str) -> String {
     serde_json::json!({
         "session_id": "sess-1",
@@ -56,7 +66,7 @@ fn allow_is_audited_with_context() {
         ),
         0
     );
-    let recs = read_all(dir.path()).records;
+    let recs = guard_records(dir.path());
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
     assert_eq!(r.decision, DecisionKind::Allow);
@@ -79,7 +89,7 @@ fn deny_is_audited_with_pack_rule_reason() {
         ),
         2
     );
-    let r = &read_all(dir.path()).records[0];
+    let r = &guard_records(dir.path())[0];
     assert_eq!(r.decision, DecisionKind::Deny);
     assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
     assert!(r.rule.is_some());
@@ -90,7 +100,7 @@ fn deny_is_audited_with_pack_rule_reason() {
 fn garbage_payload_is_audited_as_error_allowed() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(check(dir.path(), &["--hook-exit"], "{not json"), 0);
-    let r = &read_all(dir.path()).records[0];
+    let r = &guard_records(dir.path())[0];
     assert_eq!(r.decision, DecisionKind::ErrorAllowed);
     assert_eq!(r.agent, "unknown");
     assert!(r.reason.as_deref().unwrap().contains("payload"));
@@ -101,7 +111,7 @@ fn oversize_payload_is_error_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let big = payload(&format!("echo {}", "a".repeat(300 * 1024)));
     assert_eq!(check(dir.path(), &["--hook-exit"], &big), 0);
-    let r = &read_all(dir.path()).records[0];
+    let r = &guard_records(dir.path())[0];
     assert_eq!(r.decision, DecisionKind::ErrorAllowed);
     assert!(
         r.input.starts_with("echo "),
@@ -173,12 +183,13 @@ fn concurrent_checks_write_whole_lines() {
     let got = read_all(dir.path());
     assert_eq!(got.skipped_lines, 0, "every line is whole");
     assert_eq!(got.unreadable_files, 0);
-    assert_eq!(got.records.len(), 20, "every line parses");
+    assert_eq!(got.records.len(), 21, "every line parses (20 + genesis)");
     // Records keep 4096 chars of input; 4-byte chars push every line past
     // 16 KB, well beyond PIPE_BUF-sized writes.
     assert!(got
         .records
         .iter()
+        .filter(|r| r.kind() == "guard")
         .all(|r| serde_json::to_string(r).unwrap().len() > 16 * 1024));
 }
 
@@ -256,4 +267,45 @@ fn relative_audit_dir_is_ignored() {
         .unwrap();
     child.wait().unwrap();
     assert!(!project.path().join("rel-audit").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_record_is_v2_chained() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        check(
+            dir.path(),
+            &["--hook-exit", "--agent", "claude"],
+            &serde_json::json!({
+                "session_id": "s", "cwd": common::FIXTURE_CWD,
+                "permission_mode": "plan",
+                "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": { "command": "ls" }
+            })
+            .to_string()
+        ),
+        0
+    );
+    let file = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .unwrap();
+    let body = std::fs::read_to_string(file).unwrap();
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["kind"], "genesis");
+    let g = &lines[1];
+    assert_eq!(g["v"], 2);
+    assert_eq!(g["seq"], 1);
+    assert_eq!(g["mode"], "developer");
+    assert_eq!(g["permission_mode"], "plan");
+    assert!(g["uid"].is_number(), "{g}");
+    let policy = g["policy"].as_str().unwrap();
+    let hex = policy.strip_prefix("sha256:").unwrap();
+    assert!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
 }
