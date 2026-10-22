@@ -24,8 +24,8 @@ pub const MODE: &str = "locked";
 const LOOKUP_TTL: Duration = Duration::from_secs(60);
 /// Largest `rec` `audit.append` takes, serialized: the hook's records are
 /// a few KiB; 1 MiB ones at 1 000/s per uid would fill the audit volume
-/// for everyone.
-pub const MAX_RECORD_BYTES: usize = 64 * 1024;
+/// for everyone. Shared with the hook, which shrinks its records to fit.
+pub use saiife_ipc::msg::MAX_RECORD_BYTES;
 /// At most one `rate_limited` / `low_disk` record per uid per this.
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 

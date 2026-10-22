@@ -742,3 +742,51 @@ fn agent_config_dir_env_does_not_reach_the_worker() {
         );
     }
 }
+
+/// A payload whose fields inflate when serialized (`\u0001` is 6 bytes,
+/// a 4-byte UTF-8 char is 4) must still be recorded: the hook shrinks the
+/// record to the daemon's `MAX_RECORD_BYTES` instead of having it refused.
+fn inflated_payload_is_recorded(fill: &str, session_fill: &str, cwd_fill: &str) {
+    let d = TestDaemon::start(Opts::default());
+    let n = |s: &str, bytes: usize| s.repeat(bytes / s.len());
+    let payload = json!({
+        "session_id": n(session_fill, 64 * 1024),
+        "cwd": format!("/{}", n(cwd_fill, 4095)),
+        "permission_mode": n(fill, 1024),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": n(fill, 64 * 1024)}
+    })
+    .to_string();
+    let before = guard_records(&d).len();
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert!(matches!(code(&o), 0 | 2), "stderr: {}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("did not record"),
+        "stderr: {}",
+        stderr(&o)
+    );
+    let recs = guard_records(&d);
+    assert_eq!(recs.len(), before + 1, "daemon: {}", d.stderr_text());
+    let r = recs.last().unwrap();
+    assert!(
+        serde_json::to_vec(r).unwrap().len() <= saiife_ipc::msg::MAX_RECORD_BYTES + 512,
+        "the daemon adds only a few fields"
+    );
+    // Allowed only when the record says so.
+    if code(&o) == 0 {
+        assert_eq!(r["decision"], "allow", "{r}");
+    }
+}
+
+#[test]
+fn control_char_fields_are_still_recorded() {
+    inflated_payload_is_recorded("\u{1}", "\u{1}", "\u{1}");
+}
+
+#[test]
+fn four_byte_char_fields_are_still_recorded() {
+    // 4-byte chars alone cannot pass 64 KiB (3 fields of 4 096 chars at
+    // 4 bytes); with control chars in two of the fields they do.
+    inflated_payload_is_recorded("\u{1F600}", "\u{1}", "\u{1}");
+}

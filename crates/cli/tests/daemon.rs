@@ -7,6 +7,7 @@ mod common;
 use common::daemon::{
     append, dl, guard_rec, own_group, own_uid, refused_code, wait_for, Opts, TestDaemon,
 };
+use saiife_ipc::msg::MAX_RECORD_BYTES;
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -669,24 +670,27 @@ fn reload_of_unlocked_config_warns() {
     assert!(w["reason"].as_str().unwrap().contains("locked"), "{w}");
 }
 
-/// A record above 64 KiB serialized is refused (I2): 1 000 of them a
+/// A record above `MAX_RECORD_BYTES` (64 KiB) serialized is refused (I2): 1 000 of them a
 /// second would fill the audit volume for everyone.
 #[test]
 fn oversized_record_is_bad_request() {
     let d = TestDaemon::start(Opts::default());
     let before = d.records().len();
     let mut c = d.client();
-    let mut rec = guard_rec("x");
-    rec["pad"] = json!("p".repeat(64 * 1024));
-    let e = append(&mut c, rec).unwrap_err();
+    // `rec` padded to exactly `size` bytes serialized.
+    let padded = |size: usize| {
+        let mut rec = guard_rec("x");
+        rec["pad"] = json!("");
+        let base = serde_json::to_vec(&rec).unwrap().len();
+        rec["pad"] = json!("p".repeat(size - base));
+        assert_eq!(serde_json::to_vec(&rec).unwrap().len(), size);
+        rec
+    };
+    let e = append(&mut c, padded(MAX_RECORD_BYTES + 1)).unwrap_err();
     assert_eq!(refused_code(&e), "bad_request");
     assert_eq!(d.records().len(), before);
-    // Just under the cap is fine, and the connection stays usable.
-    let mut rec = guard_rec("x");
-    let base = serde_json::to_vec(&rec).unwrap().len();
-    rec["pad"] = json!("p".repeat(64 * 1024 - base - 16));
-    assert!(serde_json::to_vec(&rec).unwrap().len() <= 64 * 1024);
-    append(&mut c, rec).unwrap();
+    // Exactly at the cap is fine, and the connection stays usable.
+    append(&mut c, padded(MAX_RECORD_BYTES)).unwrap();
     assert_eq!(d.records().len(), before + 1);
 }
 

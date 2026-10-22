@@ -9,6 +9,13 @@ pub const OP_AUDIT_APPEND: &str = "audit.append";
 pub const OP_STATUS: &str = "status";
 pub const OP_AUDIT_ROTATE_KEY: &str = "audit.rotate_key";
 
+/// Largest `rec` that `audit.append` takes, as compact JSON
+/// (`serde_json::to_vec`). The daemon refuses a larger one with
+/// `bad_request`; the managed hook shrinks its record to fit, so a denied
+/// call can never escape the audit record. Shared so the two never
+/// disagree.
+pub const MAX_RECORD_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub id: u64,

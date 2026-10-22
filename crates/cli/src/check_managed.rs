@@ -95,7 +95,7 @@ mod imp {
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
     use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
-    use saiife_ipc::msg::OP_AUDIT_APPEND;
+    use saiife_ipc::msg::{MAX_RECORD_BYTES, OP_AUDIT_APPEND};
     use saiife_policy::{
         active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
         Mode, PackInfo, SystemConfig,
@@ -119,10 +119,27 @@ mod imp {
     /// which Codex and Gemini CLI would let the call run (§9.3). The
     /// deadlines above add up to about 5 s.
     const OVERALL_TIMEOUT: Duration = Duration::from_secs(7);
-    /// Longest `agent`, `project`, `session`, `tool` or `reason` sent, in
-    /// characters, so every record fits in one frame.
+    /// Longest `agent`, `project`, `session`, `tool`, `reason` or
+    /// `permission_mode` sent, in characters. A record can still serialize
+    /// past `MAX_RECORD_BYTES` (a control character is 6 bytes as
+    /// `\u00XX`), so `fit` then cuts by serialized bytes.
     const MAX_FIELD_CHARS: usize = 4096;
     const TRUNCATED_MARK: &str = "…[truncated]";
+    /// The reason recorded when even the shrunk record does not fit.
+    const TOO_LARGE: &str = "record too large";
+    /// The fields `fit` may cut: everything the agent or the project
+    /// controls. The daemon sets the rest, or it is short and fixed.
+    const SHRINKABLE: [&str; 9] = [
+        "input",
+        "project",
+        "session",
+        "permission_mode",
+        "reason",
+        "tool",
+        "agent",
+        "rule",
+        "pack",
+    ];
 
     /// The running worker's pid (0: none), for the watchdog.
     static WORKER_PID: AtomicU32 = AtomicU32::new(0);
@@ -270,9 +287,15 @@ mod imp {
             return blocked("saiife crashed before reaching the audit daemon");
         };
 
-        // 8. The record; 9. its ack.
+        // 8. The record, within the daemon's size limit; 9. its ack.
         let policy = policy.unwrap_or_else(|| "unavailable".into());
-        let rec = record(agent, &ctx, &policy, &judged);
+        let mut judged = judged;
+        let mut rec = record(agent, &ctx, &policy, &judged);
+        if !fit(&mut rec) {
+            // Fail closed: the record says error_denied, so must the call.
+            judged = Judged::error(String::new(), TOO_LARGE.into());
+            rec = minimal_record(agent, &policy);
+        }
         if let Err(e) = append(&mut client, rec) {
             return blocked(&format!(
                 "the audit daemon did not record this call ({})",
@@ -625,7 +648,10 @@ mod imp {
         for f in [&mut rec.agent, &mut rec.project, &mut rec.tool] {
             cap(f);
         }
-        for f in [&mut rec.session, &mut rec.reason].into_iter().flatten() {
+        for f in [&mut rec.session, &mut rec.reason, &mut rec.permission_mode]
+            .into_iter()
+            .flatten()
+        {
             cap(f);
         }
         let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
@@ -633,6 +659,97 @@ mod imp {
             m.remove("ts");
         }
         v
+    }
+
+    /// The fallback when `fit` fails: `error_denied` with no input and
+    /// nothing the agent controls but a short `agent`.
+    fn minimal_record(agent: &str, policy: &str) -> Value {
+        let agent = if json_str_len(agent) > 256 {
+            cut_to(agent, 256)
+        } else {
+            agent.to_string()
+        };
+        let rec = Record::new(
+            NewRecord {
+                agent: &agent,
+                project: "",
+                session: None,
+                tool: "unknown",
+                input: "",
+                decision: DecisionKind::ErrorDenied,
+                pack: None,
+                rule: None,
+                reason: Some(TOO_LARGE),
+                mode: "locked",
+                policy: Some(policy),
+                permission_mode: None,
+            },
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
+        if let Some(m) = v.as_object_mut() {
+            m.remove("ts");
+        }
+        v
+    }
+
+    /// Shrink the `SHRINKABLE` fields of `rec`, largest serialized first,
+    /// until `rec` serializes to at most `MAX_RECORD_BYTES` (the daemon's
+    /// limit, measured the same way). `false`: it still does not fit.
+    fn fit(rec: &mut Value) -> bool {
+        // Each round either fits or cuts a field down to the bare marker,
+        // after which that field is no longer a candidate.
+        for _ in 0..=SHRINKABLE.len() {
+            let total = serde_json::to_vec(&*rec).map_or(usize::MAX, |b| b.len());
+            if total <= MAX_RECORD_BYTES {
+                return true;
+            }
+            let excess = total - MAX_RECORD_BYTES;
+            let Some(m) = rec.as_object_mut() else {
+                return false;
+            };
+            let largest = SHRINKABLE
+                .iter()
+                .filter_map(|k| Some((*k, json_str_len(m.get(*k)?.as_str()?))))
+                .filter(|(_, len)| *len > json_str_len(TRUNCATED_MARK))
+                .max_by_key(|(_, len)| *len);
+            let Some((key, len)) = largest else {
+                return false;
+            };
+            let cut = cut_to(m[key].as_str().unwrap_or(""), len.saturating_sub(excess));
+            m.insert(key.into(), Value::String(cut));
+        }
+        false
+    }
+
+    /// The bytes `c` takes inside a JSON string as serde_json writes it.
+    fn json_char_len(c: char) -> usize {
+        match c {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        }
+    }
+
+    /// The bytes `s` takes inside a JSON string (without the quotes).
+    fn json_str_len(s: &str) -> usize {
+        s.chars().map(json_char_len).sum()
+    }
+
+    /// The longest prefix of `s` that, with the marker, takes at most
+    /// `budget` bytes inside a JSON string (at least the marker).
+    fn cut_to(s: &str, budget: usize) -> String {
+        let room = budget.saturating_sub(json_str_len(TRUNCATED_MARK));
+        let mut used = 0;
+        let mut end = 0;
+        for (i, c) in s.char_indices() {
+            used += json_char_len(c);
+            if used > room {
+                break;
+            }
+            end = i + c.len_utf8();
+        }
+        format!("{}{TRUNCATED_MARK}", &s[..end])
     }
 
     /// Cut `s` to `MAX_FIELD_CHARS` characters plus a marker.
@@ -659,6 +776,108 @@ mod imp {
             ClientError::Owner { .. } => format!("socket owner check failed: {e}"),
             ClientError::Timeout => "no answer within the deadline".into(),
             other => other.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn len(v: &Value) -> usize {
+            serde_json::to_vec(v).unwrap().len()
+        }
+
+        fn rec_with(input: &str, project: &str) -> Value {
+            let mut v = minimal_record("claude", "sha256:00");
+            v["input"] = input.into();
+            v["project"] = project.into();
+            v
+        }
+
+        #[test]
+        fn json_char_len_matches_serde_json() {
+            let mut chars: Vec<char> = (0u32..0x80).filter_map(char::from_u32).collect();
+            chars.extend(['é', '…', '\u{2028}', '\u{FEFF}', '\u{1F600}', '\u{7F}']);
+            for c in chars {
+                let s = c.to_string();
+                assert_eq!(
+                    json_char_len(c),
+                    serde_json::to_string(&s).unwrap().len() - 2,
+                    "{c:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn exactly_at_the_limit_is_left_alone() {
+            let mut v = rec_with("", "/p");
+            let pad = MAX_RECORD_BYTES - len(&v);
+            v["input"] = "\u{1}".repeat(pad / 6).into();
+            v["input"] = format!("{}{}", v["input"].as_str().unwrap(), "x".repeat(pad % 6)).into();
+            assert_eq!(len(&v), MAX_RECORD_BYTES);
+            let before = v.clone();
+            assert!(fit(&mut v));
+            assert_eq!(v, before);
+        }
+
+        #[test]
+        fn one_byte_over_is_cut_to_fit() {
+            let mut v = rec_with("", "/p");
+            let pad = MAX_RECORD_BYTES - len(&v) + 1;
+            v["input"] = "x".repeat(pad).into();
+            assert!(fit(&mut v));
+            assert!(len(&v) <= MAX_RECORD_BYTES);
+            let input = v["input"].as_str().unwrap();
+            assert!(input.ends_with(TRUNCATED_MARK), "{input}");
+            // Cut by no more than needed for the marker.
+            assert!(len(&v) > MAX_RECORD_BYTES - 32, "{}", len(&v));
+        }
+
+        #[test]
+        fn inflating_fields_are_cut_by_bytes() {
+            let ctrl = "\u{1}".repeat(MAX_FIELD_CHARS);
+            let wide = "\u{1F600}".repeat(MAX_FIELD_CHARS);
+            let mut v = rec_with(&ctrl, &ctrl);
+            v["session"] = ctrl.clone().into();
+            v["reason"] = wide.clone().into();
+            v["tool"] = wide.into();
+            assert!(len(&v) > MAX_RECORD_BYTES);
+            assert!(fit(&mut v));
+            assert!(len(&v) <= MAX_RECORD_BYTES, "{}", len(&v));
+            // Each cut field is a prefix plus the marker, on a char boundary.
+            for k in ["input", "project", "session", "reason", "tool"] {
+                let s = v[k].as_str().unwrap();
+                if let Some(p) = s.strip_suffix(TRUNCATED_MARK) {
+                    assert!(p.chars().all(|c| c == '\u{1}' || c == '\u{1F600}'), "{k}");
+                }
+            }
+        }
+
+        #[test]
+        fn unshrinkable_record_does_not_fit() {
+            let mut v = rec_with("", "/p");
+            v["saiife"] = "v".repeat(MAX_RECORD_BYTES).into();
+            assert!(!fit(&mut v));
+        }
+
+        #[test]
+        fn minimal_record_is_error_denied_and_small() {
+            let v = minimal_record(&"\u{1}".repeat(100_000), "sha256:00");
+            assert_eq!(v["decision"], "error_denied");
+            assert_eq!(v["reason"], TOO_LARGE);
+            assert_eq!(v["input"], "");
+            assert!(len(&v) < 1024, "{}", len(&v));
+        }
+
+        #[test]
+        fn cut_to_respects_the_budget() {
+            for budget in [0, 5, 14, 15, 20, 100] {
+                let c = cut_to(&"\u{1}é".repeat(50), budget);
+                assert!(
+                    json_str_len(&c) <= budget.max(json_str_len(TRUNCATED_MARK)),
+                    "{budget}: {c:?}"
+                );
+            }
         }
     }
 }
