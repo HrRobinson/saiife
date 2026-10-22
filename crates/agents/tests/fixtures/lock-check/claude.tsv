@@ -1,0 +1,33 @@
+# agent=claude
+# agent_version=2.1.308 (Claude Code)
+# node_version=v22.14.0
+# image=sha256:b639242f6566678cfc8530aa87fd966273ee2fbc6a29a1686c27342c77629d13
+# saiife_commit=af00963439d62dbc102bce420e45731f1d4fda4d
+# kernel=7.2.4-arch1-2
+# date=2026-10-22T05:04:03Z
+claude.control	control	ran	ran	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.managed.fires	gate	fired	fired	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.deny	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.disable.user	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.disable.project	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.disable.local	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.disable.cli	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.hooks-empty.user	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.config-dir	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.setting-sources	gate	blocked	blocked	PASS	mode=deny exit=0 stub=seen witness=seen
+claude.fail.exit101	gate	blocked	blocked	PASS	mode=panic exit=0 stub=seen witness=seen
+claude.fail.segv	gate	blocked	blocked	PASS	mode=segv exit=0 stub=seen witness=seen
+claude.fail.kill9	gate	blocked	blocked	PASS	mode=kill9 exit=0 stub=seen witness=seen
+claude.fail.timeout	gate	blocked	blocked	PASS	mode=hang exit=0 stub=seen witness=seen
+claude.fail.missing	gate	blocked	blocked	PASS	mode=missing exit=0 stub=unseen witness=seen
+claude.fail.exit1	design	blocked	blocked	PASS	mode=exit1 exit=0 stub=seen witness=seen
+claude.configchange.fires	design	fired	fired	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.configchange.control	design	ran	ran	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.configchange.blocks	design	blocked	blocked	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.managed-only	design	blocked	blocked	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.mcp.control	design	ran	ran	PASS	mode=allow exit=0 stub=seen witness=seen
+claude.mcp.hooked	design	fired	fired	PASS	mode=allow exit=0 stub=seen witness=seen tool_name=mcp__lockcheck__touch_marker
+claude.mcp.denied	design	unavailable	unavailable	PASS	mode=allow exit=0 stub=unseen witness=unseen
+claude.mcp.allowlist	design	unavailable	unavailable	PASS	mode=allow exit=0 stub=unseen witness=unseen
+claude.version.onfailure	info	-	found	INFO	2.1.308 (Claude Code)
+# label=lockable

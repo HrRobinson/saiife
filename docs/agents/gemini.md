@@ -111,6 +111,12 @@ not running.
   [core.secrets](../packs/core.secrets.md#not-covered) and
   [core.self](../packs/core.self.md#not-covered).
 
+## Locked mode (v2)
+
+Lock label: **unverified**. The [lock-check](../lock-check.md) for Gemini CLI has
+not been run with a logged-in account yet, so we do not know whether
+Gemini CLI can be locked.
+
 ## Not yet verified live
 
 saiife's Gemini CLI support is built from Gemini CLI's docs and source code.
