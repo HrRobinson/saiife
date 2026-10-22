@@ -17,7 +17,10 @@ pub mod layout;
 pub mod supported;
 pub mod unit;
 
-pub use host::{host_for, Chown, CmdOutput, FakeHost, FakeState, Host, RealHost, UserInfo};
+pub use host::{
+    host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost, UserInfo,
+    CONTAINER_UNKNOWN,
+};
 pub use layout::Layout;
 pub use supported::{check_supported, refusal_line, Support, NOT_LINUX};
 pub use unit::{unit_text, vault_key_mode};

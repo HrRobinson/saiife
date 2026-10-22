@@ -2,7 +2,7 @@
 //! Debian 12+, RHEL 9+ (and distributions `ID_LIKE` rhel, 9+), each with
 //! systemd running. Alpine and containers get developer mode only.
 
-use crate::host::Host;
+use crate::host::{Host, CONTAINER_UNKNOWN};
 use crate::layout::Layout;
 use std::collections::BTreeMap;
 
@@ -44,6 +44,13 @@ pub(crate) fn supported_on(linux: bool, layout: &Layout, host: &dyn Host) -> Sup
             None
         }
     });
+    if container.as_deref() == Some(CONTAINER_UNKNOWN) {
+        return Support::Refused(
+            "container detection failed (systemd-detect-virt is missing or did not answer); \
+             locked mode needs it to rule out a container"
+                .into(),
+        );
+    }
     if let Some(c) = container {
         return Support::Refused(format!("inside a container ({c}): developer mode only"));
     }
@@ -284,6 +291,15 @@ mod tests {
         let (d, l, h) = root_with(UBUNTU_2404);
         fs::write(d.path().join("run/.containerenv"), "").unwrap();
         assert!(refused(check_linux(&l, &h)).starts_with("inside a container ("));
+    }
+
+    #[test]
+    fn unknown_container_refused() {
+        let (_d, l, h) = root_with(UBUNTU_2404);
+        h.set(|s| s.container = Some(crate::host::CONTAINER_UNKNOWN.into()));
+        let why = refused(check_linux(&l, &h));
+        assert!(why.contains("systemd-detect-virt"), "{why}");
+        assert!(!why.starts_with("inside a container"), "{why}");
     }
 
     #[test]

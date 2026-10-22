@@ -132,6 +132,25 @@ pub fn read_installed(path: &Path) -> Result<Option<Installed>, String> {
     Ok(Some(installed))
 }
 
+/// `.<name>.tmp.<16 random hex>` next to `path`: not guessable, so another
+/// user cannot plant it in advance (it is also opened `O_EXCL`).
+fn temp_path(path: &Path) -> io::Result<PathBuf> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(|e| io::Error::other(e.to_string()))?;
+    let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".tmp.{hex}"));
+    Ok(dir.join(tmp_name))
+}
+
 /// Writes `installed.toml`: a temp file next to it at mode 0644, synced,
 /// then renamed over it (and the directory synced), so a reader sees the
 /// old list or the new one, never a torn one.
@@ -141,13 +160,7 @@ pub fn write_installed(path: &Path, i: &Installed) -> io::Result<()> {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = dir.join(tmp_name);
+    let tmp = temp_path(path)?;
     let result = (|| {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -246,6 +259,18 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("installed.toml")]);
+    }
+
+    #[test]
+    fn temp_names_are_random() {
+        let p = Path::new("/etc/saiife/installed.toml");
+        let a = temp_path(p).unwrap();
+        let b = temp_path(p).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(Path::new("/etc/saiife")));
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(".installed.toml.tmp."), "{name}");
+        assert!(!name.ends_with(&std::process::id().to_string()), "{name}");
     }
 
     #[test]

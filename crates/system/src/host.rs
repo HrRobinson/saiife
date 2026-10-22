@@ -71,16 +71,52 @@ pub trait Host: Send + Sync {
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput>;
 }
 
-/// The host for `layout`: the machine itself for the real root, a
-/// [`FakeHost`] for any other root.
-pub fn host_for(layout: &Layout) -> Box<dyn Host> {
-    if layout.is_system() {
-        return Box::new(RealHost);
+/// What `container` reports when it cannot tell (systemd-detect-virt
+/// missing or not answering on a systemd host). The supported check refuses
+/// it: locked mode fails closed.
+pub const CONTAINER_UNKNOWN: &str = "unknown";
+
+/// Which host a resolved root gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKind {
+    Real,
+    Fake,
+}
+
+/// The decision behind [`host_for`]: `/` is the machine; any other root is
+/// a fake tree, which root may not use (a fake tree run as root would mix
+/// fake bookkeeping with real privileges).
+pub fn host_kind(canonical_root: &Path, euid: u32) -> Result<HostKind, String> {
+    if canonical_root == Path::new("/") {
+        Ok(HostKind::Real)
+    } else if euid == 0 {
+        Err(format!(
+            "refusing --root {} as root: a test root is only for unprivileged runs",
+            canonical_root.display()
+        ))
+    } else {
+        Ok(HostKind::Fake)
     }
-    match FakeHost::open(layout.root()) {
-        Ok(h) => Box::new(h),
-        // Every call that needs the state file then fails with its error.
-        Err(_) => Box::new(FakeHost::unopened(layout.root())),
+}
+
+/// The host for `layout`: the machine itself for the real root, a
+/// [`FakeHost`] for any other root. Refuses a root that could not be
+/// resolved, and a test root when running as root.
+pub fn host_for(layout: &Layout) -> io::Result<Box<dyn Host>> {
+    if !layout.is_resolved() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "root {} cannot be resolved (`..` below a missing directory)",
+                layout.root().display()
+            ),
+        ));
+    }
+    let euid = rustix::process::geteuid().as_raw();
+    match host_kind(layout.root(), euid) {
+        Ok(HostKind::Real) => Ok(Box::new(RealHost)),
+        Ok(HostKind::Fake) => Ok(Box::new(FakeHost::open(layout.root())?)),
+        Err(msg) => Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
     }
 }
 
@@ -164,9 +200,10 @@ impl Host for RealHost {
     }
 
     fn container(&self) -> Option<String> {
-        let out = exec(DETECT_VIRT, &["--container"], None, QUERY_TIMEOUT).ok()?;
-        let name = out.stdout.trim();
-        (out.status == 0 && !name.is_empty()).then(|| name.to_string())
+        container_from(
+            exec(DETECT_VIRT, &["--container"], None, QUERY_TIMEOUT),
+            Path::new("/run/systemd/system").is_dir(),
+        )
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
@@ -174,14 +211,34 @@ impl Host for RealHost {
     }
 }
 
-/// A user or group name safe to pass as an argument: not empty, no leading
-/// `-` (no option injection), no `:`, `/`, whitespace or control characters.
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('-')
-        && !name
-            .chars()
-            .any(|c| c == ':' || c == '/' || c.is_whitespace() || c.is_control())
+/// `systemd-detect-virt --container`'s answer. Exit 0 names the container;
+/// `none` means none. Anything else (missing program, timeout, an error)
+/// is [`CONTAINER_UNKNOWN`] on a systemd host, so the check fails closed;
+/// without systemd the systemd check refuses anyway.
+pub(crate) fn container_from(res: io::Result<CmdOutput>, systemd_running: bool) -> Option<String> {
+    if let Ok(out) = &res {
+        let name = out.stdout.trim();
+        if name == "none" {
+            return None;
+        }
+        if out.status == 0 && !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    systemd_running.then(|| CONTAINER_UNKNOWN.to_string())
+}
+
+/// A user or group name safe to pass to the user tools:
+/// `^[a-z_][a-z0-9_-]{0,31}$`. No option injection (`-`), no lists (`,`
+/// for `usermod -aG`), no all-digit names (read as ids, `0` = root).
+pub(crate) fn valid_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && matches!(b[0], b'a'..=b'z' | b'_')
+        && b[1..]
+            .iter()
+            .all(|c| matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
 fn check_names(names: &[&str]) -> io::Result<()> {
@@ -327,8 +384,14 @@ fn exec(
     );
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -512,7 +575,8 @@ impl FakeHost {
     /// file when they are missing.
     pub fn open(root: &Path) -> io::Result<FakeHost> {
         std::fs::create_dir_all(root)?;
-        let h = FakeHost::unopened(root);
+        // The same spelling as `Layout::under` gives its paths.
+        let h = FakeHost::unopened(&std::fs::canonicalize(root)?);
         let state = h.load()?;
         if !h.state_path().exists() {
             h.save(&state)?;
@@ -651,6 +715,7 @@ impl Host for FakeHost {
     }
 
     fn delete_user(&self, name: &str) -> io::Result<()> {
+        check_names(&[name])?;
         self.update(|s| {
             s.users.remove(name).ok_or_else(|| missing("user", name))?;
             for m in s.members.values_mut() {
@@ -661,6 +726,7 @@ impl Host for FakeHost {
     }
 
     fn delete_group(&self, name: &str) -> io::Result<()> {
+        check_names(&[name])?;
         self.update(|s| {
             s.groups
                 .remove(name)
@@ -947,9 +1013,109 @@ mod tests {
     }
 
     #[test]
+    fn host_kind_decision() {
+        let tmp = Path::new("/home/u/t");
+        assert_eq!(host_kind(Path::new("/"), 0), Ok(HostKind::Real));
+        assert_eq!(host_kind(Path::new("/"), 1000), Ok(HostKind::Real));
+        assert_eq!(host_kind(tmp, 1000), Ok(HostKind::Fake));
+        let e = host_kind(tmp, 0).unwrap_err();
+        assert!(e.contains("as root") && e.contains("/home/u/t"), "{e}");
+    }
+
+    #[test]
+    fn host_for_refuses_an_unresolvable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = Layout::under(dir.path().join("missing/../../.."));
+        assert!(host_for(&l).is_err());
+    }
+
+    #[test]
+    fn names_follow_the_portable_pattern() {
+        for ok in ["saiife", "saiife-audit", "_svc", "a", "u2", &"a".repeat(32)] {
+            assert!(valid_name(ok), "{ok}");
+        }
+        for bad in [
+            "saiife-audit,docker",
+            "0",
+            "123",
+            "Saiife",
+            "-o",
+            "",
+            "a b",
+            "a:b",
+            "a/b",
+            "1abc",
+            &"a".repeat(33),
+            "sa\u{e9}",
+        ] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+        assert!(argv_add_to_group("saiife", "saiife-audit,docker").is_err());
+        assert!(argv_create_group("0").is_err());
+    }
+
+    #[test]
+    fn fake_delete_validates_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        h.set(|s| {
+            s.users.insert(
+                "-r".into(),
+                UserInfo {
+                    uid: 1,
+                    gid: 1,
+                    home: "/".into(),
+                    shell: "/bin/sh".into(),
+                },
+            );
+            s.groups.insert("a,b".into(), 1);
+        });
+        assert_eq!(
+            h.delete_user("-r").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            h.delete_group("a,b").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn container_detection_fails_closed() {
+        let out = |status: i32, stdout: &str| -> io::Result<CmdOutput> {
+            Ok(CmdOutput {
+                status,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            })
+        };
+        assert_eq!(
+            container_from(out(0, "docker\n"), true).as_deref(),
+            Some("docker")
+        );
+        assert_eq!(container_from(out(1, "none\n"), true), None);
+        let missing = || Err(io::Error::new(io::ErrorKind::NotFound, "x not found"));
+        let timeout = || Err(io::Error::new(io::ErrorKind::TimedOut, "slow"));
+        assert_eq!(
+            container_from(missing(), true).as_deref(),
+            Some(CONTAINER_UNKNOWN)
+        );
+        assert_eq!(
+            container_from(timeout(), true).as_deref(),
+            Some(CONTAINER_UNKNOWN)
+        );
+        assert_eq!(
+            container_from(out(2, ""), true).as_deref(),
+            Some(CONTAINER_UNKNOWN)
+        );
+        // Without systemd, the systemd check refuses anyway.
+        assert_eq!(container_from(missing(), false), None);
+    }
+
+    #[test]
     fn host_for_picks_fake_under_a_root() {
         let dir = tempfile::tempdir().unwrap();
-        let h = host_for(&Layout::under(dir.path()));
+        let h = host_for(&Layout::under(dir.path())).unwrap();
         assert_eq!(h.systemd_version().unwrap(), 255);
         assert!(dir.path().join(".fakehost.json").is_file());
     }
