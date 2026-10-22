@@ -287,6 +287,7 @@ fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
         None => {
             let g = genesis(&GenesisSpec {
                 saiife: &rec.saiife,
+                ts: &rec.ts,
                 mode: "developer",
                 key: None,
                 uid: rec.uid,
@@ -331,9 +332,10 @@ fn year_month(name: &str) -> Option<(u32, u32)> {
 /// `<month>.jsonl` for the record, or the newest existing month file when
 /// that is later: a clock that went back must not write into the chain's
 /// past. A real month at most one month ahead of the record's is followed
-/// as it is (clock skew). One further ahead is followed only when the chain
-/// itself wrote it (`written_by_chain`), so a planted `9999-12.jsonl`
-/// cannot divert every later record.
+/// as it is (clock skew). One further ahead is followed only when its
+/// first chained line says the chain wrote it (`written_by_chain`, which
+/// names the limits), so a stray `9999-12.jsonl` cannot divert every later
+/// record.
 fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
     let own = dir.join(format!("{}.jsonl", rec.month()));
     let newest = files
@@ -356,11 +358,21 @@ fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
     }
 }
 
-/// Whether the newest of `files` (oldest first) was written by the chain
-/// after a clock rollback rather than planted: its last chained line has a
-/// `ts` in the file's own month, and its first line is a genesis or chains
-/// on from the last line of the file before it. Both reads are bounded
-/// (`MAX_SCAN` back from the end, `TAIL_WINDOW` from the start).
+/// Whether the newest of `files` (oldest first) looks like the chain wrote
+/// it, so a clock rollback of more than a month may follow it. The file is
+/// judged by its first chained line (searching forward within
+/// `TAIL_WINDOW` past unparseable and unchained lines; a v1 line first
+/// means no): its `ts` is in the file's own month, and it is a genesis or
+/// its `prev` is the hash of the physical line before it (for the file's
+/// first line, the last line of the previous non-empty file). That first
+/// line was written when the clock was right, and later rolled-back
+/// records do not change it.
+///
+/// This tells a chain-written file from a stray or carelessly planted one,
+/// not from a forgery: anyone who can write to a developer-mode audit dir
+/// can also write a first line that links. Developer mode does not defend
+/// against its own user; in locked mode the daemon owns the dir and its
+/// `ChainWriter` does not use this rule.
 fn written_by_chain(files: &[PathBuf]) -> bool {
     let Some((newest, older)) = files.split_last() else {
         return false;
@@ -372,42 +384,45 @@ fn written_by_chain(files: &[PathBuf]) -> bool {
     else {
         return false;
     };
-    let mut ts_ok = false;
-    let mut budget = MAX_SCAN;
-    let scanned = scan_back(newest, &mut budget, |line| match TailLine::parse(line) {
-        Some(t) if t.v < 2 => Some(Found::Stop),
-        Some(t) if t.seq.is_some() => {
-            ts_ok = t.ts.is_some_and(|ts| ts.starts_with(month));
-            Some(Found::Stop)
-        }
-        _ => None,
-    });
-    if !matches!(scanned, Ok(Found::Stop)) || !ts_ok {
-        return false;
-    }
-    let Some(first) = first_line(newest).as_deref().and_then(TailLine::parse) else {
+    let Some(head) = head_lines(newest) else {
         return false;
     };
-    if first.v < 2 || first.seq.is_none() {
-        return false;
+    // Computed lazily: only a first chained line on the file's first line
+    // links to the previous file.
+    let before = || {
+        older
+            .iter()
+            .rev()
+            .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
+            .and_then(|p| last_line_hash(p))
+    };
+    let mut line_before: Option<String> = None;
+    for (i, line) in head.split(|&b| b == b'\n').enumerate() {
+        match TailLine::parse(line) {
+            Some(t) if t.v < 2 => return false,
+            Some(t) if t.seq.is_some() => {
+                if !t.ts.as_deref().is_some_and(|ts| ts.starts_with(month)) {
+                    return false;
+                }
+                if t.is_genesis() {
+                    return true;
+                }
+                let want = if i == 0 { before() } else { line_before };
+                return want.is_some() && t.prev == want;
+            }
+            _ => line_before = Some(sha256_hex(line)),
+        }
     }
-    if first.is_genesis() {
-        return true;
-    }
-    let before = older
-        .iter()
-        .rev()
-        .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
-        .and_then(|p| last_line_hash(p));
-    before.is_some() && first.prev == before
+    false
 }
 
-/// The first line of `path`, if it ends within `TAIL_WINDOW` bytes.
-fn first_line(path: &Path) -> Option<Vec<u8>> {
+/// The complete lines (without the final newline) within the first
+/// `TAIL_WINDOW` bytes of `path`; `None` if there is not one.
+fn head_lines(path: &Path) -> Option<Vec<u8>> {
     let f = store::open_regular(path)?;
     let mut buf = Vec::new();
     f.take(TAIL_WINDOW).read_to_end(&mut buf).ok()?;
-    let end = buf.iter().position(|&b| b == b'\n')?;
+    let end = buf.iter().rposition(|&b| b == b'\n')?;
     buf.truncate(end);
     Some(buf)
 }
@@ -548,6 +563,9 @@ fn scan_back(
 /// What a genesis record says besides its fixed fields.
 struct GenesisSpec<'a> {
     saiife: &'a str,
+    /// The `ts` of the record it is written with: the genesis goes into
+    /// that record's file, and the rollback rule reads its month.
+    ts: &'a str,
     mode: &'a str,
     /// `ed25519:<spki b64>` of the signing key, locked mode only.
     key: Option<&'a str>,
@@ -574,6 +592,7 @@ fn genesis(spec: &GenesisSpec<'_>) -> io::Result<Record> {
         },
         spec.saiife,
     );
+    g.ts = spec.ts.to_string();
     g.kind = Some("genesis".into());
     g.seq = Some(0);
     g.prev = Some(ZERO_PREV.into());
@@ -612,12 +631,39 @@ pub struct ChainWriter {
     head: Option<(u64, String)>,
     chain_id: Option<String>,
     host: Option<String>,
-    /// The newest month file's name and an append handle on it.
-    current: Option<(String, File)>,
+    /// The newest month file, with an append handle on it.
+    current: Option<Current>,
     /// Records appended since the last checkpoint (Task 5 writes those).
     since_checkpoint: u64,
-    /// A write failed part-way: re-read the tail before the next append.
+    /// The cached head may not match the disk (a failed write, a foreign
+    /// line): re-read the tail before the next append.
     stale: bool,
+}
+
+/// The month file the writer appends to.
+#[derive(Debug)]
+struct Current {
+    name: String,
+    file: File,
+    /// Where the writer expects the file to end. Any other length means
+    /// someone else wrote to it (a developer-mode fallback line, a hand
+    /// edit), and the head no longer hashes the last line.
+    end: u64,
+}
+
+impl Current {
+    fn open(path: &Path) -> io::Result<Current> {
+        let new = fs::symlink_metadata(path).is_err();
+        let file = store::open_append_mode(path, 0o640)?;
+        if new {
+            set_mode(&file, 0o640)?;
+        }
+        Ok(Current {
+            name: file_name(path)?,
+            end: file.metadata()?.len(),
+            file,
+        })
+    }
 }
 
 impl ChainWriter {
@@ -652,38 +698,64 @@ impl ChainWriter {
         Ok(w)
     }
 
-    /// Read the chain's state from disk (tail, chain id, newest file).
+    /// Read the chain's state from disk (tail, chain id, newest file). A
+    /// chain whose genesis cannot be found (a v1 line in between) is not
+    /// continued: the next append starts a new one, as `append_chained`
+    /// does after a v1 line.
     fn load(&mut self) -> io::Result<()> {
         let files = regular_month_files(&self.dir)?;
         let tail = find_tail(&files, u64::MAX, true)?;
-        self.head = tail.as_ref().and_then(Tail::head);
-        if self.head.is_some() {
-            let tail = tail.expect("head comes from a tail");
-            self.chain_id = tail.chain;
-            self.host = tail.last.and_then(|t| t.host);
-        } else {
-            self.chain_id = None;
-            self.host = None;
-        }
-        self.current = match files.last() {
-            Some(p) => {
-                let name = file_name(p)?;
-                Some((name, store::open_append_mode(p, 0o640)?))
-            }
-            None => None,
+        let (head, chain_id, host) = match tail {
+            Some(t) => match (t.head(), t.chain) {
+                (Some(head), Some(chain)) => (Some(head), Some(chain), t.last.and_then(|l| l.host)),
+                _ => (None, None, None),
+            },
+            None => (None, None, None),
         };
+        self.head = head;
+        self.chain_id = chain_id;
+        self.host = host;
+        self.current = files.last().map(|p| Current::open(p)).transpose()?;
         self.stale = false;
         Ok(())
+    }
+
+    /// Make the file for a record of month file `own` current, and the
+    /// cached head match what is on disk.
+    fn prepare(&mut self, own: &str) -> io::Result<()> {
+        for _ in 0..2 {
+            if self.stale {
+                self.load()?;
+            }
+            if self.current.as_ref().is_none_or(|c| c.name.as_str() < own) {
+                // fsync = "checkpoint": what went to the old file is synced
+                // before its handle goes.
+                if let Some(old) = &self.current {
+                    old.file.sync_data()?;
+                }
+                let next = Current::open(&self.dir.join(own))?;
+                // A new month file someone else already wrote to.
+                self.stale |= next.end > 0;
+                self.current = Some(next);
+            }
+            let c = self.current.as_ref().expect("current file set above");
+            self.stale |= c.file.metadata()?.len() != c.end;
+            if !self.stale {
+                return Ok(());
+            }
+        }
+        Err(io::Error::other(
+            "the audit log keeps changing under the chain writer",
+        ))
     }
 
     /// Append `rec` to the chain and return its `seq`. Sets `seq`, `prev`
     /// and `host`; writes a genesis first when there is no chain yet. The
     /// target is the record's month file or the newest file, whichever is
     /// later: the writer owns the dir, so the newest file is the chain's.
+    /// A line someone else added to the file since the last append is
+    /// noticed (by the file's length) and chained on from.
     pub fn append(&mut self, mut rec: Record) -> io::Result<u64> {
-        if self.stale {
-            self.load()?;
-        }
         let own = format!("{}.jsonl", rec.month());
         if !store::is_month_file(&own) {
             return Err(io::Error::other(format!(
@@ -691,15 +763,7 @@ impl ChainWriter {
                 rec.ts
             )));
         }
-        if self.current.as_ref().is_none_or(|(name, _)| *name < own) {
-            let path = self.dir.join(&own);
-            let new = fs::symlink_metadata(&path).is_err();
-            let file = store::open_append_mode(&path, 0o640)?;
-            if new {
-                set_mode(&file, 0o640)?;
-            }
-            self.current = Some((own, file));
-        }
+        self.prepare(&own)?;
 
         let mut out = Vec::new();
         let mut started = None;
@@ -712,6 +776,7 @@ impl ChainWriter {
             None => {
                 let g = genesis(&GenesisSpec {
                     saiife: &self.opts.saiife,
+                    ts: &rec.ts,
                     mode: &self.opts.mode,
                     key: self.opts.genesis_key.as_deref(),
                     uid: own_uid(),
@@ -734,12 +799,13 @@ impl ChainWriter {
             None => self.host.clone(),
         };
         let hash = push_line(&mut out, &rec)?;
-        let (_, file) = self.current.as_mut().expect("current file set above");
-        if let Err(e) = file.write_all(&out) {
+        let c = self.current.as_mut().expect("current file set by prepare");
+        if let Err(e) = c.file.write_all(&out) {
             // Part of the line may be on disk: find the tail again.
             self.stale = true;
             return Err(e);
         }
+        c.end += out.len() as u64;
         if let Some((chain, host)) = started {
             self.chain_id = chain;
             self.host = host;
@@ -772,7 +838,7 @@ impl ChainWriter {
     /// `fdatasync` the current month file.
     pub fn sync(&self) -> io::Result<()> {
         match &self.current {
-            Some((_, f)) => f.sync_data(),
+            Some(c) => c.file.sync_data(),
             None => Ok(()),
         }
     }
@@ -1506,6 +1572,63 @@ mod tests {
             .unwrap();
         let e = append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap_err();
         assert!(written_unchained(&e).is_some(), "{e}");
+        // The writer sees the foreign line and chains on from it.
+        let seq = w
+            .append(locked_rec(datetime!(2026-10-13 10:00:00 UTC)))
+            .unwrap();
+        assert_eq!(seq, 2);
+        let ls = lines(&dir.path().join("2026-10.jsonl"));
+        assert_eq!(w.head(), Some((2, sha256_hex(&ls[3]).as_str())));
+        let report = crate::verify::verify(dir.path());
+        let kinds: Vec<_> = report.breaks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(kinds, [crate::verify::BreakKind::Unchained]);
+    }
+
+    /// A foreign line in the next month's file, written before the writer
+    /// gets there, is chained on from too.
+    #[test]
+    fn writer_chains_on_from_a_foreign_line_in_a_new_month_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        w.append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        let nov = dir.path().join("2026-11.jsonl");
+        append_raw(&nov, &unchained_line("2026-11-01T00:00:00.000Z"));
+        let seq = w
+            .append(locked_rec(datetime!(2026-11-02 08:00:00 UTC)))
+            .unwrap();
+        assert_eq!(seq, 2);
+        let report = crate::verify::verify(dir.path());
+        let kinds: Vec<_> = report.breaks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(kinds, [crate::verify::BreakKind::Unchained]);
+    }
+
+    /// M4: a v1 line between the genesis and the tail hides the chain id:
+    /// the writer starts a new chain, as `append_chained` would after v1.
+    #[test]
+    fn writer_starts_fresh_when_v1_line_hides_the_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let oct = dir.path().join("2026-10.jsonl");
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        append_raw(&oct, b"{\"v\":1,\"ts\":\"2026-10-13T08:14:02.381Z\",\"agent\":\"codex\",\"project\":\"/p\",\"tool\":\"shell\",\"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}\n");
+        let prev = sha256_hex(lines(&oct).last().unwrap());
+        append_raw(
+            &oct,
+            format!(
+                "{{\"v\":2,\"seq\":2,\"prev\":\"{prev}\",\"ts\":\"2026-10-13T08:30:00.000Z\"}}\n"
+            )
+            .as_bytes(),
+        );
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        assert_eq!(w.head(), None);
+        assert_eq!(w.chain_id(), None);
+        let seq = w
+            .append(locked_rec(datetime!(2026-10-13 09:00:00 UTC)))
+            .unwrap();
+        assert_eq!(seq, 1);
+        let ls = lines(&oct);
+        assert_eq!(parse(&ls[ls.len() - 2]).kind(), "genesis");
+        assert!(w.chain_id().is_some());
     }
 
     #[cfg(unix)]
@@ -1567,13 +1690,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         append_chained(dir.path(), rec(datetime!(2026-12-02 08:00:00 UTC))).unwrap();
         append_chained(dir.path(), rec(datetime!(2026-12-02 09:00:00 UTC))).unwrap();
-        let seq = append_chained(dir.path(), rec(datetime!(2026-09-13 08:00:00 UTC))).unwrap();
-        assert_eq!(seq, 3);
+        // I1: every rolled-back record, not only the first, stays on the chain.
+        for (i, want) in (3..=5).enumerate() {
+            let at = datetime!(2026-09-13 08:00:00 UTC) + time::Duration::minutes(i as i64);
+            assert_eq!(append_chained(dir.path(), rec(at)).unwrap(), want);
+        }
         assert!(!dir.path().join("2026-09.jsonl").exists());
         let ls = lines(&dir.path().join("2026-12.jsonl"));
-        assert_eq!(ls.len(), 4);
-        assert_eq!(parse(&ls[3]).seq, Some(3));
+        assert_eq!(ls.len(), 6);
+        assert_eq!(parse(&ls[5]).seq, Some(5));
         verify_ok(dir.path());
+    }
+
+    /// The far file is judged by its first chained line, past an unchained
+    /// fallback line at its start.
+    #[test]
+    fn clock_rollback_follows_past_an_unchained_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-08-02 08:00:00 UTC))).unwrap();
+        let dec = dir.path().join("2026-12.jsonl");
+        append_raw(&dec, &unchained_line("2026-12-01T00:00:00.000Z"));
+        assert_eq!(
+            append_chained(dir.path(), rec(datetime!(2026-12-02 08:00:00 UTC))).unwrap(),
+            2
+        );
+        for want in 3..=4 {
+            let seq = append_chained(dir.path(), rec(datetime!(2026-09-13 08:00:00 UTC))).unwrap();
+            assert_eq!(seq, want);
+        }
+        assert!(!dir.path().join("2026-09.jsonl").exists());
+        assert_eq!(lines(&dec).len(), 4);
+        let report = crate::verify::verify(dir.path());
+        let kinds: Vec<_> = report.breaks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(kinds, [crate::verify::BreakKind::Unchained]);
     }
 
     /// The far-ahead file need not hold the genesis: its first line chains
