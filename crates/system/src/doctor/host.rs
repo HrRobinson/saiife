@@ -9,6 +9,7 @@ use super::secrets::{self, read_at, read_under};
 use super::Ctx;
 use crate::host::{valid_name, SUDO};
 use saiife_agents::integrity::Integrity;
+use saiife_audit::text::sanitize;
 use saiife_ipc::client::{entry_by_name, entry_by_uid, uid_by_name};
 use std::collections::BTreeSet;
 use std::fs;
@@ -182,14 +183,19 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         }
     }
     let mut any_finding = false;
+    let mut incomplete: Vec<String> = Vec::new();
+    if users.is_empty() {
+        incomplete.push("no agent user to scan".to_string());
+    }
     for u in &users {
         let id = |what: &str| format!("user.{}.{what}", u.name);
         out.push(passwd_check(u, id("passwd")));
         out.push(root_check(ctx, u, id("root")));
-        let found = binaries(ctx, u);
-        out.push(binaries_check(u, &found, id("agent-binaries")));
-        out.push(version_check(ctx, u, &found, id("agent-version")));
+        let bins = binaries(ctx, u);
+        out.push(binaries_check(u, &bins, id("agent-binaries")));
+        out.push(version_check(ctx, u, &bins.found, id("agent-version")));
         if u.home.as_os_str().is_empty() {
+            incomplete.push(format!("{}: home directory unknown", u.name));
             out.push(Check::new(
                 id("secrets"),
                 Status::Info,
@@ -197,9 +203,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
                 "home directory unknown: not scanned",
             ));
         } else {
-            let findings = secrets::scan(&u.home, &project_roots(ctx, u));
-            any_finding |= !findings.is_empty();
-            out.extend(findings.into_iter().map(|f| {
+            let scan = secrets::scan_report(&u.home, &project_roots(ctx, u));
+            any_finding |= !scan.findings.is_empty();
+            incomplete.extend(scan.incomplete.iter().map(|r| format!("{}: {r}", u.name)));
+            out.extend(scan.findings.into_iter().map(|f| {
                 Check::new(
                     id("secrets"),
                     Status::Warn,
@@ -212,7 +219,14 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.push(leftover_hooks(ctx, u, id("leftover-hooks")));
     }
     out.push(hidepid(ctx));
-    if !any_finding {
+    if !incomplete.is_empty() {
+        out.push(Check::new(
+            "secrets.incomplete",
+            Status::Info,
+            "plaintext credentials",
+            format!("not fully scanned: {}", incomplete.join("; ")),
+        ));
+    } else if !any_finding {
         out.push(Check::new(
             "secrets.none",
             Status::Info,
@@ -284,10 +298,12 @@ fn root_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
                 .host
                 .run(SUDO, &["-n", "-l", "-U", &u.name], SUDO_TIMEOUT)
             {
-                Ok(o) if o.stdout.contains("NOPASSWD") => bad.push(format!(
-                    "sudo lists a NOPASSWD rule for {}: it gets root without a password",
-                    u.name
-                )),
+                Ok(o) if o.stdout.contains("NOPASSWD") || o.stdout.contains("!authenticate") => {
+                    bad.push(format!(
+                        "sudo -l -U {0} lists a NOPASSWD rule or !authenticate: {0} may get root without a password",
+                        u.name
+                    ))
+                }
                 Ok(_) => notes.push("no NOPASSWD sudo rule".to_string()),
                 Err(e) => warn.push(format!("could not list sudo rules: {e}")),
             }
@@ -295,7 +311,7 @@ fn root_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
     } else {
         match ctx.host.run(SUDO, &["-n", "true"], SUDO_TIMEOUT) {
             Ok(o) if o.status == 0 => bad.push(format!(
-                "sudo -n true succeeds: {} gets root without a password",
+                "sudo -n true succeeds: {} may get root without a password (NOPASSWD rule or cached sudo)",
                 u.name
             )),
             Ok(_) => notes.push("sudo needs a password".to_string()),
@@ -313,34 +329,26 @@ fn root_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
 }
 
 /// Agent binaries found, in search order: the current `PATH`, then the
-/// user's own install dirs. (name, path)
-fn binaries(ctx: &Ctx, u: &AgentUser) -> Vec<(&'static str, PathBuf)> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(
-            std::env::split_paths(&path)
-                .filter(|d| d.is_absolute())
-                .filter_map(|d| rooted(ctx, &d)),
-        );
-    }
-    if !u.home.as_os_str().is_empty() {
-        dirs.extend(USER_BIN_DIRS.iter().map(|d| u.home.join(d)));
-    }
-    let mut out: Vec<(&'static str, PathBuf)> = Vec::new();
-    for d in dirs {
-        for name in AGENT_BINARIES {
-            let p = d.join(name);
-            if fs::symlink_metadata(&p).is_ok() && !out.iter().any(|(_, x)| x == &p) {
-                out.push((name, p));
-            }
-        }
-    }
-    out
+/// user's own install dirs.
+#[derive(Default)]
+struct Bins {
+    /// (name, path)
+    found: Vec<(&'static str, PathBuf)>,
+    /// Found binaries the agent user can change.
+    writable: Vec<PathBuf>,
+    /// User-owned symlinks root did not follow.
+    symlinks: Vec<PathBuf>,
+    /// User install dirs that are, or lie below, a symlink.
+    symlinked_dirs: Vec<PathBuf>,
 }
 
 /// Owned by `uid`, or writable by group or others.
+fn writable_mode(owner: u32, mode: u32, uid: u32) -> bool {
+    owner == uid || mode & 0o022 != 0
+}
+
 fn writable_by(p: &Path, uid: u32) -> bool {
-    fs::metadata(p).is_ok_and(|m| m.uid() == uid || m.mode() & 0o022 != 0)
+    fs::metadata(p).is_ok_and(|m| writable_mode(m.uid(), m.mode(), uid))
 }
 
 /// The binary, its directory, and (through a symlink) its target and the
@@ -355,15 +363,83 @@ fn binary_writable(p: &Path, uid: u32) -> bool {
     paths.iter().any(|x| writable_by(x, uid))
 }
 
-fn binaries_check(u: &AgentUser, found: &[(&str, PathBuf)], id: String) -> Check {
+fn binaries(ctx: &Ctx, u: &AgentUser) -> Bins {
+    let mut b = Bins::default();
+    let add = |b: &mut Bins, name: &'static str, p: PathBuf, writable: bool| {
+        if !b.found.iter().any(|(_, x)| x == &p) {
+            if writable {
+                b.writable.push(p.clone());
+            }
+            b.found.push((name, p));
+        }
+    };
+    if let Some(path) = std::env::var_os("PATH") {
+        let dirs = std::env::split_paths(&path)
+            .filter(|d| d.is_absolute())
+            .filter_map(|d| rooted(ctx, &d));
+        for d in dirs {
+            for name in AGENT_BINARIES {
+                let p = d.join(name);
+                if fs::symlink_metadata(&p).is_ok() {
+                    let w = binary_writable(&p, u.uid);
+                    add(&mut b, name, p, w);
+                }
+            }
+        }
+    }
+    if u.home.as_os_str().is_empty() {
+        return b;
+    }
+    for d in USER_BIN_DIRS {
+        let dir = u.home.join(d);
+        if !ctx.as_root {
+            // The user checking itself: following its own links is safe.
+            for name in AGENT_BINARIES {
+                let p = dir.join(name);
+                if fs::symlink_metadata(&p).is_ok() {
+                    let w = binary_writable(&p, u.uid);
+                    add(&mut b, name, p, w);
+                }
+            }
+            continue;
+        }
+        // Root: nothing below the home is followed.
+        let fd = match secrets::open_under(&u.home, Path::new(d)) {
+            secrets::Node::Dir(fd) => fd,
+            secrets::Node::Symlink => {
+                b.symlinked_dirs.push(dir);
+                continue;
+            }
+            _ => continue,
+        };
+        let dir_w =
+            rustix::fs::fstat(&fd).is_ok_and(|st| writable_mode(st.st_uid, st.st_mode, u.uid));
+        for name in AGENT_BINARIES {
+            let Ok(st) = rustix::fs::statat(&fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            else {
+                continue;
+            };
+            let p = dir.join(name);
+            if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink {
+                b.symlinks.push(p);
+            } else {
+                let w = dir_w || writable_mode(st.st_uid, st.st_mode, u.uid);
+                add(&mut b, name, p, w);
+            }
+        }
+    }
+    b
+}
+
+fn binaries_check(u: &AgentUser, b: &Bins, id: String) -> Check {
     const TITLE: &str = "agent binaries not writable by the agent user";
-    if found.is_empty() {
+    if b.found.is_empty() && b.symlinks.is_empty() && b.symlinked_dirs.is_empty() {
         return Check::new(id, Status::Info, TITLE, "no agent binary found");
     }
-    let writable: Vec<String> = found
+    let mut warn: Vec<String> = b
+        .writable
         .iter()
-        .filter(|(_, p)| binary_writable(p, u.uid))
-        .map(|(_, p)| {
+        .map(|p| {
             format!(
                 "{} is writable by {}: the agent can patch itself and skip hooks (install agents system-wide)",
                 p.display(),
@@ -371,11 +447,27 @@ fn binaries_check(u: &AgentUser, found: &[(&str, PathBuf)], id: String) -> Check
             )
         })
         .collect();
-    if writable.is_empty() {
-        let list: Vec<String> = found.iter().map(|(_, p)| p.display().to_string()).collect();
+    warn.extend(b.symlinks.iter().map(|p| {
+        format!(
+            "{} is a symlink: not followed (check where it points; install agents system-wide)",
+            p.display()
+        )
+    }));
+    warn.extend(b.symlinked_dirs.iter().map(|p| {
+        format!(
+            "{} is a symlink or lies below one: not followed (check where it points; install agents system-wide)",
+            p.display()
+        )
+    }));
+    if warn.is_empty() {
+        let list: Vec<String> = b
+            .found
+            .iter()
+            .map(|(_, p)| p.display().to_string())
+            .collect();
         Check::new(id, Status::Pass, TITLE, list.join(", "))
     } else {
-        Check::new(id, Status::Warn, TITLE, writable.join("; "))
+        Check::new(id, Status::Warn, TITLE, warn.join("; "))
     }
 }
 
@@ -576,10 +668,15 @@ fn leftover_hooks(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
     } else {
         let list: Vec<String> = projects
             .iter()
-            .map(|p| format!("run saiife init --off in {p}"))
+            .map(|p| format!("run saiife init --off in {}", shell_quote(&sanitize(p))))
             .collect();
         Check::new(id, Status::Warn, TITLE, list.join("; "))
     }
+}
+
+/// `s` in single quotes for a POSIX shell (`'` becomes `'\''`).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// §5.6: `/proc` must not hide agent processes from the daemon.
@@ -605,7 +702,12 @@ fn hidepid(ctx: &Ctx) -> Check {
             && f[3].split(',').any(|o| {
                 matches!(
                     o,
-                    "hidepid=1" | "hidepid=2" | "hidepid=invisible" | "hidepid=noaccess"
+                    "hidepid=1"
+                        | "hidepid=2"
+                        | "hidepid=4"
+                        | "hidepid=invisible"
+                        | "hidepid=noaccess"
+                        | "hidepid=ptraceable"
                 )
             })
     });
@@ -1107,7 +1209,7 @@ mod tests {
         let r = t.doctor();
         let c = get(&r, "user.agent.leftover-hooks");
         assert_eq!(c.status, Status::Warn, "{}", r.to_text());
-        assert_eq!(c.detail, "run saiife init --off in /work/shop");
+        assert_eq!(c.detail, "run saiife init --off in '/work/shop'");
     }
 
     #[test]
@@ -1147,6 +1249,207 @@ mod tests {
             (c.status, c.detail.as_str()),
             (Status::Info, "no plaintext credentials found")
         );
+    }
+
+    #[test]
+    fn sudo_messages_and_no_authenticate() {
+        let mut t = T::new(true);
+        t.user("agent", 5001, 5001, true);
+        t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\n");
+        t.sudo_installed();
+        t.canned(
+            "/usr/bin/sudo -n -l -U agent",
+            0,
+            "Matching Defaults entries for agent on host:\n    env_reset, !authenticate\n\nUser agent may run the following commands on host:\n    (ALL) ALL\n",
+        );
+        let r = t.doctor();
+        let c = get(&r, "user.agent.root");
+        assert_eq!(c.status, Status::Fail, "{}", r.to_text());
+        assert!(c.detail.contains("!authenticate"), "{c:?}");
+        assert!(c.detail.contains("may get root"), "{c:?}");
+
+        let mut t = T::new(false);
+        t.me("me");
+        t.sudo_installed();
+        t.canned("/usr/bin/sudo -n true", 0, "");
+        let r = t.doctor();
+        let c = get(&r, "user.me.root");
+        assert!(
+            c.detail
+                .contains("may get root without a password (NOPASSWD rule or cached sudo)"),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn hidepid_ptraceable_warns() {
+        let t = T::new(true);
+        fs::create_dir_all(t.at("/proc")).unwrap();
+        for opt in ["hidepid=ptraceable", "hidepid=4"] {
+            fs::write(
+                t.at("/proc/mounts"),
+                format!("proc /proc proc rw,{opt} 0 0\n"),
+            )
+            .unwrap();
+            let r = t.doctor();
+            assert_eq!(status(&r, "proc.hidepid"), Status::Warn, "{opt}");
+        }
+    }
+
+    #[test]
+    fn leftover_hint_quotes_project() {
+        let mut t = T::new(true);
+        let home = t.user("agent", 5001, 5001, true);
+        t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\n");
+        let dir = home.join(".local/share/saiife/projects");
+        fs::create_dir_all(&dir).unwrap();
+        let rec = serde_json::json!({
+            "v": INTEGRITY_VERSION, "project": "/work/it's here\n", "saiife_path": "/x",
+            "saiife_version": "0", "config_sha256": "",
+            "hooks": {"claude": {"file": ".claude/settings.json", "sha256": "x"}}
+        });
+        fs::write(dir.join("a.json"), rec.to_string()).unwrap();
+        let r = t.doctor();
+        let c = get(&r, "user.agent.leftover-hooks");
+        assert_eq!(c.detail, "run saiife init --off in '/work/it'\\''s here⏎'");
+    }
+
+    #[test]
+    fn root_does_not_follow_user_binary_symlinks() {
+        let mut t = T::new(true);
+        let home = t.user("agent", 5001, 5001, true);
+        t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\n");
+        let target = t.at("/opt/elsewhere/claude");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "").unwrap();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".local/bin/claude")).unwrap();
+        std::os::unix::fs::symlink(t.at("/opt/elsewhere"), home.join(".bun")).unwrap();
+        let r = t.doctor();
+        let c = get(&r, "user.agent.agent-binaries");
+        assert_eq!(c.status, Status::Warn, "{}", r.to_text());
+        assert!(
+            c.detail.contains(&format!(
+                "{} is a symlink: not followed",
+                home.join(".local/bin/claude").display()
+            )),
+            "{c:?}"
+        );
+        assert!(
+            c.detail.contains(&format!(
+                "{} is a symlink or lies below one: not followed",
+                home.join(".bun/bin").display()
+            )),
+            "{c:?}"
+        );
+        assert!(!c.detail.contains("/opt/elsewhere"), "{c:?}");
+    }
+
+    #[test]
+    fn home_project_symlink_not_walked_as_root() {
+        let mut t = T::new(true);
+        let home = t.user("agent", 5001, 5001, true);
+        let secret_dir = t.at("/root/proj");
+        fs::create_dir_all(&secret_dir).unwrap();
+        fs::write(secret_dir.join(".env"), "X=1\n").unwrap();
+        std::os::unix::fs::symlink(t.at("/root"), home.join("code")).unwrap();
+        t.append_config(
+            "\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\nprojects = [\"~/code/*\"]\n",
+        );
+        let r = t.doctor();
+        let text = r.to_text();
+        assert!(!text.contains(&secret_dir.display().to_string()), "{text}");
+        let c = r
+            .checks
+            .iter()
+            .find(|c| c.id == "user.agent.secrets")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(
+            c.detail,
+            format!(
+                "{}: {}",
+                home.join("code").display(),
+                crate::doctor::secrets::SYMLINK
+            )
+        );
+    }
+
+    #[test]
+    fn secrets_none_only_when_fully_scanned() {
+        // No agent user at all.
+        let t = T::new(true);
+        let r = t.doctor();
+        assert!(
+            !r.checks.iter().any(|c| c.id == "secrets.none"),
+            "{}",
+            r.to_text()
+        );
+        let c = get(&r, "secrets.incomplete");
+        assert_eq!(c.status, Status::Info);
+        assert!(c.detail.starts_with("not fully scanned: "), "{c:?}");
+
+        // A user without a known home.
+        let mut t = T::new(true);
+        t.user("agent", 5001, 5001, true);
+        t.host
+            .set(|s| s.users.get_mut("agent").unwrap().home = PathBuf::new());
+        t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\n");
+        let r = t.doctor();
+        assert!(
+            !r.checks.iter().any(|c| c.id == "secrets.none"),
+            "{}",
+            r.to_text()
+        );
+        assert!(get(&r, "secrets.incomplete").detail.contains("agent"));
+
+        // A project walk cut at the entry cap.
+        let mut t = T::new(true);
+        t.user("agent", 5001, 5001, true);
+        let proj = t.at("/srv/big");
+        fs::create_dir_all(&proj).unwrap();
+        for i in 0..(crate::doctor::secrets::MAX_ENTRIES + 10) {
+            fs::write(proj.join(format!("f{i}")), "").unwrap();
+        }
+        t.append_config(
+            "\n[[scope]]\nname = \"a\"\nusers = [\"agent\"]\nprojects = [\"/srv/big\"]\n",
+        );
+        let r = t.doctor();
+        assert!(
+            !r.checks.iter().any(|c| c.id == "secrets.none"),
+            "{}",
+            r.to_text()
+        );
+        assert!(get(&r, "secrets.incomplete")
+            .detail
+            .contains("10000 entries"));
+    }
+
+    #[test]
+    fn exec_caps_output_and_ignores_grandchildren() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let out = crate::host::RealHost
+            .run(
+                "/bin/sh",
+                &["-c", "sleep 5 & echo hi"],
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(out.stdout, "hi\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let out = crate::host::RealHost
+            .run(
+                "/bin/sh",
+                &["-c", "head -c 200000 /dev/zero | tr '\\0' a"],
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.stdout.len(), 64 * 1024);
     }
 
     #[test]

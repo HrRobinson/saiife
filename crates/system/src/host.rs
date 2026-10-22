@@ -44,6 +44,10 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `systemctl enable --now` waits for the daemon's start-up notification.
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(90);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most bytes kept of a program's stdout and of its stderr (64 KiB).
+const OUTPUT_CAP: usize = 64 * 1024;
+/// How long to wait for the pipes to close once the program has exited.
+const PIPE_GRACE: Duration = Duration::from_millis(200);
 
 /// What a program printed and how it ended (`128 + signal` when killed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -405,14 +409,31 @@ fn exec(
         // A failed write shows as the program's own error below.
         let _ = pipe.write_all(bytes);
     }
+    // Each pipe is read on its own thread: the first OUTPUT_CAP bytes are
+    // kept, the rest drained so the program never blocks on a full pipe.
     let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let shared = buf.clone();
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
             if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match p.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let mut b = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            let room = OUTPUT_CAP.saturating_sub(b.len());
+                            b.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
             }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
+            let _ = done_tx.send(());
+        });
+        (buf, done_rx)
     };
     let out_t = reader(
         child
@@ -448,14 +469,26 @@ fn exec(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // A grandchild may keep the pipes open: wait for their end only a
+    // little after the program itself exits.
+    let collect = |(buf, done): (
+        std::sync::Arc<Mutex<Vec<u8>>>,
+        std::sync::mpsc::Receiver<()>,
+    )| {
+        let _ = done.recv_timeout(PIPE_GRACE);
+        let b = buf.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&b).into_owned()
+    };
+    let stdout = collect(out_t);
+    let stderr = collect(err_t);
     let code = status.code().unwrap_or_else(|| {
         use std::os::unix::process::ExitStatusExt;
         128 + status.signal().unwrap_or(0)
     });
     Ok(CmdOutput {
         status: code,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 

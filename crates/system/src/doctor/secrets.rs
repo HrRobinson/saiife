@@ -52,7 +52,31 @@ const CREDENTIAL_KEYS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTHO
 /// opened, and at most [`MAX_READ`] bytes are read per file. Files that
 /// cannot be read are skipped.
 pub fn scan(home: &Path, project_roots: &[PathBuf]) -> Vec<Finding> {
-    let mut out = Vec::new();
+    scan_report(home, project_roots).findings
+}
+
+/// What [`scan_report`] found, and why the scan was not complete (a path
+/// it could not read, a walk cut at [`MAX_ENTRIES`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scan {
+    pub findings: Vec<Finding>,
+    pub incomplete: Vec<String>,
+}
+
+/// [`scan`], also saying what it could not look at. A project root below
+/// `home` is reached from `home` without following a symlink; a symlink
+/// on the way is reported, not walked.
+pub fn scan_report(home: &Path, project_roots: &[PathBuf]) -> Scan {
+    let mut r = Scan::default();
+    match open_under(home, Path::new("")) {
+        Node::Dir(_) => {}
+        Node::Missing => r
+            .incomplete
+            .push(format!("{}: home directory missing", home.display())),
+        _ => r
+            .incomplete
+            .push(format!("{}: home directory cannot be read", home.display())),
+    }
     for rel in HOME_PATHS {
         let path = home.join(rel);
         let what = match open_under(home, Path::new(rel)) {
@@ -63,20 +87,25 @@ pub fn scan(home: &Path, project_roots: &[PathBuf]) -> Vec<Finding> {
             Node::File(f) if !is_cred_dir(rel) => read_bounded(f)
                 .ok()
                 .and_then(|bytes| file_rule(rel, &bytes)),
+            Node::Error => {
+                r.incomplete
+                    .push(format!("{}: cannot be read", path.display()));
+                None
+            }
             _ => None,
         };
         if let Some(what) = what {
-            out.push(Finding {
+            r.findings.push(Finding {
                 path,
                 what: what.to_string(),
             });
         }
     }
-    mcp(home, &mut out);
+    mcp(home, &mut r.findings);
     for root in project_roots {
-        walk_env(root, &mut out);
+        walk_env(home, root, &mut r);
     }
-    out
+    r
 }
 
 fn is_cred_dir(rel: &str) -> bool {
@@ -250,59 +279,123 @@ fn is_plain_value(s: &str) -> bool {
 
 // ------------------------------------------------------------ .env walk
 
-fn walk_env(root: &Path, out: &mut Vec<Finding>) -> usize {
-    let Ok(fd) = open_base(root) else {
-        return 0;
-    };
-    let mut seen = 0;
-    walk(&fd, root, 1, &mut seen, out);
-    seen
+/// The `.env*` walk of one project root.
+struct Walk<'a> {
+    seen: usize,
+    cut: bool,
+    r: &'a mut Scan,
 }
 
-fn walk(dir: &OwnedFd, path: &Path, depth: usize, seen: &mut usize, out: &mut Vec<Finding>) {
+/// Walks `root`. Below `home` it is reached from `home` with no symlink
+/// followed; elsewhere it is an admin's configured path and opened as is.
+/// Returns the entries looked at.
+fn walk_env(home: &Path, root: &Path, r: &mut Scan) -> usize {
+    let node = match root.strip_prefix(home) {
+        Ok(rel) if !home.as_os_str().is_empty() => open_under(home, rel),
+        _ => match open_base(root) {
+            Ok(fd) => Node::Dir(fd),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Node::Missing,
+            Err(_) => Node::Error,
+        },
+    };
+    let fd = match node {
+        Node::Dir(fd) => fd,
+        Node::Missing => return 0,
+        Node::Symlink => {
+            r.findings.push(Finding {
+                path: root.to_path_buf(),
+                what: SYMLINK.to_string(),
+            });
+            return 0;
+        }
+        _ => {
+            r.incomplete
+                .push(format!("{}: project root cannot be read", root.display()));
+            return 0;
+        }
+    };
+    let mut w = Walk {
+        seen: 0,
+        cut: false,
+        r,
+    };
+    walk(&fd, root, 1, &mut w);
+    if w.cut {
+        w.r.incomplete.push(format!(
+            "{}: walk stopped after {MAX_ENTRIES} entries",
+            root.display()
+        ));
+    }
+    w.seen
+}
+
+/// One directory level. Subdirectories are opened one at a time when the
+/// walk enters them, so at most one handle per level is held.
+fn walk(dir: &OwnedFd, path: &Path, depth: usize, w: &mut Walk) {
+    #[cfg(test)]
+    let _held = Held::new();
     let Ok(entries) = Dir::read_from(dir) else {
+        w.r.incomplete
+            .push(format!("{}: cannot be listed", path.display()));
         return;
     };
-    let mut subdirs = Vec::new();
+    let mut subdirs: Vec<OsString> = Vec::new();
     for entry in entries {
-        if *seen >= MAX_ENTRIES {
-            break;
-        }
         let Ok(entry) = entry else {
+            w.r.incomplete
+                .push(format!("{}: listing failed", path.display()));
             break;
         };
         let name = OsStr::from_bytes(entry.file_name().to_bytes()).to_os_string();
         if name == "." || name == ".." {
             continue;
         }
-        *seen += 1;
-        let is_env = name.as_bytes().starts_with(b".env");
-        let maybe_dir = matches!(entry.file_type(), FileType::Directory | FileType::Unknown);
-        if !is_env && !(maybe_dir && depth < MAX_DEPTH) {
-            continue;
-        }
-        match node_at(dir, &name) {
-            Node::Symlink if is_env => out.push(Finding {
-                path: path.join(&name),
-                what: SYMLINK.to_string(),
-            }),
-            Node::File(f) if is_env => {
-                if f.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                    out.push(Finding {
-                        path: path.join(&name),
-                        what: "is an environment file (may hold secrets)".to_string(),
-                    });
-                }
-            }
-            Node::Dir(fd) if depth < MAX_DEPTH => subdirs.push((fd, name)),
-            _ => {}
-        }
-    }
-    for (fd, name) in subdirs {
-        if *seen >= MAX_ENTRIES {
+        if w.seen >= MAX_ENTRIES {
+            w.cut = true;
             break;
         }
-        walk(&fd, &path.join(name), depth + 1, seen, out);
+        w.seen += 1;
+        let may_descend = depth < MAX_DEPTH;
+        if name.as_bytes().starts_with(b".env") {
+            match node_at(dir, &name) {
+                Node::Symlink => w.r.findings.push(Finding {
+                    path: path.join(&name),
+                    what: SYMLINK.to_string(),
+                }),
+                Node::File(f) => {
+                    if f.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                        w.r.findings.push(Finding {
+                            path: path.join(&name),
+                            what: "is an environment file (may hold secrets)".to_string(),
+                        });
+                    }
+                }
+                Node::Dir(_) if may_descend => subdirs.push(name),
+                Node::Error => {
+                    w.r.incomplete
+                        .push(format!("{}: cannot be read", path.join(&name).display()))
+                }
+                _ => {}
+            }
+        } else if may_descend
+            && matches!(entry.file_type(), FileType::Directory | FileType::Unknown)
+        {
+            subdirs.push(name);
+        }
+    }
+    for name in subdirs {
+        if w.cut {
+            break;
+        }
+        match node_at(dir, &name) {
+            Node::Dir(fd) => walk(&fd, &path.join(&name), depth + 1, w),
+            Node::Error => {
+                w.r.incomplete
+                    .push(format!("{}: cannot be read", path.join(&name).display()))
+            }
+            // A symlinked directory is not entered; a non-directory is skipped.
+            _ => {}
+        }
     }
 }
 
@@ -472,8 +565,38 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static HELD: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts the directory handles the walk holds at once (current, peak).
+#[cfg(test)]
+struct Held;
+
+#[cfg(test)]
+impl Held {
+    fn new() -> Held {
+        HELD.with(|h| {
+            let (cur, peak) = h.get();
+            h.set((cur + 1, peak.max(cur + 1)));
+        });
+        Held
+    }
+}
+
+#[cfg(test)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.with(|h| {
+            let (cur, peak) = h.get();
+            h.set((cur - 1, peak));
+        });
+    }
+}
+
+#[cfg(test)]
 fn walk_count(root: &Path) -> usize {
-    walk_env(root, &mut Vec::new())
+    walk_env(Path::new(""), root, &mut Scan::default())
 }
 
 #[cfg(test)]
@@ -644,6 +767,71 @@ mod tests {
         let _ = scan(home.path(), &[proj.path().to_path_buf()]);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(walk_count(proj.path()), MAX_ENTRIES);
+        let r = scan_report(home.path(), &[proj.path().to_path_buf()]);
+        assert!(
+            r.incomplete.iter().any(|x| x.contains("10000 entries")),
+            "{:?}",
+            r.incomplete
+        );
+    }
+
+    #[test]
+    fn home_project_root_symlink_not_walked() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let outside = tempfile::tempdir().unwrap();
+        put(outside.path(), "proj/.env", VALUE);
+        // `~/code` itself, and `~/a` above `~/a/proj`, are symlinks.
+        std::os::unix::fs::symlink(outside.path().join("proj"), h.join("code")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), h.join("a")).unwrap();
+        let roots = [h.join("code"), h.join("a/proj")];
+        let found = scan(h, &roots);
+        let text = whats(&found);
+        assert!(
+            !found.iter().any(|f| f.path.starts_with(outside.path())),
+            "{text}"
+        );
+        for r in &roots {
+            let f = found
+                .iter()
+                .find(|f| &f.path == r)
+                .unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(f.what, SYMLINK);
+            assert!(
+                !found.iter().any(|f| f.path.starts_with(r) && &f.path != r),
+                "{text}"
+            );
+        }
+        // A real directory below the home is walked.
+        put(h, "work/.env", VALUE);
+        let found = scan(h, &[h.join("work")]);
+        assert_eq!(found.len(), 1, "{}", whats(&found));
+        assert_eq!(found[0].path, h.join("work/.env"));
+    }
+
+    #[test]
+    fn many_subdirs_do_not_exhaust_fds() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        for i in 0..1500 {
+            put(proj.path(), &format!("d{i:04}/.env"), "X=1\n");
+        }
+        HELD.with(|h| h.set((0, 0)));
+        let r = scan_report(home.path(), &[proj.path().to_path_buf()]);
+        assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
+        assert_eq!(r.findings.len(), 1500);
+        // One handle per level, never one per subdirectory.
+        let (_, peak) = HELD.with(|h| h.get());
+        assert!(peak <= MAX_DEPTH, "peak {peak}");
+    }
+
+    #[test]
+    fn unreadable_or_cut_scan_is_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        let r = scan_report(&home.path().join("missing"), &[]);
+        assert!(!r.incomplete.is_empty(), "missing home must be reported");
+        let r = scan_report(home.path(), &[]);
+        assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
     }
 
     #[test]
