@@ -309,3 +309,37 @@ fn hook_record_is_v2_chained() {
     let hex = policy.strip_prefix("sha256:").unwrap();
     assert!(hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
 }
+
+/// When the chain cannot be continued the record is still written, and the
+/// warning says so in plain words.
+#[test]
+fn unchained_fallback_warning_wording() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(saiife_audit::chain::LOCK_FILE)).unwrap();
+    let home = common::FixtureHome::new();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, dir.path());
+    let mut child = cmd
+        .args(["check", "--hook-exit", "--agent", "claude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(home.real(&payload("ls")).as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "audit record written without the chain (audit chain lock unavailable); decision unaffected"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(guard_records(dir.path()).len(), 1);
+}

@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use saiife_audit::chain::{append_chained, sha256_hex};
+use saiife_audit::chain::{append_chained, sha256_hex, written_unchained};
 use saiife_audit::{store, DecisionKind, NewRecord, Record};
 use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::{expand_glob_partial, PathVars};
@@ -493,7 +493,10 @@ impl Audit {
             env!("CARGO_PKG_VERSION"),
         );
         if let Err(e) = append_chained(dir, rec) {
-            warn(&format!("audit write failed ({e}); decision unaffected"));
+            match written_unchained(&e) {
+                Some(u) => warn(&format!("{u}; decision unaffected")),
+                None => warn(&format!("audit write failed ({e}); decision unaffected")),
+            }
         }
     }
 }

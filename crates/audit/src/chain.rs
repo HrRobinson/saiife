@@ -68,12 +68,39 @@ fn raw_machine_id() -> Option<String> {
         })
 }
 
+/// The error `append_chained` returns when the record was written, but
+/// without the chain: the caller warns, `verify` reports the gap later.
+#[derive(Debug)]
+pub struct WrittenUnchained {
+    /// Why the chain could not be continued.
+    pub reason: String,
+}
+
+impl std::fmt::Display for WrittenUnchained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "audit record written without the chain ({})",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for WrittenUnchained {}
+
+/// The `WrittenUnchained` inside an error of `append_chained`; `None` when
+/// the record was not written at all.
+pub fn written_unchained(e: &io::Error) -> Option<&WrittenUnchained> {
+    e.get_ref()?.downcast_ref()
+}
+
 /// Append `rec` to the hash chain in `dir` and return its `seq`.
 ///
 /// The record is never dropped for the chain's sake: if the lock cannot be
 /// opened or taken within a second, or anything fails while it is held, the
-/// record is written unchained (no `seq`/`prev`) and an error is returned so
-/// the caller can warn; `verify` reports the gap later.
+/// record is written unchained (no `seq`/`prev`) and a `WrittenUnchained`
+/// error is returned so the caller can warn; `verify` reports the gap later.
+/// Any other error means the record was not written.
 pub fn append_chained(dir: &Path, mut rec: Record) -> io::Result<u64> {
     store::create_private_dir(dir)?;
     fill_identity(&mut rec);
@@ -88,7 +115,9 @@ pub fn append_chained(dir: &Path, mut rec: Record) -> io::Result<u64> {
     rec.seq = None;
     rec.prev = None;
     append_unchained(dir, &rec)?;
-    Err(io::Error::other(format!("{err}; record written unchained")))
+    Err(io::Error::other(WrittenUnchained {
+        reason: err.to_string(),
+    }))
 }
 
 /// The fallback write: the same target rule as the chained path (never an
@@ -148,16 +177,52 @@ fn take_lock(dir: &Path) -> Option<File> {
 }
 
 /// Where the chain stands: the hash of the last line and the last chained
-/// record, if the chain can be continued.
+/// line, if the chain can be continued.
 struct Tail {
     prev: String,
-    last: Option<Record>,
+    last: Option<TailLine>,
+}
+
+/// What the tail scan reads of a line: exactly what `verify` judges a line
+/// by (`v`, defaulting to 1, and `seq`), plus the `host` to carry on. A line
+/// is not required to parse as a full `Record`.
+struct TailLine {
+    v: u64,
+    seq: Option<u64>,
+    host: Option<String>,
+}
+
+impl TailLine {
+    /// `None` unless `line` is a JSON object (as in `verify`).
+    fn parse(line: &[u8]) -> Option<Self> {
+        let serde_json::Value::Object(obj) = serde_json::from_slice(line).ok()? else {
+            return None;
+        };
+        Some(Self {
+            v: obj
+                .get("v")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1),
+            seq: obj.get("seq").and_then(serde_json::Value::as_u64),
+            host: obj
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        })
+    }
 }
 
 fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
     let files = regular_month_files(dir)?;
     let target = target_file(dir, &rec, &files);
-    let tail = find_tail(&files)?;
+    // Only the target and the files before it: a planted or clock-skewed
+    // later file must not lend its tail to every record written now.
+    let target_name = target.file_name();
+    let upto: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| p.file_name() <= target_name)
+        .collect();
+    let tail = find_tail(&upto)?;
 
     let mut out = Vec::new();
     let next = tail
@@ -224,19 +289,21 @@ fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
 
 /// What the backwards search found.
 enum Found {
-    /// The last chained record.
-    Chained(Box<Record>),
+    /// The last chained line.
+    Chained(TailLine),
     /// A v1 line or the read budget ran out: a new chain must start.
     Stop,
     /// The file's first line was reached without a decision.
     More,
 }
 
-/// The chain's tail. `prev` hashes the physical last line of the newest
-/// non-empty month file; a missing final newline there (a crash mid-write)
+/// The chain's tail among `files` (the caller passes only those up to the
+/// write target). `prev` hashes the physical last line of the newest
+/// non-empty one of them; a missing final newline there (a crash mid-write)
 /// is added first so the half line stays a line of its own. The last chained
 /// record is the newest line, searching backwards through that file and then
-/// older ones, that parses as `v >= 2` with a `seq`. Unparseable and
+/// older ones, that is a JSON object with `v >= 2` and a `seq` (the rules
+/// of `verify`; see `TailLine`). Unparseable and
 /// unchained lines are passed over; a v1 line ends the search (a v1 writer
 /// appended after the chain), and so does reading `MAX_SCAN` bytes in all.
 fn find_tail(files: &[PathBuf]) -> io::Result<Option<Tail>> {
@@ -256,15 +323,15 @@ fn find_tail(files: &[PathBuf]) -> io::Result<Option<Tail>> {
             if prev.is_none() {
                 prev = Some(sha256_hex(line));
             }
-            match serde_json::from_slice::<Record>(line) {
-                Ok(r) if r.v < 2 => Some(Found::Stop),
-                Ok(r) if r.seq.is_some() => Some(Found::Chained(Box::new(r))),
+            match TailLine::parse(line) {
+                Some(t) if t.v < 2 => Some(Found::Stop),
+                Some(t) if t.seq.is_some() => Some(Found::Chained(t)),
                 _ => None,
             }
         })?;
         match found {
-            Found::Chained(r) => {
-                last = Some(*r);
+            Found::Chained(t) => {
+                last = Some(t);
                 break;
             }
             Found::Stop => break,
@@ -646,6 +713,74 @@ mod tests {
         assert_eq!(r.v, 2);
         assert_eq!((r.seq, r.prev), (None, None));
         assert_eq!(r.tool, "Bash");
+    }
+
+    /// M3: the fallback says what happened in words a user can act on.
+    #[cfg(unix)]
+    #[test]
+    fn unchained_fallback_names_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(LOCK_FILE)).unwrap();
+        let err = append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap_err();
+        let u = written_unchained(&err).expect("an unchained write, not a failed one");
+        assert_eq!(
+            u.to_string(),
+            "audit record written without the chain (audit chain lock unavailable)"
+        );
+        assert_eq!(lines(&dir.path().join("2026-10.jsonl")).len(), 1);
+    }
+
+    /// M1: a planted far-future month file is neither written to nor read
+    /// for the tail: records of the real months chain on among themselves.
+    #[test]
+    fn far_future_file_does_not_fork_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap(),
+            1
+        );
+        let mut planted = rec(datetime!(2026-10-13 08:00:00 UTC));
+        planted.ts = "9999-12-01T00:00:00.000Z".into();
+        planted.seq = Some(50);
+        planted.prev = Some(ZERO_PREV.into());
+        let mut line = serde_json::to_vec(&planted).unwrap();
+        line.push(b'\n');
+        fs::write(dir.path().join("9999-12.jsonl"), &line).unwrap();
+        let seqs: Vec<u64> = (0..3)
+            .map(|i| {
+                append_chained(
+                    dir.path(),
+                    rec(datetime!(2026-10-13 09:00:00 UTC) + time::Duration::minutes(i)),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, [2, 3, 4]);
+        assert_eq!(fs::read(dir.path().join("9999-12.jsonl")).unwrap(), line);
+        fs::remove_file(dir.path().join("9999-12.jsonl")).unwrap();
+        let report = crate::verify::verify(dir.path());
+        assert!(report.breaks.is_empty(), "{:?}", report.breaks);
+        assert_eq!(report.chained, 5);
+    }
+
+    /// M2: the tail scan judges a line by `v`/`seq` alone, as `verify`
+    /// does: a chained line with an odd v1 field is still the tail.
+    #[test]
+    fn tail_with_broken_v1_field_continues_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let file = dir.path().join("2026-10.jsonl");
+        let prev = sha256_hex(lines(&file).last().unwrap());
+        let hand = format!(
+            "{{\"v\":2,\"seq\":2,\"prev\":\"{prev}\",\"ts\":\"2026-10-13T08:30:00.000Z\",\"agent\":5}}\n"
+        );
+        append_raw(&file, hand.as_bytes());
+        assert_eq!(
+            append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap(),
+            3
+        );
+        let report = crate::verify::verify(dir.path());
+        assert!(report.breaks.is_empty(), "{:?}", report.breaks);
     }
 
     fn append_raw(p: &Path, bytes: &[u8]) {
