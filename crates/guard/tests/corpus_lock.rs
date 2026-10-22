@@ -229,6 +229,109 @@ fn persistence_is_denied() {
     }
 }
 
+/// Fix round 2: `setsid` is peeled (R1); the value options of `nice`,
+/// `ionice` and `stdbuf` are skipped with their value (R2); `env -S`'s
+/// string is judged as a command line (R3).
+#[test]
+fn launchers_and_wrapper_values_do_not_hide_the_command() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        // R1
+        "setsid crontab /tmp/c",
+        "setsid -f crontab /tmp/c",
+        "setsid --fork --wait crontab /tmp/c",
+        "nohup setsid crontab /tmp/c &",
+        "setsid at now",
+        "setsid systemd-run --user sh",
+        "setsid systemctl stop saiifed",
+        "setsid pkill saiifed",
+        "setsid sudo ls",
+        // R2
+        "nice -n5 sudo ls",
+        "nice --adjustment=5 sudo ls",
+        "nice --adjustment 5 sudo ls",
+        "nice -n 5 --adjustment=5 sudo ls",
+        "nice -n5 crontab /tmp/c",
+        "nice -5 crontab /tmp/c",
+        "nice -n -5 crontab /tmp/c",
+        "ionice -c 3 sudo ls",
+        "ionice -n 7 sudo ls",
+        "ionice -c3 -n7 crontab /tmp/c",
+        "ionice --class 3 crontab /tmp/c",
+        "ionice -t -c 3 crontab /tmp/c",
+        "stdbuf -o L sudo ls",
+        "stdbuf -i 0 -o L -e 0 crontab /tmp/c",
+        "stdbuf -oL crontab /tmp/c",
+        "stdbuf --output L crontab /tmp/c",
+        "stdbuf --output=L crontab /tmp/c",
+        // R3
+        "env -S 'sudo ls'",
+        "env --split-string='crontab /tmp/c'",
+        "env --split-string 'crontab /tmp/c'",
+        "env -S'pkill saiifed'",
+        "env -iS 'sudo ls'",
+        "env -S 'FOO=1 crontab' /tmp/c",
+        "timeout 5 env -S 'sudo ls'",
+        "env -S 'env -S \"sudo ls\"'",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "env -S 'ls -la'",
+        "nice -n 5 cargo build",
+        "setsid -f code .",
+        "ionice -c 3 make",
+        "stdbuf -o L tail -f log",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+/// Fix round 2 (R4): a pattern operand that matches saiifed without
+/// spelling it.
+#[test]
+fn pattern_operands_matching_saiifed_are_denied() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "pkill 'sa.*fed'",
+        "pkill -f 's[a]iifed'",
+        "pkill -f 'S.IIFED'",
+        "pkill d",
+        "pkill -9 -f 'i+fed'",
+        "pkill -f 'foo('",
+        "killall -r '^sai'",
+        "killall --regexp 'i+f'",
+        "killall 'sai*'",
+        "killall '*fed'",
+        "systemctl stop 's*d.service'",
+        "systemctl stop '*fed'",
+        "systemctl restart 'saiife?'",
+        "systemctl disable '[s]aiifed'",
+        "systemctl mask 's[!x]iifed.service'",
+        "timeout 5 pkill 'sa.*fed'",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "pkill -f sain",
+        "pkill -u jonas node",
+        "pkill -f 'python app.py'",
+        "systemctl restart saint",
+        "systemctl stop sa",
+        "systemctl restart 'nginx*'",
+        "systemctl status '*'",
+        "killall node",
+        "killall -r '^node'",
+        "pgrep -f 'sa.*fed'",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
 /// `$XDG_CONFIG_HOME` elsewhere than `~/.config` is guarded too.
 #[test]
 fn xdg_config_home_is_guarded() {

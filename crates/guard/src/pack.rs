@@ -25,6 +25,8 @@
 //!                             # in front of the command instead, joined
 //!                             # with spaces (`timeout 5 sudo ls`:
 //!                             # `timeout sudo`); never matches without one
+//! operand_match = "regex|glob" # also require an operand, read as a
+//! operand_targets = ["x"]     # pattern of this syntax, to match a target
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
 //! access = "read|write|any"
@@ -64,6 +66,94 @@ pub struct Rule {
     /// the effective command (`timeout 5 xargs sudo ls`: `timeout xargs
     /// sudo`) instead. Never matches a segment without wrappers.
     pub peeled_wrappers: bool,
+    /// Also required: an operand of the command, read as a pattern, matches
+    /// one of the targets (`pkill 'sa.*fed'` names `saiifed`).
+    pub operands: Option<OperandMatch>,
+}
+
+/// How a command reads its operands as patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OperandSyntax {
+    /// A regular expression searched in the name (`pkill`, `killall -r`).
+    Regex,
+    /// A shell glob matched against the whole name (`systemctl`); only
+    /// operands with `*`, `?` or `[` are read as patterns.
+    Glob,
+}
+
+/// `operand_match` and `operand_targets` of a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperandMatch {
+    pub syntax: OperandSyntax,
+    pub targets: Vec<String>,
+}
+
+/// Largest compiled operand pattern; a bigger one counts as a match.
+const OPERAND_REGEX_LIMIT: usize = 1 << 20;
+
+impl OperandMatch {
+    /// True if an operand (a word not starting with `-`) matches a target,
+    /// case-insensitively. An operand that is not a valid pattern counts as
+    /// a match: what the command makes of it is unknown.
+    pub fn hits(&self, operands: &[String]) -> bool {
+        operands
+            .iter()
+            .filter(|o| !o.is_empty() && !o.starts_with('-'))
+            .any(|o| {
+                let source = match self.syntax {
+                    OperandSyntax::Regex => o.clone(),
+                    OperandSyntax::Glob if o.contains(['*', '?', '[']) => glob_regex(o),
+                    OperandSyntax::Glob => return false,
+                };
+                match regex::RegexBuilder::new(&source)
+                    .case_insensitive(true)
+                    .size_limit(OPERAND_REGEX_LIMIT)
+                    .build()
+                {
+                    Ok(re) => self.targets.iter().any(|t| re.is_match(t)),
+                    Err(_) => true,
+                }
+            })
+    }
+}
+
+/// An anchored regex for a shell glob: `*`, `?`, and `[…]` classes (`[!…]`
+/// negated); everything else literal. A class without its `]` is literal.
+fn glob_regex(glob: &str) -> String {
+    let mut out = String::from("^");
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '[' => {
+                let close = chars[i + 1..]
+                    .iter()
+                    .skip(1)
+                    .position(|&c| c == ']')
+                    .map(|p| i + 2 + p);
+                let Some(end) = close else {
+                    out.push_str("\\[");
+                    i += 1;
+                    continue;
+                };
+                let mut class: String = chars[i + 1..end].iter().collect();
+                if let Some(rest) = class.strip_prefix('!') {
+                    class = format!("^{rest}");
+                }
+                out.push('[');
+                out.push_str(&class.replace('\\', "\\\\").replace('[', "\\["));
+                out.push(']');
+                i = end;
+            }
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    out.push('$');
+    out
 }
 
 /// A loaded, compiled pack.
@@ -172,6 +262,10 @@ struct RawRule {
     after_env_change: bool,
     #[serde(default)]
     peeled_wrappers: bool,
+    #[serde(default)]
+    operand_match: Option<OperandSyntax>,
+    #[serde(default)]
+    operand_targets: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +308,23 @@ fn compile_rules(
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.pattern));
         }
+        let operands = match (r.operand_match, r.operand_targets.is_empty()) {
+            (Some(syntax), false) => Some(OperandMatch {
+                syntax,
+                targets: r.operand_targets,
+            }),
+            (None, true) => None,
+            _ => {
+                warnings.push(PackWarning {
+                    source: source.to_string(),
+                    message: format!(
+                        "skipping rule {:?}: operand_match and operand_targets go together",
+                        r.pattern
+                    ),
+                });
+                continue;
+            }
+        };
         match Regex::new(&r.pattern) {
             Ok(regex) => out.push(Rule {
                 pattern: r.pattern,
@@ -222,6 +333,7 @@ fn compile_rules(
                 whole_segment: r.whole_segment,
                 after_env_change: r.after_env_change,
                 peeled_wrappers: r.peeled_wrappers,
+                operands,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
@@ -395,6 +507,43 @@ pub fn load_packs_dir(dir: &Path) -> (Vec<Pack>, Vec<PackWarning>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_regex_translates_shell_globs() {
+        assert_eq!(glob_regex("s*d.service"), r"^s.*d\.service$");
+        assert_eq!(glob_regex("sa?"), "^sa.$");
+        assert_eq!(glob_regex("[!x]y"), "^[^x]y$");
+        assert_eq!(glob_regex("[]a]"), "^[]a]$");
+        assert_eq!(glob_regex("a[b"), r"^a\[b$");
+    }
+
+    #[test]
+    fn operand_match_reads_operands_as_patterns() {
+        let m = |syntax, ops: &[&str]| {
+            OperandMatch {
+                syntax,
+                targets: vec!["saiifed".into(), "saiifed.service".into()],
+            }
+            .hits(&ops.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(m(OperandSyntax::Regex, &["sa.*fed"]));
+        assert!(m(OperandSyntax::Regex, &["-f", "S[A]IIFED"]));
+        assert!(m(OperandSyntax::Regex, &["foo("]));
+        assert!(!m(OperandSyntax::Regex, &["sain", "-saiifed"]));
+        assert!(m(OperandSyntax::Glob, &["stop", "*fed"]));
+        assert!(m(OperandSyntax::Glob, &["s*d.service"]));
+        assert!(!m(OperandSyntax::Glob, &["stop", "saiifed"]));
+        assert!(!m(OperandSyntax::Glob, &["nginx*"]));
+    }
+
+    #[test]
+    fn operand_match_needs_its_targets() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\noperand_match = \"glob\"\n[[deny]]\npattern = \"y\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", toml, &mut w).unwrap();
+        assert_eq!(p.deny.len(), 1);
+        assert!(w[0].message.contains("go together"), "{w:?}");
+    }
 
     const VALID: &str = r#"
 [pack]

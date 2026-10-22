@@ -75,6 +75,34 @@ reason = "saiifed records every agent call; an agent may not control the service
 pattern = '(?i)^(?:kill|pkill|killall)\s(?:.*\s)?(?:\S*saiif\S*|saii?(?:[*?\[]\S*)?)(?:\s|$)'
 reason = "saiifed records every agent call; stopping it would leave agents unrecorded"
 
+# A pattern operand that matches saiifed without spelling it: `pkill` and
+# `killall -r` read regexes (`pkill 'sa.*fed'`), `killall` and `systemctl`
+# globs (`systemctl stop '*fed'`). An operand that is not a valid pattern
+# counts as a match.
+[[deny]]
+pattern = '^pkill\s'
+reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
+operand_match = "regex"
+operand_targets = ["saiifed"]
+
+[[deny]]
+pattern = '^killall\s(?:.*\s)?(?:--regexp|-[A-Za-z]*r[A-Za-z]*)(?:\s|$)'
+reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
+operand_match = "regex"
+operand_targets = ["saiifed"]
+
+[[deny]]
+pattern = '^killall\s'
+reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
+operand_match = "glob"
+operand_targets = ["saiifed"]
+
+[[deny]]
+pattern = '^systemctl\s'
+reason = "this pattern matches saiifed, which records every agent call; an agent may not control the service"
+operand_match = "glob"
+operand_targets = ["saiifed", "saiifed.service"]
+
 # --- persistence --------------------------------------------------------------
 [[deny]]
 pattern = '^(?:crontab|at|batch)(?:\s|$)'

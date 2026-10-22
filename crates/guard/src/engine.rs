@@ -36,7 +36,8 @@ use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::wrappers::{
-    effective_command, is_env_assignment, peeled_wrappers, unwrap_transparent_prefix, wrapper_reads,
+    effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
+    unwrap_transparent_prefix, wrapper_reads,
 };
 
 /// Default latency budget for a single evaluation. Exceeding it yields
@@ -424,6 +425,13 @@ impl Engine {
         if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
             return Some(d);
         }
+        // `env -S 'sudo ls'`: the split string is a command line of its own.
+        for inner in env_split_payloads(seg) {
+            let nested = self.recurse(&inner, cx, state, false, "env -S command", None);
+            if let Some(d) = found.nested(nested) {
+                return Some(d);
+            }
+        }
         let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
         if view.argv.is_empty() || view.argv[0].is_empty() {
             return self.bare_segment_phase(&view, cx, state, found);
@@ -590,6 +598,7 @@ impl Engine {
                 matching: &view.peeled,
                 segment: &segment_line,
                 wrappers: &view.wrappers,
+                operands: &[],
             };
             match self.judge(lines, view.env_changed, cx.start) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -663,6 +672,7 @@ impl Engine {
             matching: matching_line,
             segment: segment_line,
             wrappers: &view.wrappers,
+            operands: &argv[1..],
         };
         match self.judge(lines, view.env_changed, cx.start) {
             JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -703,6 +713,7 @@ impl Engine {
                 matching: &line,
                 segment: &line,
                 wrappers: &view.wrappers,
+                operands: &[],
             };
             match self.judge_in(Some(CD_RESOLVED_PACK), lines, view.env_changed, cx.start) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -749,6 +760,7 @@ impl Engine {
                     matching: &line,
                     segment: view.segment_line(),
                     wrappers: &view.wrappers,
+                    operands: &alt_argv[1..],
                 };
                 match self.judge(lines, view.env_changed, cx.start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -1123,6 +1135,7 @@ impl Engine {
             matching: matching_line,
             segment: segment_line,
             wrappers,
+            operands,
         } = lines;
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
             if rule.peeled_wrappers {
@@ -1136,6 +1149,12 @@ impl Engine {
             } else {
                 Some(matching_line)
             }
+        };
+        // The rule's line matches, and an operand names a target when the
+        // rule asks for one.
+        let matches = |rule: &crate::pack::Rule| -> bool {
+            line(rule).is_some_and(|l| rule.regex.is_match(l))
+                && rule.operands.as_ref().is_none_or(|m| m.hits(operands))
         };
         let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
@@ -1151,11 +1170,7 @@ impl Engine {
             }
             // An allow match exempts only this pack's own deny rules (as
             // `allow_path` does); later packs still judge the command.
-            if let Some(rule) = pack
-                .allow
-                .iter()
-                .find(|r| line(r).is_some_and(|l| r.regex.is_match(l)))
-            {
+            if let Some(rule) = pack.allow.iter().find(|r| matches(r)) {
                 allowed.get_or_insert_with(|| AllowTrace::AllowRule {
                     pack: pack.id.clone(),
                     pattern: rule.pattern.clone(),
@@ -1165,7 +1180,7 @@ impl Engine {
             }
             // Deny rules — first match wins.
             for rule in &pack.deny {
-                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
+                if matches(rule) {
                     return JudgeOutcome::Decided(Decision::Deny {
                         pack: pack.id.clone(),
                         pattern: rule.pattern.clone(),
@@ -1752,12 +1767,14 @@ impl<'a> SegmentView<'a> {
 
 /// The lines a segment's rules match: the effective command's
 /// (`matching`), the whole segment's (`whole_segment` rules) and the peeled
-/// wrappers' names (`peeled_wrappers` rules).
+/// wrappers' names (`peeled_wrappers` rules); and the effective command's
+/// operands, for rules with `operand_match`.
 #[derive(Clone, Copy)]
 struct Lines<'a> {
     matching: &'a str,
     segment: &'a str,
     wrappers: &'a str,
+    operands: &'a [String],
 }
 
 enum JudgeOutcome {

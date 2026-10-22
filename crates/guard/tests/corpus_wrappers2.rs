@@ -62,6 +62,51 @@ fn assert_all_allow(e: &Engine, cmds: &[&str]) {
     }
 }
 
+// ---- setsid, value options of nice/ionice/stdbuf, env -S (plan 9b) --------
+
+#[test]
+fn setsid_and_wrapper_values_now_deny() {
+    let e = default_engine();
+    assert_all_deny(
+        &e,
+        &[
+            "setsid rm -rf /",
+            "setsid -f rm -rf /",
+            "nice -n5 rm -rf /",
+            "nice --adjustment 5 rm -rf /",
+            "nice --adjustment=5 rm -rf /",
+            "nice -n 5 --adjustment=5 rm -rf /",
+            "ionice -c 3 rm -rf /",
+            "ionice -n 7 rm -rf /",
+            "ionice -c3 rm -rf /",
+            "stdbuf -o L rm -rf /",
+            "stdbuf -i 0 -e 0 rm -rf /",
+            "env -S 'rm -rf /'",
+            "env --split-string='rm -rf /'",
+            "env -S'rm -rf /'",
+            "env -u FOO rm -rf /",
+        ],
+    );
+    for cmd in ["setsid rm -rf /", "nice -n5 rm -rf /", "env -S 'rm -rf /'"] {
+        match e.evaluate(cmd) {
+            saiifeguard::Decision::Deny { pack, .. } => {
+                assert_eq!(pack, "core.filesystem", "{cmd}")
+            }
+            d => panic!("expected DENY for {cmd:?}, got {d:?}"),
+        }
+    }
+    assert_all_allow(
+        &e,
+        &[
+            "setsid -f make",
+            "nice -n5 cargo build",
+            "ionice -c 3 rm -rf target",
+            "stdbuf -o L tail -f log",
+            "env -S 'ls -la'",
+        ],
+    );
+}
+
 // ---- time ----------------------------------------------------------------
 
 #[test]
