@@ -312,8 +312,9 @@ impl State {
 
     /// Judge a `key_rotate` and switch the key in force: a valid signature
     /// by the old key switches it; a missing one (`sig` null) switches it
-    /// too but is a break when there was a key to sign with; an invalid one
-    /// is a break and the key stays.
+    /// too but is a break when there was a key to sign with; an invalid one,
+    /// or an unsigned one without a valid SPKI `new_key`, is a break and the
+    /// key stays.
     fn key_rotate(
         &mut self,
         obj: &serde_json::Map<String, Value>,
@@ -324,6 +325,12 @@ impl State {
         let new_key = obj.get("new_key").and_then(Value::as_str).map(String::from);
         let sig = obj.get("sig").unwrap_or(&Value::Null);
         if sig.is_null() {
+            // An unsigned change must at least name a real key: a null or
+            // non-SPKI `new_key` would drop the key in force and let a later
+            // unsigned rotate pass as a keyless chain adopting one.
+            if new_key.as_deref().and_then(fingerprint_of).is_none() {
+                return Some(BreakKind::BadKeyRotate);
+            }
             // A chain without a key (developer mode) that gets one is not a
             // loss: there was nothing to sign the change with.
             let brk = self.key.is_some().then_some(BreakKind::UnsignedKeyRotate);

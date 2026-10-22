@@ -313,6 +313,7 @@ mod locked {
     use saiife_audit::sign::{key_rotate_message, AuditKey};
     use saiife_audit::{ChainWriter, WriterOptions};
     use saiife_audit::{DecisionKind, NewRecord};
+    use serde_json::Value;
 
     const F: &str = "2026-11.jsonl";
 
@@ -566,6 +567,80 @@ mod locked {
         assert!(rot["sig"].is_null(), "{rot}");
         assert_eq!(rot["reason"], "previous signing key missing");
         assert_eq!(rot["new_key"], b2.spki().as_str());
+    }
+
+    /// A `key_rotate` appended by hand: `key` and `sig` as given,
+    /// `new_key` only when `Some`.
+    fn forged_rotate(n: u32, key: Value, sig: Value, new_key: Option<Value>) -> Record {
+        let mut r = guard(n);
+        r.kind = Some("key_rotate".into());
+        r.tool = "key_rotate".into();
+        r.agent = String::new();
+        r.project = String::new();
+        r.input = String::new();
+        r.extra.insert("key".into(), key);
+        r.extra.insert("sig".into(), sig);
+        if let Some(k) = new_key {
+            r.extra.insert("new_key".into(), k);
+        }
+        r
+    }
+
+    /// An unsigned `key_rotate` with no usable `new_key` after a keyed
+    /// chain is a bad rotate, and the key stays in force (M4).
+    #[test]
+    fn forged_null_rotate_keeps_the_key() {
+        for new_key in [
+            None,
+            Some(Value::Null),
+            Some(Value::from("ed25519:not-a-key")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let keys = tempfile::tempdir().unwrap();
+            let (a, a2) = key_twice(keys.path(), "a");
+            drop(build_keyed(dir.path(), a));
+            let seq = append_chained(
+                dir.path(),
+                forged_rotate(90, Value::Null, Value::Null, new_key.clone()),
+            )
+            .unwrap();
+            assert_eq!(seq, 27);
+            assert_first(dir.path(), F, 28, BreakKind::BadKeyRotate);
+            let r = verify(dir.path());
+            assert_eq!(r.key, Some(a2.fingerprint()), "{new_key:?}: {r:?}");
+        }
+    }
+
+    /// Downgrade to no key, then "adopt" an attacker key as if the chain
+    /// never had one: the second step must not be silent (M4).
+    #[test]
+    fn two_step_downgrade_is_not_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let (a, a2) = key_twice(keys.path(), "a");
+        let (_b, b2) = key_twice(keys.path(), "b");
+        drop(build_keyed(dir.path(), a));
+        append_chained(
+            dir.path(),
+            forged_rotate(90, Value::Null, Value::Null, Some(Value::Null)),
+        )
+        .unwrap();
+        append_chained(
+            dir.path(),
+            forged_rotate(91, Value::Null, Value::Null, Some(b2.spki().into())),
+        )
+        .unwrap();
+        let r = verify(dir.path());
+        let kinds: Vec<_> = r.breaks.iter().map(|b| (b.seq, b.kind.clone())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (Some(27), BreakKind::BadKeyRotate),
+                (Some(28), BreakKind::UnsignedKeyRotate),
+            ],
+            "{r:?}"
+        );
+        assert_ne!(r.key, Some(a2.fingerprint()));
     }
 
     #[test]
