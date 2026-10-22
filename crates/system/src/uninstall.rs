@@ -177,6 +177,9 @@ pub fn uninstall(
     if !from_copy && fsops::remove_if_listed(&installed_path).map_err(step("installed.toml"))? {
         out.push(format!("removed {INSTALLED}"));
     }
+    if fsops::remove_if_listed(&layout.at(PREVIOUS)).map_err(step("installed.toml"))? {
+        out.push(format!("removed {PREVIOUS}"));
+    }
     for d in rec.dirs.iter().rev().filter(|d| d.starts_with(etc)) {
         let p = at(d)?;
         if fsops::remove_if_listed(&p).map_err(step("dirs"))? {
@@ -228,20 +231,15 @@ fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError>
     Ok(())
 }
 
-/// A plain uninstall keeps installed.toml as `installed.previous.toml` in
-/// the state dir (root 0600) when the state dir exists, so a later install
-/// or `--purge` knows what install created and the vault-key mode.
+/// A plain uninstall keeps installed.toml as `/etc/saiife/installed.previous.toml`
+/// (root:root 0600), so a later install or `--purge` knows what install
+/// created.
 fn keep_copy(
     layout: &Layout,
     host: &dyn Host,
     installed: &Path,
     out: &mut Vec<String>,
 ) -> Result<(), InstallError> {
-    let state = layout.at(STATE_DIR);
-    match fsops::lstat(&state) {
-        Ok(Some(m)) if m.is_dir() => {}
-        _ => return Ok(()),
-    }
     let Ok(bytes) = std::fs::read(installed) else {
         return Ok(());
     };
@@ -322,6 +320,8 @@ mod tests {
             "etc/saiife/policy.d",
             "etc/saiife/credstore",
             "etc/saiife/credstore/vault-key",
+            // The copy for a later install or --purge (root 0600).
+            "etc/saiife/installed.previous.toml",
         ]));
         assert_eq!(e.tree(), want);
         let calls = e.host.state().calls;

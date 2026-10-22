@@ -218,7 +218,10 @@ fn set_features_hooks(path: &Path, doc: &mut DocumentMut) -> Result<(), AgentErr
         let suffix = match &prior {
             // A tag from an earlier install keeps what was there first.
             Some(v) if parse_tag(&decor_suffix(v)).is_some() => decor_suffix(v),
-            _ => tagged_suffix(path, prior.as_ref(), added)?,
+            _ => {
+                let keep = prior.as_ref().map(decor_suffix).unwrap_or_default();
+                tagged_suffix(path, prior.as_ref(), added, &keep)?
+            }
         };
         let mut v = toml_edit::Value::from(true);
         v.decor_mut().set_suffix(suffix);
@@ -237,11 +240,13 @@ fn set_features_hooks(path: &Path, doc: &mut DocumentMut) -> Result<(), AgentErr
         return Err(layout(path, "`features` is not a table"));
     };
     let prior = t.get("hooks").cloned();
+    let tag = match parse_tag(&suffix) {
+        // A tag from an earlier install keeps what was there first.
+        Some(_) => suffix,
+        None => tagged_suffix(path, prior.as_ref(), false, &suffix)?,
+    };
     t.insert("hooks", toml_edit::Value::from(true));
-    if parse_tag(&suffix).is_none() {
-        let tag = tagged_suffix(path, prior.as_ref(), false)?;
-        v.decor_mut().set_suffix(tag);
-    }
+    v.decor_mut().set_suffix(tag);
     Ok(())
 }
 
@@ -257,18 +262,20 @@ fn decor_suffix(v: &toml_edit::Value) -> String {
 }
 
 /// The new suffix: the old one (an admin's comment) plus saiife's tag.
+/// `keep` is the suffix already there (the `hooks` value's in a table,
+/// the inline table's own for `features = { … }`).
 fn tagged_suffix(
     path: &Path,
     prior: Option<&toml_edit::Value>,
     table_added: bool,
+    keep: &str,
 ) -> Result<String, AgentError> {
-    let (repr, keep) = match prior {
-        None => ("absent".to_string(), String::new()),
+    let repr = match prior {
+        None => "absent".to_string(),
         Some(v) => {
-            let keep = decor_suffix(v);
             let mut bare = v.clone();
             bare.decor_mut().clear();
-            (bare.to_string().trim().to_string(), keep)
+            bare.to_string().trim().to_string()
         }
     };
     if repr.contains('\n') || repr.contains('\r') {

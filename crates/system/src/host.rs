@@ -22,6 +22,22 @@ pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
 pub const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 pub const DETECT_VIRT: &str = "/usr/bin/systemd-detect-virt";
 pub const GPASSWD: &str = "/usr/bin/gpasswd";
+pub const SUDO: &str = "/usr/bin/sudo";
+
+/// Every program locked mode runs (plan 9b global constraints), always by
+/// absolute path.
+pub const PROGRAMS: &[&str] = &[
+    USERADD,
+    GROUPADD,
+    USERMOD,
+    USERDEL,
+    GROUPDEL,
+    GPASSWD,
+    SYSTEMCTL,
+    SYSTEMD_CREDS,
+    DETECT_VIRT,
+    SUDO,
+];
 
 /// How long the user and group tools may take.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,6 +71,9 @@ pub trait Host: Send + Sync {
     /// The supplementary members of the group from `/etc/group` (primary
     /// members are not listed there); `None` when the group does not exist.
     fn group_members(&self, name: &str) -> Option<Vec<String>>;
+    /// Users in `/etc/passwd` whose primary group is `gid` (they are not
+    /// listed as members in `/etc/group`).
+    fn users_with_primary_gid(&self, gid: u32) -> Vec<String>;
     fn create_system_group(&self, name: &str) -> io::Result<()>;
     /// A system user with primary group `group`, no home and no login shell.
     fn create_system_user(&self, name: &str, group: &str) -> io::Result<()>;
@@ -147,6 +166,12 @@ impl Host for RealHost {
 
     fn group_members(&self, name: &str) -> Option<Vec<String>> {
         find_group_members(&std::fs::read_to_string("/etc/group").ok()?, name)
+    }
+
+    fn users_with_primary_gid(&self, gid: u32) -> Vec<String> {
+        std::fs::read_to_string("/etc/passwd")
+            .map(|t| find_primary_gid_users(&t, gid))
+            .unwrap_or_default()
     }
 
     fn create_system_group(&self, name: &str) -> io::Result<()> {
@@ -471,6 +496,16 @@ pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
 }
 
 /// The member list of `name` in `/etc/group` text.
+/// Names in `/etc/passwd` text whose primary gid (field 4) is `gid`.
+pub(crate) fn find_primary_gid_users(text: &str, gid: u32) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split(':').collect();
+            (f.len() >= 7 && f[3].parse::<u32>().ok() == Some(gid)).then(|| f[0].to_string())
+        })
+        .collect()
+}
+
 pub(crate) fn find_group_members(text: &str, name: &str) -> Option<Vec<String>> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -705,6 +740,18 @@ impl Host for FakeHost {
 
     fn group_id(&self, name: &str) -> Option<u32> {
         self.read().ok()?.group_id(name)
+    }
+
+    fn users_with_primary_gid(&self, gid: u32) -> Vec<String> {
+        self.read()
+            .map(|s| {
+                s.users
+                    .iter()
+                    .filter(|(_, u)| u.gid == gid)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn group_members(&self, name: &str) -> Option<Vec<String>> {
@@ -1247,6 +1294,21 @@ mod tests {
         );
         assert_eq!(SYSTEMCTL, "/usr/bin/systemctl");
         assert_eq!(DETECT_VIRT, "/usr/bin/systemd-detect-virt");
+        assert_eq!(GPASSWD, "/usr/bin/gpasswd");
+        // Every argv this module builds starts with a listed program.
+        let p = Path::new("/etc/saiife/credstore/vault-key");
+        for argv in [
+            argv_create_user("saiife", "saiife").unwrap(),
+            argv_create_group("saiife").unwrap(),
+            argv_add_to_group("saiife", "saiife-audit").unwrap(),
+            argv_remove_from_group("saiife", "saiife-audit").unwrap(),
+            argv_delete_user("saiife").unwrap(),
+            argv_delete_group("saiife").unwrap(),
+            argv_encrypt("vault-key", p).unwrap(),
+        ] {
+            assert!(PROGRAMS.contains(&argv[0].as_str()), "{argv:?}");
+        }
+        assert!(PROGRAMS.iter().all(|p| p.starts_with('/')));
     }
 
     #[test]
@@ -1344,5 +1406,27 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn primary_gid_users_parse_and_fake() {
+        let passwd = "root:x:0:0::/root:/bin/bash\nsaiife:x:990:990::/nonexistent:/usr/sbin/nologin\nalice:x:1000:990::/home/alice:/bin/bash\nbad:x\n";
+        assert_eq!(find_primary_gid_users(passwd, 990), ["saiife", "alice"]);
+        assert!(find_primary_gid_users(passwd, 5).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        h.set(|s| {
+            s.users.insert(
+                "alice".into(),
+                UserInfo {
+                    uid: 1000,
+                    gid: 990,
+                    home: "/home/alice".into(),
+                    shell: "/bin/bash".into(),
+                },
+            );
+        });
+        assert_eq!(h.users_with_primary_gid(990), ["alice"]);
+        assert!(h.users_with_primary_gid(991).is_empty());
     }
 }

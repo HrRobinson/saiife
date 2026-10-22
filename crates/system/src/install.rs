@@ -105,15 +105,16 @@ pub fn install(
     let previous =
         read_installed(&layout.at(INSTALLED)).map_err(|e| refused(&layout.at(INSTALLED), e))?;
     check_state_paths(layout, host)?;
-    // After a plain uninstall, the copy in the state dir says what an
-    // earlier install created and which vault-key mode it used.
+    // After a plain uninstall, the copy in /etc/saiife says what an earlier
+    // install created. It never relaxes a check: only the live
+    // installed.toml exempts a user or gid install made itself.
     let restored = match previous {
         Some(_) => None,
         None => read_previous(layout, host),
     };
     let known = previous.as_ref().or(restored.as_ref());
-    check_daemon_user(host, known)?;
-    check_daemon_group(host, known)?;
+    check_daemon_user(host, previous.as_ref())?;
+    check_daemon_group(host, previous.as_ref())?;
     for a in &opts.approvers {
         let name = a.strip_prefix("group:").unwrap_or(a);
         if !valid_name(name) {
@@ -128,12 +129,11 @@ pub fn install(
         None => None,
     };
 
-    let vault_key_exists = fsops::lstat(&layout.at(VAULT_KEY))
-        .map_err(step("vault-key"))?
-        .is_some();
-    let key_mode = match known {
-        Some(p) if vault_key_exists => p.vault_key,
-        _ => vault_key_mode(systemd),
+    // An existing key decides its own mode (never rotated); a record is
+    // not trusted for it.
+    let key_mode = match key_file_mode(layout)? {
+        Some(m) => m,
+        None => vault_key_mode(systemd),
     };
     let rec = known.cloned().unwrap_or_else(|| Installed {
         version: INSTALLED_VERSION,
@@ -161,11 +161,9 @@ pub fn install(
 
     // `/etc/saiife` first: installed.toml lives there.
     run.dir(ETC_DIR, 0o755, true)?;
-    if restored.is_some() {
-        run.save()?;
-        // installed.toml holds it now.
-        let _ = fsops::remove_if_listed(&layout.at(PREVIOUS));
-    }
+    run.save()?;
+    // installed.toml holds it now.
+    fsops::remove_if_listed(&layout.at(PREVIOUS)).map_err(step("installed.toml"))?;
 
     // 3. Groups, the user, the audit-group membership.
     run.users()?;
@@ -236,59 +234,96 @@ fn check_daemon_user(host: &dyn Host, previous: Option<&Installed>) -> Result<()
     Ok(())
 }
 
-/// An existing `saiife` group must be a system group with no member but
-/// `saiife`, unless an earlier install created it: on systemd < 250 the
-/// plain vault key is readable by that group (§5.2). Users whose primary
-/// group it is are not listed in `/etc/group`; `doctor` covers those.
-fn check_daemon_group(host: &dyn Host, previous: Option<&Installed>) -> Result<(), InstallError> {
+/// An existing `saiife` group must have no member but `saiife`, neither
+/// listed in `/etc/group` nor by primary gid in `/etc/passwd`: on systemd
+/// < 250 the plain vault key is readable by that group (§5.2). This always
+/// runs. Its gid must also be a system gid (below 1000), unless the live
+/// installed.toml says install created the group.
+fn check_daemon_group(host: &dyn Host, live: Option<&Installed>) -> Result<(), InstallError> {
     let Some(gid) = host.group_id(DAEMON_GROUP) else {
         return Ok(());
     };
-    if previous.is_some_and(|p| p.groups.iter().any(|n| n == DAEMON_GROUP)) {
-        return Ok(());
-    }
-    let members = host.group_members(DAEMON_GROUP).unwrap_or_default();
-    let others: Vec<&String> = members.iter().filter(|m| *m != DAEMON_USER).collect();
-    if gid >= 1000 || !others.is_empty() {
-        let who = if others.is_empty() {
-            "no other members".to_string()
-        } else {
-            format!(
-                "members {}",
-                others
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+    let mut others: Vec<String> = host
+        .group_members(DAEMON_GROUP)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(host.users_with_primary_gid(gid))
+        .filter(|m| m != DAEMON_USER)
+        .collect();
+    others.sort();
+    others.dedup();
+    let ours = live.is_some_and(|p| p.groups.iter().any(|n| n == DAEMON_GROUP));
+    if !others.is_empty() {
         return Err(refused(
             Path::new("/etc/group"),
             format!(
-                "a group {DAEMON_GROUP} already exists with gid {gid} and {who};                  saiife never adopts a shared group for its daemon (it needs a                  system gid below 1000 and no member but {DAEMON_USER})"
+                "the group {DAEMON_GROUP} (gid {gid}) has members besides {DAEMON_USER}: {}; \
+                 they could read the vault key, so saiife does not use it \
+                 (remove them from the group first)",
+                others.join(", ")
+            ),
+        ));
+    }
+    if gid >= 1000 && !ours {
+        return Err(refused(
+            Path::new("/etc/group"),
+            format!(
+                "a group {DAEMON_GROUP} already exists with gid {gid}; saiife \
+                 never adopts a regular group for its daemon (it needs a system \
+                 gid below 1000)"
             ),
         ));
     }
     Ok(())
 }
 
-/// Where a plain uninstall keeps a copy of installed.toml (root 0600).
-pub(crate) const PREVIOUS: &str = "/var/lib/saiife/installed.previous.toml";
+/// The vault-key mode of an existing key file: 32 raw bytes are a plain
+/// key (`File`), anything else an encrypted credential. `None` when there
+/// is no key.
+fn key_file_mode(layout: &Layout) -> Result<Option<VaultKeyMode>, InstallError> {
+    let p = layout.at(VAULT_KEY);
+    match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
+        None => Ok(None),
+        Some(m) if !m.is_file() => Err(refused(&p, "exists and is not a regular file")),
+        Some(m) if m.len() == 32 => Ok(Some(VaultKeyMode::File)),
+        Some(_) => Ok(Some(VaultKeyMode::Credential)),
+    }
+}
 
-/// The copy a plain uninstall left in the state dir, when it is root's
-/// regular 0600 file. The state dir belongs to the daemon user, so the copy
-/// is trusted only for what install could have created: anything else in
-/// it is dropped. Removed files (binary, unit, managed configs) are not
-/// taken over; their `created` flags are found again on the next write.
+/// Where a plain uninstall keeps a copy of installed.toml: root:root 0600
+/// in the root-owned `/etc/saiife`, never in the daemon's state dir.
+pub(crate) const PREVIOUS: &str = "/etc/saiife/installed.previous.toml";
+
+/// Largest copy read.
+const MAX_PREVIOUS: u64 = 1024 * 1024;
+
+/// The copy a plain uninstall left, read through one `O_NOFOLLOW` open: it
+/// must be a regular file of root's with mode 0600 (checked on that open
+/// file), else it is ignored. It is trusted only for what install could
+/// have created; anything else is dropped. It never relaxes a check and
+/// never decides the vault-key mode (the key file does). Removed files
+/// (binary, unit, managed configs) are not taken over; their `created`
+/// flags are found again on the next write.
 pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installed> {
-    use std::os::unix::fs::MetadataExt;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let p = layout.at(PREVIOUS);
-    let m = fsops::lstat(&p).ok()??;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(&p)
+        .ok()?;
+    let m = f.metadata().ok()?;
     let root_uid = host.user("root")?.uid;
-    if !m.is_file() || m.uid() != root_uid || m.mode() & 0o7777 != 0o600 {
+    if !m.is_file() || m.uid() != root_uid || m.mode() & 0o7777 != 0o600 || m.len() > MAX_PREVIOUS {
         return None;
     }
-    let mut i = read_installed(&p).ok()??;
+    let mut text = String::new();
+    f.take(MAX_PREVIOUS).read_to_string(&mut text).ok()?;
+    let mut i: Installed = toml::from_str(&text).ok()?;
+    if i.version != INSTALLED_VERSION {
+        return None;
+    }
     i.users.retain(|u| u == DAEMON_USER);
     i.groups.retain(|g| g == DAEMON_GROUP || g == AUDIT_GROUP);
     i.memberships
@@ -309,6 +344,11 @@ pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installe
         (f.kind == FileKind::Config && f.path == Path::new(CONFIG))
             || (f.kind == FileKind::VaultKey && f.path == Path::new(VAULT_KEY))
     });
+    for f in &mut i.files {
+        if f.kind == FileKind::VaultKey {
+            f.sha256 = None;
+        }
+    }
     i.agents.clear();
     Some(i)
 }
@@ -1566,21 +1606,12 @@ pub(crate) mod tests {
         assert!(a.created_file);
     }
 
-    fn state_dir_like_systemd(e: &Env) {
-        system_saiife_user(&e.host);
-        fs::create_dir_all(e.at(STATE_DIR)).unwrap();
-        fs::set_permissions(e.at(STATE_DIR), fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
     #[test]
     fn reinstall_after_uninstall_keeps_the_plain_key_mode() {
         // Ubuntu 22.04: systemd 249, a plain key.
         let e = env(249);
         e.install();
         assert_eq!(e.installed().vault_key, VaultKeyMode::File);
-        // systemd made the state dir when the daemon started.
-        fs::create_dir_all(e.at(STATE_DIR)).unwrap();
-        fs::set_permissions(e.at(STATE_DIR), fs::Permissions::from_mode(0o700)).unwrap();
         let out = crate::uninstall::uninstall(
             &e.layout,
             &e.host,
@@ -1594,8 +1625,15 @@ pub(crate) mod tests {
         let copy = e.at(PREVIOUS);
         assert_eq!(mode(&copy), 0o600);
         assert!(!e.at(INSTALLED).exists());
-        // Upgraded to 24.04: systemd 255.
-        e.host.set(|s| s.systemd = 255);
+        // Upgraded to 24.04: systemd 255. On a real host the user and
+        // group install made have system ids (the fake gives them the test
+        // user's, which the copy may not exempt).
+        e.host.set(|s| {
+            s.systemd = 255;
+            s.users.get_mut(DAEMON_USER).unwrap().uid = 990;
+            s.users.get_mut(DAEMON_USER).unwrap().gid = 990;
+            s.groups.insert(DAEMON_GROUP.into(), 990);
+        });
         e.install();
         let i = e.installed();
         assert_eq!(i.vault_key, VaultKeyMode::File);
@@ -1615,7 +1653,7 @@ pub(crate) mod tests {
     #[test]
     fn previous_copy_not_owned_by_root_is_ignored() {
         let e = env(249);
-        state_dir_like_systemd(&e);
+        fs::create_dir_all(e.at(ETC_DIR)).unwrap();
         e.host.set(|s| {
             s.users.insert(
                 "root".into(),
@@ -1635,7 +1673,7 @@ pub(crate) mod tests {
     #[test]
     fn previous_copy_is_limited_to_what_install_could_create() {
         let e = env(255);
-        state_dir_like_systemd(&e);
+        fs::create_dir_all(e.at(ETC_DIR)).unwrap();
         let mut i = Installed {
             version: saiife_policy::installed::INSTALLED_VERSION,
             saiife: "x".into(),
@@ -1689,5 +1727,135 @@ pub(crate) mod tests {
         let c = check(&e);
         assert_eq!(c.status, Status::Fail, "{c:?}");
         assert!(c.detail.contains("changed since install"), "{c:?}");
+    }
+
+    // ------------------------------------------------ fix round 2
+
+    /// A valid copy of `i` at `abs`, root's 0600 (root = the test user).
+    fn write_copy(e: &Env, abs: &str, i: &Installed) {
+        let p = e.at(abs);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        saiife_policy::installed::write_installed(&p, i).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn copy_record(mode: VaultKeyMode) -> Installed {
+        Installed {
+            version: saiife_policy::installed::INSTALLED_VERSION,
+            saiife: "x".into(),
+            installed_at: "x".into(),
+            systemd: 249,
+            vault_key: mode,
+            users: vec!["saiife".into()],
+            groups: vec!["saiife".into(), "saiife-audit".into()],
+            memberships: vec![],
+            dirs: vec![],
+            files: vec![saiife_policy::installed::InstalledFile {
+                path: VAULT_KEY.into(),
+                sha256: Some("ab".repeat(32)),
+                kind: FileKind::VaultKey,
+                created: true,
+            }],
+            agents: vec![],
+        }
+    }
+
+    #[test]
+    fn existing_user_with_saiife_as_primary_group_refused() {
+        let e = env(249);
+        e.host.set(|s| {
+            s.groups.insert(DAEMON_GROUP.into(), 990);
+            s.users.insert(
+                "alice".into(),
+                UserInfo {
+                    uid: 1000,
+                    gid: 990,
+                    home: "/home/alice".into(),
+                    shell: "/bin/bash".into(),
+                },
+            );
+        });
+        let err = e.run(&all_agents()).unwrap_err();
+        assert!(matches!(err, InstallError::Refused { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("alice") && msg.contains("vault key"), "{msg}");
+        assert!(!msg.contains("  "), "no stray continuation spaces: {msg}");
+        assert!(!e.at(ETC_DIR).exists());
+    }
+
+    #[test]
+    fn copy_in_the_state_dir_is_ignored() {
+        let e = env(255);
+        // The old location, in the daemon user's state dir.
+        let old = "/var/lib/saiife/installed.previous.toml";
+        write_copy(&e, old, &copy_record(VaultKeyMode::File));
+        assert!(!Path::new(PREVIOUS).starts_with(STATE_DIR));
+        assert!(read_previous(&e.layout, &e.host).is_none());
+    }
+
+    #[test]
+    fn tampered_copy_is_ignored() {
+        // Wrong mode.
+        let e = env(255);
+        write_copy(&e, PREVIOUS, &copy_record(VaultKeyMode::File));
+        assert!(read_previous(&e.layout, &e.host).is_some());
+        fs::set_permissions(e.at(PREVIOUS), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_previous(&e.layout, &e.host).is_none());
+        // A symlink to a good-looking copy.
+        let e = env(255);
+        write_copy(&e, "/etc/elsewhere.toml", &copy_record(VaultKeyMode::File));
+        fs::create_dir_all(e.at(ETC_DIR)).unwrap();
+        std::os::unix::fs::symlink(e.at("/etc/elsewhere.toml"), e.at(PREVIOUS)).unwrap();
+        assert!(read_previous(&e.layout, &e.host).is_none());
+    }
+
+    #[test]
+    fn copy_never_exempts_a_login_user() {
+        let e = env(255);
+        write_copy(&e, PREVIOUS, &copy_record(VaultKeyMode::Credential));
+        e.host.set(|s| {
+            s.users.insert(
+                DAEMON_USER.into(),
+                UserInfo {
+                    uid: 1001,
+                    gid: 1001,
+                    home: "/home/saiife".into(),
+                    shell: "/bin/bash".into(),
+                },
+            );
+        });
+        let err = e.run(&all_agents()).unwrap_err();
+        assert!(err.to_string().contains("1001"), "{err}");
+    }
+
+    #[test]
+    fn copy_clears_the_vault_key_digest() {
+        let e = env(255);
+        write_copy(&e, PREVIOUS, &copy_record(VaultKeyMode::File));
+        let i = read_previous(&e.layout, &e.host).unwrap();
+        assert!(i.files.iter().all(|f| f.sha256.is_none()));
+    }
+
+    #[test]
+    fn vault_key_mode_comes_from_the_key_file() {
+        // The copy says Credential, the key on disk is 32 raw bytes.
+        let e = env(255);
+        write_copy(&e, PREVIOUS, &copy_record(VaultKeyMode::Credential));
+        fs::create_dir_all(e.at(CREDSTORE)).unwrap();
+        fs::write(e.at(VAULT_KEY), [7u8; 32]).unwrap();
+        e.install();
+        assert_eq!(e.installed().vault_key, VaultKeyMode::File);
+        assert!(fs::read_to_string(e.at(UNIT))
+            .unwrap()
+            .contains("\nLoadCredential=vault-key:"));
+        assert_eq!(fs::read(e.at(VAULT_KEY)).unwrap(), [7u8; 32]);
+        // The copy says File, the key on disk is an encrypted credential.
+        let e = env(249);
+        write_copy(&e, PREVIOUS, &copy_record(VaultKeyMode::File));
+        fs::create_dir_all(e.at(CREDSTORE)).unwrap();
+        fs::write(e.at(VAULT_KEY), "an encrypted credential, not 32 bytes\n").unwrap();
+        e.install();
+        assert_eq!(e.installed().vault_key, VaultKeyMode::Credential);
+        assert_eq!(mode(&e.at(VAULT_KEY)), 0o600);
     }
 }

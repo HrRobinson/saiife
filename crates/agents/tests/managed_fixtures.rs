@@ -446,3 +446,16 @@ fn codex_reinstall_after_tamper_keeps_the_first_prior_value() {
     codex::remove_managed(&f).unwrap();
     assert!(toml_eq(&fs::read_to_string(&f).unwrap(), original));
 }
+
+#[test]
+fn codex_inline_features_keeps_the_admin_comment() {
+    let original = "features = { web_search = true } # company default\n";
+    let (installed, back) = codex_round_trip(original);
+    assert!(installed.contains("# company default"), "{installed}");
+    assert!(
+        installed.contains("# saiife: hooks was absent"),
+        "{installed}"
+    );
+    assert!(back.contains("} # company default"), "{back}");
+    assert!(!back.contains("saiife"), "{back}");
+}

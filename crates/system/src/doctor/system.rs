@@ -44,6 +44,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.push(files_modes(ctx));
     out.push(keys(ctx));
     out.push(audit_group(ctx));
+    out.push(daemon_group(ctx));
     out.push(daemon_unit(ctx));
     out.push(daemon_health(ctx));
     if let Some(i) = &ctx.installed {
@@ -604,6 +605,45 @@ fn audit_group(ctx: &Ctx) -> Check {
     }
 }
 
+/// No user but the daemon's is in the `saiife` group, listed in
+/// `/etc/group` or by primary gid: the plain vault key (systemd < 250) is
+/// readable by that group (§5.2).
+fn daemon_group(ctx: &Ctx) -> Check {
+    const ID: &str = "daemon.group";
+    const TITLE: &str = "saiife group holds only the daemon user";
+    let Some(gid) = ctx.host.group_id(DAEMON_GROUP) else {
+        return Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            format!("group {DAEMON_GROUP} does not exist"),
+        );
+    };
+    let mut others: Vec<String> = ctx
+        .host
+        .group_members(DAEMON_GROUP)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(ctx.host.users_with_primary_gid(gid))
+        .filter(|u| u != DAEMON_USER)
+        .collect();
+    others.sort();
+    others.dedup();
+    if others.is_empty() {
+        Check::new(ID, Status::Pass, TITLE, "")
+    } else {
+        Check::new(
+            ID,
+            Status::Fail,
+            TITLE,
+            format!(
+                "{} in group {DAEMON_GROUP}: they can read what the daemon's group can, including a plain vault key",
+                others.join(", ")
+            ),
+        )
+    }
+}
+
 fn daemon_unit(ctx: &Ctx) -> Check {
     const TITLE: &str = "saiifed.service active";
     match ctx.host.systemctl(&["is-active", UNIT_NAME]) {
@@ -731,7 +771,7 @@ fn peer_pidfd() -> Check {
 #[cfg(test)]
 mod tests {
     use super::super::{run, DoctorOptions, Report, Status};
-    use crate::host::{FakeHost, UserInfo};
+    use crate::host::{FakeHost, Host, UserInfo};
     use crate::layout::*;
     use crate::testing::fake_install;
     use saiife_policy::installed::{read_installed, write_installed, ManagedAgent, VaultKeyMode};
@@ -824,6 +864,7 @@ mod tests {
             "files.modes",
             "keys",
             "daemon.audit_group",
+            "daemon.group",
             "agents.claude.label",
         ] {
             assert_status(&r, id, Status::Pass);
@@ -1065,6 +1106,37 @@ mod tests {
         assert!(get(&r, "daemon.audit_group")
             .detail
             .contains("saiife is not a member of saiife-audit"));
+    }
+
+    #[test]
+    fn other_users_in_the_saiife_group_fail() {
+        let t = T::installed();
+        assert_status(&t.doctor(), "daemon.group", Status::Pass);
+        // A user whose primary group is saiife.
+        let gid = t.host.group_id(DAEMON_GROUP).unwrap();
+        t.host.set(|s| {
+            s.users.insert(
+                "alice".into(),
+                UserInfo {
+                    uid: 1000,
+                    gid,
+                    home: "/home/alice".into(),
+                    shell: "/bin/bash".into(),
+                },
+            );
+        });
+        let r = t.doctor();
+        assert_status(&r, "daemon.group", Status::Fail);
+        assert!(get(&r, "daemon.group")
+            .detail
+            .starts_with("alice in group saiife"));
+        // A listed member.
+        let t = T::installed();
+        t.host.set(|s| {
+            s.members
+                .insert(DAEMON_GROUP.into(), vec!["bob".to_string()]);
+        });
+        assert_status(&t.doctor(), "daemon.group", Status::Fail);
     }
 
     #[test]
