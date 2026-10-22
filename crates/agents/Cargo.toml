@@ -21,5 +21,6 @@ thiserror = "1"
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
-# Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
-libc = "0.2"
+# Safe syscalls for the project config read: openat2 with RESOLVE_BENEATH
+# on Linux, open flags and fd paths elsewhere. No unsafe in this crate.
+rustix = { version = "1", features = ["fs"] }

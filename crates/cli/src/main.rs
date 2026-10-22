@@ -3,10 +3,12 @@
 //! - `saiife test "<cmd>"` -> exit 0 allow / exit 1 deny (reason to stderr)
 //! - `saiife explain "<cmd>"` / `--read <path>` / `--write <path>` -> decision trace to stdout, always exit 0
 //! - `saiife check` -> read agent pre-tool JSON on stdin, audit, answer the hook (silent allow / block); FAIL OPEN on error.
+//! - `saiife check --managed` -> locked mode: guard in a worker, record through the daemon; FAIL CLOSED on error.
 //! - `saiife init [--off]` -> hook the agents into this project (or remove exactly that)
 //! - `saiife status` -> tamper checks; exit 1 if any fails
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
+//! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +22,8 @@ mod out;
 
 mod audit_cmd;
 mod check;
+mod check_managed;
+mod eval;
 mod init_cmd;
 mod packs_cmd;
 mod paths;
@@ -75,6 +79,13 @@ enum Cmd {
         /// Which agent is calling (claude, codex, gemini); recorded in the audit log.
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
+        /// Locked mode (Linux): judge in a worker process, record through
+        /// the saiife daemon, fail closed on every error. Implies --hook-exit.
+        #[arg(long)]
+        managed: bool,
+        /// The system config for --managed (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, requires = "managed")]
+        system_config: Option<std::path::PathBuf>,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -117,6 +128,24 @@ enum Cmd {
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
     },
+    /// Run saiifed, the locked-mode daemon, as the `[daemon] user` (Linux).
+    Daemon {
+        /// System daemon mode (the only mode in this version).
+        #[arg(long)]
+        system: bool,
+        /// Personal broker mode (after v2.0).
+        #[arg(long)]
+        user: bool,
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long, value_name = "FILE")]
+        config: Option<std::path::PathBuf>,
+        /// Where the signing key lives (default $STATE_DIRECTORY, else /var/lib/saiife).
+        #[arg(long = "state-dir", value_name = "DIR")]
+        state_dir: Option<std::path::PathBuf>,
+    },
+    /// The locked-mode guard worker (`check --managed` spawns it).
+    #[command(name = "__eval", hide = true)]
+    Eval,
 }
 
 #[derive(Subcommand)]
@@ -133,8 +162,32 @@ fn main() -> ExitCode {
 
     // Hook mode compiles only the packs it needs (it runs on every agent
     // tool call); every other command lists or judges across all packs.
-    if let Cmd::Check { hook_exit, agent } = &cli.command {
+    if let Cmd::Check {
+        hook_exit,
+        agent,
+        managed,
+        system_config,
+    } = &cli.command
+    {
+        if *managed {
+            let config = system_config
+                .as_deref()
+                .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
+            return check_managed::run(agent, config);
+        }
         return check::run(&cli.packs, *hook_exit, agent);
+    }
+    if let Cmd::Eval = cli.command {
+        return eval::worker_main();
+    }
+    if let Cmd::Daemon {
+        system,
+        user,
+        config,
+        state_dir,
+    } = cli.command
+    {
+        return cmd_daemon(system, user, config, state_dir);
     }
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
@@ -171,7 +224,7 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { hook_exit, agent } => check::run(&cli.packs, hook_exit, &agent),
+        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } => unreachable!("handled above"),
         Cmd::Init { off: true, .. } => init_cmd::off(),
         Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
         Cmd::Status => status_cmd::run(&packs),
@@ -202,6 +255,47 @@ fn main() -> ExitCode {
 /// read as "block" to every agent, e.g. after a newer saiife wrote a hook
 /// flag this binary does not know: warn and fail open, silently on stdout.
 /// Everything else (and `--help` / `--version`) keeps clap's behavior.
+/// `saiife daemon --system`: the system daemon, as the `[daemon] user`.
+fn cmd_daemon(
+    system: bool,
+    user: bool,
+    config: Option<std::path::PathBuf>,
+    state_dir: Option<std::path::PathBuf>,
+) -> ExitCode {
+    if !system || user {
+        eprintln!(
+            "saiife: use `saiife daemon --system` (personal broker mode, --user, comes after v2.0)"
+        );
+        return ExitCode::from(2);
+    }
+    let (packs, warnings) = builtin_packs();
+    for w in &warnings {
+        warn(&format!("pack warning ({}): {}", w.source, w.message));
+    }
+    let catalog = packs
+        .iter()
+        .map(|p| saiife_policy::PackInfo {
+            id: p.id.clone(),
+            version: p.version,
+            default_on: p.default_on,
+        })
+        .collect();
+    // systemd's StateDirectory= may list several dirs, colon-separated.
+    let state_dir = state_dir
+        .or_else(|| {
+            std::env::var_os("STATE_DIRECTORY")
+                .and_then(|v| v.to_str().and_then(|s| s.split(':').next()).map(Into::into))
+                .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
+        })
+        .unwrap_or_else(|| "/var/lib/saiife".into());
+    saiife_daemon::run(saiife_daemon::DaemonOptions {
+        config: config.unwrap_or_else(|| "/etc/saiife/config.toml".into()),
+        state_dir,
+        catalog,
+        directory: Box::new(saiife_policy::Getent),
+    })
+}
+
 fn arg_error(e: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     let hook_mode = std::env::args_os().nth(1).is_some_and(|a| a == "check");
@@ -212,12 +306,17 @@ fn arg_error(e: clap::Error) -> ExitCode {
             .next()
             .unwrap_or("")
             .trim_start_matches("error: ");
-        warn(&format!(
-            "bad hook arguments ({first}); failing open (allow)"
-        ));
         let args: Vec<String> = std::env::args_os()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        // Locked mode never falls back to allow, not even on a flag this
+        // binary does not know.
+        if args.iter().any(|a| a == "--managed") {
+            return check_managed::run_bad_args(&args, first);
+        }
+        warn(&format!(
+            "bad hook arguments ({first}); failing open (allow)"
+        ));
         check::record_arg_error(&args, first);
         return ExitCode::SUCCESS;
     }

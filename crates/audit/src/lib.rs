@@ -8,8 +8,10 @@
 pub mod chain;
 pub mod mask;
 pub mod record;
+pub mod sign;
 pub mod store;
 pub mod verify;
 
+pub use chain::{ChainWriter, StartupCheck, WriterOptions};
 pub use record::{DecisionKind, NewRecord, Record};
 pub use verify::{verify, Break, BreakKind, VerifyReport};

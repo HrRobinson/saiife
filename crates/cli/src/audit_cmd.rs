@@ -73,7 +73,15 @@ pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
         let files: Vec<String> = r.v1_files.iter().map(|f| sanitize(f)).collect();
         out.push_str(&format!("  not chained (v1): {}\n", files.join(", ")));
     }
-    if r.breaks.is_empty() && r.checkpoints == 0 {
+    if let Some((seq, ts)) = &r.last_checkpoint {
+        out.push_str(&format!(
+            "  last checkpoint: seq {seq} at {}\n",
+            sanitize(ts)
+        ));
+    }
+    if let Some(key) = &r.key {
+        out.push_str(&format!("  signed with key {}\n", sanitize(key)));
+    } else if r.breaks.is_empty() {
         out.push_str(
             "  developer mode: no signing key, so this catches accidental edits, not deliberate rewrites.\n",
         );

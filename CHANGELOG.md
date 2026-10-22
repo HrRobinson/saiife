@@ -8,6 +8,12 @@
 - `error_denied` now counts as blocked in `saiife audit`, `--blocked` and the report.
 - A project `.saiife/config.toml` that is not a regular file (a FIFO or device, also when reached through a symlink) or is over 64 KiB is not read: the default packs apply, with a warning.
 - A project `.saiife/config.toml` symlinked to a file outside the project is refused (never opened or quoted), by the hook and by `saiife init`; links that stay inside the project still work.
+- New `saiife daemon --system` (Linux): the locked-mode daemon. It is the single writer of the audit log, stamps every record's time and identity, and signs checkpoints with an Ed25519 key.
+- New `saiife check --managed` (Linux): the locked-mode hook. The guard runs in a separate worker process, and the call is allowed only after the daemon has recorded it. Every error (a worker crash or hang, a daemon that is down, slow or refuses, a policy that cannot be loaded) blocks the call: it fails closed.
+- `saiife audit verify` checks checkpoint and key-rotation signatures.
+- `saiife init` and `saiife status` read the project config with the same bounded, race-free read as the hook.
+
+Locked mode cannot be installed yet: `saiife system install` and the managed hook files come in plan 9b.
 
 ## 0.1.1 — 2026-10-19
 

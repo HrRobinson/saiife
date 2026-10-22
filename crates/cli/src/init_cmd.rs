@@ -109,8 +109,8 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
 
     // Was the config still exactly what saiife wrote, before this run?
     let config_was_ours = !config_written_sha256.is_empty()
-        && std::fs::read(root.join(CONFIG_REL))
-            .is_ok_and(|b| sha256_hex(&b) == config_written_sha256);
+        && config::read_config_bytes(&root)
+            .is_ok_and(|b| b.is_some_and(|b| sha256_hex(&b) == config_written_sha256));
 
     // Project config first: if it cannot be written, touch nothing else.
     let config_change = match config::ensure(&root, &packs) {
@@ -124,14 +124,14 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     let mut failed = false;
     match config_change {
         Change::Created { .. } => {
-            if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
+            if let Ok(Some(bytes)) = config::read_config_bytes(&root) {
                 config_written_sha256 = sha256_hex(&bytes);
             }
         }
         // Appending packs to a file the user edited must not make their
         // edits look like saiife's own content.
         Change::Updated if config_was_ours => {
-            if let Ok(bytes) = std::fs::read(root.join(CONFIG_REL)) {
+            if let Ok(Some(bytes)) = config::read_config_bytes(&root) {
                 config_written_sha256 = sha256_hex(&bytes);
             }
         }
@@ -187,8 +187,15 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
         }
     }
 
-    let config_sha256 = match std::fs::read(root.join(CONFIG_REL)) {
-        Ok(bytes) => sha256_hex(&bytes),
+    let config_sha256 = match config::read_config_bytes(&root) {
+        Ok(Some(bytes)) => sha256_hex(&bytes),
+        Ok(None) => {
+            failed = true;
+            lines.push(format!(
+                "  config  FAILED to read {CONFIG_REL}: it is missing"
+            ));
+            String::new()
+        }
         Err(e) => {
             failed = true;
             lines.push(format!("  config  FAILED to read {CONFIG_REL}: {e}"));
@@ -372,8 +379,8 @@ pub fn off() -> ExitCode {
     } else if config_path.exists() {
         let unchanged = record.as_ref().is_some_and(|r| {
             !r.config_written_sha256.is_empty()
-                && std::fs::read(&config_path)
-                    .is_ok_and(|b| sha256_hex(&b) == r.config_written_sha256)
+                && config::read_config_bytes(&root)
+                    .is_ok_and(|b| b.is_some_and(|b| sha256_hex(&b) == r.config_written_sha256))
         });
         if created.iter().any(|c| c == CONFIG_REL) && unchanged {
             match std::fs::remove_file(&config_path) {

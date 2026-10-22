@@ -1,0 +1,70 @@
+version = 2
+locked = true                    # v1 reserved this key (v1 §5.1); true = locked mode
+
+[daemon]
+user = "saiife"                  # "_saiife" on macOS
+socket_dir = "/run/saiife"       # "/var/run/saiife" on macOS; fixed in locked mode
+
+[admin]
+groups = []                      # uids in these groups get admin ops besides root
+
+[guard]
+packs = ["db.postgres"]          # added to the default-on packs (core.filesystem, core.git,
+                                 # core.secrets, core.self, and core.lock when locked)
+ask = ["core.git/force-push"]    # proposed (§6.10.4)
+budget_ms = 50
+fail = "closed"                  # forced "closed" when locked = true; "open" | "closed" otherwise
+
+[guard.mcp]
+allow_servers = []               # MCP servers allowed in locked mode, unbrokered (§6.1.4)
+
+[audit]
+dir = "/var/log/saiife/audit"
+retention_months = 24            # older month files are deleted by the daemon, with a record
+checkpoint_every = 1000
+checkpoint_interval = "15m"
+min_free_mb = 512
+fsync = "checkpoint"             # "always" | "checkpoint" (fdatasync at checkpoints and every 1 s)
+
+[audit.forward.siem]
+type = "syslog"
+address = "tls://siem.acme.internal:6514"
+ca = "/etc/saiife/ca/acme.pem"
+format = "rfc5424-json"
+
+[approval]
+approvers = ["group:saiife-approvers"]
+same_user = "deny"               # "deny" | "reauth"
+timeout = "30m"
+grant_ttl = "15m"                # command grants (§6.10.4)
+
+[notify]                         # proposed (§6.10.3)
+on = ["approval_created", "limit_reached", "chain_break", "forward_failing", "lockdown"]
+[notify.targets.ops]
+type = "webhook"
+url_secret = "slack-ops-hook"
+
+[gateway]
+tcp = ""                         # "127.0.0.1:7431" to enable; off by default
+max_response_bytes = 5242880
+upstream_timeout = "30s"
+
+[[scope]]
+name = "shop-agent"
+users = ["agent-shop"]           # OS users or "group:<name>"
+projects = ["/srv/agents/shop/**"]   # attribution only (client-reported); never selects scope or env
+services = ["shopify", "hubspot"]
+env = "prod"
+# Builder's call 6: each uid matches at most one scope. A user listed in two
+# scopes, directly or through a group, is a config error: `policy check`
+# fails and the daemon refuses to load the policy (it keeps the last good one,
+# or starts with connectors denied).
+
+[[example]]                      # used by `saiife policy test` (proposed)
+user = "agent-shop"
+request = "shopify orders.list status=open"
+expect = "allow"
+[[example]]
+user = "agent-shop"
+request = "shopify customers.export"
+expect = "deny"

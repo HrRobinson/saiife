@@ -72,9 +72,10 @@ pub struct Catalog {
 struct Entry {
     source: &'static str,
     toml: &'static str,
-    /// `(id, default_on)`; `None` if the header cannot be read. Such an
-    /// entry is always loaded (and fails), so its failure is still reported.
-    header: Option<(String, bool)>,
+    /// `(id, default_on, version)`; `None` if the header cannot be read.
+    /// Such an entry is always loaded (and fails), so its failure is still
+    /// reported.
+    header: Option<(String, bool, u32)>,
 }
 
 impl Catalog {
@@ -100,7 +101,17 @@ impl Catalog {
     pub fn knows(&self, id: &str) -> bool {
         self.entries
             .iter()
-            .any(|e| e.header.as_ref().is_some_and(|(i, _)| i == id))
+            .any(|e| e.header.as_ref().is_some_and(|(i, _, _)| i == id))
+    }
+
+    /// `(id, version, default_on)` of every pack whose header can be read,
+    /// in load order, without compiling any rule.
+    pub fn headers(&self) -> Vec<(String, u32, bool)> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.header.as_ref())
+            .map(|(id, on, v)| (id.clone(), *v, *on))
+            .collect()
     }
 
     /// Compile every pack.
@@ -111,10 +122,10 @@ impl Catalog {
     /// Compile the packs `select_active` would keep: every default-on pack
     /// plus those whose id is in `enabled`. The others are never compiled.
     pub fn load_active(&self, enabled: &[String]) -> (Vec<Pack>, Vec<PackWarning>) {
-        self.load(|(id, default_on)| *default_on || enabled.iter().any(|e| e == id))
+        self.load(|(id, default_on, _)| *default_on || enabled.iter().any(|e| e == id))
     }
 
-    fn load(&self, wanted: impl Fn(&(String, bool)) -> bool) -> (Vec<Pack>, Vec<PackWarning>) {
+    fn load(&self, wanted: impl Fn(&(String, bool, u32)) -> bool) -> (Vec<Pack>, Vec<PackWarning>) {
         let mut packs = Vec::new();
         let mut warnings = Vec::new();
         for e in &self.entries {
@@ -143,6 +154,22 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headers name exactly the packs a full load compiles, with the
+    /// same version and default, without compiling anything.
+    #[test]
+    fn headers_match_the_compiled_packs() {
+        let cat = Catalog::builtin();
+        let before = crate::pack::compiled_packs();
+        let headers = cat.headers();
+        assert_eq!(crate::pack::compiled_packs(), before);
+        let (packs, _) = cat.load_all();
+        let want: Vec<(String, u32, bool)> = packs
+            .iter()
+            .map(|p| (p.id.clone(), p.version, p.default_on))
+            .collect();
+        assert_eq!(headers, want);
+    }
 
     const BROKEN_CORE: &str = r#"
 [pack]

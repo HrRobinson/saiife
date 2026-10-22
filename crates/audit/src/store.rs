@@ -46,14 +46,22 @@ pub fn append(dir: &Path, rec: &Record) -> io::Result<()> {
 /// Open (creating 0600) `path` for appending, refusing a symlink, FIFO or
 /// anything else that is not a regular file.
 pub(crate) fn open_append(path: &Path) -> io::Result<fs::File> {
+    open_append_mode(path, 0o600)
+}
+
+/// `open_append`, but a new file gets `mode` (before the umask) on unix. The
+/// mode of an existing file is left alone.
+pub(crate) fn open_append_mode(path: &Path, mode: u32) -> io::Result<fs::File> {
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600)
+        opts.mode(mode)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("audit log path is not a regular file"));

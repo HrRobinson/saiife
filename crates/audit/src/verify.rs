@@ -5,12 +5,18 @@
 //! previous physical line (any line, even a bad one), `seq` runs on across
 //! unchained lines and month files, and a genesis opens each chain. At most
 //! one break is reported per line, the first that applies.
+//!
+//! Locked-mode chains also carry a signing key (spec §6.4.2): the genesis
+//! `key` sets the key in force, a `key_rotate` signed by it switches to its
+//! `new_key`, and every checkpoint must be signed by the key in force over
+//! the record before it.
 
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::chain::{sha256_hex, ZERO_PREV};
+use crate::sign::{checkpoint_message, fingerprint_of, key_rotate_message, verify_b64};
 use crate::store;
 
 /// What went wrong with a line.
@@ -24,6 +30,10 @@ pub enum BreakKind {
     MissingGenesis,
     ChainRestarted,
     V1InsideChain,
+    BadCheckpoint,
+    CheckpointWithoutKey,
+    BadKeyRotate,
+    UnsignedKeyRotate,
 }
 
 impl BreakKind {
@@ -51,6 +61,10 @@ impl BreakKind {
             Self::V1InsideChain => {
                 "v1 record inside the chain (written by saiife 0.1.x after an upgrade)".into()
             }
+            Self::BadCheckpoint => "checkpoint does not match its signature or the records before it (records were changed, or the checkpoint is forged)".into(),
+            Self::CheckpointWithoutKey => "checkpoint in a chain that has no signing key".into(),
+            Self::BadKeyRotate => "signing key change not signed by the previous key".into(),
+            Self::UnsignedKeyRotate => "signing key replaced without the previous key (the daemon's key file was lost or removed)".into(),
         }
     }
 }
@@ -78,6 +92,10 @@ pub struct VerifyReport {
     /// `seq` and line hash of the newest chained record.
     pub head: Option<(u64, String)>,
     pub checkpoints: u64,
+    /// `(seq, ts)` of the newest checkpoint that verified.
+    pub last_checkpoint: Option<(u64, String)>,
+    /// Fingerprint of the signing key in force at the end of the log.
+    pub key: Option<String>,
     pub breaks: Vec<Break>,
     /// Files or directories that could not be read; the log is unverified.
     pub read_errors: Vec<String>,
@@ -141,16 +159,39 @@ pub fn verify(dir: &Path) -> VerifyReport {
 }
 
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     /// Hash of the previous physical line, across files.
     prev_hash: Option<String>,
     /// The next `seq` to expect; `None` until the chain has started.
     expected: Option<u64>,
     seen_genesis: bool,
+    /// `chain` id of the current genesis, for the signed messages.
+    chain: Option<String>,
+    /// `ed25519:<spki b64>` of the signing key in force.
+    key: Option<String>,
 }
 
 impl State {
-    fn check(&mut self, line: &[u8], file: &str, n: usize, report: &mut VerifyReport) {
+    /// A state that continues a chain in the middle (the startup check of
+    /// the recent lines): `prev_hash` hashes the line before the first one
+    /// fed, `expected` is that line's `seq`, and `key` is the key in force
+    /// there.
+    pub(crate) fn resume(
+        prev_hash: Option<String>,
+        expected: u64,
+        chain: Option<String>,
+        key: Option<String>,
+    ) -> State {
+        State {
+            prev_hash,
+            expected: Some(expected),
+            seen_genesis: true,
+            chain,
+            key,
+        }
+    }
+
+    pub(crate) fn check(&mut self, line: &[u8], file: &str, n: usize, report: &mut VerifyReport) {
         let hash = sha256_hex(line);
         let prev_hash = self.prev_hash.replace(hash.clone());
         let (seq, kind) = self.judge(line, prev_hash.as_deref(), &hash, report);
@@ -197,7 +238,10 @@ impl State {
                 brk = Some(BreakKind::ChainRestarted);
             }
             self.seen_genesis = true;
-            report.chain = obj.get("chain").and_then(Value::as_str).map(String::from);
+            self.chain = obj.get("chain").and_then(Value::as_str).map(String::from);
+            report.chain.clone_from(&self.chain);
+            let key = obj.get("key").and_then(Value::as_str).map(String::from);
+            self.set_key(key, report);
             self.expected = Some(1);
         } else {
             match self.expected {
@@ -214,14 +258,106 @@ impl State {
                     }
                 }
             }
-            if kind_field == Some("checkpoint") {
-                report.checkpoints += 1;
+            let signed = match kind_field {
+                Some("checkpoint") => {
+                    report.checkpoints += 1;
+                    self.check_checkpoint(&obj, seq, prev_hash)
+                }
+                Some("key_rotate") => self.key_rotate(&obj, seq, prev_hash, report),
+                _ => None,
+            };
+            brk = brk.or(signed);
+            if kind_field == Some("checkpoint") && brk.is_none() {
+                let ts = obj.get("ts").and_then(Value::as_str).unwrap_or_default();
+                report.last_checkpoint = Some((seq, ts.to_string()));
             }
             self.expected = seq.checked_add(1);
         }
         report.chained += 1;
         report.head = Some((seq, hash.to_string()));
         (Some(seq), brk)
+    }
+
+    fn set_key(&mut self, key: Option<String>, report: &mut VerifyReport) {
+        report.key = key.as_deref().and_then(fingerprint_of);
+        self.key = key;
+    }
+
+    /// The break of a checkpoint, if any: it needs a key in force, must name
+    /// the record right before it (`head_seq`, `head`) and that key's
+    /// fingerprint, and carry its valid signature.
+    fn check_checkpoint(
+        &self,
+        obj: &serde_json::Map<String, Value>,
+        seq: u64,
+        prev_hash: Option<&str>,
+    ) -> Option<BreakKind> {
+        let Some(spki) = self.key.as_deref() else {
+            return Some(BreakKind::CheckpointWithoutKey);
+        };
+        let ok = (|| {
+            let head_seq = obj.get("head_seq")?.as_u64()?;
+            let head = obj.get("head")?.as_str()?;
+            let ts = obj.get("ts")?.as_str()?;
+            let msg = checkpoint_message(self.chain.as_deref()?, head_seq, head, ts);
+            Some(
+                Some(head_seq) == seq.checked_sub(1)
+                    && Some(head) == prev_hash
+                    && fingerprint_of(spki).as_deref() == obj.get("key")?.as_str()
+                    && verify_b64(spki, msg.as_bytes(), obj.get("sig")?.as_str()?),
+            )
+        })();
+        (ok != Some(true)).then_some(BreakKind::BadCheckpoint)
+    }
+
+    /// Judge a `key_rotate` and switch the key in force: a valid signature
+    /// by the old key switches it; a missing one (`sig` null) switches it
+    /// too but is a break when there was a key to sign with; an invalid one,
+    /// or an unsigned one without a valid SPKI `new_key`, is a break and the
+    /// key stays.
+    fn key_rotate(
+        &mut self,
+        obj: &serde_json::Map<String, Value>,
+        seq: u64,
+        prev_hash: Option<&str>,
+        report: &mut VerifyReport,
+    ) -> Option<BreakKind> {
+        let new_key = obj.get("new_key").and_then(Value::as_str).map(String::from);
+        let sig = obj.get("sig").unwrap_or(&Value::Null);
+        if sig.is_null() {
+            // An unsigned change must at least name a real key: a null or
+            // non-SPKI `new_key` would drop the key in force and let a later
+            // unsigned rotate pass as a keyless chain adopting one.
+            if new_key.as_deref().and_then(fingerprint_of).is_none() {
+                return Some(BreakKind::BadKeyRotate);
+            }
+            // A chain without a key (developer mode) that gets one is not a
+            // loss: there was nothing to sign the change with.
+            let brk = self.key.is_some().then_some(BreakKind::UnsignedKeyRotate);
+            self.set_key(new_key, report);
+            return brk;
+        }
+        let ok = (|| {
+            let old = self.key.as_deref()?;
+            let head_seq = obj.get("head_seq")?.as_u64()?;
+            let head = obj.get("head")?.as_str()?;
+            let ts = obj.get("ts")?.as_str()?;
+            let new_key = new_key.as_deref()?;
+            fingerprint_of(new_key)?;
+            let msg = key_rotate_message(self.chain.as_deref()?, head_seq, head, new_key, ts);
+            Some(
+                Some(head_seq) == seq.checked_sub(1)
+                    && Some(head) == prev_hash
+                    && fingerprint_of(old).as_deref() == obj.get("key")?.as_str()
+                    && verify_b64(old, msg.as_bytes(), sig.as_str()?),
+            )
+        })();
+        if ok == Some(true) {
+            self.set_key(new_key, report);
+            None
+        } else {
+            Some(BreakKind::BadKeyRotate)
+        }
     }
 }
 

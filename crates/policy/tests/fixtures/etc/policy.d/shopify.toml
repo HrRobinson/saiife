@@ -1,0 +1,16 @@
+[services.shopify]
+connector = "shopify"
+secret = "shopify-prod"
+params = { shop = "acme" }
+allow = ["orders:read", "products:read"]
+ask   = ["products:write", "refunds:write"]
+deny  = ["customers:export", "*:delete"]
+
+[services.shopify.limits]
+requests_per_minute = 60
+writes_per_hour = 50
+bulk_per_session = 1
+amount_per_day = { max = 500, currency = "EUR" }     # proposed
+
+[services.shopify.redact]                            # proposed
+fields = ["customer.email", "customer.phone"]

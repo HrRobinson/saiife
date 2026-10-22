@@ -24,6 +24,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       - run: cargo test --workspace --no-fail-fast
+      # The hook path (guard, audit, policy, ipc) must not link tokio: only
+      # the daemon crate does (spec §4.2).
+      - name: no tokio in hook crates
+        if: matrix.os == 'ubuntu-latest'
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc | grep -c tokio)" = 0
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
@@ -77,17 +82,22 @@ jobs:
             "https://github.com/HrRobinson/saiife/releases/download/v0.1.0/$asset.tar.gz"
           echo "3f5b0d344794d880f87a62c4c30d96166d885046d688e7d09e9312b09a6e1e93  $work/$asset.tar.gz" | sha256sum -c -
           tar -xzf "$work/$asset.tar.gz" -C "$work" --strip-components=1 "$asset/saiife"
-          status=0
-          SAIIFE_AUDIT_DIR="$PWD/crates/audit/tests/fixtures/v2" HOME="$(mktemp -d)" \
-            "$work/saiife" audit >"$work/out" 2>"$work/err" || status=$?
-          cat "$work/out"; cat "$work/err"
-          test "$status" -eq 0
-          # 0.1.0 wording: "N unreadable lines skipped" (stdout) and
-          # "... unreadable log lines were skipped ..." (stderr).
-          if grep -q unreadable "$work/out" "$work/err"; then
-            echo "0.1.0 reported unreadable lines"
-            exit 1
-          fi
-          rows="$(grep -c '^2026-' "$work/out")"
-          lines="$(wc -l < crates/audit/tests/fixtures/v2/2026-11.jsonl)"
-          test "$rows" -eq "$lines"
+          for fixture in v2 v2-locked; do
+            dir="$PWD/crates/audit/tests/fixtures/$fixture"
+            echo "== $fixture"
+            status=0
+            SAIIFE_AUDIT_DIR="$dir" HOME="$(mktemp -d)" \
+              "$work/saiife" audit >"$work/out" 2>"$work/err" || status=$?
+            cat "$work/out"; cat "$work/err"
+            test "$status" -eq 0
+            # 0.1.0 wording: "N unreadable lines skipped" (stdout) and
+            # "... unreadable log lines were skipped ..." (stderr).
+            if grep -q unreadable "$work/out" "$work/err"; then
+              echo "0.1.0 reported unreadable lines in $fixture"
+              exit 1
+            fi
+            # 0.1.0 lists every line as a row, bookkeeping records included.
+            rows="$(grep -c '^2026-' "$work/out")"
+            lines="$(cat "$dir"/*.jsonl | wc -l)"
+            test "$rows" -eq "$lines"
+          done

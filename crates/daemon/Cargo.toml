@@ -1,0 +1,29 @@
+[package]
+name = "saiife-daemon"
+description = "saiifed, the locked-mode daemon of saiife: control server, single audit writer, checkpoints, reload and stop."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+saiife-audit = { path = "../audit" }
+saiife-ipc = { path = "../ipc" }
+saiife-policy = { path = "../policy" }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+toml = "0.8"
+
+# The daemon is Linux-only in this version (decision 2); on other platforms
+# the crate builds a stub `run` and links no runtime.
+[target.'cfg(target_os = "linux")'.dependencies]
+# 1.53.3 and later are younger than 14 days (2026-10-22).
+tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros"] }
+rustix = { version = "1", features = ["fs", "process", "net"] }
+
+[dev-dependencies]
+tempfile = "3"
