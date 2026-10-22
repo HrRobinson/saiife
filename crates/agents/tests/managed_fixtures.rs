@@ -371,3 +371,78 @@ fn is_saiife_command_accepts_managed_path() {
     ));
     assert!(!is_saiife_command("/opt/saiife/bin/saiife daemon --system"));
 }
+
+/// install_managed then remove_managed gives back `original`'s parsed value.
+fn codex_round_trip(original: &str) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("requirements.toml");
+    fs::write(&f, original).unwrap();
+    codex::install_managed(&f).unwrap();
+    let installed = fs::read_to_string(&f).unwrap();
+    let d = installed.parse::<DocumentMut>().unwrap();
+    assert_eq!(d["features"]["hooks"].as_bool(), Some(true), "{installed}");
+    codex::remove_managed(&f).unwrap();
+    let back = fs::read_to_string(&f).unwrap();
+    assert!(
+        toml_eq(&back, original),
+        "original:\n{original}\nback:\n{back}"
+    );
+    (installed, back)
+}
+
+#[test]
+fn codex_prior_hooks_false_is_restored() {
+    let (_, back) = codex_round_trip("[features]\nhooks = false\nweb_search = true\n");
+    assert!(back.contains("hooks = false"), "{back}");
+}
+
+#[test]
+fn codex_prior_hooks_other_value_is_restored() {
+    codex_round_trip("[features]\nhooks = \"maybe\"\n");
+    codex_round_trip("[features]\nhooks = 0 # admin note\n");
+}
+
+#[test]
+fn codex_prior_admin_comment_is_kept() {
+    let (installed, back) = codex_round_trip("[features]\nhooks = false # keep me\n");
+    assert!(installed.contains("# keep me"), "{installed}");
+    assert!(back.contains("hooks = false # keep me"), "{back}");
+}
+
+#[test]
+fn codex_inline_features_round_trip() {
+    let (installed, _) = codex_round_trip("features = { web_search = true }\n");
+    assert!(
+        installed.contains("# saiife: hooks was absent"),
+        "{installed}"
+    );
+    codex_round_trip("features = { web_search = true, hooks = false }\n");
+}
+
+#[test]
+fn codex_features_table_added_is_dropped_again() {
+    // No [features] before: none after (the hooks group is the only other
+    // content, so the file is empty again).
+    let (_, back) = codex_round_trip("model = \"x\"\n");
+    assert!(!back.contains("features"), "{back}");
+    // An admin's empty [features] stays.
+    let (_, back) = codex_round_trip("[features]\n");
+    assert!(back.contains("[features]"), "{back}");
+}
+
+#[test]
+fn codex_reinstall_after_tamper_keeps_the_first_prior_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("requirements.toml");
+    let original = "[features]\nweb_search = true\n";
+    fs::write(&f, original).unwrap();
+    codex::install_managed(&f).unwrap();
+    // Someone turns hooks off but leaves saiife's comment.
+    let t = fs::read_to_string(&f)
+        .unwrap()
+        .replacen("hooks = true", "hooks = false", 1);
+    fs::write(&f, t).unwrap();
+    codex::install_managed(&f).unwrap();
+    codex::remove_managed(&f).unwrap();
+    assert!(toml_eq(&fs::read_to_string(&f).unwrap(), original));
+}

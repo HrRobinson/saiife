@@ -47,8 +47,9 @@ pub enum SystemAction {
         /// Keep the audit, state, config and users (the default).
         #[arg(long, conflicts_with = "purge")]
         keep_audit: bool,
-        /// Also remove the config, vault key, state, audit, and the users
-        /// and groups install created.
+        /// Also remove the state dir and the audit, and what install
+        /// created: config.toml and the vault key (only if install wrote
+        /// them, never an admin's), the users, groups and group memberships.
         #[arg(long)]
         purge: bool,
         /// Uninstall below this directory with a fake host (tests only).

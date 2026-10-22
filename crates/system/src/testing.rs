@@ -107,7 +107,7 @@ pub fn fake_install(root: &Path) -> Installed {
 
     let f = |path: &str, bytes: &[u8], kind| InstalledFile {
         path: path.into(),
-        sha256: sha256_hex(bytes),
+        sha256: (kind != FileKind::VaultKey).then(|| sha256_hex(bytes)),
         kind,
         created: true,
     };

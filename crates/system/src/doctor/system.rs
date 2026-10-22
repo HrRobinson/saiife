@@ -369,20 +369,27 @@ fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, t: &mut Tally) {
 }
 
 /// The fingerprint of saiife's entry in a shared managed file (Codex,
-/// Gemini CLI; §8.3). The entry readers come with `system install`; until
-/// they are wired here, the entry is reported, not assumed to match.
-fn entry_fingerprint(agent: &str, _file: &Path) -> Result<Option<String>, String> {
-    Err(format!(
-        "the {agent} entry cannot be read by this build, so it was not compared"
-    ))
+/// Gemini CLI; §8.3), as `system install` recorded it.
+fn entry_fingerprint(agent: &str, file: &Path) -> Result<Option<String>, String> {
+    let r = match agent {
+        "codex" => saiife_agents::codex::managed_entry(file),
+        "gemini" => saiife_agents::gemini::managed_entry(file),
+        other => return Err(format!("unknown managed agent {other:?}")),
+    };
+    r.map_err(|e| e.to_string())
 }
 
 fn files_installed(ctx: &Ctx, i: &Installed) -> Check {
     let mut t = Tally::default();
     for f in &i.files {
         // The admin edits the config; only its presence is checked here,
-        // its content by `config.valid`.
-        let want = (f.kind != FileKind::Config).then_some(f.sha256.as_str());
+        // its content by `config.valid`. The vault key has no digest on
+        // record (installed.toml is world-readable); `files.modes` checks
+        // its owner and mode.
+        let want = match f.kind {
+            FileKind::Config | FileKind::VaultKey => None,
+            _ => f.sha256.as_deref(),
+        };
         verify_file(ctx, &f.path, want, &mut t);
     }
     for a in &i.agents {

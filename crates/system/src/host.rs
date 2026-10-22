@@ -21,6 +21,7 @@ pub const GROUPDEL: &str = "/usr/sbin/groupdel";
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
 pub const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 pub const DETECT_VIRT: &str = "/usr/bin/systemd-detect-virt";
+pub const GPASSWD: &str = "/usr/bin/gpasswd";
 
 /// How long the user and group tools may take.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +61,8 @@ pub trait Host: Send + Sync {
     fn add_to_group(&self, user: &str, group: &str) -> io::Result<()>;
     fn delete_user(&self, name: &str) -> io::Result<()>;
     fn delete_group(&self, name: &str) -> io::Result<()>;
+    /// Removes `user` from the supplementary group `group`.
+    fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()>;
     /// Changes owner and group of `path` itself; never follows a symlink.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
     /// Runs `systemctl <args>`. A non-zero exit is an `Ok` with its status.
@@ -164,6 +167,10 @@ impl Host for RealHost {
 
     fn delete_group(&self, name: &str) -> io::Result<()> {
         admin(&argv_delete_group(name)?)
+    }
+
+    fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()> {
+        admin(&argv_remove_from_group(user, group)?)
     }
 
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
@@ -291,6 +298,11 @@ pub(crate) fn argv_add_to_group(user: &str, group: &str) -> io::Result<Vec<Strin
 pub(crate) fn argv_delete_user(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[USERDEL, name]))
+}
+
+pub(crate) fn argv_remove_from_group(user: &str, group: &str) -> io::Result<Vec<String>> {
+    check_names(&[user, group])?;
+    Ok(owned(&[GPASSWD, "-d", user, group]))
 }
 
 pub(crate) fn argv_delete_group(name: &str) -> io::Result<Vec<String>> {
@@ -514,6 +526,8 @@ pub struct FakeState {
     /// `"/usr/bin/sudo -n true"`). A `run` without one exits 1 with no
     /// output; a `systemctl` without one exits 0.
     pub run: BTreeMap<String, CmdOutput>,
+    /// Paths whose `chown` fails (tests of a step failing part-way).
+    pub fail_chown: Vec<PathBuf>,
 }
 
 impl Default for FakeState {
@@ -528,6 +542,7 @@ impl Default for FakeState {
             systemd: 255,
             container: None,
             run: BTreeMap::new(),
+            fail_chown: Vec::new(),
         }
     }
 }
@@ -765,11 +780,28 @@ impl Host for FakeHost {
         })
     }
 
+    fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()> {
+        check_names(&[user, group])?;
+        self.update(|s| {
+            s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if let Some(m) = s.members.get_mut(group) {
+                m.retain(|u| u != user);
+            }
+            Ok(())
+        })
+    }
+
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
         // Like the real call: the path itself must exist (a symlink counts).
         std::fs::symlink_metadata(path)
             .map_err(|e| io::Error::new(e.kind(), format!("chown {}: {e}", path.display())))?;
         self.update(|s| {
+            if s.fail_chown.iter().any(|p| p == path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("chown {}: fake failure", path.display()),
+                ));
+            }
             s.chowns.push(Chown {
                 path: path.to_path_buf(),
                 uid,
@@ -1193,6 +1225,12 @@ mod tests {
             argv_delete_user("saiife").unwrap(),
             ["/usr/sbin/userdel", "saiife"]
         );
+        assert_eq!(
+            argv_remove_from_group("saiife", "saiife-audit").unwrap(),
+            ["/usr/bin/gpasswd", "-d", "saiife", "saiife-audit"]
+        );
+        assert!(argv_remove_from_group("saiife", "a,b").is_err());
+        assert!(argv_remove_from_group("-r", "g").is_err());
         assert_eq!(
             argv_delete_group("saiife").unwrap(),
             ["/usr/sbin/groupdel", "saiife"]

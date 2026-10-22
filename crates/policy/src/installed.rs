@@ -37,7 +37,12 @@ pub enum FileKind {
 #[serde(deny_unknown_fields)]
 pub struct InstalledFile {
     pub path: PathBuf,
-    pub sha256: String,
+    /// SHA-256 of the file. `None` for the vault key: installed.toml is
+    /// world-readable, so it holds no digest of a secret, and doctor checks
+    /// the key's existence, owner and mode instead. Also `None` while a
+    /// write is in progress (the entry is recorded before the write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub kind: FileKind,
     /// The file did not exist before install.
     pub created: bool,
@@ -224,13 +229,13 @@ mod tests {
             files: vec![
                 InstalledFile {
                     path: "/opt/saiife/bin/saiife".into(),
-                    sha256: "aa".repeat(32),
+                    sha256: Some("aa".repeat(32)),
                     kind: FileKind::Binary,
                     created: true,
                 },
                 InstalledFile {
                     path: "/etc/saiife/credstore/vault-key".into(),
-                    sha256: "bb".repeat(32),
+                    sha256: None,
                     kind: FileKind::VaultKey,
                     created: true,
                 },
@@ -265,6 +270,8 @@ mod tests {
         assert!(text.contains("vault_key = \"file\""), "{text}");
         assert!(text.contains("kind = \"vault_key\""), "{text}");
         assert!(text.contains("[[memberships]]"), "{text}");
+        // No digest of the vault key in the world-readable file.
+        assert_eq!(text.matches("sha256").count(), 3, "{text}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

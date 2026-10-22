@@ -33,10 +33,6 @@ pub const MANAGED_MATCHER: &str = ".*";
 
 pub const MANAGED_STATUS_MESSAGE: &str = "saiife guard (locked)";
 
-/// The comment that marks a `[features] hooks = true` saiife set, so
-/// `remove_managed` takes back only its own change.
-const FEATURES_TAG: &str = " # set by saiife system install";
-
 pub const NEXT_STEP: &str = "Codex asks you to trust every new or changed hook once: start `codex` in this folder (the project's .codex folder must be trusted), run `/hooks` and trust the saiife hook.";
 
 pub fn install(project: &Path) -> Result<Change, AgentError> {
@@ -204,46 +200,151 @@ fn features_hooks(path: &Path, doc: &DocumentMut) -> Result<Option<bool>, AgentE
     Ok(f.get("hooks").and_then(Item::as_bool))
 }
 
-/// Sets `[features] hooks = true`, tagged as saiife's.
+/// Sets `[features] hooks = true` and tags it with what was there before,
+/// so `remove_managed` can put that back exactly: an absent key, `false`
+/// or any other value, and whether saiife added the `[features]` table.
+/// The tag is a comment after the value (`[features]` table) or after the
+/// inline table (`features = { … }`); an admin's comment there is kept.
 fn set_features_hooks(path: &Path, doc: &mut DocumentMut) -> Result<(), AgentError> {
+    let added = doc.get("features").is_none();
     let features = doc
         .entry("features")
         .or_insert_with(|| Item::Table(Table::new()));
-    let mut v = toml_edit::Value::from(true);
-    v.decor_mut().set_suffix(FEATURES_TAG);
     if let Some(t) = features.as_table_mut() {
+        if t.get("hooks").is_some_and(|h| !h.is_value()) {
+            return Err(layout(path, "`features.hooks` is not a value"));
+        }
+        let prior = t.get("hooks").and_then(Item::as_value).cloned();
+        let suffix = match &prior {
+            // A tag from an earlier install keeps what was there first.
+            Some(v) if parse_tag(&decor_suffix(v)).is_some() => decor_suffix(v),
+            _ => tagged_suffix(path, prior.as_ref(), added)?,
+        };
+        let mut v = toml_edit::Value::from(true);
+        v.decor_mut().set_suffix(suffix);
         t.insert("hooks", Item::Value(v));
         // A new `[features]` goes first, as in the spec's fixture.
-        if t.position().is_none() {
+        if added {
             t.set_position(0);
         }
-    } else if let Some(t) = features.as_inline_table_mut() {
-        t.insert("hooks", toml_edit::Value::from(true));
-    } else {
+        return Ok(());
+    }
+    let Some(v) = features.as_value_mut() else {
         return Err(layout(path, "`features` is not a table"));
+    };
+    let suffix = decor_suffix(v);
+    let Some(t) = v.as_inline_table_mut() else {
+        return Err(layout(path, "`features` is not a table"));
+    };
+    let prior = t.get("hooks").cloned();
+    t.insert("hooks", toml_edit::Value::from(true));
+    if parse_tag(&suffix).is_none() {
+        let tag = tagged_suffix(path, prior.as_ref(), false)?;
+        v.decor_mut().set_suffix(tag);
     }
     Ok(())
 }
 
-/// Removes `[features] hooks` when it carries saiife's tag (and then an
-/// emptied `[features]`). True when it did.
+const TAG: &str = "# saiife: hooks was ";
+const TABLE_ADDED: &str = "; [features] added by saiife";
+
+fn decor_suffix(v: &toml_edit::Value) -> String {
+    v.decor()
+        .suffix()
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The new suffix: the old one (an admin's comment) plus saiife's tag.
+fn tagged_suffix(
+    path: &Path,
+    prior: Option<&toml_edit::Value>,
+    table_added: bool,
+) -> Result<String, AgentError> {
+    let (repr, keep) = match prior {
+        None => ("absent".to_string(), String::new()),
+        Some(v) => {
+            let keep = decor_suffix(v);
+            let mut bare = v.clone();
+            bare.decor_mut().clear();
+            (bare.to_string().trim().to_string(), keep)
+        }
+    };
+    if repr.contains('\n') || repr.contains('\r') {
+        return Err(layout(
+            path,
+            "`features.hooks` holds a multi-line value saiife cannot record",
+        ));
+    }
+    let keep = keep.trim_end();
+    Ok(format!(
+        "{keep} {TAG}{repr}{}",
+        if table_added { TABLE_ADDED } else { "" }
+    ))
+}
+
+/// What a tag says: the prior value (`None` = absent), whether saiife added
+/// the table, and the suffix without the tag.
+fn parse_tag(suffix: &str) -> Option<(Option<toml_edit::Value>, bool, String)> {
+    let i = suffix.find(TAG)?;
+    let rest = suffix[i + TAG.len()..].trim_end();
+    let (repr, added) = match rest.strip_suffix(TABLE_ADDED) {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
+    let prior = if repr == "absent" {
+        None
+    } else {
+        Some(repr.parse::<toml_edit::Value>().ok()?)
+    };
+    Some((prior, added, suffix[..i].trim_end().to_string()))
+}
+
+/// Puts back what saiife's tag recorded for `[features] hooks` (and drops
+/// a `[features]` saiife added and left empty). True when there was a tag.
 fn untag_features_hooks(doc: &mut DocumentMut) -> bool {
-    let Some(f) = doc.get_mut("features").and_then(Item::as_table_mut) else {
+    let Some(features) = doc.get_mut("features") else {
         return false;
     };
-    let tagged = f
-        .get("hooks")
-        .and_then(Item::as_value)
-        .and_then(|v| v.decor().suffix())
-        .and_then(|s| s.as_str())
-        .is_some_and(|s| s.contains(FEATURES_TAG.trim()));
-    if !tagged {
+    if let Some(t) = features.as_table_mut() {
+        let Some(suffix) = t.get("hooks").and_then(Item::as_value).map(decor_suffix) else {
+            return false;
+        };
+        let Some((prior, added, rest)) = parse_tag(&suffix) else {
+            return false;
+        };
+        match prior {
+            None => {
+                t.remove("hooks");
+            }
+            Some(mut v) => {
+                v.decor_mut().set_suffix(rest);
+                t.insert("hooks", Item::Value(v));
+            }
+        }
+        if added && t.is_empty() {
+            doc.remove("features");
+        }
+        return true;
+    }
+    let Some(v) = features.as_value_mut() else {
         return false;
+    };
+    let Some((prior, _, rest)) = parse_tag(&decor_suffix(v)) else {
+        return false;
+    };
+    if let Some(t) = v.as_inline_table_mut() {
+        match prior {
+            None => {
+                t.remove("hooks");
+            }
+            Some(p) => {
+                t.insert("hooks", p);
+            }
+        }
     }
-    f.remove("hooks");
-    if f.is_empty() {
-        doc.remove("features");
-    }
+    v.decor_mut().set_suffix(rest);
     true
 }
 
