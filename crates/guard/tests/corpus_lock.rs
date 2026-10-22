@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::canon::PathVars;
-use saiifeguard::engine::{Decision, Engine};
+use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -326,6 +326,146 @@ fn pattern_operands_matching_saiifed_are_denied() {
         "killall node",
         "killall -r '^node'",
         "pgrep -f 'sa.*fed'",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+fn assert_denies(e: &Engine, cmd: &str) {
+    let d = e.evaluate(cmd);
+    assert!(d.is_deny(), "expected DENY for {cmd:?}, got {d:?}");
+}
+
+/// Fix round 3 (T1): env's own escapes, `${…}` and `#` in an `env -S`
+/// string are not modelled: denied outright.
+#[test]
+fn env_split_string_escapes_fail_closed() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "env -S 'crontab\\_/tmp/c'",
+        "env -S 'sudo\\_ls'",
+        "env -S 'sudo\\_-u\\_root\\_id'",
+        "env -S 'pkill\\_saiifed'",
+        "env -S 'systemctl\\_stop\\_saiifed'",
+        "env -S 'crontab\\c' /tmp/c",
+        "X=sudo env -S '${X} ls'",
+        "env -S 'ls #x'",
+    ] {
+        match e.evaluate(cmd) {
+            Decision::Deny { reason, .. } => {
+                assert_eq!(reason, "env -S escapes are not judged", "{cmd}")
+            }
+            d => panic!("expected DENY for {cmd:?}, got {d:?}"),
+        }
+    }
+    for cmd in ["env -S 'node --inspect' app.js", "env -S 'ls -la'"] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}
+
+/// Fix round 3 (T2): long options by unambiguous prefix, as getopt reads
+/// them; an unknown or ambiguous one leaves the segment not fully judged.
+#[test]
+fn wrapper_long_option_prefixes_are_resolved() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "nice --adj 5 crontab /tmp/c",
+        "nice --adj 5 sudo ls",
+        "nice --adj=5 sudo ls",
+        "stdbuf --out L crontab /tmp/c",
+        "stdbuf --err 0 sudo ls",
+        "ionice --classd 7 crontab /tmp/c",
+        "env --sp='crontab /tmp/c'",
+        "env --sp='sudo ls'",
+        "env --split-s 'crontab /tmp/c'",
+        "timeout --sig KILL 5 crontab /tmp/c",
+        "sudo --us root crontab -l",
+    ] {
+        assert_denies(&e, cmd);
+    }
+    for cmd in ["nice --frobnicate 5 crontab", "stdbuf --x L sudo-free-cmd"] {
+        match e.evaluate(cmd) {
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { reason },
+            } => assert!(reason.contains("wrapper option"), "{cmd}: {reason}"),
+            d => panic!("expected an unjudged allow for {cmd:?}, got {d:?}"),
+        }
+    }
+    let d = e.evaluate("nice --adjustment=5 make");
+    assert!(
+        matches!(
+            d,
+            Decision::Allow {
+                trace: AllowTrace::NoMatch
+            }
+        ),
+        "{d:?}"
+    );
+}
+
+/// Fix round 3 (T3): many operands stay within the budget, and what
+/// follows is still judged.
+#[test]
+fn many_operands_stay_within_budget() {
+    let f = Fixture::new();
+    // The production budget is 50 ms; these take about 2–13 ms in a debug
+    // build. A generous engine budget and a 250 ms wall-clock bound keep a
+    // loaded test runner from turning the check into a flake, while one
+    // regex compile per operand (~0.2 ms each, 2000 of them) would still
+    // blow it.
+    let e = f.engine();
+    let plain: Vec<String> = (0..400).map(|i| format!("w{i}")).collect();
+    let patterns: Vec<String> = (0..2000).map(|i| format!("x{i}.y")).collect();
+    for cmd in [
+        format!("pkill {}; rm -rf ~", plain.join(" ")),
+        format!("pkill {}; sudo ls", plain.join(" ")),
+        format!("systemctl restart {}; sudo ls", plain.join(" ")),
+        format!("pkill {}", patterns.join(" ")),
+        format!("killall -r {}", patterns.join(" ")),
+    ] {
+        let t = std::time::Instant::now();
+        let d = e.evaluate(&cmd);
+        let elapsed = t.elapsed();
+        assert!(
+            matches!(d, Decision::Deny { ref pack, .. } if pack == "core.lock"),
+            "{d:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "{elapsed:?}"
+        );
+    }
+}
+
+/// Fix round 3 (T5, T6): `pkill -f` patterns are matched against the
+/// daemon's command line; read-only `systemctl` verbs take any pattern.
+#[test]
+fn pkill_full_and_read_only_globs() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "pkill -f 'bin/saiife daemon'",
+        "pkill -f 'opt/s.*e'",
+        "pkill -f daemon.--system",
+        "pkill --full 'saiife d'",
+        "pkill -9f 'saiife\\s'",
+        "systemctl stop '[[:alpha:]]*'",
+        "systemctl stop 'sai\\ifed'",
+    ] {
+        assert_lock_denies(&e, cmd);
+    }
+    for cmd in [
+        "pkill -f 'python app.py'",
+        "pkill -f node",
+        "pkill 'daemon'",
+        "systemctl list-units '*'",
+        "systemctl list-unit-files 'sai*'",
+        "systemctl status '*fed'",
+        "systemctl is-active '*'",
     ] {
         let d = e.evaluate(cmd);
         assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");

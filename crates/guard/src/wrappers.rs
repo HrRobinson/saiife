@@ -74,6 +74,7 @@ const SUDO_ARG_TAKING_LONG: &[&str] = &[
     "other-user",
     "chroot",
     "directory",
+    "command-timeout",
 ];
 
 /// Peel any number of transparent wrapper commands off the front of a
@@ -134,7 +135,7 @@ fn unwrap_one(rest: &[Word]) -> Option<(String, &[Word])> {
                 if is_env_assignment(t) {
                     rest = &rest[1..];
                 } else if let Some(long) = t.strip_prefix("--") {
-                    let takes = ENV_VALUE_LONG.contains(&long);
+                    let takes = !long.contains('=') && long_takes_value(long, ENV_VALUE_LONG);
                     rest = &rest[if takes { 2 } else { 1 }.min(rest.len())..];
                 } else if let Some(bundle) = t.strip_prefix('-') {
                     let takes = takes_separate_value(bundle, ENV_VALUE_SHORT);
@@ -316,7 +317,7 @@ pub fn wrapper_reads(seg: &[Word]) -> Vec<(String, bool)> {
 /// any order and any number. The redirections stay in the segment, where
 /// `operands` judges them; whole-segment rules still see the assignments.
 pub fn effective_command(seg: &[Word]) -> &[Word] {
-    peel(seg, &mut |_, _| {})
+    peel(seg, &mut |_, _, _| {})
 }
 
 /// The names of the wrappers `effective_command` peels off, in order
@@ -324,8 +325,15 @@ pub fn effective_command(seg: &[Word]) -> &[Word] {
 /// `["timeout", "xargs", "sudo"]`.
 pub fn peeled_wrappers(seg: &[Word]) -> Vec<String> {
     let mut names = Vec::new();
-    peel(seg, &mut |name, _| names.push(name.to_string()));
+    peel(seg, &mut |name, _, _| names.push(name.to_string()));
     names
+}
+
+/// One `env -S STRING`: the string as given, and the command line it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSplit {
+    pub string: String,
+    pub line: String,
 }
 
 /// The command lines hidden in `env -S STRING` (`--split-string[=]STRING`,
@@ -333,7 +341,7 @@ pub fn peeled_wrappers(seg: &[Word]) -> Vec<String> {
 /// the string, and the words after it, joined with spaces, to be judged as
 /// a command line of its own (env splits the string into arguments and
 /// runs them with the rest appended).
-pub fn env_split_payloads(seg: &[Word]) -> Vec<String> {
+pub fn env_split_payloads(seg: &[Word]) -> Vec<EnvSplit> {
     let mut out = Vec::new();
     // Cheap pre-check: no option word that could be `-S`/`--split-string`.
     if !seg
@@ -342,7 +350,7 @@ pub fn env_split_payloads(seg: &[Word]) -> Vec<String> {
     {
         return out;
     }
-    peel(seg, &mut |name, args| {
+    peel(seg, &mut |name, args, _| {
         if name == "env" {
             out.extend(env_split_string(args));
         }
@@ -350,21 +358,204 @@ pub fn env_split_payloads(seg: &[Word]) -> Vec<String> {
     out
 }
 
+/// Long options (`--name`, `--name=value`) of the wrappers peeled off the
+/// segment that are not one of the wrapper's options, nor an unambiguous
+/// prefix of one. The wrapper itself would refuse them, but a newer version
+/// may know an option that takes a value, which would make saiife judge
+/// the wrong word as the command: the caller records the segment as not
+/// fully judged.
+pub fn unknown_wrapper_options(seg: &[Word]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !seg.iter().any(|w| w.text.starts_with("--")) {
+        return out;
+    }
+    peel(seg, &mut |name, args, opts| {
+        let Some(table) = long_options(name) else {
+            return;
+        };
+        for w in &args[..opts] {
+            let Some(long) = w.text.strip_prefix("--") else {
+                continue;
+            };
+            let opt = long.split('=').next().unwrap_or(long);
+            if !opt.is_empty() && resolve_long(opt, table).is_none() {
+                out.push(format!("{name} --{opt}"));
+            }
+        }
+    });
+    out
+}
+
+/// getopt_long: the option `name` names, exactly or as an unambiguous
+/// prefix; `None` when it is unknown or ambiguous.
+fn resolve_long(name: &str, table: &[&'static str]) -> Option<&'static str> {
+    if let Some(exact) = table.iter().find(|o| **o == name) {
+        return Some(exact);
+    }
+    let mut hits = table.iter().filter(|o| o.starts_with(name));
+    match (hits.next(), hits.next()) {
+        (Some(one), None) if !name.is_empty() => Some(one),
+        _ => None,
+    }
+}
+
+/// Does `--name` (without `=value`) take the next word as its value? True
+/// when it is, or is a prefix of, a value-taking option. A prefix that is
+/// also a flag's is ambiguous, and the wrapper refuses it, so reading it as
+/// value-taking never hides the command it would run. No flag name of the
+/// wrappers below is a prefix of one of their value-taking options.
+fn long_takes_value(name: &str, values: &[&str]) -> bool {
+    !name.is_empty() && values.iter().any(|v| v.starts_with(name))
+}
+
+/// env's long options (GNU coreutils).
+const ENV_LONG: &[&str] = &[
+    "ignore-environment",
+    "null",
+    "unset",
+    "chdir",
+    "split-string",
+    "block-signal",
+    "default-signal",
+    "ignore-signal",
+    "list-signal-handling",
+    "debug",
+    "argv0",
+    "help",
+    "version",
+];
+
+/// Every long option of a peeled wrapper, for `unknown_wrapper_options`;
+/// `None` for wrappers that have none to check (shell builtins).
+fn long_options(wrapper: &str) -> Option<&'static [&'static str]> {
+    Some(match wrapper {
+        "env" => ENV_LONG,
+        "nice" => &["adjustment", "help", "version"],
+        "ionice" => &[
+            "class",
+            "classdata",
+            "pid",
+            "pgid",
+            "uid",
+            "ignore",
+            "help",
+            "version",
+        ],
+        "stdbuf" => &["input", "output", "error", "help", "version"],
+        "setsid" => &["ctty", "fork", "wait", "help", "version"],
+        "nohup" => &["help", "version"],
+        "timeout" => &[
+            "signal",
+            "kill-after",
+            "preserve-status",
+            "foreground",
+            "verbose",
+            "help",
+            "version",
+        ],
+        "time" => &[
+            "output",
+            "format",
+            "portability",
+            "append",
+            "verbose",
+            "quiet",
+            "help",
+            "version",
+        ],
+        "chroot" => &["userspec", "groups", "skip-chdir", "help", "version"],
+        "flock" => &[
+            "timeout",
+            "wait",
+            "conflict-exit-code",
+            "command",
+            "shared",
+            "exclusive",
+            "unlock",
+            "nonblock",
+            "nb",
+            "close",
+            "no-fork",
+            "verbose",
+            "help",
+            "version",
+        ],
+        "xargs" => &[
+            "null",
+            "arg-file",
+            "delimiter",
+            "eof",
+            "replace",
+            "max-lines",
+            "max-args",
+            "max-procs",
+            "max-chars",
+            "interactive",
+            "verbose",
+            "no-run-if-empty",
+            "exit",
+            "show-limits",
+            "open-tty",
+            "process-slot-var",
+            "help",
+            "version",
+        ],
+        "sudo" => &[
+            "askpass",
+            "background",
+            "bell",
+            "close-from",
+            "chdir",
+            "chroot",
+            "preserve-env",
+            "edit",
+            "group",
+            "set-home",
+            "help",
+            "host",
+            "login",
+            "remove-timestamp",
+            "reset-timestamp",
+            "list",
+            "non-interactive",
+            "preserve-groups",
+            "prompt",
+            "role",
+            "stdin",
+            "shell",
+            "type",
+            "command-timeout",
+            "other-user",
+            "user",
+            "directory",
+            "version",
+            "validate",
+        ],
+        _ => return None,
+    })
+}
+
 /// `env`'s options in `args` (the words after `env`), up to its command:
 /// the payload of its `-S` option, if any.
-fn env_split_string(args: &[Word]) -> Option<String> {
+fn env_split_string(args: &[Word]) -> Option<EnvSplit> {
     let mut i = 0;
     while let Some(w) = args.get(i) {
         let t = w.text.as_str();
         let value = if is_env_assignment(t) {
             None
         } else if let Some(long) = t.strip_prefix("--") {
-            if let Some(v) = long.strip_prefix("split-string=") {
-                Some((v.to_string(), i + 1))
-            } else if long == "split-string" {
-                args.get(i + 1).map(|v| (v.text.clone(), i + 2))
+            // getopt takes any unambiguous prefix (`--sp=…`).
+            let (name, attached) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if resolve_long(name, ENV_LONG) == Some("split-string") {
+                match attached {
+                    Some(v) => Some((v.to_string(), i + 1)),
+                    None => args.get(i + 1).map(|v| (v.text.clone(), i + 2)),
+                }
             } else {
-                if ENV_VALUE_LONG.contains(&long) {
+                if attached.is_none() && long_takes_value(name, ENV_VALUE_LONG) {
                     i += 1;
                 }
                 None
@@ -397,24 +588,31 @@ fn env_split_string(args: &[Word]) -> Option<String> {
                 line.push(' ');
                 line.push_str(&tail.join(" "));
             }
-            return Some(line);
+            return Some(EnvSplit {
+                string: payload,
+                line,
+            });
         }
         i += 1;
     }
     None
 }
 
-/// Peel wrappers off the front of `rest`, telling `visit` each one's name
-/// and the words after it.
-fn unwrap_visit<'a>(mut rest: &'a [Word], visit: &mut dyn FnMut(&str, &'a [Word])) -> &'a [Word] {
+/// What `peel` tells its visitor about each wrapper: its name, the words
+/// after the name, and how many of them are the wrapper's own options.
+type Visit<'v, 'a> = &'v mut dyn FnMut(&str, &'a [Word], usize);
+
+/// Peel wrappers off the front of `rest`, telling `visit` about each.
+fn unwrap_visit<'a>(mut rest: &'a [Word], visit: Visit<'_, 'a>) -> &'a [Word] {
     while let Some((name, after)) = unwrap_one(rest) {
-        visit(&name, &rest[1..]);
+        let args = &rest[1..];
+        visit(&name, args, args.len() - after.len());
         rest = after;
     }
     rest
 }
 
-fn peel<'a>(seg: &'a [Word], visit: &mut dyn FnMut(&str, &'a [Word])) -> &'a [Word] {
+fn peel<'a>(seg: &'a [Word], visit: Visit<'_, 'a>) -> &'a [Word] {
     let mut rest = unwrap_visit(seg, visit);
     loop {
         let before = rest.len();
@@ -457,7 +655,7 @@ fn skip_sudo_options(mut rest: &[Word]) -> &[Word] {
                 return &rest[1..]; // bare "--" already handled above
             }
             let name = long.split('=').next().unwrap_or(long);
-            if long.contains('=') || !SUDO_ARG_TAKING_LONG.contains(&name) {
+            if long.contains('=') || !long_takes_value(name, SUDO_ARG_TAKING_LONG) {
                 // `--user=root` (value attached) or a boolean/unrecognized
                 // long flag: the whole token is consumed either way.
                 rest = &rest[1..];
@@ -524,7 +722,7 @@ fn skip_options_then_positionals<'a>(
         if let Some(long) = tok.strip_prefix("--") {
             // `long` is non-empty (bare "--" handled above).
             let name = long.split('=').next().unwrap_or(long);
-            if long.contains('=') || !value_longs.contains(&name) {
+            if long.contains('=') || !long_takes_value(name, value_longs) {
                 // Attached value (`--timeout=5`) or a boolean/unrecognized
                 // long flag: one token either way.
                 rest = &rest[1..];
@@ -1167,8 +1365,16 @@ mod tests {
         let p = |words: &[&str]| {
             let seg: Vec<Word> = words.iter().map(|s| w(s)).collect();
             env_split_payloads(&seg)
+                .into_iter()
+                .map(|e| e.line)
+                .collect::<Vec<_>>()
         };
         assert_eq!(p(&["env", "-S", "sudo ls"]), ["env sudo ls"]);
+        assert_eq!(p(&["env", "--sp=a b"]), ["env a b"]);
+        assert_eq!(p(&["env", "--split-s", "a b"]), ["env a b"]);
+        assert_eq!(p(&["env", "--un", "S", "ls"]), Vec::<String>::new());
+        let seg: Vec<Word> = ["env", "-S", "a\\_b", "c#"].iter().map(|s| w(s)).collect();
+        assert_eq!(env_split_payloads(&seg)[0].string, "a\\_b");
         assert_eq!(p(&["env", "-Ssudo ls", "x"]), ["env sudo ls x"]);
         assert_eq!(p(&["env", "-iS", "a b"]), ["env a b"]);
         assert_eq!(p(&["env", "--split-string=a b"]), ["env a b"]);

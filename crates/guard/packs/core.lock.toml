@@ -35,7 +35,7 @@ triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "systemctl", "l
 [[allow]]
 # `systemctl status saiifed`: only option flags that take no value may come
 # before the verb, so the verb is really the first operand.
-pattern = '^systemctl\s+(?:(?:--no-pager|--user|--system|--full|--no-legend|--quiet|-l|-q)\s+)*(?:status|show|is-active|is-enabled|is-failed|cat)(?:\s|$)'
+pattern = '^systemctl\s+(?:(?:--no-pager|--user|--system|--full|--no-legend|--quiet|-l|-q)\s+)*(?:status|show|is-active|is-enabled|is-failed|cat|list-units|list-unit-files)(?:\s|$)'
 reason = "reading the service state changes nothing"
 whole_segment = true
 
@@ -79,6 +79,13 @@ reason = "saiifed records every agent call; stopping it would leave agents unrec
 # `killall -r` read regexes (`pkill 'sa.*fed'`), `killall` and `systemctl`
 # globs (`systemctl stop '*fed'`). An operand that is not a valid pattern
 # counts as a match.
+[[deny]]
+# `pkill -f` matches the full command line too (any part of it).
+pattern = '^pkill\s(?:.*\s)?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--fu(?:l|ll)?)(?:\s|$)'
+reason = "this pattern matches saiifed's command line; stopping it would leave agents unrecorded"
+operand_match = "regex"
+operand_targets = ["saiifed", "/opt/saiife/bin/saiife daemon --system"]
+
 [[deny]]
 pattern = '^pkill\s'
 reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"

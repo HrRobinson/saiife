@@ -85,6 +85,15 @@ fn setsid_and_wrapper_values_now_deny() {
             "env --split-string='rm -rf /'",
             "env -S'rm -rf /'",
             "env -u FOO rm -rf /",
+            // Long options by unambiguous prefix (getopt).
+            "nice --adj 5 rm -rf /",
+            "nice --adj=5 rm -rf /",
+            "stdbuf --out L rm -rf /",
+            "ionice --classd 7 rm -rf /",
+            "env --sp='rm -rf /'",
+            "env --un FOO rm -rf /",
+            "timeout --sig KILL 5 rm -rf /",
+            "sudo --us root rm -rf /",
         ],
     );
     for cmd in ["setsid rm -rf /", "nice -n5 rm -rf /", "env -S 'rm -rf /'"] {

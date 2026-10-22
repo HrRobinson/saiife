@@ -30,14 +30,14 @@ use crate::lexer::{
 };
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
-use crate::pack::Pack;
+use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::wrappers::{
     effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
-    unwrap_transparent_prefix, wrapper_reads,
+    unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
 };
 
 /// Default latency budget for a single evaluation. Exceeding it yields
@@ -425,9 +425,27 @@ impl Engine {
         if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
             return Some(d);
         }
+        // A wrapper option saiife does not know may take a value, which
+        // would make the wrong word the command: not fully judged.
+        for opt in unknown_wrapper_options(seg) {
+            found.unjudged(format!(
+                "unknown or ambiguous wrapper option `{opt}`: the command after it may not be judged"
+            ));
+        }
         // `env -S 'sudo ls'`: the split string is a command line of its own.
-        for inner in env_split_payloads(seg) {
-            let nested = self.recurse(&inner, cx, state, false, "env -S command", None);
+        for split in env_split_payloads(seg) {
+            // env has its own escapes (`\_` is a space, `\c` ends the
+            // string), `${NAME}` expansion and `#` comments, which the
+            // shell lexer does not model: fail closed.
+            if split.string.contains(['\\', '#']) || split.string.contains("${") {
+                return Some(Decision::Deny {
+                    pack: SUBSTITUTION_GUARD_PACK.to_string(),
+                    pattern: "env-split-string-escape".to_string(),
+                    reason: "env -S escapes are not judged".to_string(),
+                    via_inline: None,
+                });
+            }
+            let nested = self.recurse(&split.line, cx, state, false, "env -S command", None);
             if let Some(d) = found.nested(nested) {
                 return Some(d);
             }
@@ -1152,9 +1170,15 @@ impl Engine {
         };
         // The rule's line matches, and an operand names a target when the
         // rule asks for one.
-        let matches = |rule: &crate::pack::Rule| -> bool {
-            line(rule).is_some_and(|l| rule.regex.is_match(l))
-                && rule.operands.as_ref().is_none_or(|m| m.hits(operands))
+        let over_budget = || start.elapsed() > self.budget;
+        let matches = |rule: &crate::pack::Rule| -> Hit {
+            if !line(rule).is_some_and(|l| rule.regex.is_match(l)) {
+                return Hit::No;
+            }
+            match &rule.operands {
+                None => Hit::Yes,
+                Some(m) => m.hits(operands, &over_budget),
+            }
         };
         let mut allowed: Option<AllowTrace> = None;
         for pack in &self.packs {
@@ -1170,7 +1194,18 @@ impl Engine {
             }
             // An allow match exempts only this pack's own deny rules (as
             // `allow_path` does); later packs still judge the command.
-            if let Some(rule) = pack.allow.iter().find(|r| matches(r)) {
+            let mut allow_rule = None;
+            for r in &pack.allow {
+                match matches(r) {
+                    Hit::Yes => {
+                        allow_rule = Some(r);
+                        break;
+                    }
+                    Hit::OutOfBudget => return JudgeOutcome::TimedOut,
+                    Hit::No => {}
+                }
+            }
+            if let Some(rule) = allow_rule {
                 allowed.get_or_insert_with(|| AllowTrace::AllowRule {
                     pack: pack.id.clone(),
                     pattern: rule.pattern.clone(),
@@ -1180,7 +1215,11 @@ impl Engine {
             }
             // Deny rules — first match wins.
             for rule in &pack.deny {
-                if matches(rule) {
+                let hit = matches(rule);
+                if hit == Hit::OutOfBudget {
+                    return JudgeOutcome::TimedOut;
+                }
+                if hit == Hit::Yes {
                     return JudgeOutcome::Decided(Decision::Deny {
                         pack: pack.id.clone(),
                         pattern: rule.pattern.clone(),

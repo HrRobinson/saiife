@@ -19,8 +19,11 @@ Commands are judged after the wrappers saiife sees through, with their
 options: `sudo`, `env`, `timeout`, `time`, `nice`, `nohup`, `setsid`,
 `stdbuf`, `ionice`, `xargs`, `flock`, `chroot`, `command`, `builtin` and
 `exec`. So `timeout 5 crontab -e` and `nice -n 5 sudo ls` are blocked like
-`crontab -e` and `sudo ls`. The command in `env -S '...'` is judged as a
-command of its own.
+`crontab -e` and `sudo ls`. Long options are read the way the wrappers
+read them, so a shortened one counts too (`nice --adj 5`). The command in
+`env -S '...'` is judged as a command of its own. An `env -S` string with
+env's own escapes (`\_`, `\c`), a `${NAME}` or a `#` is blocked outright:
+saiife does not read those.
 
 **Commands:**
 
@@ -32,7 +35,9 @@ command of its own.
   prefix like `sai` or `saii*`), and `launchctl` with a `com.saiife.`
   service. A pattern that matches `saiifed` without spelling it is blocked
   too: a regular expression for `pkill` or `killall -r` (`pkill 'sa.*fed'`),
-  and a glob for `killall` or `systemctl` (`systemctl stop '*fed'`).
+  and a glob for `killall` or `systemctl` (`systemctl stop '*fed'`). A
+  `pkill -f` pattern is also matched against the daemon's whole command
+  line, `/opt/saiife/bin/saiife daemon --system`.
 - Jobs that run later with no hook around them: `crontab`, `at`, `batch`,
   `systemd-run --user`, `launchctl load` and `launchctl bootstrap`,
   `loginctl enable-linger`, and `systemctl --user` with `link`, `enable`,
@@ -67,8 +72,9 @@ agent's file tools and through shell commands:
 - Reading saiife's config, the audit log, the unit and the managed agent
   settings. Only changes are blocked (except for `/var/lib/saiife`).
 - Read-only queries: `systemctl status`, `show`, `is-active`, `is-enabled`,
-  `is-failed` and `cat` of saiifed, `crontab -l`, `at -l` and `atq`. A
-  wrapper in front of them (`sudo crontab -l`) is still blocked.
+  `is-failed`, `cat`, `list-units` and `list-unit-files` of saiifed or of
+  any pattern (`systemctl list-units '*'`), `crontab -l`, `at -l` and
+  `atq`. A wrapper in front of them (`sudo crontab -l`) is still blocked.
 - `systemctl` for other services, for example `systemctl status nginx`,
   and `systemctl --user start` or `restart` of an existing user service.
 - `kill` and `pkill` of other processes, for example `kill 1234`.
@@ -94,8 +100,14 @@ agent's file tools and through shell commands:
 - A service or process named some other way: `kill 1234` where 1234 is
   saiifed's process id, a name built at run time
   (`systemctl stop $(echo saiifed)`), or a `pkill -f` pattern that matches
-  only saiifed's full command line. Substitutions are not blocked here,
-  because `kill $(cat app.pid)` is everyday use.
+  only saiifed's process in another way. Substitutions are not blocked
+  here, because `kill $(cat app.pid)` is everyday use.
+- Broad `pkill` and `killall` selectors: `-u` or `-U` with another user
+  than saiife, `-g`, `-P` and `-s`. saiifed runs as its own user, so without
+  root the kernel refuses the signal anyway.
+- An option of a wrapper that saiife does not know (`nice --frobnicate`).
+  The command after it may not be judged, so saiife records the call as
+  not fully judged. In locked mode that blocks it.
 - Other ways to run code later as the user: a shell profile (`~/.bashrc`),
   a git hook, `nohup ... &` or a `tmux` session. Every agent call from them
   still goes through saiife.
@@ -113,6 +125,13 @@ It also blocks too much in a few cases. This is the safe direction:
   would only list rights (`sudo -l`).
 - A `pkill` or `killall -r` pattern that matches `saiifed` along with other
   names, such as `pkill d`, and a pattern saiife cannot read (`pkill 'a('`).
+  With `pkill -f`, any part of the daemon's command line counts, so
+  `pkill -f bin`, `pkill -f daemon` and `pkill -f system` are blocked.
+- A `systemctl` or `killall` glob with a `\` (also systemd's own escapes,
+  such as `\x2d`) or a class like `[[:alpha:]]`, outside the read-only
+  queries: saiife does not read these.
+- A pattern longer than 256 characters, and more than 32 pattern operands
+  on one command (`systemctl restart` with 33 globs).
 - Creating `~/.config/systemd` or moving `~/.config`, since they are
   parents of the user service folder.
 
@@ -129,6 +148,9 @@ deny env -u FOO sudo ls
 deny nice -n5 sudo ls
 deny setsid crontab /tmp/c
 deny env -S 'sudo ls'
+deny env -S 'sudo\_ls'
+deny nice --adj 5 sudo ls
+deny pkill -f 'bin/saiife daemon'
 deny pkill 'sa.*fed'
 deny systemctl stop '*fed'
 deny su -
@@ -154,6 +176,8 @@ allow atq
 allow pkill -f sain
 allow systemctl restart saint
 allow env -S 'ls -la'
+allow env -S 'node --inspect' app.js
+allow systemctl list-units '*'
 allow kill 1234
 allow atop
 allow cat /etc/codex/requirements.toml

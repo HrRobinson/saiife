@@ -91,30 +91,85 @@ pub struct OperandMatch {
 
 /// Largest compiled operand pattern; a bigger one counts as a match.
 const OPERAND_REGEX_LIMIT: usize = 1 << 20;
+/// Most pattern operands compiled for one command; more count as a match.
+pub const MAX_PATTERN_OPERANDS: usize = 32;
+/// Longest pattern operand compiled; a longer one counts as a match.
+pub const MAX_PATTERN_BYTES: usize = 256;
+
+/// Regex metacharacters: an operand without any is a plain substring.
+const REGEX_META: &[char] = &[
+    '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
+];
+/// Glob metacharacters.
+const GLOB_META: &[char] = &['*', '?', '['];
+
+/// The answer of `OperandMatch::hits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    Yes,
+    No,
+    /// The engine's budget ran out while compiling patterns.
+    OutOfBudget,
+}
 
 impl OperandMatch {
-    /// True if an operand (a word not starting with `-`) matches a target,
-    /// case-insensitively. An operand that is not a valid pattern counts as
-    /// a match: what the command makes of it is unknown.
-    pub fn hits(&self, operands: &[String]) -> bool {
-        operands
+    /// `Yes` if an operand (a word not starting with `-`) matches a target,
+    /// case-insensitively. A plain operand (no pattern characters) is a
+    /// substring test (regex) or an equality test (glob), without compiling
+    /// anything. These count as a match, since what the command makes of
+    /// them is unknown or too costly to find out: a pattern that does not
+    /// compile, a glob with `\` or `[:` (escapes and classes are not
+    /// modelled), a pattern longer than `MAX_PATTERN_BYTES`, and more than
+    /// `MAX_PATTERN_OPERANDS` patterns. `over_budget` is checked before
+    /// each compile.
+    pub fn hits(&self, operands: &[String], over_budget: &dyn Fn() -> bool) -> Hit {
+        let mut compiled = 0;
+        for o in operands
             .iter()
             .filter(|o| !o.is_empty() && !o.starts_with('-'))
-            .any(|o| {
-                let source = match self.syntax {
-                    OperandSyntax::Regex => o.clone(),
-                    OperandSyntax::Glob if o.contains(['*', '?', '[']) => glob_regex(o),
-                    OperandSyntax::Glob => return false,
-                };
-                match regex::RegexBuilder::new(&source)
-                    .case_insensitive(true)
-                    .size_limit(OPERAND_REGEX_LIMIT)
-                    .build()
-                {
-                    Ok(re) => self.targets.iter().any(|t| re.is_match(t)),
-                    Err(_) => true,
+        {
+            let lower = o.to_lowercase();
+            let source = match self.syntax {
+                OperandSyntax::Regex if !o.contains(REGEX_META) => {
+                    if self
+                        .targets
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&lower))
+                    {
+                        return Hit::Yes;
+                    }
+                    continue;
                 }
-            })
+                // `\` escapes (`sai\ifed` is `saiifed`) and `[:class:]` are
+                // not modelled.
+                OperandSyntax::Glob if o.contains('\\') || o.contains("[:") => return Hit::Yes,
+                OperandSyntax::Glob if !o.contains(GLOB_META) => {
+                    if self.targets.iter().any(|t| t.to_lowercase() == lower) {
+                        return Hit::Yes;
+                    }
+                    continue;
+                }
+                OperandSyntax::Regex => o.clone(),
+                OperandSyntax::Glob => glob_regex(o),
+            };
+            compiled += 1;
+            if compiled > MAX_PATTERN_OPERANDS || o.len() > MAX_PATTERN_BYTES {
+                return Hit::Yes;
+            }
+            if over_budget() {
+                return Hit::OutOfBudget;
+            }
+            match regex::RegexBuilder::new(&source)
+                .case_insensitive(true)
+                .size_limit(OPERAND_REGEX_LIMIT)
+                .build()
+            {
+                Ok(re) if self.targets.iter().any(|t| re.is_match(t)) => return Hit::Yes,
+                Ok(_) => {}
+                Err(_) => return Hit::Yes,
+            }
+        }
+        Hit::No
     }
 }
 
@@ -524,16 +579,42 @@ mod tests {
                 syntax,
                 targets: vec!["saiifed".into(), "saiifed.service".into()],
             }
-            .hits(&ops.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .hits(
+                &ops.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &|| false,
+            ) == Hit::Yes
         };
         assert!(m(OperandSyntax::Regex, &["sa.*fed"]));
         assert!(m(OperandSyntax::Regex, &["-f", "S[A]IIFED"]));
         assert!(m(OperandSyntax::Regex, &["foo("]));
+        assert!(m(OperandSyntax::Regex, &["IIFE"]), "plain: substring");
         assert!(!m(OperandSyntax::Regex, &["sain", "-saiifed"]));
         assert!(m(OperandSyntax::Glob, &["stop", "*fed"]));
         assert!(m(OperandSyntax::Glob, &["s*d.service"]));
-        assert!(!m(OperandSyntax::Glob, &["stop", "saiifed"]));
+        assert!(
+            m(OperandSyntax::Glob, &["stop", "SAIIFED"]),
+            "plain: equality"
+        );
+        assert!(!m(OperandSyntax::Glob, &["stop", "saiife"]));
         assert!(!m(OperandSyntax::Glob, &["nginx*"]));
+        // Not modelled: escapes and character classes count as a match.
+        assert!(m(OperandSyntax::Glob, &["\\x*"]));
+        assert!(m(OperandSyntax::Glob, &["[[:alpha:]]*"]));
+        // Caps: a long pattern, or too many patterns.
+        assert!(m(
+            OperandSyntax::Regex,
+            &[&format!("x{}.", "y".repeat(300))]
+        ));
+        let many: Vec<String> = (0..40).map(|i| format!("x{i}.")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(m(OperandSyntax::Regex, &many));
+        assert!(!m(OperandSyntax::Regex, &many[..30]));
+        // Budget.
+        let om = OperandMatch {
+            syntax: OperandSyntax::Regex,
+            targets: vec!["saiifed".into()],
+        };
+        assert_eq!(om.hits(&["x.".to_string()], &|| true), Hit::OutOfBudget);
     }
 
     #[test]
