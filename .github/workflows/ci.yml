@@ -24,11 +24,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       - run: cargo test --workspace --no-fail-fast
-      # The hook path (guard, audit, policy, ipc) must not link tokio: only
+      # The hook path (guard, audit, policy, ipc) and saiife-system must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates
         if: matrix.os == 'ubuntu-latest'
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system | grep -c tokio)" = 0
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh

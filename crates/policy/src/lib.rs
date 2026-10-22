@@ -9,6 +9,7 @@
 
 pub mod duration;
 pub mod effective;
+pub mod installed;
 pub mod load;
 pub mod project;
 pub mod scope;

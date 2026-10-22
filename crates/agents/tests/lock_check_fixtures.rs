@@ -53,3 +53,33 @@ fn claude_is_lockable() {
         assert!(rows.iter().any(|r| r[0] == id), "missing row {id}");
     }
 }
+
+/// The lock label saiife reports for Claude Code is the recorded one.
+#[test]
+fn claude_label_matches_recording() {
+    use saiife_agents::{lock, Agent};
+    let tsv = read("claude");
+    assert_eq!(label(&tsv), lock::label(Agent::Claude).id());
+}
+
+/// Codex and Gemini CLI have no recording yet, so they are unverified. When
+/// a recording lands, this fails until `lock::label` follows it.
+#[test]
+fn unrecorded_agents_are_unverified() {
+    use saiife_agents::{lock, Agent};
+    for a in [Agent::Codex, Agent::Gemini] {
+        let p: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "tests/fixtures/lock-check",
+            &format!("{}.tsv", a.name()),
+        ]
+        .iter()
+        .collect();
+        if p.exists() {
+            let tsv = read(a.name());
+            assert_eq!(label(&tsv), lock::label(a).id(), "{}", a.name());
+        } else {
+            assert_eq!(lock::label(a), lock::LockLabel::Unverified, "{}", a.name());
+        }
+    }
+}

@@ -758,6 +758,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-system"
+version = "0.1.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "rustix",
+ "saiife-agents",
+ "saiife-ipc",
+ "saiife-policy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "toml",
+ "toml_edit",
+ "zeroize",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
