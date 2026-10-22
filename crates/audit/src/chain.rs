@@ -25,6 +25,9 @@ pub const LOCK_FILE: &str = ".chain.lock";
 /// How much of the newest month file is read to find the chain's tail: keeps
 /// the hook inside its time budget however big the file grows.
 const TAIL_WINDOW: u64 = 256 * 1024;
+/// How much the backwards search for the last chained record may read in
+/// all, over every month file, before it gives up and starts a new chain.
+const MAX_SCAN: u64 = 4 * 1024 * 1024;
 const LOCK_WAIT: Duration = Duration::from_millis(1000);
 const LOCK_RETRY: Duration = Duration::from_millis(5);
 
@@ -67,22 +70,39 @@ fn raw_machine_id() -> Option<String> {
 
 /// Append `rec` to the hash chain in `dir` and return its `seq`.
 ///
-/// If the lock file cannot be opened or taken within a second, the record is
-/// written unchained (no `seq`/`prev`) and an error is returned so the caller
-/// can warn; `verify` reports the gap later.
+/// The record is never dropped for the chain's sake: if the lock cannot be
+/// opened or taken within a second, or anything fails while it is held, the
+/// record is written unchained (no `seq`/`prev`) and an error is returned so
+/// the caller can warn; `verify` reports the gap later.
 pub fn append_chained(dir: &Path, mut rec: Record) -> io::Result<u64> {
     store::create_private_dir(dir)?;
     fill_identity(&mut rec);
-    let Some(_lock) = take_lock(dir) else {
-        rec.seq = None;
-        rec.prev = None;
-        store::append(dir, &rec)?;
-        return Err(io::Error::other(
-            "audit chain lock unavailable; record written unchained",
-        ));
+    let err = match take_lock(dir) {
+        // The flock is held until `_lock` drops at the end of this arm.
+        Some(_lock) => match append_locked(dir, rec.clone()) {
+            Ok(seq) => return Ok(seq),
+            Err(e) => e,
+        },
+        None => io::Error::other("audit chain lock unavailable"),
     };
-    // `_lock` holds the flock until it is dropped at the end of this scope.
-    append_locked(dir, rec)
+    rec.seq = None;
+    rec.prev = None;
+    append_unchained(dir, &rec)?;
+    Err(io::Error::other(format!("{err}; record written unchained")))
+}
+
+/// The fallback write: the same target rule as the chained path (never an
+/// older file than the newest), else the record's own month file.
+fn append_unchained(dir: &Path, rec: &Record) -> io::Result<()> {
+    let files = regular_month_files(dir).unwrap_or_default();
+    let target = target_file(dir, rec, &files);
+    let mut line = serde_json::to_vec(rec).map_err(io::Error::other)?;
+    line.push(b'\n');
+    match store::open_append(&target).and_then(|mut f| f.write_all(&line)) {
+        Ok(()) => Ok(()),
+        Err(_) if target != dir.join(format!("{}.jsonl", rec.month())) => store::append(dir, rec),
+        Err(e) => Err(e),
+    }
 }
 
 /// `uid` and `user`, only where the caller left them unset.
@@ -135,7 +155,7 @@ struct Tail {
 }
 
 fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
-    let files = store::month_files(dir).map_err(io::Error::other)?;
+    let files = regular_month_files(dir)?;
     let target = target_file(dir, &rec, &files);
     let tail = find_tail(&files)?;
 
@@ -160,89 +180,151 @@ fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
     Ok(seq)
 }
 
-/// `<month>.jsonl` for the record, but never older than the newest existing
-/// month file: a clock that went back must not write into the chain's past.
+/// The month files of `dir` that are regular files (a planted symlink, FIFO
+/// or directory is skipped), oldest first.
+fn regular_month_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = store::month_files(dir).map_err(io::Error::other)?;
+    files.retain(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_file()));
+    Ok(files)
+}
+
+/// `(year, month)` of a `YYYY-MM` prefix with a real month (01–12).
+fn year_month(name: &str) -> Option<(u32, u32)> {
+    let y = name.get(..4)?.parse().ok()?;
+    let m = name.get(5..7)?.parse().ok()?;
+    (name.as_bytes().get(4) == Some(&b'-') && (1..=12).contains(&m)).then_some((y, m))
+}
+
+/// `<month>.jsonl` for the record, or the newest existing month file when
+/// that is later: a clock that went back must not write into the chain's
+/// past. Only a real month at most one month ahead of the record's is
+/// followed, so a planted `9999-12.jsonl` cannot divert every later record.
 fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
-    let own = format!("{}.jsonl", rec.month());
+    let own = dir.join(format!("{}.jsonl", rec.month()));
     let newest = files
         .last()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str());
-    match newest {
-        Some(n) if !store::is_month_file(&own) || n > own.as_str() => dir.join(n),
-        _ => dir.join(own),
+    let (Some(n), Some((y, m))) = (newest, year_month(rec.month())) else {
+        return own;
+    };
+    let next = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    match year_month(n) {
+        Some(nm) if nm > (y, m) && nm <= next && store::is_month_file(n) => dir.join(n),
+        _ => own,
     }
 }
 
-/// The tail of the newest non-empty month file. A missing final newline (a
-/// crash mid-write) is added first so the half line stays a line of its own.
+/// What the backwards search found.
+enum Found {
+    /// The last chained record.
+    Chained(Box<Record>),
+    /// A v1 line or the read budget ran out: a new chain must start.
+    Stop,
+    /// The file's first line was reached without a decision.
+    More,
+}
+
+/// The chain's tail. `prev` hashes the physical last line of the newest
+/// non-empty month file; a missing final newline there (a crash mid-write)
+/// is added first so the half line stays a line of its own. The last chained
+/// record is the newest line, searching backwards through that file and then
+/// older ones, that parses as `v >= 2` with a `seq`. Unparseable and
+/// unchained lines are passed over; a v1 line ends the search (a v1 writer
+/// appended after the chain), and so does reading `MAX_SCAN` bytes in all.
 fn find_tail(files: &[PathBuf]) -> io::Result<Option<Tail>> {
-    let Some(path) = files
+    let non_empty: Vec<&PathBuf> = files
         .iter()
-        .rev()
-        .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
-    else {
+        .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
+        .collect();
+    let Some(newest) = non_empty.last() else {
         return Ok(None);
     };
-    let (mut body, whole) = read_window(path)?;
-    if !body.ends_with(b"\n") {
-        store::open_append(path)?.write_all(b"\n")?;
-        body.push(b'\n');
+    terminate(newest)?;
+    let mut budget = MAX_SCAN;
+    let mut prev = None;
+    let mut last = None;
+    for path in non_empty.iter().rev() {
+        let found = scan_back(path, &mut budget, |line| {
+            if prev.is_none() {
+                prev = Some(sha256_hex(line));
+            }
+            match serde_json::from_slice::<Record>(line) {
+                Ok(r) if r.v < 2 => Some(Found::Stop),
+                Ok(r) if r.seq.is_some() => Some(Found::Chained(Box::new(r))),
+                _ => None,
+            }
+        })?;
+        match found {
+            Found::Chained(r) => {
+                last = Some(*r);
+                break;
+            }
+            Found::Stop => break,
+            Found::More => {}
+        }
     }
-    if let Some(t) = scan(&body, whole) {
-        return Ok(Some(t));
+    Ok(prev.map(|prev| Tail { prev, last }))
+}
+
+/// Add a `\n` to `path` unless it already ends with one.
+fn terminate(path: &Path) -> io::Result<()> {
+    let mut f = store::open_regular(path).ok_or_else(not_regular)?;
+    let len = f.metadata()?.len();
+    let mut end = [0u8];
+    if len > 0 {
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut end)?;
+        if end[0] != b'\n' {
+            store::open_append(path)?.write_all(b"\n")?;
+        }
     }
-    // The window holds no complete line: one huge last line. Read it all.
-    let body = store::read_regular(path).ok_or_else(not_regular)?;
-    Ok(scan(&body, true))
+    Ok(())
 }
 
 fn not_regular() -> io::Error {
     io::Error::other("audit log path is not a regular file")
 }
 
-/// The last `TAIL_WINDOW` bytes of `path`, and whether that is the whole file.
-fn read_window(path: &Path) -> io::Result<(Vec<u8>, bool)> {
+/// Feed the lines of `path` to `on_line`, last first, reading backwards in
+/// `TAIL_WINDOW` chunks and charging every byte read to `budget`. The final
+/// newline does not start an empty line. Stops at the first `Some`.
+fn scan_back(
+    path: &Path,
+    budget: &mut u64,
+    mut on_line: impl FnMut(&[u8]) -> Option<Found>,
+) -> io::Result<Found> {
     let mut f = store::open_regular(path).ok_or_else(not_regular)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(TAIL_WINDOW);
-    f.seek(SeekFrom::Start(start))?;
-    let mut body = Vec::new();
-    f.take(TAIL_WINDOW).read_to_end(&mut body)?;
-    Ok((body, start == 0))
-}
-
-/// The chain state at the end of `body` (which ends with `\n`). `whole` says
-/// `body` starts at a line start; otherwise its first piece is dropped as a
-/// possibly cut line, and `None` means no complete line was left.
-///
-/// `prev` hashes the last line whatever it holds. The chained record is the
-/// last line, scanning backwards, that parses as `v >= 2` with a `seq`;
-/// unparseable and unchained lines are passed over, and a v1 line ends the
-/// search (a v1 writer appended after the chain, so a new chain starts).
-fn scan(body: &[u8], whole: bool) -> Option<Tail> {
-    let mut lines: Vec<&[u8]> = body[..body.len() - 1].split(|&b| b == b'\n').collect();
-    if !whole {
-        if lines.len() < 2 {
-            return None;
+    let mut pos = f.metadata()?.len();
+    let mut carry: Vec<u8> = Vec::new();
+    let mut first = true;
+    loop {
+        let n = TAIL_WINDOW.min(pos).min(*budget);
+        if n == 0 && pos > 0 {
+            return Ok(Found::Stop);
         }
-        lines.remove(0);
-    }
-    let prev = sha256_hex(lines.last()?);
-    let mut last = None;
-    for line in lines.iter().rev() {
-        let Ok(r) = serde_json::from_slice::<Record>(line) else {
-            continue;
-        };
-        if r.v < 2 {
-            break;
+        pos -= n;
+        *budget -= n;
+        let mut buf = vec![0u8; n as usize];
+        f.seek(SeekFrom::Start(pos))?;
+        f.read_exact(&mut buf)?;
+        if std::mem::take(&mut first) && buf.last() == Some(&b'\n') {
+            buf.pop();
         }
-        if r.seq.is_some() {
-            last = Some(r);
-            break;
+        buf.extend_from_slice(&carry);
+        let mut parts: Vec<&[u8]> = buf.split(|&b| b == b'\n').collect();
+        // Unless the file start was reached, the first piece may be cut.
+        let head = if pos > 0 { Some(parts.remove(0)) } else { None };
+        for line in parts.iter().rev() {
+            if let Some(found) = on_line(line) {
+                return Ok(found);
+            }
+        }
+        match head {
+            Some(h) => carry = h.to_vec(),
+            None => return Ok(Found::More),
         }
     }
-    Some(Tail { prev, last })
 }
 
 /// Record 0 of a new chain (spec §6.4.1).
@@ -557,5 +639,170 @@ mod tests {
         assert_eq!(r.v, 2);
         assert_eq!((r.seq, r.prev), (None, None));
         assert_eq!(r.tool, "Bash");
+    }
+
+    fn append_raw(p: &Path, bytes: &[u8]) {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    fn unchained_line(ts: &str) -> Vec<u8> {
+        let mut r = rec(datetime!(2026-10-13 08:00:00 UTC));
+        r.ts = ts.into();
+        let mut l = serde_json::to_vec(&r).unwrap();
+        l.push(b'\n');
+        l
+    }
+
+    #[test]
+    fn unchained_first_line_of_new_month_keeps_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let nov = dir.path().join("2026-11.jsonl");
+        let raw = unchained_line("2026-11-01T00:00:00.000Z");
+        append_raw(&nov, &raw);
+        let seq = append_chained(dir.path(), rec(datetime!(2026-11-02 00:00:00 UTC))).unwrap();
+        assert_eq!(seq, 2);
+        let ls = lines(&nov);
+        assert_eq!(ls.len(), 2, "no new genesis");
+        let r = parse(&ls[1]);
+        assert_eq!(r.prev, Some(sha256_hex(&raw[..raw.len() - 1])));
+        assert_eq!(r.kind(), "guard");
+    }
+
+    #[test]
+    fn half_line_alone_in_new_month_keeps_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let nov = dir.path().join("2026-11.jsonl");
+        append_raw(&nov, b"{\"v\":2,\"se");
+        let seq = append_chained(dir.path(), rec(datetime!(2026-11-02 00:00:00 UTC))).unwrap();
+        assert_eq!(seq, 2);
+        let ls = lines(&nov);
+        assert_eq!(ls.len(), 2);
+        assert_eq!(parse(&ls[1]).prev, Some(sha256_hex(b"{\"v\":2,\"se")));
+    }
+
+    #[test]
+    fn unchained_lines_past_the_window_keep_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let oct = dir.path().join("2026-10.jsonl");
+        let raw = unchained_line("2026-10-13T08:00:01.000Z");
+        let many: Vec<u8> = raw.repeat(300 * 1024 / raw.len() + 1);
+        append_raw(&oct, &many);
+        let seq = append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap();
+        assert_eq!(seq, 2);
+    }
+
+    #[test]
+    fn scan_gives_up_after_4_mib() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let oct = dir.path().join("2026-10.jsonl");
+        let raw = unchained_line("2026-10-13T08:00:01.000Z");
+        append_raw(&oct, &raw.repeat(MAX_SCAN as usize / raw.len() + 1));
+        let seq = append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap();
+        assert_eq!(seq, 1, "a new chain starts");
+        let ls = lines(&oct);
+        assert_eq!(parse(&ls[ls.len() - 2]).kind(), "genesis");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_newest_month_file_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let target = dir.path().join("elsewhere");
+        fs::write(&target, "original\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("2026-11.jsonl")).unwrap();
+        let seq = append_chained(dir.path(), rec(datetime!(2026-10-14 08:00:00 UTC))).unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+        let ls = lines(&dir.path().join("2026-10.jsonl"));
+        assert_eq!(ls.len(), 3);
+        assert_eq!(parse(&ls[2]).prev, Some(sha256_hex(&ls[1])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_after_lock_writes_unchained() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::getuid().is_root() {
+            return; // root reads a 0000 file anyway
+        }
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let oct = dir.path().join("2026-10.jsonl");
+        fs::set_permissions(&oct, fs::Permissions::from_mode(0o000)).unwrap();
+        let got = append_chained(dir.path(), rec(datetime!(2026-11-02 08:00:00 UTC)));
+        fs::set_permissions(&oct, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(got.is_err());
+        let ls = lines(&dir.path().join("2026-11.jsonl"));
+        assert_eq!(ls.len(), 1);
+        assert_eq!(parse(&ls[0]).seq, None);
+    }
+
+    #[test]
+    fn far_future_month_file_does_not_divert() {
+        let dir = tempfile::tempdir().unwrap();
+        append_raw(
+            &dir.path().join("9999-12.jsonl"),
+            &unchained_line("9999-12-01T00:00:00.000Z"),
+        );
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        assert_eq!(lines(&dir.path().join("2026-10.jsonl")).len(), 2);
+        assert_eq!(lines(&dir.path().join("9999-12.jsonl")).len(), 1);
+        // A next-month file (clock skew) is still followed.
+        append_raw(
+            &dir.path().join("2026-11.jsonl"),
+            &unchained_line("2026-11-01T00:00:00.000Z"),
+        );
+        fs::remove_file(dir.path().join("9999-12.jsonl")).unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap();
+        assert_eq!(lines(&dir.path().join("2026-11.jsonl")).len(), 2);
+    }
+
+    #[test]
+    fn invalid_month_name_does_not_divert() {
+        let dir = tempfile::tempdir().unwrap();
+        append_raw(
+            &dir.path().join("2026-13.jsonl"),
+            &unchained_line("2026-10-01T00:00:00.000Z"),
+        );
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        assert_eq!(lines(&dir.path().join("2026-10.jsonl")).len(), 2);
+    }
+
+    #[test]
+    fn unchained_fallback_never_writes_an_older_file() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-11-02 08:00:00 UTC))).unwrap();
+        let lock = fs::File::open(dir.path().join(LOCK_FILE)).unwrap();
+        lock.lock().unwrap();
+        assert!(append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).is_err());
+        assert!(!dir.path().join("2026-10.jsonl").exists());
+        assert_eq!(lines(&dir.path().join("2026-11.jsonl")).len(), 3);
+    }
+
+    #[test]
+    fn genesis_host_is_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let g = parse(&lines(&dir.path().join("2026-10.jsonl"))[0]);
+        if let Some(h) = &g.host {
+            assert_eq!(h.len(), 64, "{h}");
+            assert!(
+                h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{h}"
+            );
+        }
+        assert_eq!(g.host, host_id());
     }
 }
