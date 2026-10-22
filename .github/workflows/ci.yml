@@ -81,7 +81,10 @@ jobs:
           test "$status" -eq 0
           # 0.1.0 wording: "N unreadable lines skipped" (stdout) and
           # "... unreadable log lines were skipped ..." (stderr).
-          ! grep -q 'unreadable' "$work/out" "$work/err"
+          if grep -q unreadable "$work/out" "$work/err"; then
+            echo "0.1.0 reported unreadable lines"
+            exit 1
+          fi
           rows="$(grep -c '^2026-' "$work/out")"
           lines="$(wc -l < crates/audit/tests/fixtures/v2/2026-11.jsonl)"
           test "$rows" -eq "$lines"

@@ -42,7 +42,9 @@ before it (each record carries the hash of the previous line). It catches
 edited, deleted, inserted or reordered lines, and reports the file and line of
 the first break. Exit code 0 means intact, 1 broken, 2 the log could not be
 read. In developer mode there is no signing key, so it catches accidental edits
-and clumsy tampering, not a deliberate rewrite by someone with your rights.
+and clumsy tampering, not a deliberate rewrite by someone with your rights,
+and it does not notice that the newest records were removed (see
+[threat coverage](docs/threats.md)).
 `saiife audit --report` shows the same chain status.
 
 ## What it covers

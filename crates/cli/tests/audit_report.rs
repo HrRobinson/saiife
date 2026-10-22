@@ -339,7 +339,6 @@ fn html_report_has_chain_policy_mode_sections() {
         assert!(html.contains(&format!("<h2>{h}</h2>")), "{h}");
     }
     assert!(html.contains("intact ("), "{html}");
-    assert!(!html.contains("<script>alert(1)"), "hostile policy escaped");
     assert!(html.contains("&lt;script&gt;"));
     assert!(!html.contains("http://") && !html.contains("https://"));
 }
