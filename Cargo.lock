@@ -586,6 +586,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-policy"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
