@@ -62,7 +62,7 @@ jobs:
   # The released 0.1.0 binary must still read a v2 (chained) log: no skipped
   # lines, one row per fixture line. 0.1.0 ignores a relative SAIIFE_AUDIT_DIR,
   # so the path is absolute.
-  compat-0.1.0:
+  compat-v010:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
