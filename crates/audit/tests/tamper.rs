@@ -343,7 +343,7 @@ mod locked {
     /// Two handles on one key (`AuditKey` is not `Clone`): one for the
     /// writer, one for the test.
     fn key_twice(keys: &Path, name: &str) -> (AuditKey, AuditKey) {
-        let path = keys.join(name);
+        let path = keys.join("keys").join(name);
         let (a, _) = AuditKey::load_or_create(&path).unwrap();
         let (b, _) = AuditKey::load_or_create(&path).unwrap();
         (a, b)

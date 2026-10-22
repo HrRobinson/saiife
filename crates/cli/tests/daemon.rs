@@ -350,6 +350,35 @@ fn sigterm_writes_stop_and_checkpoint() {
 }
 
 #[test]
+fn restart_with_lost_key_after_clean_stop_is_clean() {
+    let mut d = TestDaemon::start(Opts::default());
+    let mut c = d.client();
+    append(&mut c, guard_rec("before stop")).unwrap();
+    d.signal("TERM");
+    let st = d.wait_exit(Duration::from_secs(5)).expect("daemon exits");
+    assert_eq!(st.code(), Some(0));
+    std::fs::remove_file(d.state_dir().join("keys/audit.ed25519")).unwrap();
+
+    d.spawn_and_wait();
+    let starts = d.events("start");
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[1]["previous_clean_stop"], json!(true));
+    assert_eq!(d.of_kind("key_rotate").len(), 1);
+    // The lost key is still reported.
+    let v = d.verify();
+    assert_eq!(v.status.code(), Some(1), "verify: {}", out(&v));
+    let report = saiife_audit::verify(&d.audit_dir());
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| b.kind == saiife_audit::BreakKind::UnsignedKeyRotate),
+        "{:?}",
+        report.breaks
+    );
+}
+
+#[test]
 fn sigint_stops_cleanly_too() {
     let mut d = TestDaemon::start(Opts::default());
     d.signal("INT");

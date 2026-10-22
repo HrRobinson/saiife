@@ -20,6 +20,8 @@ use tokio::signal::unix::{signal, SignalKind};
 /// Records re-verified at start (spec §6.2).
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// The group that may read the audit log (spec §5.2).
+const AUDIT_GROUP: &str = "saiife-audit";
 
 /// A startup refusal: one line on stderr, exit 2.
 struct Refuse(String);
@@ -186,6 +188,14 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         },
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
+    if let Some(g) = directory.group(AUDIT_GROUP) {
+        if let Err(e) = adopt_audit_group(&audit_cfg.dir, g.gid) {
+            eprintln!(
+                "saiife: warning: cannot give {} to group {AUDIT_GROUP}: {e}",
+                audit_cfg.dir.display()
+            );
+        }
+    }
     let check = cw.startup_check(STARTUP_CHECK_RECORDS);
     let writer_cfg = WriterConfig {
         checkpoint_every: audit_cfg.checkpoint_every,
@@ -225,6 +235,40 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     drop(ctx);
     let _ = join.join();
     Ok(code)
+}
+
+/// Give the audit dir and every regular `*.jsonl` in it to group `gid`
+/// when the dir is in another group; the owner stays, and nothing is
+/// followed through a symlink. Returns how many month files were changed.
+///
+/// systemd's `LogsDirectory=` gives the dir to the unit's `Group=saiife`
+/// on every start, and §5.2 wants it in `saiife-audit` (readers of the log).
+fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
+    use rustix::fs::{AtFlags, Gid, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let fd = std::fs::File::from(fd);
+    if fd.metadata()?.gid() == gid {
+        return Ok(0);
+    }
+    let group = Some(Gid::from_raw(gid));
+    rustix::fs::fchown(&fd, None, group)?;
+    let mut changed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // `file_type` of a directory entry does not follow a symlink.
+        if !entry.file_type()?.is_file() || !name.to_string_lossy().ends_with(".jsonl") {
+            continue;
+        }
+        rustix::fs::chownat(&fd, &name, None, group, AtFlags::SYMLINK_NOFOLLOW)?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -543,4 +587,38 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
         out.push("[audit] fsync changed".to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn adopt_audit_group_changes_dir_and_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("2026-10.jsonl"), b"{}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let primary = rustix::process::getgid().as_raw();
+        let gid = |p: &Path| std::fs::symlink_metadata(p).unwrap().gid();
+        // The dir is already in the group: nothing to do.
+        rustix::fs::chown(&dir, None, Some(rustix::fs::Gid::from_raw(primary))).unwrap();
+        assert_eq!(adopt_audit_group(&dir, primary).unwrap(), 0);
+        // Another group this user is in, when there is one: the dir and its
+        // month files move to it, nothing else does. (CI asserts the real
+        // saiife-audit change as root, Task 8.)
+        let other = rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != primary);
+        let Some(other) = other else { return };
+        assert_eq!(adopt_audit_group(&dir, other).unwrap(), 1);
+        assert_eq!(gid(&dir), other);
+        assert_eq!(gid(&dir.join("2026-10.jsonl")), other);
+        assert_eq!(gid(&dir.join("notes.txt")), primary);
+        assert_eq!(adopt_audit_group(&dir, other).unwrap(), 0);
+    }
 }

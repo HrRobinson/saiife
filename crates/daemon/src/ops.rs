@@ -73,7 +73,7 @@ pub struct Ctx {
     pub policy: Mutex<PolicyState>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
-    notices: Mutex<HashMap<(u32, &'static str), Instant>>,
+    notices: Mutex<HashMap<(u32, Notice), Instant>>,
 }
 
 pub struct CtxInit {
@@ -210,43 +210,73 @@ impl Ctx {
             .any(|g| admin.iter().any(|a| a == g))
     }
 
-    /// Write a `rate_limited` / `low_disk` record for `uid`, at most once
-    /// per uid per minute, without waiting for it.
-    pub fn notice(self: &Arc<Self>, uid: u32, event: &'static str) {
-        if !notice_due(&mut lock(&self.notices), uid, event, Instant::now()) {
+    /// Write the record of notice `n` for `uid`, at most once per uid and
+    /// notice per minute, without waiting for it.
+    pub fn notice(&self, uid: u32, n: Notice) {
+        if !notice_due(&mut lock(&self.notices), uid, n, Instant::now()) {
             return;
         }
+        let event = n.event();
         let mut r = self.event(event);
-        r.reason = Some(match event {
-            "rate_limited" => {
-                format!("uid {uid} is over its request limits (64 in flight, 1000/s)")
-            }
-            _ => format!("uid {uid}: audit volume below [audit] min_free_mb"),
-        });
-        let ctx = Arc::clone(self);
+        r.reason = Some(n.reason(uid));
+        let writer = self.writer.clone();
         tokio::spawn(async move {
-            if let Err(e) = ctx.writer.append(r).await {
+            if let Err(e) = writer.append(r).await {
                 eprintln!("saiifed: warning: cannot write {event} record: {e}");
             }
         });
     }
 }
 
-/// Whether a `rate_limited` / `low_disk` record for `uid` is due at `now`
-/// (none in the last minute); records `now` when it is.
+/// Why a uid was refused, for its `rate_limited` / `low_disk` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Notice {
+    /// Over the in-flight or per-second request limit.
+    Requests,
+    /// Over the open-connection cap (per uid or the daemon's total).
+    Connections,
+    /// The audit volume is below `[audit] min_free_mb`.
+    LowDisk,
+}
+
+impl Notice {
+    /// The record's `event`.
+    pub fn event(self) -> &'static str {
+        match self {
+            Notice::Requests | Notice::Connections => "rate_limited",
+            Notice::LowDisk => "low_disk",
+        }
+    }
+
+    /// The record's `reason`.
+    pub fn reason(self, uid: u32) -> String {
+        match self {
+            Notice::Requests => {
+                format!("uid {uid} is over its request limits (64 in flight, 1000/s)")
+            }
+            Notice::Connections => format!(
+                "uid {uid} is over its connection limits (32 open per uid, or the daemon's total)"
+            ),
+            Notice::LowDisk => format!("uid {uid}: audit volume below [audit] min_free_mb"),
+        }
+    }
+}
+
+/// Whether notice `n` for `uid` is due at `now` (none in the last minute);
+/// records `now` when it is.
 fn notice_due(
-    last: &mut HashMap<(u32, &'static str), Instant>,
+    last: &mut HashMap<(u32, Notice), Instant>,
     uid: u32,
-    event: &'static str,
+    n: Notice,
     now: Instant,
 ) -> bool {
     if last
-        .get(&(uid, event))
+        .get(&(uid, n))
         .is_some_and(|at| now.saturating_duration_since(*at) < NOTICE_EVERY)
     {
         return false;
     }
-    last.insert((uid, event), now);
+    last.insert((uid, n), now);
     true
 }
 
@@ -335,7 +365,7 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Err(_) => disk::disk_gate(0, min_free, peer.uid, ctx.own_uid),
     };
     if let Err(code) = gate {
-        ctx.notice(peer.uid, "low_disk");
+        ctx.notice(peer.uid, Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     rec.v = saiife_audit::record::RECORD_VERSION;
@@ -403,30 +433,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notices_at_most_once_per_uid_and_event_per_minute() {
+    fn notices_at_most_once_per_uid_and_kind_per_minute() {
         let mut m = HashMap::new();
         let t0 = Instant::now();
-        assert!(notice_due(&mut m, 1000, "rate_limited", t0));
+        assert!(notice_due(&mut m, 1000, Notice::Requests, t0));
         assert!(!notice_due(
             &mut m,
             1000,
-            "rate_limited",
+            Notice::Requests,
             t0 + Duration::from_secs(59)
         ));
-        // Another uid, or another event, has its own minute.
-        assert!(notice_due(&mut m, 1001, "rate_limited", t0));
-        assert!(notice_due(&mut m, 1000, "low_disk", t0));
+        // Another uid, or another kind, has its own minute.
+        assert!(notice_due(&mut m, 1001, Notice::Requests, t0));
+        assert!(notice_due(&mut m, 1000, Notice::LowDisk, t0));
         assert!(notice_due(
             &mut m,
             1000,
-            "rate_limited",
+            Notice::Requests,
             t0 + Duration::from_secs(60)
         ));
         assert!(!notice_due(
             &mut m,
             1000,
-            "rate_limited",
+            Notice::Requests,
             t0 + Duration::from_secs(61)
         ));
+    }
+
+    #[test]
+    fn notice_reasons_are_exact() {
+        assert_eq!(
+            Notice::Requests.reason(1000),
+            "uid 1000 is over its request limits (64 in flight, 1000/s)"
+        );
+        assert_eq!(
+            Notice::Connections.reason(1000),
+            "uid 1000 is over its connection limits (32 open per uid, or the daemon's total)"
+        );
+        assert_eq!(
+            Notice::LowDisk.reason(1000),
+            "uid 1000: audit volume below [audit] min_free_mb"
+        );
+        assert_eq!(Notice::Requests.event(), "rate_limited");
+        assert_eq!(Notice::Connections.event(), "rate_limited");
+        assert_eq!(Notice::LowDisk.event(), "low_disk");
+    }
+
+    #[test]
+    fn connection_and_request_notices_dedupe_separately() {
+        let mut m = HashMap::new();
+        let t0 = Instant::now();
+        assert!(notice_due(&mut m, 1000, Notice::Connections, t0));
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(notice_due(&mut m, 1000, Notice::Requests, t1));
+        assert!(!notice_due(&mut m, 1000, Notice::Connections, t1));
+        assert!(!notice_due(&mut m, 1000, Notice::Requests, t1));
     }
 }
