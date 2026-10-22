@@ -187,19 +187,17 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
     let check = cw.startup_check(STARTUP_CHECK_RECORDS);
-    let (handle, join) = writer::spawn(
-        cw,
-        WriterConfig {
-            checkpoint_every: audit_cfg.checkpoint_every,
-            checkpoint_interval: audit_cfg.checkpoint_interval,
-            fsync: audit_cfg.fsync,
-        },
-        check.last_checkpoint,
-    )
-    .map_err(|e| format!("cannot start the audit writer: {e}"))?;
+    let writer_cfg = WriterConfig {
+        checkpoint_every: audit_cfg.checkpoint_every,
+        checkpoint_interval: audit_cfg.checkpoint_interval,
+        fsync: audit_cfg.fsync,
+    };
+    let (handle, join) = writer::spawn(cw, writer_cfg, check.last_checkpoint)
+        .map_err(|e| format!("cannot start the audit writer: {e}"))?;
 
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
+        writer_cfg,
         directory,
         own_uid: euid,
         own_user: name,
@@ -429,6 +427,7 @@ async fn serve(
 
     // 8. Ready.
     notify::ready();
+    let mut writer_died = false;
     loop {
         tokio::select! {
             r = listener.accept() => match r {
@@ -442,6 +441,13 @@ async fn serve(
                 }
             },
             _ = hup.recv() => reload(&ctx).await,
+            // Outside a stop the writer never ends on its own: without it
+            // every append fails, so exit and let the service manager
+            // restart the daemon.
+            _ = ctx.writer.exited() => {
+                writer_died = true;
+                break;
+            }
             _ = term.recv() => break,
             _ = int.recv() => break,
         }
@@ -450,6 +456,14 @@ async fn serve(
     // Stop: no new connections, the stop record and a checkpoint, synced.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    if writer_died {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "saiife: the audit writer stopped unexpectedly; exiting so the daemon is restarted"
+        );
+        return ExitCode::from(1);
+    }
     match ctx.writer.stop(Some(ctx.event("stop"))).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -517,6 +531,16 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
     }
     if c.audit.dir != ctx.audit_dir {
         out.push("[audit] dir changed".to_string());
+    }
+    let w = &ctx.writer_cfg;
+    if c.audit.checkpoint_every != w.checkpoint_every {
+        out.push("[audit] checkpoint_every changed".to_string());
+    }
+    if c.audit.checkpoint_interval != w.checkpoint_interval {
+        out.push("[audit] checkpoint_interval changed".to_string());
+    }
+    if c.audit.fsync != w.fsync {
+        out.push("[audit] fsync changed".to_string());
     }
     out
 }

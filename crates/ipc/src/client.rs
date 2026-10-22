@@ -63,10 +63,11 @@ fn check_owner(dir: &Path, sock: &Path, uid: u32) -> Result<(), ClientError> {
     if !dm.file_type().is_dir() {
         return Err(owner_err(dir, "not a directory"));
     }
-    if dm.uid() != uid {
+    // The daemon accepts a dir root created for it, so the client does too.
+    if dm.uid() != uid && dm.uid() != 0 {
         return Err(owner_err(
             dir,
-            format!("owned by uid {}, expected {uid}", dm.uid()),
+            format!("owned by uid {}, expected {uid} or root", dm.uid()),
         ));
     }
     if dm.mode() & 0o022 != 0 {
@@ -363,6 +364,17 @@ mod tests {
         let r = Client::connect(d.path(), me() + 1, dl(500));
         assert!(matches!(r, Err(ClientError::Owner { .. })));
         assert!(l.accept().is_err(), "listener must never be connected to");
+    }
+
+    /// A root-owned socket dir is accepted, as the daemon accepts it (M2):
+    /// the check gets past `/` to the (missing) socket.
+    #[test]
+    fn accepts_root_owned_dir() {
+        let r = check_owner(Path::new("/"), &Path::new("/").join(SOCKET_NAME), me());
+        match r {
+            Err(ClientError::Owner { path, .. }) => assert_eq!(path, Path::new("/saiife.sock")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

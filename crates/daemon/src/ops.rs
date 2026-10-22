@@ -2,7 +2,7 @@
 
 use crate::disk;
 use crate::limits::{ConnLimits, Limits};
-use crate::writer::WriterHandle;
+use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_STATUS, PROTO,
@@ -22,6 +22,10 @@ pub const MODE: &str = "locked";
 
 /// How long a user or group lookup is trusted.
 const LOOKUP_TTL: Duration = Duration::from_secs(60);
+/// Largest `rec` `audit.append` takes, serialized: the hook's records are
+/// a few KiB; 1 MiB ones at 1 000/s per uid would fill the audit volume
+/// for everyone.
+pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 /// At most one `rate_limited` / `low_disk` record per uid per this.
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 
@@ -52,6 +56,9 @@ type Cache<K, V> = Mutex<HashMap<K, (Instant, V)>>;
 /// What every connection shares.
 pub struct Ctx {
     pub writer: WriterHandle,
+    /// The writer settings in force since start (a reload cannot change
+    /// them).
+    pub writer_cfg: WriterConfig,
     pub limits: Limits,
     pub conns: ConnLimits,
     pub directory: Arc<dyn Directory + Send + Sync>,
@@ -71,6 +78,7 @@ pub struct Ctx {
 
 pub struct CtxInit {
     pub writer: WriterHandle,
+    pub writer_cfg: WriterConfig,
     pub directory: Arc<dyn Directory + Send + Sync>,
     pub own_uid: u32,
     pub own_user: String,
@@ -90,6 +98,7 @@ impl Ctx {
     pub fn new(i: CtxInit) -> Ctx {
         Ctx {
             writer: i.writer,
+            writer_cfg: i.writer_cfg,
             limits: Limits::new(),
             conns: ConnLimits::from_rlimit(),
             directory: i.directory,
@@ -284,6 +293,13 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             "audit.append takes a record object in rec",
         );
     };
+    if !matches!(serde_json::to_vec(raw), Ok(b) if b.len() <= MAX_RECORD_BYTES) {
+        return err(
+            id,
+            ErrorCode::BadRequest,
+            &format!("rec is larger than {MAX_RECORD_BYTES} bytes"),
+        );
+    }
     if raw
         .get("kind")
         .is_some_and(|k| !k.is_null() && k.as_str() != Some("guard"))

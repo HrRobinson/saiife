@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// Jobs queued before the writer refuses more.
 pub const QUEUE: usize = 1024;
@@ -61,6 +61,9 @@ pub enum Job {
 pub struct WriterHandle {
     tx: SyncSender<Job>,
     state: Arc<Mutex<Snapshot>>,
+    /// Closed when the writer thread ends (its sender is dropped then,
+    /// also when the thread unwinds from a panic).
+    alive: watch::Receiver<()>,
 }
 
 impl WriterHandle {
@@ -110,6 +113,12 @@ impl WriterHandle {
             .unwrap_or_else(|_| Err("the audit writer has stopped".into()))
     }
 
+    /// Resolves once the writer thread has ended, however it ended.
+    pub async fn exited(&self) {
+        let mut rx = self.alive.clone();
+        while rx.changed().await.is_ok() {}
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -155,10 +164,15 @@ pub fn spawn(
         last_sync: Instant::now(),
     };
     w.publish();
+    let (alive_tx, alive) = watch::channel(());
     let join = std::thread::Builder::new()
         .name("saiife-audit-writer".into())
-        .spawn(move || w.run(rx))?;
-    Ok((WriterHandle { tx, state }, join))
+        .spawn(move || {
+            // Dropped when the thread ends or unwinds: `exited` resolves.
+            let _alive = alive_tx;
+            w.run(rx)
+        })?;
+    Ok((WriterHandle { tx, state, alive }, join))
 }
 
 struct Writer {
@@ -238,6 +252,13 @@ impl Writer {
     }
 
     fn append(&mut self, rec: Record) -> Result<u64, String> {
+        // Test seam, debug builds only: the writer dies on a guard record.
+        #[cfg(debug_assertions)]
+        if rec.kind() == "guard"
+            && std::env::var_os("SAIIFE_DAEMON_FAULT").is_some_and(|v| v == "writer_panic")
+        {
+            panic!("SAIIFE_DAEMON_FAULT=writer_panic");
+        }
         let r = self.cw.append(rec);
         self.publish();
         let seq = r.map_err(|e| format!("audit write failed: {e}"))?;
@@ -476,6 +497,31 @@ mod tests {
             "syncs {} should be per checkpoint (and tick), not per append",
             snap.syncs
         );
+    }
+
+    /// `exited` stays pending while the thread runs and resolves once it
+    /// ends, however it ends (I4).
+    #[test]
+    fn exited_resolves_when_the_thread_ends() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = WriterConfig {
+            checkpoint_every: 1000,
+            checkpoint_interval: Duration::from_secs(3600),
+            fsync: Fsync::Checkpoint,
+        };
+        let (h, join) = spawn(open(d.path()), cfg, None).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let short = Duration::from_millis(100);
+        assert!(rt
+            .block_on(async { tokio::time::timeout(short, h.exited()).await })
+            .is_err());
+        rt.block_on(h.stop(None)).unwrap();
+        join.join().unwrap();
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(1), h.exited()).await })
+            .expect("exited must resolve after the thread ended");
     }
 
     #[test]

@@ -205,13 +205,21 @@ impl TestDaemon {
     }
 
     pub fn spawn_and_wait(&mut self) {
+        self.spawn_and_wait_with(&[]);
+    }
+
+    /// `spawn_and_wait` with extra environment (debug-build fault seams).
+    pub fn spawn_and_wait_with(&mut self, env: &[(&str, &str)]) {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.stderr_path())
             .unwrap();
-        let child = self
-            .command()
+        let mut cmd = self.command();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()

@@ -668,3 +668,76 @@ fn reload_of_unlocked_config_warns() {
     let w = &d.events("reload_warning")[0];
     assert!(w["reason"].as_str().unwrap().contains("locked"), "{w}");
 }
+
+/// A record above 64 KiB serialized is refused (I2): 1 000 of them a
+/// second would fill the audit volume for everyone.
+#[test]
+fn oversized_record_is_bad_request() {
+    let d = TestDaemon::start(Opts::default());
+    let before = d.records().len();
+    let mut c = d.client();
+    let mut rec = guard_rec("x");
+    rec["pad"] = json!("p".repeat(64 * 1024));
+    let e = append(&mut c, rec).unwrap_err();
+    assert_eq!(refused_code(&e), "bad_request");
+    assert_eq!(d.records().len(), before);
+    // Just under the cap is fine, and the connection stays usable.
+    let mut rec = guard_rec("x");
+    let base = serde_json::to_vec(&rec).unwrap().len();
+    rec["pad"] = json!("p".repeat(64 * 1024 - base - 16));
+    assert!(serde_json::to_vec(&rec).unwrap().len() <= 64 * 1024);
+    append(&mut c, rec).unwrap();
+    assert_eq!(d.records().len(), before + 1);
+}
+
+/// The writer thread dying outside a stop takes the daemon down with a
+/// non-zero exit (I4), so systemd restarts it instead of a daemon that
+/// answers `internal` forever.
+#[test]
+fn writer_death_exits_the_daemon() {
+    let mut d = TestDaemon::prepare(&Opts::default());
+    d.spawn_and_wait_with(&[("SAIIFE_DAEMON_FAULT", "writer_panic")]);
+    let mut c = d.client();
+    // `internal`, or no answer at all when the daemon exits first.
+    match append(&mut c, guard_rec("x")) {
+        Ok(a) => panic!("acked by a dead writer: {a:?}"),
+        Err(saiife_ipc::client::ClientError::Refused { code, .. }) => assert_eq!(code, "internal"),
+        Err(_) => {}
+    }
+    let st = d
+        .wait_exit(Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("daemon still running: {}", d.stderr_text()));
+    assert!(!st.success(), "{st:?}");
+    assert!(
+        d.stderr_text().contains("the audit writer stopped"),
+        "{}",
+        d.stderr_text()
+    );
+    assert!(std::fs::symlink_metadata(d.socket()).is_err());
+}
+
+/// Writer settings are fixed at start: a reload that changes them says so
+/// (M5).
+#[test]
+fn reload_of_writer_settings_warns() {
+    let d = TestDaemon::start(Opts::default());
+    let text = d.config_text(&Opts {
+        checkpoint_every: 5,
+        checkpoint_interval: "1m".into(),
+        extra: String::new(),
+        ..Opts::default()
+    });
+    let text = text.replace("[audit]\n", "[audit]\nfsync = \"always\"\n");
+    std::fs::write(d.config(), text).unwrap();
+    d.signal("HUP");
+    assert!(wait_for(Duration::from_secs(5), || !d
+        .events("reload_warning")
+        .is_empty()));
+    let w = d.events("reload_warning")[0]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for k in ["checkpoint_every", "checkpoint_interval", "fsync"] {
+        assert!(w.contains(k), "{k}: {w}");
+    }
+}
