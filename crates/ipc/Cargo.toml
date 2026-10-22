@@ -1,0 +1,22 @@
+[package]
+name = "saiife-ipc"
+description = "Control-socket protocol for saiife locked mode: frames, messages, blocking client, peer credentials."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_ipc"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["net", "fs", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
