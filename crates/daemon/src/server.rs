@@ -15,6 +15,10 @@ use tokio::time::timeout;
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// An answer the peer does not read within this closes the connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The `hello` frame must be complete within this of the accept.
+pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
+/// How long a refused connection gets to take its `busy` answer.
+const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum ReadError {
     /// A malformed frame: answer `bad_frame` and close.
@@ -48,22 +52,43 @@ async fn read_frame(s: &mut UnixStream) -> Result<Option<Map<String, Value>>, Re
 }
 
 async fn write(s: &mut UnixStream, v: &Value) -> bool {
+    write_within(s, v, WRITE_TIMEOUT).await
+}
+
+async fn write_within(s: &mut UnixStream, v: &Value, limit: Duration) -> bool {
     let Ok(bytes) = encode(v) else {
         return false;
     };
-    matches!(
-        timeout(WRITE_TIMEOUT, s.write_all(&bytes)).await,
-        Ok(Ok(()))
-    )
+    matches!(timeout(limit, s.write_all(&bytes)).await, Ok(Ok(())))
 }
 
 pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
+    let accepted = tokio::time::Instant::now();
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
+    // Open-connection caps, before any frame is read: idle connections
+    // must not use up the daemon's file descriptors.
+    let _slot = match ctx.conns.try_open(peer.uid) {
+        Ok(slot) => slot,
+        Err(code) => {
+            ctx.notice(peer.uid, "rate_limited");
+            let msg = "too many open connections";
+            write_within(&mut s, &err(0, code, msg), REFUSE_WRITE_TIMEOUT).await;
+            return;
+        }
+    };
     let mut greeted = false;
     loop {
-        let frame = match read_frame(&mut s).await {
+        let next = if greeted {
+            read_frame(&mut s).await
+        } else {
+            // No idle timeout between frames, but the hello must come in time.
+            tokio::time::timeout_at(accepted + HELLO_DEADLINE, read_frame(&mut s))
+                .await
+                .unwrap_or(Err(ReadError::Gone))
+        };
+        let frame = match next {
             Ok(Some(f)) => f,
             Ok(None) | Err(ReadError::Gone) => return,
             Err(ReadError::Bad(e)) => {
@@ -88,12 +113,10 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
                 write(&mut s, &err(req.id, ErrorCode::HelloRequired, msg)).await;
                 return;
             }
-            if let Some(p) = req.args.get("proto") {
-                if p.as_u64() != Some(PROTO) {
-                    let msg = format!("this daemon speaks proto {PROTO}");
-                    write(&mut s, &err(req.id, ErrorCode::BadRequest, &msg)).await;
-                    return;
-                }
+            if req.args.get("proto").and_then(Value::as_u64) != Some(PROTO) {
+                let msg = format!("hello needs proto {PROTO}");
+                write(&mut s, &err(req.id, ErrorCode::BadRequest, &msg)).await;
+                return;
             }
             greeted = true;
             if !write(&mut s, &ops::hello(req.id)).await {

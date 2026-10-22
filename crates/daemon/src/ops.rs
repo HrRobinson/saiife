@@ -1,7 +1,7 @@
 //! The control-socket ops (spec §8.7) and the state they share.
 
 use crate::disk;
-use crate::limits::Limits;
+use crate::limits::{ConnLimits, Limits};
 use crate::writer::WriterHandle;
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
@@ -53,10 +53,12 @@ type Cache<K, V> = Mutex<HashMap<K, (Instant, V)>>;
 pub struct Ctx {
     pub writer: WriterHandle,
     pub limits: Limits,
+    pub conns: ConnLimits,
     pub directory: Arc<dyn Directory + Send + Sync>,
     pub own_uid: u32,
     pub own_user: String,
     pub audit_dir: PathBuf,
+    pub socket_dir: PathBuf,
     pub key_path: PathBuf,
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
@@ -73,6 +75,7 @@ pub struct CtxInit {
     pub own_uid: u32,
     pub own_user: String,
     pub audit_dir: PathBuf,
+    pub socket_dir: PathBuf,
     pub key_path: PathBuf,
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
@@ -88,10 +91,12 @@ impl Ctx {
         Ctx {
             writer: i.writer,
             limits: Limits::new(),
+            conns: ConnLimits::from_rlimit(),
             directory: i.directory,
             own_uid: i.own_uid,
             own_user: i.own_user,
             audit_dir: i.audit_dir,
+            socket_dir: i.socket_dir,
             key_path: i.key_path,
             config_path: i.config_path,
             catalog: i.catalog,
@@ -236,6 +241,16 @@ fn notice_due(
     true
 }
 
+/// Now, in the record format: UTC, `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+pub fn now_ts() -> String {
+    const F: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+    );
+    time::OffsetDateTime::now_utc()
+        .format(F)
+        .unwrap_or_default()
+}
+
 pub fn hello(id: u64) -> Value {
     let mut m = Map::new();
     m.insert("proto".into(), PROTO.into());
@@ -262,14 +277,40 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let forbidden = |m: &str| err(id, ErrorCode::Forbidden, m);
-    let Some(raw) = req.args.get("rec") else {
-        return forbidden("audit.append takes a guard record in rec");
+    let Some(raw) = req.args.get("rec").and_then(Value::as_object) else {
+        return err(
+            id,
+            ErrorCode::BadRequest,
+            "audit.append takes a record object in rec",
+        );
     };
-    let Ok(mut rec) = serde_json::from_value::<Record>(raw.clone()) else {
-        return forbidden("rec is not an audit record");
+    if raw
+        .get("kind")
+        .is_some_and(|k| !k.is_null() && k.as_str() != Some("guard"))
+    {
+        return forbidden("audit.append takes only kind \"guard\"");
+    }
+    let mut raw = raw.clone();
+    // The daemon stamps the time: a client's far-future or backdated `ts`
+    // would move later records to another month file or falsify the
+    // timeline. The client's value is kept, bounded, as `client_ts`.
+    let client_ts = raw.remove("ts").map(|v| match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    });
+    raw.insert("ts".into(), now_ts().into());
+    let mut rec = match serde_json::from_value::<Record>(Value::Object(raw)) {
+        Ok(r) => r,
+        Err(e) => return err(id, ErrorCode::BadRequest, &format!("rec: {e}")),
     };
     if rec.kind() != "guard" {
         return forbidden("audit.append takes only kind \"guard\"");
+    }
+    if let Some(t) = client_ts {
+        rec.extra.insert(
+            "client_ts".into(),
+            t.chars().take(32).collect::<String>().into(),
+        );
     }
     let min_free = ctx.policy().min_free_mb;
     let gate = match disk::free_mb(&ctx.audit_dir) {

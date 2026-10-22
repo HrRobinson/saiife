@@ -9,7 +9,7 @@ use saiife_ipc::msg::SOCKET_NAME;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -204,6 +204,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         own_uid: euid,
         own_user: name,
         audit_dir: audit_cfg.dir.clone(),
+        socket_dir: daemon_cfg.socket_dir.clone(),
         key_path,
         config_path: opts.config.clone(),
         catalog: opts.catalog,
@@ -254,29 +255,68 @@ fn policy_record(
     r
 }
 
-/// The socket dir (created 0755 when missing) and a fresh `saiife.sock`,
-/// 0666. A stale socket is removed only when it is a socket of this uid
-/// that nobody answers on.
+/// Refuse a socket dir others could write to or that is not this user's
+/// (or root's): the client trusts whatever socket is in it.
+fn check_socket_dir(st: &rustix::fs::Stat, dir: &Path, uid: u32) -> Result<(), String> {
+    if st.st_mode & 0o170000 != 0o040000 {
+        return Err(format!("{}: not a directory", dir.display()));
+    }
+    if st.st_uid != uid && st.st_uid != 0 {
+        return Err(format!(
+            "{}: owned by uid {}, expected the daemon user (uid {uid}) or root",
+            dir.display(),
+            st.st_uid
+        ));
+    }
+    if st.st_mode & 0o022 != 0 {
+        return Err(format!("{}: writable by group or others", dir.display()));
+    }
+    Ok(())
+}
+
+/// The socket dir (created 0755 when missing; an existing one must be
+/// this user's or root's and not group/other-writable) and a fresh
+/// `saiife.sock`, 0666. A stale socket is removed only when it is a socket
+/// of this uid that nobody answers on; anything else there is left alone.
+/// The dir is held open (`O_NOFOLLOW`) and every later step works relative
+/// to it, without following a symlink at `saiife.sock`.
 fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    let at = |e: &dyn std::fmt::Display| format!("{}: {e}", socket_dir.display());
     match std::fs::symlink_metadata(socket_dir) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Err(format!("{}: not a directory", socket_dir.display())),
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(socket_dir)
+            if let Some(parent) = socket_dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| at(&e))?;
+            }
+            std::fs::create_dir(socket_dir)
                 .and_then(|()| {
                     std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o755))
                 })
-                .map_err(|e| format!("{}: {e}", socket_dir.display()))?;
+                .map_err(|e| at(&e))?;
         }
-        Err(e) => return Err(format!("{}: {e}", socket_dir.display())),
+        Err(e) => return Err(at(&e)),
     }
+    let dirfd = rustix::fs::open(
+        socket_dir,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| at(&e))?;
+    check_socket_dir(
+        &rustix::fs::fstat(&dirfd).map_err(|e| at(&e))?,
+        socket_dir,
+        uid,
+    )?;
+
     let path = socket_dir.join(SOCKET_NAME);
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_socket() && m.uid() == uid => {
+    let at_sock = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    match rustix::fs::statat(&dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) if st.st_mode & 0o170000 == 0o140000 && st.st_uid == uid => {
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
                 return Err(format!("another daemon is listening on {}", path.display()));
             }
-            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            rustix::fs::unlinkat(&dirfd, SOCKET_NAME, AtFlags::empty()).map_err(|e| at_sock(&e))?;
         }
         Ok(_) => {
             return Err(format!(
@@ -284,13 +324,47 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
                 path.display()
             ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(at_sock(&e)),
     }
-    let l = UnixListener::bind(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let l = UnixListener::bind(&path).map_err(|e| at_sock(&e))?;
+    chmod_socket(&dirfd, uid).map_err(|e| at_sock(&e))?;
     Ok((l, path))
+}
+
+/// `chmod 0666` on the socket just bound, never through a symlink: an
+/// `O_PATH | O_NOFOLLOW` handle is checked to be this uid's socket and
+/// changed through `/proc/self/fd`. Without `/proc`, `fchmodat` on the
+/// checked name in the held dir, which only this uid or root can change.
+fn chmod_socket(dirfd: &rustix::fd::OwnedFd, uid: u32) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use std::os::fd::AsRawFd;
+    let mode = Mode::from_raw_mode(0o666);
+    let fd = rustix::fs::openat(
+        dirfd,
+        SOCKET_NAME,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let st = rustix::fs::fstat(&fd)?;
+    if st.st_mode & 0o170000 != 0o140000 || st.st_uid != uid {
+        return Err(std::io::Error::other("not the socket this daemon bound"));
+    }
+    match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let st = rustix::fs::statat(dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW)?;
+            if st.st_mode & 0o170000 != 0o140000 || st.st_uid != uid {
+                return Err(std::io::Error::other("not the socket this daemon bound"));
+            }
+            Ok(rustix::fs::chmodat(
+                dirfd,
+                SOCKET_NAME,
+                mode,
+                AtFlags::empty(),
+            )?)
+        }
+    }
 }
 
 async fn serve(
@@ -394,18 +468,55 @@ async fn reload(ctx: &Arc<Ctx>) {
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
-    let rec = match loaded {
+    let mut recs = Vec::new();
+    match loaded {
         Ok(l) => {
             let next = PolicyState::from_loaded(&l, &ctx.catalog);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
-            policy_record(ctx, "loaded", Some(files_json(&l)), None)
+            recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
+            let changed = restart_only_changes(ctx, &l);
+            if !changed.is_empty() {
+                let reason = format!(
+                    "{}; these take effect only at a restart, the daemon keeps running as started",
+                    changed.join("; ")
+                );
+                eprintln!("saiife: warning: {reason}");
+                let mut w = ctx.event("reload_warning");
+                w.reason = Some(reason);
+                recs.push(w);
+            }
         }
         Err(reason) => {
             eprintln!("saiife: warning: policy reload refused, keeping the old policy: {reason}");
-            policy_record(ctx, "rejected", None, Some(reason))
+            recs.push(policy_record(ctx, "rejected", None, Some(reason)));
         }
-    };
-    if let Err(e) = ctx.writer.append(rec).await {
-        eprintln!("saiife: warning: cannot write the policy record: {e}");
     }
+    for rec in recs {
+        if let Err(e) = ctx.writer.append(rec).await {
+            eprintln!("saiife: warning: cannot write the policy record: {e}");
+        }
+    }
+}
+
+/// Settings a reload cannot apply: what the daemon would refuse to start
+/// with, or paths it opened at start.
+fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
+    let c = &l.config;
+    let mut out = Vec::new();
+    if !c.locked {
+        out.push("the reloaded config lacks locked = true".to_string());
+    }
+    if c.daemon.user != ctx.own_user {
+        out.push(format!(
+            "[daemon] user changed from {} to {}",
+            ctx.own_user, c.daemon.user
+        ));
+    }
+    if c.daemon.socket_dir != ctx.socket_dir {
+        out.push("[daemon] socket_dir changed".to_string());
+    }
+    if c.audit.dir != ctx.audit_dir {
+        out.push("[audit] dir changed".to_string());
+    }
+    out
 }

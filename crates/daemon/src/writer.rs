@@ -13,6 +13,8 @@ use tokio::sync::oneshot;
 
 /// Jobs queued before the writer refuses more.
 pub const QUEUE: usize = 1024;
+/// How long a stop waits for room in a full queue.
+pub const STOP_SEND_WAIT: Duration = Duration::from_secs(5);
 /// The writer wakes at least this often (interval checkpoints, fsync).
 const TICK: Duration = Duration::from_secs(1);
 
@@ -90,16 +92,45 @@ impl WriterHandle {
         self.send(|reply| Job::RotateKey { key_path, reply }).await
     }
 
+    /// Stop the writer. Unlike the other jobs this one waits for room in a
+    /// full queue (at most `STOP_SEND_WAIT`, off the runtime), so the stop
+    /// record is not lost behind a burst of appends.
     pub async fn stop(&self, rec: Option<Record>) -> Result<(), String> {
-        self.send(|reply| Job::Stop {
+        let (reply, rx) = oneshot::channel();
+        let job = Job::Stop {
             rec: rec.map(Box::new),
             reply,
-        })
-        .await
+        };
+        let tx = self.tx.clone();
+        let sent = tokio::task::spawn_blocking(move || send_within(&tx, job, STOP_SEND_WAIT))
+            .await
+            .unwrap_or_else(|e| Err(format!("stop: {e}")));
+        sent?;
+        rx.await
+            .unwrap_or_else(|_| Err("the audit writer has stopped".into()))
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// `try_send` until `job` fits or `limit` passes (`SyncSender` has no
+/// stable `send_timeout`).
+fn send_within(tx: &SyncSender<Job>, mut job: Job, limit: Duration) -> Result<(), String> {
+    let end = Instant::now() + limit;
+    loop {
+        match tx.try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Disconnected(_)) => return Err("the audit writer has stopped".into()),
+            Err(TrySendError::Full(j)) => {
+                if Instant::now() >= end {
+                    return Err("the audit writer queue stayed full".into());
+                }
+                job = j;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -275,16 +306,28 @@ impl Writer {
                 return Err(format!("key rotation record failed, old key kept: {e}"));
             }
         };
+        // The record is written: the chain now names the new key, so the
+        // rename is attempted even when the sync fails (both are reported).
         self.unsynced = true;
-        self.sync()
-            .map_err(|e| format!("audit sync after key rotation failed: {e}"))?;
-        std::fs::rename(&pending, key_path).map_err(|e| {
-            format!(
-                "key_rotate written (seq {seq}) but {} could not be renamed to {}: {e}",
+        let synced = self.sync();
+        let renamed = std::fs::rename(&pending, key_path);
+        let mut problems = Vec::new();
+        if let Err(e) = synced {
+            problems.push(format!("audit sync after key rotation failed: {e}"));
+        }
+        if let Err(e) = renamed {
+            problems.push(format!(
+                "{} could not be renamed to {}: {e}",
                 pending.display(),
                 key_path.display()
-            )
-        })?;
+            ));
+        }
+        if !problems.is_empty() {
+            return Err(format!(
+                "key_rotate written (seq {seq}), but {}",
+                problems.join("; ")
+            ));
+        }
         if let Some(parent) = key_path.parent() {
             if let Ok(d) = std::fs::File::open(parent) {
                 let _ = d.sync_all();
@@ -457,6 +500,42 @@ mod tests {
         assert_eq!(k[k.len() - 2..], ["daemon", "checkpoint"]);
         // A job after stop is refused, not lost silently.
         assert!(rt.block_on(h.append(rec(2))).is_err());
+    }
+
+    #[test]
+    fn stop_waits_for_room_in_a_full_queue() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = WriterConfig {
+            checkpoint_every: 100_000,
+            checkpoint_interval: Duration::from_secs(3600),
+            fsync: Fsync::Checkpoint,
+        };
+        let (h, join) = spawn(open(d.path()), cfg, None).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Fill the queue without waiting for answers.
+        let mut pending = Vec::new();
+        for i in 0..QUEUE * 2 {
+            let (reply, rx) = oneshot::channel();
+            if h.tx
+                .try_send(Job::Append {
+                    rec: Box::new(rec(i)),
+                    reply,
+                })
+                .is_ok()
+            {
+                pending.push(rx);
+            }
+        }
+        let mut stop = rec(0);
+        stop.kind = Some("daemon".into());
+        stop.extra.insert("event".into(), "stop".into());
+        rt.block_on(h.stop(Some(stop))).unwrap();
+        join.join().unwrap();
+        let k = kinds(d.path());
+        assert_eq!(k[k.len() - 2..], ["daemon", "checkpoint"]);
     }
 
     #[test]

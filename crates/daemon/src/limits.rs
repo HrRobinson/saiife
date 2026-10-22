@@ -67,6 +67,84 @@ impl Limits {
     }
 }
 
+/// Open connections per uid.
+pub const MAX_CONNS_PER_UID: u32 = 32;
+/// File descriptors kept free of connections for logs, keys and the like.
+const FD_RESERVE: u64 = 64;
+
+/// Open-connection caps, checked at accept: per uid and in total.
+#[derive(Debug, Clone)]
+pub struct ConnLimits {
+    inner: Arc<Mutex<Conns>>,
+}
+
+#[derive(Debug)]
+struct Conns {
+    per_uid: HashMap<u32, u32>,
+    total: u64,
+    max_total: u64,
+}
+
+/// One open connection; released on drop.
+#[derive(Debug)]
+pub struct ConnSlot {
+    inner: Arc<Mutex<Conns>>,
+    uid: u32,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        c.total = c.total.saturating_sub(1);
+        if let Some(n) = c.per_uid.get_mut(&self.uid) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.per_uid.remove(&self.uid);
+            }
+        }
+    }
+}
+
+/// The global cap for a soft `RLIMIT_NOFILE` of `nofile`: that minus a
+/// reserve of 64, and at least 64.
+pub fn total_cap(nofile: u64) -> u64 {
+    nofile.saturating_sub(FD_RESERVE).max(64)
+}
+
+impl ConnLimits {
+    pub fn new(max_total: u64) -> ConnLimits {
+        ConnLimits {
+            inner: Arc::new(Mutex::new(Conns {
+                per_uid: HashMap::new(),
+                total: 0,
+                max_total,
+            })),
+        }
+    }
+
+    /// From the process's soft `RLIMIT_NOFILE`.
+    pub fn from_rlimit() -> ConnLimits {
+        let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+            .current
+            .unwrap_or(u64::MAX);
+        ConnLimits::new(total_cap(soft))
+    }
+
+    pub fn try_open(&self, uid: u32) -> Result<ConnSlot, ErrorCode> {
+        let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mine = c.per_uid.get(&uid).copied().unwrap_or(0);
+        if mine >= MAX_CONNS_PER_UID || c.total >= c.max_total {
+            return Err(ErrorCode::Busy);
+        }
+        c.per_uid.insert(uid, mine + 1);
+        c.total += 1;
+        Ok(ConnSlot {
+            inner: Arc::clone(&self.inner),
+            uid,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +184,28 @@ mod tests {
         let again = l.try_begin(1, t);
         assert!(again.is_ok());
         assert_eq!(l.try_begin(1, t).unwrap_err(), ErrorCode::Busy);
+    }
+
+    #[test]
+    fn connection_cap_is_32_per_uid_and_global() {
+        let l = ConnLimits::new(40);
+        let mut a: Vec<ConnSlot> = (0..32).map(|_| l.try_open(1).unwrap()).collect();
+        assert_eq!(l.try_open(1).unwrap_err(), ErrorCode::Busy);
+        let b: Vec<ConnSlot> = (0..8).map(|_| l.try_open(2).unwrap()).collect();
+        // Global cap of 40 reached.
+        assert_eq!(l.try_open(3).unwrap_err(), ErrorCode::Busy);
+        a.pop();
+        assert!(l.try_open(3).is_ok());
+        drop(b);
+        let again = l.try_open(1);
+        assert!(again.is_ok());
+    }
+
+    #[test]
+    fn total_cap_keeps_a_reserve_and_a_floor() {
+        assert_eq!(total_cap(1024), 960);
+        assert_eq!(total_cap(100), 64);
+        assert_eq!(total_cap(0), 64);
+        assert_eq!(total_cap(u64::MAX), u64::MAX - 64);
     }
 }

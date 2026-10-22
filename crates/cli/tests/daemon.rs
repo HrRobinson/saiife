@@ -161,9 +161,15 @@ fn append_non_guard_kind_is_forbidden() {
         let e = append(&mut c, rec).unwrap_err();
         assert_eq!(refused_code(&e), "forbidden", "{kind}");
     }
-    // Not a record at all.
+    // Not a record at all, or a field of the wrong type: bad_request.
     let e = append(&mut c, json!({"nope": 1})).unwrap_err();
-    assert_eq!(refused_code(&e), "forbidden");
+    assert_eq!(refused_code(&e), "bad_request");
+    let mut rec = guard_rec("x");
+    rec["decision"] = json!(42);
+    let e = append(&mut c, rec).unwrap_err();
+    assert_eq!(refused_code(&e), "bad_request");
+    let e = c.call("audit.append", Map::new(), dl()).unwrap_err();
+    assert_eq!(refused_code(&e), "bad_request");
     assert_eq!(d.records().len(), before);
 }
 
@@ -486,4 +492,179 @@ fn status_reports_chain_and_policy() {
     assert_eq!(s["policy_ok"], json!(true));
     assert!(s["uptime_s"].as_u64().is_some());
     assert!(s.contains_key("last_checkpoint_seq"));
+}
+
+fn this_month() -> String {
+    let r = guard_rec("now");
+    r["ts"].as_str().unwrap()[..7].to_string()
+}
+
+#[test]
+fn daemon_stamps_ts_and_keeps_client_ts() {
+    let d = TestDaemon::start(Opts::default());
+    let mut c = d.client();
+    let long = format!("2001-01-01T00:00:00.000Z{}", "x".repeat(40));
+    for ts in [
+        "9999-12-31T23:59:59.999Z",
+        "2001-01-01T00:00:00.000Z",
+        "nonsense",
+        &long,
+    ] {
+        let mut rec = guard_rec(&format!("ts {ts}"));
+        rec["ts"] = json!(ts);
+        append(&mut c, rec).unwrap();
+    }
+    append(&mut c, guard_rec("after")).unwrap();
+    let month = this_month();
+    let files: Vec<String> = std::fs::read_dir(d.audit_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".jsonl"))
+        .collect();
+    assert_eq!(files, [format!("{month}.jsonl")]);
+    let guards = d.of_kind("guard");
+    let client: Vec<&str> = guards
+        .iter()
+        .map(|g| g["client_ts"].as_str().unwrap())
+        .collect();
+    assert_eq!(client[0], "9999-12-31T23:59:59.999Z");
+    assert_eq!(client[1], "2001-01-01T00:00:00.000Z");
+    assert_eq!(client[2], "nonsense");
+    assert_eq!(client[3].chars().count(), 32);
+    for g in &guards {
+        let ts = g["ts"].as_str().unwrap();
+        assert!(ts.starts_with(&month), "{ts}");
+        assert_eq!(ts.len(), 24, "{ts}");
+        assert!(ts.ends_with('Z'));
+    }
+    assert_verifies(&d);
+}
+
+#[test]
+fn hello_without_proto_is_bad_request() {
+    let d = TestDaemon::start(Opts::default());
+    let mut s = raw(&d);
+    send_frame(&mut s, &json!({"id": 1, "op": "hello"}));
+    let a = read_frame(&mut s).unwrap();
+    assert_eq!(a["error"], json!("bad_request"));
+    assert!(drain_to_eof(&mut s).is_empty());
+}
+
+#[test]
+fn silent_client_is_closed_after_hello_deadline() {
+    let d = TestDaemon::start(Opts::default());
+    let mut silent = raw(&d);
+    let t0 = Instant::now();
+    let mut c = d.client();
+    append(&mut c, guard_rec("other")).unwrap();
+    drain_to_eof(&mut silent);
+    let closed = t0.elapsed();
+    assert!(
+        closed >= Duration::from_secs(4) && closed < Duration::from_secs(8),
+        "silent client closed after {closed:?}"
+    );
+    // Greeted clients have no idle timeout.
+    std::thread::sleep(Duration::from_millis(500));
+    append(&mut c, guard_rec("still greeted")).unwrap();
+}
+
+#[test]
+fn connection_cap_per_uid_is_32() {
+    let d = TestDaemon::start(Opts::default());
+    let mut held: Vec<_> = (0..32).map(|_| d.client()).collect();
+    let mut s = raw(&d);
+    let a = read_frame(&mut s).expect("a busy answer");
+    assert_eq!(a["error"], json!("busy"));
+    assert_eq!(a["id"], json!(0));
+    assert!(drain_to_eof(&mut s).is_empty());
+    for c in held.iter_mut() {
+        append(c, guard_rec("held")).unwrap();
+    }
+    assert!(wait_for(Duration::from_secs(3), || d
+        .events("rate_limited")
+        .len()
+        == 1));
+    held.pop();
+    // A freed slot is usable again (the close may take a moment to land).
+    assert!(wait_for(Duration::from_secs(3), || d.try_client().is_ok()));
+    // Still one rate_limited record within the minute.
+    let mut s = raw(&d);
+    let _ = read_frame(&mut s);
+    drop(held);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(d.events("rate_limited").len(), 1);
+}
+
+#[test]
+fn created_socket_dir_and_socket_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TestDaemon::start(Opts::default());
+    let dm = std::fs::metadata(d.socket_dir())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    let sm = std::fs::symlink_metadata(d.socket())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(dm, 0o755);
+    assert_eq!(sm, 0o666);
+}
+
+#[test]
+fn foreign_socket_path_is_left_alone() {
+    let d = TestDaemon::prepare(&Opts::default());
+    std::fs::create_dir_all(d.socket_dir()).unwrap();
+    std::fs::write(d.socket(), "not a socket").unwrap();
+    let o = d.run_to_exit();
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
+    assert!(out(&o).contains("not a socket"), "{}", out(&o));
+    assert_eq!(std::fs::read_to_string(d.socket()).unwrap(), "not a socket");
+}
+
+#[test]
+fn symlinked_socket_path_is_left_alone() {
+    let d = TestDaemon::prepare(&Opts::default());
+    std::fs::create_dir_all(d.socket_dir()).unwrap();
+    let target = d.path().join("elsewhere");
+    std::fs::write(&target, "x").unwrap();
+    std::os::unix::fs::symlink(&target, d.socket()).unwrap();
+    let o = d.run_to_exit();
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
+    assert!(std::fs::symlink_metadata(d.socket())
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn writable_socket_dir_refuses_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = TestDaemon::prepare(&Opts::default());
+    std::fs::create_dir_all(d.socket_dir()).unwrap();
+    std::fs::set_permissions(d.socket_dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let o = d.run_to_exit();
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
+    assert!(
+        out(&o).contains("writable by group or others"),
+        "{}",
+        out(&o)
+    );
+}
+
+#[test]
+fn reload_of_unlocked_config_warns() {
+    let d = TestDaemon::start(Opts::default());
+    let text = d
+        .config_text(&Opts::default())
+        .replace("locked = true", "locked = false");
+    std::fs::write(d.config(), text).unwrap();
+    d.signal("HUP");
+    assert!(wait_for(Duration::from_secs(5), || !d
+        .events("reload_warning")
+        .is_empty()));
+    let w = &d.events("reload_warning")[0];
+    assert!(w["reason"].as_str().unwrap().contains("locked"), "{w}");
 }

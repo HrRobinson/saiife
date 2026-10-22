@@ -194,11 +194,26 @@ impl TestDaemon {
         child.wait_with_output().unwrap()
     }
 
+    /// The daemon's stderr goes to a file (appended across restarts), so a
+    /// chatty daemon can never block on a full pipe.
+    pub fn stderr_path(&self) -> PathBuf {
+        self.path().join("daemon.stderr")
+    }
+
+    pub fn stderr_text(&self) -> String {
+        fs::read_to_string(self.stderr_path()).unwrap_or_default()
+    }
+
     pub fn spawn_and_wait(&mut self) {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.stderr_path())
+            .unwrap();
         let child = self
             .command()
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap();
         self.child = Some(child);
@@ -209,11 +224,8 @@ impl TestDaemon {
         if !up {
             let mut child = self.child.take().unwrap();
             let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            panic!(
-                "daemon did not come up in 5 s: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let _ = child.wait();
+            panic!("daemon did not come up in 5 s: {}", self.stderr_text());
         }
     }
 
