@@ -43,8 +43,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// A stable, non-reversible id of this machine: the SHA-256 of the machine
 /// id (never the raw value), or `None` when the platform has none to offer.
+/// Looked up once per process: on macOS that spawns `ioreg`.
 pub fn host_id() -> Option<String> {
-    raw_machine_id().map(|id| sha256_hex(id.as_bytes()))
+    static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| raw_machine_id().map(|id| sha256_hex(id.as_bytes())))
+        .clone()
 }
 
 #[cfg(target_os = "macos")]
@@ -188,14 +191,25 @@ fn open_lock(dir: &Path) -> io::Result<File> {
 /// The lock file (see `open_lock`), locked within `LOCK_WAIT`.
 fn take_lock(dir: &Path) -> Option<File> {
     let file = open_lock(dir).ok()?;
+    lock_within(&file).ok().map(|()| file)
+}
+
+/// Lock `file` (flock), retrying for up to `LOCK_WAIT` while it is held.
+///
+/// A flock belongs to the open file, not to the fd, and lasts until every
+/// copy of it is closed. A child that another thread forks or spawns gets
+/// a copy of every fd, close-on-exec ones included, and keeps it until it
+/// execs: for that moment a lock its owner already dropped is still held.
+/// On macOS every genesis spawns `ioreg` (`host_id`), so the moment comes
+/// up; a held lock is only reported once it outlasts the wait.
+fn lock_within(file: &File) -> Result<(), fs::TryLockError> {
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match file.try_lock() {
-            Ok(()) => return Some(file),
             Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(LOCK_RETRY);
             }
-            Err(_) => return None,
+            r => return r,
         }
     }
 }
@@ -706,12 +720,12 @@ impl Current {
 
 impl ChainWriter {
     /// Take the chain lock of `dir` (created 0750 when missing; an existing
-    /// dir keeps its mode) without waiting, and find the chain's tail with
-    /// no read budget. A held lock is an error.
+    /// dir keeps its mode) and find the chain's tail with no read budget. A
+    /// lock still held after `LOCK_WAIT` is an error (see `lock_within`).
     pub fn open(dir: &Path, opts: WriterOptions) -> io::Result<ChainWriter> {
         create_writer_dir(dir)?;
         let lock = open_lock(dir)?;
-        match lock.try_lock() {
+        match lock_within(&lock) {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::other(format!(
@@ -1881,6 +1895,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(ChainWriter::open(dir.path(), opts("locked", None)).unwrap());
         ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+    }
+
+    /// A copy of the lock's open file outliving the writer, as a child
+    /// spawned by another thread holds one until it execs (macOS spawns
+    /// `ioreg` for every genesis): the flock stays held for a moment after
+    /// the drop, and the next writer waits for it instead of failing.
+    #[test]
+    fn writer_waits_for_a_briefly_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        let copy = w._lock.try_clone().unwrap();
+        drop(w);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(copy);
+        });
+        let start = Instant::now();
+        ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        assert!(start.elapsed() < LOCK_WAIT, "{:?}", start.elapsed());
+        release.join().unwrap();
     }
 
     #[test]
