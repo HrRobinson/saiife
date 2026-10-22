@@ -11,5 +11,6 @@ pub mod record;
 pub mod store;
 pub mod verify;
 
+pub use chain::{ChainWriter, WriterOptions};
 pub use record::{DecisionKind, NewRecord, Record};
 pub use verify::{verify, Break, BreakKind, VerifyReport};

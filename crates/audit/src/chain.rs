@@ -136,22 +136,35 @@ fn append_unchained(dir: &Path, rec: &Record) -> io::Result<()> {
 
 /// `uid` and `user`, only where the caller left them unset.
 fn fill_identity(rec: &mut Record) {
-    #[cfg(unix)]
     if rec.uid.is_none() {
-        rec.uid = Some(rustix::process::getuid().as_raw());
+        rec.uid = own_uid();
     }
     if rec.user.is_none() {
-        rec.user = ["USER", "LOGNAME"]
-            .iter()
-            .filter_map(std::env::var_os)
-            .filter_map(|v| v.into_string().ok())
-            .find(|v| !v.is_empty());
+        rec.user = own_user();
     }
 }
 
+#[cfg(unix)]
+fn own_uid() -> Option<u32> {
+    Some(rustix::process::getuid().as_raw())
+}
+
+#[cfg(not(unix))]
+fn own_uid() -> Option<u32> {
+    None
+}
+
+fn own_user() -> Option<String> {
+    ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|v| v.into_string().ok())
+        .find(|v| !v.is_empty())
+}
+
 /// The lock file, opened 0600 without following a symlink, refused unless it
-/// is a regular file, and locked within `LOCK_WAIT`.
-fn take_lock(dir: &Path) -> Option<File> {
+/// is a regular file. Not locked yet.
+fn open_lock(dir: &Path) -> io::Result<File> {
     let mut opts = fs::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -160,10 +173,19 @@ fn take_lock(dir: &Path) -> Option<File> {
         opts.mode(0o600)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    let file = opts.open(dir.join(LOCK_FILE)).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    let file = opts.open(dir.join(LOCK_FILE))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            dir.join(LOCK_FILE).display()
+        )));
     }
+    Ok(file)
+}
+
+/// The lock file (see `open_lock`), locked within `LOCK_WAIT`.
+fn take_lock(dir: &Path) -> Option<File> {
+    let file = open_lock(dir).ok()?;
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -181,15 +203,33 @@ fn take_lock(dir: &Path) -> Option<File> {
 struct Tail {
     prev: String,
     last: Option<TailLine>,
+    /// The `chain` id of the genesis the last chained line belongs to; only
+    /// looked for when the caller asks (`find_tail(.., want_chain: true)`).
+    chain: Option<String>,
+}
+
+impl Tail {
+    /// `(seq, hash of the last line)` of a chain that can be continued: a
+    /// last seq of `u64::MAX` cannot be followed, so a new chain must start.
+    fn head(&self) -> Option<(u64, String)> {
+        let seq = self.last.as_ref()?.seq?;
+        seq.checked_add(1)?;
+        Some((seq, self.prev.clone()))
+    }
 }
 
 /// What the tail scan reads of a line: exactly what `verify` judges a line
-/// by (`v`, defaulting to 1, and `seq`), plus the `host` to carry on. A line
-/// is not required to parse as a full `Record`.
+/// by (`v`, defaulting to 1, and `seq`), plus the `host` to carry on and the
+/// fields the rollback and genesis checks need. A line is not required to
+/// parse as a full `Record`.
 struct TailLine {
     v: u64,
     seq: Option<u64>,
     host: Option<String>,
+    ts: Option<String>,
+    prev: Option<String>,
+    kind: Option<String>,
+    chain: Option<String>,
 }
 
 impl TailLine {
@@ -198,17 +238,30 @@ impl TailLine {
         let serde_json::Value::Object(obj) = serde_json::from_slice(line).ok()? else {
             return None;
         };
+        let text = |k: &str| {
+            obj.get(k)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
         Some(Self {
             v: obj
                 .get("v")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1),
             seq: obj.get("seq").and_then(serde_json::Value::as_u64),
-            host: obj
-                .get("host")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            host: text("host"),
+            ts: text("ts"),
+            prev: text("prev"),
+            kind: text("kind"),
+            chain: text("chain"),
         })
+    }
+
+    /// A well-formed genesis, by the rules of `verify`.
+    fn is_genesis(&self) -> bool {
+        self.kind.as_deref() == Some("genesis")
+            && self.seq == Some(0)
+            && self.prev.as_deref() == Some(ZERO_PREV)
     }
 }
 
@@ -222,34 +275,42 @@ fn append_locked(dir: &Path, mut rec: Record) -> io::Result<u64> {
         .into_iter()
         .filter(|p| p.file_name() <= target_name)
         .collect();
-    let tail = find_tail(&upto)?;
+    let tail = find_tail(&upto, MAX_SCAN, false)?;
 
     let mut out = Vec::new();
-    let next = tail
-        .and_then(|t| t.last.map(|r| (r, t.prev)))
-        .and_then(|(last, prev)| {
-            // A last seq of u64::MAX cannot be followed: start a new chain.
-            let seq = last.seq.unwrap_or(0).checked_add(1)?;
-            Some((seq, prev, last.host))
-        });
+    let next = tail.and_then(|t| {
+        let (seq, prev) = t.head()?;
+        Some((seq + 1, prev, t.last?.host))
+    });
     let (seq, prev, host) = match next {
         Some(n) => n,
         None => {
-            let g = genesis(&rec)?;
-            let line = serde_json::to_vec(&g).map_err(io::Error::other)?;
-            let prev = sha256_hex(&line);
-            out.extend_from_slice(&line);
-            out.push(b'\n');
+            let g = genesis(&GenesisSpec {
+                saiife: &rec.saiife,
+                mode: "developer",
+                key: None,
+                uid: rec.uid,
+                user: rec.user.clone(),
+            })?;
+            let prev = push_line(&mut out, &g)?;
             (1, prev, g.host)
         }
     };
     rec.seq = Some(seq);
     rec.prev = Some(prev);
     rec.host = host;
-    serde_json::to_writer(&mut out, &rec).map_err(io::Error::other)?;
-    out.push(b'\n');
+    push_line(&mut out, &rec)?;
     store::open_append(&target)?.write_all(&out)?;
     Ok(seq)
+}
+
+/// Serialise `rec` as one line onto `out` and return the line's hash.
+fn push_line(out: &mut Vec<u8>, rec: &Record) -> io::Result<String> {
+    let line = serde_json::to_vec(rec).map_err(io::Error::other)?;
+    let hash = sha256_hex(&line);
+    out.extend_from_slice(&line);
+    out.push(b'\n');
+    Ok(hash)
 }
 
 /// The month files of `dir` that are regular files (a planted symlink, FIFO
@@ -269,8 +330,10 @@ fn year_month(name: &str) -> Option<(u32, u32)> {
 
 /// `<month>.jsonl` for the record, or the newest existing month file when
 /// that is later: a clock that went back must not write into the chain's
-/// past. Only a real month at most one month ahead of the record's is
-/// followed, so a planted `9999-12.jsonl` cannot divert every later record.
+/// past. A real month at most one month ahead of the record's is followed
+/// as it is (clock skew). One further ahead is followed only when the chain
+/// itself wrote it (`written_by_chain`), so a planted `9999-12.jsonl`
+/// cannot divert every later record.
 fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
     let own = dir.join(format!("{}.jsonl", rec.month()));
     let newest = files
@@ -282,31 +345,108 @@ fn target_file(dir: &Path, rec: &Record, files: &[PathBuf]) -> PathBuf {
     };
     let next = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     match year_month(n) {
-        Some(nm) if nm > (y, m) && nm <= next && store::is_month_file(n) => dir.join(n),
+        Some(nm)
+            if nm > (y, m)
+                && store::is_month_file(n)
+                && (nm <= next || written_by_chain(files)) =>
+        {
+            dir.join(n)
+        }
         _ => own,
     }
 }
 
+/// Whether the newest of `files` (oldest first) was written by the chain
+/// after a clock rollback rather than planted: its last chained line has a
+/// `ts` in the file's own month, and its first line is a genesis or chains
+/// on from the last line of the file before it. Both reads are bounded
+/// (`MAX_SCAN` back from the end, `TAIL_WINDOW` from the start).
+fn written_by_chain(files: &[PathBuf]) -> bool {
+    let Some((newest, older)) = files.split_last() else {
+        return false;
+    };
+    let Some(month) = newest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.get(..7))
+    else {
+        return false;
+    };
+    let mut ts_ok = false;
+    let mut budget = MAX_SCAN;
+    let scanned = scan_back(newest, &mut budget, |line| match TailLine::parse(line) {
+        Some(t) if t.v < 2 => Some(Found::Stop),
+        Some(t) if t.seq.is_some() => {
+            ts_ok = t.ts.is_some_and(|ts| ts.starts_with(month));
+            Some(Found::Stop)
+        }
+        _ => None,
+    });
+    if !matches!(scanned, Ok(Found::Stop)) || !ts_ok {
+        return false;
+    }
+    let Some(first) = first_line(newest).as_deref().and_then(TailLine::parse) else {
+        return false;
+    };
+    if first.v < 2 || first.seq.is_none() {
+        return false;
+    }
+    if first.is_genesis() {
+        return true;
+    }
+    let before = older
+        .iter()
+        .rev()
+        .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
+        .and_then(|p| last_line_hash(p));
+    before.is_some() && first.prev == before
+}
+
+/// The first line of `path`, if it ends within `TAIL_WINDOW` bytes.
+fn first_line(path: &Path) -> Option<Vec<u8>> {
+    let f = store::open_regular(path)?;
+    let mut buf = Vec::new();
+    f.take(TAIL_WINDOW).read_to_end(&mut buf).ok()?;
+    let end = buf.iter().position(|&b| b == b'\n')?;
+    buf.truncate(end);
+    Some(buf)
+}
+
+/// The hash of the last line of `path` (a missing final newline does not
+/// matter: the half line is the last line either way).
+fn last_line_hash(path: &Path) -> Option<String> {
+    let mut hash = None;
+    let mut budget = MAX_SCAN;
+    scan_back(path, &mut budget, |line| {
+        hash = Some(sha256_hex(line));
+        Some(Found::Stop)
+    })
+    .ok()?;
+    hash
+}
+
 /// What the backwards search found.
 enum Found {
-    /// The last chained line.
-    Chained(TailLine),
-    /// A v1 line or the read budget ran out: a new chain must start.
+    /// The search is over: the scanner has what it wanted, a v1 line ended
+    /// it, or the read budget ran out.
     Stop,
     /// The file's first line was reached without a decision.
     More,
 }
 
-/// The chain's tail among `files` (the caller passes only those up to the
-/// write target). `prev` hashes the physical last line of the newest
-/// non-empty one of them; a missing final newline there (a crash mid-write)
-/// is added first so the half line stays a line of its own. The last chained
-/// record is the newest line, searching backwards through that file and then
-/// older ones, that is a JSON object with `v >= 2` and a `seq` (the rules
-/// of `verify`; see `TailLine`). Unparseable and
-/// unchained lines are passed over; a v1 line ends the search (a v1 writer
-/// appended after the chain), and so does reading `MAX_SCAN` bytes in all.
-fn find_tail(files: &[PathBuf]) -> io::Result<Option<Tail>> {
+/// The chain's tail among `files`. `prev` hashes the physical last line of
+/// the newest non-empty one of them; a missing final newline there (a crash
+/// mid-write) is added first so the half line stays a line of its own. The
+/// last chained record is the newest line, searching backwards through that
+/// file and then older ones, that is a JSON object with `v >= 2` and a `seq`
+/// (the rules of `verify`; see `TailLine`). Unparseable and unchained lines
+/// are passed over; a v1 line ends the search (a v1 writer appended after
+/// the chain), and so does reading `budget` bytes in all.
+///
+/// With `want_chain`, the search goes on past the last chained line to the
+/// genesis it belongs to, for its `chain` id (a v1 line or the budget stops
+/// that search too, leaving `chain` empty).
+fn find_tail(files: &[PathBuf], mut budget: u64, want_chain: bool) -> io::Result<Option<Tail>> {
     let non_empty: Vec<&PathBuf> = files
         .iter()
         .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.len() > 0))
@@ -315,30 +455,34 @@ fn find_tail(files: &[PathBuf]) -> io::Result<Option<Tail>> {
         return Ok(None);
     };
     terminate(newest)?;
-    let mut budget = MAX_SCAN;
     let mut prev = None;
-    let mut last = None;
+    let mut last: Option<TailLine> = None;
+    let mut chain = None;
     for path in non_empty.iter().rev() {
         let found = scan_back(path, &mut budget, |line| {
             if prev.is_none() {
                 prev = Some(sha256_hex(line));
             }
-            match TailLine::parse(line) {
-                Some(t) if t.v < 2 => Some(Found::Stop),
-                Some(t) if t.seq.is_some() => Some(Found::Chained(t)),
-                _ => None,
+            let t = TailLine::parse(line)?;
+            if t.v < 2 {
+                return Some(Found::Stop);
             }
-        })?;
-        match found {
-            Found::Chained(t) => {
+            t.seq?; // unchained: passed over
+            let genesis = t.kind.as_deref() == Some("genesis");
+            if genesis {
+                chain.clone_from(&t.chain);
+            }
+            if last.is_none() {
                 last = Some(t);
-                break;
+                return (!want_chain || genesis).then_some(Found::Stop);
             }
-            Found::Stop => break,
-            Found::More => {}
+            genesis.then_some(Found::Stop)
+        })?;
+        if let Found::Stop = found {
+            break;
         }
     }
-    Ok(prev.map(|prev| Tail { prev, last }))
+    Ok(prev.map(|prev| Tail { prev, last, chain }))
 }
 
 /// Add a `\n` to `path` unless it already ends with one.
@@ -401,8 +545,18 @@ fn scan_back(
     }
 }
 
+/// What a genesis record says besides its fixed fields.
+struct GenesisSpec<'a> {
+    saiife: &'a str,
+    mode: &'a str,
+    /// `ed25519:<spki b64>` of the signing key, locked mode only.
+    key: Option<&'a str>,
+    uid: Option<u32>,
+    user: Option<String>,
+}
+
 /// Record 0 of a new chain (spec §6.4.1).
-fn genesis(rec: &Record) -> io::Result<Record> {
+fn genesis(spec: &GenesisSpec<'_>) -> io::Result<Record> {
     let mut g = Record::new(
         NewRecord {
             agent: "",
@@ -414,20 +568,258 @@ fn genesis(rec: &Record) -> io::Result<Record> {
             pack: None,
             rule: None,
             reason: None,
-            mode: "developer",
+            mode: spec.mode,
             policy: None,
             permission_mode: None,
         },
-        &rec.saiife,
+        spec.saiife,
     );
     g.kind = Some("genesis".into());
     g.seq = Some(0);
     g.prev = Some(ZERO_PREV.into());
     g.host = host_id();
-    g.uid = rec.uid;
-    g.user = rec.user.clone();
+    g.uid = spec.uid;
+    g.user = spec.user.clone();
     g.extra.insert("chain".into(), uuid_v4()?.into());
+    if let Some(key) = spec.key {
+        g.extra.insert("key".into(), key.into());
+    }
     Ok(g)
+}
+
+/// How a `ChainWriter` starts a new chain.
+#[derive(Debug, Clone)]
+pub struct WriterOptions {
+    /// `mode` of the genesis record (`"locked"` for the daemon).
+    pub mode: String,
+    /// Version of the saiife binary, for the genesis record.
+    pub saiife: String,
+    /// `ed25519:<spki b64>`, written as the genesis `key` when set.
+    pub genesis_key: Option<String>,
+}
+
+/// The single long-lived writer of the hash chain (locked mode): it holds
+/// `.chain.lock` for its whole life, so no other process can append chained
+/// records, and keeps the chain's head in memory instead of reading the
+/// tail on every append.
+#[derive(Debug)]
+pub struct ChainWriter {
+    dir: PathBuf,
+    /// Held (flock) until the writer drops.
+    _lock: File,
+    opts: WriterOptions,
+    /// `(seq, hash of the last line)`; `None` until there is a chain to go on.
+    head: Option<(u64, String)>,
+    chain_id: Option<String>,
+    host: Option<String>,
+    /// The newest month file's name and an append handle on it.
+    current: Option<(String, File)>,
+    /// Records appended since the last checkpoint (Task 5 writes those).
+    since_checkpoint: u64,
+    /// A write failed part-way: re-read the tail before the next append.
+    stale: bool,
+}
+
+impl ChainWriter {
+    /// Take the chain lock of `dir` (created 0750 when missing; an existing
+    /// dir keeps its mode) without waiting, and find the chain's tail with
+    /// no read budget. A held lock is an error.
+    pub fn open(dir: &Path, opts: WriterOptions) -> io::Result<ChainWriter> {
+        create_writer_dir(dir)?;
+        let lock = open_lock(dir)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::other(format!(
+                    "another process holds the audit chain lock ({})",
+                    dir.join(LOCK_FILE).display()
+                )));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let mut w = ChainWriter {
+            dir: dir.to_path_buf(),
+            _lock: lock,
+            opts,
+            head: None,
+            chain_id: None,
+            host: None,
+            current: None,
+            since_checkpoint: 0,
+            stale: true,
+        };
+        w.load()?;
+        Ok(w)
+    }
+
+    /// Read the chain's state from disk (tail, chain id, newest file).
+    fn load(&mut self) -> io::Result<()> {
+        let files = regular_month_files(&self.dir)?;
+        let tail = find_tail(&files, u64::MAX, true)?;
+        self.head = tail.as_ref().and_then(Tail::head);
+        if self.head.is_some() {
+            let tail = tail.expect("head comes from a tail");
+            self.chain_id = tail.chain;
+            self.host = tail.last.and_then(|t| t.host);
+        } else {
+            self.chain_id = None;
+            self.host = None;
+        }
+        self.current = match files.last() {
+            Some(p) => {
+                let name = file_name(p)?;
+                Some((name, store::open_append_mode(p, 0o640)?))
+            }
+            None => None,
+        };
+        self.stale = false;
+        Ok(())
+    }
+
+    /// Append `rec` to the chain and return its `seq`. Sets `seq`, `prev`
+    /// and `host`; writes a genesis first when there is no chain yet. The
+    /// target is the record's month file or the newest file, whichever is
+    /// later: the writer owns the dir, so the newest file is the chain's.
+    pub fn append(&mut self, mut rec: Record) -> io::Result<u64> {
+        if self.stale {
+            self.load()?;
+        }
+        let own = format!("{}.jsonl", rec.month());
+        if !store::is_month_file(&own) {
+            return Err(io::Error::other(format!(
+                "audit record has no usable timestamp: {:?}",
+                rec.ts
+            )));
+        }
+        if self.current.as_ref().is_none_or(|(name, _)| *name < own) {
+            let path = self.dir.join(&own);
+            let new = fs::symlink_metadata(&path).is_err();
+            let file = store::open_append_mode(&path, 0o640)?;
+            if new {
+                set_mode(&file, 0o640)?;
+            }
+            self.current = Some((own, file));
+        }
+
+        let mut out = Vec::new();
+        let mut started = None;
+        let (seq, prev) = match self
+            .head
+            .as_ref()
+            .and_then(|(s, h)| Some((s.checked_add(1)?, h)))
+        {
+            Some((seq, h)) => (seq, h.clone()),
+            None => {
+                let g = genesis(&GenesisSpec {
+                    saiife: &self.opts.saiife,
+                    mode: &self.opts.mode,
+                    key: self.opts.genesis_key.as_deref(),
+                    uid: own_uid(),
+                    user: own_user(),
+                })?;
+                let prev = push_line(&mut out, &g)?;
+                let chain = g
+                    .extra
+                    .get("chain")
+                    .and_then(|c| c.as_str())
+                    .map(String::from);
+                started = Some((chain, g.host));
+                (1, prev)
+            }
+        };
+        rec.seq = Some(seq);
+        rec.prev = Some(prev);
+        rec.host = match &started {
+            Some((_, host)) => host.clone(),
+            None => self.host.clone(),
+        };
+        let hash = push_line(&mut out, &rec)?;
+        let (_, file) = self.current.as_mut().expect("current file set above");
+        if let Err(e) = file.write_all(&out) {
+            // Part of the line may be on disk: find the tail again.
+            self.stale = true;
+            return Err(e);
+        }
+        if let Some((chain, host)) = started {
+            self.chain_id = chain;
+            self.host = host;
+        }
+        self.head = Some((seq, hash));
+        self.since_checkpoint += 1;
+        Ok(seq)
+    }
+
+    /// `(seq, hash of the last line)` of the chain, if there is one.
+    pub fn head(&self) -> Option<(u64, &str)> {
+        self.head.as_ref().map(|(s, h)| (*s, h.as_str()))
+    }
+
+    /// The `chain` id of the current chain's genesis.
+    pub fn chain_id(&self) -> Option<&str> {
+        self.chain_id.as_deref()
+    }
+
+    /// The hashed host id the chain carries.
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    /// Records appended since the last checkpoint.
+    pub fn since_checkpoint(&self) -> u64 {
+        self.since_checkpoint
+    }
+
+    /// `fdatasync` the current month file.
+    pub fn sync(&self) -> io::Result<()> {
+        match &self.current {
+            Some((_, f)) => f.sync_data(),
+            None => Ok(()),
+        }
+    }
+}
+
+fn file_name(p: &Path) -> io::Result<String> {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::other(format!("bad audit file name {}", p.display())))
+}
+
+/// Create the writer's audit dir 0750 when missing; an existing one keeps
+/// its mode (2750 under systemd).
+fn create_writer_dir(dir: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(dir).is_ok() {
+        return Ok(());
+    }
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o750);
+    }
+    b.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o750))?;
+    }
+    Ok(())
+}
+
+/// Set `mode` on a file this process just created (the umask may have
+/// taken bits off it).
+fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+        Ok(())
+    }
 }
 
 /// A random UUID v4, lowercase `8-4-4-4-12`.
@@ -960,5 +1352,261 @@ mod tests {
         assert_eq!(seq, 1);
         let ls = lines(&dir.path().join("2026-10.jsonl"));
         assert_eq!(parse(&ls[1]).kind.as_deref(), Some("genesis"));
+    }
+
+    fn opts(mode: &str, key: Option<&str>) -> WriterOptions {
+        WriterOptions {
+            mode: mode.into(),
+            saiife: "0.2.0".into(),
+            genesis_key: key.map(str::to_string),
+        }
+    }
+
+    fn locked_rec(at: OffsetDateTime) -> Record {
+        let mut r = rec(at);
+        r.mode = Some("locked".into());
+        r.uid = Some(1000);
+        r.user = Some("bob".into());
+        r
+    }
+
+    fn verify_ok(dir: &Path) {
+        let report = crate::verify::verify(dir);
+        assert_eq!(report.exit_code(), 0, "{:?}", report.breaks);
+    }
+
+    #[test]
+    fn writer_genesis_carries_key_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", Some("ed25519:abc"))).unwrap();
+        assert_eq!(w.head(), None);
+        assert_eq!(w.chain_id(), None);
+        let seq = w
+            .append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        assert_eq!(seq, 1);
+        let ls = lines(&dir.path().join("2026-10.jsonl"));
+        assert_eq!(ls.len(), 2);
+        let text = String::from_utf8(ls[0].clone()).unwrap();
+        assert!(text.contains("\"mode\":\"locked\""), "{text}");
+        assert!(text.contains("\"key\":\"ed25519:abc\""), "{text}");
+        let g = parse(&ls[0]);
+        assert_eq!(g.kind(), "genesis");
+        assert_eq!(g.seq, Some(0));
+        assert_eq!(g.prev.as_deref(), Some(ZERO_PREV));
+        assert_eq!(g.saiife, "0.2.0");
+        assert_eq!(w.chain_id(), g.extra["chain"].as_str());
+        assert_eq!(w.host(), g.host.as_deref());
+        let r = parse(&ls[1]);
+        assert_eq!((r.seq, r.prev), (Some(1), Some(sha256_hex(&ls[0]))));
+        assert_eq!(r.host, g.host);
+        assert_eq!((r.uid, r.user.as_deref()), (Some(1000), Some("bob")));
+        verify_ok(dir.path());
+    }
+
+    #[test]
+    fn writer_genesis_without_key_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        w.append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        let g = parse(&lines(&dir.path().join("2026-10.jsonl"))[0]);
+        assert!(!g.extra.contains_key("key"));
+        assert_eq!(g.mode.as_deref(), Some("locked"));
+    }
+
+    #[test]
+    fn writer_continues_existing_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        for h in 0..3 {
+            append_chained(
+                dir.path(),
+                rec(datetime!(2026-10-13 08:00:00 UTC) + time::Duration::hours(h)),
+            )
+            .unwrap();
+        }
+        let genesis = parse(&lines(&dir.path().join("2026-10.jsonl"))[0]);
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        assert_eq!(w.head().map(|h| h.0), Some(3));
+        assert_eq!(w.chain_id(), genesis.extra["chain"].as_str());
+        assert_eq!(w.host(), genesis.host.as_deref());
+        let seqs: Vec<u64> = (0..2)
+            .map(|i| {
+                w.append(locked_rec(
+                    datetime!(2026-10-14 08:00:00 UTC) + time::Duration::minutes(i),
+                ))
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, [4, 5]);
+        drop(w);
+        verify_ok(dir.path());
+    }
+
+    #[test]
+    fn writer_finds_chain_past_the_scan_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+        let oct = dir.path().join("2026-10.jsonl");
+        let raw = unchained_line("2026-10-13T08:00:01.000Z");
+        append_raw(&oct, &raw.repeat(MAX_SCAN as usize / raw.len() + 1));
+        let w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        let ls = lines(&oct);
+        let want = sha256_hex(ls.last().unwrap());
+        assert_eq!(w.head(), Some((1, want.as_str())));
+        assert!(w.chain_id().is_some(), "genesis found past 4 MiB");
+    }
+
+    #[test]
+    fn writer_follows_newest_file_after_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        let put = |w: &mut ChainWriter, at| w.append(locked_rec(at)).unwrap();
+        assert_eq!(put(&mut w, datetime!(2026-12-02 08:00:00 UTC)), 1);
+        assert_eq!(put(&mut w, datetime!(2025-01-02 08:00:00 UTC)), 2);
+        drop(w);
+        assert!(!dir.path().join("2025-01.jsonl").exists());
+        assert_eq!(lines(&dir.path().join("2026-12.jsonl")).len(), 3);
+        verify_ok(dir.path());
+        // A new writer finds the same newest file.
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        assert_eq!(put(&mut w, datetime!(2025-01-02 09:00:00 UTC)), 3);
+        assert_eq!(lines(&dir.path().join("2026-12.jsonl")).len(), 4);
+        // Moving forward starts the next month file.
+        assert_eq!(put(&mut w, datetime!(2027-01-01 00:00:00 UTC)), 4);
+        assert_eq!(lines(&dir.path().join("2027-01.jsonl")).len(), 1);
+        drop(w);
+        verify_ok(dir.path());
+    }
+
+    #[test]
+    fn second_writer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        let Err(err) = ChainWriter::open(dir.path(), opts("locked", None)) else {
+            panic!("second writer must be refused");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("holds the audit chain lock"), "{msg}");
+        assert!(msg.contains(LOCK_FILE), "{msg}");
+    }
+
+    #[test]
+    fn writer_lock_is_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(ChainWriter::open(dir.path(), opts("locked", None)).unwrap());
+        ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+    }
+
+    #[test]
+    fn writer_holds_lock_so_dev_append_goes_unchained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        w.append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        let e = append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap_err();
+        assert!(written_unchained(&e).is_some(), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_files_are_0640() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        w.append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        w.append(locked_rec(datetime!(2026-11-01 08:00:00 UTC)))
+            .unwrap();
+        for m in ["2026-10", "2026-11"] {
+            let mode = fs::metadata(dir.path().join(format!("{m}.jsonl")))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o640, "{m}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_creates_dir_0750_and_leaves_existing_dir_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("audit");
+        drop(ChainWriter::open(&dir, opts("locked", None)).unwrap());
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o750);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        drop(ChainWriter::open(&dir, opts("locked", None)).unwrap());
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn writer_head_is_hash_of_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(dir.path(), opts("locked", None)).unwrap();
+        for i in 0..3 {
+            let seq = w
+                .append(locked_rec(
+                    datetime!(2026-10-13 08:00:00 UTC) + time::Duration::minutes(i),
+                ))
+                .unwrap();
+            let ls = lines(&dir.path().join("2026-10.jsonl"));
+            let want = sha256_hex(ls.last().unwrap());
+            assert_eq!(w.head(), Some((seq, want.as_str())));
+        }
+        w.sync().unwrap();
+        let report = crate::verify::verify(dir.path());
+        let (seq, hash) = w.head().unwrap();
+        assert_eq!(report.head, Some((seq, hash.to_string())));
+    }
+
+    #[test]
+    fn clock_rollback_over_a_month_stays_on_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-12-02 08:00:00 UTC))).unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-12-02 09:00:00 UTC))).unwrap();
+        let seq = append_chained(dir.path(), rec(datetime!(2026-09-13 08:00:00 UTC))).unwrap();
+        assert_eq!(seq, 3);
+        assert!(!dir.path().join("2026-09.jsonl").exists());
+        let ls = lines(&dir.path().join("2026-12.jsonl"));
+        assert_eq!(ls.len(), 4);
+        assert_eq!(parse(&ls[3]).seq, Some(3));
+        verify_ok(dir.path());
+    }
+
+    /// The far-ahead file need not hold the genesis: its first line chains
+    /// on from the file before it.
+    #[test]
+    fn clock_rollback_follows_a_file_that_continues_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-08-02 08:00:00 UTC))).unwrap();
+        append_chained(dir.path(), rec(datetime!(2026-12-02 08:00:00 UTC))).unwrap();
+        let seq = append_chained(dir.path(), rec(datetime!(2026-09-13 08:00:00 UTC))).unwrap();
+        assert_eq!(seq, 3);
+        assert!(!dir.path().join("2026-09.jsonl").exists());
+        assert_eq!(lines(&dir.path().join("2026-12.jsonl")).len(), 2);
+        verify_ok(dir.path());
+    }
+
+    #[test]
+    fn planted_far_future_file_is_not_followed() {
+        let v1 = b"{\"v\":1,\"ts\":\"9999-12-01T00:00:00.000Z\",\"agent\":\"codex\",\"project\":\"/p\",\"tool\":\"shell\",\"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}\n".to_vec();
+        let mut other = rec(datetime!(2026-10-13 08:00:00 UTC));
+        other.seq = Some(0);
+        other.prev = Some(ZERO_PREV.into());
+        other.kind = Some("genesis".into());
+        let mut other = serde_json::to_vec(&other).unwrap();
+        other.push(b'\n');
+        for planted in [Vec::new(), v1, other] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("9999-12.jsonl"), &planted).unwrap();
+            append_chained(dir.path(), rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+            let seq = append_chained(dir.path(), rec(datetime!(2026-10-13 09:00:00 UTC))).unwrap();
+            assert_eq!(seq, 2);
+            assert_eq!(lines(&dir.path().join("2026-10.jsonl")).len(), 3);
+            assert_eq!(fs::read(dir.path().join("9999-12.jsonl")).unwrap(), planted);
+        }
     }
 }
