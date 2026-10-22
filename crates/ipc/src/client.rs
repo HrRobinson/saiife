@@ -370,6 +370,13 @@ mod tests {
     /// the check gets past `/` to the (missing) socket.
     #[test]
     fn accepts_root_owned_dir() {
+        // In a user namespace that maps only the current user
+        // (scripts/test-offline.sh), root's files show the overflow uid:
+        // there is no root-owned dir to test with.
+        if std::fs::metadata("/").unwrap().uid() != 0 {
+            eprintln!("skipped: / is not owned by uid 0 here (user namespace)");
+            return;
+        }
         let r = check_owner(Path::new("/"), &Path::new("/").join(SOCKET_NAME), me());
         match r {
             Err(ClientError::Owner { path, .. }) => assert_eq!(path, Path::new("/saiife.sock")),
