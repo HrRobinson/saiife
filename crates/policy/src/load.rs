@@ -221,12 +221,23 @@ fn check_dropin_keys(path: &Path, table: &toml::Table) -> Result<(), PolicyError
 }
 
 /// `<dir of config_file>/policy.d/*.toml`, sorted by file name (bytes). A
-/// missing `policy.d` means no drop-ins.
+/// missing `policy.d` means no drop-ins; a symlinked one is refused, as a
+/// symlinked drop-in is. Dot-files (editor lock links such as emacs
+/// `.#a.toml`, hidden backups) are skipped.
 fn dropin_paths(config_file: &Path) -> Result<Vec<PathBuf>, PolicyError> {
     let dir = config_file
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .join("policy.d");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(invalid(&dir, "is a symlink (symlinks are not followed)"))
+        }
+        Ok(m) if !m.is_dir() => return Err(invalid(&dir, "not a directory")),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(PolicyError::Io { path: dir, source }),
+    }
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -239,7 +250,8 @@ fn dropin_paths(config_file: &Path) -> Result<Vec<PathBuf>, PolicyError> {
             source,
         })?;
         let name = entry.file_name();
-        if name.as_encoded_bytes().ends_with(b".toml") {
+        let bytes = name.as_encoded_bytes();
+        if bytes.ends_with(b".toml") && !bytes.starts_with(b".") {
             names.push(name);
         }
     }

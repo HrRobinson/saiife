@@ -323,3 +323,44 @@ fn missing_config_is_io_error() {
         Err(PolicyError::Io { .. })
     ));
 }
+
+/// Editor droppings (`.#a.toml` emacs lock links, `.a.toml.swp`-style
+/// hidden files) are skipped, not loaded and not refused (M3).
+#[cfg(unix)]
+#[test]
+fn dotfiles_in_policy_d_are_skipped() {
+    let (d, cfg) = etc(
+        "version = 2\n",
+        &[
+            ("a.toml", "[guard]\npacks = [\"x\"]\n"),
+            (".hidden.toml", "not toml at all ["),
+        ],
+    );
+    std::os::unix::fs::symlink(
+        "jonas@host.1234:1700000000",
+        d.path().join("policy.d/.#a.toml"),
+    )
+    .unwrap();
+    let l = load_system(&cfg).unwrap();
+    assert_eq!(l.files.len(), 2, "{:?}", l.files);
+    assert!(
+        l.files.iter().all(|(n, _)| !n.contains("policy.d/.")),
+        "{:?}",
+        l.files
+    );
+}
+
+/// A symlinked `policy.d` is refused like a symlinked drop-in (M3).
+#[cfg(unix)]
+#[test]
+fn symlinked_policy_d_is_refused() {
+    let (d, cfg) = etc("version = 2\n", &[]);
+    let real = d.path().join("elsewhere");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.toml"), "[guard]\npacks = [\"evil\"]\n").unwrap();
+    std::os::unix::fs::symlink(&real, d.path().join("policy.d")).unwrap();
+    match load_system(&cfg) {
+        Err(PolicyError::Invalid { path, .. }) => assert!(path.ends_with("policy.d"), "{path:?}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}

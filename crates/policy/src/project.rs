@@ -17,6 +17,8 @@ pub struct ServiceOverlay {
 /// config holds no authority in locked mode.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ProjectOverlay {
+    /// 1 when absent, as in developer mode.
+    #[serde(default = "version_1")]
     pub version: i64,
     #[serde(default)]
     pub packs: Vec<String>,
@@ -27,6 +29,10 @@ pub struct ProjectOverlay {
     pub locked: Option<bool>,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceOverlay>,
+}
+
+fn version_1() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +197,16 @@ mod tests {
         assert_eq!(p.locked, Some(false));
     }
 
+    /// No `version` means 1, as in developer mode (I3): the packs count in
+    /// the locked merge.
+    #[test]
+    fn missing_version_defaults_to_1() {
+        let p = parse_project(b"packs = [\"db.postgres\"]\n").unwrap();
+        assert_eq!(p.version, 1);
+        let m = merge_project(&s(&["core.git"]), &p, Mode::Locked);
+        assert_eq!(m.packs, s(&["core.git", "db.postgres"]));
+    }
+
     #[test]
     fn unknown_keys_ignored_bad_version_rejected() {
         let p = parse_project(
@@ -201,10 +217,6 @@ mod tests {
         assert!(matches!(
             parse_project(b"version = 3\n"),
             Err(PolicyError::Invalid { .. })
-        ));
-        assert!(matches!(
-            parse_project(b"packs = []\n"),
-            Err(PolicyError::Parse { .. })
         ));
         assert!(matches!(
             parse_project(b"version = [\n"),
