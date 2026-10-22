@@ -87,6 +87,11 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
     rest
 }
 
+/// env short options that take a value (GNU `-u`/`-C`/`-a`, BSD `-P`).
+const ENV_VALUE_SHORT: &[char] = &['u', 'C', 'a', 'P'];
+/// env long options that take a value when not given as `--opt=value`.
+const ENV_VALUE_LONG: &[&str] = &["unset", "chdir", "argv0"];
+
 /// xargs short options that take a value.
 const XARGS_VALUE_SHORT: &[char] = &['I', 'n', 'P', 'L', 's', 'd', 'E', 'a', 'R', 'S'];
 /// xargs long options that take a value.
@@ -119,13 +124,21 @@ fn unwrap_one(rest: &[Word]) -> Option<(String, &[Word])> {
     match name {
         "env" => {
             // `env FOO=bar -i rm -rf /` — skip leading assignments and
-            // env's own flags to reach the real command.
-            while rest
-                .first()
-                .map(|w| is_env_assignment(&w.text) || w.text.starts_with('-'))
-                .unwrap_or(false)
-            {
-                rest = &rest[1..];
+            // env's own flags to reach the real command, with the value of
+            // `-u NAME`, `-C DIR`, `-P PATH`, `-a ARG0` (and long forms).
+            while let Some(w) = rest.first() {
+                let t = w.text.as_str();
+                if is_env_assignment(t) {
+                    rest = &rest[1..];
+                } else if let Some(long) = t.strip_prefix("--") {
+                    let takes = ENV_VALUE_LONG.contains(&long);
+                    rest = &rest[if takes { 2 } else { 1 }.min(rest.len())..];
+                } else if let Some(bundle) = t.strip_prefix('-') {
+                    let takes = takes_separate_value(bundle, ENV_VALUE_SHORT);
+                    rest = &rest[if takes { 2 } else { 1 }.min(rest.len())..];
+                } else {
+                    break;
+                }
             }
         }
         "nice" => {
@@ -283,7 +296,29 @@ pub fn wrapper_reads(seg: &[Word]) -> Vec<(String, bool)> {
 /// any order and any number. The redirections stay in the segment, where
 /// `operands` judges them; whole-segment rules still see the assignments.
 pub fn effective_command(seg: &[Word]) -> &[Word] {
-    let mut rest = unwrap_transparent_prefix(seg);
+    peel(seg, &mut Vec::new())
+}
+
+/// The names of the wrappers `effective_command` peels off, in order
+/// (lowered, directory stripped): `timeout 5 xargs sudo ls` gives
+/// `["timeout", "xargs", "sudo"]`.
+pub fn peeled_wrappers(seg: &[Word]) -> Vec<String> {
+    let mut names = Vec::new();
+    peel(seg, &mut names);
+    names
+}
+
+/// Peel wrappers off the front of `rest`, pushing their names.
+fn unwrap_named<'a>(mut rest: &'a [Word], names: &mut Vec<String>) -> &'a [Word] {
+    while let Some((name, after)) = unwrap_one(rest) {
+        names.push(name);
+        rest = after;
+    }
+    rest
+}
+
+fn peel<'a>(seg: &'a [Word], names: &mut Vec<String>) -> &'a [Word] {
+    let mut rest = unwrap_named(seg, names);
     loop {
         let before = rest.len();
         while let Some(w) = rest.first() {
@@ -295,7 +330,7 @@ pub fn effective_command(seg: &[Word]) -> &[Word] {
                 break;
             }
         }
-        rest = unwrap_transparent_prefix(rest);
+        rest = unwrap_named(rest, names);
         if rest.len() == before {
             return rest;
         }
@@ -1011,6 +1046,46 @@ mod tests {
             texts(unwrap_transparent_prefix(&seg)),
             vec!["rm", "-rf", "/"]
         );
+    }
+
+    /// `-u NAME`, `-C DIR`, `-a ARG0`, `-P PATH` and their long forms take
+    /// the next word; attached and `=` forms are one word.
+    #[test]
+    fn unwraps_env_value_options() {
+        let line = |s: &str| {
+            let seg: Vec<Word> = s.split(' ').map(w).collect();
+            texts(unwrap_transparent_prefix(&seg)).join(" ")
+        };
+        for s in [
+            "env -u FOO rm -rf /",
+            "env -iu FOO rm -rf /",
+            "env --unset FOO rm -rf /",
+            "env --unset=FOO rm -rf /",
+            "env -uFOO rm -rf /",
+            "env -C /tmp rm -rf /",
+            "env --chdir /tmp X=1 rm -rf /",
+            "env -P /bin rm -rf /",
+            "env -a x rm -rf /",
+            "env -i rm -rf /",
+        ] {
+            assert_eq!(line(s), "rm -rf /", "{s}");
+        }
+        assert_eq!(line("env -u FOO"), "");
+    }
+
+    #[test]
+    fn peeled_wrappers_names_every_wrapper_in_order() {
+        let names = |s: &str| {
+            let seg: Vec<Word> = s.split(' ').map(w).collect();
+            peeled_wrappers(&seg)
+        };
+        assert_eq!(
+            names("timeout 5 /usr/bin/xargs SUDO -u root ls"),
+            ["timeout", "xargs", "sudo"]
+        );
+        assert_eq!(names("sudo -l"), ["sudo"]);
+        assert!(names("ls -la").is_empty());
+        assert!(names("echo sudo").is_empty());
     }
 
     #[test]

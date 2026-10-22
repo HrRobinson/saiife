@@ -21,6 +21,10 @@
 //!                             # assignments included
 //! after_env_change = true     # only after an earlier segment of the same
 //!                             # command line changed PATH/HOME/XDG_DATA_HOME
+//! peeled_wrappers = true      # match the names of the wrappers peeled off
+//!                             # in front of the command instead, joined
+//!                             # with spaces (`timeout 5 sudo ls`:
+//!                             # `timeout sudo`); never matches without one
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
 //! access = "read|write|any"
@@ -56,6 +60,10 @@ pub struct Rule {
     /// same command line exported or assigned `PATH` (other than appending
     /// to it), `HOME` or `XDG_DATA_HOME`; matches the effective command.
     pub after_env_change: bool,
+    /// Match the names of the transparent wrappers peeled off in front of
+    /// the effective command (`timeout 5 xargs sudo ls`: `timeout xargs
+    /// sudo`) instead. Never matches a segment without wrappers.
+    pub peeled_wrappers: bool,
 }
 
 /// A loaded, compiled pack.
@@ -162,6 +170,8 @@ struct RawRule {
     whole_segment: bool,
     #[serde(default)]
     after_env_change: bool,
+    #[serde(default)]
+    peeled_wrappers: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +221,7 @@ fn compile_rules(
                 reason: r.reason.unwrap_or_default(),
                 whole_segment: r.whole_segment,
                 after_env_change: r.after_env_change,
+                peeled_wrappers: r.peeled_wrappers,
             }),
             Err(e) => warnings.push(PackWarning {
                 source: source.to_string(),
@@ -506,10 +517,11 @@ reason = "bad glob: dropped with a warning"
                 "{table}"
             );
         }
-        let ok = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nwhole_segment = true\nafter_env_change = true\n";
+        let ok = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nwhole_segment = true\nafter_env_change = true\npeeled_wrappers = true\n";
         let mut w = Vec::new();
         let p = load_pack_str("<t>", ok, &mut w).expect("known keys load");
         assert!(p.deny[0].whole_segment && p.deny[0].after_env_change);
+        assert!(p.deny[0].peeled_wrappers);
     }
 
     #[test]

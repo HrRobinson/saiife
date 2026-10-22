@@ -36,7 +36,7 @@ use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::wrappers::{
-    effective_command, is_env_assignment, unwrap_transparent_prefix, wrapper_reads,
+    effective_command, is_env_assignment, peeled_wrappers, unwrap_transparent_prefix, wrapper_reads,
 };
 
 /// Default latency budget for a single evaluation. Exceeding it yields
@@ -586,7 +586,12 @@ impl Engine {
     ) -> Option<Decision> {
         let segment_line = segment_line(view.seg);
         if self.combined.might_match(&segment_line) {
-            match self.judge(&view.peeled, &segment_line, view.env_changed, cx.start) {
+            let lines = Lines {
+                matching: &view.peeled,
+                segment: &segment_line,
+                wrappers: &view.wrappers,
+            };
+            match self.judge(lines, view.env_changed, cx.start) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
                 _ => {}
@@ -654,7 +659,12 @@ impl Engine {
         {
             return None;
         }
-        match self.judge(matching_line, segment_line, view.env_changed, cx.start) {
+        let lines = Lines {
+            matching: matching_line,
+            segment: segment_line,
+            wrappers: &view.wrappers,
+        };
+        match self.judge(lines, view.env_changed, cx.start) {
             JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
             JudgeOutcome::Decided(Decision::Allow { trace }) => {
                 found.allow_trace = Some(trace);
@@ -689,13 +699,12 @@ impl Engine {
                 line.push(' ');
                 line.push_str(&view.peeled);
             }
-            match self.judge_in(
-                Some(CD_RESOLVED_PACK),
-                &line,
-                &line,
-                view.env_changed,
-                cx.start,
-            ) {
+            let lines = Lines {
+                matching: &line,
+                segment: &line,
+                wrappers: &view.wrappers,
+            };
+            match self.judge_in(Some(CD_RESOLVED_PACK), lines, view.env_changed, cx.start) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
                 _ => {}
@@ -736,7 +745,12 @@ impl Engine {
                 line.push_str(&view.peeled);
             }
             if self.combined.might_match(&line) {
-                match self.judge(&line, view.segment_line(), view.env_changed, cx.start) {
+                let lines = Lines {
+                    matching: &line,
+                    segment: view.segment_line(),
+                    wrappers: &view.wrappers,
+                };
+                match self.judge(lines, view.env_changed, cx.start) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                     JudgeOutcome::TimedOut => return Some(timed_out()),
                     _ => {}
@@ -1093,27 +1107,27 @@ impl Engine {
     /// single spaces); `whole_segment` rules match the line of the whole
     /// segment, wrappers and leading assignments included. An empty
     /// `matching_line` (a bare wrapper) leaves only `whole_segment` rules.
-    fn judge(
-        &self,
-        matching_line: &str,
-        segment_line: &str,
-        env_changed: bool,
-        start: Instant,
-    ) -> JudgeOutcome {
-        self.judge_in(None, matching_line, segment_line, env_changed, start)
+    fn judge(&self, lines: Lines, env_changed: bool, start: Instant) -> JudgeOutcome {
+        self.judge_in(None, lines, env_changed, start)
     }
 
     /// `judge`, over the pack `only` names when it is set.
     fn judge_in(
         &self,
         only: Option<&str>,
-        matching_line: &str,
-        segment_line: &str,
+        lines: Lines,
         env_changed: bool,
         start: Instant,
     ) -> JudgeOutcome {
+        let Lines {
+            matching: matching_line,
+            segment: segment_line,
+            wrappers,
+        } = lines;
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
-            if rule.after_env_change {
+            if rule.peeled_wrappers {
+                (!wrappers.is_empty()).then_some(wrappers)
+            } else if rule.after_env_change {
                 (env_changed && !matching_line.is_empty()).then_some(matching_line)
             } else if rule.whole_segment {
                 Some(segment_line)
@@ -1634,6 +1648,8 @@ struct SegmentView<'a> {
     matching_line: String,
     /// The whole segment's line, when it differs.
     whole: Option<String>,
+    /// The names of the peeled-off wrappers, joined with spaces.
+    wrappers: String,
 }
 
 impl<'a> SegmentView<'a> {
@@ -1720,6 +1736,11 @@ impl<'a> SegmentView<'a> {
             peeled,
             matching_line,
             whole,
+            wrappers: if prefix_len > 0 {
+                peeled_wrappers(seg).join(" ")
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -1727,6 +1748,16 @@ impl<'a> SegmentView<'a> {
     fn segment_line(&self) -> &str {
         self.whole.as_deref().unwrap_or(&self.matching_line)
     }
+}
+
+/// The lines a segment's rules match: the effective command's
+/// (`matching`), the whole segment's (`whole_segment` rules) and the peeled
+/// wrappers' names (`peeled_wrappers` rules).
+#[derive(Clone, Copy)]
+struct Lines<'a> {
+    matching: &'a str,
+    segment: &'a str,
+    wrappers: &'a str,
 }
 
 enum JudgeOutcome {

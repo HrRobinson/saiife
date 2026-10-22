@@ -75,7 +75,13 @@ pub fn path_vars_locked(
     }
     // The agents' config dirs: the variable when set (and absolute), else
     // the default under HOME, so the rules naming them are always active.
-    for (name, default) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+    // `XDG_CONFIG_HOME` the same way (`~/.config`); in locked mode the
+    // worker's environment is cleared, so it is always the default there.
+    for (name, default) in [
+        ("CLAUDE_CONFIG_DIR", ".claude"),
+        ("CODEX_HOME", ".codex"),
+        ("XDG_CONFIG_HOME", ".config"),
+    ] {
         if let Some(d) = config_dir(std::env::var_os(name), dirs::home_dir(), default) {
             v = v.with_var(name, d);
         }
@@ -184,5 +190,14 @@ mod tests {
             );
         }
         assert!(v.values("SAIIFE_ETC").len() <= 2);
+        // `XDG_CONFIG_HOME`: the variable when set and absolute, else
+        // `~/.config` (the same rule as the agent config dirs).
+        assert_eq!(
+            config_dir(None, Some(PathBuf::from("/home/u")), ".config"),
+            Some(PathBuf::from("/home/u/.config"))
+        );
+        if dirs::home_dir().is_some() {
+            assert!(!v.values("XDG_CONFIG_HOME").is_empty());
+        }
     }
 }

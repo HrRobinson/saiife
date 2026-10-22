@@ -10,8 +10,13 @@
 # stops a helpful agent from looping on them, and the persistence rules
 # close the cheapest way to run code later with no hook around it.
 #
-# Command rules match the whole segment (`whole_segment = true`), so a
-# wrapper such as `sudo`, `env` or a leading `NAME=value` stays visible.
+# Command rules match the effective command, after the engine peeled off
+# transparent wrappers (`timeout 5`, `xargs`, `env -u X`, `nice -n 5`, …),
+# so no rule lists wrappers itself. `sudo` is such a wrapper: the
+# `peeled_wrappers` rule sees it wherever it was peeled. The read-only
+# allow rules match the whole segment, so a wrapper in front of them
+# (`sudo crontab -l`) gets no carve-out.
+#
 # READING saiife's config and the managed settings stays allowed; only its
 # state dir (the audit signing key) is closed to reads as well.
 
@@ -24,52 +29,74 @@ version = 1
 # `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
 # substitution argument must not block every `kill` or `systemctl`.
 substitution_failsafe = false
-triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "systemctl", "launchctl", "kill", "pkill", "killall", "crontab", "at", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+
+# --- read-only carve-outs (whole segment: no wrapper in front) ----------------
+[[allow]]
+# `systemctl status saiifed`: only option flags that take no value may come
+# before the verb, so the verb is really the first operand.
+pattern = '^systemctl\s+(?:(?:--no-pager|--user|--system|--full|--no-legend|--quiet|-l|-q)\s+)*(?:status|show|is-active|is-enabled|is-failed|cat)(?:\s|$)'
+reason = "reading the service state changes nothing"
+whole_segment = true
+
+[[allow]]
+pattern = '^(?:crontab|at)\s+-l$'
+reason = "listing scheduled jobs changes nothing"
+whole_segment = true
 
 # --- privilege changes --------------------------------------------------------
 [[deny]]
-# The segment's first word, after `env`/`nohup`/`exec`-style wrappers and
-# leading assignments.
-pattern = '^(?:(?:env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:sudo|su|doas|pkexec|run0)(?:\s|$)'
+# `sudo` wherever the engine peeled it (`timeout 5 sudo ls`, `xargs sudo`,
+# `sudo -l`, a bare `sudo`).
+pattern = '(?:^|\s)sudo(?:\s|$)'
 reason = "an agent may not change privileges in locked mode; root could switch saiife off"
-whole_segment = true
+peeled_wrappers = true
 
 [[deny]]
-pattern = '(?i)^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*osascript\s.*with\s+administrator\s+privileges'
+pattern = '^(?:sudo|su|doas|pkexec|run0)(?:\s|$)'
+reason = "an agent may not change privileges in locked mode; root could switch saiife off"
+
+[[deny]]
+pattern = '(?i)^osascript\s.*with\s+administrator\s+privileges'
 reason = "an agent may not ask for administrator privileges in locked mode; root could switch saiife off"
-whole_segment = true
 
 # --- saiife's service ---------------------------------------------------------
+# An operand naming saiife: containing `saiif` (`saiifed`, `saiife*`,
+# `-u saiife`), or a shorter prefix with or without a glob (`sai`, `saii*`).
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*systemctl\s+(?:\S+\s+)*\S*saiifed'
+pattern = '(?i)^systemctl\s(?:.*\s)?(?:\S*saiif\S*|saii?(?:[*?\[]\S*)?)(?:\s|$)'
 reason = "saiifed records every agent call; an agent may not control the service"
-whole_segment = true
 
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*launchctl\s+(?:\S+\s+)*(?:\S*/)?com\.saiife\.'
+pattern = '(?i)^launchctl\s(?:.*\s)?(?:\S*/)?com\.saiife\.'
 reason = "saiifed records every agent call; an agent may not control the service"
-whole_segment = true
 
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:kill|pkill|killall)\s+(?:\S+\s+)*\S*saiifed'
+pattern = '(?i)^(?:kill|pkill|killall)\s(?:.*\s)?(?:\S*saiif\S*|saii?(?:[*?\[]\S*)?)(?:\s|$)'
 reason = "saiifed records every agent call; stopping it would leave agents unrecorded"
-whole_segment = true
 
 # --- persistence --------------------------------------------------------------
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*(?:crontab|at)(?:\s|$)'
+pattern = '^(?:crontab|at|batch)(?:\s|$)'
 reason = "a scheduled job runs later outside any agent session, with no hook around it"
-whole_segment = true
 
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*systemd-run\s+(?:\S+\s+)*--user(?:\s|=|$)'
+pattern = '^systemd-run\s+(?:\S+\s+)*--user(?:\s|=|$)'
 reason = "a user service runs later outside any agent session, with no hook around it"
-whole_segment = true
 
 [[deny]]
-pattern = '^(?:(?:sudo|doas|env|command|nohup|exec|nice|setsid)\s+|-\S*\s+|\S+=\S*\s+)*launchctl\s+(?:-\S+\s+)*(?:load|bootstrap)(?:\s|$)'
+# `systemctl --user enable x` (either order): systemctl writes the unit
+# dirs itself.
+pattern = '^systemctl\s+(?:\S+\s+)*?(?:--user\s+(?:\S+\s+)*(?:link|enable|reenable|edit|daemon-reload|preset|preset-all|revert|add-wants|add-requires|set-property|set-environment|import-environment)|(?:link|enable|reenable|edit|daemon-reload|preset|preset-all|revert|add-wants|add-requires|set-property|set-environment|import-environment)\s+(?:\S+\s+)*--user)(?:\s|$)'
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny]]
+pattern = '^loginctl\s+(?:\S+\s+)*enable-linger(?:\s|$)'
+reason = "lingering keeps user services running after every session ends, with no hook around them"
+
+[[deny]]
+pattern = '^launchctl\s+(?:-\S+\s+)*(?:load|bootstrap)(?:\s|$)'
 reason = "a launch agent runs later outside any agent session, with no hook around it"
-whole_segment = true
 
 # --- agent safety switches ----------------------------------------------------
 [[deny]]
@@ -85,8 +112,82 @@ reason = "Gemini CLI's system settings hold the managed saiife hook; moving them
 whole_segment = true
 
 # --- persistence through files ------------------------------------------------
+# Each unit or autostart dir, plus its parents (`mv /tmp/s ~/.config/systemd`,
+# `ln -s /tmp/u ~/.config/systemd`, `mv ~/.config ~/.config.bak`).
 [[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the user service dir can install a user service"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user.control/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user.control"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the user service dir can install a user service"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/autostart/**"
+access = "write"
+reason = "an autostart entry runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/autostart"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the autostart dir can install an autostart entry"
+
+[[deny_path]]
+# `~/.config` as well, for a host where `XDG_CONFIG_HOME` points elsewhere.
 glob = "~/.config/systemd/user/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/.config/systemd/user"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the user service dir can install a user service"
+
+[[deny_path]]
+glob = "~/.config/systemd/user.control/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/.config/autostart/**"
+access = "write"
+reason = "an autostart entry runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/.config/autostart"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the autostart dir can install an autostart entry"
+
+[[deny_path]]
+glob = "~/.local/share/systemd/user/**"
+access = "write"
+reason = "a user service runs later outside any agent session, with no hook around it"
+
+[[deny_path]]
+glob = "~/.local/share/systemd/user"
+access = "write"
+ancestors = true
+reason = "replacing a parent of the user service dir can install a user service"
+
+[[deny_path]]
+glob = "/run/user/*/systemd/**"
 access = "write"
 reason = "a user service runs later outside any agent session, with no hook around it"
 
@@ -96,9 +197,10 @@ access = "write"
 reason = "a launch agent runs later outside any agent session, with no hook around it"
 
 [[deny_path]]
-glob = "~/.config/autostart/**"
+glob = "~/Library/LaunchAgents"
 access = "write"
-reason = "an autostart entry runs later outside any agent session, with no hook around it"
+ancestors = true
+reason = "replacing a parent of the launch agents dir can install a launch agent"
 
 # --- saiife's system paths (§5.2) ---------------------------------------------
 [[deny_path]]
@@ -180,6 +282,8 @@ ancestors = true
 reason = "removing or moving a parent of saiife's state removes the audit signing key"
 
 # --- the managed agent settings (§8.3) ----------------------------------------
+# Their parents `/etc` and `/` are guarded by the `$SAIIFE_ETC` ancestors
+# rule (`ancestors` needs a variable-rooted glob).
 [[deny_path]]
 glob = "/etc/claude-code/managed-settings.d/**"
 access = "write"
@@ -194,6 +298,11 @@ reason = "removing or moving Claude Code's managed settings removes the saiife h
 glob = "/etc/claude-code/managed-settings.json"
 access = "write"
 reason = "Claude Code's managed settings take precedence over the saiife hook's"
+
+[[deny_path]]
+glob = "/etc/claude-code"
+access = "write"
+reason = "removing or moving Claude Code's managed config dir removes the saiife hook"
 
 [[deny_path]]
 glob = "/etc/codex/requirements.toml"

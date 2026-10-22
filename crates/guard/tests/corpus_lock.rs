@@ -30,12 +30,16 @@ impl Fixture {
         Fixture { _dir: dir, home }
     }
 
-    /// The variables as `path_vars_locked` binds them for a host with the
-    /// default system config.
+    /// A hand-written copy of what the CLI's `path_vars_locked` binds on a
+    /// host with the default system config (this crate cannot call it):
+    /// the §5.2 defaults, the per-user and the system audit dir, and
+    /// `XDG_CONFIG_HOME` at its default (the locked worker's environment
+    /// is cleared). `crates/cli/src/paths.rs` tests the real binding.
     fn vars(&self) -> PathVars {
         PathVars::new()
             .with_cwd(self.home.join("app"))
             .with_var("HOME", &self.home)
+            .with_var("XDG_CONFIG_HOME", self.home.join(".config"))
             .with_var("PROJECT", self.home.join("app"))
             .with_var("SAIIFE_DATA_DIR", self.home.join(".local/share/saiife"))
             .with_var(
@@ -102,6 +106,25 @@ fn privilege_changes_are_denied() {
         "cd /tmp && sudo rm x",
         "bash -c 'sudo ls'",
         "echo x | sudo tee /etc/hosts",
+        "sudo",
+        "sudo -l",
+        // Every wrapper the engine peels (fix round 1, I1).
+        "timeout 5 sudo ls",
+        "time sudo ls",
+        "stdbuf -o0 sudo ls",
+        "ionice -c3 sudo ls",
+        "xargs sudo ls",
+        "flock /tmp/l sudo ls",
+        "chroot / sudo ls",
+        "builtin exec sudo ls",
+        "nice -n 5 sudo ls",
+        "env -u FOO sudo ls",
+        "env --unset FOO sudo ls",
+        "nohup sudo ls",
+        "command sudo ls",
+        "timeout 5 doas sh",
+        "xargs pkexec bash",
+        "nice -n 5 su -",
     ] {
         assert_lock_denies(&e, cmd);
     }
@@ -120,6 +143,22 @@ fn touching_the_service_is_denied() {
         "kill -TERM saiifed",
         "launchctl bootout system/com.saiife.saiifed",
         "launchctl unload com.saiife.saiifed",
+        "timeout 5 systemctl stop saiifed",
+        "timeout 1 pkill saiifed",
+        "xargs kill saiifed",
+        // Prefixes, globs, the user (M2).
+        "pkill saiif",
+        "pkill sai",
+        "pkill -f saiife",
+        "pkill -u saiife",
+        "killall -u saiife",
+        "systemctl stop saiif*",
+        "systemctl stop 'saiife*'",
+        "systemctl stop 'sai*'",
+        "systemctl kill saiifed",
+        "systemctl -s status kill saiifed",
+        "sudo systemctl status saiifed",
+        "timeout 5 systemctl status saiifed",
     ] {
         assert_lock_denies(&e, cmd);
     }
@@ -141,8 +180,74 @@ fn persistence_is_denied() {
         "echo x > ~/.config/systemd/user/x.service",
         "cp x.desktop ~/.config/autostart/",
         "cp x.plist ~/Library/LaunchAgents/x.plist",
+        // Behind wrappers (I1).
+        "timeout 5 crontab -e",
+        "xargs crontab < /tmp/c",
+        "echo x | timeout 5 at now",
+        "timeout 5 systemd-run --user sh",
+        "sudo crontab -l",
+        // More schedulers and unit managers (I2).
+        "echo x | batch",
+        "loginctl enable-linger",
+        "loginctl enable-linger jonas",
+        "systemctl --user link /tmp/x.service",
+        "systemctl --user enable x",
+        "systemctl --user enable --now x",
+        "systemctl enable --user x",
+        "systemctl --user edit x",
+        "systemctl --user daemon-reload",
+        "systemctl --user preset x",
+        "systemctl --user revert x",
+        "systemctl --user add-wants default.target x",
+        "systemctl --user add-requires default.target x",
+        // Unit dirs replaced from outside, or their parents moved (I2).
+        "mkdir -p /tmp/s/user && mv /tmp/s ~/.config/systemd",
+        "ln -s /tmp/u ~/.config/systemd",
+        "mv ~/.config/systemd /tmp/x",
+        "mv ~/.config ~/.config.bak",
+        "echo x > ~/.local/share/systemd/user/x.service",
+        "echo x > /run/user/1000/systemd/user/x.service",
+        "echo x > ~/.config/systemd/user.control/x.service",
+        "mv /tmp/la ~/Library/LaunchAgents",
+        "ln -s /tmp/a ~/.config/autostart",
     ] {
         assert_lock_denies(&e, cmd);
+    }
+    for path in [
+        "~/.config/systemd",
+        "~/.config",
+        "~/.config/systemd/user",
+        "~/.config/systemd/user.control/x.service",
+        "~/.local/share/systemd/user/x.service",
+        "~/.local/share/systemd",
+        "/run/user/1000/systemd/user/x.service",
+        "/run/user/1000/systemd/user",
+        "~/Library",
+        "~/.config/autostart",
+    ] {
+        assert_lock_denies_path(&e, Access::Write, path);
+    }
+}
+
+/// `$XDG_CONFIG_HOME` elsewhere than `~/.config` is guarded too.
+#[test]
+fn xdg_config_home_is_guarded() {
+    let f = Fixture::new();
+    let (packs, _) = builtin_packs();
+    let lock: Vec<_> = packs.into_iter().filter(|p| p.id == "core.lock").collect();
+    let xdg = f.home.join("xdg");
+    let e = Engine::new(lock)
+        .with_budget(TEST_BUDGET)
+        .with_paths(f.vars().with_var("XDG_CONFIG_HOME", &xdg));
+    for rel in [
+        "systemd/user/x.service",
+        "systemd/user",
+        "systemd",
+        "autostart/x.desktop",
+        "",
+    ] {
+        let p = xdg.join(rel).display().to_string();
+        assert_lock_denies_path(&e, Access::Write, p.trim_end_matches('/'));
     }
 }
 
@@ -187,6 +292,7 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "/etc/claude-code/managed-settings.d/50-saiife.json",
         "/etc/claude-code/managed-settings.d",
         "/etc/claude-code/managed-settings.json",
+        "/etc/claude-code",
         "/etc/codex/requirements.toml",
         "/etc/codex",
         "/etc/gemini-cli/settings.json",
@@ -213,6 +319,7 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "rm /etc/claude-code/managed-settings.d/50-saiife.json",
         "echo x > /etc/codex/requirements.toml",
         "rm -rf /etc/gemini-cli",
+        "mv /etc/claude-code /tmp/x",
     ] {
         assert_lock_denies(&e, cmd);
     }
@@ -245,6 +352,23 @@ fn everyday_work_and_reading_the_setup_are_allowed() {
         "codex exec fix",
         "gemini -p hi",
         "launchctl list",
+        // Read-only service and scheduler queries (M5).
+        "systemctl status saiifed",
+        "systemctl show saiifed",
+        "systemctl is-active saiifed",
+        "systemctl is-enabled saiifed.service",
+        "systemctl --no-pager status saiifed",
+        "crontab -l",
+        "at -l",
+        "atq",
+        "systemctl --user status x",
+        "loginctl list-sessions",
+        "pkill -u jonas node",
+        "systemctl restart nginx",
+        "batchelor",
+        "env -u FOO npm test",
+        "timeout 5 cargo test",
+        "xargs rm -f < list.txt",
     ] {
         let d = e.evaluate(cmd);
         assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
