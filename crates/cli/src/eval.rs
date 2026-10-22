@@ -35,6 +35,24 @@ pub const PARSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// twice its size for a payload that is itself JSON), plus the envelope.
 pub const MAX_EVAL_BYTES: usize = 2 * PARSE_MAX_BYTES + 64 * 1024;
 
+/// Longest payload `cwd` that is used (Linux `PATH_MAX`). A longer one, or
+/// one with a NUL, is never looked up: walking it can take longer than the
+/// agent's hook timeout.
+pub const MAX_CWD_BYTES: usize = 4096;
+
+/// `Err` with the reason when the payload `cwd` must not be used.
+pub fn check_cwd(cwd: Option<&str>) -> Result<(), String> {
+    match cwd {
+        Some(c) if c.len() > MAX_CWD_BYTES => Err(format!(
+            "hook payload cwd is longer than {MAX_CWD_BYTES} bytes; not judged"
+        )),
+        Some(c) if c.contains('\0') => {
+            Err("hook payload cwd contains a NUL byte; not judged".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// What the parent sends the worker on stdin.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EvalRequest {
@@ -255,6 +273,9 @@ pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
         rule: None,
         reason: Some(reason.to_string()),
     };
+    if let Err(reason) = check_cwd(ctx.cwd.as_deref()) {
+        return answer(Verdict::Unjudged, String::new(), &reason);
+    }
     let engine = || engine_for(packs, ctx.cwd.as_deref(), budget);
     match plan(payload) {
         Plan::TooLarge { command } => {
@@ -350,6 +371,10 @@ fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer
 /// `EvalAnswer` to stdout, exit 0. Any other exit is a worker failure,
 /// which the parent turns into `error_denied`.
 pub fn worker_main() -> ExitCode {
+    #[cfg(debug_assertions)]
+    if fault() == "noread" {
+        std::thread::sleep(Duration::from_secs(10));
+    }
     let mut buf = Vec::new();
     let read = std::io::stdin()
         .lock()
@@ -380,14 +405,22 @@ pub fn worker_main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Test seam, debug builds only: `SAIIFE_EVAL_FAULT=abort|segv|hang|overflow`
-/// makes the worker fail the way a broken engine could.
+/// The `SAIIFE_EVAL_FAULT` test seam's value (debug builds only).
+#[cfg(debug_assertions)]
+pub fn fault() -> String {
+    std::env::var("SAIIFE_EVAL_FAULT").unwrap_or_default()
+}
+
+/// Test seam, debug builds only:
+/// `SAIIFE_EVAL_FAULT=abort|segv|hang|overflow|flood` makes the worker fail
+/// the way a broken engine could (`noread`: it never reads its request;
+/// `parent_hang` is the parent's).
 #[cfg(debug_assertions)]
 fn fault_seam() {
-    match std::env::var("SAIIFE_EVAL_FAULT").as_deref() {
-        Ok("abort") => std::process::abort(),
+    match fault().as_str() {
+        "abort" => std::process::abort(),
         #[cfg(unix)]
-        Ok("segv") => {
+        "segv" => {
             // std's SIGSEGV handler (stack-overflow detection) takes the
             // first signal, finds no guard-page hit and restores the
             // default action; the second one kills the process.
@@ -400,9 +433,17 @@ fn fault_seam() {
             // Never judge after the seam fired.
             std::process::abort();
         }
-        Ok("hang") => std::thread::sleep(Duration::from_secs(10)),
-        Ok("overflow") => {
+        "hang" => std::thread::sleep(Duration::from_secs(10)),
+        "overflow" => {
             overflow(1);
+        }
+        "flood" => {
+            let chunk = [b'x'; 64 * 1024];
+            let mut out = std::io::stdout().lock();
+            // Keeps writing, errors (EPIPE) included, until killed.
+            loop {
+                let _ = out.write_all(&chunk);
+            }
         }
         _ => {}
     }
@@ -566,6 +607,22 @@ mod tests {
             a.reason.as_deref(),
             Some("guard exceeded its latency budget")
         );
+    }
+
+    #[test]
+    fn unusable_cwd_is_unjudged() {
+        let long = format!("/{}", "a".repeat(MAX_CWD_BYTES));
+        for cwd in [long.as_str(), "/tmp/a\0b"] {
+            let a = judge(
+                &payload(cwd, "Bash", serde_json::json!({ "command": "ls" })),
+                &defaults(),
+                BUDGET,
+            );
+            assert_eq!(a.verdict, Verdict::Unjudged, "{a:?}");
+            assert!(a.reason.unwrap().contains("cwd"));
+        }
+        assert!(check_cwd(Some(&"/".repeat(MAX_CWD_BYTES))).is_ok());
+        assert!(check_cwd(None).is_ok());
     }
 
     #[test]

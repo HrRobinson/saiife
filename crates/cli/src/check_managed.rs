@@ -39,7 +39,9 @@ pub fn run_bad_args(args: &[String], error: &str) -> ExitCode {
     guarded(|| imp::run_with(agent, Path::new(config), Some(reason.clone())))
 }
 
+/// Starts the watchdog, then runs `f` inside `catch_unwind`.
 fn guarded(f: impl FnOnce() -> ExitCode) -> ExitCode {
+    imp::start_watchdog();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(code) => code,
         Err(_) => blocked("saiife crashed"),
@@ -61,6 +63,8 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 mod imp {
     use super::*;
 
+    pub fn start_watchdog() {}
+
     pub fn run_with(_agent: &str, _config: &Path, _forced: Option<String>) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
@@ -77,12 +81,13 @@ mod imp {
     use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
-    use saiife_ipc::client::{system_uid, Client, ClientError};
+    use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
     use saiife_ipc::msg::OP_AUDIT_APPEND;
     use saiife_policy::{
         active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
@@ -102,6 +107,38 @@ mod imp {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// The daemon's ack of `audit.append`, from the send (§6.1.2).
     const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+    /// The whole hook call, whatever hangs (a stat on a dead FUSE mount, a
+    /// slow lookup): well inside the agents' 10 s hook timeout, after
+    /// which Codex and Gemini CLI would let the call run (§9.3). The
+    /// deadlines above add up to about 5 s.
+    const OVERALL_TIMEOUT: Duration = Duration::from_secs(7);
+    /// Longest `agent`, `project`, `session`, `tool` or `reason` sent, in
+    /// characters, so every record fits in one frame.
+    const MAX_FIELD_CHARS: usize = 4096;
+    const TRUNCATED_MARK: &str = "…[truncated]";
+
+    /// The running worker's pid (0: none), for the watchdog.
+    static WORKER_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// After `OVERALL_TIMEOUT`, kill the worker if one runs, say why on
+    /// stderr and exit 2, wherever the main thread is stuck. The message is
+    /// written to the stderr fd directly: a main thread blocked while
+    /// holding the stderr lock cannot stop it.
+    pub fn start_watchdog() {
+        let _ = std::thread::Builder::new()
+            .name("saiife-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(OVERALL_TIMEOUT);
+                let pid = WORKER_PID.load(Ordering::SeqCst);
+                if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+                use std::os::fd::AsFd;
+                let msg = b"saiife: BLOCKED (fail closed): saiife took too long\n";
+                let _ = rustix::io::write(std::io::stderr().as_fd(), msg);
+                std::process::exit(2);
+            });
+    }
 
     /// How the call is answered.
     enum Outcome {
@@ -174,6 +211,10 @@ mod imp {
     pub fn run_with(agent: &str, config: &Path, forced: Option<String>) -> ExitCode {
         // 1. The payload, bounded.
         let input = read_stdin();
+        #[cfg(debug_assertions)]
+        if eval::fault() == "parent_hang" {
+            std::thread::sleep(Duration::from_secs(20));
+        }
 
         // 2. The system policy. Without it there is no daemon to tell.
         let cfg = match load_locked(config) {
@@ -249,10 +290,19 @@ mod imp {
         client: &mut Option<Client>,
         policy: &mut Option<String>,
     ) -> Result<Judged, String> {
-        let (packs, hash) = policy_for(cfg, ctx.cwd.as_deref());
+        // An unusable cwd is never looked up: no project, no worker.
+        let cwd = eval::check_cwd(ctx.cwd.as_deref());
+        let start = match (&cwd, &ctx.cwd) {
+            (Err(_), _) => None,
+            (Ok(()), Some(c)) => Some(PathBuf::from(c)),
+            (Ok(()), None) => std::env::current_dir().ok(),
+        };
+        let (packs, hash) = policy_for(cfg, start.as_deref());
         *policy = Some(hash);
 
-        let failed = forced.or_else(|| input.as_ref().err().cloned());
+        let failed = forced
+            .or_else(|| input.as_ref().err().cloned())
+            .or(cwd.err());
         let mut worker = match (&failed, input) {
             (None, Ok(payload)) => Some(Worker::spawn(EvalRequest {
                 payload,
@@ -333,35 +383,28 @@ mod imp {
         Ok(loaded.config)
     }
 
-    /// The active pack ids and the `policy` hash for a call in `cwd`. The
+    /// The active pack ids and the `policy` hash for a call in `start`. The
     /// project config adds packs and service rules only (add-only merge);
     /// an invalid one is ignored with a warning: the system policy alone
     /// applies.
-    fn policy_for(cfg: &SystemConfig, cwd: Option<&str>) -> (Vec<String>, String) {
-        let start = match cwd {
-            Some(c) => Some(PathBuf::from(c)),
-            None => std::env::current_dir().ok(),
-        };
-        let merged = start
-            .as_deref()
-            .and_then(find_project_root)
-            .and_then(|root| {
-                let ignored = |why: &str| {
-                    warn(&format!(
-                        "project config {} ignored ({why}); the system policy applies",
-                        root.join(CONFIG_REL).display()
-                    ));
-                    None
-                };
-                match read_config_bytes(&root) {
-                    Ok(None) => None,
-                    Ok(Some(bytes)) => match parse_project(&bytes) {
-                        Ok(p) => Some(merge_project(&cfg.guard.packs, &p, Mode::Locked)),
-                        Err(e) => ignored(&e.to_string()),
-                    },
+    fn policy_for(cfg: &SystemConfig, start: Option<&Path>) -> (Vec<String>, String) {
+        let merged = start.and_then(find_project_root).and_then(|root| {
+            let ignored = |why: &str| {
+                warn(&format!(
+                    "project config {} ignored ({why}); the system policy applies",
+                    root.join(CONFIG_REL).display()
+                ));
+                None
+            };
+            match read_config_bytes(&root) {
+                Ok(None) => None,
+                Ok(Some(bytes)) => match parse_project(&bytes) {
+                    Ok(p) => Some(merge_project(&cfg.guard.packs, &p, Mode::Locked)),
                     Err(e) => ignored(&e.to_string()),
-                }
-            });
+                },
+                Err(e) => ignored(&e.to_string()),
+            }
+        });
         let catalog: Vec<PackInfo> = Catalog::builtin()
             .headers()
             .into_iter()
@@ -390,31 +433,45 @@ mod imp {
     }
 
     impl Worker {
-        /// `saiife __eval` with every `SAIIFE_*` variable removed (debug
-        /// builds keep the `SAIIFE_EVAL_FAULT` test seam). The request is
-        /// written and the answer read on threads, so neither a worker that
-        /// never reads nor one that never writes can outlast the deadline.
+        /// `saiife __eval` with a cleared environment: only `HOME` and
+        /// `USER` from the `/etc/passwd` entry of this process's real uid,
+        /// `PATH=/usr/bin:/bin` and `LANG=C` (debug builds add the
+        /// `SAIIFE_EVAL_FAULT` test seam). An agent started with another
+        /// `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `XDG_*` therefore
+        /// cannot move the path rules; the worker derives the agent dirs
+        /// from that home. The request is written and the answer read on
+        /// threads, so neither a worker that never reads nor one that
+        /// never writes can outlast the deadline.
         fn spawn(req: EvalRequest) -> Result<Worker, (String, std::io::Error)> {
             let started = Instant::now();
+            let uid = rustix::process::getuid().as_raw();
+            let Some(account) = system_entry(uid) else {
+                let e = std::io::Error::other(format!("no /etc/passwd entry for uid {uid}"));
+                return Err((req.payload, e));
+            };
             let exe = match std::env::current_exe() {
                 Ok(e) => e,
                 Err(e) => return Err((req.payload, e)),
             };
             let mut cmd = Command::new(exe);
             cmd.arg("__eval")
+                .env_clear()
+                .env("HOME", &account.home)
+                .env("USER", &account.name)
+                .env("PATH", "/usr/bin:/bin")
+                .env("LANG", "C")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
-            for (k, _) in std::env::vars_os() {
-                let keep = cfg!(debug_assertions) && k == "SAIIFE_EVAL_FAULT";
-                if k.as_encoded_bytes().starts_with(b"SAIIFE_") && !keep {
-                    cmd.env_remove(&k);
-                }
+            #[cfg(debug_assertions)]
+            if let Some(f) = std::env::var_os("SAIIFE_EVAL_FAULT") {
+                cmd.env("SAIIFE_EVAL_FAULT", f);
             }
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => return Err((req.payload, e)),
             };
+            WORKER_PID.store(child.id(), Ordering::SeqCst);
             let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -441,9 +498,11 @@ mod imp {
             })
         }
 
+        /// Kill and reap (a no-op for a worker already reaped).
         fn kill(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+            WORKER_PID.store(0, Ordering::SeqCst);
         }
 
         /// The answer, or why there is none, within `WORKER_TIMEOUT` of the
@@ -484,6 +543,13 @@ mod imp {
                 return Err("answer too large".into());
             }
             serde_json::from_slice(&out).map_err(|_| "unparsable answer".into())
+        }
+    }
+
+    /// A worker is never left behind, also when the parent unwinds.
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.kill();
         }
     }
 
@@ -534,11 +600,27 @@ mod imp {
             },
             env!("CARGO_PKG_VERSION"),
         );
+        // After masking, so a cut never splits a secret out of its mask.
+        let mut rec = rec;
+        for f in [&mut rec.agent, &mut rec.project, &mut rec.tool] {
+            cap(f);
+        }
+        for f in [&mut rec.session, &mut rec.reason].into_iter().flatten() {
+            cap(f);
+        }
         let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
         if let Some(m) = v.as_object_mut() {
             m.remove("ts");
         }
         v
+    }
+
+    /// Cut `s` to `MAX_FIELD_CHARS` characters plus a marker.
+    fn cap(s: &mut String) {
+        if let Some((cut, _)) = s.char_indices().nth(MAX_FIELD_CHARS) {
+            s.truncate(cut);
+            s.push_str(TRUNCATED_MARK);
+        }
     }
 
     /// `audit.append`, acknowledged with a `seq` within `ACK_TIMEOUT`.

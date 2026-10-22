@@ -255,14 +255,18 @@ fn socket_owner_mismatch_denies() {
 }
 
 fn worker_fault(fault: &str) -> (Output, Duration, TestDaemon) {
-    let d = TestDaemon::start(Opts::default());
     let home = common::FixtureHome::new();
-    let (o, elapsed, _sb) = managed_with(
-        &d.config(),
+    worker_fault_with(
+        fault,
         &home.real(&fixture("claude/bash-allow.json")),
-        &[("SAIIFE_EVAL_FAULT", fault)],
-        &[],
-    );
+        "ls -la",
+    )
+}
+
+fn worker_fault_with(fault: &str, payload: &str, input: &str) -> (Output, Duration, TestDaemon) {
+    let d = TestDaemon::start(Opts::default());
+    let (o, elapsed, _sb) =
+        managed_with(&d.config(), payload, &[("SAIIFE_EVAL_FAULT", fault)], &[]);
     assert_eq!(code(&o), 2, "{fault}: stderr: {}", stderr(&o));
     assert!(o.stdout.is_empty());
     let err = stderr(&o);
@@ -279,7 +283,7 @@ fn worker_fault(fault: &str) -> (Output, Duration, TestDaemon) {
             .starts_with("guard worker failed"),
         "{fault}: {r}"
     );
-    assert_eq!(r["input"], "ls -la", "{fault}: {r}");
+    assert_eq!(r["input"], input, "{fault}: {r}");
     (o, elapsed, d)
 }
 
@@ -495,4 +499,180 @@ fn developer_check_untouched() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].mode.as_deref(), Some("developer"));
     assert_eq!(recs[0].decision, saiife_audit::DecisionKind::Deny);
+}
+
+#[test]
+fn worker_flooding_stdout_denies() {
+    let (_, elapsed, _) = worker_fault("flood");
+    assert!(elapsed <= Duration::from_millis(4500), "{elapsed:?}");
+}
+
+#[test]
+fn worker_never_reading_stdin_denies() {
+    // 8 MiB of content: far more than a pipe buffer holds.
+    let p = tempfile::tempdir().unwrap();
+    let target = p.path().join("big.txt").display().to_string();
+    let payload = json!({
+        "session_id": "s-m",
+        "cwd": p.path(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": target, "content": "x".repeat(8 << 20)}
+    })
+    .to_string();
+    let (_, elapsed, _) = worker_fault_with("noread", &payload, &target);
+    assert!(
+        elapsed >= Duration::from_millis(3000) && elapsed <= Duration::from_millis(4500),
+        "{elapsed:?}"
+    );
+}
+
+/// The parent's own watchdog: whatever hangs, the hook answers (exit 2)
+/// before the agent's 10 s hook timeout.
+#[test]
+fn parent_hang_is_cut_by_the_watchdog() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let (o, elapsed, _sb) = managed_with(
+        &d.config(),
+        &home.real(&fixture("claude/bash-allow.json")),
+        &[("SAIIFE_EVAL_FAULT", "parent_hang")],
+        &[],
+    );
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("saiife: BLOCKED (fail closed): saiife took too long"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(7000) && elapsed <= Duration::from_millis(8500),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn huge_cwd_is_error_denied_without_filesystem_walk() {
+    let d = TestDaemon::start(Opts::default());
+    let cwd = format!("/{}", "a/".repeat(256 * 1024));
+    let payload = json!({
+        "session_id": "s-m",
+        "cwd": cwd,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/etc/hostname"}
+    })
+    .to_string();
+    let (o, elapsed, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("fail closed"), "{}", stderr(&o));
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "error_denied", "{r}");
+    assert!(r["reason"].as_str().unwrap().contains("cwd"), "{r}");
+}
+
+#[test]
+fn oversized_session_is_still_recorded() {
+    let d = TestDaemon::start(Opts::default());
+    let p = tempfile::tempdir().unwrap();
+    let f = p.path().join("notes.txt");
+    fs::write(&f, "hi").unwrap();
+    let payload = json!({
+        "session_id": "s".repeat(1200 * 1024),
+        "cwd": p.path(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": f}
+    })
+    .to_string();
+    let (o, _, _sb) = managed(&d.config(), &payload);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    let session = r["session"].as_str().unwrap();
+    assert!(session.ends_with("[truncated]"), "{}", session.len());
+    assert!(session.len() < 8192);
+}
+
+/// The account's home from /etc/passwd, not from HOME.
+fn passwd_home() -> String {
+    let uid = common::daemon::own_uid().to_string();
+    fs::read_to_string("/etc/passwd")
+        .unwrap()
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 7 && f[2] == uid).then(|| f[5].to_string())
+        })
+        .expect("own passwd entry")
+}
+
+fn file_call(tool: &str, path: &str) -> String {
+    let mut input = json!({ "file_path": path });
+    if tool == "Write" {
+        input["content"] = json!("x");
+    }
+    json!({
+        "session_id": "s-m",
+        "cwd": "/",
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": input
+    })
+    .to_string()
+}
+
+/// An agent started with another HOME must not move the `~` rules off the
+/// account's real home (A6/A18). `managed_with` already runs the hook with
+/// HOME pointing at a temp dir.
+#[test]
+fn hook_home_does_not_rebind_home_rules() {
+    let d = TestDaemon::start(Opts::default());
+    let home = passwd_home();
+    for (tool, path, pack) in [
+        (
+            "Read",
+            format!("{home}/.claude/.credentials.json"),
+            "core.secrets",
+        ),
+        ("Read", format!("{home}/.ssh/id_rsa"), "core.secrets"),
+    ] {
+        let (o, _, _sb) = managed(&d.config(), &file_call(tool, &path));
+        assert_eq!(code(&o), 2, "{path}: {}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with(&format!("BLOCKED by {pack}")),
+            "{path}: {}",
+            stderr(&o)
+        );
+    }
+}
+
+#[test]
+fn agent_config_dir_env_does_not_reach_the_worker() {
+    let d = TestDaemon::start(Opts::default());
+    let home = passwd_home();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = elsewhere.path().to_str().unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", elsewhere), ("CODEX_HOME", elsewhere)];
+    for (tool, path, pack) in [
+        (
+            "Write",
+            format!("{home}/.claude/settings.json"),
+            "core.self",
+        ),
+        (
+            "Read",
+            format!("{home}/.claude/.credentials.json"),
+            "core.secrets",
+        ),
+    ] {
+        let (o, _, _sb) = managed_with(&d.config(), &file_call(tool, &path), &env, &[]);
+        assert_eq!(code(&o), 2, "{path}: {}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with(&format!("BLOCKED by {pack}")),
+            "{path}: {}",
+            stderr(&o)
+        );
+    }
 }
