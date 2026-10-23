@@ -140,8 +140,14 @@ fn pkill_with_only_selectors_is_denied() {
             // both ways (S14): `-ttin` is SIGTTIN, or `-t tin`.
             "pkill -ttin",
             "pkill -USR1",
-            // Blocks too much, documented (M3/M4): `$$` is the agent's shell.
-            "pkill -P $$",
+            // A parent, group or session of 0 (pkill's own) or 1 (init),
+            // or one not known until it runs, names no target.
+            "pkill -P 0",
+            "pkill -g 1",
+            "pkill -s 1,0",
+            "pkill -P $PID",
+            "pkill -g \"$G\"",
+            "pkill -P 1234,1",
             "xargs kill -1",
             "pkill -u $(whoami) node",
         ],
@@ -283,6 +289,79 @@ fn a_pattern_from_a_substitution_is_denied() {
             "pkill -f `cat pattern.txt`",
             "killall $(cat names.txt)",
             "killall -r \"$(cat pattern.txt)\"",
+        ],
+    );
+}
+
+/// Final review I5a: an option's value is not a pattern, and a parent,
+/// process group or session given as literal ids (above 1) or `$$` names a
+/// target.
+#[test]
+fn option_values_and_targeted_selectors_are_allowed() {
+    assert_all_allow(
+        &engine(),
+        &[
+            "pkill --signal 9 node",
+            "pkill --signal=9 node",
+            "pkill -u 0 node",
+            "pkill -q 5 node",
+            "pkill -U 1000 -x node",
+            "killall -r -s 9 '^node$'",
+            "killall -s 9 node",
+            "killall --signal 9 -r '^node$'",
+            "pkill -P 1234",
+            "pkill -P $$",
+            "pkill -g 1234",
+            "pkill --pgroup 1234",
+            "pkill -s 4321",
+            "pkill -P 1234,5678",
+            "pkill -9 -P 1234",
+            "pkill -n -P 1234",
+        ],
+    );
+}
+
+/// Final review M1: a pattern that is only an expansion may expand to
+/// nothing (matching every process).
+#[test]
+fn a_bare_expansion_pattern_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill \"$X\"",
+            "pkill $X",
+            "pkill \"${X}\"",
+            "pkill -f \"$X\"",
+            "pkill -f \"${PATTERN}\"",
+            "pkill -9 \"$1\"",
+            "pkill \"$X$Y\"",
+            "killall -r \"$X\"",
+            "killall -r \"${X}\"",
+            "killall \"$NAME\"",
+        ],
+    );
+    assert_all_allow(
+        &engine(),
+        &[
+            "pkill \"$X-server\"",
+            "pkill -f \"node $APP\"",
+            "killall \"${X}d\"",
+        ],
+    );
+}
+
+/// Security review: Rust regex class set operations (`&&`, `--`, `~~`)
+/// mean something else to pkill's ERE and to fnmatch: such a pattern
+/// counts as a match.
+#[test]
+fn class_set_operations_count_as_a_match() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill '[a-z&&[^x]]x'",
+            "pkill '[a-z--b]xy'",
+            "pkill '[a-z~~b]xy'",
+            "killall -r '[a-z&&[^x]]x'",
         ],
     );
 }

@@ -168,7 +168,7 @@ impl Engine {
         let triggers: Vec<String> = packs.iter().flat_map(|p| p.triggers.clone()).collect();
         let guarded_commands = packs
             .iter()
-            .filter(|p| !p.deny.is_empty() && p.substitution_failsafe)
+            .filter(|p| p.has_deny() && p.substitution_failsafe)
             .flat_map(|p| p.triggers.iter())
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
@@ -1213,9 +1213,12 @@ impl Engine {
             {
                 return Hit::No;
             }
-            match &rule.operands {
-                None => Hit::Yes,
-                Some(m) => m.hits(operands, &over_budget, spent),
+            match (&rule.operands, &rule.table) {
+                (None, _) => Hit::Yes,
+                // Read with the command's own options: `pkill -u 0 node`
+                // has the one operand `node`.
+                (Some(m), Some(t)) => m.hits(&t.operand_args(operands), &over_budget, spent),
+                (Some(m), None) => m.hits(operands, &over_budget, spent),
             }
         };
         let mut allowed: Option<AllowTrace> = None;
@@ -1233,7 +1236,7 @@ impl Engine {
             // An allow match exempts only this pack's own deny rules (as
             // `allow_path` does); later packs still judge the command.
             let mut allow_rule = None;
-            for r in &pack.allow {
+            for r in pack.allow_rules() {
                 match matches(r) {
                     Hit::Yes => {
                         allow_rule = Some(r);
@@ -1252,7 +1255,7 @@ impl Engine {
                 continue;
             }
             // Deny rules — first match wins.
-            for rule in &pack.deny {
+            for rule in pack.deny_rules() {
                 let hit = matches(rule);
                 if hit == Hit::OutOfBudget {
                     return JudgeOutcome::TimedOut;

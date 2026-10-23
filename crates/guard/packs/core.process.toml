@@ -16,10 +16,12 @@
 #
 # `pkill` and `killall` options are read with getopt from each tool's own
 # table (procps-ng 4.0.x pgrep(1)/pkill(1); psmisc killall(1)), the same
-# tables `core.lock` uses. Both take a `-SIGNAL` word (`-9`, `-HUP`). A word
-# that may be a signal or an option bundle (`-ttin`: SIGTTIN, or `-t tin`)
-# is read both ways by the `when_no_operand` rules, and either reading
-# being broad blocks the command.
+# tables `core.lock` uses, and so are their operands: an option's value is
+# not a pattern (`pkill -u 0 node`, `pkill --signal 9 node`, `killall -s 9
+# -r '^node$'` each have the one pattern). Both take a `-SIGNAL` word
+# (`-9`, `-HUP`) as their first argument. A first word that may be a
+# signal or an option bundle (`-ttin`: SIGTTIN, or `-t tin`) is read both
+# ways, and either reading being broad blocks the command.
 
 [pack]
 id = "core.process"
@@ -31,6 +33,9 @@ version = 1
 # block every `kill`.
 substitution_failsafe = false
 triggers = ["kill"]
+# Compiled only when a command line holds `kill` (pkill, killall, killall5
+# included): most hook calls never do.
+lazy = true
 
 # --- pkill --------------------------------------------------------------------
 [[deny]]
@@ -56,7 +61,11 @@ command_long_options = [
 # No pattern, only selectors: `pkill -n` is the newest process of all,
 # `pkill -u me` every process of the user. `-F` (a pid file) and `-p` (a
 # pid) name their target and are not in the list. An option pkill does not
-# know counts as a selector.
+# know counts as a selector. A parent, process group or session given as
+# literal ids above 1 or `$$` (`pkill -P 1234`, `pkill -g $$`) names a
+# target: not blocked. `0` is pkill's own group or session (the agent's),
+# `1` init. A terminal (`pkill -t pts/3`: everything on it, the owner's
+# shell maybe) stays blocked.
 pattern = '^pkill(?:\s|$)'
 reason = "pkill without a pattern signals whatever the selectors match (pkill -n: the newest process on the machine); add the process name, or use kill <pid>"
 when_option = [
@@ -66,6 +75,7 @@ when_option = [
     "--ns", "--env",
 ]
 when_no_operand = true
+target_options = ["-P", "--parent", "-g", "--pgroup", "-s", "--session"]
 command_signal_word = true
 command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
 command_long_options = [
@@ -83,9 +93,22 @@ command_long_options = [
 # A pattern that matches most processes: one matching at least 80% of a
 # set of common process names (`.`, `''`, `.*`, `^`, `[a-z]`), one of a
 # single character (`pkill e`), or one built at run time (`pkill $(cat f)`,
-# which may come out empty). A pattern saiife cannot read counts too.
+# which may come out empty), also a bare expansion (`pkill "$X"`, empty
+# when X is unset). A pattern saiife cannot read counts too.
 pattern = '^pkill\s'
 reason = "this pkill pattern matches most processes (or is not known until it runs); name the process to stop"
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
 operand_match = "regex"
 operand_match_share = 0.8
 operand_min_len = 2
@@ -195,9 +218,19 @@ operand_targets = [
 ]
 
 [[deny]]
-# A name built at run time (`killall $(cat f)`): not known until it runs.
+# A name built at run time (`killall $(cat f)`, `killall "$X"`): not known
+# until it runs.
 pattern = '^killall\s'
 reason = "this killall name is not known until it runs; name the process to stop"
+command_signal_word = true
+command_long_only = true
+command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
+command_long_options = [
+    "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",
+    "older-than=|o", "interactive|i", "list|l", "quiet|q", "regexp|r",
+    "signal=|s", "user=|u", "verbose|v", "version|V", "wait|w", "ns=|n",
+    "context=|Z", "help",
+]
 operand_match = "glob"
 operand_match_share = 1.0
 operand_substitution = true

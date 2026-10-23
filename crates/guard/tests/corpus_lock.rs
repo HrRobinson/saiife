@@ -723,6 +723,12 @@ fn signal_words_do_not_hide_options() {
         "killall -9 -r '^sai'",
         "killall -regexp '^sai'",
         "killall -reg '^sai'",
+        // Final review S14: a leading signal-name word is read as options
+        // too (`-rtmin` may be `-r …`).
+        "killall -rtmin '^sai'",
+        "killall -RTMIN '^sai'",
+        "killall -rtmin+1 '^sai'",
+        "killall -rtmax '^sai'",
     ] {
         assert_lock_denies(&e, cmd);
     }

@@ -114,8 +114,12 @@ operand_targets = ["saiifed"]
 [[deny]]
 # `killall -r`: the option read from killall's table (psmisc 23.7,
 # killall(1) man page), so `--reg` and `-Ir` count. killall takes a
-# `-SIGNAL` word (`-HUP`, `-9`) and reads options with getopt_long_only,
-# so `-regexp` is a long option: a `-word` is read both ways.
+# `-SIGNAL` word (`-HUP`, `-9`) as its first argument only, and reads
+# options with getopt_long_only, so `-regexp` is a long option: a `-word`
+# is read both as a long option and as a short bundle. A first word that
+# is a signal name is also read as options (`-rtmin`, `-RTMIN+1`: SIGRTMIN,
+# or `-r` and more): either reading giving `-r` counts. The operands are
+# read with the same table, from both readings.
 pattern = '^killall\s'
 reason = "this pattern matches saiifed, which records every agent call; stopping it would leave agents unrecorded"
 when_option = ["-r", "--regexp"]

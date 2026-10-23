@@ -95,6 +95,11 @@ pub struct Rule {
     /// with getopt from the command's own option table (`pkill -f`,
     /// `--full`, `--f`, `-9f`).
     pub when_option: Option<WhenOption>,
+    /// The command's option table (`command_options`,
+    /// `command_long_options`), when the rule has one: `operands` then
+    /// reads the operands with getopt, so option values (`pkill -u 0
+    /// node`, `--signal 9`) are not operands.
+    pub table: Option<WhenOption>,
 }
 
 /// `when_option`, `command_options` and `command_long_options` of a rule.
@@ -114,6 +119,30 @@ pub struct WhenOption {
     /// true`; `pkill -n`). The `-SIGNAL` word is then read both ways, as a
     /// signal and as options, and the rule matches if either reading does.
     pub no_operand: bool,
+    /// Options whose value names a target (`target_options`; `pkill -P
+    /// 1234`): with `no_operand`, a command given one of them with a
+    /// target value ([`names_target`]) has a target, and the rule does not
+    /// match.
+    pub targets: Vec<String>,
+}
+
+fn strs(words: &[String]) -> Vec<&str> {
+    words.iter().map(String::as_str).collect()
+}
+
+/// Does an option value name a specific target: a comma list of literal
+/// pids, process groups or sessions above 1 (`0` is the caller's own group
+/// or session, `1` init), or `$$` (the shell's own pid)? An expansion other
+/// than `$$`, a glob, a name or an empty value names none.
+pub fn names_target(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(',').all(|v| {
+            v == "$$"
+                || (!v.is_empty()
+                    && v.len() <= 10
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                    && v.parse::<u64>().is_ok_and(|n| n > 1))
+        })
 }
 
 /// Linux signal names (`/usr/include/bits/signum-generic.h` and
@@ -157,36 +186,106 @@ impl WhenOption {
     ///   (`pkill -IO -f`: whatever `-IO` means, `-f` is seen);
     /// - with `long_only`, a `-word` is read both as a long option and as
     ///   a short bundle.
+    ///
+    /// With `signal_word`, a leading `-SIGNAL` word (only the first
+    /// argument: pkill and killall look at no other) is read both ways: as
+    /// the signal, and as options (`killall -rtmin x` may be `-r` …).
+    /// Either reading giving the option is a match.
     pub fn given(&self, args: &[String]) -> bool {
-        let mut words: Vec<&str> = args.iter().map(String::as_str).collect();
-        if self.signal_word {
-            if let Some(i) = words.iter().position(|w| is_signal_word(w)) {
-                words.remove(i);
+        self.readings(args)
+            .iter()
+            .any(|r| self.given_in(&strs(r)).0)
+    }
+
+    /// The ways `args` may be read: without a leading `-SIGNAL` word (when
+    /// the command takes one and it is there), and as written.
+    /// The leading word is also read in lower case when that differs (how
+    /// the tool turns a signal name it does not take back into options is
+    /// not modelled: `killall -RTMIN` may be read as `-rtmin`).
+    fn readings(&self, args: &[String]) -> Vec<Vec<String>> {
+        let words: Vec<String> = args.to_vec();
+        let mut out = Vec::with_capacity(3);
+        if self.signal_word && words.first().is_some_and(|w| is_signal_word(w)) {
+            out.push(words[1..].to_vec());
+            let lower = words[0].to_ascii_lowercase();
+            if lower != words[0] {
+                let mut l = words.clone();
+                l[0] = lower;
+                out.push(l);
             }
         }
-        self.given_in(&words)
+        out.push(words);
+        out
     }
 
     /// The rule's whole option test: `given`, and with `no_operand` also
-    /// no operand. With `no_operand` a `-SIGNAL` word is read both ways
-    /// (fails closed: `pkill -ttin` is SIGTTIN, or `-t tin`), and either
-    /// reading matching is a match.
+    /// no operand and no option naming a target (`targets`). A leading
+    /// `-SIGNAL` word is read both ways (fails closed: `pkill -ttin` is
+    /// SIGTTIN, or `-t tin`), and either reading matching is a match.
     pub fn matches(&self, args: &[String]) -> bool {
         if !self.no_operand {
             return self.given(args);
         }
-        let words: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut readings = vec![words.clone()];
-        if self.signal_word {
-            if let Some(i) = words.iter().position(|w| is_signal_word(w)) {
-                let mut dropped = words;
-                dropped.remove(i);
-                readings.push(dropped);
+        self.readings(args).iter().any(|r| {
+            let r = strs(r);
+            let (hit, targeted) = self.given_in(&r);
+            hit && !targeted && !self.has_operand(&r)
+        })
+    }
+
+    /// The operands of `args`, read with getopt (option values are not
+    /// operands, unless they hold a command substitution), as `--`
+    /// followed by every operand of any reading (fails closed: more
+    /// operands, more to match). With `long_only`, a `-word`
+    /// that may be a long option taking the next word is read as not
+    /// taking it, so that word is an operand too.
+    pub fn operand_args(&self, args: &[String]) -> Vec<String> {
+        let mut out = vec!["--".to_string()];
+        for r in self.readings(args) {
+            for o in self.operands_in(&strs(&r)) {
+                if !out[1..].iter().any(|x| x == o) {
+                    out.push(o.to_string());
+                }
             }
         }
-        readings
-            .iter()
-            .any(|r| self.given_in(r) && !self.has_operand(r))
+        // A command substitution may split into several words, operands
+        // among them, wherever it stands (`pkill -u $(…) node`): it stays
+        // an operand.
+        for a in args {
+            if (a.contains("$(") || a.contains('`')) && !out[1..].contains(a) {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
+
+    fn operands_in<'w>(&self, words: &[&'w str]) -> Vec<&'w str> {
+        self.spec.with(|spec| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < words.len() {
+                let w = words[i];
+                if w == "--" {
+                    out.extend_from_slice(&words[i + 1..]);
+                    break;
+                }
+                // An unknown or ambiguous long option is refused by the
+                // tool; whether it would take the next word is unknown, so
+                // that word is read as an operand too (fails closed).
+                let mut unknown = false;
+                match spec.option_at(words, i, &mut |o| {
+                    unknown |= matches!(o, Opt::Unknown { .. })
+                }) {
+                    Some(_) if unknown => i += 1,
+                    Some(n) => i = n,
+                    None => {
+                        out.push(w);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        })
     }
 
     /// Does `words` hold an operand? Read with getopt, permuting, up to
@@ -225,20 +324,29 @@ impl WhenOption {
         })
     }
 
-    /// `given`, over words with the signal word already handled.
-    fn given_in(&self, words: &[&str]) -> bool {
+    /// `given`, over one reading: whether one of `names` was given, and
+    /// whether one of `targets` was given with a value naming a target.
+    fn given_in(&self, words: &[&str]) -> (bool, bool) {
+        let named = |list: &[String], short: char, long: Option<&str>| {
+            list.iter().any(|n| match n.strip_prefix("--") {
+                Some(l) => long == Some(l),
+                None => {
+                    short != '\0'
+                        && n.strip_prefix('-')
+                            .is_some_and(|s| s.chars().eq(std::iter::once(short)))
+                }
+            })
+        };
         self.spec.with(|spec| {
             let mut hit = false;
+            let mut targeted = false;
             let mut seen = |o: Opt<'_, '_>| match o {
-                Opt::Known { short, long, .. } => {
-                    hit |= self.names.iter().any(|n| match n.strip_prefix("--") {
-                        Some(l) => long == Some(l),
-                        None => {
-                            short != '\0'
-                                && n.strip_prefix('-')
-                                    .is_some_and(|s| s.chars().eq(std::iter::once(short)))
-                        }
-                    });
+                Opt::Known {
+                    short, long, value, ..
+                } => {
+                    hit |= named(&self.names, short, long);
+                    targeted |=
+                        value.is_some_and(names_target) && named(&self.targets, short, long);
                 }
                 Opt::Unknown { .. } => hit = true,
             };
@@ -277,7 +385,7 @@ impl WhenOption {
                     None => i += 1,
                 }
             }
-            hit
+            (hit, targeted)
         })
     }
 }
@@ -392,11 +500,19 @@ impl OperandMatch {
             if self.min_len > 0 && o.chars().count() < self.min_len {
                 return Hit::Yes;
             }
-            if self.substitution && (o.contains("$(") || o.contains('`') || o.contains("$[")) {
+            if self.substitution
+                && (o.contains("$(") || o.contains('`') || o.contains("$[") || only_expansions(o))
+            {
                 return Hit::Yes;
             }
             if o.is_empty() {
                 continue;
+            }
+            // Rust regex class set operations (`[a-z&&[^x]]`, `--`, `~~`)
+            // mean nothing to POSIX ERE (pkill, killall) or fnmatch: what
+            // the tool makes of them is not what the guard would judge.
+            if has_class_set_op(o) {
+                return Hit::Yes;
             }
             let lower = o.to_lowercase();
             let source = match self.syntax {
@@ -446,6 +562,44 @@ impl OperandMatch {
     }
 }
 
+/// Is `word` made of parameter expansions only (`$X`, `"${X}"`, `$1`,
+/// `$@`, `$X$Y`), so it may expand to nothing (`pkill "$X"` with `X`
+/// unset matches every process)? `$$`, `$#` and `$?` always expand to
+/// digits and count as text.
+fn only_expansions(word: &str) -> bool {
+    let b = word.as_bytes();
+    let mut i = 0;
+    let mut any = false;
+    while i < b.len() {
+        if b[i] != b'$' {
+            return false;
+        }
+        let rest = &b[i + 1..];
+        let len = match rest.first() {
+            Some(b'{') => match rest.iter().position(|&c| c == b'}') {
+                Some(end) => end + 1,
+                None => return false,
+            },
+            Some(c) if c.is_ascii_alphabetic() || *c == b'_' => rest
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(rest.len()),
+            Some(b'@' | b'*' | b'!' | b'-' | b'0'..=b'9') => 1,
+            _ => return false,
+        };
+        any = true;
+        i += 1 + len;
+    }
+    any
+}
+
+/// Does a pattern operand hold a Rust regex class set operation (`&&`,
+/// `--` or `~~` after a `[`)? Read loosely: any of them after any `[`.
+fn has_class_set_op(o: &str) -> bool {
+    o.find('[')
+        .is_some_and(|i| ["&&", "--", "~~"].iter().any(|op| o[i..].contains(op)))
+}
+
 /// An anchored regex for a shell glob: `*`, `?`, and `[…]` classes (`[!…]`
 /// negated); everything else literal. A class without its `]` is literal.
 fn glob_regex(glob: &str) -> String {
@@ -472,7 +626,15 @@ fn glob_regex(glob: &str) -> String {
                     class = format!("^{rest}");
                 }
                 out.push('[');
-                out.push_str(&class.replace('\\', "\\\\").replace('[', "\\["));
+                // `&`, `~` (and `[`, `\`) are escaped one by one: Rust
+                // regex reads `&&` and `~~` in a class as set operations.
+                out.push_str(
+                    &class
+                        .replace('\\', "\\\\")
+                        .replace('[', "\\[")
+                        .replace('&', "\\&")
+                        .replace('~', "\\~"),
+                );
                 out.push(']');
                 i = end;
             }
@@ -505,6 +667,35 @@ pub struct Pack {
     pub deny_path: Vec<PathRule>,
     /// Built once from `triggers` at load.
     prefilter: Prefilter,
+    /// `[pack] lazy = true` from a catalog: `allow` and `deny` are empty
+    /// and the rules are compiled on first use ([`Pack::allow_rules`],
+    /// [`Pack::deny_rules`]), which the engine asks for only when a command
+    /// line holds one of the pack's triggers.
+    lazy: Option<std::sync::Arc<LazyRules>>,
+}
+
+/// The rules of a lazy pack, compiled once on first use.
+#[derive(Debug)]
+struct LazyRules {
+    source: &'static str,
+    toml: &'static str,
+    has_deny: bool,
+    rules: std::sync::OnceLock<(Vec<Rule>, Vec<Rule>)>,
+}
+
+impl LazyRules {
+    fn get(&self) -> &(Vec<Rule>, Vec<Rule>) {
+        self.rules.get_or_init(|| {
+            // A broken built-in drops its rules, as an eager load does;
+            // `load_all` (eager) reports it, and the tests keep every
+            // built-in loading clean.
+            let mut warnings = Vec::new();
+            match load_pack_str(self.source, self.toml, &mut warnings) {
+                Ok(p) => (p.allow, p.deny),
+                Err(_) => (Vec::new(), Vec::new()),
+            }
+        })
+    }
 }
 
 impl Pack {
@@ -513,9 +704,41 @@ impl Pack {
         &self.prefilter
     }
 
+    /// The `[[allow]]` rules (compiled now, for a lazy pack).
+    pub fn allow_rules(&self) -> &[Rule] {
+        match &self.lazy {
+            Some(l) => &l.get().0,
+            None => &self.allow,
+        }
+    }
+
+    /// The `[[deny]]` rules (compiled now, for a lazy pack).
+    pub fn deny_rules(&self) -> &[Rule] {
+        match &self.lazy {
+            Some(l) => &l.get().1,
+            None => &self.deny,
+        }
+    }
+
+    /// The pack has `[[deny]]` rules, without compiling a lazy pack.
+    pub fn has_deny(&self) -> bool {
+        match &self.lazy {
+            Some(l) => l.has_deny,
+            None => !self.deny.is_empty(),
+        }
+    }
+
+    /// The rules are compiled on first use.
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.is_some()
+    }
+
     /// Command rules plus path rules.
     pub fn rule_count(&self) -> usize {
-        self.allow.len() + self.deny.len() + self.allow_path.len() + self.deny_path.len()
+        self.allow_rules().len()
+            + self.deny_rules().len()
+            + self.allow_path.len()
+            + self.deny_path.len()
     }
 }
 
@@ -576,6 +799,10 @@ struct RawMeta {
     triggers: Vec<String>,
     #[serde(default = "default_true")]
     substitution_failsafe: bool,
+    /// Compile the rules on first use (a catalog load; see [`Pack::lazy`]).
+    #[serde(default)]
+    #[allow(dead_code)] // read by `peek_header`
+    lazy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +833,8 @@ struct RawRule {
     command_long_only: bool,
     #[serde(default)]
     when_no_operand: bool,
+    #[serde(default)]
+    target_options: Vec<String>,
     #[serde(default)]
     operand_match_share: Option<f64>,
     #[serde(default)]
@@ -687,10 +916,16 @@ fn compile_rules(
             }
         };
         let has_table = r.command_options.is_some() || !r.command_long_options.is_empty();
-        let when_option = match (r.when_option.is_empty(), has_table) {
-            (true, false) if !r.when_no_operand => None,
-            (false, true) => {
-                let names_ok = r.when_option.iter().all(|n| {
+        let gates = !r.when_option.is_empty() || r.when_no_operand;
+        // A table without `when_option` reads the operands of an operand
+        // rule; `target_options` needs `when_no_operand`.
+        let table_use_ok = (gates || operands.is_some())
+            && (!r.when_no_operand || !r.when_option.is_empty())
+            && (r.target_options.is_empty() || r.when_no_operand);
+        let table = match (gates, has_table) {
+            (false, false) if r.target_options.is_empty() => None,
+            (_, true) if table_use_ok => {
+                let names_ok = r.when_option.iter().chain(&r.target_options).all(|n| {
                     n.strip_prefix("--").is_some_and(|l| !l.is_empty())
                         || n.strip_prefix('-').is_some_and(|s| s.chars().count() == 1)
                 });
@@ -705,6 +940,7 @@ fn compile_rules(
                         signal_word: r.command_signal_word,
                         long_only: r.command_long_only,
                         no_operand: r.when_no_operand,
+                        targets: r.target_options,
                     }),
                     Ok(_) => {
                         warnings.push(PackWarning {
@@ -730,17 +966,20 @@ fn compile_rules(
                     source: source.to_string(),
                     message: format!(
                         "skipping rule {:?}: when_option needs command_options or \
-                         command_long_options, and they need it (when_no_operand \
-                         needs all of them)",
+                         command_long_options, and they need it or operand_match \
+                         (when_no_operand needs all of them; target_options needs \
+                         when_no_operand)",
                         r.pattern
                     ),
                 });
                 continue;
             }
         };
+        let when_option = table.clone().filter(|_| gates);
         match Regex::new(&r.pattern) {
             Ok(regex) => out.push(Rule {
                 when_option,
+                table,
                 pattern: r.pattern,
                 regex,
                 reason: r.reason.unwrap_or_default(),
@@ -796,6 +1035,12 @@ fn check_path_rules(
 #[derive(Deserialize)]
 struct RawHeader {
     pack: RawHeaderMeta,
+    #[serde(default)]
+    deny: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    allow_path: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    deny_path: Vec<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -805,14 +1050,79 @@ struct RawHeaderMeta {
     default_on: bool,
     #[serde(default = "default_version")]
     version: u32,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    triggers: Vec<String>,
+    #[serde(default = "default_true")]
+    substitution_failsafe: bool,
+    #[serde(default)]
+    lazy: bool,
+}
+
+/// What a lazy pack needs before its rules are compiled.
+#[derive(Debug, Clone)]
+pub(crate) struct LazyMeta {
+    name: String,
+    description: String,
+    triggers: Vec<String>,
+    substitution_failsafe: bool,
+    has_deny: bool,
 }
 
 /// A pack's `id`, `default_on` and `version` without compiling any of its
-/// rules, so a caller can decide whether the pack is needed. `None` if the
-/// TOML or its `[pack]` table cannot be read (a full load reports why).
-pub(crate) fn peek_header(toml_str: &str) -> Option<(String, bool, u32)> {
+/// rules, so a caller can decide whether the pack is needed, and, for a
+/// pack that says `lazy = true` (with triggers and no path rules), what
+/// [`lazy_pack`] needs. `None` if the TOML or its `[pack]` table cannot be
+/// read (a full load reports why).
+pub(crate) fn peek_header(toml_str: &str) -> Option<((String, bool, u32), Option<LazyMeta>)> {
     let h: RawHeader = toml::from_str(toml_str).ok()?;
-    (!h.pack.id.trim().is_empty()).then_some((h.pack.id, h.pack.default_on, h.pack.version))
+    if h.pack.id.trim().is_empty() {
+        return None;
+    }
+    let lazy = (h.pack.lazy
+        && !h.pack.triggers.is_empty()
+        && h.allow_path.is_empty()
+        && h.deny_path.is_empty())
+    .then_some(LazyMeta {
+        name: h.pack.name,
+        description: h.pack.description,
+        triggers: h.pack.triggers,
+        substitution_failsafe: h.pack.substitution_failsafe,
+        has_deny: !h.deny.is_empty(),
+    });
+    Some(((h.pack.id, h.pack.default_on, h.pack.version), lazy))
+}
+
+/// A pack whose rules are compiled on first use, from its peeked header.
+pub(crate) fn lazy_pack(
+    source: &'static str,
+    toml: &'static str,
+    (id, default_on, version): &(String, bool, u32),
+    meta: &LazyMeta,
+) -> Pack {
+    Pack {
+        prefilter: Prefilter::new(meta.triggers.clone()),
+        id: id.clone(),
+        name: meta.name.clone(),
+        description: meta.description.clone(),
+        default_on: *default_on,
+        version: *version,
+        triggers: meta.triggers.clone(),
+        substitution_failsafe: meta.substitution_failsafe,
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_path: Vec::new(),
+        deny_path: Vec::new(),
+        lazy: Some(std::sync::Arc::new(LazyRules {
+            source,
+            toml,
+            has_deny: meta.has_deny,
+            rules: std::sync::OnceLock::new(),
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +1169,7 @@ pub fn load_pack_str(
         deny,
         allow_path,
         deny_path,
+        lazy: None,
     })
 }
 
@@ -1047,6 +1358,7 @@ mod tests {
             signal_word: true,
             long_only: false,
             no_operand: false,
+            targets: Vec::new(),
         };
         let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in [
@@ -1128,6 +1440,7 @@ mod tests {
             signal_word: true,
             long_only: true,
             no_operand: false,
+            targets: Vec::new(),
         };
         let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in ["-regexp x", "-reg x", "-XFSZ -r x", "-Ir x", "-verbose x"] {
@@ -1168,6 +1481,7 @@ mod tests {
             signal_word: true,
             long_only: false,
             no_operand: true,
+            targets: Vec::new(),
         };
         let m = |s: &str| w.matches(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in [
@@ -1182,12 +1496,14 @@ mod tests {
             // `-ttin`: SIGTTIN (no selector), or `-t tin` (a selector).
             "-ttin",
             "--zz",
+            // Final review S14: the leading word in lower case too
+            // (`-term`: `-t erm`). pkill without a pattern refuses to run
+            // anyway.
+            "-TERM",
         ] {
             assert!(m(yes), "{yes}");
         }
-        for no in [
-            "-n x", "x -n", "-u me x", "-n -- x", "-HUP x", "-TERM", "-9", "-F f",
-        ] {
+        for no in ["-n x", "x -n", "-u me x", "-n -- x", "-HUP x", "-9", "-F f"] {
             assert!(!m(no), "{no}");
         }
     }
@@ -1204,6 +1520,7 @@ mod tests {
             signal_word: true,
             long_only: true,
             no_operand: true,
+            targets: Vec::new(),
         };
         let m = |s: &str| w.matches(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in ["-u me", "-user me", "--user=me", "-9 -u me"] {
@@ -1253,6 +1570,88 @@ mod tests {
         for no in [&["ab"][..], &["[a-c]"], &["node"], &["-f"], &["-*."], &[]] {
             assert_eq!(hit(no), Hit::No, "{no:?}");
         }
+    }
+
+    /// Security review: Rust regex class set operations mean nothing to
+    /// ERE or fnmatch; such a pattern counts as a match, in both syntaxes.
+    #[test]
+    fn class_set_operations_count_as_a_match() {
+        let hit = |syntax, o: &str| {
+            OperandMatch {
+                syntax,
+                targets: vec!["nginx".into()],
+                need: 1,
+                min_len: 0,
+                substitution: false,
+            }
+            .hits_within(&[o.to_string()], &|| false, &Cell::default(), Duration::MAX)
+        };
+        for o in ["[a-z&&[^x]]", "[a-z--x]y", "[a~~b]", "x[[a]&&[b]]"] {
+            assert_eq!(hit(OperandSyntax::Regex, o), Hit::Yes, "{o}");
+            assert_eq!(hit(OperandSyntax::Glob, o), Hit::Yes, "{o}");
+        }
+        assert_eq!(hit(OperandSyntax::Regex, "[a-c]x"), Hit::No);
+        // Read loosely (after any `[`): fails closed.
+        assert_eq!(hit(OperandSyntax::Regex, "[a-c]&&x"), Hit::Yes);
+        // `&` and `~` in a glob class are literal characters.
+        assert_eq!(glob_regex("[&~]x"), "^[\\&\\~]x$");
+        assert!(regex::Regex::new(&glob_regex("[&~a]*")).is_ok());
+        assert!(regex::Regex::new(&glob_regex("[&&a]*")).is_ok());
+        assert_eq!(hit(OperandSyntax::Glob, "ngin[&x]"), Hit::Yes);
+    }
+
+    #[test]
+    fn expansion_only_operands() {
+        for yes in ["$X", "${X}", "$X$Y", "$1", "$@", "${X:-}", "$_x"] {
+            assert!(only_expansions(yes), "{yes}");
+        }
+        for no in ["", "$$", "$#", "x$X", "$X-y", "${X}d", "$", "$(x)"] {
+            assert!(!only_expansions(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn target_values() {
+        for yes in ["1234", "$$", "2", "1234,5678", "$$,99"] {
+            assert!(names_target(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "0",
+            "1",
+            "01",
+            "1234,1",
+            "$PID",
+            "pts/3",
+            "12a",
+            "99999999999",
+        ] {
+            assert!(!names_target(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn operand_args_skip_option_values() {
+        let w = WhenOption {
+            spec: OwnedSpec::parse(
+                "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:",
+                &["signal=".into(), "euid=|u".into(), "full|f".into()],
+            )
+            .unwrap(),
+            names: Vec::new(),
+            signal_word: true,
+            long_only: false,
+            no_operand: false,
+            targets: Vec::new(),
+        };
+        let ops = |s: &str| w.operand_args(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        assert_eq!(ops("--signal 9 node"), ["--", "node"]);
+        assert_eq!(ops("-u 0 node"), ["--", "node"]);
+        assert_eq!(ops("-9 -f x -- -y"), ["--", "x", "-y"]);
+        // An unknown long option does not swallow the next word.
+        assert_eq!(ops("--zz node"), ["--", "node"]);
+        // A substitution stays an operand wherever it stands.
+        assert_eq!(ops("-u $(id) node"), ["--", "node", "$(id)"]);
     }
 
     #[test]
