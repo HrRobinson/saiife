@@ -202,7 +202,11 @@ mod tests {
         let link = dir.path().join("slash");
         std::os::unix::fs::symlink("/", &link).unwrap();
         assert!(Layout::under(&link).is_system());
-        assert!(Layout::under(link.join("etc/..")).is_system());
+        // Through a real directory below `/`: `usr` is one on Linux and
+        // macOS (`etc` is not: on macOS it is a symlink to `private/etc`,
+        // so `/etc/..` is `/private`).
+        assert!(!std::fs::symlink_metadata("/usr").unwrap().is_symlink());
+        assert!(Layout::under(link.join("usr/..")).is_system());
     }
 
     #[test]

@@ -1137,7 +1137,9 @@ mod tests {
     fn fake_encrypt_writes_under_root_only() {
         let dir = tempfile::tempdir().unwrap();
         let h = FakeHost::open(dir.path()).unwrap();
-        let out = dir.path().join("vault-key");
+        // Spelled as `Layout::under` spells it: canonical (on macOS the temp
+        // dir is below the /var -> /private/var symlink).
+        let out = fs::canonicalize(dir.path()).unwrap().join("vault-key");
         h.encrypt_credential("vault-key", &[7u8; 32], &out).unwrap();
         let bytes = fs::read(&out).unwrap();
         assert!(!bytes.is_empty());

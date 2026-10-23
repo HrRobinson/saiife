@@ -1009,7 +1009,14 @@ mod tests {
     fn hostile_policy_drop_in_name_is_named_safely() {
         use std::os::unix::ffi::OsStrExt;
         let t = T::installed();
-        let raw = std::ffi::OsStr::from_bytes(b"\x1b[31mevil\n\xff.toml");
+        // APFS (macOS) refuses a name that is not UTF-8 (EILSEQ); there the
+        // name keeps the escape and the newline but not the 0xff byte.
+        let name: &[u8] = if cfg!(target_os = "macos") {
+            b"\x1b[31mevil\n.toml"
+        } else {
+            b"\x1b[31mevil\n\xff.toml"
+        };
+        let raw = std::ffi::OsStr::from_bytes(name);
         let p = t.at(POLICY_D).join(raw);
         fs::write(&p, "").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).unwrap();
