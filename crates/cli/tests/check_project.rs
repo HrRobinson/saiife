@@ -261,3 +261,283 @@ fn symlink_outside_project_is_refused_without_leaking() {
     assert!(!stderr.contains("SECRET-CANARY"), "{stderr}");
     assert!(stderr.contains("outside the project"), "{stderr}");
 }
+
+// ---- Developer hook under a locked-mode `/etc` (spec §6.1.1, §11) ----
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// A stand-in for `/etc/saiife` in a temp dir.
+struct Etc {
+    dir: tempfile::TempDir,
+}
+
+impl Etc {
+    fn new() -> Etc {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc/saiife")).unwrap();
+        Etc { dir }
+    }
+    fn config(&self) -> std::path::PathBuf {
+        self.dir.path().join("etc/saiife/config.toml")
+    }
+    fn write_config(&self, text: &str) {
+        std::fs::write(self.config(), text).unwrap();
+    }
+    /// `installed.toml` listing a managed hook for each of `agents`.
+    fn install(&self, agents: &[&str]) {
+        use saiife_policy::installed::*;
+        let i = Installed {
+            version: INSTALLED_VERSION,
+            saiife: "0.1.1".into(),
+            installed_at: "2026-10-22T10:00:00Z".into(),
+            systemd: 255,
+            vault_key: VaultKeyMode::Credential,
+            users: vec![],
+            groups: vec![],
+            memberships: vec![],
+            dirs: vec![],
+            files: vec![],
+            agents: agents
+                .iter()
+                .map(|a| ManagedAgent {
+                    agent: a.to_string(),
+                    path: format!("/etc/{a}/managed").into(),
+                    sha256: "cc".repeat(32),
+                    whole_file: true,
+                    created_file: true,
+                })
+                .collect(),
+        };
+        write_installed(&self.dir.path().join("etc/saiife/installed.toml"), &i).unwrap();
+    }
+}
+
+/// `saiife check --agent <agent> --system-config <etc>` with `payload`;
+/// `hook_exit` adds `--hook-exit`.
+fn dev_check(
+    etc: &Etc,
+    audit: &Path,
+    agent: &str,
+    hook_exit: bool,
+    payload: &str,
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit);
+    cmd.args(["check", "--agent", agent, "--system-config"])
+        .arg(etc.config());
+    if hook_exit {
+        cmd.arg("--hook-exit");
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut sin = child.stdin.take().unwrap();
+    let data = payload.as_bytes().to_vec();
+    let w = std::thread::spawn(move || {
+        let _ = sin.write_all(&data);
+    });
+    let out = child.wait_with_output().unwrap();
+    w.join().unwrap();
+    out
+}
+
+fn fixture(rel: &str) -> String {
+    std::fs::read_to_string(Path::new(FIXTURES).join(rel)).unwrap()
+}
+
+fn guard_records(audit: &Path) -> Vec<saiife_audit::Record> {
+    read_all(audit)
+        .records
+        .into_iter()
+        .filter(|r| !r.is_bookkeeping())
+        .collect()
+}
+
+#[test]
+fn project_hook_quiet_when_agent_managed() {
+    let etc = Etc::new();
+    etc.install(&["claude", "codex"]);
+    let audit = tempfile::tempdir().unwrap();
+    let home = common::FixtureHome::new();
+    let deny = home.real(&fixture("claude/bash-deny.json"));
+    for hook_exit in [true, false] {
+        let o = dev_check(&etc, audit.path(), "claude", hook_exit, &deny);
+        assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+        assert!(o.stdout.is_empty(), "{}", common::stdout(&o));
+        assert!(o.stderr.is_empty(), "{}", common::stderr(&o));
+    }
+    // Even a payload over the parse cap is drained quietly.
+    let big = "x".repeat(70 << 20);
+    let o = dev_check(&etc, audit.path(), "claude", true, &big);
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+    assert!(o.stderr.is_empty(), "{}", common::stderr(&o));
+    assert!(
+        std::fs::read_dir(audit.path()).unwrap().next().is_none(),
+        "no record, no audit file"
+    );
+}
+
+#[test]
+fn project_hook_works_for_unmanaged_agent() {
+    let etc = Etc::new();
+    etc.install(&["codex"]);
+    let audit = tempfile::tempdir().unwrap();
+    let home = common::FixtureHome::new();
+    let o = dev_check(
+        &etc,
+        audit.path(),
+        "claude",
+        true,
+        &home.real(&fixture("claude/bash-deny.json")),
+    );
+    assert_eq!(common::code(&o), 2, "{}", common::stderr(&o));
+    assert!(
+        common::stderr(&o).starts_with("saiife: BLOCKED by core.filesystem"),
+        "{}",
+        common::stderr(&o)
+    );
+    let recs = guard_records(audit.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].decision, DecisionKind::Deny);
+    assert_eq!(recs[0].mode.as_deref(), Some("developer"));
+}
+
+#[test]
+fn developer_fail_closed_opt_in() {
+    let etc = Etc::new();
+    etc.write_config("version = 2\n[guard]\nfail = \"closed\"\n");
+    let audit = tempfile::tempdir().unwrap();
+    let bad = fixture("malformed/not-json.txt");
+    let o = dev_check(&etc, audit.path(), "claude", true, &bad);
+    assert_eq!(common::code(&o), 2, "{}", common::stderr(&o));
+    let err = common::stderr(&o);
+    assert!(
+        err.starts_with("saiife: BLOCKED (fail closed): hook payload not usable"),
+        "{err}"
+    );
+    assert!(o.stdout.is_empty());
+    let recs = guard_records(audit.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].decision, DecisionKind::ErrorDenied);
+
+    // Without --hook-exit: the JSON deny.
+    let o = dev_check(&etc, audit.path(), "claude", false, &bad);
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("fail closed"));
+    assert_eq!(
+        guard_records(audit.path())[1].decision,
+        DecisionKind::ErrorDenied
+    );
+
+    // A judged call is unchanged.
+    let home = common::FixtureHome::new();
+    let o = dev_check(
+        &etc,
+        audit.path(),
+        "claude",
+        true,
+        &home.real(&fixture("claude/bash-allow.json")),
+    );
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+
+    // `locked = true` alone turns it on as well.
+    etc.write_config("version = 2\nlocked = true\n");
+    let o = dev_check(&etc, audit.path(), "claude", true, &bad);
+    assert_eq!(common::code(&o), 2, "{}", common::stderr(&o));
+}
+
+#[test]
+fn developer_bad_args_fail_closed_when_opted_in() {
+    let etc = Etc::new();
+    etc.write_config("version = 2\n[guard]\nfail = \"closed\"\n");
+    let audit = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sandbox = common::hermetic(&mut cmd, audit.path());
+    let o = cmd
+        .args([
+            "check",
+            "--hook-exit",
+            "--agent",
+            "claude",
+            "--bogus",
+            "--system-config",
+        ])
+        .arg(etc.config())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(common::code(&o), 2, "{}", common::stderr(&o));
+    assert!(
+        common::stderr(&o).contains("fail closed"),
+        "{}",
+        common::stderr(&o)
+    );
+    let recs = guard_records(audit.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].decision, DecisionKind::ErrorDenied);
+}
+
+#[test]
+fn developer_default_still_fails_open() {
+    // No file under the stand-in /etc at all.
+    let etc = Etc::new();
+    let audit = tempfile::tempdir().unwrap();
+    let o = dev_check(
+        &etc,
+        audit.path(),
+        "claude",
+        true,
+        &fixture("malformed/not-json.txt"),
+    );
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+    assert!(
+        common::stderr(&o).contains("failing open (allow)"),
+        "{}",
+        common::stderr(&o)
+    );
+    let recs = guard_records(audit.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].decision, DecisionKind::ErrorAllowed);
+
+    // An explicit `fail = "open"` (and a config without `fail`) too.
+    for text in ["version = 2\n[guard]\nfail = \"open\"\n", "version = 2\n"] {
+        etc.write_config(text);
+        let o = dev_check(
+            &etc,
+            audit.path(),
+            "claude",
+            true,
+            &fixture("malformed/not-json.txt"),
+        );
+        assert_eq!(common::code(&o), 0, "{text}: {}", common::stderr(&o));
+    }
+}
+
+#[test]
+fn invalid_system_config_fails_open_with_warning() {
+    let etc = Etc::new();
+    etc.write_config("version = = 2\n[guard]\nfail = \"closed\"\n");
+    let audit = tempfile::tempdir().unwrap();
+    let o = dev_check(
+        &etc,
+        audit.path(),
+        "claude",
+        true,
+        &fixture("malformed/not-json.txt"),
+    );
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+    let err = common::stderr(&o);
+    let want = format!("saiife: warning: {} ignored: ", etc.config().display());
+    assert_eq!(err.matches(&want).count(), 1, "{err}");
+    let recs = guard_records(audit.path());
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].decision, DecisionKind::ErrorAllowed);
+}

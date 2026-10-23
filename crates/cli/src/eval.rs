@@ -65,6 +65,9 @@ pub struct EvalRequest {
     /// The system config's paths, bound as extra rule-variable values.
     #[serde(default)]
     pub locked: Option<LockedPaths>,
+    /// The hook event when it is not a tool call (`config-change`).
+    #[serde(default)]
+    pub event: Option<String>,
 }
 
 /// What the worker answers on stdout.
@@ -387,6 +390,165 @@ fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer
     }
 }
 
+/// The top-level settings keys a session may not change (spec §6.1.1).
+pub const LOCKED_SETTINGS_KEYS: [&str; 5] = [
+    "hooks",
+    "disableAllHooks",
+    "permissions",
+    "env",
+    "apiKeyHelper",
+];
+
+/// Largest settings file `judge_config_change` reads.
+const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+
+/// Judge a Claude Code `ConfigChange` payload (spec §6.1.1): the changed
+/// settings file must not set a `LOCKED_SETTINGS_KEYS` key. A change to the
+/// managed settings (root's) is allowed; a removed file is allowed (managed
+/// hooks outrank it either way); a file that cannot be checked is denied.
+/// Skills are not settings files and are allowed.
+pub fn judge_config_change(payload: &str) -> EvalAnswer {
+    let v: Option<serde_json::Value> = serde_json::from_str(payload).ok();
+    let field = |k: &str| {
+        v.as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let source = field("source");
+    let file_path = field("file_path");
+    let answer = |verdict, reason: String| {
+        let deny = verdict == Verdict::Deny;
+        EvalAnswer {
+            verdict,
+            input: format!("{source} {file_path}"),
+            tool: Some("ConfigChange".to_string()),
+            pack: deny.then(|| "core.self".to_string()),
+            rule: deny.then(|| "config-change".to_string()),
+            reason: Some(reason),
+        }
+    };
+    if !v.as_ref().is_some_and(serde_json::Value::is_object) {
+        return answer(
+            Verdict::Unjudged,
+            "hook payload not usable: not a JSON object".to_string(),
+        );
+    }
+    let unchecked = |why: &str| {
+        answer(
+            Verdict::Deny,
+            format!("settings change could not be checked: {why}"),
+        )
+    };
+    match source.as_str() {
+        "policy_settings" => return answer(Verdict::Allow, "managed settings changed".into()),
+        "skills" => return answer(Verdict::Allow, "skills changed".into()),
+        _ => {}
+    }
+    if file_path.is_empty() {
+        return unchecked("no file_path");
+    }
+    let path = std::path::Path::new(&file_path);
+    if !path.is_absolute() {
+        return unchecked("file_path is not absolute");
+    }
+    let bytes = match crate::system_view::read_regular(path, true, MAX_SETTINGS_BYTES) {
+        Ok(Some(b)) => b,
+        Ok(None) => return answer(Verdict::Allow, "settings file removed".into()),
+        Err(e) => return unchecked(&e),
+    };
+    let settings: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return unchecked(&format!("not valid JSON ({e})")),
+    };
+    let Some(map) = settings.as_object() else {
+        return unchecked("not a JSON object");
+    };
+    match LOCKED_SETTINGS_KEYS.iter().find(|k| map.contains_key(**k)) {
+        Some(key) => answer(
+            Verdict::Deny,
+            format!(
+                "settings change touches {key} (hooks, disableAllHooks, permissions, env and \
+                 apiKeyHelper are locked during a session)"
+            ),
+        ),
+        None => answer(Verdict::Allow, "settings change allowed".into()),
+    }
+}
+
+/// Whether an MCP tool may be used in locked mode (spec §6.1.4).
+// Used by the locked hook, which is Linux-only in this version.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCheck {
+    /// Not an MCP tool.
+    NotMcp,
+    /// Its server is in `[guard.mcp] allow_servers`.
+    Allowed,
+    /// Its server (or, when there is no server part, the whole tool name)
+    /// is not listed.
+    Denied(String),
+    /// A Gemini-style `mcp_…` name without a server identity in the
+    /// payload: `mcp_<server>_<tool>` cannot be split safely (an unlisted
+    /// `linear_x` would pass as `linear`), so the server is unknown.
+    Unknown,
+}
+
+/// Judge `tool` of `agent` against `allow`. Claude Code and Codex name MCP
+/// tools `mcp__<server>__<tool>`; the server is the text up to the next
+/// `__`. Gemini CLI names them `mcp_<server>_<tool>`, which is ambiguous,
+/// so a Gemini MCP call is allowed only when the payload's explicit
+/// `server` identity (`mcp_context.server_name`) is listed. Other agents:
+/// both forms.
+// Used by the locked hook, which is Linux-only in this version.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn mcp_check(agent: &str, tool: &str, server: Option<&str>, allow: &[String]) -> McpCheck {
+    let listed = |s: &str| allow.iter().any(|a| a == s);
+    let double = |tool: &str| {
+        let rest = tool.strip_prefix("mcp__")?;
+        Some(match rest.split_once("__") {
+            Some((s, _)) if !s.is_empty() && listed(s) => McpCheck::Allowed,
+            Some((s, _)) if !s.is_empty() => McpCheck::Denied(s.to_string()),
+            _ => McpCheck::Denied(tool.to_string()),
+        })
+    };
+    let single = |tool: &str| {
+        if !tool.starts_with("mcp_") && server.is_none() {
+            return None;
+        }
+        Some(match server {
+            Some(s) if listed(s) => McpCheck::Allowed,
+            Some(s) => McpCheck::Denied(s.to_string()),
+            None => McpCheck::Unknown,
+        })
+    };
+    let found = match agent {
+        "claude" | "codex" => double(tool),
+        "gemini" => single(tool),
+        _ => double(tool).or_else(|| single(tool)),
+    };
+    found.unwrap_or(McpCheck::NotMcp)
+}
+
+/// The payload's explicit MCP server identity (Gemini CLI's
+/// `mcp_context.server_name`), if it carries one.
+// Used by the locked hook, which is Linux-only in this version.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn mcp_server_field(payload: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Ctx {
+        server_name: Option<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct P {
+        mcp_context: Option<serde_json::Value>,
+    }
+    let p: P = serde_json::from_str(payload).ok()?;
+    let ctx: Ctx = serde_json::from_value(p.mcp_context?).ok()?;
+    ctx.server_name?.as_str().map(str::to_string)
+}
+
 /// `saiife __eval`: read one `EvalRequest` from stdin, write one
 /// `EvalAnswer` to stdout, exit 0. Any other exit is a worker failure,
 /// which the parent turns into `error_denied`.
@@ -409,12 +571,23 @@ pub fn worker_main() -> ExitCode {
     drop(buf);
     #[cfg(debug_assertions)]
     fault_seam();
-    let answer = judge_with(
-        &req.payload,
-        &req.packs,
-        Duration::from_millis(req.budget_ms),
-        req.locked.as_ref(),
-    );
+    let answer = match req.event.as_deref() {
+        None => judge_with(
+            &req.payload,
+            &req.packs,
+            Duration::from_millis(req.budget_ms),
+            req.locked.as_ref(),
+        ),
+        Some("config-change") => judge_config_change(&req.payload),
+        Some(other) => EvalAnswer {
+            verdict: Verdict::Unjudged,
+            input: String::new(),
+            tool: None,
+            pack: None,
+            rule: None,
+            reason: Some(format!("unknown hook event {other:?}")),
+        },
+    };
     let mut out = std::io::stdout().lock();
     if serde_json::to_writer(&mut out, &answer)
         .map_err(std::io::Error::from)
@@ -645,6 +818,265 @@ mod tests {
         }
         assert!(check_cwd(Some(&"/".repeat(MAX_CWD_BYTES))).is_ok());
         assert!(check_cwd(None).is_ok());
+    }
+
+    fn config_change(source: &str, file_path: &str) -> String {
+        serde_json::json!({
+            "session_id": "s",
+            "cwd": "/",
+            "hook_event_name": "ConfigChange",
+            "source": source,
+            "file_path": file_path,
+        })
+        .to_string()
+    }
+
+    fn settings_file(dir: &std::path::Path, text: &str) -> String {
+        let f = dir.join("settings.json");
+        std::fs::write(&f, text).unwrap();
+        f.display().to_string()
+    }
+
+    #[test]
+    fn config_change_with_hooks_key_denied() {
+        let d = tempfile::tempdir().unwrap();
+        let f = settings_file(d.path(), r#"{"hooks":{}}"#);
+        let a = judge_config_change(&config_change("user_settings", &f));
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+        assert_eq!(a.pack.as_deref(), Some("core.self"));
+        assert_eq!(a.rule.as_deref(), Some("config-change"));
+        assert_eq!(
+            a.reason.as_deref(),
+            Some(
+                "settings change touches hooks (hooks, disableAllHooks, permissions, env and \
+                 apiKeyHelper are locked during a session)"
+            )
+        );
+        assert_eq!(a.tool.as_deref(), Some("ConfigChange"));
+        assert_eq!(a.input, format!("user_settings {f}"));
+        for key in LOCKED_SETTINGS_KEYS {
+            let f = settings_file(d.path(), &format!(r#"{{"theme":"x","{key}":1}}"#));
+            let a = judge_config_change(&config_change("project_settings", &f));
+            assert_eq!(a.verdict, Verdict::Deny, "{key}: {a:?}");
+            assert!(
+                a.reason.unwrap().contains(&format!("touches {key} ")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_change_harmless_allowed() {
+        let d = tempfile::tempdir().unwrap();
+        let f = settings_file(d.path(), r#"{"theme":"dark"}"#);
+        let a = judge_config_change(&config_change("local_settings", &f));
+        assert_eq!(a.verdict, Verdict::Allow, "{a:?}");
+        assert_eq!(a.tool.as_deref(), Some("ConfigChange"));
+        assert_eq!(a.input, format!("local_settings {f}"));
+        assert_eq!((a.pack, a.rule), (None, None));
+        // A removed settings file takes nothing away from the lock.
+        let gone = d.path().join("gone.json").display().to_string();
+        let a = judge_config_change(&config_change("user_settings", &gone));
+        assert_eq!(a.verdict, Verdict::Allow, "{a:?}");
+        assert_eq!(a.reason.as_deref(), Some("settings file removed"));
+    }
+
+    #[test]
+    fn config_change_policy_settings_allowed() {
+        // Never opened: the managed file is root's.
+        let a = judge_config_change(&config_change(
+            "policy_settings",
+            "/nonexistent/dir/managed-settings.json",
+        ));
+        assert_eq!(a.verdict, Verdict::Allow, "{a:?}");
+        assert_eq!(a.reason.as_deref(), Some("managed settings changed"));
+        assert_eq!(
+            a.input,
+            "policy_settings /nonexistent/dir/managed-settings.json"
+        );
+    }
+
+    #[test]
+    fn config_change_unparsable_denied() {
+        let d = tempfile::tempdir().unwrap();
+        for text in ["{\"hooks\": ", "not json", "[1,2]"] {
+            let f = settings_file(d.path(), text);
+            let a = judge_config_change(&config_change("user_settings", &f));
+            assert_eq!(a.verdict, Verdict::Deny, "{text}: {a:?}");
+            assert_eq!(a.pack.as_deref(), Some("core.self"));
+            assert_eq!(a.rule.as_deref(), Some("config-change"));
+            assert!(
+                a.reason
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("settings change could not be checked: "),
+                "{a:?}"
+            );
+        }
+        // Larger than 1 MiB.
+        let f = settings_file(
+            d.path(),
+            &format!("{{\"theme\":\"{}\"}}", "x".repeat(1 << 20)),
+        );
+        let a = judge_config_change(&config_change("user_settings", &f));
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_change_fifo_denied_quickly() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("settings.json");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let t = std::time::Instant::now();
+        let a = judge_config_change(&config_change("user_settings", &fifo.display().to_string()));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+        assert!(a
+            .reason
+            .unwrap()
+            .starts_with("settings change could not be checked: "));
+    }
+
+    #[test]
+    fn config_change_relative_path_denied() {
+        for p in ["settings.json", ".claude/settings.json", ""] {
+            let a = judge_config_change(&config_change("project_settings", p));
+            assert_eq!(a.verdict, Verdict::Deny, "{p}: {a:?}");
+            assert_eq!(a.rule.as_deref(), Some("config-change"));
+        }
+        // No file_path at all.
+        let a =
+            judge_config_change(r#"{"hook_event_name":"ConfigChange","source":"user_settings"}"#);
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+    }
+
+    #[test]
+    fn config_change_unusable_payload_is_unjudged() {
+        let a = judge_config_change("not json");
+        assert_eq!(a.verdict, Verdict::Unjudged, "{a:?}");
+        assert_eq!(a.tool.as_deref(), Some("ConfigChange"));
+    }
+
+    fn list(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mcp_check_claude() {
+        let allow = list(&["linear"]);
+        for agent in ["claude", "codex", "unknown"] {
+            assert_eq!(
+                mcp_check(agent, "mcp__linear__create", None, &allow),
+                McpCheck::Allowed,
+                "{agent}"
+            );
+            assert_eq!(
+                mcp_check(agent, "mcp__other__x", None, &allow),
+                McpCheck::Denied("other".into()),
+                "{agent}"
+            );
+            assert_eq!(mcp_check(agent, "Bash", None, &allow), McpCheck::NotMcp);
+            // A claimed server field does not override the tool name.
+            assert_eq!(
+                mcp_check(agent, "mcp__other__x", Some("linear"), &allow),
+                McpCheck::Denied("other".into()),
+                "{agent}"
+            );
+            // No server part: the whole name.
+            assert_eq!(
+                mcp_check(agent, "mcp__linear", None, &allow),
+                McpCheck::Denied("mcp__linear".into()),
+                "{agent}"
+            );
+            assert_eq!(
+                mcp_check(agent, "mcp____x", None, &list(&[""])),
+                McpCheck::Denied("mcp____x".into()),
+                "{agent}"
+            );
+        }
+        assert_eq!(
+            mcp_check("claude", "mcp__linear__create", None, &[]),
+            McpCheck::Denied("linear".into())
+        );
+    }
+
+    /// Controller ruling: Gemini's `mcp_<server>_<tool>` is ambiguous (an
+    /// unlisted `linear_x` would pass a prefix match), so only an explicit
+    /// server identity in the payload allows the call.
+    #[test]
+    fn mcp_check_gemini_prefix() {
+        let allow = list(&["linear"]);
+        assert_eq!(
+            mcp_check("gemini", "mcp_linear_x", Some("linear"), &allow),
+            McpCheck::Allowed
+        );
+        assert_eq!(
+            mcp_check("gemini", "mcp_linear_x", None, &allow),
+            McpCheck::Unknown
+        );
+        assert_eq!(
+            mcp_check("gemini", "mcp_linear_x_y", Some("linear_x"), &allow),
+            McpCheck::Denied("linear_x".into())
+        );
+        assert_eq!(
+            mcp_check("gemini", "read_file", None, &allow),
+            McpCheck::NotMcp
+        );
+        // A tool outside the `mcp_` names that still says it is an MCP call.
+        assert_eq!(
+            mcp_check("gemini", "search", Some("other"), &allow),
+            McpCheck::Denied("other".into())
+        );
+        // Other agents: the single-underscore form follows the Gemini rule.
+        assert_eq!(
+            mcp_check("unknown", "mcp_linear_x", None, &allow),
+            McpCheck::Unknown
+        );
+        assert_eq!(
+            mcp_check("unknown", "mcp_linear_x", Some("linear"), &allow),
+            McpCheck::Allowed
+        );
+    }
+
+    #[test]
+    fn mcp_check_double_underscore_server_name() {
+        // The server ends at the first `__` after the prefix.
+        assert_eq!(
+            mcp_check("claude", "mcp__a__b__c", None, &list(&["a"])),
+            McpCheck::Allowed
+        );
+        assert_eq!(
+            mcp_check("claude", "mcp__a__b__c", None, &list(&["a__b"])),
+            McpCheck::Denied("a".into())
+        );
+        // On Gemini the double form is still only an `mcp_` name.
+        assert_eq!(
+            mcp_check("gemini", "mcp__a__b", None, &list(&["a"])),
+            McpCheck::Unknown
+        );
+    }
+
+    #[test]
+    fn mcp_server_field_reads_gemini_context() {
+        let p = serde_json::json!({
+            "tool_name": "mcp_linear_x",
+            "mcp_context": {"server_name": "linear", "tool_name": "x"},
+        })
+        .to_string();
+        assert_eq!(mcp_server_field(&p).as_deref(), Some("linear"));
+        for p in [
+            r#"{"tool_name":"mcp_linear_x"}"#,
+            r#"{"mcp_context":{"server_name":7}}"#,
+            r#"{"mcp_context":"linear"}"#,
+            "not json",
+        ] {
+            assert_eq!(mcp_server_field(p), None, "{p}");
+        }
     }
 
     #[test]

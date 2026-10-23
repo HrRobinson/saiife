@@ -35,6 +35,7 @@ mod report;
 mod report_html;
 mod status_cmd;
 mod system_cmd;
+mod system_view;
 mod text;
 
 use saiifeguard::builtins::builtin_packs;
@@ -87,9 +88,15 @@ enum Cmd {
         /// the saiife daemon, fail closed on every error. Implies --hook-exit.
         #[arg(long)]
         managed: bool,
-        /// The system config for --managed (default /etc/saiife/config.toml).
-        #[arg(long = "system-config", hide = true, requires = "managed")]
+        /// The system config (default /etc/saiife/config.toml). The
+        /// developer hook reads which agents are managed and whether to
+        /// fail closed from it.
+        #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// The hook event when it is not a tool call (Claude Code's
+        /// ConfigChange hook: `config-change`). Locked mode only.
+        #[arg(long, value_parser = ["config-change"], requires = "managed")]
+        event: Option<String>,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -189,15 +196,16 @@ fn main() -> ExitCode {
         agent,
         managed,
         system_config,
+        event,
     } = &cli.command
     {
         if *managed {
             let config = system_config
                 .as_deref()
                 .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
-            return check_managed::run(agent, config);
+            return check_managed::run(agent, config, event.as_deref());
         }
-        return check::run(&cli.packs, *hook_exit, agent);
+        return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
     }
     if let Cmd::Eval = cli.command {
         return eval::worker_main();
@@ -348,11 +356,15 @@ fn arg_error(e: clap::Error) -> ExitCode {
         if args.iter().any(|a| a == "--managed") {
             return check_managed::run_bad_args(&args, first);
         }
-        warn(&format!(
-            "bad hook arguments ({first}); failing open (allow)"
-        ));
-        check::record_arg_error(&args, first);
-        return ExitCode::SUCCESS;
+        // `--event` belongs to managed hooks only: a hook that passes it
+        // without `--managed` is miswritten, not from a newer saiife.
+        if args
+            .iter()
+            .any(|a| a == "--event" || a.starts_with("--event="))
+        {
+            e.exit()
+        }
+        return check::arg_error(&args, first);
     }
     e.exit()
 }

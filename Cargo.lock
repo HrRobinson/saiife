@@ -659,6 +659,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dirs",
+ "libc",
  "predicates",
  "rustix",
  "saiife-agents",
@@ -672,6 +673,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "time",
+ "toml",
 ]
 
 [[package]]

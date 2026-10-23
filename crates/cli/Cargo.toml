@@ -21,12 +21,16 @@ saiife-system = { path = "../system" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+# The developer hook reads /etc/saiife/config.toml as a raw table.
+toml = "0.8"
 time = { version = "0.3", features = ["formatting", "macros"] }
 dirs = "5"
 
 [target.'cfg(unix)'.dependencies]
 # Signals for the worker fault seam (debug builds); no unsafe calls.
 rustix = { version = "1", features = ["process"] }
+# Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
