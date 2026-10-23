@@ -409,16 +409,22 @@ pub(crate) fn check_trusted_dir(
     root_uid: u32,
 ) -> Result<(), InstallError> {
     use std::os::unix::fs::MetadataExt;
-    if m.uid() != root_uid {
+    check_trusted_owner_mode(p, m.uid(), m.mode() & 0o7777, root_uid)
+}
+
+/// [`check_trusted_dir`] from an owner and permission bits.
+pub(crate) fn check_trusted_owner_mode(
+    p: &Path,
+    uid: u32,
+    mode: u32,
+    root_uid: u32,
+) -> Result<(), InstallError> {
+    if uid != root_uid {
         return Err(refused(
             p,
-            format!(
-                "exists and is owned by uid {}, not root; saiife does not write below it",
-                m.uid()
-            ),
+            format!("exists and is owned by uid {uid}, not root; saiife does not write below it"),
         ));
     }
-    let mode = m.mode() & 0o7777;
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Err(refused(
             p,
@@ -426,28 +432,6 @@ pub(crate) fn check_trusted_dir(
                 "mode {mode:04o} is writable by group or others; saiife does not write below it"
             ),
         ));
-    }
-    Ok(())
-}
-
-/// Every existing directory from below the root down to `abs` (inclusive)
-/// must pass [`check_trusted_dir`].
-pub(crate) fn check_trusted_chain(
-    layout: &Layout,
-    abs: &str,
-    root_uid: u32,
-) -> Result<(), InstallError> {
-    let mut logical = PathBuf::from("/");
-    for comp in Path::new(abs).components().skip(1) {
-        logical.push(comp);
-        let p = layout
-            .try_at(&logical)
-            .map_err(|e| refused(&logical, e.to_string()))?;
-        match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
-            None => break,
-            Some(m) if m.is_dir() => check_trusted_dir(&p, &m, root_uid)?,
-            Some(_) => return Err(refused(&p, "exists and is not a directory")),
-        }
     }
     Ok(())
 }
@@ -905,7 +889,9 @@ impl Run<'_> {
     }
 }
 
-#[cfg(test)]
+// Locked mode is Linux-only: on macOS `check_supported` refuses every
+// install (spec §0 decision 8), so these tests run on Linux only.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use super::*;
     use crate::host::{CmdOutput, FakeHost, UserInfo};

@@ -1,5 +1,7 @@
 //! `saiife system install|uninstall`, only ever against a temp root with the
-//! fake host (`--root`). Nothing here touches the real machine.
+//! fake host (`--root`). Nothing here touches the real machine. Locked mode
+//! is Linux-only: on macOS install refuses every root, so the tests that
+//! install run on Linux only.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -56,6 +58,7 @@ fn install_without_root_refused() {
         .stderr(contains("needs root"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn install_and_uninstall_under_root_flag() {
     let root = fake_root();
@@ -106,6 +109,7 @@ fn install_and_uninstall_under_root_flag() {
     assert!(!p("etc/saiife/installed.toml").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn install_under_root_runs_doctor() {
     let root = fake_root();
@@ -141,6 +145,7 @@ fn install_under_root_runs_doctor() {
     assert!(!stdout.contains("install failed") && !stderr.contains("install failed"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unsupported_root_exits_2_with_the_refusal_line() {
     let root = fake_root();
@@ -159,6 +164,7 @@ fn unsupported_root_exits_2_with_the_refusal_line() {
     assert!(!root.path().join("etc/saiife").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn step_failure_exits_2_with_the_step() {
     let root = fake_root();

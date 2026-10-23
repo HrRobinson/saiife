@@ -19,8 +19,12 @@ use std::path::{Path, PathBuf};
 
 const NOT_INSTALLED: &str = "locked mode is not installed: developer mode checks only";
 const NOT_CHECKED: &str = "not checked (run as root)";
-/// Largest file `files.installed` fingerprints (16 MiB).
+/// Largest file `files.installed` fingerprints (16 MiB), the binary
+/// excepted ([`MAX_BINARY`]).
 const MAX_FINGERPRINT: u64 = 16 * 1024 * 1024;
+/// Largest binary `files.installed` fingerprints and `files.binary` reads
+/// (256 MiB): a saiife build can outgrow 16 MiB.
+const MAX_BINARY: u64 = 256 * 1024 * 1024;
 /// The audit key seed length.
 const KEY_LEN: u64 = 32;
 
@@ -333,24 +337,25 @@ fn open_regular(path: &Path) -> io::Result<(fs::File, Metadata)> {
     Ok((f, md))
 }
 
-/// The SHA-256 of the regular file `path` (see [`open_regular`]).
-fn sha256_file(path: &Path) -> io::Result<String> {
+/// The SHA-256 of the regular file `path` (see [`open_regular`]) of at
+/// most `max` bytes.
+fn sha256_file(path: &Path, max: u64) -> io::Result<String> {
     let (f, md) = open_regular(path)?;
     let too_large = || io::Error::new(io::ErrorKind::InvalidData, "file too large to fingerprint");
-    if md.len() > MAX_FINGERPRINT {
+    if md.len() > max {
         return Err(too_large());
     }
     let mut h = Sha256::new();
     // Bounded even when the file grows after the size check.
-    if io::copy(&mut io::Read::take(f, MAX_FINGERPRINT + 1), &mut h)? > MAX_FINGERPRINT {
+    if io::copy(&mut io::Read::take(f, max + 1), &mut h)? > max {
         return Err(too_large());
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Whether the file listed as `listed` still exists (and, when `want` is
-/// given, still has that SHA-256).
-fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, t: &mut Tally) {
+/// given, still has that SHA-256; read up to `max` bytes).
+fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, max: u64, t: &mut Tally) {
     let shown = listed.display().to_string();
     let at = match ctx.layout.try_at(listed) {
         Ok(p) => p,
@@ -365,7 +370,7 @@ fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, t: &mut Tally) {
         Stat::Found(_) => {}
     }
     let Some(want) = want else { return };
-    match sha256_file(&at) {
+    match sha256_file(&at, max) {
         Ok(got) if got == want => {}
         Ok(_) => t.bad(format!("{shown}: changed since install")),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
@@ -386,9 +391,6 @@ fn entry_fingerprint(agent: &str, file: &Path) -> Result<Option<String>, String>
     };
     r.map_err(|e| e.to_string())
 }
-
-/// Largest binary `files.binary` reads (256 MiB).
-const MAX_BINARY: u64 = 256 * 1024 * 1024;
 
 /// The installed binary must be the static release build (spec §9.2 A4): a
 /// dynamic one honours `LD_PRELOAD` from an environment the agent shapes, a
@@ -458,11 +460,16 @@ fn files_installed(ctx: &Ctx, i: &Installed) -> Check {
             FileKind::Config | FileKind::VaultKey => None,
             _ => f.sha256.as_deref(),
         };
-        verify_file(ctx, &f.path, want, &mut t);
+        let max = if f.kind == FileKind::Binary {
+            MAX_BINARY
+        } else {
+            MAX_FINGERPRINT
+        };
+        verify_file(ctx, &f.path, want, max, &mut t);
     }
     for a in &i.agents {
         if a.whole_file {
-            verify_file(ctx, &a.path, Some(&a.sha256), &mut t);
+            verify_file(ctx, &a.path, Some(&a.sha256), MAX_FINGERPRINT, &mut t);
             continue;
         }
         let shown = a.path.display().to_string();
@@ -918,6 +925,8 @@ mod tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    // Linux only: on macOS `system.supported` fails (locked mode needs Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn fake_install_fails_only_daemon_checks() {
         let t = T::installed();
@@ -1033,13 +1042,38 @@ mod tests {
     #[test]
     fn oversized_file_is_not_fingerprinted() {
         let t = T::installed();
-        let f = fs::File::options().write(true).open(t.at(BINARY)).unwrap();
+        let f = fs::File::options().write(true).open(t.at(UNIT)).unwrap();
         f.set_len(super::MAX_FINGERPRINT + 1).unwrap();
+        let f = fs::File::options().write(true).open(t.at(BINARY)).unwrap();
+        f.set_len(super::MAX_BINARY + 1).unwrap();
         let r = t.doctor();
         assert_status(&r, "files.installed", Status::Fail);
         let d = &get(&r, "files.installed").detail;
+        for p in [UNIT, BINARY] {
+            assert!(
+                d.contains(&format!("{p}: file too large to fingerprint")),
+                "{d}"
+            );
+        }
+    }
+
+    /// A binary may be larger than the 16 MiB other files are held to.
+    #[test]
+    fn large_binary_is_fingerprinted() {
+        let t = T::installed();
+        let mut big = crate::binary::fake_elf(None, 0, Some(false));
+        big.resize(super::MAX_FINGERPRINT as usize + 4096, 0x5a);
+        put_binary(&t, &big);
+        let r = t.doctor();
+        assert_status(&r, "files.installed", Status::Pass);
+        assert_status(&r, "files.binary", Status::Pass);
+        // Still compared: one byte changed is a changed file.
+        let mut f = fs::File::options().write(true).open(t.at(BINARY)).unwrap();
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::End(-1)).unwrap();
+        std::io::Write::write_all(&mut f, b"x").unwrap();
+        let d = get(&t.doctor(), "files.installed").detail.clone();
         assert!(
-            d.contains(&format!("{BINARY}: file too large to fingerprint")),
+            d.contains(&format!("{BINARY}: changed since install")),
             "{d}"
         );
     }
@@ -1341,6 +1375,8 @@ mod tests {
         assert_eq!(r.exit_code(), 0);
     }
 
+    // Linux only: on macOS `system.supported` fails (locked mode needs Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn unsupported_system_fails_when_installed() {
         let t = T::installed();

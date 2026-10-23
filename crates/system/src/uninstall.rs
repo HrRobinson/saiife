@@ -5,10 +5,12 @@
 
 use crate::fsops;
 use crate::host::Host;
-use crate::install::{check_trusted_chain, read_previous, step, InstallError, PREVIOUS};
+use crate::install::{check_trusted_owner_mode, read_previous, step, InstallError, PREVIOUS};
 use crate::layout::*;
 use saiife_agents::{codex, gemini, AgentError, Change};
 use saiife_policy::installed::{read_installed, FileKind};
+use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 pub struct UninstallOptions {
@@ -52,8 +54,11 @@ pub fn uninstall(
         })
     };
 
-    // 2. Stop the daemon; a failure is only a warning.
-    systemctl_warn(host, &["disable", "--now", UNIT_NAME], &mut out);
+    // 2. Stop the daemon. A failure is a warning, except before --purge
+    // deletes the daemon's state while it may still run.
+    if !systemctl_warn(host, &["disable", "--now", UNIT_NAME], &mut out) && opts.purge {
+        stopped_or_refuse(host, &out)?;
+    }
 
     // 3. Managed agent configs.
     for a in rec.agents.iter().rev() {
@@ -104,7 +109,7 @@ pub fn uninstall(
             }
         }
         if kind == FileKind::Unit {
-            systemctl_warn(host, &["daemon-reload"], &mut out);
+            let _ = systemctl_warn(host, &["daemon-reload"], &mut out);
         }
     }
     // Listed dirs outside /etc/saiife, if empty, innermost first.
@@ -140,13 +145,23 @@ pub fn uninstall(
         }
     }
     // systemd made these for the daemon (StateDirectory, LogsDirectory).
+    // Removed fd-relative from the root (checked again here).
     for abs in [STATE_DIR, AUDIT_DIR] {
-        if fsops::remove_tree(&layout.at(abs)).map_err(step("purge"))? {
+        if let Some(t) = purge_target(layout, host, abs)? {
+            fsops::remove_tree_at(&t.parent, t.name, &t.stat)
+                .map_err(|e| step("purge")(io_at(abs, e)))?;
             out.push(format!("removed {abs}"));
         }
     }
-    if fsops::remove_if_listed(&layout.at(LOG_DIR)).map_err(step("purge"))? {
-        out.push(format!("removed {LOG_DIR}"));
+    let (log_parent, log_name) = split(LOG_DIR);
+    if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(log_parent))
+        .map_err(|e| step("purge")(io_at(log_parent, e)))?
+    {
+        if fsops::remove_empty_dir_at(&fd, log_name)
+            .map_err(|e| step("purge")(io_at(LOG_DIR, e)))?
+        {
+            out.push(format!("removed {LOG_DIR}"));
+        }
     }
     // Memberships install added, where neither side is deleted below (a
     // deleted user or group takes its memberships with it).
@@ -191,12 +206,50 @@ pub fn uninstall(
     Ok(out)
 }
 
-/// Before `--purge` deletes the state and audit trees: every existing
-/// ancestor is root's and not writable by others, and each tree itself is a
-/// real directory owned by root or the daemon user. Checked before anything
-/// is removed.
+/// Before `--purge` deletes the state and audit trees: each is checked as
+/// [`purge_target`] checks it, before anything is removed.
 fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
-    use std::os::unix::fs::MetadataExt;
+    for abs in [STATE_DIR, AUDIT_DIR] {
+        purge_target(layout, host, abs)?;
+    }
+    Ok(())
+}
+
+/// A tree `--purge` removes: its parent, open, and its `stat`.
+struct PurgeTarget {
+    parent: OwnedFd,
+    name: &'static OsStr,
+    stat: fsops::Stat,
+}
+
+/// `(parent, name)` of a path constant.
+fn split(abs: &'static str) -> (&'static str, &'static OsStr) {
+    let p = Path::new(abs);
+    let parent = p.parent().and_then(Path::to_str).unwrap_or("/");
+    (parent, p.file_name().unwrap_or_default())
+}
+
+/// A path constant relative to the root.
+fn rel(abs: &str) -> &Path {
+    Path::new(abs).strip_prefix("/").unwrap_or(Path::new(abs))
+}
+
+fn io_at(abs: &str, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{abs}: {e}"))
+}
+
+/// The state or audit tree `abs` for `--purge`, or `None` when it (or its
+/// parent) is missing. Its parent is opened fd-relative from the root
+/// ([`fsops::open_dir_beneath`]), so the modes of the ancestors above do
+/// not matter (stock Ubuntu's /var/log is root:syslog 0775). The parent
+/// itself must be root's and not writable by group or others (sticky
+/// dirs excepted), and the tree a real directory owned by root or the
+/// daemon user: nobody else can have swapped it in.
+fn purge_target(
+    layout: &Layout,
+    host: &dyn Host,
+    abs: &'static str,
+) -> Result<Option<PurgeTarget>, InstallError> {
     let root_uid = host
         .user("root")
         .map(|u| u.uid)
@@ -205,30 +258,63 @@ fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError>
             detail: "user root not found".into(),
         })?;
     let daemon_uid = host.user(DAEMON_USER).map(|u| u.uid);
-    for abs in [STATE_DIR, AUDIT_DIR] {
-        let parent = Path::new(abs)
-            .parent()
-            .and_then(Path::to_str)
-            .unwrap_or("/");
-        check_trusted_chain(layout, parent, root_uid)?;
-        let p = layout.at(abs);
-        let refuse = |detail: String| InstallError::Refused {
-            path: p.clone(),
-            detail,
-        };
-        match fsops::lstat(&p).map_err(|e| refuse(e.to_string()))? {
-            None => {}
-            Some(m) if !m.is_dir() => return Err(refuse("is not a directory".into())),
-            Some(m) if m.uid() != root_uid && Some(m.uid()) != daemon_uid => {
-                return Err(refuse(format!(
-                    "is owned by uid {}, not root or {DAEMON_USER}; --purge does not remove it",
-                    m.uid()
-                )))
-            }
-            Some(_) => {}
-        }
+    let (parent_abs, name) = split(abs);
+    let shown_parent = layout.at(parent_abs);
+    let refuse_parent = |detail: String| InstallError::Refused {
+        path: shown_parent.clone(),
+        detail,
+    };
+    let Some(parent) = fsops::open_dir_beneath(layout.root(), rel(parent_abs))
+        .map_err(|e| refuse_parent(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let pst = fsops::stat_fd(&parent).map_err(|e| refuse_parent(e.to_string()))?;
+    let (uid, mode, _) = fsops::stat_owner_mode(&pst);
+    check_trusted_owner_mode(&shown_parent, uid, mode, root_uid)?;
+    let p = layout.at(abs);
+    let refuse = |detail: String| InstallError::Refused {
+        path: p.clone(),
+        detail,
+    };
+    let Some(stat) = fsops::stat_at(&parent, name).map_err(|e| refuse(e.to_string()))? else {
+        return Ok(None);
+    };
+    let (uid, _, is_dir) = fsops::stat_owner_mode(&stat);
+    if !is_dir {
+        return Err(refuse("is not a directory".into()));
     }
-    Ok(())
+    if uid != root_uid && Some(uid) != daemon_uid {
+        return Err(refuse(format!(
+            "is owned by uid {uid}, not root or {DAEMON_USER}; --purge does not remove it"
+        )));
+    }
+    Ok(Some(PurgeTarget { parent, name, stat }))
+}
+
+/// `systemctl disable --now` failed before `--purge`: go on only when
+/// systemd says the daemon is not running (`inactive` or `failed`, as for
+/// a unit a plain uninstall already removed). Otherwise stop: the state and
+/// audit must not go while the daemon may still write them.
+fn stopped_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError> {
+    let state = host
+        .systemctl(&["is-active", UNIT_NAME])
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default();
+    if state == "inactive" || state == "failed" {
+        return Ok(());
+    }
+    let why = out
+        .last()
+        .and_then(|l| l.strip_prefix("warning: "))
+        .unwrap_or("systemctl disable --now failed");
+    Err(InstallError::Step {
+        step: "stop".into(),
+        detail: format!(
+            "{why}; the daemon may still run ({UNIT_NAME} is {}), so --purge removed nothing",
+            if state.is_empty() { "unknown" } else { &state }
+        ),
+    })
 }
 
 /// A plain uninstall keeps installed.toml as `/etc/saiife/installed.previous.toml`
@@ -254,16 +340,24 @@ fn keep_copy(
     Ok(())
 }
 
-fn systemctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) {
+/// Runs `systemctl args`; a failure is a `warning:` line. True when it
+/// succeeded.
+fn systemctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool {
     let line = args.join(" ");
     match host.systemctl(args) {
-        Ok(o) if o.status == 0 => {}
-        Ok(o) => out.push(format!(
-            "warning: systemctl {line} exited {}: {}",
-            o.status,
-            o.stderr.trim()
-        )),
-        Err(e) => out.push(format!("warning: systemctl {line}: {e}")),
+        Ok(o) if o.status == 0 => true,
+        Ok(o) => {
+            out.push(format!(
+                "warning: systemctl {line} exited {}: {}",
+                o.status,
+                o.stderr.trim()
+            ));
+            false
+        }
+        Err(e) => {
+            out.push(format!("warning: systemctl {line}: {e}"));
+            false
+        }
     }
 }
 
@@ -282,7 +376,9 @@ fn is_empty_config(agent: &str, p: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
+// Locked mode is Linux-only: on macOS `check_supported` refuses every
+// install (and these tests install first) (spec §0 decision 8), so these tests run on Linux only.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::install::tests::{env, Env};
@@ -560,6 +656,123 @@ mod tests {
         assert!(e.at(BINARY).exists());
         assert!(e.at(INSTALLED).exists());
         assert!(e.at(AUDIT_DIR).exists());
+    }
+
+    /// Stock Ubuntu: /var/log is root:syslog 0775. The trees are removed
+    /// fd-relative from the root, so a group-writable ancestor above the
+    /// final parent does not matter.
+    #[test]
+    fn purge_ignores_a_group_writable_ancestor() {
+        let e = env(255);
+        e.install();
+        fs::create_dir_all(e.at(KEYS_DIR)).unwrap();
+        fs::write(e.at(AUDIT_KEY), "k").unwrap();
+        fs::set_permissions(e.at(STATE_DIR), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(e.at(AUDIT_DIR).join("old/deeper")).unwrap();
+        fs::write(e.at(AUDIT_DIR).join("2026-10.jsonl"), "{}\n").unwrap();
+        fs::write(e.at(AUDIT_DIR).join("old/deeper/x"), "x").unwrap();
+        // A symlink inside the tree is removed, never followed.
+        let outside = e.src.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, e.at(AUDIT_DIR).join("link")).unwrap();
+        fs::set_permissions(e.at("/var/log"), fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(e.at("/var"), fs::Permissions::from_mode(0o777)).unwrap();
+        let out = un(&e, true);
+        for abs in [STATE_DIR, AUDIT_DIR, LOG_DIR] {
+            assert!(out.contains(&format!("removed {abs}")), "{abs}: {out:?}");
+            assert!(!e.at(abs).exists(), "{abs}");
+        }
+        assert!(outside.join("keep").exists());
+        assert!(e.at("/var/log").is_dir());
+    }
+
+    #[test]
+    fn purge_refuses_a_final_parent_not_owned_by_root() {
+        let e = env(255);
+        e.install();
+        fs::create_dir_all(e.at(AUDIT_DIR)).unwrap();
+        // Everything in the test root is the caller's: make root someone else.
+        e.host.set(|s| {
+            s.users.insert(
+                "root".into(),
+                UserInfo {
+                    uid: 4242,
+                    gid: 4242,
+                    home: "/root".into(),
+                    shell: "/bin/sh".into(),
+                },
+            );
+        });
+        let err = uninstall(&e.layout, &e.host, &UninstallOptions { purge: true }).unwrap_err();
+        match &err {
+            InstallError::Refused { path, detail } => {
+                // The audit tree's parent (no state dir was made here).
+                assert_eq!(path, &e.at(LOG_DIR), "{detail}");
+                assert!(detail.contains("not root"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.at(BINARY).exists());
+        assert!(e.at(AUDIT_DIR).exists());
+    }
+
+    fn disable_fails(e: &Env, is_active: &str) {
+        e.host.set(|s| {
+            s.run.insert(
+                "systemctl disable --now saiifed.service".into(),
+                crate::host::CmdOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to disable unit: Access denied".into(),
+                },
+            );
+            s.run.insert(
+                "systemctl is-active saiifed.service".into(),
+                crate::host::CmdOutput {
+                    status: if is_active == "active" { 0 } else { 3 },
+                    stdout: format!("{is_active}\n"),
+                    stderr: String::new(),
+                },
+            );
+        });
+    }
+
+    /// The daemon may still run: --purge stops before removing anything.
+    #[test]
+    fn purge_stops_when_the_daemon_is_not_stopped() {
+        let e = env(255);
+        e.install();
+        fs::create_dir_all(e.at(AUDIT_DIR)).unwrap();
+        disable_fails(&e, "active");
+        match uninstall(&e.layout, &e.host, &UninstallOptions { purge: true }) {
+            Err(InstallError::Step { step, detail }) => {
+                assert_eq!(step, "stop");
+                assert!(detail.contains("Access denied"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.at(BINARY).exists());
+        assert!(e.at(INSTALLED).exists());
+        assert!(e.at(AUDIT_DIR).exists());
+        assert!(e.host.user(DAEMON_USER).is_some());
+    }
+
+    /// After a plain uninstall the unit is gone and `disable` fails; the
+    /// daemon is known to be stopped, so --purge goes on.
+    #[test]
+    fn purge_goes_on_when_the_unit_is_gone_and_inactive() {
+        let e = env(255);
+        e.install();
+        un(&e, false);
+        disable_fails(&e, "inactive");
+        let out = un(&e, true);
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with("warning: systemctl disable")),
+            "{out:?}"
+        );
+        assert!(out.iter().any(|l| l == "deleted user saiife"), "{out:?}");
     }
 
     #[test]

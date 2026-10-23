@@ -214,6 +214,13 @@ Uninstall removes exactly what `installed.toml` lists. By default it keeps
 `/var/log/saiife` and the users and groups (`--keep-audit` says the same
 explicitly). `--purge` also removes the state, the audit log, the config and
 vault key install wrote (never an admin's own) and the users and groups.
+It removes `/var/lib/saiife` and `/var/log/saiife/audit` relative to open
+directory handles from `/`, so a group-writable ancestor (stock Ubuntu's
+`/var/log` is `root:syslog 0775`) does not matter; it refuses when a tree is
+not owned by root or `saiife`, or its parent directory is not root's or is
+writable by others. If `systemctl disable --now saiifed` fails and systemd
+does not report the daemon `inactive` or `failed`, `--purge` stops before
+it removes anything.
 
 ## Network use
 

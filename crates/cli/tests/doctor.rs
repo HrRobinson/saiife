@@ -29,6 +29,8 @@ fn check<'v>(report: &'v Value, id: &str) -> &'v Value {
         .unwrap_or_else(|| panic!("no check {id} in {report:#}"))
 }
 
+// Linux only: the failure count includes system.supported on macOS.
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_json_exit_matches_report() {
     let tmp = tempfile::tempdir().unwrap();
@@ -139,6 +141,8 @@ fn doctor_user_name_is_escaped() {
     );
 }
 
+// Linux only: the per-user host checks are Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_as_user_checks_self() {
     let tmp = tempfile::tempdir().unwrap();

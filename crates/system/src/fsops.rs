@@ -225,21 +225,147 @@ pub fn remove_if_listed(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Removes the directory tree `path` (`--purge` of the state and audit
-/// dirs). Symlinks inside are removed, not followed; a symlink at `path`
-/// is refused. A missing path gives false.
-pub fn remove_tree(path: &Path) -> io::Result<bool> {
-    let Some(m) = lstat(path)? else {
-        return Ok(false);
-    };
-    if !m.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", path.display()),
-        ));
+// ------------------------------------------------ fd-relative removal
+
+use rustix::fs::{AtFlags, Mode, OFlags};
+use std::ffi::{CString, OsStr};
+use std::os::fd::OwnedFd;
+use std::path::Component;
+
+pub use rustix::fs::Stat;
+
+/// How a directory below the root is opened: never through a symlink.
+fn dir_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// The deepest tree [`remove_tree_at`] descends into.
+const MAX_TREE_DEPTH: usize = 64;
+
+fn errno_at(shown: &Path, e: rustix::io::Errno) -> io::Error {
+    refine(shown, io::Error::from(e))
+}
+
+/// Opens the directory `rel` below `root` one component at a time
+/// (`openat` with `O_NOFOLLOW | O_DIRECTORY` from the previous one), so no
+/// symlink on the way is followed and the modes of the ancestors do not
+/// matter: each step is relative to the directory already open. `None`
+/// when a component is missing. `rel` holds plain components only.
+pub fn open_dir_beneath(root: &Path, rel: &Path) -> io::Result<Option<OwnedFd>> {
+    let mut fd = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| errno_at(root, e))?;
+    let mut shown = root.to_path_buf();
+    for c in rel.components() {
+        match c {
+            Component::Normal(name) => {
+                shown.push(name);
+                fd = match rustix::fs::openat(&fd, name, dir_flags(), Mode::empty()) {
+                    Ok(f) => f,
+                    Err(rustix::io::Errno::NOENT) => return Ok(None),
+                    Err(e) => return Err(errno_at(&shown, e)),
+                };
+            }
+            Component::RootDir | Component::CurDir => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: only plain components are allowed", rel.display()),
+                ))
+            }
+        }
     }
-    fs::remove_dir_all(path).map_err(|e| with_path(path, e))?;
-    Ok(true)
+    Ok(Some(fd))
+}
+
+/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`; `None` when it is missing.
+pub fn stat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<Stat>> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok(Some(st)),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The `fstat` of an open directory.
+pub fn stat_fd(fd: &OwnedFd) -> io::Result<Stat> {
+    rustix::fs::fstat(fd).map_err(Into::into)
+}
+
+/// Owner, permission bits (with setgid and sticky) and whether it is a
+/// directory, from a [`Stat`].
+#[allow(clippy::unnecessary_cast)] // st_mode is u16 on macOS
+pub fn stat_owner_mode(st: &Stat) -> (u32, u32, bool) {
+    let mode = st.st_mode as u32;
+    let is_dir = rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory;
+    (st.st_uid, mode & 0o7777, is_dir)
+}
+
+/// Removes the directory tree `name` in the open directory `dir`,
+/// fd-relative throughout: every directory is opened with `O_NOFOLLOW`
+/// from its parent's descriptor, every entry removed with `unlinkat`, so a
+/// symlink inside is removed, never followed, and a renamed ancestor cannot
+/// redirect the removal. `expect` is the `stat` the caller checked: the
+/// directory opened must be that one (same device and inode).
+pub fn remove_tree_at(dir: &OwnedFd, name: &OsStr, expect: &Stat) -> io::Result<()> {
+    let shown = Path::new(name);
+    let fd = rustix::fs::openat(dir, name, dir_flags(), Mode::empty())
+        .map_err(|e| errno_at(shown, e))?;
+    let st = stat_fd(&fd)?;
+    if (st.st_dev, st.st_ino) != (expect.st_dev, expect.st_ino) {
+        return Err(io::Error::other(format!(
+            "{} changed while it was being removed",
+            shown.display()
+        )));
+    }
+    remove_contents(&fd, 0)?;
+    rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(|e| errno_at(shown, e))
+}
+
+fn remove_contents(dir: &OwnedFd, depth: usize) -> io::Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(io::Error::other(format!(
+            "tree deeper than {MAX_TREE_DEPTH} levels"
+        )));
+    }
+    let mut names: Vec<CString> = Vec::new();
+    for e in rustix::fs::Dir::read_from(dir)? {
+        let e = e?;
+        let n = e.file_name();
+        if n.to_bytes() != b"." && n.to_bytes() != b".." {
+            names.push(n.to_owned());
+        }
+    }
+    for n in names {
+        let st = match rustix::fs::statat(dir, n.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if stat_owner_mode(&st).2 {
+            let child = rustix::fs::openat(dir, n.as_c_str(), dir_flags(), Mode::empty())?;
+            remove_contents(&child, depth + 1)?;
+            rustix::fs::unlinkat(dir, n.as_c_str(), AtFlags::REMOVEDIR)?;
+        } else {
+            rustix::fs::unlinkat(dir, n.as_c_str(), AtFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the directory `name` in `dir` when it is empty. False when it is
+/// missing or not empty.
+pub fn remove_empty_dir_at(dir: &OwnedFd, name: &OsStr) -> io::Result<bool> {
+    match rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST) => {
+            Ok(false)
+        }
+        Err(e) => Err(errno_at(Path::new(name), e)),
+    }
 }
 
 #[cfg(test)]
