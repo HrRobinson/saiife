@@ -118,9 +118,35 @@ macOS gets locked mode in v2.1.
 
 ### Install
 
+Install the **static release binary** (the `x86_64-unknown-linux-musl` or
+`aarch64-unknown-linux-musl` tarball) and run it from a path only root can
+change. Do not run `sudo "$(command -v saiife)" system install` on a binary
+in your home: sudo's `secure_path` does not search `~/.local/bin`, and a
+file your user owns could be swapped before root runs it. Download and
+check the tarball as described in [Manual install](#manual-install), then:
+
 ```sh
-sudo saiife system install --agents claude,codex,gemini
+sudo install -m 0755 -o root -g root ./saiife /usr/local/bin/saiife
+sudo /usr/local/bin/saiife system install --agents claude,codex,gemini
 ```
+
+(or download and extract the tarball as root.) Install copies the binary it
+runs to `/opt/saiife/bin/saiife`.
+
+**Why only the static release build (spec §9.2 A4).** The managed hooks run
+`/opt/saiife/bin/saiife` as the agent user, in an environment the agent can
+shape: Claude Code's settings `env`, for one, is set by files the agent can
+write. A dynamically linked binary loads whatever `LD_PRELOAD` names before
+`main`, so an agent could persist `LD_PRELOAD` there and run its own code
+inside the hook that judges it. A build with debug assertions (`cargo build`
+without `--release`) has a test seam (`SAIIFE_EVAL_FAULT`) that can hang the
+guard past an agent's hook timeout; Codex and Gemini CLI then fail open. So
+`system install` refuses (exit 2) a binary that is dynamically linked (an
+ELF interpreter or a needed shared library), has debug assertions on, or has
+no saiife build marker, and `saiife doctor` fails `files.binary` on a
+dynamic binary and warns `test build installed` on a debug-assertions build.
+The hidden `--allow-test-build` flag exists for the CI job `locked-linux`
+only; never use it in production.
 
 - `--agents` defaults to all three. Install only adds managed hooks; to
   remove one, uninstall.

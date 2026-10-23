@@ -4,7 +4,7 @@
 # sources it. Each phase prints `== <phase>` and stops the job at the first
 # broken assertion.
 #
-# Needs from run.sh: BIN (the debug saiife to install), HERE, REPO, LOGS,
+# Needs from run.sh: BIN (the static ci-locked saiife to install), HERE, REPO, LOGS,
 # WORK (a scratch dir).
 
 AGENT_USER="agent-ci"
@@ -190,8 +190,10 @@ expect_denied() {
 # config, its output in $WORK/install.out.
 install_saiife() {
     local code=0 c
+    # --allow-test-build: $BIN has debug assertions on (the fault seam);
+    # install refuses such a build on a real system without it.
     as_root "$BIN" system install --config "$CI_CONFIG" --agents claude,codex,gemini \
-        --non-interactive >"$WORK/install.out" 2>&1 || code=$?
+        --non-interactive --allow-test-build >"$WORK/install.out" 2>&1 || code=$?
     cat "$WORK/install.out"
     for c in "$@"; do
         [[ "$code" == "$c" ]] && {
@@ -367,6 +369,10 @@ phase_doctor() {
         [[ "$status" == pass ]] || fail "doctor check $id: ${status:-missing}"
         ok "doctor $id: pass"
     done
+    # The ci-locked build is static but has debug assertions on.
+    status="$(jq -r '.checks[] | select(.id == "files.binary") | .status' "$WORK/doctor.json")"
+    [[ "$status" == warn ]] || fail "doctor check files.binary: ${status:-missing}, want warn (test build installed)"
+    ok "doctor files.binary: warn (test build installed)"
     ok "doctor exit $code"
 }
 

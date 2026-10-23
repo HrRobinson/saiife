@@ -125,10 +125,19 @@ fn install_under_root_runs_doctor() {
     );
     assert!(stdout.contains("FAIL  daemon.health  "), "{stdout}");
     assert!(stdout.contains("\ndoctor: "), "{stdout}");
+    // The cargo-built binary is a test build: under --root install only
+    // warns (on the real system it refuses), and doctor fails files.binary
+    // when it is dynamically linked.
+    let (warning, last) = stderr.trim_end().rsplit_once('\n').unwrap_or(("", &stderr));
     assert_eq!(
-        stderr,
-        "saiife: installed, but doctor found failures: fix them before relying on the lock\n"
+        last.trim_end(),
+        "saiife: installed, but doctor found failures: fix them before relying on the lock"
     );
+    assert!(
+        warning.starts_with("saiife: warning: ") && warning.contains("test build"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("  files.binary  "), "{stdout}");
     assert!(!stdout.contains("install failed") && !stderr.contains("install failed"));
 }
 

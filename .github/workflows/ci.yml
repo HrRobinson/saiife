@@ -82,14 +82,22 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      # rust-toolchain.toml selects the toolchain; make sure it has the target.
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # A debug build: the SAIIFE_EVAL_FAULT test seam exists only there.
-      - run: cargo build --bin saiife
+      # Static (musl), like the release, but with debug assertions on: the
+      # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it
+      # with --allow-test-build (spec §9.2 A4: never in production).
+      - run: cargo build --locked --profile ci-locked --target x86_64-unknown-linux-musl --bin saiife
       - name: install, fail-closed matrix, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
-        run: bash scripts/locked-linux/run.sh "$PWD/target/debug/saiife"
+        run: bash scripts/locked-linux/run.sh "$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife"
       - name: upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -41,6 +41,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     if let Some(i) = &ctx.installed {
         out.push(files_installed(ctx, i));
     }
+    out.push(files_binary(ctx));
     out.push(files_modes(ctx));
     out.push(keys(ctx));
     out.push(audit_group(ctx));
@@ -312,9 +313,9 @@ fn paths_owner(ctx: &Ctx) -> Check {
     t.check(ID, TITLE)
 }
 
-/// The SHA-256 of the regular file `path`, opened without following a
-/// symlink or blocking on a FIFO.
-fn sha256_file(path: &Path) -> io::Result<String> {
+/// The regular file `path`, opened without following a symlink or
+/// blocking on a FIFO, with its metadata.
+fn open_regular(path: &Path) -> io::Result<(fs::File, Metadata)> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
@@ -329,6 +330,12 @@ fn sha256_file(path: &Path) -> io::Result<String> {
             "not a regular file",
         ));
     }
+    Ok((f, md))
+}
+
+/// The SHA-256 of the regular file `path` (see [`open_regular`]).
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let (f, md) = open_regular(path)?;
     let too_large = || io::Error::new(io::ErrorKind::InvalidData, "file too large to fingerprint");
     if md.len() > MAX_FINGERPRINT {
         return Err(too_large());
@@ -378,6 +385,66 @@ fn entry_fingerprint(agent: &str, file: &Path) -> Result<Option<String>, String>
         other => return Err(format!("unknown managed agent {other:?}")),
     };
     r.map_err(|e| e.to_string())
+}
+
+/// Largest binary `files.binary` reads (256 MiB).
+const MAX_BINARY: u64 = 256 * 1024 * 1024;
+
+/// The installed binary must be the static release build (spec §9.2 A4): a
+/// dynamic one honours `LD_PRELOAD` from an environment the agent shapes, a
+/// debug-assertions build the `SAIIFE_EVAL_FAULT` test seam.
+fn files_binary(ctx: &Ctx) -> Check {
+    use crate::binary::{inspect, Linking, Profile};
+    const ID: &str = "files.binary";
+    const TITLE: &str = "installed binary";
+    let fail = |d: String| Check::new(ID, Status::Fail, TITLE, d);
+    let read = open_regular(&ctx.layout.at(BINARY)).and_then(|(f, md)| {
+        if md.len() > MAX_BINARY {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+        }
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut io::Read::take(f, MAX_BINARY + 1), &mut bytes)?;
+        if bytes.len() as u64 > MAX_BINARY {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+        }
+        Ok(bytes)
+    });
+    let bytes = match read {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {
+            return Check::new(ID, Status::Info, TITLE, format!("{NOT_CHECKED}: {BINARY}"))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return fail(format!("{BINARY}: missing")),
+        Err(e) => return fail(format!("{BINARY}: cannot read: {e}")),
+    };
+    let info = match inspect(&bytes) {
+        Ok(i) => i,
+        Err(e) => return fail(format!("{BINARY}: not a static ELF executable ({e})")),
+    };
+    if let Linking::Dynamic(why) = &info.linking {
+        return fail(format!(
+            "{BINARY}: dynamically linked ({why}); an agent can inject code into the \
+             managed hook through LD_PRELOAD: install the static release build"
+        ));
+    }
+    match info.profile {
+        Profile::Release => Check::new(ID, Status::Pass, TITLE, "static release build"),
+        Profile::DebugAssertions => Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!(
+                "test build installed: {BINARY} has debug assertions on (the \
+                 SAIIFE_EVAL_FAULT test seam can hang the guard); install the release build"
+            ),
+        ),
+        Profile::Unknown => Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!("{BINARY}: no saiife build marker; its build is unknown"),
+        ),
+    }
 }
 
 fn files_installed(ctx: &Ctx, i: &Installed) -> Check {
@@ -861,6 +928,7 @@ mod tests {
             "config.valid",
             "paths.owner",
             "files.installed",
+            "files.binary",
             "files.modes",
             "keys",
             "daemon.audit_group",
@@ -974,6 +1042,67 @@ mod tests {
             d.contains(&format!("{BINARY}: file too large to fingerprint")),
             "{d}"
         );
+    }
+
+    /// Replaces the installed binary (and its digest on record).
+    fn put_binary(t: &T, bytes: &[u8]) {
+        fs::write(t.at(BINARY), bytes).unwrap();
+        let sha = crate::fsops::sha256_hex(bytes);
+        t.edit_installed(|i| {
+            for f in &mut i.files {
+                if f.kind == saiife_policy::installed::FileKind::Binary {
+                    f.sha256 = Some(sha.clone());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn dynamic_binary_fails() {
+        let t = T::installed();
+        put_binary(
+            &t,
+            &crate::binary::fake_elf(Some("/lib64/ld-linux-x86-64.so.2"), 3, Some(false)),
+        );
+        let r = t.doctor();
+        assert_status(&r, "files.binary", Status::Fail);
+        assert_status(&r, "files.installed", Status::Pass);
+        let d = &get(&r, "files.binary").detail;
+        assert!(
+            d.contains("dynamically linked (interpreter /lib64/ld-linux-x86-64.so.2)")
+                && d.contains("LD_PRELOAD"),
+            "{d}"
+        );
+        // Without an interpreter, a needed library is just as dynamic.
+        put_binary(&t, &crate::binary::fake_elf(None, 1, Some(false)));
+        assert_status(&t.doctor(), "files.binary", Status::Fail);
+    }
+
+    #[test]
+    fn debug_build_warns_test_build_installed() {
+        let t = T::installed();
+        put_binary(&t, &crate::binary::fake_elf(None, 0, Some(true)));
+        let r = t.doctor();
+        assert_status(&r, "files.binary", Status::Warn);
+        assert!(
+            get(&r, "files.binary")
+                .detail
+                .starts_with("test build installed"),
+            "{}",
+            r.to_text()
+        );
+    }
+
+    #[test]
+    fn non_elf_or_missing_binary_fails() {
+        let t = T::installed();
+        put_binary(&t, b"#!/bin/sh\nexit 0\n");
+        let r = t.doctor();
+        assert_status(&r, "files.binary", Status::Fail);
+        assert!(get(&r, "files.binary").detail.contains("not an ELF file"));
+        fs::remove_file(t.at(BINARY)).unwrap();
+        let r = t.doctor();
+        assert_eq!(get(&r, "files.binary").detail, format!("{BINARY}: missing"));
     }
 
     #[test]

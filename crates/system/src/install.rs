@@ -27,6 +27,9 @@ pub struct InstallOptions {
     pub agents: Vec<Agent>,
     pub approvers: Vec<String>,
     pub non_interactive: bool,
+    /// Install a dynamic or debug-assertions build on the real system
+    /// (the CI job `locked-linux` only; never for production).
+    pub allow_test_build: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,6 +39,9 @@ pub struct InstallReport {
     /// What was already as it should be.
     pub unchanged: Vec<String>,
     pub started: bool,
+    /// Said but not refused: a test build under `--root` or with
+    /// `--allow-test-build`.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +134,15 @@ pub fn install(
         Some(p) => Some(validated_config(p)?),
         None => None,
     };
+    // The bytes checked are the bytes copied.
+    let binary_bytes = std::fs::read(binary).map_err(|e| InstallError::Step {
+        step: "binary".into(),
+        detail: format!("{}: {e}", binary.display()),
+    })?;
+    let strict = layout.is_system() && !opts.allow_test_build;
+    let warnings: Vec<String> = check_binary(binary, &binary_bytes, strict)?
+        .into_iter()
+        .collect();
 
     // An existing key decides its own mode (never rotated); a record is
     // not trusted for it.
@@ -153,7 +168,10 @@ pub fn install(
         host,
         saved: previous,
         rec,
-        report: InstallReport::default(),
+        report: InstallReport {
+            warnings,
+            ..InstallReport::default()
+        },
     };
     run.rec.systemd = systemd;
     run.rec.vault_key = key_mode;
@@ -168,7 +186,7 @@ pub fn install(
     // 3. Groups, the user, the audit-group membership.
     run.users()?;
     // 4. The binary.
-    let binary_changed = run.binary(binary)?;
+    let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
     run.config(new_config.as_deref(), &opts.approvers)?;
     // 6. The vault key.
@@ -203,6 +221,35 @@ pub fn install(
     }
     run.report.started = true;
     Ok(run.report)
+}
+
+/// Why the binary `bytes` is unfit for locked mode (spec §9.2 A4): not a
+/// static ELF, or a build with debug assertions. `None` for the static
+/// release build.
+fn binary_problem(bytes: &[u8]) -> Option<String> {
+    let problems = match crate::binary::inspect(bytes) {
+        Ok(info) => info.problems(),
+        Err(e) => vec![format!("it is not a static ELF executable ({e})")],
+    };
+    (!problems.is_empty()).then(|| problems.join("; "))
+}
+
+/// `strict` (the real system without `--allow-test-build`): an unfit
+/// binary is refused. Otherwise it is a warning.
+fn check_binary(path: &Path, bytes: &[u8], strict: bool) -> Result<Option<String>, InstallError> {
+    let Some(problem) = binary_problem(bytes) else {
+        return Ok(None);
+    };
+    if strict {
+        return Err(refused(
+            path,
+            format!(
+                "{problem}; locked mode installs only the static release build \
+                 (see docs/install.md)"
+            ),
+        ));
+    }
+    Ok(Some(format!("{}: {problem}", path.display())))
 }
 
 fn now() -> String {
@@ -661,14 +708,10 @@ impl Run<'_> {
         Ok(write)
     }
 
-    fn binary(&mut self, binary: &Path) -> Result<bool, InstallError> {
+    fn binary(&mut self, bytes: &[u8]) -> Result<bool, InstallError> {
         self.dir(OPT_DIR, 0o755, true)?;
         self.dir(BIN_DIR, 0o755, true)?;
-        let bytes = std::fs::read(binary).map_err(|e| InstallError::Step {
-            step: "binary".into(),
-            detail: format!("{}: {e}", binary.display()),
-        })?;
-        self.file(BINARY, &bytes, 0o755, FileKind::Binary, "binary")
+        self.file(BINARY, bytes, 0o755, FileKind::Binary, "binary")
     }
 
     fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<(), InstallError> {
@@ -927,7 +970,7 @@ pub(crate) mod tests {
         host.set(|s| s.systemd = systemd);
         let src = tempfile::tempdir().unwrap();
         let binary = src.path().join("saiife");
-        fs::write(&binary, b"\x7fELF saiife v1").unwrap();
+        fs::write(&binary, crate::binary::fake_elf(None, 0, Some(false))).unwrap();
         Env {
             _dir: dir,
             src,
@@ -943,6 +986,7 @@ pub(crate) mod tests {
             agents: Agent::ALL.to_vec(),
             approvers: Vec::new(),
             non_interactive: true,
+            allow_test_build: false,
         }
     }
 
@@ -998,7 +1042,11 @@ pub(crate) mod tests {
                 "{abs}: {c:?}"
             );
         }
-        assert_eq!(fs::read(e.at(BINARY)).unwrap(), b"\x7fELF saiife v1");
+        assert_eq!(
+            fs::read(e.at(BINARY)).unwrap(),
+            fs::read(&e.binary).unwrap()
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(
             fs::read_to_string(e.at(UNIT)).unwrap(),
             crate::unit_text(255)
@@ -1187,7 +1235,9 @@ pub(crate) mod tests {
         e.host.set(|s| s.calls.clear());
         e.install();
         assert!(!e.host.state().calls.iter().any(|c| c.contains("restart")));
-        fs::write(&e.binary, b"\x7fELF saiife v2").unwrap();
+        let mut v2 = crate::binary::fake_elf(None, 0, Some(false));
+        v2.extend_from_slice(b"v2");
+        fs::write(&e.binary, &v2).unwrap();
         e.host.set(|s| s.calls.clear());
         let r = e.install();
         let calls = e.host.state().calls;
@@ -1196,7 +1246,7 @@ pub(crate) mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("enable --now")));
-        assert_eq!(fs::read(e.at(BINARY)).unwrap(), b"\x7fELF saiife v2");
+        assert_eq!(fs::read(e.at(BINARY)).unwrap(), v2);
         assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
     }
 
@@ -1449,8 +1499,65 @@ pub(crate) mod tests {
             Err(InstallError::Step { step, .. }) => assert_eq!(step, "binary"),
             other => panic!("{other:?}"),
         }
-        // What was created so far is listed.
-        assert_eq!(e.installed().users, ["saiife"]);
+        // Read (and checked) before anything is created.
+        assert!(!e.at(INSTALLED).exists());
+        assert!(e.host.state().calls.is_empty());
+    }
+
+    // ------------------------------------------------ A4: the binary kind
+
+    #[test]
+    fn unfit_binary_is_refused_on_the_real_system() {
+        let p = Path::new("/usr/local/bin/saiife");
+        let dynamic = crate::binary::fake_elf(Some("/lib64/ld-linux-x86-64.so.2"), 1, Some(false));
+        let debug = crate::binary::fake_elf(None, 0, Some(true));
+        for (bytes, want) in [
+            (
+                &dynamic[..],
+                "dynamically linked (interpreter /lib64/ld-linux-x86-64.so.2)",
+            ),
+            (&debug[..], "test build (debug assertions on"),
+            (
+                &b"#!/bin/sh\n"[..],
+                "not a static ELF executable (not an ELF file)",
+            ),
+        ] {
+            match check_binary(p, bytes, true) {
+                Err(InstallError::Refused { path, detail }) => {
+                    assert_eq!(path, p);
+                    assert!(detail.contains(want), "{detail}");
+                    assert!(detail.contains("static release build"), "{detail}");
+                }
+                other => panic!("{other:?}"),
+            }
+            // Not strict (`--root`, `--allow-test-build`): a warning.
+            let w = check_binary(p, bytes, false).unwrap().unwrap();
+            assert!(
+                w.starts_with("/usr/local/bin/saiife: ") && w.contains(want),
+                "{w}"
+            );
+        }
+        let release = crate::binary::fake_elf(None, 0, Some(false));
+        assert_eq!(check_binary(p, &release, true).unwrap(), None);
+    }
+
+    #[test]
+    fn test_build_under_root_installs_with_a_warning() {
+        let e = env(255);
+        fs::write(
+            &e.binary,
+            crate::binary::fake_elf(Some("/lib64/ld-linux-x86-64.so.2"), 1, Some(true)),
+        )
+        .unwrap();
+        let r = e.install();
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("dynamically linked"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].contains("test build"), "{:?}", r.warnings);
+        assert!(e.at(BINARY).is_file());
     }
 
     // ------------------------------------------------ fix round 1

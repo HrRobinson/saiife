@@ -41,6 +41,11 @@ pub enum SystemAction {
         /// Install below this directory with a fake host (tests only).
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
+        /// Install a dynamically linked or debug-assertions build (the CI
+        /// job locked-linux only). Never for production: such a binary lets
+        /// an agent inject code into, or hang, the managed hook.
+        #[arg(long, hide = true)]
+        allow_test_build: bool,
     },
     /// Remove exactly what `system install` listed in installed.toml. The
     /// config, vault key, state, audit, users and groups are kept unless
@@ -120,6 +125,7 @@ pub fn run(action: SystemAction) -> ExitCode {
             approvers,
             non_interactive,
             root,
+            allow_test_build,
         } => {
             let layout = layout_for(root);
             let host = match host_for(&layout) {
@@ -139,9 +145,13 @@ pub fn run(action: SystemAction) -> ExitCode {
                 agents,
                 approvers,
                 non_interactive,
+                allow_test_build,
             };
             match install(&layout, host.as_ref(), &opts, &binary) {
                 Ok(r) => {
+                    for w in &r.warnings {
+                        eprintln!("saiife: warning: {w}");
+                    }
                     for c in &r.changed {
                         println!("  {c}");
                     }

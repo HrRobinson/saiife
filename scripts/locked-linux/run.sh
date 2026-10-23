@@ -12,8 +12,10 @@
 #
 #   SAIIFE_LOCKED_CI=1 bash scripts/locked-linux/run.sh <saiife binary>
 #
-# The binary must be a debug build: the SAIIFE_EVAL_FAULT test seam exists
-# only there. On a failure the journal, the audit log and /etc/saiife are
+# The binary must be the static ci-locked build (Cargo.toml: musl, debug
+# assertions on): the SAIIFE_EVAL_FAULT test seam exists only with debug
+# assertions, and install refuses anything but a static binary. It is
+# installed with --allow-test-build. On a failure the journal, the audit log and /etc/saiife are
 # copied to $SAIIFE_LOCKED_LOGS (default target/locked-linux-logs) for the
 # job to upload.
 set -euo pipefail
@@ -23,7 +25,7 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" || "${SAIIFE_LOCKED_CI:-}" != "1" || "$(id
     exit 2
 fi
 if [[ $# -ne 1 || ! -x "$1" || "$1" != /* ]]; then
-    echo "usage: SAIIFE_LOCKED_CI=1 bash scripts/locked-linux/run.sh <absolute path to a debug saiife binary>" >&2
+    echo "usage: SAIIFE_LOCKED_CI=1 bash scripts/locked-linux/run.sh <absolute path to the ci-locked saiife binary>" >&2
     exit 2
 fi
 

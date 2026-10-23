@@ -14,8 +14,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-/// What the fake binary holds.
-pub const FAKE_BINARY: &[u8] = b"#!/bin/sh\nexit 0\n";
+/// What the fake binary holds: a minimal static ELF with the release
+/// build marker.
+pub fn fake_binary() -> Vec<u8> {
+    crate::binary::fake_elf(None, 0, Some(false))
+}
 /// What the fake Claude Code managed file holds.
 pub const FAKE_CLAUDE_MANAGED: &str = "{\"hooks\":{}}\n";
 /// The systemd version of the fake install.
@@ -108,7 +111,8 @@ pub fn fake_install(root: &Path) -> Installed {
     dir(&l(CREDSTORE), 0o700);
     dir(&l(CLAUDE_MANAGED_DIR), 0o755);
 
-    file(&l(BINARY), FAKE_BINARY, 0o755);
+    let binary = fake_binary();
+    file(&l(BINARY), &binary, 0o755);
     let config = fake_config(&layout);
     file(&l(CONFIG), config.as_bytes(), 0o644);
     let vault = b"fake encrypted credential\n";
@@ -155,7 +159,7 @@ pub fn fake_install(root: &Path) -> Installed {
         .map(Into::into)
         .collect(),
         files: vec![
-            f(BINARY, FAKE_BINARY, FileKind::Binary),
+            f(BINARY, &binary, FileKind::Binary),
             f(UNIT, unit.as_bytes(), FileKind::Unit),
             f(CONFIG, config.as_bytes(), FileKind::Config),
             f(VAULT_KEY, vault, FileKind::VaultKey),
