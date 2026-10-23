@@ -171,7 +171,10 @@ before you rely on the lock), 2 install error or unsupported system.
 
 The managed hooks fail closed: if the daemon is down, the policy is invalid
 or the guard crashes, every agent tool call is denied. Project hooks from
-`saiife init` go quiet for agents that have a managed hook. In a project,
+`saiife init` go quiet for an agent only when its managed hook was written
+and its lock label holds (lockable, with gaps or with caveats). For Codex and
+Gemini CLI (unverified today), and for a managed file whose write did not
+finish, the project hook keeps judging and `saiife status` says so. In a project,
 `saiife init` then writes only `.saiife/config.toml` (packs can be added,
 never removed), and `saiife init --off` removes leftover project hooks and
 keeps the config.

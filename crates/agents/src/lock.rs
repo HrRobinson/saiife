@@ -39,6 +39,15 @@ impl LockLabel {
         }
     }
 
+    /// The managed hook holds the agent (lockable, with gaps or with
+    /// caveats): its project hook may go quiet.
+    pub fn holds(self) -> bool {
+        matches!(
+            self,
+            LockLabel::Lockable | LockLabel::LockableWithGaps | LockLabel::LockableWithCaveats
+        )
+    }
+
     /// How `doctor` and `status` say it.
     pub fn wording(self) -> &'static str {
         match self {
@@ -62,9 +71,35 @@ pub fn label(agent: Agent) -> LockLabel {
     }
 }
 
+/// Whether the managed hook installed.toml lists for `agent` (with the
+/// fingerprint `sha256`) replaces its project hook (spec §6.1.1): install
+/// finished writing it (a fingerprint on record) and the agent's lock
+/// holds. Otherwise the project hook keeps judging, and `status` says so.
+pub fn replaces_project_hook(agent: &str, sha256: &str) -> bool {
+    !sha256.is_empty() && Agent::from_name(agent).is_some_and(|a| label(a).holds())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_written_holding_managed_hook_replaces_the_project_hook() {
+        assert!(replaces_project_hook("claude", "ab"));
+        assert!(!replaces_project_hook("claude", ""));
+        assert!(!replaces_project_hook("codex", "ab"));
+        assert!(!replaces_project_hook("gemini", "ab"));
+        assert!(!replaces_project_hook("other", "ab"));
+        let holding: Vec<_> = LockLabel::ALL.into_iter().filter(|l| l.holds()).collect();
+        assert_eq!(
+            holding,
+            [
+                LockLabel::Lockable,
+                LockLabel::LockableWithGaps,
+                LockLabel::LockableWithCaveats
+            ]
+        );
+    }
 
     /// The wording column of the label table in docs/lock-check.md.
     #[test]

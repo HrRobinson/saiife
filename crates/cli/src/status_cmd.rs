@@ -718,7 +718,8 @@ struct LockedState {
     /// Something makes every managed hook call fail or the install differ
     /// from its record: status exits 1.
     failed: bool,
-    /// Agents with a managed hook.
+    /// Agents whose managed hook replaces the project hook (written and
+    /// lockable: [`lock::replaces_project_hook`]).
     managed: Vec<String>,
 }
 
@@ -807,8 +808,22 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
             let wording = Agent::from_name(&a.agent)
                 .map(|ag| lock::label(ag).wording())
                 .unwrap_or("unknown agent");
-            outln!("  agent {}: managed hook, {wording}", sanitize(&a.agent));
-            st.managed.push(a.agent.clone());
+            // The same rule as the project hook (`system_view`): only a
+            // written, holding managed hook makes the project hook quiet.
+            if lock::replaces_project_hook(&a.agent, &a.sha256) {
+                outln!("  agent {}: managed hook, {wording}", sanitize(&a.agent));
+                st.managed.push(a.agent.clone());
+            } else if a.sha256.is_empty() {
+                outln!(
+                    "  agent {}: managed hook not written (install did not finish); its project hook still judges its calls",
+                    sanitize(&a.agent)
+                );
+            } else {
+                outln!(
+                    "  agent {}: managed hook, {wording}; its project hook still judges its calls",
+                    sanitize(&a.agent)
+                );
+            }
         }
         for problem in fingerprint_problems(layout, i) {
             st.failed = true;

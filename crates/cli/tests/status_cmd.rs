@@ -1243,8 +1243,11 @@ mod locked {
             text.contains("  agent claude: managed hook, lockable\n"),
             "{text}"
         );
+        // Unverified: the project hook still judges Codex calls.
         assert!(
-            text.contains("  agent codex: managed hook, unverified\n"),
+            text.contains(
+                "  agent codex: managed hook, unverified; its project hook still judges its calls\n"
+            ),
             "{text}"
         );
         // The block comes before the v1 checks.
@@ -1295,6 +1298,26 @@ mod locked {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn status_says_an_unwritten_managed_hook_does_not_guard() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let installed = root.path().join("etc/saiife/installed.toml");
+        let mut i = read_installed(&installed).unwrap().unwrap();
+        for a in &mut i.agents {
+            a.sha256 = String::new();
+        }
+        write_installed(&installed, &i).unwrap();
+        let (_, text) = status_at(root.path());
+        assert!(
+            text.contains(
+                "  agent claude: managed hook not written (install did not finish); its project hook still judges its calls\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("the managed hooks guard"), "{text}");
     }
 
     #[test]

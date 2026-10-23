@@ -8,6 +8,7 @@
 use std::io::Read;
 use std::path::Path;
 
+use saiife_agents::lock::replaces_project_hook;
 use saiife_policy::installed::read_installed;
 
 use crate::warn;
@@ -17,7 +18,9 @@ const MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SystemView {
-    /// Agents `installed.toml` lists a managed hook for.
+    /// Agents whose managed hook replaces the project hook: listed in
+    /// `installed.toml` with a fingerprint, and lockable
+    /// ([`saiife_agents::lock::replaces_project_hook`]).
     pub managed_agents: Vec<String>,
     /// `locked = true`, or `[guard] fail = "closed"` set explicitly.
     pub fail_closed: bool,
@@ -55,7 +58,14 @@ pub fn read(config: &Path) -> SystemView {
         .unwrap_or(Path::new("/"))
         .join("installed.toml");
     match read_installed(&installed) {
-        Ok(Some(i)) => view.managed_agents = i.agents.into_iter().map(|a| a.agent).collect(),
+        Ok(Some(i)) => {
+            view.managed_agents = i
+                .agents
+                .into_iter()
+                .filter(|a| replaces_project_hook(&a.agent, &a.sha256))
+                .map(|a| a.agent)
+                .collect()
+        }
         Ok(None) => {}
         Err(e) => {
             // `read_installed` names the path itself.

@@ -674,6 +674,40 @@ fn locked_init_writes_no_hook_for_managed_agent() {
     assert!(env.root().join(".saiife/config.toml").is_file());
 }
 
+/// A managed hook that does not hold (Gemini CLI is unverified) or whose
+/// write did not finish (no fingerprint) does not replace the project hook.
+#[cfg(unix)]
+#[test]
+fn locked_init_hooks_agents_whose_managed_hook_does_not_hold() {
+    use saiife_policy::installed::{read_installed, write_installed, ManagedAgent};
+    let root = locked_root();
+    let installed = root.path().join("etc/saiife/installed.toml");
+    let mut i = read_installed(&installed).unwrap().unwrap();
+    for a in &mut i.agents {
+        a.sha256 = String::new();
+    }
+    i.agents.push(ManagedAgent {
+        agent: "gemini".into(),
+        path: "/etc/gemini-cli/settings.json".into(),
+        sha256: "cc".repeat(32),
+        whole_file: false,
+        created_file: true,
+    });
+    write_installed(&installed, &i).unwrap();
+    let env = Env::new(&["claude", "gemini"]);
+    let out = env.saiife(&["init", "--root", root.path().to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+    assert!(
+        !text.contains("managed hook installed by the admin"),
+        "{text}"
+    );
+    assert!(env.read(".claude/settings.json").contains("saiife check"));
+    assert!(env
+        .read(".gemini/settings.json")
+        .contains("\"name\": \"saiife\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn locked_init_off_removes_leftover_project_hooks_keeps_config() {

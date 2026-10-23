@@ -1,8 +1,9 @@
 //! `saiife check`: hook mode. Read the agent's pre-tool JSON on stdin, decide,
 //! audit, and answer in the agent's contract. FAIL OPEN on every error,
-//! unless `/etc/saiife` asks for fail closed (spec §11). For an agent with a
-//! managed hook it stays quiet: the managed hook judges and records the call
-//! (spec §6.1.1).
+//! unless `/etc/saiife` asks for fail closed (spec §11). For an agent whose
+//! managed hook replaces it (written by install, and the agent's lock holds:
+//! `saiife_agents::lock::replaces_project_hook`) it stays quiet: the managed
+//! hook judges and records the call (spec §6.1.1).
 
 use std::cell::OnceCell;
 use std::io::Read;

@@ -16,9 +16,11 @@ use saiife_system::Layout;
 
 use crate::project::project_root;
 
-/// Locked mode (spec §7 `init`): `Some(agents with a managed hook)` when
-/// `<root>/etc/saiife/installed.toml` exists, `None` in developer mode. An
-/// unreadable record is locked mode with no agent known to be managed.
+/// Locked mode (spec §7 `init`): `Some(agents whose managed hook replaces
+/// the project hook)` when `<root>/etc/saiife/installed.toml` exists,
+/// `None` in developer mode. An agent whose managed file was not written or
+/// whose lock does not hold still gets a project hook. An unreadable record
+/// is locked mode with no agent known to be managed.
 fn locked_mode(system_root: Option<PathBuf>) -> Option<Vec<String>> {
     let layout = system_root
         .map(Layout::under)
@@ -27,8 +29,14 @@ fn locked_mode(system_root: Option<PathBuf>) -> Option<Vec<String>> {
     std::fs::symlink_metadata(&path).ok()?;
     match read_installed(&path) {
         Ok(i) => Some(
-            i.map(|i| i.agents.into_iter().map(|a| a.agent).collect())
-                .unwrap_or_default(),
+            i.map(|i| {
+                i.agents
+                    .into_iter()
+                    .filter(|a| saiife_agents::lock::replaces_project_hook(&a.agent, &a.sha256))
+                    .map(|a| a.agent)
+                    .collect()
+            })
+            .unwrap_or_default(),
         ),
         Err(e) => {
             crate::warn(&format!(

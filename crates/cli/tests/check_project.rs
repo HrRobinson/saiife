@@ -285,6 +285,12 @@ impl Etc {
     }
     /// `installed.toml` listing a managed hook for each of `agents`.
     fn install(&self, agents: &[&str]) {
+        let sha = "cc".repeat(32);
+        let with: Vec<(&str, &str)> = agents.iter().map(|a| (*a, sha.as_str())).collect();
+        self.install_with(&with);
+    }
+    /// `installed.toml` listing `(agent, sha256)` managed hooks.
+    fn install_with(&self, agents: &[(&str, &str)]) {
         use saiife_policy::installed::*;
         let i = Installed {
             version: INSTALLED_VERSION,
@@ -299,10 +305,10 @@ impl Etc {
             files: vec![],
             agents: agents
                 .iter()
-                .map(|a| ManagedAgent {
+                .map(|(a, sha)| ManagedAgent {
                     agent: a.to_string(),
                     path: format!("/etc/{a}/managed").into(),
-                    sha256: "cc".repeat(32),
+                    sha256: sha.to_string(),
                     whole_file: true,
                     created_file: true,
                 })
@@ -386,6 +392,41 @@ fn project_hook_quiet_when_agent_managed() {
         std::fs::read_dir(audit.path()).unwrap().next().is_none(),
         "no record, no audit file"
     );
+}
+
+/// A managed hook replaces the project hook only when install wrote it (a
+/// fingerprint on record) and the agent's lock holds (lock label lockable,
+/// with gaps or with caveats). Otherwise the project hook still judges.
+#[test]
+fn project_hook_judges_when_managed_hook_does_not_hold() {
+    let home = common::FixtureHome::new();
+    for (installed, agent, payload) in [
+        // The managed file write failed part-way: no fingerprint.
+        (vec![("claude", "")], "claude", "claude/bash-deny.json"),
+        // Codex and Gemini CLI are unverified.
+        (vec![("codex", "cc")], "codex", "codex/bash-deny.json"),
+        (vec![("gemini", "cc")], "gemini", "gemini/shell-deny.json"),
+    ] {
+        let etc = Etc::new();
+        etc.install_with(&installed);
+        let audit = tempfile::tempdir().unwrap();
+        let o = dev_check(
+            &etc,
+            audit.path(),
+            agent,
+            true,
+            &home.real(&fixture(payload)),
+        );
+        assert_eq!(common::code(&o), 2, "{agent}: {}", common::stderr(&o));
+        assert!(
+            common::stderr(&o).starts_with("saiife: BLOCKED by "),
+            "{agent}: {}",
+            common::stderr(&o)
+        );
+        let recs = guard_records(audit.path());
+        assert_eq!(recs.len(), 1, "{agent}");
+        assert_eq!(recs[0].decision, DecisionKind::Deny, "{agent}");
+    }
 }
 
 #[test]

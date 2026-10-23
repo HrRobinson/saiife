@@ -590,9 +590,9 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
 }
 
 /// The MCP server identity `payload` states. A payload that does not parse
-/// (the worker denies it as unusable) states none, unless its raw text
-/// mentions `"mcp_context"` (a duplicate key, say): then it is an MCP call
-/// whose server is unknown.
+/// (a duplicate key, an escaped key spelling, not JSON at all) is an MCP
+/// call whose server is unknown: denied for Gemini CLI and other agents,
+/// never guessed from its raw text.
 // Used by the locked hook, which is Linux-only in this version.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn mcp_identity(payload: &str) -> McpIdentity {
@@ -608,11 +608,7 @@ pub fn mcp_identity(payload: &str) -> McpIdentity {
         mcp_context: Option<serde_json::Value>,
     }
     let Ok(p) = serde_json::from_str::<P>(payload) else {
-        return if payload.contains("\"mcp_context\"") {
-            McpIdentity::NoServer
-        } else {
-            McpIdentity::Absent
-        };
+        return McpIdentity::NoServer;
     };
     match p.mcp_context {
         None => McpIdentity::Absent,
@@ -1285,14 +1281,28 @@ mod tests {
         ] {
             assert_eq!(mcp_identity(p), McpIdentity::NoServer, "{p}");
         }
-        for p in [r#"{"tool_name":"mcp_linear_x"}"#, "not json"] {
-            assert_eq!(mcp_identity(p), McpIdentity::Absent, "{p}");
-        }
-        // Unparsable, yet it names an `mcp_context`.
+        assert_eq!(
+            mcp_identity(r#"{"tool_name":"mcp_linear_x"}"#),
+            McpIdentity::Absent
+        );
+        // Any payload that does not parse states an unknown server, whether
+        // or not its raw text spells `"mcp_context"`.
         let dup =
             r#"{"tool_name":"search","mcp_context":{"server_name":"linear"},"mcp_context":{}}"#;
-        assert_eq!(mcp_identity(dup), McpIdentity::NoServer);
-        assert_eq!(mcp_identity(r#"{"mcp_context": {"#), McpIdentity::NoServer);
+        let escaped = r#"{"tool_name":"search","mcp\u005fcontext":{"server_name":"linear"},"mcp_context":{"server_name":"linear"}}"#;
+        let escaped_dup = r#"{"tool_name":"search","mcp\u005fcontext":{},"mcp\u005fcontext":{}}"#;
+        for p in [
+            dup,
+            escaped_dup,
+            r#"{"mcp_context": {"#,
+            "not json",
+            "",
+            "[1]",
+        ] {
+            assert_eq!(mcp_identity(p), McpIdentity::NoServer, "{p}");
+        }
+        // A key spelled with an escape is the same key once parsed.
+        assert_eq!(mcp_identity(escaped), McpIdentity::NoServer);
         // The ruling's case end to end.
         let p = r#"{"tool_name":"search","mcp_context":{}}"#;
         assert_eq!(
