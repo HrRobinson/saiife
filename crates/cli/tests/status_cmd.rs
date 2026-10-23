@@ -1320,6 +1320,27 @@ mod locked {
         assert!(!text.contains("the managed hooks guard"), "{text}");
     }
 
+    /// Final review I5e: without `saiife init` here, the managed hooks
+    /// still read this project's config and nested ones: status checks
+    /// them before it returns.
+    #[test]
+    fn status_without_init_still_checks_project_and_nested_configs() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let env = Env::new(&["claude"]);
+        env.write(".saiife/config.toml", "packs = [\"no.such-pack\"]\n");
+        env.write("sub/.saiife/config.toml", "packs = []\n");
+        let out = env.saiife(&["status", "--root", root.path().to_str().unwrap()]);
+        let text = stdout(&out);
+        assert!(text.contains("project hooks: none"), "{text}");
+        assert!(text.contains("no.such-pack"), "{text}");
+        assert!(
+            text.contains("sub/.saiife/config.toml is a separate saiife config"),
+            "{text}"
+        );
+        assert_eq!(code(&out), 1, "{text}");
+    }
+
     #[test]
     fn status_reports_changed_managed_file() {
         let d = TestDaemon::start(Opts::default());

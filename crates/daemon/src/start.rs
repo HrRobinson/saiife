@@ -609,12 +609,31 @@ mod tests {
         // Another group this user is in, when there is one: the dir and its
         // month files move to it, nothing else does. (CI asserts the real
         // saiife-audit change as root, Task 8.)
+        // In a user namespace (the offline CI job runs under `unshare
+        // --map-current-user`) the supplementary groups are unmapped and
+        // show as the overflow gid (nogroup); chown to them fails. Only a
+        // group a scratch file can really be given is used.
+        let overflow: Option<u32> = std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        let probe = d.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let usable = |g: u32| {
+            Some(g) != overflow
+                && rustix::fs::chown(&probe, None, Some(rustix::fs::Gid::from_raw(g))).is_ok()
+        };
         let other = rustix::process::getgroups()
             .unwrap()
             .into_iter()
             .map(|g| g.as_raw())
-            .find(|&g| g != primary);
-        let Some(other) = other else { return };
+            .find(|&g| g != primary && usable(g));
+        let Some(other) = other else {
+            eprintln!(
+                "skipped the regroup part: no supplementary group this user can chown to \
+                 (none, or unmapped in a user namespace)"
+            );
+            return;
+        };
         assert_eq!(adopt_audit_group(&dir, other).unwrap(), 1);
         assert_eq!(gid(&dir), other);
         assert_eq!(gid(&dir.join("2026-10.jsonl")), other);

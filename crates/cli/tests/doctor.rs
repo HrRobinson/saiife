@@ -29,8 +29,6 @@ fn check<'v>(report: &'v Value, id: &str) -> &'v Value {
         .unwrap_or_else(|| panic!("no check {id} in {report:#}"))
 }
 
-// Linux only: the failure count includes system.supported on macOS.
-#[cfg(target_os = "linux")]
 #[test]
 fn doctor_json_exit_matches_report() {
     let tmp = tempfile::tempdir().unwrap();
@@ -49,7 +47,12 @@ fn doctor_json_exit_matches_report() {
     assert_eq!(out.status.code(), Some(2));
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("PASS  keys  audit signing key\n"), "{text}");
-    assert!(text.ends_with("doctor: 2 failures, 0 warnings\n"), "{text}");
+    // On macOS system.supported fails too (locked mode needs Linux).
+    let fails = if cfg!(target_os = "linux") { 2 } else { 3 };
+    assert!(
+        text.ends_with(&format!("doctor: {fails} failures, 0 warnings\n")),
+        "{text}"
+    );
 }
 
 #[test]
@@ -141,8 +144,8 @@ fn doctor_user_name_is_escaped() {
     );
 }
 
-// Linux only: the per-user host checks are Linux-only.
-#[cfg(target_os = "linux")]
+/// The secret is never printed. The per-user host checks (the `.secrets`
+/// finding) run on Linux only.
 #[test]
 fn doctor_as_user_checks_self() {
     let tmp = tempfile::tempdir().unwrap();
@@ -178,7 +181,11 @@ fn doctor_as_user_checks_self() {
                     .is_some_and(|d| d.contains(&netrc.display().to_string()))
         })
         .collect();
-    assert_eq!(found.len(), 1, "{report:#}");
+    assert_eq!(
+        found.len(),
+        usize::from(cfg!(target_os = "linux")),
+        "{report:#}"
+    );
 
     let out = Command::cargo_bin("saiife")
         .unwrap()
@@ -190,8 +197,9 @@ fn doctor_as_user_checks_self() {
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(!text.contains("hunter2-s3cr3t"), "{text}");
-    assert!(
+    assert_eq!(
         text.contains(&format!("{}: holds a password", netrc.display())),
+        cfg!(target_os = "linux"),
         "{text}"
     );
 }

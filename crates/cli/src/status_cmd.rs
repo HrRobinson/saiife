@@ -85,8 +85,29 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
                 "\n  project hooks: none (`saiife init` was not run here); the managed hooks guard {}",
                 managed.join(", ")
             );
-            return if locked_failed {
-                outln!("\nLocked mode check(s) failed.");
+            // The managed hooks still read this project's packs and the
+            // nearest nested config: check them as for a hooked project.
+            let mut problems = Vec::new();
+            let mut notes = Vec::new();
+            check_project_packs(&root, builtin, &mut problems);
+            check_nested_configs(&root, &mut problems, &mut notes);
+            for n in &notes {
+                outln!("\nNote: {n}");
+            }
+            for p in &problems {
+                if p.fix.is_empty() {
+                    outln!("\nWARNING: {}", p.what);
+                } else {
+                    outln!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
+                }
+            }
+            return if locked_failed || !problems.is_empty() {
+                if locked_failed {
+                    outln!("\nLocked mode check(s) failed.");
+                }
+                if !problems.is_empty() {
+                    outln!("{} check(s) failed.", problems.len());
+                }
                 ExitCode::from(1)
             } else {
                 outln!("\nAll checks passed.");
@@ -452,6 +473,12 @@ fn check_config(root: &Path, record: &Integrity, builtin: &[Pack], problems: &mu
         "`saiife init`",
         restore(root),
     ));
+    check_project_packs(root, builtin, problems);
+}
+
+/// The project's packs: unknown ids are problems; the packs line and the
+/// rules whose variables are unbound are printed.
+fn check_project_packs(root: &Path, builtin: &[Pack], problems: &mut Vec<Problem>) {
     let project = project_packs(root, builtin);
     for w in project.warnings {
         problems.push(Problem {

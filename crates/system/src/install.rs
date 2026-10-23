@@ -184,7 +184,7 @@ pub fn install(
     fsops::remove_if_listed(&layout.at(PREVIOUS)).map_err(step("installed.toml"))?;
 
     // 3. Groups, the user, the audit-group membership.
-    run.users()?;
+    let member_added = run.users()?;
     // 4. The binary.
     let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
@@ -202,7 +202,8 @@ pub fn install(
     }
     run.save()?;
     // 9. Start (or restart) the daemon.
-    run.start(binary_changed || unit_changed)?;
+    // A running daemon picks up a new group membership only at start.
+    run.start(binary_changed || unit_changed || member_added)?;
     // 10. Wait for the socket on the real machine.
     if layout.is_system() {
         let sock = layout.at(SOCKET);
@@ -598,7 +599,8 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn users(&mut self) -> Result<(), InstallError> {
+    /// True when the daemon user was just added to the audit group.
+    fn users(&mut self) -> Result<bool, InstallError> {
         for g in [DAEMON_GROUP, AUDIT_GROUP] {
             if self.host.group_id(g).is_none() {
                 self.host.create_system_group(g).map_err(step("users"))?;
@@ -641,7 +643,7 @@ impl Run<'_> {
                 .map_err(step("users"))?;
             self.changed(format!("{DAEMON_USER} in group {AUDIT_GROUP}"));
         }
-        Ok(())
+        Ok(!member)
     }
 
     /// Records (or refreshes) a file. `created` sticks from the first record.
@@ -1234,6 +1236,31 @@ pub(crate) mod tests {
         assert!(!calls.iter().any(|c| c.contains("enable --now")));
         assert_eq!(fs::read(e.at(BINARY)).unwrap(), v2);
         assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
+    }
+
+    /// The daemon regroups the audit dir at start: a membership added while
+    /// it runs needs a restart to take effect.
+    #[test]
+    fn new_audit_membership_restarts() {
+        let e = env(255);
+        e.install();
+        set_active(&e.host);
+        e.host.set(|s| {
+            s.members.remove(AUDIT_GROUP);
+            s.calls.clear();
+        });
+        let r = e.install();
+        assert!(
+            r.changed
+                .contains(&"saiife in group saiife-audit".to_string()),
+            "{:?}",
+            r.changed
+        );
+        let calls = e.host.state().calls;
+        assert!(
+            calls.contains(&"systemctl restart saiifed.service".to_string()),
+            "{calls:?}"
+        );
     }
 
     #[test]
