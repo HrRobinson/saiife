@@ -80,14 +80,70 @@ command_long_options = [
 ]
 
 [[deny]]
-# A pattern that matches every name: `.`, `''`, `.*`, `^`. A pattern is
-# taken as matching everything when it matches each of these one-character
-# probes (case-insensitively); a pattern saiife cannot read counts too.
+# A pattern that matches most processes: one matching at least 80% of a
+# set of common process names (`.`, `''`, `.*`, `^`, `[a-z]`), one of a
+# single character (`pkill e`), or one built at run time (`pkill $(cat f)`,
+# which may come out empty). A pattern saiife cannot read counts too.
 pattern = '^pkill\s'
-reason = "this pkill pattern matches every process; name the process to stop"
+reason = "this pkill pattern matches most processes (or is not known until it runs); name the process to stop"
 operand_match = "regex"
-operand_match_all = true
-operand_targets = ["a", "Z", "0", "_", "-", ".", "/", ":", " ", "~"]
+operand_match_share = 0.8
+operand_min_len = 2
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
+
+[[deny]]
+# `pkill -f` matches the whole command line: the same test on a set of
+# common command lines (`pkill -f '[a-z]'` matches most of them).
+pattern = '^pkill\s'
+reason = "this pkill -f pattern matches most command lines; name the process to stop"
+when_option = ["-f", "--full"]
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
+operand_match = "regex"
+operand_match_share = 0.8
+operand_targets = [
+    "/sbin/init splash", "/usr/lib/systemd/systemd --user", "[kthreadd]",
+    "[kworker/0:1-events]", "/usr/lib/systemd/systemd-journald",
+    "/usr/bin/dbus-daemon --system --address=systemd:",
+    "/usr/sbin/NetworkManager --no-daemon", "/usr/lib/polkit-1/polkitd --no-debug",
+    "/sbin/agetty -o -p -- \\u --noclear - linux", "sshd: jonas@pts/0",
+    "/usr/sbin/cron -f", "/usr/lib/Xorg :0 -seat seat0 vt2",
+    "/usr/bin/gnome-shell", "/usr/bin/plasmashell --no-respawn",
+    "/usr/bin/pipewire", "/usr/bin/wireplumber",
+    "/usr/lib/firefox/firefox -contentproc -childID 5 -isForBrowser",
+    "/opt/google/chrome/chrome --type=renderer --lang=en-US",
+    "/usr/share/code/code --type=zygote", "-bash", "/bin/zsh -l", "bash",
+    "tmux new -s work", "ssh git@github.com", "nvim src/main.rs", "htop",
+    "node /home/jonas/app/server.js", "npm run dev", "node_modules/.bin/vite",
+    "python3 -m http.server 8000", "python3 manage.py runserver",
+    "/usr/bin/java -jar app.jar", "cargo test --workspace",
+    "/usr/bin/dockerd -H fd://", "/usr/bin/containerd",
+    "postgres: checkpointer", "/usr/sbin/mysqld", "redis-server *:6379",
+    "nginx: worker process", "claude --resume", "codex exec fix",
+    "/opt/saiife/bin/saiife daemon --system", "sleep 60", "make -j8",
+]
 
 # --- killall ------------------------------------------------------------------
 [[deny]]
@@ -122,8 +178,41 @@ command_long_options = [
     "context=|Z", "help",
 ]
 operand_match = "regex"
-operand_match_all = true
-operand_targets = ["a", "Z", "0", "_", "-", ".", "/", ":", " ", "~"]
+operand_match_share = 0.8
+operand_min_len = 2
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
+
+[[deny]]
+# A name built at run time (`killall $(cat f)`): not known until it runs.
+pattern = '^killall\s'
+reason = "this killall name is not known until it runs; name the process to stop"
+operand_match = "glob"
+operand_match_share = 1.0
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
 
 [[deny]]
 # killall5 (sysvinit) signals every process outside the caller's session.
@@ -136,15 +225,20 @@ reason = "killall5 signals every process on the machine"
 # `+1`, `01` or `-1:<inode>`. kill (util-linux kill(1), the shell builtin)
 # reads its first `-word` as the signal; after that, and after the first
 # pid or `--`, a `-1` is a pid.
+#
+# The kill rules read the command without its redirections: in
+# `kill 1234 2>&1` the `1` is not a pid.
 
 [[deny]]
 # The first argument: `kill 0`, `kill 1`.
 pattern = '^kill\s+\+?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
 reason = "kill 0 signals your whole process group (the agent too) and kill 1 signals init; kill the process by its own pid"
 
 [[deny]]
 # After a pid or a signal name or number (`kill 1234 -1`, `kill -s KILL -1`).
 pattern = '^kill\s(?:.*\s)?[^-\s]\S*\s+[-+]?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
 reason = "kill -1 signals every process you own, 0 your whole process group and 1 init; kill the process by its own pid"
 
 [[deny]]
@@ -152,10 +246,19 @@ reason = "kill -1 signals every process you own, 0 your whole process group and 
 # options that take a value (`-s`, `-n`, `-q`) or list signals (`-l`,
 # `-L`, `-d`).
 pattern = '^kill\s(?:.*\s)?(?:--|-\d+|-[A-Za-z][A-Za-z0-9+_-]+|-[a-ce-kmoprt-zA-KM-Z]|--(?:verbose|all|pid|require-handler)|--[A-Za-z-]+=\S*)\s+[-+]?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
 reason = "kill -1 signals every process you own, 0 your whole process group and 1 init; kill the process by its own pid"
 
 [[deny]]
 # A lone `kill -1` or `kill -0` is a signal with no pid, or a pid: read
 # both ways.
 pattern = '^kill\s+-0*[01]$'
+no_redirections = true
 reason = "kill -1 signals every process you own and kill -0 your whole process group; kill the process by its own pid"
+
+[[deny]]
+# A pid computed by arithmetic (`kill -9 $((-1))`, `kill $((PID-1))`): it
+# may come out as -1, 0 or 1.
+pattern = '^kill\s(?:.*\s)?\S*\$(?:\(\(|\[)'
+no_redirections = true
+reason = "this kill pid is computed when it runs and may be -1, 0 or 1; kill the process by its own pid"

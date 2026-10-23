@@ -4,7 +4,9 @@
 //! Signalling a named process or a process id stays allowed.
 //!
 //! Every command is also judged behind the wrappers the engine peels
-//! (`timeout 5`, `setsid`, `nice -n 5`, `env`).
+//! (`timeout 5`, `setsid`, `nice -n 5`, `env`), and with the redirections
+//! an agent tacks on (`2>/dev/null`, `2>&1`, `|| true`): they are not
+//! operands (fix round 1, I1 and I2).
 //!
 //! These tests judge command TEXT only; nothing here runs a process tool.
 
@@ -15,6 +17,25 @@ use saiifeguard::profile::select_active;
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 const WRAPPERS: [&str; 5] = ["", "timeout 5 ", "setsid ", "nice -n 5 ", "env "];
+
+const SUFFIXES: [&str; 8] = [
+    "",
+    " 2>/dev/null",
+    " >/dev/null 2>&1",
+    " &>/dev/null",
+    " 2>&1",
+    " </dev/null",
+    " >&1",
+    " 2>/dev/null || true",
+];
+
+/// Every wrapper and suffix around `cmd`.
+fn forms(cmd: &str) -> Vec<String> {
+    WRAPPERS
+        .iter()
+        .flat_map(|w| SUFFIXES.iter().map(move |s| format!("{w}{cmd}{s}")))
+        .collect()
+}
 
 /// `core.process` alone.
 fn engine() -> Engine {
@@ -32,8 +53,7 @@ fn engine() -> Engine {
 fn assert_all_deny(e: &Engine, cmds: &[&str]) {
     let mut wrong = Vec::new();
     for cmd in cmds {
-        for w in WRAPPERS {
-            let line = format!("{w}{cmd}");
+        for line in forms(cmd) {
             match e.evaluate(&line) {
                 Decision::Deny { pack, reason, .. }
                     if pack == "core.process" && !reason.is_empty() => {}
@@ -47,8 +67,7 @@ fn assert_all_deny(e: &Engine, cmds: &[&str]) {
 fn assert_all_allow(e: &Engine, cmds: &[&str]) {
     let mut wrong = Vec::new();
     for cmd in cmds {
-        for w in WRAPPERS {
-            let line = format!("{w}{cmd}");
+        for line in forms(cmd) {
             let got = e.evaluate(&line);
             if got.is_deny() {
                 wrong.push(format!("expected ALLOW for {line:?}, got {got:?}"));
@@ -121,6 +140,10 @@ fn pkill_with_only_selectors_is_denied() {
             // both ways (S14): `-ttin` is SIGTTIN, or `-t tin`.
             "pkill -ttin",
             "pkill -USR1",
+            // Blocks too much, documented (M3/M4): `$$` is the agent's shell.
+            "pkill -P $$",
+            "xargs kill -1",
+            "pkill -u $(whoami) node",
         ],
     );
 }
@@ -156,6 +179,20 @@ fn a_pattern_matching_every_process_is_denied() {
             "killall -r '.*'",
             "killall --regexp '^'",
             "killall -9 -r .",
+            // After `--` a word starting with `-` is a pattern too (S15).
+            "pkill -- '-*.'",
+            "pkill -n -- '-*.'",
+            "killall -r -- '-*.'",
+            // Most names (S16): a one-character pattern, a class.
+            "pkill e",
+            "pkill s",
+            "pkill -f /",
+            "pkill -f ' '",
+            "pkill '[a-z]'",
+            "pkill -f '[a-z]'",
+            "pkill -9 -i '[a-z]'",
+            "killall -r '[a-z]'",
+            "killall -r e",
         ],
     );
 }
@@ -226,6 +263,26 @@ fn kill_of_every_process_the_group_or_init_is_denied() {
             "kill 1:12345",
             "/bin/kill -9 -1",
             "/usr/bin/kill 0",
+            // A pid from arithmetic (S17).
+            "kill -9 $((-1))",
+            "kill $((0))",
+            "kill -9 $((PID-1))",
+            "kill -9 -- $((1))",
+        ],
+    );
+}
+
+#[test]
+fn a_pattern_from_a_substitution_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill $(cat name.txt)",
+            "pkill -f \"$(cat pattern.txt)\"",
+            "pkill -n $(cat name.txt)",
+            "pkill -f `cat pattern.txt`",
+            "killall $(cat names.txt)",
+            "killall -r \"$(cat pattern.txt)\"",
         ],
     );
 }
@@ -280,6 +337,30 @@ fn targeted_kills_are_allowed() {
             "pgrep -f .",
             "echo kill -9 -1",
             "grep 'pkill -n' notes.txt",
+            // A redirection target is not a pid (I2).
+            "kill 1234 2>&1",
+            "kill -9 1234 2>&1",
+            "kill -9 $PID >/dev/null 2>&1",
+            "kill $PID 2>&1 || true",
+            "kill -0 $PID 2>&1",
+            "kill $(cat .pid) 2>&1 || true",
+            "kill -9 -- $PID 2>&1",
+            "kill $PID >&1",
+            "kill $PID 1>&2",
+            "kill $PID 0</dev/null",
+            "kill $(cat *.pid)",
+            "kill $(pgrep node)",
+            "kill $(lsof -ti:3000)",
+            "kill $PID",
+            "kill -9 $PID",
+            "kill -9 -$PGID",
+            // Two characters or more name few enough processes (S16).
+            "pkill sh",
+            "pkill no",
+            "pkill -f server.js",
+            "pkill -f 'python3 -m http.server'",
+            "pkill -- node",
+            "killall -r '^vite'",
         ],
     );
 }

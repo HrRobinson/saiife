@@ -16,7 +16,8 @@ Yes. It is always on.
 Commands are judged after the wrappers saiife sees through (`timeout 5`,
 `setsid`, `nice -n 5`, `env`, `sudo`, `xargs` and the others listed in
 [core.lock](core.lock.md#blocked)), so `timeout 5 pkill -n` is blocked like
-`pkill -n`.
+`pkill -n`. Redirections are not arguments: `pkill -n 2>/dev/null` is
+blocked like `pkill -n`, and in `kill 1234 2>&1` the `1` is not a pid.
 
 - `pkill` without a pattern but with a selector that picks processes by
   something other than their name: `-n`/`--newest`, `-o`/`--oldest`,
@@ -25,8 +26,15 @@ Commands are judged after the wrappers saiife sees through (`timeout 5`,
   `-r`/`--runstates`, `--cgroup`, `--ns` and `--env`. So `pkill -n`,
   `pkill -9 -o` and `pkill -u jonas` are blocked.
 - `pkill --inverse`, which kills every process that does not match.
-- A `pkill` or `killall -r` pattern that matches every name: `.`, `''`,
-  `.*`, `^`, with or without `-f` (`pkill -f .`).
+- A `pkill` or `killall -r` pattern that matches most processes: one that
+  matches at least 80% of a list of about 70 common process names (`.`,
+  `''`, `.*`, `^`, `[a-z]`), a pattern of one character (`pkill e`,
+  `pkill -f /`), and with `pkill -f` one that matches at least 80% of a
+  list of common command lines. A pattern after `--` counts too, even when
+  it starts with `-` (`pkill -- '-*.'`).
+- A `pkill` or `killall` pattern or name built at run time:
+  `pkill $(cat name.txt)`, `pkill -f "$(...)"`, `killall $(cat names)`.
+  It may come out empty, and an empty pattern matches every process.
 - `killall` without a process name, with `-u`/`--user` or `-Z`/`--context`
   (`killall -u jonas`).
 - `killall5`, which signals every process on the machine.
@@ -35,6 +43,8 @@ Commands are judged after the wrappers saiife sees through (`timeout 5`,
   `kill -9 -1`, `kill -- -1`, `kill -s KILL -1`, `kill 0`, `kill 1`. Also
   written `+1`, `01` or `-1:<inode>`, and after another pid
   (`kill 1234 -1`).
+- `kill` with a pid computed by arithmetic: `kill -9 $((-1))`,
+  `kill $((PID-1))`. It may come out as -1, 0 or 1.
 
 Options are read the way the tools read them, from each tool's own option
 list: long options can be shortened (`pkill --new`), short ones bundled
@@ -46,26 +56,33 @@ list: long options can be shortened (`pkill --new`), short ones bundled
 
 - `kill` of a process id or a job: `kill 12345`, `kill -9 12345`,
   `kill %1`, `kill -- -12345` (the process group 12345), `kill -0 12345`
-  (is it alive?), and `kill $(cat app.pid)`.
+  (is it alive?), `kill $PID`, `kill $(cat app.pid)`, `kill $(pgrep node)`
+  and `kill $(lsof -ti:3000)`, with or without `2>/dev/null`, `2>&1` or
+  `|| true` after them.
 - `kill -1 12345` and `kill -0 12345`: the first `-1` or `-0` is the
   signal (HUP or the alive check), not a pid.
 - Listing signals: `kill -l`, `kill -l 1`, `kill -L`, `killall -l`.
 - `pkill` and `killall` with a process name or a pattern:
   `pkill node`, `pkill -f 'npm run dev'`, `pkill -n node` (the newest
   `node`), `pkill -u jonas node`, `killall -HUP nginx`,
-  `killall -r '^node$'`.
+  `killall -r '^node$'`. A pattern of two characters is allowed
+  (`pkill sh`), even though it may match several processes.
 - `pkill -F app.pid` and `pkill -p 12345`, which name their process.
 - `pgrep` in every form, including `pgrep -n` and `pgrep -f .`: it only
   lists processes.
 
 ## Not covered
 
-- A broad pattern that does not match every name: `pkill a`, `pkill -f /`
-  or `pkill -f bin` still kill many processes. saiife blocks only patterns
-  that match any name.
-- A pid found at run time: `kill $(pgrep -n)`, `pgrep -o | xargs kill` or
-  `kill -9 $PID` where the variable holds `-1`. Substitutions are not
-  blocked here, because `kill $(cat app.pid)` is everyday use.
+- A pattern that matches many processes, but fewer than 80% of saiife's
+  list: `pkill sh`, `pkill -f bin` or `pkill -f /usr` still kill many
+  processes. The list holds common names; a machine's own processes may
+  differ.
+- A pid found at run time other than by arithmetic: `kill $(pgrep -n)`,
+  `pgrep -o | xargs kill`, or `kill -9 $PID` where the variable holds
+  `-1`. These are not blocked, because `kill $(cat app.pid)` and
+  `kill $PID` are everyday use.
+- A pattern from a variable: `pkill $NAME` (an empty `$NAME` gives no
+  pattern at all, and `pkill -f "$NAME"` an empty one).
 - `kill <name>` (util-linux `kill` can take a process name) and other tools
   that send signals to many processes: `skill`, `snice`, `systemctl kill`,
   `loginctl kill-user`, `fuser -k`.
@@ -83,8 +100,13 @@ It also blocks too much in a few cases. This is the safe direction:
 - A pattern saiife cannot read (`pkill 'a('`), longer than 256 characters,
   or behind more than 32 others counts as matching every name.
 - An option value that happens to match every name (`pkill -t . node`).
-- `xargs pkill -n` and the like: the pattern `xargs` would add at run time
-  is not known, so the command counts as having none.
+- `xargs pkill -n` and `xargs kill -1` and the like: what `xargs` adds at
+  run time is not known, so `pkill -n` has no pattern and `kill -1` no pid.
+- `pkill -P $$` (the children of the agent's own shell): `$$` is not read,
+  so it counts as a selector. To stop the jobs the shell started, use
+  `kill $(jobs -p)`.
+- A substitution in an option value counts like a pattern:
+  `pkill -u $(whoami) node` is blocked. Write the user name instead.
 
 The limits that apply to every pack are in
 [Limits of the guard as a whole](../threats.md#limits-of-the-guard-as-a-whole).
@@ -94,6 +116,14 @@ The limits that apply to every pack are in
 ```saiife-examples
 deny pkill -n
 deny pkill -o
+deny pkill -n 2>/dev/null
+deny pkill -o 2>/dev/null || true
+deny pkill -n &>/dev/null
+deny pkill e
+deny pkill '[a-z]'
+deny pkill -- '-*.'
+deny pkill $(cat name.txt)
+deny kill -9 $((-1))
 deny pkill --newest
 deny pkill -9 -o
 deny timeout 5 pkill -n
@@ -128,6 +158,11 @@ allow kill -0 12345
 allow kill -- -12345
 allow kill -l
 allow kill $(cat app.pid)
+allow kill 1234 2>&1
+allow kill -9 $PID >/dev/null 2>&1
+allow kill $(cat .pid) 2>&1 || true
+allow kill $(pgrep node)
+allow pkill sh
 allow pkill node
 allow pkill -f 'npm run dev'
 allow pkill -n node

@@ -27,8 +27,12 @@
 //!                             # `timeout sudo`); never matches without one
 //! operand_match = "regex|glob" # also require an operand, read as a
 //! operand_targets = ["x"]     # pattern of this syntax, to match a target
-//! operand_match_all = true    # the operand must match every target (an
-//!                             # empty regex operand matches them all)
+//! operand_match_share = 0.8   # the operand must match this share of the
+//!                             # targets instead of one
+//! operand_min_len = 2         # a shorter operand (empty too) is a match
+//! operand_substitution = true # an operand holding `$(…)` is a match
+//! no_redirections = true      # match the effective command without its
+//!                             # redirections (`2>&1` is not an argument)
 //! when_option = ["-f", "--full"] # also require one of these options,
 //! command_options = "fq:"     # read with getopt from the command's own
 //! command_long_options = ["full|f", "queue=|q", "eof[=]"] # options
@@ -81,6 +85,9 @@ pub struct Rule {
     /// the effective command (`timeout 5 xargs sudo ls`: `timeout xargs
     /// sudo`) instead. Never matches a segment without wrappers.
     pub peeled_wrappers: bool,
+    /// Match the effective command without its redirections (`kill 1234
+    /// 2>&1` is `kill 1234`).
+    pub no_redirections: bool,
     /// Also required: an operand of the command, read as a pattern, matches
     /// one of the targets (`pkill 'sa.*fed'` names `saiifed`).
     pub operands: Option<OperandMatch>,
@@ -291,10 +298,15 @@ pub enum OperandSyntax {
 pub struct OperandMatch {
     pub syntax: OperandSyntax,
     pub targets: Vec<String>,
-    /// An operand must match every target, not just one
-    /// (`operand_match_all = true`; `pkill .` matches every name). An
-    /// empty regex operand matches them all.
-    pub all: bool,
+    /// How many targets one operand must match: 1, or the share the rule
+    /// sets (`operand_match_share = 0.8`; `pkill .` matches every name).
+    pub need: usize,
+    /// An operand shorter than this many characters, empty included,
+    /// counts as a match (`operand_min_len = 2`; `pkill e`); 0 for none.
+    pub min_len: usize,
+    /// An operand holding a command substitution or arithmetic counts as a
+    /// match (`operand_substitution = true`; `pkill $(cat f)`).
+    pub substitution: bool,
 }
 
 /// Largest compiled operand pattern (the regex NFA size limit); a bigger
@@ -329,15 +341,19 @@ pub enum Hit {
 }
 
 impl OperandMatch {
-    /// `Yes` if an operand (a word not starting with `-`) matches a target,
-    /// case-insensitively. A plain operand (no pattern characters) is a
-    /// substring test (regex) or an equality test (glob), without compiling
-    /// anything. These count as a match, since what the command makes of
-    /// them is unknown or too costly to find out: a pattern that does not
-    /// compile, a glob with `\` or `[:` (escapes and classes are not
-    /// modelled), a pattern longer than `MAX_PATTERN_BYTES`, and more than
-    /// `MAX_PATTERN_OPERANDS` patterns, and any pattern once `spent` (the
-    /// evaluation's compile time so far) exceeds `MAX_PATTERN_COMPILE`.
+    /// `Yes` if an operand matches enough targets (`need`; one unless the
+    /// rule sets `operand_match_share`), case-insensitively. Operands are
+    /// the words not starting with `-`, and every word after a `--`. A
+    /// plain operand (no pattern characters) is a substring test (regex)
+    /// or an equality test (glob), without compiling anything. These count
+    /// as a match, since what the command makes of them is unknown or too
+    /// costly to find out: a pattern that does not compile, a glob with `\`
+    /// or `[:` (escapes and classes are not modelled), a pattern longer
+    /// than `MAX_PATTERN_BYTES`, and more than `MAX_PATTERN_OPERANDS`
+    /// patterns, and any pattern once `spent` (the evaluation's compile
+    /// time so far) exceeds `MAX_PATTERN_COMPILE`. With `min_len`, an
+    /// operand shorter than that (empty included) counts too; with
+    /// `substitution`, an operand holding a `$(…)`, `` `…` `` or `$((…))`.
     /// `over_budget` is checked before each compile.
     pub fn hits(
         &self,
@@ -345,28 +361,47 @@ impl OperandMatch {
         over_budget: &dyn Fn() -> bool,
         spent: &Cell<Duration>,
     ) -> Hit {
+        self.hits_within(operands, over_budget, spent, MAX_PATTERN_COMPILE)
+    }
+
+    /// `hits`, with `allowance` in place of `MAX_PATTERN_COMPILE`.
+    pub(crate) fn hits_within(
+        &self,
+        operands: &[String],
+        over_budget: &dyn Fn() -> bool,
+        spent: &Cell<Duration>,
+        allowance: Duration,
+    ) -> Hit {
         let mut compiled = 0;
-        // Any target (or, with `all`, every target) passes `test`.
-        let some = |test: &dyn Fn(&str) -> bool| {
-            if self.all {
-                self.targets.iter().all(|t| test(t))
-            } else {
-                self.targets.iter().any(|t| test(t))
-            }
+        let need = self.need.max(1);
+        // Enough targets pass `test`.
+        let enough = |test: &dyn Fn(&str) -> bool| {
+            self.targets.iter().filter(|t| test(t)).take(need).count() >= need
         };
-        if self.all && self.syntax == OperandSyntax::Regex && operands.iter().any(|o| o.is_empty())
-        {
-            // An empty regex matches every name.
-            return Hit::Yes;
-        }
-        for o in operands
+        let dashdash = operands.iter().position(|o| o == "--");
+        let words = operands
             .iter()
-            .filter(|o| !o.is_empty() && !o.starts_with('-'))
-        {
+            .enumerate()
+            .filter(|(i, o)| match dashdash {
+                Some(d) if *i > d => true,
+                Some(d) if *i == d => false,
+                _ => !o.starts_with('-'),
+            })
+            .map(|(_, o)| o);
+        for o in words {
+            if self.min_len > 0 && o.chars().count() < self.min_len {
+                return Hit::Yes;
+            }
+            if self.substitution && (o.contains("$(") || o.contains('`') || o.contains("$[")) {
+                return Hit::Yes;
+            }
+            if o.is_empty() {
+                continue;
+            }
             let lower = o.to_lowercase();
             let source = match self.syntax {
                 OperandSyntax::Regex if !o.contains(REGEX_META) => {
-                    if some(&|t| t.to_lowercase().contains(&lower)) {
+                    if enough(&|t| t.to_lowercase().contains(&lower)) {
                         return Hit::Yes;
                     }
                     continue;
@@ -375,7 +410,7 @@ impl OperandMatch {
                 // not modelled.
                 OperandSyntax::Glob if o.contains('\\') || o.contains("[:") => return Hit::Yes,
                 OperandSyntax::Glob if !o.contains(GLOB_META) => {
-                    if some(&|t| t.to_lowercase() == lower) {
+                    if enough(&|t| t.to_lowercase() == lower) {
                         return Hit::Yes;
                     }
                     continue;
@@ -386,7 +421,7 @@ impl OperandMatch {
             compiled += 1;
             if compiled > MAX_PATTERN_OPERANDS
                 || o.len() > MAX_PATTERN_BYTES
-                || spent.get() > MAX_PATTERN_COMPILE
+                || spent.get() > allowance
             {
                 return Hit::Yes;
             }
@@ -402,7 +437,7 @@ impl OperandMatch {
                 .build();
             spent.set(spent.get() + t0.elapsed());
             match built {
-                Ok(re) if some(&|t| re.is_match(t.as_bytes())) => return Hit::Yes,
+                Ok(re) if enough(&|t| re.is_match(t.as_bytes())) => return Hit::Yes,
                 Ok(_) => {}
                 Err(_) => return Hit::Yes,
             }
@@ -572,7 +607,13 @@ struct RawRule {
     #[serde(default)]
     when_no_operand: bool,
     #[serde(default)]
-    operand_match_all: bool,
+    operand_match_share: Option<f64>,
+    #[serde(default)]
+    operand_min_len: usize,
+    #[serde(default)]
+    operand_substitution: bool,
+    #[serde(default)]
+    no_redirections: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,19 +656,30 @@ fn compile_rules(
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.pattern));
         }
+        let share_ok = r.operand_match_share.is_none_or(|x| x > 0.0 && x <= 1.0);
+        let extras =
+            r.operand_match_share.is_some() || r.operand_min_len > 0 || r.operand_substitution;
         let operands = match (r.operand_match, r.operand_targets.is_empty()) {
-            (Some(syntax), false) => Some(OperandMatch {
-                syntax,
-                targets: r.operand_targets,
-                all: r.operand_match_all,
-            }),
-            (None, true) if !r.operand_match_all => None,
+            (Some(syntax), false) if share_ok => {
+                let n = r.operand_targets.len();
+                let need = r
+                    .operand_match_share
+                    .map_or(1, |x| ((x * n as f64).ceil() as usize).clamp(1, n));
+                Some(OperandMatch {
+                    syntax,
+                    targets: r.operand_targets,
+                    need,
+                    min_len: r.operand_min_len,
+                    substitution: r.operand_substitution,
+                })
+            }
+            (None, true) if !extras => None,
             _ => {
                 warnings.push(PackWarning {
                     source: source.to_string(),
                     message: format!(
                         "skipping rule {:?}: operand_match and operand_targets go together \
-                         (and operand_match_all needs them)",
+                         (the other operand_ keys need them; a share is in (0, 1])",
                         r.pattern
                     ),
                 });
@@ -695,6 +747,7 @@ fn compile_rules(
                 whole_segment: r.whole_segment,
                 after_env_change: r.after_env_change,
                 peeled_wrappers: r.peeled_wrappers,
+                no_redirections: r.no_redirections,
                 operands,
             }),
             Err(e) => warnings.push(PackWarning {
@@ -885,12 +938,17 @@ mod tests {
             OperandMatch {
                 syntax,
                 targets: vec!["saiifed".into(), "saiifed.service".into()],
-                all: false,
+                need: 1,
+                min_len: 0,
+                substitution: false,
             }
-            .hits(
+            // No compile-time allowance: the caps tested here must not
+            // depend on how fast a loaded runner compiles (M7).
+            .hits_within(
                 &ops.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 &|| false,
                 &Cell::default(),
+                Duration::MAX,
             ) == Hit::Yes
         };
         assert!(m(OperandSyntax::Regex, &["sa.*fed"]));
@@ -922,7 +980,9 @@ mod tests {
         let om = OperandMatch {
             syntax: OperandSyntax::Regex,
             targets: vec!["saiifed".into()],
-            all: false,
+            need: 1,
+            min_len: 0,
+            substitution: false,
         };
         assert_eq!(
             om.hits(&["x.".to_string()], &|| true, &Cell::default()),
@@ -944,7 +1004,9 @@ mod tests {
         let om = OperandMatch {
             syntax: OperandSyntax::Regex,
             targets: vec!["saiifed".into()],
-            all: false,
+            need: 1,
+            min_len: 0,
+            substitution: false,
         };
         let ops: Vec<String> = (0..31).map(|i| format!("\\w{{1,10}}\\d{i}")).collect();
         let spent = Cell::default();
@@ -1153,32 +1215,53 @@ mod tests {
     }
 
     #[test]
-    fn operand_match_all_needs_every_target() {
+    fn operand_match_share_min_len_and_substitution() {
         let om = OperandMatch {
             syntax: OperandSyntax::Regex,
-            targets: vec!["a".into(), "Z".into(), "0".into(), " ".into()],
-            all: true,
+            targets: vec![
+                "ab".into(),
+                "Zc".into(),
+                "0d".into(),
+                " e".into(),
+                "f".into(),
+            ],
+            need: 4,
+            min_len: 2,
+            substitution: true,
         };
         let spent = Cell::new(Duration::ZERO);
         let hit = |ops: &[&str]| {
             let ops: Vec<String> = ops.iter().map(|s| s.to_string()).collect();
             om.hits(&ops, &|| false, &spent)
         };
-        for yes in [&["."][..], &[""], &[".*"], &["^"], &["x", "."], &["a("]] {
+        for yes in [
+            &["."][..],
+            &[""],
+            &["e"],
+            &[".*"],
+            &["^"],
+            &["x", "."],
+            &["a("],
+            &["[a-z0 ]"],
+            &["$(cat f)"],
+            &["`cat f`"],
+            &["--", "-*."],
+            &["-n", "--", "-*."],
+        ] {
             assert_eq!(hit(yes), Hit::Yes, "{yes:?}");
         }
-        for no in [&["a"][..], &["[a-z]"], &["node"], &["-f"], &[]] {
+        for no in [&["ab"][..], &["[a-c]"], &["node"], &["-f"], &["-*."], &[]] {
             assert_eq!(hit(no), Hit::No, "{no:?}");
         }
     }
 
     #[test]
     fn new_operand_keys_need_their_partners() {
-        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\noperand_match_all = true\n[[deny]]\npattern = \"y\"\nreason = \"r\"\nwhen_no_operand = true\n[[deny]]\npattern = \"z\"\nreason = \"r\"\nwhen_no_operand = true\ncommand_options = \"n\"\n[[deny]]\npattern = \"w\"\nreason = \"r\"\nwhen_no_operand = true\nwhen_option = [\"-n\"]\ncommand_options = \"n\"\n";
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\noperand_match_share = 0.5\n[[deny]]\npattern = \"y\"\nreason = \"r\"\nwhen_no_operand = true\n[[deny]]\npattern = \"z\"\nreason = \"r\"\nwhen_no_operand = true\ncommand_options = \"n\"\n[[deny]]\npattern = \"v\"\nreason = \"r\"\noperand_match = \"regex\"\noperand_targets = [\"a\"]\noperand_match_share = 1.5\n[[deny]]\npattern = \"u\"\nreason = \"r\"\noperand_min_len = 2\n[[deny]]\npattern = \"w\"\nreason = \"r\"\nwhen_no_operand = true\nwhen_option = [\"-n\"]\ncommand_options = \"n\"\n";
         let mut w = Vec::new();
         let p = load_pack_str("<t>", toml, &mut w).unwrap();
         assert_eq!(p.deny.len(), 1, "{w:?}");
-        assert_eq!(w.len(), 3, "{w:?}");
+        assert_eq!(w.len(), 5, "{w:?}");
     }
 
     const VALID: &str = r#"

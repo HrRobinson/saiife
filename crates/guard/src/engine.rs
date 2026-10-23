@@ -621,6 +621,7 @@ impl Engine {
         if self.combined.might_match(&segment_line) {
             let lines = Lines {
                 matching: &view.peeled,
+                args: "",
                 segment: &segment_line,
                 wrappers: &view.wrappers,
                 operands: &[],
@@ -695,9 +696,10 @@ impl Engine {
         }
         let lines = Lines {
             matching: matching_line,
+            args: &view.args_line,
             segment: segment_line,
             wrappers: &view.wrappers,
-            operands: &argv[1..],
+            operands: &view.rule_args,
         };
         match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
             JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -736,6 +738,7 @@ impl Engine {
             }
             let lines = Lines {
                 matching: &line,
+                args: "",
                 segment: &line,
                 wrappers: &view.wrappers,
                 operands: &[],
@@ -787,11 +790,14 @@ impl Engine {
                 line.push_str(&view.peeled);
             }
             if self.combined.might_match(&line) {
+                let alt_args = without_redirections(alt_eff, &alt_argv);
+                let alt_args_line = args_line(&alt_argv, &alt_args);
                 let lines = Lines {
                     matching: &line,
+                    args: &alt_args_line,
                     segment: view.segment_line(),
                     wrappers: &view.wrappers,
-                    operands: &alt_argv[1..],
+                    operands: &alt_args,
                 };
                 match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
@@ -1171,6 +1177,7 @@ impl Engine {
     ) -> JudgeOutcome {
         let Lines {
             matching: matching_line,
+            args: args_line,
             segment: segment_line,
             wrappers,
             operands,
@@ -1182,6 +1189,8 @@ impl Engine {
                 (env_changed && !matching_line.is_empty()).then_some(matching_line)
             } else if rule.whole_segment {
                 Some(segment_line)
+            } else if rule.no_redirections {
+                (!matching_line.is_empty() && !args_line.is_empty()).then_some(args_line)
             } else if matching_line.is_empty() {
                 None
             } else {
@@ -1738,6 +1747,11 @@ struct SegmentView<'a> {
     peeled: String,
     /// What the rules match: argv plus the peeled-off redirections.
     matching_line: String,
+    /// The arguments without redirections (`2>/dev/null`, `2>&1`): what
+    /// option and operand tests read.
+    rule_args: Vec<String>,
+    /// The command and `rule_args` (`no_redirections` rules).
+    args_line: String,
     /// The whole segment's line, when it differs.
     whole: Option<String>,
     /// The names of the peeled-off wrappers, joined with spaces.
@@ -1816,6 +1830,8 @@ impl<'a> SegmentView<'a> {
         // The whole segment's line differs only when a wrapper was
         // peeled off or the segment starts with an assignment.
         let whole = (prefix_len > 0 || is_env_assignment(&seg[0].text)).then(|| segment_line(seg));
+        let rule_args = without_redirections(&resolved, &argv);
+        let args_line = args_line(&argv, &rule_args);
         SegmentView {
             seg,
             unresolved: effective,
@@ -1827,6 +1843,8 @@ impl<'a> SegmentView<'a> {
             env_changed,
             peeled,
             matching_line,
+            rule_args,
+            args_line,
             whole,
             wrappers: if prefix_len > 0 {
                 peeled_wrappers(seg).join(" ")
@@ -1842,6 +1860,32 @@ impl<'a> SegmentView<'a> {
     }
 }
 
+/// `argv[1..]` without its redirections: each redirection operator word
+/// (`2>`, `>&`, `<`) and the target word after it. `words` and `argv` are
+/// the same command, word for word.
+fn without_redirections(words: &[Word], argv: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        if words.get(i).is_some_and(|w| w.redirect) {
+            i += 2;
+            continue;
+        }
+        out.push(argv[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// The command name and its arguments without redirections, joined with
+/// single spaces.
+fn args_line(argv: &[String], args: &[String]) -> String {
+    std::iter::once(argv.first().map(String::as_str).unwrap_or(""))
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The lines a segment's rules match: the effective command's
 /// (`matching`), the whole segment's (`whole_segment` rules) and the peeled
 /// wrappers' names (`peeled_wrappers` rules); and the effective command's
@@ -1849,6 +1893,9 @@ impl<'a> SegmentView<'a> {
 #[derive(Clone, Copy)]
 struct Lines<'a> {
     matching: &'a str,
+    /// The effective command without its redirections
+    /// (`no_redirections` rules).
+    args: &'a str,
     segment: &'a str,
     wrappers: &'a str,
     operands: &'a [String],
