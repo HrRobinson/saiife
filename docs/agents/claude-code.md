@@ -107,6 +107,23 @@ With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
   binary is missing), the tool call is blocked.
 - An edit to a settings file during a session is caught by the
   `ConfigChange` hook and blocked.
+  - The check is presence-based. A user, project or local settings file
+    changed mid-session may hold only `$schema`, `model`, `theme`, `verbose`,
+    `cleanupPeriodDays`, `includeCoAuthoredBy`, `outputStyle`,
+    `spinnerTipsEnabled`, `alwaysThinkingEnabled` and `language`. Any other
+    top-level key denies the change, even when only `theme` was edited in a
+    file that already holds `permissions`, for example. Such edits apply
+    from the next session.
+  - A removed settings file, a symlinked one, or one that is not a JSON
+    object is denied too, because saiife cannot verify it.
+  - saiife reads the file while Claude Code applies it, so the two race. The
+    check is a heuristic that records the attempt and denies it. The real
+    control is that managed settings outrank user, project and local ones.
+- MCP tools are denied unless their server is listed in
+  `[guard.mcp] allow_servers` in `/etc/saiife/config.toml`. Tool names
+  are matched against the listed names, and a name that could belong to a
+  longer, unlisted server (`mcp__linear__evil__x` when only `linear` is
+  listed) is denied.
 - MCP tool calls go through the hook, and managed settings can block MCP
   servers outright.
 

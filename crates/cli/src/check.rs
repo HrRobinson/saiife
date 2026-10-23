@@ -76,12 +76,9 @@ fn system_view(system_config: Option<&Path>) -> SystemView {
     system_view::read(system_config.unwrap_or(Path::new(SYSTEM_CONFIG)))
 }
 
-/// Read and discard stdin up to `PARSE_MAX_BYTES`.
+/// Read and discard all of stdin, so the agent gets no EPIPE.
 fn drain_stdin() {
-    let _ = std::io::copy(
-        &mut std::io::stdin().lock().take(PARSE_MAX_BYTES as u64),
-        &mut std::io::sink(),
-    );
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
 }
 
 /// `cli_packs`: `--pack` ids. The project's own packs are added from the
@@ -95,11 +92,13 @@ pub fn run(
     system_config: Option<&Path>,
 ) -> ExitCode {
     let view = system_view(system_config);
-    if view.managed_agents.iter().any(|a| a == agent) {
-        // The managed hook judges and records this call: no second record.
+    if view.is_managed(agent) {
+        // The managed hook judges and records this call: no second record,
+        // and nothing on stderr.
         drain_stdin();
         return allow();
     }
+    view.print_warnings();
     let fail = Fail {
         closed: view.fail_closed,
         hook_exit,
@@ -173,10 +172,11 @@ pub fn arg_error(args: &[String], error: &str) -> ExitCode {
     let config = crate::check_managed::flag_value(args, "--system-config").map(Path::new);
     let view = system_view(config);
     let agent = agent_from_args(args).unwrap_or("unknown");
-    if view.managed_agents.iter().any(|a| a == agent) {
+    if view.is_managed(agent) {
         drain_stdin();
         return allow();
     }
+    view.print_warnings();
     let reason = format!("bad hook arguments: {error}");
     if view.fail_closed {
         record_arg_error(args, &reason, DecisionKind::ErrorDenied);

@@ -914,6 +914,20 @@ fn config_change_unreadable_settings_denied() {
         stderr(&o)
     );
     assert_eq!(last_guard(&d)["decision"], "deny");
+    // Removed: it cannot be verified.
+    fs::remove_file(&f).unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("user_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("settings file cannot be verified"),
+        "{}",
+        stderr(&o)
+    );
+    // A key outside the allowlist.
+    fs::write(&f, r#"{"statusLine":{"type":"command","command":"x"}}"#).unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("user_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("touches statusLine"), "{}", stderr(&o));
 }
 
 /// The MCP tool fixture of `agent`, its server `docs` not listed.
@@ -961,6 +975,18 @@ fn listed_mcp_server_allowed_not_judged() {
         assert_eq!(r["reason"], "tool not judged", "{r}");
         assert_eq!(r["tool"], "mcp__docs__search", "{r}");
     }
+    // A server named `docs__evil` does not pass as the listed `docs`.
+    let mut v: Value = serde_json::from_str(&fixture("claude/mcp-tool.json")).unwrap();
+    v["tool_name"] = json!("mcp__docs__evil__search");
+    v["cwd"] = json!("/");
+    let (o, _, _sb) = managed_as("claude", &d.config(), &v.to_string(), &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by guard.mcp: MCP server mcp__docs__evil__search"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
 }
 
 /// Controller ruling: on Gemini only an explicit server identity in the
@@ -1002,6 +1028,20 @@ fn gemini_mcp_needs_server_identity() {
     let o = call(Some(json!({"server_name": "docs", "tool_name": "search"})));
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     assert_eq!(last_guard(&d)["reason"], "tool not judged");
+    // A bare tool name with an `mcp_context` but no server: unknown.
+    let o = managed_as(
+        "gemini",
+        &d.config(),
+        r#"{"session_id":"g-1","cwd":"/","hook_event_name":"BeforeTool","tool_name":"search","tool_input":{},"mcp_context":{}}"#,
+        &[],
+        &[],
+    )
+    .0;
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server unknown on Gemini"
+    );
 }
 
 #[test]

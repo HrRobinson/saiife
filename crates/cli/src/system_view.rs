@@ -21,17 +21,34 @@ pub struct SystemView {
     pub managed_agents: Vec<String>,
     /// `locked = true`, or `[guard] fail = "closed"` set explicitly.
     pub fail_closed: bool,
+    /// One `warning: <path> ignored: <error>` per invalid file, for the
+    /// caller to print once it knows the hook is not quiet.
+    pub warnings: Vec<String>,
+}
+
+impl SystemView {
+    /// `agent` has a managed hook: its project hook stays quiet.
+    pub fn is_managed(&self, agent: &str) -> bool {
+        self.managed_agents.iter().any(|a| a == agent)
+    }
+
+    /// Print the warnings on stderr (once per call).
+    pub fn print_warnings(&self) {
+        for w in &self.warnings {
+            warn(w);
+        }
+    }
 }
 
 /// Reads `config` and the `installed.toml` next to it. A missing file reads
 /// as the v1 default (nothing managed, fail open). An invalid one reads as
-/// the v1 default too, with one warning on stderr.
+/// the v1 default too, with one warning in `warnings`.
 pub fn read(config: &Path) -> SystemView {
     let mut view = SystemView::default();
     match read_regular(config, false, MAX_BYTES).and_then(|b| b.map(parse_config).transpose()) {
         Ok(Some(closed)) => view.fail_closed = closed,
         Ok(None) => {}
-        Err(e) => ignored(config, &e),
+        Err(e) => view.warnings.push(ignored(config, &e)),
     }
     let installed = config
         .parent()
@@ -43,14 +60,15 @@ pub fn read(config: &Path) -> SystemView {
         Err(e) => {
             // `read_installed` names the path itself.
             let prefix = format!("{}: ", installed.display());
-            ignored(&installed, e.strip_prefix(&prefix).unwrap_or(&e));
+            let e = ignored(&installed, e.strip_prefix(&prefix).unwrap_or(&e));
+            view.warnings.push(e);
         }
     }
     view
 }
 
-fn ignored(path: &Path, error: &str) {
-    warn(&format!("warning: {} ignored: {error}", path.display()));
+fn ignored(path: &Path, error: &str) -> String {
+    format!("warning: {} ignored: {error}", path.display())
 }
 
 /// `fail_closed` from the config's bytes.
@@ -144,7 +162,13 @@ mod tests {
             ("version = 2\nlocked = \"true\"\n", false),
             ("version = = 2\n[guard]\nfail = \"closed\"\n", false),
         ] {
-            assert_eq!(view(Some(text)).1.fail_closed, closed, "{text}");
+            let (_d, v) = view(Some(text));
+            assert_eq!(v.fail_closed, closed, "{text}");
+            assert_eq!(
+                v.warnings.len(),
+                usize::from(text.contains("= =")),
+                "{text}"
+            );
         }
     }
 

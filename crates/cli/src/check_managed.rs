@@ -116,7 +116,9 @@ mod imp {
     use serde_json::{Map, Value};
 
     use crate::eval::PARSE_MAX_BYTES;
-    use crate::eval::{self, EvalAnswer, EvalRequest, McpCheck, Plan, Verdict, MAX_EVAL_BYTES};
+    use crate::eval::{
+        self, EvalAnswer, EvalRequest, McpCheck, McpIdentity, Plan, Verdict, MAX_EVAL_BYTES,
+    };
     use crate::paths::LockedPaths;
     use crate::warn;
 
@@ -447,19 +449,13 @@ mod imp {
         cfg: &SystemConfig,
     ) -> Option<String> {
         let tool = ctx.tool.as_deref()?;
-        // Only a single-underscore name can need the payload's server
-        // field: the scan of a large payload is paid by MCP calls alone.
-        let server = (tool.starts_with("mcp_") && !tool.starts_with("mcp__"))
-            .then(|| eval::mcp_server_field(payload))
-            .flatten();
-        let server = server.or_else(|| {
-            // A Gemini call whose name does not say MCP may still say so in
-            // its payload.
-            (agent == "gemini" && !tool.starts_with("mcp_"))
-                .then(|| eval::mcp_server_field(payload))
-                .flatten()
-        });
-        match eval::mcp_check(agent, tool, server.as_deref(), &cfg.guard.mcp.allow_servers) {
+        // Claude Code and Codex names are judged alone; only the other
+        // agents' payloads are scanned for `mcp_context`.
+        let identity = match agent {
+            "claude" | "codex" => McpIdentity::Absent,
+            _ => eval::mcp_identity(payload),
+        };
+        match eval::mcp_check(agent, tool, &identity, &cfg.guard.mcp.allow_servers) {
             McpCheck::NotMcp | McpCheck::Allowed => None,
             McpCheck::Denied(s) => Some(format!(
                 "MCP server {s} is not in [guard.mcp] allow_servers"

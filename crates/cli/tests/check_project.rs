@@ -336,11 +336,13 @@ fn dev_check(
         .unwrap();
     let mut sin = child.stdin.take().unwrap();
     let data = payload.as_bytes().to_vec();
-    let w = std::thread::spawn(move || {
-        let _ = sin.write_all(&data);
-    });
+    let w = std::thread::spawn(move || sin.write_all(&data));
     let out = child.wait_with_output().unwrap();
-    w.join().unwrap();
+    // Every path reads the whole payload: an EPIPE here means the hook
+    // stopped reading early.
+    w.join()
+        .unwrap()
+        .unwrap_or_else(|e| panic!("writing the payload: {e}"));
     out
 }
 
@@ -369,9 +371,15 @@ fn project_hook_quiet_when_agent_managed() {
         assert!(o.stdout.is_empty(), "{}", common::stdout(&o));
         assert!(o.stderr.is_empty(), "{}", common::stderr(&o));
     }
-    // Even a payload over the parse cap is drained quietly.
+    // Even a payload over the parse cap is drained completely (the writer
+    // in `dev_check` would see EPIPE otherwise) and quietly.
     let big = "x".repeat(70 << 20);
     let o = dev_check(&etc, audit.path(), "claude", true, &big);
+    assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
+    assert!(o.stderr.is_empty(), "{}", common::stderr(&o));
+    // An invalid /etc config does not make the quiet hook speak.
+    etc.write_config("version = = 2\n");
+    let o = dev_check(&etc, audit.path(), "claude", true, &deny);
     assert_eq!(common::code(&o), 0, "{}", common::stderr(&o));
     assert!(o.stderr.is_empty(), "{}", common::stderr(&o));
     assert!(
