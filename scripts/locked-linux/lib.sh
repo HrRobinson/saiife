@@ -53,6 +53,13 @@ on_exit() {
         as_root journalctl -u saiifed --no-pager -o short-precise >"$LOGS/journal-saiifed.txt" 2>&1 || true
         as_root systemctl status saiifed --no-pager >"$LOGS/systemctl-status.txt" 2>&1 || true
         as_root sh -c 'ls -la /etc/saiife /etc/saiife/credstore /var/lib/saiife /var/lib/saiife/keys /var/log/saiife /var/log/saiife/audit /run/saiife' >"$LOGS/ls.txt" 2>&1 || true
+        show_daemon_groups >"$LOGS/daemon-groups.txt" 2>&1 || true
+        echo "-- daemon groups"
+        cat "$LOGS/daemon-groups.txt" 2>/dev/null || true
+        echo "-- journal (last 60 lines)"
+        tail -n 60 "$LOGS/journal-saiifed.txt" 2>/dev/null || true
+        echo "-- ls"
+        cat "$LOGS/ls.txt" 2>/dev/null || true
         # Copied as root through tar, the credstore (the vault key) left
         # out at copy time: it never lands in $LOGS, not even for a moment.
         # The unprivileged tar writes the copy as the runner user.
@@ -228,6 +235,19 @@ audit_dir_checks() {
     sudo -n -u saiife test -w "$AUDIT_DIR" || fail "the daemon user cannot write $AUDIT_DIR"
 }
 
+# For the log: the daemon user's groups by name and the groups the running
+# daemon really holds (read-only; for debugging a regroup failure).
+show_daemon_groups() {
+    local pid
+    echo "  id saiife: $(id saiife 2>&1 || true)"
+    pid="$(daemon_pid 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != 0 ]]; then
+        echo "  daemon pid $pid $(as_root grep -E '^(Uid|Gid|Groups):' "/proc/$pid/status" 2>&1 | tr '\t\n' '  ' || true)"
+    else
+        echo "  daemon: not running"
+    fi
+}
+
 # The paths an installed.toml lists: files, managed configs and dirs.
 listed_paths() {
     sed -n 's/^path = "\(.*\)"$/\1/p' "$1"
@@ -302,9 +322,11 @@ phase_modes() {
     expect_stat /run/saiife "saiife:saiife 755"
     expect_stat "$SOCKET" "saiife:saiife 666"
     audit_dir_checks
+    show_daemon_groups
     as_root systemctl restart saiifed
     wait_until 30 "the daemon socket after a restart" daemon_ready
     echo "  after systemctl restart saiifed:"
+    show_daemon_groups
     audit_dir_checks
 }
 
@@ -365,11 +387,17 @@ phase_fail_closed() {
     as_root systemctl reload saiifed
     wait_until 15 "the disk floor to deny the allow fixture" hook_code_is 2 claude "$allow"
     ok "disk floor reached: allow fixture -> exit 2 ($HOOK_ERR)"
+    # ExecReload= is spawned with LogsDirectory=, which hands the audit dir
+    # back to Group=saiife; the daemon regroups it on SIGHUP.
+    echo "  after systemctl reload saiifed:"
+    audit_dir_checks
     as_root sed -i 's/^min_free_mb = 99999999$/min_free_mb = 512/' /etc/saiife/config.toml
     as_root grep -qx 'min_free_mb = 512' /etc/saiife/config.toml || fail "min_free_mb was not restored"
     as_root systemctl reload saiifed
     wait_until 15 "the restored floor to allow again" hook_code_is 0 claude "$allow"
     ok "floor restored: allow fixture -> exit 0"
+    echo "  after the second reload:"
+    audit_dir_checks
 }
 
 phase_attacks() {

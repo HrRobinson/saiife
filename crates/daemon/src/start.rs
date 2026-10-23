@@ -188,14 +188,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         },
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
-    if let Some(g) = directory.group(AUDIT_GROUP) {
-        if let Err(e) = adopt_audit_group(&audit_cfg.dir, g.gid) {
-            eprintln!(
-                "saiife: warning: cannot give {} to group {AUDIT_GROUP}: {e}",
-                audit_cfg.dir.display()
-            );
-        }
-    }
+    regroup_audit_dir(&audit_cfg.dir, directory.as_ref());
     let check = cw.startup_check(STARTUP_CHECK_RECORDS);
     let writer_cfg = WriterConfig {
         checkpoint_every: audit_cfg.checkpoint_every,
@@ -237,12 +230,33 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     Ok(code)
 }
 
+/// Give the audit dir to `saiife-audit` when that group exists, warning on
+/// stderr (the journal) when that fails. Called at start and at every
+/// reload: systemd's `LogsDirectory=` hands the dir (recursively) back to
+/// the unit's `Group=saiife` before every command it spawns for the unit,
+/// `ExecReload=` (`/bin/kill -HUP`) included, not only before `ExecStart=`.
+/// `None` when there is no such group.
+fn regroup_audit_dir(dir: &Path, directory: &dyn saiife_policy::Directory) -> Option<u32> {
+    let g = directory.group(AUDIT_GROUP)?;
+    match adopt_audit_group(dir, g.gid) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            eprintln!(
+                "saiife: warning: cannot give {} to group {AUDIT_GROUP}: {e}",
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Give the audit dir and every regular `*.jsonl` in it to group `gid`
 /// when the dir is in another group; the owner stays, and nothing is
 /// followed through a symlink. Returns how many month files were changed.
 ///
 /// systemd's `LogsDirectory=` gives the dir to the unit's `Group=saiife`
-/// on every start, and §5.2 wants it in `saiife-audit` (readers of the log).
+/// before every command it spawns for the unit (start and reload), and
+/// §5.2 wants it in `saiife-audit` (readers of the log).
 fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
     use rustix::fs::{AtFlags, Gid, Mode, OFlags};
     use std::os::unix::fs::MetadataExt;
@@ -518,10 +532,14 @@ async fn serve(
 }
 
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
-/// one step; an invalid one is refused and the old one stays.
+/// one step; an invalid one is refused and the old one stays. First the
+/// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
+/// sent the signal was spawned with `LogsDirectory=`, which gave the dir
+/// back to `saiife`.
 async fn reload(ctx: &Arc<Ctx>) {
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
+        regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
         load_and_check(&c.config_path, c.directory.as_ref()).map_err(|e| e.to_string())
     })
     .await
@@ -593,6 +611,26 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// The start and reload helper: no `saiife-audit` group, nothing to do;
+    /// a group the dir is already in, nothing changed; a dir that cannot be
+    /// regrouped (missing) is a warning, not a stop.
+    #[test]
+    fn regroup_audit_dir_looks_up_the_group() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        let primary = rustix::process::getgid().as_raw();
+        rustix::fs::chown(&dir, None, Some(rustix::fs::Gid::from_raw(primary))).unwrap();
+        let none = saiife_policy::FixedDirectory::from_text("", "");
+        assert_eq!(regroup_audit_dir(&dir, &none), None);
+        let with = saiife_policy::FixedDirectory::from_text(
+            "",
+            &format!("{AUDIT_GROUP}:x:{primary}:saiife\n"),
+        );
+        assert_eq!(regroup_audit_dir(&dir, &with), Some(0));
+        assert_eq!(regroup_audit_dir(&d.path().join("missing"), &with), None);
+    }
 
     #[test]
     fn adopt_audit_group_changes_dir_and_files() {
