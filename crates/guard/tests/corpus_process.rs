@@ -148,6 +148,13 @@ fn pkill_with_only_selectors_is_denied() {
             "pkill -P $PID",
             "pkill -g \"$G\"",
             "pkill -P 1234,1",
+            // Final review S24: a target option given twice, or once
+            // without a target, does not name one.
+            "pkill -P 1234 -P ''",
+            "pkill -P 1234 --parent ''",
+            "pkill --parent=1234 -P 0",
+            "pkill -g 1234 -g $X",
+            "pkill -P 1234 -s 0",
             "xargs kill -1",
             "pkill -u $(whoami) node",
         ],
@@ -335,6 +342,15 @@ fn a_bare_expansion_pattern_is_denied() {
             "pkill -f \"${PATTERN}\"",
             "pkill -9 \"$1\"",
             "pkill \"$X$Y\"",
+            // Final review S23: an expansion may be empty, the rest is
+            // judged alone.
+            "pkill \"x$X\"",
+            "pkill \"$X.\"",
+            "pkill \".$X\"",
+            "pkill \"${X}e\"",
+            "pkill -f \"${X}/\"",
+            "killall -r \"$X.*\"",
+            "killall \"${X}d\"",
             "killall -r \"$X\"",
             "killall -r \"${X}\"",
             "killall \"$NAME\"",
@@ -345,7 +361,9 @@ fn a_bare_expansion_pattern_is_denied() {
         &[
             "pkill \"$X-server\"",
             "pkill -f \"node $APP\"",
-            "killall \"${X}d\"",
+            "pkill \"${X}node\"",
+            "killall \"${X}nginx\"",
+            "pkill node",
         ],
     );
 }

@@ -325,7 +325,10 @@ impl WhenOption {
     }
 
     /// `given`, over one reading: whether one of `names` was given, and
-    /// whether one of `targets` was given with a value naming a target.
+    /// whether the `targets` given name a target. Fails closed: every
+    /// occurrence of a target option must name a target, and none may be
+    /// given twice (short and long spelling share a slot), so a later
+    /// `-P ''` cannot override an earlier `-P 1234`.
     fn given_in(&self, words: &[&str]) -> (bool, bool) {
         let named = |list: &[String], short: char, long: Option<&str>| {
             list.iter().any(|n| match n.strip_prefix("--") {
@@ -339,14 +342,22 @@ impl WhenOption {
         };
         self.spec.with(|spec| {
             let mut hit = false;
-            let mut targeted = false;
+            let mut slots: Vec<String> = Vec::new();
+            let mut target_bad = false;
             let mut seen = |o: Opt<'_, '_>| match o {
                 Opt::Known {
                     short, long, value, ..
                 } => {
                     hit |= named(&self.names, short, long);
-                    targeted |=
-                        value.is_some_and(names_target) && named(&self.targets, short, long);
+                    if named(&self.targets, short, long) {
+                        let slot = if short != '\0' {
+                            short.to_string()
+                        } else {
+                            long.unwrap_or_default().to_string()
+                        };
+                        target_bad |= slots.contains(&slot) || !value.is_some_and(names_target);
+                        slots.push(slot);
+                    }
                 }
                 Opt::Unknown { .. } => hit = true,
             };
@@ -385,7 +396,7 @@ impl WhenOption {
                     None => i += 1,
                 }
             }
-            (hit, targeted)
+            (hit, !slots.is_empty() && !target_bad)
         })
     }
 }
@@ -505,6 +516,15 @@ impl OperandMatch {
             {
                 return Hit::Yes;
             }
+            // A parameter expansion may be empty: the operand is judged as
+            // its text without the expansions (`x$X` as `x`), and a text of
+            // fewer than two characters counts as a match (`pkill "$X"`).
+            let reduced = without_expansions(o);
+            let o = match &reduced {
+                Some(r) if r.chars().count() < 2 => return Hit::Yes,
+                Some(r) => r,
+                None => o,
+            };
             if o.is_empty() {
                 continue;
             }
@@ -591,6 +611,40 @@ fn only_expansions(word: &str) -> bool {
         i += 1 + len;
     }
     any
+}
+
+/// `word` without its parameter expansions (`$X`, `${…}`, `$1`, `$@`,
+/// …); `None` when it has none. `$$`, `$#` and `$?` (always digits) and a
+/// `$` before anything else (`$(`, a lone `$`) are kept as text.
+fn without_expansions(word: &str) -> Option<String> {
+    let b = word.as_bytes();
+    let mut out = String::with_capacity(word.len());
+    let mut found = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' {
+            let rest = &b[i + 1..];
+            let len = match rest.first() {
+                Some(b'{') => rest.iter().position(|&c| c == b'}').map(|e| e + 1),
+                Some(c) if c.is_ascii_alphabetic() || *c == b'_' => Some(
+                    rest.iter()
+                        .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                        .unwrap_or(rest.len()),
+                ),
+                Some(b'@' | b'*' | b'!' | b'-' | b'0'..=b'9') => Some(1),
+                _ => None,
+            };
+            if let Some(len) = len {
+                found = true;
+                i += 1 + len;
+                continue;
+            }
+        }
+        let ch = word[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8().max(1);
+    }
+    found.then_some(out)
 }
 
 /// Does a pattern operand hold a Rust regex class set operation (`&&`,
@@ -1608,6 +1662,18 @@ mod tests {
         for no in ["", "$$", "$#", "x$X", "$X-y", "${X}d", "$", "$(x)"] {
             assert!(!only_expansions(no), "{no}");
         }
+    }
+
+    #[test]
+    fn expansions_are_judged_as_empty() {
+        assert_eq!(without_expansions("node"), None);
+        assert_eq!(without_expansions("$$"), None);
+        assert_eq!(without_expansions("$X").as_deref(), Some(""));
+        assert_eq!(without_expansions("x$X").as_deref(), Some("x"));
+        assert_eq!(without_expansions("${X}node").as_deref(), Some("node"));
+        assert_eq!(without_expansions("a$1b$@").as_deref(), Some("ab"));
+        assert_eq!(without_expansions("$(x)$Y").as_deref(), Some("$(x)"));
+        assert_eq!(without_expansions("é$X").as_deref(), Some("é"));
     }
 
     #[test]

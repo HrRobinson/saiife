@@ -99,7 +99,7 @@ agent's file tools and through shell commands:
   goes through saiife.
 - Launchers saiife does not see through: `taskset`, `chrt`, `unshare`,
   `prlimit`, `find ... -exec`, `tmux` and `screen`, `parallel`,
-  `ssh localhost`, `script -c` and `flock ... -c`, and a program path found
+  `ssh localhost`, `script -c`, `sg ... -c` and `flock ... -c`, and a program path found
   at run time (`$(which sudo) ls`). Without root a privilege change fails
   on permissions anyway.
 - Other files under `~/.config/systemd/` than the unit folders, such as

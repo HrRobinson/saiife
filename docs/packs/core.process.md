@@ -24,7 +24,12 @@ blocked like `pkill -n`, and in `kill 1234 2>&1` the `1` is not a pid.
   `-u`/`--euid`, `-U`/`--uid`, `-g`/`--pgroup`, `-G`/`--group`,
   `-s`/`--session`, `-P`/`--parent`, `-t`/`--terminal`, `-O`/`--older`,
   `-r`/`--runstates`, `--cgroup`, `--ns` and `--env`. So `pkill -n`,
-  `pkill -9 -o` and `pkill -u jonas` are blocked.
+  `pkill -9 -o` and `pkill -u jonas` are blocked. A parent, process group
+  or session given as literal ids above 1, or `$$`, names a target and is
+  allowed (`pkill -P 1234`, `pkill -g $$`); `0` (pkill's own group or
+  session, which holds the agent), `1` (init) and a value from a variable
+  (`pkill -P $PID`) are not, nor is an option given twice
+  (`pkill -P 1234 -P ''`: the last one counts).
 - `pkill --inverse`, which kills every process that does not match.
 - A `pkill` or `killall -r` pattern that matches most processes: one that
   matches at least 80% of a list of about 70 common process names (`.`,
@@ -33,8 +38,10 @@ blocked like `pkill -n`, and in `kill 1234 2>&1` the `1` is not a pid.
   list of common command lines. A pattern after `--` counts too, even when
   it starts with `-` (`pkill -- '-*.'`).
 - A `pkill` or `killall` pattern or name built at run time:
-  `pkill $(cat name.txt)`, `pkill -f "$(...)"`, `killall $(cat names)`.
-  It may come out empty, and an empty pattern matches every process.
+  `pkill $(cat name.txt)`, `pkill -f "$(...)"`, `killall $(cat names)`,
+  and one that is only a variable: `pkill "$NAME"`, `pkill -f "${X}"`,
+  `killall -r "$X"`. It may come out empty, and an empty pattern matches
+  every process.
 - `killall` without a process name, with `-u`/`--user` or `-Z`/`--context`
   (`killall -u jonas`).
 - `killall5`, which signals every process on the machine.
@@ -49,8 +56,11 @@ blocked like `pkill -n`, and in `kill 1234 2>&1` the `1` is not a pid.
 Options are read the way the tools read them, from each tool's own option
 list: long options can be shortened (`pkill --new`), short ones bundled
 (`pkill -en`), and an option's value is not mistaken for a pattern
-(`pkill -u jonas` has no pattern). A signal in front (`pkill -9 -n`,
-`killall -KILL -u jonas`) does not hide the option.
+(`pkill -u jonas` has no pattern; in `pkill --signal 9 node`,
+`pkill -u 0 node` and `killall -r -s 9 '^node$'` the pattern is the last
+word). A signal in front (`pkill -9 -n`, `killall -KILL -u jonas`) does not
+hide the option: only the first word can be a signal, and it is read both
+as the signal and as options.
 
 ## Allowed on purpose
 
@@ -68,6 +78,8 @@ list: long options can be shortened (`pkill --new`), short ones bundled
   `killall -r '^node$'`. A pattern of two characters is allowed
   (`pkill sh`), even though it may match several processes.
 - `pkill -F app.pid` and `pkill -p 12345`, which name their process.
+- `pkill -P 1234` (the children of 1234), `pkill -P $$` (the children of
+  the agent's shell), `pkill -g 1234` and `pkill -s 1234`.
 - `pgrep` in every form, including `pgrep -n` and `pgrep -f .`: it only
   lists processes.
 
@@ -81,8 +93,13 @@ list: long options can be shortened (`pkill --new`), short ones bundled
   `pgrep -o | xargs kill`, or `kill -9 $PID` where the variable holds
   `-1`. These are not blocked, because `kill $(cat app.pid)` and
   `kill $PID` are everyday use.
-- A pattern from a variable: `pkill $NAME` (an empty `$NAME` gives no
-  pattern at all, and `pkill -f "$NAME"` an empty one).
+- Launchers saiife does not see through: `chrt`, `taskset`, `unshare`,
+  `script -c`, `find ... -exec`, `parallel`, `sg ... -c` and the like run
+  `pkill -n` without the guard reading it.
+- A pattern that is part variable, part text (`pkill "$X-server"`) is
+  judged as its text alone (`-server`), since the variable may be empty.
+  So `pkill "x$X"` and `killall "${X}d"` (one character left) are blocked,
+  `pkill "${X}node"` is not.
 - `kill <name>` (util-linux `kill` can take a process name) and other tools
   that send signals to many processes: `skill`, `snice`, `systemctl kill`,
   `loginctl kill-user`, `fuser -k`.
@@ -99,12 +116,14 @@ It also blocks too much in a few cases. This is the safe direction:
   counts as a selector.
 - A pattern saiife cannot read (`pkill 'a('`), longer than 256 characters,
   or behind more than 32 others counts as matching every name.
-- An option value that happens to match every name (`pkill -t . node`).
+- A pattern with a regex class set operation (`[a-z&&[^x]]`, `--`, `~~`
+  inside `[...]`): pkill's and killall's regexes have none, so saiife does
+  not try to read it.
+- A leading signal name is also read in lower case as options:
+  `pkill -TERM` alone is read as `-t erm` too (pkill would refuse it: no
+  pattern).
 - `xargs pkill -n` and `xargs kill -1` and the like: what `xargs` adds at
   run time is not known, so `pkill -n` has no pattern and `kill -1` no pid.
-- `pkill -P $$` (the children of the agent's own shell): `$$` is not read,
-  so it counts as a selector. To stop the jobs the shell started, use
-  `kill $(jobs -p)`.
 - A substitution in an option value counts like a pattern:
   `pkill -u $(whoami) node` is blocked. Write the user name instead.
 
@@ -123,6 +142,8 @@ deny pkill e
 deny pkill '[a-z]'
 deny pkill -- '-*.'
 deny pkill $(cat name.txt)
+deny pkill "$NAME"
+deny pkill -P 1
 deny kill -9 $((-1))
 deny pkill --newest
 deny pkill -9 -o
@@ -167,6 +188,10 @@ allow pkill node
 allow pkill -f 'npm run dev'
 allow pkill -n node
 allow pkill -u jonas node
+allow pkill --signal 9 node
+allow pkill -u 0 node
+allow pkill -P 1234
+allow pkill -P $$
 allow pkill -F app.pid
 allow killall -HUP nginx
 allow killall -r '^node$'
