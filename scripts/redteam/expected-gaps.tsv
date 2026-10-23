@@ -1,0 +1,8 @@
+id	attack	doc	quote
+lock-pid	A5	docs/packs/core.lock.md	`kill 1234` where 1234 is saiifed's process id
+lock-runtime-name	A5	docs/packs/core.lock.md	a name built at run time
+lock-interpreter	A5 A7 A10	docs/packs/core.lock.md	Code run through an interpreter
+lock-launchers	A16	docs/packs/core.lock.md	Launchers saiife does not see through
+lock-runtime-program	A16	docs/packs/core.lock.md	a program path found at run time
+self-shell-function	A3	docs/packs/core.self.md	A shell function named `saiife` is not detected
+self-codex-profile	A2	docs/packs/core.self.md	`codex --profile` can pick a user profile

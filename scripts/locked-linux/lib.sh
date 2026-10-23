@@ -178,21 +178,6 @@ expect_hook() {
     ok "$what: exit $HOOK_CODE${HOOK_ERR:+ ($HOOK_ERR)}"
 }
 
-# `expect_denied <what> <command...>`: the command, as the agent user,
-# fails with a permission error.
-expect_denied() {
-    local what="$1" code=0 out
-    shift
-    # The output file is the runner's (the redirect is not the attack).
-    # shellcheck disable=SC2024
-    sudo -n -u "$AGENT_USER" env -C "$AGENT_HOME" "$@" >"$WORK/attack.out" 2>&1 || code=$?
-    out="$(cat "$WORK/attack.out")"
-    [[ "$code" != 0 ]] || fail "$what succeeded as $AGENT_USER"
-    [[ "$out" == *"Permission denied"* || "$out" == *"Operation not permitted"* ]] ||
-        fail "$what failed without a permission error (exit $code): $out"
-    ok "$what: $out"
-}
-
 # `install_saiife <allowed exit codes...>`: `system install` with the CI
 # config, its output in $WORK/install.out.
 install_saiife() {
@@ -400,20 +385,12 @@ phase_fail_closed() {
     audit_dir_checks
 }
 
-phase_attacks() {
-    phase "5. attacks on the install as $AGENT_USER"
-    local p before pid
-    for p in /etc/saiife/config.toml /etc/claude-code/managed-settings.d/50-saiife.json "$OPT_BIN"; do
-        before="$(as_root sha256sum "$p")"
-        # shellcheck disable=SC2016
-        expect_denied "write $p" sh -c 'printf x >>"$1"' sh "$p"
-        [[ "$(as_root sha256sum "$p")" == "$before" ]] || fail "$p changed"
-    done
-    expect_denied "read /var/lib/saiife/keys/audit.ed25519" cat /var/lib/saiife/keys/audit.ed25519
-    pid="$(daemon_pid)"
-    [[ "$pid" -gt 0 ]] || fail "no daemon pid"
-    expect_denied "kill the daemon (pid $pid)" kill -s TERM "$pid"
-    [[ "$(daemon_pid)" == "$pid" ]] || fail "the daemon pid changed"
+# The red team (plan 9c): each attack in scripts/redteam runs wholly as the
+# agent user, and the runner pairs its rows with the audit records. It
+# replaces 9b's five attack rows (now in a01, a03, a05, a10 and a18).
+phase_redteam() {
+    phase "5. red team as $AGENT_USER (scripts/redteam)"
+    bash "$REPO/scripts/redteam/run.sh"
 }
 
 phase_doctor() {

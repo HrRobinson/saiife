@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Locked mode on a real machine (spec §13 "Daemon integration", plan 9b
 # Task 8): `system install` as root, the §5.2 owners and modes, managed
-# hooks as an unprivileged agent user, the fail-closed matrix (§9.3),
-# attacks on the installed files, `doctor`, reinstall, uninstall and purge.
+# hooks as an unprivileged agent user, the fail-closed matrix (§9.3), the
+# red team (plan 9c, scripts/redteam/run.sh: attacks A1-A10 and A16-A18 as
+# the agent user, two scopes, the auditor read), `doctor`, reinstall,
+# uninstall and purge.
 #
 # CI ONLY. This creates system users, writes /etc, /opt, /var and /run,
 # installs and kills a systemd service. It runs in the GitHub Actions job
@@ -48,7 +50,7 @@ phase_install
 phase_modes
 phase_hooks
 phase_fail_closed
-phase_attacks
+phase_redteam
 phase_doctor
 phase_reinstall_uninstall
 

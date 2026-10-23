@@ -46,6 +46,12 @@ jobs:
       - name: lock-check harness (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/lock-check/test-lib.sh
+      # Red-team framework without a locked install: row pairing, gap rows,
+      # the summary, the gap quotes in the docs, the static lints over the
+      # attack scripts, and ipc.py's frames. Executes no attack.
+      - name: red-team offline checks
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/redteam/test-lib.sh && python3 -I scripts/redteam/test_ipc.py
 
   offline:
     runs-on: ubuntu-latest
@@ -62,12 +68,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/redteam/*.sh
 
   # Locked mode on real machines (spec §13 "Daemon integration"): `system
   # install` as root, the §5.2 owners and modes, managed hooks run as an
-  # unprivileged agent user, the fail-closed matrix (§9.3), attacks on the
-  # installed files, doctor, reinstall, uninstall and purge. systemd 249
+  # unprivileged agent user, the fail-closed matrix (§9.3), the red team
+  # (scripts/redteam: attacks A1-A10 and A16-A18 run as the agent user,
+  # two scopes, the auditor read), doctor, reinstall, uninstall and purge. systemd 249
   # (22.04, plain vault key file) and 255 (24.04, encrypted credential).
   # The only place anything privileged runs: run.sh refuses outside GitHub
   # Actions and calls sudo itself (the runner has passwordless sudo).
@@ -77,7 +84,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -94,7 +101,7 @@ jobs:
       # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it
       # with --allow-test-build (spec §9.2 A4: never in production).
       - run: cargo build --locked --profile ci-locked --target x86_64-unknown-linux-musl --bin saiife
-      - name: install, fail-closed matrix, uninstall (sudo inside, this job only)
+      - name: install, fail-closed matrix, red team, uninstall (sudo inside, this job only)
         env:
           SAIIFE_LOCKED_CI: "1"
           SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
