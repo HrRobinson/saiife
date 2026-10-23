@@ -2,7 +2,7 @@
 
 A pack is a set of rules for one area, such as git or a cloud provider. Each
 rule either blocks a command or file access, or allows it on purpose. The
-four `core` packs are always on, and `core.lock` is on in locked mode. The
+five `core` packs are always on, and `core.lock` is on in locked mode. The
 others are opt-in: turn one on for a project with `saiife init --pack <id>`
 in your own terminal, or by adding its id to the `packs` list in
 `.saiife/config.toml`.
@@ -16,6 +16,7 @@ in your own terminal, or by adding its id to the `packs` list in
 | [core.git](core.git.md) | yes | Git commands that throw away work: hard reset, clean, force-push, force branch delete. |
 | [core.secrets](core.secrets.md) | yes | Reading secret files, printing all environment variables, printing secrets from secret managers and cloud tools. |
 | [core.self](core.self.md) | yes | Turning saiife off, changing its settings or hook, replacing it, hiding the audit log. |
+| [core.process](core.process.md) | yes | Killing processes without naming one: `pkill -n`, `pkill -u me`, `kill -9 -1`, `kill 0`, `killall5`. |
 | [core.lock](core.lock.md) | in locked mode | Changing privileges, stopping saiife's service, jobs that run later, changing saiife's system files and the managed agent settings. |
 | [cloud.aws](cloud.aws.md) | no | Deleting AWS stacks, tables, databases and instances; emptying S3 buckets; IAM and organization changes. |
 | [cloud.azure](cloud.azure.md) | no | Deleting Azure resource groups, VMs, storage accounts and clusters; role changes. |

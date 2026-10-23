@@ -27,6 +27,8 @@
 //!                             # `timeout sudo`); never matches without one
 //! operand_match = "regex|glob" # also require an operand, read as a
 //! operand_targets = ["x"]     # pattern of this syntax, to match a target
+//! operand_match_all = true    # the operand must match every target (an
+//!                             # empty regex operand matches them all)
 //! when_option = ["-f", "--full"] # also require one of these options,
 //! command_options = "fq:"     # read with getopt from the command's own
 //! command_long_options = ["full|f", "queue=|q", "eof[=]"] # options
@@ -34,6 +36,9 @@
 //!                             # attached one; `|c` is the short alias)
 //! command_signal_word = true  # the first `-SIGNAL` word is not options
 //! command_long_only = true    # `-name` may be a long option too
+//! when_no_operand = true      # also require that the command has no
+//!                             # operand (after getopt); a word that may be
+//!                             # a signal or options is read both ways
 //! [[allow_path]] / [[deny_path]]
 //! glob = "~/.ssh/id_*"        # see `crate::pathrule`
 //! access = "read|write|any"
@@ -98,6 +103,10 @@ pub struct WhenOption {
     /// The command reads options with `getopt_long_only`: `-name` may be a
     /// long option too (`killall -regexp`; `command_long_only = true`).
     pub long_only: bool,
+    /// Also required: the command has no operand (`when_no_operand =
+    /// true`; `pkill -n`). The `-SIGNAL` word is then read both ways, as a
+    /// signal and as options, and the rule matches if either reading does.
+    pub no_operand: bool,
 }
 
 /// Linux signal names (`/usr/include/bits/signum-generic.h` and
@@ -148,6 +157,69 @@ impl WhenOption {
                 words.remove(i);
             }
         }
+        self.given_in(&words)
+    }
+
+    /// The rule's whole option test: `given`, and with `no_operand` also
+    /// no operand. With `no_operand` a `-SIGNAL` word is read both ways
+    /// (fails closed: `pkill -ttin` is SIGTTIN, or `-t tin`), and either
+    /// reading matching is a match.
+    pub fn matches(&self, args: &[String]) -> bool {
+        if !self.no_operand {
+            return self.given(args);
+        }
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut readings = vec![words.clone()];
+        if self.signal_word {
+            if let Some(i) = words.iter().position(|w| is_signal_word(w)) {
+                let mut dropped = words;
+                dropped.remove(i);
+                readings.push(dropped);
+            }
+        }
+        readings
+            .iter()
+            .any(|r| self.given_in(r) && !self.has_operand(r))
+    }
+
+    /// Does `words` hold an operand? Read with getopt, permuting, up to
+    /// `--` (any word after it is an operand). Fails closed towards "no
+    /// operand": a word is skipped as a value when any reading takes it
+    /// as one (with `long_only`, `-user x` as `--user x`).
+    fn has_operand(&self, words: &[&str]) -> bool {
+        self.spec.with(|spec| {
+            let mut i = 0;
+            while i < words.len() {
+                let w = words[i];
+                if w == "--" {
+                    return i + 1 < words.len();
+                }
+                let mut next = spec.option_at(words, i, &mut |_| {});
+                if self.long_only && w.len() > 2 && !w.starts_with("--") && w.starts_with('-') {
+                    let (name, attached) = match w[1..].split_once('=') {
+                        Some((n, _)) => (n, true),
+                        None => (&w[1..], false),
+                    };
+                    if let crate::getopt::Resolved::Known(o) = spec.resolve_long(name) {
+                        let long_next = if o.arg == crate::getopt::Arg::Required && !attached {
+                            i + 2
+                        } else {
+                            i + 1
+                        };
+                        next = Some(next.map_or(long_next, |n| n.max(long_next)));
+                    }
+                }
+                match next {
+                    Some(n) => i = n,
+                    None => return true,
+                }
+            }
+            false
+        })
+    }
+
+    /// `given`, over words with the signal word already handled.
+    fn given_in(&self, words: &[&str]) -> bool {
         self.spec.with(|spec| {
             let mut hit = false;
             let mut seen = |o: Opt<'_, '_>| match o {
@@ -182,7 +254,7 @@ impl WhenOption {
                     }
                 }
                 let mut dash_value = false;
-                match spec.option_at(&words, i, &mut |o| {
+                match spec.option_at(words, i, &mut |o| {
                     if let Opt::Known {
                         value: Some(v),
                         separate: true,
@@ -219,6 +291,10 @@ pub enum OperandSyntax {
 pub struct OperandMatch {
     pub syntax: OperandSyntax,
     pub targets: Vec<String>,
+    /// An operand must match every target, not just one
+    /// (`operand_match_all = true`; `pkill .` matches every name). An
+    /// empty regex operand matches them all.
+    pub all: bool,
 }
 
 /// Largest compiled operand pattern (the regex NFA size limit); a bigger
@@ -270,6 +346,19 @@ impl OperandMatch {
         spent: &Cell<Duration>,
     ) -> Hit {
         let mut compiled = 0;
+        // Any target (or, with `all`, every target) passes `test`.
+        let some = |test: &dyn Fn(&str) -> bool| {
+            if self.all {
+                self.targets.iter().all(|t| test(t))
+            } else {
+                self.targets.iter().any(|t| test(t))
+            }
+        };
+        if self.all && self.syntax == OperandSyntax::Regex && operands.iter().any(|o| o.is_empty())
+        {
+            // An empty regex matches every name.
+            return Hit::Yes;
+        }
         for o in operands
             .iter()
             .filter(|o| !o.is_empty() && !o.starts_with('-'))
@@ -277,11 +366,7 @@ impl OperandMatch {
             let lower = o.to_lowercase();
             let source = match self.syntax {
                 OperandSyntax::Regex if !o.contains(REGEX_META) => {
-                    if self
-                        .targets
-                        .iter()
-                        .any(|t| t.to_lowercase().contains(&lower))
-                    {
+                    if some(&|t| t.to_lowercase().contains(&lower)) {
                         return Hit::Yes;
                     }
                     continue;
@@ -290,7 +375,7 @@ impl OperandMatch {
                 // not modelled.
                 OperandSyntax::Glob if o.contains('\\') || o.contains("[:") => return Hit::Yes,
                 OperandSyntax::Glob if !o.contains(GLOB_META) => {
-                    if self.targets.iter().any(|t| t.to_lowercase() == lower) {
+                    if some(&|t| t.to_lowercase() == lower) {
                         return Hit::Yes;
                     }
                     continue;
@@ -317,9 +402,7 @@ impl OperandMatch {
                 .build();
             spent.set(spent.get() + t0.elapsed());
             match built {
-                Ok(re) if self.targets.iter().any(|t| re.is_match(t.as_bytes())) => {
-                    return Hit::Yes
-                }
+                Ok(re) if some(&|t| re.is_match(t.as_bytes())) => return Hit::Yes,
                 Ok(_) => {}
                 Err(_) => return Hit::Yes,
             }
@@ -486,6 +569,10 @@ struct RawRule {
     command_signal_word: bool,
     #[serde(default)]
     command_long_only: bool,
+    #[serde(default)]
+    when_no_operand: bool,
+    #[serde(default)]
+    operand_match_all: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,13 +619,15 @@ fn compile_rules(
             (Some(syntax), false) => Some(OperandMatch {
                 syntax,
                 targets: r.operand_targets,
+                all: r.operand_match_all,
             }),
-            (None, true) => None,
+            (None, true) if !r.operand_match_all => None,
             _ => {
                 warnings.push(PackWarning {
                     source: source.to_string(),
                     message: format!(
-                        "skipping rule {:?}: operand_match and operand_targets go together",
+                        "skipping rule {:?}: operand_match and operand_targets go together \
+                         (and operand_match_all needs them)",
                         r.pattern
                     ),
                 });
@@ -547,7 +636,7 @@ fn compile_rules(
         };
         let has_table = r.command_options.is_some() || !r.command_long_options.is_empty();
         let when_option = match (r.when_option.is_empty(), has_table) {
-            (true, false) => None,
+            (true, false) if !r.when_no_operand => None,
             (false, true) => {
                 let names_ok = r.when_option.iter().all(|n| {
                     n.strip_prefix("--").is_some_and(|l| !l.is_empty())
@@ -563,6 +652,7 @@ fn compile_rules(
                         names: r.when_option,
                         signal_word: r.command_signal_word,
                         long_only: r.command_long_only,
+                        no_operand: r.when_no_operand,
                     }),
                     Ok(_) => {
                         warnings.push(PackWarning {
@@ -588,7 +678,8 @@ fn compile_rules(
                     source: source.to_string(),
                     message: format!(
                         "skipping rule {:?}: when_option needs command_options or \
-                         command_long_options, and they need it",
+                         command_long_options, and they need it (when_no_operand \
+                         needs all of them)",
                         r.pattern
                     ),
                 });
@@ -794,6 +885,7 @@ mod tests {
             OperandMatch {
                 syntax,
                 targets: vec!["saiifed".into(), "saiifed.service".into()],
+                all: false,
             }
             .hits(
                 &ops.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -830,6 +922,7 @@ mod tests {
         let om = OperandMatch {
             syntax: OperandSyntax::Regex,
             targets: vec!["saiifed".into()],
+            all: false,
         };
         assert_eq!(
             om.hits(&["x.".to_string()], &|| true, &Cell::default()),
@@ -851,6 +944,7 @@ mod tests {
         let om = OperandMatch {
             syntax: OperandSyntax::Regex,
             targets: vec!["saiifed".into()],
+            all: false,
         };
         let ops: Vec<String> = (0..31).map(|i| format!("\\w{{1,10}}\\d{i}")).collect();
         let spent = Cell::default();
@@ -890,6 +984,7 @@ mod tests {
             names: vec!["-f".into(), "--full".into()],
             signal_word: true,
             long_only: false,
+            no_operand: false,
         };
         let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in [
@@ -970,6 +1065,7 @@ mod tests {
             names: vec!["-r".into(), "--regexp".into()],
             signal_word: true,
             long_only: true,
+            no_operand: false,
         };
         let given = |s: &str| w.given(&s.split(' ').map(String::from).collect::<Vec<_>>());
         for yes in ["-regexp x", "-reg x", "-XFSZ -r x", "-Ir x", "-verbose x"] {
@@ -996,6 +1092,93 @@ mod tests {
         let p = load_pack_str("<t>", toml, &mut w).unwrap();
         assert_eq!(p.deny.len(), 1);
         assert!(w[0].message.contains("go together"), "{w:?}");
+    }
+
+    #[test]
+    fn when_no_operand_reads_both_readings_of_a_signal_word() {
+        let w = WhenOption {
+            spec: OwnedSpec::parse(
+                "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:",
+                &["newest|n".into(), "euid=|u".into(), "signal=".into()],
+            )
+            .unwrap(),
+            names: vec!["-n".into(), "--newest".into(), "-u".into(), "-t".into()],
+            signal_word: true,
+            long_only: false,
+            no_operand: true,
+        };
+        let m = |s: &str| w.matches(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        for yes in [
+            "-n",
+            "--new",
+            "-9 -n",
+            "-n -9",
+            "-u me",
+            "-ume",
+            "-n --",
+            "--signal KILL -n",
+            // `-ttin`: SIGTTIN (no selector), or `-t tin` (a selector).
+            "-ttin",
+            "--zz",
+        ] {
+            assert!(m(yes), "{yes}");
+        }
+        for no in [
+            "-n x", "x -n", "-u me x", "-n -- x", "-HUP x", "-TERM", "-9", "-F f",
+        ] {
+            assert!(!m(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn when_no_operand_skips_a_long_only_value() {
+        let w = WhenOption {
+            spec: OwnedSpec::parse(
+                "eIgy:o:ilqrs:u:vVwn:Z:",
+                &["user=|u".into(), "list|l".into()],
+            )
+            .unwrap(),
+            names: vec!["-u".into(), "--user".into()],
+            signal_word: true,
+            long_only: true,
+            no_operand: true,
+        };
+        let m = |s: &str| w.matches(&s.split(' ').map(String::from).collect::<Vec<_>>());
+        for yes in ["-u me", "-user me", "--user=me", "-9 -u me"] {
+            assert!(m(yes), "{yes}");
+        }
+        for no in ["-u me x", "-user me x", "-l", "x"] {
+            assert!(!m(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn operand_match_all_needs_every_target() {
+        let om = OperandMatch {
+            syntax: OperandSyntax::Regex,
+            targets: vec!["a".into(), "Z".into(), "0".into(), " ".into()],
+            all: true,
+        };
+        let spent = Cell::new(Duration::ZERO);
+        let hit = |ops: &[&str]| {
+            let ops: Vec<String> = ops.iter().map(|s| s.to_string()).collect();
+            om.hits(&ops, &|| false, &spent)
+        };
+        for yes in [&["."][..], &[""], &[".*"], &["^"], &["x", "."], &["a("]] {
+            assert_eq!(hit(yes), Hit::Yes, "{yes:?}");
+        }
+        for no in [&["a"][..], &["[a-z]"], &["node"], &["-f"], &[]] {
+            assert_eq!(hit(no), Hit::No, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn new_operand_keys_need_their_partners() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\noperand_match_all = true\n[[deny]]\npattern = \"y\"\nreason = \"r\"\nwhen_no_operand = true\n[[deny]]\npattern = \"z\"\nreason = \"r\"\nwhen_no_operand = true\ncommand_options = \"n\"\n[[deny]]\npattern = \"w\"\nreason = \"r\"\nwhen_no_operand = true\nwhen_option = [\"-n\"]\ncommand_options = \"n\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", toml, &mut w).unwrap();
+        assert_eq!(p.deny.len(), 1, "{w:?}");
+        assert_eq!(w.len(), 3, "{w:?}");
     }
 
     const VALID: &str = r#"

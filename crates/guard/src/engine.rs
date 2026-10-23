@@ -1189,7 +1189,8 @@ impl Engine {
             }
         };
         // The rule's line matches, the command was given the option the
-        // rule asks for, and an operand names a target when the rule asks
+        // rule asks for (and has no operand, when the rule asks for that),
+        // and an operand names a target when the rule asks
         // for one.
         let over_budget = || start.elapsed() > self.budget;
         let matches = |rule: &crate::pack::Rule| -> Hit {
@@ -1199,7 +1200,7 @@ impl Engine {
             if rule
                 .when_option
                 .as_ref()
-                .is_some_and(|w| !w.given(operands))
+                .is_some_and(|w| !w.matches(operands))
             {
                 return Hit::No;
             }

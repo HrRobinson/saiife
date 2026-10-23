@@ -2,7 +2,8 @@
 //! no external pack files. At runtime saiife also loads `guard/packs/*.toml`
 //! from userData; the built-ins are the shipped defaults.
 //!
-//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self` (default-on),
+//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self`,
+//! `core.process` (default-on),
 //! `core.lock` (on in locked mode, opt-in elsewhere) and the opt-in packs
 //! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
@@ -32,6 +33,12 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     (
         "<builtin>core.self",
         include_str!("../packs/core.self.toml"),
+    ),
+    // After core.lock, so a locked-mode kill that names saiifed stays
+    // core.lock's verdict.
+    (
+        "<builtin>core.process",
+        include_str!("../packs/core.process.toml"),
     ),
     (
         "<builtin>cloud.gcloud",

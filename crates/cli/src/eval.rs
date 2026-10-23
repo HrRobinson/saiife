@@ -731,7 +731,13 @@ mod tests {
     use saiifeguard::builtins::builtin_packs;
     use saiifeguard::profile::select_active;
 
-    const DEFAULTS: &[&str] = &["core.filesystem", "core.git", "core.secrets", "core.self"];
+    const DEFAULTS: &[&str] = &[
+        "core.filesystem",
+        "core.git",
+        "core.secrets",
+        "core.self",
+        "core.process",
+    ];
 
     fn defaults() -> Vec<String> {
         DEFAULTS.iter().map(|s| s.to_string()).collect()

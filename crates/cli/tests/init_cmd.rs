@@ -28,7 +28,7 @@ fn init_hooks_detected_agents_and_writes_the_config() {
     let cfg = env.read(".saiife/config.toml");
     assert!(
         cfg.contains(
-            "packs = [\"core.filesystem\", \"core.git\", \"core.secrets\", \"core.self\"]"
+            "packs = [\"core.filesystem\", \"core.git\", \"core.secrets\", \"core.self\", \"core.process\"]"
         ),
         "{cfg}"
     );

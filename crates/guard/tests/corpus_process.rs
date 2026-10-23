@@ -1,0 +1,314 @@
+//! Golden corpus for the `core.process` pack: an agent may not signal
+//! processes without naming a specific target (`pkill -n`, `pkill -u me`,
+//! `kill -9 -1`, `killall5`, a pattern that matches every process).
+//! Signalling a named process or a process id stays allowed.
+//!
+//! Every command is also judged behind the wrappers the engine peels
+//! (`timeout 5`, `setsid`, `nice -n 5`, `env`).
+//!
+//! These tests judge command TEXT only; nothing here runs a process tool.
+
+use saiifeguard::builtins::builtin_packs;
+use saiifeguard::engine::{Decision, Engine};
+use saiifeguard::profile::select_active;
+
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+const WRAPPERS: [&str; 5] = ["", "timeout 5 ", "setsid ", "nice -n 5 ", "env "];
+
+/// `core.process` alone.
+fn engine() -> Engine {
+    let (packs, warnings) = builtin_packs();
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    let process: Vec<_> = packs
+        .into_iter()
+        .filter(|p| p.id == "core.process")
+        .collect();
+    assert_eq!(process.len(), 1, "core.process ships");
+    assert!(process[0].default_on, "core.process is on by default");
+    Engine::new(process).with_budget(TEST_BUDGET)
+}
+
+fn assert_all_deny(e: &Engine, cmds: &[&str]) {
+    let mut wrong = Vec::new();
+    for cmd in cmds {
+        for w in WRAPPERS {
+            let line = format!("{w}{cmd}");
+            match e.evaluate(&line) {
+                Decision::Deny { pack, reason, .. }
+                    if pack == "core.process" && !reason.is_empty() => {}
+                other => wrong.push(format!("expected DENY for {line:?}, got {other:?}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn assert_all_allow(e: &Engine, cmds: &[&str]) {
+    let mut wrong = Vec::new();
+    for cmd in cmds {
+        for w in WRAPPERS {
+            let line = format!("{w}{cmd}");
+            let got = e.evaluate(&line);
+            if got.is_deny() {
+                wrong.push(format!("expected ALLOW for {line:?}, got {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn pkill_newest_or_oldest_without_a_pattern_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill -n",
+            "pkill -o",
+            "pkill --newest",
+            "pkill --oldest",
+            "pkill --new",
+            "pkill --old",
+            "pkill -9 -n",
+            "pkill -KILL -o",
+            "pkill -n -9",
+            "pkill -SIGKILL --newest",
+            "pkill --signal KILL -n",
+            "pkill --signal=KILL -o",
+            "pkill -e -n",
+            "pkill -en",
+            "pkill -n --",
+            "/usr/bin/pkill -n",
+            "sudo pkill -n",
+            "xargs pkill -n",
+            "bash -c 'pkill -n'",
+            "cd /tmp && pkill -o",
+        ],
+    );
+}
+
+#[test]
+fn pkill_with_only_selectors_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill -u jonas",
+            "pkill -ujonas",
+            "pkill --euid jonas",
+            "pkill --euid=jonas",
+            "pkill -U 1000",
+            "pkill --uid 1000",
+            "pkill -g 0",
+            "pkill --pgroup 0",
+            "pkill -G users",
+            "pkill -s 0",
+            "pkill --session 0",
+            "pkill -P 1",
+            "pkill --parent 1",
+            "pkill -t pts/1",
+            "pkill --terminal pts/1",
+            "pkill -9 -u jonas",
+            "pkill -KILL -U jonas",
+            "pkill -u jonas -n",
+            "pkill -O 60",
+            "pkill --older 60",
+            "pkill -r S",
+            "pkill --cgroup /user.slice",
+            "pkill --ns 1",
+            "pkill --env FOO=1",
+            "pkill --frobnicate",
+            // A word that may be a signal or an option bundle is judged
+            // both ways (S14): `-ttin` is SIGTTIN, or `-t tin`.
+            "pkill -ttin",
+            "pkill -USR1",
+        ],
+    );
+}
+
+#[test]
+fn pkill_inverse_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill --inverse node",
+            "pkill --inv node",
+            "pkill -9 --inverse -f 'npm run dev'",
+        ],
+    );
+}
+
+#[test]
+fn a_pattern_matching_every_process_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "pkill .",
+            "pkill ''",
+            "pkill \"\"",
+            "pkill -f .",
+            "pkill -f ''",
+            "pkill '.*'",
+            "pkill '^'",
+            "pkill -9 .",
+            "pkill -u jonas .",
+            "pkill -f -- '.*'",
+            "killall -r .",
+            "killall -r '.*'",
+            "killall --regexp '^'",
+            "killall -9 -r .",
+        ],
+    );
+}
+
+#[test]
+fn killall_without_a_name_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            "killall -u jonas",
+            "killall -ujonas",
+            "killall -9 -u jonas",
+            "killall -KILL -u jonas",
+            "killall --user jonas",
+            "killall --user=jonas",
+            "killall -user jonas",
+            "killall -s KILL -u jonas",
+            "killall -Z 'unconfined_t'",
+            "killall -u jonas --",
+            "killall5",
+            "killall5 -9",
+            "killall5 -15 -o 1234",
+            "/usr/bin/killall5",
+        ],
+    );
+}
+
+#[test]
+fn kill_of_every_process_the_group_or_init_is_denied() {
+    assert_all_deny(
+        &engine(),
+        &[
+            // -1: every process the user may signal.
+            "kill -9 -1",
+            "kill -KILL -1",
+            "kill -SIGKILL -1",
+            "kill -- -1",
+            "kill -9 -- -1",
+            "kill -s KILL -1",
+            "kill -s 9 -1",
+            "kill -n 9 -1",
+            "kill --signal KILL -1",
+            "kill --signal=KILL -1",
+            "kill 1234 -1",
+            "kill -9 1234 -1",
+            "kill -9 -001",
+            // A lone `-1` or `-0` is a signal with no pid, or a pid: both
+            // readings are judged.
+            "kill -1",
+            "kill -0",
+            // 0 / -0: the caller's own process group.
+            "kill 0",
+            "kill 00",
+            "kill -9 0",
+            "kill -TERM 0",
+            "kill -- 0",
+            "kill -- -0",
+            "kill -9 -0",
+            "kill 1234 0",
+            // 1: init.
+            "kill 1",
+            "kill +1",
+            "kill 01",
+            "kill -9 1",
+            "kill -TERM 1",
+            "kill -s TERM 1",
+            "kill -- 1",
+            "kill 1:12345",
+            "/bin/kill -9 -1",
+            "/usr/bin/kill 0",
+        ],
+    );
+}
+
+#[test]
+fn targeted_kills_are_allowed() {
+    assert_all_allow(
+        &engine(),
+        &[
+            "kill 12345",
+            "kill %1",
+            "kill -9 %1",
+            "kill -9 12345",
+            "kill -TERM 12345",
+            "kill -1 12345",
+            "kill -HUP 12345",
+            "kill -0 12345",
+            "kill -s HUP 12345",
+            "kill -s 1 12345",
+            "kill -n 1 12345",
+            "kill -9 -12345",
+            "kill -- -12345",
+            "kill 10",
+            "kill 100 101",
+            "kill -l",
+            "kill -l 1",
+            "kill -L",
+            "kill -d 12345",
+            "kill $(cat app.pid)",
+            "pkill node",
+            "pkill -f 'npm run dev'",
+            "pkill -9 -f 'npm run dev'",
+            "pkill -HUP node",
+            "pkill -TERM node",
+            "pkill -n node",
+            "pkill -o -f vite",
+            "pkill -u jonas node",
+            "pkill -x node",
+            "pkill -F app.pid",
+            "pkill --pidfile app.pid",
+            "pkill -p 12345",
+            "killall node",
+            "killall -HUP nginx",
+            "killall -9 node",
+            "killall -u jonas node",
+            "killall -r '^node$'",
+            "killall -l",
+            "killall -V",
+            "pgrep -a node",
+            "pgrep -n",
+            "pgrep -u jonas",
+            "pgrep -f .",
+            "echo kill -9 -1",
+            "grep 'pkill -n' notes.txt",
+        ],
+    );
+}
+
+/// With every default-on pack active, the broad kills are still denied
+/// and named by `core.process`.
+#[test]
+fn default_packs_deny_broad_kills() {
+    let (packs, warnings) = builtin_packs();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let active = select_active(packs, &[]);
+    assert!(
+        active.iter().any(|p| p.id == "core.process"),
+        "core.process is among the default-on packs"
+    );
+    let e = Engine::new(active).with_budget(TEST_BUDGET);
+    for cmd in [
+        "pkill -n",
+        "pkill -o",
+        "kill -9 -1",
+        "killall5",
+        "pkill -u jonas",
+    ] {
+        match e.evaluate(cmd) {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "core.process", "{cmd}"),
+            other => panic!("expected DENY for {cmd:?}, got {other:?}"),
+        }
+    }
+    for cmd in ["kill 12345", "pkill node", "killall -HUP nginx"] {
+        assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+    }
+}
