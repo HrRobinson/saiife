@@ -28,7 +28,7 @@ fn docs_dir() -> PathBuf {
 fn packs() -> Vec<Pack> {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    assert_eq!(packs.len(), 13, "expected the 13 built-in packs");
+    assert_eq!(packs.len(), 15, "expected the 15 built-in packs");
     packs
 }
 

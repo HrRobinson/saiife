@@ -1,6 +1,6 @@
 //! One task per connection on the control socket (spec §6.3, §8.7).
 
-use crate::ops::{self, Ctx};
+use crate::ops::{self, Ctx, Notice};
 use saiife_ipc::frame::{body_len, decode, encode, FrameError};
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO, PROTO};
 use saiife_ipc::peer::peer_cred;
@@ -72,7 +72,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(code) => {
-            ctx.notice(peer.uid, "rate_limited");
+            ctx.notice(peer.uid, Notice::Connections);
             let msg = "too many open connections";
             write_within(&mut s, &err(0, code, msg), REFUSE_WRITE_TIMEOUT).await;
             return;
@@ -127,7 +127,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
             Ok(_in_flight) => ops::dispatch(&ctx, &peer, req).await,
             Err(code) => {
-                ctx.notice(peer.uid, "rate_limited");
+                ctx.notice(peer.uid, Notice::Requests);
                 err(req.id, code, "too many requests from this uid")
             }
         };

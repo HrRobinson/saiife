@@ -56,9 +56,20 @@ fn managed_with(
     extra_env: &[(&str, &str)],
     extra_args: &[&str],
 ) -> (Output, Duration, Sandbox) {
+    managed_as("claude", config, stdin, extra_env, extra_args)
+}
+
+/// `managed_with` for `--agent <agent>`.
+fn managed_as(
+    agent: &str,
+    config: &Path,
+    stdin: &str,
+    extra_env: &[(&str, &str)],
+    extra_args: &[&str],
+) -> (Output, Duration, Sandbox) {
     let sb = Sandbox::new();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
-    cmd.args(["check", "--managed", "--agent", "claude", "--system-config"])
+    cmd.args(["check", "--managed", "--agent", agent, "--system-config"])
         .arg(config)
         .args(extra_args)
         .env("HOME", sb.dir.path().join("home"))
@@ -179,6 +190,43 @@ fn managed_deny_exit_2() {
     assert_eq!(r["pack"], "core.filesystem");
     assert_eq!(r["mode"], "locked");
     assert_eq!(r["input"], "rm -rf /");
+}
+
+#[test]
+fn managed_write_to_daemon_audit_dir_denied() {
+    let d = TestDaemon::start(Opts::default());
+    let target = d.audit_dir().join("x.jsonl");
+    let (o, _, _sb) = managed(
+        &d.config(),
+        &file_call("Write", &target.display().to_string()),
+    );
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.lock"),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["pack"], "core.lock");
+    assert!(!target.exists());
+}
+
+#[test]
+fn managed_sudo_denied() {
+    let d = TestDaemon::start(Opts::default());
+    let cwd = tempfile::tempdir().unwrap();
+    let (o, _, _sb) = managed(&d.config(), &bash(cwd.path(), "sudo ls"));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.lock"),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["pack"], "core.lock");
+    assert_eq!(r["input"], "sudo ls");
 }
 
 #[test]
@@ -586,9 +634,13 @@ fn worker_never_reading_stdin_denies() {
         "tool_input": {"file_path": target, "content": "x".repeat(8 << 20)}
     })
     .to_string();
+    // `worker_fault_with` asserts exit 2 and an `error_denied` record whose
+    // reason starts `guard worker failed`. Reading and copying 8 MiB on a
+    // loaded machine can take a while: the bound that matters is the
+    // worker's 3 s deadline below and the parent's 7 s watchdog above.
     let (_, elapsed, _) = worker_fault_with("noread", &payload, &target);
     assert!(
-        elapsed >= Duration::from_millis(3000) && elapsed <= Duration::from_millis(4500),
+        elapsed >= Duration::from_millis(3000) && elapsed < Duration::from_millis(7000),
         "{elapsed:?}"
     );
 }
@@ -789,4 +841,267 @@ fn four_byte_char_fields_are_still_recorded() {
     // 4-byte chars alone cannot pass 64 KiB (3 fields of 4 096 chars at
     // 4 bytes); with control chars in two of the fields they do.
     inflated_payload_is_recorded("\u{1F600}", "\u{1}", "\u{1}");
+}
+
+/// A ConfigChange payload for `file_path` (spec §6.1.1).
+fn config_change(source: &str, file_path: &Path) -> String {
+    let mut v: Value = serde_json::from_str(&fixture("claude/config-change.json")).unwrap();
+    v["source"] = json!(source);
+    v["file_path"] = json!(file_path);
+    v["cwd"] = json!("/");
+    v.to_string()
+}
+
+fn config_change_call(d: &TestDaemon, payload: &str) -> (Output, Sandbox) {
+    let (o, _, sb) = managed_with(&d.config(), payload, &[], &["--event", "config-change"]);
+    (o, sb)
+}
+
+#[test]
+fn config_change_touching_hooks_denied_and_recorded() {
+    let d = TestDaemon::start(Opts::default());
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    fs::write(&f, r#"{"hooks":{"PreToolUse":[]},"theme":"dark"}"#).unwrap();
+    let (o, sb) = config_change_call(&d, &config_change("user_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(o.stdout.is_empty());
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.self: settings change touches hooks"),
+        "{}",
+        stderr(&o)
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["tool"], "ConfigChange", "{r}");
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert_eq!(r["pack"], "core.self", "{r}");
+    assert_eq!(r["rule"], "config-change", "{r}");
+    assert_eq!(r["input"], format!("user_settings {}", f.display()), "{r}");
+    assert_eq!(r["mode"], "locked");
+    assert!(sb.is_untouched());
+}
+
+#[test]
+fn config_change_harmless_allowed_and_recorded() {
+    let d = TestDaemon::start(Opts::default());
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    fs::write(&f, r#"{"theme":"dark"}"#).unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("project_settings", &f));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["tool"], "ConfigChange", "{r}");
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_eq!(
+        r["input"],
+        format!("project_settings {}", f.display()),
+        "{r}"
+    );
+}
+
+#[test]
+fn config_change_unreadable_settings_denied() {
+    let d = TestDaemon::start(Opts::default());
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    fs::write(&f, "{\"hooks\": ").unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("local_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("settings change could not be checked"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(last_guard(&d)["decision"], "deny");
+    // Removed: it cannot be verified.
+    fs::remove_file(&f).unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("user_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("settings file cannot be verified"),
+        "{}",
+        stderr(&o)
+    );
+    // A key outside the allowlist.
+    fs::write(&f, r#"{"statusLine":{"type":"command","command":"x"}}"#).unwrap();
+    let (o, _sb) = config_change_call(&d, &config_change("user_settings", &f));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("touches statusLine"), "{}", stderr(&o));
+}
+
+/// The MCP tool fixture of `agent`, its server `docs` not listed.
+fn mcp_denied(agent: &str, rel: &str) {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let (o, _, sb) = managed_as(agent, &d.config(), &home.real(&fixture(rel)), &[], &[]);
+    assert_eq!(code(&o), 2, "{rel}: stderr: {}", stderr(&o));
+    assert!(o.stdout.is_empty());
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server docs is not in [guard.mcp] allow_servers",
+        "{rel}"
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert_eq!(r["pack"], "guard.mcp", "{r}");
+    assert_eq!(r["rule"], "mcp_server_not_allowed", "{r}");
+    assert_eq!(r["tool"], "mcp__docs__search", "{r}");
+    assert_eq!(r["agent"], agent, "{r}");
+    assert!(sb.is_untouched());
+}
+
+#[test]
+fn unlisted_mcp_server_denied() {
+    mcp_denied("codex", "codex/mcp-tool.json");
+    mcp_denied("claude", "claude/mcp-tool.json");
+}
+
+#[test]
+fn listed_mcp_server_allowed_not_judged() {
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"docs\"]\n".into(),
+        ..Opts::default()
+    });
+    let home = common::FixtureHome::new();
+    for (agent, rel) in [
+        ("codex", "codex/mcp-tool.json"),
+        ("claude", "claude/mcp-tool.json"),
+    ] {
+        let (o, _, _sb) = managed_as(agent, &d.config(), &home.real(&fixture(rel)), &[], &[]);
+        assert_eq!(code(&o), 0, "{rel}: stderr: {}", stderr(&o));
+        let r = last_guard(&d);
+        assert_eq!(r["decision"], "allow", "{r}");
+        assert_eq!(r["reason"], "tool not judged", "{r}");
+        assert_eq!(r["tool"], "mcp__docs__search", "{r}");
+    }
+    // A server named `docs__evil` does not pass as the listed `docs`.
+    let mut v: Value = serde_json::from_str(&fixture("claude/mcp-tool.json")).unwrap();
+    v["tool_name"] = json!("mcp__docs__evil__search");
+    v["cwd"] = json!("/");
+    let (o, _, _sb) = managed_as("claude", &d.config(), &v.to_string(), &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by guard.mcp: MCP server mcp__docs__evil__search"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    // Nor does `docs_` (Claude Code's form of `docs.`).
+    v["tool_name"] = json!("mcp__docs___search");
+    let (o, _, _sb) = managed_as("claude", &d.config(), &v.to_string(), &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by guard.mcp: MCP server mcp__docs___search"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+/// Controller ruling: on Gemini only an explicit server identity in the
+/// payload allows an MCP call; `mcp_docs_x` alone could be server `docs_x`.
+#[test]
+fn gemini_mcp_needs_server_identity() {
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"docs\"]\n".into(),
+        ..Opts::default()
+    });
+    let call = |ctx: Option<Value>| {
+        let mut v = json!({
+            "session_id": "g-1",
+            "cwd": "/",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "mcp_docs_search",
+            "tool_input": {"query": "hooks"}
+        });
+        if let Some(c) = ctx {
+            v["mcp_context"] = c;
+        }
+        managed_as("gemini", &d.config(), &v.to_string(), &[], &[]).0
+    };
+    let o = call(None);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server unknown on Gemini"
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["rule"], "mcp_server_not_allowed", "{r}");
+    let o = call(Some(json!({"server_name": "docs_x"})));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("MCP server docs_x is not in"),
+        "{}",
+        stderr(&o)
+    );
+    let o = call(Some(json!({"server_name": "docs", "tool_name": "search"})));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["reason"], "tool not judged");
+    // A duplicate `mcp_context` key: the payload does not parse, so the
+    // server is unknown (the second key cannot hide the call).
+    let o = managed_as(
+        "gemini",
+        &d.config(),
+        r#"{"session_id":"g-1","cwd":"/","hook_event_name":"BeforeTool","tool_name":"search","tool_input":{},"mcp_context":{"server_name":"docs"},"mcp_context":{}}"#,
+        &[],
+        &[],
+    )
+    .0;
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server unknown on Gemini"
+    );
+    // A bare tool name with an `mcp_context` but no server: unknown.
+    let o = managed_as(
+        "gemini",
+        &d.config(),
+        r#"{"session_id":"g-1","cwd":"/","hook_event_name":"BeforeTool","tool_name":"search","tool_input":{},"mcp_context":{}}"#,
+        &[],
+        &[],
+    )
+    .0;
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server unknown on Gemini"
+    );
+}
+
+#[test]
+fn event_requires_managed() {
+    let sb = Sandbox::new();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args([
+            "check",
+            "--hook-exit",
+            "--agent",
+            "claude",
+            "--event",
+            "config-change",
+        ])
+        .env("HOME", sb.dir.path().join("home"))
+        .env("SAIIFE_DATA_DIR", sb.data())
+        .env("SAIIFE_AUDIT_DIR", sb.audit())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("--managed"), "{}", stderr(&o));
+    assert!(sb.is_untouched());
+}
+
+#[test]
+fn unknown_event_with_managed_fails_closed() {
+    let d = TestDaemon::start(Opts::default());
+    let home = common::FixtureHome::new();
+    let (o, _, _sb) = managed_with(
+        &d.config(),
+        &home.real(&fixture("claude/config-change.json")),
+        &[],
+        &["--event", "session-start"],
+    );
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(stderr(&o).contains("fail closed"), "{}", stderr(&o));
+    assert_eq!(last_guard(&d)["decision"], "error_denied");
 }

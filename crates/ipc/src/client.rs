@@ -306,6 +306,23 @@ pub fn entry_by_uid(passwd: &str, uid: u32) -> Option<PasswdEntry> {
     })
 }
 
+/// The entry for `name` in `/etc/passwd`-format text (the first one).
+pub fn entry_by_name(passwd: &str, name: &str) -> Option<PasswdEntry> {
+    if name.is_empty() {
+        return None;
+    }
+    passwd.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() < 7 || f[0] != name || f[2].parse::<u32>().is_err() {
+            return None;
+        }
+        Some(PasswdEntry {
+            name: f[0].to_string(),
+            home: PathBuf::from(f[5]),
+        })
+    })
+}
+
 /// The `/etc/passwd` entry of `uid`, read directly as `system_uid` does.
 pub fn system_entry(uid: u32) -> Option<PasswdEntry> {
     entry_by_uid(&std::fs::read_to_string("/etc/passwd").ok()?, uid)
@@ -629,6 +646,26 @@ mod tests {
         assert_eq!(entry_by_uid(p, 0).unwrap().home, PathBuf::from("/root"));
         assert_eq!(entry_by_uid(p, 5), None);
         assert_eq!(entry_by_uid(p, 4242), None);
+    }
+
+    #[test]
+    fn entry_by_name_parses_passwd() {
+        let p = "root:x:0:0::/root:/bin/sh\nbad:x:5\nme:x:1000:1000:Me:/home/me:/bin/bash\n\
+                 me:x:1001:1001::/home/me2:/bin/sh\n";
+        assert_eq!(
+            entry_by_name(p, "me"),
+            Some(PasswdEntry {
+                name: "me".into(),
+                home: "/home/me".into()
+            })
+        );
+        assert_eq!(
+            entry_by_name(p, "root").unwrap().home,
+            PathBuf::from("/root")
+        );
+        assert_eq!(entry_by_name(p, "bad"), None);
+        assert_eq!(entry_by_name(p, ""), None);
+        assert_eq!(entry_by_name(p, "nobody"), None);
     }
 
     #[test]

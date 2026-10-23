@@ -117,6 +117,15 @@ Lock label: **unverified**. The [lock-check](../lock-check.md) for Gemini CLI ha
 not been run with a logged-in account yet, so we do not know whether
 Gemini CLI can be locked.
 
+In locked mode, MCP tools are denied unless `[guard.mcp] allow_servers`
+lists their server. Gemini CLI's `mcp_<server>_<tool>` names cannot be split
+safely: `mcp_linear_x` could come from a server `linear_x`. So a Gemini MCP
+call is allowed only when the hook payload names its server in
+`mcp_context.server_name`. A call that looks like MCP is denied with "MCP
+server unknown on Gemini" when that field is missing. That covers a name
+starting `mcp_`, a name containing `__`, or any payload with `mcp_context`.
+The field name has not yet been checked against a live Gemini CLI.
+
 ## Not yet verified live
 
 saiife's Gemini CLI support is built from Gemini CLI's docs and source code.

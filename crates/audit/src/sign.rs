@@ -47,41 +47,17 @@ impl AuditKey {
         })
     }
 
-    /// Load the key at `path`, or create it when there is no file there.
-    /// Returns the key and whether it was created.
-    ///
-    /// The file must be exactly 32 bytes, a regular file, mode 0600, and not
-    /// a symlink (it is opened with `O_NOFOLLOW`). Anything else is an error
-    /// naming the path and the problem, and the file is left as it is. A new
-    /// key is created with `O_EXCL`, in a parent dir created 0700 if missing.
+    /// Load the key at `path`, or create it, for the effective uid: see
+    /// `load_or_create_owned`.
+    #[cfg(unix)]
     pub fn load_or_create(path: &Path) -> io::Result<(AuditKey, bool)> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            create_key_dir(parent)?;
-        }
-        // Twice: a key created by someone else between our open and our
-        // create is then loaded, never overwritten.
-        for _ in 0..2 {
-            match open_existing(path) {
-                Ok(file) => return Ok((read_key(path, file)?, false)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            let key = AuditKey::generate()?;
-            match create_new(path) {
-                Ok(mut file) => {
-                    let seed = Zeroizing::new(key.key.to_bytes());
-                    file.write_all(&seed[..])
-                        .and_then(|()| set_mode(&file, 0o600))
-                        .and_then(|()| file.sync_all())
-                        .map_err(|e| problem(path, &format!("cannot write the new key: {e}")))?;
-                    sync_parent(path);
-                    return Ok((key, true));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(open_error(path, e)),
-            }
-        }
-        Err(problem(path, "the key file keeps changing"))
+        load_or_create_owned(path, rustix::process::geteuid().as_raw())
+    }
+
+    /// The key file's owner and mode checks need Unix.
+    #[cfg(not(unix))]
+    pub fn load_or_create(path: &Path) -> io::Result<(AuditKey, bool)> {
+        Err(problem(path, "the audit signing key needs a Unix system"))
     }
 
     /// Write `key` to `path` for key rotation: a 0600 temp file next to it,
@@ -140,6 +116,262 @@ impl AuditKey {
     }
 }
 
+/// Load the key at `path`, or create it when there is no file there,
+/// checking that `owner` owns it. Returns the key and whether it was created.
+///
+/// - The state dir (the key dir's parent) must not be a symlink nor
+///   writable by group or others; it is created 0700 when missing.
+/// - The key dir (`keys/`) must be a real directory owned by `owner` with
+///   no group or other access; it is created 0700 (`mkdirat` in the state
+///   dir, opened `O_NOFOLLOW`) when missing.
+/// - The key file is opened `O_NOFOLLOW` and must be a regular file owned
+///   by `owner`, mode 0600, exactly 32 bytes.
+///
+/// Anything else is an error naming the path and what was wanted and
+/// found, and nothing is changed. The first key is created crash-safe: a
+/// synced 0600 `.audit.ed25519.tmp` (`O_EXCL`) is hard-linked to the final
+/// name and then removed, so the key file never exists half-written.
+/// Creators hold the key dir's flock, so a temp file seen under it is a
+/// crash's leftover and is removed (`unlinkat`, which never follows). A link
+/// that finds the name taken loads the key that won.
+#[cfg(unix)]
+pub fn load_or_create_owned(path: &Path, owner: u32) -> io::Result<(AuditKey, bool)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| problem(path, "not a file path"))?;
+    let keys_path = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let keys = unix::open_key_dir(keys_path, owner)?;
+    if let Some(k) = unix::load_at(&keys, path, name, owner)? {
+        return Ok((k, false));
+    }
+    keys.lock()
+        .map_err(|e| problem(keys_path, &format!("cannot lock the key dir: {e}")))?;
+    // Under the lock: a key another creator made meanwhile is loaded.
+    if let Some(k) = unix::load_at(&keys, path, name, owner)? {
+        return Ok((k, false));
+    }
+    let mut tmp = std::ffi::OsString::from(".");
+    tmp.push(name);
+    tmp.push(".tmp");
+    let tmp = Path::new(&tmp);
+    unix::remove_at(&keys, tmp).map_err(|e| {
+        problem(
+            &keys_path.join(tmp),
+            &format!("cannot remove a temp file left by a crash: {e}"),
+        )
+    })?;
+    let key = AuditKey::generate()?;
+    if let Err(e) = unix::write_new_at(&keys, tmp, &key) {
+        let _ = unix::remove_at(&keys, tmp);
+        return Err(problem(path, &format!("cannot write the new key: {e}")));
+    }
+    let linked = rustix::fs::linkat(&keys, tmp, &keys, name, rustix::fs::AtFlags::empty());
+    // A temp name left behind is only a second link to the same 0600 key
+    // inside the checked 0700 dir: not worth failing the start for.
+    let _ = unix::remove_at(&keys, tmp);
+    match linked {
+        Ok(()) => {
+            let _ = keys.sync_all();
+            Ok((key, true))
+        }
+        // Someone not holding the lock won the race: theirs is the key.
+        Err(rustix::io::Errno::EXIST) => match unix::load_at(&keys, path, name, owner)? {
+            Some(k) => Ok((k, false)),
+            None => Err(problem(path, "the key file keeps changing")),
+        },
+        Err(e) => Err(problem(
+            path,
+            &format!("cannot link the new key into place: {e}"),
+        )),
+    }
+}
+
+/// What [`judge`] checks a path as.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The key dir's parent: a directory not writable by group or others.
+    StateDir,
+    /// `keys/`: a directory of the owner, no group or other access.
+    KeyDir,
+    /// The key file: a regular file of the owner, mode 0600.
+    KeyFile,
+}
+
+/// Whether a `kind` with this `uid` and `st_mode` is acceptable for
+/// `owner`: a pure decision, so the owner checks can be tested for owners
+/// a test cannot be. The error names the path, and what was wanted and
+/// found. `saiife doctor` reports with the same rules the daemon starts by.
+#[cfg(unix)]
+pub fn judge(path: &Path, kind: Kind, uid: u32, mode: u32, owner: u32) -> io::Result<()> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFLNK: u32 = 0o120000;
+    let ty = mode & S_IFMT;
+    let perm = mode & 0o7777;
+    if ty == S_IFLNK {
+        return Err(problem(path, "is a symlink, refusing to follow it"));
+    }
+    let want_ty = match kind {
+        Kind::StateDir | Kind::KeyDir => S_IFDIR,
+        Kind::KeyFile => S_IFREG,
+    };
+    if ty != want_ty {
+        return Err(problem(
+            path,
+            match kind {
+                Kind::KeyFile => "is not a regular file",
+                _ => "is not a directory",
+            },
+        ));
+    }
+    if !matches!(kind, Kind::StateDir) && uid != owner {
+        return Err(problem(
+            path,
+            &format!("is owned by uid {uid}, must be owned by uid {owner}"),
+        ));
+    }
+    match kind {
+        Kind::StateDir if perm & 0o022 != 0 => Err(problem(
+            path,
+            &format!("has mode {perm:04o}, must not be writable by group or others"),
+        )),
+        Kind::KeyDir if perm & 0o077 != 0 => Err(problem(
+            path,
+            &format!("has mode {perm:04o}, must be 0700 (no group or other access)"),
+        )),
+        Kind::KeyFile if perm != 0o600 => {
+            Err(problem(path, &format!("has mode {perm:04o}, must be 0600")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The fd-relative steps of `load_or_create_owned`.
+#[cfg(unix)]
+mod unix {
+    use super::{judge, problem, read_key, AuditKey, Kind};
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+    use std::fs::{self, File};
+    use std::io::{self, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use zeroize::Zeroizing;
+
+    const DIR_FLAGS: OFlags = OFlags::DIRECTORY
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::RDONLY)
+        .union(OFlags::CLOEXEC);
+
+    /// The error of opening the dir `path` `O_NOFOLLOW`, with a symlink
+    /// named as such.
+    fn dir_error(path: &Path, e: Errno) -> io::Error {
+        match fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                problem(path, "is a symlink, refusing to follow it")
+            }
+            Ok(m) if !m.is_dir() => problem(path, "is not a directory"),
+            _ => problem(path, &format!("cannot open: {e}")),
+        }
+    }
+
+    fn check(path: &Path, f: &File, kind: Kind, owner: u32) -> io::Result<()> {
+        let md = f
+            .metadata()
+            .map_err(|e| problem(path, &format!("cannot stat: {e}")))?;
+        judge(path, kind, md.uid(), md.mode(), owner)
+    }
+
+    /// The key dir, opened and checked (see `load_or_create_owned`).
+    pub(super) fn open_key_dir(keys_path: &Path, owner: u32) -> io::Result<File> {
+        let state_path = keys_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let keys_name = keys_path
+            .file_name()
+            .ok_or_else(|| problem(keys_path, "not a key dir path"))?;
+        if fs::symlink_metadata(state_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(state_path)
+                .map_err(|e| problem(state_path, &format!("cannot create: {e}")))?;
+        }
+        let state = File::from(
+            rustix::fs::open(state_path, DIR_FLAGS, Mode::empty())
+                .map_err(|e| dir_error(state_path, e))?,
+        );
+        check(state_path, &state, Kind::StateDir, owner)?;
+        let open = || rustix::fs::openat(&state, keys_name, DIR_FLAGS, Mode::empty());
+        let fd = match open() {
+            Err(Errno::NOENT) => {
+                match rustix::fs::mkdirat(&state, keys_name, Mode::RWXU) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(e) => {
+                        return Err(problem(
+                            keys_path,
+                            &format!("cannot create the key dir: {e}"),
+                        ))
+                    }
+                }
+                open()
+            }
+            r => r,
+        }
+        .map_err(|e| dir_error(keys_path, e))?;
+        let keys = File::from(fd);
+        check(keys_path, &keys, Kind::KeyDir, owner)?;
+        Ok(keys)
+    }
+
+    /// The key `name` in `keys`, checked; `None` when there is none.
+    pub(super) fn load_at(
+        keys: &File,
+        path: &Path,
+        name: &std::ffi::OsStr,
+        owner: u32,
+    ) -> io::Result<Option<AuditKey>> {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        match rustix::fs::openat(keys, name, flags, Mode::empty()) {
+            Ok(fd) => read_key(path, File::from(fd), owner).map(Some),
+            Err(Errno::NOENT) => Ok(None),
+            Err(Errno::LOOP) => Err(problem(path, "is a symlink, refusing to follow it")),
+            Err(e) => Err(problem(path, &format!("cannot open: {e}"))),
+        }
+    }
+
+    /// `unlinkat`, a missing name being fine.
+    pub(super) fn remove_at(keys: &File, name: &Path) -> io::Result<()> {
+        match rustix::fs::unlinkat(keys, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `key`'s seed in a new file `name` in `keys`: `O_EXCL`, 0600, synced.
+    pub(super) fn write_new_at(keys: &File, name: &Path, key: &AuditKey) -> io::Result<()> {
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut f = File::from(rustix::fs::openat(
+            keys,
+            name,
+            flags,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        let seed = Zeroizing::new(key.key.to_bytes());
+        f.write_all(&seed[..])?;
+        super::set_mode(&f, 0o600)?;
+        f.sync_all()
+    }
+}
+
 /// The raw public key of an `ed25519:<spki b64>` string.
 fn public_key_of(spki: &str) -> Option<[u8; 32]> {
     let der = B64.decode(spki.strip_prefix(KEY_PREFIX)?).ok()?;
@@ -192,41 +424,6 @@ fn problem(path: &Path, what: &str) -> io::Error {
     io::Error::other(format!("audit key {}: {what}", path.display()))
 }
 
-/// The error of opening `path`, with a symlink named as such.
-fn open_error(path: &Path, e: io::Error) -> io::Error {
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return problem(path, "is a symlink, refusing to follow it");
-    }
-    #[cfg(unix)]
-    if e.raw_os_error() == Some(libc::ELOOP) {
-        return problem(path, "is a symlink, refusing to follow it");
-    }
-    problem(path, &format!("cannot open: {e}"))
-}
-
-/// `path` opened for reading without following a symlink. `NotFound` is
-/// passed through as is (the caller creates the key then).
-fn open_existing(path: &Path) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    match opts.open(path) {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // A dangling symlink also opens as NotFound: never create through it.
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(open_error(path, e));
-            }
-            Err(e)
-        }
-        Err(e) => Err(open_error(path, e)),
-    }
-}
-
 /// A new file at `path`, 0600, `O_EXCL` (and `O_NOFOLLOW`).
 fn create_new(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
@@ -239,22 +436,15 @@ fn create_new(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
-/// The key in an opened key file, after checking its type, mode and size.
-fn read_key(path: &Path, mut file: File) -> io::Result<AuditKey> {
+/// The key in an opened key file, after checking (`fstat`) its type, owner,
+/// mode and size.
+#[cfg(unix)]
+fn read_key(path: &Path, mut file: File, owner: u32) -> io::Result<AuditKey> {
+    use std::os::unix::fs::MetadataExt;
     let md = file
         .metadata()
         .map_err(|e| problem(path, &format!("cannot stat: {e}")))?;
-    if !md.is_file() {
-        return Err(problem(path, "is not a regular file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = md.permissions().mode() & 0o7777;
-        if mode != 0o600 {
-            return Err(problem(path, &format!("has mode {mode:04o}, must be 0600")));
-        }
-    }
+    judge(path, Kind::KeyFile, md.uid(), md.mode(), owner)?;
     if md.len() != SEED_LEN {
         return Err(problem(
             path,
@@ -418,12 +608,23 @@ mod tests {
         assert_eq!(names, ["audit.ed25519"], "no temp file is left behind");
     }
 
+    /// `dir/keys`, 0700: a key dir that passes the owner and mode checks
+    /// whatever the temp root is (`/tmp` is world-writable).
+    #[cfg(unix)]
+    fn keys(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let k = dir.join("keys");
+        fs::create_dir_all(&k).unwrap();
+        fs::set_permissions(&k, fs::Permissions::from_mode(0o700)).unwrap();
+        k
+    }
+
     #[cfg(unix)]
     #[test]
     fn key_file_wrong_mode_refused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.ed25519");
+        let path = keys(dir.path()).join("audit.ed25519");
         AuditKey::load_or_create(&path).unwrap();
         let before = fs::read(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -433,10 +634,11 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before, "never replaced");
     }
 
+    #[cfg(unix)]
     #[test]
     fn key_file_wrong_size_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.ed25519");
+        let path = keys(dir.path()).join("audit.ed25519");
         for len in [0usize, 31, 33, 64] {
             fs::write(&path, vec![7u8; len]).unwrap();
             #[cfg(unix)]
@@ -455,17 +657,179 @@ mod tests {
     #[test]
     fn key_file_symlink_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.ed25519");
+        let keys = keys(dir.path());
+        let real = keys.join("real.ed25519");
         AuditKey::load_or_create(&real).unwrap();
-        let link = dir.path().join("audit.ed25519");
+        let link = keys.join("audit.ed25519");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let err = AuditKey::load_or_create(&link).unwrap_err().to_string();
         assert!(err.contains(&link.display().to_string()), "{err}");
         assert!(err.contains("symlink"), "{err}");
         // A dangling link is not followed to create a key elsewhere.
-        let dangling = dir.path().join("dangling.ed25519");
-        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &dangling).unwrap();
+        let dangling = keys.join("dangling.ed25519");
+        std::os::unix::fs::symlink(keys.join("elsewhere"), &dangling).unwrap();
         assert!(AuditKey::load_or_create(&dangling).is_err());
-        assert!(!dir.path().join("elsewhere").exists());
+        assert!(!keys.join("elsewhere").exists());
+    }
+
+    #[cfg(unix)]
+    fn chmod(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn me() -> u32 {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_dir_wrong_owner_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = keys(dir.path()).join("audit.ed25519");
+        let err = load_or_create_owned(&path, me() + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by uid"), "{err}");
+        assert!(err.contains(&format!("uid {}", me())), "{err}");
+        assert!(err.contains(&format!("uid {}", me() + 1)), "{err}");
+        assert!(
+            err.contains(&dir.path().join("keys").display().to_string()),
+            "{err}"
+        );
+        assert!(!path.exists(), "no key is created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_dir_group_readable_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = keys(dir.path());
+        chmod(&keys, 0o750);
+        let err = AuditKey::load_or_create(&keys.join("audit.ed25519"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&keys.display().to_string()), "{err}");
+        assert!(err.contains("0750") && err.contains("0700"), "{err}");
+        assert!(!keys.join("audit.ed25519").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_dir_symlink_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        chmod(&other, 0o700);
+        let keys = dir.path().join("keys");
+        std::os::unix::fs::symlink(&other, &keys).unwrap();
+        let err = AuditKey::load_or_create(&keys.join("audit.ed25519"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&keys.display().to_string()), "{err}");
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0, "nothing created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_dir_world_writable_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        chmod(&state, 0o777);
+        let err = AuditKey::load_or_create(&state.join("keys/audit.ed25519"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&state.display().to_string()), "{err}");
+        assert!(err.contains("0777"), "{err}");
+        assert!(!state.join("keys").exists(), "no key dir is created");
+        // A symlinked state dir is refused too.
+        chmod(&state, 0o700);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        let err = AuditKey::load_or_create(&link.join("keys/audit.ed25519"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!state.join("keys").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_wrong_owner_refused() {
+        let p = Path::new("/s/keys/audit.ed25519");
+        let err = judge(p, Kind::KeyFile, 1001, 0o100600, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by uid 1001"), "{err}");
+        assert!(err.contains("uid 1000"), "{err}");
+        assert!(err.contains("/s/keys/audit.ed25519"), "{err}");
+        judge(p, Kind::KeyFile, 1000, 0o100600, 1000).unwrap();
+        let err = judge(p, Kind::KeyFile, 1000, 0o100640, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0640") && err.contains("0600"), "{err}");
+        assert!(judge(p, Kind::KeyFile, 1000, 0o040600, 1000).is_err());
+        // The key dir and state dir rules, for owners a test cannot be.
+        let k = Path::new("/s/keys");
+        judge(k, Kind::KeyDir, 0, 0o040700, 0).unwrap();
+        judge(k, Kind::KeyDir, 0, 0o040500, 0).unwrap();
+        let err = judge(k, Kind::KeyDir, 0, 0o040700, 998)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("owned by uid 0") && err.contains("uid 998"),
+            "{err}"
+        );
+        assert!(judge(k, Kind::KeyDir, 998, 0o040701, 998).is_err());
+        assert!(judge(k, Kind::KeyDir, 998, 0o120700, 998).is_err());
+        let s = Path::new("/s");
+        judge(s, Kind::StateDir, 0, 0o040755, 998).unwrap();
+        assert!(judge(s, Kind::StateDir, 998, 0o040770, 998).is_err());
+        assert!(judge(s, Kind::StateDir, 998, 0o040702, 998).is_err());
+        assert!(judge(s, Kind::StateDir, 998, 0o100700, 998).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_leftover_tmp_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = keys(dir.path());
+        let tmp = keys.join(".audit.ed25519.tmp");
+        fs::write(&tmp, [1u8; 5]).unwrap();
+        let path = keys.join("audit.ed25519");
+        let (k, created) = AuditKey::load_or_create(&path).unwrap();
+        assert!(created);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 32);
+        assert_eq!(mode(&path), 0o600);
+        assert!(!tmp.exists(), "the temp file is gone");
+        let (again, _) = AuditKey::load_or_create(&path).unwrap();
+        assert_eq!(again.spki(), k.spki());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_create_yields_one_key() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = keys(dir.path()).join("audit.ed25519");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let p = path.clone();
+                    let b = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        b.wait();
+                        AuditKey::load_or_create(&p).unwrap()
+                    })
+                })
+                .collect();
+            let got: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(got[0].0.spki(), got[1].0.spki());
+            assert_eq!(got.iter().filter(|(_, c)| *c).count(), 1, "one creator");
+            assert_eq!(fs::read_dir(dir.path().join("keys")).unwrap().count(), 1);
+        }
     }
 }

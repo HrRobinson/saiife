@@ -20,6 +20,8 @@ use tokio::signal::unix::{signal, SignalKind};
 /// Records re-verified at start (spec §6.2).
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// The group that may read the audit log (spec §5.2).
+const AUDIT_GROUP: &str = "saiife-audit";
 
 /// A startup refusal: one line on stderr, exit 2.
 struct Refuse(String);
@@ -186,6 +188,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         },
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
+    regroup_audit_dir(&audit_cfg.dir, directory.as_ref());
     let check = cw.startup_check(STARTUP_CHECK_RECORDS);
     let writer_cfg = WriterConfig {
         checkpoint_every: audit_cfg.checkpoint_every,
@@ -225,6 +228,61 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     drop(ctx);
     let _ = join.join();
     Ok(code)
+}
+
+/// Give the audit dir to `saiife-audit` when that group exists, warning on
+/// stderr (the journal) when that fails. Called at start and at every
+/// reload: systemd's `LogsDirectory=` hands the dir (recursively) back to
+/// the unit's `Group=saiife` before every command it spawns for the unit,
+/// `ExecReload=` (`/bin/kill -HUP`) included, not only before `ExecStart=`.
+/// `None` when there is no such group.
+fn regroup_audit_dir(dir: &Path, directory: &dyn saiife_policy::Directory) -> Option<u32> {
+    let g = directory.group(AUDIT_GROUP)?;
+    match adopt_audit_group(dir, g.gid) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            eprintln!(
+                "saiife: warning: cannot give {} to group {AUDIT_GROUP}: {e}",
+                dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// Give the audit dir and every regular `*.jsonl` in it to group `gid`
+/// when the dir is in another group; the owner stays, and nothing is
+/// followed through a symlink. Returns how many month files were changed.
+///
+/// systemd's `LogsDirectory=` gives the dir to the unit's `Group=saiife`
+/// before every command it spawns for the unit (start and reload), and
+/// §5.2 wants it in `saiife-audit` (readers of the log).
+fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
+    use rustix::fs::{AtFlags, Gid, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let fd = std::fs::File::from(fd);
+    if fd.metadata()?.gid() == gid {
+        return Ok(0);
+    }
+    let group = Some(Gid::from_raw(gid));
+    rustix::fs::fchown(&fd, None, group)?;
+    let mut changed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        // `file_type` of a directory entry does not follow a symlink.
+        if !entry.file_type()?.is_file() || !name.to_string_lossy().ends_with(".jsonl") {
+            continue;
+        }
+        rustix::fs::chownat(&fd, &name, None, group, AtFlags::SYMLINK_NOFOLLOW)?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -474,10 +532,14 @@ async fn serve(
 }
 
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
-/// one step; an invalid one is refused and the old one stays.
+/// one step; an invalid one is refused and the old one stays. First the
+/// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
+/// sent the signal was spawned with `LogsDirectory=`, which gave the dir
+/// back to `saiife`.
 async fn reload(ctx: &Arc<Ctx>) {
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
+        regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
         load_and_check(&c.config_path, c.directory.as_ref()).map_err(|e| e.to_string())
     })
     .await
@@ -543,4 +605,77 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
         out.push("[audit] fsync changed".to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// The start and reload helper: no `saiife-audit` group, nothing to do;
+    /// a group the dir is already in, nothing changed; a dir that cannot be
+    /// regrouped (missing) is a warning, not a stop.
+    #[test]
+    fn regroup_audit_dir_looks_up_the_group() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        let primary = rustix::process::getgid().as_raw();
+        rustix::fs::chown(&dir, None, Some(rustix::fs::Gid::from_raw(primary))).unwrap();
+        let none = saiife_policy::FixedDirectory::from_text("", "");
+        assert_eq!(regroup_audit_dir(&dir, &none), None);
+        let with = saiife_policy::FixedDirectory::from_text(
+            "",
+            &format!("{AUDIT_GROUP}:x:{primary}:saiife\n"),
+        );
+        assert_eq!(regroup_audit_dir(&dir, &with), Some(0));
+        assert_eq!(regroup_audit_dir(&d.path().join("missing"), &with), None);
+    }
+
+    #[test]
+    fn adopt_audit_group_changes_dir_and_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("audit");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("2026-10.jsonl"), b"{}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let primary = rustix::process::getgid().as_raw();
+        let gid = |p: &Path| std::fs::symlink_metadata(p).unwrap().gid();
+        // The dir is already in the group: nothing to do.
+        rustix::fs::chown(&dir, None, Some(rustix::fs::Gid::from_raw(primary))).unwrap();
+        assert_eq!(adopt_audit_group(&dir, primary).unwrap(), 0);
+        // Another group this user is in, when there is one: the dir and its
+        // month files move to it, nothing else does. (CI asserts the real
+        // saiife-audit change as root, Task 8.)
+        // In a user namespace (the offline CI job runs under `unshare
+        // --map-current-user`) the supplementary groups are unmapped and
+        // show as the overflow gid (nogroup); chown to them fails. Only a
+        // group a scratch file can really be given is used.
+        let overflow: Option<u32> = std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        let probe = d.path().join("probe");
+        std::fs::write(&probe, b"").unwrap();
+        let usable = |g: u32| {
+            Some(g) != overflow
+                && rustix::fs::chown(&probe, None, Some(rustix::fs::Gid::from_raw(g))).is_ok()
+        };
+        let other = rustix::process::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != primary && usable(g));
+        let Some(other) = other else {
+            eprintln!(
+                "skipped the regroup part: no supplementary group this user can chown to \
+                 (none, or unmapped in a user namespace)"
+            );
+            return;
+        };
+        assert_eq!(adopt_audit_group(&dir, other).unwrap(), 1);
+        assert_eq!(gid(&dir), other);
+        assert_eq!(gid(&dir.join("2026-10.jsonl")), other);
+        assert_eq!(gid(&dir.join("notes.txt")), primary);
+        assert_eq!(adopt_audit_group(&dir, other).unwrap(), 0);
+    }
 }

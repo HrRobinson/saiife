@@ -1184,3 +1184,180 @@ fn status_with_fifo_config_does_not_hang() {
     assert_eq!(code(&out), 1, "{}", stdout(&out));
     assert!(stdout(&out).contains("cannot be read"), "{}", stdout(&out));
 }
+
+/// Locked mode (plan 9b): `status --root <tree>` against a fake install
+/// whose config points at a test daemon. Never the real /etc, /run or /var.
+#[cfg(target_os = "linux")]
+mod locked {
+    use super::common::daemon::{Opts, TestDaemon};
+    use super::common::{code, stdout, Env};
+    use saiife_policy::installed::{read_installed, write_installed, ManagedAgent};
+    use std::path::Path;
+
+    /// A fake install with Claude Code (whole file) and Codex (an entry in
+    /// requirements.toml) managed, and `config` as its config.toml.
+    fn locked_root(config: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        saiife_system::testing::fake_install(root.path());
+        let codex = root.path().join("etc/codex/requirements.toml");
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        saiife_agents::codex::install_managed(&codex).unwrap();
+        let fp = saiife_agents::codex::managed_entry(&codex)
+            .unwrap()
+            .unwrap();
+        let installed = root.path().join("etc/saiife/installed.toml");
+        let mut i = read_installed(&installed).unwrap().unwrap();
+        i.agents.push(ManagedAgent {
+            agent: "codex".into(),
+            path: "/etc/codex/requirements.toml".into(),
+            sha256: fp,
+            whole_file: false,
+            created_file: true,
+        });
+        write_installed(&installed, &i).unwrap();
+        std::fs::write(root.path().join("etc/saiife/config.toml"), config).unwrap();
+        root
+    }
+
+    fn status_at(root: &Path) -> (i32, String) {
+        let env = Env::new(&["claude"]);
+        let out = env.saiife(&["status", "--root", root.to_str().unwrap()]);
+        (code(&out), stdout(&out))
+    }
+
+    #[test]
+    fn status_shows_locked_block_and_labels() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let (c, text) = status_at(root.path());
+        assert!(text.contains("Locked mode\n"), "{text}");
+        assert!(
+            text.contains("  mode: locked (installed 2026-10-22T00:00:00Z, saiife "),
+            "{text}"
+        );
+        assert!(text.contains("  daemon: running, chain "), "{text}");
+        assert!(text.contains(", head seq "), "{text}");
+        assert!(text.contains(", last checkpoint seq "), "{text}");
+        assert!(text.contains("  policy: sha256:"), "{text}");
+        assert!(
+            text.contains("  agent claude: managed hook, lockable\n"),
+            "{text}"
+        );
+        // Unverified: the project hook still judges Codex calls.
+        assert!(
+            text.contains(
+                "  agent codex: managed hook, unverified; its project hook still judges its calls\n"
+            ),
+            "{text}"
+        );
+        // The block comes before the v1 checks.
+        let block = text.find("Locked mode").unwrap();
+        let v1 = text.find("project hooks").unwrap();
+        assert!(block < v1, "{text}");
+        // Nothing failed: no project hooks are needed under managed ones.
+        assert_eq!(c, 0, "{text}");
+    }
+
+    #[test]
+    fn status_reports_daemon_down() {
+        let d = TestDaemon::prepare(&Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let (c, text) = status_at(root.path());
+        assert_eq!(c, 1, "{text}");
+        assert!(text.contains("  daemon: not answering ("), "{text}");
+        assert!(
+            text.contains("): every managed hook call is denied"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_reports_invalid_system_config() {
+        let root = locked_root("version = = 2\n");
+        let (c, text) = status_at(root.path());
+        assert_eq!(c, 1, "{text}");
+        assert!(text.contains("  policy: invalid ("), "{text}");
+        assert!(
+            text.contains("): every managed hook call is denied and nothing is recorded"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_prints_mcp_warning() {
+        let opts = Opts {
+            extra: "[guard.mcp]\nallow_servers = [\"github\"]\n".into(),
+            ..Opts::default()
+        };
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&opts));
+        let (_, text) = status_at(root.path());
+        assert!(
+            text.contains(
+                "MCP server github bypasses saiife: its requests are not brokered or limited\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_says_an_unwritten_managed_hook_does_not_guard() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let installed = root.path().join("etc/saiife/installed.toml");
+        let mut i = read_installed(&installed).unwrap().unwrap();
+        for a in &mut i.agents {
+            a.sha256 = String::new();
+        }
+        write_installed(&installed, &i).unwrap();
+        let (_, text) = status_at(root.path());
+        assert!(
+            text.contains(
+                "  agent claude: managed hook not written (install did not finish); its project hook still judges its calls\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("the managed hooks guard"), "{text}");
+    }
+
+    /// Final review I5e: without `saiife init` here, the managed hooks
+    /// still read this project's config and nested ones: status checks
+    /// them before it returns.
+    #[test]
+    fn status_without_init_still_checks_project_and_nested_configs() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        let env = Env::new(&["claude"]);
+        env.write(".saiife/config.toml", "packs = [\"no.such-pack\"]\n");
+        env.write("sub/.saiife/config.toml", "packs = []\n");
+        let out = env.saiife(&["status", "--root", root.path().to_str().unwrap()]);
+        let text = stdout(&out);
+        assert!(text.contains("project hooks: none"), "{text}");
+        assert!(text.contains("no.such-pack"), "{text}");
+        assert!(
+            text.contains("sub/.saiife/config.toml is a separate saiife config"),
+            "{text}"
+        );
+        assert_eq!(code(&out), 1, "{text}");
+    }
+
+    #[test]
+    fn status_reports_changed_managed_file() {
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&Opts::default()));
+        std::fs::write(
+            root.path()
+                .join("etc/claude-code/managed-settings.d/50-saiife.json"),
+            "{}\n",
+        )
+        .unwrap();
+        let (c, text) = status_at(root.path());
+        assert_eq!(c, 1, "{text}");
+        assert!(
+            text.contains(
+                "/etc/claude-code/managed-settings.d/50-saiife.json: changed since install"
+            ),
+            "{text}"
+        );
+    }
+}

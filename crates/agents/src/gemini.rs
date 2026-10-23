@@ -6,7 +6,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::json_hooks::JsonHooks;
-use crate::{Agent, AgentError, Change};
+use crate::{fingerprint, Agent, AgentError, Change};
 
 pub const SETTINGS_REL: &str = ".gemini/settings.json";
 
@@ -51,6 +51,46 @@ pub fn entries(project: &Path) -> Result<Vec<String>, AgentError> {
 
 pub fn expected_entry() -> String {
     HOOKS.expected()
+}
+
+/// The managed group (locked mode, spec §8.3): no matcher, which means
+/// every tool, and the absolute path of the root-owned binary.
+fn managed_group() -> Value {
+    json!({
+        "hooks": [{
+            "type": "command",
+            "command": Agent::Gemini.managed_command(),
+            "name": "saiife",
+            "timeout": TIMEOUT_MS,
+        }]
+    })
+}
+
+const MANAGED: JsonHooks = JsonHooks {
+    rel: "",
+    event: "BeforeTool",
+    group: managed_group,
+};
+
+/// Adds saiife's managed group to the system `settings.json` at `file`
+/// (an absolute path; the directory must exist), keeping everything else.
+pub fn install_managed(file: &Path) -> Result<Change, AgentError> {
+    MANAGED.install_file(file)
+}
+
+/// Removes saiife's handlers from `file`; never deletes the file.
+pub fn remove_managed(file: &Path) -> Result<Change, AgentError> {
+    MANAGED.remove_file(file)
+}
+
+/// Fingerprint of saiife's entries in `file` (stored in `installed.toml`),
+/// `None` when there is none.
+pub fn managed_entry(file: &Path) -> Result<Option<String>, AgentError> {
+    let entries = MANAGED.entries_file(file)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(fingerprint::of_json(&json!({ "entries": entries }))))
 }
 
 #[cfg(test)]

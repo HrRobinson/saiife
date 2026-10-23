@@ -9,6 +9,8 @@
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
+//! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
+//! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +25,7 @@ mod out;
 mod audit_cmd;
 mod check;
 mod check_managed;
+mod doctor_cmd;
 mod eval;
 mod init_cmd;
 mod packs_cmd;
@@ -31,6 +34,8 @@ mod project;
 mod report;
 mod report_html;
 mod status_cmd;
+mod system_cmd;
+mod system_view;
 mod text;
 
 use saiifeguard::builtins::builtin_packs;
@@ -83,9 +88,15 @@ enum Cmd {
         /// the saiife daemon, fail closed on every error. Implies --hook-exit.
         #[arg(long)]
         managed: bool,
-        /// The system config for --managed (default /etc/saiife/config.toml).
-        #[arg(long = "system-config", hide = true, requires = "managed")]
+        /// The system config (default /etc/saiife/config.toml). The
+        /// developer hook reads which agents are managed and whether to
+        /// fail closed from it.
+        #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// The hook event when it is not a tool call (Claude Code's
+        /// ConfigChange hook: `config-change`). Locked mode only.
+        #[arg(long, value_parser = ["config-change"], requires = "managed")]
+        event: Option<String>,
     },
     /// Turn saiife on for this project: write the guard hook into each
     /// agent's project config and create .saiife/config.toml.
@@ -97,9 +108,16 @@ enum Cmd {
         /// Remove exactly what `saiife init` added.
         #[arg(long, conflicts_with = "agents")]
         off: bool,
+        /// Read the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
     },
     /// Check that this project is still guarded; exit 1 if any check fails.
-    Status,
+    Status {
+        /// Read the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
+    },
     /// List packs: id, on by default, on here, rule count, summary. With a
     /// pack id: that pack's command and path rules.
     Packs {
@@ -143,9 +161,27 @@ enum Cmd {
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
     },
+    /// Check the machine locked mode relies on: exit 0 all pass, 1 a
+    /// warning, 2 a failure.
+    Doctor {
+        /// Check this agent user (root only, unless it is you).
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+        /// Check the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
+    },
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
+    /// Locked mode on Linux: install or uninstall the system setup (root).
+    System {
+        #[command(subcommand)]
+        action: system_cmd::SystemAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,15 +203,16 @@ fn main() -> ExitCode {
         agent,
         managed,
         system_config,
+        event,
     } = &cli.command
     {
         if *managed {
             let config = system_config
                 .as_deref()
                 .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
-            return check_managed::run(agent, config);
+            return check_managed::run(agent, config, event.as_deref());
         }
-        return check::run(&cli.packs, *hook_exit, agent);
+        return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
     }
     if let Cmd::Eval = cli.command {
         return eval::worker_main();
@@ -188,6 +225,12 @@ fn main() -> ExitCode {
     } = cli.command
     {
         return cmd_daemon(system, user, config, state_dir);
+    }
+    if let Cmd::System { action } = cli.command {
+        return system_cmd::run(action);
+    }
+    if let Cmd::Doctor { user, json, root } = cli.command {
+        return doctor_cmd::run(user, json, root);
     }
     // Load the shipped built-in packs. Warnings are surfaced on stderr but are
     // never fatal (fail open). The default profile is default-on packs only;
@@ -224,10 +267,22 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
-        Cmd::Check { .. } | Cmd::Eval | Cmd::Daemon { .. } => unreachable!("handled above"),
-        Cmd::Init { off: true, .. } => init_cmd::off(),
-        Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
-        Cmd::Status => status_cmd::run(&packs),
+        Cmd::Check { .. }
+        | Cmd::Eval
+        | Cmd::Daemon { .. }
+        | Cmd::System { .. }
+        | Cmd::Doctor { .. } => {
+            unreachable!("handled above")
+        }
+        Cmd::Init {
+            off: true, root, ..
+        } => init_cmd::off(root),
+        Cmd::Init {
+            agents,
+            off: false,
+            root,
+        } => init_cmd::run(&packs, &agents, &cli.packs, root),
+        Cmd::Status { root } => status_cmd::run(&packs, root),
         Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
             action: Some(AuditAction::Verify),
@@ -314,11 +369,15 @@ fn arg_error(e: clap::Error) -> ExitCode {
         if args.iter().any(|a| a == "--managed") {
             return check_managed::run_bad_args(&args, first);
         }
-        warn(&format!(
-            "bad hook arguments ({first}); failing open (allow)"
-        ));
-        check::record_arg_error(&args, first);
-        return ExitCode::SUCCESS;
+        // `--event` belongs to managed hooks only: a hook that passes it
+        // without `--managed` is miswritten, not from a newer saiife.
+        if args
+            .iter()
+            .any(|a| a == "--event" || a.starts_with("--event="))
+        {
+            e.exit()
+        }
+        return check::arg_error(&args, first);
     }
     e.exit()
 }

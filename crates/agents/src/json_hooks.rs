@@ -30,15 +30,10 @@ impl JsonHooks {
         fsutil::ensure_inside(project, self.rel)?;
         let path = project.join(self.rel);
         let text = fsutil::read_optional(&path)?;
-        let mut root = parse(&path, text.as_deref())?;
-        let current = self.fingerprints(&path, &root)?;
-        if current == [self.expected()] {
-            return Ok(Change::Unchanged);
+        match self.installed_text(&path, text.as_deref())? {
+            None => Ok(Change::Unchanged),
+            Some(out) => fsutil::write(project, self.rel, &out),
         }
-        self.strip_ours(&path, &mut root)?;
-        let groups = event_array(&path, &mut root, self.event)?;
-        groups.push((self.group)());
-        fsutil::write(project, self.rel, &render(&root, text.as_deref()))
     }
 
     /// Remove saiife's handlers. With `delete_if_empty`, a file left as `{}`
@@ -49,16 +44,72 @@ impl JsonHooks {
         let Some(text) = fsutil::read_optional(&path)? else {
             return Ok(Change::Unchanged);
         };
-        let mut root = parse(&path, Some(&text))?;
-        if self.strip_ours(&path, &mut root)? == 0 {
+        match self.removed_text(&path, &text)? {
+            None => Ok(Change::Unchanged),
+            Some((_, true)) if delete_if_empty => {
+                fsutil::remove(project, self.rel)?;
+                Ok(Change::Deleted)
+            }
+            Some((out, _)) => fsutil::write(project, self.rel, &out),
+        }
+    }
+
+    /// [`JsonHooks::install`] for a machine-wide managed file at an absolute
+    /// path (locked mode): no project, symlinks refused, written 0644.
+    pub fn install_file(&self, path: &Path) -> Result<Change, AgentError> {
+        let text = fsutil::read_managed(path)?;
+        match self.installed_text(path, text.as_deref())? {
+            None => Ok(Change::Unchanged),
+            Some(out) => fsutil::write_managed(path, &out),
+        }
+    }
+
+    /// [`JsonHooks::remove`] for a managed file; never deletes the file.
+    pub fn remove_file(&self, path: &Path) -> Result<Change, AgentError> {
+        let Some(text) = fsutil::read_managed(path)? else {
             return Ok(Change::Unchanged);
+        };
+        match self.removed_text(path, &text)? {
+            None => Ok(Change::Unchanged),
+            Some((out, _)) => fsutil::write_managed(path, &out),
+        }
+    }
+
+    /// Fingerprints of saiife's handlers in a managed file.
+    pub fn entries_file(&self, path: &Path) -> Result<Vec<String>, AgentError> {
+        let Some(text) = fsutil::read_managed(path)? else {
+            return Ok(Vec::new());
+        };
+        let root = parse(path, Some(&text))?;
+        self.fingerprints(path, &root)
+    }
+
+    /// The text with saiife's group in place, or `None` when the file
+    /// already holds exactly that entry and no other of saiife's.
+    fn installed_text(
+        &self,
+        path: &Path,
+        text: Option<&str>,
+    ) -> Result<Option<String>, AgentError> {
+        let mut root = parse(path, text)?;
+        if self.fingerprints(path, &root)? == [self.expected()] {
+            return Ok(None);
+        }
+        self.strip_ours(path, &mut root)?;
+        event_array(path, &mut root, self.event)?.push((self.group)());
+        Ok(Some(render(&root, text)))
+    }
+
+    /// The text without saiife's handlers and whether nothing else is left
+    /// (`{}`), or `None` when there was nothing of saiife's.
+    fn removed_text(&self, path: &Path, text: &str) -> Result<Option<(String, bool)>, AgentError> {
+        let mut root = parse(path, Some(text))?;
+        if self.strip_ours(path, &mut root)? == 0 {
+            return Ok(None);
         }
         prune(&mut root, self.event);
-        if delete_if_empty && root.as_object().is_some_and(Map::is_empty) {
-            fsutil::remove(project, self.rel)?;
-            return Ok(Change::Deleted);
-        }
-        fsutil::write(project, self.rel, &render(&root, Some(&text)))
+        let empty = root.as_object().is_some_and(Map::is_empty);
+        Ok(Some((render(&root, Some(text)), empty)))
     }
 
     pub fn entries(&self, project: &Path) -> Result<Vec<String>, AgentError> {

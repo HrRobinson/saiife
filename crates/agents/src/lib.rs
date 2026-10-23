@@ -22,6 +22,7 @@ pub mod fsutil;
 pub mod gemini;
 pub mod integrity;
 mod json_hooks;
+pub mod lock;
 
 /// The agents saiife v1 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,6 +76,15 @@ impl Agent {
     /// so an upgrade never leaves a stale absolute path (spec §5.2).
     pub fn hook_command(self) -> String {
         format!("saiife check --hook-exit --agent {}", self.name())
+    }
+
+    /// The hook command in the machine-wide managed config (locked mode,
+    /// spec §8.3): the absolute path of the root-owned binary, never `PATH`.
+    pub fn managed_command(self) -> String {
+        format!(
+            "/opt/saiife/bin/saiife check --managed --hook-exit --agent {}",
+            self.name()
+        )
     }
 
     /// What the user still has to do in the agent before the hook runs.
@@ -251,6 +261,22 @@ mod tests {
         assert_eq!(
             Agent::Gemini.hook_command(),
             "saiife check --hook-exit --agent gemini"
+        );
+    }
+
+    #[test]
+    fn managed_commands_use_the_opt_binary() {
+        assert_eq!(
+            Agent::Claude.managed_command(),
+            "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude"
+        );
+        assert_eq!(
+            Agent::Codex.managed_command(),
+            "/opt/saiife/bin/saiife check --managed --hook-exit --agent codex"
+        );
+        assert_eq!(
+            Agent::Gemini.managed_command(),
+            "/opt/saiife/bin/saiife check --managed --hook-exit --agent gemini"
         );
     }
 

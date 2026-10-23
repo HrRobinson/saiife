@@ -16,6 +16,8 @@ serde_json = "1"
 toml = "0.8"
 sha2 = "0.10"
 thiserror = "1"
+# Random temp-file names for installed.toml.
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

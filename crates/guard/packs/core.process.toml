@@ -1,0 +1,297 @@
+# Core: process — on by default.
+#
+# Blocks commands that signal processes without naming a specific target:
+# `pkill -n` / `pkill -o` with no pattern (the newest or oldest process of
+# all), `pkill` and `killall` with only user, group, session, parent or
+# terminal selectors, a pattern that matches every process (`pkill .`),
+# `kill` of pid -1 (every process), 0 or -0 (the caller's process group) or
+# 1 (init), and `killall5`.
+#
+# Why: while saiife was being built an agent ran `pkill -n` and `pkill -o`
+# to stop "its" process; they killed the owner's newest and oldest
+# processes and crashed the machine.
+#
+# Rules match the effective command, after the engine peeled off
+# transparent wrappers (`timeout 5`, `setsid`, `nice -n 5`, `env`, …).
+#
+# `pkill` and `killall` options are read with getopt from each tool's own
+# table (procps-ng 4.0.x pgrep(1)/pkill(1); psmisc killall(1)), the same
+# tables `core.lock` uses, and so are their operands: an option's value is
+# not a pattern (`pkill -u 0 node`, `pkill --signal 9 node`, `killall -s 9
+# -r '^node$'` each have the one pattern). Both take a `-SIGNAL` word
+# (`-9`, `-HUP`) as their first argument. A first word that may be a
+# signal or an option bundle (`-ttin`: SIGTTIN, or `-t tin`) is read both
+# ways, and either reading being broad blocks the command.
+
+[pack]
+id = "core.process"
+name = "Core: process"
+description = "Signalling processes without naming a target: pkill -n/-o with no pattern, user-only kills, kill -1/0/1, killall5."
+default_on = true
+version = 1
+# `kill $(cat app.pid)` is everyday use; a substitution argument must not
+# block every `kill`.
+substitution_failsafe = false
+triggers = ["kill"]
+# Compiled only when a command line holds `kill` (pkill, killall, killall5
+# included): most hook calls never do.
+lazy = true
+
+# --- pkill --------------------------------------------------------------------
+[[deny]]
+# `--inverse` kills every process that does NOT match. pkill disables the
+# short `-v`, but the long option still works.
+pattern = '^pkill\s'
+reason = "pkill --inverse signals every process except the ones named; name the process to stop instead"
+when_option = ["--inverse"]
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
+
+[[deny]]
+# No pattern, only selectors: `pkill -n` is the newest process of all,
+# `pkill -u me` every process of the user. `-F` (a pid file) and `-p` (a
+# pid) name their target and are not in the list. An option pkill does not
+# know counts as a selector. A parent, process group or session given as
+# literal ids above 1 or `$$` (`pkill -P 1234`, `pkill -g $$`) names a
+# target: not blocked. `0` is pkill's own group or session (the agent's),
+# `1` init. A terminal (`pkill -t pts/3`: everything on it, the owner's
+# shell maybe) stays blocked.
+pattern = '^pkill(?:\s|$)'
+reason = "pkill without a pattern signals whatever the selectors match (pkill -n: the newest process on the machine); add the process name, or use kill <pid>"
+when_option = [
+    "-n", "--newest", "-o", "--oldest", "-u", "--euid", "-U", "--uid",
+    "-g", "--pgroup", "-G", "--group", "-s", "--session", "-P", "--parent",
+    "-t", "--terminal", "-O", "--older", "-r", "--runstates", "--cgroup",
+    "--ns", "--env",
+]
+when_no_operand = true
+target_options = ["-P", "--parent", "-g", "--pgroup", "-s", "--session"]
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
+
+[[deny]]
+# A pattern that matches most processes: one matching at least 80% of a
+# set of common process names (`.`, `''`, `.*`, `^`, `[a-z]`), one of a
+# single character (`pkill e`), or one built at run time (`pkill $(cat f)`,
+# which may come out empty), also a bare expansion (`pkill "$X"`, empty
+# when X is unset). A pattern saiife cannot read counts too.
+pattern = '^pkill\s'
+reason = "this pkill pattern matches most processes (or is not known until it runs); name the process to stop"
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
+operand_match = "regex"
+operand_match_share = 0.8
+operand_min_len = 2
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
+
+[[deny]]
+# `pkill -f` matches the whole command line: the same test on a set of
+# common command lines (`pkill -f '[a-z]'` matches most of them).
+pattern = '^pkill\s'
+reason = "this pkill -f pattern matches most command lines; name the process to stop"
+when_option = ["-f", "--full"]
+command_signal_word = true
+command_options = "cefhimnoxAHLQVg:p:q:r:s:t:u:F:G:O:P:U:"
+command_long_options = [
+    "signal=", "require-handler|H", "queue=|q", "echo|e", "mrelease|m",
+    "count|c", "full|f", "pgroup=|g", "group=|G", "ignore-case|i",
+    "newest|n", "oldest|o", "older=|O", "pid=|p", "parent=|P", "session=|s",
+    "terminal=|t", "euid=|u", "uid=|U", "exact|x", "pidfile=|F",
+    "logpidfile|L", "runstates=|r", "ignore-ancestors|A", "shell-quote|Q",
+    "cgroup=", "ns=", "nslist=", "env=", "quiet", "delimiter=|d",
+    "list-name|l", "list-full|a", "inverse|v", "lightweight|w", "help|h",
+    "version|V",
+]
+operand_match = "regex"
+operand_match_share = 0.8
+operand_targets = [
+    "/sbin/init splash", "/usr/lib/systemd/systemd --user", "[kthreadd]",
+    "[kworker/0:1-events]", "/usr/lib/systemd/systemd-journald",
+    "/usr/bin/dbus-daemon --system --address=systemd:",
+    "/usr/sbin/NetworkManager --no-daemon", "/usr/lib/polkit-1/polkitd --no-debug",
+    "/sbin/agetty -o -p -- \\u --noclear - linux", "sshd: jonas@pts/0",
+    "/usr/sbin/cron -f", "/usr/lib/Xorg :0 -seat seat0 vt2",
+    "/usr/bin/gnome-shell", "/usr/bin/plasmashell --no-respawn",
+    "/usr/bin/pipewire", "/usr/bin/wireplumber",
+    "/usr/lib/firefox/firefox -contentproc -childID 5 -isForBrowser",
+    "/opt/google/chrome/chrome --type=renderer --lang=en-US",
+    "/usr/share/code/code --type=zygote", "-bash", "/bin/zsh -l", "bash",
+    "tmux new -s work", "ssh git@github.com", "nvim src/main.rs", "htop",
+    "node /home/jonas/app/server.js", "npm run dev", "node_modules/.bin/vite",
+    "python3 -m http.server 8000", "python3 manage.py runserver",
+    "/usr/bin/java -jar app.jar", "cargo test --workspace",
+    "/usr/bin/dockerd -H fd://", "/usr/bin/containerd",
+    "postgres: checkpointer", "/usr/sbin/mysqld", "redis-server *:6379",
+    "nginx: worker process", "claude --resume", "codex exec fix",
+    "/opt/saiife/bin/saiife daemon --system", "sleep 60", "make -j8",
+]
+
+# --- killall ------------------------------------------------------------------
+[[deny]]
+# Names are optional only with `-u` and `-Z`: `killall -u me` signals every
+# process of the user. killall reads options with getopt_long_only
+# (`-user me` is `--user me`).
+pattern = '^killall\s'
+reason = "killall without a process name signals every process of that user or context; add the process name"
+when_option = ["-u", "--user", "-Z", "--context"]
+when_no_operand = true
+command_signal_word = true
+command_long_only = true
+command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
+command_long_options = [
+    "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",
+    "older-than=|o", "interactive|i", "list|l", "quiet|q", "regexp|r",
+    "signal=|s", "user=|u", "verbose|v", "version|V", "wait|w", "ns=|n",
+    "context=|Z", "help",
+]
+
+[[deny]]
+pattern = '^killall\s'
+reason = "this killall -r pattern matches every process; name the process to stop"
+when_option = ["-r", "--regexp"]
+command_signal_word = true
+command_long_only = true
+command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
+command_long_options = [
+    "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",
+    "older-than=|o", "interactive|i", "list|l", "quiet|q", "regexp|r",
+    "signal=|s", "user=|u", "verbose|v", "version|V", "wait|w", "ns=|n",
+    "context=|Z", "help",
+]
+operand_match = "regex"
+operand_match_share = 0.8
+operand_min_len = 2
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
+
+[[deny]]
+# A name built at run time (`killall $(cat f)`, `killall "$X"`): not known
+# until it runs.
+pattern = '^killall\s'
+reason = "this killall name is not known until it runs; name the process to stop"
+command_signal_word = true
+command_long_only = true
+command_options = "eIgy:o:ilqrs:u:vVwn:Z:"
+command_long_options = [
+    "exact|e", "ignore-case|I", "process-group|g", "younger-than=|y",
+    "older-than=|o", "interactive|i", "list|l", "quiet|q", "regexp|r",
+    "signal=|s", "user=|u", "verbose|v", "version|V", "wait|w", "ns=|n",
+    "context=|Z", "help",
+]
+operand_match = "glob"
+operand_match_share = 1.0
+operand_substitution = true
+operand_targets = [
+    "systemd", "init", "kthreadd", "kworker/0:1-eve", "ksoftirqd/0", "rcu_sched",
+    "systemd-journal", "systemd-udevd", "systemd-logind", "dbus-daemon",
+    "NetworkManager", "polkitd", "rtkit-daemon", "agetty", "login", "sshd", "cron",
+    "Xorg", "Xwayland", "gnome-shell", "plasmashell", "kwin_wayland", "Hyprland",
+    "pipewire", "wireplumber", "pulseaudio", "gvfsd", "xdg-desktop-por",
+    "firefox", "chrome", "chromium", "code", "slack", "bash", "zsh", "fish", "sh",
+    "tmux: server", "ssh", "vim", "nvim", "emacs", "less", "top", "htop",
+    "node", "npm", "python3", "ruby", "java", "cargo", "rustc", "go", "make",
+    "gcc", "git", "docker", "dockerd", "containerd", "postgres", "mysqld",
+    "redis-server", "nginx", "claude", "codex", "gemini", "saiifed", "sleep",
+]
+
+[[deny]]
+# killall5 (sysvinit) signals every process outside the caller's session.
+pattern = '^killall5(?:\s|$)'
+reason = "killall5 signals every process on the machine"
+
+# --- kill ---------------------------------------------------------------------
+# A pid of -1 (every process the user may signal), 0 or -0 (the caller's
+# own process group, which holds the agent itself) or 1 (init), also as
+# `+1`, `01` or `-1:<inode>`. kill (util-linux kill(1), the shell builtin)
+# reads its first `-word` as the signal; after that, and after the first
+# pid or `--`, a `-1` is a pid.
+#
+# The kill rules read the command without its redirections: in
+# `kill 1234 2>&1` the `1` is not a pid.
+
+[[deny]]
+# The first argument: `kill 0`, `kill 1`.
+pattern = '^kill\s+\+?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
+reason = "kill 0 signals your whole process group (the agent too) and kill 1 signals init; kill the process by its own pid"
+
+[[deny]]
+# After a pid or a signal name or number (`kill 1234 -1`, `kill -s KILL -1`).
+pattern = '^kill\s(?:.*\s)?[^-\s]\S*\s+[-+]?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
+reason = "kill -1 signals every process you own, 0 your whole process group and 1 init; kill the process by its own pid"
+
+[[deny]]
+# After a signal word or `--` (`kill -9 -1`, `kill -- 0`). Not after the
+# options that take a value (`-s`, `-n`, `-q`) or list signals (`-l`,
+# `-L`, `-d`).
+pattern = '^kill\s(?:.*\s)?(?:--|-\d+|-[A-Za-z][A-Za-z0-9+_-]+|-[a-ce-kmoprt-zA-KM-Z]|--(?:verbose|all|pid|require-handler)|--[A-Za-z-]+=\S*)\s+[-+]?0*[01](?::\S*)?(?:\s|$)'
+no_redirections = true
+reason = "kill -1 signals every process you own, 0 your whole process group and 1 init; kill the process by its own pid"
+
+[[deny]]
+# A lone `kill -1` or `kill -0` is a signal with no pid, or a pid: read
+# both ways.
+pattern = '^kill\s+-0*[01]$'
+no_redirections = true
+reason = "kill -1 signals every process you own and kill -0 your whole process group; kill the process by its own pid"
+
+[[deny]]
+# A pid computed by arithmetic (`kill -9 $((-1))`, `kill $((PID-1))`): it
+# may come out as -1, 0 or 1.
+pattern = '^kill\s(?:.*\s)?\S*\$(?:\(\(|\[)'
+no_redirections = true
+reason = "this kill pid is computed when it runs and may be -1, 0 or 1; kill the process by its own pid"

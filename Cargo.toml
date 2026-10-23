@@ -31,3 +31,15 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.memchr]
 opt-level = 3
+
+# The CI job `locked-linux` only (built for x86_64-unknown-linux-musl): a
+# static binary with debug assertions on, so its SAIIFE_EVAL_FAULT test
+# seam exists, installed with `system install --allow-test-build`. Never
+# for production (spec §9.2 A4). opt-level 1 keeps it small and fast enough
+# for the guard's latency budget without the release build's LTO time.
+[profile.ci-locked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+opt-level = 1
+lto = false

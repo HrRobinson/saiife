@@ -24,9 +24,13 @@ fn blocked(reason: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// The whole run is inside `catch_unwind`: a panic denies.
-pub fn run(agent: &str, system_config: &Path) -> ExitCode {
-    guarded(|| imp::run_with(agent, system_config, None))
+/// The hook event `--event` names: Claude Code's `ConfigChange`.
+pub const EVENT_CONFIG_CHANGE: &str = "config-change";
+
+/// The whole run is inside `catch_unwind`: a panic denies. `event`: the
+/// hook event when it is not a tool call (`config-change`).
+pub fn run(agent: &str, system_config: &Path, event: Option<&str>) -> ExitCode {
+    guarded(|| imp::run_with(agent, system_config, event, None))
 }
 
 /// `check --managed` got arguments it cannot parse: deny, and record that
@@ -36,7 +40,9 @@ pub fn run_bad_args(args: &[String], error: &str) -> ExitCode {
     let agent = crate::check::agent_from_args(args).unwrap_or("unknown");
     let config = flag_value(args, "--system-config").unwrap_or(SYSTEM_CONFIG);
     let reason = format!("bad hook arguments: {error}");
-    guarded(|| imp::run_with(agent, Path::new(config), Some(reason.clone())))
+    // Only to name the tool in the record.
+    let event = flag_value(args, "--event").filter(|e| *e == EVENT_CONFIG_CHANGE);
+    guarded(|| imp::run_with(agent, Path::new(config), event, Some(reason.clone())))
 }
 
 /// Starts the watchdog, then runs `f` inside `catch_unwind`. Without a
@@ -54,7 +60,7 @@ fn guarded(f: impl FnOnce() -> ExitCode) -> ExitCode {
 }
 
 /// The value of `<name> <value>` or `<name>=<value>` in `args`.
-fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+pub(crate) fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().enumerate().find_map(|(i, a)| {
         if a == name {
             args.get(i + 1).map(String::as_str)
@@ -72,7 +78,12 @@ mod imp {
         true
     }
 
-    pub fn run_with(_agent: &str, _config: &Path, _forced: Option<String>) -> ExitCode {
+    pub fn run_with(
+        _agent: &str,
+        _config: &Path,
+        _event: Option<&str>,
+        _forced: Option<String>,
+    ) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
         crate::warn("locked mode needs Linux in this version (macOS: v2.1)");
@@ -105,7 +116,10 @@ mod imp {
     use serde_json::{Map, Value};
 
     use crate::eval::PARSE_MAX_BYTES;
-    use crate::eval::{self, EvalAnswer, EvalRequest, Plan, Verdict, MAX_EVAL_BYTES};
+    use crate::eval::{
+        self, EvalAnswer, EvalRequest, McpCheck, McpIdentity, Plan, Verdict, MAX_EVAL_BYTES,
+    };
+    use crate::paths::LockedPaths;
     use crate::warn;
 
     /// The worker's deadline, from its spawn (§6.1.2).
@@ -204,6 +218,19 @@ mod imp {
             }
         }
 
+        /// A `deny` by `guard.mcp` (spec §6.1.4).
+        fn mcp_denied(reason: String) -> Judged {
+            Judged {
+                decision: DecisionKind::Deny,
+                input: String::new(),
+                tool: None,
+                pack: Some("guard.mcp".into()),
+                rule: Some("mcp_server_not_allowed".into()),
+                outcome: Outcome::Deny(format!("BLOCKED by guard.mcp: {reason}")),
+                reason: Some(reason),
+            }
+        }
+
         fn from_answer(a: EvalAnswer) -> Judged {
             let (decision, outcome) = match a.verdict {
                 Verdict::Allow => (DecisionKind::Allow, Outcome::Allow),
@@ -236,9 +263,14 @@ mod imp {
         }
     }
 
-    /// `forced`: fail closed with this reason without judging (bad
-    /// arguments).
-    pub fn run_with(agent: &str, config: &Path, forced: Option<String>) -> ExitCode {
+    /// `event`: the hook event when it is not a tool call. `forced`: fail
+    /// closed with this reason without judging (bad arguments).
+    pub fn run_with(
+        agent: &str,
+        config: &Path,
+        event: Option<&str>,
+        forced: Option<String>,
+    ) -> ExitCode {
         // 1. The payload, bounded.
         let input = read_stdin();
         #[cfg(debug_assertions)]
@@ -258,18 +290,23 @@ mod imp {
             ));
         };
 
-        let ctx = match &input {
+        let mut ctx = match &input {
             Ok(buf) => context_from_hook_json_bounded(buf, PARSE_MAX_BYTES),
             Err(_) => HookContext::default(),
         };
+        if event == Some(EVENT_CONFIG_CHANGE) {
+            // A settings change is no tool call; its record says what it is.
+            ctx.tool = Some("ConfigChange".into());
+        }
         // A panic from here until the record is built still gets an
         // `error_denied` record, as long as the daemon was reached.
         let mut client: Option<Client> = None;
         let mut policy: Option<String> = None;
         let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judge_call(
-                &cfg,
+                (&cfg, config),
                 daemon_uid,
+                (agent, event),
                 &ctx,
                 input,
                 forced,
@@ -316,10 +353,14 @@ mod imp {
 
     /// Steps 3 to 7: the project, the policy, the worker and the daemon
     /// connection (made while the worker runs). `Err` is a reason for
-    /// stderr only: the daemon could not be reached.
+    /// stderr only: the daemon could not be reached. `cfg` was loaded from
+    /// `config`. An MCP tool whose server `[guard.mcp]` does not list is
+    /// denied without a worker.
+    #[allow(clippy::too_many_arguments)]
     fn judge_call(
-        cfg: &SystemConfig,
+        (cfg, config): (&SystemConfig, &Path),
         daemon_uid: u32,
+        (agent, event): (&str, Option<&str>),
         ctx: &HookContext,
         input: Result<String, String>,
         forced: Option<String>,
@@ -339,11 +380,18 @@ mod imp {
         let failed = forced
             .or_else(|| input.as_ref().err().cloned())
             .or(cwd.err());
-        let mut worker = match (&failed, input) {
-            (None, Ok(payload)) => Some(Worker::spawn(EvalRequest {
+        let mcp_denied = match (&failed, &input, event) {
+            (None, Ok(payload), None) => mcp_denial(agent, ctx, payload, cfg),
+            _ => None,
+        };
+        let mut worker = match (&failed, &mcp_denied, input) {
+            (None, None, Ok(payload)) => Some(Worker::spawn(EvalRequest {
                 payload,
-                packs,
+                // A settings change is judged without packs.
+                packs: if event.is_some() { Vec::new() } else { packs },
                 budget_ms: cfg.guard.budget_ms,
+                locked: Some(locked_paths(cfg, config)),
+                event: event.map(str::to_string),
             })),
             _ => None,
         };
@@ -374,6 +422,9 @@ mod imp {
         if let Some(reason) = failed {
             return Ok(Judged::error(String::new(), reason));
         }
+        if let Some(reason) = mcp_denied {
+            return Ok(Judged::mcp_denied(reason));
+        }
         let (payload, answer) = match worker {
             Some(Ok(w)) => w.finish(),
             Some(Err((payload, e))) => (payload, Err(format!("could not start: {e}"))),
@@ -387,6 +438,30 @@ mod imp {
                 format!("guard worker failed ({why})"),
             ),
         })
+    }
+
+    /// The `guard.mcp` deny reason for this call, if its tool is an MCP
+    /// tool whose server `[guard.mcp] allow_servers` does not list.
+    fn mcp_denial(
+        agent: &str,
+        ctx: &HookContext,
+        payload: &str,
+        cfg: &SystemConfig,
+    ) -> Option<String> {
+        let tool = ctx.tool.as_deref()?;
+        // Claude Code and Codex names are judged alone; only the other
+        // agents' payloads are scanned for `mcp_context`.
+        let identity = match agent {
+            "claude" | "codex" => McpIdentity::Absent,
+            _ => eval::mcp_identity(payload),
+        };
+        match eval::mcp_check(agent, tool, &identity, &cfg.guard.mcp.allow_servers) {
+            McpCheck::NotMcp | McpCheck::Allowed => None,
+            McpCheck::Denied(s) => Some(format!(
+                "MCP server {s} is not in [guard.mcp] allow_servers"
+            )),
+            McpCheck::Unknown => Some("MCP server unknown on Gemini".into()),
+        }
     }
 
     /// What the record names when the worker gave no answer: the command
@@ -415,6 +490,16 @@ mod imp {
         }
         read.map(|_| buf)
             .map_err(|_| "could not read hook payload".to_string())
+    }
+
+    /// The paths `core.lock` guards beyond the §5.2 defaults: the system
+    /// config's own dir, the audit dir and the socket dir it names.
+    fn locked_paths(cfg: &SystemConfig, config: &Path) -> LockedPaths {
+        LockedPaths {
+            etc: config.parent().unwrap_or(Path::new("/")).to_path_buf(),
+            audit_dir: cfg.audit.dir.clone(),
+            socket_dir: cfg.daemon.socket_dir.clone(),
+        }
     }
 
     /// `load_system`, which must say `locked = true`.

@@ -28,6 +28,11 @@ pub const TIMEOUT_SECS: i64 = 10;
 
 pub const STATUS_MESSAGE: &str = "saiife guard";
 
+/// The managed hook's matcher: every tool (spec §6.1.1, §8.3).
+pub const MANAGED_MATCHER: &str = ".*";
+
+pub const MANAGED_STATUS_MESSAGE: &str = "saiife guard (locked)";
+
 pub const NEXT_STEP: &str = "Codex asks you to trust every new or changed hook once: start `codex` in this folder (the project's .codex folder must be trusted), run `/hooks` and trust the saiife hook.";
 
 pub fn install(project: &Path) -> Result<Change, AgentError> {
@@ -38,10 +43,16 @@ pub fn install(project: &Path) -> Result<Change, AgentError> {
     if fingerprints(&path, &doc)? == [expected_entry()] {
         return Ok(Change::Unchanged);
     }
-    strip_ours(&path, &mut doc)?;
-    match groups_mut(&mut doc) {
-        Some(GroupsMut::Tables(groups)) => groups.push(group()),
-        Some(GroupsMut::Inline(groups)) => groups.push(inline_group()),
+    add_group(&path, &mut doc, &PROJECT)?;
+    fsutil::write(project, CONFIG_REL, &render(&doc))
+}
+
+/// Replaces saiife's handlers in `doc` with `entry`'s group.
+fn add_group(path: &Path, doc: &mut DocumentMut, entry: &Entry) -> Result<(), AgentError> {
+    strip_ours(path, doc)?;
+    match groups_mut(doc) {
+        Some(GroupsMut::Tables(groups)) => groups.push(group_of(entry)),
+        Some(GroupsMut::Inline(groups)) => groups.push(inline_group_of(entry)),
         None => {
             let hooks = doc.entry("hooks").or_insert_with(|| {
                 let mut t = Table::new();
@@ -50,20 +61,27 @@ pub fn install(project: &Path) -> Result<Change, AgentError> {
             });
             if let Some(t) = hooks.as_table_mut() {
                 let mut groups = ArrayOfTables::new();
-                groups.push(group());
+                groups.push(group_of(entry));
                 t.insert("PreToolUse", Item::ArrayOfTables(groups));
             } else if let Some(t) = hooks.as_inline_table_mut() {
-                t.insert("PreToolUse", Array::from_iter([inline_group()]).into());
+                t.insert(
+                    "PreToolUse",
+                    Array::from_iter([inline_group_of(entry)]).into(),
+                );
             } else {
-                return Err(layout(&path, "`hooks` is not a table"));
+                return Err(layout(path, "`hooks` is not a table"));
             }
         }
     }
+    Ok(())
+}
+
+fn render(doc: &DocumentMut) -> String {
     let mut out = doc.to_string();
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    fsutil::write(project, CONFIG_REL, &out)
+    out
 }
 
 /// Remove saiife's handlers. With `delete_if_empty`, a file left with no
@@ -98,6 +116,243 @@ pub fn entries(project: &Path) -> Result<Vec<String>, AgentError> {
 pub fn expected_entry() -> String {
     let g = table_to_json(&group());
     entry_fingerprint(g.get("matcher"), &g["hooks"][0])
+}
+
+/// Adds saiife's managed group to the Codex `requirements.toml` at `file`
+/// (an absolute path; the directory must exist) and pins `[features]
+/// hooks = true`. Everything else in the file is kept. Symlinks are
+/// refused; the file is written 0644.
+pub fn install_managed(file: &Path) -> Result<Change, AgentError> {
+    let text = fsutil::read_managed(file)?;
+    let mut doc = parse(file, text.as_deref().unwrap_or(""))?;
+    let entry_ok = fingerprints(file, &doc)? == [expected_managed()];
+    let features_ok = features_hooks(file, &doc)? == Some(true);
+    if entry_ok && features_ok {
+        return Ok(Change::Unchanged);
+    }
+    if !features_ok {
+        set_features_hooks(file, &mut doc)?;
+    }
+    if !entry_ok {
+        add_group(file, &mut doc, &MANAGED)?;
+    }
+    fsutil::write_managed(file, &render(&doc))
+}
+
+/// Removes saiife's handlers from `file`, and `[features] hooks` when saiife
+/// set it. Never deletes the file.
+pub fn remove_managed(file: &Path) -> Result<Change, AgentError> {
+    let Some(text) = fsutil::read_managed(file)? else {
+        return Ok(Change::Unchanged);
+    };
+    let mut doc = parse(file, &text)?;
+    let removed = strip_ours(file, &mut doc)?;
+    let untagged = untag_features_hooks(&mut doc);
+    if removed == 0 && !untagged {
+        return Ok(Change::Unchanged);
+    }
+    prune(&mut doc);
+    fsutil::write_managed(file, &doc.to_string())
+}
+
+/// Fingerprint of saiife's entries in `file` together with `[features]
+/// hooks` (stored in `installed.toml`; switching hooks off changes it),
+/// `None` when there is no saiife entry.
+pub fn managed_entry(file: &Path) -> Result<Option<String>, AgentError> {
+    let Some(text) = fsutil::read_managed(file)? else {
+        return Ok(None);
+    };
+    let doc = parse(file, &text)?;
+    let entries = fingerprints(file, &doc)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let features = features_hooks_value(&doc);
+    Ok(Some(fingerprint::of_json(&serde_json::json!({
+        "entries": entries,
+        "features_hooks": features,
+    }))))
+}
+
+fn expected_managed() -> String {
+    let g = table_to_json(&group_of(&MANAGED));
+    entry_fingerprint(g.get("matcher"), &g["hooks"][0])
+}
+
+/// `[features] hooks` as JSON (`null` when absent).
+fn features_hooks_value(doc: &DocumentMut) -> Value {
+    doc.get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|f| f.get("hooks"))
+        .map(item_to_json)
+        .unwrap_or(Value::Null)
+}
+
+/// `[features] hooks` when it is a boolean; an error when `features` is not
+/// a table.
+fn features_hooks(path: &Path, doc: &DocumentMut) -> Result<Option<bool>, AgentError> {
+    let Some(f) = doc.get("features") else {
+        return Ok(None);
+    };
+    let Some(f) = f.as_table_like() else {
+        return Err(layout(path, "`features` is not a table"));
+    };
+    Ok(f.get("hooks").and_then(Item::as_bool))
+}
+
+/// Sets `[features] hooks = true` and tags it with what was there before,
+/// so `remove_managed` can put that back exactly: an absent key, `false`
+/// or any other value, and whether saiife added the `[features]` table.
+/// The tag is a comment after the value (`[features]` table) or after the
+/// inline table (`features = { … }`); an admin's comment there is kept.
+fn set_features_hooks(path: &Path, doc: &mut DocumentMut) -> Result<(), AgentError> {
+    let added = doc.get("features").is_none();
+    let features = doc
+        .entry("features")
+        .or_insert_with(|| Item::Table(Table::new()));
+    if let Some(t) = features.as_table_mut() {
+        if t.get("hooks").is_some_and(|h| !h.is_value()) {
+            return Err(layout(path, "`features.hooks` is not a value"));
+        }
+        let prior = t.get("hooks").and_then(Item::as_value).cloned();
+        let suffix = match &prior {
+            // A tag from an earlier install keeps what was there first.
+            Some(v) if parse_tag(&decor_suffix(v)).is_some() => decor_suffix(v),
+            _ => {
+                let keep = prior.as_ref().map(decor_suffix).unwrap_or_default();
+                tagged_suffix(path, prior.as_ref(), added, &keep)?
+            }
+        };
+        let mut v = toml_edit::Value::from(true);
+        v.decor_mut().set_suffix(suffix);
+        t.insert("hooks", Item::Value(v));
+        // A new `[features]` goes first, as in the spec's fixture.
+        if added {
+            t.set_position(0);
+        }
+        return Ok(());
+    }
+    let Some(v) = features.as_value_mut() else {
+        return Err(layout(path, "`features` is not a table"));
+    };
+    let suffix = decor_suffix(v);
+    let Some(t) = v.as_inline_table_mut() else {
+        return Err(layout(path, "`features` is not a table"));
+    };
+    let prior = t.get("hooks").cloned();
+    let tag = match parse_tag(&suffix) {
+        // A tag from an earlier install keeps what was there first.
+        Some(_) => suffix,
+        None => tagged_suffix(path, prior.as_ref(), false, &suffix)?,
+    };
+    t.insert("hooks", toml_edit::Value::from(true));
+    v.decor_mut().set_suffix(tag);
+    Ok(())
+}
+
+const TAG: &str = "# saiife: hooks was ";
+const TABLE_ADDED: &str = "; [features] added by saiife";
+
+fn decor_suffix(v: &toml_edit::Value) -> String {
+    v.decor()
+        .suffix()
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The new suffix: the old one (an admin's comment) plus saiife's tag.
+/// `keep` is the suffix already there (the `hooks` value's in a table,
+/// the inline table's own for `features = { … }`).
+fn tagged_suffix(
+    path: &Path,
+    prior: Option<&toml_edit::Value>,
+    table_added: bool,
+    keep: &str,
+) -> Result<String, AgentError> {
+    let repr = match prior {
+        None => "absent".to_string(),
+        Some(v) => {
+            let mut bare = v.clone();
+            bare.decor_mut().clear();
+            bare.to_string().trim().to_string()
+        }
+    };
+    if repr.contains('\n') || repr.contains('\r') {
+        return Err(layout(
+            path,
+            "`features.hooks` holds a multi-line value saiife cannot record",
+        ));
+    }
+    let keep = keep.trim_end();
+    Ok(format!(
+        "{keep} {TAG}{repr}{}",
+        if table_added { TABLE_ADDED } else { "" }
+    ))
+}
+
+/// What a tag says: the prior value (`None` = absent), whether saiife added
+/// the table, and the suffix without the tag.
+fn parse_tag(suffix: &str) -> Option<(Option<toml_edit::Value>, bool, String)> {
+    let i = suffix.find(TAG)?;
+    let rest = suffix[i + TAG.len()..].trim_end();
+    let (repr, added) = match rest.strip_suffix(TABLE_ADDED) {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
+    let prior = if repr == "absent" {
+        None
+    } else {
+        Some(repr.parse::<toml_edit::Value>().ok()?)
+    };
+    Some((prior, added, suffix[..i].trim_end().to_string()))
+}
+
+/// Puts back what saiife's tag recorded for `[features] hooks` (and drops
+/// a `[features]` saiife added and left empty). True when there was a tag.
+fn untag_features_hooks(doc: &mut DocumentMut) -> bool {
+    let Some(features) = doc.get_mut("features") else {
+        return false;
+    };
+    if let Some(t) = features.as_table_mut() {
+        let Some(suffix) = t.get("hooks").and_then(Item::as_value).map(decor_suffix) else {
+            return false;
+        };
+        let Some((prior, added, rest)) = parse_tag(&suffix) else {
+            return false;
+        };
+        match prior {
+            None => {
+                t.remove("hooks");
+            }
+            Some(mut v) => {
+                v.decor_mut().set_suffix(rest);
+                t.insert("hooks", Item::Value(v));
+            }
+        }
+        if added && t.is_empty() {
+            doc.remove("features");
+        }
+        return true;
+    }
+    let Some(v) = features.as_value_mut() else {
+        return false;
+    };
+    let Some((prior, _, rest)) = parse_tag(&decor_suffix(v)) else {
+        return false;
+    };
+    if let Some(t) = v.as_inline_table_mut() {
+        match prior {
+            None => {
+                t.remove("hooks");
+            }
+            Some(p) => {
+                t.insert("hooks", p);
+            }
+        }
+    }
+    v.decor_mut().set_suffix(rest);
+    true
 }
 
 /// `[features] hooks = false` in the project or user config turns every
@@ -153,30 +408,63 @@ fn unreadable(path: PathBuf, error: String) -> HookBlocker {
     }
 }
 
+/// One saiife hook group: matcher, command and status message.
+struct Entry {
+    matcher: &'static str,
+    command: fn() -> String,
+    status: &'static str,
+}
+
+/// The project hook (developer mode).
+const PROJECT: Entry = Entry {
+    matcher: MATCHER,
+    command: project_command,
+    status: STATUS_MESSAGE,
+};
+
+/// The managed hook (locked mode, spec §8.3): every tool, absolute path.
+const MANAGED: Entry = Entry {
+    matcher: MANAGED_MATCHER,
+    command: managed_command,
+    status: MANAGED_STATUS_MESSAGE,
+};
+
+fn project_command() -> String {
+    Agent::Codex.hook_command()
+}
+
+fn managed_command() -> String {
+    Agent::Codex.managed_command()
+}
+
 /// The `[[hooks.PreToolUse]]` table `install` appends.
 fn group() -> Table {
+    group_of(&PROJECT)
+}
+
+fn group_of(e: &Entry) -> Table {
     let mut handler = Table::new();
     handler["type"] = value("command");
-    handler["command"] = value(Agent::Codex.hook_command());
+    handler["command"] = value((e.command)());
     handler["timeout"] = value(TIMEOUT_SECS);
-    handler["statusMessage"] = value(STATUS_MESSAGE);
+    handler["statusMessage"] = value(e.status);
     let mut handlers = ArrayOfTables::new();
     handlers.push(handler);
     let mut g = Table::new();
-    g["matcher"] = value(MATCHER);
+    g["matcher"] = value(e.matcher);
     g["hooks"] = Item::ArrayOfTables(handlers);
     g
 }
 
 /// The same group as an inline table, for a user's inline array.
-fn inline_group() -> toml_edit::Value {
+fn inline_group_of(e: &Entry) -> toml_edit::Value {
     let mut handler = InlineTable::new();
     handler.insert("type", "command".into());
-    handler.insert("command", Agent::Codex.hook_command().into());
+    handler.insert("command", (e.command)().into());
     handler.insert("timeout", TIMEOUT_SECS.into());
-    handler.insert("statusMessage", STATUS_MESSAGE.into());
+    handler.insert("statusMessage", e.status.into());
     let mut g = InlineTable::new();
-    g.insert("matcher", MATCHER.into());
+    g.insert("matcher", e.matcher.into());
     g.insert("hooks", Array::from_iter([handler]).into());
     g.into()
 }

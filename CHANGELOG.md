@@ -13,7 +13,15 @@
 - `saiife audit verify` checks checkpoint and key-rotation signatures.
 - `saiife init` and `saiife status` read the project config with the same bounded, race-free read as the hook.
 
-Locked mode cannot be installed yet: `saiife system install` and the managed hook files come in plan 9b.
+- New `sudo saiife system install` and `sudo saiife system uninstall` (Linux): set up or remove locked mode on Ubuntu 22.04+, Debian 12+ and RHEL 9+ (Rocky, Alma) with systemd. Install creates the `saiife` user and groups, puts the binary in `/opt/saiife/bin`, writes `/etc/saiife`, the vault key and the `saiifed` unit, adds managed hooks for Claude Code, Codex and Gemini CLI, starts the daemon and runs `saiife doctor`. Exit 2 on an install error or an unsupported system, 1 when installed but `doctor` found a failure. Uninstall removes exactly what install listed; `--purge` also removes the state, the audit and the users.
+- New `saiife doctor [--user <name>] [--json]`: checks the machine locked mode relies on (files, owners and modes, keys, daemon, agent users, sudo and root-equivalent groups, plaintext credentials). Exit 0 all pass, 1 a warning, 2 a failure.
+- New `core.lock` pack, on in locked mode: protects saiife's own install (`/etc/saiife`, `/opt/saiife`, the state, audit and socket dirs, the unit and the managed agent settings).
+- New `saiife check --managed --event config-change`: Claude Code's ConfigChange hook. A change to user, project or local settings that sets a locked key is denied.
+- Locked mode denies MCP tools whose server is not in `[guard.mcp] allow_servers`. `doctor` and `status` warn about each listed server: its requests are not brokered or limited.
+- Under a managed hook, the project hook of that agent goes quiet (no double judging, no second record).
+- Developer mode can opt in to fail closed with `[guard] fail = "closed"` in `/etc/saiife/config.toml`.
+- `saiife status` shows a Locked mode block: mode, daemon health and chain head, policy hash, each managed agent's lock label and the MCP warnings. In locked mode `saiife init` writes no project hook for an agent with a managed hook, and `saiife init --off` keeps the project config.
+- Lock labels: Claude Code is lockable; Codex and Gemini CLI are unverified (managed hooks are installed, `doctor` warns).
 
 ## 0.1.1 — 2026-10-19
 

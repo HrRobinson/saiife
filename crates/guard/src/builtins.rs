@@ -2,12 +2,14 @@
 //! no external pack files. At runtime saiife also loads `guard/packs/*.toml`
 //! from userData; the built-ins are the shipped defaults.
 //!
-//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self` (default-on) and the opt-in packs
+//! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self`,
+//! `core.process` (default-on),
+//! `core.lock` (on in locked mode, opt-in elsewhere) and the opt-in packs
 //! `cloud.gcloud`, `cloud.aws`, `cloud.azure`, `iac.terraform`, `db.postgres`,
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
 
-use crate::pack::{load_pack_str, peek_header, Pack, PackWarning};
+use crate::pack::{lazy_pack, load_pack_str, peek_header, LazyMeta, Pack, PackWarning};
 
 /// `(source_label, toml)` for every embedded pack.
 const BUILTIN_SOURCES: &[(&str, &str)] = &[
@@ -20,9 +22,23 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
         "<builtin>core.secrets",
         include_str!("../packs/core.secrets.toml"),
     ),
+    // Before core.self (the first deny wins): in locked mode a write to the
+    // system audit dir, bound to `$SAIIFE_AUDIT_DIR` for both packs, is
+    // named core.lock. After the other core packs, so their verdicts on
+    // `sudo rm -rf /` and the like stay theirs.
+    (
+        "<builtin>core.lock",
+        include_str!("../packs/core.lock.toml"),
+    ),
     (
         "<builtin>core.self",
         include_str!("../packs/core.self.toml"),
+    ),
+    // After core.lock, so a locked-mode kill that names saiifed stays
+    // core.lock's verdict.
+    (
+        "<builtin>core.process",
+        include_str!("../packs/core.process.toml"),
     ),
     (
         "<builtin>cloud.gcloud",
@@ -76,6 +92,9 @@ struct Entry {
     /// Such an entry is always loaded (and fails), so its failure is still
     /// reported.
     header: Option<(String, bool, u32)>,
+    /// `[pack] lazy = true` (with triggers, without path rules): what
+    /// `load_active` builds the pack from without compiling its rules.
+    lazy: Option<LazyMeta>,
 }
 
 impl Catalog {
@@ -88,10 +107,17 @@ impl Catalog {
     pub fn from_sources(sources: &[(&'static str, &'static str)]) -> Self {
         let entries = sources
             .iter()
-            .map(|&(source, toml)| Entry {
-                source,
-                toml,
-                header: peek_header(toml),
+            .map(|&(source, toml)| {
+                let (header, lazy) = match peek_header(toml) {
+                    Some((h, l)) => (Some(h), l),
+                    None => (None, None),
+                };
+                Entry {
+                    source,
+                    toml,
+                    header,
+                    lazy,
+                }
             })
             .collect();
         Self { entries }
@@ -116,20 +142,34 @@ impl Catalog {
 
     /// Compile every pack.
     pub fn load_all(&self) -> (Vec<Pack>, Vec<PackWarning>) {
-        self.load(|_| true)
+        self.load(|_| true, false)
     }
 
     /// Compile the packs `select_active` would keep: every default-on pack
     /// plus those whose id is in `enabled`. The others are never compiled.
+    /// A pack that says `lazy = true` is compiled only when the engine
+    /// first sees one of its triggers (`core.process`: most hook calls
+    /// never name `kill`).
     pub fn load_active(&self, enabled: &[String]) -> (Vec<Pack>, Vec<PackWarning>) {
-        self.load(|(id, default_on, _)| *default_on || enabled.iter().any(|e| e == id))
+        self.load(
+            |(id, default_on, _)| *default_on || enabled.iter().any(|e| e == id),
+            true,
+        )
     }
 
-    fn load(&self, wanted: impl Fn(&(String, bool, u32)) -> bool) -> (Vec<Pack>, Vec<PackWarning>) {
+    fn load(
+        &self,
+        wanted: impl Fn(&(String, bool, u32)) -> bool,
+        allow_lazy: bool,
+    ) -> (Vec<Pack>, Vec<PackWarning>) {
         let mut packs = Vec::new();
         let mut warnings = Vec::new();
         for e in &self.entries {
             if e.header.as_ref().is_some_and(|h| !wanted(h)) {
+                continue;
+            }
+            if let (true, Some(h), Some(meta)) = (allow_lazy, &e.header, &e.lazy) {
+                packs.push(lazy_pack(e.source, e.toml, h, meta));
                 continue;
             }
             match load_pack_str(e.source, e.toml, &mut warnings) {
@@ -209,6 +249,52 @@ reason = "bad regex"
             ("<t>opt.thing", OPT_IN),
             ("<t>bad", BAD_TOML),
         ])
+    }
+
+    const LAZY: &str = r#"
+[pack]
+id = "core.lazy"
+triggers = ["zap"]
+lazy = true
+[[deny]]
+pattern = '^zap\s+-all'
+reason = "zaps everything"
+"#;
+
+    /// Final review I5c: a `lazy = true` pack is compiled only when a
+    /// command line holds one of its triggers, then judges as before.
+    #[test]
+    fn lazy_pack_compiles_on_its_trigger_only() {
+        let cat = Catalog::from_sources(&[("<t>core.lazy", LAZY)]);
+        let before = crate::pack::compiled_packs();
+        let (packs, warnings) = cat.load_active(&[]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(packs[0].is_lazy() && packs[0].has_deny());
+        let e = crate::engine::Engine::new(packs);
+        assert!(!e.evaluate("ls -la").is_deny());
+        assert!(!e.evaluate("git status && cargo test").is_deny());
+        assert_eq!(
+            crate::pack::compiled_packs(),
+            before,
+            "no trigger, no compile"
+        );
+        assert!(e.evaluate("zap -all").is_deny());
+        assert!(e.evaluate("timeout 5 zap -all").is_deny());
+        assert_eq!(crate::pack::compiled_packs(), before + 1, "compiled once");
+        assert!(!e.evaluate("zap one").is_deny());
+        assert_eq!(crate::pack::compiled_packs(), before + 1);
+        // An eager load (packs, report) compiles it at once.
+        let (all, _) = cat.load_all();
+        assert!(!all[0].is_lazy());
+        assert_eq!(all[0].deny_rules().len(), 1);
+    }
+
+    #[test]
+    fn core_process_is_lazy_in_the_hook() {
+        let (packs, _) = Catalog::builtin().load_active(&[]);
+        let p = packs.iter().find(|p| p.id == "core.process").unwrap();
+        assert!(p.is_lazy());
+        assert!(p.deny_rules().len() > 5);
     }
 
     /// Only the active packs are compiled, and loading them reports the
@@ -307,11 +393,12 @@ reason = "bad regex"
 
     /// Naming convention: `core.*` packs are default-on; other namespaces
     /// (`cloud.*`, `db.*`) are opt-in. Holds for whatever subset is registered.
+    /// `core.lock` is the exception: locked mode turns it on (spec §6.17).
     #[test]
     fn core_packs_default_on_others_opt_in() {
         let (packs, _) = builtin_packs();
         for p in &packs {
-            let is_core = p.id.starts_with("core.");
+            let is_core = p.id.starts_with("core.") && p.id != "core.lock";
             assert_eq!(
                 p.default_on, is_core,
                 "pack {} default_on={} but is_core={}",

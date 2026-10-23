@@ -106,10 +106,15 @@ pub fn written_unchained(e: &io::Error) -> Option<&WrittenUnchained> {
 /// record is written unchained (no `seq`/`prev`) and a `WrittenUnchained`
 /// error is returned so the caller can warn; `verify` reports the gap later.
 /// Any other error means the record was not written.
-pub fn append_chained(dir: &Path, mut rec: Record) -> io::Result<u64> {
+pub fn append_chained(dir: &Path, rec: Record) -> io::Result<u64> {
+    append_chained_wait(dir, rec, LOCK_WAIT)
+}
+
+/// `append_chained` with its own wait for the lock instead of `LOCK_WAIT`.
+pub(crate) fn append_chained_wait(dir: &Path, mut rec: Record, wait: Duration) -> io::Result<u64> {
     store::create_private_dir(dir)?;
     fill_identity(&mut rec);
-    let err = match take_lock(dir) {
+    let err = match take_lock(dir, wait) {
         // The flock is held until `_lock` drops at the end of this arm.
         Some(_lock) => match append_locked(dir, rec.clone()) {
             Ok(seq) => return Ok(seq),
@@ -188,13 +193,13 @@ fn open_lock(dir: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// The lock file (see `open_lock`), locked within `LOCK_WAIT`.
-fn take_lock(dir: &Path) -> Option<File> {
+/// The lock file (see `open_lock`), locked within `wait`.
+fn take_lock(dir: &Path, wait: Duration) -> Option<File> {
     let file = open_lock(dir).ok()?;
-    lock_within(&file).ok().map(|()| file)
+    lock_within(&file, wait).ok().map(|()| file)
 }
 
-/// Lock `file` (flock), retrying for up to `LOCK_WAIT` while it is held.
+/// Lock `file` (flock), retrying for up to `wait` while it is held.
 ///
 /// A flock belongs to the open file, not to the fd, and lasts until every
 /// copy of it is closed. A child that another thread forks or spawns gets
@@ -202,8 +207,8 @@ fn take_lock(dir: &Path) -> Option<File> {
 /// execs: for that moment a lock its owner already dropped is still held.
 /// On macOS every genesis spawns `ioreg` (`host_id`), so the moment comes
 /// up; a held lock is only reported once it outlasts the wait.
-fn lock_within(file: &File) -> Result<(), fs::TryLockError> {
-    let deadline = Instant::now() + LOCK_WAIT;
+fn lock_within(file: &File, wait: Duration) -> Result<(), fs::TryLockError> {
+    let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
             Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
@@ -662,7 +667,8 @@ pub struct StartupCheck {
     pub recent: Result<(), String>,
     /// `seq` of the newest checkpoint among them.
     pub last_checkpoint: Option<u64>,
-    /// The last non-checkpoint record is a `daemon` `stop`.
+    /// The last record that is not a `checkpoint` or a `key_rotate` is a
+    /// `daemon` `stop`.
     pub last_clean_stop: bool,
 }
 
@@ -725,7 +731,7 @@ impl ChainWriter {
     pub fn open(dir: &Path, opts: WriterOptions) -> io::Result<ChainWriter> {
         create_writer_dir(dir)?;
         let lock = open_lock(dir)?;
-        match lock_within(&lock) {
+        match lock_within(&lock, LOCK_WAIT) {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::other(format!(
@@ -1154,10 +1160,15 @@ impl Window {
                 continue;
             };
             let field = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
-            if field("kind") == Some("checkpoint") {
-                last_checkpoint = Some(seq);
-            } else {
-                last_clean_stop = field("kind") == Some("daemon") && field("event") == Some("stop");
+            match field("kind") {
+                Some("checkpoint") => last_checkpoint = Some(seq),
+                // A key_rotate is bookkeeping like a checkpoint: the
+                // unsigned one written after a lost key must not hide the
+                // stop record before it.
+                Some("key_rotate") => {}
+                kind => {
+                    last_clean_stop = kind == Some("daemon") && field("event") == Some("stop");
+                }
             }
         }
         let recent = match report.first_break() {
@@ -1450,7 +1461,15 @@ mod tests {
                 let d = dir.path().to_path_buf();
                 std::thread::spawn(move || {
                     for _ in 0..50 {
-                        append_chained(&d, rec(datetime!(2026-10-13 08:00:00 UTC))).unwrap();
+                        // A generous wait: on a loaded machine one append
+                        // can outlast the production second, and the
+                        // fallback would then write an unchained line.
+                        append_chained_wait(
+                            &d,
+                            rec(datetime!(2026-10-13 08:00:00 UTC)),
+                            Duration::from_secs(30),
+                        )
+                        .unwrap();
                     }
                 })
             })
@@ -1801,6 +1820,32 @@ mod tests {
         assert_eq!(r.host, g.host);
         assert_eq!((r.uid, r.user.as_deref()), (Some(1000), Some("bob")));
         verify_ok(dir.path());
+    }
+
+    #[test]
+    fn clean_stop_survives_lost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = ChainWriter::open(
+            dir.path(),
+            opts("locked", Some(AuditKey::generate().unwrap())),
+        )
+        .unwrap();
+        w.append(locked_rec(datetime!(2026-10-13 08:00:00 UTC)))
+            .unwrap();
+        let mut stop = locked_rec(datetime!(2026-10-13 08:00:01 UTC));
+        stop.kind = Some("daemon".into());
+        stop.extra.insert("event".into(), "stop".into());
+        w.append(stop).unwrap();
+        drop(w);
+        // Key A is lost: key B writes an unsigned key_rotate after the stop.
+        let w = ChainWriter::open(
+            dir.path(),
+            opts("locked", Some(AuditKey::generate().unwrap())),
+        )
+        .unwrap();
+        let newest = regular_month_files(dir.path()).unwrap().pop().unwrap();
+        assert_eq!(parse(lines(&newest).last().unwrap()).kind(), "key_rotate");
+        assert!(w.startup_check(1000).last_clean_stop);
     }
 
     #[test]

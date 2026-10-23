@@ -659,6 +659,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dirs",
+ "libc",
  "predicates",
  "rustix",
  "saiife-agents",
@@ -667,10 +668,12 @@ dependencies = [
  "saiife-guard",
  "saiife-ipc",
  "saiife-policy",
+ "saiife-system",
  "serde",
  "serde_json",
  "tempfile",
  "time",
+ "toml",
 ]
 
 [[package]]
@@ -748,6 +751,7 @@ dependencies = [
 name = "saiife-policy"
 version = "0.1.1"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "serde",
  "serde_json",
@@ -755,6 +759,27 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "saiife-system"
+version = "0.1.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "rustix",
+ "saiife-agents",
+ "saiife-audit",
+ "saiife-ipc",
+ "saiife-policy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "toml",
+ "toml_edit",
+ "zeroize",
 ]
 
 [[package]]

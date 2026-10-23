@@ -24,11 +24,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       - run: cargo test --workspace --no-fail-fast
-      # The hook path (guard, audit, policy, ipc) must not link tokio: only
+      # The hook path (guard, audit, policy, ipc) and saiife-system must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates
         if: matrix.os == 'ubuntu-latest'
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system | grep -c tokio)" = 0
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
@@ -62,7 +62,51 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh
+
+  # Locked mode on real machines (spec §13 "Daemon integration"): `system
+  # install` as root, the §5.2 owners and modes, managed hooks run as an
+  # unprivileged agent user, the fail-closed matrix (§9.3), attacks on the
+  # installed files, doctor, reinstall, uninstall and purge. systemd 249
+  # (22.04, plain vault key file) and 255 (24.04, encrypted credential).
+  # The only place anything privileged runs: run.sh refuses outside GitHub
+  # Actions and calls sudo itself (the runner has passwordless sudo).
+  locked-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      # rust-toolchain.toml selects the toolchain; make sure it has the target.
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Static (musl), like the release, but with debug assertions on: the
+      # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it
+      # with --allow-test-build (spec §9.2 A4: never in production).
+      - run: cargo build --locked --profile ci-locked --target x86_64-unknown-linux-musl --bin saiife
+      - name: install, fail-closed matrix, uninstall (sudo inside, this job only)
+        env:
+          SAIIFE_LOCKED_CI: "1"
+          SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-linux-logs
+        run: bash scripts/locked-linux/run.sh "$PWD/target/x86_64-unknown-linux-musl/ci-locked/saiife"
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: locked-linux-logs-${{ matrix.os }}
+          path: target/locked-linux-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The released 0.1.0 binary must still read a v2 (chained) log: no skipped
   # lines, one row per fixture line. 0.1.0 ignores a relative SAIIFE_AUDIT_DIR,

@@ -13,6 +13,7 @@
 //! (`a&&rm -rf /`) is never missed and a quoted one (`echo "a && b"`) is
 //! never manufactured.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -30,13 +31,14 @@ use crate::lexer::{
 };
 use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
-use crate::pack::Pack;
+use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::wrappers::{
-    effective_command, is_env_assignment, unwrap_transparent_prefix, wrapper_reads,
+    effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
+    unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
 };
 
 /// Default latency budget for a single evaluation. Exceeding it yields
@@ -166,7 +168,7 @@ impl Engine {
         let triggers: Vec<String> = packs.iter().flat_map(|p| p.triggers.clone()).collect();
         let guarded_commands = packs
             .iter()
-            .filter(|p| !p.deny.is_empty() && p.substitution_failsafe)
+            .filter(|p| p.has_deny() && p.substitution_failsafe)
             .flat_map(|p| p.triggers.iter())
             .filter(|t| looks_like_bare_command_name(t))
             .map(|t| t.to_ascii_lowercase())
@@ -344,7 +346,11 @@ impl Engine {
             env_changed: false,
             ifs_named: false,
         };
-        self.evaluate_inner(raw_cmd, start, 0, &state, false, None)
+        let clock = Clock {
+            start,
+            spent: Cell::default(),
+        };
+        self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None)
     }
 
     /// `state`: the shell state at the start of `raw_cmd`; a nested
@@ -355,12 +361,13 @@ impl Engine {
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
-        start: Instant,
+        clock: &Clock,
         depth: u32,
         state: &ShellState,
         sub_body: bool,
         out: Option<&mut RuleCwd>,
     ) -> Decision {
+        let start = clock.start;
         let mut state = state.clone();
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
         // comment): values are still judged, the unresolved words too.
@@ -378,6 +385,7 @@ impl Engine {
             start,
             depth,
             literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
+            clock,
         };
 
         for seg in segments {
@@ -424,6 +432,31 @@ impl Engine {
         if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
             return Some(d);
         }
+        // A wrapper option saiife does not know may take a value, which
+        // would make the wrong word the command: not fully judged.
+        for opt in unknown_wrapper_options(seg) {
+            found.unjudged(format!(
+                "unknown or ambiguous wrapper option `{opt}`: the command after it may not be judged"
+            ));
+        }
+        // `env -S 'sudo ls'`: the split string is a command line of its own.
+        for split in env_split_payloads(seg) {
+            // env has its own escapes (`\_` is a space, `\c` ends the
+            // string), `${NAME}` expansion and `#` comments, which the
+            // shell lexer does not model: fail closed.
+            if split.string.contains(['\\', '#']) || split.string.contains("${") {
+                return Some(Decision::Deny {
+                    pack: SUBSTITUTION_GUARD_PACK.to_string(),
+                    pattern: "env-split-string-escape".to_string(),
+                    reason: "env -S escapes are not judged".to_string(),
+                    via_inline: None,
+                });
+            }
+            let nested = self.recurse(&split.line, cx, state, false, "env -S command", None);
+            if let Some(d) = found.nested(nested) {
+                return Some(d);
+            }
+        }
         let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
         if view.argv.is_empty() || view.argv[0].is_empty() {
             return self.bare_segment_phase(&view, cx, state, found);
@@ -464,7 +497,7 @@ impl Engine {
         if start.elapsed() > self.budget {
             return Nested::TimedOut;
         }
-        match self.evaluate_inner(inner, start, depth + 1, state, sub_body, out) {
+        match self.evaluate_inner(inner, cx.clock, depth + 1, state, sub_body, out) {
             Decision::Deny {
                 pack,
                 pattern,
@@ -586,7 +619,14 @@ impl Engine {
     ) -> Option<Decision> {
         let segment_line = segment_line(view.seg);
         if self.combined.might_match(&segment_line) {
-            match self.judge(&view.peeled, &segment_line, view.env_changed, cx.start) {
+            let lines = Lines {
+                matching: &view.peeled,
+                args: "",
+                segment: &segment_line,
+                wrappers: &view.wrappers,
+                operands: &[],
+            };
+            match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
                 _ => {}
@@ -654,7 +694,14 @@ impl Engine {
         {
             return None;
         }
-        match self.judge(matching_line, segment_line, view.env_changed, cx.start) {
+        let lines = Lines {
+            matching: matching_line,
+            args: &view.args_line,
+            segment: segment_line,
+            wrappers: &view.wrappers,
+            operands: &view.rule_args,
+        };
+        match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
             JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
             JudgeOutcome::Decided(Decision::Allow { trace }) => {
                 found.allow_trace = Some(trace);
@@ -689,12 +736,19 @@ impl Engine {
                 line.push(' ');
                 line.push_str(&view.peeled);
             }
+            let lines = Lines {
+                matching: &line,
+                args: "",
+                segment: &line,
+                wrappers: &view.wrappers,
+                operands: &[],
+            };
             match self.judge_in(
                 Some(CD_RESOLVED_PACK),
-                &line,
-                &line,
+                lines,
                 view.env_changed,
                 cx.start,
+                &cx.clock.spent,
             ) {
                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                 JudgeOutcome::TimedOut => return Some(timed_out()),
@@ -736,7 +790,16 @@ impl Engine {
                 line.push_str(&view.peeled);
             }
             if self.combined.might_match(&line) {
-                match self.judge(&line, view.segment_line(), view.env_changed, cx.start) {
+                let alt_args = without_redirections(alt_eff, &alt_argv);
+                let alt_args_line = args_line(&alt_argv, &alt_args);
+                let lines = Lines {
+                    matching: &line,
+                    args: &alt_args_line,
+                    segment: view.segment_line(),
+                    wrappers: &view.wrappers,
+                    operands: &alt_args,
+                };
+                match self.judge(lines, view.env_changed, cx.start, &cx.clock.spent) {
                     JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),
                     JudgeOutcome::TimedOut => return Some(timed_out()),
                     _ => {}
@@ -1095,32 +1158,67 @@ impl Engine {
     /// `matching_line` (a bare wrapper) leaves only `whole_segment` rules.
     fn judge(
         &self,
-        matching_line: &str,
-        segment_line: &str,
+        lines: Lines,
         env_changed: bool,
         start: Instant,
+        spent: &Cell<Duration>,
     ) -> JudgeOutcome {
-        self.judge_in(None, matching_line, segment_line, env_changed, start)
+        self.judge_in(None, lines, env_changed, start, spent)
     }
 
     /// `judge`, over the pack `only` names when it is set.
     fn judge_in(
         &self,
         only: Option<&str>,
-        matching_line: &str,
-        segment_line: &str,
+        lines: Lines,
         env_changed: bool,
         start: Instant,
+        spent: &Cell<Duration>,
     ) -> JudgeOutcome {
+        let Lines {
+            matching: matching_line,
+            args: args_line,
+            segment: segment_line,
+            wrappers,
+            operands,
+        } = lines;
         let line = |rule: &crate::pack::Rule| -> Option<&str> {
-            if rule.after_env_change {
+            if rule.peeled_wrappers {
+                (!wrappers.is_empty()).then_some(wrappers)
+            } else if rule.after_env_change {
                 (env_changed && !matching_line.is_empty()).then_some(matching_line)
             } else if rule.whole_segment {
                 Some(segment_line)
+            } else if rule.no_redirections {
+                (!matching_line.is_empty() && !args_line.is_empty()).then_some(args_line)
             } else if matching_line.is_empty() {
                 None
             } else {
                 Some(matching_line)
+            }
+        };
+        // The rule's line matches, the command was given the option the
+        // rule asks for (and has no operand, when the rule asks for that),
+        // and an operand names a target when the rule asks
+        // for one.
+        let over_budget = || start.elapsed() > self.budget;
+        let matches = |rule: &crate::pack::Rule| -> Hit {
+            if !line(rule).is_some_and(|l| rule.regex.is_match(l)) {
+                return Hit::No;
+            }
+            if rule
+                .when_option
+                .as_ref()
+                .is_some_and(|w| !w.matches(operands))
+            {
+                return Hit::No;
+            }
+            match (&rule.operands, &rule.table) {
+                (None, _) => Hit::Yes,
+                // Read with the command's own options: `pkill -u 0 node`
+                // has the one operand `node`.
+                (Some(m), Some(t)) => m.hits(&t.operand_args(operands), &over_budget, spent),
+                (Some(m), None) => m.hits(operands, &over_budget, spent),
             }
         };
         let mut allowed: Option<AllowTrace> = None;
@@ -1137,11 +1235,18 @@ impl Engine {
             }
             // An allow match exempts only this pack's own deny rules (as
             // `allow_path` does); later packs still judge the command.
-            if let Some(rule) = pack
-                .allow
-                .iter()
-                .find(|r| line(r).is_some_and(|l| r.regex.is_match(l)))
-            {
+            let mut allow_rule = None;
+            for r in pack.allow_rules() {
+                match matches(r) {
+                    Hit::Yes => {
+                        allow_rule = Some(r);
+                        break;
+                    }
+                    Hit::OutOfBudget => return JudgeOutcome::TimedOut,
+                    Hit::No => {}
+                }
+            }
+            if let Some(rule) = allow_rule {
                 allowed.get_or_insert_with(|| AllowTrace::AllowRule {
                     pack: pack.id.clone(),
                     pattern: rule.pattern.clone(),
@@ -1150,8 +1255,12 @@ impl Engine {
                 continue;
             }
             // Deny rules — first match wins.
-            for rule in &pack.deny {
-                if line(rule).is_some_and(|l| rule.regex.is_match(l)) {
+            for rule in pack.deny_rules() {
+                let hit = matches(rule);
+                if hit == Hit::OutOfBudget {
+                    return JudgeOutcome::TimedOut;
+                }
+                if hit == Hit::Yes {
                     return JudgeOutcome::Decided(Decision::Deny {
                         pack: pack.id.clone(),
                         pattern: rule.pattern.clone(),
@@ -1533,12 +1642,21 @@ enum Flow {
 }
 
 /// Fixed for one evaluation of one command line.
-struct Ctx {
+struct Ctx<'a> {
     start: Instant,
     depth: u32,
     /// The line holds a path reference spelled out literally (see
     /// `has_literal_path_ref`, `path_refs_are_plain`).
     literal_path: bool,
+    clock: &'a Clock,
+}
+
+/// One evaluation's clock, shared by its nested lines.
+struct Clock {
+    start: Instant,
+    /// Time spent compiling operand patterns so far
+    /// (`pack::MAX_PATTERN_COMPILE`).
+    spent: Cell<Duration>,
 }
 
 /// What the segments of one command line found short of a deny.
@@ -1632,8 +1750,15 @@ struct SegmentView<'a> {
     peeled: String,
     /// What the rules match: argv plus the peeled-off redirections.
     matching_line: String,
+    /// The arguments without redirections (`2>/dev/null`, `2>&1`): what
+    /// option and operand tests read.
+    rule_args: Vec<String>,
+    /// The command and `rule_args` (`no_redirections` rules).
+    args_line: String,
     /// The whole segment's line, when it differs.
     whole: Option<String>,
+    /// The names of the peeled-off wrappers, joined with spaces.
+    wrappers: String,
 }
 
 impl<'a> SegmentView<'a> {
@@ -1708,6 +1833,8 @@ impl<'a> SegmentView<'a> {
         // The whole segment's line differs only when a wrapper was
         // peeled off or the segment starts with an assignment.
         let whole = (prefix_len > 0 || is_env_assignment(&seg[0].text)).then(|| segment_line(seg));
+        let rule_args = without_redirections(&resolved, &argv);
+        let args_line = args_line(&argv, &rule_args);
         SegmentView {
             seg,
             unresolved: effective,
@@ -1719,7 +1846,14 @@ impl<'a> SegmentView<'a> {
             env_changed,
             peeled,
             matching_line,
+            rule_args,
+            args_line,
             whole,
+            wrappers: if prefix_len > 0 {
+                peeled_wrappers(seg).join(" ")
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -1727,6 +1861,47 @@ impl<'a> SegmentView<'a> {
     fn segment_line(&self) -> &str {
         self.whole.as_deref().unwrap_or(&self.matching_line)
     }
+}
+
+/// `argv[1..]` without its redirections: each redirection operator word
+/// (`2>`, `>&`, `<`) and the target word after it. `words` and `argv` are
+/// the same command, word for word.
+fn without_redirections(words: &[Word], argv: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        if words.get(i).is_some_and(|w| w.redirect) {
+            i += 2;
+            continue;
+        }
+        out.push(argv[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// The command name and its arguments without redirections, joined with
+/// single spaces.
+fn args_line(argv: &[String], args: &[String]) -> String {
+    std::iter::once(argv.first().map(String::as_str).unwrap_or(""))
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The lines a segment's rules match: the effective command's
+/// (`matching`), the whole segment's (`whole_segment` rules) and the peeled
+/// wrappers' names (`peeled_wrappers` rules); and the effective command's
+/// operands, for rules with `operand_match`.
+#[derive(Clone, Copy)]
+struct Lines<'a> {
+    matching: &'a str,
+    /// The effective command without its redirections
+    /// (`no_redirections` rules).
+    args: &'a str,
+    segment: &'a str,
+    wrappers: &'a str,
+    operands: &'a [String],
 }
 
 enum JudgeOutcome {

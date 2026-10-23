@@ -6,8 +6,9 @@
 //!
 //! - a glob starts with `/`, `~/`, `**/` or a variable (`$HOME`, `$PROJECT`,
 //!   `$SAIIFE_DATA_DIR`, `$SAIIFE_AUDIT_DIR`, `$SAIIFE_BIN`,
-//!   `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`), which stands alone or is followed
-//!   by `/`;
+//!   `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`, `$XDG_CONFIG_HOME`, and locked mode's `$SAIIFE_ETC`,
+//!   `$SAIIFE_STATE`, `$SAIIFE_LOG`, `$SAIIFE_RUN`, `$SAIIFE_OPT`,
+//!   `$SAIIFE_UNIT`), which stands alone or is followed by `/`;
 //! - `*` matches within one path component, `?` one character of it;
 //! - `**` is a whole component: `**/x` matches `x` in any directory,
 //!   `a/**/b` any depth between, and a trailing `/**` matches the directory
@@ -88,6 +89,16 @@ pub const VARIABLES: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "SAIIFE_BIN",
+    // `$XDG_CONFIG_HOME`, else `~/.config` (user services, autostart).
+    "XDG_CONFIG_HOME",
+    // Locked mode's system paths (spec §5.2), always bound to their
+    // defaults; only `core.lock` uses them.
+    "SAIIFE_ETC",
+    "SAIIFE_STATE",
+    "SAIIFE_LOG",
+    "SAIIFE_RUN",
+    "SAIIFE_OPT",
+    "SAIIFE_UNIT",
 ];
 
 /// Split a glob into its leading variable (if any) and the rest. `~` is
