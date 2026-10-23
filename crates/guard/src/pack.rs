@@ -511,20 +511,16 @@ impl OperandMatch {
             if self.min_len > 0 && o.chars().count() < self.min_len {
                 return Hit::Yes;
             }
-            if self.substitution
-                && (o.contains("$(") || o.contains('`') || o.contains("$[") || only_expansions(o))
-            {
+            if self.substitution && (o.contains("$(") || o.contains('`') || o.contains("$[")) {
                 return Hit::Yes;
             }
-            // A parameter expansion may be empty: the operand is judged as
-            // its text without the expansions (`x$X` as `x`), and a text of
-            // fewer than two characters counts as a match (`pkill "$X"`).
-            let reduced = without_expansions(o);
-            let o = match &reduced {
-                Some(r) if r.chars().count() < 2 => return Hit::Yes,
-                Some(r) => r,
-                None => o,
-            };
+            // A parameter expansion is not known until the command runs
+            // (empty, or anything): an operand holding one counts as a
+            // match (`pkill "$X"`, `pkill "sa${X}fed"`). A bare `$$`, `$#`,
+            // `$?` or `$!` is a number.
+            if has_expansion(o) {
+                return Hit::Yes;
+            }
             if o.is_empty() {
                 continue;
             }
@@ -582,69 +578,25 @@ impl OperandMatch {
     }
 }
 
-/// Is `word` made of parameter expansions only (`$X`, `"${X}"`, `$1`,
-/// `$@`, `$X$Y`), so it may expand to nothing (`pkill "$X"` with `X`
-/// unset matches every process)? `$$`, `$#` and `$?` always expand to
-/// digits and count as text.
-fn only_expansions(word: &str) -> bool {
-    let b = word.as_bytes();
-    let mut i = 0;
-    let mut any = false;
-    while i < b.len() {
-        if b[i] != b'$' {
-            return false;
-        }
-        let rest = &b[i + 1..];
-        let len = match rest.first() {
-            Some(b'{') => match rest.iter().position(|&c| c == b'}') {
-                Some(end) => end + 1,
-                None => return false,
-            },
-            Some(c) if c.is_ascii_alphabetic() || *c == b'_' => rest
-                .iter()
-                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                .unwrap_or(rest.len()),
-            Some(b'@' | b'*' | b'!' | b'-' | b'0'..=b'9') => 1,
-            _ => return false,
-        };
-        any = true;
-        i += 1 + len;
+/// Does `word` hold a parameter expansion (`$X`, `${…}`, `$1`, `$@`, …)?
+/// A whole word of `$$`, `$#`, `$?` or `$!` does not count; a `$` before
+/// anything else (`$(`, a lone `$`) is not one.
+fn has_expansion(word: &str) -> bool {
+    if matches!(word, "$$" | "$#" | "$?" | "$!") {
+        return false;
     }
-    any
-}
-
-/// `word` without its parameter expansions (`$X`, `${…}`, `$1`, `$@`,
-/// …); `None` when it has none. `$$`, `$#` and `$?` (always digits) and a
-/// `$` before anything else (`$(`, a lone `$`) are kept as text.
-fn without_expansions(word: &str) -> Option<String> {
     let b = word.as_bytes();
-    let mut out = String::with_capacity(word.len());
-    let mut found = false;
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'$' {
-            let rest = &b[i + 1..];
-            let len = match rest.first() {
-                Some(b'{') => rest.iter().position(|&c| c == b'}').map(|e| e + 1),
-                Some(c) if c.is_ascii_alphabetic() || *c == b'_' => Some(
-                    rest.iter()
-                        .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                        .unwrap_or(rest.len()),
-                ),
-                Some(b'@' | b'*' | b'!' | b'-' | b'0'..=b'9') => Some(1),
-                _ => None,
-            };
-            if let Some(len) = len {
-                found = true;
-                i += 1 + len;
-                continue;
+    b.iter().enumerate().any(|(i, &c)| {
+        c == b'$'
+            && match b.get(i + 1) {
+                Some(b'{') => true,
+                Some(n) => {
+                    n.is_ascii_alphanumeric()
+                        || matches!(n, b'_' | b'@' | b'*' | b'!' | b'-' | b'$' | b'#' | b'?')
+                }
+                None => false,
             }
-        }
-        let ch = word[i..].chars().next().unwrap_or_default();
-        out.push(ch);
-        i += ch.len_utf8().max(1);
-    }
-    found.then_some(out)
+    })
 }
 
 /// Does a pattern operand hold a Rust regex class set operation (`&&`,
@@ -1655,25 +1607,23 @@ mod tests {
     }
 
     #[test]
-    fn expansion_only_operands() {
-        for yes in ["$X", "${X}", "$X$Y", "$1", "$@", "${X:-}", "$_x"] {
-            assert!(only_expansions(yes), "{yes}");
+    fn any_expansion_counts() {
+        for yes in [
+            "$X",
+            "${X}",
+            "x$X",
+            "sa${X}fed",
+            "${X}node",
+            "a$1",
+            "$@",
+            "$$x",
+            "x$$",
+        ] {
+            assert!(has_expansion(yes), "{yes}");
         }
-        for no in ["", "$$", "$#", "x$X", "$X-y", "${X}d", "$", "$(x)"] {
-            assert!(!only_expansions(no), "{no}");
+        for no in ["node", "$$", "$#", "$?", "$!", "$(x)", "x$", "$"] {
+            assert!(!has_expansion(no), "{no}");
         }
-    }
-
-    #[test]
-    fn expansions_are_judged_as_empty() {
-        assert_eq!(without_expansions("node"), None);
-        assert_eq!(without_expansions("$$"), None);
-        assert_eq!(without_expansions("$X").as_deref(), Some(""));
-        assert_eq!(without_expansions("x$X").as_deref(), Some("x"));
-        assert_eq!(without_expansions("${X}node").as_deref(), Some("node"));
-        assert_eq!(without_expansions("a$1b$@").as_deref(), Some("ab"));
-        assert_eq!(without_expansions("$(x)$Y").as_deref(), Some("$(x)"));
-        assert_eq!(without_expansions("é$X").as_deref(), Some("é"));
     }
 
     #[test]

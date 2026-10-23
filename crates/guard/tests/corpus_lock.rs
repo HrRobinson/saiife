@@ -729,6 +729,10 @@ fn signal_words_do_not_hide_options() {
         "killall -RTMIN '^sai'",
         "killall -rtmin+1 '^sai'",
         "killall -rtmax '^sai'",
+        // Final review S23: an expansion in a pattern counts as a match.
+        "pkill \"sa${X}fed\"",
+        "pkill \"$X\"",
+        "killall \"saii${X}\"",
     ] {
         assert_lock_denies(&e, cmd);
     }

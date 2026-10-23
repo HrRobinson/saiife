@@ -124,6 +124,9 @@ agent's file tools and through shell commands:
 
 It also blocks too much in a few cases. This is the safe direction:
 
+- A `pkill`, `killall` or `systemctl` pattern with a variable in it
+  (`pkill "$APP"`, `pkill "sa${X}fed"`) counts as matching saiifed: what
+  it expands to is not known. Write the name instead.
 - Any `systemctl` naming saiife other than the read-only queries above, and
   any read-only query with a wrapper or an option before the verb other
   than `--no-pager`, `--user`, `--system`, `--full`, `--no-legend`,

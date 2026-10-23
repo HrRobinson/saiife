@@ -39,9 +39,9 @@ blocked like `pkill -n`, and in `kill 1234 2>&1` the `1` is not a pid.
   it starts with `-` (`pkill -- '-*.'`).
 - A `pkill` or `killall` pattern or name built at run time:
   `pkill $(cat name.txt)`, `pkill -f "$(...)"`, `killall $(cat names)`,
-  and one that is only a variable: `pkill "$NAME"`, `pkill -f "${X}"`,
-  `killall -r "$X"`. It may come out empty, and an empty pattern matches
-  every process.
+  and one holding a variable: `pkill "$NAME"`, `pkill -f "${X}"`,
+  `pkill "x$X"`, `killall -r "$X"`. It may come out empty (an empty
+  pattern matches every process) or as anything.
 - `killall` without a process name, with `-u`/`--user` or `-Z`/`--context`
   (`killall -u jonas`).
 - `killall5`, which signals every process on the machine.
@@ -96,10 +96,6 @@ as the signal and as options.
 - Launchers saiife does not see through: `chrt`, `taskset`, `unshare`,
   `script -c`, `find ... -exec`, `parallel`, `sg ... -c` and the like run
   `pkill -n` without the guard reading it.
-- A pattern that is part variable, part text (`pkill "$X-server"`) is
-  judged as its text alone (`-server`), since the variable may be empty.
-  So `pkill "x$X"` and `killall "${X}d"` (one character left) are blocked,
-  `pkill "${X}node"` is not.
 - `kill <name>` (util-linux `kill` can take a process name) and other tools
   that send signals to many processes: `skill`, `snice`, `systemctl kill`,
   `loginctl kill-user`, `fuser -k`.
@@ -124,6 +120,9 @@ It also blocks too much in a few cases. This is the safe direction:
   pattern).
 - `xargs pkill -n` and `xargs kill -1` and the like: what `xargs` adds at
   run time is not known, so `pkill -n` has no pattern and `kill -1` no pid.
+- Any pattern with a variable in it is blocked, even one that would name
+  a single process: `pkill "$APP"`, `pkill -f "node $APP"`. Write the name
+  instead.
 - A substitution in an option value counts like a pattern:
   `pkill -u $(whoami) node` is blocked. Write the user name instead.
 

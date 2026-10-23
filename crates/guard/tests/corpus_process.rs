@@ -328,10 +328,11 @@ fn option_values_and_targeted_selectors_are_allowed() {
     );
 }
 
-/// Final review M1: a pattern that is only an expansion may expand to
-/// nothing (matching every process).
+/// Final review M1 / S23: a pattern holding a parameter expansion is not
+/// known until it runs (it may be empty, or anything): it counts as a
+/// match.
 #[test]
-fn a_bare_expansion_pattern_is_denied() {
+fn a_pattern_with_an_expansion_is_denied() {
     assert_all_deny(
         &engine(),
         &[
@@ -342,30 +343,18 @@ fn a_bare_expansion_pattern_is_denied() {
             "pkill -f \"${PATTERN}\"",
             "pkill -9 \"$1\"",
             "pkill \"$X$Y\"",
-            // Final review S23: an expansion may be empty, the rest is
-            // judged alone.
             "pkill \"x$X\"",
-            "pkill \"$X.\"",
-            "pkill \".$X\"",
-            "pkill \"${X}e\"",
-            "pkill -f \"${X}/\"",
-            "killall -r \"$X.*\"",
-            "killall \"${X}d\"",
+            "pkill \"sa${X}fed\"",
+            "pkill \"${X}node\"",
+            "pkill \"$APP-server\"",
+            "pkill -f \"node $APP\"",
             "killall -r \"$X\"",
             "killall -r \"${X}\"",
             "killall \"$NAME\"",
-        ],
-    );
-    assert_all_allow(
-        &engine(),
-        &[
-            "pkill \"$X-server\"",
-            "pkill -f \"node $APP\"",
-            "pkill \"${X}node\"",
             "killall \"${X}nginx\"",
-            "pkill node",
         ],
     );
+    assert_all_allow(&engine(), &["pkill node", "pkill -f 'npm run dev'"]);
 }
 
 /// Security review: Rust regex class set operations (`&&`, `--`, `~~`)
