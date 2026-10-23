@@ -64,7 +64,8 @@ fn install_and_uninstall_under_root_flag() {
         .args(["system", "install", "--root", r, "--agents", "claude,codex"])
         .args(["--approvers", "alice,group:ops", "--non-interactive"])
         .assert()
-        .success();
+        // Installed; doctor fails the daemon checks under the fake host.
+        .code(1);
     let p = |rel: &str| root.path().join(rel);
     assert!(p("opt/saiife/bin/saiife").is_file());
     assert!(p("etc/claude-code/managed-settings.d/50-saiife.json").is_file());
@@ -92,7 +93,7 @@ fn install_and_uninstall_under_root_flag() {
     saiife()
         .args(["system", "install", "--root", r, "--agents", "claude,codex"])
         .assert()
-        .success();
+        .code(1);
 
     saiife()
         .args(["system", "uninstall", "--root", r])
@@ -103,6 +104,32 @@ fn install_and_uninstall_under_root_flag() {
     assert!(!p("etc/codex").exists());
     assert!(p("etc/saiife/config.toml").is_file());
     assert!(!p("etc/saiife/installed.toml").exists());
+}
+
+#[test]
+fn install_under_root_runs_doctor() {
+    let root = fake_root();
+    let out = saiife()
+        .args(["system", "install", "--root"])
+        .arg(root.path())
+        .args(["--agents", "claude", "--non-interactive"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // No daemon answers under the fake host: daemon.health fails.
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("saiife: locked mode is installed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("FAIL  daemon.health  "), "{stdout}");
+    assert!(stdout.contains("\ndoctor: "), "{stdout}");
+    assert_eq!(
+        stderr,
+        "saiife: installed, but doctor found failures: fix them before relying on the lock\n"
+    );
+    assert!(!stdout.contains("install failed") && !stderr.contains("install failed"));
 }
 
 #[test]

@@ -108,9 +108,16 @@ enum Cmd {
         /// Remove exactly what `saiife init` added.
         #[arg(long, conflicts_with = "agents")]
         off: bool,
+        /// Read the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
     },
     /// Check that this project is still guarded; exit 1 if any check fails.
-    Status,
+    Status {
+        /// Read the locked-mode tree under this directory (tests).
+        #[arg(long, hide = true, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
+    },
     /// List packs: id, on by default, on here, rule count, summary. With a
     /// pack id: that pack's command and path rules.
     Packs {
@@ -267,9 +274,15 @@ fn main() -> ExitCode {
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }
-        Cmd::Init { off: true, .. } => init_cmd::off(),
-        Cmd::Init { agents, off: false } => init_cmd::run(&packs, &agents, &cli.packs),
-        Cmd::Status => status_cmd::run(&packs),
+        Cmd::Init {
+            off: true, root, ..
+        } => init_cmd::off(root),
+        Cmd::Init {
+            agents,
+            off: false,
+            root,
+        } => init_cmd::run(&packs, &agents, &cli.packs, root),
+        Cmd::Status { root } => status_cmd::run(&packs, root),
         Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
             action: Some(AuditAction::Verify),

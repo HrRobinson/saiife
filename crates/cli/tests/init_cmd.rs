@@ -636,3 +636,77 @@ fn init_with_fifo_config_does_not_hang() {
         .expect("saiife init hung on a FIFO config");
     assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
 }
+
+/// Locked mode (plan 9b): `--root` points at a fake install in which Claude
+/// Code has a managed hook. Never the real /etc.
+#[cfg(unix)]
+fn locked_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    saiife_system::testing::fake_install(root.path());
+    root
+}
+
+#[cfg(unix)]
+#[test]
+fn locked_init_writes_no_hook_for_managed_agent() {
+    let root = locked_root();
+    let r = root.path().to_str().unwrap();
+    let env = Env::new(&["claude", "gemini"]);
+    let out = env.saiife(&["init", "--root", r]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+    assert!(
+        text.contains("claude: managed hook installed by the admin; no project hook written"),
+        "{text}"
+    );
+    assert!(!env.root().join(".claude/settings.json").exists(), "{text}");
+    // Gemini CLI has no managed hook here: it gets its project hook.
+    assert!(env
+        .read(".gemini/settings.json")
+        .contains("\"name\": \"saiife\""));
+    assert!(env.read(".saiife/config.toml").contains("packs = ["));
+
+    // Only the managed agent, named: the config is still written.
+    let env = Env::new(&[]);
+    let out = env.saiife(&["init", "--agent", "claude", "--root", r]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(!env.root().join(".claude").exists());
+    assert!(env.root().join(".saiife/config.toml").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn locked_init_off_removes_leftover_project_hooks_keeps_config() {
+    // A v1 project hook from before the machine was locked.
+    let env = Env::new(&["claude"]);
+    let out = env.saiife(&["init"]);
+    assert_eq!(code(&out), 0, "{}", stdout(&out));
+    assert!(env.read(".claude/settings.json").contains("saiife check"));
+
+    let root = locked_root();
+    let out = env.saiife(&["init", "--off", "--root", root.path().to_str().unwrap()]);
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}{}", stderr(&out));
+    assert!(text.contains("hook removed"), "{text}");
+    assert!(!env.root().join(".claude/settings.json").exists(), "{text}");
+    assert!(env.root().join(".saiife/config.toml").is_file(), "{text}");
+    assert!(
+        text.contains("managed hooks stay (remove them with: sudo saiife system uninstall)"),
+        "{text}"
+    );
+    // The managed file is untouched.
+    assert!(root
+        .path()
+        .join("etc/claude-code/managed-settings.d/50-saiife.json")
+        .is_file());
+}
+
+#[test]
+fn root_flag_is_hidden_on_init_and_status() {
+    let env = Env::new(&[]);
+    for cmd in ["init", "status"] {
+        let out = env.saiife(&[cmd, "--help"]);
+        assert_eq!(code(&out), 0);
+        assert!(!stdout(&out).contains("--root"), "{cmd}: {}", stdout(&out));
+    }
+}

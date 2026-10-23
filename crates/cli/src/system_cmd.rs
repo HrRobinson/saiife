@@ -7,9 +7,11 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use saiife_agents::Agent;
+use saiife_policy::Getent;
+use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::install::{install, InstallError, InstallOptions};
 use saiife_system::uninstall::{uninstall, UninstallOptions};
-use saiife_system::{host_for, refusal_line, Layout};
+use saiife_system::{host_for, refusal_line, Host, Layout};
 
 #[derive(Subcommand)]
 pub enum SystemAction {
@@ -87,6 +89,29 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
     }
 }
 
+/// `doctor` after a successful install (spec §7): its text on stdout.
+/// Exit 0 when it found nothing worse than a warning, 1 on a failure (the
+/// install itself stays done; install errors are exit 2).
+fn after_install_doctor(layout: &Layout, host: &dyn Host) -> ExitCode {
+    let opts = DoctorOptions {
+        user: None,
+        home: std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute()),
+    };
+    let report = doctor::run(layout, host, &Getent, &opts);
+    outln!();
+    out!("{}", report.to_text());
+    if report.exit_code() == 2 {
+        eprintln!(
+            "saiife: installed, but doctor found failures: fix them before relying on the lock"
+        );
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 pub fn run(action: SystemAction) -> ExitCode {
     match action {
         SystemAction::Install {
@@ -125,7 +150,7 @@ pub fn run(action: SystemAction) -> ExitCode {
                     } else {
                         println!("saiife: locked mode is installed; the daemon is running");
                     }
-                    ExitCode::SUCCESS
+                    after_install_doctor(&layout, host.as_ref())
                 }
                 Err(e) => report_error("install", e),
             }

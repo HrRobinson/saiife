@@ -1,6 +1,6 @@
 //! `saiife init` and `saiife init --off` (spec §5, §5.1, §5.2, §7.5).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use saiife_agents::config::{self, CONFIG_REL};
@@ -10,9 +10,45 @@ use saiife_agents::integrity::{self, HookRecord, Integrity, INTEGRITY_VERSION};
 use saiife_agents::{Agent, Change};
 use saiifeguard::Pack;
 
+use saiife_policy::installed::read_installed;
+use saiife_system::layout::INSTALLED;
+use saiife_system::Layout;
+
 use crate::project::project_root;
 
-pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> ExitCode {
+/// Locked mode (spec §7 `init`): `Some(agents with a managed hook)` when
+/// `<root>/etc/saiife/installed.toml` exists, `None` in developer mode. An
+/// unreadable record is locked mode with no agent known to be managed.
+fn locked_mode(system_root: Option<PathBuf>) -> Option<Vec<String>> {
+    let layout = system_root
+        .map(Layout::under)
+        .unwrap_or_else(Layout::system);
+    let path = layout.at(INSTALLED);
+    std::fs::symlink_metadata(&path).ok()?;
+    match read_installed(&path) {
+        Ok(i) => Some(
+            i.map(|i| i.agents.into_iter().map(|a| a.agent).collect())
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            crate::warn(&format!(
+                "{}; every agent gets a project hook",
+                crate::text::sanitize(&e)
+            ));
+            Some(Vec::new())
+        }
+    }
+}
+
+/// `system_root`: the hidden `--root` (tests); the real `/` otherwise.
+pub fn run(
+    builtin: &[Pack],
+    agent_names: &[String],
+    pack_ids: &[String],
+    system_root: Option<PathBuf>,
+) -> ExitCode {
+    let locked = locked_mode(system_root);
+    let managed = locked.clone().unwrap_or_default();
     let Ok(cwd) = std::env::current_dir() else {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
@@ -25,7 +61,8 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     // Which agents.
     let agents = if agent_names.is_empty() {
         let found = detect_agents();
-        if found.is_empty() {
+        // Locked mode still writes the project config (its packs apply).
+        if found.is_empty() && locked.is_none() {
             eprintln!(
                 "saiife: no supported agent found on PATH (looked for claude, codex, gemini).\n\
                  Install one, or name it: saiife init --agent claude"
@@ -145,6 +182,13 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
 
     let mut installed = Vec::new();
     for agent in &agents {
+        if managed.iter().any(|m| m == agent.name()) {
+            lines.push(format!(
+                "  {}: managed hook installed by the admin; no project hook written",
+                agent.name()
+            ));
+            continue;
+        }
         match agent.install(&root) {
             Ok(change) => {
                 note_created(&mut created, &change, agent.config_rel());
@@ -252,7 +296,10 @@ pub fn run(builtin: &[Pack], agent_names: &[String], pack_ids: &[String]) -> Exi
     for w in &warnings {
         outln!("\n{w}");
     }
-    path_warning(&exe);
+    // The PATH matters only to project hooks.
+    if locked.is_none() || !installed.is_empty() {
+        path_warning(&exe);
+    }
     if !installed.is_empty() {
         outln!("\nNext steps:");
         for agent in &installed {
@@ -286,7 +333,11 @@ fn path_warning(exe: &Path) {
     }
 }
 
-pub fn off() -> ExitCode {
+/// `system_root`: the hidden `--root` (tests); the real `/` otherwise. In
+/// locked mode the project config stays (it sets this project's packs) and
+/// the managed hooks are not touched.
+pub fn off(system_root: Option<PathBuf>) -> ExitCode {
+    let locked = locked_mode(system_root).is_some();
     let Ok(cwd) = std::env::current_dir() else {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
@@ -372,7 +423,11 @@ pub fn off() -> ExitCode {
     }
 
     let config_path = root.join(CONFIG_REL);
-    if config_path.exists() && !failed_agents.is_empty() {
+    if config_path.exists() && locked {
+        lines.push(format!(
+            "  config  {CONFIG_REL} kept (locked mode: it sets this project's packs)"
+        ));
+    } else if config_path.exists() && !failed_agents.is_empty() {
         lines.push(format!(
             "  config  {CONFIG_REL} kept (saiife is still on for the agent(s) above)"
         ));
@@ -448,6 +503,9 @@ pub fn off() -> ExitCode {
     }
     for l in &lines {
         outln!("{l}");
+    }
+    if locked {
+        outln!("managed hooks stay (remove them with: sudo saiife system uninstall)");
     }
     if failed {
         ExitCode::from(1)

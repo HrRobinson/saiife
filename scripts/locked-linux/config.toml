@@ -1,0 +1,13 @@
+# The system config the locked-linux CI job installs (scripts/locked-linux/
+# run.sh). Locked, with the CI's unprivileged agent user in one scope.
+# run.sh swaps the min_free_mb line to test the disk floor: keep it exactly
+# as written.
+version = 2
+locked = true
+
+[audit]
+min_free_mb = 512
+
+[[scope]]
+name = "ci"
+users = ["agent-ci"]

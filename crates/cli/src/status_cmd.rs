@@ -11,9 +11,13 @@ use saiife_agents::config::{self, CONFIG_REL};
 use saiife_agents::detect::which;
 use saiife_agents::fingerprint::sha256_hex;
 use saiife_agents::integrity::{self, Integrity};
-use saiife_agents::Agent;
+use saiife_agents::{lock, Agent};
 use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
+use saiife_policy::installed::{read_installed, FileKind, Installed};
+use saiife_policy::{active_packs, effective_policy, load_system, policy_hash, PackInfo};
+use saiife_system::layout::{CONFIG, INSTALLED};
+use saiife_system::{host_for, Host, Layout};
 use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
@@ -58,16 +62,37 @@ struct Problem {
     fix: String,
 }
 
-pub fn run(builtin: &[Pack]) -> ExitCode {
+/// `system_root`: the hidden `--root` (tests); the real `/` otherwise.
+pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
     let Ok(cwd) = std::env::current_dir() else {
         eprintln!("saiife: cannot read the current directory");
         return ExitCode::from(2);
     };
     let root = project_root(&cwd);
     outln!("saiife status for {}", shown(&root));
+    let layout = system_root
+        .map(Layout::under)
+        .unwrap_or_else(Layout::system);
+    let locked = locked_block(&layout, builtin);
+    let locked_failed = locked.as_ref().is_some_and(|l| l.failed);
+    // Agents with a managed hook need no project hook (spec §7 `init`).
+    let managed = locked.map(|l| l.managed).unwrap_or_default();
 
     let record = match load_record(&root) {
         Ok(Some(r)) => r,
+        Ok(None) if !managed.is_empty() => {
+            outln!(
+                "\n  project hooks: none (`saiife init` was not run here); the managed hooks guard {}",
+                managed.join(", ")
+            );
+            return if locked_failed {
+                outln!("\nLocked mode check(s) failed.");
+                ExitCode::from(1)
+            } else {
+                outln!("\nAll checks passed.");
+                ExitCode::SUCCESS
+            };
+        }
         Ok(None) => {
             outln!(
                 "\nWARNING: saiife is not set up for this project on this machine \
@@ -236,10 +261,11 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
 
     // A hook `init --off` could not remove may still guard; otherwise no
     // successful hook means nothing is protected, failed entries or not.
-    if !record
-        .hooks
-        .values()
-        .any(|h| h.error.is_none() || h.off_failed)
+    if managed.is_empty()
+        && !record
+            .hooks
+            .values()
+            .any(|h| h.error.is_none() || h.off_failed)
     {
         problems.push(Problem {
             what: "no agent is hooked in this project, so saiife guards nothing here.".into(),
@@ -263,10 +289,18 @@ pub fn run(builtin: &[Pack]) -> ExitCode {
             outln!("\nWARNING: {}\n  Fix: {}", p.what, p.fix);
         }
     }
-    outln!(
-        "\nsaiife v1 catches mistakes and makes a switched-off guard visible; it cannot stop a \
-         determined agent running as your user."
-    );
+    if managed.is_empty() {
+        outln!(
+            "\nsaiife v1 catches mistakes and makes a switched-off guard visible; it cannot stop a \
+             determined agent running as your user."
+        );
+    }
+    if locked_failed {
+        problems.push(Problem {
+            what: "the locked mode checks above failed.".into(),
+            fix: String::new(),
+        });
+    }
     if problems.is_empty() {
         outln!("All checks passed.");
         ExitCode::SUCCESS
@@ -675,6 +709,237 @@ fn ago(t: OffsetDateTime) -> String {
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
     }
+}
+
+// ------------------------------------------------------------ locked mode
+
+/// What the `Locked mode` block found.
+struct LockedState {
+    /// Something makes every managed hook call fail or the install differ
+    /// from its record: status exits 1.
+    failed: bool,
+    /// Agents with a managed hook.
+    managed: Vec<String>,
+}
+
+/// The `Locked mode` block (spec §7 `status`), printed when
+/// `<root>/etc/saiife/installed.toml` exists; `None` otherwise (developer
+/// mode). Pending approvals and lockdown come in plan 11.
+fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
+    let installed_path = layout.at(INSTALLED);
+    // A dangling or symlinked record still means locked mode (and fails).
+    std::fs::symlink_metadata(&installed_path).ok()?;
+    let mut st = LockedState {
+        failed: false,
+        managed: Vec::new(),
+    };
+    outln!("\nLocked mode");
+    let installed = match read_installed(&installed_path) {
+        Ok(Some(i)) => {
+            outln!(
+                "  mode: locked (installed {}, saiife {})",
+                sanitize(&i.installed_at),
+                sanitize(&i.saiife)
+            );
+            Some(i)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            st.failed = true;
+            outln!(
+                "  mode: locked (the install record cannot be read: {}); ask your administrator to run `sudo saiife system install`",
+                sanitize(&e)
+            );
+            None
+        }
+    };
+
+    let config = load_system(&layout.at(CONFIG))
+        .map_err(|e| e.to_string())
+        .and_then(|l| {
+            if l.config.locked {
+                Ok(l)
+            } else {
+                Err(format!("{CONFIG}: locked is not true"))
+            }
+        });
+    let host = host_for(layout);
+    let daemon = match &host {
+        Ok(h) => daemon_status(layout, h.as_ref(), config.as_ref().ok().map(|l| &l.config)),
+        Err(e) => Err(e.to_string()),
+    };
+    match daemon {
+        Ok(line) => outln!("  daemon: running, {line}"),
+        Err(e) => {
+            st.failed = true;
+            outln!(
+                "  daemon: not answering ({}): every managed hook call is denied",
+                sanitize(&e)
+            );
+        }
+    }
+    match &config {
+        Ok(l) => {
+            let catalog: Vec<PackInfo> = builtin
+                .iter()
+                .map(|p| PackInfo {
+                    id: p.id.clone(),
+                    version: p.version,
+                    default_on: p.default_on,
+                })
+                .collect();
+            let (packs, _) = active_packs(&l.config, &catalog, None);
+            outln!(
+                "  policy: {}",
+                policy_hash(&effective_policy(&l.config, &packs, None))
+            );
+        }
+        Err(e) => {
+            st.failed = true;
+            outln!(
+                "  policy: invalid ({}): every managed hook call is denied and nothing is recorded",
+                sanitize(e)
+            );
+        }
+    }
+    if let Some(i) = &installed {
+        for a in &i.agents {
+            let wording = Agent::from_name(&a.agent)
+                .map(|ag| lock::label(ag).wording())
+                .unwrap_or("unknown agent");
+            outln!("  agent {}: managed hook, {wording}", sanitize(&a.agent));
+            st.managed.push(a.agent.clone());
+        }
+        for problem in fingerprint_problems(layout, i) {
+            st.failed = true;
+            outln!(
+                "  WARNING: {}\n    Fix: ask your administrator to run `sudo saiife system install` (or `sudo saiife doctor`)",
+                sanitize(&problem)
+            );
+        }
+    }
+    if let Ok(l) = &config {
+        for s in &l.config.guard.mcp.allow_servers {
+            outln!(
+                "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
+                sanitize(s)
+            );
+        }
+    }
+    Some(st)
+}
+
+/// `chain <id>, head seq <n>, last checkpoint seq <m>` from the daemon's
+/// `status`, or why it did not answer.
+#[cfg(target_os = "linux")]
+fn daemon_status(
+    layout: &Layout,
+    host: &dyn Host,
+    cfg: Option<&saiife_policy::SystemConfig>,
+) -> Result<String, String> {
+    use saiife_ipc::client::Client;
+    use saiife_ipc::msg::OP_STATUS;
+    use saiife_system::layout::{DAEMON_USER, RUN_DIR};
+    use serde_json::{Map, Value};
+    use std::time::Instant;
+    // The §5.2 default lies under the layout's root; any other value is
+    // taken as written (as `doctor` does).
+    let configured = |value: &Path, default: &str| {
+        if value == Path::new(default) {
+            layout.at(default)
+        } else {
+            value.to_path_buf()
+        }
+    };
+    let (user, dir) = match cfg {
+        Some(c) => (
+            c.daemon.user.clone(),
+            configured(&c.daemon.socket_dir, RUN_DIR),
+        ),
+        None => (DAEMON_USER.to_string(), layout.at(RUN_DIR)),
+    };
+    let Some(uid) = host.user(&user).map(|u| u.uid) else {
+        return Err(format!("the daemon user {user} does not exist"));
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let m = Client::connect(&dir, uid, deadline)
+        .and_then(|mut c| c.call(OP_STATUS, Map::new(), deadline))
+        .map_err(|e| e.to_string())?;
+    let show = |k: &str| match m.get(k) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => "none".to_string(),
+        Some(v) => v.to_string(),
+    };
+    Ok(format!(
+        "chain {}, head seq {}, last checkpoint seq {}",
+        show("chain"),
+        show("head_seq"),
+        show("last_checkpoint_seq")
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_status(
+    _layout: &Layout,
+    _host: &dyn Host,
+    _cfg: Option<&saiife_policy::SystemConfig>,
+) -> Result<String, String> {
+    Err(saiife_system::NOT_LINUX.to_string())
+}
+
+/// Installed files whose fingerprint differs from `installed.toml`: the
+/// binary, the unit and the managed agent configs. The config is the
+/// admin's to edit, and the vault key has no digest on record.
+fn fingerprint_problems(layout: &Layout, i: &Installed) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut check = |listed: &Path, got: Result<Option<String>, String>, want: &str| {
+        let shown = listed.display();
+        match got {
+            Ok(Some(g)) if g == want => {}
+            Ok(Some(_)) => out.push(format!("{shown}: changed since install")),
+            Ok(None) => out.push(format!("{shown}: missing")),
+            Err(e) => out.push(format!("{shown}: cannot be checked: {e}")),
+        }
+    };
+    let file_sha = |listed: &Path| -> Result<Option<String>, String> {
+        let at = layout.try_at(listed).map_err(|e| e.to_string())?;
+        match std::fs::symlink_metadata(&at) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+            Ok(m) if !m.is_file() => return Err("not a regular file".into()),
+            Ok(_) => {}
+        }
+        std::fs::read(&at)
+            .map(|b| Some(sha256_hex(&b)))
+            .map_err(|e| e.to_string())
+    };
+    for f in &i.files {
+        if matches!(f.kind, FileKind::Config | FileKind::VaultKey) {
+            continue;
+        }
+        if let Some(want) = &f.sha256 {
+            check(&f.path, file_sha(&f.path), want);
+        }
+    }
+    for a in &i.agents {
+        let got = if a.whole_file {
+            file_sha(&a.path)
+        } else {
+            layout
+                .try_at(&a.path)
+                .map_err(|e| e.to_string())
+                .and_then(|at| {
+                    match a.agent.as_str() {
+                        "codex" => saiife_agents::codex::managed_entry(&at),
+                        "gemini" => saiife_agents::gemini::managed_entry(&at),
+                        other => return Err(format!("unknown managed agent {other:?}")),
+                    }
+                    .map_err(|e| e.to_string())
+                })
+        };
+        check(&a.path, got, &a.sha256);
+    }
+    out
 }
 
 #[cfg(test)]

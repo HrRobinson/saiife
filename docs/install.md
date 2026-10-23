@@ -101,6 +101,91 @@ This puts `saiife` in `~/.cargo/bin`.
    The log is your record of what the agents did. Keep it if you may need it.
 4. Optional: delete the `.saiife` folder in each project.
 
+## Locked mode (Linux)
+
+In developer mode (everything above) the hooks run as your user, so an agent
+running as your user can switch them off. Locked mode moves the hooks, the
+policy and the audit log out of the agent user's reach: root installs them,
+and a daemon (`saiifed`, its own system user) writes the audit log.
+
+### Supported systems
+
+Ubuntu 22.04 or later, Debian 12 or later, and RHEL 9 or later (also Rocky
+and Alma 9+), each with systemd running. Install refuses anything else
+(Alpine, containers, no systemd) with one line:
+`saiife: locked mode is not supported here: <why>. Developer mode works as before.`
+macOS gets locked mode in v2.1.
+
+### Install
+
+```sh
+sudo saiife system install --agents claude,codex,gemini
+```
+
+- `--agents` defaults to all three. Install only adds managed hooks; to
+  remove one, uninstall.
+- `--config <file>` installs your system config (it must say
+  `locked = true`). Without it, install keeps the current
+  `/etc/saiife/config.toml` or writes a commented default.
+- `--approvers <list>` sets the approvers in a new default config (user
+  names, or `group:<name>`).
+- `--non-interactive` for scripts and configuration tools.
+
+Install creates the `saiife` user and the `saiife` and `saiife-audit`
+groups, copies the binary to `/opt/saiife/bin/saiife`, writes `/etc/saiife`
+(config, `policy.d`, the vault key, `installed.toml`), the
+`saiifed.service` unit and the managed hook files
+(`/etc/claude-code/managed-settings.d/50-saiife.json`,
+`/etc/codex/requirements.toml`, `/etc/gemini-cli/settings.json`), starts the
+daemon, then runs `saiife doctor` and prints its report. Running it again
+changes only what differs.
+
+Exit codes: 0 installed, 1 installed but `doctor` found a failure (fix it
+before you rely on the lock), 2 install error or unsupported system.
+
+The managed hooks fail closed: if the daemon is down, the policy is invalid
+or the guard crashes, every agent tool call is denied. Project hooks from
+`saiife init` go quiet for agents that have a managed hook. In a project,
+`saiife init` then writes only `.saiife/config.toml` (packs can be added,
+never removed), and `saiife init --off` removes leftover project hooks and
+keeps the config.
+
+### Check it
+
+```sh
+sudo saiife doctor          # every check; --json for tools
+saiife doctor               # as an agent user: your own account
+saiife status               # in a project: the Locked mode block first
+```
+
+`doctor` exits 0 when everything passes, 1 on a warning and 2 on a failure.
+`status` exits 1 when the daemon does not answer, the policy is invalid or
+an installed file changed.
+
+### Lock labels
+
+How well a managed hook holds depends on the agent. The labels come from the
+live lock check (`docs/lock-check.md`); `doctor` and `status` show them.
+
+| Agent | Label |
+|---|---|
+| Claude Code | lockable |
+| Codex | unverified (managed hook installed; `doctor` warns) |
+| Gemini CLI | unverified (managed hook installed; `doctor` warns) |
+
+### Uninstall
+
+```sh
+sudo saiife system uninstall          # keeps config, vault key, state, audit, users
+sudo saiife system uninstall --purge  # removes everything install made
+```
+
+Uninstall removes exactly what `installed.toml` lists. By default it keeps
+`/etc/saiife/config.toml`, the vault key, `/var/lib/saiife`,
+`/var/log/saiife` and the users and groups (`--keep-audit` says the same
+explicitly). `--purge` also removes the state, the audit log, the config and
+vault key install wrote (never an admin's own) and the users and groups.
+
 ## Network use
 
 saiife makes no network calls. Only `install.sh` downloads files, and only when you run it.
