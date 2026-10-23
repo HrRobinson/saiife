@@ -533,8 +533,9 @@ pub enum McpIdentity {
 /// Claude Code and Codex name MCP tools `mcp__<server>__<tool>`. The name
 /// is matched against the listed servers: the longest listed `s` with
 /// `mcp__<s>__` as a prefix. When the rest of the name holds another `__`,
-/// a longer, unlisted server could be meant (`mcp__linear__evil__x` from a
-/// server `linear__evil`): denied as ambiguous.
+/// or starts with `_`, a longer, unlisted server could be meant
+/// (`mcp__linear__evil__x` from a server `linear__evil`, `mcp__linear___x`
+/// from `linear_`): denied as ambiguous.
 ///
 /// Gemini CLI names them `mcp_<server>_<tool>`, which cannot be split, so a
 /// Gemini MCP call (a name starting `mcp_` or holding `__`, or any payload
@@ -557,7 +558,9 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
         Some(match best {
             Some(s) => {
                 let name = &rest[s.len() + 2..];
-                if name.is_empty() || name.contains("__") {
+                // `mcp__linear___x` may come from an unlisted `linear_`
+                // (Claude Code turns `linear.` into `linear_`).
+                if name.is_empty() || name.contains("__") || name.starts_with('_') {
                     McpCheck::Denied(tool.to_string())
                 } else {
                     McpCheck::Allowed
@@ -586,8 +589,10 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
     found.unwrap_or(McpCheck::NotMcp)
 }
 
-/// The MCP server identity `payload` states. A payload that is not a JSON
-/// object states none (the worker denies it as unusable).
+/// The MCP server identity `payload` states. A payload that does not parse
+/// (the worker denies it as unusable) states none, unless its raw text
+/// mentions `"mcp_context"` (a duplicate key, say): then it is an MCP call
+/// whose server is unknown.
 // Used by the locked hook, which is Linux-only in this version.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn mcp_identity(payload: &str) -> McpIdentity {
@@ -603,7 +608,11 @@ pub fn mcp_identity(payload: &str) -> McpIdentity {
         mcp_context: Option<serde_json::Value>,
     }
     let Ok(p) = serde_json::from_str::<P>(payload) else {
-        return McpIdentity::Absent;
+        return if payload.contains("\"mcp_context\"") {
+            McpIdentity::NoServer
+        } else {
+            McpIdentity::Absent
+        };
     };
     match p.mcp_context {
         None => McpIdentity::Absent,
@@ -1220,6 +1229,27 @@ mod tests {
                 McpCheck::Allowed,
                 "{agent}"
             );
+            // `linear_` (from `linear.`) does not pass as `linear`.
+            assert_eq!(
+                mcp_check(agent, "mcp__linear___x", &NONE, &list(&["linear"])),
+                McpCheck::Denied("mcp__linear___x".into()),
+                "{agent}"
+            );
+            assert_eq!(
+                mcp_check(agent, "mcp__linear___x", &NONE, &list(&["linear_"])),
+                McpCheck::Allowed,
+                "{agent}"
+            );
+            assert_eq!(
+                mcp_check(
+                    agent,
+                    "mcp__linear___x",
+                    &NONE,
+                    &list(&["linear", "linear_"])
+                ),
+                McpCheck::Allowed,
+                "{agent}"
+            );
             assert_eq!(
                 mcp_check(agent, "mcp__a__b__c", &NONE, &list(&["a__b__c"])),
                 McpCheck::Denied("a".into()),
@@ -1252,6 +1282,11 @@ mod tests {
         for p in [r#"{"tool_name":"mcp_linear_x"}"#, "not json"] {
             assert_eq!(mcp_identity(p), McpIdentity::Absent, "{p}");
         }
+        // Unparsable, yet it names an `mcp_context`.
+        let dup =
+            r#"{"tool_name":"search","mcp_context":{"server_name":"linear"},"mcp_context":{}}"#;
+        assert_eq!(mcp_identity(dup), McpIdentity::NoServer);
+        assert_eq!(mcp_identity(r#"{"mcp_context": {"#), McpIdentity::NoServer);
         // The ruling's case end to end.
         let p = r#"{"tool_name":"search","mcp_context":{}}"#;
         assert_eq!(

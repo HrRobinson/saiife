@@ -987,6 +987,15 @@ fn listed_mcp_server_allowed_not_judged() {
         stderr(&o)
     );
     assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    // Nor does `docs_` (Claude Code's form of `docs.`).
+    v["tool_name"] = json!("mcp__docs___search");
+    let (o, _, _sb) = managed_as("claude", &d.config(), &v.to_string(), &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by guard.mcp: MCP server mcp__docs___search"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 /// Controller ruling: on Gemini only an explicit server identity in the
@@ -1028,6 +1037,21 @@ fn gemini_mcp_needs_server_identity() {
     let o = call(Some(json!({"server_name": "docs", "tool_name": "search"})));
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
     assert_eq!(last_guard(&d)["reason"], "tool not judged");
+    // A duplicate `mcp_context` key: the payload does not parse, so the
+    // server is unknown (the second key cannot hide the call).
+    let o = managed_as(
+        "gemini",
+        &d.config(),
+        r#"{"session_id":"g-1","cwd":"/","hook_event_name":"BeforeTool","tool_name":"search","tool_input":{},"mcp_context":{"server_name":"docs"},"mcp_context":{}}"#,
+        &[],
+        &[],
+    )
+    .0;
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server unknown on Gemini"
+    );
     // A bare tool name with an `mcp_context` but no server: unknown.
     let o = managed_as(
         "gemini",
