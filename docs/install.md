@@ -133,6 +133,13 @@ sudo /usr/local/bin/saiife system install --agents claude,codex,gemini
 (or download and extract the tarball as root.) Install copies the binary it
 runs to `/opt/saiife/bin/saiife`.
 
+Install refuses to write below a directory that is not root's or that
+group or others can write (sticky directories excepted): another user
+could swap what install puts there. It names the directory
+(`saiife: install failed at check: /opt: mode 0777 is writable by group or
+others`). Check the owner and mode, and if nothing on the machine needs
+it writable, fix it before installing, for example `sudo chmod go-w /opt`.
+
 **Why only the static release build (spec §9.2 A4).** The managed hooks run
 `/opt/saiife/bin/saiife` as the agent user, in an environment the agent can
 shape: Claude Code's settings `env`, for one, is set by files the agent can
@@ -188,6 +195,8 @@ saiife status               # in a project: the Locked mode block first
 ```
 
 `doctor` exits 0 when everything passes, 1 on a warning and 2 on a failure.
+Its sudo check reads `sudo -l` only: rules in doas, polkit (`pkexec`) or
+`run0` that give an agent user root are not checked.
 `status` exits 1 when the daemon does not answer, the policy is invalid or
 an installed file changed.
 

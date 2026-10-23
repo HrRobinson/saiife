@@ -43,6 +43,7 @@ WORK="$(mktemp -d)"
 export WORK
 trap 'on_exit $?' EXIT
 
+prepare_host
 phase_install
 phase_modes
 phase_hooks

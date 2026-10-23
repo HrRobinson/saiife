@@ -53,12 +53,12 @@ on_exit() {
         as_root journalctl -u saiifed --no-pager -o short-precise >"$LOGS/journal-saiifed.txt" 2>&1 || true
         as_root systemctl status saiifed --no-pager >"$LOGS/systemctl-status.txt" 2>&1 || true
         as_root sh -c 'ls -la /etc/saiife /etc/saiife/credstore /var/lib/saiife /var/lib/saiife/keys /var/log/saiife /var/log/saiife/audit /run/saiife' >"$LOGS/ls.txt" 2>&1 || true
-        for p in /etc/saiife "$AUDIT_DIR" "$UNIT_FILE"; do
-            as_root cp -r "$p" "$LOGS/" 2>/dev/null || true
-        done
-        # Never upload a key.
-        as_root rm -rf "$LOGS/saiife/credstore" 2>/dev/null || true
-        as_root chown -R "$(id -u):$(id -g)" "$LOGS" 2>/dev/null || true
+        # Copied as root through tar, the credstore (the vault key) left
+        # out at copy time: it never lands in $LOGS, not even for a moment.
+        # The unprivileged tar writes the copy as the runner user.
+        as_root tar -C / --exclude=etc/saiife/credstore -cf - \
+            etc/saiife "${AUDIT_DIR#/}" "${UNIT_FILE#/}" 2>/dev/null |
+            tar -C "$LOGS" -xf - 2>/dev/null || true
         cp -r "$WORK" "$LOGS/work" 2>/dev/null || true
     fi
     rm -rf "$WORK"
@@ -236,6 +236,30 @@ listed_paths() {
 
 # ------------------------------------------------------------ phases
 
+# GitHub's runner images ship /opt as 0777. `system install` refuses to
+# write below a directory group or others can write (a production
+# safeguard, docs/install.md), so the throwaway runner is normalised first:
+# every ancestor install writes below loses group/other write (sticky
+# dirs excepted), and each change is logged. /var/log is left as the image
+# has it (Ubuntu: root:syslog 0775): `uninstall --purge` must cope with it.
+prepare_host() {
+    phase "0. host preparation (runner image)"
+    local d mode owner
+    for d in /opt /etc /etc/systemd /etc/systemd/system /var /var/lib /run /usr/local; do
+        [[ -d "$d" ]] || continue
+        owner="$(stat -c '%U' "$d")"
+        mode="$(stat -c '%a' "$d")"
+        [[ "$owner" == root ]] || fail "$d is owned by $owner, not root"
+        if (((8#$mode & 8#022) != 0 && (8#$mode & 8#1000) == 0)); then
+            as_root chmod go-w "$d"
+            echo "  changed: $d mode $mode -> $(stat -c '%a' "$d")"
+        else
+            echo "  kept: $d mode $mode"
+        fi
+    done
+    echo "  kept: /var/log $(stat -c '%U:%G %a' /var/log)"
+}
+
 phase_install() {
     phase "1. system install (systemd $(systemd_version), $(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2-))"
     as_root useradd -m -s /bin/bash "$AGENT_USER"
@@ -286,35 +310,43 @@ phase_modes() {
 
 phase_hooks() {
     phase "3. managed hooks as $AGENT_USER"
-    expect_hook 0 "" "claude Bash allow" claude "$(payload claude/bash-allow.json)"
+    # Each payload is made first: a failing `payload` inside an argument
+    # list would not stop the job (set -e ignores it there).
+    local allow deny codex_deny gemini_deny mcp write
+    allow="$(payload claude/bash-allow.json)"
+    deny="$(payload claude/bash-deny.json)"
+    codex_deny="$(payload codex/bash-deny.json)"
+    gemini_deny="$(payload gemini/shell-deny.json)"
+    mcp="$(payload codex/mcp-tool.json)"
+    write="$(payload claude/write.json '.tool_input.file_path = "/etc/saiife/x"')"
+    expect_hook 0 "" "claude Bash allow" claude "$allow"
     expect_last_guard claude allow "ls -la"
-    expect_hook 2 "BLOCKED by" "claude Bash deny" claude "$(payload claude/bash-deny.json)"
+    expect_hook 2 "BLOCKED by" "claude Bash deny" claude "$deny"
     expect_last_guard claude deny "rm -rf /"
-    expect_hook 2 "BLOCKED by" "codex Bash deny" codex "$(payload codex/bash-deny.json)"
+    expect_hook 2 "BLOCKED by" "codex Bash deny" codex "$codex_deny"
     expect_last_guard codex deny
-    expect_hook 2 "BLOCKED by" "gemini shell deny" gemini "$(payload gemini/shell-deny.json)"
+    expect_hook 2 "BLOCKED by" "gemini shell deny" gemini "$gemini_deny"
     expect_last_guard gemini deny
-    expect_hook 2 "BLOCKED by guard.mcp" "codex MCP tool of an unlisted server" codex \
-        "$(payload codex/mcp-tool.json)"
-    expect_hook 2 "BLOCKED by core.lock" "claude Write to /etc/saiife/x" claude \
-        "$(payload claude/write.json '.tool_input.file_path = "/etc/saiife/x"')"
+    expect_hook 2 "BLOCKED by guard.mcp" "codex MCP tool of an unlisted server" codex "$mcp"
+    expect_hook 2 "BLOCKED by core.lock" "claude Write to /etc/saiife/x" claude "$write"
     as_root test ! -e /etc/saiife/x || fail "/etc/saiife/x exists"
-    expect_hook 2 "" "guard worker SIGSEGV" claude "$(payload claude/bash-allow.json)" SAIIFE_EVAL_FAULT=segv
+    expect_hook 2 "" "guard worker SIGSEGV" claude "$allow" SAIIFE_EVAL_FAULT=segv
     expect_last_guard claude error_denied
-    expect_hook 2 "" "guard worker hang" claude "$(payload claude/bash-allow.json)" SAIIFE_EVAL_FAULT=hang
+    expect_hook 2 "" "guard worker hang" claude "$allow" SAIIFE_EVAL_FAULT=hang
     audit_verify
 }
 
 phase_fail_closed() {
     phase "4. fail closed (spec §9.3)"
-    local spec agent fixture before
+    local spec agent fixture before p
     as_root systemctl stop saiifed
     for spec in claude:claude/bash-deny.json claude:claude/bash-allow.json \
         codex:codex/bash-deny.json codex:codex/bash-allow.json \
         gemini:gemini/shell-deny.json gemini:gemini/shell-allow.json; do
         agent="${spec%%:*}"
         fixture="${spec#*:}"
-        expect_hook 2 "fail closed" "daemon stopped: $fixture" "$agent" "$(payload "$fixture")"
+        p="$(payload "$fixture")"
+        expect_hook 2 "fail closed" "daemon stopped: $fixture" "$agent" "$p"
     done
     as_root systemctl start saiifed
     wait_until 30 "the daemon socket after start" daemon_ready
@@ -324,10 +356,10 @@ phase_fail_closed() {
     as_root systemctl kill -s KILL saiifed
     wait_until 60 "the restart after SIGKILL" restarted_since "$before"
     expect_last_start false "after SIGKILL and the automatic restart"
-    expect_hook 0 "" "allow after the restart" claude "$(payload claude/bash-allow.json)"
-
     local allow
     allow="$(payload claude/bash-allow.json)"
+    expect_hook 0 "" "allow after the restart" claude "$allow"
+
     as_root sed -i 's/^min_free_mb = 512$/min_free_mb = 99999999/' /etc/saiife/config.toml
     as_root grep -qx 'min_free_mb = 99999999' /etc/saiife/config.toml || fail "min_free_mb was not raised"
     as_root systemctl reload saiifed
@@ -421,5 +453,7 @@ phase_reinstall_uninstall() {
         fi
     done
     [[ -z "$(getent passwd saiife || true)" ]] || fail "purge left the user saiife"
-    ok "purged: nothing under /etc/saiife, /var/lib/saiife, /var/log/saiife, /opt/saiife; no user saiife"
+    [[ -z "$(getent group saiife saiife-audit || true)" ]] ||
+        fail "purge left a group: $(getent group saiife saiife-audit)"
+    ok "purged: nothing under /etc/saiife, /var/lib/saiife, /var/log/saiife, /opt/saiife; no user saiife, no groups saiife, saiife-audit"
 }
