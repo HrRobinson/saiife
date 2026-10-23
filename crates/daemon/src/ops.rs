@@ -237,6 +237,8 @@ pub enum Notice {
     Connections,
     /// The audit volume is below `[audit] min_free_mb`.
     LowDisk,
+    /// A request the uid may not make (non-guard append, admin op).
+    Forbidden,
 }
 
 impl Notice {
@@ -245,6 +247,7 @@ impl Notice {
         match self {
             Notice::Requests | Notice::Connections => "rate_limited",
             Notice::LowDisk => "low_disk",
+            Notice::Forbidden => "forbidden",
         }
     }
 
@@ -258,6 +261,9 @@ impl Notice {
                 "uid {uid} is over its connection limits (32 open per uid, or the daemon's total)"
             ),
             Notice::LowDisk => format!("uid {uid}: audit volume below [audit] min_free_mb"),
+            Notice::Forbidden => format!(
+                "uid {uid} made a request it is not allowed to make (a non-guard audit.append or an admin op)"
+            ),
         }
     }
 }
@@ -315,7 +321,10 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 
 async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
-    let forbidden = |m: &str| err(id, ErrorCode::Forbidden, m);
+    let forbidden = |m: &str| {
+        ctx.notice(peer.uid, Notice::Forbidden);
+        err(id, ErrorCode::Forbidden, m)
+    };
     let Some(raw) = req.args.get("rec").and_then(Value::as_object) else {
         return err(
             id,
@@ -411,6 +420,7 @@ fn status(ctx: &Ctx, id: u64) -> Value {
 
 async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
     if !ctx.is_admin(peer.uid).await {
+        ctx.notice(peer.uid, Notice::Forbidden);
         return err(
             id,
             ErrorCode::Forbidden,
@@ -474,6 +484,8 @@ mod tests {
             Notice::LowDisk.reason(1000),
             "uid 1000: audit volume below [audit] min_free_mb"
         );
+        assert_eq!(Notice::Forbidden.event(), "forbidden");
+        assert!(Notice::Forbidden.reason(1000).contains("uid 1000 "));
         assert_eq!(Notice::Requests.event(), "rate_limited");
         assert_eq!(Notice::Connections.event(), "rate_limited");
         assert_eq!(Notice::LowDisk.event(), "low_disk");

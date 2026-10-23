@@ -171,7 +171,32 @@ fn append_non_guard_kind_is_forbidden() {
     assert_eq!(refused_code(&e), "bad_request");
     let e = c.call("audit.append", Map::new(), dl()).unwrap_err();
     assert_eq!(refused_code(&e), "bad_request");
-    assert_eq!(d.records().len(), before);
+    // Four refusals, one record: at most one notice per uid per minute.
+    assert!(wait_for(Duration::from_secs(5), || d
+        .events("forbidden")
+        .len()
+        == 1));
+    let f = d.events("forbidden");
+    assert_eq!(f.len(), 1);
+    let reason = f[0]["reason"].as_str().unwrap();
+    assert!(reason.contains(&format!("uid {} ", own_uid())), "{reason}");
+    assert_eq!(d.records().len(), before + 1);
+}
+
+#[test]
+fn rotate_key_forbidden_is_recorded_once() {
+    let d = TestDaemon::start(Opts::default());
+    let mut c = d.client();
+    for _ in 0..2 {
+        let e = c.call("audit.rotate_key", Map::new(), dl()).unwrap_err();
+        assert_eq!(refused_code(&e), "forbidden");
+    }
+    assert!(wait_for(Duration::from_secs(5), || d
+        .events("forbidden")
+        .len()
+        == 1));
+    assert_eq!(d.events("forbidden").len(), 1);
+    assert_verifies(&d);
 }
 
 fn raw(d: &TestDaemon) -> UnixStream {
