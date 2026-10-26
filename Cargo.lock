@@ -1243,10 +1243,13 @@ dependencies = [
 name = "saiife-daemon"
 version = "0.1.1"
 dependencies = [
+ "base64 0.23.1",
+ "bytes",
  "chacha20poly1305",
  "getrandom 0.3.4",
  "rustix",
  "saiife-audit",
+ "saiife-broker",
  "saiife-ipc",
  "saiife-policy",
  "saiife-system",

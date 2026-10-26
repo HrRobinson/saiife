@@ -1,11 +1,14 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
-use crate::ops::{Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::ops::{check_services, Ctx, CtxInit, PolicyState, MODE, VERSION};
 use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
 use crate::{notify, server, DaemonOptions};
 use saiife_audit::sign::AuditKey;
 use saiife_audit::{ChainWriter, WriterOptions};
+use saiife_broker::limits::Limiter;
+use saiife_broker::pipeline::limit_event;
+use saiife_broker::upstream::Upstream;
 use saiife_ipc::msg::SOCKET_NAME;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
@@ -143,12 +146,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 
     // 3. The policy; an invalid one still lets the daemon accept audit.
     let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(opts.directory);
-    let loaded = load_and_check(&opts.config, directory.as_ref());
+    // The services are checked against the connector catalog as part of
+    // the policy: a broken one makes the whole policy invalid.
+    let loaded = load_and_check(&opts.config, directory.as_ref())
+        .map_err(|e| e.to_string())
+        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)));
     let (daemon_cfg, audit_cfg, policy, policy_err) = match &loaded {
-        Ok(l) => (
+        Ok((l, cat)) => (
             l.config.daemon.clone(),
             l.config.audit.clone(),
-            PolicyState::from_loaded(l, &opts.catalog),
+            PolicyState::from_loaded(l, &opts.catalog, cat.clone()),
             None,
         ),
         Err(e) => {
@@ -162,10 +169,15 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
                     min_free_mb: boot.audit.min_free_mb,
                     admin_groups: Vec::new(),
                     system: None,
+                    gateway: None,
                 },
-                Some(e.to_string()),
+                Some(e.clone()),
             )
         }
+    };
+    let gateway_cfg = match &loaded {
+        Ok((l, _)) => l.config.gateway.clone(),
+        Err(_) => saiife_policy::GatewayCfg::default(),
     };
 
     // 4. The signing key.
@@ -208,6 +220,18 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         None => VaultState::Unavailable("no vault key".into()),
     };
 
+    // Connector limits survive a restart: rebuilt from the last 24 h of
+    // connector records (spec §6.9.2).
+    let limiter = rebuild_limiter(&audit_cfg.dir);
+    // The upstream client: the native roots plus `<config dir>/ca`. The
+    // tests trust their loopback CA through that same directory, so the
+    // daemon has no test-only seam for roots or names.
+    let ca_dir = opts.config.parent().unwrap_or(Path::new("/")).join("ca");
+    let upstream = Upstream::new(&ca_dir, gateway_cfg.upstream_timeout).map_err(|e| {
+        eprintln!("saiife: warning: connector calls will fail: {e}");
+        e.to_string()
+    });
+
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
         writer_cfg,
@@ -223,13 +247,15 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         proc: Box::new(crate::sessions::RealProc::new("/proc")),
         vault,
         vault_path,
+        limiter,
+        upstream,
     }));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
-    let loaded_files = loaded.as_ref().ok().map(files_json);
+    let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         daemon_cfg.socket_dir.clone(),
@@ -296,6 +322,17 @@ fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
         changed += 1;
     }
     Ok(changed)
+}
+
+/// The limiter from the connector records of the last 24 h (the two newest
+/// month files cover a month boundary).
+fn rebuild_limiter(audit_dir: &Path) -> Limiter {
+    let now = time::OffsetDateTime::now_utc();
+    let cutoff = now - time::Duration::days(1);
+    let read = saiife_audit::store::read_recent(audit_dir, 2, |r| {
+        r.timestamp().is_none_or(|t| t > cutoff)
+    });
+    Limiter::rebuild(read.records.iter().filter_map(limit_event), now)
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -565,14 +602,16 @@ async fn reload(ctx: &Arc<Ctx>) {
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
         regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
-        load_and_check(&c.config_path, c.directory.as_ref()).map_err(|e| e.to_string())
+        load_and_check(&c.config_path, c.directory.as_ref())
+            .map_err(|e| e.to_string())
+            .and_then(|l| check_services(&l, &c.config_path).map(|cat| (l, cat)))
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
     let mut recs = Vec::new();
     match loaded {
-        Ok(l) => {
-            let next = PolicyState::from_loaded(&l, &ctx.catalog);
+        Ok((l, cat)) => {
+            let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);

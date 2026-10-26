@@ -6,13 +6,19 @@ use crate::sessions::{agent_ancestor, Proc, Sessions};
 use crate::vault::VaultState;
 use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
+use saiife_broker::limits::Limiter;
+use saiife_broker::pipeline::{PolicySnapshot, Pools};
+use saiife_broker::upstream::Upstream;
+use saiife_broker::Catalog;
 use saiife_ipc::msg::{
-    err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD,
-    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_AUDIT_APPEND,
+    OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
+    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo, SystemConfig,
+    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, Mode, PackInfo,
+    SystemConfig,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -32,6 +38,14 @@ pub use saiife_ipc::msg::MAX_RECORD_BYTES;
 /// At most one `rate_limited` / `low_disk` record per uid per this.
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 
+/// The connector side of a valid policy: the snapshot every call takes when
+/// it starts, and the connector catalog checked against it.
+#[derive(Debug)]
+pub struct GatewayPolicy {
+    pub snap: PolicySnapshot,
+    pub catalog: Catalog,
+}
+
 /// The policy in force.
 #[derive(Debug, Clone)]
 pub struct PolicyState {
@@ -43,19 +57,51 @@ pub struct PolicyState {
     /// The merged system config (scopes, `[secrets.*] run_allow`); `None`
     /// while no valid policy was ever loaded.
     pub system: Option<Arc<SystemConfig>>,
+    /// `None` while no valid policy was ever loaded (connectors are denied
+    /// with `policy_invalid`).
+    pub gateway: Option<Arc<GatewayPolicy>>,
 }
 
 impl PolicyState {
-    pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo]) -> PolicyState {
+    /// The state of a loaded policy whose services passed
+    /// [`check_services`].
+    pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo], connectors: Catalog) -> PolicyState {
         let (packs, _) = active_packs(&l.config, catalog, None);
+        let hash = policy_hash(&effective_policy(&l.config, &packs, None));
         PolicyState {
-            hash: Some(policy_hash(&effective_policy(&l.config, &packs, None))),
+            hash: Some(hash.clone()),
             ok: true,
             min_free_mb: l.config.audit.min_free_mb,
             admin_groups: l.config.admin.groups.clone(),
             system: Some(Arc::new(l.config.clone())),
+            gateway: Some(Arc::new(GatewayPolicy {
+                snap: PolicySnapshot {
+                    config: l.config.clone(),
+                    hash,
+                    mode: Mode::Locked,
+                },
+                catalog: connectors,
+            })),
         }
     }
+}
+
+/// The connector catalog for a loaded policy: the built-in manifests plus
+/// the admin's in `<config dir>/connectors` (root-owned), with every
+/// `[services.*]` checked against it. An error makes the policy invalid
+/// (at a reload: `rejected`, the old policy stays). Warnings go to stderr.
+pub fn check_services(l: &LoadedPolicy, config_path: &std::path::Path) -> Result<Catalog, String> {
+    let dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/"))
+        .join("connectors");
+    let local = saiife_broker::manifest::load_local(&dir).map_err(|e| e.to_string())?;
+    let cat = Catalog::new(saiife_broker::builtin(), local);
+    let warnings = saiife_broker::catalog::validate(&l.config, &cat).map_err(|e| e.to_string())?;
+    for w in warnings {
+        eprintln!("saiife: warning: {w}");
+    }
+    Ok(cat)
 }
 
 type Cache<K, V> = Mutex<HashMap<K, (Instant, V)>>;
@@ -85,6 +131,13 @@ pub struct Ctx {
     pub vault: Mutex<VaultState>,
     /// Where `vault.bin` lives (named in the `VaultUnavailable` message).
     pub vault_path: PathBuf,
+    /// Connector limits, rebuilt at start from the last 24 h of records.
+    pub limiter: Limiter,
+    /// The upstream client (the native roots plus `<config dir>/ca`), or
+    /// why it could not be built.
+    pub upstream: Result<Upstream, String>,
+    /// At most 4 upstream calls in flight per service.
+    pub pools: Pools,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -105,6 +158,8 @@ pub struct CtxInit {
     pub proc: Box<dyn Proc + Send + Sync>,
     pub vault: VaultState,
     pub vault_path: PathBuf,
+    pub limiter: Limiter,
+    pub upstream: Result<Upstream, String>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -132,6 +187,9 @@ impl Ctx {
             proc: i.proc,
             vault: Mutex::new(i.vault),
             vault_path: i.vault_path,
+            limiter: i.limiter,
+            upstream: i.upstream,
+            pools: Pools::new(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -197,7 +255,7 @@ impl Ctx {
 
     /// The user's groups, cached for at most 60 s. A failed lookup is an
     /// empty list (so: not an admin).
-    async fn groups_of(&self, user: &str) -> Vec<String> {
+    pub(crate) async fn groups_of(&self, user: &str) -> Vec<String> {
         if let Some((at, v)) = lock(&self.groups).get(user) {
             if at.elapsed() < LOOKUP_TTL {
                 return v.clone();
@@ -330,6 +388,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
             crate::secret_ops::handle(ctx, peer, req).await
         }
+        OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,

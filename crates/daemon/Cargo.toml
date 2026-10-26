@@ -31,6 +31,10 @@ saiife-system = { path = "../system" }
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 zeroize = { version = "=1.9.1", features = ["serde"] }
 getrandom = "0.3"
+# The connector gateway (plan 10, Task 9); versions as in saiife-broker.
+saiife-broker = { path = "../broker" }
+bytes = "=1.12.1"
+base64 = "=0.23.1"
 
 [dev-dependencies]
 tempfile = "3"
