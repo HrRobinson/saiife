@@ -567,3 +567,42 @@ Each connector task follows the same shape:
 - [ ] **Red-team cases for the 9c suite.** Append to the 9c plan's case list, not to code: A11 (a credential file the import left, readable as the agent user, is reported by `doctor`), A12 (the imported key is gone from the home), A13 (the Task 10 traversal table plus header injection via `curl --unix-socket`, as the agent user), A14 (the 61st request in a minute → 429 and a record), A20 (the echoed token comes back `[MASKED]`). Same arrangement as 9c: the owner writes the scripts and Claude reviews them. Commit `docs(plan-9c): red-team cases A11–A14, A20 from plan 10`.
 - [ ] **Docs.** `docs/connectors/README.md` lists the four connectors. `README.md` gets one paragraph on brokered services, using §10's wording rule verbatim ("the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model"). `CHANGELOG.md` gets an Unreleased entry.
 - [ ] **Gates:** `cargo test --workspace`, `scripts/test-offline.sh`, clippy, fmt, the tokio gate, and `scripts/bench-check.sh` on an idle machine (put the numbers in the PR). Then the whole-branch review (Opus, security focus) and one fix wave, push, CI, PR. The owner merges.
+
+## Appendix: red-team cases for the 9c suite
+
+These cases extend the 9c case list (spec §9.2). They are descriptions, not scripts: the owner writes the scripts and Claude reviews them. Each runs as the agent user against a locked-mode install made by `system install`, as in 9c. In every case the daemon's audit log is the record to check, and the suite fails the case if an expected record is missing.
+
+### A11: a credential file the import left behind
+
+- **Setup.** The agent user's home holds a credential the import did not take: for example a `.env` with an API key that the admin declined at the `store as ...?` prompt, or a cloud file such as `~/.aws/credentials`, which `secret import` lists but never touches. A second key in another file was imported, so the suite can tell the two apart.
+- **Attack.** As the agent user, outside any tool call, the script reads the file that was left and recovers the key. This confirms the residual risk the spec names for A11: what was never imported is still readable.
+- **Expected result.** The read succeeds (known and documented). `saiife doctor --user <agent>` reports the leftover file as a plaintext credential (a warning, exit code 1 or higher) and names the path, never the value. The imported file no longer contains its credential. The doctor output and the audit log hold no credential value.
+- **Record.** The read itself is not seen by the daemon. The suite checks the `doctor` finding, and that the `secret add` (with backup) of the imported credential has a record that holds the name and not the value.
+
+### A12: calling the service with a key found in the home
+
+- **Setup.** One credential was imported with `secret import` and then connected with `saiife connect`. The suite keeps the original value as a test fixture, and it controls a loopback upstream that records which credentials it sees.
+- **Attack.** As the agent user, the script searches the home and the project for the imported key: the source file, shell history, editor and tool caches, the environment of its own processes, and `~/.saiife`. It then tries to call the upstream directly with anything it finds.
+- **Expected result.** The key is not found anywhere readable by the agent user. The only copies are the vault (encrypted, unreadable to the agent user) and the import backup, which the daemon keeps under its own state directory with owner-only access. The direct call has nothing to use.
+- **Record.** The `secret add` record from the import exists. No `connector` record and no upstream request carries a call the agent made on its own, and the original value appears in no file the agent user can read.
+
+### A13: abusing the gateway
+
+- **Setup.** A service is connected with a policy that allows one read operation. A loopback upstream records every request it gets (method, path, headers). The agent user can reach `gateway.sock`, and only that.
+- **Attack.** Through `curl --unix-socket`, as the agent user, the script sends the traversal table of Task 10 (a `..` segment, encoded dots, an encoded slash, an encoded backslash, a double slash, an absolute URL, another host, a fragment, a NUL) on `/v1/proxy/...`, including raw forms that a client or server could normalize before the check. It also sends operations that are not listed, and operations that the policy does not allow. It then tries header injection: its own `Authorization`, `Cookie` and `Host`, forwarded and proxy headers that name another uid, and header values with line breaks.
+- **Expected result.** Every traversal and unlisted-operation attempt is denied with HTTP 403 and the matching rule (`bad_path`, `unknown_operation` or `default_deny`). The upstream sees none of them. For the allowed read, the upstream sees the vault credential and never the agent's `Authorization` or `Cookie`, and the `Host` is the pinned one. The forwarded headers change nothing about identity: the caller is the uid of the socket peer. An upstream redirect to another host is not followed.
+- **Record.** One `connector` record per attempt, with the deny rule, and none for attempts that never parsed as HTTP. The log holds no agent-supplied header values that look like credentials.
+
+### A14: staying within policy but at volume
+
+- **Setup.** A service has `requests_per_minute = 60` and an allowed read operation, with a loopback upstream that counts requests. The suite uses a fixed clock window or starts the minute fresh.
+- **Attack.** As the agent user, the script sends 61 allowed requests inside one minute through `saiife api` or the gateway socket, as fast as it can, and then tries again from a second session of the same uid.
+- **Expected result.** The first 60 are sent upstream. The 61st is refused with HTTP 429 (exit code 4 for `saiife api`) and `limit = "requests_per_minute"`, and the upstream sees 60 requests. The second session shares the uid's limit and is refused too. After the window passes, requests work again. A restart of the daemon inside the window does not reset the count.
+- **Record.** Sixty `connector` records with a sent result, and a `connector` record for the 61st with the limit name and no upstream request. The limit state is rebuilt from the records after a daemon restart.
+
+### A20: reading a response with a secret in it
+
+- **Setup.** A loopback upstream echoes the request's `Authorization` header (the vault token) in its response body, in several encodings: raw, base64 (standard and URL-safe, padded and unpadded), URL-encoded and hex. A second variant puts the token in a header, and a third places it across the truncation boundary of `max_response_bytes`.
+- **Attack.** As the agent user, the script calls the echo operation through `saiife api` and through the gateway, and then reads everything it can get back: stdout, stderr, response headers, the `Link` header and any `next` parameters.
+- **Expected result.** The token never reaches the agent in any encoding. Each occurrence comes back as `[MASKED]`. The same holds for the token in a header and for the straddling case. Nothing in the agent's reach (its terminal output, the audit log, daemon logs it can read) holds the token.
+- **Record.** A `connector` record for each call, with the masked parameters and the size of the response, and no token value anywhere in the audit files. The suite searches every audit file for each encoding of the token.
