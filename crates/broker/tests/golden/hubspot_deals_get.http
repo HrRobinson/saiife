@@ -1,0 +1,3 @@
+GET https://api.hubapi.com/crm/v3/objects/deals/7001?properties=dealname%2Camount
+accept: application/json
+authorization: Bearer <AUTH>

@@ -1,0 +1,3 @@
+GET https://api.hubapi.com/crm/v3/objects/contacts?after=52&limit=2&properties=email%2Cfirstname
+accept: application/json
+authorization: Bearer <AUTH>

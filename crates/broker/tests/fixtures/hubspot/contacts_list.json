@@ -1,0 +1,35 @@
+{
+  "_source": "Shape per vendor docs; not fetched (no network). Values are synthetic. Reference: https://developers.hubspot.com/docs/api/crm/contacts",
+  "results": [
+    {
+      "id": "51",
+      "properties": {
+        "email": "ada@example.test",
+        "firstname": "Ada",
+        "lastname": "Lovelace",
+        "hs_object_id": "51"
+      },
+      "createdAt": "2026-01-12T09:30:11.482Z",
+      "updatedAt": "2026-02-01T10:00:00.000Z",
+      "archived": false
+    },
+    {
+      "id": "52",
+      "properties": {
+        "email": "alan@example.test",
+        "firstname": "Alan",
+        "lastname": "Turing",
+        "hs_object_id": "52"
+      },
+      "createdAt": "2026-01-12T09:30:11.482Z",
+      "updatedAt": "2026-02-01T10:00:00.000Z",
+      "archived": false
+    }
+  ],
+  "paging": {
+    "next": {
+      "after": "52",
+      "link": "https://api.hubapi.com/crm/v3/objects/contacts?after=52"
+    }
+  }
+}

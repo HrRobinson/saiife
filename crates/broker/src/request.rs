@@ -2,7 +2,7 @@
 //! manifest and the service parameters, the operation's path and query, the
 //! headers the manifest allows, and the credential in exactly one place.
 
-use crate::manifest::{template_segments, AuthSpec, Manifest, Operation, Seg};
+use crate::manifest::{template_segments, AuthSpec, Manifest, Operation, Pagination, Seg};
 use crate::BrokerError;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -335,6 +335,25 @@ pub fn build(
         headers,
         body,
     })
+}
+
+/// The next-page parameter of a cursor-paginated answer: `(param, value)`
+/// when `body` holds a string or number at the `next` JSON path, else `None`
+/// (last page, or `p` is not cursor pagination). Arrays are not traversed.
+pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, String)> {
+    let Pagination::Cursor { param, next } = p else {
+        return None;
+    };
+    let mut cur = body;
+    for key in next.split('.') {
+        cur = cur.get(key)?;
+    }
+    let v = match cur {
+        serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    Some((param.clone(), v))
 }
 
 #[cfg(test)]

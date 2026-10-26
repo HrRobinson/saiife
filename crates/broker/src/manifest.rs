@@ -318,7 +318,11 @@ fn braces(s: &str) -> Result<Vec<&str>, String> {
 }
 
 /// `(file name, contents)` of every built-in manifest. Later tasks append.
-const BUILTIN: &[(&str, &str)] = &[("shopify.toml", include_str!("../connectors/shopify.toml"))];
+const BUILTIN: &[(&str, &str)] = &[
+    ("github.toml", include_str!("../connectors/github.toml")),
+    ("hubspot.toml", include_str!("../connectors/hubspot.toml")),
+    ("shopify.toml", include_str!("../connectors/shopify.toml")),
+];
 
 /// The built-in manifests, parsed once. A bad one panics, which the test
 /// `every_builtin_manifest_loads` turns into a build-time failure.

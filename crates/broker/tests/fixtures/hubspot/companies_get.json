@@ -1,0 +1,12 @@
+{
+  "_source": "Shape per vendor docs; not fetched (no network). Values are synthetic. Reference: https://developers.hubspot.com/docs/api/crm/companies",
+  "id": "9001",
+  "properties": {
+    "name": "Analytical Engines Ltd",
+    "domain": "engines.example.test",
+    "hs_object_id": "9001"
+  },
+  "createdAt": "2026-01-12T09:30:11.482Z",
+  "updatedAt": "2026-02-01T10:00:00.000Z",
+  "archived": false
+}
