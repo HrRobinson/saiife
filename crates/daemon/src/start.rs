@@ -229,6 +229,17 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         eprintln!("saiife: warning: {reason}");
         ("limits_rebuild_failed", reason, fields)
     });
+    let capped_note = (limiter.rebuild_dropped() > 0).then(|| {
+        let dropped = limiter.rebuild_dropped();
+        let reason = format!(
+            "{dropped} connector record(s) of the last 24 h were left out of the limits: a (uid, service) bucket holds at most {} events, and the oldest went",
+            saiife_broker::limits::BUCKET_CAP
+        );
+        eprintln!("saiife: warning: {reason}");
+        let mut m = serde_json::Map::new();
+        m.insert("dropped".into(), dropped.into());
+        ("limits_rebuild_capped", reason, m)
+    });
     // The upstream client: the native roots plus `<config dir>/ca`, which
     // must be root's (a CA there can impersonate any upstream). A refused
     // directory is a `ca_refused` record; the native roots stay. The tests
@@ -294,6 +305,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
             .into_iter()
             .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
             .chain(rebuild_note)
+            .chain(capped_note)
             .collect(),
         tcp,
     ));
@@ -633,7 +645,7 @@ async fn serve(
     policy_err: Option<String>,
     loaded_files: Option<Value>,
     // More start records: `(event, reason, fields)` (`ca_refused`,
-    // `tokens_reset`, `limits_rebuild_failed`).
+    // `tokens_reset`, `limits_rebuild_failed`, `limits_rebuild_capped`).
     notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {

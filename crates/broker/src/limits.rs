@@ -95,6 +95,8 @@ pub struct Limiter {
     unavailable_until: Option<OffsetDateTime>,
     /// [`BUCKET_CAP`]; smaller in tests.
     cap: usize,
+    /// Events the rebuild dropped, oldest first, from buckets over the cap.
+    rebuild_dropped: usize,
 }
 
 impl Default for Limiter {
@@ -151,6 +153,7 @@ impl Limiter {
             state: Arc::new(Mutex::new(State::default())),
             unavailable_until: None,
             cap: BUCKET_CAP,
+            rebuild_dropped: 0,
         }
     }
 
@@ -163,18 +166,46 @@ impl Limiter {
         }
     }
 
-    /// Rebuild from audit records; events older than 24 h are dropped.
+    /// Rebuild from audit records, in any order; events older than 24 h
+    /// are dropped. A bucket over [`BUCKET_CAP`] keeps its newest events
+    /// ([`Limiter::rebuild_dropped`] counts the others): at run time it
+    /// could not have grown past the cap.
     pub fn rebuild(records: impl Iterator<Item = Event>, now: OffsetDateTime) -> Limiter {
+        Limiter::rebuild_capped(records, now, BUCKET_CAP)
+    }
+
+    fn rebuild_capped(
+        records: impl Iterator<Item = Event>,
+        now: OffsetDateTime,
+        cap: usize,
+    ) -> Limiter {
         let cutoff = now - Duration::seconds(DAY);
+        // Sorted first: every push is at the back (the records come newest
+        // month file first, so in-order pushes would insert mid-bucket).
+        let mut events: Vec<Event> = records.filter(|e| e.at > cutoff).collect();
+        events.sort_by_key(|e| e.at);
         let mut st = State::default();
-        for ev in records.filter(|e| e.at > cutoff) {
+        for ev in events {
             st.push(ev);
+        }
+        let mut dropped = 0;
+        for b in st.buckets.values_mut() {
+            let over = b.len().saturating_sub(cap);
+            b.drain(..over);
+            dropped += over;
         }
         Limiter {
             state: Arc::new(Mutex::new(st)),
             unavailable_until: None,
-            cap: BUCKET_CAP,
+            cap,
+            rebuild_dropped: dropped,
         }
+    }
+
+    /// How many events [`Limiter::rebuild`] dropped to keep its buckets
+    /// within the cap (the oldest of each bucket over it).
+    pub fn rebuild_dropped(&self) -> usize {
+        self.rebuild_dropped
     }
 
     /// [`Limiter::rebuild`] from records known to be incomplete (a file
@@ -834,6 +865,42 @@ mod tests {
                 .unwrap(),
         );
         go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
+    }
+
+    #[test]
+    fn rebuild_sorts_and_keeps_the_newest_within_the_cap() {
+        let k = key(1, None);
+        let ev = |secs: i64| Event {
+            at: t0() - Duration::seconds(secs),
+            key: k.clone(),
+            kind: OpKind::Read,
+            amount_minor: None,
+        };
+        // Newest month first, each in its own order (as `read_recent`).
+        let records = vec![ev(10), ev(5), ev(1), ev(40), ev(30), ev(20)];
+        let ats = |l: &Limiter| -> Vec<OffsetDateTime> {
+            lock(&l.state).buckets[&(1, "stripe".to_string())]
+                .iter()
+                .map(|e| e.ev.at)
+                .collect()
+        };
+        let l = Limiter::rebuild(records.clone().into_iter(), t0());
+        assert_eq!(l.rebuild_dropped(), 0);
+        let want: Vec<OffsetDateTime> = [40, 30, 20, 10, 5, 1]
+            .iter()
+            .map(|s| t0() - Duration::seconds(*s))
+            .collect();
+        assert_eq!(ats(&l), want);
+        // Over the cap: the oldest go, the rest stay in order.
+        let l = Limiter::rebuild_capped(records.into_iter(), t0(), 4);
+        assert_eq!(l.rebuild_dropped(), 2);
+        assert_eq!(ats(&l), want[2..].to_vec());
+        assert_eq!(remembered(&l), 4);
+        // At the cap, as it would be at run time: a further call is denied.
+        assert_eq!(
+            go(&l, &k, OpKind::Read, None, &LimitsCfg::default(), t0()),
+            Err("limits_capacity")
+        );
     }
 
     #[test]
