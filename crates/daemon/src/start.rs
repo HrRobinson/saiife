@@ -223,7 +223,12 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 
     // Connector limits survive a restart: rebuilt from the last 24 h of
     // connector records (spec §6.9.2).
-    let limiter = rebuild_limiter(&audit_cfg.dir);
+    let (limiter, rebuild_failed) = rebuild_limiter(&audit_cfg.dir);
+    let rebuild_note = rebuild_failed.map(|f| {
+        let (reason, fields) = f.note();
+        eprintln!("saiife: warning: {reason}");
+        ("limits_rebuild_failed", reason, fields)
+    });
     // The upstream client: the native roots plus `<config dir>/ca`, which
     // must be root's (a CA there can impersonate any upstream). A refused
     // directory is a `ca_refused` record; the native roots stay. The tests
@@ -287,7 +292,8 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         loaded_files,
         [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
             .into_iter()
-            .filter_map(|(e, r)| Some((e, r?)))
+            .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
+            .chain(rebuild_note)
             .collect(),
         tcp,
     ));
@@ -403,25 +409,64 @@ fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
 
 /// The limiter from the connector records of the last 24 h (the two newest
 /// month files cover a month boundary).
-fn rebuild_limiter(audit_dir: &Path) -> Limiter {
+fn rebuild_limiter(audit_dir: &Path) -> (Limiter, Option<RebuildFailed>) {
     rebuild_limiter_at(audit_dir, time::OffsetDateTime::now_utc())
+}
+
+/// What kept the limiter rebuild from reading every record of the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebuildFailed {
+    dir_error: Option<String>,
+    unreadable_files: usize,
+    skipped_lines: usize,
+}
+
+impl RebuildFailed {
+    /// The `limits_rebuild_failed` record's reason and fields.
+    fn note(&self) -> (String, serde_json::Map<String, Value>) {
+        let reason = format!(
+            "the connector limits could not be rebuilt from the audit log ({}{} unreadable file(s), {} skipped line(s)); connector calls are denied with limits_unavailable for 24 h or until a clean start",
+            self.dir_error
+                .as_deref()
+                .map(|e| format!("directory: {e}; "))
+                .unwrap_or_default(),
+            self.unreadable_files,
+            self.skipped_lines
+        );
+        let mut m = serde_json::Map::new();
+        m.insert("dir_error".into(), json!(self.dir_error));
+        m.insert("unreadable_files".into(), self.unreadable_files.into());
+        m.insert("skipped_lines".into(), self.skipped_lines.into());
+        (reason, m)
+    }
 }
 
 /// [`rebuild_limiter`] at `now`. A record dated after `now` (a clock that
 /// went back, or an edited log) is dropped: it would hold a slot for longer
-/// than its window.
-fn rebuild_limiter_at(audit_dir: &Path, now: time::OffsetDateTime) -> Limiter {
+/// than its window. A log that could not be read in full fails closed
+/// ([`Limiter::rebuild_incomplete`]).
+fn rebuild_limiter_at(
+    audit_dir: &Path,
+    now: time::OffsetDateTime,
+) -> (Limiter, Option<RebuildFailed>) {
     let cutoff = now - time::Duration::days(1);
     let read = saiife_audit::store::read_recent(audit_dir, 2, |r| {
         r.timestamp().is_none_or(|t| t > cutoff)
     });
-    Limiter::rebuild(
-        read.records
-            .iter()
-            .filter_map(limit_event)
-            .filter(|e| e.at <= now),
-        now,
-    )
+    let events = read
+        .records
+        .iter()
+        .filter_map(limit_event)
+        .filter(|e| e.at <= now);
+    if read.dir_error.is_none() && read.unreadable_files == 0 && read.skipped_lines == 0 {
+        return (Limiter::rebuild(events, now), None);
+    }
+    let failed = RebuildFailed {
+        dir_error: read.dir_error.clone(),
+        unreadable_files: read.unreadable_files,
+        skipped_lines: read.skipped_lines,
+    };
+    (Limiter::rebuild_incomplete(events, now), Some(failed))
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -564,8 +609,9 @@ async fn serve(
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
-    // More start records: `(event, reason)` (`ca_refused`, `tokens_reset`).
-    notes: Vec<(&'static str, String)>,
+    // More start records: `(event, reason, fields)` (`ca_refused`,
+    // `tokens_reset`, `limits_rebuild_failed`).
+    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let signals = (
@@ -609,9 +655,10 @@ async fn serve(
         r.reason = Some(reason.clone());
         first.push(r);
     }
-    for (event, reason) in notes {
+    for (event, reason, fields) in notes {
         let mut r = ctx.event(event);
         r.reason = Some(reason);
+        r.extra.extend(fields);
         first.push(r);
     }
     for r in first {
@@ -953,11 +1000,54 @@ mod tests {
         // A record from the future (clock went back) is not a slot.
         saiife_audit::store::append(d.path(), &connector_rec(now + time::Duration::minutes(5)))
             .unwrap();
-        assert!(!one_per_minute_hit(&rebuild_limiter_at(d.path(), now), now));
+        assert!(!one_per_minute_hit(
+            &rebuild_limiter_at(d.path(), now).0,
+            now
+        ));
         // A record 10 s old is.
         saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
             .unwrap();
-        assert!(one_per_minute_hit(&rebuild_limiter_at(d.path(), now), now));
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        assert!(one_per_minute_hit(&lim, now));
+        assert_eq!(failed, None);
+        assert!(!lim.unavailable(now));
+    }
+
+    #[test]
+    fn rebuild_from_an_unreadable_log_fails_closed() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        // A line that is not a record: the window may hide a call.
+        let month = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&month)
+            .unwrap();
+        f.write_all(b"{not a record\n").unwrap();
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        let failed = failed.expect("the rebuild must report the skipped line");
+        assert_eq!(failed.skipped_lines, 1);
+        assert_eq!(failed.unreadable_files, 0);
+        let (reason, fields) = failed.note();
+        assert!(reason.contains("limits_unavailable"), "{reason}");
+        assert_eq!(fields["skipped_lines"], 1);
+        // Denied for a full window, then known again.
+        assert!(lim.unavailable(now));
+        assert!(lim.unavailable(now + time::Duration::hours(23)));
+        assert!(!lim.unavailable(now + time::Duration::hours(24)));
+        // An audit dir that cannot be listed fails closed too.
+        let file = d.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let (lim, failed) = rebuild_limiter_at(&file, now);
+        assert!(failed.unwrap().dir_error.is_some());
+        assert!(lim.unavailable(now));
     }
 
     #[test]

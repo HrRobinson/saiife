@@ -494,13 +494,18 @@ async fn steps(
         service: call.service.clone(),
         session: call.session.clone(),
     };
+    let now = OffsetDateTime::now_utc();
+    // The limits could not be rebuilt at start: fail closed.
+    if lim.unavailable(now) {
+        return denied("limits_unavailable");
+    }
     let reservation = match lim.check_and_commit(
         &key,
         op.kind,
         tr.amount.as_ref().map(|(m, c)| (*m, c.as_str())),
         op.amount.is_some(),
         &svc.limits,
-        OffsetDateTime::now_utc(),
+        now,
     ) {
         Ok(r) => r,
         Err(limit) => return Outcome::Limited { limit },

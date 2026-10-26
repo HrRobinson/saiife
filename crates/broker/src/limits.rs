@@ -39,6 +39,9 @@ struct State {
 
 pub struct Limiter {
     state: Arc<Mutex<State>>,
+    /// Set when the rebuild could not read every record of the window:
+    /// until then the limits are not known and calls are denied.
+    unavailable_until: Option<OffsetDateTime>,
 }
 
 impl Default for Limiter {
@@ -86,6 +89,7 @@ impl Limiter {
     pub fn new() -> Limiter {
         Limiter {
             state: Arc::new(Mutex::new(State::default())),
+            unavailable_until: None,
         }
     }
 
@@ -100,7 +104,29 @@ impl Limiter {
         }
         Limiter {
             state: Arc::new(Mutex::new(st)),
+            unavailable_until: None,
         }
+    }
+
+    /// [`Limiter::rebuild`] from records known to be incomplete (a file
+    /// or line of the window could not be read): fail closed. Calls are
+    /// denied ([`Limiter::unavailable`]) until a full window has passed
+    /// since `now`, after which every event that counts is one this
+    /// limiter saw.
+    pub fn rebuild_incomplete(
+        records: impl Iterator<Item = Event>,
+        now: OffsetDateTime,
+    ) -> Limiter {
+        Limiter {
+            unavailable_until: Some(now + Duration::seconds(DAY)),
+            ..Limiter::rebuild(records, now)
+        }
+    }
+
+    /// The limits cannot be checked at `now` (see
+    /// [`Limiter::rebuild_incomplete`]): deny with `limits_unavailable`.
+    pub fn unavailable(&self, now: OffsetDateTime) -> bool {
+        self.unavailable_until.is_some_and(|t| now < t)
     }
 
     /// Check every configured limit against the (uid, service) bucket and

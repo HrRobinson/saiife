@@ -340,6 +340,34 @@ fn rule(o: &Outcome) -> &str {
 }
 
 #[tokio::test]
+async fn incomplete_limiter_rebuild_denies_limits_unavailable() {
+    let (m, up) = mock().await;
+    let now = time::OffsetDateTime::now_utc();
+    let lim = Limiter::rebuild_incomplete(std::iter::empty(), now);
+    let o = go(
+        &call("orders.list", &[]),
+        &snapshot(""),
+        &FakeEnv::ok(),
+        &up,
+        &lim,
+    )
+    .await;
+    assert_eq!(rule(&o), "limits_unavailable");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    // A full window later the limiter knows every event that counts.
+    let old = Limiter::rebuild_incomplete(std::iter::empty(), now - time::Duration::days(1));
+    let o = go(
+        &call("orders.list", &[]),
+        &snapshot(""),
+        &FakeEnv::ok(),
+        &up,
+        &old,
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+}
+
+#[tokio::test]
 async fn no_scope_denied_no_upstream_call() {
     let (m, up) = mock().await;
     let mut env = FakeEnv::ok();
