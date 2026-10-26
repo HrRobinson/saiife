@@ -130,6 +130,12 @@ impl ConnLimits {
         ConnLimits::new(total_cap(soft))
     }
 
+    /// Connections `uid` has open now.
+    pub fn open_for(&self, uid: u32) -> u32 {
+        let c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        c.per_uid.get(&uid).copied().unwrap_or(0)
+    }
+
     pub fn try_open(&self, uid: u32) -> Result<ConnSlot, ErrorCode> {
         let mut c = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mine = c.per_uid.get(&uid).copied().unwrap_or(0);

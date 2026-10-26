@@ -41,6 +41,8 @@ use zeroize::Zeroizing;
 
 const TOKEN: &str = "echo-token-7f3a9c";
 const AGENT_TOKEN: &str = "agent-own-token-55d1";
+/// The size of `/api/files/big`.
+const BIG: usize = 3 * 1024 * 1024;
 
 // ---------------------------------------------------------------- mock
 
@@ -99,6 +101,8 @@ async fn answer(
             format!(r#"{{"orders":[{{"id":1}}],"echo":"{token}"}}"#),
         ),
         "/api/orders/404" => json(404, r#"{"errors":"Not Found"}"#.into()),
+        // Far more than a socket buffer holds.
+        "/api/files/big" => json(200, format!(r#"{{"blob":"{}"}}"#, "b".repeat(BIG))),
         _ => json(404, "{}".into()),
     };
     Ok(resp)
@@ -592,6 +596,7 @@ async fn proxy_traversal_403_bad_path() {
         "/v1/proxy/shop/a%2Fb",
         "/v1/proxy/shop/a%5cb",
         "/v1/proxy/shop/orders/1%00",
+        "/v1/proxy/shop/a\\b",
     ];
     for target in bad {
         let raw = w
@@ -619,13 +624,15 @@ async fn proxy_traversal_403_bad_path() {
     assert!(recs
         .iter()
         .all(|r| r["rule"] == "bad_path" && r["via"] == "http"));
-    // A raw backslash, a fragment, a control byte or an absolute target
-    // never reaches the pipeline: refused by the HTTP parser or here.
-    for target in [
-        "/v1/proxy/shop/a\\b",
-        "/v1/proxy/shop/a#b",
-        "/v1/proxy/shop/a\x01b",
-        "http://evil/v1/proxy/shop/orders.json",
+    // A fragment, a control byte or an absolute target
+    // never reaches the pipeline: 400, from this gateway (a JSON body) or
+    // from the HTTP parser (none).
+    for (target, from_gateway) in [
+        ("/v1/proxy/shop/a#b", true),
+        ("/v1/proxy/shop/orders.json#frag", true),
+        ("/v1/proxy/shop/orders.json?status=open#x", true),
+        ("/v1/proxy/shop/a\x01b", false),
+        ("http://evil/v1/proxy/shop/orders.json", true),
     ] {
         let raw = w
             .raw(
@@ -633,9 +640,12 @@ async fn proxy_traversal_403_bad_path() {
                     .as_bytes(),
             )
             .await;
-        let st = status_of(&raw);
-        assert!(st == 400 || st == 403 || st == 0, "{target:?}: {raw}");
+        assert_eq!(status_of(&raw), 400, "{target:?}: {raw}");
+        if from_gateway {
+            assert_eq!(body_of(&raw)["error"], "bad_request", "{target:?}: {raw}");
+        }
     }
+    assert_eq!(w.connector_records().len(), bad.len());
     assert_eq!(w.hits(), 0);
 }
 
@@ -766,7 +776,7 @@ async fn slow_headers_closed_after_10s() {
     assert!(took >= Duration::from_millis(200), "{took:?}");
     assert!(!String::from_utf8_lossy(&buf).contains("200 OK"));
 
-    // An idle kept-alive connection is closed the same way.
+    // A connection that sends nothing is closed the same way.
     let mut s = UnixStream::connect(&w.sock).await.unwrap();
     let t0 = Instant::now();
     let mut buf = Vec::new();
@@ -895,4 +905,115 @@ async fn invalid_policy_403_requests_503_unknown_404() {
     let (st, _, _) = w.send("GET", "/v1/../v1/services", &[], b"").await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert_eq!(w.hits(), 0);
+}
+
+async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
+#[tokio::test]
+async fn client_that_never_reads_is_closed_after_write_timeout() {
+    assert_eq!(gateway::WRITE_TIMEOUT, Duration::from_secs(10));
+    let w = world_with(Setup {
+        opts: Opts {
+            write_timeout: Duration::from_millis(300),
+            ..Opts::default()
+        },
+        ..Setup::default()
+    })
+    .await;
+    let uid = rustix::process::getuid().as_raw();
+    let mut s = UnixStream::connect(&w.sock).await.unwrap();
+    s.write_all(b"GET /v1/proxy/shop/files/big HTTP/1.1\r\nHost: saiife\r\n\r\n")
+        .await
+        .unwrap();
+    // The answer is on its way and the client reads nothing: the slot is
+    // held while the write stalls ...
+    assert!(wait_until(Duration::from_secs(10), || w.hits() == 1).await);
+    assert_eq!(w.ctx.conns.open_for(uid), 1);
+    // ... and given back once no write progressed for the write timeout.
+    let t0 = Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(10), || w.ctx.conns.open_for(uid) == 0).await,
+        "the stalled connection kept its slot"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    // What was buffered can still be read, then the end: never all of it.
+    let mut out = Vec::new();
+    let r = tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut out)).await;
+    assert!(r.is_ok(), "the connection was not closed");
+    assert!(
+        out.starts_with(b"HTTP/1.1 200"),
+        "{:?}",
+        &out[..out.len().min(64)]
+    );
+    assert!(out.len() < BIG, "{}", out.len());
+    // The call itself was made and recorded.
+    assert_eq!(w.connector_records().len(), 1);
+
+    // A client that does read gets all of it.
+    let (st, _, b) = w.send("GET", "/v1/proxy/shop/files/big", &[], b"").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(b.len() > BIG);
+}
+
+#[tokio::test]
+async fn content_length_checked_only_without_transfer_encoding() {
+    let w = world().await;
+    let raw = w
+        .raw(b"POST /v1/api/shop/orders.list HTTP/1.1\r\nHost: saiife\r\nContent-Length: abc\r\nConnection: close\r\n\r\n")
+        .await;
+    assert_eq!(status_of(&raw), 400, "{raw}");
+    // Chunked: a stale Content-Length says nothing; the body is small.
+    let raw = w
+        .raw(b"POST /v1/api/shop/orders.list HTTP/1.1\r\nHost: saiife\r\nTransfer-Encoding: chunked\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n2\r\n{}\r\n0\r\n\r\n")
+        .await;
+    assert_eq!(status_of(&raw), 200, "{raw}");
+    assert_eq!(w.hits(), 1);
+}
+
+#[tokio::test]
+async fn proxy_outcome_header_tells_upstream_from_saiife() {
+    let w = world_with(Setup {
+        shop_extra: "limits = { requests_per_minute = 2 }",
+        ..Setup::default()
+    })
+    .await;
+    let outcome = |h: &HeaderMap| h["x-saiife-outcome"].to_str().unwrap().to_string();
+    let (st, h, _) = w.send("GET", "/v1/proxy/shop/orders.json", &[], b"").await;
+    assert_eq!((st, outcome(&h).as_str()), (StatusCode::OK, "upstream"));
+    // An upstream 404 is the upstream's.
+    let (st, h, _) = w.send("GET", "/v1/proxy/shop/orders/404", &[], b"").await;
+    assert_eq!(
+        (st, outcome(&h).as_str()),
+        (StatusCode::NOT_FOUND, "upstream")
+    );
+    // saiife's own 403, 429 and 400.
+    let (st, h, _) = w
+        .send("DELETE", "/v1/proxy/shop/orders.json", &[], b"")
+        .await;
+    assert_eq!(
+        (st, outcome(&h).as_str()),
+        (StatusCode::FORBIDDEN, "saiife")
+    );
+    let (st, h, _) = w.send("GET", "/v1/proxy/shop/orders.json", &[], b"").await;
+    assert_eq!(
+        (st, outcome(&h).as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, "saiife")
+    );
+    let raw = w
+        .raw(b"GET /v1/proxy/shop/a#b HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n")
+        .await;
+    assert_eq!(status_of(&raw), 400);
+    assert!(raw.contains("x-saiife-outcome: saiife"), "{raw}");
+    // `/v1/api` says it with X-Saiife-Upstream-Status instead.
+    let (_, h, _) = w.api("shop/orders.list", json!({})).await;
+    assert!(h.get("x-saiife-outcome").is_none());
 }

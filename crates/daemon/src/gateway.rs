@@ -14,6 +14,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{
     HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
+    TRANSFER_ENCODING,
 };
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
@@ -27,20 +28,27 @@ use saiife_ipc::peer::{peer_cred, PeerCred};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 
 /// The read buffer of a connection, which bounds the request head.
 pub const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// A request body over this is refused with 413 as soon as it is seen.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
-/// The request head (also the next one on a kept-alive connection) must be
+/// The request head (from the accept: also an idle connection) must be
 /// in within this, or the connection is closed.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The body must be in within this of the head (408).
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A write to the client must make progress within this, or the
+/// connection is closed.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a refused connection gets to take its answer.
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -77,6 +85,7 @@ const NEXT_SET: &AsciiSet = &NON_ALPHANUMERIC
 pub struct Opts {
     pub header_read_timeout: Duration,
     pub body_read_timeout: Duration,
+    pub write_timeout: Duration,
 }
 
 impl Default for Opts {
@@ -84,6 +93,7 @@ impl Default for Opts {
         Opts {
             header_read_timeout: HEADER_READ_TIMEOUT,
             body_read_timeout: BODY_READ_TIMEOUT,
+            write_timeout: WRITE_TIMEOUT,
         }
     }
 }
@@ -121,24 +131,174 @@ async fn connection(mut s: UnixStream, ctx: Arc<Ctx>, opts: Opts) {
             ctx.notice(peer.uid, Notice::Connections);
             let body = r#"{"error":"busy","reason":"too many open connections"}"#;
             let raw = format!(
-                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\nx-saiife-outcome: saiife\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = tokio::time::timeout(REFUSE_WRITE_TIMEOUT, s.write_all(raw.as_bytes())).await;
             return;
         }
     };
+    let io = Guarded::new(s, opts.write_timeout);
+    let line = Arc::clone(&io.line);
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
-        async move { Ok::<_, Infallible>(admit(&ctx, &peer, req, opts).await) }
+        let raw = raw_target(&line);
+        async move { Ok::<_, Infallible>(admit(&ctx, &peer, req, raw, opts).await) }
     });
+    // One request per connection: the first line of the stream is then
+    // the request line, read as sent (see [`Guarded`]).
     let _ = http1::Builder::new()
         .timer(TokioTimer::new())
+        .keep_alive(false)
         .max_buf_size(MAX_HEAD_BYTES)
         .max_header_size(MAX_HEAD_BYTES)
         .header_read_timeout(opts.header_read_timeout)
-        .serve_connection(TokioIo::new(s), svc)
+        .serve_connection(TokioIo::new(io), svc)
         .await;
+}
+
+/// The request line as it came off the socket, before the HTTP parser.
+#[derive(Default)]
+struct FirstLine {
+    bytes: Vec<u8>,
+    done: bool,
+}
+
+impl FirstLine {
+    fn feed(&mut self, mut b: &[u8]) {
+        if self.done {
+            return;
+        }
+        if self.bytes.is_empty() {
+            // Empty lines before the request line are allowed (RFC 9112 2.2).
+            let skip = b.iter().take_while(|c| matches!(c, b'\r' | b'\n')).count();
+            b = &b[skip..];
+        }
+        match b.iter().position(|c| *c == b'\n') {
+            Some(i) => {
+                self.bytes.extend_from_slice(&b[..i]);
+                self.done = true;
+            }
+            None => self.bytes.extend_from_slice(b),
+        }
+        if self.bytes.len() > MAX_HEAD_BYTES {
+            // The parser refuses it anyway; keep nothing of it.
+            self.bytes.clear();
+            self.done = true;
+        }
+    }
+}
+
+/// The request target of the captured request line, `None` if there is no
+/// complete one.
+fn raw_target(line: &Mutex<FirstLine>) -> Option<String> {
+    let l = line.lock().unwrap_or_else(|p| p.into_inner());
+    if !l.done {
+        return None;
+    }
+    let s = std::str::from_utf8(&l.bytes).ok()?;
+    let mut it = s.trim_end_matches('\r').split(' ');
+    let (_method, target) = (it.next()?, it.next()?);
+    Some(target.to_string())
+}
+
+/// The connection's stream: records the request line (`http::Uri` drops a
+/// fragment and so cannot be trusted to show the target as sent), and
+/// closes the connection when a write makes no progress within the write
+/// timeout. A client that sends and never reads cannot hold its slot, and
+/// the shared connection total, for longer than that.
+struct Guarded {
+    inner: UnixStream,
+    write_timeout: Duration,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+    line: Arc<Mutex<FirstLine>>,
+}
+
+impl Guarded {
+    fn new(inner: UnixStream, write_timeout: Duration) -> Guarded {
+        Guarded {
+            inner,
+            write_timeout,
+            stalled: None,
+            line: Arc::new(Mutex::new(FirstLine::default())),
+        }
+    }
+
+    /// `r` from a write-side poll: progress clears the deadline; pending
+    /// arms it, and a deadline that passed is a `TimedOut` error.
+    fn deadline<T>(&mut self, cx: &mut Context<'_>, r: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        match r {
+            Poll::Ready(r) => {
+                self.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let t = self.write_timeout;
+                let sleep = self
+                    .stalled
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(t)));
+                match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the client does not read its answer",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl AsyncRead for Guarded {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = r {
+            self.line
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .feed(&buf.filled()[before..]);
+        }
+        r
+    }
+}
+
+impl AsyncWrite for Guarded {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.deadline(cx, r)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.deadline(cx, r)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = Pin::new(&mut self.inner).poll_flush(cx);
+        self.deadline(cx, r)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let r = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.deadline(cx, r)
+    }
 }
 
 type Resp = Response<Full<Bytes>>;
@@ -155,10 +315,37 @@ fn error(status: StatusCode, error: &str, message: &str) -> Resp {
     json_resp(status, json!({"error": error, "message": message}))
 }
 
-/// The per-uid request caps of the control socket, shared.
-async fn admit(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request<Incoming>, opts: Opts) -> Resp {
+const OUTCOME: &str = "x-saiife-outcome";
+
+/// The per-uid request caps of the control socket, shared. Every answer on
+/// `/v1/proxy` says who gave its status: `X-Saiife-Outcome: upstream` for
+/// a passed-through upstream answer, `saiife` for anything saiife decided.
+async fn admit(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    req: Request<Incoming>,
+    raw: Option<String>,
+    opts: Opts,
+) -> Resp {
+    let proxy = raw.as_deref().is_some_and(|t| t.starts_with("/v1/proxy/"));
+    let mut r = admit_inner(ctx, peer, req, raw, opts).await;
+    if proxy {
+        r.headers_mut()
+            .entry(OUTCOME)
+            .or_insert(HeaderValue::from_static("saiife"));
+    }
+    r
+}
+
+async fn admit_inner(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    req: Request<Incoming>,
+    raw: Option<String>,
+    opts: Opts,
+) -> Resp {
     match ctx.limits.try_begin(peer.uid, Instant::now()) {
-        Ok(_in_flight) => route(ctx, peer, req, opts).await,
+        Ok(_in_flight) => route(ctx, peer, req, raw, opts).await,
         Err(_) => {
             ctx.notice(peer.uid, Notice::Requests);
             let mut r = error(
@@ -180,21 +367,42 @@ enum Route {
     Proxy,
 }
 
-async fn route(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request<Incoming>, opts: Opts) -> Resp {
-    // The request target exactly as received: hyper and `http::Uri` keep
-    // the origin-form path and query byte for byte (no dot-segment removal,
-    // no percent-decoding), and the pipeline's own checks run on that.
-    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+async fn route(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    req: Request<Incoming>,
+    raw: Option<String>,
+    opts: Opts,
+) -> Resp {
+    // The request target exactly as received, from the request line itself
+    // ([`Guarded`]): no dot-segment removal, no percent-decoding, and a
+    // fragment (which `http::Uri` would silently cut) is refused. The
+    // pipeline's own checks run on that.
+    let Some(target) = raw else {
+        return error(StatusCode::BAD_REQUEST, "bad_request", "no request line");
+    };
+    if !target.starts_with('/') {
         return error(
             StatusCode::BAD_REQUEST,
             "bad_request",
             "the request target must be origin-form (/v1/...)",
         );
     }
-    let target = match req.uri().path_and_query() {
-        Some(pq) => pq.as_str().to_string(),
-        None => return error(StatusCode::BAD_REQUEST, "bad_request", "no request target"),
-    };
+    if target.contains('#') {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the request target holds a fragment (#)",
+        );
+    }
+    // What the parser made of it must be the same bytes.
+    if req.uri().path_and_query().map(|pq| pq.as_str()) != Some(target.as_str()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "the request target cannot be read as sent",
+        );
+    }
     let path = target.split('?').next().unwrap_or("");
     if path == "/v1/services" {
         if req.method() != Method::GET {
@@ -288,10 +496,24 @@ async fn read_body(
             .insert(CONNECTION, HeaderValue::from_static("close"));
         r
     };
-    if let Some(n) = parts.headers.get(CONTENT_LENGTH) {
-        let n = n.to_str().ok().and_then(|s| s.parse::<u64>().ok());
-        if n.is_none_or(|n| n > MAX_BODY_BYTES as u64) {
-            return Err(Box::new(too_large()));
+    // With a Transfer-Encoding the length is not the Content-Length; the
+    // cap below applies either way.
+    if !parts.headers.contains_key(TRANSFER_ENCODING) {
+        if let Some(n) = parts.headers.get(CONTENT_LENGTH) {
+            match n.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+                Some(n) if n > MAX_BODY_BYTES as u64 => return Err(Box::new(too_large())),
+                Some(_) => {}
+                None => {
+                    let mut r = error(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "the Content-Length is not a number",
+                    );
+                    r.headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("close"));
+                    return Err(Box::new(r));
+                }
+            }
         }
     }
     match tokio::time::timeout(
@@ -450,7 +672,10 @@ fn respond(outcome: Outcome, route: Route) -> Resp {
             let h = r.headers_mut();
             match route {
                 // The allowlisted upstream headers, masked.
-                Route::Proxy => h.extend(finished.headers),
+                Route::Proxy => {
+                    h.extend(finished.headers);
+                    h.insert(OUTCOME, HeaderValue::from_static("upstream"));
+                }
                 Route::Api => {
                     if let Some(ct) = finished.headers.get(CONTENT_TYPE) {
                         h.insert(CONTENT_TYPE, ct.clone());
