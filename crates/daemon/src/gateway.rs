@@ -872,7 +872,22 @@ async fn call(ctx: &Arc<Ctx>, caller: &Caller, args: Map<String, Value>, route: 
         Err(m) => return error(StatusCode::BAD_REQUEST, "bad_request", m),
     };
     call.via = Via::Http;
-    match api_ops::execute(ctx, caller, call).await {
+    // A task of its own: hyper drops this future when the client goes away,
+    // and a call that may have reached the upstream must still finish,
+    // count against the limits and be recorded.
+    let task = {
+        let ctx = Arc::clone(ctx);
+        let caller = *caller;
+        tokio::spawn(async move { api_ops::execute(&ctx, &caller, call).await })
+    };
+    let Ok(done) = task.await else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the call did not complete",
+        );
+    };
+    match done {
         Ok(outcome) => respond(outcome, route),
         Err(Refused::LowDisk(_)) => error(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -144,6 +144,9 @@ pub struct Ctx {
     pub tokens: Arc<crate::tokens::Tokens>,
     /// The `[gateway] tcp` the daemon started with, and what it bound.
     pub tcp: Mutex<TcpState>,
+    /// Connector calls in flight; a stop waits for them (bounded) before
+    /// the stop record.
+    pub calls: InFlight,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -168,6 +171,57 @@ pub struct CtxInit {
     pub upstream: Result<Upstream, String>,
     pub backup_dir: PathBuf,
     pub tokens: Arc<crate::tokens::Tokens>,
+}
+
+/// A count of work in flight that a stop waits for.
+#[derive(Default)]
+pub struct InFlight {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// One unit of [`InFlight`] work, until dropped.
+pub struct Busy<'a>(&'a InFlight);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl InFlight {
+    pub fn enter(&self) -> Busy<'_> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Busy(self)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until nothing is in flight, at most `limit`; `true` when idle.
+    pub async fn wait_idle(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // Registered before the check: a drop in between still wakes us.
+            idle.as_mut().enable();
+            if self.count() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+                return self.count() == 0;
+            }
+        }
+    }
 }
 
 /// The optional loopback TCP listener of the gateway.
@@ -210,6 +264,7 @@ impl Ctx {
             backup_dir: i.backup_dir,
             tokens: i.tokens,
             tcp: Mutex::new(TcpState::default()),
+            calls: InFlight::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -552,6 +607,32 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_waits_for_calls_in_flight() {
+        let f = Arc::new(InFlight::default());
+        assert!(f.wait_idle(Duration::from_millis(10)).await);
+        let f2 = Arc::clone(&f);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let call = tokio::spawn(async move {
+            let _busy = f2.enter();
+            let _ = rx.await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(f.count(), 1);
+        // Bounded: still busy after the limit.
+        assert!(!f.wait_idle(Duration::from_millis(50)).await);
+        // Woken as soon as the last call ends.
+        let waiter = {
+            let f = Arc::clone(&f);
+            tokio::spawn(async move { f.wait_idle(Duration::from_secs(10)).await })
+        };
+        tokio::task::yield_now().await;
+        tx.send(()).unwrap();
+        call.await.unwrap();
+        assert!(waiter.await.unwrap());
+        assert_eq!(f.count(), 0);
+    }
 
     #[test]
     fn overlong_session_id_is_not_stored() {

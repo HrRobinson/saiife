@@ -386,6 +386,8 @@ pub(crate) async fn execute(
     caller: &Caller,
     mut call: Call,
 ) -> Result<Outcome, Refused> {
+    // A stop waits for this call (and its record) before it ends the log.
+    let _busy = ctx.calls.enter();
     let uid = caller.uid();
     if let Err(code) = disk_ok(ctx, uid) {
         ctx.notice(uid, Notice::LowDisk);

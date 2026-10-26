@@ -99,6 +99,10 @@ async fn answer(
             .body(Full::new(Bytes::from(b)))
             .unwrap()
     };
+    if parts.uri.path() == "/api/files/slow" {
+        // Long enough for the client to give up while the call is upstream.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
     let resp = match parts.uri.path() {
         "/api/orders.json" => json(
             200,
@@ -1029,6 +1033,35 @@ async fn client_that_never_reads_is_closed_after_write_timeout() {
     let (st, _, b) = w.send("GET", "/v1/proxy/shop/files/big", &[], b"").await;
     assert_eq!(st, StatusCode::OK);
     assert!(b.len() > BIG);
+}
+
+#[tokio::test]
+async fn client_gone_mid_call_still_records_and_counts() {
+    let w = world_with(Setup {
+        shop_extra: "limits = { requests_per_minute = 1 }",
+        ..Setup::default()
+    })
+    .await;
+    let mut s = UnixStream::connect(&w.sock).await.unwrap();
+    s.write_all(b"GET /v1/proxy/shop/files/slow HTTP/1.1\r\nHost: saiife\r\n\r\n")
+        .await
+        .unwrap();
+    // The request is upstream; the client closes its socket.
+    assert!(wait_until(Duration::from_secs(10), || w.hits() == 1).await);
+    drop(s);
+    // The call finishes anyway: its record is written ...
+    assert!(
+        wait_until(Duration::from_secs(10), || w.connector_records().len() == 1).await,
+        "no connector record for a call the client walked away from"
+    );
+    let recs = w.connector_records();
+    assert_eq!(recs[0]["decision"], "allow");
+    assert_eq!(recs[0]["status"], 404);
+    // ... and it counts: the next call is over the limit.
+    let (st, _, b) = w.api("shop/orders.list", json!({})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
+    assert_eq!(b["limit"], "requests_per_minute");
+    assert_eq!(w.hits(), 1);
 }
 
 #[tokio::test]

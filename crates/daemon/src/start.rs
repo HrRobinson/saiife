@@ -709,13 +709,9 @@ async fn serve(
         }
     }
 
-    // Pending `last_used` marks go to disk before the stop record.
-    if let VaultState::Ready(v) = &mut *ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
-        if let Err(e) = v.flush() {
-            eprintln!("saiife: warning: cannot write the vault at stop: {e}");
-        }
-    }
-    // Stop: no new connections, the stop record and a checkpoint, synced.
+    // No new connections; connector calls in flight (which a client that
+    // went away no longer holds) finish and are recorded first, for at
+    // most the upstream timeout.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
     gateway.abort();
@@ -725,6 +721,26 @@ async fn serve(
         let _ = t.await;
     }
     let _ = std::fs::remove_file(&gw_path);
+    if !writer_died {
+        let limit = ctx
+            .upstream
+            .as_ref()
+            .map(|u| u.timeout())
+            .unwrap_or(Duration::from_secs(30));
+        if !ctx.calls.wait_idle(limit).await {
+            eprintln!(
+                "saiife: warning: {} connector call(s) still in flight at stop",
+                ctx.calls.count()
+            );
+        }
+    }
+    // Pending `last_used` marks go to disk before the stop record.
+    if let VaultState::Ready(v) = &mut *ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
+        if let Err(e) = v.flush() {
+            eprintln!("saiife: warning: cannot write the vault at stop: {e}");
+        }
+    }
+    // Stop: the stop record and a checkpoint, synced.
     if writer_died {
         use std::io::Write;
         let _ = writeln!(

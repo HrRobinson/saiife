@@ -578,13 +578,15 @@ async fn steps(
             }
         }
     };
+    // Decision 6: what was sent counts, whatever came back. Committed
+    // before the send, so a caller that drops this future mid-send (a
+    // client gone) cannot release a slot the upstream may have used.
+    reservation.commit();
     let sent = {
         let _permit = permit;
         tr.sent = true;
         up.send(built, read_limit).await
     };
-    // Decision 6: what was sent counts, whatever came back.
-    reservation.commit();
     let resp = match sent {
         Ok(r) => r,
         Err(BrokerError::RedirectRefused) => return denied("redirect_refused"),
