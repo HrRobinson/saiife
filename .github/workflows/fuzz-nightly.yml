@@ -25,7 +25,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked --version 0.12.0
+      # cargo-fuzz 0.12.0's locked rustix does not build on this nightly;
+      # install it with stable. The fuzz runs below keep nightly.
+      - run: rustup toolchain install stable --profile minimal
+      - name: install cargo-fuzz
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo install cargo-fuzz --locked --version 0.12.0
       - name: fuzz each target for 30 min
         run: |
           set -euo pipefail

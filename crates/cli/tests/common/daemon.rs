@@ -32,34 +32,6 @@ impl Default for Opts {
     }
 }
 
-/// The longest path under a test dir that becomes a socket address:
-/// `/<prefix+6 random>/run/gateway.sock`.
-const SOCKET_TAIL: usize = 25;
-/// `sockaddr_un.sun_path` holds 108 bytes, with the terminating NUL.
-const SUN_PATH_MAX: usize = 108;
-
-/// A temp dir for a test, under a short base so unix socket paths fit in
-/// 108 bytes: `$SAIIFE_TEST_TMP`, else `$CARGO_TARGET_TMPDIR`, else
-/// `<repo>/target/t`. Never `/tmp`.
-pub fn short_tempdir() -> TempDir {
-    let base = std::env::var_os("SAIIFE_TEST_TMP")
-        .or_else(|| std::env::var_os("CARGO_TARGET_TMPDIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/t"));
-    fs::create_dir_all(&base).unwrap_or_else(|e| panic!("cannot create {}: {e}", base.display()));
-    let base = fs::canonicalize(&base).unwrap();
-    assert!(
-        base.as_os_str().len() + SOCKET_TAIL < SUN_PATH_MAX,
-        "the test temp base {} is too long for unix socket paths (108 bytes); \
-         set SAIIFE_TEST_TMP to a short directory",
-        base.display()
-    );
-    tempfile::Builder::new()
-        .prefix("s")
-        .tempdir_in(&base)
-        .unwrap_or_else(|e| panic!("cannot create a temp dir in {}: {e}", base.display()))
-}
-
 pub struct TestDaemon {
     pub tmp: TempDir,
     pub child: Option<Child>,
@@ -136,7 +108,7 @@ pub fn refused_code(e: &ClientError) -> &str {
 impl TestDaemon {
     /// A temp dir with the config written, no daemon yet.
     pub fn prepare(opts: &Opts) -> TestDaemon {
-        let tmp = short_tempdir();
+        let tmp = super::tmp::short_tempdir();
         let d = TestDaemon { tmp, child: None };
         fs::create_dir_all(d.path().join("etc")).unwrap();
         fs::create_dir_all(d.path().join("home")).unwrap();
