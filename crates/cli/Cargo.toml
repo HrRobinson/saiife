@@ -32,6 +32,7 @@ base64 = "=0.23.1"
 [target.'cfg(unix)'.dependencies]
 # Signals for the worker fault seam (debug builds); no unsafe calls.
 rustix = { version = "1", features = ["process", "termios", "fs"] }
+base64 = "=0.23.1"
 # Secret values `saiife secret` reads are wiped when dropped.
 zeroize = "=1.9.1"
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.

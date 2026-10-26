@@ -238,6 +238,9 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         eprintln!("saiife: warning: connector calls will fail: {e}");
         e.to_string()
     });
+    // Import backups older than 7 days go at start (and daily in `serve`).
+    let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
+    crate::import_backup::purge(&backup_dir, crate::import_backup::now());
 
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
@@ -256,6 +259,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         vault_path,
         limiter,
         upstream,
+        backup_dir,
     }));
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -621,6 +625,8 @@ async fn serve(
     // thread, never from a connector request on the runtime thread.
     let mut vault_tick = tokio::time::interval(Duration::from_secs(60));
     vault_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let day = Duration::from_secs(24 * 3600);
+    let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
     loop {
         tokio::select! {
             _ = vault_tick.tick() => {
@@ -631,6 +637,12 @@ async fn serve(
                             eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
                         }
                     }
+                });
+            }
+            _ = purge_tick.tick() => {
+                let dir = ctx.backup_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::import_backup::purge(&dir, crate::import_backup::now())
                 });
             }
             r = listener.accept() => match r {

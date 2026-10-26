@@ -10,7 +10,7 @@
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
-//! - `saiife secret add|list|rotate|remove` -> the vault, through the daemon (Linux, admin)
+//! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
 //! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
@@ -31,6 +31,8 @@ mod check_managed;
 mod connect_cmd;
 mod doctor_cmd;
 mod eval;
+#[cfg(target_os = "linux")]
+mod import_cmd;
 mod init_cmd;
 mod packs_cmd;
 mod paths;

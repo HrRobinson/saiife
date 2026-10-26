@@ -45,6 +45,23 @@ pub enum SecretAction {
     },
     /// Delete a secret.
     Remove { name: String },
+    /// Move plaintext credentials from an agent user's home and projects
+    /// into the vault (the daemon keeps a backup of each changed file for
+    /// 7 days), then remove them from the file.
+    Import {
+        /// The agent user whose files are scanned.
+        #[arg(long, value_name = "NAME")]
+        user: String,
+        /// A project root to scan for `.env*` files (repeatable).
+        #[arg(long = "project", value_name = "DIR")]
+        projects: Vec<PathBuf>,
+        /// Answer yes for every credential in this file (repeatable).
+        #[arg(long = "yes-to", value_name = "PATH")]
+        yes_to: Vec<PathBuf>,
+        /// The user's home (default: from /etc/passwd). Test seam.
+        #[arg(long, hide = true, value_name = "DIR")]
+        home: Option<PathBuf>,
+    },
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -137,6 +154,20 @@ pub(crate) mod linux {
                 }
                 Ok(())
             }
+            SecretAction::Import {
+                user,
+                projects,
+                yes_to,
+                home,
+            } => crate::import_cmd::run(
+                config,
+                crate::import_cmd::ImportArgs {
+                    user,
+                    projects,
+                    yes_to,
+                    home,
+                },
+            ),
             SecretAction::Remove { name } => {
                 call(config, "secret.remove", args([("name", json!(name))]))?;
                 outln!("removed {name}");

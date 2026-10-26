@@ -2,6 +2,12 @@
 //! vault. Every op is for root and `[admin] groups` only; anyone else gets
 //! `forbidden` and a `secret` record with `decision = "deny"`. A record or an
 //! answer never holds a field value, and an error never echoes `fields`.
+//!
+//! `secret.add` from `saiife secret import` also carries `backup {path,
+//! bytes_b64}`: the original bytes of the file the credential came from.
+//! They are written to the import-backup dir before the vault, and the add
+//! fails (with nothing stored) when that write fails. The bytes are a
+//! secret too and are never echoed.
 
 use crate::ops::{now_ts, Ctx, Notice};
 use crate::vault::{valid_name, Entry, Kind, Vault, VaultState};
@@ -51,6 +57,14 @@ fn event_of(op: &str) -> &'static str {
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let event = event_of(&req.op);
+    // The source path of an import goes into the record (never its bytes).
+    let source = req
+        .args
+        .get("backup")
+        .and_then(|b| b.get("path"))
+        .and_then(Value::as_str)
+        .filter(|p| valid_source(p))
+        .map(str::to_string);
     // Only a well-formed name goes into a record.
     let name = req
         .args
@@ -90,7 +104,10 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match done {
         Ok(Ok(fields)) => {
             if event != "secret_list" {
-                let r = record(ctx, peer, event, &name).await;
+                let mut r = record(ctx, peer, event, &name).await;
+                if let Some(src) = &source {
+                    r.extra.insert("imported_from".into(), src.clone().into());
+                }
                 if let Err(e) = ctx.writer.append(r).await {
                     // The change is made; say so rather than hide it.
                     eprintln!("saiife: {event} {name} committed without audit record: {e}");
@@ -138,7 +155,49 @@ fn execute(ctx: &Ctx, uid: u32, req: Request) -> Result<Map<String, Value>, Refu
             ))
         }
     };
-    run(vault, uid, parsed)
+    run(vault, uid, parsed, &ctx.backup_dir)
+}
+
+/// A backup's source path: absolute, no NUL, bounded.
+fn valid_source(p: &str) -> bool {
+    p.starts_with('/') && p.len() <= 4096 && !p.contains('\0')
+}
+
+/// The original bytes of an imported file and where they came from.
+struct Backup {
+    source: String,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+fn parse_backup(v: Option<&Value>) -> Result<Option<Backup>, Refusal> {
+    use base64::Engine as _;
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    // Never echo what was sent.
+    let (Some(path), Some(b64)) = (
+        v.get("path").and_then(Value::as_str),
+        v.get("bytes_b64").and_then(Value::as_str),
+    ) else {
+        return Err(bad("backup takes a path and bytes_b64"));
+    };
+    if !valid_source(path) {
+        return Err(bad("the backup path must be absolute"));
+    }
+    if b64.len() > crate::import_backup::MAX_BACKUP_BYTES.div_ceil(3) * 4 {
+        return Err(bad("the backup is too large"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| bad("the backup is not valid base64"))?;
+    let bytes = Zeroizing::new(bytes);
+    if bytes.len() > crate::import_backup::MAX_BACKUP_BYTES {
+        return Err(bad("the backup is too large"));
+    }
+    Ok(Some(Backup {
+        source: path.to_string(),
+        bytes,
+    }))
 }
 
 enum Parsed {
@@ -147,6 +206,7 @@ enum Parsed {
         kind: Kind,
         fields: BTreeMap<String, Zeroizing<String>>,
         services: Vec<String>,
+        backup: Option<Backup>,
     },
     Rotate {
         name: String,
@@ -173,11 +233,13 @@ fn parse(req: &Request) -> Result<Parsed, Refusal> {
             let kind = parse_kind(req.args.get("kind"))?;
             let services = parse_services(req.args.get("allowed_services"))?;
             let fields = parse_fields(req.args.get("fields"), kind)?;
+            let backup = parse_backup(req.args.get("backup"))?;
             Ok(Parsed::Add {
                 name,
                 kind,
                 fields,
                 services,
+                backup,
             })
         }
         OP_SECRET_ROTATE => {
@@ -292,7 +354,12 @@ fn parse_fields(
     Ok(f)
 }
 
-fn run(vault: &mut Vault, uid: u32, p: Parsed) -> Result<Map<String, Value>, Refusal> {
+fn run(
+    vault: &mut Vault,
+    uid: u32,
+    p: Parsed,
+    backup_dir: &Path,
+) -> Result<Map<String, Value>, Refusal> {
     let io = |_e: std::io::Error| (ErrorCode::Internal, "cannot write the vault".to_string());
     match p {
         Parsed::List => {
@@ -320,25 +387,50 @@ fn run(vault: &mut Vault, uid: u32, p: Parsed) -> Result<Map<String, Value>, Ref
             kind,
             fields,
             services,
+            backup,
         } => {
             if vault.get(&name).is_some() {
                 return Err(bad(format!(
                     "secret {name} exists; use rotate to replace its value"
                 )));
             }
-            vault
-                .put(Entry {
-                    name,
-                    kind,
-                    fields,
-                    allowed_services: services,
-                    created_by: uid,
-                    created: now_ts(),
-                    last_used: None,
-                    rotate_after: None,
-                })
-                .map_err(io)?;
-            Ok(Map::new())
+            // The backup first: no backup, no add (and so no rewrite).
+            let written = match &backup {
+                Some(b) => Some(
+                    crate::import_backup::write(
+                        backup_dir,
+                        crate::import_backup::now(),
+                        &b.source,
+                        &b.bytes,
+                    )
+                    .map_err(|e| {
+                        eprintln!("saiifed: warning: cannot write an import backup: {e}");
+                        (ErrorCode::Internal, "cannot write the backup".to_string())
+                    })?,
+                ),
+                None => None,
+            };
+            let put = vault.put(Entry {
+                name,
+                kind,
+                fields,
+                allowed_services: services,
+                created_by: uid,
+                created: now_ts(),
+                last_used: None,
+                rotate_after: None,
+            });
+            if let Err(e) = put {
+                if let Some(p) = &written {
+                    let _ = std::fs::remove_file(p);
+                }
+                return Err(io(e));
+            }
+            let mut m = Map::new();
+            if written.is_some() {
+                m.insert("backup".into(), true.into());
+            }
+            Ok(m)
         }
         Parsed::Rotate { name, fields } => {
             let Some(old) = vault.get(&name) else {
@@ -667,6 +759,37 @@ mod tests {
         assert_eq!(gate(Ok(10), 512, 1000, 990), Err(ErrorCode::LowDisk));
         assert_eq!(gate(Ok(512), 512, 1000, 990), Ok(()));
         assert_eq!(gate(io_err(), 512, 1000, 990), Err(ErrorCode::LowDisk));
+    }
+
+    #[test]
+    fn backup_is_checked_and_never_echoed() {
+        let add = |backup: Value| json!({"name":"a1","kind":"token","fields":{"token":"abcd"},"allowed_services":["s"],"backup":backup});
+        let good = add(json!({"path":"/h/.env","bytes_b64":"QT0xCg=="}));
+        match parse(&req(OP_SECRET_ADD, good)) {
+            Ok(Parsed::Add {
+                backup: Some(b), ..
+            }) => {
+                assert_eq!(b.source, "/h/.env");
+                assert_eq!(&b.bytes[..], b"A=1\n");
+            }
+            _ => panic!("not parsed"),
+        }
+        let m = msg(parse(&req(
+            OP_SECRET_ADD,
+            add(json!({"path":"/h/.env","bytes_b64":"c2VjcmV0!!"})),
+        )));
+        assert_eq!(m, "the backup is not valid base64");
+        let m = msg(parse(&req(
+            OP_SECRET_ADD,
+            add(json!({"path":"rel/.env","bytes_b64":"QQ=="})),
+        )));
+        assert_eq!(m, "the backup path must be absolute");
+        let big = "A".repeat(crate::import_backup::MAX_BACKUP_BYTES / 3 * 4 + 8);
+        let m = msg(parse(&req(
+            OP_SECRET_ADD,
+            add(json!({"path":"/h/.env","bytes_b64":big})),
+        )));
+        assert_eq!(m, "the backup is too large");
     }
 
     #[test]

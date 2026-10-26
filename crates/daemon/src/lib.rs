@@ -9,6 +9,8 @@ pub mod api_ops;
 #[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
+pub mod import_backup;
+#[cfg(target_os = "linux")]
 pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod notify;

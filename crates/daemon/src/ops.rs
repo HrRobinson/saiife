@@ -138,6 +138,8 @@ pub struct Ctx {
     pub upstream: Result<Upstream, String>,
     /// At most 4 upstream calls in flight per service.
     pub pools: Pools,
+    /// Where `secret.add` keeps the backups of imported files.
+    pub backup_dir: PathBuf,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -160,6 +162,7 @@ pub struct CtxInit {
     pub vault_path: PathBuf,
     pub limiter: Limiter,
     pub upstream: Result<Upstream, String>,
+    pub backup_dir: PathBuf,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -190,6 +193,7 @@ impl Ctx {
             limiter: i.limiter,
             upstream: i.upstream,
             pools: Pools::new(),
+            backup_dir: i.backup_dir,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
