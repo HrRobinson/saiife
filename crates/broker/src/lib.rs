@@ -7,7 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod amount;
 pub mod catalog;
+pub mod limits;
 pub mod manifest;
 pub mod params;
 pub mod resolve;
@@ -37,4 +39,6 @@ pub enum BrokerError {
     UnknownConnector(String),
     #[error("missing required parameter {0:?}")]
     MissingParam(String),
+    #[error("bad amount: {0}")]
+    BadAmount(String),
 }

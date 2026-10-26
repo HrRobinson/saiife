@@ -17,6 +17,7 @@ toml = "0.8"
 regex = "1"
 thiserror = "1"
 percent-encoding = "2"
+time = "0.3"
 saiife-policy = { path = "../policy" }
 
 [dev-dependencies]

@@ -1,0 +1,478 @@
+//! Sliding-window rate, blast-radius and amount limits (spec §6.9.2, §6.9.4).
+//! Counts requests that were sent upstream. Check and reserve happen under
+//! one lock; a `Reservation` is committed once the request was sent.
+
+use crate::amount::exponent;
+use crate::manifest::OpKind;
+use saiife_policy::LimitsCfg;
+use std::sync::{Arc, Mutex};
+use time::{Duration, OffsetDateTime};
+
+const DAY: i64 = 86_400;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Key {
+    pub uid: u32,
+    pub service: String,
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub at: OffsetDateTime,
+    pub key: Key,
+    pub kind: OpKind,
+    pub amount_minor: Option<(u64, String)>,
+}
+
+struct Entry {
+    id: u64,
+    ev: Event,
+}
+
+#[derive(Default)]
+struct State {
+    next_id: u64,
+    /// Committed and still-pending (reserved) events alike: both hold a slot.
+    entries: Vec<Entry>,
+}
+
+pub struct Limiter {
+    state: Arc<Mutex<State>>,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A slot held until `commit`; dropping it uncommitted releases the slot.
+#[must_use = "commit the reservation once the request was sent"]
+pub struct Reservation {
+    state: Arc<Mutex<State>>,
+    id: u64,
+    committed: bool,
+}
+
+fn lock(s: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    s.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl Reservation {
+    /// The request was sent: the slot stays taken.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock(&self.state).entries.retain(|e| e.id != self.id);
+        }
+    }
+}
+
+fn is_write(k: OpKind) -> bool {
+    !matches!(k, OpKind::Read)
+}
+
+fn cap_minor(max_major: u64, currency: &str) -> u128 {
+    u128::from(max_major) * 10u128.pow(exponent(currency))
+}
+
+impl Limiter {
+    pub fn new() -> Limiter {
+        Limiter {
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+
+    /// Rebuild from audit records; events older than 24 h are dropped.
+    pub fn rebuild(records: impl Iterator<Item = Event>, now: OffsetDateTime) -> Limiter {
+        let cutoff = now - Duration::seconds(DAY);
+        let mut st = State::default();
+        for ev in records.filter(|e| e.at > cutoff) {
+            let id = st.next_id;
+            st.next_id += 1;
+            st.entries.push(Entry { id, ev });
+        }
+        Limiter {
+            state: Arc::new(Mutex::new(st)),
+        }
+    }
+
+    /// Check every configured limit against the (uid, service) bucket and
+    /// the (uid, service, session) bucket, and reserve a slot. Errs with the
+    /// name of the limit hit.
+    pub fn check_and_commit(
+        &self,
+        k: &Key,
+        kind: OpKind,
+        amount: Option<(u64, &str)>,
+        cfg: &LimitsCfg,
+        now: OffsetDateTime,
+    ) -> Result<Reservation, &'static str> {
+        let mut st = lock(&self.state);
+        let cutoff = now - Duration::seconds(DAY);
+        st.entries.retain(|e| e.ev.at > cutoff);
+
+        let amount = amount.map(|(m, c)| (m, c.to_ascii_uppercase()));
+        if let Some((m, c)) = &amount {
+            for cap in [&cfg.amount_per_request, &cfg.amount_per_day]
+                .into_iter()
+                .flatten()
+            {
+                if !cap.currency.eq_ignore_ascii_case(c) {
+                    return Err("amount_currency");
+                }
+            }
+            if let Some(cap) = &cfg.amount_per_request {
+                if u128::from(*m) > cap_minor(cap.max, &cap.currency) {
+                    return Err("amount_per_request");
+                }
+            }
+        }
+
+        let in_win = |e: &Entry, secs: i64| e.ev.at > now - Duration::seconds(secs);
+        let uid_bucket = |e: &Entry| e.ev.key.uid == k.uid && e.ev.key.service == k.service;
+        let session_bucket = |e: &Entry| e.ev.key == *k;
+        let buckets: [&dyn Fn(&Entry) -> bool; 2] = [&uid_bucket, &session_bucket];
+        for b in buckets {
+            let count = |secs: i64, f: &dyn Fn(OpKind) -> bool| -> u64 {
+                st.entries
+                    .iter()
+                    .filter(|e| b(e) && in_win(e, secs) && f(e.ev.kind))
+                    .count() as u64
+            };
+            if let Some(l) = cfg.requests_per_minute {
+                if count(60, &|_| true) + 1 > u64::from(l) {
+                    return Err("requests_per_minute");
+                }
+            }
+            if is_write(kind) {
+                if let Some(l) = cfg.writes_per_hour {
+                    if count(3600, &is_write) + 1 > u64::from(l) {
+                        return Err("writes_per_hour");
+                    }
+                }
+            }
+            if kind == OpKind::Delete {
+                if let Some(l) = cfg.deletes_per_day {
+                    if count(DAY, &|x| x == OpKind::Delete) + 1 > u64::from(l) {
+                        return Err("deletes_per_day");
+                    }
+                }
+            }
+            if kind == OpKind::Bulk {
+                if let Some(l) = cfg.bulk_per_session {
+                    if count(DAY, &|x| x == OpKind::Bulk) + 1 > u64::from(l) {
+                        return Err("bulk_per_session");
+                    }
+                }
+            }
+            if let (Some(cap), Some((m, c))) = (&cfg.amount_per_day, &amount) {
+                let sum: u128 = st
+                    .entries
+                    .iter()
+                    .filter(|e| b(e) && in_win(e, DAY))
+                    .filter_map(|e| e.ev.amount_minor.as_ref())
+                    .filter(|(_, ec)| ec.eq_ignore_ascii_case(c))
+                    .map(|(a, _)| u128::from(*a))
+                    .sum();
+                if sum + u128::from(*m) > cap_minor(cap.max, &cap.currency) {
+                    return Err("amount_per_day");
+                }
+            }
+        }
+
+        let id = st.next_id;
+        st.next_id += 1;
+        st.entries.push(Entry {
+            id,
+            ev: Event {
+                at: now,
+                key: k.clone(),
+                kind,
+                amount_minor: amount,
+            },
+        });
+        Ok(Reservation {
+            state: Arc::clone(&self.state),
+            id,
+            committed: false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{AmountSpec, Unit};
+    use saiife_policy::AmountCap;
+    use serde_json::json;
+
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+    fn key(uid: u32, s: Option<&str>) -> Key {
+        Key {
+            uid,
+            service: "stripe".into(),
+            session: s.map(String::from),
+        }
+    }
+    fn cap(max: u64, c: &str) -> Option<AmountCap> {
+        Some(AmountCap {
+            max,
+            currency: c.into(),
+        })
+    }
+    fn go(
+        l: &Limiter,
+        k: &Key,
+        kind: OpKind,
+        a: Option<(u64, &str)>,
+        c: &LimitsCfg,
+        now: OffsetDateTime,
+    ) -> Result<(), &'static str> {
+        l.check_and_commit(k, kind, a, c, now).map(|r| r.commit())
+    }
+
+    #[test]
+    fn rpm_61st_denied_then_ok_after_window() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            requests_per_minute: Some(60),
+            ..Default::default()
+        };
+        let k = key(1, Some("s"));
+        for _ in 0..60 {
+            go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
+        }
+        assert_eq!(
+            go(&l, &k, OpKind::Read, None, &c, t0()),
+            Err("requests_per_minute")
+        );
+        go(&l, &k, OpKind::Read, None, &c, t0() + Duration::seconds(61)).unwrap();
+    }
+
+    #[test]
+    fn session_bucket_and_uid_bucket_both_apply() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            requests_per_minute: Some(2),
+            ..Default::default()
+        };
+        go(&l, &key(1, Some("a")), OpKind::Read, None, &c, t0()).unwrap();
+        go(&l, &key(1, Some("b")), OpKind::Read, None, &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &key(1, Some("c")), OpKind::Read, None, &c, t0()),
+            Err("requests_per_minute")
+        );
+        go(&l, &key(2, Some("a")), OpKind::Read, None, &c, t0()).unwrap();
+    }
+
+    #[test]
+    fn null_session_is_one_bucket() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            bulk_per_session: Some(1),
+            ..Default::default()
+        };
+        go(&l, &key(1, None), OpKind::Bulk, None, &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &key(1, None), OpKind::Bulk, None, &c, t0()),
+            Err("bulk_per_session")
+        );
+    }
+
+    #[test]
+    fn deletes_zero_means_never() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            deletes_per_day: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            go(&l, &key(1, None), OpKind::Delete, None, &c, t0()),
+            Err("deletes_per_day")
+        );
+        go(&l, &key(1, None), OpKind::Read, None, &c, t0()).unwrap();
+    }
+
+    #[test]
+    fn amount_per_day_sums_minor_units() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "EUR"),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        go(&l, &k, OpKind::Write, Some((20_000, "EUR")), &c, t0()).unwrap();
+        go(&l, &k, OpKind::Write, Some((25_000, "EUR")), &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((10_000, "EUR")), &c, t0()),
+            Err("amount_per_day")
+        );
+    }
+
+    #[test]
+    fn amount_per_request_is_single_request() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            amount_per_request: cap(100, "EUR"),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        go(&l, &k, OpKind::Write, Some((10_000, "EUR")), &c, t0()).unwrap();
+        go(&l, &k, OpKind::Write, Some((10_000, "EUR")), &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((10_001, "EUR")), &c, t0()),
+            Err("amount_per_request")
+        );
+    }
+
+    #[test]
+    fn split_refund_still_capped() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "EUR"),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        let ok = (0..600)
+            .filter(|_| go(&l, &k, OpKind::Write, Some((100, "EUR")), &c, t0()).is_ok())
+            .count();
+        assert_eq!(ok, 500);
+    }
+
+    #[test]
+    fn amount_currency_mismatch_denied() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "EUR"),
+            ..Default::default()
+        };
+        assert_eq!(
+            go(
+                &l,
+                &key(1, None),
+                OpKind::Write,
+                Some((100, "USD")),
+                &c,
+                t0()
+            ),
+            Err("amount_currency")
+        );
+    }
+
+    #[test]
+    fn jpy_exponent_zero() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            amount_per_request: cap(500, "JPY"),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        go(&l, &k, OpKind::Write, Some((500, "JPY")), &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((501, "JPY")), &c, t0()),
+            Err("amount_per_request")
+        );
+    }
+
+    #[test]
+    fn extract_sums_array_path() {
+        use crate::amount::extract;
+        let spec = AmountSpec {
+            field: "refund.transactions[].amount".into(),
+            currency_field: "refund.currency".into(),
+            unit: Unit::Major,
+        };
+        let body = json!({"refund":{"currency":"eur","transactions":[{"amount":"1.50"},{"amount":2},{"amount":0.25}]}});
+        assert_eq!(extract(&spec, &body).unwrap(), (375, "EUR".to_string()));
+        for bad in [
+            json!({"refund":{"currency":"EUR","transactions":[{"amount":-1}]}}),
+            json!({"refund":{"currency":"EUR","transactions":[{"amount":"1.234"}]}}),
+            json!({"refund":{"currency":"EUR","transactions":[{"amount":"x"}]}}),
+            json!({"refund":{"currency":"EUR","transactions":[]}}),
+            json!({"refund":{"currency":"EUR"}}),
+            json!({"refund":{"transactions":[{"amount":1}]}}),
+        ] {
+            assert!(extract(&spec, &bad).is_err(), "{bad}");
+        }
+        let minor = AmountSpec {
+            unit: Unit::Minor,
+            ..spec.clone()
+        };
+        let b = json!({"refund":{"currency":"JPY","transactions":[{"amount":300}]}});
+        assert_eq!(extract(&minor, &b).unwrap(), (300, "JPY".to_string()));
+        let b = json!({"refund":{"currency":"EUR","transactions":[{"amount":"3.5"}]}});
+        assert!(extract(&minor, &b).is_err());
+    }
+
+    #[test]
+    fn concurrent_last_slot_once() {
+        let l = Arc::new(Limiter::new());
+        let c = LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (l, c) = (l.clone(), c.clone());
+                std::thread::spawn(move || {
+                    l.check_and_commit(&key(1, None), OpKind::Read, None, &c, t0())
+                        .map(|r| {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            r.commit()
+                        })
+                        .is_ok()
+                })
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(ok, 1);
+    }
+
+    #[test]
+    fn dropped_reservation_releases() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        drop(
+            l.check_and_commit(&k, OpKind::Read, None, &c, t0())
+                .unwrap(),
+        );
+        go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
+    }
+
+    #[test]
+    fn rebuild_from_records_keeps_window() {
+        let k = key(1, None);
+        let ev = |secs: i64| Event {
+            at: t0() - Duration::seconds(secs),
+            key: k.clone(),
+            kind: OpKind::Delete,
+            amount_minor: None,
+        };
+        let l = Limiter::rebuild(vec![ev(10), ev(DAY + 5)].into_iter(), t0());
+        let c = LimitsCfg {
+            deletes_per_day: Some(2),
+            ..Default::default()
+        };
+        go(&l, &k, OpKind::Delete, None, &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Delete, None, &c, t0()),
+            Err("deletes_per_day")
+        );
+    }
+}
