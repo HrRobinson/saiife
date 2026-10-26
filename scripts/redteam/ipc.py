@@ -7,12 +7,17 @@ Runs only in the GitHub locked-linux job; refuses anywhere else.
 import json
 import os
 import socket
+import stat
 import sys
 import threading
 import time
 
 MAX_FRAME = 1048576
 DEFAULT_SOCKET = "/run/saiife/saiife.sock"
+
+
+class UsageError(Exception):
+    """A caller mistake (bad/missing args): the gate reports it and exits 2."""
 
 
 def encode(obj):
@@ -33,7 +38,7 @@ def _recv_exact(sock, n):
 
 
 def read_frame(sock):
-    """Next frame as a dict, or None on EOF."""
+    """Next frame as decoded JSON, or None on EOF."""
     h = _recv_exact(sock, 4)
     if h is None:
         return None
@@ -44,6 +49,14 @@ def read_frame(sock):
     if body is None:
         return None
     return json.loads(body.decode("utf-8"))
+
+
+def _ans_ok(a):
+    return isinstance(a, dict) and a.get("ok") is True
+
+
+def _ans_busy(a):
+    return isinstance(a, dict) and a.get("error") == "busy"
 
 
 class Conn:
@@ -58,7 +71,12 @@ class Conn:
         self._next = 2
 
     def send(self, obj):
+        """Send one well-formed frame; the encode path stays strict."""
         self.sock.sendall(encode(obj))
+
+    def send_raw(self, data):
+        """Send exactly these bytes, bypassing the length/JSON encoder."""
+        self.sock.sendall(data)
 
     def hello(self):
         self.send({"id": 1, "op": "hello", "proto": 1, "client": "redteam"})
@@ -80,9 +98,14 @@ class Conn:
 
 
 def guard_record(input, **override):
+    now = time.time()
+    ms = int(round((now - int(now)) * 1000))
+    if ms > 999:
+        ms = 999
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".%03dZ" % ms
     rec = {
         "v": 2,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".000Z",
+        "ts": ts,
         "agent": "claude",
         "project": "/tmp",
         "tool": "Bash",
@@ -99,6 +122,22 @@ def _hello_append(path, rec):
     try:
         c.hello()
         return c.call("audit.append", rec=rec)
+    finally:
+        c.close()
+
+
+def raw_send(path, data):
+    """Send raw bytes to the daemon, report the one answer or that it closed."""
+    c = Conn(path)
+    try:
+        c.send_raw(data)
+        try:
+            a = read_frame(c.sock)
+        except (OSError, ValueError):
+            return {"closed": True}
+        if a is None:
+            return {"closed": True}
+        return {"answer": a}
     finally:
         c.close()
 
@@ -131,9 +170,9 @@ def _flood_worker(path, count, stats, lock):
                 if a is None:
                     break
                 got += 1
-                if a.get("ok"):
+                if _ans_ok(a):
                     ok += 1
-                elif a.get("error") == "busy":
+                elif _ans_busy(a):
                     busy += 1
                 else:
                     other += 1
@@ -170,10 +209,12 @@ def conns(path, n):
     held = []
     ok = busy = refused = 0
     for _ in range(n):
+        # A short per-connection timeout keeps the worst case bounded even if
+        # the daemon accepts but never answers the hello.
         try:
-            c = Conn(path)
+            c = Conn(path, timeout=2.0)
             a = c.hello()
-        except OSError:
+        except (OSError, ValueError):
             refused += 1
             continue
         if a is None:
@@ -181,9 +222,9 @@ def conns(path, n):
             c.close()
             continue
         held.append(c)
-        if a.get("error") == "busy":
+        if _ans_busy(a):
             busy += 1
-        elif a.get("ok"):
+        elif _ans_ok(a):
             ok += 1
         else:
             refused += 1
@@ -193,46 +234,105 @@ def conns(path, n):
     return {"ok": ok, "busy": busy, "refused": refused}
 
 
-def serve_fake(path, count_file, ready=None, stop=None):
+def _unlink_stale_socket(path):
+    """Remove a leftover socket file only if it is a socket we own."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid():
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def serve_fake(path, count_file, ready=None, stop=None, ready_file=None):
+    _unlink_stale_socket(path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(path)
     srv.listen(64)
-    if stop is not None:
-        srv.settimeout(0.1)
-    if ready is not None:
-        ready.set()
+    # Open the count file before announcing readiness so an unwritable path is
+    # reported here, not as a traceback from an accept loop or handler thread.
+    cf = open(count_file, "a")
+    try:
+        if stop is not None:
+            srv.settimeout(0.1)
+        if ready_file is not None:
+            with open(ready_file, "w") as rf:
+                rf.write("ready\n")
+        if ready is not None:
+            ready.set()
 
-    def handle(c):
-        c.settimeout(None)
-        try:
-            while True:
-                req = read_frame(c)
-                if req is None:
-                    break
-                if req.get("op") == "hello":
-                    a = {"id": req.get("id"), "ok": True, "proto": 1,
-                         "daemon": "fake", "mode": "locked"}
-                else:
-                    a = {"id": req.get("id"), "ok": True}
-                c.sendall(encode(a))
-        except (OSError, ValueError):
-            pass
-        finally:
-            c.close()
+        def handle(c):
+            c.settimeout(None)
+            try:
+                while True:
+                    req = read_frame(c)
+                    if req is None:
+                        break
+                    rid = req.get("id") if isinstance(req, dict) else None
+                    op = req.get("op") if isinstance(req, dict) else None
+                    if op == "hello":
+                        a = {"id": rid, "ok": True, "proto": 1,
+                             "daemon": "fake", "mode": "locked"}
+                    else:
+                        a = {"id": rid, "ok": True}
+                    c.sendall(encode(a))
+            except (OSError, ValueError):
+                pass
+            finally:
+                c.close()
 
-    while stop is None or not stop.is_set():
-        try:
-            c, _ = srv.accept()
-        except socket.timeout:
-            continue
-        with open(count_file, "a") as f:
-            f.write("conn\n")
-        threading.Thread(target=handle, args=(c,), daemon=True).start()
-    srv.close()
+        while stop is None or not stop.is_set():
+            try:
+                c, _ = srv.accept()
+            except socket.timeout:
+                continue
+            cf.write("conn\n")
+            cf.flush()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    finally:
+        cf.close()
+        srv.close()
 
 
 def _emit(obj):
     print(json.dumps(obj))
+
+
+def _take_opt(rest, name):
+    """Pull `--name VALUE` out of rest, returning (value_or_None, remaining)."""
+    out = []
+    val = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == name:
+            if i + 1 >= len(rest):
+                raise UsageError("%s needs a value" % name)
+            val = rest[i + 1]
+            i += 2
+            continue
+        out.append(rest[i])
+        i += 1
+    return val, out
+
+
+def _arg(rest, i, what):
+    if i >= len(rest):
+        raise UsageError("missing argument: %s" % what)
+    return rest[i]
+
+
+def _int_arg(rest, i, what, minimum=None):
+    raw = _arg(rest, i, what)
+    try:
+        v = int(raw)
+    except ValueError:
+        raise UsageError("%s must be an integer, got %r" % (what, raw))
+    if minimum is not None and v < minimum:
+        raise UsageError("%s must be >= %d, got %d" % (what, minimum, v))
+    return v
 
 
 def main(argv):
@@ -258,10 +358,16 @@ def main(argv):
             finally:
                 c.close()
         elif cmd == "append-json":
-            _emit(_hello_append(path, json.loads(rest[0])))
+            raw = _arg(rest, 0, "<json>")
+            try:
+                rec = json.loads(raw)
+            except ValueError as e:
+                raise UsageError("append-json needs valid JSON: %s" % e)
+            _emit(_hello_append(path, rec))
         elif cmd == "forge-guard":
-            rec = guard_record(rest[0], uid=0, user="root", mode="developer", seq=1,
-                               prev="0" * 64, host="evil", ts="2001-01-01T00:00:00.000Z")
+            rec = guard_record(_arg(rest, 0, "<input>"), uid=0, user="root",
+                               mode="developer", seq=1, prev="0" * 64, host="evil",
+                               ts="2001-01-01T00:00:00.000Z")
             _emit(_hello_append(path, rec))
         elif cmd == "rotate-key":
             c = Conn(path)
@@ -270,14 +376,39 @@ def main(argv):
                 _emit(c.call("audit.rotate_key"))
             finally:
                 c.close()
+        elif cmd == "raw":
+            hexstr, _rest = _take_opt(rest, "--hex")
+            if hexstr is None:
+                raise UsageError("raw needs --hex <bytes>")
+            try:
+                data = bytes.fromhex(hexstr)
+            except ValueError as e:
+                raise UsageError("--hex must be hex digits: %s" % e)
+            _emit(raw_send(path, data))
+        elif cmd == "raw-frame":
+            length, rest = _take_opt(rest, "--length")
+            body, rest = _take_opt(rest, "--body")
+            if length is None or body is None:
+                raise UsageError("raw-frame needs --length N and --body <text>")
+            try:
+                n = int(length)
+            except ValueError:
+                raise UsageError("--length must be an integer, got %r" % length)
+            if n < 0 or n > 0xFFFFFFFF:
+                raise UsageError("--length must fit in u32, got %d" % n)
+            data = n.to_bytes(4, "big") + body.encode("utf-8")
+            _emit(raw_send(path, data))
         elif cmd == "flood":
-            _emit(flood(path, int(rest[0]), int(rest[1])))
+            n = _int_arg(rest, 0, "<n>", minimum=0)
+            threads = _int_arg(rest, 1, "<threads>", minimum=1)
+            _emit(flood(path, n, threads))
         elif cmd == "conns":
-            _emit(conns(path, int(rest[0])))
+            _emit(conns(path, _int_arg(rest, 0, "<n>", minimum=0)))
         elif cmd == "bind":
+            target = _arg(rest, 0, "<path>")
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                s.bind(rest[0])
+                s.bind(target)
             except OSError as e:
                 _emit({"error": e.strerror})
                 print(e.strerror, file=sys.stderr)
@@ -285,14 +416,20 @@ def main(argv):
             finally:
                 s.close()
             try:
-                os.unlink(rest[0])
+                os.unlink(target)
             except OSError:
                 pass
         elif cmd == "serve-fake":
-            serve_fake(rest[0], rest[1])
+            ready_file, rest = _take_opt(rest, "--ready-file")
+            spath = _arg(rest, 0, "<path>")
+            cfile = _arg(rest, 1, "<count-file>")
+            serve_fake(spath, cfile, ready_file=ready_file)
         else:
             print("unknown command: %s" % cmd, file=sys.stderr)
             return 2
+    except UsageError as e:
+        print("usage error: %s" % e, file=sys.stderr)
+        return 2
     except (OSError, ValueError, IndexError) as e:
         print("connection failure: %s" % e, file=sys.stderr)
         return 3

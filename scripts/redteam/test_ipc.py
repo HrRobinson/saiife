@@ -7,6 +7,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -83,6 +84,98 @@ class IpcTests(unittest.TestCase):
         with mock.patch.dict(os.environ, GATE), contextlib.redirect_stdout(out):
             self.assertEqual(ipc.main(["--socket", path, "forge-guard", "x"]), 0)
         self.assertTrue(json.loads(out.getvalue())["ok"])
+
+    def test_raw_oversize_length_header_closes(self):
+        path, _ = self._fake()
+        # 4-byte header claiming 2 MiB, then a tiny body: the server rejects
+        # the length and closes without answering.
+        out = self._raw(path, {"--length": str(2 * 1024 * 1024), "--body": "{}"})
+        self.assertTrue(out["closed"])
+
+    def test_raw_zero_length_closes(self):
+        path, _ = self._fake()
+        out = self._raw(path, {"--length": "0", "--body": ""})
+        self.assertTrue(out["closed"])
+
+    def test_raw_non_json_body_closes(self):
+        path, _ = self._fake()
+        out = self._raw(path, {"--length": "5", "--body": "notjs"})
+        self.assertTrue(out["closed"])
+
+    def _raw(self, path, opts):
+        argv = ["--socket", path, "raw-frame"]
+        for k, v in opts.items():
+            argv += [k, v]
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, GATE), contextlib.redirect_stdout(out):
+            self.assertEqual(ipc.main(argv), 0)
+        return json.loads(out.getvalue())
+
+    def test_serve_fake_ready_file_and_stale_socket(self):
+        path = os.path.join(self.dir, "s.sock")
+        count = os.path.join(self.dir, "count")
+        ready_file = os.path.join(self.dir, "ready")
+        # Leave a stale socket of our own at the path; serve_fake must unlink it.
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(path)
+        stale.close()
+        self.assertTrue(os.path.exists(path))
+        stop = threading.Event()
+        t = threading.Thread(target=ipc.serve_fake,
+                             kwargs={"path": path, "count_file": count,
+                                     "stop": stop, "ready_file": ready_file})
+        t.start()
+        self.addCleanup(t.join)
+        self.addCleanup(stop.set)
+        for _ in range(50):
+            if os.path.exists(ready_file):
+                break
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(ready_file))
+        c = ipc.Conn(path)
+        self.assertEqual(c.hello()["mode"], "locked")
+        c.close()
+
+    def test_unlink_stale_socket_leaves_plain_file(self):
+        plain = os.path.join(self.dir, "plain")
+        with open(plain, "w") as f:
+            f.write("not a socket")
+        ipc._unlink_stale_socket(plain)
+        self.assertTrue(os.path.exists(plain))
+
+    def test_usage_errors_exit_2(self):
+        with mock.patch.dict(os.environ, GATE), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ipc.main(["append-json", "{not json"]), 2)
+            self.assertEqual(ipc.main(["flood", "100", "0"]), 2)
+            self.assertEqual(ipc.main(["append-json"]), 2)
+            self.assertEqual(ipc.main(["conns"]), 2)
+
+    def test_guard_record_ts_has_millis(self):
+        ts = ipc.guard_record("x")["ts"]
+        self.assertRegex(ts, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+    def test_non_dict_answer_handled(self):
+        # A server that answers with a bare JSON number must not crash conns().
+        path = os.path.join(self.dir, "weird.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(8)
+        self.addCleanup(srv.close)
+
+        def serve():
+            try:
+                while True:
+                    conn, _ = srv.accept()
+                    ipc.read_frame(conn)
+                    conn.sendall(ipc.encode(42))
+                    conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        res = ipc.conns(path, 1)
+        self.assertEqual(res["refused"], 1)
 
     def test_bind_reports_permission_error(self):
         if os.geteuid() == 0:
