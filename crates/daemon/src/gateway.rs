@@ -603,61 +603,90 @@ async fn route(
     raw: Option<String>,
     opts: Opts,
 ) -> Resp {
-    // The request target exactly as received, from the request line itself
-    // ([`Guarded`]): no dot-segment removal, no percent-decoding, and a
-    // fragment (which `http::Uri` would silently cut) is refused. The
-    // pipeline's own checks run on that.
+    match classify(req.method(), req.uri(), raw.as_deref()) {
+        Target::BadRequest(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
+        Target::Services => {
+            let services = api_ops::services_for(ctx, caller.uid(), &BTreeMap::new()).await;
+            json_resp(StatusCode::OK, json!({"services": services}))
+        }
+        Target::MethodNotAllowed(allow) => method_not_allowed(allow),
+        Target::Api { service, op } => {
+            let body = match read_body(req, opts).await {
+                Ok((_, b)) => b,
+                Err(r) => return *r,
+            };
+            match api_args(&service, &op, &body) {
+                Ok(args) => call(ctx, caller, args, Route::Api).await,
+                Err(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
+            }
+        }
+        Target::Proxy { service, upstream } => {
+            let method = req.method().as_str().to_string();
+            let (parts, body) = match read_body(req, opts).await {
+                Ok(x) => x,
+                Err(r) => return *r,
+            };
+            let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
+            call(ctx, caller, args, Route::Proxy).await
+        }
+        Target::Requests => json_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "approvals come in plan 11"}),
+        ),
+        Target::NotFound => not_found(),
+    }
+}
+
+/// Where a request goes, decided from its method and target alone (no IO).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    BadRequest(&'static str),
+    Services,
+    MethodNotAllowed(&'static str),
+    Api { service: String, op: String },
+    Proxy { service: String, upstream: String },
+    Requests,
+    NotFound,
+}
+
+/// The pure routing decision. `raw` is the request target exactly as
+/// received, from the request line itself ([`Guarded`]): no dot-segment
+/// removal, no percent-decoding, and a fragment (which `http::Uri` would
+/// silently cut) is refused. The pipeline's own checks run on that.
+pub fn classify(method: &Method, uri: &http::Uri, raw: Option<&str>) -> Target {
     let Some(target) = raw else {
-        return error(StatusCode::BAD_REQUEST, "bad_request", "no request line");
+        return Target::BadRequest("no request line");
     };
     if !target.starts_with('/') {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the request target must be origin-form (/v1/...)",
-        );
+        return Target::BadRequest("the request target must be origin-form (/v1/...)");
     }
     if target.contains('#') {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the request target holds a fragment (#)",
-        );
+        return Target::BadRequest("the request target holds a fragment (#)");
     }
     // What the parser made of it must be the same bytes.
-    if req.uri().path_and_query().map(|pq| pq.as_str()) != Some(target.as_str()) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "bad_request",
-            "the request target cannot be read as sent",
-        );
+    if uri.path_and_query().map(|pq| pq.as_str()) != Some(target) {
+        return Target::BadRequest("the request target cannot be read as sent");
     }
     let path = target.split('?').next().unwrap_or("");
     if path == "/v1/services" {
-        if req.method() != Method::GET {
-            return method_not_allowed("GET");
+        if method != Method::GET {
+            return Target::MethodNotAllowed("GET");
         }
-        let services = api_ops::services_for(ctx, caller.uid(), &BTreeMap::new()).await;
-        return json_resp(StatusCode::OK, json!({"services": services}));
+        return Target::Services;
     }
     if let Some(rest) = path.strip_prefix("/v1/api/") {
-        if req.method() != Method::POST {
-            return method_not_allowed("POST");
+        if method != Method::POST {
+            return Target::MethodNotAllowed("POST");
         }
         let Some((service, op)) = rest
             .split_once('/')
             .filter(|(s, o)| !s.is_empty() && !o.is_empty() && !o.contains('/'))
         else {
-            return not_found();
+            return Target::NotFound;
         };
-        let (service, op) = (service.to_string(), op.to_string());
-        let body = match read_body(req, opts).await {
-            Ok((_, b)) => b,
-            Err(r) => return *r,
-        };
-        return match api_args(&service, &op, &body) {
-            Ok(args) => call(ctx, caller, args, Route::Api).await,
-            Err(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
+        return Target::Api {
+            service: service.to_string(),
+            op: op.to_string(),
         };
     }
     if let Some(rest) = target.strip_prefix("/v1/proxy/") {
@@ -666,29 +695,22 @@ async fn route(
         let cut = rest.find(['/', '?']).unwrap_or(rest.len());
         let (service, upstream) = rest.split_at(cut);
         if service.is_empty() {
-            return not_found();
+            return Target::NotFound;
         }
         let upstream = if upstream.starts_with('/') {
             upstream.to_string()
         } else {
             format!("/{upstream}")
         };
-        let service = service.to_string();
-        let method = req.method().as_str().to_string();
-        let (parts, body) = match read_body(req, opts).await {
-            Ok(x) => x,
-            Err(r) => return *r,
+        return Target::Proxy {
+            service: service.to_string(),
+            upstream,
         };
-        let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
-        return call(ctx, caller, args, Route::Proxy).await;
     }
     if path.starts_with("/v1/requests/") {
-        return json_resp(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "approvals come in plan 11"}),
-        );
+        return Target::Requests;
     }
-    not_found()
+    Target::NotFound
 }
 
 fn not_found() -> Resp {

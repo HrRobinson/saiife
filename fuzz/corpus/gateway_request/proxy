@@ -1,0 +1,2 @@
+GET
+/v1/proxy/github/repos/o/r?x=1
