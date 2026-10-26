@@ -324,6 +324,35 @@ fn checkpoint_after_every_n_records() {
 }
 
 #[test]
+fn good_vault_key_writes_no_vault_event() {
+    let d = TestDaemon::start(Opts::default());
+    assert!(d.events("vault_unavailable").is_empty());
+}
+
+#[test]
+fn missing_or_short_vault_key_is_recorded_and_audit_keeps_serving() {
+    for (key, reason) in [
+        (None, "no vault key"),
+        (Some(vec![1u8; 16]), "vault key is not 32 bytes"),
+    ] {
+        let mut d = TestDaemon::prepare(&Opts::default());
+        let key_file = d.creds_dir().join("vault-key");
+        match key {
+            None => std::fs::remove_file(&key_file).unwrap(),
+            Some(k) => std::fs::write(&key_file, k).unwrap(),
+        }
+        d.spawn_and_wait();
+        let ev = d.events("vault_unavailable");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0]["reason"], json!(reason));
+        let mut c = d.client();
+        append(&mut c, guard_rec("still serving")).unwrap();
+        assert!(!d.stderr_text().contains("panicked"));
+        assert_verifies(&d);
+    }
+}
+
+#[test]
 fn sigterm_writes_stop_and_checkpoint() {
     let mut d = TestDaemon::start(Opts::default());
     let mut c = d.client();

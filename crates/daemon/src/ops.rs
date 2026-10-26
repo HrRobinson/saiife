@@ -3,6 +3,7 @@
 use crate::disk;
 use crate::limits::{ConnLimits, Limits};
 use crate::sessions::{agent_ancestor, Proc, Sessions};
+use crate::vault::VaultState;
 use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
@@ -75,6 +76,8 @@ pub struct Ctx {
     /// Agent process -> session, for attributing connector requests.
     pub sessions: Sessions,
     pub proc: Box<dyn Proc + Send + Sync>,
+    /// The credential vault (plan 10); `Unavailable` keeps the daemon up.
+    pub vault: Mutex<VaultState>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -93,6 +96,7 @@ pub struct CtxInit {
     pub catalog: Vec<PackInfo>,
     pub policy: PolicyState,
     pub proc: Box<dyn Proc + Send + Sync>,
+    pub vault: VaultState,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -118,6 +122,7 @@ impl Ctx {
             policy: Mutex::new(i.policy),
             sessions: Sessions::new(),
             proc: i.proc,
+            vault: Mutex::new(i.vault),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),

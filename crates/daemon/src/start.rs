@@ -1,6 +1,7 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
 use crate::ops::{Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
 use crate::{notify, server, DaemonOptions};
 use saiife_audit::sign::AuditKey;
@@ -198,6 +199,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     let (handle, join) = writer::spawn(cw, writer_cfg, check.last_checkpoint)
         .map_err(|e| format!("cannot start the audit writer: {e}"))?;
 
+    // The vault: an unavailable one never stops the daemon (fail closed
+    // for connectors, audit keeps working).
+    let vault = match &opts.credentials_dir {
+        Some(d) => vault::open(
+            &d.join("vault-key"),
+            &opts.state_dir.join("vault").join("vault.bin"),
+        ),
+        None => VaultState::Unavailable("no vault key".into()),
+    };
+
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
         writer_cfg,
@@ -211,6 +222,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         catalog: opts.catalog,
         policy,
         proc: Box::new(crate::sessions::RealProc::new("/proc")),
+        vault,
     }));
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -466,6 +478,12 @@ async fn serve(
         }
         None => first.push(policy_record(&ctx, "loaded", loaded_files, None)),
     }
+    if let VaultState::Unavailable(reason) = &*ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
+        eprintln!("saiife: warning: vault unavailable: {reason}");
+        let mut r = ctx.event("vault_unavailable");
+        r.reason = Some(reason.clone());
+        first.push(r);
+    }
     for r in first {
         if let Err(e) = ctx.writer.append(r).await {
             eprintln!("saiife: cannot write to the audit log: {e}");
@@ -512,6 +530,12 @@ async fn serve(
         }
     }
 
+    // Pending `last_used` marks go to disk before the stop record.
+    if let VaultState::Ready(v) = &mut *ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
+        if let Err(e) = v.flush() {
+            eprintln!("saiife: warning: cannot write the vault at stop: {e}");
+        }
+    }
     // Stop: no new connections, the stop record and a checkpoint, synced.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);

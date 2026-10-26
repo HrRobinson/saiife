@@ -19,6 +19,8 @@ pub mod sessions;
 #[cfg(target_os = "linux")]
 mod start;
 #[cfg(target_os = "linux")]
+pub mod vault;
+#[cfg(target_os = "linux")]
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};
@@ -33,6 +35,8 @@ pub struct DaemonOptions {
     /// The built-in packs, for the policy hash.
     pub catalog: Vec<PackInfo>,
     pub directory: Box<dyn Directory + Send + Sync>,
+    /// Holds `vault-key` (systemd `$CREDENTIALS_DIRECTORY`); `None` means no vault key.
+    pub credentials_dir: Option<PathBuf>,
 }
 
 /// Run the daemon until SIGTERM or SIGINT. Startup refusals print one line

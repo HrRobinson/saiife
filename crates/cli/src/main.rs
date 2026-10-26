@@ -160,6 +160,9 @@ enum Cmd {
         /// Where the signing key lives (default $STATE_DIRECTORY, else /var/lib/saiife).
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
+        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY).
+        #[arg(long = "credentials-dir", value_name = "DIR", hide = true)]
+        credentials_dir: Option<std::path::PathBuf>,
     },
     /// Check the machine locked mode relies on: exit 0 all pass, 1 a
     /// warning, 2 a failure.
@@ -222,9 +225,10 @@ fn main() -> ExitCode {
         user,
         config,
         state_dir,
+        credentials_dir,
     } = cli.command
     {
-        return cmd_daemon(system, user, config, state_dir);
+        return cmd_daemon(system, user, config, state_dir, credentials_dir);
     }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
@@ -316,6 +320,7 @@ fn cmd_daemon(
     user: bool,
     config: Option<std::path::PathBuf>,
     state_dir: Option<std::path::PathBuf>,
+    credentials_dir: Option<std::path::PathBuf>,
 ) -> ExitCode {
     if !system || user {
         eprintln!(
@@ -346,6 +351,9 @@ fn cmd_daemon(
     saiife_daemon::run(saiife_daemon::DaemonOptions {
         config: config.unwrap_or_else(|| "/etc/saiife/config.toml".into()),
         state_dir,
+        credentials_dir: credentials_dir
+            .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
+            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty()),
         catalog,
         directory: Box::new(saiife_policy::Getent),
     })
