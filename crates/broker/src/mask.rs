@@ -123,10 +123,18 @@ impl Masker {
         let mut spans = Vec::new();
         self.collect_spans(b, &mut spans);
         if b.contains(&b'\\') {
+            if u32::try_from(b.len()).is_err() {
+                // Far above any read limit; fail closed rather than map it.
+                return MASK.as_bytes().to_vec();
+            }
             let (decoded, map) = json_unescape(b);
             let mut inner = Vec::new();
             self.collect_spans(&decoded, &mut inner);
-            spans.extend(inner.into_iter().map(|(s, e)| (map[s].0, map[e - 1].1)));
+            spans.extend(
+                inner
+                    .into_iter()
+                    .map(|(s, e)| (map[s] as usize, orig_span(&map, b.len(), e - 1).1)),
+            );
         }
         apply_spans(b, spans)
     }
@@ -185,9 +193,14 @@ fn percent_pattern(v: &[u8]) -> Zeroizing<String> {
 }
 
 /// Decode JSON string escapes anywhere in `b`. Returns the decoded bytes and,
-/// for each decoded byte, the `[start, end)` span of `b` it came from.
-/// Malformed escapes and lone surrogates are kept as literal bytes.
-fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
+/// for each decoded byte, the offset in `b` where its source starts (see
+/// [`orig_span`] for the end). Malformed escapes and lone surrogates are kept
+/// as literal bytes.
+///
+/// Memory bound: the decoded output is never longer than `b`, and the map is
+/// one `u32` per decoded byte, so it takes at most 4x `b.len()` (test
+/// `unescape_map_is_compact`). The caller keeps `b.len() <= u32::MAX`.
+fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<u32>) {
     fn hex4(b: &[u8], at: usize) -> Option<u32> {
         let s = b.get(at..at + 4)?;
         let s = std::str::from_utf8(s).ok()?;
@@ -214,7 +227,7 @@ fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
             };
             if let Some(c) = simple {
                 out.push(c);
-                map.push((i, i + 2));
+                map.push(i as u32);
                 i += 2;
                 continue;
             }
@@ -237,7 +250,7 @@ fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
                         let mut buf = [0u8; 4];
                         for &c in ch.encode_utf8(&mut buf).as_bytes() {
                             out.push(c);
-                            map.push((i, i + len));
+                            map.push(i as u32);
                         }
                         i += len;
                         continue;
@@ -246,10 +259,23 @@ fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
             }
         }
         out.push(b[i]);
-        map.push((i, i + 1));
+        map.push(i as u32);
         i += 1;
     }
     (out, map)
+}
+
+/// `[start, end)` in the original bytes (of length `len`) of decoded byte
+/// `i`. Sources are contiguous, so a byte's source ends where the next
+/// different start begins; the bytes of one `\uXXXX` share a start, so this
+/// looks at most 3 entries ahead.
+fn orig_span(map: &[u32], len: usize, i: usize) -> (usize, usize) {
+    let start = map[i];
+    let end = map[i + 1..]
+        .iter()
+        .find(|&&s| s != start)
+        .map_or(len, |&s| s as usize);
+    (start as usize, end)
 }
 
 /// Replace the union of `spans` in `b` with one `[MASKED]` per merged run.
@@ -405,31 +431,20 @@ fn mask_headers(headers: &HeaderMap, masker: &Masker) -> HeaderMap {
 }
 
 /// Mask strings (keys and values) of a JSON tree in place, with the vault
-/// forms and the v1 patterns. Returns whether anything changed.
-fn mask_json_strings(v: &mut serde_json::Value, masker: &Masker) -> bool {
+/// forms and the v1 patterns.
+fn mask_json_strings(v: &mut serde_json::Value, masker: &Masker) {
     use serde_json::Value;
     match v {
-        Value::String(s) => {
-            let m = masker.mask_text(s);
-            let changed = m != *s;
-            *s = m;
-            changed
-        }
-        Value::Array(items) => items
-            .iter_mut()
-            .fold(false, |acc, i| mask_json_strings(i, masker) | acc),
+        Value::String(s) => *s = masker.mask_text(s),
+        Value::Array(items) => items.iter_mut().for_each(|i| mask_json_strings(i, masker)),
         Value::Object(map) => {
-            let mut changed = false;
             let old = std::mem::take(map);
             for (k, mut child) in old {
-                changed |= mask_json_strings(&mut child, masker);
-                let mk = masker.mask_text(&k);
-                changed |= mk != k;
-                map.insert(mk, child);
+                mask_json_strings(&mut child, masker);
+                map.insert(masker.mask_text(&k), child);
             }
-            changed
         }
-        _ => false,
+        _ => {}
     }
 }
 
@@ -475,8 +490,8 @@ fn v1_mask_body(masked: Vec<u8>) -> Vec<u8> {
 ///    (`BadResponseEncoding`), except a char cut by the reader,
 /// 1. mask the bytes with the vault forms (every body),
 /// 2. if it parses as JSON: redact (when `redact` is set), mask every key
-///    and string with the vault forms and the v1 patterns, re-serialize only
-///    if something changed. Not JSON: `RedactNonJson` when `redact` is set,
+///    and string with the vault forms and the v1 patterns, always
+///    re-serialize, then the v1 patterns over the whole text. Not JSON: `RedactNonJson` when `redact` is set,
 ///    else the v1 patterns over the (lossy, if need be) text,
 /// 3. cut to `max` and set `truncated`.
 ///
@@ -503,19 +518,22 @@ pub fn finish(
     // Pass 1, every body: the vault forms over the bytes.
     let masked = masker.mask_bytes(&body);
     // Pass 2: JSON gets the tree pass (redact, then every key and string,
-    // which sees values hidden by escapes); it is re-serialized only if
-    // something changed. Anything else gets the v1 patterns over the text.
+    // which sees values hidden by escapes), is always re-serialized, and gets
+    // the v1 patterns once more over the whole text. Anything else gets the
+    // v1 patterns over the text.
     let mut out: Vec<u8> = match serde_json::from_slice::<serde_json::Value>(&masked) {
         Ok(mut v) => {
             if !redact.is_empty() {
                 redacted = crate::redact::redact(&mut v, redact);
             }
-            let changed = mask_json_strings(&mut v, masker);
-            if changed || redacted > 0 {
-                serde_json::to_vec(&v).map_err(|_| BrokerError::RedactNonJson)?
-            } else {
-                masked
-            }
+            mask_json_strings(&mut v, masker);
+            // Always the re-serialized tree: with duplicate keys serde keeps
+            // the last value, and a client could read the first, so only the
+            // checked tree may leave.
+            let text = serde_json::to_string(&v).map_err(|_| BrokerError::RedactNonJson)?;
+            // Last pass over the whole text, for v1 patterns that span JSON
+            // tokens. It may break the JSON; over-masking is accepted.
+            saiife_audit::mask::mask(&text).into_bytes()
         }
         Err(_) if !redact.is_empty() => return Err(BrokerError::RedactNonJson),
         Err(_) => v1_mask_body(masked),
@@ -855,11 +873,74 @@ mod tests {
     }
 
     #[test]
-    fn json_without_hits_keeps_original_bytes() {
+    fn json_always_reserialized() {
+        // The bytes sent are exactly the tree that was checked.
         let m = Masker::new(&[SECRET]);
         let body = b"{ \"a\" : 1,\n  \"b\": \"\\u0041\" }".to_vec();
-        let f = fin(&m, Some("application/json"), body.clone(), false).unwrap();
-        assert_eq!(&f.body[..], &body[..]);
+        let f = fin(&m, Some("application/json"), body, false).unwrap();
+        assert_eq!(&f.body[..], br#"{"a":1,"b":"A"}"#);
+    }
+
+    #[test]
+    fn duplicate_keys_resolved_to_checked_value() {
+        // serde keeps the last value; a client reading the first must not
+        // see a different, unchecked one.
+        let m = Masker::new(&[SECRET]);
+        let body = format!(r#"{{"a":"{SECRET}","a":"fine"}}"#);
+        let f = fin(&m, Some("application/json"), body.into_bytes(), false).unwrap();
+        assert_eq!(&f.body[..], br#"{"a":"fine"}"#);
+        let body = br#"{"a":"first","a":"second"}"#.to_vec();
+        let f = fin(&m, None, body, false).unwrap();
+        assert_eq!(&f.body[..], br#"{"a":"second"}"#);
+    }
+
+    #[test]
+    fn v1_pass_over_whole_serialized_text() {
+        // The key `MY_TOKEN=` alone is no hit for the tree pass; over the
+        // whole text the v1 `..TOKEN=` rule eats what follows. That breaks
+        // the JSON, which is the accepted over-masking.
+        let m = Masker::new(&[]);
+        let body = br#"{"MY_TOKEN=":918273645}"#.to_vec();
+        let f = fin(&m, Some("application/json"), body, false).unwrap();
+        assert_eq!(&f.body[..], br#"{"MY_TOKEN=[MASKED]"#);
+    }
+
+    #[test]
+    fn truncated_json_inside_unicode_escape_does_not_panic() {
+        let m = Masker::new(&[SECRET]);
+        for tail in ["\\u00", "\\u0", "\\u", "\\", "\\ud83d\\u", "\\ud83d\\ude0"] {
+            let body = format!(r#"{{"k":"abc{tail}"#);
+            let f = fin(
+                &m,
+                Some("application/json"),
+                body.clone().into_bytes(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(&f.body[..], body.as_bytes());
+        }
+    }
+
+    #[test]
+    fn unescape_map_is_compact() {
+        // 1 MiB of mixed raw bytes and escapes: the offset map stays at
+        // 4 bytes per decoded byte, so at most 4x the body.
+        let unit = "ab\\u0041\\/c\\n";
+        let mut body = String::new();
+        while body.len() < (1 << 20) {
+            body.push_str(unit);
+        }
+        let (decoded, map) = json_unescape(body.as_bytes());
+        assert_eq!(map.len(), decoded.len());
+        let map_bytes = map.capacity() * std::mem::size_of_val(&map[0]);
+        assert!(
+            map_bytes <= 4 * body.len(),
+            "{map_bytes} > 4 x {}",
+            body.len()
+        );
+        // And the spans still map back exactly.
+        assert_eq!(orig_span(&map, body.len(), 2), (2, 8));
+        assert_eq!(orig_span(&map, body.len(), 0), (0, 1));
     }
 
     #[test]
