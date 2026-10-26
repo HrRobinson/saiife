@@ -1,7 +1,7 @@
 //! One task per connection on the control socket (spec §6.3, §8.7).
 
 use crate::ops::{self, Ctx, Notice};
-use saiife_ipc::frame::{body_len, decode, encode, FrameError};
+use saiife_ipc::frame::{body_len, decode, encode_max, FrameError, MAX_ANSWER_FRAME};
 use saiife_ipc::msg::{err, ErrorCode, Request, OP_HELLO, PROTO};
 use saiife_ipc::peer::peer_cred;
 use serde_json::{Map, Value};
@@ -56,7 +56,7 @@ async fn write(s: &mut UnixStream, v: &Value) -> bool {
 }
 
 async fn write_within(s: &mut UnixStream, v: &Value, limit: Duration) -> bool {
-    let Ok(bytes) = encode(v) else {
+    let Ok(bytes) = encode_max(v, MAX_ANSWER_FRAME) else {
         return false;
     };
     matches!(timeout(limit, s.write_all(&bytes)).await, Ok(Ok(())))

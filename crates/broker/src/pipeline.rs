@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
 /// At most this many upstream calls in flight per service (§4.1).
 pub const POOL_SIZE: usize = 4;
@@ -130,8 +131,83 @@ pub trait Env: Sync {
         service: &str,
         auth: &[AuthSpec],
     ) -> Result<AuthMaterial, &'static str>;
+    /// Every value of secret `name`, only to mask the record of a call
+    /// (also a denied one); nothing is sent with them. `None` when the
+    /// vault cannot be read or there is no such secret.
+    fn secret_values(&self, name: &str) -> Option<Vec<Zeroizing<String>>>;
     /// The per-service upstream pool ([`Pools`]).
     fn pool(&self, service: &str) -> Arc<Semaphore>;
+}
+
+/// Parses a JSON body, refusing a duplicate object key anywhere (two
+/// parsers that keep the first and the last value would see different
+/// amounts). serde_json's recursion limit applies.
+pub fn strict_json(b: &[u8]) -> Result<Value, ()> {
+    use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
+
+    struct Strict;
+
+    impl<'de> DeserializeSeed<'de> for Strict {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(Strict)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Strict {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+            Ok(Value::Bool(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_f64<E: Error>(self, v: f64) -> Result<Value, E> {
+            serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .ok_or_else(|| E::custom("not a finite number"))
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+            Ok(Value::String(v.to_string()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Value, E> {
+            Ok(Value::String(v))
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_none<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(v) = a.next_element_seed(Strict)? {
+                out.push(v);
+            }
+            Ok(Value::Array(out))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+            let mut out = Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                let v = a.next_value_seed(Strict)?;
+                if out.insert(k, v).is_some() {
+                    return Err(A::Error::custom("duplicate key"));
+                }
+            }
+            Ok(Value::Object(out))
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(b);
+    let v = Strict.deserialize(&mut de).map_err(|_| ())?;
+    de.end().map_err(|_| ())?;
+    Ok(v)
 }
 
 /// One semaphore of [`POOL_SIZE`] per service.
@@ -275,6 +351,20 @@ async fn steps(
     masker: &mut Masker,
 ) -> Outcome {
     let cfg = &snap.config;
+    // The record's params are masked with the service's secret values even
+    // when the call is denied before step 9 (nothing is sent for this). A
+    // vault that cannot be read leaves the v1 patterns only; the agent
+    // supplied those params.
+    if let Some(name) = cfg
+        .services
+        .get(&call.service)
+        .and_then(|s| s.secret.as_deref())
+    {
+        if let Some(values) = env.secret_values(name) {
+            let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
+            *masker = Masker::new(&refs);
+        }
+    }
     // 3. Scope.
     let scope = match env.scope(&call.user) {
         Ok(Some(s)) => s,
@@ -324,9 +414,27 @@ async fn steps(
         Ok(p) => p,
         Err(e) => return denied(rule_of(&e)),
     };
-    let body = call.body.clone().filter(|b| !b.is_empty());
+    let mut body = call.body.clone().filter(|b| !b.is_empty());
     if body.is_some() && op.body.is_none() {
         return denied("bad_param");
+    }
+    // A JSON body is parsed once, strictly (a duplicate key is refused),
+    // and the re-serialized tree is what goes upstream: the amount checked
+    // is the amount sent, whatever parser the upstream uses.
+    let mut json_body: Option<Value> = None;
+    if op.body.as_deref() == Some("json") {
+        if let Some(b) = &body {
+            match strict_json(b) {
+                Ok(v) => {
+                    match serde_json::to_vec(&v) {
+                        Ok(canon) => body = Some(Bytes::from(canon)),
+                        Err(_) => return denied("bad_body"),
+                    }
+                    json_body = Some(v);
+                }
+                Err(()) => return denied("bad_body"),
+            }
+        }
     }
 
     // 6. Policy.
@@ -357,10 +465,7 @@ async fn steps(
 
     // 7. Limits. An operation that moves money must carry its amount.
     if let Some(spec) = &op.amount {
-        let parsed = body
-            .as_ref()
-            .and_then(|b| serde_json::from_slice::<Value>(b).ok());
-        match parsed.map(|v| amount::extract(spec, &v)) {
+        match json_body.as_ref().map(|v| amount::extract(spec, v)) {
             Some(Ok(a)) => tr.amount = Some(a),
             _ => return denied("bad_amount"),
         }
@@ -399,6 +504,7 @@ async fn steps(
         None => return denied("secret_missing"),
     };
     {
+        // Every value of the secret in use (each field and the basic pair).
         let values = auth.values();
         let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
         *masker = Masker::new(&refs);
@@ -420,10 +526,8 @@ async fn steps(
     built
         .headers
         .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if body.is_some()
-        && op.body.as_deref() == Some("json")
-        && !built.headers.contains_key(CONTENT_TYPE)
-    {
+    if json_body.is_some() {
+        // The body is the canonical JSON: say so, whatever the agent sent.
         built
             .headers
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

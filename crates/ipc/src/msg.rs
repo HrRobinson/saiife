@@ -13,6 +13,9 @@ pub const OP_SECRET_ROTATE: &str = "secret.rotate";
 pub const OP_SECRET_REMOVE: &str = "secret.remove";
 pub const OP_SECRET_LIST: &str = "secret.list";
 pub const OP_SECRET_LEASE: &str = "secret.lease";
+pub const OP_API_CALL: &str = "api.call";
+pub const OP_API_LIST: &str = "api.list";
+pub const OP_API_RESULT: &str = "api.result";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
@@ -80,8 +83,14 @@ pub enum ErrorCode {
     Internal,
     /// The credential vault cannot be read.
     VaultUnavailable,
-    /// A policy rule refused the request; the message starts with the rule.
+    /// A policy rule refused the request; the message starts with the rule
+    /// (connector calls also carry it in `rule`).
     Denied,
+    /// A connector call hit a limit (`limit` names it).
+    Limited,
+    /// The upstream failed, or its answer was withheld (`rule` or
+    /// `reason`).
+    UpstreamFailed,
 }
 
 impl ErrorCode {
@@ -98,6 +107,8 @@ impl ErrorCode {
             ErrorCode::Internal => "internal",
             ErrorCode::VaultUnavailable => "vault_unavailable",
             ErrorCode::Denied => "denied",
+            ErrorCode::Limited => "limited",
+            ErrorCode::UpstreamFailed => "upstream_failed",
         }
     }
 }
@@ -125,10 +136,40 @@ pub fn err(id: u64, code: ErrorCode, message: &str) -> Value {
     Value::Object(m)
 }
 
+/// [`err`] plus `extra` fields (`rule`, `limit`, ...); `extra` cannot
+/// replace `id`, `ok`, `error` or `message`.
+pub fn err_with(id: u64, code: ErrorCode, message: &str, extra: Map<String, Value>) -> Value {
+    let mut v = err(id, code, message);
+    if let Value::Object(m) = &mut v {
+        for (k, x) in extra {
+            if !matches!(k.as_str(), "id" | "ok" | "error" | "message") {
+                m.insert(k, x);
+            }
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn err_with_adds_fields_but_keeps_the_shape() {
+        let mut x = serde_json::Map::new();
+        x.insert("rule".into(), json!("no_scope"));
+        x.insert("error".into(), json!("spoofed"));
+        assert_eq!(
+            err_with(4, ErrorCode::Denied, "denied (no_scope)", x),
+            json!({"id":4,"ok":false,"error":"denied","message":"denied (no_scope)","rule":"no_scope"})
+        );
+        assert_eq!(ErrorCode::Limited.as_str(), "limited");
+        assert_eq!(
+            serde_json::to_value(ErrorCode::UpstreamFailed).unwrap(),
+            "upstream_failed"
+        );
+    }
 
     #[test]
     fn request_without_id_is_bad_request() {

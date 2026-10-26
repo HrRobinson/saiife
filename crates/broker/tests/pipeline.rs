@@ -33,7 +33,7 @@ const TOKEN: &str = "echo-token-7f3a9c";
 
 struct Mock {
     hits: Arc<AtomicUsize>,
-    seen: Arc<Mutex<Vec<(String, http::HeaderMap)>>>,
+    seen: Arc<Mutex<Vec<(String, http::HeaderMap, Bytes)>>>,
 }
 
 struct Loopback(u16);
@@ -51,11 +51,15 @@ impl Resolver for Loopback {
 async fn answer(
     req: Request<Incoming>,
     hits: Arc<AtomicUsize>,
-    seen: Arc<Mutex<Vec<(String, http::HeaderMap)>>>,
+    seen: Arc<Mutex<Vec<(String, http::HeaderMap, Bytes)>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     hits.fetch_add(1, Ordering::SeqCst);
     let (parts, body) = req.into_parts();
-    let _ = body.collect().await;
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let token = parts
         .headers
         .get("x-echo-token")
@@ -64,7 +68,7 @@ async fn answer(
         .to_string();
     seen.lock()
         .unwrap()
-        .push((parts.uri.to_string(), parts.headers.clone()));
+        .push((parts.uri.to_string(), parts.headers.clone(), body));
     let json = |status: u16, b: String| {
         Response::builder()
             .status(status)
@@ -190,9 +194,79 @@ impl Env for FakeEnv {
         let fields = [("token".to_string(), Zeroizing::new(v.to_string()))].into();
         Ok(AuthMaterial::from_spec(&auth[0], fields))
     }
+    fn secret_values(&self, _name: &str) -> Option<Vec<Zeroizing<String>>> {
+        // Masking values come from the vault even when the service may not
+        // use the secret.
+        Some(vec![Zeroizing::new(TOKEN.to_string())])
+    }
     fn pool(&self, service: &str) -> Arc<Semaphore> {
         self.pools.get(service)
     }
+}
+
+fn refunds_allowed() -> PolicySnapshot {
+    let mut snap = snapshot("");
+    let s = snap.config.services.get_mut("shop").unwrap();
+    s.ask = vec![];
+    s.allow = vec!["refunds:write".into()];
+    snap
+}
+
+#[tokio::test]
+async fn denied_call_params_masked_with_the_service_secret() {
+    let (_m, up) = mock().await;
+    let mut env = FakeEnv::ok();
+    env.scope = Ok(None);
+    let snap = snapshot("");
+    let c = call("files.get", &[("name", TOKEN)]);
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, &up).await;
+    assert_eq!(rule(&o), "no_scope");
+    let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert!(!r.contains(TOKEN), "{r}");
+    assert!(r.contains("[MASKED]"), "{r}");
+}
+
+#[tokio::test]
+async fn duplicate_key_in_json_body_is_bad_body() {
+    let (m, up) = mock().await;
+    let mut c = call("refunds.create", &[("order_id", "7")]);
+    c.body = Some(Bytes::from_static(
+        br#"{"refund":{"currency":"EUR","transactions":[{"amount":"1.00","amount":"900.00"}]}}"#,
+    ));
+    let o = go(&c, &refunds_allowed(), &FakeEnv::ok(), &up, &Limiter::new()).await;
+    assert_eq!(rule(&o), "bad_body");
+    c.body = Some(Bytes::from_static(b"{not json"));
+    let o = go(&c, &refunds_allowed(), &FakeEnv::ok(), &up, &Limiter::new()).await;
+    assert_eq!(rule(&o), "bad_body");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn json_body_sent_canonical_with_json_content_type() {
+    let (m, up) = mock().await;
+    let mut c = call("refunds.create", &[("order_id", "7")]);
+    c.body = Some(Bytes::from_static(
+        b"{ \"refund\" : { \"currency\":\"EUR\",\n \"transactions\":[{\"amount\":\"5.00\"}]}}",
+    ));
+    c.headers = vec![("Content-Type".into(), "text/plain".into())];
+    let (o, tr) = run(
+        &c,
+        &refunds_allowed(),
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        &up,
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(tr.amount, Some((500, "EUR".to_string())));
+    let seen = m.seen.lock().unwrap();
+    let (_, headers, body) = &seen[0];
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(
+        &body[..],
+        br#"{"refund":{"currency":"EUR","transactions":[{"amount":"5.00"}]}}"#
+    );
 }
 
 fn snapshot(extra: &str) -> PolicySnapshot {
@@ -456,7 +530,7 @@ async fn response_value_masked_and_next_page() {
     assert!(!next.contains_key("page_info"));
     // The upstream got the vault token, identity encoding and the query.
     let seen = m.seen.lock().unwrap();
-    let (uri, headers) = &seen[0];
+    let (uri, headers, _) = &seen[0];
     assert_eq!(uri, "/api/orders.json?status=open");
     assert_eq!(headers["x-echo-token"], TOKEN);
     assert_eq!(headers["accept-encoding"], "identity");
