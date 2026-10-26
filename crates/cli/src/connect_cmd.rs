@@ -71,7 +71,7 @@ mod linux {
     use saiife_broker::manifest::{builtin, load_local, Manifest, OpKind, HTTP_CONNECTOR};
 
     use super::ConnectArgs;
-    use crate::secret_cmd::linux::{add_secret, source, Stop};
+    use crate::secret_cmd::linux::{add_secret, call, source, Stop};
 
     const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
 
@@ -108,24 +108,55 @@ mod linux {
         let text = render(&service, &secret, &manifest, &params);
 
         // 4. The secret, through the daemon (admin check included).
-        add_secret(
-            &config,
-            &secret,
-            secret_kind(&manifest),
-            std::slice::from_ref(&service),
-            source(a.from_file, a.from_env),
-        )?;
+        // An existing secret of that name is reused, if it allows the service.
+        let listed = call(&config, "secret.list", serde_json::Map::new())?;
+        let existing = listed
+            .get("secrets")
+            .and_then(|v| v.as_array())
+            .and_then(|l| {
+                l.iter()
+                    .find(|s| s["name"].as_str() == Some(secret.as_str()))
+            });
+        let reused = existing.is_some();
+        match existing {
+            Some(s) => {
+                let allows = s["allowed_services"]
+                    .as_array()
+                    .is_some_and(|l| l.iter().any(|x| x.as_str() == Some(service.as_str())));
+                if !allows {
+                    return refuse(format!(
+                        "secret {secret} exists but does not allow {service}; use another name"
+                    ));
+                }
+            }
+            None => add_secret(
+                &config,
+                &secret,
+                secret_kind(&manifest),
+                std::slice::from_ref(&service),
+                source(a.from_file, a.from_env),
+            )?,
+        }
 
         // 5. The policy file. If it fails, tell how to undo the secret.
         let wrote = std::fs::create_dir_all(&dir)
             .and_then(|()| saiife_system::fsops::write_new_file(&target, text.as_bytes(), 0o644));
         if let Err(e) = wrote {
             return refuse(format!(
-                "cannot write {}: {e}\nthe secret was stored; undo it with: saiife secret remove {secret}",
-                target.display()
+                "cannot write {}: {e}\n{}",
+                target.display(),
+                if reused {
+                    "the existing secret was left as it was".to_string()
+                } else {
+                    format!("the secret was stored; undo it with: saiife secret remove {secret}")
+                }
             ));
         }
-        outln!("added {secret}");
+        if reused {
+            outln!("using existing secret {secret}");
+        } else {
+            outln!("added {secret}");
+        }
         outln!("next: edit {}, then saiife policy reload", target.display());
         Ok(())
     }

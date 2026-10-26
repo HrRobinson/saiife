@@ -253,3 +253,56 @@ fn unwritable_policy_dir_stores_nothing() {
     assert_eq!(o.status.code(), Some(2));
     assert!(secrets(&d).is_empty());
 }
+
+fn add_secret(d: &TestDaemon, name: &str, service: &str) {
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args([
+            "secret",
+            "add",
+            name,
+            "--kind",
+            "token",
+            "--service",
+            service,
+        ])
+        .args(["--from-env", "CONNECT_TEST_TOKEN", "--system-config"])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("CONNECT_TEST_TOKEN", TOKEN)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+}
+
+#[test]
+fn existing_secret_is_reused_when_it_allows_the_service() {
+    let d = admin();
+    add_secret(&d, "imported", "shopify");
+    let o = connect(
+        &d,
+        &["shopify", "--param", "shop=acme", "--secret", "imported"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(secrets(&d), vec!["imported".to_string()]);
+    let text = fs::read_to_string(policy_file(&d, "shopify.toml")).unwrap();
+    assert!(text.contains("secret = \"imported\""), "{text}");
+}
+
+#[test]
+fn existing_secret_for_another_service_is_refused() {
+    let d = admin();
+    add_secret(&d, "imported", "github");
+    let o = connect(
+        &d,
+        &["shopify", "--param", "shop=acme", "--secret", "imported"],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        err(&o).contains("secret imported exists but does not allow shopify; use another name"),
+        "{}",
+        err(&o)
+    );
+    assert!(!policy_file(&d, "shopify.toml").exists());
+}
