@@ -638,6 +638,31 @@ fn chmod_socket(dirfd: &rustix::fd::OwnedFd, name: &str, uid: u32) -> std::io::R
     }
 }
 
+/// A periodic blocking job that runs at most once at a time.
+#[derive(Default)]
+struct OneAtATime {
+    running: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OneAtATime {
+    /// Start `job` on a blocking thread unless the previous one is still
+    /// running (then `false`, and `job` is dropped). A finished previous
+    /// job is awaited first (it is done: this does not wait).
+    async fn start(&mut self, job: impl FnOnce() + Send + 'static) -> bool {
+        if let Some(h) = self.running.take() {
+            if !h.is_finished() {
+                self.running = Some(h);
+                return false;
+            }
+            if let Err(e) = h.await {
+                eprintln!("saiife: warning: a background job failed: {e}");
+            }
+        }
+        self.running = Some(tokio::task::spawn_blocking(job));
+        true
+    }
+}
+
 async fn serve(
     ctx: Arc<Ctx>,
     socket_dir: PathBuf,
@@ -738,6 +763,7 @@ async fn serve(
     // thread, never from a connector request on the runtime thread.
     let mut vault_tick = tokio::time::interval(Duration::from_secs(60));
     vault_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut vault_flush = OneAtATime::default();
     let day = Duration::from_secs(24 * 3600);
     let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
     let hour = Duration::from_secs(3600);
@@ -747,12 +773,17 @@ async fn serve(
             _ = vault_tick.tick() => {
                 let c = Arc::clone(&ctx);
                 // The file is written outside the vault's memory lock: a
-                // connector call reading the vault never waits on it.
-                tokio::task::spawn_blocking(move || {
+                // connector call reading the vault never waits on it. One
+                // flush at a time: on a hung disk the ticks are skipped
+                // instead of piling up blocked threads.
+                let started = vault_flush.start(move || {
                     if let Err(e) = c.vault.writer().flush_if_due(std::time::Instant::now()) {
                         eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
                     }
-                });
+                }).await;
+                if !started {
+                    eprintln!("saiife: warning: the vault's last flush is still running; skipping this one");
+                }
             }
             _ = purge_tick.tick() => {
                 let dir = ctx.backup_dir.clone();
@@ -1046,6 +1077,48 @@ mod tests {
         assert!(one_per_minute_hit(&lim, now));
         assert_eq!(failed, None);
         assert!(!lim.unavailable(now));
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_skips_while_the_last_job_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut one = OneAtATime::default();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&runs);
+        assert!(
+            one.start(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                let _ = wait.recv();
+            })
+            .await
+        );
+        // A hung job: the next ticks start nothing.
+        for _ in 0..3 {
+            let r = Arc::clone(&runs);
+            let started = one
+                .start(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+            assert!(!started);
+        }
+        release.send(()).unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !one.running.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < end, "the job never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Done: the next tick runs again.
+        let r = Arc::clone(&runs);
+        assert!(
+            one.start(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+        );
+        one.running.take().unwrap().await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     #[test]
