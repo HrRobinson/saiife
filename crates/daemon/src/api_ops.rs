@@ -22,7 +22,7 @@ use saiife_policy::{
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
@@ -108,10 +108,9 @@ impl Env for DaemonEnv<'_> {
         // A secret of a kind the connector cannot use is as good as none.
         let spec = spec_for(e.kind, auth).ok_or("secret_missing")?;
         let material = AuthMaterial::from_spec(spec, e.fields.clone());
+        // In memory only: the serve loop's timer writes `last_used` off the
+        // runtime thread (no fsync here, under the lock, on a request).
         v.touch(name, &crate::ops::now_ts());
-        if let Err(err) = v.flush_if_due(Instant::now()) {
-            eprintln!("saiife: warning: cannot write the vault's last_used marks: {err}");
-        }
         Ok(material)
     }
 
@@ -343,34 +342,30 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // The policy as it is now: a reload while this call runs does not
     // change what it runs under.
     let state = ctx.policy();
-    let (outcome, trace, snap): (Outcome, Trace, Arc<GatewayPolicy>) =
-        match (&state.gateway, &ctx.upstream) {
-            (Some(g), Ok(up)) => {
-                let env = DaemonEnv {
-                    ctx,
-                    config: &g.snap.config,
-                    groups: Groups(groups),
-                };
-                let (o, t) =
-                    pipeline::run(&call, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
-                (o, t, Arc::clone(g))
-            }
-            (Some(g), Err(e)) => (
-                Outcome::UpstreamFailed { reason: e.clone() },
-                Trace::default(),
-                Arc::clone(g),
-            ),
-            (None, _) => (
-                Outcome::Denied {
-                    rule: "policy_invalid".into(),
-                },
-                Trace::default(),
-                Arc::new(GatewayPolicy {
-                    snap: no_policy_snapshot(state.hash.clone()),
-                    catalog: Default::default(),
-                }),
-            ),
-        };
+    let (outcome, trace, snap): (Outcome, Trace, Arc<GatewayPolicy>) = match &state.gateway {
+        Some(g) => {
+            let env = DaemonEnv {
+                ctx,
+                config: &g.snap.config,
+                groups: Groups(groups),
+            };
+            // Without an upstream client steps 3–8 still run; step 9
+            // denies with `upstream_unavailable`.
+            let up = ctx.upstream.as_ref().ok();
+            let (o, t) = pipeline::run(&call, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
+            (o, t, Arc::clone(g))
+        }
+        None => (
+            Outcome::Denied {
+                rule: "policy_invalid".into(),
+            },
+            Trace::default(),
+            Arc::new(GatewayPolicy {
+                snap: no_policy_snapshot(state.hash.clone()),
+                catalog: Default::default(),
+            }),
+        ),
+    };
 
     // 11. Record (before the answer: an unrecorded result is withheld).
     let mut rec = pipeline::record(&call, &snap.snap, &trace, &outcome, &agent, VERSION);
@@ -382,6 +377,9 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
     if let Err(e) = ctx.writer.append(rec).await {
+        // A request that was sent is already counted by the limiter, but a
+        // rebuild at the next start will not see it (it has no record). The
+        // answer is withheld; the limits are briefly looser after a restart.
         return err(
             id,
             ErrorCode::Internal,

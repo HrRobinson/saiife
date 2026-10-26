@@ -325,6 +325,11 @@ impl Upstream {
         scheme == "https"
     }
 
+    /// The timeout of one [`Upstream::send`].
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Sends `b`, follows same-origin redirects and reads the body up to
     /// `read_limit` bytes, all within the timeout.
     pub async fn send(&self, b: Built, read_limit: usize) -> Result<UpstreamResponse, BrokerError> {

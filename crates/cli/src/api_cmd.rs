@@ -208,7 +208,9 @@ mod linux {
         if let Some(w) = wait_ms {
             args.insert("wait_ms".into(), w.into());
         }
-        let timeout = d.cfg.gateway.upstream_timeout + Duration::from_secs(15);
+        // The daemon waits at most one upstream timeout for a pool slot and
+        // one for the upstream; past both, plus slack, it is gone.
+        let timeout = d.cfg.gateway.upstream_timeout * 2 + Duration::from_secs(15);
         let started = Instant::now();
         let ans = d
             .client

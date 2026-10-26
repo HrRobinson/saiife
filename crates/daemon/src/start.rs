@@ -384,12 +384,24 @@ fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
 /// The limiter from the connector records of the last 24 h (the two newest
 /// month files cover a month boundary).
 fn rebuild_limiter(audit_dir: &Path) -> Limiter {
-    let now = time::OffsetDateTime::now_utc();
+    rebuild_limiter_at(audit_dir, time::OffsetDateTime::now_utc())
+}
+
+/// [`rebuild_limiter`] at `now`. A record dated after `now` (a clock that
+/// went back, or an edited log) is dropped: it would hold a slot for longer
+/// than its window.
+fn rebuild_limiter_at(audit_dir: &Path, now: time::OffsetDateTime) -> Limiter {
     let cutoff = now - time::Duration::days(1);
     let read = saiife_audit::store::read_recent(audit_dir, 2, |r| {
         r.timestamp().is_none_or(|t| t > cutoff)
     });
-    Limiter::rebuild(read.records.iter().filter_map(limit_event), now)
+    Limiter::rebuild(
+        read.records
+            .iter()
+            .filter_map(limit_event)
+            .filter(|e| e.at <= now),
+        now,
+    )
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -605,8 +617,22 @@ async fn serve(
     // 8. Ready.
     notify::ready();
     let mut writer_died = false;
+    // `last_used` marks reach the vault file from here, on a blocking
+    // thread, never from a connector request on the runtime thread.
+    let mut vault_tick = tokio::time::interval(Duration::from_secs(60));
+    vault_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = vault_tick.tick() => {
+                let c = Arc::clone(&ctx);
+                tokio::task::spawn_blocking(move || {
+                    if let VaultState::Ready(v) = &mut *c.vault.lock().unwrap_or_else(|p| p.into_inner()) {
+                        if let Err(e) = v.flush_if_due(std::time::Instant::now()) {
+                            eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
+                        }
+                    }
+                });
+            }
             r = listener.accept() => match r {
                 Ok((s, _)) => {
                     tokio::spawn(server::connection(s, Arc::clone(&ctx)));
@@ -757,6 +783,67 @@ mod tests {
         );
         assert_eq!(regroup_audit_dir(&dir, &with), Some(0));
         assert_eq!(regroup_audit_dir(&d.path().join("missing"), &with), None);
+    }
+
+    fn connector_rec(at: time::OffsetDateTime) -> saiife_audit::Record {
+        let mut r = saiife_audit::Record::at(
+            saiife_audit::NewRecord {
+                agent: "",
+                project: "",
+                session: None,
+                tool: "api",
+                input: "erp invoices.list",
+                decision: saiife_audit::DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: "locked",
+                policy: None,
+                permission_mode: None,
+            },
+            "test",
+            at,
+        );
+        r.kind = Some("connector".into());
+        r.uid = Some(1001);
+        r.extra.insert("service".into(), "erp".into());
+        r.extra.insert("op_kind".into(), "read".into());
+        r
+    }
+
+    fn one_per_minute_hit(lim: &Limiter, now: time::OffsetDateTime) -> bool {
+        let k = saiife_broker::limits::Key {
+            uid: 1001,
+            service: "erp".into(),
+            session: None,
+        };
+        let cfg = saiife_policy::LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        lim.check_and_commit(
+            &k,
+            saiife_broker::manifest::OpKind::Read,
+            None,
+            false,
+            &cfg,
+            now,
+        )
+        .is_err()
+    }
+
+    #[test]
+    fn rebuild_counts_recent_records_and_drops_future_ones() {
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        // A record from the future (clock went back) is not a slot.
+        saiife_audit::store::append(d.path(), &connector_rec(now + time::Duration::minutes(5)))
+            .unwrap();
+        assert!(!one_per_minute_hit(&rebuild_limiter_at(d.path(), now), now));
+        // A record 10 s old is.
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        assert!(one_per_minute_hit(&rebuild_limiter_at(d.path(), now), now));
     }
 
     #[test]

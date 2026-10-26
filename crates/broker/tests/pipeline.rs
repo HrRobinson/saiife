@@ -147,7 +147,7 @@ async fn mock() -> (Mock, Upstream) {
     });
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
-    let up = Upstream::with_roots(roots, Arc::new(Loopback(port)), Duration::from_secs(5));
+    let up = Upstream::with_roots(roots, Arc::new(Loopback(port)), Duration::from_secs(2));
     (Mock { hits, seen }, up)
 }
 
@@ -156,6 +156,8 @@ struct FakeEnv {
     scope: Result<Option<Scope>, &'static str>,
     secret: Result<&'static str, &'static str>,
     pools: Pools,
+    /// Replaces the per-service pool (a full or closed one).
+    pool: Option<Arc<Semaphore>>,
 }
 
 impl FakeEnv {
@@ -170,6 +172,7 @@ impl FakeEnv {
             })),
             secret: Ok(TOKEN),
             pools: Pools::new(),
+            pool: None,
         }
     }
 }
@@ -200,7 +203,7 @@ impl Env for FakeEnv {
         Some(vec![Zeroizing::new(TOKEN.to_string())])
     }
     fn pool(&self, service: &str) -> Arc<Semaphore> {
-        self.pools.get(service)
+        self.pool.clone().unwrap_or_else(|| self.pools.get(service))
     }
 }
 
@@ -219,7 +222,7 @@ async fn denied_call_params_masked_with_the_service_secret() {
     env.scope = Ok(None);
     let snap = snapshot("");
     let c = call("files.get", &[("name", TOKEN)]);
-    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, &up).await;
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
     assert_eq!(rule(&o), "no_scope");
     let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
     assert!(!r.contains(TOKEN), "{r}");
@@ -255,7 +258,7 @@ async fn json_body_sent_canonical_with_json_content_type() {
         &catalog(),
         &Limiter::new(),
         &FakeEnv::ok(),
-        &up,
+        Some(&up),
     )
     .await;
     assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
@@ -321,7 +324,7 @@ async fn go(
     up: &Upstream,
     lim: &Limiter,
 ) -> Outcome {
-    run(c, snap, &catalog(), lim, env, up).await.0
+    run(c, snap, &catalog(), lim, env, Some(up)).await.0
 }
 
 fn rule(o: &Outcome) -> &str {
@@ -623,7 +626,15 @@ async fn connector_record_fields_exact() {
     let (_m, up) = mock().await;
     let snap = snapshot("");
     let c = call("orders.list", &[("status", "open"), ("limit", "50")]);
-    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &FakeEnv::ok(), &up).await;
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
     let r = record(&c, &snap, &tr, &o, "claude", "0.2.0");
     let v = serde_json::to_value(&r).unwrap();
     let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -688,7 +699,15 @@ async fn connector_record_fields_exact() {
     let ev = limit_event(&r).unwrap();
     assert_eq!((ev.key.uid, ev.key.service.as_str()), (1001, "shop"));
     let c2 = call("orders.nuke", &[]);
-    let (o2, tr2) = run(&c2, &snap, &catalog(), &Limiter::new(), &FakeEnv::ok(), &up).await;
+    let (o2, tr2) = run(
+        &c2,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
     assert!(limit_event(&record(&c2, &snap, &tr2, &o2, "", "0.2.0")).is_none());
 }
 
@@ -697,7 +716,15 @@ async fn param_echoing_the_token_is_masked_in_the_record() {
     let (_m, up) = mock().await;
     let snap = snapshot("");
     let c = call("files.get", &[("name", TOKEN)]);
-    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &FakeEnv::ok(), &up).await;
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
     let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
     assert!(!r.contains(TOKEN), "{r}");
 }
@@ -736,4 +763,130 @@ body = "json"
         b.uri.to_string(),
         "https://hooks.example.com/services/T000/B000/"
     );
+}
+
+/// Fix round 1, I1: no upstream client still runs steps 3–8 first.
+#[tokio::test]
+async fn no_upstream_client_denies_after_the_earlier_steps() {
+    let (m, _up) = mock().await;
+    let snap = snapshot("");
+    let mut env = FakeEnv::ok();
+    env.scope = Ok(None);
+    let c = call("orders.list", &[]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, None).await;
+    assert_eq!(rule(&o), "no_scope");
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &FakeEnv::ok(), None).await;
+    assert_eq!(rule(&o), "upstream_unavailable");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(v["decision"], "deny");
+    assert_eq!(v["capability"], "orders:read");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// M1: the agent's operation id and proxy request are masked in the record.
+#[tokio::test]
+async fn operation_and_proxy_path_masked_in_the_record() {
+    let (_m, up) = mock().await;
+    let snap = snapshot("");
+    let c = call(&format!("x{TOKEN}"), &[]);
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
+    assert_eq!(rule(&o), "unknown_operation");
+    let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert!(!r.contains(TOKEN), "{r}");
+    let mut c = call("x", &[]);
+    c.op = OpRef::Proxy {
+        method: "GET".into(),
+        path: format!("/nothing/{TOKEN}"),
+    };
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
+    assert_eq!(rule(&o), "unknown_operation");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert!(!v.to_string().contains(TOKEN), "{v}");
+    assert_eq!(v["input"], "shop GET /nothing/[MASKED]");
+}
+
+/// M2: the body hash and size are of the canonical bytes sent.
+#[tokio::test]
+async fn body_hash_is_of_the_bytes_sent() {
+    use sha2::Digest as _;
+    let (m, up) = mock().await;
+    let mut c = call("refunds.create", &[("order_id", "7")]);
+    c.body = Some(Bytes::from_static(
+        b"{ \"refund\" : { \"currency\":\"EUR\", \"transactions\":[{\"amount\":\"5.00\"}]}}",
+    ));
+    let (o, tr) = run(
+        &c,
+        &refunds_allowed(),
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    let seen = m.seen.lock().unwrap();
+    let sent = &seen[0].2;
+    assert_eq!(tr.body_bytes, sent.len());
+    let hex: String = sha2::Sha256::digest(sent)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(tr.body_sha256.as_deref(), Some(hex.as_str()));
+}
+
+/// M4 and M5: a full pool is the `concurrency` limit after a bounded wait;
+/// a closed one fails closed. Nothing is sent either way.
+#[tokio::test]
+async fn full_pool_is_a_limit_and_closed_pool_fails_closed() {
+    let (m, up) = mock().await;
+    let mut env = FakeEnv::ok();
+    env.pool = Some(Arc::new(Semaphore::new(0)));
+    let started = std::time::Instant::now();
+    let o = go(
+        &call("orders.list", &[]),
+        &snapshot(""),
+        &env,
+        &up,
+        &Limiter::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            o,
+            Outcome::Limited {
+                limit: "concurrency"
+            }
+        ),
+        "{o:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    let closed = Arc::new(Semaphore::new(1));
+    closed.close();
+    env.pool = Some(closed);
+    let o = go(
+        &call("orders.list", &[]),
+        &snapshot(""),
+        &env,
+        &up,
+        &Limiter::new(),
+    )
+    .await;
+    assert!(matches!(o, Outcome::UpstreamFailed { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }

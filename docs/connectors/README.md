@@ -66,6 +66,7 @@ never touch the network, so a denied call costs no upstream request.
 | `approval_not_available` | the call matched `ask` (approvals come with plan 11) |
 | `policy_invalid` | the daemon has no valid policy, or a service config is broken |
 | `vault_unavailable` | the vault key is missing, or the vault cannot be decrypted |
+| `upstream_unavailable` | the daemon could not build its HTTPS client at start (no trusted roots) |
 | `secret_missing` | the service names no secret, or a secret the vault does not hold or cannot use for this auth kind |
 | `secret_not_allowed_for_service` | the secret's `allowed_services` does not list the service |
 | `redirect_refused` | the upstream redirected to another origin. The answer is withheld: exit 1 |
@@ -74,7 +75,8 @@ never touch the network, so a denied call costs no upstream request.
 Limits deny with `limit` set to the name of the limit, for example
 `requests_per_minute`, `writes_per_hour`, `deletes_per_day`,
 `bulk_per_session`, `amount_per_request`, `amount_per_day`,
-`amount_missing` or `amount_currency`. A request that was sent counts,
+`amount_missing`, `amount_currency` or `concurrency` (all 4 upstream slots of
+the service stayed busy for a whole upstream timeout). A request that was sent counts,
 whatever its status. Limits are rebuilt from the last 24 hours of
 `connector` records when the daemon starts, so a restart does not reset
 them.

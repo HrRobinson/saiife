@@ -268,8 +268,12 @@ pub struct Trace {
     pub secret: Option<String>,
     /// Masked with every vault value in use and the v1 patterns.
     pub params: BTreeMap<String, String>,
+    /// Of the bytes sent upstream (the canonical JSON when re-serialized).
     pub body_sha256: Option<String>,
     pub body_bytes: usize,
+    /// The operation as the record's `input` names it, masked: the id, or
+    /// `{method} {path}` of an unresolved proxy request.
+    pub op_label: String,
     pub status: Option<u16>,
     pub resp_bytes: Option<usize>,
     pub duration_ms: u64,
@@ -284,7 +288,7 @@ pub async fn handle(
     cat: &Catalog,
     lim: &Limiter,
     env: &dyn Env,
-    up: &Upstream,
+    up: Option<&Upstream>,
 ) -> Outcome {
     run(&call, cfg, cat, lim, env, up).await.0
 }
@@ -296,7 +300,7 @@ pub async fn run(
     cat: &Catalog,
     lim: &Limiter,
     env: &dyn Env,
-    up: &Upstream,
+    up: Option<&Upstream>,
 ) -> (Outcome, Trace) {
     let started = Instant::now();
     let mut tr = Trace {
@@ -307,7 +311,14 @@ pub async fn run(
     let mut masker = Masker::new(&[]);
     let outcome = steps(call, cfg, cat, lim, env, up, &mut tr, &mut masker).await;
     // Agent-supplied values go into the record masked with every vault
-    // value in use (an agent may echo the token) and the v1 patterns.
+    // value in use (an agent may echo the token) and the v1 patterns: the
+    // operation id or proxy request (§8.5) and the params.
+    tr.operation = tr.operation.as_deref().map(|o| masker.mask_text(o));
+    tr.op_label = match (&tr.operation, &call.op) {
+        (Some(id), _) => id.clone(),
+        (None, OpRef::Named(id)) => masker.mask_text(id),
+        (None, OpRef::Proxy { method, path }) => masker.mask_text(&format!("{method} {path}")),
+    };
     tr.params = call
         .params
         .iter()
@@ -346,7 +357,7 @@ async fn steps(
     cat: &Catalog,
     lim: &Limiter,
     env: &dyn Env,
-    up: &Upstream,
+    up: Option<&Upstream>,
     tr: &mut Trace,
     masker: &mut Masker,
 ) -> Outcome {
@@ -427,7 +438,12 @@ async fn steps(
             match strict_json(b) {
                 Some(v) => {
                     match serde_json::to_vec(&v) {
-                        Ok(canon) => body = Some(Bytes::from(canon)),
+                        Ok(canon) => {
+                            // The record describes what is sent.
+                            tr.body_bytes = canon.len();
+                            tr.body_sha256 = Some(hex(&Sha256::digest(&canon)));
+                            body = Some(Bytes::from(canon));
+                        }
                         Err(_) => return denied("bad_body"),
                     }
                     json_body = Some(v);
@@ -493,7 +509,11 @@ async fn steps(
         return denied("approval_not_available");
     }
 
-    // 9. Send.
+    // 9. Send. Without an upstream client (it could not be built at start)
+    // nothing can be sent: a deny, after every earlier check ran.
+    let Some(up) = up else {
+        return denied("upstream_unavailable");
+    };
     tr.secret = svc.secret.clone();
     let auth = match &svc.secret {
         Some(name) => match env.secret(name, &call.service, &m.auth) {
@@ -539,8 +559,24 @@ async fn steps(
     let max = usize::try_from(max).unwrap_or(usize::MAX);
     let read_limit = max.saturating_add(READ_SLACK);
     let pool = env.pool(&call.service);
+    // The wait for a pool slot is bounded by the upstream timeout; a full
+    // pool is a limit (`concurrency`), and a closed one fails closed. The
+    // daemon's worst case is therefore twice the upstream timeout.
+    let permit = match tokio::time::timeout(up.timeout(), pool.acquire_owned()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
+            return Outcome::UpstreamFailed {
+                reason: "the upstream pool is closed".into(),
+            }
+        }
+        Err(_) => {
+            return Outcome::Limited {
+                limit: "concurrency",
+            }
+        }
+    };
     let sent = {
-        let _permit = pool.acquire_owned().await;
+        let _permit = permit;
         tr.sent = true;
         up.send(built, read_limit).await
     };
@@ -708,10 +744,11 @@ pub fn record(
     agent: &str,
     saiife_version: &str,
 ) -> Record {
-    let op_name = match (&tr.operation, &call.op) {
-        (Some(id), _) => id.clone(),
-        (None, OpRef::Named(id)) => id.clone(),
-        (None, OpRef::Proxy { method, path }) => format!("{method} {path}"),
+    // Masked in `run` (agent input).
+    let op_name = if tr.op_label.is_empty() {
+        tr.operation.clone().unwrap_or_default()
+    } else {
+        tr.op_label.clone()
     };
     let mut input = format!("{} {op_name}", call.service);
     for (k, v) in &tr.params {
