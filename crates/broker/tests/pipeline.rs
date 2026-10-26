@@ -934,15 +934,18 @@ async fn full_pool_is_a_limit_and_closed_pool_fails_closed() {
     let closed = Arc::new(Semaphore::new(1));
     closed.close();
     env.pool = Some(closed);
-    let o = go(
-        &call("orders.list", &[]),
-        &snapshot(""),
-        &env,
-        &up,
-        &Limiter::new(),
-    )
-    .await;
-    assert!(matches!(o, Outcome::UpstreamFailed { .. }), "{o:?}");
+    let c = call("orders.list", &[]);
+    let snap = snapshot("");
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    // A deny: nothing was sent, so the record does not count at a rebuild.
+    assert_eq!(rule(&o), "upstream_unavailable");
+    assert!(!tr.sent);
+    let r = record(&c, &snap, &tr, &o, "", "0.2.0");
+    assert_eq!(
+        serde_json::to_value(&r).unwrap()["decision"],
+        serde_json::json!("deny")
+    );
+    assert!(saiife_broker::pipeline::limit_event(&r).is_none());
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }
 

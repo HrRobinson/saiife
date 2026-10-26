@@ -574,15 +574,12 @@ async fn steps(
     let read_limit = max.saturating_add(READ_SLACK);
     let pool = env.pool(&call.service);
     // The wait for a pool slot is bounded by the upstream timeout; a full
-    // pool is a limit (`concurrency`), and a closed one fails closed. The
-    // daemon's worst case is therefore twice the upstream timeout.
+    // pool is a limit (`concurrency`), and a closed one fails closed: a
+    // deny (nothing was sent, so nothing counts, here or at a rebuild).
+    // The daemon's worst case is therefore twice the upstream timeout.
     let permit = match tokio::time::timeout(up.timeout(), pool.acquire_owned()).await {
         Ok(Ok(p)) => p,
-        Ok(Err(_)) => {
-            return Outcome::UpstreamFailed {
-                reason: "the upstream pool is closed".into(),
-            }
-        }
+        Ok(Err(_)) => return denied("upstream_unavailable"),
         Err(_) => {
             return Outcome::Limited {
                 limit: "concurrency",
