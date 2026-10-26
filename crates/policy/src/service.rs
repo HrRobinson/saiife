@@ -114,8 +114,16 @@ pub struct SecretCfg {
     pub run_allow: Vec<PathBuf>,
 }
 
-/// Basenames a `run_allow` entry may not have: an interpreter or a shell
-/// would let the agent run anything with the secret.
+/// Basenames a `run_allow` entry may not have: an interpreter, a shell or a
+/// program that runs another program (`xargs`, `find -exec`, `timeout`,
+/// `nice`, `sudo`, `make` ...) would let the agent run anything with the
+/// secret.
+///
+/// This denylist is best effort. It cannot know every program that can run
+/// code (a pager, an editor, an `--exec` flag, a plugin loader). A
+/// `run_allow` list should hold only purpose-built, argument-constrained
+/// programs (`psql`, `pg_dump`), never general tools. The daemon applies the
+/// same list to the symlink-resolved path at lease time.
 const INTERPRETERS: &[&str] = &[
     "sh",
     "bash",
@@ -144,6 +152,35 @@ const INTERPRETERS: &[&str] = &[
     "lua",
     "tclsh",
     "osascript",
+    "ash",
+    "mksh",
+    "rbash",
+    "pwsh",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "xargs",
+    "find",
+    "timeout",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "setsid",
+    "sudo",
+    "doas",
+    "chroot",
+    "irb",
+    "java",
+    "jshell",
+    "rscript",
+    "expect",
+    "wish",
+    "vim",
+    "vi",
+    "ed",
+    "gdb",
+    "make",
 ];
 
 /// True when `path` names an interpreter or shell (by basename).

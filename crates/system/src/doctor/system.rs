@@ -304,14 +304,8 @@ fn paths_owner(ctx: &Ctx) -> Check {
             t.bad(format!("{shown}: is a symlink"));
             continue;
         }
-        if m.uid() != root.uid {
-            t.bad(format!("{shown}: owned by uid {}, not root", m.uid()));
-        }
-        let perm = m.mode() & 0o7777;
-        if perm & 0o022 != 0 {
-            t.bad(format!(
-                "{shown}: mode {perm:04o} is writable by group or others"
-            ));
+        for problem in crate::fsops::root_owned_problems(&m, root.uid) {
+            t.bad(format!("{shown}: {problem}"));
         }
     }
     t.check(ID, TITLE)

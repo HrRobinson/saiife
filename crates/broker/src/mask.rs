@@ -55,6 +55,8 @@ pub struct Masker {
     /// `encodeURIComponent`) and mixed-case escapes.
     pct: Vec<Regex>,
     forms: usize,
+    /// The longest span `mask_bytes` can replace, in input bytes.
+    max_span: usize,
 }
 
 impl std::fmt::Debug for Masker {
@@ -70,11 +72,15 @@ impl Masker {
     pub fn new(values: &[&str]) -> Masker {
         let mut forms: Vec<Zeroizing<Vec<u8>>> = Vec::new();
         let mut pct = Vec::new();
+        let mut max_span = 0usize;
         for v in values {
             let v = v.as_bytes();
             if v.len() < MIN_VALUE_LEN {
                 continue;
             }
+            // A percent-form byte is 3 bytes (`%XX`); a JSON-escaped one up
+            // to 6 (`\u00XX`).
+            max_span = max_span.max(v.len().saturating_mul(6));
             // The pattern is generated and always valid; a size-limit error
             // (a huge value) leaves the exact percent forms in `ac` below.
             // regex errors for size never quote the pattern.
@@ -94,6 +100,7 @@ impl Masker {
         forms.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
         forms.dedup_by(|a, b| a.as_slice() == b.as_slice());
         forms.retain(|f| !f.is_empty());
+        max_span = forms.iter().map(|f| f.len()).fold(max_span, usize::max);
         let ac = if forms.is_empty() {
             None
         } else {
@@ -111,7 +118,16 @@ impl Masker {
             ac,
             pct,
             forms: forms.len(),
+            max_span,
         }
+    }
+
+    /// The longest input span that one masked form can cover. A streaming
+    /// caller keeps back `max_span() - 1` bytes between reads so a value
+    /// split across two reads is still found whole. 0 when nothing is
+    /// masked.
+    pub fn max_span(&self) -> usize {
+        self.max_span
     }
 
     /// Replace every vault form in `b` with `[MASKED]`. Matches are looked
@@ -120,13 +136,20 @@ impl Masker {
     /// hidden by escapes is caught even in JSON that does not parse (a body
     /// cut by the reader). Overlapping hits are merged into one mask.
     pub fn mask_bytes(&self, b: &[u8]) -> Vec<u8> {
+        match self.spans(b) {
+            Some(spans) => apply_spans(b, spans),
+            // Far above any read limit; fail closed rather than map it.
+            None => MASK.as_bytes().to_vec(),
+        }
+    }
+
+    /// Every span of `b` that holds a masked form (`None`: `b` is too long
+    /// to map).
+    fn spans(&self, b: &[u8]) -> Option<Vec<(usize, usize)>> {
         let mut spans = Vec::new();
         self.collect_spans(b, &mut spans);
         if b.contains(&b'\\') {
-            if u32::try_from(b.len()).is_err() {
-                // Far above any read limit; fail closed rather than map it.
-                return MASK.as_bytes().to_vec();
-            }
+            u32::try_from(b.len()).ok()?;
             let (decoded, map) = json_unescape(b);
             let mut inner = Vec::new();
             self.collect_spans(&decoded, &mut inner);
@@ -136,7 +159,31 @@ impl Masker {
                     .map(|(s, e)| (map[s] as usize, orig_span(&map, b.len(), e - 1).1)),
             );
         }
-        apply_spans(b, spans)
+        Some(spans)
+    }
+
+    /// One step of masking a stream. `buf` is the bytes held back from the
+    /// last step followed by the new read. Returns the masked bytes that
+    /// are safe to write and how many bytes of `buf` they cover; the caller
+    /// keeps `buf[consumed..]` and puts the next read after it. Nothing is
+    /// held back when `last`. At most `max_span() - 1` bytes (plus a match
+    /// that straddles that edge) are kept, so a value split across reads is
+    /// masked whole.
+    pub fn mask_chunk(&self, buf: &[u8], last: bool) -> (Vec<u8>, usize) {
+        let Some(spans) = self.spans(buf) else {
+            return (MASK.as_bytes().to_vec(), buf.len());
+        };
+        let mut cut = if last {
+            buf.len()
+        } else {
+            buf.len().saturating_sub(self.max_span.saturating_sub(1))
+        };
+        // A match across the edge is held back whole.
+        while let Some(&(s, _)) = spans.iter().find(|&&(s, e)| s < cut && e > cut) {
+            cut = s;
+        }
+        let inside: Vec<(usize, usize)> = spans.into_iter().filter(|&(_, e)| e <= cut).collect();
+        (apply_spans(&buf[..cut], inside), cut)
     }
 
     fn collect_spans(&self, b: &[u8], spans: &mut Vec<(usize, usize)>) {

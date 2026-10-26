@@ -59,7 +59,7 @@ pub fn run(config: Option<PathBuf>, action: SecretAction) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use super::SecretAction;
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
@@ -81,11 +81,13 @@ mod linux {
     const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Why the command stops: `Refused` is exit 2, `Unavailable` exit 5.
-    enum Stop {
+    pub(crate) enum Stop {
         Refused(String),
         /// The daemon said `forbidden` (also exit 2).
         Forbidden(String),
         Unavailable(String),
+        /// `saiife run`: the command is not on `PATH` (exit 127).
+        NotFound(String),
     }
 
     type Fields = BTreeMap<&'static str, Zeroizing<String>>;
@@ -115,6 +117,10 @@ mod linux {
             Err(Stop::Unavailable(m)) => {
                 eprintln!("saiife: {m}");
                 ExitCode::from(5)
+            }
+            Err(Stop::NotFound(m)) => {
+                eprintln!("saiife: {m}");
+                ExitCode::from(127)
             }
         }
     }
@@ -217,7 +223,11 @@ mod linux {
     }
 
     /// One call on a fresh connection to the daemon.
-    fn call(config: &Path, op: &str, a: Map<String, Value>) -> Result<Map<String, Value>, Stop> {
+    pub(crate) fn call(
+        config: &Path,
+        op: &str,
+        a: Map<String, Value>,
+    ) -> Result<Map<String, Value>, Stop> {
         let loaded = load_system(config)
             .map_err(|e| Stop::Unavailable(format!("cannot read the system config: {e}")))?;
         if !loaded.config.locked {

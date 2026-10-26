@@ -25,6 +25,7 @@ toml = "0.8"
 # 1.53.3 and later are younger than 14 days (2026-10-22).
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros"] }
 rustix = { version = "1", features = ["fs", "process", "net"] }
+saiife-system = { path = "../system" }
 # Newest releases older than 14 days (2026-10-26): chacha20poly1305 0.11.0
 # is from 2026-06-28, zeroize 1.9.1 from 2026-10-06.
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }

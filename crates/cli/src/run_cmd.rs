@@ -1,0 +1,301 @@
+//! `saiife run --secret <name>[:ENV] -- <cmd> [args]` (spec §6.14): the
+//! daemon leases the secret for one allowed, root-owned command; this puts
+//! it in that command's environment and masks both of its output streams.
+//! Linux only. Exit codes: the command's own (128 + signal when a signal
+//! ended it), 2 refused, 5 the daemon cannot be reached, 127 the command
+//! was not found.
+//!
+//! The command runs as the calling user, so the agent's code holds the
+//! value while it runs; masking only hides what the command prints. That is
+//! why the daemon lists the executables (`run_allow`) and why that list
+//! should hold purpose-built, argument-constrained programs only. Prefer a
+//! connector wherever one exists.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+/// What `clap` hands over.
+pub struct RunArgs {
+    pub system_config: Option<PathBuf>,
+    /// `<name>[:ENV_VAR]`, repeatable.
+    pub secrets: Vec<String>,
+    /// The command and its arguments.
+    pub command: Vec<String>,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run(_args: RunArgs) -> ExitCode {
+    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    ExitCode::from(5)
+}
+
+#[cfg(target_os = "linux")]
+pub fn run(args: RunArgs) -> ExitCode {
+    linux::run(args)
+}
+
+/// `NAME` or `NAME:ENV_VAR` into the name and the variable. The default
+/// variable is the name upper-cased with `-` and `.` turned into `_`.
+pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
+    let (name, env) = match spec.split_once(':') {
+        Some((n, e)) => (n, e.to_string()),
+        None => (spec, spec.to_ascii_uppercase().replace(['-', '.'], "_")),
+    };
+    if name.is_empty() {
+        return Err("--secret needs a name".into());
+    }
+    let mut chars = env.chars();
+    let ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        return Err(format!(
+            "{env:?} is not a valid environment variable name (give one: --secret {name}:ENV_VAR)"
+        ));
+    }
+    Ok((name.to_string(), env))
+}
+
+/// Copy `r` to `w`, replacing every form of a masked value with
+/// `[MASKED]`. The bytes held back between reads (`max_span - 1`) make a
+/// value split across two reads masked whole. A write error stops the
+/// writing but not the reading, so the command never blocks on a full pipe.
+pub(crate) fn pump(
+    mut r: impl std::io::Read,
+    mut w: impl std::io::Write,
+    masker: &saiife_broker::mask::Masker,
+) {
+    let mut held: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    let mut writing = true;
+    let emit = |bytes: &[u8], w: &mut dyn std::io::Write, writing: &mut bool| {
+        if *writing && !bytes.is_empty() && (w.write_all(bytes).is_err() || w.flush().is_err()) {
+            *writing = false;
+        }
+    };
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        held.extend_from_slice(&chunk[..n]);
+        let (out, used) = masker.mask_chunk(&held, false);
+        held.drain(..used);
+        emit(&out, &mut w, &mut writing);
+    }
+    let (out, _) = masker.mask_chunk(&held, true);
+    emit(&out, &mut w, &mut writing);
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{parse_spec, pump, RunArgs};
+    use crate::secret_cmd::linux::{call, Stop};
+    use saiife_broker::mask::Masker;
+    use serde_json::{json, Map};
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitCode, Stdio};
+    use zeroize::Zeroizing;
+
+    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+
+    pub fn run(args: RunArgs) -> ExitCode {
+        match go(args) {
+            Ok(code) => code,
+            Err(Stop::Refused(m) | Stop::Forbidden(m)) => {
+                eprintln!("saiife: {m}");
+                ExitCode::from(2)
+            }
+            Err(Stop::Unavailable(m)) => {
+                eprintln!("saiife: {m}");
+                ExitCode::from(5)
+            }
+            Err(Stop::NotFound(m)) => {
+                eprintln!("saiife: {m}");
+                ExitCode::from(127)
+            }
+        }
+    }
+
+    fn go(args: RunArgs) -> Result<ExitCode, Stop> {
+        let config = args
+            .system_config
+            .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+        let mut specs: Vec<(String, String)> = Vec::new();
+        for s in &args.secrets {
+            let spec = parse_spec(s).map_err(Stop::Refused)?;
+            if specs.iter().any(|(_, e)| *e == spec.1) {
+                return Err(Stop::Refused(format!(
+                    "two secrets would use the variable {}",
+                    spec.1
+                )));
+            }
+            specs.push(spec);
+        }
+        let Some((argv0, rest)) = args.command.split_first() else {
+            return Err(Stop::Refused(
+                "run --secret needs a command after --".into(),
+            ));
+        };
+        let exe = resolve(argv0)?;
+        let exe_s = exe
+            .to_str()
+            .ok_or_else(|| Stop::Refused("the command's path is not valid UTF-8".into()))?;
+        let mut values: Vec<(String, Zeroizing<String>)> = Vec::new();
+        for (name, env) in &specs {
+            let mut a = Map::new();
+            a.insert("name".into(), json!(name));
+            a.insert("exe".into(), json!(exe_s));
+            let ans = call(&config, "secret.lease", a)?;
+            let v = ans
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Stop::Unavailable("the daemon sent no value".into()))?;
+            values.push((env.clone(), Zeroizing::new(v.to_string())));
+        }
+        let refs: Vec<&str> = values.iter().map(|(_, v)| v.as_str()).collect();
+        let masker = Masker::new(&refs);
+
+        let mut cmd = Command::new(&exe);
+        // The multi-call binaries (busybox, coreutils) pick their applet
+        // from argv[0]: keep the name as typed.
+        cmd.arg0(argv0)
+            .args(rest)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (env, v) in &values {
+            cmd.env(env, v.as_str());
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Stop::Refused(format!("cannot start {}: {e}", exe.display())))?;
+        let out = child.stdout.take();
+        let errs = child.stderr.take();
+        std::thread::scope(|s| {
+            if let Some(o) = out {
+                s.spawn(|| pump(o, std::io::stdout(), &masker));
+            }
+            if let Some(e) = errs {
+                s.spawn(|| pump(e, std::io::stderr(), &masker));
+            }
+        });
+        let status = child
+            .wait()
+            .map_err(|e| Stop::Unavailable(format!("cannot wait for the command: {e}")))?;
+        Ok(match (status.code(), status.signal()) {
+            (Some(c), _) => ExitCode::from(c.clamp(0, 255) as u8),
+            (None, Some(sig)) => ExitCode::from((128 + sig).clamp(0, 255) as u8),
+            (None, None) => ExitCode::from(1),
+        })
+    }
+
+    /// `cmd` through `PATH` (or as a path) to its canonical form.
+    fn resolve(cmd: &str) -> Result<PathBuf, Stop> {
+        let miss = || Stop::NotFound(format!("{cmd}: command not found"));
+        let candidate: PathBuf = if cmd.contains('/') {
+            PathBuf::from(cmd)
+        } else {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(cmd))
+                .find(|p| is_exec(p))
+                .ok_or_else(miss)?
+        };
+        if !is_exec(&candidate) {
+            return Err(miss());
+        }
+        std::fs::canonicalize(&candidate).map_err(|_| miss())
+    }
+
+    fn is_exec(p: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saiife_broker::mask::Masker;
+    use std::io::Read;
+
+    /// Hands out `parts` one read at a time.
+    struct Parts(std::collections::VecDeque<Vec<u8>>);
+
+    impl Read for Parts {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(p) => {
+                    buf[..p.len()].copy_from_slice(&p);
+                    Ok(p.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    fn pumped(parts: &[&[u8]], values: &[&str]) -> Vec<u8> {
+        let m = Masker::new(values);
+        let mut out = Vec::new();
+        pump(
+            Parts(parts.iter().map(|p| p.to_vec()).collect()),
+            &mut out,
+            &m,
+        );
+        out
+    }
+
+    #[test]
+    fn split_value_across_reads_masked() {
+        let v = "Zq9-run-secret-VALUE-1";
+        // Every split point of the value, and of its base64 form.
+        let line = format!("before {v} after\n");
+        for i in 1..line.len() {
+            let (a, b) = line.as_bytes().split_at(i);
+            let out = pumped(&[a, b], &[v]);
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "before [MASKED] after\n",
+                "split at {i}"
+            );
+        }
+        // Three-way split, one byte at a time.
+        let one: Vec<&[u8]> = line.as_bytes().chunks(1).collect();
+        let out = pumped(&one, &[v]);
+        assert_eq!(String::from_utf8(out).unwrap(), "before [MASKED] after\n");
+    }
+
+    #[test]
+    fn output_without_the_value_passes_through_whole() {
+        let out = pumped(
+            &[b"hello ", b"world\n", b"tail"],
+            &["Zq9-run-secret-VALUE-1"],
+        );
+        assert_eq!(out, b"hello world\ntail");
+    }
+
+    #[test]
+    fn spec_defaults_and_validation() {
+        assert_eq!(
+            parse_spec("db-readonly.v2").unwrap(),
+            ("db-readonly.v2".into(), "DB_READONLY_V2".into())
+        );
+        assert_eq!(
+            parse_spec("tok:TOKEN").unwrap(),
+            ("tok".into(), "TOKEN".into())
+        );
+        assert!(parse_spec("tok:1BAD").is_err());
+        assert!(parse_spec("tok:A-B").is_err());
+        assert!(
+            parse_spec("9lives").is_err(),
+            "default would start with a digit"
+        );
+        assert!(parse_spec(":X").is_err());
+    }
+}

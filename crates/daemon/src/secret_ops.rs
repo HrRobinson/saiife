@@ -10,8 +10,10 @@ use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_SECRET_ADD, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE,
 };
 use saiife_ipc::peer::{comm, PeerCred};
+use saiife_policy::{is_interpreter, scope_for};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -355,6 +357,193 @@ fn run(vault: &mut Vault, uid: u32, p: Parsed) -> Result<Map<String, Value>, Ref
             Ok(Map::new())
         }
     }
+}
+
+// ---- secret.lease (spec §6.14) ----
+
+/// Longest `exe` a lease takes.
+const MAX_EXE_BYTES: usize = 4096;
+
+/// A refused lease: the rule and why.
+struct Deny {
+    rule: &'static str,
+    detail: String,
+}
+
+fn deny(rule: &'static str, detail: impl Into<String>) -> Deny {
+    Deny {
+        rule,
+        detail: detail.into(),
+    }
+}
+
+/// `secret.lease {name, exe}`: the value of secret `name` for one command,
+/// only when the caller is in a scope and `exe` is a listed, root-owned,
+/// non-interpreter executable. Every answer, grant or refusal, is a
+/// `secret` record (`event = "secret_use"`).
+///
+/// The interpreter denylist is best effort (see `INTERPRETERS` in the
+/// policy crate): `run_allow` should hold only purpose-built,
+/// argument-constrained programs.
+pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+    let id = req.id;
+    let name = match req.args.get("name").and_then(Value::as_str) {
+        Some(n) if valid_name(n) => n.to_string(),
+        _ => return err(id, ErrorCode::BadRequest, "secret.lease takes a valid name"),
+    };
+    let exe = match req.args.get("exe").and_then(Value::as_str) {
+        Some(e) if !e.is_empty() && e.len() <= MAX_EXE_BYTES && !e.contains('\0') => e.to_string(),
+        _ => return err(id, ErrorCode::BadRequest, "secret.lease takes an exe path"),
+    };
+    let free = crate::disk::free_mb(&ctx.audit_dir);
+    if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
+        ctx.notice(peer.uid, Notice::LowDisk);
+        return err(id, code, "the audit volume is below [audit] min_free_mb");
+    }
+    let verdict = match check_lease(ctx, peer.uid, &name, &exe).await {
+        Ok(()) => take_value(ctx, &name).await,
+        Err(d) => Err(d),
+    };
+    let mut r = use_record(ctx, peer, &name, &exe).await;
+    match verdict {
+        Ok(value) => {
+            if let Err(e) = ctx.writer.append(r).await {
+                // No record, no value.
+                return err(
+                    id,
+                    ErrorCode::Internal,
+                    &format!("cannot write the audit record: {e}"),
+                );
+            }
+            let mut m = Map::new();
+            m.insert("value".into(), Value::String(value.to_string()));
+            ok(id, m)
+        }
+        Err(Deny { rule, detail }) => {
+            r.decision = DecisionKind::Deny;
+            r.rule = Some(rule.to_string());
+            r.reason = Some(detail.clone());
+            if let Err(e) = ctx.writer.append(r).await {
+                eprintln!("saiifed: warning: cannot write secret_use record: {e}");
+            }
+            let code = if rule == "vault_unavailable" {
+                ErrorCode::VaultUnavailable
+            } else {
+                ErrorCode::Denied
+            };
+            let mut v = err(id, code, &format!("{rule}: {detail}"));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("rule".into(), rule.into());
+            }
+            v
+        }
+    }
+}
+
+async fn use_record(ctx: &Ctx, peer: &PeerCred, name: &str, exe: &str) -> saiife_audit::Record {
+    let mut r = ctx.record("secret", &format!("run {name} {exe}"));
+    r.uid = Some(peer.uid);
+    r.user = ctx.name_of(peer.uid).await;
+    r.extra.insert("event".into(), "secret_use".into());
+    r.extra.insert("name".into(), name.into());
+    r.extra.insert(
+        "peer".into(),
+        json!({"pid": peer.pid, "comm": comm(peer.pid)}),
+    );
+    r
+}
+
+/// Scope, then the executable.
+async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<(), Deny> {
+    let Some(sys) = ctx.policy().system else {
+        return Err(deny("run_not_allowed", "no valid policy is loaded"));
+    };
+    let Some(user) = ctx.name_of(uid).await else {
+        return Err(deny("no_scope", "the caller has no user name"));
+    };
+    let dir = Arc::clone(&ctx.directory);
+    let cfg = Arc::clone(&sys);
+    let scope = tokio::task::spawn_blocking(move || {
+        scope_for(&cfg, dir.as_ref(), &user).map(|s| s.map(|s| s.name.clone()))
+    })
+    .await
+    .map_err(|_| deny("run_not_allowed", "scope lookup failed"))?;
+    match scope {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(deny("no_scope", "the caller is in no scope")),
+        Err(_) => {
+            return Err(deny(
+                "scope_conflict",
+                "the caller is in more than one scope",
+            ))
+        }
+    }
+    let allow: Vec<PathBuf> = sys
+        .secrets
+        .get(name)
+        .map(|s| s.run_allow.clone())
+        .unwrap_or_default();
+    let exe = PathBuf::from(exe);
+    tokio::task::spawn_blocking(move || check_exe(&exe, &allow))
+        .await
+        .map_err(|_| deny("run_not_allowed", "executable check failed"))?
+}
+
+/// The executable: absolute and canonical, listed (as written or
+/// resolved), no interpreter by its resolved name, a regular file, and
+/// root-owned along its whole path.
+fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
+    let no = |d: &str| deny("run_not_allowed", d);
+    if !exe.is_absolute() {
+        return Err(no("the executable path is not absolute"));
+    }
+    let listed = allow
+        .iter()
+        .any(|a| a == exe || std::fs::canonicalize(a).is_ok_and(|c| c == exe));
+    if !listed {
+        return Err(no("the executable is not in run_allow for this secret"));
+    }
+    match std::fs::canonicalize(exe) {
+        Ok(c) if c == exe => {}
+        _ => return Err(no("the executable path is not canonical")),
+    }
+    // A listed name can be a link to a shell: judge the resolved name too.
+    if is_interpreter(exe) {
+        return Err(no("the executable is an interpreter or shell"));
+    }
+    match std::fs::metadata(exe) {
+        Ok(m) if m.is_file() => {}
+        _ => return Err(no("the executable is not a regular file")),
+    }
+    saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
+}
+
+/// The value for the answer, and the use noted in the vault.
+async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<Zeroizing<String>, Deny> {
+    let c = Arc::clone(ctx);
+    let n = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = c.vault.lock().unwrap_or_else(|p| p.into_inner());
+        let vault = match &mut *guard {
+            VaultState::Ready(v) => v,
+            VaultState::Unavailable(_) => {
+                return Err(deny("vault_unavailable", "the vault cannot be read"))
+            }
+        };
+        let Some(e) = vault.get(&n) else {
+            return Err(deny("unknown_secret", "no such secret"));
+        };
+        let field = |k: &str| e.fields.get(k).map(|v| v.as_str()).unwrap_or("");
+        let value = match e.kind {
+            Kind::Token => Zeroizing::new(field("token").to_string()),
+            Kind::Basic => Zeroizing::new(format!("{}:{}", field("username"), field("password"))),
+            Kind::Header => Zeroizing::new(field("value").to_string()),
+        };
+        vault.touch(&n, &now_ts());
+        Ok(value)
+    })
+    .await
+    .map_err(|_| deny("run_not_allowed", "vault read failed"))?
 }
 
 #[cfg(test)]

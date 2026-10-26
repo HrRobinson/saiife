@@ -34,6 +34,7 @@ mod paths;
 mod project;
 mod report;
 mod report_html;
+mod run_cmd;
 mod secret_cmd;
 mod status_cmd;
 mod system_cmd;
@@ -191,6 +192,19 @@ enum Cmd {
         #[command(subcommand)]
         action: secret_cmd::SecretAction,
     },
+    /// Locked mode (Linux): run one allowed, root-owned command with a
+    /// secret in its environment; its output is masked.
+    Run {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+        /// The secret and the variable to set: NAME or NAME:ENV_VAR.
+        #[arg(long = "secret", value_name = "NAME[:ENV_VAR]", required = true)]
+        secrets: Vec<String>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -248,6 +262,18 @@ fn main() -> ExitCode {
     {
         return secret_cmd::run(system_config, action);
     }
+    if let Cmd::Run {
+        system_config,
+        secrets,
+        command,
+    } = cli.command
+    {
+        return run_cmd::run(run_cmd::RunArgs {
+            system_config,
+            secrets,
+            command,
+        });
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -294,6 +320,7 @@ fn main() -> ExitCode {
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }
+        | Cmd::Run { .. }
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }

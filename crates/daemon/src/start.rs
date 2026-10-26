@@ -161,6 +161,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
                     ok: false,
                     min_free_mb: boot.audit.min_free_mb,
                     admin_groups: Vec::new(),
+                    system: None,
                 },
                 Some(e.to_string()),
             )

@@ -27,8 +27,8 @@ pub use load::{load_system, LoadedPolicy, PolicyError};
 pub use project::{merge_project, parse_project, Merged, Mode, ProjectOverlay, ServiceOverlay};
 pub use scope::{check_scopes, load_and_check, scope_for};
 pub use service::{
-    Action, AmountCap, AuthCfg, HttpOperationCfg, LimitsCfg, RedactCfg, RuleCfg, SecretCfg,
-    ServiceCfg,
+    is_interpreter, Action, AmountCap, AuthCfg, HttpOperationCfg, LimitsCfg, RedactCfg, RuleCfg,
+    SecretCfg, ServiceCfg,
 };
 pub use system::{
     AdminCfg, ApprovalCfg, AuditCfg, DaemonCfg, Fail, Fsync, GatewayCfg, GuardCfg, McpCfg,

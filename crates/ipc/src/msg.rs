@@ -12,6 +12,7 @@ pub const OP_SECRET_ADD: &str = "secret.add";
 pub const OP_SECRET_ROTATE: &str = "secret.rotate";
 pub const OP_SECRET_REMOVE: &str = "secret.remove";
 pub const OP_SECRET_LIST: &str = "secret.list";
+pub const OP_SECRET_LEASE: &str = "secret.lease";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
@@ -79,6 +80,8 @@ pub enum ErrorCode {
     Internal,
     /// The credential vault cannot be read.
     VaultUnavailable,
+    /// A policy rule refused the request; the message starts with the rule.
+    Denied,
 }
 
 impl ErrorCode {
@@ -94,6 +97,7 @@ impl ErrorCode {
             ErrorCode::Unavailable => "unavailable",
             ErrorCode::Internal => "internal",
             ErrorCode::VaultUnavailable => "vault_unavailable",
+            ErrorCode::Denied => "denied",
         }
     }
 }

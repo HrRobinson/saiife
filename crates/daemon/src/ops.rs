@@ -8,11 +8,11 @@ use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD,
-    OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo,
+    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo, SystemConfig,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -40,6 +40,9 @@ pub struct PolicyState {
     pub ok: bool,
     pub min_free_mb: u64,
     pub admin_groups: Vec<String>,
+    /// The merged system config (scopes, `[secrets.*] run_allow`); `None`
+    /// while no valid policy was ever loaded.
+    pub system: Option<Arc<SystemConfig>>,
 }
 
 impl PolicyState {
@@ -50,6 +53,7 @@ impl PolicyState {
             ok: true,
             min_free_mb: l.config.audit.min_free_mb,
             admin_groups: l.config.admin.groups.clone(),
+            system: Some(Arc::new(l.config.clone())),
         }
     }
 }
@@ -322,6 +326,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         OP_AUDIT_APPEND => append(ctx, peer, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
+        OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
         OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
             crate::secret_ops::handle(ctx, peer, req).await
         }
