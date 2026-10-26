@@ -28,7 +28,13 @@ pub struct RunArgs {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_args: RunArgs) -> ExitCode {
+pub fn run(args: RunArgs) -> ExitCode {
+    let RunArgs {
+        system_config,
+        secrets,
+        command,
+    } = args;
+    let _ = (system_config, secrets, command);
     eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
     ExitCode::from(5)
 }
