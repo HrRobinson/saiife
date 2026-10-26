@@ -528,6 +528,11 @@ fn answer(id: u64, outcome: Outcome) -> Value {
 /// (without a scope it could call nothing). The token is in this answer
 /// and nowhere else; the daemon keeps its SHA-256.
 pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
+    // No record, no token: below the audit floor none is issued.
+    if let Err(code) = disk_ok(ctx, uid) {
+        ctx.notice(uid, Notice::LowDisk);
+        return err(id, code, LOW_DISK);
+    }
     if !has_scope(ctx, uid).await {
         return err(
             id,
@@ -549,7 +554,19 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
     r.reason = Some(format!("issued to uid {uid}, expires {expires}"));
     r.extra.insert("token_uid".into(), uid.into());
     if let Err(e) = ctx.writer.append(r).await {
+        // No record, no token: it is withdrawn before anyone saw it.
         eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
+        let t = Arc::clone(&ctx.tokens);
+        let token = issued.token;
+        let revoked = tokio::task::spawn_blocking(move || t.revoke(&token)).await;
+        if !matches!(revoked, Ok(Ok(()))) {
+            eprintln!("saiife: warning: cannot write the gateway tokens after withdrawing one");
+        }
+        return err(
+            id,
+            ErrorCode::Internal,
+            &format!("the gateway_token record could not be written; no token issued: {e}"),
+        );
     }
     let mut m = Map::new();
     m.insert("token".into(), issued.token.as_str().into());

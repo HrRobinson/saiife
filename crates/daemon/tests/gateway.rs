@@ -1065,6 +1065,41 @@ async fn client_gone_mid_call_still_records_and_counts() {
 }
 
 #[tokio::test]
+async fn api_token_withheld_without_its_record_or_below_the_disk_floor() {
+    let w = world().await;
+    let me = rustix::process::getuid().as_raw();
+    // Below `[audit] min_free_mb` a uid other than the daemon's gets none.
+    w.ctx.policy.lock().unwrap().min_free_mb = u64::MAX;
+    let peer = PeerCred {
+        uid: me + 1,
+        gid: rustix::process::getgid().as_raw(),
+        pid: std::process::id(),
+    };
+    let req = IpcRequest {
+        id: 9,
+        op: "api.token".into(),
+        args: Default::default(),
+    };
+    let a = saiife_daemon::ops::dispatch(&w.ctx, &peer, req).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(a.get("token").is_none(), "{a}");
+    assert_eq!(a["error"], "low_disk", "{a}");
+    assert_eq!(w.ctx.tokens.live_for(me + 1), 0);
+    w.ctx.policy.lock().unwrap().min_free_mb = 0;
+    // The record cannot be written: no token, and none left live.
+    // (No signing key here: the stop fails its checkpoint, and stops.)
+    let _ = w.ctx.writer.stop(None).await;
+    let a = w.token_op().await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert!(a.get("token").is_none(), "{a}");
+    assert!(
+        a["message"].as_str().unwrap().contains("no token issued"),
+        "{a}"
+    );
+    assert_eq!(w.ctx.tokens.live_for(me), 0);
+}
+
+#[tokio::test]
 async fn content_length_checked_only_without_transfer_encoding() {
     let w = world().await;
     let raw = w

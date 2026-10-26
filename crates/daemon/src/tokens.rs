@@ -243,6 +243,20 @@ impl Tokens {
         found
     }
 
+    /// Withdraw `token` (issued, but never handed out). Memory drops it
+    /// whatever the disk does.
+    pub fn revoke(&self, token: &str) -> io::Result<()> {
+        let h = sha256(token);
+        let _w = lock(&self.write);
+        let next: Vec<Entry> = lock(&self.entries)
+            .iter()
+            .filter(|e| !ct_eq(&e.hash, &h))
+            .cloned()
+            .collect();
+        *lock(&self.entries) = next.clone();
+        self.save(&next)
+    }
+
     /// Drop expired tokens (at start and hourly); `true` when any went.
     pub fn purge(&self) -> io::Result<bool> {
         let now = self.now();
