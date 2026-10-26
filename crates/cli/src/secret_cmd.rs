@@ -58,7 +58,14 @@ pub enum SecretAction {
         /// Answer yes for every credential in this file (repeatable).
         #[arg(long = "yes-to", value_name = "PATH")]
         yes_to: Vec<PathBuf>,
-        /// The user's home (default: from /etc/passwd). Test seam.
+        /// The service the credentials in this file are for, as
+        /// `<path>=<service>` (repeatable): a configured service or a
+        /// built-in connector.
+        #[arg(long = "service", value_name = "PATH=SERVICE")]
+        services: Vec<String>,
+        /// The user's home (default: from /etc/passwd). Test seam, debug
+        /// builds only.
+        #[cfg(debug_assertions)]
         #[arg(long, hide = true, value_name = "DIR")]
         home: Option<PathBuf>,
     },
@@ -105,6 +112,8 @@ pub(crate) mod linux {
         Unavailable(String),
         /// `saiife run`: the command is not on `PATH` (exit 127).
         NotFound(String),
+        /// The daemon made the change but could not record it (exit 2).
+        Unrecorded(String),
     }
 
     type Fields = BTreeMap<&'static str, Zeroizing<String>>;
@@ -127,7 +136,7 @@ pub(crate) mod linux {
         let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
         match go(&config, action) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(Stop::Refused(m) | Stop::Forbidden(m)) => {
+            Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m)) => {
                 eprintln!("saiife: {m}");
                 ExitCode::from(2)
             }
@@ -158,16 +167,23 @@ pub(crate) mod linux {
                 user,
                 projects,
                 yes_to,
+                services,
+                #[cfg(debug_assertions)]
                 home,
-            } => crate::import_cmd::run(
-                config,
-                crate::import_cmd::ImportArgs {
-                    user,
-                    projects,
-                    yes_to,
-                    home,
-                },
-            ),
+            } => {
+                #[cfg(not(debug_assertions))]
+                let home = None;
+                crate::import_cmd::run(
+                    config,
+                    crate::import_cmd::ImportArgs {
+                        user,
+                        projects,
+                        yes_to,
+                        services,
+                        home,
+                    },
+                )
+            }
             SecretAction::Remove { name } => {
                 call(config, "secret.remove", args([("name", json!(name))]))?;
                 outln!("removed {name}");
@@ -295,6 +311,9 @@ pub(crate) mod linux {
             .map_err(|e| match e {
                 ClientError::Refused { code, message } if code == "forbidden" => {
                     Stop::Forbidden(message)
+                }
+                ClientError::Refused { code, message } if code == "unrecorded" => {
+                    Stop::Unrecorded(message)
                 }
                 ClientError::Refused { message, .. } => Stop::Refused(message),
                 other => down(&other),

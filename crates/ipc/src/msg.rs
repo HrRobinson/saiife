@@ -91,6 +91,8 @@ pub enum ErrorCode {
     /// The upstream failed, or its answer was withheld (`rule` or
     /// `reason`).
     UpstreamFailed,
+    /// The change was made, but its audit record could not be written.
+    Unrecorded,
 }
 
 impl ErrorCode {
@@ -109,6 +111,7 @@ impl ErrorCode {
             ErrorCode::Denied => "denied",
             ErrorCode::Limited => "limited",
             ErrorCode::UpstreamFailed => "upstream_failed",
+            ErrorCode::Unrecorded => "unrecorded",
         }
     }
 }

@@ -46,7 +46,7 @@ pub fn run(args: ConnectArgs) -> ExitCode {
     use crate::secret_cmd::linux::Stop;
     match linux::go(args) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(Stop::Refused(m) | Stop::Forbidden(m)) => {
+        Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m)) => {
             eprintln!("saiife: {m}");
             ExitCode::from(2)
         }

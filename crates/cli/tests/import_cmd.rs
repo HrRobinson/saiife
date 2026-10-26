@@ -44,7 +44,12 @@ fn put(base: &Path, rel: &str, text: &str, mode: u32) -> PathBuf {
 }
 
 fn saiife(d: &TestDaemon, args: &[&str]) -> Output {
+    saiife_env(d, args, &[])
+}
+
+fn saiife_env(d: &TestDaemon, args: &[&str], envs: &[(&str, &str)]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .envs(envs.iter().copied())
         .arg("secret")
         .arg("--system-config")
         .arg(d.config())
@@ -59,11 +64,19 @@ fn saiife(d: &TestDaemon, args: &[&str]) -> Output {
 }
 
 fn import(d: &TestDaemon, home: &Path, extra: &[&str]) -> Output {
+    import_env(d, home, extra, &[])
+}
+
+fn import_env(d: &TestDaemon, home: &Path, extra: &[&str], envs: &[(&str, &str)]) -> Output {
     let user = own_user();
     let home = home.to_str().unwrap();
     let mut args = vec!["import", "--user", user.as_str(), "--home", home];
     args.extend_from_slice(extra);
-    saiife(d, &args)
+    saiife_env(d, &args, envs)
+}
+
+fn svc(p: &Path, s: &str) -> String {
+    format!("{}={s}", p.display())
 }
 
 fn out(o: &Output) -> String {
@@ -315,8 +328,11 @@ fn no_terminal_skips_and_lists() {
     let o = import(&d, home.path(), &[]);
     assert_eq!(o.status.code(), Some(0), "{}", all(&o));
     let t = out(&o);
-    assert!(t.contains("skipped (no terminal"), "{t}");
-    assert!(t.contains(&format!("{}: Vault token", vt.display())), "{t}");
+    assert!(t.contains("skipped:"), "{t}");
+    assert!(
+        t.contains(&format!("{}: Vault token (no terminal", vt.display())),
+        "{t}"
+    );
     assert_eq!(fs::read_to_string(&vt).unwrap(), "hvs.skipvalue0005\n");
     assert!(names(&d).is_empty());
     assert!(!all(&o).contains("skipvalue0005"));
@@ -369,7 +385,12 @@ fn backup_written_and_purged_after_7_days() {
     let mut d = admin();
     let home = scratch();
     let vt = put(home.path(), ".vault-token", "hvs.purgevalue0008\n", 0o600);
-    let o = import(&d, home.path(), &["--yes-to", vt.to_str().unwrap()]);
+    let s = svc(&vt, "github");
+    let o = import(
+        &d,
+        home.path(),
+        &["--yes-to", vt.to_str().unwrap(), "--service", &s],
+    );
     assert_eq!(o.status.code(), Some(0), "{}", all(&o));
     assert_eq!(fs::read_to_string(&vt).unwrap(), "");
     let b = backups(&d);
@@ -421,6 +442,10 @@ fn value_never_printed() {
         args.push("--yes-to".into());
         args.push(p.display().to_string());
     }
+    for (p, s) in [(&env, "shopify"), (&creds, "github"), (&npm, "hubspot")] {
+        args.push("--service".into());
+        args.push(svc(p, s));
+    }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let o = import(&d, home.path(), &args);
     assert_eq!(o.status.code(), Some(0), "{}", all(&o));
@@ -436,6 +461,7 @@ fn value_never_printed() {
     );
     assert!(out(&o).contains("next: saiife connect shopify --secret"));
 
+    let daemon_stderr = d.stderr_text();
     let seen = format!("{}{}", all(&o), audit_text(&d));
     for v in [
         "envvalue0009",
@@ -445,9 +471,175 @@ fn value_never_printed() {
         "ghovalue0009",
     ] {
         assert!(!seen.contains(v), "{v} leaked");
+        assert!(!daemon_stderr.contains(v), "{v} in the daemon's stderr");
         assert!(!seen.contains(&b64(v.as_bytes())), "{v} leaked as base64");
     }
     for orig in &originals {
         assert!(!seen.contains(&b64(orig)), "a backup leaked as base64");
     }
+}
+
+#[test]
+fn no_service_is_skipped_not_stored() {
+    let d = admin();
+    let home = scratch();
+    let vt = put(home.path(), ".vault-token", "hvs.orphan0010\n", 0o600);
+    let creds = put(
+        home.path(),
+        ".git-credentials",
+        "https://bob:orphan0010b@github.com.evil.example\n",
+        0o600,
+    );
+    let o = import(
+        &d,
+        home.path(),
+        &[
+            "--yes-to",
+            vt.to_str().unwrap(),
+            "--yes-to",
+            creds.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", all(&o));
+    let t = out(&o);
+    for (p, what) in [(&vt, "Vault token"), (&creds, "git credential for")] {
+        assert!(
+            t.contains(&format!("{}: {what}", p.display()))
+                && t.contains("(no known service; pass --service <path>=<service>)"),
+            "{t}"
+        );
+    }
+    assert!(names(&d).is_empty(), "never stored as unassigned");
+    assert_eq!(fs::read_to_string(&vt).unwrap(), "hvs.orphan0010\n");
+    assert!(backups(&d).is_empty());
+}
+
+#[test]
+fn unknown_service_or_relative_path_refused() {
+    let d = admin();
+    let home = scratch();
+    let vt = put(home.path(), ".vault-token", "hvs.badsvc0011\n", 0o600);
+    let bad = svc(&vt, "unassigned");
+    let o = import(&d, home.path(), &["--service", &bad]);
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    assert!(
+        all(&o).contains("unknown service unassigned"),
+        "{}",
+        all(&o)
+    );
+    let o = import(&d, home.path(), &["--yes-to", ".vault-token"]);
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    assert!(all(&o).contains("--yes-to takes an absolute path"));
+    assert_eq!(fs::read_to_string(&vt).unwrap(), "hvs.badsvc0011\n");
+    assert!(names(&d).is_empty());
+}
+
+#[test]
+fn file_of_another_uid_refused() {
+    let d = admin();
+    let home = scratch();
+    let vt = put(home.path(), ".vault-token", "hvs.otheruid0012\n", 0o600);
+    let s = svc(&vt, "github");
+    // Test seam: the agent user is someone else, so the file is not theirs.
+    let other = (common::daemon::own_uid() + 1).to_string();
+    let o = import_env(
+        &d,
+        home.path(),
+        &["--yes-to", vt.to_str().unwrap(), "--service", &s],
+        &[("SAIIFE_IMPORT_TARGET_UID", other.as_str())],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    let want = format!(
+        "{}: not imported: owned by uid {}; remove by hand",
+        vt.display(),
+        common::daemon::own_uid()
+    );
+    assert!(out(&o).contains(&want), "{}", all(&o));
+    assert_eq!(fs::read_to_string(&vt).unwrap(), "hvs.otheruid0012\n");
+    assert!(names(&d).is_empty());
+    assert!(backups(&d).is_empty());
+}
+
+#[test]
+fn hardlinked_file_refused() {
+    let d = admin();
+    let home = scratch();
+    let vt = put(home.path(), ".vault-token", "hvs.hardlink0013\n", 0o600);
+    let twin = home.path().join("twin");
+    fs::hard_link(&vt, &twin).unwrap();
+    let s = svc(&vt, "github");
+    let o = import(
+        &d,
+        home.path(),
+        &["--yes-to", vt.to_str().unwrap(), "--service", &s],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    assert!(
+        out(&o).contains("not imported: has other links; remove by hand"),
+        "{}",
+        all(&o)
+    );
+    assert_eq!(fs::read_to_string(&twin).unwrap(), "hvs.hardlink0013\n");
+    assert!(names(&d).is_empty());
+}
+
+#[test]
+fn symlinked_project_root_refused() {
+    let d = admin();
+    let home = scratch();
+    let outside = scratch();
+    let real = outside.path().join("real");
+    let env = put(&real, ".env", "GITHUB_TOKEN=ghp_rootlink0014\n", 0o600);
+    let link = outside.path().join("proj");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let linked_env = link.join(".env");
+    let o = import(
+        &d,
+        home.path(),
+        &[
+            "--project",
+            link.to_str().unwrap(),
+            "--yes-to",
+            linked_env.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    assert!(
+        all(&o).contains("is a symlink; give the real path"),
+        "{}",
+        all(&o)
+    );
+    assert_eq!(
+        fs::read_to_string(&env).unwrap(),
+        "GITHUB_TOKEN=ghp_rootlink0014\n"
+    );
+    assert!(names(&d).is_empty());
+}
+
+#[test]
+fn unrecorded_add_reports_stored_and_leaves_the_file() {
+    let mut d = TestDaemon::prepare(&admin_opts());
+    d.spawn_and_wait_with(&[("SAIIFE_DAEMON_FAULT", "secret_record")]);
+    let home = scratch();
+    let creds = put(
+        home.path(),
+        ".git-credentials",
+        "https://bob:ghp_unrec0015@github.com\n",
+        0o600,
+    );
+    let o = import(&d, home.path(), &["--yes-to", creds.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2), "{}", all(&o));
+    let t = out(&o);
+    let name = format!("{}-git-github.com", own_user());
+    assert!(
+        t.contains(&format!("{}: stored {name}, but", creds.display()))
+            && t.contains("audit record failed")
+            && t.contains("the file is not changed, remove it by hand"),
+        "{t}"
+    );
+    assert!(!t.contains("not stored"), "{t}");
+    assert_eq!(
+        fs::read_to_string(&creds).unwrap(),
+        "https://bob:ghp_unrec0015@github.com\n"
+    );
 }

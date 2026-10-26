@@ -169,7 +169,7 @@ mod linux {
     pub fn run(args: RunArgs) -> ExitCode {
         match go(args) {
             Ok(code) => code,
-            Err(Stop::Refused(m) | Stop::Forbidden(m)) => {
+            Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m)) => {
                 eprintln!("saiife: {m}");
                 ExitCode::from(2)
             }

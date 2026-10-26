@@ -113,8 +113,19 @@ pub fn write(dir: &Path, t: SystemTime, source: &str, bytes: &[u8]) -> io::Resul
     Err(last.unwrap_or_else(|| io::Error::other("no free backup name")))
 }
 
-/// Removes the regular files in `dir` last modified more than [`KEEP`]
-/// before `t`. Returns how many went. A missing dir is no error.
+/// A backup's name: `^\d{8}T\d{6}\.\d{3}Z-` and then the path.
+fn is_backup_name(name: &[u8]) -> bool {
+    let shape = b"########T######.###Z-";
+    name.len() > shape.len()
+        && shape.iter().zip(name).all(|(s, c)| match s {
+            b'#' => c.is_ascii_digit(),
+            s => s == c,
+        })
+}
+
+/// Removes the backups (by name, regular files only) in `dir` last
+/// modified more than [`KEEP`] before `t`. Returns how many went. A
+/// missing dir is no error.
 pub fn purge(dir: &Path, t: SystemTime) -> usize {
     let Ok(rd) = fs::read_dir(dir) else {
         return 0;
@@ -124,7 +135,7 @@ pub fn purge(dir: &Path, t: SystemTime) -> usize {
         let Ok(m) = fs::symlink_metadata(e.path()) else {
             continue;
         };
-        if !m.file_type().is_file() {
+        if !m.file_type().is_file() || !is_backup_name(e.file_name().as_encoded_bytes()) {
             continue;
         }
         let old = m
@@ -190,5 +201,14 @@ mod tests {
         assert_eq!(purge(&dir, SystemTime::now() + 8 * day), 1);
         assert!(!p.exists());
         assert_eq!(purge(&t.path().join("missing"), SystemTime::now()), 0);
+        // Only backup names go, whatever their age.
+        let other = dir.join("notes.txt");
+        fs::write(&other, b"x").unwrap();
+        let odd = dir.join("2026102xT101112.123Z-x");
+        fs::write(&odd, b"x").unwrap();
+        assert_eq!(purge(&dir, SystemTime::now() + 30 * day), 0);
+        assert!(other.exists() && odd.exists());
+        assert!(is_backup_name(b"20261026T101112.123Z-_h_.env"));
+        assert!(!is_backup_name(b"20261026T101112.123Z-"));
     }
 }

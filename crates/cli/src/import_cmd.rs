@@ -15,6 +15,12 @@
 //! project root) is opened `O_NOFOLLOW`, and the file must still be the
 //! regular file (same device and inode, same bytes) that was read.
 //!
+//! Only a file owned by the agent user with one link is read or changed
+//! (as root, a link or a file of someone else's would be read or rewritten
+//! on the agent's behalf). A secret is stored only for a known service (a
+//! configured one or a built-in connector): the guess, `--service
+//! <path>=<svc>` or `s(ervice)` at the prompt; without one it is skipped.
+//!
 //! Cloud and kube files are listed and never touched (plan 15).
 
 use std::collections::BTreeSet;
@@ -41,14 +47,79 @@ pub const MAX_SOURCE_BYTES: u64 = 700 * 1024;
 pub const CLOUD: &str = "cloud credentials come with plan 15; remove or rotate by hand";
 const MANUAL: &str = "no importer for this file in this version; remove or rotate by hand";
 const UNREADABLE: &str = "no credential the importer can read; remove or rotate by hand";
-/// The service a secret is allowed for when none can be guessed.
-const FALLBACK_SERVICE: &str = "unassigned";
 
 pub struct ImportArgs {
     pub user: String,
     pub projects: Vec<PathBuf>,
     pub yes_to: Vec<PathBuf>,
+    /// `<path>=<service>`.
+    pub services: Vec<String>,
+    /// The test seam for the home (debug builds only; `None` otherwise).
     pub home: Option<PathBuf>,
+}
+
+/// The services a secret may be stored for: the configured ones and the
+/// built-in connector ids.
+fn known_services(config: &Path) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = saiife_broker::manifest::builtin()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    if let Ok(l) = saiife_policy::load_system(config) {
+        out.extend(l.config.services.keys().cloned());
+    }
+    out
+}
+
+/// `--service <path>=<svc>` entries, checked.
+fn parse_services(
+    raw: &[String],
+    known: &BTreeSet<String>,
+) -> Result<Vec<(PathBuf, String)>, Stop> {
+    let mut out = Vec::new();
+    for r in raw {
+        let Some((p, s)) = r.rsplit_once('=') else {
+            return Err(Stop::Refused("--service takes <path>=<service>".into()));
+        };
+        let p = PathBuf::from(p);
+        if !p.is_absolute() {
+            return Err(Stop::Refused("--service takes an absolute path".into()));
+        }
+        if !known.contains(s) {
+            let list: Vec<&str> = known.iter().map(String::as_str).collect();
+            return Err(Stop::Refused(format!(
+                "--service: unknown service {} (known: {})",
+                sanitize(s),
+                list.join(", ")
+            )));
+        }
+        out.push((p, s.to_string()));
+    }
+    Ok(out)
+}
+
+/// The agent user's uid and home: `/etc/passwd`, else NSS for the uid.
+/// Test seams, debug builds only: `--home` and `SAIIFE_IMPORT_TARGET_UID`.
+fn target(a: &ImportArgs, user: &str) -> Result<(u32, PathBuf), Stop> {
+    use saiife_policy::Directory as _;
+    let info = RealHost.user(&a.user);
+    let uid = info
+        .as_ref()
+        .map(|u| u.uid)
+        .or_else(|| saiife_policy::Getent.user(&a.user).map(|u| u.uid));
+    #[cfg(debug_assertions)]
+    let uid = std::env::var("SAIIFE_IMPORT_TARGET_UID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(uid);
+    let home = a.home.clone().or(info.map(|u| u.home));
+    match (uid, home) {
+        (Some(uid), Some(home)) if home.is_absolute() => Ok((uid, home)),
+        (Some(_), Some(_)) => Err(Stop::Refused(format!(
+            "the home of {user} is not an absolute path"
+        ))),
+        _ => Err(Stop::Refused(format!("no user {user} in /etc/passwd"))),
+    }
 }
 
 /// What kind of file a finding is.
@@ -96,6 +167,7 @@ struct Cand {
     /// What it is, without the value (`credential in GITHUB_TOKEN`).
     what: String,
     name: String,
+    /// The guessed connector (only a built-in id).
     service: Option<&'static str>,
     value: Zeroizing<String>,
     /// The line it is on; `None` when the whole file is the secret.
@@ -104,21 +176,25 @@ struct Cand {
 
 pub fn run(config: &Path, a: ImportArgs) -> Result<(), Stop> {
     let user = sanitize(&a.user);
-    let home = match &a.home {
-        Some(h) => h.clone(),
-        None => RealHost
-            .user(&a.user)
-            .map(|u| u.home)
-            .ok_or_else(|| Stop::Refused(format!("no user {user} in /etc/passwd")))?,
-    };
-    if !home.is_absolute() {
-        return Err(Stop::Refused(format!(
-            "the home of {user} is not an absolute path"
-        )));
-    }
+    let (target_uid, home) = target(&a, &user)?;
     if a.projects.iter().any(|p| !p.is_absolute()) {
         return Err(Stop::Refused("--project takes an absolute path".into()));
     }
+    if a.yes_to.iter().any(|p| !p.is_absolute()) {
+        return Err(Stop::Refused("--yes-to takes an absolute path".into()));
+    }
+    // A project root outside the home is opened as given: it may not be a
+    // symlink (the agent may own it and point it anywhere).
+    for p in a.projects.iter().filter(|p| !p.starts_with(&home)) {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Stop::Refused(format!(
+                "--project {} is a symlink; give the real path",
+                sanitize(&p.display().to_string())
+            )));
+        }
+    }
+    let known = known_services(config);
+    let services = parse_services(&a.services, &known)?;
     // Admin first: nothing is read before the daemon says so. A vault that
     // cannot be read still lets the scan run; each add then says why.
     let mut taken: BTreeSet<String> = match call(config, "secret.list", Map::new()) {
@@ -149,6 +225,9 @@ pub fn run(config: &Path, a: ImportArgs) -> Result<(), Stop> {
         user: &user,
         tty: std::io::stdin().is_terminal(),
         taken: &mut taken,
+        known: &known,
+        home: &home,
+        target_uid,
         failed: 0,
         skipped: Vec::new(),
     };
@@ -167,7 +246,11 @@ pub fn run(config: &Path, a: ImportArgs) -> Result<(), Stop> {
                     continue;
                 };
                 let yes = a.yes_to.iter().any(|p| p == &f.path);
-                if let Err(m) = run.file(f, class, &base, yes) {
+                let service = services
+                    .iter()
+                    .find(|(p, _)| p == &f.path)
+                    .map(|(_, s)| s.clone());
+                if let Err(m) = run.file(f, class, &base, yes, service) {
                     down = Some(m);
                     break;
                 }
@@ -175,7 +258,7 @@ pub fn run(config: &Path, a: ImportArgs) -> Result<(), Stop> {
         }
     }
     if !run.skipped.is_empty() {
-        outln!("skipped (no terminal; pass --yes-to <path> to import):");
+        outln!("skipped:");
         for s in &run.skipped {
             outln!("  {s}");
         }
@@ -207,17 +290,27 @@ struct Run<'a> {
     user: &'a str,
     tty: bool,
     taken: &'a mut BTreeSet<String>,
+    known: &'a BTreeSet<String>,
+    home: &'a Path,
+    target_uid: u32,
     failed: usize,
     skipped: Vec<String>,
 }
 
 impl Run<'_> {
     /// One importable file. `Err` only when the daemon cannot be reached.
-    fn file(&mut self, f: &Finding, class: Class, base: &Path, yes: bool) -> Result<(), String> {
+    fn file(
+        &mut self,
+        f: &Finding,
+        class: Class,
+        base: &Path,
+        yes: bool,
+        service: Option<String>,
+    ) -> Result<(), String> {
         let disp = sanitize(&f.path.display().to_string());
         let what = sanitize(&f.what);
         let rel = f.path.strip_prefix(base).unwrap_or(&f.path);
-        let src = match Source::open(base, rel) {
+        let src = match Source::open(base, rel, self.target_uid, base == self.home) {
             Ok(s) => s,
             Err(m) => {
                 outln!("{disp}: not imported: {m}");
@@ -230,16 +323,36 @@ impl Run<'_> {
             outln!("{disp}: {what}: {UNREADABLE}");
             return Ok(());
         }
-        let mut chosen: Vec<(Cand, String)> = Vec::new();
+        let mut chosen: Vec<(Cand, String, String)> = Vec::new();
         for c in cands {
             let name = unique(&c.name, self.taken);
-            match ask(&disp, &c.what, name, yes, self.tty, self.taken) {
-                Answer::Yes(n) => {
+            let svc = service.clone().or_else(|| {
+                c.service
+                    .filter(|s| self.known.contains(*s))
+                    .map(str::to_string)
+            });
+            let q = Question {
+                disp: &disp,
+                what: &c.what,
+                yes,
+                tty: self.tty,
+                taken: self.taken,
+                known: self.known,
+            };
+            match q.ask(name, svc) {
+                Answer::Yes(n, s) => {
                     self.taken.insert(n.clone());
-                    chosen.push((c, n));
+                    chosen.push((c, n, s));
                 }
                 Answer::No => outln!("{disp}: {}: left in place", c.what),
-                Answer::NoTty => self.skipped.push(format!("{disp}: {}", c.what)),
+                Answer::NoTty => self.skipped.push(format!(
+                    "{disp}: {} (no terminal; pass --yes-to <path>)",
+                    c.what
+                )),
+                Answer::NoService => self.skipped.push(format!(
+                    "{disp}: {} (no known service; pass --service <path>=<service>)",
+                    c.what
+                )),
             }
         }
         if chosen.is_empty() {
@@ -247,12 +360,11 @@ impl Run<'_> {
         }
         let b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&src.bytes[..]));
         let source = f.path.to_string_lossy().into_owned();
-        let mut stored: Vec<&(Cand, String)> = Vec::new();
+        let mut stored: Vec<&(Cand, String, String)> = Vec::new();
         let mut backed = false;
         let mut down = None;
         for pair in &chosen {
-            let (c, n) = pair;
-            let service = c.service.unwrap_or(FALLBACK_SERVICE);
+            let (c, n, service) = pair;
             let mut args = Map::new();
             args.insert("name".into(), json!(n));
             args.insert("kind".into(), json!("token"));
@@ -281,6 +393,13 @@ impl Run<'_> {
                     down = Some(m);
                     break;
                 }
+                Err(Stop::Unrecorded(m)) => {
+                    outln!(
+                        "{disp}: stored {n}, but {}; the file is not changed, remove it by hand",
+                        sanitize(&m)
+                    );
+                    self.failed += 1;
+                }
                 Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::NotFound(m)) => {
                     outln!("{disp}: {}: not stored: {}", c.what, sanitize(&m));
                     self.failed += 1;
@@ -288,15 +407,15 @@ impl Run<'_> {
             }
         }
         if !stored.is_empty() {
-            let whole = stored.iter().any(|(c, _)| c.line.is_none());
-            let gone: BTreeSet<usize> = stored.iter().filter_map(|(c, _)| c.line).collect();
+            let whole = stored.iter().any(|(c, _, _)| c.line.is_none());
+            let gone: BTreeSet<usize> = stored.iter().filter_map(|(c, _, _)| c.line).collect();
             let new = if whole {
                 Zeroizing::new(Vec::new())
             } else {
                 without_lines(&src.bytes, &gone)
             };
             let changed = src.rewrite(&new);
-            for (c, n) in &stored {
+            for (c, n, service) in &stored {
                 match &changed {
                     Ok(()) => outln!("stored {n} from {disp} ({}); removed it from the file", c.what),
                     Err(m) => outln!(
@@ -304,10 +423,7 @@ impl Run<'_> {
                         c.what
                     ),
                 }
-                outln!(
-                    "next: saiife connect {} --secret {n}",
-                    c.service.unwrap_or("<service>")
-                );
+                outln!("next: saiife connect {service} --secret {n}");
                 outln!("rotate this credential: it was readable by {}", self.user);
             }
             if changed.is_err() {
@@ -322,53 +438,92 @@ impl Run<'_> {
 }
 
 enum Answer {
-    Yes(String),
+    /// Store it under this name for this service.
+    Yes(String, String),
     No,
     NoTty,
+    /// `--yes-to`, but no known service for it.
+    NoService,
 }
 
-/// `--yes-to`, else the terminal, else skipped.
-fn ask(
-    disp: &str,
-    what: &str,
-    mut name: String,
+struct Question<'a> {
+    disp: &'a str,
+    what: &'a str,
     yes: bool,
     tty: bool,
-    taken: &BTreeSet<String>,
-) -> Answer {
-    if yes {
-        return Answer::Yes(name);
+    taken: &'a BTreeSet<String>,
+    known: &'a BTreeSet<String>,
+}
+
+/// One line from stdin, trimmed; `None` at the end.
+fn read_answer(label: &str) -> Option<String> {
+    eprint!("{label}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim().to_string()),
     }
-    if !tty {
-        return Answer::NoTty;
-    }
-    let stdin = std::io::stdin();
-    loop {
-        eprint!("{disp}: {what}\nstore as {name}? [y/N/e(dit name)] ");
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            return Answer::No;
+}
+
+impl Question<'_> {
+    /// `--yes-to`, else the terminal, else skipped. A secret is never
+    /// stored without a known service.
+    fn ask(&self, mut name: String, mut service: Option<String>) -> Answer {
+        if self.yes {
+            return match service {
+                Some(s) => Answer::Yes(name, s),
+                None => Answer::NoService,
+            };
         }
-        match line.trim() {
-            "y" | "Y" | "yes" => return Answer::Yes(name),
-            "e" | "E" => {
-                eprint!("name: ");
-                let _ = std::io::stderr().flush();
-                let mut n = String::new();
-                if stdin.lock().read_line(&mut n).unwrap_or(0) == 0 {
-                    return Answer::No;
+        if !self.tty {
+            return Answer::NoTty;
+        }
+        loop {
+            let svc = match &service {
+                Some(s) => format!("service {s}"),
+                None => "no service yet".to_string(),
+            };
+            let Some(a) = read_answer(&format!(
+                "{}: {}\nstore as {name} ({svc})? [y/N/e(dit name)/s(ervice)] ",
+                self.disp, self.what
+            )) else {
+                return Answer::No;
+            };
+            match a.as_str() {
+                "y" | "Y" | "yes" => match &service {
+                    Some(s) => return Answer::Yes(name, s.clone()),
+                    None => eprintln!("saiife: choose a service first (s)"),
+                },
+                "e" | "E" => {
+                    let Some(n) = read_answer("name: ") else {
+                        return Answer::No;
+                    };
+                    if !valid_name(&n) {
+                        eprintln!("saiife: a name is a-z, 0-9, `.`, `_`, `-`; up to 64 characters");
+                    } else if self.taken.contains(&n) {
+                        eprintln!("saiife: secret {n} exists");
+                    } else {
+                        name = n;
+                    }
                 }
-                let n = n.trim();
-                if !valid_name(n) {
-                    eprintln!("saiife: a name is a-z, 0-9, `.`, `_`, `-`; up to 64 characters");
-                } else if taken.contains(n) {
-                    eprintln!("saiife: secret {n} exists");
-                } else {
-                    name = n.to_string();
+                "s" | "S" => {
+                    let Some(s) = read_answer("service: ") else {
+                        return Answer::No;
+                    };
+                    if self.known.contains(&s) {
+                        service = Some(s);
+                    } else {
+                        let list: Vec<&str> = self.known.iter().map(String::as_str).collect();
+                        eprintln!(
+                            "saiife: unknown service {} (known: {})",
+                            sanitize(&s),
+                            list.join(", ")
+                        );
+                    }
                 }
+                _ => return Answer::No,
             }
-            _ => return Answer::No,
         }
     }
 }
@@ -432,7 +587,22 @@ fn unique(name: &str, taken: &BTreeSet<String>) -> String {
     name.to_string()
 }
 
-/// The connector a credential is likely for.
+/// The connector a host is for: exact names only.
+fn guess_host(host: &str) -> Option<&'static str> {
+    let h = host.to_ascii_lowercase();
+    let h = h.rsplit_once(':').map_or(h.as_str(), |(h, _)| h);
+    if h == "github.com" || h.ends_with(".github.com") {
+        Some("github")
+    } else if h.ends_with(".myshopify.com") {
+        Some("shopify")
+    } else if h == "api.hubapi.com" {
+        Some("hubspot")
+    } else {
+        None
+    }
+}
+
+/// The connector an environment variable name is likely for.
 fn guess(hay: &str) -> Option<&'static str> {
     let h = hay.to_ascii_lowercase();
     if h.contains("github") || h.starts_with("gh_") {
@@ -577,7 +747,7 @@ fn parse_git(lines: &[&[u8]], user: &str) -> Vec<Cand> {
         out.push(Cand {
             what: format!("git credential for {host}"),
             name: suggest(user, &format!("git-{host}")),
-            service: guess(&host),
+            service: guess_host(&host),
             value,
             line: Some(i),
         });
@@ -609,7 +779,7 @@ fn parse_gh(lines: &[&[u8]], user: &str) -> Vec<Cand> {
         out.push(Cand {
             what: format!("GitHub CLI token for {host}"),
             name: suggest(user, &format!("gh-{host}")),
-            service: Some("github"),
+            service: guess_host(&host),
             value,
             line: Some(i),
         });
@@ -643,7 +813,7 @@ fn parse_npmrc(lines: &[&[u8]], user: &str) -> Vec<Cand> {
         out.push(Cand {
             what: format!("npm auth token for {host}"),
             name: suggest(user, &format!("npm-{host}")),
-            service: Some("npm"),
+            service: None,
             value,
             line: Some(i),
         });
@@ -662,7 +832,7 @@ fn parse_vault(bytes: &[u8], user: &str) -> Vec<Cand> {
     vec![Cand {
         what: "Vault token".into(),
         name: suggest(user, "vault-token"),
-        service: Some("vault"),
+        service: None,
         value: Zeroizing::new(t.to_string()),
         line: None,
     }]
@@ -684,6 +854,7 @@ fn without_lines(bytes: &[u8], gone: &BTreeSet<usize>) -> Zeroizing<Vec<u8>> {
 struct Source {
     dir: OwnedFd,
     name: OsString,
+    target_uid: u32,
     dev: u64,
     ino: u64,
     uid: u32,
@@ -696,8 +867,14 @@ fn errno(e: rustix::io::Errno) -> String {
     std::io::Error::from(e).to_string()
 }
 
-/// A regular file opened `O_NOFOLLOW` in `dir`: its handle and status.
-fn open_regular(dir: &OwnedFd, name: &OsStr) -> Result<(OwnedFd, rustix::fs::Stat), String> {
+/// A regular file opened `O_NOFOLLOW` in `dir`, owned by `uid` and with
+/// no other link (as root, a link would read or rewrite someone else's
+/// file): its handle and status.
+fn open_regular(
+    dir: &OwnedFd,
+    name: &OsStr,
+    uid: u32,
+) -> Result<(OwnedFd, rustix::fs::Stat), String> {
     let fd = openat(
         dir,
         name,
@@ -711,6 +888,12 @@ fn open_regular(dir: &OwnedFd, name: &OsStr) -> Result<(OwnedFd, rustix::fs::Sta
     let st = fstat(&fd).map_err(errno)?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
         return Err("not a regular file".into());
+    }
+    if st.st_uid != uid {
+        return Err(format!("owned by uid {}; remove by hand", st.st_uid));
+    }
+    if st.st_nlink != 1 {
+        return Err("has other links; remove by hand".into());
     }
     Ok((fd, st))
 }
@@ -733,10 +916,10 @@ fn read_bounded(fd: OwnedFd, size: u64) -> Result<Zeroizing<Vec<u8>>, String> {
 // `st_dev` and `st_ino` are not `u64` on every target.
 #[allow(clippy::unnecessary_cast)]
 impl Source {
-    /// `rel` below `base`: `base` is opened as is (the home from
-    /// `/etc/passwd` or an admin's `--project`), every directory below it
-    /// `O_NOFOLLOW | O_DIRECTORY`, the file `O_NOFOLLOW`.
-    fn open(base: &Path, rel: &Path) -> Result<Source, String> {
+    /// `rel` below `base`: the home (from `/etc/passwd`) is opened as is, a
+    /// project root outside it `O_NOFOLLOW`; every directory below
+    /// `O_NOFOLLOW | O_DIRECTORY`, the file `O_NOFOLLOW` and owned by `uid`.
+    fn open(base: &Path, rel: &Path, uid: u32, is_home: bool) -> Result<Source, String> {
         let mut parts: Vec<&OsStr> = Vec::new();
         for c in rel.components() {
             match c {
@@ -747,13 +930,16 @@ impl Source {
         let Some(name) = parts.pop() else {
             return Err("not a file".into());
         };
-        let mut dir = openat(
-            CWD,
-            base,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(errno)?;
+        let mut flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        if !is_home {
+            flags |= OFlags::NOFOLLOW;
+        }
+        let mut dir = openat(CWD, base, flags, Mode::empty()).map_err(|e| match e {
+            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
+                "the project root is a symlink: not followed".to_string()
+            }
+            e => errno(e),
+        })?;
         for p in parts {
             dir = openat(
                 &dir,
@@ -768,11 +954,12 @@ impl Source {
                 e => errno(e),
             })?;
         }
-        let (fd, st) = open_regular(&dir, name)?;
+        let (fd, st) = open_regular(&dir, name, uid)?;
         let bytes = read_bounded(fd, st.st_size.max(0) as u64)?;
         Ok(Source {
             dir,
             name: name.to_os_string(),
+            target_uid: uid,
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
             uid: st.st_uid,
@@ -786,7 +973,7 @@ impl Source {
     /// file in the same dir, synced, renamed over it, the dir synced. The
     /// file must still be the one read, byte for byte.
     fn rewrite(&self, new: &[u8]) -> Result<(), String> {
-        let (fd, st) = open_regular(&self.dir, &self.name)?;
+        let (fd, st) = open_regular(&self.dir, &self.name, self.target_uid)?;
         if st.st_dev as u64 != self.dev || st.st_ino as u64 != self.ino {
             return Err("it was replaced since it was read".into());
         }
@@ -823,6 +1010,8 @@ impl Source {
             }
             f.set_permissions(std::fs::Permissions::from_mode(self.mode))?;
             f.sync_all()?;
+            // A write to the file between the check above and here is lost
+            // (accepted: the agent's own file in its own dir).
             renameat(&self.dir, tmp.as_str(), &self.dir, &self.name)?;
             rustix::fs::fsync(&self.dir)?;
             Ok(())
@@ -891,6 +1080,23 @@ mod tests {
         assert_eq!(n[0].name, "u-npm-registry.npmjs.org");
         let v = parse_vault(b"hvs.abcd\n", "u");
         assert_eq!((v[0].value.as_str(), v[0].line), ("hvs.abcd", None));
+    }
+
+    #[test]
+    fn host_guess_is_exact() {
+        assert_eq!(guess_host("github.com"), Some("github"));
+        assert_eq!(guess_host("api.github.com:443"), Some("github"));
+        assert_eq!(guess_host("github.com.evil.example"), None);
+        assert_eq!(guess_host("notgithub.com"), None);
+        assert_eq!(guess_host("acme.myshopify.com"), Some("shopify"));
+        assert_eq!(guess_host("myshopify.com.evil"), None);
+        assert_eq!(guess_host("api.hubapi.com"), Some("hubspot"));
+        assert_eq!(guess_host("x.api.hubapi.com"), None);
+        assert_eq!(
+            parse_npmrc(&lines("_authToken=abcd1234\n"), "u")[0].service,
+            None
+        );
+        assert_eq!(parse_vault(b"hvs.abcd", "u")[0].service, None);
     }
 
     #[test]

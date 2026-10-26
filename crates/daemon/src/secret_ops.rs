@@ -108,12 +108,22 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 if let Some(src) = &source {
                     r.extra.insert("imported_from".into(), src.clone().into());
                 }
-                if let Err(e) = ctx.writer.append(r).await {
+                let appended = ctx.writer.append(r).await;
+                // Test seam, debug builds only: the record "fails" after the change.
+                #[cfg(debug_assertions)]
+                let appended = if std::env::var_os("SAIIFE_DAEMON_FAULT")
+                    .is_some_and(|v| v == "secret_record")
+                {
+                    appended.and(Err("injected fault".to_string()))
+                } else {
+                    appended
+                };
+                if let Err(e) = appended {
                     // The change is made; say so rather than hide it.
                     eprintln!("saiife: {event} {name} committed without audit record: {e}");
                     return err(
                         id,
-                        ErrorCode::Internal,
+                        ErrorCode::Unrecorded,
                         &format!("the change was made but its audit record failed: {e}"),
                     );
                 }
