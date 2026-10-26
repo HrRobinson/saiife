@@ -103,6 +103,10 @@ async fn answer(
         // Long enough for the client to give up while the call is upstream.
         tokio::time::sleep(Duration::from_millis(700)).await;
     }
+    if parts.uri.path() == "/api/files/hang" {
+        // An upstream that does not answer while the test runs.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
     let resp = match parts.uri.path() {
         "/api/orders.json" => json(
             200,
@@ -217,6 +221,9 @@ struct Setup {
     upstream_timeout: Duration,
     /// `false`: no valid policy (connectors denied with `policy_invalid`).
     policy: bool,
+    /// Services `s0`.. like `shop` (same secret, same scope), each with
+    /// its own 4 upstream slots.
+    extra_services: usize,
 }
 
 impl Default for Setup {
@@ -227,6 +234,7 @@ impl Default for Setup {
             opts: Opts::default(),
             upstream_timeout: Duration::from_secs(5),
             policy: true,
+            extra_services: 0,
         }
     }
 }
@@ -275,7 +283,9 @@ async fn world_with(s: Setup) -> World {
         name: "echo-tok".into(),
         kind: Kind::Token,
         fields: [("token".to_string(), Zeroizing::new(TOKEN.to_string()))].into(),
-        allowed_services: vec!["shop".into()],
+        allowed_services: std::iter::once("shop".to_string())
+            .chain((0..s.extra_services).map(|i| format!("s{i}")))
+            .collect(),
         created_by: 0,
         created: "2026-10-26T00:00:00Z".into(),
         last_used: None,
@@ -283,6 +293,17 @@ async fn world_with(s: Setup) -> World {
     })
     .unwrap();
 
+    let extra_names: String = (0..s.extra_services)
+        .map(|i| format!(", \"s{i}\""))
+        .collect();
+    let extra_tables: String = (0..s.extra_services)
+        .map(|i| {
+            format!(
+                "\n[services.s{i}]\nconnector = \"test-echo\"\nsecret = \"echo-tok\"\n\
+                 params = {{ shop = \"acme\" }}\nallow = [\"files:read\"]\n"
+            )
+        })
+        .collect();
     let text = format!(
         r#"version = 2
 locked = true
@@ -290,7 +311,7 @@ locked = true
 [[scope]]
 name = "agents"
 users = [{users}]
-services = ["shop"]
+services = ["shop"{extra_names}]
 env = "prod"
 
 [services.shop]
@@ -304,7 +325,7 @@ allow = ["orders:read", "files:read"]
 connector = "test-echo"
 params = {{ shop = "other" }}
 allow = ["orders:read"]
-"#,
+{extra_tables}"#,
         users = s.users,
         extra = s.shop_extra,
     );
@@ -1062,6 +1083,44 @@ async fn client_gone_mid_call_still_records_and_counts() {
     assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
     assert_eq!(b["limit"], "requests_per_minute");
     assert_eq!(w.hits(), 1);
+}
+
+#[tokio::test]
+async fn walked_away_calls_keep_their_in_flight_slot() {
+    // 16 services x 4 upstream slots: 64 calls can hang upstream at once.
+    let w = world_with(Setup {
+        extra_services: 15,
+        upstream_timeout: Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
+    let services: Vec<String> = std::iter::once("shop".to_string())
+        .chain((0..15).map(|i| format!("s{i}")))
+        .collect();
+    // Each client sends a call to a hanging upstream and walks away once
+    // it is upstream (one at a time: the per-uid connection cap is 32).
+    for i in 0..64 {
+        let mut s = UnixStream::connect(&w.sock).await.unwrap();
+        let req = format!(
+            "GET /v1/proxy/{}/files/hang HTTP/1.1\r\nHost: saiife\r\n\r\n",
+            services[i / 4]
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || w.hits() == i + 1).await,
+            "call {i} did not reach the upstream"
+        );
+        drop(s);
+    }
+    let uid = rustix::process::getuid().as_raw();
+    assert!(wait_until(Duration::from_secs(10), || w.ctx.conns.open_for(uid) == 0).await);
+    // Every client is gone, but 64 calls still run: the 65th is busy (not
+    // admitted and then refused by a service's upstream slots).
+    let (st, h, b) = w.api("shop/orders.list", json!({})).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{b}");
+    assert_eq!(b["error"], "busy", "{b}");
+    assert_eq!(h.get("retry-after").unwrap(), "1");
+    assert_eq!(w.hits(), 64);
 }
 
 #[tokio::test]

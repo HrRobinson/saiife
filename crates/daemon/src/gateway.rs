@@ -15,7 +15,7 @@
 //! same code path as the Unix socket.
 
 use crate::api_ops::{self, Caller, Refused};
-use crate::limits::ConnSlot;
+use crate::limits::{ConnSlot, InFlight};
 use crate::ops::{Ctx, GatewayRefusal, Notice, UNKNOWN_UID};
 use base64::Engine as _;
 use bytes::Bytes;
@@ -583,7 +583,7 @@ async fn admit_inner(
     req.headers_mut().remove(AUTHORIZATION);
     let uid = caller.uid();
     match ctx.limits.try_begin(uid, Instant::now()) {
-        Ok(_in_flight) => route(ctx, &caller, req, raw, opts).await,
+        Ok(in_flight) => route(ctx, &caller, req, raw, opts, in_flight).await,
         Err(_) => {
             ctx.notice(uid, Notice::Requests);
             busy("too many requests from this uid")
@@ -604,6 +604,7 @@ async fn route(
     req: Request<Incoming>,
     raw: Option<String>,
     opts: Opts,
+    in_flight: InFlight,
 ) -> Resp {
     let uid = caller.uid();
     match classify(req.method(), req.uri(), raw.as_deref()) {
@@ -626,7 +627,7 @@ async fn route(
                 Err(r) => return body_refused(ctx, uid, *r),
             };
             match api_args(&service, &op, &body) {
-                Ok(args) => call(ctx, caller, args, Route::Api).await,
+                Ok(args) => call(ctx, caller, args, Route::Api, in_flight).await,
                 Err(m) => refused(
                     ctx,
                     uid,
@@ -642,7 +643,7 @@ async fn route(
                 Err(r) => return body_refused(ctx, uid, *r),
             };
             let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
-            call(ctx, caller, args, Route::Proxy).await
+            call(ctx, caller, args, Route::Proxy, in_flight).await
         }
         Target::Requests => json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -898,7 +899,13 @@ fn proxy_args(
     args
 }
 
-async fn call(ctx: &Arc<Ctx>, caller: &Caller, args: Map<String, Value>, route: Route) -> Resp {
+async fn call(
+    ctx: &Arc<Ctx>,
+    caller: &Caller,
+    args: Map<String, Value>,
+    route: Route,
+    in_flight: InFlight,
+) -> Resp {
     let (_, _, mut call) = match api_ops::parse_call(&args) {
         Ok(x) => x,
         Err(m) => {
@@ -913,11 +920,16 @@ async fn call(ctx: &Arc<Ctx>, caller: &Caller, args: Map<String, Value>, route: 
     call.via = Via::Http;
     // A task of its own: hyper drops this future when the client goes away,
     // and a call that may have reached the upstream must still finish,
-    // count against the limits and be recorded.
+    // count against the limits and be recorded. It keeps the uid's
+    // in-flight slot until it ends: a client that walks away does not get
+    // the slot back while its call still runs.
     let task = {
         let ctx = Arc::clone(ctx);
         let caller = *caller;
-        tokio::spawn(async move { api_ops::execute(&ctx, &caller, call).await })
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            api_ops::execute(&ctx, &caller, call).await
+        })
     };
     let Ok(done) = task.await else {
         return error(
