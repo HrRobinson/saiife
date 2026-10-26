@@ -904,3 +904,180 @@ fn oversized_overlay_is_bad_request() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(w.m.hits().is_empty());
 }
+
+// ---------------------------------------------------------------- tcp
+
+const TCP_ON: &str = "\n[gateway]\ntcp = \"127.0.0.1:0\"\n";
+
+/// One HTTP/1.1 request by hand on the loopback TCP listener.
+fn tcp_request(addr: &str, req: &str) -> String {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+fn tcp_addr(d: &TestDaemon) -> Option<String> {
+    d.status()
+        .get("gateway_tcp")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn tcp_off_by_default() {
+    let w = world();
+    assert_eq!(w.d.status().get("gateway_tcp"), Some(&Value::Null));
+    assert!(w.d.events("gateway_tcp").is_empty());
+}
+
+#[test]
+fn tcp_listener_with_api_token() {
+    let w = world_with(
+        |p| format!("{}{TCP_ON}", policy(p, "\"erp\"", "")),
+        &["erp"],
+    );
+    // The ephemeral port, as bound.
+    let addr = tcp_addr(&w.d).expect("a TCP listener");
+    let port: u16 = addr.strip_prefix("127.0.0.1:").unwrap().parse().unwrap();
+    assert_ne!(port, 0);
+    let ev = w.d.events("gateway_tcp");
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0]["addr"], json!(addr));
+
+    let o = api(&w, &["token", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let v: Value = serde_json::from_str(stdout(&o).trim()).unwrap();
+    let tok = v["token"].as_str().unwrap().to_string();
+    assert!(tok.starts_with("saiife_gw_"), "{tok}");
+    assert!(v["expires"].as_str().unwrap().ends_with('Z'));
+    assert!(stderr(&o).contains("valid until"), "{}", stderr(&o));
+    // Plain: the token alone on stdout.
+    let o = api(&w, &["token"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(stdout(&o).trim().starts_with("saiife_gw_"));
+
+    let body = r#"{"params":{"status":"open"}}"#;
+    let call = |auth: &str| {
+        tcp_request(
+            &addr,
+            &format!(
+                "POST /v1/api/erp/invoices.list HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    let out = call(&format!("Authorization: Bearer {tok}\r\n"));
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("[MASKED]") && !out.contains(SECRET), "{out}");
+    let out = call("");
+    assert!(out.starts_with("HTTP/1.1 401"), "{out}");
+    assert!(out.ends_with(r#"{"error":"token"}"#), "{out}");
+    assert_eq!(w.m.hits().len(), 1);
+    let recs = connector(&w.d);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["uid"], json!(common::daemon::own_uid()));
+    assert_eq!(recs[0]["peer"]["auth"], "token");
+
+    // Stored hashed, 0600; the token is in no record and no log line.
+    use std::os::unix::fs::PermissionsExt;
+    let file = w.d.state_dir().join("state/gateway-tokens.json");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(!text.contains(&tok[10..]), "{text}");
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let audit: String =
+        w.d.records()
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+    assert!(!audit.contains(&tok[10..]));
+    assert!(!w.d.stderr_text().contains(&tok[10..]));
+}
+
+#[test]
+fn api_token_without_scope_forbidden() {
+    // The only scope is someone else's.
+    let w = world_with(
+        |p| {
+            let text = policy(p, "\"erp\"", "").replace(
+                &format!("users = [{:?}]", own_user()),
+                "users = [\"someone-else\"]",
+            );
+            format!("{text}{TCP_ON}")
+        },
+        &["erp"],
+    );
+    let o = api(&w, &["token"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stdout(&o).is_empty());
+}
+
+#[test]
+fn tcp_bind_failure_keeps_the_daemon() {
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = taken.local_addr().unwrap().to_string();
+    let w = world_with(
+        |p| {
+            format!(
+                "{}\n[gateway]\ntcp = \"{addr}\"\n",
+                policy(p, "\"erp\"", "")
+            )
+        },
+        &["erp"],
+    );
+    let ev = w.d.events("gateway_tcp_failed");
+    assert_eq!(ev.len(), 1, "{:?}", w.d.records());
+    assert!(ev[0]["reason"].as_str().unwrap().contains(&addr));
+    assert_eq!(tcp_addr(&w.d), None);
+    // The Unix sockets serve as before.
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    drop(taken);
+}
+
+#[test]
+fn non_loopback_tcp_rejected_at_reload() {
+    let w = world_with(
+        |p| format!("{}{TCP_ON}", policy(p, "\"erp\"", "")),
+        &["erp"],
+    );
+    let addr = tcp_addr(&w.d).unwrap();
+    let text = fs::read_to_string(w.d.config())
+        .unwrap()
+        .replace("tcp = \"127.0.0.1:0\"", "tcp = \"0.0.0.0:7431\"");
+    fs::write(w.d.config(), text).unwrap();
+    reload(&w);
+    assert!(wait_for(Duration::from_secs(5), || !policy_records(
+        &w.d, "rejected"
+    )
+    .is_empty()));
+    let r = &policy_records(&w.d, "rejected")[0];
+    assert!(r["reason"].as_str().unwrap().contains("loopback"), "{r}");
+    // The listener stays as started.
+    assert_eq!(tcp_addr(&w.d), Some(addr));
+}
+
+#[test]
+fn corrupt_token_file_resets() {
+    let w = world_spawned(
+        |p| format!("{}{TCP_ON}", policy(p, "\"erp\"", "")),
+        &["erp"],
+        |d| {
+            let dir = d.state_dir().join("state");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("gateway-tokens.json"), "{not json").unwrap();
+            spawn(d);
+        },
+    );
+    let ev = w.d.events("tokens_reset");
+    assert_eq!(ev.len(), 1, "{:?}", w.d.records());
+    // Tokens work again from scratch.
+    let o = api(&w, &["token"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+}

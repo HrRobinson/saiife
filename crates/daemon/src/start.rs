@@ -1,6 +1,7 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
 use crate::ops::{check_services, Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::tokens::{self, Tokens};
 use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
 use crate::{gateway, notify, server, DaemonOptions};
@@ -241,6 +242,15 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // Import backups older than 7 days go at start (and daily in `serve`).
     let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
     crate::import_backup::purge(&backup_dir, crate::import_backup::now());
+    // The gateway's bearer tokens; an unreadable file is no tokens and a
+    // `tokens_reset` record.
+    let (tokens, tokens_reset) =
+        Tokens::open(tokens::path_in(&opts.state_dir), tokens::system_clock());
+    if let Some(why) = &tokens_reset {
+        eprintln!("saiife: warning: gateway tokens reset: {why}");
+    }
+    // Checked at load: loopback only. No valid policy, no listener.
+    let tcp = gateway_cfg.tcp_addr().ok().flatten();
 
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
@@ -260,7 +270,9 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         limiter,
         upstream,
         backup_dir,
+        tokens: Arc::new(tokens),
     }));
+    ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -273,7 +285,11 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         check,
         policy_err,
         loaded_files,
-        ca_refused,
+        [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
+            .into_iter()
+            .filter_map(|(e, r)| Some((e, r?)))
+            .collect(),
+        tcp,
     ));
     rt.shutdown_timeout(Duration::from_secs(1));
     drop(ctx);
@@ -548,7 +564,9 @@ async fn serve(
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
-    ca_refused: Option<String>,
+    // More start records: `(event, reason)` (`ca_refused`, `tokens_reset`).
+    notes: Vec<(&'static str, String)>,
+    tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let signals = (
         signal(SignalKind::hangup()),
@@ -591,8 +609,8 @@ async fn serve(
         r.reason = Some(reason.clone());
         first.push(r);
     }
-    if let Some(reason) = ca_refused {
-        let mut r = ctx.event("ca_refused");
+    for (event, reason) in notes {
+        let mut r = ctx.event(event);
         r.reason = Some(reason);
         first.push(r);
     }
@@ -624,6 +642,12 @@ async fn serve(
         }
     };
     let gateway = tokio::spawn(gateway::serve(gw_listener, Arc::clone(&ctx)));
+    // The optional loopback TCP listener: a bind failure is a record and
+    // no listener; the Unix sockets stay.
+    let gateway_tcp = match tcp {
+        Some(addr) => start_tcp(&ctx, addr).await,
+        None => None,
+    };
 
     // 8. Ready.
     notify::ready();
@@ -634,6 +658,8 @@ async fn serve(
     vault_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let day = Duration::from_secs(24 * 3600);
     let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
+    let hour = Duration::from_secs(3600);
+    let mut token_tick = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
     loop {
         tokio::select! {
             _ = vault_tick.tick() => {
@@ -650,6 +676,14 @@ async fn serve(
                 let dir = ctx.backup_dir.clone();
                 tokio::task::spawn_blocking(move || {
                     crate::import_backup::purge(&dir, crate::import_backup::now())
+                });
+            }
+            _ = token_tick.tick() => {
+                let t = Arc::clone(&ctx.tokens);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = t.purge() {
+                        eprintln!("saiife: warning: cannot write the gateway tokens: {e}");
+                    }
                 });
             }
             r = listener.accept() => match r {
@@ -686,6 +720,10 @@ async fn serve(
     let _ = std::fs::remove_file(&sock_path);
     gateway.abort();
     let _ = gateway.await;
+    if let Some(t) = gateway_tcp {
+        t.abort();
+        let _ = t.await;
+    }
     let _ = std::fs::remove_file(&gw_path);
     if writer_died {
         use std::io::Write;
@@ -702,6 +740,42 @@ async fn serve(
             ExitCode::from(1)
         }
     }
+}
+
+/// Bind `addr` (loopback, checked at load) and serve the gateway on it.
+/// The bound address (the real port for `:0`) goes into `status` and a
+/// `gateway_tcp` record; a failure is a `gateway_tcp_failed` record.
+async fn start_tcp(
+    ctx: &Arc<Ctx>,
+    addr: std::net::SocketAddr,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let bound = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(|l| l.local_addr().map(|a| (l, a)));
+    let (rec, task) = match bound {
+        Ok((l, a)) => {
+            ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).bound = Some(a);
+            let mut r = ctx.event("gateway_tcp");
+            r.extra.insert("addr".into(), a.to_string().into());
+            let task = tokio::spawn(gateway::serve_tcp(
+                l,
+                Arc::clone(ctx),
+                gateway::Opts::default(),
+            ));
+            (r, Some(task))
+        }
+        Err(e) => {
+            let reason = format!("cannot listen on {addr}: {e}");
+            eprintln!("saiife: warning: gateway tcp: {reason}");
+            let mut r = ctx.event("gateway_tcp_failed");
+            r.reason = Some(reason);
+            (r, None)
+        }
+    };
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!("saiife: warning: cannot write the gateway_tcp record: {e}");
+    }
+    task
 }
 
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
@@ -765,6 +839,9 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
     }
     if c.daemon.socket_dir != ctx.socket_dir {
         out.push("[daemon] socket_dir changed".to_string());
+    }
+    if c.gateway.tcp != ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured {
+        out.push("[gateway] tcp changed".to_string());
     }
     if c.audit.dir != ctx.audit_dir {
         out.push("[audit] dir changed".to_string());

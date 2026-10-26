@@ -28,7 +28,8 @@ pub struct ApiArgs {
     /// The system config (default /etc/saiife/config.toml).
     #[arg(long = "system-config", hide = true)]
     pub system_config: Option<PathBuf>,
-    /// `<service> <operation> [k=v ...]`, or `[<service>]` with --list.
+    /// `<service> <operation> [k=v ...]`, `[<service>]` with --list, or
+    /// `token` (a 12 h bearer token for the gateway's TCP listener).
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
 }
@@ -152,6 +153,9 @@ mod linux {
             .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
         if a.list {
             return list(&config, &a);
+        }
+        if a.args.len() == 1 && a.args[0] == "token" {
+            return token(&config, a.json);
         }
         let [service, operation, rest @ ..] = a.args.as_slice() else {
             return Err(refused(
@@ -297,6 +301,38 @@ mod linux {
             "bad_request" | "forbidden" => Stop(2, s("message").to_string()),
             _ => Stop(5, s("message").to_string()),
         }
+    }
+
+    /// `saiife api token`: a bearer token for the gateway's loopback TCP
+    /// listener (`[gateway] tcp`), bound to this uid, valid 12 h. The token
+    /// goes to stdout (with `--json`: `{"token", "expires"}`), the expiry
+    /// to stderr.
+    fn token(config: &Path, as_json: bool) -> Result<u8, Stop> {
+        let mut d = connect(config)?;
+        let ans = d
+            .client
+            .call_answer(
+                "api.token",
+                Map::new(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+        if ans.get("ok") != Some(&Value::Bool(true)) {
+            return Err(refusal(&ans));
+        }
+        let s = |k: &str| ans.get(k).and_then(Value::as_str).unwrap_or_default();
+        if as_json {
+            outln!("{}", json!({"token": s("token"), "expires": s("expires")}));
+        } else {
+            outln!("{}", s("token"));
+        }
+        let tcp = if d.cfg.gateway.tcp.is_empty() {
+            " ([gateway] tcp is not set: no TCP listener)".to_string()
+        } else {
+            format!(" for {}", d.cfg.gateway.tcp)
+        };
+        eprintln!("saiife: gateway token{tcp}, valid until {}", s("expires"));
+        Ok(0)
     }
 
     fn list(config: &Path, a: &ApiArgs) -> Result<u8, Stop> {

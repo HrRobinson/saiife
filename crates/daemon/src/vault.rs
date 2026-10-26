@@ -104,7 +104,7 @@ fn real_dir_sync(dir: &Path) -> io::Result<()> {
 
 /// Open a regular file without following a symlink and without blocking on
 /// a FIFO; anything else is `InvalidData`.
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
@@ -124,7 +124,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// The vault dir must be a real directory (no symlink) owned by the euid,
 /// mode 0700 (fixed when it is not). With `create`, a missing dir is made;
 /// otherwise a missing dir is `NotFound`.
-fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
+pub(crate) fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let md = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,

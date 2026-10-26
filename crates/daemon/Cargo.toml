@@ -41,6 +41,8 @@ hyper-util = { version = "=0.1.21", features = ["tokio"] }
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 percent-encoding = "2"
+# Gateway bearer tokens are stored as SHA-256 (Task 11); as in saiife-audit.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

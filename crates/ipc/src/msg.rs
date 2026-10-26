@@ -18,6 +18,8 @@ pub const OP_SECRET_LEASE: &str = "secret.lease";
 pub const OP_API_CALL: &str = "api.call";
 pub const OP_API_LIST: &str = "api.list";
 pub const OP_API_RESULT: &str = "api.result";
+/// A bearer token for the gateway's loopback TCP listener: `{token, expires}`.
+pub const OP_API_TOKEN: &str = "api.token";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with

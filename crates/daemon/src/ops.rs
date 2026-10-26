@@ -11,8 +11,8 @@ use saiife_broker::pipeline::{PolicySnapshot, Pools};
 use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 use saiife_ipc::msg::{
-    err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
+    err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
+    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
     OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
@@ -140,6 +140,10 @@ pub struct Ctx {
     pub pools: Pools,
     /// Where `secret.add` keeps the backups of imported files.
     pub backup_dir: PathBuf,
+    /// Bearer tokens of the loopback TCP listener (`api.token`).
+    pub tokens: Arc<crate::tokens::Tokens>,
+    /// The `[gateway] tcp` the daemon started with, and what it bound.
+    pub tcp: Mutex<TcpState>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -163,6 +167,16 @@ pub struct CtxInit {
     pub limiter: Limiter,
     pub upstream: Result<Upstream, String>,
     pub backup_dir: PathBuf,
+    pub tokens: Arc<crate::tokens::Tokens>,
+}
+
+/// The optional loopback TCP listener of the gateway.
+#[derive(Debug, Clone, Default)]
+pub struct TcpState {
+    /// `[gateway] tcp` at start (a reload cannot change it).
+    pub configured: String,
+    /// The address bound (the real port when `:0` was asked for).
+    pub bound: Option<std::net::SocketAddr>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -194,6 +208,8 @@ impl Ctx {
             upstream: i.upstream,
             pools: Pools::new(),
             backup_dir: i.backup_dir,
+            tokens: i.tokens,
+            tcp: Mutex::new(TcpState::default()),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -393,6 +409,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             crate::secret_ops::handle(ctx, peer, req).await
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
+        OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -507,6 +524,9 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     m.insert("policy".into(), json!(p.hash));
     m.insert("policy_ok".into(), p.ok.into());
     m.insert("uptime_s".into(), ctx.started.elapsed().as_secs().into());
+    // The loopback TCP listener's address, `null` when there is none.
+    let tcp = lock(&ctx.tcp).bound;
+    m.insert("gateway_tcp".into(), json!(tcp.map(|a| a.to_string())));
     ok(id, m)
 }
 

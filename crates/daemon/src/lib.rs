@@ -27,6 +27,8 @@ pub mod sessions;
 #[cfg(target_os = "linux")]
 mod start;
 #[cfg(target_os = "linux")]
+pub mod tokens;
+#[cfg(target_os = "linux")]
 pub mod vault;
 #[cfg(target_os = "linux")]
 pub mod writer;

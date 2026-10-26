@@ -165,6 +165,9 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     }
 
     validate_services(config_file, &cfg, &service_origin)?;
+    cfg.gateway
+        .tcp_addr()
+        .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {
         if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
             return Err(invalid(

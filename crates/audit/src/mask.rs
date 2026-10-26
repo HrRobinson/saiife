@@ -25,6 +25,8 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // No leading `\b`: a token glued to an identifier (`X_ghp_…`) still counts.
         (r"(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}\b", MASK),
         (r"github_pat_[A-Za-z0-9_]{20,}\b", MASK),
+        // saiife's own gateway bearer tokens (`saiife api token`).
+        (r"saiife_gw_[A-Za-z0-9_-]{20,}", MASK),
         (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", MASK),
     ]
     .into_iter()
@@ -58,6 +60,18 @@ mod tests {
         assert_eq!(mask(&format!("echo {pat}")), "echo [MASKED]");
         let gho = format!("gho_{}", "c".repeat(36));
         assert_eq!(mask(&gho), "[MASKED]");
+    }
+
+    #[test]
+    fn saiife_gateway_tokens() {
+        let tok = format!("saiife_gw_{}", "aZ09_-".repeat(7));
+        assert_eq!(mask(&format!("curl -H x:{tok} u")), "curl -H x:[MASKED] u");
+        assert_eq!(
+            mask(&format!("/v1/proxy/s/a?t={tok}&b=1")),
+            "/v1/proxy/s/a?t=[MASKED]&b=1"
+        );
+        // Too short to be one.
+        assert_eq!(mask("saiife_gw_short"), "saiife_gw_short");
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! Unix socket, the `test-echo` connector and a loopback TLS upstream. The
 //! tests talk HTTP/1.1 over the socket: through a hyper client, and by hand
 //! where the request target must reach the daemon byte for byte. Nothing
-//! leaves 127.0.0.1.
+//! leaves 127.0.0.1. The loopback TCP listener (`gateway::serve_tcp`) runs
+//! beside it on `127.0.0.1:0`, with its bearer tokens on an injected clock.
 #![cfg(target_os = "linux")]
 
 use bytes::Bytes;
@@ -23,8 +24,11 @@ use saiife_broker::{Catalog, Manifest};
 use saiife_daemon::gateway::{self, Opts};
 use saiife_daemon::ops::{Ctx, CtxInit, GatewayPolicy, PolicyState};
 use saiife_daemon::sessions::RealProc;
+use saiife_daemon::tokens::Tokens;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
 use saiife_daemon::writer::{self, WriterConfig};
+use saiife_ipc::msg::Request as IpcRequest;
+use saiife_ipc::peer::PeerCred;
 use saiife_policy::{Directory, Fsync, GroupEntry, Mode, SystemConfig, UserEntry};
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -32,7 +36,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -182,6 +186,10 @@ struct World {
     ctx: Arc<Ctx>,
     m: Mock,
     sock: PathBuf,
+    /// The loopback TCP listener.
+    tcp: SocketAddr,
+    /// The token clock, seconds since the epoch.
+    clock: Arc<AtomicU64>,
     audit: PathBuf,
     _dir_fd: std::fs::File,
     _tmp: tempfile::TempDir,
@@ -317,6 +325,9 @@ allow = ["orders:read"]
     };
 
     let (m, up) = mock(s.upstream_timeout).await;
+    let clock = Arc::new(AtomicU64::new(1_800_000_000));
+    let c2 = Arc::clone(&clock);
+    let tokens = Tokens::memory_with_clock(Arc::new(move || c2.load(Ordering::SeqCst)));
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
         writer_cfg: WriterConfig {
@@ -341,6 +352,7 @@ allow = ["orders:read"]
         backup_dir: state.join("import-backup"),
         limiter: Limiter::new(),
         upstream: Ok(up),
+        tokens: Arc::new(tokens),
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.
@@ -348,10 +360,15 @@ allow = ["orders:read"]
     let sock = PathBuf::from(format!("/proc/self/fd/{}/gateway.sock", dir_fd.as_raw_fd()));
     let listener = UnixListener::bind(&sock).unwrap();
     tokio::spawn(gateway::serve_with(listener, Arc::clone(&ctx), s.opts));
+    let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let tcp = tcp_listener.local_addr().unwrap();
+    tokio::spawn(gateway::serve_tcp(tcp_listener, Arc::clone(&ctx), s.opts));
     World {
         ctx,
         m,
         sock,
+        tcp,
+        clock,
         audit,
         _dir_fd: dir_fd,
         _tmp: tmp,
@@ -417,6 +434,56 @@ impl World {
         let (parts, body) = resp.into_parts();
         let body = body.collect().await.unwrap().to_bytes();
         (parts.status, parts.headers, body)
+    }
+
+    /// One request through a hyper client on the TCP listener.
+    async fn send_tcp(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let s = tokio::net::TcpStream::connect(self.tcp).await.unwrap();
+        let (mut tx, conn) = hyper::client::conn::http1::handshake(TokioIo::new(s))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let resp = tx
+            .send_request(b.body(Full::new(Bytes::copy_from_slice(body))).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        (parts.status, parts.headers, body)
+    }
+
+    /// `api.token` as this process (the peer uid) asks for it.
+    async fn token_op(&self) -> Value {
+        let peer = PeerCred {
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
+            pid: std::process::id(),
+        };
+        let req = IpcRequest {
+            id: 9,
+            op: "api.token".into(),
+            args: Default::default(),
+        };
+        saiife_daemon::ops::dispatch(&self.ctx, &peer, req).await
+    }
+
+    async fn token(&self) -> String {
+        let a = self.token_op().await;
+        assert_eq!(a["ok"], true, "{a}");
+        a["token"].as_str().unwrap().to_string()
     }
 
     async fn api(&self, service_op: &str, body: Value) -> (StatusCode, HeaderMap, Value) {
@@ -1016,4 +1083,243 @@ async fn proxy_outcome_header_tells_upstream_from_saiife() {
     // `/v1/api` says it with X-Saiife-Upstream-Status instead.
     let (_, h, _) = w.api("shop/orders.list", json!({})).await;
     assert!(h.get("x-saiife-outcome").is_none());
+}
+
+// ---------------------------------------------------------------- tcp
+
+#[tokio::test]
+async fn token_maps_to_uid() {
+    let w = world().await;
+    let me = rustix::process::getuid().as_raw();
+    let a = w.token_op().await;
+    assert_eq!(a["ok"], true, "{a}");
+    let tok = a["token"].as_str().unwrap();
+    assert!(
+        tok.starts_with("saiife_gw_") && tok.len() == 10 + 43,
+        "{tok}"
+    );
+    // 12 h on the injected clock, in the record format.
+    assert_eq!(a["expires"], "2027-01-15T20:00:00Z");
+    let bearer = format!("Bearer {tok}");
+    let auth = [("authorization", bearer.as_str())];
+
+    // The same routes as on the Unix socket, the identity from the token.
+    let (st, _, b) = w.send_tcp("GET", "/v1/services", &auth, b"").await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["services"][0]["name"], "shop", "{v}");
+    let (st, h, b) = w
+        .send_tcp(
+            "POST",
+            "/v1/api/shop/orders.list",
+            &auth,
+            br#"{"params":{"status":"open"}}"#,
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b:?}");
+    assert_eq!(h["x-saiife-upstream-status"], "200");
+    assert_eq!(w.hits(), 1);
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["uid"], me);
+    assert_eq!(recs[0]["user"], "agent");
+    assert_eq!(recs[0]["via"], "http");
+    assert_eq!(recs[0]["peer"]["auth"], "token");
+    assert!(recs[0]["peer"]["tcp"]
+        .as_str()
+        .unwrap()
+        .starts_with("127.0.0.1:"));
+    // The issue is in the log; the token is not.
+    let issued: Vec<Value> = w
+        .audit_text()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r["event"] == "gateway_token")
+        .collect();
+    assert_eq!(issued.len(), 1);
+    assert_eq!(issued[0]["token_uid"], me);
+    assert!(!w.audit_text().contains(&tok[10..]));
+}
+
+#[tokio::test]
+async fn tcp_without_a_good_token_401() {
+    let w = world().await;
+    let tok = w.token().await;
+    let wrong = format!("Bearer {}", tok.replace("saiife_gw_", "saiife_gw_x"));
+    let basic = format!("Basic {tok}");
+    let bare = tok.clone();
+    let cases: Vec<Vec<(&str, &str)>> = vec![
+        vec![],
+        vec![("authorization", wrong.as_str())],
+        vec![("authorization", basic.as_str())],
+        vec![("authorization", bare.as_str())],
+        vec![("authorization", "Bearer ")],
+        // Who the agent says it is never counts.
+        vec![("x-forwarded-user", "agent")],
+    ];
+    for hdrs in &cases {
+        for (m, uri, body) in [
+            ("GET", "/v1/services", &b""[..]),
+            ("POST", "/v1/api/shop/orders.list", &b"{}"[..]),
+            ("GET", "/v1/proxy/shop/orders.json", &b""[..]),
+        ] {
+            let (st, h, b) = w.send_tcp(m, uri, hdrs, body).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{hdrs:?} {uri}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&b).unwrap(),
+                json!({"error": "token"})
+            );
+            assert_eq!(h["www-authenticate"], "Bearer");
+        }
+    }
+    // Two Authorization headers, one good: refused.
+    let good = format!("Bearer {tok}");
+    let (st, _, _) = w
+        .send_tcp(
+            "GET",
+            "/v1/services",
+            &[
+                ("authorization", good.as_str()),
+                ("authorization", "Bearer x"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(w.hits(), 0);
+    assert!(w.connector_records().is_empty());
+}
+
+#[tokio::test]
+async fn expired_token_401() {
+    let w = world().await;
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    let auth = [("authorization", bearer.as_str())];
+    w.clock.fetch_add(12 * 3600 - 1, Ordering::SeqCst);
+    let (st, _, _) = w.send_tcp("GET", "/v1/services", &auth, b"").await;
+    assert_eq!(st, StatusCode::OK);
+    w.clock.fetch_add(1, Ordering::SeqCst);
+    let (st, _, b) = w.send_tcp("GET", "/v1/services", &auth, b"").await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&b).unwrap(),
+        json!({"error": "token"})
+    );
+}
+
+#[tokio::test]
+async fn token_never_forwarded_upstream() {
+    let w = world().await;
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    for uri in ["/v1/proxy/shop/orders.json", "/v1/api/shop/orders.list"] {
+        let method = if uri.starts_with("/v1/api/") {
+            "POST"
+        } else {
+            "GET"
+        };
+        let (st, _, _) = w
+            .send_tcp(
+                method,
+                uri,
+                &[
+                    ("authorization", bearer.as_str()),
+                    ("accept", "application/json"),
+                ],
+                b"",
+            )
+            .await;
+        assert_eq!(st, StatusCode::OK, "{uri}");
+    }
+    let seen = w.m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    for (_, h) in seen.iter() {
+        assert!(h.get("authorization").is_none());
+        // The vault credential went up, as on the Unix socket.
+        assert_eq!(h["x-echo-token"], TOKEN);
+        for (_, v) in h.iter() {
+            assert!(!v.to_str().unwrap_or("").contains(&tok[10..]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_masked_in_records() {
+    let w = world().await;
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    // An agent that puts its token where it does not belong: in a query
+    // parameter, sent upstream. The record keeps the request, masked.
+    let body = json!({"params": {"name": tok}}).to_string();
+    let (st, _, b) = w
+        .send_tcp(
+            "POST",
+            "/v1/api/shop/files.get",
+            &[("authorization", bearer.as_str())],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{b:?}");
+    let seen = w.m.seen.lock().unwrap().clone();
+    assert!(
+        seen[0].0.contains(&tok[10..]),
+        "the agent's choice: {seen:?}"
+    );
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 1);
+    let text = w.audit_text();
+    assert!(!text.contains(&tok[10..]), "{text}");
+    assert!(recs[0].to_string().contains("[MASKED]"), "{}", recs[0]);
+}
+
+#[tokio::test]
+async fn api_token_needs_a_scope() {
+    let w = world_with(Setup {
+        users: r#""someone-else""#,
+        ..Setup::default()
+    })
+    .await;
+    let a = w.token_op().await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "forbidden");
+    assert_eq!(w.ctx.tokens.live_for(rustix::process::getuid().as_raw()), 0);
+}
+
+#[tokio::test]
+async fn tcp_listener_caps_64_connections() {
+    let w = world().await;
+    let mut held = Vec::new();
+    for _ in 0..gateway::MAX_TCP_CONNS {
+        held.push(tokio::net::TcpStream::connect(w.tcp).await.unwrap());
+    }
+    // Let the listener take all of them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut s = tokio::net::TcpStream::connect(w.tcp).await.unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    let out = String::from_utf8_lossy(&out);
+    assert_eq!(status_of(&out), 429, "{out}");
+    assert_eq!(body_of(&out)["error"], "busy");
+    // One goes, one more gets in.
+    drop(held.pop());
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    let mut got = StatusCode::TOO_MANY_REQUESTS;
+    for _ in 0..50 {
+        let (st, _, _) = w
+            .send_tcp(
+                "GET",
+                "/v1/services",
+                &[("authorization", bearer.as_str())],
+                b"",
+            )
+            .await;
+        got = st;
+        if st == StatusCode::OK {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(got, StatusCode::OK);
 }

@@ -4,16 +4,22 @@
 //! the same parser, and run by [`api_ops::execute`]: one `connector`
 //! record per request that reaches the pipeline, with `via = "http"`.
 //!
-//! Identity is the peer uid of the socket and nothing else: `Authorization`,
-//! `Forwarded` and `X-Forwarded-*` are never read for it, and agent
-//! credentials never go upstream.
+//! On `gateway.sock` identity is the peer uid of the socket and nothing
+//! else: `Authorization`, `Forwarded` and `X-Forwarded-*` are never read
+//! for it, and agent credentials never go upstream.
+//!
+//! The optional loopback TCP listener (`[gateway] tcp`, spec §6.3) has no
+//! peer uid: there identity is the bearer token of `saiife api token` and
+//! nothing else. `Authorization: Bearer <token>` is required on every
+//! request and consumed before the pipeline; everything after that is the
+//! same code path as the Unix socket.
 
-use crate::api_ops::{self, Refused};
+use crate::api_ops::{self, Caller, Refused};
 use crate::ops::{Ctx, Notice};
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{
-    HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
+    HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
     TRANSFER_ENCODING,
 };
 use http::{Method, Request, Response, StatusCode};
@@ -30,12 +36,15 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
 /// The read buffer of a connection, which bounds the request head.
 pub const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -49,6 +58,9 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A write to the client must make progress within this, or the
 /// connection is closed.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Open connections on the TCP listener, all uids together (each uid's
+/// connections also count against its 32).
+pub const MAX_TCP_CONNS: usize = 64;
 /// How long a refused connection gets to take its answer.
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -119,7 +131,26 @@ pub async fn serve_with(listener: UnixListener, ctx: Arc<Ctx>, opts: Opts) {
     }
 }
 
-async fn connection(mut s: UnixStream, ctx: Arc<Ctx>, opts: Opts) {
+/// Where a connection came from, which says where its identity comes from.
+#[derive(Debug, Clone, Copy)]
+enum Source {
+    /// `gateway.sock`: the peer's uid, from the kernel.
+    Unix(PeerCred),
+    /// The loopback TCP listener: no peer uid; the bearer token decides.
+    Tcp(SocketAddr),
+}
+
+/// The answer to a connection refused at accept.
+async fn refuse_busy<S: AsyncWrite + Unpin>(mut s: S) {
+    let body = r#"{"error":"busy","reason":"too many open connections"}"#;
+    let raw = format!(
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\nx-saiife-outcome: saiife\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = tokio::time::timeout(REFUSE_WRITE_TIMEOUT, s.write_all(raw.as_bytes())).await;
+}
+
+async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
@@ -129,21 +160,58 @@ async fn connection(mut s: UnixStream, ctx: Arc<Ctx>, opts: Opts) {
         Ok(slot) => slot,
         Err(_) => {
             ctx.notice(peer.uid, Notice::Connections);
-            let body = r#"{"error":"busy","reason":"too many open connections"}"#;
-            let raw = format!(
-                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\nx-saiife-outcome: saiife\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = tokio::time::timeout(REFUSE_WRITE_TIMEOUT, s.write_all(raw.as_bytes())).await;
+            refuse_busy(s).await;
             return;
         }
     };
+    serve_conn(s, Source::Unix(peer), ctx, opts).await;
+}
+
+/// Serve the loopback TCP listener until the task is dropped. At most
+/// [`MAX_TCP_CONNS`] connections are open at once; each request then
+/// takes a connection slot of its token's uid.
+pub async fn serve_tcp(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
+    let cap = Arc::new(Semaphore::new(MAX_TCP_CONNS));
+    loop {
+        match listener.accept().await {
+            Ok((s, addr)) => {
+                // The listener is bound to loopback; nothing else is
+                // served.
+                if !addr.ip().is_loopback() {
+                    continue;
+                }
+                match Arc::clone(&cap).try_acquire_owned() {
+                    Ok(permit) => {
+                        let ctx = Arc::clone(&ctx);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            serve_conn(s, Source::Tcp(addr), ctx, opts).await;
+                        });
+                    }
+                    Err(_) => {
+                        tokio::spawn(refuse_busy(s));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("saiife: warning: gateway tcp accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// One HTTP/1.1 request on `s`, whichever listener it came from.
+async fn serve_conn<S>(s: S, source: Source, ctx: Arc<Ctx>, opts: Opts)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = Guarded::new(s, opts.write_timeout);
     let line = Arc::clone(&io.line);
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
         let raw = raw_target(&line);
-        async move { Ok::<_, Infallible>(admit(&ctx, &peer, req, raw, opts).await) }
+        async move { Ok::<_, Infallible>(admit(&ctx, source, req, raw, opts).await) }
     });
     // One request per connection: the first line of the stream is then
     // the request line, read as sent (see [`Guarded`]).
@@ -207,15 +275,15 @@ fn raw_target(line: &Mutex<FirstLine>) -> Option<String> {
 /// closes the connection when a write makes no progress within the write
 /// timeout. A client that sends and never reads cannot hold its slot, and
 /// the shared connection total, for longer than that.
-struct Guarded {
-    inner: UnixStream,
+struct Guarded<S> {
+    inner: S,
     write_timeout: Duration,
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
     line: Arc<Mutex<FirstLine>>,
 }
 
-impl Guarded {
-    fn new(inner: UnixStream, write_timeout: Duration) -> Guarded {
+impl<S> Guarded<S> {
+    fn new(inner: S, write_timeout: Duration) -> Guarded<S> {
         Guarded {
             inner,
             write_timeout,
@@ -249,7 +317,7 @@ impl Guarded {
     }
 }
 
-impl AsyncRead for Guarded {
+impl<S: AsyncRead + Unpin> AsyncRead for Guarded<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -267,7 +335,7 @@ impl AsyncRead for Guarded {
     }
 }
 
-impl AsyncWrite for Guarded {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Guarded<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -322,13 +390,13 @@ const OUTCOME: &str = "x-saiife-outcome";
 /// a passed-through upstream answer, `saiife` for anything saiife decided.
 async fn admit(
     ctx: &Arc<Ctx>,
-    peer: &PeerCred,
+    source: Source,
     req: Request<Incoming>,
     raw: Option<String>,
     opts: Opts,
 ) -> Resp {
     let proxy = raw.as_deref().is_some_and(|t| t.starts_with("/v1/proxy/"));
-    let mut r = admit_inner(ctx, peer, req, raw, opts).await;
+    let mut r = admit_inner(ctx, source, req, raw, opts).await;
     if proxy {
         r.headers_mut()
             .entry(OUTCOME)
@@ -337,25 +405,73 @@ async fn admit(
     r
 }
 
+/// The token of the one `Authorization: Bearer <token>` header; `None`
+/// for none, several, or another scheme.
+fn bearer(headers: &http::HeaderMap) -> Option<Zeroizing<String>> {
+    let mut all = headers.get_all(AUTHORIZATION).iter();
+    let (Some(v), None) = (all.next(), all.next()) else {
+        return None;
+    };
+    let v = v.to_str().ok()?;
+    let (scheme, token) = v.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| Zeroizing::new(token.to_string()))
+}
+
+/// 401 `{"error":"token"}`: a missing, expired or unknown token.
+fn unauthorized() -> Resp {
+    let mut r = json_resp(StatusCode::UNAUTHORIZED, json!({"error": "token"}));
+    r.headers_mut().insert(
+        http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    r
+}
+
+fn busy(message: &str) -> Resp {
+    let mut r = error(StatusCode::TOO_MANY_REQUESTS, "busy", message);
+    r.headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    r
+}
+
 async fn admit_inner(
     ctx: &Arc<Ctx>,
-    peer: &PeerCred,
-    req: Request<Incoming>,
+    source: Source,
+    mut req: Request<Incoming>,
     raw: Option<String>,
     opts: Opts,
 ) -> Resp {
-    match ctx.limits.try_begin(peer.uid, Instant::now()) {
-        Ok(_in_flight) => route(ctx, peer, req, raw, opts).await,
+    // The identity, and on TCP the token uid's connection slot for this
+    // request (the connection carries one request).
+    let (caller, _slot) = match source {
+        Source::Unix(peer) => (Caller::Unix(peer), None),
+        Source::Tcp(addr) => {
+            let uid = bearer(req.headers()).and_then(|t| ctx.tokens.verify(&t));
+            let Some(uid) = uid else {
+                return unauthorized();
+            };
+            match ctx.conns.try_open(uid) {
+                Ok(slot) => (Caller::Token { uid, addr }, Some(slot)),
+                Err(_) => {
+                    ctx.notice(uid, Notice::Connections);
+                    return busy("too many open connections");
+                }
+            }
+        }
+    };
+    // Consumed here: the token (or, on the Unix socket, an agent's own
+    // credential) never reaches the pipeline.
+    req.headers_mut().remove(AUTHORIZATION);
+    let uid = caller.uid();
+    match ctx.limits.try_begin(uid, Instant::now()) {
+        Ok(_in_flight) => route(ctx, &caller, req, raw, opts).await,
         Err(_) => {
-            ctx.notice(peer.uid, Notice::Requests);
-            let mut r = error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "busy",
-                "too many requests from this uid",
-            );
-            r.headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
-            r
+            ctx.notice(uid, Notice::Requests);
+            busy("too many requests from this uid")
         }
     }
 }
@@ -369,7 +485,7 @@ enum Route {
 
 async fn route(
     ctx: &Arc<Ctx>,
-    peer: &PeerCred,
+    caller: &Caller,
     req: Request<Incoming>,
     raw: Option<String>,
     opts: Opts,
@@ -408,7 +524,7 @@ async fn route(
         if req.method() != Method::GET {
             return method_not_allowed("GET");
         }
-        let services = api_ops::services_for(ctx, peer.uid, &BTreeMap::new()).await;
+        let services = api_ops::services_for(ctx, caller.uid(), &BTreeMap::new()).await;
         return json_resp(StatusCode::OK, json!({"services": services}));
     }
     if let Some(rest) = path.strip_prefix("/v1/api/") {
@@ -427,7 +543,7 @@ async fn route(
             Err(r) => return *r,
         };
         return match api_args(&service, &op, &body) {
-            Ok(args) => call(ctx, peer, args, Route::Api).await,
+            Ok(args) => call(ctx, caller, args, Route::Api).await,
             Err(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
         };
     }
@@ -451,7 +567,7 @@ async fn route(
             Err(r) => return *r,
         };
         let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
-        return call(ctx, peer, args, Route::Proxy).await;
+        return call(ctx, caller, args, Route::Proxy).await;
     }
     if path.starts_with("/v1/requests/") {
         return json_resp(
@@ -615,13 +731,13 @@ fn proxy_args(
     args
 }
 
-async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, args: Map<String, Value>, route: Route) -> Resp {
+async fn call(ctx: &Arc<Ctx>, caller: &Caller, args: Map<String, Value>, route: Route) -> Resp {
     let (_, _, mut call) = match api_ops::parse_call(&args) {
         Ok(x) => x,
         Err(m) => return error(StatusCode::BAD_REQUEST, "bad_request", m),
     };
     call.via = Via::Http;
-    match api_ops::execute(ctx, peer, call).await {
+    match api_ops::execute(ctx, caller, call).await {
         Ok(outcome) => respond(outcome, route),
         Err(Refused::LowDisk(_)) => error(
             StatusCode::SERVICE_UNAVAILABLE,

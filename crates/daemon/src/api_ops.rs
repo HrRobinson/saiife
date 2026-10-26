@@ -6,6 +6,7 @@
 
 use crate::ops::{Ctx, GatewayPolicy, Notice, VERSION};
 use crate::sessions::agent_ancestor;
+use crate::tokens;
 use crate::vault::{Kind, VaultState};
 use base64::Engine as _;
 use bytes::Bytes;
@@ -300,9 +301,9 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
 
 /// The audit-volume gate (as for `audit.append`): a call that cannot be
 /// recorded is not made.
-fn disk_ok(ctx: &Ctx, peer: &PeerCred) -> Result<(), ErrorCode> {
+fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
     let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
-    crate::disk::disk_gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid)
+    crate::disk::disk_gate(free, ctx.policy().min_free_mb, uid, ctx.own_uid)
 }
 
 /// A snapshot for the record of a call made without a valid policy.
@@ -330,7 +331,7 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(x) => x,
         Err(m) => return bad(id, m),
     };
-    match execute(ctx, peer, call).await {
+    match execute(ctx, &Caller::Unix(*peer), call).await {
         // 12. Return.
         Ok(outcome) => answer(id, outcome),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
@@ -338,25 +339,64 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     }
 }
 
+/// Who makes a connector call: a Unix-socket peer (uid and pid from the
+/// kernel), or a bearer token on the gateway's loopback TCP listener (the
+/// uid the token is bound to, and nothing else: no pid, so no session).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Caller {
+    Unix(PeerCred),
+    Token {
+        uid: u32,
+        addr: std::net::SocketAddr,
+    },
+}
+
+impl Caller {
+    pub(crate) fn uid(&self) -> u32 {
+        match self {
+            Caller::Unix(p) => p.uid,
+            Caller::Token { uid, .. } => *uid,
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Caller::Unix(p) => Some(p.pid),
+            Caller::Token { .. } => None,
+        }
+    }
+
+    /// The record's `peer`.
+    fn record(&self) -> Value {
+        match self {
+            Caller::Unix(p) => json!({"pid": p.pid, "comm": comm(p.pid)}),
+            Caller::Token { addr, .. } => json!({"tcp": addr.to_string(), "auth": "token"}),
+        }
+    }
+}
+
 /// Every entry point (`api.call`, the HTTP gateway) once it has parsed its
-/// request into `call`: step 1 (the uid from the peer credentials, the
+/// request into `call`: step 1 (the uid from the caller's identity, the
 /// session by attribution), steps 3–12 under the policy in force when the
 /// call starts, and its one `connector` record (step 11), written before
 /// the outcome is returned. `uid`, `user` and `session` are set here from
-/// the peer, whatever the caller put there.
+/// the caller, whatever the request put there.
 pub(crate) async fn execute(
     ctx: &Arc<Ctx>,
-    peer: &PeerCred,
+    caller: &Caller,
     mut call: Call,
 ) -> Result<Outcome, Refused> {
-    if let Err(code) = disk_ok(ctx, peer) {
-        ctx.notice(peer.uid, Notice::LowDisk);
+    let uid = caller.uid();
+    if let Err(code) = disk_ok(ctx, uid) {
+        ctx.notice(uid, Notice::LowDisk);
         return Err(Refused::LowDisk(code));
     }
-    // 1. Identify: the peer's uid, the session by attribution.
-    call.uid = peer.uid;
-    call.user = ctx.name_of(peer.uid).await.unwrap_or_default();
-    let ancestor = agent_ancestor(ctx.proc.as_ref(), peer.pid);
+    // 1. Identify: the caller's uid, the session by attribution.
+    call.uid = uid;
+    call.user = ctx.name_of(uid).await.unwrap_or_default();
+    let ancestor = caller
+        .pid()
+        .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
     call.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
     let agent = ancestor
         .and_then(|(pid, _)| ctx.proc.stat(pid))
@@ -401,10 +441,7 @@ pub(crate) async fn execute(
     if snap.snap.hash.is_empty() {
         rec.policy = None;
     }
-    rec.extra.insert(
-        "peer".into(),
-        json!({"pid": peer.pid, "comm": comm(peer.pid)}),
-    );
+    rec.extra.insert("peer".into(), caller.record());
     if let Err(e) = ctx.writer.append(rec).await {
         // A request that was sent is already counted by the limiter, but a
         // rebuild at the next start will not see it (it has no record). The
@@ -482,6 +519,51 @@ fn answer(id: u64, outcome: Outcome) -> Value {
             one("reason", reason.into()),
         ),
     }
+}
+
+/// `api.token`: a bearer token for the gateway's loopback TCP listener,
+/// bound to the caller's uid, valid 12 h. Only a uid with a scope gets one
+/// (without a scope it could call nothing). The token is in this answer
+/// and nowhere else; the daemon keeps its SHA-256.
+pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
+    if !has_scope(ctx, uid).await {
+        return err(
+            id,
+            ErrorCode::Forbidden,
+            "api.token is for users in a [[scope]] of the system policy",
+        );
+    }
+    let tokens = Arc::clone(&ctx.tokens);
+    let issued = tokens::issue_blocking(tokens, uid).await;
+    let issued = match issued {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("saiife: warning: cannot store a gateway token: {e}");
+            return err(id, ErrorCode::Internal, "the token could not be stored");
+        }
+    };
+    let expires = tokens::rfc3339(issued.expires);
+    let mut r = ctx.event("gateway_token");
+    r.reason = Some(format!("issued to uid {uid}, expires {expires}"));
+    r.extra.insert("token_uid".into(), uid.into());
+    if let Err(e) = ctx.writer.append(r).await {
+        eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
+    }
+    let mut m = Map::new();
+    m.insert("token".into(), issued.token.as_str().into());
+    m.insert("expires".into(), expires.into());
+    ok(id, m)
+}
+
+/// Whether `uid` has a scope in the policy in force (a scope conflict or no
+/// valid policy: no).
+async fn has_scope(ctx: &Arc<Ctx>, uid: u32) -> bool {
+    let state = ctx.policy();
+    let (Some(g), Some(user)) = (&state.gateway, ctx.name_of(uid).await) else {
+        return false;
+    };
+    let groups = Groups(ctx.groups_of(&user).await);
+    matches!(scope_for(&g.snap.config, &groups, &user), Ok(Some(_)))
 }
 
 /// `api.list`: [`services_for`] the caller.

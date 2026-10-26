@@ -612,3 +612,19 @@ fn run_allow_hardening() {
     let e = load_system(&cfg).unwrap_err();
     assert!(e.to_string().contains("absolute"), "{e}");
 }
+
+#[test]
+fn non_loopback_tcp_is_config_error_at_load() {
+    let (_d, cfg) = etc(
+        "version = 2\nlocked = true\n[gateway]\ntcp = \"0.0.0.0:7431\"\n",
+        &[],
+    );
+    let e = load_system(&cfg).unwrap_err().to_string();
+    assert!(e.contains("loopback"), "{e}");
+    let (_d, cfg) = etc(
+        "version = 2\nlocked = true\n[gateway]\ntcp = \"127.0.0.1:0\"\n",
+        &[],
+    );
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.gateway.tcp_addr().unwrap().unwrap().port(), 0);
+}
