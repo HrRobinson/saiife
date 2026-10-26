@@ -24,9 +24,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
       # A short temp base keeps unix socket paths under 108 bytes.
+      # TMPDIR too: tempfile::tempdir() (and anything else using the
+      # system temp dir) stays off a quota'd or shared /tmp.
       - run: cargo test --workspace --no-fail-fast
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
       # The hook path (guard, audit, policy, ipc) and saiife-system must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates
@@ -59,6 +62,9 @@ jobs:
       # Ubuntu 24.04 blocks unprivileged user namespaces by default.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: ./scripts/test-offline.sh
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
+          TMPDIR: ${{ runner.temp }}
 
   shellcheck:
     runs-on: ubuntu-latest
