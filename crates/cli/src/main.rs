@@ -11,6 +11,7 @@
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
 //! - `saiife secret add|list|rotate|remove` -> the vault, through the daemon (Linux, admin)
+//! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
@@ -23,6 +24,7 @@ use clap::{Parser, Subcommand};
 #[macro_use]
 mod out;
 
+mod api_cmd;
 mod audit_cmd;
 mod check;
 mod check_managed;
@@ -217,6 +219,9 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
+    /// Locked mode (Linux): call a connector operation through the daemon,
+    /// or list the ones you may call. The credential never reaches you.
+    Api(api_cmd::ApiArgs),
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -289,6 +294,9 @@ fn main() -> ExitCode {
             command,
         });
     }
+    if let Cmd::Api(a) = cli.command {
+        return api_cmd::run(a);
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -337,6 +345,7 @@ fn main() -> ExitCode {
         | Cmd::Secret { .. }
         | Cmd::Connect(..)
         | Cmd::Run { .. }
+        | Cmd::Api(_)
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }

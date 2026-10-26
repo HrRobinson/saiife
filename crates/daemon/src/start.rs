@@ -223,11 +223,18 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // Connector limits survive a restart: rebuilt from the last 24 h of
     // connector records (spec §6.9.2).
     let limiter = rebuild_limiter(&audit_cfg.dir);
-    // The upstream client: the native roots plus `<config dir>/ca`. The
-    // tests trust their loopback CA through that same directory, so the
-    // daemon has no test-only seam for roots or names.
+    // The upstream client: the native roots plus `<config dir>/ca`, which
+    // must be root's (a CA there can impersonate any upstream). A refused
+    // directory is a `ca_refused` record; the native roots stay. The tests
+    // trust their loopback CA through that same directory (owner seam in
+    // `trusted_owner`), so the daemon has no seam for roots or names.
     let ca_dir = opts.config.parent().unwrap_or(Path::new("/")).join("ca");
-    let upstream = Upstream::new(&ca_dir, gateway_cfg.upstream_timeout).map_err(|e| {
+    let ca_refused = check_ca_dir(&ca_dir, trusted_owner()).err();
+    if let Some(why) = &ca_refused {
+        eprintln!("saiife: warning: extra CAs not used: {why}");
+    }
+    let ca = ca_refused.is_none().then_some(ca_dir.as_path());
+    let upstream = Upstream::with_ca_dir(ca, gateway_cfg.upstream_timeout).map_err(|e| {
         eprintln!("saiife: warning: connector calls will fail: {e}");
         e.to_string()
     });
@@ -262,6 +269,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         check,
         policy_err,
         loaded_files,
+        ca_refused,
     ));
     rt.shutdown_timeout(Duration::from_secs(1));
     drop(ctx);
@@ -322,6 +330,55 @@ fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
         changed += 1;
     }
     Ok(changed)
+}
+
+/// Who must own `<config dir>/ca` and its files: root. A debug build (the
+/// test suite) honours `SAIIFE_TEST_CA_OWNER=<uid>`, so tests running as a
+/// normal user can use the directory; a release build has no such seam.
+fn trusted_owner() -> u32 {
+    #[cfg(debug_assertions)]
+    if let Some(uid) = std::env::var("SAIIFE_TEST_CA_OWNER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return uid;
+    }
+    0
+}
+
+/// The checks `load_local_with` makes on local manifests, for the CA
+/// directory: owned by `owner`, not writable by group or others, no
+/// symlinks, and every `*.pem` a regular file with the same owner and mode
+/// rules. A missing directory is fine (no extra CAs).
+fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let err = |p: &Path, why: &str| format!("{}: {why}", p.display());
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(dir, &e.to_string())),
+    };
+    if !meta.is_dir() {
+        return Err(err(dir, "not a directory (symlinks are not followed)"));
+    }
+    if meta.uid() != owner || meta.mode() & 0o022 != 0 {
+        return Err(err(dir, "must be owned by root and not writable by others"));
+    }
+    for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
+        let e = e.map_err(|e| err(dir, &e.to_string()))?;
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "pem") {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(&p).map_err(|e| err(&p, &e.to_string()))?;
+        if !m.file_type().is_file() {
+            return Err(err(&p, "not a regular file (symlinks are not followed)"));
+        }
+        if m.uid() != owner || m.mode() & 0o022 != 0 {
+            return Err(err(&p, "must be owned by root and not writable by others"));
+        }
+    }
+    Ok(())
 }
 
 /// The limiter from the connector records of the last 24 h (the two newest
@@ -479,6 +536,7 @@ async fn serve(
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
+    ca_refused: Option<String>,
 ) -> ExitCode {
     let signals = (
         signal(SignalKind::hangup()),
@@ -519,6 +577,11 @@ async fn serve(
         eprintln!("saiife: warning: vault unavailable: {reason}");
         let mut r = ctx.event("vault_unavailable");
         r.reason = Some(reason.clone());
+        first.push(r);
+    }
+    if let Some(reason) = ca_refused {
+        let mut r = ctx.event("ca_refused");
+        r.reason = Some(reason);
         first.push(r);
     }
     for r in first {
@@ -694,6 +757,38 @@ mod tests {
         );
         assert_eq!(regroup_audit_dir(&dir, &with), Some(0));
         assert_eq!(regroup_audit_dir(&d.path().join("missing"), &with), None);
+    }
+
+    #[test]
+    fn ca_dir_must_be_the_owners_and_hold_no_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let dir = d.path().join("ca");
+        // Missing: no extra CAs, fine.
+        check_ca_dir(&dir, me).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pem = dir.join("a.pem");
+        std::fs::write(&pem, "x").unwrap();
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o644)).unwrap();
+        check_ca_dir(&dir, me).unwrap();
+        // Not root's (the production owner).
+        assert!(check_ca_dir(&dir, 0).unwrap_err().contains("owned by root"));
+        // A group-writable file.
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(check_ca_dir(&dir, me).is_err());
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A symlinked pem.
+        std::os::unix::fs::symlink(&pem, dir.join("b.pem")).unwrap();
+        assert!(check_ca_dir(&dir, me).unwrap_err().contains("symlink"));
+        std::fs::remove_file(dir.join("b.pem")).unwrap();
+        // A world-writable dir; a symlinked dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_ca_dir(&dir, me).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = d.path().join("ca-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_ca_dir(&link, me).is_err());
     }
 
     #[test]

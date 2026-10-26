@@ -269,12 +269,20 @@ impl Upstream {
     /// The production client: the native roots plus every `*.pem` in
     /// `ca_dir` (`/etc/saiife/ca`; missing means none).
     pub fn new(ca_dir: &Path, timeout: Duration) -> Result<Upstream, BrokerError> {
+        Upstream::with_ca_dir(Some(ca_dir), timeout)
+    }
+
+    /// [`Upstream::new`] with no extra CA directory when `ca_dir` is `None`
+    /// (the daemon refused the directory): the native roots only.
+    pub fn with_ca_dir(ca_dir: Option<&Path>, timeout: Duration) -> Result<Upstream, BrokerError> {
         let mut roots = RootCertStore::empty();
         // Unreadable platform certificates are skipped, as every rustls
         // client does; an empty store is refused below.
         let native = rustls_native_certs::load_native_certs();
         roots.add_parsable_certificates(native.certs);
-        load_ca_dir(ca_dir, &mut roots)?;
+        if let Some(dir) = ca_dir {
+            load_ca_dir(dir, &mut roots)?;
+        }
         if roots.is_empty() {
             return Err(BrokerError::Upstream("no trusted root certificates".into()));
         }

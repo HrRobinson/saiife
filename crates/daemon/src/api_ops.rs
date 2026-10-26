@@ -31,6 +31,8 @@ const MAX_KEY: usize = 128;
 const MAX_VALUE: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_PATTERNS: usize = 256;
+const MAX_PATTERN_BYTES: usize = 256;
+const MAX_OVERLAY_SERVICES: usize = 64;
 const MAX_PROJECT: usize = 4096;
 
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
@@ -159,13 +161,40 @@ fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static s
     };
     let o: ServiceOverlay =
         serde_json::from_value(v.clone()).map_err(|_| "overlay must be {allow, ask, deny}")?;
+    check_overlay(&o)?;
+    Ok(Some(o))
+}
+
+/// Each list at most [`MAX_PATTERNS`] entries of at most
+/// [`MAX_PATTERN_BYTES`] bytes.
+fn check_overlay(o: &ServiceOverlay) -> Result<(), &'static str> {
     if [&o.allow, &o.ask, &o.deny]
         .iter()
-        .any(|l| l.len() > MAX_PATTERNS || l.iter().any(|p| p.len() > MAX_KEY))
+        .any(|l| l.len() > MAX_PATTERNS || l.iter().any(|p| p.len() > MAX_PATTERN_BYTES))
     {
         return Err("overlay too large");
     }
-    Ok(Some(o))
+    Ok(())
+}
+
+/// `api.list`'s `overlays`: at most [`MAX_OVERLAY_SERVICES`] services, each
+/// overlay bounded as in `api.call`.
+fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>, &'static str> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(BTreeMap::new());
+    };
+    let m: BTreeMap<String, ServiceOverlay> = serde_json::from_value(v.clone())
+        .map_err(|_| "overlays must map services to {allow, ask, deny}")?;
+    if m.len() > MAX_OVERLAY_SERVICES {
+        return Err("overlays: too many services");
+    }
+    for (name, o) in &m {
+        if !valid_service(name) {
+            return Err("overlays: invalid service name");
+        }
+        check_overlay(o)?;
+    }
+    Ok(m)
 }
 
 /// The arguments of `api.call`, checked. Errors never quote a value.
@@ -436,12 +465,9 @@ fn answer(id: u64, outcome: Outcome) -> Value {
 /// each with the action the policy (and the client's overlay) gives it.
 async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
-    let overlays: BTreeMap<String, ServiceOverlay> = match req.args.get("overlays") {
-        None | Some(Value::Null) => BTreeMap::new(),
-        Some(v) => match serde_json::from_value(v.clone()) {
-            Ok(o) => o,
-            Err(_) => return bad(id, "overlays must map services to {allow, ask, deny}"),
-        },
+    let overlays = match parse_overlays(req.args.get("overlays")) {
+        Ok(o) => o,
+        Err(m) => return bad(id, m),
     };
     let mut services = Vec::new();
     let state = ctx.policy();
@@ -482,6 +508,32 @@ mod tests {
         assert_eq!(c.params["n"], "5");
         assert_eq!(c.body.as_deref(), Some(&b"hi"[..]));
         assert_eq!(c.overlay.unwrap().deny, vec!["*:write"]);
+    }
+
+    #[test]
+    fn overlays_are_bounded() {
+        let ok_list: Vec<String> = (0..256).map(|i| format!("r{i}:read")).collect();
+        let o = json!({"deny": ok_list});
+        assert!(parse_overlay(Some(&o)).unwrap().is_some());
+        let long: Vec<String> = (0..257).map(|i| format!("r{i}:read")).collect();
+        assert!(parse_overlay(Some(&json!({"deny": long}))).is_err());
+        let big = "x".repeat(257);
+        assert!(parse_overlay(Some(&json!({"ask": [big]}))).is_err());
+        assert!(parse_overlay(Some(&json!({"ask": ["x".repeat(256)]}))).is_ok());
+        // api.call refuses the same.
+        let a = json!({"service": "erp", "operation": "x", "overlay": {"deny": long_list(257)}});
+        assert!(parse_call(a.as_object().unwrap()).is_err());
+        // api.list: 64 services at most, each bounded.
+        let m: Map<String, Value> = (0..64).map(|i| (format!("s{i}"), json!({}))).collect();
+        assert_eq!(parse_overlays(Some(&Value::Object(m))).unwrap().len(), 64);
+        let m: Map<String, Value> = (0..65).map(|i| (format!("s{i}"), json!({}))).collect();
+        assert!(parse_overlays(Some(&Value::Object(m))).is_err());
+        assert!(parse_overlays(Some(&json!({"erp": {"deny": long_list(257)}}))).is_err());
+        assert!(parse_overlays(Some(&json!({"Bad Name": {}}))).is_err());
+    }
+
+    fn long_list(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("r{i}:read")).collect()
     }
 
     #[test]

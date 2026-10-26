@@ -1154,11 +1154,14 @@ name = "saiife"
 version = "0.1.1"
 dependencies = [
  "assert_cmd",
+ "base64 0.23.1",
  "clap",
  "dirs",
  "libc",
  "predicates",
+ "rcgen",
  "rustix",
+ "rustls",
  "saiife-agents",
  "saiife-audit",
  "saiife-broker",
