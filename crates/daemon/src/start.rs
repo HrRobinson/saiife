@@ -422,18 +422,35 @@ struct RebuildFailed {
 }
 
 impl RebuildFailed {
+    /// A directory or a month file could not be read: whole stretches of
+    /// the window may be missing, so the limits fail closed. Skipped lines
+    /// alone (a torn line from a crash stays in the log for good) are only
+    /// a warning: failing closed on them would deny every connector call
+    /// for 24 h after each start.
+    fn fatal(&self) -> bool {
+        self.dir_error.is_some() || self.unreadable_files > 0
+    }
+
     /// The `limits_rebuild_failed` record's reason and fields.
     fn note(&self) -> (String, serde_json::Map<String, Value>) {
-        let reason = format!(
-            "the connector limits could not be rebuilt from the audit log ({}{} unreadable file(s), {} skipped line(s)); connector calls are denied with limits_unavailable for 24 h or until a clean start",
-            self.dir_error
-                .as_deref()
-                .map(|e| format!("directory: {e}; "))
-                .unwrap_or_default(),
-            self.unreadable_files,
-            self.skipped_lines
-        );
+        let reason = if self.fatal() {
+            format!(
+                "the connector limits could not be rebuilt from the audit log ({}{} unreadable file(s), {} skipped line(s)); connector calls are denied with limits_unavailable for 24 h or until a clean start",
+                self.dir_error
+                    .as_deref()
+                    .map(|e| format!("directory: {e}; "))
+                    .unwrap_or_default(),
+                self.unreadable_files,
+                self.skipped_lines
+            )
+        } else {
+            format!(
+                "the connector limits were rebuilt from the audit log with {} unreadable line(s) skipped; a call recorded on such a line is not counted (connector calls are not denied)",
+                self.skipped_lines
+            )
+        };
         let mut m = serde_json::Map::new();
+        m.insert("fatal".into(), self.fatal().into());
         m.insert("dir_error".into(), json!(self.dir_error));
         m.insert("unreadable_files".into(), self.unreadable_files.into());
         m.insert("skipped_lines".into(), self.skipped_lines.into());
@@ -443,8 +460,9 @@ impl RebuildFailed {
 
 /// [`rebuild_limiter`] at `now`. A record dated after `now` (a clock that
 /// went back, or an edited log) is dropped: it would hold a slot for longer
-/// than its window. A log that could not be read in full fails closed
-/// ([`Limiter::rebuild_incomplete`]).
+/// than its window. A directory or month file that could not be read fails
+/// closed ([`Limiter::rebuild_incomplete`]); skipped lines are reported but
+/// do not deny ([`RebuildFailed::fatal`]).
 fn rebuild_limiter_at(
     audit_dir: &Path,
     now: time::OffsetDateTime,
@@ -466,7 +484,12 @@ fn rebuild_limiter_at(
         unreadable_files: read.unreadable_files,
         skipped_lines: read.skipped_lines,
     };
-    (Limiter::rebuild_incomplete(events, now), Some(failed))
+    let limiter = if failed.fatal() {
+        Limiter::rebuild_incomplete(events, now)
+    } else {
+        Limiter::rebuild(events, now)
+    };
+    (limiter, Some(failed))
 }
 
 fn files_json(l: &LoadedPolicy) -> Value {
@@ -1014,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_from_an_unreadable_log_fails_closed() {
+    fn rebuild_with_skipped_lines_warns_but_allows() {
         use std::io::Write;
         let d = tempfile::tempdir().unwrap();
         let now = time::OffsetDateTime::now_utc();
@@ -1030,23 +1053,64 @@ mod tests {
             .append(true)
             .open(&month)
             .unwrap();
+        // A torn middle line (a crash mid-write, terminated at the next
+        // open), then a record after it.
         f.write_all(b"{not a record\n").unwrap();
+        drop(f);
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(5)))
+            .unwrap();
         let (lim, failed) = rebuild_limiter_at(d.path(), now);
         let failed = failed.expect("the rebuild must report the skipped line");
         assert_eq!(failed.skipped_lines, 1);
         assert_eq!(failed.unreadable_files, 0);
+        assert!(!failed.fatal());
         let (reason, fields) = failed.note();
-        assert!(reason.contains("limits_unavailable"), "{reason}");
+        assert!(!reason.contains("denied with"), "{reason}");
+        assert_eq!(fields["fatal"], false);
         assert_eq!(fields["skipped_lines"], 1);
-        // Denied for a full window, then known again.
-        assert!(lim.unavailable(now));
-        assert!(lim.unavailable(now + time::Duration::hours(23)));
-        assert!(!lim.unavailable(now + time::Duration::hours(24)));
+        // Not denied, and the readable records still count.
+        assert!(!lim.unavailable(now));
+        assert!(one_per_minute_hit(&lim, now));
+    }
+
+    #[test]
+    fn rebuild_from_an_unreadable_log_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        let month = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .unwrap();
+        // A month file that cannot be opened: the window may hide calls.
+        std::fs::set_permissions(&month, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&month).is_err();
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        std::fs::set_permissions(&month, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // (As root every file opens: nothing to check there.)
+        if unreadable {
+            let failed = failed.expect("the rebuild must report the unreadable file");
+            assert_eq!(failed.unreadable_files, 1);
+            assert!(failed.fatal());
+            let (reason, fields) = failed.note();
+            assert!(reason.contains("limits_unavailable"), "{reason}");
+            assert_eq!(fields["fatal"], true);
+            assert_eq!(fields["unreadable_files"], 1);
+            // Denied for a full window, then known again.
+            assert!(lim.unavailable(now));
+            assert!(lim.unavailable(now + time::Duration::hours(23)));
+            assert!(!lim.unavailable(now + time::Duration::hours(24)));
+        }
         // An audit dir that cannot be listed fails closed too.
         let file = d.path().join("not-a-dir");
         std::fs::write(&file, b"x").unwrap();
         let (lim, failed) = rebuild_limiter_at(&file, now);
-        assert!(failed.unwrap().dir_error.is_some());
+        let failed = failed.unwrap();
+        assert!(failed.dir_error.is_some());
+        assert!(failed.fatal());
         assert!(lim.unavailable(now));
     }
 

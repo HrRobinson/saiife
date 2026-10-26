@@ -560,6 +560,106 @@ fn limit_survives_restart() {
     assert_eq!(w.m.hits().len(), 1);
 }
 
+/// The daemon's `event` records, skipping lines that are not JSON (a torn
+/// line a test planted).
+fn events_lenient(d: &TestDaemon, event: &str) -> Vec<Value> {
+    let mut files: Vec<PathBuf> = fs::read_dir(d.audit_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .flat_map(|f| {
+            fs::read_to_string(f)
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|r| r["kind"] == "daemon" && r["event"] == json!(event))
+        .collect()
+}
+
+/// The newest month file of the audit log.
+fn newest_month(d: &TestDaemon) -> PathBuf {
+    let mut files: Vec<PathBuf> = fs::read_dir(d.audit_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
+    files.sort();
+    files.pop().unwrap()
+}
+
+fn restart(w: &mut World) {
+    signal(&w.d, rustix::process::Signal::TERM);
+    assert!(w.d.wait_exit(Duration::from_secs(10)).is_some());
+    spawn(&mut w.d);
+}
+
+#[test]
+fn torn_audit_line_warns_at_restart_but_calls_go_through() {
+    let mut w = world();
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    signal(&w.d, rustix::process::Signal::TERM);
+    assert!(w.d.wait_exit(Duration::from_secs(10)).is_some());
+    // A crash mid-write: half a line at the end of the month file. The
+    // next open terminates it, so it stays as a middle line for good.
+    let month = newest_month(&w.d);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&month)
+        .unwrap()
+        .write_all(b"{\"kind\":\"connector\",\"ts\":\"20")
+        .unwrap();
+    spawn(&mut w.d);
+    // Twice: every later start sees the same torn line.
+    for start in 1..=2 {
+        let o = api(&w, &["erp", "invoices.list"]);
+        assert_eq!(o.status.code(), Some(0), "start {start}: {}", stderr(&o));
+        let notes = events_lenient(&w.d, "limits_rebuild_failed");
+        assert_eq!(notes.len(), start, "{notes:?}");
+        let n = notes.last().unwrap();
+        assert_eq!(n["fatal"], false, "{n}");
+        assert_eq!(n["skipped_lines"], 1, "{n}");
+        assert_eq!(n["unreadable_files"], 0, "{n}");
+        if start == 1 {
+            restart(&mut w);
+        }
+    }
+    assert_eq!(w.m.hits().len(), 3);
+}
+
+#[test]
+fn unreadable_audit_month_denies_limits_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut w = world();
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    signal(&w.d, rustix::process::Signal::TERM);
+    assert!(w.d.wait_exit(Duration::from_secs(10)).is_some());
+    // An older month file the daemon cannot open: the window may hide
+    // calls in it.
+    let older = w.d.audit_dir().join("2000-01.jsonl");
+    fs::write(&older, b"").unwrap();
+    fs::set_permissions(&older, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&older).is_ok() {
+        // As root every file opens: nothing to check here.
+        return;
+    }
+    spawn(&mut w.d);
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(denied_rule(&o), "limits_unavailable");
+    fs::set_permissions(&older, fs::Permissions::from_mode(0o600)).unwrap();
+    let n = w.d.events("limits_rebuild_failed").pop().unwrap();
+    assert_eq!(n["fatal"], true, "{n}");
+    assert_eq!(n["unreadable_files"], 1, "{n}");
+    assert_eq!(w.m.hits().len(), 1);
+}
+
 #[test]
 fn reload_mid_request_uses_start_snapshot() {
     let mut w = world();
