@@ -488,7 +488,8 @@ fn deny(rule: &'static str, detail: impl Into<String>) -> Deny {
 }
 
 /// `secret.lease {name, exe}`: the value of secret `name` for one command,
-/// only when the caller is in a scope and `exe` is a listed, root-owned,
+/// only when the caller is in a scope, the secret serves one of its
+/// services (`allowed_services`), and `exe` is a listed, root-owned,
 /// non-interpreter executable. Every answer, grant or refusal, is a
 /// `secret` record (`event = "secret_use"`).
 ///
@@ -517,7 +518,7 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     let verdict = match check_lease(ctx, peer.uid, &name, &exe).await {
-        Ok(()) => take_value(ctx, &name).await,
+        Ok(services) => take_value(ctx, &name, services).await,
         Err(d) => Err(d),
     };
     let mut r = use_record(ctx, peer, &name, &exe).await;
@@ -578,8 +579,23 @@ async fn use_record(ctx: &Ctx, peer: &PeerCred, name: &str, exe: &str) -> saiife
     r
 }
 
-/// Scope, then the executable.
-async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<(), Deny> {
+/// The secret serves a service of the caller's scope.
+fn serves_scope(e: &Entry, scope_services: &[String]) -> bool {
+    e.allowed_services
+        .iter()
+        .any(|s| scope_services.iter().any(|x| x == s))
+}
+
+fn out_of_scope() -> Deny {
+    deny(
+        "no_scope",
+        "the secret serves no service of the caller's scope",
+    )
+}
+
+/// Scope (the caller's, and the secret's services within it), then the
+/// executable. Returns the scope's services.
+async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<Vec<String>, Deny> {
     let Some(sys) = ctx.policy().system else {
         return Err(deny("run_not_allowed", "no valid policy is loaded"));
     };
@@ -589,18 +605,25 @@ async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<
     let dir = Arc::clone(&ctx.directory);
     let cfg = Arc::clone(&sys);
     let scope = tokio::task::spawn_blocking(move || {
-        scope_for(&cfg, dir.as_ref(), &user).map(|s| s.map(|s| s.name.clone()))
+        scope_for(&cfg, dir.as_ref(), &user).map(|s| s.map(|s| s.services.clone()))
     })
     .await
     .map_err(|_| deny("run_not_allowed", "scope lookup failed"))?;
-    match scope {
-        Ok(Some(_)) => {}
+    let services = match scope {
+        Ok(Some(services)) => services,
         Ok(None) => return Err(deny("no_scope", "the caller is in no scope")),
         Err(_) => {
             return Err(deny(
                 "scope_conflict",
                 "the caller is in more than one scope",
             ))
+        }
+    };
+    // Memory only. A missing secret or an unavailable vault is refused
+    // when the value is taken.
+    if let VaultState::Ready(v) = &*ctx.vault.lock() {
+        if v.get(name).is_some_and(|e| !serves_scope(e, &services)) {
+            return Err(out_of_scope());
         }
     }
     let allow: Vec<PathBuf> = sys
@@ -611,7 +634,8 @@ async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<
     let exe = PathBuf::from(exe);
     tokio::task::spawn_blocking(move || check_exe(&exe, &allow))
         .await
-        .map_err(|_| deny("run_not_allowed", "executable check failed"))?
+        .map_err(|_| deny("run_not_allowed", "executable check failed"))??;
+    Ok(services)
 }
 
 /// A listed entry must be the canonical file itself: no symlink hop
@@ -663,7 +687,13 @@ fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
 }
 
 /// The value for the answer, and the use noted in the vault.
-async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<(Zeroizing<String>, Kind), Deny> {
+/// The secret must still serve a service of the caller's scope (checked
+/// again here, under the same lock that reads the value).
+async fn take_value(
+    ctx: &Arc<Ctx>,
+    name: &str,
+    scope_services: Vec<String>,
+) -> Result<(Zeroizing<String>, Kind), Deny> {
     let c = Arc::clone(ctx);
     let n = name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -677,6 +707,9 @@ async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<(Zeroizing<String>, Ki
         let Some(e) = vault.get(&n) else {
             return Err(deny("unknown_secret", "no such secret"));
         };
+        if !serves_scope(e, &scope_services) {
+            return Err(out_of_scope());
+        }
         let field = |k: &str| e.fields.get(k).map(|v| v.as_str()).unwrap_or("");
         let value = match e.kind {
             Kind::Token => Zeroizing::new(field("token").to_string()),

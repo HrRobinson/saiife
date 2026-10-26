@@ -77,7 +77,7 @@ fn config_extra(run_allow: &[&Path], scoped: bool) -> String {
     ) + &format!("\n[secrets.tok2]\nrun_allow = [{}]\n", list.join(", "));
     if scoped {
         s.push_str(&format!(
-            "\n[[scope]]\nname = \"t\"\nusers = [{:?}]\n",
+            "\n[[scope]]\nname = \"t\"\nusers = [{:?}]\nservices = [\"s\"]\n",
             own_user()
         ));
     }
@@ -95,10 +95,14 @@ fn start(run_allow: &[&Path], scoped: bool) -> TestDaemon {
 }
 
 fn secret_add(d: &TestDaemon, name: &str, value: &str) -> Output {
+    secret_add_for(d, name, value, "s")
+}
+
+fn secret_add_for(d: &TestDaemon, name: &str, value: &str, service: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["secret", "--system-config"])
         .arg(d.config())
-        .args(["add", name, "--kind", "token", "--service", "s"])
+        .args(["add", name, "--kind", "token", "--service", service])
         .args(["--from-env", "SV"])
         .env("SV", value)
         .env("HOME", d.path().join("home"))
@@ -390,6 +394,26 @@ fn two_secrets_two_records_both_masked() {
         ));
     }
     assert!(!hay.contains(v2));
+}
+
+#[test]
+fn secret_for_a_service_outside_the_scope_refused() {
+    let bin = need!(root_owned_bin());
+    let dir = bin.parent().unwrap().display().to_string();
+    // The caller's scope serves `s`; `tok2` is only for `elsewhere`.
+    let d = start(&[&bin], true);
+    let o = secret_add_for(&d, "tok2", VALUE, "elsewhere");
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let name = bin.file_name().unwrap().to_str().unwrap();
+    let o = run(&d, &dir, &["--secret", "tok2:TOK", "--", name, "TOK"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("no_scope"), "{}", err(&o));
+    let u = uses(&d);
+    assert_eq!(u.len(), 1, "{u:?}");
+    assert_eq!(u[0]["decision"], "deny");
+    assert_eq!(u[0]["rule"], "no_scope");
+    assert_eq!(u[0]["name"], "tok2");
+    assert_no_leak(&d, &[&o]);
 }
 
 #[test]
