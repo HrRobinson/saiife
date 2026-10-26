@@ -531,6 +531,12 @@ pub fn finish(
             // the last value, and a client could read the first, so only the
             // checked tree may leave.
             let text = serde_json::to_string(&v).map_err(|_| BrokerError::RedactNonJson)?;
+            // The vault forms once more over exactly the bytes that leave: a
+            // value can form across a key/value boundary or by re-escaping.
+            let text = match String::from_utf8(masker.mask_bytes(text.as_bytes())) {
+                Ok(t) => t,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            };
             // Last pass over the whole text, for v1 patterns that span JSON
             // tokens. It may break the JSON; over-masking is accepted.
             saiife_audit::mask::mask(&text).into_bytes()
@@ -892,6 +898,17 @@ mod tests {
         let body = br#"{"a":"first","a":"second"}"#.to_vec();
         let f = fin(&m, None, body, false).unwrap();
         assert_eq!(&f.body[..], br#"{"a":"second"}"#);
+    }
+
+    #[test]
+    fn vault_value_formed_only_by_reserialization_masked() {
+        // Neither the raw bytes (space before `:`), the key nor the value
+        // holds the secret; the compact serialization `abcd":"wxyz` does.
+        let secret = r#"abcd":"wxyz"#;
+        let m = Masker::new(&[secret]);
+        let body = br#"{"abcd" : "wxyz"}"#.to_vec();
+        let f = fin(&m, Some("application/json"), body, false).unwrap();
+        assert_eq!(&f.body[..], br#"{"[MASKED]"}"#);
     }
 
     #[test]
