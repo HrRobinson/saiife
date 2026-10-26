@@ -32,7 +32,9 @@ impl ParamType {
         match spec {
             "string" => {
                 let pattern = pattern
-                    .map(Regex::new)
+                    // Always anchored: a value like `evil.com#x` must not pass
+                    // `[a-z]+` by matching a part of it.
+                    .map(|p| Regex::new(&format!("^(?:{p})$")))
                     .transpose()
                     .map_err(|e| bad(format!("pattern: {e}")))?;
                 Ok(ParamType::String { pattern })
@@ -196,15 +198,24 @@ fn path_value_problem(v: &str) -> Option<&'static str> {
     }
     let mut cur = v.to_string();
     for _ in 0..5 {
-        if cur.contains(['/', '\\', '\u{2215}', '\u{ff0f}']) {
-            return Some("contains a path separator");
+        if !cur.is_ascii() {
+            return Some("contains a non-ASCII character");
+        }
+        if cur == "." {
+            return Some("is a . segment");
+        }
+        if cur.contains(['/', '\\', '?', '#', ';']) {
+            return Some("contains a path or URL delimiter");
         }
         if cur.contains("..") {
             return Some("contains ..");
         }
         let lower = cur.to_ascii_lowercase();
-        if lower.contains("%2f") || lower.contains("%5c") {
-            return Some("contains an encoded path separator");
+        if ["%2f", "%5c", "%3f", "%23", "%3b"]
+            .iter()
+            .any(|e| lower.contains(e))
+        {
+            return Some("contains an encoded path or URL delimiter");
         }
         let next = percent_decode_str(&cur).decode_utf8_lossy().into_owned();
         if next == cur {
@@ -212,7 +223,7 @@ fn path_value_problem(v: &str) -> Option<&'static str> {
         }
         cur = next;
     }
-    None
+    Some("too deeply percent-encoded")
 }
 
 fn type_of(op: &Operation, name: &str) -> Result<Option<(ParamType, bool)>, BrokerError> {

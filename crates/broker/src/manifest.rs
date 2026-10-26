@@ -59,6 +59,10 @@ pub struct AuthSpec {
     pub kind: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// The vault field holding the credential (`token`, `value`, ...). Not
+    /// used for `basic`, which always uses the fields `username` and
+    /// `password`; it defaults to empty.
+    #[serde(default)]
     pub secret_field: String,
 }
 
@@ -123,35 +127,71 @@ fn bad(m: &str, why: impl std::fmt::Display) -> BrokerError {
     BrokerError::Manifest(format!("{m}: {why}"))
 }
 
-/// The segments of a path template: `Ok` with `(literal or placeholder)`.
-/// A placeholder must fill a whole segment.
+/// One segment of a path template: a literal, or `prefix{name}suffix` with
+/// exactly one placeholder (so `{order_id}.json` works).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Seg<'a> {
     Lit(&'a str),
-    Var(&'a str),
+    Var {
+        prefix: &'a str,
+        name: &'a str,
+        suffix: &'a str,
+    },
+}
+
+fn plain(s: &str) -> bool {
+    !s.contains(['%', '\\', '?', '#', '{', '}'])
 }
 
 pub(crate) fn template_segments(path: &str) -> Result<Vec<Seg<'_>>, String> {
     let rest = path
         .strip_prefix('/')
         .ok_or_else(|| "path must start with /".to_string())?;
-    rest.split('/')
+    let segs = rest
+        .split('/')
         .map(|s| {
             if s.contains(['{', '}']) {
-                let name = s
-                    .strip_prefix('{')
-                    .and_then(|x| x.strip_suffix('}'))
-                    .filter(|n| {
-                        !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                    })
-                    .ok_or_else(|| {
-                        format!("segment {s:?}: a placeholder must be a whole segment {{name}}")
-                    })?;
-                Ok(Seg::Var(name))
-            } else if s == ".." || s == "." || s.contains(['%', '\\', '?', '#']) {
+                let err =
+                    || format!("segment {s:?}: expected prefix{{name}}suffix with one placeholder");
+                let (prefix, tail) = s.split_once('{').ok_or_else(err)?;
+                let (name, suffix) = tail.split_once('}').ok_or_else(err)?;
+                if !plain(prefix)
+                    || !plain(suffix)
+                    || name.is_empty()
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(err());
+                }
+                Ok(Seg::Var {
+                    prefix,
+                    name,
+                    suffix,
+                })
+            } else if s == ".." || s == "." || !plain(s) {
                 Err(format!("segment {s:?} is not allowed"))
             } else {
                 Ok(Seg::Lit(s))
             }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut seen = BTreeSet::new();
+    for s in &segs {
+        if let Seg::Var { name, .. } = s {
+            if !seen.insert(*name) {
+                return Err(format!("placeholder {name} appears twice"));
+            }
+        }
+    }
+    Ok(segs)
+}
+
+/// The template with placeholder names erased: two operations with the same
+/// method and shape would match the same requests.
+fn shape<'a>(segs: &[Seg<'a>]) -> Vec<(bool, &'a str, &'a str)> {
+    segs.iter()
+        .map(|s| match s {
+            Seg::Lit(l) => (false, *l, ""),
+            Seg::Var { prefix, suffix, .. } => (true, *prefix, *suffix),
         })
         .collect()
 }
@@ -196,12 +236,24 @@ impl Manifest {
             if !AUTH_KINDS.contains(&a.kind.as_str()) {
                 return Err(bad(id, format!("auth kind {:?} is not supported", a.kind)));
             }
+            if a.kind != "basic" && a.secret_field.is_empty() {
+                return Err(bad(id, "auth needs a secret_field"));
+            }
             if a.kind == "header" && a.name.as_deref().unwrap_or("").is_empty() {
                 return Err(bad(id, "auth kind header needs a name"));
             }
         }
         let mut seen = BTreeSet::new();
+        let mut shapes = BTreeSet::new();
         for op in &self.operation {
+            if let Ok(segs) = template_segments(&op.path) {
+                if !shapes.insert((op.method.clone(), shape(&segs))) {
+                    return Err(bad(
+                        id,
+                        format!("operation {}: same method and path shape as another", op.id),
+                    ));
+                }
+            }
             if !seen.insert(op.id.as_str()) {
                 return Err(bad(id, format!("duplicate operation {}", op.id)));
             }
@@ -229,7 +281,7 @@ impl Manifest {
         let vars: BTreeSet<&str> = template_segments(&op.path)?
             .into_iter()
             .filter_map(|s| match s {
-                Seg::Var(n) => Some(n),
+                Seg::Var { name, .. } => Some(name),
                 Seg::Lit(_) => None,
             })
             .collect();
@@ -380,12 +432,12 @@ pub fn from_http_service(name: &str, svc: &ServiceCfg) -> Result<Manifest, Broke
         Some(a) => vec![AuthSpec {
             kind: a.kind.clone(),
             name: a.name.clone(),
-            // v2.0 secret shapes: header {value}, bearer {token}, basic
-            // {username, password} (the password is the field named here).
+            // header {value}, bearer {token}; basic uses the vault fields
+            // username and password and no secret_field.
             secret_field: match a.kind.as_str() {
                 "header" => "value",
                 "bearer" => "token",
-                _ => "password",
+                _ => "",
             }
             .to_string(),
         }],
@@ -403,7 +455,7 @@ pub fn from_http_service(name: &str, svc: &ServiceCfg) -> Result<Manifest, Broke
             .map_err(|e| fail(format!("operation {}: {e}", o.id)))?
             .into_iter()
             .filter_map(|s| match s {
-                Seg::Var(n) => Some((n.to_string(), "string".to_string())),
+                Seg::Var { name, .. } => Some((name.to_string(), "string".to_string())),
                 Seg::Lit(_) => None,
             })
             .collect();

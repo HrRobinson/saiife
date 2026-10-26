@@ -104,7 +104,38 @@ fn path_param_double_encoded_slash_rejected() {
     let m = echo();
     let f = map(&[]);
     for bad in [
-        "%252f", "%2F", "%2f", "a/b", "\u{ff0f}", "\u{2215}", "..", "a..b", "", "a\\b", "%255c",
+        "%252f",
+        "%2F",
+        "%2f",
+        "a/b",
+        "\u{ff0f}",
+        "\u{2215}",
+        "..",
+        "a..b",
+        "",
+        "a\\b",
+        "%255c",
+        ".",
+        "%2e",
+        "%252e",
+        "a?b",
+        "a#b",
+        "a;b",
+        "%3f",
+        "%3F",
+        "%23",
+        "%3b",
+        "%3B",
+        "%253f",
+        "%2523",
+        "\u{ff0e}",
+        "\u{2044}",
+        "\u{202e}",
+        "\u{85}",
+        "caf\u{e9}",
+        "%c3%a9",
+        // five rounds of encoding of "A" is still changing after the last round
+        "%2525252541",
     ] {
         let r = validate(op(&m, "files.get"), &map(&[("name", bad)]), &f);
         assert!(matches!(r, Err(BrokerError::BadValue { .. })), "{bad:?}");
