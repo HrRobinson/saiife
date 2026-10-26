@@ -22,8 +22,8 @@ pub fn exponent(currency: &str) -> Option<u32> {
         "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK",
         "NPR", "NZD", "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "QAR", "RON", "RSD", "RUB", "SAR",
         "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP",
-        "SZL", "THB", "TJS", "TMT", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "USD", "USN", "UZS",
-        "VED", "VES", "WST", "XCD", "YER", "ZAR", "ZMW", "ZWG",
+        "SZL", "THB", "TJS", "TMT", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "USD", "USN", "UYU",
+        "UZS", "VED", "VES", "WST", "XCD", "XCG", "YER", "ZAR", "ZMW", "ZWG",
     ];
     const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
     const FOUR: &[&str] = &["CLF", "UYW"];
@@ -140,4 +140,27 @@ pub fn extract(spec: &AmountSpec, body: &Value) -> Result<(u64, String), BrokerE
             .ok_or_else(|| bad("amount out of range"))?;
     }
     Ok((total, currency))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exponent;
+
+    #[test]
+    fn known_exponents() {
+        for (c, e) in [
+            ("UYU", 2),
+            ("XCG", 2),
+            ("ANG", 2),
+            ("USD", 2),
+            ("JPY", 0),
+            ("UYI", 0),
+            ("KWD", 3),
+            ("CLF", 4),
+        ] {
+            assert_eq!(exponent(c), Some(e), "{c}");
+        }
+        assert_eq!(exponent("xcg"), Some(2));
+        assert_eq!(exponent("XAU"), None);
+    }
 }
