@@ -22,10 +22,16 @@ pub enum ParamType {
 }
 
 impl ParamType {
-    /// Parses `string`, `int`, `int:1..250`, `enum:a,b`, `datetime`, `bool`.
+    /// Parses `string`, `string:<regex>`, `int`, `int:1..250`, `enum:a,b`, `datetime`, `bool`.
     /// `pattern` (a regex) is only allowed on `string`.
     pub fn parse(spec: &str, pattern: Option<&str>) -> Result<ParamType, BrokerError> {
         let bad = |why: String| BrokerError::Manifest(format!("param type {spec:?}: {why}"));
+        // `string:<regex>` is the inline form for operation parameters.
+        let (spec, pattern) = match spec.strip_prefix("string:") {
+            Some(re) if pattern.is_none() => ("string", Some(re)),
+            Some(_) => return Err(bad("two patterns".into())),
+            None => (spec, pattern),
+        };
         if pattern.is_some() && spec != "string" {
             return Err(bad("pattern is only allowed on string".into()));
         }

@@ -1,0 +1,32 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/order#get-orders (shape per vendor docs; not fetched)",
+  "_link": "<https://acme.myshopify.com/admin/api/2026-07/orders.json?limit=2&page_info=eyJsYXN0X2lkIjo0NTA3ODk0NjkyfQ>; rel=\"next\"",
+  "orders": [
+    {
+      "id": 450789469,
+      "name": "#1001",
+      "email": "bob.norman@mail.example.com",
+      "created_at": "2026-07-01T10:15:30-04:00",
+      "financial_status": "paid",
+      "fulfillment_status": null,
+      "currency": "EUR",
+      "total_price": "409.94",
+      "customer": { "id": 207119551, "email": "bob.norman@mail.example.com", "phone": "+4512345678" },
+      "line_items": [
+        { "id": 466157049, "title": "IPod Nano - 8gb", "quantity": 1, "price": "199.00" }
+      ]
+    },
+    {
+      "id": 450789470,
+      "name": "#1002",
+      "email": "ann.lee@mail.example.com",
+      "created_at": "2026-07-02T08:00:00-04:00",
+      "financial_status": "pending",
+      "fulfillment_status": null,
+      "currency": "EUR",
+      "total_price": "59.90",
+      "customer": { "id": 207119552, "email": "ann.lee@mail.example.com", "phone": null },
+      "line_items": []
+    }
+  ]
+}

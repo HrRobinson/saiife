@@ -1,0 +1,22 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/pricerule#post-price-rules (shape per vendor docs; not fetched)",
+  "_request": {
+    "price_rule": {
+      "title": "SUMMERSALE10OFF",
+      "target_type": "line_item",
+      "target_selection": "all",
+      "allocation_method": "across",
+      "value_type": "fixed_amount",
+      "value": "-10.0",
+      "customer_selection": "all",
+      "starts_at": "2026-07-01T00:00:00Z"
+    }
+  },
+  "price_rule": {
+    "id": 507328175,
+    "title": "SUMMERSALE10OFF",
+    "value_type": "fixed_amount",
+    "value": "-10.0",
+    "starts_at": "2026-07-01T00:00:00Z"
+  }
+}

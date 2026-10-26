@@ -58,6 +58,12 @@ fn unknown_manifest_key_is_error() {
 fn param_types_table() {
     let t = |s: &str| ParamType::parse(s, None).unwrap();
     let ok = |ty: &str, v: &str| t(ty).check(v).is_ok();
+    // `string:<regex>` for operation params, anchored like service patterns.
+    assert!(ok("string:[a-z]+", "abc"));
+    assert!(!ok("string:[a-z]+", "abc#x"));
+    assert!(!ok("string:[a-z]+", "1abc"));
+    assert!(ParamType::parse("string:(", None).is_err());
+    assert!(ParamType::parse("string:a", Some("b")).is_err());
     assert!(ok("int:1..250", "1"));
     assert!(ok("int:1..250", "250"));
     assert!(!ok("int:1..250", "0"));

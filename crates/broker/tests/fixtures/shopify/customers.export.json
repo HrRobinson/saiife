@@ -1,0 +1,8 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/customer#get-customers-search (shape per vendor docs; not fetched)",
+  "_link": "<https://acme.myshopify.com/admin/api/2026-07/customers/search.json?limit=250&page_info=eyJsYXN0X2lkIjoyMDcxMTk1NTJ9>; rel=\"next\"",
+  "customers": [
+    { "id": 207119551, "email": "bob.norman@mail.example.com", "first_name": "Bob", "last_name": "Norman", "phone": "+4512345678" },
+    { "id": 207119552, "email": "ann.lee@mail.example.com", "first_name": "Ann", "last_name": "Lee", "phone": null }
+  ]
+}
