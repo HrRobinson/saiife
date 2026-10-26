@@ -10,6 +10,7 @@
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
+//! - `saiife secret add|list|rotate|remove` -> the vault, through the daemon (Linux, admin)
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
@@ -33,6 +34,7 @@ mod paths;
 mod project;
 mod report;
 mod report_html;
+mod secret_cmd;
 mod status_cmd;
 mod system_cmd;
 mod system_view;
@@ -180,6 +182,15 @@ enum Cmd {
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
+    /// Locked mode (Linux, admin): add, list, rotate or remove the
+    /// secrets in the daemon's vault. Values never leave the daemon.
+    Secret {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: secret_cmd::SecretAction,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -230,6 +241,13 @@ fn main() -> ExitCode {
     {
         return cmd_daemon(system, user, config, state_dir, credentials_dir);
     }
+    if let Cmd::Secret {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return secret_cmd::run(system_config, action);
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -275,6 +293,7 @@ fn main() -> ExitCode {
         | Cmd::Eval
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
+        | Cmd::Secret { .. }
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }

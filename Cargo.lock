@@ -799,6 +799,7 @@ dependencies = [
  "tempfile",
  "time",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

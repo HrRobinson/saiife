@@ -28,7 +28,9 @@ dirs = "5"
 
 [target.'cfg(unix)'.dependencies]
 # Signals for the worker fault seam (debug builds); no unsafe calls.
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "termios"] }
+# Secret values `saiife secret` reads are wiped when dropped.
+zeroize = "=1.9.1"
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 

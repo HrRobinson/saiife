@@ -7,7 +7,8 @@ use crate::vault::VaultState;
 use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
-    err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_STATUS, PROTO,
+    err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD,
+    OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -78,6 +79,8 @@ pub struct Ctx {
     pub proc: Box<dyn Proc + Send + Sync>,
     /// The credential vault (plan 10); `Unavailable` keeps the daemon up.
     pub vault: Mutex<VaultState>,
+    /// Where `vault.bin` lives (named in the `VaultUnavailable` message).
+    pub vault_path: PathBuf,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -97,6 +100,7 @@ pub struct CtxInit {
     pub policy: PolicyState,
     pub proc: Box<dyn Proc + Send + Sync>,
     pub vault: VaultState,
+    pub vault_path: PathBuf,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -123,6 +127,7 @@ impl Ctx {
             sessions: Sessions::new(),
             proc: i.proc,
             vault: Mutex::new(i.vault),
+            vault_path: i.vault_path,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -317,6 +322,9 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         OP_AUDIT_APPEND => append(ctx, peer, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
+        OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
+            crate::secret_ops::handle(ctx, peer, req).await
+        }
         other => err(
             req.id,
             ErrorCode::UnknownOp,

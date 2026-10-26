@@ -8,6 +8,10 @@ pub const OP_HELLO: &str = "hello";
 pub const OP_AUDIT_APPEND: &str = "audit.append";
 pub const OP_STATUS: &str = "status";
 pub const OP_AUDIT_ROTATE_KEY: &str = "audit.rotate_key";
+pub const OP_SECRET_ADD: &str = "secret.add";
+pub const OP_SECRET_ROTATE: &str = "secret.rotate";
+pub const OP_SECRET_REMOVE: &str = "secret.remove";
+pub const OP_SECRET_LIST: &str = "secret.list";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
@@ -61,6 +65,8 @@ pub enum ErrorCode {
     LowDisk,
     Unavailable,
     Internal,
+    /// The credential vault cannot be read.
+    VaultUnavailable,
 }
 
 impl ErrorCode {
@@ -75,6 +81,7 @@ impl ErrorCode {
             ErrorCode::LowDisk => "low_disk",
             ErrorCode::Unavailable => "unavailable",
             ErrorCode::Internal => "internal",
+            ErrorCode::VaultUnavailable => "vault_unavailable",
         }
     }
 }
@@ -138,6 +145,11 @@ mod tests {
             "low_disk"
         );
         assert_eq!(ErrorCode::LowDisk.as_str(), "low_disk");
+        assert_eq!(
+            serde_json::to_value(ErrorCode::VaultUnavailable).unwrap(),
+            "vault_unavailable"
+        );
+        assert_eq!(ErrorCode::VaultUnavailable.as_str(), "vault_unavailable");
     }
 
     #[test]

@@ -201,11 +201,9 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 
     // The vault: an unavailable one never stops the daemon (fail closed
     // for connectors, audit keeps working).
+    let vault_path = opts.state_dir.join("vault").join("vault.bin");
     let vault = match &opts.credentials_dir {
-        Some(d) => vault::open(
-            &d.join("vault-key"),
-            &opts.state_dir.join("vault").join("vault.bin"),
-        ),
+        Some(d) => vault::open(&d.join("vault-key"), &vault_path),
         None => VaultState::Unavailable("no vault key".into()),
     };
 
@@ -223,6 +221,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         policy,
         proc: Box::new(crate::sessions::RealProc::new("/proc")),
         vault,
+        vault_path,
     }));
 
     let rt = tokio::runtime::Builder::new_current_thread()

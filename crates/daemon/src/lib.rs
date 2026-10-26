@@ -13,6 +13,8 @@ pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
+pub mod secret_ops;
+#[cfg(target_os = "linux")]
 pub mod server;
 #[cfg(target_os = "linux")]
 pub mod sessions;
