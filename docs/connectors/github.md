@@ -37,8 +37,13 @@ scopes a write to one organization.
 | `pulls.get`      | `GET /repos/{owner}/{repo}/pulls/{pull_number}`     | `pulls:read`   | |
 | `pulls.create`   | `POST /repos/{owner}/{repo}/pulls`                  | `pulls:write`  | JSON body |
 
-No operation has an `amount`. Note that GitHub's issues endpoint also lists
-pull requests, so `issues:read` can see them.
+No operation has an `amount`.
+
+**Pull requests are also issues.** GitHub models a pull request as an issue,
+so the `issues.*` operations also list, read, comment on and
+change pull requests. A `pulls:*` deny does not cover them. When
+pull requests must be untouchable, deny `issues:write` as well (and
+`issues:read` if they must not even be read), not only `pulls:write`.
 
 `owner` and `repo` are single path segments: a value with `/`, `..` or a
 backslash is refused. Pagination: `issues.list` and `pulls.list` return

@@ -202,20 +202,24 @@ fn bad_path_params_are_refused() {
         ("issue_number", "x")
     ]));
     assert!(no(&[("owner", "acme"), ("repo", "web")]));
-    // `/` in a segment is refused when the request is built.
-    let params = validate(
-        op,
-        &map(&[
-            ("owner", "acme/evil"),
-            ("repo", "web"),
-            ("issue_number", "1"),
-        ]),
-        &BTreeMap::new(),
-    );
-    if let Ok(p) = params {
-        let auth = AuthMaterial::none();
-        assert!(build(&m, op, &BTreeMap::new(), &p, &[], None, &auth).is_err());
+    for bad in ["acme/evil", "..", "%2e%2e", "%2F", "%2f", "a\\b", ""] {
+        assert!(
+            no(&[("owner", bad), ("repo", "web"), ("issue_number", "1")]),
+            "owner {bad:?}"
+        );
+        assert!(
+            no(&[("owner", "acme"), ("repo", bad), ("issue_number", "1")]),
+            "repo {bad:?}"
+        );
     }
+}
+
+#[test]
+fn qualifier_with_unknown_placeholder_is_refused() {
+    let bad = GITHUB.replacen("repo={owner}/{repo}", "repo={owner}/{nope}", 1);
+    assert!(Manifest::parse(&bad).is_err());
+    let unclosed = GITHUB.replacen("repo={owner}/{repo}", "repo={owner}/{repo", 1);
+    assert!(Manifest::parse(&unclosed).is_err());
 }
 
 #[test]
@@ -340,6 +344,12 @@ fn qualifier_policy() {
     );
     assert_eq!(verdict(&s, "issues.create", &REPO), Verdict::Allow);
     let secret = [("owner", "acme"), ("repo", "secret")];
+    let s2 = svc("connector = \"github\"\nallow = [\"issues:write:repo=acme/*\"]\ndeny = [\"issues:write:repo=acme/secret\"]\n");
+    let upper_secret = [("owner", "ACME"), ("repo", "secret")];
+    assert!(matches!(
+        verdict(&s2, "issues.create", &upper_secret),
+        Verdict::Deny { ref rule } if rule.starts_with("deny:")
+    ));
     assert!(matches!(
         verdict(&s, "issues.create", &secret),
         Verdict::Deny { ref rule } if rule.starts_with("deny:")

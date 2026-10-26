@@ -292,6 +292,16 @@ impl Manifest {
         if op.query.keys().any(|k| declared.contains(k.as_str())) {
             return Err("a name is both a path and a query parameter".into());
         }
+        if let Some(q) = op.qualifier.as_deref() {
+            let vars = braces(q).map_err(|e| format!("qualifier: {e}"))?;
+            for v in vars {
+                if !declared.contains(v) && !op.query.contains_key(v) {
+                    return Err(format!(
+                        "qualifier uses {v}, which is not a path or query param of the operation"
+                    ));
+                }
+            }
+        }
         for t in op.path_params.values().chain(op.query.values()) {
             ParamType::parse(t, None).map_err(|e| e.to_string())?;
         }
