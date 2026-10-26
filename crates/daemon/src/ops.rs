@@ -391,7 +391,28 @@ pub enum Notice {
     Connections,
     /// The audit volume is below `[audit] min_free_mb`.
     LowDisk,
+    /// The HTTP gateway refused a request before the pipeline (no
+    /// `connector` record is written for it).
+    Gateway(GatewayRefusal),
 }
+
+/// Why the HTTP gateway refused a request before the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GatewayRefusal {
+    /// 400 (or 408): a request that cannot be read as a call.
+    BadRequest,
+    /// 413: a body over 1 MiB.
+    TooLarge,
+    /// 401: no valid bearer token on the TCP listener.
+    Token,
+    /// 403: a browser-like request on the TCP listener.
+    Origin,
+    /// 405: the wrong method for the route.
+    Method,
+}
+
+/// The uid of a [`Notice`] about a TCP client that showed no valid token.
+pub const UNKNOWN_UID: u32 = u32::MAX;
 
 impl Notice {
     /// The record's `event`.
@@ -399,6 +420,7 @@ impl Notice {
         match self {
             Notice::Requests | Notice::Connections => "rate_limited",
             Notice::LowDisk => "low_disk",
+            Notice::Gateway(_) => "gateway_refused",
         }
     }
 
@@ -412,6 +434,21 @@ impl Notice {
                 "uid {uid} is over its connection limits (32 open per uid, or the daemon's total)"
             ),
             Notice::LowDisk => format!("uid {uid}: audit volume below [audit] min_free_mb"),
+            Notice::Gateway(r) => {
+                let who = if uid == UNKNOWN_UID {
+                    "a TCP client without a valid token".to_string()
+                } else {
+                    format!("uid {uid}")
+                };
+                let what = match r {
+                    GatewayRefusal::BadRequest => "a request that could not be read (400)",
+                    GatewayRefusal::TooLarge => "a request body over 1 MiB (413)",
+                    GatewayRefusal::Token => "a missing, expired or unknown token (401)",
+                    GatewayRefusal::Origin => "a browser-like request (403 origin)",
+                    GatewayRefusal::Method => "a method the route does not take (405)",
+                };
+                format!("the HTTP gateway refused {what} from {who}; at most one record a minute")
+            }
         }
     }
 }

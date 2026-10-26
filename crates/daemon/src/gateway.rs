@@ -16,7 +16,7 @@
 
 use crate::api_ops::{self, Caller, Refused};
 use crate::limits::ConnSlot;
-use crate::ops::{Ctx, Notice};
+use crate::ops::{Ctx, GatewayRefusal, Notice, UNKNOWN_UID};
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{
@@ -547,10 +547,12 @@ async fn admit_inner(
         Source::Unix(peer) => Caller::Unix(peer),
         Source::Tcp(conn) => {
             if browser_like(req.headers(), conn.port) {
+                ctx.notice(UNKNOWN_UID, Notice::Gateway(GatewayRefusal::Origin));
                 return json_resp(StatusCode::FORBIDDEN, json!({"error": "origin"}));
             }
             let uid = bearer(req.headers()).and_then(|t| ctx.tokens.verify(&t));
             let Some(uid) = uid else {
+                ctx.notice(UNKNOWN_UID, Notice::Gateway(GatewayRefusal::Token));
                 return unauthorized();
             };
             let Ok(main) = Arc::clone(&conn.main).try_acquire_owned() else {
@@ -603,28 +605,41 @@ async fn route(
     raw: Option<String>,
     opts: Opts,
 ) -> Resp {
+    let uid = caller.uid();
     match classify(req.method(), req.uri(), raw.as_deref()) {
-        Target::BadRequest(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
+        Target::BadRequest(m) => refused(
+            ctx,
+            uid,
+            GatewayRefusal::BadRequest,
+            error(StatusCode::BAD_REQUEST, "bad_request", m),
+        ),
         Target::Services => {
-            let services = api_ops::services_for(ctx, caller.uid(), &BTreeMap::new()).await;
+            let services = api_ops::services_for(ctx, uid, &BTreeMap::new()).await;
             json_resp(StatusCode::OK, json!({"services": services}))
         }
-        Target::MethodNotAllowed(allow) => method_not_allowed(allow),
+        Target::MethodNotAllowed(allow) => {
+            refused(ctx, uid, GatewayRefusal::Method, method_not_allowed(allow))
+        }
         Target::Api { service, op } => {
             let body = match read_body(req, opts).await {
                 Ok((_, b)) => b,
-                Err(r) => return *r,
+                Err(r) => return body_refused(ctx, uid, *r),
             };
             match api_args(&service, &op, &body) {
                 Ok(args) => call(ctx, caller, args, Route::Api).await,
-                Err(m) => error(StatusCode::BAD_REQUEST, "bad_request", m),
+                Err(m) => refused(
+                    ctx,
+                    uid,
+                    GatewayRefusal::BadRequest,
+                    error(StatusCode::BAD_REQUEST, "bad_request", m),
+                ),
             }
         }
         Target::Proxy { service, upstream } => {
             let method = req.method().as_str().to_string();
             let (parts, body) = match read_body(req, opts).await {
                 Ok(x) => x,
-                Err(r) => return *r,
+                Err(r) => return body_refused(ctx, uid, *r),
             };
             let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
             call(ctx, caller, args, Route::Proxy).await
@@ -635,6 +650,23 @@ async fn route(
         ),
         Target::NotFound => not_found(),
     }
+}
+
+/// `r`, a refusal before the pipeline: no `connector` record, only a
+/// `gateway_refused` notice (at most one per uid and kind a minute).
+fn refused(ctx: &Ctx, uid: u32, why: GatewayRefusal, r: Resp) -> Resp {
+    ctx.notice(uid, Notice::Gateway(why));
+    r
+}
+
+/// [`refused`] for a body [`read_body`] would not take.
+fn body_refused(ctx: &Ctx, uid: u32, r: Resp) -> Resp {
+    let why = if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        GatewayRefusal::TooLarge
+    } else {
+        GatewayRefusal::BadRequest
+    };
+    refused(ctx, uid, why, r)
 }
 
 /// Where a request goes, decided from its method and target alone (no IO).
@@ -869,7 +901,14 @@ fn proxy_args(
 async fn call(ctx: &Arc<Ctx>, caller: &Caller, args: Map<String, Value>, route: Route) -> Resp {
     let (_, _, mut call) = match api_ops::parse_call(&args) {
         Ok(x) => x,
-        Err(m) => return error(StatusCode::BAD_REQUEST, "bad_request", m),
+        Err(m) => {
+            return refused(
+                ctx,
+                caller.uid(),
+                GatewayRefusal::BadRequest,
+                error(StatusCode::BAD_REQUEST, "bad_request", m),
+            )
+        }
     };
     call.via = Via::Http;
     // A task of its own: hyper drops this future when the client goes away,

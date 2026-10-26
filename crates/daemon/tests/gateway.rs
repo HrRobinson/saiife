@@ -1065,6 +1065,41 @@ async fn client_gone_mid_call_still_records_and_counts() {
 }
 
 #[tokio::test]
+async fn pre_pipeline_refusals_leave_one_notice_per_kind_a_minute() {
+    let w = world().await;
+    let refusals = |w: &World| -> Vec<Value> {
+        w.audit_text()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == "gateway_refused")
+            .collect()
+    };
+    for _ in 0..3 {
+        let (st, _, _) = w.send("GET", "/v1/api/shop/orders.list", &[], b"").await;
+        assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+        let (st, _, _) = w.send("POST", "/v1/api/shop/orders.list", &[], b"[]").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _, _) = w.send_tcp("GET", "/v1/services", &[], b"").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    // Method, bad request (this uid) and token (an unknown TCP client).
+    assert!(wait_until(Duration::from_secs(10), || refusals(&w).len() >= 3).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let r = refusals(&w);
+    assert_eq!(r.len(), 3, "{r:?}");
+    let reasons: Vec<&str> = r.iter().map(|v| v["reason"].as_str().unwrap()).collect();
+    assert!(reasons.iter().any(|s| s.contains("(405)")), "{reasons:?}");
+    assert!(reasons.iter().any(|s| s.contains("(400)")), "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|s| s.contains("(401)") && s.contains("without a valid token")),
+        "{reasons:?}"
+    );
+    assert!(w.connector_records().is_empty());
+}
+
+#[tokio::test]
 async fn api_token_withheld_without_its_record_or_below_the_disk_floor() {
     let w = world().await;
     let me = rustix::process::getuid().as_raw();
