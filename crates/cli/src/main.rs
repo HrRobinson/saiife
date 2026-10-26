@@ -26,6 +26,7 @@ mod out;
 mod audit_cmd;
 mod check;
 mod check_managed;
+mod connect_cmd;
 mod doctor_cmd;
 mod eval;
 mod init_cmd;
@@ -192,6 +193,10 @@ enum Cmd {
         #[command(subcommand)]
         action: secret_cmd::SecretAction,
     },
+    /// Locked mode (Linux, admin): set up a connector service. Stores its
+    /// secret and writes policy.d/<service>.toml with every operation
+    /// commented out (deny-all until you edit it).
+    Connect(connect_cmd::ConnectArgs),
     /// Locked mode (Linux): run one allowed, root-owned command with a
     /// secret in its environment; its output is masked.
     ///
@@ -269,6 +274,9 @@ fn main() -> ExitCode {
     {
         return secret_cmd::run(system_config, action);
     }
+    if let Cmd::Connect(args) = cli.command {
+        return connect_cmd::run(args);
+    }
     if let Cmd::Run {
         system_config,
         secrets,
@@ -327,6 +335,7 @@ fn main() -> ExitCode {
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }
+        | Cmd::Connect(..)
         | Cmd::Run { .. }
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")

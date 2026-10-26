@@ -92,13 +92,13 @@ pub(crate) mod linux {
 
     type Fields = BTreeMap<&'static str, Zeroizing<String>>;
 
-    enum Source {
+    pub(crate) enum Source {
         File(PathBuf),
         Env(String),
         Terminal,
     }
 
-    fn source(file: Option<PathBuf>, env: Option<String>) -> Source {
+    pub(crate) fn source(file: Option<PathBuf>, env: Option<String>) -> Source {
         match (file, env) {
             (Some(f), _) => Source::File(f),
             (None, Some(v)) => Source::Env(v),
@@ -149,18 +149,7 @@ pub(crate) mod linux {
                 from_file,
                 from_env,
             } => {
-                check_kind(&kind)?;
-                let fields = gather(&kind, source(from_file, from_env))?;
-                call(
-                    config,
-                    "secret.add",
-                    args([
-                        ("name", json!(name)),
-                        ("kind", json!(kind)),
-                        ("fields", fields_json(&fields)),
-                        ("allowed_services", json!(services)),
-                    ]),
-                )?;
+                add_secret(config, &name, &kind, &services, source(from_file, from_env))?;
                 outln!("added {name}");
                 Ok(())
             }
@@ -196,6 +185,30 @@ pub(crate) mod linux {
                 Ok(())
             }
         }
+    }
+
+    /// The Task 5 add flow: check the kind, read the value (file, variable or
+    /// terminal) and send `secret.add`. Shared with `saiife connect`.
+    pub(crate) fn add_secret(
+        config: &Path,
+        name: &str,
+        kind: &str,
+        services: &[String],
+        src: Source,
+    ) -> Result<(), Stop> {
+        check_kind(kind)?;
+        let fields = gather(kind, src)?;
+        call(
+            config,
+            "secret.add",
+            args([
+                ("name", json!(name)),
+                ("kind", json!(kind)),
+                ("fields", fields_json(&fields)),
+                ("allowed_services", json!(services)),
+            ]),
+        )?;
+        Ok(())
     }
 
     fn args<const N: usize>(kv: [(&str, Value); N]) -> Map<String, Value> {
