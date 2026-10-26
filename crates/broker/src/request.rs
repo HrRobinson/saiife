@@ -276,14 +276,20 @@ pub fn build(
         url.push('/');
         match seg {
             Seg::Lit(s) => url.push_str(s),
-            Seg::Var(name) => {
+            Seg::Var {
+                prefix,
+                name,
+                suffix,
+            } => {
                 let v = params
                     .get(name)
                     .ok_or_else(|| BrokerError::MissingParam(name.to_string()))?;
                 if v.is_empty() || v == "." || v == ".." || v.contains(['/', '\\']) {
                     return Err(bad_value(name, "not a single path segment"));
                 }
+                url.push_str(prefix);
                 url.extend(utf8_percent_encode(v, COMPONENT));
+                url.push_str(suffix);
             }
         }
     }
@@ -563,6 +569,24 @@ body = "json"
             render(&b),
             golden("build_path_param_encoded.http", "shpat_SECRET123")
         );
+    }
+
+    #[test]
+    fn path_segment_with_prefix_and_suffix() {
+        let mut m = shopify();
+        m.operation[1].path = "/orders/v{order_id}.json".into();
+        let op = &m.operation[1];
+        let b = build(
+            &m,
+            op,
+            &map(&[("shop", "acme")]),
+            &map(&[("order_id", "12 34")]),
+            &[],
+            None,
+            &shop_auth(&m),
+        )
+        .unwrap();
+        assert_eq!(b.uri.path(), "/admin/api/2026-07/orders/v12%2034.json");
     }
 
     #[test]
