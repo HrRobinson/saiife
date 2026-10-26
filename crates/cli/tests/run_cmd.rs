@@ -44,6 +44,15 @@ fn other_root_bin(not: &Path) -> Option<PathBuf> {
     None
 }
 
+/// A scratch dir outside /tmp: `SAIIFE_TEST_TMP`, else cargo's target tmp.
+fn scratch() -> tempfile::TempDir {
+    let base = std::env::var_os("SAIIFE_TEST_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(base).unwrap()
+}
+
 macro_rules! need {
     ($e:expr) => {
         match $e {
@@ -65,7 +74,7 @@ fn config_extra(run_allow: &[&Path], scoped: bool) -> String {
         "[admin]\ngroups = [{:?}]\n\n[secrets.tok]\nrun_allow = [{}]\n",
         own_group(),
         list.join(", ")
-    );
+    ) + &format!("\n[secrets.tok2]\nrun_allow = [{}]\n", list.join(", "));
     if scoped {
         s.push_str(&format!(
             "\n[[scope]]\nname = \"t\"\nusers = [{:?}]\n",
@@ -80,18 +89,18 @@ fn start(run_allow: &[&Path], scoped: bool) -> TestDaemon {
         extra: config_extra(run_allow, scoped),
         ..Opts::default()
     });
-    let o = secret_add(&d);
+    let o = secret_add(&d, "tok", VALUE);
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     d
 }
 
-fn secret_add(d: &TestDaemon) -> Output {
+fn secret_add(d: &TestDaemon, name: &str, value: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["secret", "--system-config"])
         .arg(d.config())
-        .args(["add", "tok", "--kind", "token", "--service", "s"])
+        .args(["add", name, "--kind", "token", "--service", "s"])
         .args(["--from-env", "SV"])
-        .env("SV", VALUE)
+        .env("SV", value)
         .env("HOME", d.path().join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("SAIIFE_DATA_DIR", d.path().join("data"))
@@ -257,7 +266,7 @@ fn canonical_interpreter_behind_a_symlink_is_refused() {
         eprintln!("skipped: the shell is not root-owned here");
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let link = tmp.path().join("purpose-built");
     std::os::unix::fs::symlink(&sh, &link).unwrap();
     let d = start(&[&link], true);
@@ -272,7 +281,7 @@ fn canonical_interpreter_behind_a_symlink_is_refused() {
 #[test]
 fn user_owned_binary_refused() {
     let bin = need!(root_owned_bin());
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = scratch();
     let copy = fs::canonicalize(tmp.path())
         .unwrap()
         .join(bin.file_name().unwrap());
@@ -287,7 +296,100 @@ fn user_owned_binary_refused() {
     assert_eq!(u.len(), 1, "{u:?}");
     assert_eq!(u[0]["decision"], "deny");
     assert_eq!(u[0]["rule"], "run_not_allowed");
+    // It reached the owner check (not only a mode check on a shared dir).
+    let why = u[0]["reason"].as_str().unwrap();
+    assert!(why.contains("owned by uid"), "{why}");
     assert_no_leak(&d, &[&o]);
+}
+
+#[test]
+fn symlinked_run_allow_entry_is_denied() {
+    let bin = need!(root_owned_bin());
+    let tmp = scratch();
+    let link = fs::canonicalize(tmp.path()).unwrap().join("pe");
+    std::os::unix::fs::symlink(&bin, &link).unwrap();
+    // The link is listed; the client resolves to the real file.
+    let d = start(&[&link], true);
+    let dir = bin.parent().unwrap().display().to_string();
+    let name = bin.file_name().unwrap().to_str().unwrap();
+    let o = run(&d, &dir, &["--secret", "tok", "--", name, "TOK"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    let u = uses(&d);
+    assert_eq!(u[0]["decision"], "deny");
+    assert_eq!(u[0]["rule"], "run_not_allowed");
+    assert_no_leak(&d, &[&o]);
+}
+
+#[test]
+fn loader_variables_are_removed_from_the_child() {
+    let bin = need!(root_owned_bin());
+    if bin.file_name().unwrap() != "printenv" {
+        eprintln!("skipped: printenv is not root-owned here");
+        return;
+    }
+    let dir = bin.parent().unwrap().display().to_string();
+    let d = start(&[&bin], true);
+    for (var, keep) in [
+        ("LD_PRELOAD", false),
+        ("LD_LIBRARY_PATH", false),
+        ("GCONV_PATH", false),
+        ("MALLOC_PERTURB_", false),
+        ("SAIIFE_KEEP_ME", true),
+    ] {
+        let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .arg("run")
+            .arg("--system-config")
+            .arg(d.config())
+            .args(["--secret", "tok", "--", "printenv", var])
+            .env("PATH", &dir)
+            .env("HOME", d.path().join("home"))
+            .env("SAIIFE_DATA_DIR", d.path().join("data"))
+            .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+            .env(var, "/nonexistent/x")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        if keep {
+            assert_eq!(out(&o), "/nonexistent/x\n", "{var}");
+        } else {
+            assert_eq!(o.status.code(), Some(1), "{var} reached the child");
+        }
+    }
+}
+
+#[test]
+fn two_secrets_two_records_both_masked() {
+    let bin = need!(root_owned_bin());
+    if bin.file_name().unwrap() != "printenv" {
+        eprintln!("skipped: printenv is not root-owned here");
+        return;
+    }
+    let dir = bin.parent().unwrap().display().to_string();
+    let d = start(&[&bin], true);
+    let v2 = "Zq9-second-secret-VALUE-2";
+    let o = secret_add(&d, "tok2", v2);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let o = run(
+        &d,
+        &dir,
+        &[
+            "--secret", "tok:ONE", "--secret", "tok2:TWO", "--", "printenv", "ONE", "TWO",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "[MASKED]\n[MASKED]\n");
+    let u = uses(&d);
+    assert_eq!(u.len(), 2, "{u:?}");
+    let names: Vec<&str> = u.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["tok", "tok2"]);
+    assert_no_leak(&d, &[&o]);
+    let mut hay = String::new();
+    for e in fs::read_dir(d.audit_dir()).unwrap() {
+        hay.push_str(&String::from_utf8_lossy(
+            &fs::read(e.unwrap().path()).unwrap(),
+        ));
+    }
+    assert!(!hay.contains(v2));
 }
 
 #[test]

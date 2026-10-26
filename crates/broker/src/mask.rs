@@ -100,7 +100,11 @@ impl Masker {
         forms.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
         forms.dedup_by(|a, b| a.as_slice() == b.as_slice());
         forms.retain(|f| !f.is_empty());
-        max_span = forms.iter().map(|f| f.len()).fold(max_span, usize::max);
+        // A JSON `\u00XX` escape makes one form byte up to 6 input bytes.
+        max_span = forms
+            .iter()
+            .map(|f| f.len().saturating_mul(6))
+            .fold(max_span, usize::max);
         let ac = if forms.is_empty() {
             None
         } else {

@@ -10,6 +10,10 @@
 //! why the daemon lists the executables (`run_allow`) and why that list
 //! should hold purpose-built, argument-constrained programs only. Prefer a
 //! connector wherever one exists.
+//!
+//! Trust boundary: any process of the agent's uid can lease a listed secret
+//! straight from the daemon. The executable check binds only this honest
+//! client. The boundary is the uid plus its scope.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,6 +38,7 @@ pub fn run(args: RunArgs) -> ExitCode {
     linux::run(args)
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// `NAME` or `NAME:ENV_VAR` into the name and the variable. The default
 /// variable is the name upper-cased with `-` and `.` turned into `_`.
 pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
@@ -57,6 +62,7 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), env))
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Copy `r` to `w`, replacing every form of a masked value with
 /// `[MASKED]`. The bytes held back between reads (`max_span - 1`) make a
 /// value split across two reads masked whole. A write error stops the
@@ -90,9 +96,51 @@ pub(crate) fn pump(
     emit(&out, &mut w, &mut writing);
 }
 
+/// The variables the dynamic loader and libc read that could make the
+/// command load or run other code: `LD_*` and a few more. They are removed
+/// before the command starts.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn loader_vars<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    const EXTRA: &[&str] = &[
+        "GCONV_PATH",
+        "LOCPATH",
+        "MALLOC_CHECK_",
+        "MALLOC_PERTURB_",
+        "HOSTALIASES",
+        "NLSPATH",
+        "RES_OPTIONS",
+    ];
+    names
+        .into_iter()
+        .filter(|n| n.starts_with("LD_") || EXTRA.contains(&n.as_str()))
+        .collect()
+}
+
+/// What `argv[0]` is for the command: the canonical file's basename, never
+/// the name the user typed (multi-call binaries pick their applet from it).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn argv0_for(exe: &std::path::Path) -> std::ffi::OsString {
+    exe.file_name().unwrap_or(exe.as_os_str()).to_os_string()
+}
+
+/// The values to mask for a lease: the value, and for a `basic` secret
+/// (`user:password`) the password on its own when it is long enough.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<String>> {
+    let mut out = vec![zeroize::Zeroizing::new(value.to_string())];
+    if kind == "basic" {
+        if let Some((_, pw)) = value.split_once(':') {
+            if pw.len() >= 4 {
+                out.push(zeroize::Zeroizing::new(pw.to_string()));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{parse_spec, pump, RunArgs};
+    use super::{argv0_for, loader_vars, mask_values, parse_spec, pump, RunArgs};
     use crate::secret_cmd::linux::{call, Stop};
     use saiife_broker::mask::Masker;
     use serde_json::{json, Map};
@@ -146,28 +194,37 @@ mod linux {
             .to_str()
             .ok_or_else(|| Stop::Refused("the command's path is not valid UTF-8".into()))?;
         let mut values: Vec<(String, Zeroizing<String>)> = Vec::new();
+        let mut masked: Vec<Zeroizing<String>> = Vec::new();
         for (name, env) in &specs {
             let mut a = Map::new();
             a.insert("name".into(), json!(name));
             a.insert("exe".into(), json!(exe_s));
             let ans = call(&config, "secret.lease", a)?;
-            let v = ans
+            let value = ans
                 .get("value")
                 .and_then(|v| v.as_str())
+                .map(|v| Zeroizing::new(v.to_string()))
                 .ok_or_else(|| Stop::Unavailable("the daemon sent no value".into()))?;
-            values.push((env.clone(), Zeroizing::new(v.to_string())));
+            let kind = ans.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+            masked.extend(mask_values(kind, &value));
+            // The answer map holds a copy of the value: drop it now.
+            drop(ans);
+            values.push((env.clone(), value));
         }
-        let refs: Vec<&str> = values.iter().map(|(_, v)| v.as_str()).collect();
+        let refs: Vec<&str> = masked.iter().map(|v| v.as_str()).collect();
         let masker = Masker::new(&refs);
 
         let mut cmd = Command::new(&exe);
         // The multi-call binaries (busybox, coreutils) pick their applet
-        // from argv[0]: keep the name as typed.
-        cmd.arg0(argv0)
+        // from argv[0]: it is the canonical file's name, not the typed one.
+        cmd.arg0(argv0_for(&exe))
             .args(rest)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for var in loader_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+            cmd.env_remove(var);
+        }
         for (env, v) in &values {
             cmd.env(env, v.as_str());
         }
@@ -297,5 +354,72 @@ mod tests {
             "default would start with a digit"
         );
         assert!(parse_spec(":X").is_err());
+    }
+
+    #[test]
+    fn loader_variables_are_picked_out() {
+        let names = [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "GCONV_PATH",
+            "LOCPATH",
+            "MALLOC_CHECK_",
+            "MALLOC_PERTURB_",
+            "HOSTALIASES",
+            "NLSPATH",
+            "RES_OPTIONS",
+            "PATH",
+            "HOME",
+            "LANG",
+            "OLD_LD_X",
+        ];
+        let got = loader_vars(names.iter().map(|s| s.to_string()));
+        assert_eq!(got.len(), 9, "{got:?}");
+        assert!(!got
+            .iter()
+            .any(|n| n == "PATH" || n == "HOME" || n == "LANG"));
+    }
+
+    #[test]
+    fn argv0_is_the_canonical_basename() {
+        assert_eq!(
+            argv0_for(std::path::Path::new("/usr/bin/coreutils")),
+            std::ffi::OsString::from("coreutils")
+        );
+    }
+
+    #[test]
+    fn basic_password_is_masked_on_its_own() {
+        let v = mask_values("basic", "alice:s3cr3t-pass");
+        let strs: Vec<&str> = v.iter().map(|z| z.as_str()).collect();
+        assert_eq!(strs, vec!["alice:s3cr3t-pass", "s3cr3t-pass"]);
+        let short = mask_values("basic", "alice:abc");
+        assert_eq!(short.len(), 1);
+        assert_eq!(mask_values("token", "a:bcdefgh").len(), 1);
+        let m = Masker::new(&strs);
+        let out = m.mask_bytes(b"login with s3cr3t-pass ok");
+        assert_eq!(out, b"login with [MASKED] ok");
+    }
+
+    #[test]
+    fn json_escaped_percent_form_split_across_reads_is_masked() {
+        // `a b/c` percent-encoded `a%20b%2Fc`, then written as JSON with
+        // every byte \u-escaped: far longer than the plain forms.
+        let v = "ab cd/ef+gh";
+        let esc: String = "ab%20cd%2Fef%2Bgh"
+            .bytes()
+            .map(|b| format!("\\u{b:04x}"))
+            .collect();
+        let line = format!("{{\"x\":\"{esc}\"}}");
+        for i in 1..line.len() {
+            let (a, b) = line.as_bytes().split_at(i);
+            let out = pumped(&[a, b], &[v]);
+            let t = String::from_utf8(out).unwrap();
+            assert!(
+                !t.contains("u0025") && !t.contains("u0032"),
+                "split {i}: {t}"
+            );
+            assert!(t.contains("[MASKED]"), "split {i}: {t}");
+        }
     }
 }

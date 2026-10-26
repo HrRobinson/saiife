@@ -194,6 +194,13 @@ enum Cmd {
     },
     /// Locked mode (Linux): run one allowed, root-owned command with a
     /// secret in its environment; its output is masked.
+    ///
+    /// Trust boundary: any process of the agent's uid can lease a listed
+    /// secret from the daemon; the executable check binds only this honest
+    /// client. The boundary is the uid plus its scope. The command runs as
+    /// you and holds the value while it runs. Prefer a connector wherever
+    /// one exists, and list only purpose-built, argument-constrained
+    /// programs in run_allow.
     Run {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]

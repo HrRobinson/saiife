@@ -382,6 +382,12 @@ fn deny(rule: &'static str, detail: impl Into<String>) -> Deny {
 /// non-interpreter executable. Every answer, grant or refusal, is a
 /// `secret` record (`event = "secret_use"`).
 ///
+/// Trust boundary: any process running as the agent's uid can ask for a
+/// lease of a listed secret, and the `exe` check binds only the honest
+/// client (a dishonest one names a listed program and then runs something
+/// else). The boundary is the uid plus its scope. Prefer a connector
+/// wherever one exists.
+///
 /// The interpreter denylist is best effort (see `INTERPRETERS` in the
 /// policy crate): `run_allow` should hold only purpose-built,
 /// argument-constrained programs.
@@ -406,7 +412,7 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     };
     let mut r = use_record(ctx, peer, &name, &exe).await;
     match verdict {
-        Ok(value) => {
+        Ok((value, kind)) => {
             if let Err(e) = ctx.writer.append(r).await {
                 // No record, no value.
                 return err(
@@ -417,6 +423,15 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             }
             let mut m = Map::new();
             m.insert("value".into(), Value::String(value.to_string()));
+            m.insert(
+                "kind".into(),
+                match kind {
+                    Kind::Token => "token",
+                    Kind::Basic => "basic",
+                    Kind::Header => "header",
+                }
+                .into(),
+            );
             ok(id, m)
         }
         Err(Deny { rule, detail }) => {
@@ -489,25 +504,44 @@ async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<
         .map_err(|_| deny("run_not_allowed", "executable check failed"))?
 }
 
-/// The executable: absolute and canonical, listed (as written or
-/// resolved), no interpreter by its resolved name, a regular file, and
-/// root-owned along its whole path.
+/// A listed entry must be the canonical file itself: no symlink hop
+/// anywhere in it, and (so) the same basename. A multi-call binary reached
+/// through a link (`printenv` -> `coreutils`) therefore needs the real file
+/// listed.
+fn entry_is_canonical(entry: &Path, canonical: &Path) -> Result<(), &'static str> {
+    if entry == canonical {
+        return Ok(());
+    }
+    if entry.file_name() != canonical.file_name() {
+        return Err("the listed name differs from the real file's name; list the real file");
+    }
+    Err("the listed path is not canonical (a symlink is in it); list the real file")
+}
+
+/// The executable: absolute and canonical, listed as itself, no
+/// interpreter by its resolved name, a regular file, and root-owned along
+/// its whole path.
 fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     let no = |d: &str| deny("run_not_allowed", d);
     if !exe.is_absolute() {
         return Err(no("the executable path is not absolute"));
     }
-    let listed = allow
-        .iter()
-        .any(|a| a == exe || std::fs::canonicalize(a).is_ok_and(|c| c == exe));
-    if !listed {
+    // Only an exact match counts: a link in run_allow never grants its target.
+    if !allow.iter().any(|a| a == exe) {
+        // Say why when an entry resolves to this file by another path.
+        for a in allow {
+            if std::fs::canonicalize(a).is_ok_and(|c| c == exe) {
+                if let Err(why) = entry_is_canonical(a, exe) {
+                    return Err(no(why));
+                }
+            }
+        }
         return Err(no("the executable is not in run_allow for this secret"));
     }
     match std::fs::canonicalize(exe) {
         Ok(c) if c == exe => {}
         _ => return Err(no("the executable path is not canonical")),
     }
-    // A listed name can be a link to a shell: judge the resolved name too.
     if is_interpreter(exe) {
         return Err(no("the executable is an interpreter or shell"));
     }
@@ -519,7 +553,7 @@ fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
 }
 
 /// The value for the answer, and the use noted in the vault.
-async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<Zeroizing<String>, Deny> {
+async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<(Zeroizing<String>, Kind), Deny> {
     let c = Arc::clone(ctx);
     let n = name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -539,8 +573,9 @@ async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<Zeroizing<String>, Den
             Kind::Basic => Zeroizing::new(format!("{}:{}", field("username"), field("password"))),
             Kind::Header => Zeroizing::new(field("value").to_string()),
         };
+        let kind = e.kind;
         vault.touch(&n, &now_ts());
-        Ok(value)
+        Ok((value, kind))
     })
     .await
     .map_err(|_| deny("run_not_allowed", "vault read failed"))?
@@ -642,5 +677,29 @@ mod tests {
             msg(parse(&req(OP_SECRET_REMOVE, json!({"name":"../x"})))),
             "invalid secret name"
         );
+    }
+
+    #[test]
+    fn listed_entry_must_be_the_canonical_file() {
+        let real = Path::new("/usr/bin/coreutils");
+        assert!(entry_is_canonical(real, real).is_ok());
+        // printenv -> coreutils: the names differ.
+        let e = entry_is_canonical(Path::new("/usr/bin/printenv"), real).unwrap_err();
+        assert!(e.contains("differs"), "{e}");
+        // Same name, a link hop in a directory.
+        let e = entry_is_canonical(Path::new("/bin/coreutils"), real).unwrap_err();
+        assert!(e.contains("not canonical"), "{e}");
+    }
+
+    #[test]
+    fn symlinked_entry_never_grants_its_target() {
+        let dir = std::env::var("CARGO_TARGET_TMPDIR").unwrap_or_else(|_| ".".into());
+        let tmp = tempfile::tempdir_in(dir).unwrap();
+        let real = std::fs::canonicalize("/bin/echo").unwrap();
+        let link = tmp.path().join("echo");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The link is listed, the client sends the canonical target.
+        let r = check_exe(&real, std::slice::from_ref(&link));
+        assert_eq!(r.unwrap_err().rule, "run_not_allowed");
     }
 }
