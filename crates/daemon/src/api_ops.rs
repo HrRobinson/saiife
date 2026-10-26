@@ -146,7 +146,7 @@ fn string_of(v: &Value) -> Option<String> {
     }
 }
 
-fn valid_service(s: &str) -> bool {
+pub(crate) fn valid_service(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
@@ -197,7 +197,7 @@ fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>,
 }
 
 /// The arguments of `api.call`, checked. Errors never quote a value.
-fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Call), &'static str> {
+pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Call), &'static str> {
     let service = args
         .get("service")
         .and_then(Value::as_str)
@@ -314,15 +314,44 @@ fn no_policy_snapshot(hash: Option<String>) -> PolicySnapshot {
     }
 }
 
+/// Why a parsed call got no outcome. Neither writes a `connector` record.
+pub(crate) enum Refused {
+    /// The audit volume is below `[audit] min_free_mb`.
+    LowDisk(ErrorCode),
+    /// The record could not be written: the result is withheld.
+    Unrecorded(String),
+}
+
+pub(crate) const LOW_DISK: &str = "the audit volume is below [audit] min_free_mb";
+
 async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
-    let (_service, _op, mut call) = match parse_call(&req.args) {
+    let (_service, _op, call) = match parse_call(&req.args) {
         Ok(x) => x,
         Err(m) => return bad(id, m),
     };
+    match execute(ctx, peer, call).await {
+        // 12. Return.
+        Ok(outcome) => answer(id, outcome),
+        Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
+        Err(Refused::Unrecorded(m)) => err(id, ErrorCode::Internal, &m),
+    }
+}
+
+/// Every entry point (`api.call`, the HTTP gateway) once it has parsed its
+/// request into `call`: step 1 (the uid from the peer credentials, the
+/// session by attribution), steps 3–12 under the policy in force when the
+/// call starts, and its one `connector` record (step 11), written before
+/// the outcome is returned. `uid`, `user` and `session` are set here from
+/// the peer, whatever the caller put there.
+pub(crate) async fn execute(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    mut call: Call,
+) -> Result<Outcome, Refused> {
     if let Err(code) = disk_ok(ctx, peer) {
         ctx.notice(peer.uid, Notice::LowDisk);
-        return err(id, code, "the audit volume is below [audit] min_free_mb");
+        return Err(Refused::LowDisk(code));
     }
     // 1. Identify: the peer's uid, the session by attribution.
     call.uid = peer.uid;
@@ -380,15 +409,11 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         // A request that was sent is already counted by the limiter, but a
         // rebuild at the next start will not see it (it has no record). The
         // answer is withheld; the limits are briefly looser after a restart.
-        return err(
-            id,
-            ErrorCode::Internal,
-            &format!("the connector record could not be written: {e}"),
-        );
+        return Err(Refused::Unrecorded(format!(
+            "the connector record could not be written: {e}"
+        )));
     }
-
-    // 12. Return.
-    answer(id, outcome)
+    Ok(outcome)
 }
 
 fn answer(id: u64, outcome: Outcome) -> Value {
@@ -459,17 +484,30 @@ fn answer(id: u64, outcome: Outcome) -> Value {
     }
 }
 
-/// `api.list`: the services of the caller's scope and their operations,
-/// each with the action the policy (and the client's overlay) gives it.
+/// `api.list`: [`services_for`] the caller.
 async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let overlays = match parse_overlays(req.args.get("overlays")) {
         Ok(o) => o,
         Err(m) => return bad(id, m),
     };
+    let services = services_for(ctx, peer.uid, &overlays).await;
+    let mut m = Map::new();
+    m.insert("services".into(), Value::Array(services));
+    ok(id, m)
+}
+
+/// The services of `uid`'s scope and their operations, each with the
+/// action the policy (and the client's overlay) gives it. Empty without a
+/// valid policy, a name for the uid or a scope.
+pub(crate) async fn services_for(
+    ctx: &Arc<Ctx>,
+    uid: u32,
+    overlays: &BTreeMap<String, ServiceOverlay>,
+) -> Vec<Value> {
     let mut services = Vec::new();
     let state = ctx.policy();
-    let user = ctx.name_of(peer.uid).await;
+    let user = ctx.name_of(uid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
         let groups = Groups(ctx.groups_of(&user).await);
         if let Ok(Some(scope)) = scope_for(&g.snap.config, &groups, &user) {
@@ -482,9 +520,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             }
         }
     }
-    let mut m = Map::new();
-    m.insert("services".into(), Value::Array(services));
-    ok(id, m)
+    services
 }
 
 #[cfg(test)]

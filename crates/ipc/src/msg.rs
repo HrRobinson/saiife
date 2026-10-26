@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 
 pub const PROTO: u64 = 1;
 pub const SOCKET_NAME: &str = "saiife.sock";
+/// The HTTP/1.1 connector gateway (spec §8.8), beside [`SOCKET_NAME`].
+pub const GATEWAY_SOCKET_NAME: &str = "gateway.sock";
 pub const OP_HELLO: &str = "hello";
 pub const OP_AUDIT_APPEND: &str = "audit.append";
 pub const OP_STATUS: &str = "status";

@@ -35,6 +35,21 @@ getrandom = "0.3"
 saiife-broker = { path = "../broker" }
 bytes = "=1.12.1"
 base64 = "=0.23.1"
+# The HTTP gateway on gateway.sock (Task 10); versions as in saiife-broker.
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The gateway tests: a hyper client over the socket and a loopback TLS
+# upstream; versions as in saiife-broker.
+tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }

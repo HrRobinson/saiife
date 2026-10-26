@@ -3,13 +3,13 @@
 use crate::ops::{check_services, Ctx, CtxInit, PolicyState, MODE, VERSION};
 use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
-use crate::{notify, server, DaemonOptions};
+use crate::{gateway, notify, server, DaemonOptions};
 use saiife_audit::sign::AuditKey;
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_broker::limits::Limiter;
 use saiife_broker::pipeline::limit_event;
 use saiife_broker::upstream::Upstream;
-use saiife_ipc::msg::SOCKET_NAME;
+use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -454,12 +454,13 @@ fn check_socket_dir(st: &rustix::fs::Stat, dir: &Path, uid: u32) -> Result<(), S
 }
 
 /// The socket dir (created 0755 when missing; an existing one must be
-/// this user's or root's and not group/other-writable) and a fresh
-/// `saiife.sock`, 0666. A stale socket is removed only when it is a socket
-/// of this uid that nobody answers on; anything else there is left alone.
-/// The dir is held open (`O_NOFOLLOW`) and every later step works relative
-/// to it, without following a symlink at `saiife.sock`.
-fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> {
+/// this user's or root's and not group/other-writable) and a fresh socket
+/// `name` in it (`saiife.sock`, `gateway.sock`), 0666. A stale socket is
+/// removed only when it is a socket of this uid that nobody answers on;
+/// anything else there is left alone. The dir is held open (`O_NOFOLLOW`)
+/// and every later step works relative to it, without following a symlink
+/// at `name`.
+fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBuf), String> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     let at = |e: &dyn std::fmt::Display| format!("{}: {e}", socket_dir.display());
     match std::fs::symlink_metadata(socket_dir) {
@@ -488,14 +489,14 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
         uid,
     )?;
 
-    let path = socket_dir.join(SOCKET_NAME);
+    let path = socket_dir.join(name);
     let at_sock = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    match rustix::fs::statat(&dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+    match rustix::fs::statat(&dirfd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) if st.st_mode & 0o170000 == 0o140000 && st.st_uid == uid => {
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
                 return Err(format!("another daemon is listening on {}", path.display()));
             }
-            rustix::fs::unlinkat(&dirfd, SOCKET_NAME, AtFlags::empty()).map_err(|e| at_sock(&e))?;
+            rustix::fs::unlinkat(&dirfd, name, AtFlags::empty()).map_err(|e| at_sock(&e))?;
         }
         Ok(_) => {
             return Err(format!(
@@ -507,7 +508,7 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
         Err(e) => return Err(at_sock(&e)),
     }
     let l = UnixListener::bind(&path).map_err(|e| at_sock(&e))?;
-    chmod_socket(&dirfd, uid).map_err(|e| at_sock(&e))?;
+    chmod_socket(&dirfd, name, uid).map_err(|e| at_sock(&e))?;
     Ok((l, path))
 }
 
@@ -515,13 +516,13 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
 /// `O_PATH | O_NOFOLLOW` handle is checked to be this uid's socket and
 /// changed through `/proc/self/fd`. Without `/proc`, `fchmodat` on the
 /// checked name in the held dir, which only this uid or root can change.
-fn chmod_socket(dirfd: &rustix::fd::OwnedFd, uid: u32) -> std::io::Result<()> {
+fn chmod_socket(dirfd: &rustix::fd::OwnedFd, name: &str, uid: u32) -> std::io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     use std::os::fd::AsRawFd;
     let mode = Mode::from_raw_mode(0o666);
     let fd = rustix::fs::openat(
         dirfd,
-        SOCKET_NAME,
+        name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
@@ -532,16 +533,11 @@ fn chmod_socket(dirfd: &rustix::fd::OwnedFd, uid: u32) -> std::io::Result<()> {
     match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
         Ok(()) => Ok(()),
         Err(_) => {
-            let st = rustix::fs::statat(dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW)?;
+            let st = rustix::fs::statat(dirfd, name, AtFlags::SYMLINK_NOFOLLOW)?;
             if st.st_mode & 0o170000 != 0o140000 || st.st_uid != uid {
                 return Err(std::io::Error::other("not the socket this daemon bound"));
             }
-            Ok(rustix::fs::chmodat(
-                dirfd,
-                SOCKET_NAME,
-                mode,
-                AtFlags::empty(),
-            )?)
+            Ok(rustix::fs::chmodat(dirfd, name, mode, AtFlags::empty())?)
         }
     }
 }
@@ -608,8 +604,8 @@ async fn serve(
         }
     }
 
-    // 7. The socket.
-    let (listener, sock_path) = match bind(&socket_dir, ctx.own_uid) {
+    // 7. The sockets: control and the HTTP gateway (§8.8), side by side.
+    let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("saiife: {e}");
@@ -617,6 +613,17 @@ async fn serve(
             return ExitCode::from(2);
         }
     };
+    let (gw_listener, gw_path) = match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("saiife: {e}");
+            drop(listener);
+            let _ = std::fs::remove_file(&sock_path);
+            let _ = ctx.writer.stop(None).await;
+            return ExitCode::from(2);
+        }
+    };
+    let gateway = tokio::spawn(gateway::serve(gw_listener, Arc::clone(&ctx)));
 
     // 8. Ready.
     notify::ready();
@@ -677,6 +684,9 @@ async fn serve(
     // Stop: no new connections, the stop record and a checkpoint, synced.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    gateway.abort();
+    let _ = gateway.await;
+    let _ = std::fs::remove_file(&gw_path);
     if writer_died {
         use std::io::Write;
         let _ = writeln!(

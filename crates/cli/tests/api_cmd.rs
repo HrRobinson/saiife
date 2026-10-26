@@ -374,6 +374,48 @@ fn denied_rule(o: &Output) -> String {
 
 // ---------------------------------------------------------------- tests
 
+/// One HTTP/1.1 request by hand on `gateway.sock`; the whole answer.
+fn gateway(d: &TestDaemon, req: &str) -> String {
+    let mut s =
+        std::os::unix::net::UnixStream::connect(d.socket_dir().join("gateway.sock")).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+#[test]
+fn gateway_socket_runs_the_same_pipeline() {
+    let w = world();
+    let body = r#"{"params":{"status":"open"}}"#;
+    let out = gateway(
+        &w.d,
+        &format!(
+            "POST /v1/api/erp/invoices.list HTTP/1.1\r\nHost: saiife\r\nAuthorization: Bearer agent-tok\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(
+        out.to_ascii_lowercase()
+            .contains("x-saiife-upstream-status: 200"),
+        "{out}"
+    );
+    // The vault value the mock echoed is masked.
+    assert!(out.contains("[MASKED]") && !out.contains(SECRET), "{out}");
+    let out = gateway(
+        &w.d,
+        "GET /v1/proxy/erp/echo/%2e%2e HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n",
+    );
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+    assert!(out.contains(r#""rule":"bad_path""#), "{out}");
+    assert_eq!(w.m.hits(), vec!["GET /api/echo?status=open".to_string()]);
+    let recs = connector(&w.d);
+    assert_eq!(recs.len(), 2);
+    assert!(recs.iter().all(|r| r["via"] == "http"), "{recs:?}");
+}
+
 #[test]
 fn no_scope_denied_no_upstream_call() {
     let w = world_with(|p| policy(p, "", ""), &["erp"]);

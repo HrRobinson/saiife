@@ -366,6 +366,7 @@ fn sigterm_writes_stop_and_checkpoint() {
     assert_eq!(recs[n - 2]["event"], json!("stop"));
     assert_eq!(recs[n - 1]["kind"], json!("checkpoint"));
     assert!(!d.socket().exists());
+    assert!(!d.socket_dir().join("gateway.sock").exists());
     let v = assert_verifies(&d);
     assert!(v.contains("last checkpoint"), "{v}");
     let report = saiife_audit::verify(&d.audit_dir());
@@ -670,6 +671,10 @@ fn created_socket_dir_and_socket_modes() {
         & 0o7777;
     assert_eq!(dm, 0o755);
     assert_eq!(sm, 0o666);
+    // The HTTP gateway (§8.8) beside it, as open.
+    let gw = d.socket_dir().join("gateway.sock");
+    let gm = std::fs::symlink_metadata(&gw).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(gm, 0o666);
 }
 
 #[test]
