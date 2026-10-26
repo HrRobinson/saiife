@@ -47,6 +47,17 @@ and it does not notice that the newest records were removed (see
 [threat coverage](docs/threats.md)).
 `saiife audit --report` shows the same chain status.
 
+## Brokered services
+
+In locked mode on Linux, saiife can make API calls for the agent. You store a
+credential in saiife's vault (`saiife secret add`, or `saiife secret import`
+to move plaintext credentials out of the home), connect a service with
+`saiife connect shopify|hubspot|github`, and the agent calls it through
+`saiife api`. The saiife daemon checks each call against your policy, adds
+the credential, sends the request and masks the answer. So the agent never
+holds a credential for a brokered service; it holds its own model-provider
+login unless you run a local model. See [Connectors](docs/connectors/README.md).
+
 ## What it covers
 
 - [Threat coverage](docs/threats.md): which risks saiife covers, and which it

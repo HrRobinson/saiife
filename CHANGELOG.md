@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Locked mode (Linux) gets an encrypted vault and a connector gateway. New `saiife secret add|list|rotate|remove|import` store credentials (token, basic, header) in a vault the agent cannot read; `import` moves plaintext credentials out of a home and keeps a 7-day backup. New `saiife connect <service>` writes a deny-all policy file; with `--secret <name>` it reuses an existing secret that allows the service.
+- New `saiife api <service> <operation>`: the daemon checks the call against the policy and limits, adds the vault credential, sends it and masks the answer. Connectors for Shopify, HubSpot, GitHub and a generic HTTP service; see `docs/connectors/README.md`.
+- New HTTP gateway on `gateway.sock`, and an optional loopback TCP listener with `saiife api token` (12 h bearer tokens bound to your uid).
+- New `saiife run --secret`: runs a command from the daemon's `run_allow` list with a leased secret in its environment, and masks its output.
+- Requests per minute, writes, deletes, bulk and amount limits per service; the `connector` audit record.
+- The control socket's answers may be up to 16 MiB; requests stay at 1 MiB.
+
 - Audit records are now v2: each carries a sequence number and the SHA-256 of the previous line (a hash chain), plus kind, mode, host and policy. 0.1.0 can still read them.
 - New `saiife audit verify` checks the chain (exit 0 intact, 1 broken, 2 unreadable).
 - `saiife audit --report` gains Audit chain, Policy in force and Mode per host sections.

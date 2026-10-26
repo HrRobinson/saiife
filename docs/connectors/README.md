@@ -98,6 +98,46 @@ An answer travels as base64 in a frame of at most 16 MiB, so
 JSON responses lose precision, because JSON bodies are re-serialized after
 masking.
 
-## Pages
+## Gateway
 
-- [Generic HTTP connector and outbound webhooks](http.md)
+Besides `saiife api`, the daemon serves the same pipeline over HTTP/1.1, for
+scripts and tools that speak HTTP. The routes are `/v1/api/<service>/<op>`
+(a JSON body `{params, body, wait}`) and `/v1/proxy/<service>/<path>` (the raw
+path and query, passed to the matching operation).
+
+- **`gateway.sock`** sits next to `saiife.sock` in the daemon's socket
+  directory, mode 0666. The peer uid comes from the socket's credentials, so
+  nothing the client sends can claim another identity. `X-Forwarded-*` and
+  proxy headers are ignored.
+- **Optional TCP listener.** `[gateway] tcp = "127.0.0.1:<port>"` opens a
+  loopback listener; the default is none, and an address that is not
+  loopback (`127.0.0.0/8`, `::1`) is a config error. Every request needs
+  `Authorization: Bearer <token>`. Get a token with `saiife api token`: it is
+  bound to your uid, valid for 12 hours, and the daemon stores only its
+  SHA-256. The header is consumed and never forwarded upstream. A missing,
+  expired or unknown token answers 401.
+- Agent-supplied `Authorization`, `Cookie` and `Host` headers are dropped.
+  Statuses: 200, 202, 403 `{"error":"denied","rule":...}`, 429, 502, 503. The
+  upstream status is in `X-Saiife-Upstream-Status`.
+- **No project overlay over HTTP.** A project's `.saiife/config.toml` is read
+  by the `saiife` client and sent with the call, so HTTP calls, which never
+  pass through the client, carry no project overlay. The system policy still
+  applies in full; only a project's extra `deny` and `ask` rules are absent.
+
+## Connectors
+
+- [Shopify](shopify.md): orders, products, customers, refunds, discounts.
+- [HubSpot](hubspot.md): contacts, companies and deals.
+- [GitHub](github.md): repositories, issues and pull requests.
+- [Generic HTTP connector and outbound webhooks](http.md): any other API,
+  configured by hand.
+
+To use one, run `saiife connect <service>`. It stores the secret (or reuses
+an existing one with `--secret <name>`, if that secret allows the service)
+and writes a policy file that starts deny-all.
+
+## Note for plan 12
+
+The control socket accepts requests of up to 1 MiB, but an answer may be up
+to 16 MiB (`MAX_ANSWER_FRAME`). A client that reads answers must allow for
+that size.
