@@ -320,6 +320,13 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     }
 }
 
+/// A client-supplied session id over the cap is not remembered (the
+/// record is still accepted).
+fn storable_session(s: Option<&str>) -> Option<String> {
+    s.filter(|s| s.len() <= crate::sessions::MAX_SESSION_ID)
+        .map(str::to_string)
+}
+
 async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let forbidden = |m: &str| err(id, ErrorCode::Forbidden, m);
@@ -387,7 +394,7 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         "peer".into(),
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
-    let session = rec.session.clone();
+    let session = storable_session(rec.session.as_deref());
     match ctx.writer.append(rec).await {
         Ok(seq) => {
             if let Some(sid) = session {
@@ -444,6 +451,14 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlong_session_id_is_not_stored() {
+        assert_eq!(storable_session(Some("abc")).as_deref(), Some("abc"));
+        assert_eq!(storable_session(None), None);
+        let long = "x".repeat(crate::sessions::MAX_SESSION_ID + 1);
+        assert_eq!(storable_session(Some(&long)), None);
+    }
 
     #[test]
     fn notices_at_most_once_per_uid_and_kind_per_minute() {

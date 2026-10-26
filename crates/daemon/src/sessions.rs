@@ -11,6 +11,10 @@ use std::sync::Mutex;
 const MAX_DEPTH: usize = 64;
 /// Most sessions remembered.
 pub const MAX_SESSIONS: usize = 4096;
+/// Longest session id kept; the id is client-supplied.
+pub const MAX_SESSION_ID: usize = 128;
+/// Most of a cmdline read.
+const MAX_CMDLINE: u64 = 64 * 1024;
 const AGENTS: [&str; 3] = ["claude", "codex", "gemini"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +47,10 @@ impl Proc for RealProc {
     }
 
     fn cmdline(&self, pid: u32) -> Option<Vec<String>> {
-        let b = std::fs::read(self.root.join(pid.to_string()).join("cmdline")).ok()?;
+        use std::io::Read;
+        let f = std::fs::File::open(self.root.join(pid.to_string()).join("cmdline")).ok()?;
+        let mut b = Vec::new();
+        f.take(MAX_CMDLINE).read_to_end(&mut b).ok()?;
         Some(
             b.split(|&c| c == 0)
                 .filter(|a| !a.is_empty())
@@ -94,7 +101,9 @@ fn is_agent(p: &dyn Proc, pid: u32, comm: &str) -> bool {
 /// `None` when there is none within 64 levels, or when the agent's start
 /// time changed during the walk (the pid was reused).
 pub fn agent_ancestor(p: &dyn Proc, pid: u32) -> Option<(u32, u64)> {
+    let first = p.stat(pid)?.start_time;
     let mut cur = pid;
+    let mut found = None;
     for _ in 0..MAX_DEPTH {
         if cur == 0 {
             return None;
@@ -102,14 +111,21 @@ pub fn agent_ancestor(p: &dyn Proc, pid: u32) -> Option<(u32, u64)> {
         let st = p.stat(cur)?;
         if is_agent(p, cur, &st.comm) {
             let again = p.stat(cur)?;
-            return (again.start_time == st.start_time).then_some((cur, st.start_time));
+            if again.start_time != st.start_time {
+                return None;
+            }
+            found = Some((cur, st.start_time));
+            break;
         }
         if cur == 1 || st.ppid == cur {
             return None;
         }
         cur = st.ppid;
     }
-    None
+    // The requester must still be the same process after the walk.
+    (p.stat(pid)?.start_time == first)
+        .then_some(found)
+        .flatten()
 }
 
 #[derive(Default)]
@@ -131,6 +147,9 @@ impl Sessions {
 
     /// The newest session wins. Beyond 4 096 entries the oldest goes.
     pub fn record(&self, ancestor: (u32, u64), session_id: &str) {
+        if session_id.len() > MAX_SESSION_ID {
+            return;
+        }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if g.map.insert(ancestor, session_id.to_string()).is_some() {
             g.order.retain(|k| *k != ancestor);
@@ -234,6 +253,42 @@ mod tests {
         fn cmdline(&self, _: u32) -> Option<Vec<String>> {
             None
         }
+    }
+
+    /// The requester's own stat changes on its second read only.
+    struct RequesterFlip(std::cell::Cell<u32>);
+    impl Proc for RequesterFlip {
+        fn stat(&self, pid: u32) -> Option<ProcStat> {
+            let (comm, ppid, start) = if pid == 20 {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                ("sh", 10, if n == 0 { 5 } else { 6 })
+            } else {
+                ("claude", 1, 1)
+            };
+            Some(ProcStat {
+                ppid,
+                comm: comm.into(),
+                start_time: start,
+            })
+        }
+        fn cmdline(&self, _: u32) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn requester_start_time_change_mid_walk_gives_none() {
+        assert_eq!(agent_ancestor(&RequesterFlip(Default::default()), 20), None);
+    }
+
+    #[test]
+    fn long_session_id_not_stored() {
+        let s = Sessions::new();
+        s.record((1, 1), &"x".repeat(MAX_SESSION_ID + 1));
+        assert_eq!(s.lookup((1, 1)), None);
+        s.record((1, 1), &"x".repeat(MAX_SESSION_ID));
+        assert!(s.lookup((1, 1)).is_some());
     }
 
     #[test]
