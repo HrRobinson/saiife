@@ -23,7 +23,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the rest.
+      # A short temp base keeps unix socket paths under 108 bytes.
       - run: cargo test --workspace --no-fail-fast
+        env:
+          SAIIFE_TEST_TMP: ${{ runner.temp }}/s
       # The hook path (guard, audit, policy, ipc) and saiife-system must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates

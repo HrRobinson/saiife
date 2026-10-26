@@ -17,6 +17,15 @@ offline() {
     exec unshare --user --map-user="$1" --map-group="$2" "${@:3}"
   ' offline "$(id -u)" "$(id -g)" "$@"
 }
+# Test dirs live under a short base so unix socket paths fit in 108 bytes.
+# Set SAIIFE_TEST_TMP yourself; the default is <repo>/target/t.
+if [ -z "${SAIIFE_TEST_TMP:-}" ] && [ -n "${RUNNER_TEMP:-}" ]; then
+  SAIIFE_TEST_TMP="$RUNNER_TEMP/s"
+fi
+if [ -n "${SAIIFE_TEST_TMP:-}" ]; then
+  mkdir -p "$SAIIFE_TEST_TMP"
+  export SAIIFE_TEST_TMP
+fi
 cargo test --workspace --no-run --quiet
 # Sanity checks: inside the namespace there must be no network, and the
 # tests must not run as root.
