@@ -167,6 +167,31 @@ test_paired_field() {
     t_eq "$(rt_paired_field "$T/rows" "$T/win" agent-ci allow .policy | paste -sd' ' -)" '"h1" "h2"' "policies"
 }
 
+test_split_rows_drops_stray_stdout() {
+    {
+        row deny pass claude a
+        echo "SECRET-VAULT-KEY"
+        printf 'not a row\tSECRET\n'
+        row allow pass claude b
+        printf 'SECRET without newline'
+    } >"$T/raw"
+    local n
+    n="$(rt_split_rows "$T/raw" "$T/rows")"
+    t_eq "$n" 3 "stray count"
+    t_lacks "$(cat "$T/rows")" "SECRET" "rows file"
+    t_eq "$(wc -l <"$T/rows")" 2 "rows kept"
+    : >"$T/empty"
+    t_eq "$(rt_split_rows "$T/empty" "$T/rows")" 0 "empty"
+    # run.sh writes the raw stdout outside $WORK (the dir copied to the
+    # logs) and only the split rows into it.
+    # shellcheck disable=SC2016
+    grep -qF 'bash "$STAGE/$script" >"$RAW/$id.out"' "$HERE/run.sh" || t_fail "run.sh does not send raw attack stdout to \$RAW"
+    # shellcheck disable=SC2016
+    grep -qF 'rt_split_rows "$RAW/$id.out" "$WORK/$id.rows"' "$HERE/run.sh" || t_fail "run.sh does not split rows into \$WORK"
+    # shellcheck disable=SC2016
+    if grep -F 'cp -r' "$HERE/run.sh" | grep -qF '$RAW'; then t_fail "run.sh copies \$RAW to the logs"; fi
+}
+
 # ------------------------------------------------------------ rt_summary
 
 test_gap_closed_fails_summary() {

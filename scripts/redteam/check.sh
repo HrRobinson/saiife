@@ -27,6 +27,16 @@ rt_verdict() {
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$label" "$detail"
 }
 
+# `rt_split_rows <raw stdout> <rows file>`: only the RT rows of an attack's
+# stdout go to the rows file (which may reach the uploaded logs); any other
+# line is dropped unseen, and their count is printed.
+rt_split_rows() {
+    local stray
+    grep -a $'^RT\t' "$1" >"$2" || true
+    stray="$(grep -acv $'^RT\t' "$1" || true)"
+    printf '%s\n' "${stray:-0}"
+}
+
 # The jq definitions shared by rt_zip and rt_paired_field: $rows (raw
 # text), $w (the window's records), $u (the agent user).
 # shellcheck disable=SC2016

@@ -47,7 +47,25 @@ PROTECTED=(
 )
 
 WORK="$(mktemp -d)"
+# Raw attack stdout, before only the RT rows are kept: never copied to the
+# logs, removed at exit.
+RAW="$(mktemp -d)"
 STAGE=""
+# Files the attack setups write into agent-ci's real home (a01:
+# ~/.claude/settings.json); each that did not exist before is removed at
+# exit, so 9b's later phases see the 9b host. Everything else the attacks
+# write is under ~/rt.
+HOME_FILES=("$AGENT_HOME/.claude/settings.json" "$AGENT_HOME/.claude")
+declare -A HOME_HAD=()
+HOME_SNAP=""
+
+home_snapshot() {
+    local f
+    for f in "${HOME_FILES[@]}"; do
+        if as_root test -e "$f"; then HOME_HAD[$f]=1; else HOME_HAD[$f]=0; fi
+    done
+    HOME_SNAP=1
+}
 VERDICTS="$WORK/verdicts.tsv"
 : >"$VERDICTS"
 export WORK
@@ -90,10 +108,23 @@ cleanup() {
     if [[ -n "$STAGE" ]] && as_root test -f "$STAGE/config.toml.saved"; then
         if [[ "$(as_root sha256sum <"$CONFIG")" != "$(as_root sha256sum <"$STAGE/config.toml.saved")" ]]; then
             echo "red team: restoring $CONFIG" >&2
+            local since
+            since="$(chain_head)"
             as_root cp "$STAGE/config.toml.saved" "$CONFIG"
             as_root systemctl reload saiifed
+            poll 15 policy_record_since "$since" loaded ||
+                echo "red team: no policy loaded record within 15 s of the restore" >&2
         fi
     fi
+    local f
+    if [[ -n "$HOME_SNAP" ]]; then
+        for f in "${HOME_FILES[@]}"; do
+            if [[ "${HOME_HAD[$f]}" == 0 ]] && as_root test -e "$f"; then
+                as_root rm -rf "$f"
+            fi
+        done
+    fi
+    rm -rf "$RAW"
     if getent passwd "$AUDITOR" >/dev/null; then
         as_root userdel -r "$AUDITOR" 2>/dev/null
     fi
@@ -148,21 +179,24 @@ stage() {
 # ------------------------------------------------------------ attacks
 
 run_attack() {
-    local id="$1" script since code=0 n
+    local id="$1" script since code=0 n stray
     script="$(script_for "$id")"
     echo
     echo "-- $id ($script)"
     since="$(chain_head)"
     if declare -F "pre_$id" >/dev/null; then "pre_$id"; fi
     # The runner opens the output files; the attack runs wholly as the
-    # agent user, with a clean environment.
+    # agent user, with a clean environment. Its raw stdout lands in $RAW,
+    # which is never copied to the logs: only the RT rows reach $WORK.
     # shellcheck disable=SC2024
-    timeout 180 sudo -n -u "$AGENT_USER" env -i HOME="$AGENT_HOME" USER="$AGENT_USER" LOGNAME="$AGENT_USER" \
+    timeout -k 10 180 sudo -n -u "$AGENT_USER" env -i HOME="$AGENT_HOME" USER="$AGENT_USER" LOGNAME="$AGENT_USER" \
         PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 GITHUB_ACTIONS=true SAIIFE_LOCKED_CI=1 \
-        RT_STAGE="$STAGE" bash "$STAGE/$script" >"$WORK/$id.rows" 2>"$WORK/$id.err" || code=$?
+        RT_STAGE="$STAGE" bash "$STAGE/$script" >"$RAW/$id.out" 2>"$WORK/$id.err" || code=$?
+    stray="$(rt_split_rows "$RAW/$id.out" "$WORK/$id.rows")"
+    rm -f "$RAW/$id.out"
     sed 's/^/  | /' "$WORK/$id.err" >&2
     n="$(grep -c $'^RT\t' "$WORK/$id.rows" || true)"
-    if [[ "$code" == 124 ]]; then
+    if [[ "$code" == 124 || "$code" == 137 ]]; then
         verdict FAIL "$id" "$script" "script: timed out after 180 s"
     elif [[ "$code" != 0 ]]; then
         verdict FAIL "$id" "$script" "script: exit $code"
@@ -170,8 +204,8 @@ run_attack() {
     if [[ "$n" == 0 ]]; then
         verdict FAIL "$id" "$script" "script: no rows"
     fi
-    if grep -qv $'^RT\t' "$WORK/$id.rows"; then
-        verdict FAIL "$id" "$script" "script: $(grep -cv $'^RT\t' "$WORK/$id.rows") stray stdout lines (not shown)"
+    if [[ "$stray" != 0 ]]; then
+        verdict FAIL "$id" "$script" "script: $stray stray stdout lines (dropped, not shown)"
     fi
     window_since "$since" >"$WORK/$id.window.jsonl"
     rt_zip "$WORK/$id.rows" "$WORK/$id.window.jsonl" "$AGENT_USER" | tee -a "$VERDICTS" | sed 's/^/  /'
@@ -434,6 +468,7 @@ gaps_exercised() {
 main() {
     local id status=0
     echo "red team: ${#ATTACKS[@]} attacks as $AGENT_USER (uid $(agent_uid))"
+    home_snapshot
     stage
     protected_snapshot
     for id in "${ATTACKS[@]}"; do
