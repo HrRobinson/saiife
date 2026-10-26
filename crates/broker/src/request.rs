@@ -339,7 +339,8 @@ pub fn build(
 
 /// The next-page parameter of a cursor-paginated answer: `(param, value)`
 /// when `body` holds a string or number at the `next` JSON path, else `None`
-/// (last page, or `p` is not cursor pagination). Arrays are not traversed.
+/// (last page, or `p` is not cursor pagination, or the value is longer than
+/// 256 bytes or has a byte outside `[A-Za-z0-9_.=-]`). Arrays are not traversed.
 pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, String)> {
     let Pagination::Cursor { param, next } = p else {
         return None;
@@ -349,10 +350,20 @@ pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, 
         cur = cur.get(key)?;
     }
     let v = match cur {
-        serde_json::Value::String(s) if !s.is_empty() => s.clone(),
+        serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         _ => return None,
     };
+    // The value is echoed into an HTTP header and a CLI line: refuse anything
+    // long or outside a conservative alphabet.
+    if v.is_empty()
+        || v.len() > 256
+        || !v
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-'))
+    {
+        return None;
+    }
     Some((param.clone(), v))
 }
 

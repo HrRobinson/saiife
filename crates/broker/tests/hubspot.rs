@@ -306,6 +306,25 @@ fn next_cursor_from_fixtures() {
 }
 
 #[test]
+fn next_cursor_refuses_unsafe_values() {
+    let p = op("contacts.list").pagination.clone().unwrap();
+    let with = |v: Value| serde_json::json!({"paging":{"next":{"after": v}}});
+    let long = "a".repeat(257);
+    assert_eq!(next_cursor(&p, &with(Value::String(long))), None);
+    let ok = "a".repeat(256);
+    assert!(next_cursor(&p, &with(Value::String(ok))).is_some());
+    for bad in ["52\r\nX-Evil: 1", "a b", "a&b=c", "a/b", "é"] {
+        assert_eq!(
+            next_cursor(&p, &with(Value::String(bad.into()))),
+            None,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(next_cursor(&p, &with(serde_json::json!({"x": "1"}))), None);
+    assert!(next_cursor(&p, &with(serde_json::json!(52))).is_some());
+}
+
+#[test]
 fn next_page_request_carries_the_cursor() {
     let p = op("contacts.list").pagination.clone().unwrap();
     let (param, value) = next_cursor(&p, &fixture("contacts_list")).unwrap();

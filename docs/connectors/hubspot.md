@@ -41,6 +41,14 @@ wave 1. A call that matches no operation is denied as `unknown_operation`.
 No operation has an `amount` field, so amount caps do not apply to HubSpot
 in this version (a deal `amount` property is data, not a spend).
 
+### The update body is not constrained
+
+saiife validates the object id and the headers of `contacts.update` and
+`deals.update`, but not the JSON body. An agent with `contacts:write` or
+`deals:write` can set any property HubSpot lets the token write, including
+`hubspot_owner_id`, `lifecyclestage` and `hs_*` properties. Keep both write
+capabilities under `ask` (or denied), and limit the private app's scopes.
+
 ## Pagination
 
 List answers carry `paging.next.after` when there is another page. saiife
