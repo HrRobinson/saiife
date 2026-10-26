@@ -17,7 +17,7 @@ capability = "contacts:read"
 kind = "read"
 method = "GET"
 path = "/crm/v3/objects/contacts"
-query = { limit = "int:1..100", after = "string", properties = "string", archived = "bool" }
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 pagination = { cursor = { param = "after", next = "paging.next.after" } }
 
 [[operation]]
@@ -27,7 +27,7 @@ kind = "read"
 method = "GET"
 path = "/crm/v3/objects/contacts/{contact_id}"
 path_params = { contact_id = "int" }
-query = { properties = "string", archived = "bool" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 
 [[operation]]
 id = "contacts.update"
@@ -44,7 +44,7 @@ capability = "companies:read"
 kind = "read"
 method = "GET"
 path = "/crm/v3/objects/companies"
-query = { limit = "int:1..100", after = "string", properties = "string", archived = "bool" }
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 pagination = { cursor = { param = "after", next = "paging.next.after" } }
 
 [[operation]]
@@ -54,7 +54,7 @@ kind = "read"
 method = "GET"
 path = "/crm/v3/objects/companies/{company_id}"
 path_params = { company_id = "int" }
-query = { properties = "string", archived = "bool" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 
 [[operation]]
 id = "deals.list"
@@ -62,7 +62,7 @@ capability = "deals:read"
 kind = "read"
 method = "GET"
 path = "/crm/v3/objects/deals"
-query = { limit = "int:1..100", after = "string", properties = "string", archived = "bool" }
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 pagination = { cursor = { param = "after", next = "paging.next.after" } }
 
 [[operation]]
@@ -72,7 +72,7 @@ kind = "read"
 method = "GET"
 path = "/crm/v3/objects/deals/{deal_id}"
 path_params = { deal_id = "int" }
-query = { properties = "string", archived = "bool" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
 
 [[operation]]
 id = "deals.update"

@@ -215,6 +215,49 @@ fn bad_path_params_are_refused() {
 }
 
 #[test]
+fn owner_repo_and_free_strings_are_pattern_checked() {
+    let m = github();
+    let get = named(&m, "issues.get").unwrap();
+    let list = named(&m, "issues.list").unwrap();
+    let ok = |op: &_, call: &[(&str, &str)]| validate(op, &map(call), &BTreeMap::new()).is_ok();
+    let long = "a".repeat(101);
+    assert!(ok(
+        get,
+        &[
+            ("owner", "acme-co"),
+            ("repo", "my.repo_1"),
+            ("issue_number", "1")
+        ]
+    ));
+    for bad in ["a b", "a?x=1", "a#b", "a:b", "a@b", long.as_str()] {
+        assert!(
+            !ok(
+                get,
+                &[("owner", bad), ("repo", "web"), ("issue_number", "1")]
+            ),
+            "owner {bad:?}"
+        );
+        assert!(
+            !ok(
+                get,
+                &[("owner", "acme"), ("repo", bad), ("issue_number", "1")]
+            ),
+            "repo {bad:?}"
+        );
+    }
+    let base = [("owner", "acme"), ("repo", "web")];
+    let with = |k: &'static str, v: &str| -> bool {
+        let mut c = base.to_vec();
+        c.push((k, v));
+        ok(list, &c)
+    };
+    assert!(with("labels", "bug,help wanted"));
+    assert!(!with("labels", ""));
+    assert!(!with("labels", &"x".repeat(257)));
+    assert!(!with("assignee", ""));
+}
+
+#[test]
 fn qualifier_with_unknown_placeholder_is_refused() {
     let bad = GITHUB.replacen("repo={owner}/{repo}", "repo={owner}/{nope}", 1);
     assert!(Manifest::parse(&bad).is_err());

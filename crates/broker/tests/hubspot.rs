@@ -220,6 +220,30 @@ fn path_ids_are_one_segment() {
 }
 
 #[test]
+fn properties_and_after_are_pattern_checked() {
+    for ok in ["email,firstname", "hs_object_id", "a_b,c"] {
+        assert!(call("contacts.list", &[("properties", ok)], &[], None).is_ok());
+    }
+    let long_p = "x".repeat(513);
+    for bad in ["a b", "a&limit=1", "a#b", "a%2cb", "", long_p.as_str()] {
+        assert!(
+            call("contacts.list", &[("properties", bad)], &[], None).is_err(),
+            "properties {bad:?}"
+        );
+    }
+    for ok in ["NTI1Cg==", "a.b-c_d"] {
+        assert!(call("contacts.list", &[("after", ok)], &[], None).is_ok());
+    }
+    let long_a = "x".repeat(257);
+    for bad in ["a b", "a&b=1", "a/b", "", long_a.as_str()] {
+        assert!(
+            call("contacts.list", &[("after", bad)], &[], None).is_err(),
+            "after {bad:?}"
+        );
+    }
+}
+
+#[test]
 fn unknown_and_out_of_range_params_are_refused() {
     assert!(call("contacts.list", &[("limit", "101")], &[], None).is_err());
     assert!(call("contacts.list", &[("limit", "0")], &[], None).is_err());

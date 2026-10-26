@@ -22,7 +22,7 @@ qualifier = "repo={owner}/{repo}"
 kind = "read"
 method = "GET"
 path = "/repos/{owner}/{repo}"
-path_params = { owner = "string", repo = "string" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
 
 [[operation]]
 id = "issues.list"
@@ -31,8 +31,8 @@ qualifier = "repo={owner}/{repo}"
 kind = "read"
 method = "GET"
 path = "/repos/{owner}/{repo}/issues"
-path_params = { owner = "string", repo = "string" }
-query = { state = "enum:open,closed,all", labels = "string", assignee = "string", since = "datetime", per_page = "int:1..100", page = "int:1..100000" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+query = { state = "enum:open,closed,all", labels = "string:.{1,256}", assignee = "string:.{1,256}", since = "datetime", per_page = "int:1..100", page = "int:1..100000" }
 pagination = "link-header"
 
 [[operation]]
@@ -42,7 +42,7 @@ qualifier = "repo={owner}/{repo}"
 kind = "read"
 method = "GET"
 path = "/repos/{owner}/{repo}/issues/{issue_number}"
-path_params = { owner = "string", repo = "string", issue_number = "int" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", issue_number = "int" }
 
 [[operation]]
 id = "issues.create"
@@ -51,7 +51,7 @@ qualifier = "repo={owner}/{repo}"
 kind = "write"
 method = "POST"
 path = "/repos/{owner}/{repo}/issues"
-path_params = { owner = "string", repo = "string" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
 body = "json"
 
 [[operation]]
@@ -61,7 +61,7 @@ qualifier = "repo={owner}/{repo}"
 kind = "write"
 method = "POST"
 path = "/repos/{owner}/{repo}/issues/{issue_number}/comments"
-path_params = { owner = "string", repo = "string", issue_number = "int" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", issue_number = "int" }
 body = "json"
 
 [[operation]]
@@ -71,8 +71,8 @@ qualifier = "repo={owner}/{repo}"
 kind = "read"
 method = "GET"
 path = "/repos/{owner}/{repo}/pulls"
-path_params = { owner = "string", repo = "string" }
-query = { state = "enum:open,closed,all", head = "string", base = "string", per_page = "int:1..100", page = "int:1..100000" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+query = { state = "enum:open,closed,all", head = "string:.{1,256}", base = "string:.{1,256}", per_page = "int:1..100", page = "int:1..100000" }
 pagination = "link-header"
 
 [[operation]]
@@ -82,7 +82,7 @@ qualifier = "repo={owner}/{repo}"
 kind = "read"
 method = "GET"
 path = "/repos/{owner}/{repo}/pulls/{pull_number}"
-path_params = { owner = "string", repo = "string", pull_number = "int" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", pull_number = "int" }
 
 [[operation]]
 id = "pulls.create"
@@ -91,5 +91,5 @@ qualifier = "repo={owner}/{repo}"
 kind = "write"
 method = "POST"
 path = "/repos/{owner}/{repo}/pulls"
-path_params = { owner = "string", repo = "string" }
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
 body = "json"
