@@ -449,7 +449,7 @@ fn run_allow_refuses_interpreters() {
         Err(PolicyError::RunAllowInterpreter { .. })
     ));
     let (_d, cfg) = etc(
-        "version = 2\n[secrets.k]\nrun_allow = [\"/usr/bin/curl\", \"/opt/tools/python-lint\"]\n",
+        "version = 2\n[secrets.k]\nrun_allow = [\"/usr/bin/curl\", \"/opt/tools/pylint-wrapper\"]\n",
         &[],
     );
     let c = load_system(&cfg).unwrap().config;
@@ -558,6 +558,11 @@ fn run_allow_hardening() {
         "/usr/bin/nodejs",
         "/usr/bin/pypy3",
         "/usr/bin/pypy",
+        "/usr/bin/pythonw",
+        "/usr/bin/ipython",
+        "/usr/bin/python3m",
+        "/usr/bin/perl-5.36",
+        "/usr/bin/python-config",
         "/bin/BASH",
         "/bin/Python3",
     ] {

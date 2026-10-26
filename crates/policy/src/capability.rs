@@ -72,9 +72,8 @@ pub fn matches(pattern: &str, cap: &Capability) -> bool {
 
 /// Does `pattern` match `cap`? A pattern is `resource:verb[:qualifier]`;
 /// `*` as the resource or the verb matches exactly one segment. Anything
-/// else (including `*` alone) matches nothing. The qualifier is an ASCII
-/// case-insensitive glob; a pattern without a qualifier matches any
-/// qualifier.
+/// else (including `*` alone) matches nothing. The qualifier is a glob; a
+/// pattern without a qualifier matches any qualifier.
 ///
 /// `broad` selects the restrictive stages (deny and ask), which must err
 /// towards matching:
@@ -107,14 +106,19 @@ pub fn matches_with(pattern: &str, cap: &Capability, broad: bool) -> bool {
 }
 
 /// Glob match where `*` matches any run of characters except `/`, `**`
-/// matches any run, and every other character matches itself, ASCII
-/// case-insensitively.
+/// matches any run, and every other character matches itself, case
+/// exactly (allow-stage semantics).
 pub fn glob(pattern: &str, text: &str) -> bool {
     glob_with(pattern, text, false)
 }
 
-/// As [`glob`]; with `star_crosses`, a single `*` crosses `/` as well.
-pub fn glob_with(pattern: &str, text: &str, star_crosses: bool) -> bool {
+/// As [`glob`]; with `broad` (deny and ask stages) a single `*` crosses `/`
+/// as well and ASCII case is ignored. The allow stage compares case
+/// exactly, because case-sensitive backends (S3 keys) would otherwise be
+/// widened; the restrictive stages ignore case because a missed deny is
+/// worse than a spurious one.
+pub fn glob_with(pattern: &str, text: &str, broad: bool) -> bool {
+    let fold = |c: char| if broad { c.to_ascii_lowercase() } else { c };
     // Tokens: Some(c) literal, None = star; the bool says it crosses `/`.
     let mut toks: Vec<(Option<char>, bool)> = Vec::new();
     let mut chars = pattern.chars().peekable();
@@ -124,12 +128,12 @@ pub fn glob_with(pattern: &str, text: &str, star_crosses: bool) -> bool {
             while chars.next_if_eq(&'*').is_some() {
                 n += 1;
             }
-            toks.push((None, star_crosses || n > 1));
+            toks.push((None, broad || n > 1));
         } else {
-            toks.push((Some(c.to_ascii_lowercase()), false));
+            toks.push((Some(fold(c)), false));
         }
     }
-    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t: Vec<char> = text.chars().map(fold).collect();
     // reach[j]: the tokens so far match t[..j].
     let mut reach = vec![false; t.len() + 1];
     reach[0] = true;
@@ -279,9 +283,15 @@ mod tests {
             &cap("issues:write"),
             false
         ));
-        // Case-insensitive qualifier in both.
+        // Case-insensitive in deny and ask only; allow is case-exact.
         let c = cap("issues:write:repo=ACME/Secret");
-        assert!(matches("issues:write:repo=acme/secret", &c));
+        assert!(!matches("issues:write:repo=acme/secret", &c));
+        assert!(matches("issues:write:repo=ACME/Secret", &c));
         assert!(matches_with("issues:write:repo=acme/secret", &c, true));
+        assert!(!matches_with(
+            "s3:read:b/public/*",
+            &cap("s3:read:b/PUBLIC/x"),
+            false
+        ));
     }
 }

@@ -22,8 +22,9 @@ pub enum Verdict {
 /// outside locked mode. Deny and ask patterns and `when` globs match broadly
 /// (`*` crosses `/`; a missing param or qualifier matches); allow matches
 /// narrowly (`*` stays within one `/` level; missing means no match). `**`
-/// crosses `/` everywhere and globs ignore ASCII case. See
-/// `capability::matches_with`.
+/// crosses `/` everywhere. Deny and ask globs ignore ASCII case (a missed
+/// deny is worse than a spurious one); allow globs compare case exactly, so
+/// a case-sensitive backend is never widened. See `capability::matches_with`.
 pub fn decide(
     svc: &ServiceCfg,
     overlay: Option<&ServiceOverlay>,
@@ -68,9 +69,9 @@ pub fn decide(
 }
 
 /// The capability matches and every `when` entry matches its param (an
-/// ASCII case-insensitive glob). A missing param is no match for an allow
-/// rule and a match for a deny or ask rule (`broad`), which also lets `*`
-/// cross `/`.
+/// glob). A missing param is no match for an allow rule and a match for a
+/// deny or ask rule (`broad`), which also lets `*` cross `/` and ignores
+/// ASCII case; allow compares case exactly.
 fn rule_matches(r: &RuleCfg, req: &Request, broad: bool) -> bool {
     matches_with(&r.capability, req.capability, broad)
         && r.when.iter().all(|(k, g)| match req.params.get(k) {
@@ -184,12 +185,15 @@ action = "ask"
             d("issues:write", &[("org", "acme/web")]),
             deny("deny:issues:write")
         );
-        // Case-insensitive.
+        // Deny is case-insensitive; allow is case-exact.
         assert_eq!(
             d("issues:write", &[("repo", "ACME/secret")]),
             deny("deny:issues:write")
         );
-        assert_eq!(d("issues:write", &[("repo", "ACME/web")]), Verdict::Allow);
+        assert_eq!(
+            d("issues:write", &[("repo", "ACME/web")]),
+            deny("default_deny")
+        );
         // Every `when` entry must match.
         assert_eq!(
             d("pulls:write", &[("repo", "acme/web"), ("base", "main")]),
@@ -271,8 +275,30 @@ action = "ask"
         // A qualified deny/ask applies to an unqualified request.
         assert_eq!(d("s3:delete"), deny("deny:s3:delete:b=x"));
         assert_eq!(d("s3:write"), Verdict::Ask);
-        // Case-insensitive qualifier.
+        // Deny qualifier is case-insensitive.
         assert_eq!(d("s3:delete:b=X"), deny("deny:s3:delete:b=x"));
+        // Allow is case-exact: `PUBLIC` is not `public`.
+        let s = svc("connector = \"x\"\nallow = [\"s3:read:arn:aws:s3:::b/public/*\"]\n");
+        assert_eq!(
+            run(
+                &s,
+                None,
+                Mode::Locked,
+                "s3:read:arn:aws:s3:::b/public/x",
+                &[]
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            run(
+                &s,
+                None,
+                Mode::Locked,
+                "s3:read:arn:aws:s3:::b/PUBLIC/x",
+                &[]
+            ),
+            deny("default_deny")
+        );
         // A qualified allow does not cover an unqualified request.
         let s = svc("connector = \"x\"\nallow = [\"issues:write:repo=acme/*\"]\n");
         assert_eq!(

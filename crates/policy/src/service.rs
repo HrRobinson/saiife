@@ -133,6 +133,9 @@ const INTERPRETERS: &[&str] = &[
     "ruby",
     "node",
     "nodejs",
+    "ipython",
+    "pythonw",
+    "python3m",
     "pypy",
     "pypy3",
     "deno",
@@ -152,7 +155,10 @@ pub fn is_interpreter(path: &Path) -> bool {
     // `python2`, `ruby3.2`, `perl5.36`, `lua5.4`, `php8.2`, `python3.12`.
     let lower = name.to_ascii_lowercase();
     let base = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    INTERPRETERS.contains(&lower.as_str()) || INTERPRETERS.contains(&base)
+    INTERPRETERS.contains(&lower.as_str())
+        || INTERPRETERS.contains(&base)
+        || lower.starts_with("perl-")
+        || lower.starts_with("python-")
 }
 
 /// Auth kinds a service may use.
