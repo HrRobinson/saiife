@@ -5,7 +5,7 @@
 use crate::amount::exponent;
 use crate::manifest::OpKind;
 use saiife_policy::LimitsCfg;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
@@ -38,31 +38,51 @@ type BucketKey = (u32, String);
 /// Every this many checks, buckets nobody asked about lately are pruned.
 const SWEEP_EVERY: u64 = 1024;
 
+/// At most this many events are held per (uid, service) bucket. A full
+/// bucket denies (`limits_capacity`) rather than forget history.
+pub const BUCKET_CAP: usize = 100_000;
+
+/// One bucket's events, oldest first.
+type Bucket = VecDeque<Entry>;
+
 #[derive(Default)]
 struct State {
     next_id: u64,
     /// Committed and still-pending (reserved) events alike: both hold a
     /// slot. Indexed by bucket, so a check reads only its own events.
-    buckets: HashMap<BucketKey, Vec<Entry>>,
+    buckets: HashMap<BucketKey, Bucket>,
     checks: u64,
 }
 
+/// Drop the events at or before `cutoff` from the front of `b`.
+fn trim(b: &mut Bucket, cutoff: OffsetDateTime) {
+    while b.front().is_some_and(|e| e.ev.at <= cutoff) {
+        b.pop_front();
+    }
+}
+
 impl State {
+    /// Add `ev` in time order (at the back unless the clock went back).
     fn push(&mut self, ev: Event) -> (BucketKey, u64) {
         let id = self.next_id;
         self.next_id += 1;
         let key = (ev.key.uid, ev.key.service.clone());
-        self.buckets
-            .entry(key.clone())
-            .or_default()
-            .push(Entry { id, ev });
+        let b = self.buckets.entry(key.clone()).or_default();
+        let e = Entry { id, ev };
+        if b.back().is_none_or(|last| last.ev.at <= e.ev.at) {
+            b.push_back(e);
+        } else {
+            let i = b.partition_point(|x| x.ev.at <= e.ev.at);
+            b.insert(i, e);
+        }
         (key, id)
     }
 
-    /// Drop every event at or before `cutoff`, and the buckets left empty.
+    /// Trim every bucket's front and drop the buckets left empty: only
+    /// the expired events are touched.
     fn sweep(&mut self, cutoff: OffsetDateTime) {
         self.buckets.retain(|_, b| {
-            b.retain(|e| e.ev.at > cutoff);
+            trim(b, cutoff);
             !b.is_empty()
         });
     }
@@ -73,6 +93,8 @@ pub struct Limiter {
     /// Set when the rebuild could not read every record of the window:
     /// until then the limits are not known and calls are denied.
     unavailable_until: Option<OffsetDateTime>,
+    /// [`BUCKET_CAP`]; smaller in tests.
+    cap: usize,
 }
 
 impl Default for Limiter {
@@ -107,7 +129,10 @@ impl Drop for Reservation {
         }
         let (key, id) = &self.slot;
         if let Some(b) = lock(&self.state).buckets.get_mut(key) {
-            b.retain(|e| e.id != *id);
+            // A pending reservation is among the newest: look from the back.
+            if let Some(i) = b.iter().rposition(|e| e.id == *id) {
+                b.remove(i);
+            }
         }
     }
 }
@@ -125,6 +150,16 @@ impl Limiter {
         Limiter {
             state: Arc::new(Mutex::new(State::default())),
             unavailable_until: None,
+            cap: BUCKET_CAP,
+        }
+    }
+
+    /// [`Limiter::new`] with a smaller bucket cap.
+    #[cfg(test)]
+    fn with_cap(cap: usize) -> Limiter {
+        Limiter {
+            cap,
+            ..Limiter::new()
         }
     }
 
@@ -138,6 +173,7 @@ impl Limiter {
         Limiter {
             state: Arc::new(Mutex::new(st)),
             unavailable_until: None,
+            cap: BUCKET_CAP,
         }
     }
 
@@ -187,7 +223,11 @@ impl Limiter {
         }
         let bucket_key: BucketKey = (k.uid, k.service.clone());
         if let Some(b) = st.buckets.get_mut(&bucket_key) {
-            b.retain(|e| e.ev.at > cutoff);
+            trim(b, cutoff);
+            // Full: deny rather than forget what counts (fail closed).
+            if b.len() >= self.cap {
+                return Err("limits_capacity");
+            }
         }
 
         let amount = amount.map(|(m, c)| (m, c.to_ascii_uppercase()));
@@ -213,15 +253,19 @@ impl Limiter {
         let in_win = |e: &Entry, secs: i64| e.ev.at > now - Duration::seconds(secs);
         // Only this (uid, service)'s events: the uid bucket is all of them,
         // the session bucket those with the same session.
-        let events: &[Entry] = st.buckets.get(&bucket_key).map_or(&[], |b| b.as_slice());
+        let empty = Bucket::new();
+        let events: &Bucket = st.buckets.get(&bucket_key).unwrap_or(&empty);
         let uid_bucket = |_: &Entry| true;
         let session_bucket = |e: &Entry| e.ev.key.session == k.session;
         let buckets: [&dyn Fn(&Entry) -> bool; 2] = [&uid_bucket, &session_bucket];
         for b in buckets {
+            // Time-ordered: walk back from the newest to the window's start.
             let count = |secs: i64, f: &dyn Fn(OpKind) -> bool| -> u64 {
                 events
                     .iter()
-                    .filter(|e| b(e) && in_win(e, secs) && f(e.ev.kind))
+                    .rev()
+                    .take_while(|e| in_win(e, secs))
+                    .filter(|e| b(e) && f(e.ev.kind))
                     .count() as u64
             };
             if let Some(l) = cfg.requests_per_minute {
@@ -625,7 +669,7 @@ mod tests {
     }
 
     fn remembered(l: &Limiter) -> usize {
-        lock(&l.state).buckets.values().map(Vec::len).sum()
+        lock(&l.state).buckets.values().map(VecDeque::len).sum()
     }
 
     #[test]
@@ -666,6 +710,92 @@ mod tests {
             st.buckets[&(1, "stripe".to_string())].len() as u64,
             SWEEP_EVERY
         );
+    }
+
+    #[test]
+    fn front_trim_at_the_window_boundary() {
+        let l = Limiter::new();
+        let k = key(1, None);
+        let none = LimitsCfg::default();
+        go(&l, &k, OpKind::Delete, None, &none, t0()).unwrap();
+        go(
+            &l,
+            &k,
+            OpKind::Delete,
+            None,
+            &none,
+            t0() + Duration::seconds(1),
+        )
+        .unwrap();
+        // Out of order (a clock that went back): kept in time order.
+        go(
+            &l,
+            &k,
+            OpKind::Delete,
+            None,
+            &none,
+            t0() - Duration::seconds(5),
+        )
+        .unwrap();
+        let ats = |l: &Limiter| -> Vec<OffsetDateTime> {
+            lock(&l.state).buckets[&(1, "stripe".to_string())]
+                .iter()
+                .map(|e| e.ev.at)
+                .collect()
+        };
+        assert_eq!(
+            ats(&l),
+            vec![
+                t0() - Duration::seconds(5),
+                t0(),
+                t0() + Duration::seconds(1)
+            ]
+        );
+        // Exactly 24 h after t0: t0's event (and the older one) are out,
+        // t0 + 1 s is still in.
+        let c = LimitsCfg {
+            deletes_per_day: Some(2),
+            ..Default::default()
+        };
+        let edge = t0() + Duration::seconds(DAY);
+        go(&l, &k, OpKind::Delete, None, &c, edge).unwrap();
+        assert_eq!(ats(&l), vec![t0() + Duration::seconds(1), edge]);
+        assert_eq!(
+            go(&l, &k, OpKind::Delete, None, &c, edge),
+            Err("deletes_per_day")
+        );
+    }
+
+    #[test]
+    fn full_bucket_denies_limits_capacity() {
+        let l = Limiter::with_cap(3);
+        let k = key(1, Some("a"));
+        let none = LimitsCfg::default();
+        for _ in 0..3 {
+            go(&l, &k, OpKind::Read, None, &none, t0()).unwrap();
+        }
+        // Full: denied, history kept, whatever the limits say.
+        assert_eq!(
+            go(&l, &k, OpKind::Read, None, &none, t0()),
+            Err("limits_capacity")
+        );
+        assert_eq!(
+            go(&l, &key(1, Some("b")), OpKind::Read, None, &none, t0()),
+            Err("limits_capacity")
+        );
+        assert_eq!(remembered(&l), 3);
+        // Another bucket is not affected; the window frees the full one.
+        go(&l, &key(2, None), OpKind::Read, None, &none, t0()).unwrap();
+        go(
+            &l,
+            &k,
+            OpKind::Read,
+            None,
+            &none,
+            t0() + Duration::seconds(DAY),
+        )
+        .unwrap();
+        assert_eq!(BUCKET_CAP, 100_000);
     }
 
     #[test]
