@@ -20,11 +20,23 @@ pub const OP_SECRET_LIST: &str = "secret.list";
 /// disagree.
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Request {
     pub id: u64,
     pub op: String,
     pub args: Map<String, Value>,
+}
+
+/// `args` can hold a secret value (`secret.add` fields): Debug shows the
+/// keys only.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("id", &self.id)
+            .field("op", &self.op)
+            .field("args", &self.args.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Request {
@@ -123,6 +135,15 @@ mod tests {
         assert!(Request::from_map(m.as_object().unwrap().clone()).is_err());
         let m = json!({"id":1});
         assert!(Request::from_map(m.as_object().unwrap().clone()).is_err());
+    }
+
+    #[test]
+    fn request_debug_shows_arg_keys_only() {
+        let m = json!({"id":1,"op":"secret.add","fields":{"token":"hunter2-value"},"name":"n"});
+        let r = Request::from_map(m.as_object().unwrap().clone()).unwrap();
+        let d = format!("{r:?}");
+        assert!(d.contains("fields") && d.contains("secret.add"), "{d}");
+        assert!(!d.contains("hunter2-value"), "{d}");
     }
 
     #[test]

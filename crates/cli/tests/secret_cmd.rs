@@ -212,6 +212,12 @@ fn non_admin_add_is_forbidden_and_recorded() {
     assert_eq!(add["tool"], "secret");
     assert_eq!(add["input"], "secret_add k1");
     assert_eq!(add["uid"].as_u64(), Some(common::daemon::own_uid() as u64));
+    let rot = recs.iter().find(|r| r["event"] == "secret_rotate").unwrap();
+    assert_eq!(rot["decision"], "deny");
+    assert_eq!(rot["input"], "secret_rotate k1");
+    assert_eq!(rot["name"], "k1");
+    let rem = recs.iter().find(|r| r["event"] == "secret_remove").unwrap();
+    assert_eq!(rem["input"], "secret_remove k1");
     let all = serde_json::to_string(&recs).unwrap();
     assert!(!all.contains("valuevalue"));
 }
@@ -394,9 +400,33 @@ fn unsupported_kind_refused() {
 #[test]
 fn from_env_and_from_file() {
     let d = admin();
-    // header, from a file with one trailing newline (stripped).
+    // Two trailing newlines: only one is stripped, the other is a control
+    // character, which the daemon refuses.
     let f = d.path().join("hdr.txt");
     fs::write(&f, "header-value-123\n\n").unwrap();
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "hdr",
+            "--kind",
+            "header",
+            "--service",
+            "s",
+            "--from-file",
+            f.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(
+        err(&o).contains("secret value has control characters"),
+        "{}",
+        err(&o)
+    );
+    // One trailing CRLF is stripped (a stored value with a CR would have
+    // been refused above).
+    fs::write(&f, "header-value-123\r\n").unwrap();
     let o = saiife(
         &d,
         &[

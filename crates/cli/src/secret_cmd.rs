@@ -83,6 +83,8 @@ mod linux {
     /// Why the command stops: `Refused` is exit 2, `Unavailable` exit 5.
     enum Stop {
         Refused(String),
+        /// The daemon said `forbidden` (also exit 2).
+        Forbidden(String),
         Unavailable(String),
     }
 
@@ -106,7 +108,7 @@ mod linux {
         let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
         match go(&config, action) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(Stop::Refused(m)) => {
+            Err(Stop::Refused(m) | Stop::Forbidden(m)) => {
                 eprintln!("saiife: {m}");
                 ExitCode::from(2)
             }
@@ -162,7 +164,16 @@ mod linux {
                 from_env,
             } => {
                 // The stored kind says which fields to read.
-                let l = call(config, "secret.list", Map::new())?;
+                let l = match call(config, "secret.list", Map::new()) {
+                    Ok(l) => l,
+                    // Not an admin: let the daemon refuse and record the
+                    // rotate itself (no value is read or sent).
+                    Err(Stop::Forbidden(_)) => {
+                        return call(config, "secret.rotate", args([("name", json!(name))]))
+                            .map(|_| ());
+                    }
+                    Err(e) => return Err(e),
+                };
                 let kind = l["secrets"]
                     .as_array()
                     .and_then(|a| a.iter().find(|s| s["name"] == json!(name)))
@@ -228,6 +239,9 @@ mod linux {
         .map_err(|e| down(&e))?;
         c.call(op, a, Instant::now() + CALL_TIMEOUT)
             .map_err(|e| match e {
+                ClientError::Refused { code, message } if code == "forbidden" => {
+                    Stop::Forbidden(message)
+                }
                 ClientError::Refused { message, .. } => Stop::Refused(message),
                 other => down(&other),
             })
@@ -311,18 +325,22 @@ mod linux {
             }
             Source::File(p) => {
                 let mut raw = read_file(&p)?;
-                if raw.last() == Some(&b'\n') {
-                    raw.pop();
-                }
+                strip_eol(&mut raw);
                 single(kind, utf8(&raw)?, &mut f)?;
             }
             Source::Env(var) => {
-                let v = std::env::var_os(&var)
+                let mut v = std::env::var_os(&var)
                     .ok_or_else(|| Stop::Refused(format!("environment variable {var} is not set")))?
                     .into_string()
                     .map_err(|_| Stop::Refused("the value is not UTF-8 text".into()))?;
                 if v.len() > MAX_VALUE_BYTES {
                     return Err(Stop::Refused("secret value is too long".into()));
+                }
+                if v.ends_with('\n') {
+                    v.pop();
+                    if v.ends_with('\r') {
+                        v.pop();
+                    }
                 }
                 single(kind, Zeroizing::new(v), &mut f)?;
             }
@@ -356,6 +374,16 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    /// Exactly one trailing `\n` or `\r\n` goes; nothing else.
+    fn strip_eol(b: &mut Vec<u8>) {
+        if b.last() == Some(&b'\n') {
+            b.pop();
+            if b.last() == Some(&b'\r') {
+                b.pop();
+            }
+        }
     }
 
     fn utf8(b: &[u8]) -> Result<Zeroizing<String>, Stop> {
@@ -458,5 +486,26 @@ mod linux {
             return Err(Stop::Refused("no value read".into()));
         }
         Ok(buf)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::strip_eol;
+
+        #[test]
+        fn strips_exactly_one_line_ending() {
+            let mut cases: Vec<(&[u8], &[u8])> = vec![
+                (b"abc\n", b"abc"),
+                (b"abc\r\n", b"abc"),
+                (b"abc\n\n", b"abc\n"),
+                (b"abc\r", b"abc\r"),
+                (b"abc", b"abc"),
+            ];
+            for (i, o) in cases.drain(..) {
+                let mut v = i.to_vec();
+                strip_eol(&mut v);
+                assert_eq!(v, o);
+            }
+        }
     }
 }

@@ -3,7 +3,7 @@
 //! `forbidden` and a `secret` record with `decision = "deny"`. A record or an
 //! answer never holds a field value, and an error never echoes `fields`.
 
-use crate::ops::{now_ts, Ctx};
+use crate::ops::{now_ts, Ctx, Notice};
 use crate::vault::{valid_name, Entry, Kind, Vault, VaultState};
 use saiife_audit::DecisionKind;
 use saiife_ipc::msg::{
@@ -21,6 +21,16 @@ const MAX_SERVICES: usize = 64;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 
 type Refusal = (ErrorCode, String);
+
+/// The audit-volume gate; an unknown free space counts as too little.
+fn gate(
+    free: std::io::Result<u64>,
+    min_free_mb: u64,
+    peer_uid: u32,
+    own_uid: u32,
+) -> Result<(), ErrorCode> {
+    crate::disk::disk_gate(free.unwrap_or(0), min_free_mb, peer_uid, own_uid)
+}
 
 fn bad(m: impl Into<String>) -> Refusal {
     (ErrorCode::BadRequest, m.into())
@@ -47,7 +57,18 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         .filter(|n| valid_name(n))
         .unwrap_or("")
         .to_string();
-    if !ctx.is_admin(peer.uid).await {
+    // Whatever writes a record (every op but an admin's list) is refused
+    // before it changes anything when the audit volume is below the floor
+    // (same gate as audit.append).
+    let admin = ctx.is_admin(peer.uid).await;
+    if event != "secret_list" || !admin {
+        let free = crate::disk::free_mb(&ctx.audit_dir);
+        if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
+            ctx.notice(peer.uid, Notice::LowDisk);
+            return err(id, code, "the audit volume is below [audit] min_free_mb");
+        }
+    }
+    if !admin {
         let mut r = record(ctx, peer, event, &name).await;
         r.decision = DecisionKind::Deny;
         r.reason = Some("secret ops are for root and [admin] groups".into());
@@ -70,6 +91,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 let r = record(ctx, peer, event, &name).await;
                 if let Err(e) = ctx.writer.append(r).await {
                     // The change is made; say so rather than hide it.
+                    eprintln!("saiife: {event} {name} committed without audit record: {e}");
                     return err(
                         id,
                         ErrorCode::Internal,
@@ -233,6 +255,9 @@ fn parse_fields_any(v: Option<&Value>) -> Result<BTreeMap<String, Zeroizing<Stri
         if s.len() > MAX_FIELD_BYTES {
             return Err(bad("secret value is too long"));
         }
+        if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(bad("secret value has control characters"));
+        }
         out.insert(k.clone(), Zeroizing::new(s.to_string()));
     }
     Ok(out)
@@ -389,6 +414,35 @@ mod tests {
             msg(parse(&req(OP_SECRET_ADD, short))),
             "secret value is too short"
         );
+    }
+
+    #[test]
+    fn control_characters_are_refused_and_not_echoed() {
+        for v in ["abcd\n", "ab\r\ncd", "abc\td", "abc\u{7f}d", "ab\u{0}cd"] {
+            let r =
+                json!({"name":"a1","kind":"token","fields":{"token":v},"allowed_services":["s"]});
+            let m = msg(parse(&req(OP_SECRET_ADD, r)));
+            assert_eq!(m, "secret value has control characters", "{v:?}");
+        }
+        // Stored exactly: a clean value parses to itself.
+        let r = json!({"name":"a1","kind":"token","fields":{"token":"header-value-123"},"allowed_services":["s"]});
+        match parse(&req(OP_SECRET_ADD, r)) {
+            Ok(Parsed::Add { fields, .. }) => assert_eq!(&*fields["token"], "header-value-123"),
+            _ => panic!("not parsed"),
+        }
+        let r = json!({"name":"a1","fields":{"token":"abcd\n"}});
+        assert_eq!(
+            msg(parse(&req(OP_SECRET_ROTATE, r))),
+            "secret value has control characters"
+        );
+    }
+
+    #[test]
+    fn gate_refuses_below_the_floor_and_fails_closed() {
+        let io_err = || Err(std::io::Error::other("x"));
+        assert_eq!(gate(Ok(10), 512, 1000, 990), Err(ErrorCode::LowDisk));
+        assert_eq!(gate(Ok(512), 512, 1000, 990), Ok(()));
+        assert_eq!(gate(io_err(), 512, 1000, 990), Err(ErrorCode::LowDisk));
     }
 
     #[test]
