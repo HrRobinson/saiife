@@ -1,8 +1,9 @@
 //! `/etc/saiife/config.toml` (spec §8.1). Every section rejects unknown keys
 //! (typos in a security config are errors) and every default is the §8.1
-//! value. `forward`, `notify`, `services` and `example` stay raw tables until
-//! plans 10 to 12 type them.
+//! value. `forward`, `notify` and `example` stay raw tables until plans 11 and 12
+//! type them.
 
+use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -31,7 +32,10 @@ pub struct SystemConfig {
     #[serde(default)]
     pub gateway: GatewayCfg,
     #[serde(default)]
-    pub services: BTreeMap<String, toml::Table>,
+    pub services: BTreeMap<String, ServiceCfg>,
+    /// `[secrets.<name>]`: per-secret admin settings (`run_allow`).
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     pub scope: Vec<Scope>,
     #[serde(default)]

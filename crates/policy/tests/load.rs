@@ -364,3 +364,134 @@ fn symlinked_policy_d_is_refused() {
         other => panic!("expected Invalid, got {other:?}"),
     }
 }
+
+#[test]
+fn typed_services_reject_unknown_key() {
+    let (_d, cfg) = etc(
+        "version = 2\n",
+        &[(
+            "10-shop.toml",
+            "[services.shopify]\nconnector = \"shopify\"\nallwo = []\n",
+        )],
+    );
+    let e = load_system(&cfg).unwrap_err();
+    let msg = e.to_string();
+    assert!(matches!(e, PolicyError::Parse { .. }), "{msg}");
+    assert!(
+        msg.contains("allwo") && msg.contains("10-shop.toml"),
+        "{msg}"
+    );
+    // Nested typed tables too.
+    let (_d, cfg) = etc(
+        "version = 2\n[services.s]\nconnector = \"c\"\n[services.s.limits]\nrequests_per_min = 1\n",
+        &[],
+    );
+    let msg = load_system(&cfg).unwrap_err().to_string();
+    assert!(
+        msg.contains("requests_per_min") && msg.contains("config.toml"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn profile_key_reserved() {
+    for text in [
+        "version = 2\n[services.s]\nconnector = \"c\"\nprofile = \"x\"\n",
+        "version = 2\n[services.s]\nconnector = \"c\"\n[services.s.limits]\nprofile = 1\n",
+        "version = 2\n[services.s]\nconnector = \"c\"\n[[services.s.rule]]\ncapability = \"a:read\"\naction = \"allow\"\nprofile = \"x\"\n",
+        "version = 2\n[secrets.k]\nprofile = \"x\"\n",
+    ] {
+        let (_d, cfg) = etc(text, &[]);
+        let e = load_system(&cfg).unwrap_err();
+        assert!(matches!(e, PolicyError::Reserved { .. }), "{text}: {e:?}");
+        assert!(e.to_string().contains("reserved for v3"), "{e}");
+    }
+    let (_d, cfg) = etc(
+        "version = 2\n",
+        &[(
+            "a.toml",
+            "[services.s]\nconnector = \"c\"\nprofile = \"x\"\n",
+        )],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::Reserved { .. })
+    ));
+}
+
+#[test]
+fn run_allow_refuses_interpreters() {
+    for bad in [
+        "/usr/bin/python3",
+        "/usr/bin/python3.12",
+        "/bin/sh",
+        "/usr/bin/env",
+        "/usr/bin/osascript",
+        "/bin/busybox",
+    ] {
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[secrets.k]\nrun_allow = [\"/usr/bin/curl\", \"{bad}\"]\n"),
+            &[],
+        );
+        let e = load_system(&cfg).unwrap_err();
+        assert!(
+            matches!(&e, PolicyError::RunAllowInterpreter { secret, .. } if secret == "k"),
+            "{bad}: {e:?}"
+        );
+    }
+    // A drop-in is checked too.
+    let (_d, cfg) = etc(
+        "version = 2\n",
+        &[("a.toml", "[secrets.k]\nrun_allow = [\"/usr/bin/node\"]\n")],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::RunAllowInterpreter { .. })
+    ));
+    let (_d, cfg) = etc(
+        "version = 2\n[secrets.k]\nrun_allow = [\"/usr/bin/curl\", \"/opt/tools/python-lint\"]\n",
+        &[],
+    );
+    let c = load_system(&cfg).unwrap().config;
+    assert_eq!(c.secrets["k"].run_allow.len(), 2);
+}
+
+#[test]
+fn secret_defined_twice_and_bad_auth_kind() {
+    let (_d, cfg) = etc(
+        "version = 2\n[secrets.k]\nrun_allow = []\n",
+        &[("a.toml", "[secrets.k]\nrun_allow = []\n")],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::Invalid { .. })
+    ));
+    let (_d, cfg) = etc(
+        "version = 2\n[services.s]\nconnector = \"c\"\nauth = { kind = \"magic\" }\n",
+        &[],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::Invalid { .. })
+    ));
+}
+
+#[test]
+fn spec_shopify_dropin_types() {
+    let (_d, cfg) = etc(
+        "version = 2\n",
+        &[(
+            "shopify.toml",
+            "[services.shopify]\nconnector = \"shopify\"\nsecret = \"shopify-prod\"\nparams = { shop = \"acme\" }\n\
+             allow = [\"orders:read\"]\ndeny = [\"*:delete\"]\n\
+             [services.shopify.limits]\nrequests_per_minute = 60\namount_per_day = { max = 500, currency = \"EUR\" }\n\
+             [services.shopify.redact]\nfields = [\"customer.email\"]\n",
+        )],
+    );
+    let c = load_system(&cfg).unwrap().config;
+    let s = &c.services["shopify"];
+    assert_eq!(s.params["shop"], "acme");
+    assert_eq!(s.limits.requests_per_minute, Some(60));
+    assert_eq!(s.limits.amount_per_day.as_ref().unwrap().max, 500);
+    assert_eq!(s.redact.fields, vec!["customer.email"]);
+}

@@ -269,6 +269,23 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_changes_with_service() {
+        let a = cfg(CFG_A);
+        let b = cfg(&CFG_A.replace("allow = [\"a\"]", "allow = [\"b\"]"));
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&b, &catalog(), None));
+        // Secrets and limits are part of the hash too.
+        let c = cfg(&format!(
+            "{CFG_A}[secrets.k]\nrun_allow = [\"/usr/bin/curl\"]\n"
+        ));
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&c, &catalog(), None));
+        let d = cfg(&format!(
+            "{CFG_A}[services.shopify.limits]\nrequests_per_minute = 1\n"
+        ));
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&d, &catalog(), None));
+    }
+
+    #[test]
     fn notes_do_not_change_hash() {
         let c = cfg(CFG_A);
         let p = parse_project(b"version = 2\n[services.shopify]\ndeny = [\"a\"]\n").unwrap();
