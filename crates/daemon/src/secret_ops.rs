@@ -693,7 +693,10 @@ mod tests {
 
     #[test]
     fn symlinked_entry_never_grants_its_target() {
-        let dir = std::env::var("CARGO_TARGET_TMPDIR").unwrap_or_else(|_| ".".into());
+        let dir = std::env::var_os("SAIIFE_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp"));
+        std::fs::create_dir_all(&dir).unwrap();
         let tmp = tempfile::tempdir_in(dir).unwrap();
         let real = std::fs::canonicalize("/bin/echo").unwrap();
         let link = tmp.path().join("echo");

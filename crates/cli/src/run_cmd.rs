@@ -49,6 +49,11 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
     if name.is_empty() {
         return Err("--secret needs a name".into());
     }
+    if is_loader_var(&env) {
+        return Err(format!(
+            "{env} is a loader variable and is removed from the command's environment; pick another"
+        ));
+    }
     let mut chars = env.chars();
     let ok = chars
         .next()
@@ -100,20 +105,30 @@ pub(crate) fn pump(
 /// command load or run other code: `LD_*` and a few more. They are removed
 /// before the command starts.
 #[cfg(any(target_os = "linux", test))]
+const LOADER_EXTRA: &[&str] = &[
+    "GCONV_PATH",
+    "LOCPATH",
+    "MALLOC_CHECK_",
+    "MALLOC_PERTURB_",
+    "HOSTALIASES",
+    "NLSPATH",
+    "RES_OPTIONS",
+    "GLIBC_TUNABLES",
+    "MALLOC_TRACE",
+    "RESOLV_HOST_CONF",
+    "LOCALDOMAIN",
+    "GETCONF_DIR",
+    "TZDIR",
+];
+
+#[cfg(any(target_os = "linux", test))]
+fn is_loader_var(n: &str) -> bool {
+    n.starts_with("LD_") || LOADER_EXTRA.contains(&n)
+}
+
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn loader_vars<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
-    const EXTRA: &[&str] = &[
-        "GCONV_PATH",
-        "LOCPATH",
-        "MALLOC_CHECK_",
-        "MALLOC_PERTURB_",
-        "HOSTALIASES",
-        "NLSPATH",
-        "RES_OPTIONS",
-    ];
-    names
-        .into_iter()
-        .filter(|n| n.starts_with("LD_") || EXTRA.contains(&n.as_str()))
-        .collect()
+    names.into_iter().filter(|n| is_loader_var(n)).collect()
 }
 
 /// What `argv[0]` is for the command: the canonical file's basename, never
@@ -354,6 +369,9 @@ mod tests {
             "default would start with a digit"
         );
         assert!(parse_spec(":X").is_err());
+        assert!(parse_spec("tok:LD_PRELOAD").is_err());
+        assert!(parse_spec("tok:GLIBC_TUNABLES").is_err());
+        assert!(parse_spec("tok:LD_X").is_err());
     }
 
     #[test]
@@ -368,13 +386,19 @@ mod tests {
             "HOSTALIASES",
             "NLSPATH",
             "RES_OPTIONS",
+            "GLIBC_TUNABLES",
+            "MALLOC_TRACE",
+            "RESOLV_HOST_CONF",
+            "LOCALDOMAIN",
+            "GETCONF_DIR",
+            "TZDIR",
             "PATH",
             "HOME",
             "LANG",
             "OLD_LD_X",
         ];
         let got = loader_vars(names.iter().map(|s| s.to_string()));
-        assert_eq!(got.len(), 9, "{got:?}");
+        assert_eq!(got.len(), 15, "{got:?}");
         assert!(!got
             .iter()
             .any(|n| n == "PATH" || n == "HOME" || n == "LANG"));

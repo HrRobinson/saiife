@@ -457,6 +457,7 @@ fn run_allow_refuses_interpreters() {
         "/usr/bin/ed",
         "/usr/bin/gdb",
         "/usr/bin/make",
+        "/usr/bin/coreutils",
     ] {
         let (_d, cfg) = etc(
             &format!("version = 2\n[secrets.k]\nrun_allow = [\"/usr/bin/curl\", \"{bad}\"]\n"),

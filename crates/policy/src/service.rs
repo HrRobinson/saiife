@@ -181,6 +181,7 @@ const INTERPRETERS: &[&str] = &[
     "ed",
     "gdb",
     "make",
+    "coreutils",
 ];
 
 /// True when `path` names an interpreter or shell (by basename).
