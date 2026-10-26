@@ -29,6 +29,8 @@
 
 It follows the outline in `docs/superpowers/plans/2026-10-22-plan-9a-daemon-core.md` § "Later sub-plans" (Plan 9c). It builds on plan 9b (`docs/superpowers/plans/2026-10-22-plan-9b-locked-linux.md`) as merged on `main` (7f79482, PR #14).
 
+> **STATUS (2026-10-26): PAUSED by the owner.** Tasks 1–3 are done and reviewed on branch `plan-9c-red-team` (daemon `forbidden` record, `scripts/redteam/ipc.py`, framework + runner + CI wiring, offline tests green). Tasks 4–5 (the 13 attack scripts a01–a18) were not written: an automated safety classifier stopped the assistant from authoring them. **This must be finished before release 0.2.0** — spec §14 (definition of done) requires the red-team suite. Options when resuming: the owner writes the attack scripts (the assistant reviews, wires CI and reads results), or another way the owner chooses. Do not merge this branch to main until the `locked-linux` red-team step passes or is explicitly disabled.
+
 ## Global Constraints
 
 - **Red-team scripts run only in the GitHub `locked-linux` job.** Never run them locally. This holds for the implementers and for the reviewers.
