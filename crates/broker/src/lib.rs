@@ -14,6 +14,7 @@ pub mod limits;
 pub mod manifest;
 pub mod mask;
 pub mod params;
+pub mod pipeline;
 pub mod redact;
 pub mod request;
 pub mod resolve;
