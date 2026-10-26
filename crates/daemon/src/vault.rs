@@ -94,6 +94,66 @@ pub struct Vault {
     /// `last_used` changed in memory since the last write.
     dirty: bool,
     last_write: Option<Instant>,
+    /// The fsync of the dir after the rename (a seam for tests).
+    dir_sync: fn(&Path) -> io::Result<()>,
+}
+
+fn real_dir_sync(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Open a regular file without following a symlink and without blocking on
+/// a FIFO; anything else is `InvalidData`.
+fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let f = std::fs::File::from(fd);
+    if !f.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    Ok(f)
+}
+
+/// The vault dir must be a real directory (no symlink) owned by the euid,
+/// mode 0700 (fixed when it is not). With `create`, a missing dir is made;
+/// otherwise a missing dir is `NotFound`.
+fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let md = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            std::fs::symlink_metadata(dir)?
+        }
+        Err(e) => return Err(e),
+    };
+    if !md.file_type().is_dir() {
+        return Err(io::Error::other("the vault dir is not a directory"));
+    }
+    if md.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other("the vault dir is not owned by this user"));
+    }
+    if md.permissions().mode() & 0o7777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Where a write failed: before the rename the old file is intact; after it
+/// the new file is already the vault.
+enum WriteErr {
+    Before(io::Error),
+    After(io::Error),
 }
 
 impl std::fmt::Debug for Vault {
@@ -117,7 +177,7 @@ pub fn valid_name(n: &str) -> bool {
 }
 
 fn read_key(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, &'static str> {
-    let f = std::fs::File::open(key_file).map_err(|_| "no vault key")?;
+    let f = open_regular(key_file).map_err(|_| "no vault key")?;
     let mut buf = Zeroizing::new(Vec::with_capacity(64));
     f.take(33)
         .read_to_end(&mut buf)
@@ -150,8 +210,16 @@ pub fn open(key_file: &Path, vault_file: &Path) -> VaultState {
         entries: BTreeMap::new(),
         dirty: false,
         last_write: None,
+        dir_sync: real_dir_sync,
     };
-    let raw = match std::fs::File::open(vault_file) {
+    if let Some(dir) = vault_file.parent() {
+        match check_dir(dir, false) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return VaultState::Ready(v),
+            Err(_) => return not_a_vault(),
+        }
+    }
+    let raw = match open_regular(vault_file) {
         Ok(f) => {
             let mut raw = Vec::new();
             if f.take(MAX_VAULT_BYTES + 1).read_to_end(&mut raw).is_err()
@@ -193,6 +261,19 @@ pub fn open(key_file: &Path, vault_file: &Path) -> VaultState {
     }
 }
 
+/// The rename succeeded and the dir fsync did not: the change is on disk,
+/// so `put`/`remove` count it as done (memory stays ahead, never behind the
+/// file) and report `Ok`; the only trace is this one stderr line.
+fn warn_committed(e: &io::Error) {
+    eprintln!("saiife: warning: vault written but the directory sync failed: {e}");
+}
+
+fn finish(r: Result<(), WriteErr>) -> io::Result<()> {
+    r.map_err(|e| match e {
+        WriteErr::Before(e) | WriteErr::After(e) => e,
+    })
+}
+
 impl Vault {
     pub fn get(&self, name: &str) -> Option<&Entry> {
         self.entries.get(name)
@@ -209,12 +290,16 @@ impl Vault {
         }
         let name = e.name.clone();
         let old = self.entries.insert(name.clone(), e);
-        if let Err(err) = self.write(Instant::now()) {
-            match old {
-                Some(o) => self.entries.insert(name, o),
-                None => self.entries.remove(&name),
-            };
-            return Err(err);
+        match self.write(Instant::now()) {
+            Ok(()) => {}
+            Err(WriteErr::Before(err)) => {
+                match old {
+                    Some(o) => self.entries.insert(name, o),
+                    None => self.entries.remove(&name),
+                };
+                return Err(err);
+            }
+            Err(WriteErr::After(err)) => warn_committed(&err),
         }
         Ok(())
     }
@@ -224,9 +309,13 @@ impl Vault {
         let Some(old) = self.entries.remove(name) else {
             return Ok(false);
         };
-        if let Err(err) = self.write(Instant::now()) {
-            self.entries.insert(name.to_string(), old);
-            return Err(err);
+        match self.write(Instant::now()) {
+            Ok(()) => {}
+            Err(WriteErr::Before(err)) => {
+                self.entries.insert(name.to_string(), old);
+                return Err(err);
+            }
+            Err(WriteErr::After(err)) => warn_committed(&err),
         }
         Ok(true)
     }
@@ -265,28 +354,34 @@ impl Vault {
                 return Ok(false);
             }
         }
-        self.write(now)?;
+        match self.write(now) {
+            Ok(()) => {}
+            Err(WriteErr::Before(e)) => return Err(e),
+            Err(WriteErr::After(e)) => warn_committed(&e),
+        }
         Ok(true)
     }
 
     /// Write pending changes now (on stop).
     pub fn flush(&mut self) -> io::Result<()> {
         if self.dirty {
-            self.write(Instant::now())?;
+            finish(self.write(Instant::now()))?;
         }
         Ok(())
     }
 
-    fn write(&mut self, now: Instant) -> io::Result<()> {
+    fn write(&mut self, now: Instant) -> Result<(), WriteErr> {
         // Reserved up front so growth does not leave plaintext copies in
         // freed memory for typical vault sizes.
         let mut plain = Zeroizing::new(Vec::with_capacity(64 * 1024));
         let body = BodyRef {
             entries: self.entries.values().collect(),
         };
-        serde_json::to_writer(&mut *plain, &body).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut *plain, &body)
+            .map_err(|e| WriteErr::Before(io::Error::other(e)))?;
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
+        getrandom::fill(&mut nonce)
+            .map_err(|e| WriteErr::Before(io::Error::other(e.to_string())))?;
         let mut head = [0u8; 9];
         head[..8].copy_from_slice(MAGIC);
         head[8] = VERSION;
@@ -298,34 +393,36 @@ impl Vault {
                     aad: &head,
                 },
             )
-            .map_err(|_| io::Error::other("cannot encrypt the vault"))?;
+            .map_err(|_| WriteErr::Before(io::Error::other("cannot encrypt the vault")))?;
         let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
         out.extend_from_slice(&head);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-        write_atomic(&self.file, &out)?;
-        self.dirty = false;
-        self.last_write = Some(now);
-        Ok(())
+        let r = write_atomic(&self.file, &out, self.dir_sync);
+        if !matches!(r, Err(WriteErr::Before(_))) {
+            // On disk (an After failure counts as written).
+            self.dirty = false;
+            self.last_write = Some(now);
+        }
+        r
     }
 }
 
-/// Temp file in the same dir (0600), fsync, rename, fsync the dir. The dir
-/// is created 0700. A failure removes the temp file and leaves the old
-/// file as it was.
-fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Check the dir, then: temp file in the same dir (0600), fsync, rename,
+/// fsync the dir. A failure before the rename removes the temp file and
+/// leaves the old file as it was; one after it is `After`.
+fn write_atomic(
+    file: &Path,
+    bytes: &[u8],
+    dir_sync: fn(&Path) -> io::Result<()>,
+) -> Result<(), WriteErr> {
     let dir = file
         .parent()
-        .ok_or_else(|| io::Error::other("vault path has no directory"))?;
-    if !dir.exists() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
+        .ok_or_else(|| WriteErr::Before(io::Error::other("vault path has no directory")))?;
+    check_dir(dir, true).map_err(WriteErr::Before)?;
     let tmp = dir.join(".vault.bin.tmp");
     let _ = std::fs::remove_file(&tmp);
-    let res = (|| {
+    let staged = (|| {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -333,13 +430,13 @@ fn write_atomic(file: &Path, bytes: &[u8]) -> io::Result<()> {
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, file)?;
-        std::fs::File::open(dir)?.sync_all()
+        std::fs::rename(&tmp, file)
     })();
-    if res.is_err() {
+    if let Err(e) = staged {
         let _ = std::fs::remove_file(&tmp);
+        return Err(WriteErr::Before(e));
     }
-    res
+    dir_sync(dir).map_err(WriteErr::After)
 }
 
 #[cfg(test)]
@@ -482,15 +579,23 @@ mod tests {
         let mut v = ready(&e);
         v.put(entry("gh", "old")).unwrap();
         let before = std::fs::read(&e.file).unwrap();
-        let dir = e.file.parent().unwrap();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Seam: the target becomes a non-empty dir, so the rename fails
+        // after the temp file was written.
+        let moved = e.file.with_file_name("moved.bin");
+        std::fs::rename(&e.file, &moved).unwrap();
+        std::fs::create_dir(&e.file).unwrap();
+        std::fs::write(e.file.join("x"), b"x").unwrap();
         let r = v.put(entry("gh", "new"));
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(r.is_err());
+        std::fs::remove_dir_all(&e.file).unwrap();
+        std::fs::rename(&moved, &e.file).unwrap();
         assert_eq!(std::fs::read(&e.file).unwrap(), before);
         // The in-memory view did not move ahead of the file.
         assert_eq!(v.get("gh").unwrap().fields["token"].as_str(), "old");
-        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(e.file.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]
@@ -569,5 +674,89 @@ mod tests {
             ready(&e).get("gh").unwrap().last_used.as_deref(),
             Some("2026-10-26T10:05:00Z")
         );
+    }
+
+    #[test]
+    fn existing_dir_is_fixed_to_0700_and_symlinked_dir_refused() {
+        let e = env();
+        let dir = e.file.parent().unwrap().to_path_buf();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Open fixes it too.
+        let _ = ready(&e);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ready(&e).put(entry("gh", "x")).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        // A symlinked vault dir is refused at open and at write.
+        let other = e.file.parent().unwrap().parent().unwrap().join("elsewhere");
+        std::fs::create_dir(&other).unwrap();
+        let mut v = ready(&e);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&other, &dir).unwrap();
+        assert!(v.put(entry("gh", "y")).is_err());
+        assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
+        assert_eq!(reason(&e), "vault file is not a saiife vault");
+    }
+
+    #[test]
+    fn failure_after_rename_counts_as_committed() {
+        let e = env();
+        let mut v = ready(&e);
+        v.put(entry("gh", "x")).unwrap();
+        v.dir_sync = |_| Err(io::Error::other("injected"));
+        v.put(entry("gh2", "y")).unwrap();
+        assert!(v.get("gh2").is_some());
+        assert!(v.remove("gh").unwrap());
+        assert!(v.get("gh").is_none());
+        // The file agrees with memory: the removed secret is not back.
+        let on_disk = ready(&e);
+        assert!(on_disk.get("gh").is_none());
+        assert!(on_disk.get("gh2").is_some());
+    }
+
+    #[test]
+    fn fifo_or_symlinked_key_is_unavailable_without_blocking() {
+        let e = env();
+        std::fs::remove_file(&e.key).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &e.key,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let t = Instant::now();
+        assert_eq!(reason(&e), "no vault key");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        std::fs::remove_file(&e.key).unwrap();
+        let real = e.key.with_file_name("real-key");
+        std::fs::write(&real, KEY).unwrap();
+        std::os::unix::fs::symlink(&real, &e.key).unwrap();
+        assert_eq!(reason(&e), "no vault key");
+    }
+
+    #[test]
+    fn fifo_or_symlinked_vault_file_is_unavailable() {
+        let e = env();
+        ready(&e).put(entry("gh", "x")).unwrap();
+        let real = e.file.with_file_name("real.bin");
+        std::fs::rename(&e.file, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &e.file).unwrap();
+        assert_eq!(reason(&e), "vault file is not a saiife vault");
+        std::fs::remove_file(&e.file).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &e.file,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let t = Instant::now();
+        assert_eq!(reason(&e), "vault file is not a saiife vault");
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 }
