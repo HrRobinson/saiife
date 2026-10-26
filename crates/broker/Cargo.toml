@@ -19,6 +19,32 @@ thiserror = "1"
 percent-encoding = "2"
 time = "0.3"
 saiife-policy = { path = "../policy" }
+# Upstream client (Task 7). Newest releases older than 14 days (2026-10-26):
+# hyper 1.12.0 is from 2026-10-06, hyper-util 0.1.21 from 2026-09-24,
+# http 1.5.0 from 2026-07-29, http-body-util 0.1.5 from 2026-08-12, bytes
+# 1.12.1 from 2026-07-08, rustls 0.23.45 from 2026-09-14 (0.23.46 is younger),
+# tokio-rustls 0.26.6 from 2026-09-28, rustls-native-certs 0.8.4 from
+# 2026-06-01 (0.8.5 is younger), rustls-pemfile 2.2.0 from 2024-09-30,
+# base64 0.23.1 from 2026-08-04, zeroize 1.9.1 from 2026-10-06.
+# rustls uses the ring provider only: the static musl build has no C/cmake
+# toolchain for aws-lc-rs.
+# 1.53.3 and later are younger than 14 days (2026-10-22).
+tokio = { version = "=1.53.2", features = ["rt", "net", "time"] }
+hyper = { version = "=1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "=0.8.4"
+rustls-pemfile = "=2.2.0"
+base64 = "=0.23.1"
+zeroize = "=1.9.1"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "=1.53.2", features = ["rt", "net", "time", "macros"] }
+hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
+# 0.14.10 is from 2026-08-28. ring only, as above.
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }

@@ -1,9 +1,10 @@
 //! saiife-broker — connector manifests, parameter validation and operation
 //! resolution (spec §6.7.1 steps 4–5, §6.8, §8.4).
 //!
-//! This crate never touches the network: it turns a request (a named
+//! Steps 4–5 never touch the network: they turn a request (a named
 //! operation or a proxy path) into a validated operation plus parameters.
-//! The gateway (later tasks) sends the upstream request.
+//! [`request`] builds the upstream request and [`upstream`] sends it over
+//! pinned TLS (step 9).
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +13,9 @@ pub mod catalog;
 pub mod limits;
 pub mod manifest;
 pub mod params;
+pub mod request;
 pub mod resolve;
+pub mod upstream;
 
 pub use catalog::Catalog;
 pub use manifest::{builtin, Manifest, Operation};
@@ -41,4 +44,13 @@ pub enum BrokerError {
     MissingParam(String),
     #[error("bad amount: {0}")]
     BadAmount(String),
+    #[error("the upstream host is not one of the connector's hosts")]
+    HostNotAllowed,
+    #[error("redirect refused (only same-origin redirects, at most 3, are followed)")]
+    RedirectRefused,
+    #[error("upstream timeout")]
+    Timeout,
+    /// A transport or TLS failure. The message never holds a header or body.
+    #[error("upstream: {0}")]
+    Upstream(String),
 }

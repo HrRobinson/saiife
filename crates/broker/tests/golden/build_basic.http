@@ -1,0 +1,3 @@
+POST https://api.example.test/v1/items
+authorization: Basic <AUTH>
+content-type: application/json
