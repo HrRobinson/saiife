@@ -58,13 +58,22 @@ impl AuthMaterial {
         }
     }
 
-    /// Every non-empty field value, for the response masker (Task 8).
-    pub fn values(&self) -> Vec<&str> {
-        self.fields
+    /// Every non-empty field value, for the response masker (Task 8). For
+    /// `basic` it also holds `username:password`, whose base64 is what goes
+    /// on the wire.
+    pub fn values(&self) -> Vec<Zeroizing<String>> {
+        let mut out: Vec<Zeroizing<String>> = self
+            .fields
             .values()
-            .map(|v| v.as_str())
             .filter(|v| !v.is_empty())
-            .collect()
+            .cloned()
+            .collect();
+        if self.kind == "basic" {
+            if let (Some(u), Some(p)) = (self.fields.get("username"), self.fields.get("password")) {
+                out.push(basic_pair(u, p));
+            }
+        }
+        out
     }
 
     fn field(&self, name: &str) -> Result<&str, BrokerError> {
@@ -77,11 +86,31 @@ impl AuthMaterial {
     }
 }
 
+fn basic_pair(username: &str, password: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("{username}:{password}"))
+}
+
 /// [`AuthMaterial::kind`] of [`AuthMaterial::none`].
 pub const NO_AUTH: &str = "none";
 
-/// Agent headers that never reach the upstream, whatever the manifest says.
-const ALWAYS_DROPPED: &[&str] = &["authorization", "proxy-authorization", "cookie", "host"];
+/// Agent headers that never reach the upstream, whatever the manifest says:
+/// credentials and the host, plus hop-by-hop and framing headers, which
+/// hyper sets itself (letting an agent set them invites request smuggling).
+const ALWAYS_DROPPED: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "upgrade",
+    "expect",
+    "keep-alive",
+    "trailer",
+    "proxy-connection",
+];
 
 /// Everything but RFC 3986 unreserved characters is percent-encoded, in
 /// path segments and query components alike.
@@ -204,11 +233,7 @@ fn auth_header(
         "basic" => {
             // Ruling: basic uses the fields `username` and `password`;
             // `secret_field` is not used.
-            let pair = Zeroizing::new(format!(
-                "{}:{}",
-                auth.field("username")?,
-                auth.field("password")?
-            ));
+            let pair = basic_pair(auth.field("username")?, auth.field("password")?);
             (
                 AUTHORIZATION,
                 format!(
@@ -291,7 +316,8 @@ pub fn build(
             .any(|h| h.eq_ignore_ascii_case(lower));
         let is_auth = auth.as_ref().is_some_and(|(n, _)| n == hname);
         if listed && !is_auth && !ALWAYS_DROPPED.contains(&lower) {
-            headers.append(hname, hvalue);
+            // A repeated header: the last one wins.
+            headers.insert(hname, hvalue);
         }
     }
     if let Some((name, value)) = auth {
@@ -761,11 +787,75 @@ body = "json"
     fn auth_material_values_and_debug() {
         let m = plain_api("basic", "");
         let a = auth(&m.auth[0], &[("username", "ann"), ("password", "s3cret")]);
-        let mut v = a.values();
+        let mut v: Vec<String> = a.values().iter().map(|s| s.to_string()).collect();
         v.sort();
-        assert_eq!(v, ["ann", "s3cret"]);
+        // Basic also yields the combined pair, whose base64 is the wire form.
+        assert_eq!(v, ["ann", "ann:s3cret", "s3cret"]);
         let d = format!("{a:?}");
         assert!(!d.contains("s3cret") && d.contains("password"), "{d}");
+        // Other kinds yield only their fields.
+        let b = AuthMaterial {
+            kind: "bearer".into(),
+            name: None,
+            fields: [("token".to_string(), Zeroizing::new("t0k".to_string()))].into(),
+        };
+        let v: Vec<String> = b.values().iter().map(|s| s.to_string()).collect();
+        assert_eq!(v, ["t0k"]);
+    }
+
+    #[test]
+    fn hop_by_hop_and_framing_headers_dropped() {
+        let mut m = shopify();
+        let hop = [
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "TE",
+            "Upgrade",
+            "Expect",
+            "Keep-Alive",
+            "Trailer",
+            "Proxy-Connection",
+        ];
+        m.request_headers.extend(hop.iter().map(|h| h.to_string()));
+        let op = named(&m, "orders.list").unwrap();
+        let agent: Vec<(String, String)> = hop
+            .iter()
+            .map(|h| (h.to_string(), "1".to_string()))
+            .chain([("Accept".to_string(), "*/*".to_string())])
+            .collect();
+        let b = build(
+            &m,
+            op,
+            &map(&[("shop", "acme")]),
+            &BTreeMap::new(),
+            &agent,
+            None,
+            &shop_auth(&m),
+        )
+        .unwrap();
+        for h in hop {
+            assert!(b.headers.get(h).is_none(), "{h} survived");
+        }
+        assert_eq!(b.headers.get("accept").unwrap(), "*/*");
+    }
+
+    #[test]
+    fn duplicate_agent_header_last_wins() {
+        let m = shopify();
+        let op = named(&m, "orders.list").unwrap();
+        let b = build(
+            &m,
+            op,
+            &map(&[("shop", "acme")]),
+            &BTreeMap::new(),
+            &hdrs(&[("Accept", "text/plain"), ("accept", "application/json")]),
+            None,
+            &shop_auth(&m),
+        )
+        .unwrap();
+        let all: Vec<_> = b.headers.get_all("accept").iter().collect();
+        assert_eq!(all, ["application/json"]);
     }
 
     #[test]

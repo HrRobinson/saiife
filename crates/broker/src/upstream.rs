@@ -44,7 +44,9 @@ impl Resolver for SystemResolver {
     }
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` shows the status, the header names and the body length, never
+/// a header value or the body (it is not masked yet).
+#[derive(Clone)]
 pub struct UpstreamResponse {
     pub status: u16,
     pub headers: HeaderMap,
@@ -52,6 +54,20 @@ pub struct UpstreamResponse {
     pub body: Bytes,
     /// More body was available than `read_limit`.
     pub truncated: bool,
+}
+
+impl std::fmt::Debug for UpstreamResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamResponse")
+            .field("status", &self.status)
+            .field(
+                "headers",
+                &self.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            )
+            .field("body_len", &self.body.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 pub struct Upstream {
@@ -138,20 +154,114 @@ fn origin(uri: &Uri) -> Option<(String, String, u16)> {
     Some((scheme, authority.host().to_ascii_lowercase(), port))
 }
 
-/// The redirect target of `location` from `current`, if it is an absolute
-/// URL, a scheme-relative one or an absolute path. Anything else (a
-/// relative path, garbage) is refused by the caller.
+/// RFC 3986 §5.2.4.
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut out = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") || input == "/.." {
+            input = if input == "/.." { "/" } else { &input[3..] };
+            match out.rfind('/') {
+                Some(i) => out.truncate(i),
+                None => out.clear(),
+            }
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let start = usize::from(input.starts_with('/'));
+            let end = input[start..].find('/').map_or(input.len(), |i| i + start);
+            out.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    out
+}
+
+/// A reference's scheme, if it has one (`ALPHA *( ALPHA / DIGIT / + - . ) ":"`).
+fn ref_scheme(r: &str) -> Option<&str> {
+    let i = r.find(':')?;
+    let s = &r[..i];
+    let mut bytes = s.bytes();
+    let first = bytes.next()?;
+    (first.is_ascii_alphabetic() && bytes.all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)))
+        .then_some(s)
+}
+
+/// The redirect target of `location` from `current`: the reference resolved
+/// per RFC 3986 §5.2.2, without its fragment. An empty or unparsable
+/// Location is `None`, which the caller refuses.
 fn redirect_target(current: &Uri, location: &str) -> Option<Uri> {
     let scheme = current.scheme_str()?;
-    let text = if location.starts_with("//") {
-        format!("{scheme}:{location}")
-    } else if location.starts_with('/') {
-        format!("{scheme}://{}{location}", current.authority()?.as_str())
+    let authority = current.authority()?.as_str();
+    if location.is_empty() {
+        return None;
+    }
+    let location = location.split('#').next().unwrap_or("");
+    let split_query = |s: &str| -> (String, Option<String>) {
+        match s.split_once('?') {
+            Some((p, q)) => (p.to_string(), Some(q.to_string())),
+            None => (s.to_string(), None),
+        }
+    };
+    let (t_scheme, t_authority, path, query) = if let Some(s) = ref_scheme(location) {
+        let rest = &location[s.len() + 1..];
+        let rest = rest.strip_prefix("//")?;
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (p, q) = split_query(&rest[end..]);
+        (
+            s.to_string(),
+            rest[..end].to_string(),
+            remove_dot_segments(&p),
+            q,
+        )
+    } else if let Some(rest) = location.strip_prefix("//") {
+        let end = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (p, q) = split_query(&rest[end..]);
+        (
+            scheme.to_string(),
+            rest[..end].to_string(),
+            remove_dot_segments(&p),
+            q,
+        )
     } else {
-        location.to_string()
+        let (r_path, r_query) = split_query(location);
+        let base_path = current.path();
+        let (path, query) = if r_path.is_empty() {
+            let q = r_query.or_else(|| current.query().map(str::to_string));
+            (base_path.to_string(), q)
+        } else if r_path.starts_with('/') {
+            (remove_dot_segments(&r_path), r_query)
+        } else {
+            // Merge (§5.2.3): the base path up to its last `/`, then the
+            // reference. The base always has an authority here.
+            let dir = match base_path.rfind('/') {
+                Some(i) => &base_path[..=i],
+                None => "/",
+            };
+            (remove_dot_segments(&format!("{dir}{r_path}")), r_query)
+        };
+        (scheme.to_string(), authority.to_string(), path, query)
+    };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
+    let text = match query {
+        Some(q) => format!("{t_scheme}://{t_authority}{path}?{q}"),
+        None => format!("{t_scheme}://{t_authority}{path}"),
     };
     let uri: Uri = text.parse().ok()?;
     uri.scheme()?;
+    uri.authority()?;
     Some(uri)
 }
 
@@ -231,7 +341,10 @@ impl Upstream {
             let (resp, guard) = self.once(&b).await?;
             let status = resp.status().as_u16();
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                if redirects == MAX_REDIRECTS {
+                // Controller ruling: only GET and HEAD follow redirects, so
+                // a write is never sent twice.
+                let safe = b.method == Method::GET || b.method == Method::HEAD;
+                if !safe || redirects == MAX_REDIRECTS {
                     return Err(BrokerError::RedirectRefused);
                 }
                 let target = resp
@@ -247,7 +360,8 @@ impl Upstream {
                 redirects += 1;
                 b.uri = target;
                 if status == 303 {
-                    b.method = Method::GET;
+                    // GET stays GET and HEAD stays HEAD (RFC 9110 §15.4.4);
+                    // a body never follows.
                     b.body = None;
                     b.headers.remove(CONTENT_TYPE);
                     b.headers.remove(CONTENT_LENGTH);
@@ -366,9 +480,59 @@ mod tests {
             t("https://a.test:8443/z").as_deref(),
             Some("https://a.test:8443/z")
         );
-        assert_eq!(t("z"), None);
+        assert_eq!(t("z").as_deref(), Some("https://a.test:8443/x/z"));
+        assert_eq!(t("?p=2").as_deref(), Some("https://a.test:8443/x/y?p=2"));
+        assert_eq!(t("#f").as_deref(), Some("https://a.test:8443/x/y?q=1"));
+        // An empty Location is refused, not a loop on the same URL.
         assert_eq!(t(""), None);
         assert_eq!(t("ht tp://x"), None);
+    }
+
+    /// RFC 3986 §5.4.1 and §5.4.2 examples.
+    #[test]
+    fn rfc3986_reference_resolution() {
+        let base: Uri = "http://a/b/c/d;p?q".parse().unwrap();
+        for (r, want) in [
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g/"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q"),
+            ("g#s", "http://a/b/c/g"),
+            ("g?y#s", "http://a/b/c/g?y"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x", "http://a/b/c/g;x"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../", "http://a/"),
+            ("../../g", "http://a/g"),
+            ("../../../g", "http://a/g"),
+            ("../../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("/../g", "http://a/g"),
+            ("g.", "http://a/b/c/g."),
+            (".g", "http://a/b/c/.g"),
+            ("g..", "http://a/b/c/g.."),
+            ("..g", "http://a/b/c/..g"),
+            ("./../g", "http://a/b/g"),
+            ("./g/.", "http://a/b/c/g/"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+            ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+            ("g;x=1/../y", "http://a/b/c/y"),
+            ("g?y/./x", "http://a/b/c/g?y/./x"),
+            ("http://x/a/../b", "http://x/b"),
+        ] {
+            let got = redirect_target(&base, r).map(|u| u.to_string());
+            assert_eq!(got.as_deref(), Some(want), "{r:?}");
+        }
     }
 
     #[test]

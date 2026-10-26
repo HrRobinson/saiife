@@ -120,6 +120,13 @@ async fn handle(
             "/downgrade" => redirect(301, format!("http://{HOST}:{port}/hello")),
             "/userinfo" => redirect(302, format!("https://u:p@{HOST}:{port}/hello")),
             "/see-other" => redirect(303, "/method".to_string()),
+            "/rel/start" => redirect(302, "next".to_string()),
+            "/rel/next" => ok(Bytes::from_static(b"rel ok")),
+            "/q" if parts.uri.query() == Some("page=2") => ok(Bytes::from_static(b"page 2")),
+            "/q" => redirect(302, "?page=2".to_string()),
+            "/dots/a/b" => redirect(307, "../c#frag".to_string()),
+            "/dots/c" => ok(Bytes::from_static(b"dots ok")),
+            "/rel-other" => redirect(302, format!("//other.example.test:{port}/hello")),
             "/method" => ok(Bytes::from(format!("{} {}", parts.method, body.len()))),
             "/slow" => {
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -295,16 +302,98 @@ async fn redirect_downgrade_refused() {
 async fn see_other_becomes_get_without_body() {
     let (_pki, server, up) = setup().await;
     let mut b = get(server.port, "/see-other");
-    b.method = Method::POST;
     b.headers
         .insert("content-type", HeaderValue::from_static("application/json"));
     b.body = Some(Bytes::from_static(b"{\"a\":1}"));
     let r = up.send(b, 1024).await.unwrap();
     assert_eq!(&r.body[..], b"GET 0");
     let seen = server.seen.lock().unwrap();
-    assert_eq!(seen.requests[0].0, Method::POST);
     assert_eq!(seen.requests[0].3, 7);
     assert!(seen.requests[1].2.get("content-type").is_none());
+}
+
+/// Controller ruling: only GET and HEAD follow redirects, so a write is
+/// never sent twice.
+#[tokio::test]
+async fn redirect_of_a_write_refused() {
+    let (_pki, server, up) = setup().await;
+    for (method, path) in [
+        (Method::POST, "/see-other"),
+        (Method::POST, "/r/1"),
+        (Method::PUT, "/r/2"),
+        (Method::PATCH, "/r/1"),
+        (Method::DELETE, "/r/1"),
+    ] {
+        let before = hits(&server);
+        let mut b = get(server.port, path);
+        b.method = method.clone();
+        b.body = Some(Bytes::from_static(b"{}"));
+        let err = up.send(b, 1024).await.unwrap_err();
+        assert!(
+            matches!(err, BrokerError::RedirectRefused),
+            "{method} {path}: {err:?}"
+        );
+        assert_eq!(hits(&server) - before, 1, "{method} {path} sent once");
+    }
+    // HEAD follows.
+    let mut b = get(server.port, "/r/2");
+    b.method = Method::HEAD;
+    let r = up.send(b, 1024).await.unwrap();
+    assert_eq!(r.status, 200);
+    let seen = server.seen.lock().unwrap();
+    assert!(seen
+        .requests
+        .iter()
+        .rev()
+        .take(3)
+        .all(|r| r.0 == Method::HEAD));
+}
+
+#[tokio::test]
+async fn relative_redirect_resolved_and_followed() {
+    let (_pki, server, up) = setup().await;
+    for (path, want) in [
+        ("/rel/start", "rel ok"),
+        ("/q", "page 2"),
+        ("/dots/a/b", "dots ok"),
+    ] {
+        let r = up.send(get(server.port, path), 1024).await.unwrap();
+        assert_eq!((r.status, &r.body[..]), (200, want.as_bytes()), "{path}");
+    }
+    let seen = server.seen.lock().unwrap();
+    let uris: Vec<&str> = seen.requests.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(
+        uris,
+        [
+            "/rel/start",
+            "/rel/next",
+            "/q",
+            "/q?page=2",
+            "/dots/a/b",
+            "/dots/c"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn relative_redirect_to_other_origin_refused() {
+    let (_pki, server, up) = setup().await;
+    let err = up
+        .send(get(server.port, "/rel-other"), 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BrokerError::RedirectRefused), "{err:?}");
+    assert_eq!(hits(&server), 1);
+}
+
+#[tokio::test]
+async fn response_debug_hides_the_body() {
+    let (_pki, server, up) = setup().await;
+    let r = up.send(get(server.port, "/hello"), 1024).await.unwrap();
+    let d = format!("{r:?}");
+    assert!(!d.contains("hello world"), "{d}");
+    assert!(d.contains("200") && d.contains("11"), "{d}");
+    assert!(d.contains("content-length"), "{d}");
 }
 
 #[tokio::test]
