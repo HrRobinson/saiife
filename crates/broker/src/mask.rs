@@ -11,14 +11,18 @@
 //!   each offset we keep the characters whose 6 bits come from the value
 //!   alone. At most one character on each side of a masked core carries up
 //!   to 4 bits of the value; that is not enough to recover anything;
-//! - percent-encoded (every byte outside the RFC 3986 unreserved set), with
-//!   upper- and lower-case hex digits;
+//! - percent-encoded: exact forms (every byte outside the RFC 3986
+//!   unreserved set, upper- and lower-case hex), plus a per-value byte regex
+//!   where each byte may be raw or `%XX` in any case and a space may be `+`
+//!   or `%20` (partial encoders such as Python `quote` or JS
+//!   `encodeURIComponent`, mixed case, form encoding);
 //! - hex, lower and upper case;
 //! - each of the above as it appears inside a JSON string (`\"`, `\\`,
 //!   control characters, and `/` either as-is or as `\/`), when that differs.
 //!
-//! Matching is Aho-Corasick, leftmost-longest, so a full form wins over a
-//! core or a shorter form that is a prefix of it.
+//! Matching is Aho-Corasick with overlapping matches plus the percent
+//! regexes, over the bytes and over a JSON-unescaped view of them; the union
+//! of all hits is masked, so overlapping values are hidden whole.
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -26,6 +30,7 @@ use base64::Engine;
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use regex::bytes::{Regex, RegexBuilder};
 use zeroize::Zeroizing;
 
 use crate::BrokerError;
@@ -45,6 +50,10 @@ const NOT_UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
 /// Replaces vault values in every masked form. `Debug` never prints them.
 pub struct Masker {
     ac: Option<AhoCorasick>,
+    /// One per value: every byte raw or `%XX` (any hex case), a space also
+    /// as `+` or `%20`. Covers partial encoders (Python `quote`, JS
+    /// `encodeURIComponent`) and mixed-case escapes.
+    pct: Vec<Regex>,
     forms: usize,
 }
 
@@ -52,6 +61,7 @@ impl std::fmt::Debug for Masker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Masker")
             .field("forms", &self.forms)
+            .field("percent_patterns", &self.pct.len())
             .finish()
     }
 }
@@ -59,10 +69,20 @@ impl std::fmt::Debug for Masker {
 impl Masker {
     pub fn new(values: &[&str]) -> Masker {
         let mut forms: Vec<Zeroizing<Vec<u8>>> = Vec::new();
+        let mut pct = Vec::new();
         for v in values {
             let v = v.as_bytes();
             if v.len() < MIN_VALUE_LEN {
                 continue;
+            }
+            // The pattern is generated and always valid; a size-limit error
+            // (a huge value) leaves the exact percent forms in `ac` below.
+            // regex errors for size never quote the pattern.
+            if let Ok(re) = RegexBuilder::new(&percent_pattern(v))
+                .size_limit(64 << 20)
+                .build()
+            {
+                pct.push(re);
             }
             for form in encodings(v) {
                 for escaped in json_escapes(&form) {
@@ -78,32 +98,50 @@ impl Masker {
             None
         } else {
             Some(
+                // Standard semantics: overlapping matches are all reported
+                // and masked as a union, so two values sharing a suffix and
+                // a prefix are both hidden whole.
                 AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
+                    .match_kind(MatchKind::Standard)
                     .build(forms.iter().map(|f| f.as_slice()))
                     .expect("masking automaton builds"),
             )
         };
         Masker {
             ac,
+            pct,
             forms: forms.len(),
         }
     }
 
-    /// Replace every vault form in `b` with `[MASKED]`.
+    /// Replace every vault form in `b` with `[MASKED]`. Matches are looked
+    /// for in `b` and, when `b` holds a backslash, in a JSON-unescaped view
+    /// of it (`\uXXXX`, `\/`, ...) mapped back to `b`'s offsets, so a value
+    /// hidden by escapes is caught even in JSON that does not parse (a body
+    /// cut by the reader). Overlapping hits are merged into one mask.
     pub fn mask_bytes(&self, b: &[u8]) -> Vec<u8> {
-        let Some(ac) = &self.ac else {
-            return b.to_vec();
-        };
-        let mut out = Vec::with_capacity(b.len());
-        let mut last = 0;
-        for m in ac.find_iter(b) {
-            out.extend_from_slice(&b[last..m.start()]);
-            out.extend_from_slice(MASK.as_bytes());
-            last = m.end();
+        let mut spans = Vec::new();
+        self.collect_spans(b, &mut spans);
+        if b.contains(&b'\\') {
+            let (decoded, map) = json_unescape(b);
+            let mut inner = Vec::new();
+            self.collect_spans(&decoded, &mut inner);
+            spans.extend(inner.into_iter().map(|(s, e)| (map[s].0, map[e - 1].1)));
         }
-        out.extend_from_slice(&b[last..]);
-        out
+        apply_spans(b, spans)
+    }
+
+    fn collect_spans(&self, b: &[u8], spans: &mut Vec<(usize, usize)>) {
+        if let Some(ac) = &self.ac {
+            spans.extend(ac.find_overlapping_iter(b).map(|m| (m.start(), m.end())));
+        }
+        for re in &self.pct {
+            spans.extend(
+                re.find_iter(b)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| (m.start(), m.end())),
+            );
+        }
     }
 
     /// Vault forms, then the v1 masking patterns.
@@ -115,6 +153,133 @@ impl Masker {
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         saiife_audit::mask::mask(&masked)
     }
+}
+
+/// Byte regex for `v` with each byte raw or percent-encoded in any hex case
+/// (unreserved bytes too: some encoders escape them), and a space also as
+/// `+`. Unicode is off, so `\xNN` is one byte.
+fn percent_pattern(v: &[u8]) -> Zeroizing<String> {
+    fn nibble(p: &mut String, n: u8) {
+        match n {
+            0..=9 => p.push((b'0' + n) as char),
+            _ => {
+                let up = (b'A' + n - 10) as char;
+                p.push('[');
+                p.push(up);
+                p.push(up.to_ascii_lowercase());
+                p.push(']');
+            }
+        }
+    }
+    let mut p = Zeroizing::new(String::from("(?-u)"));
+    for &b in v {
+        p.push_str(&format!("(?:\\x{b:02X}|%"));
+        nibble(&mut p, b >> 4);
+        nibble(&mut p, b & 0xf);
+        if b == b' ' {
+            p.push_str("|\\+");
+        }
+        p.push(')');
+    }
+    p
+}
+
+/// Decode JSON string escapes anywhere in `b`. Returns the decoded bytes and,
+/// for each decoded byte, the `[start, end)` span of `b` it came from.
+/// Malformed escapes and lone surrogates are kept as literal bytes.
+fn json_unescape(b: &[u8]) -> (Vec<u8>, Vec<(usize, usize)>) {
+    fn hex4(b: &[u8], at: usize) -> Option<u32> {
+        let s = b.get(at..at + 4)?;
+        let s = std::str::from_utf8(s).ok()?;
+        if !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(s, 16).ok()
+    }
+    let mut out = Vec::with_capacity(b.len());
+    let mut map = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() {
+            let simple = match b[i + 1] {
+                b'"' => Some(b'"'),
+                b'\\' => Some(b'\\'),
+                b'/' => Some(b'/'),
+                b'n' => Some(b'\n'),
+                b'r' => Some(b'\r'),
+                b't' => Some(b'\t'),
+                b'b' => Some(0x08),
+                b'f' => Some(0x0c),
+                _ => None,
+            };
+            if let Some(c) = simple {
+                out.push(c);
+                map.push((i, i + 2));
+                i += 2;
+                continue;
+            }
+            if b[i + 1] == b'u' {
+                if let Some(hi) = hex4(b, i + 2) {
+                    let (cp, len) = if (0xD800..0xDC00).contains(&hi)
+                        && b.get(i + 6) == Some(&b'\\')
+                        && b.get(i + 7) == Some(&b'u')
+                    {
+                        match hex4(b, i + 8) {
+                            Some(lo) if (0xDC00..0xE000).contains(&lo) => {
+                                (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 12)
+                            }
+                            _ => (hi, 6),
+                        }
+                    } else {
+                        (hi, 6)
+                    };
+                    if let Some(ch) = char::from_u32(cp) {
+                        let mut buf = [0u8; 4];
+                        for &c in ch.encode_utf8(&mut buf).as_bytes() {
+                            out.push(c);
+                            map.push((i, i + len));
+                        }
+                        i += len;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b[i]);
+        map.push((i, i + 1));
+        i += 1;
+    }
+    (out, map)
+}
+
+/// Replace the union of `spans` in `b` with one `[MASKED]` per merged run.
+fn apply_spans(b: &[u8], mut spans: Vec<(usize, usize)>) -> Vec<u8> {
+    if spans.is_empty() {
+        return b.to_vec();
+    }
+    spans.sort_unstable();
+    let mut out = Vec::with_capacity(b.len());
+    let mut last = 0;
+    let mut cur: Option<(usize, usize)> = None;
+    for (s, e) in spans {
+        match cur {
+            Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
+            Some((cs, ce)) => {
+                out.extend_from_slice(&b[last..cs]);
+                out.extend_from_slice(MASK.as_bytes());
+                last = ce;
+                cur = Some((s, e));
+            }
+            None => cur = Some((s, e)),
+        }
+    }
+    if let Some((cs, ce)) = cur {
+        out.extend_from_slice(&b[last..cs]);
+        out.extend_from_slice(MASK.as_bytes());
+        last = ce;
+    }
+    out.extend_from_slice(&b[last..]);
+    out
 }
 
 /// Raw, base64 (both alphabets, padded, unpadded, three alignments),
@@ -239,28 +404,80 @@ fn mask_headers(headers: &HeaderMap, masker: &Masker) -> HeaderMap {
     out
 }
 
-/// Mask strings (keys and values) of a JSON tree in place.
-fn mask_json_strings(v: &mut serde_json::Value, masker: &Masker) {
+/// Mask strings (keys and values) of a JSON tree in place, with the vault
+/// forms and the v1 patterns. Returns whether anything changed.
+fn mask_json_strings(v: &mut serde_json::Value, masker: &Masker) -> bool {
     use serde_json::Value;
     match v {
-        Value::String(s) => *s = masker.mask_text(s),
-        Value::Array(items) => items.iter_mut().for_each(|i| mask_json_strings(i, masker)),
+        Value::String(s) => {
+            let m = masker.mask_text(s);
+            let changed = m != *s;
+            *s = m;
+            changed
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, i| mask_json_strings(i, masker) | acc),
         Value::Object(map) => {
+            let mut changed = false;
             let old = std::mem::take(map);
             for (k, mut child) in old {
-                mask_json_strings(&mut child, masker);
-                map.insert(masker.mask_text(&k), child);
+                changed |= mask_json_strings(&mut child, masker);
+                let mk = masker.mask_text(&k);
+                changed |= mk != k;
+                map.insert(mk, child);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// `application/json`, `text/json` or any `+json` media type.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let mt = ct
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            mt.ends_with("/json") || mt.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
+/// The v1 patterns over a body that is not JSON. A body that is not UTF-8
+/// is scanned through a lossy view; it is only replaced by that (masked)
+/// view when a pattern hit, so clean binary passes through byte for byte.
+fn v1_mask_body(masked: Vec<u8>) -> Vec<u8> {
+    match String::from_utf8(masked) {
+        Ok(s) => saiife_audit::mask::mask(&s).into_bytes(),
+        Err(e) => {
+            let bytes = e.into_bytes();
+            let lossy = String::from_utf8_lossy(&bytes);
+            let m = saiife_audit::mask::mask(&lossy);
+            if m == lossy {
+                bytes
+            } else {
+                m.into_bytes()
             }
         }
-        _ => {}
     }
 }
 
 /// Step 10 of the pipeline. `body` was read up to `max + 64 KiB` (Task 9)
 /// and `truncated` says whether more was available. Order:
-/// 1. mask the bytes (vault forms; v1 patterns too when the body is UTF-8),
-/// 2. with `redact` set: parse JSON (not JSON → `RedactNonJson`), redact,
-///    mask every string, re-serialize,
+/// 0. a JSON content type over a body that is not UTF-8 is refused
+///    (`BadResponseEncoding`), except a char cut by the reader,
+/// 1. mask the bytes with the vault forms (every body),
+/// 2. if it parses as JSON: redact (when `redact` is set), mask every key
+///    and string with the vault forms and the v1 patterns, re-serialize only
+///    if something changed. Not JSON: `RedactNonJson` when `redact` is set,
+///    else the v1 patterns over the (lossy, if need be) text,
 /// 3. cut to `max` and set `truncated`.
 ///
 /// Masking before the cut means a value straddling `max` is replaced whole.
@@ -273,21 +490,35 @@ pub fn finish(
     redact: &[String],
     max: usize,
 ) -> Result<Finished, BrokerError> {
+    if is_json_content_type(&headers) {
+        if let Err(e) = std::str::from_utf8(&body) {
+            // Only a multi-byte char cut by the reader is tolerated.
+            if !(truncated && e.error_len().is_none()) {
+                return Err(BrokerError::BadResponseEncoding);
+            }
+        }
+    }
     let headers = mask_headers(&headers, masker);
     let mut redacted = 0;
-    let mut out: Vec<u8> = if redact.is_empty() {
-        let masked = masker.mask_bytes(&body);
-        match String::from_utf8(masked) {
-            Ok(s) => saiife_audit::mask::mask(&s).into_bytes(),
-            Err(e) => e.into_bytes(),
+    // Pass 1, every body: the vault forms over the bytes.
+    let masked = masker.mask_bytes(&body);
+    // Pass 2: JSON gets the tree pass (redact, then every key and string,
+    // which sees values hidden by escapes); it is re-serialized only if
+    // something changed. Anything else gets the v1 patterns over the text.
+    let mut out: Vec<u8> = match serde_json::from_slice::<serde_json::Value>(&masked) {
+        Ok(mut v) => {
+            if !redact.is_empty() {
+                redacted = crate::redact::redact(&mut v, redact);
+            }
+            let changed = mask_json_strings(&mut v, masker);
+            if changed || redacted > 0 {
+                serde_json::to_vec(&v).map_err(|_| BrokerError::RedactNonJson)?
+            } else {
+                masked
+            }
         }
-    } else {
-        let masked = masker.mask_bytes(&body);
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&masked).map_err(|_| BrokerError::RedactNonJson)?;
-        redacted = crate::redact::redact(&mut v, redact);
-        mask_json_strings(&mut v, masker);
-        serde_json::to_vec(&v).map_err(|_| BrokerError::RedactNonJson)?
+        Err(_) if !redact.is_empty() => return Err(BrokerError::RedactNonJson),
+        Err(_) => v1_mask_body(masked),
     };
     let mut truncated = truncated;
     if out.len() > max {
@@ -496,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_masks_values_hidden_by_json_escapes() {
+    fn redact_set_masks_values_hidden_by_json_escapes() {
         // `s` is `s`: only visible to the masker after parsing.
         let m = Masker::new(&[SECRET]);
         let hidden = SECRET.replacen('s', "\\u0073", 1);
@@ -584,5 +815,145 @@ mod tests {
             f.headers["link"],
             "<https://x/?page=2&t=[MASKED]>; rel=\"next\""
         );
+    }
+
+    fn fin(
+        m: &Masker,
+        ct: Option<&str>,
+        body: Vec<u8>,
+        truncated: bool,
+    ) -> Result<Finished, BrokerError> {
+        let mut h = HeaderMap::new();
+        if let Some(ct) = ct {
+            h.insert("content-type", HeaderValue::from_str(ct).unwrap());
+        }
+        finish(200, h, Bytes::from(body), truncated, m, &[], 1 << 20)
+    }
+
+    #[test]
+    fn redact_masks_values_hidden_by_json_escapes() {
+        // redact = []: the tree pass still runs on every JSON body.
+        let m = Masker::new(&[SECRET]);
+        let hidden = SECRET.replacen('s', "\\u0073", 1);
+        let body = format!(r#"{{"k":"{hidden}","n":1}}"#);
+        let f = fin(&m, Some("application/json"), body.into_bytes(), false).unwrap();
+        assert_eq!(&f.body[..], br#"{"k":"[MASKED]","n":1}"#);
+
+        // Every byte escaped, in a key.
+        let all: String = SECRET.bytes().map(|b| format!("\\u{b:04x}")).collect();
+        let body = format!(r#"{{"{all}":"v"}}"#);
+        let f = fin(&m, None, body.into_bytes(), false).unwrap();
+        assert_eq!(&f.body[..], br#"{"[MASKED]":"v"}"#);
+
+        // Python json.dumps (ensure_ascii): non-ASCII as `\u00XX`.
+        let py = "t\u{f8}ken-\u{e9}1234";
+        let m = Masker::new(&[py]);
+        let body = br#"{"a": "t\u00f8ken-\u00e91234", "b": [1, 2]}"#.to_vec();
+        let f = fin(&m, Some("application/json"), body, false).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&f.body).unwrap();
+        assert_eq!(v["a"], "[MASKED]");
+    }
+
+    #[test]
+    fn json_without_hits_keeps_original_bytes() {
+        let m = Masker::new(&[SECRET]);
+        let body = b"{ \"a\" : 1,\n  \"b\": \"\\u0041\" }".to_vec();
+        let f = fin(&m, Some("application/json"), body.clone(), false).unwrap();
+        assert_eq!(&f.body[..], &body[..]);
+    }
+
+    #[test]
+    fn escaped_value_masked_in_truncated_json() {
+        // Cut by the reader, so not parseable: the escape-decoded view still
+        // finds the value.
+        let m = Masker::new(&[SECRET]);
+        let hidden = SECRET.replace('/', "\\/").replacen('a', "\\u0061", 1);
+        let body = format!(r#"{{"k":"{hidden}","rest":"aaaa"#);
+        let f = fin(&m, Some("application/json"), body.into_bytes(), true).unwrap();
+        let text = std::str::from_utf8(&f.body).unwrap();
+        assert_eq!(text, r#"{"k":"[MASKED]","rest":"aaaa"#);
+    }
+
+    #[test]
+    fn partial_and_mixed_percent_encoding_masked() {
+        let m = Masker::new(&[SECRET]); // shpat_0123456789abcdef/+x?Y
+                                        // Python urllib.parse.quote: `/` stays raw.
+        assert_eq!(
+            masked(&m, "t=shpat_0123456789abcdef/%2Bx%3FY&"),
+            "t=[MASKED]&"
+        );
+        // Mixed-case escapes.
+        assert_eq!(masked(&m, "shpat_0123456789abcdef%2f%2bx%3FY"), "[MASKED]");
+        // JS encodeURIComponent leaves !'()* raw.
+        let js = "a!b'c(d)e*f/g";
+        let m = Masker::new(&[js]);
+        assert_eq!(masked(&m, "q=a!b'c(d)e*f%2Fg"), "q=[MASKED]");
+        // Form encoding: `+` (or %20) for space.
+        let sp = "my secret pass";
+        let m = Masker::new(&[sp]);
+        assert_eq!(masked(&m, "p=my+secret+pass&"), "p=[MASKED]&");
+        assert_eq!(masked(&m, "p=my%20secret+pass&"), "p=[MASKED]&");
+    }
+
+    #[test]
+    fn surrogate_pair_escape_decoded() {
+        let v = "key\u{1F600}value";
+        let m = Masker::new(&[v]);
+        assert_eq!(masked(&m, r#""key\ud83d\ude00value""#), "\"[MASKED]\"");
+        // A lone surrogate is left alone, nothing panics.
+        assert_eq!(masked(&m, r#""\ud83d x""#), r#""\ud83d x""#);
+    }
+
+    #[test]
+    fn overlapping_secrets_masked_as_union() {
+        let a = "abcdefXYZW";
+        let b = "XYZW12345678";
+        let m = Masker::new(&[a, b]);
+        assert_eq!(masked(&m, "<abcdefXYZW12345678>"), "<[MASKED]>");
+        assert_eq!(
+            masked(&m, "<XYZW12345678 abcdefXYZW>"),
+            "<[MASKED] [MASKED]>"
+        );
+    }
+
+    #[test]
+    fn v1_patterns_run_on_non_utf8_bodies() {
+        let m = Masker::new(&[]);
+        let gh = format!("ghp_{}", "Q".repeat(36));
+        let mut body = vec![0xff, 0xfe, b' '];
+        body.extend_from_slice(gh.as_bytes());
+        let f = fin(&m, Some("application/octet-stream"), body, false).unwrap();
+        let lossy = String::from_utf8_lossy(&f.body);
+        assert!(!lossy.contains(&gh), "{lossy}");
+        assert!(lossy.contains(MASK));
+        // Binary without hits passes through unchanged.
+        let bin = vec![0u8, 0xff, 0x80, 7, 9];
+        let f = fin(&m, None, bin.clone(), false).unwrap();
+        assert_eq!(&f.body[..], &bin[..]);
+    }
+
+    #[test]
+    fn json_content_type_with_bad_utf8_refused() {
+        let m = Masker::new(&[]);
+        let bad = b"{\"a\":\"\xff\"}".to_vec();
+        let err = fin(&m, Some("application/json; charset=utf-8"), bad, false).unwrap_err();
+        assert!(matches!(err, BrokerError::BadResponseEncoding));
+        let err = fin(
+            &m,
+            Some("application/problem+json"),
+            vec![0xc3, 0x28],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerError::BadResponseEncoding));
+        // A body the reader cut inside a multi-byte char is not an error.
+        let f = fin(
+            &m,
+            Some("application/json"),
+            b"{\"a\":\"\xc3".to_vec(),
+            true,
+        )
+        .unwrap();
+        assert!(f.truncated);
     }
 }

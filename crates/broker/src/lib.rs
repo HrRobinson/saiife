@@ -59,4 +59,7 @@ pub enum BrokerError {
     /// so it is withheld (decision 5, `rule = "redact_non_json"`).
     #[error("response withheld: the service redacts fields but the response is not JSON")]
     RedactNonJson,
+    /// The upstream says the body is JSON but it is not valid UTF-8.
+    #[error("upstream response is labelled JSON but is not valid UTF-8")]
+    BadResponseEncoding,
 }
