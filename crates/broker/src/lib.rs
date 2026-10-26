@@ -12,7 +12,9 @@ pub mod amount;
 pub mod catalog;
 pub mod limits;
 pub mod manifest;
+pub mod mask;
 pub mod params;
+pub mod redact;
 pub mod request;
 pub mod resolve;
 pub mod upstream;
@@ -53,4 +55,8 @@ pub enum BrokerError {
     /// A transport or TLS failure. The message never holds a header or body.
     #[error("upstream: {0}")]
     Upstream(String),
+    /// The service has `redact` fields but the upstream answer is not JSON,
+    /// so it is withheld (decision 5, `rule = "redact_non_json"`).
+    #[error("response withheld: the service redacts fields but the response is not JSON")]
+    RedactNonJson,
 }

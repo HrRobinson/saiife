@@ -40,6 +40,10 @@ tokio-rustls = { version = "=0.26.6", default-features = false, features = ["rin
 rustls-native-certs = "=0.8.4"
 rustls-pemfile = "=2.2.0"
 base64 = "=0.23.1"
+saiife-audit = { path = "../audit" }
+# Response masking (Task 8): aho-corasick 1.1.4 reuses the version already in
+# Cargo.lock; http, bytes, base64 and zeroize are pinned above.
+aho-corasick = "=1.1.4"
 zeroize = "=1.9.1"
 
 [dev-dependencies]

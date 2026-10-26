@@ -1211,6 +1211,7 @@ dependencies = [
 name = "saiife-broker"
 version = "0.1.1"
 dependencies = [
+ "aho-corasick",
  "base64 0.23.1",
  "bytes",
  "http",
@@ -1223,6 +1224,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
+ "saiife-audit",
  "saiife-policy",
  "serde",
  "serde_json",
