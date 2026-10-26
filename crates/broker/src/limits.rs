@@ -5,6 +5,7 @@
 use crate::amount::exponent;
 use crate::manifest::OpKind;
 use saiife_policy::LimitsCfg;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
@@ -30,11 +31,51 @@ struct Entry {
     ev: Event,
 }
 
+/// The (uid, service) bucket an event counts in; the session bucket is
+/// the part of it with the same session.
+type BucketKey = (u32, String);
+
+/// Every this many checks, buckets nobody asked about lately are pruned.
+const SWEEP_EVERY: u64 = 1024;
+
 #[derive(Default)]
 struct State {
     next_id: u64,
-    /// Committed and still-pending (reserved) events alike: both hold a slot.
-    entries: Vec<Entry>,
+    /// Committed and still-pending (reserved) events alike: both hold a
+    /// slot. Indexed by bucket, so a check reads only its own events.
+    buckets: HashMap<BucketKey, Vec<Entry>>,
+    checks: u64,
+}
+
+impl State {
+    fn push(&mut self, ev: Event) -> (BucketKey, u64) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let key = (ev.key.uid, ev.key.service.clone());
+        self.buckets
+            .entry(key.clone())
+            .or_default()
+            .push(Entry { id, ev });
+        (key, id)
+    }
+
+    /// Drop every event at or before `cutoff`, and the buckets left empty.
+    fn sweep(&mut self, cutoff: OffsetDateTime) {
+        self.buckets.retain(|_, b| {
+            b.retain(|e| e.ev.at > cutoff);
+            !b.is_empty()
+        });
+    }
+}
+
+/// Whether `cfg` has a limit that counts past events (a window or a
+/// daily sum). Without one, nothing needs to be remembered.
+fn counts(cfg: &LimitsCfg) -> bool {
+    cfg.requests_per_minute.is_some()
+        || cfg.writes_per_hour.is_some()
+        || cfg.deletes_per_day.is_some()
+        || cfg.bulk_per_session.is_some()
+        || cfg.amount_per_day.is_some()
 }
 
 pub struct Limiter {
@@ -54,7 +95,8 @@ impl Default for Limiter {
 #[must_use = "commit the reservation once the request was sent"]
 pub struct Reservation {
     state: Arc<Mutex<State>>,
-    id: u64,
+    /// `None` when nothing was recorded (no counting limit configured).
+    slot: Option<(BucketKey, u64)>,
     committed: bool,
 }
 
@@ -71,8 +113,13 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if !self.committed {
-            lock(&self.state).entries.retain(|e| e.id != self.id);
+        if self.committed {
+            return;
+        }
+        if let Some((key, id)) = &self.slot {
+            if let Some(b) = lock(&self.state).buckets.get_mut(key) {
+                b.retain(|e| e.id != *id);
+            }
         }
     }
 }
@@ -98,9 +145,7 @@ impl Limiter {
         let cutoff = now - Duration::seconds(DAY);
         let mut st = State::default();
         for ev in records.filter(|e| e.at > cutoff) {
-            let id = st.next_id;
-            st.next_id += 1;
-            st.entries.push(Entry { id, ev });
+            st.push(ev);
         }
         Limiter {
             state: Arc::new(Mutex::new(st)),
@@ -148,7 +193,14 @@ impl Limiter {
         }
         let mut st = lock(&self.state);
         let cutoff = now - Duration::seconds(DAY);
-        st.entries.retain(|e| e.ev.at > cutoff);
+        st.checks += 1;
+        if st.checks % SWEEP_EVERY == 0 {
+            st.sweep(cutoff);
+        }
+        let bucket_key: BucketKey = (k.uid, k.service.clone());
+        if let Some(b) = st.buckets.get_mut(&bucket_key) {
+            b.retain(|e| e.ev.at > cutoff);
+        }
 
         let amount = amount.map(|(m, c)| (m, c.to_ascii_uppercase()));
         if let Some((m, c)) = &amount {
@@ -171,12 +223,15 @@ impl Limiter {
         }
 
         let in_win = |e: &Entry, secs: i64| e.ev.at > now - Duration::seconds(secs);
-        let uid_bucket = |e: &Entry| e.ev.key.uid == k.uid && e.ev.key.service == k.service;
-        let session_bucket = |e: &Entry| e.ev.key == *k;
+        // Only this (uid, service)'s events: the uid bucket is all of them,
+        // the session bucket those with the same session.
+        let events: &[Entry] = st.buckets.get(&bucket_key).map_or(&[], |b| b.as_slice());
+        let uid_bucket = |_: &Entry| true;
+        let session_bucket = |e: &Entry| e.ev.key.session == k.session;
         let buckets: [&dyn Fn(&Entry) -> bool; 2] = [&uid_bucket, &session_bucket];
         for b in buckets {
             let count = |secs: i64, f: &dyn Fn(OpKind) -> bool| -> u64 {
-                st.entries
+                events
                     .iter()
                     .filter(|e| b(e) && in_win(e, secs) && f(e.ev.kind))
                     .count() as u64
@@ -208,8 +263,7 @@ impl Limiter {
                 }
             }
             if let (Some(cap), Some((m, c))) = (&cfg.amount_per_day, &amount) {
-                let sum: u128 = st
-                    .entries
+                let sum: u128 = events
                     .iter()
                     .filter(|e| b(e) && in_win(e, DAY))
                     .filter_map(|e| e.ev.amount_minor.as_ref())
@@ -222,20 +276,18 @@ impl Limiter {
             }
         }
 
-        let id = st.next_id;
-        st.next_id += 1;
-        st.entries.push(Entry {
-            id,
-            ev: Event {
+        // A service without a counting limit has nothing to remember.
+        let slot = counts(cfg).then(|| {
+            st.push(Event {
                 at: now,
                 key: k.clone(),
                 kind,
                 amount_minor: amount,
-            },
+            })
         });
         Ok(Reservation {
             state: Arc::clone(&self.state),
-            id,
+            slot,
             committed: false,
         })
     }
@@ -583,6 +635,91 @@ mod tests {
         assert!(l
             .check_and_commit(&k, OpKind::Write, None, false, &c, t0())
             .is_ok());
+    }
+
+    fn remembered(l: &Limiter) -> usize {
+        lock(&l.state).buckets.values().map(Vec::len).sum()
+    }
+
+    #[test]
+    fn service_without_counting_limits_remembers_nothing() {
+        let l = Limiter::new();
+        let k = key(1, None);
+        let per_request_only = LimitsCfg {
+            amount_per_request: cap(100, "EUR"),
+            ..Default::default()
+        };
+        for _ in 0..100 {
+            go(&l, &k, OpKind::Read, None, &LimitsCfg::default(), t0()).unwrap();
+            go(
+                &l,
+                &k,
+                OpKind::Write,
+                Some((1, "EUR")),
+                &per_request_only,
+                t0(),
+            )
+            .unwrap();
+        }
+        drop(
+            l.check_and_commit(&k, OpKind::Read, None, false, &LimitsCfg::default(), t0())
+                .unwrap(),
+        );
+        assert_eq!(remembered(&l), 0);
+        // Its checks still apply.
+        assert_eq!(
+            go(
+                &l,
+                &k,
+                OpKind::Write,
+                Some((10_001, "EUR")),
+                &per_request_only,
+                t0()
+            ),
+            Err("amount_per_request")
+        );
+        // A counting limit remembers.
+        let c = LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
+        assert_eq!(remembered(&l), 1);
+    }
+
+    #[test]
+    fn buckets_are_indexed_and_old_ones_swept() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        // Another service and another uid do not count against uid 1's
+        // `stripe` bucket.
+        let other = Key {
+            uid: 1,
+            service: "erp".into(),
+            session: None,
+        };
+        go(&l, &other, OpKind::Read, None, &c, t0()).unwrap();
+        go(&l, &key(2, None), OpKind::Read, None, &c, t0()).unwrap();
+        go(&l, &key(1, None), OpKind::Read, None, &c, t0()).unwrap();
+        assert_eq!(remembered(&l), 3);
+        // A day later the sweep drops buckets nobody asked about again.
+        let later = t0() + Duration::seconds(DAY + 1);
+        for _ in 0..SWEEP_EVERY {
+            go(
+                &l,
+                &key(1, None),
+                OpKind::Read,
+                None,
+                &LimitsCfg::default(),
+                later,
+            )
+            .unwrap();
+        }
+        assert_eq!(remembered(&l), 0);
+        assert!(lock(&l.state).buckets.is_empty());
     }
 
     #[test]
