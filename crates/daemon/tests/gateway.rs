@@ -449,10 +449,10 @@ impl World {
             .await
             .unwrap();
         tokio::spawn(conn);
-        let mut b = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "127.0.0.1");
+        let mut b = Request::builder().method(method).uri(uri);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            b = b.header("host", format!("127.0.0.1:{}", self.tcp.port()));
+        }
         for (k, v) in headers {
             b = b.header(*k, *v);
         }
@@ -1286,40 +1286,197 @@ async fn api_token_needs_a_scope() {
     assert_eq!(w.ctx.tokens.live_for(rustix::process::getuid().as_raw()), 0);
 }
 
-#[tokio::test]
-async fn tcp_listener_caps_64_connections() {
-    let w = world().await;
+/// Open `n` TCP connections that send nothing.
+async fn idle(w: &World, n: usize) -> Vec<tokio::net::TcpStream> {
     let mut held = Vec::new();
-    for _ in 0..gateway::MAX_TCP_CONNS {
+    for _ in 0..n {
         held.push(tokio::net::TcpStream::connect(w.tcp).await.unwrap());
     }
     // Let the listener take all of them.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut s = tokio::net::TcpStream::connect(w.tcp).await.unwrap();
-    let mut out = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
-    let out = String::from_utf8_lossy(&out);
-    assert_eq!(status_of(&out), 429, "{out}");
-    assert_eq!(body_of(&out)["error"], "busy");
-    // One goes, one more gets in.
-    drop(held.pop());
+    held
+}
+
+/// Whether the peer closed `s` within `limit`.
+async fn closed(s: &mut tokio::net::TcpStream, limit: Duration) -> bool {
+    let mut b = [0u8; 64];
+    matches!(
+        tokio::time::timeout(limit, s.read(&mut b)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
+}
+
+#[tokio::test]
+async fn idle_unauthenticated_connections_do_not_block_a_token_holder() {
+    let w = world().await;
     let tok = w.token().await;
     let bearer = format!("Bearer {tok}");
-    let mut got = StatusCode::TOO_MANY_REQUESTS;
-    for _ in 0..50 {
+    let mut held = idle(&w, gateway::MAX_TCP_PRE_AUTH).await;
+    // The token holder gets in at once (the oldest idle one goes).
+    let started = Instant::now();
+    let (st, _, _) = w
+        .send_tcp(
+            "GET",
+            "/v1/services",
+            &[("authorization", bearer.as_str())],
+            b"",
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(closed(&mut held[0], Duration::from_millis(500)).await);
+    // Never more than 16 pre-auth at once: 16 more push all the old out.
+    let _more = idle(&w, gateway::MAX_TCP_PRE_AUTH).await;
+    for s in held.iter_mut().skip(1) {
+        assert!(closed(s, Duration::from_millis(500)).await);
+    }
+}
+
+#[tokio::test]
+async fn pre_auth_head_timeout_is_2s() {
+    let w = world().await;
+    let mut held = idle(&w, 1).await;
+    let started = Instant::now();
+    assert!(closed(&mut held[0], Duration::from_secs(5)).await);
+    let t = started.elapsed();
+    assert!(
+        t >= Duration::from_millis(1500) && t < Duration::from_millis(3500),
+        "{t:?}"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_tcp_connections_capped() {
+    let w = world_with(Setup {
+        opts: Opts {
+            tcp_max_conns: 2,
+            ..Opts::default()
+        },
+        upstream_timeout: Duration::from_millis(1500),
+        ..Setup::default()
+    })
+    .await;
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    let auth = [("authorization", bearer.as_str())];
+    // The upstream slots are taken: two calls stay in flight a while.
+    let held = w.ctx.pools.get("shop").acquire_many_owned(4).await.unwrap();
+    let slow = || w.send_tcp("POST", "/v1/api/shop/orders.list", &auth, b"{}");
+    let third = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        w.send_tcp("GET", "/v1/services", &auth, b"").await
+    };
+    let ((a, _, _), (b, _, _), (c, _, body)) = tokio::join!(slow(), slow(), third);
+    assert_eq!(a, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(b, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(c, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["message"],
+        "too many open connections"
+    );
+    drop(held);
+    // Their slots came back.
+    let (st, _, _) = w.send_tcp("GET", "/v1/services", &auth, b"").await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unix_socket_ignores_bearer_token() {
+    let w = world().await;
+    let me = rustix::process::getuid().as_raw();
+    let other = me + 1;
+    let tok = w.ctx.tokens.issue(other).unwrap();
+    assert_eq!(w.ctx.tokens.verify(&tok.token), Some(other));
+    let bearer = format!("Bearer {}", tok.token.as_str());
+    let (st, _, _) = w
+        .send(
+            "POST",
+            "/v1/api/shop/orders.list",
+            &[("authorization", &bearer)],
+            b"{}",
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["uid"], me);
+    assert_eq!(recs[0]["user"], "agent");
+    assert_eq!(recs[0]["peer"]["pid"], std::process::id());
+    assert!(recs[0]["peer"].get("auth").is_none());
+}
+
+#[tokio::test]
+async fn tcp_refuses_browser_origin_and_foreign_host() {
+    let w = world().await;
+    let tok = w.token().await;
+    let bearer = format!("Bearer {tok}");
+    let port = w.tcp.port();
+    let ok_hosts = [
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        format!("localhost:{port}"),
+        format!("LocalHost:{port}"),
+    ];
+    for h in &ok_hosts {
         let (st, _, _) = w
             .send_tcp(
                 "GET",
                 "/v1/services",
-                &[("authorization", bearer.as_str())],
+                &[("authorization", bearer.as_str()), ("host", h.as_str())],
                 b"",
             )
             .await;
-        got = st;
-        if st == StatusCode::OK {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(st, StatusCode::OK, "{h}");
     }
-    assert_eq!(got, StatusCode::OK);
+    let bad_hosts = [
+        "evil.example:80".to_string(),
+        format!("evil.example:{port}"),
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        format!("127.0.0.1:{}", port.wrapping_add(1)),
+        format!("127.0.0.2:{port}"),
+    ];
+    for h in &bad_hosts {
+        let (st, _, b) = w
+            .send_tcp(
+                "GET",
+                "/v1/services",
+                &[("authorization", bearer.as_str()), ("host", h.as_str())],
+                b"",
+            )
+            .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{h}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            json!({"error": "origin"})
+        );
+    }
+    // Any Origin, even a loopback one, with or without a token.
+    for o in [
+        "https://evil.example",
+        "null",
+        &format!("http://127.0.0.1:{port}"),
+    ] {
+        for hdrs in [
+            vec![("origin", o), ("authorization", bearer.as_str())],
+            vec![("origin", o)],
+        ] {
+            let (st, h, b) = w
+                .send_tcp("POST", "/v1/api/shop/orders.list", &hdrs, b"{}")
+                .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{o}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&b).unwrap(),
+                json!({"error": "origin"})
+            );
+            assert!(h.get("access-control-allow-origin").is_none());
+        }
+    }
+    assert_eq!(w.hits(), 0);
+    assert!(w.connector_records().is_empty());
+    // The Unix socket has no such rule (no browser reaches it).
+    let (st, _, _) = w
+        .send("GET", "/v1/services", &[("origin", "https://x")], b"")
+        .await;
+    assert_eq!(st, StatusCode::OK);
 }

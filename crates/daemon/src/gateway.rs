@@ -15,6 +15,7 @@
 //! same code path as the Unix socket.
 
 use crate::api_ops::{self, Caller, Refused};
+use crate::limits::ConnSlot;
 use crate::ops::{Ctx, Notice};
 use base64::Engine as _;
 use bytes::Bytes;
@@ -43,7 +44,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 /// The read buffer of a connection, which bounds the request head.
@@ -58,9 +59,14 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// A write to the client must make progress within this, or the
 /// connection is closed.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Open connections on the TCP listener, all uids together (each uid's
-/// connections also count against its 32).
+/// Authenticated connections on the TCP listener, all uids together (each
+/// uid's connections also count against its 32).
 pub const MAX_TCP_CONNS: usize = 64;
+/// TCP connections that have not shown a valid token yet; apart from the
+/// 64, so idle strangers cannot lock token holders out.
+pub const MAX_TCP_PRE_AUTH: usize = 16;
+/// A TCP connection's request head must be in within this.
+pub const PRE_AUTH_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a refused connection gets to take its answer.
 const REFUSE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -92,12 +98,16 @@ const NEXT_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// The gateway's timeouts; the tests shorten them.
+/// The gateway's timeouts and TCP caps; the tests shorten them.
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
     pub header_read_timeout: Duration,
     pub body_read_timeout: Duration,
     pub write_timeout: Duration,
+    /// The head timeout of a TCP connection (not yet authenticated).
+    pub pre_auth_header_timeout: Duration,
+    pub tcp_max_conns: usize,
+    pub tcp_max_pre_auth: usize,
 }
 
 impl Default for Opts {
@@ -106,6 +116,9 @@ impl Default for Opts {
             header_read_timeout: HEADER_READ_TIMEOUT,
             body_read_timeout: BODY_READ_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
+            pre_auth_header_timeout: PRE_AUTH_HEADER_TIMEOUT,
+            tcp_max_conns: MAX_TCP_CONNS,
+            tcp_max_pre_auth: MAX_TCP_PRE_AUTH,
         }
     }
 }
@@ -132,12 +145,24 @@ pub async fn serve_with(listener: UnixListener, ctx: Arc<Ctx>, opts: Opts) {
 }
 
 /// Where a connection came from, which says where its identity comes from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 enum Source {
     /// `gateway.sock`: the peer's uid, from the kernel.
     Unix(PeerCred),
     /// The loopback TCP listener: no peer uid; the bearer token decides.
-    Tcp(SocketAddr),
+    Tcp(Arc<TcpConn>),
+}
+
+/// One TCP connection and the caps it holds: its pre-auth place until its
+/// token is verified, then a permit of the main cap and its uid's slot,
+/// both until the connection closes.
+struct TcpConn {
+    peer: SocketAddr,
+    /// The listener's port, for the `Host` check.
+    port: u16,
+    main: Arc<Semaphore>,
+    pre_auth: Mutex<Option<PreAuth>>,
+    authed: Mutex<Option<(OwnedSemaphorePermit, ConnSlot)>>,
 }
 
 /// The answer to a connection refused at accept.
@@ -167,11 +192,36 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     serve_conn(s, Source::Unix(peer), ctx, opts).await;
 }
 
-/// Serve the loopback TCP listener until the task is dropped. At most
-/// [`MAX_TCP_CONNS`] connections are open at once; each request then
-/// takes a connection slot of its token's uid.
+/// The TCP connections that have not shown a valid token yet, by accept
+/// order, each with the signal that closes it.
+type PreAuthSet = Arc<Mutex<BTreeMap<u64, Arc<Notify>>>>;
+
+/// A connection's place in the pre-auth set; leaving it (a verified token,
+/// or the connection's end) removes it.
+struct PreAuth {
+    id: u64,
+    set: PreAuthSet,
+}
+
+impl Drop for PreAuth {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Serve the loopback TCP listener until the task is dropped. A new
+/// connection is pre-auth: at most 16 of those are open (a 17th closes the
+/// oldest, so idle strangers cannot lock a token holder out), and each has
+/// 2 s for its request head. Once its token is verified it leaves that
+/// set for the main cap of 64 and its uid's connection slots.
 pub async fn serve_tcp(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
-    let cap = Arc::new(Semaphore::new(MAX_TCP_CONNS));
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let pre: PreAuthSet = Arc::new(Mutex::new(BTreeMap::new()));
+    let main = Arc::new(Semaphore::new(opts.tcp_max_conns));
+    let mut next_id = 0u64;
     loop {
         match listener.accept().await {
             Ok((s, addr)) => {
@@ -180,18 +230,35 @@ pub async fn serve_tcp(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
                 if !addr.ip().is_loopback() {
                     continue;
                 }
-                match Arc::clone(&cap).try_acquire_owned() {
-                    Ok(permit) => {
-                        let ctx = Arc::clone(&ctx);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            serve_conn(s, Source::Tcp(addr), ctx, opts).await;
-                        });
+                next_id += 1;
+                let close = Arc::new(Notify::new());
+                {
+                    let mut set = pre.lock().unwrap_or_else(|p| p.into_inner());
+                    while set.len() >= opts.tcp_max_pre_auth.max(1) {
+                        if let Some((_, oldest)) = set.pop_first() {
+                            oldest.notify_one();
+                        }
                     }
-                    Err(_) => {
-                        tokio::spawn(refuse_busy(s));
-                    }
+                    set.insert(next_id, Arc::clone(&close));
                 }
+                let conn = Arc::new(TcpConn {
+                    peer: addr,
+                    port,
+                    main: Arc::clone(&main),
+                    pre_auth: Mutex::new(Some(PreAuth {
+                        id: next_id,
+                        set: Arc::clone(&pre),
+                    })),
+                    authed: Mutex::new(None),
+                });
+                let ctx = Arc::clone(&ctx);
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = serve_conn(s, Source::Tcp(conn), ctx, opts) => {}
+                        // Evicted while still pre-auth.
+                        _ = close.notified() => {}
+                    }
+                });
             }
             Err(e) => {
                 eprintln!("saiife: warning: gateway tcp accept failed: {e}");
@@ -206,11 +273,16 @@ async fn serve_conn<S>(s: S, source: Source, ctx: Arc<Ctx>, opts: Opts)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let header_timeout = match source {
+        Source::Unix(_) => opts.header_read_timeout,
+        Source::Tcp(_) => opts.pre_auth_header_timeout,
+    };
     let io = Guarded::new(s, opts.write_timeout);
     let line = Arc::clone(&io.line);
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
         let raw = raw_target(&line);
+        let source = source.clone();
         async move { Ok::<_, Infallible>(admit(&ctx, source, req, raw, opts).await) }
     });
     // One request per connection: the first line of the stream is then
@@ -220,7 +292,7 @@ where
         .keep_alive(false)
         .max_buf_size(MAX_HEAD_BYTES)
         .max_header_size(MAX_HEAD_BYTES)
-        .header_read_timeout(opts.header_read_timeout)
+        .header_read_timeout(header_timeout)
         .serve_connection(TokioIo::new(io), svc)
         .await;
 }
@@ -431,6 +503,29 @@ fn unauthorized() -> Resp {
     r
 }
 
+/// A TCP request a browser could have sent: an `Origin` header, or a
+/// `Host` other than this listener's loopback name and port (DNS
+/// rebinding).
+fn browser_like(h: &http::HeaderMap, port: u16) -> bool {
+    if h.contains_key(http::header::ORIGIN) {
+        return true;
+    }
+    let mut all = h.get_all(http::header::HOST).iter();
+    let (Some(v), None) = (all.next(), all.next()) else {
+        return true;
+    };
+    let Ok(v) = v.to_str() else {
+        return true;
+    };
+    let v = v.to_ascii_lowercase();
+    ![
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        format!("localhost:{port}"),
+    ]
+    .contains(&v)
+}
+
 fn busy(message: &str) -> Resp {
     let mut r = error(StatusCode::TOO_MANY_REQUESTS, "busy", message);
     r.headers_mut()
@@ -445,21 +540,39 @@ async fn admit_inner(
     raw: Option<String>,
     opts: Opts,
 ) -> Resp {
-    // The identity, and on TCP the token uid's connection slot for this
-    // request (the connection carries one request).
-    let (caller, _slot) = match source {
-        Source::Unix(peer) => (Caller::Unix(peer), None),
-        Source::Tcp(addr) => {
+    // The identity. On TCP: no browser, a valid token, then the
+    // connection moves from the pre-auth cap to the main cap and its
+    // uid's slots (held until it closes).
+    let caller = match source {
+        Source::Unix(peer) => Caller::Unix(peer),
+        Source::Tcp(conn) => {
+            if browser_like(req.headers(), conn.port) {
+                return json_resp(StatusCode::FORBIDDEN, json!({"error": "origin"}));
+            }
             let uid = bearer(req.headers()).and_then(|t| ctx.tokens.verify(&t));
             let Some(uid) = uid else {
                 return unauthorized();
             };
-            match ctx.conns.try_open(uid) {
-                Ok(slot) => (Caller::Token { uid, addr }, Some(slot)),
+            let Ok(main) = Arc::clone(&conn.main).try_acquire_owned() else {
+                return busy("too many open connections");
+            };
+            let slot = match ctx.conns.try_open(uid) {
+                Ok(slot) => slot,
                 Err(_) => {
                     ctx.notice(uid, Notice::Connections);
                     return busy("too many open connections");
                 }
+            };
+            *conn.authed.lock().unwrap_or_else(|p| p.into_inner()) = Some((main, slot));
+            drop(
+                conn.pre_auth
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take(),
+            );
+            Caller::Token {
+                uid,
+                addr: conn.peer,
             }
         }
     };

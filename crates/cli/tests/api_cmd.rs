@@ -964,7 +964,7 @@ fn tcp_listener_with_api_token() {
         tcp_request(
             &addr,
             &format!(
-                "POST /v1/api/erp/invoices.list HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST /v1/api/erp/invoices.list HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             ),
         )

@@ -234,7 +234,9 @@ impl Tokens {
         let now = self.now();
         let mut found = None;
         for e in lock(&self.entries).iter() {
-            if ct_eq(&e.hash, &h) && e.expires > now {
+            // An expiry past now + TTL (a clock that went back, an edited
+            // file) is not trusted.
+            if ct_eq(&e.hash, &h) && e.expires > now && e.expires <= now.saturating_add(TTL_SECS) {
                 found = Some(e.uid);
             }
         }
@@ -483,6 +485,31 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(d.path().join("elsewhere"), &path).unwrap();
         assert!(Tokens::open(path.clone(), system_clock()).1.is_some());
+    }
+
+    #[test]
+    fn expiry_beyond_ttl_is_refused() {
+        let at = Arc::new(AtomicU64::new(1_000_000));
+        let t = Tokens::memory_with_clock(clock(&at));
+        let i = t.issue(3).unwrap();
+        // The clock went back a minute: the expiry is now more than 12 h
+        // away, which no issued token can be.
+        at.store(1_000_000 - 60, Ordering::SeqCst);
+        assert_eq!(t.verify(&i.token), None);
+        at.store(1_000_000, Ordering::SeqCst);
+        assert_eq!(t.verify(&i.token), Some(3));
+        // An edited file with a far expiry is refused the same way.
+        let d = scratch();
+        let path = path_in(d.path());
+        let (t, _) = Tokens::open(path.clone(), clock(&at));
+        let i = t.issue(4).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&i.expires.to_string(), "99999999999");
+        std::fs::write(&path, text).unwrap();
+        let (t2, reset) = Tokens::open(path, clock(&at));
+        assert!(reset.is_none());
+        assert_eq!(t2.verify(&i.token), None);
     }
 
     #[test]
