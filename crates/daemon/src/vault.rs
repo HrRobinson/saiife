@@ -91,8 +91,12 @@ pub struct Vault {
     key: Zeroizing<[u8; 32]>,
     file: PathBuf,
     entries: BTreeMap<String, Entry>,
-    /// `last_used` changed in memory since the last write.
-    dirty: bool,
+    /// In-memory changes so far, and how many of them the file holds: the
+    /// vault is dirty while they differ.
+    changes: u64,
+    saved: u64,
+    /// Generation of the last snapshot sealed (see [`Sealed`]).
+    gen: u64,
     last_write: Option<Instant>,
     /// The fsync of the dir after the rename (a seam for tests).
     dir_sync: fn(&Path) -> io::Result<()>,
@@ -208,7 +212,9 @@ pub fn open(key_file: &Path, vault_file: &Path) -> VaultState {
         key,
         file: vault_file.to_path_buf(),
         entries: BTreeMap::new(),
-        dirty: false,
+        changes: 0,
+        saved: 0,
+        gen: 0,
         last_write: None,
         dir_sync: real_dir_sync,
     };
@@ -282,21 +288,11 @@ impl Vault {
     /// Insert or replace, then write. On a write error the in-memory vault
     /// is left as it was.
     pub fn put(&mut self, e: Entry) -> io::Result<()> {
-        if !valid_name(&e.name) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid secret name",
-            ));
-        }
-        let name = e.name.clone();
-        let old = self.entries.insert(name.clone(), e);
+        let (name, old) = self.insert(e)?;
         match self.write(Instant::now()) {
             Ok(()) => {}
             Err(WriteErr::Before(err)) => {
-                match old {
-                    Some(o) => self.entries.insert(name, o),
-                    None => self.entries.remove(&name),
-                };
+                self.restore(&name, old);
                 return Err(err);
             }
             Err(WriteErr::After(err)) => warn_committed(&err),
@@ -306,18 +302,60 @@ impl Vault {
 
     /// Remove and write; `false` when there was no such entry.
     pub fn remove(&mut self, name: &str) -> io::Result<bool> {
-        let Some(old) = self.entries.remove(name) else {
+        let Some(old) = self.take(name) else {
             return Ok(false);
         };
         match self.write(Instant::now()) {
             Ok(()) => {}
             Err(WriteErr::Before(err)) => {
-                self.entries.insert(name.to_string(), old);
+                self.restore(name, Some(old));
                 return Err(err);
             }
             Err(WriteErr::After(err)) => warn_committed(&err),
         }
         Ok(true)
+    }
+
+    /// Insert or replace in memory: the name and the entry it replaced.
+    fn insert(&mut self, e: Entry) -> io::Result<(String, Option<Entry>)> {
+        if !valid_name(&e.name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid secret name",
+            ));
+        }
+        let name = e.name.clone();
+        let old = self.entries.insert(name.clone(), e);
+        self.changes += 1;
+        Ok((name, old))
+    }
+
+    /// Remove in memory.
+    fn take(&mut self, name: &str) -> Option<Entry> {
+        let old = self.entries.remove(name)?;
+        self.changes += 1;
+        Some(old)
+    }
+
+    /// Put `name` back as it was before a write that did not happen.
+    fn restore(&mut self, name: &str, old: Option<Entry>) {
+        match old {
+            Some(o) => self.entries.insert(name.to_string(), o),
+            None => self.entries.remove(name),
+        };
+        self.changes += 1;
+    }
+
+    fn dirty(&self) -> bool {
+        self.changes != self.saved
+    }
+
+    /// Dirty, and the last write is a minute old.
+    fn flush_due(&self, now: Instant) -> bool {
+        self.dirty()
+            && self
+                .last_write
+                .is_none_or(|t| now.saturating_duration_since(t) >= FLUSH_EVERY)
     }
 
     pub fn list(&self) -> Vec<Meta> {
@@ -339,20 +377,15 @@ impl Vault {
     pub fn touch(&mut self, name: &str, ts: &str) {
         if let Some(e) = self.entries.get_mut(name) {
             e.last_used = Some(ts.to_string());
-            self.dirty = true;
+            self.changes += 1;
         }
     }
 
     /// Write pending `last_used` changes when the last write is a minute
     /// old. `true` when it wrote.
     pub fn flush_if_due(&mut self, now: Instant) -> io::Result<bool> {
-        if !self.dirty {
+        if !self.flush_due(now) {
             return Ok(false);
-        }
-        if let Some(t) = self.last_write {
-            if now.saturating_duration_since(t) < FLUSH_EVERY {
-                return Ok(false);
-            }
         }
         match self.write(now) {
             Ok(()) => {}
@@ -364,24 +397,24 @@ impl Vault {
 
     /// Write pending changes now (on stop).
     pub fn flush(&mut self) -> io::Result<()> {
-        if self.dirty {
+        if self.dirty() {
             finish(self.write(Instant::now()))?;
         }
         Ok(())
     }
 
-    fn write(&mut self, now: Instant) -> Result<(), WriteErr> {
+    /// The vault as it is now, serialized and encrypted with a new nonce,
+    /// ready to be written without this vault (or its lock) at hand.
+    fn seal(&mut self) -> io::Result<Sealed> {
         // Reserved up front so growth does not leave plaintext copies in
         // freed memory for typical vault sizes.
         let mut plain = Zeroizing::new(Vec::with_capacity(64 * 1024));
         let body = BodyRef {
             entries: self.entries.values().collect(),
         };
-        serde_json::to_writer(&mut *plain, &body)
-            .map_err(|e| WriteErr::Before(io::Error::other(e)))?;
+        serde_json::to_writer(&mut *plain, &body).map_err(io::Error::other)?;
         let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| WriteErr::Before(io::Error::other(e.to_string())))?;
+        getrandom::fill(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
         let mut head = [0u8; 9];
         head[..8].copy_from_slice(MAGIC);
         head[8] = VERSION;
@@ -393,18 +426,238 @@ impl Vault {
                     aad: &head,
                 },
             )
-            .map_err(|_| WriteErr::Before(io::Error::other("cannot encrypt the vault")))?;
-        let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
-        out.extend_from_slice(&head);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        let r = write_atomic(&self.file, &out, self.dir_sync);
+            .map_err(|_| io::Error::other("cannot encrypt the vault"))?;
+        let mut bytes = Vec::with_capacity(HEADER_LEN + ct.len());
+        bytes.extend_from_slice(&head);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ct);
+        self.gen += 1;
+        Ok(Sealed {
+            gen: self.gen,
+            changes: self.changes,
+            file: self.file.clone(),
+            bytes,
+            dir_sync: self.dir_sync,
+        })
+    }
+
+    /// `s` is on disk (an `After` failure counts as written).
+    fn saved(&mut self, s: &Sealed, now: Instant) {
+        self.saved = self.saved.max(s.changes);
+        self.last_write = Some(now);
+    }
+
+    fn write(&mut self, now: Instant) -> Result<(), WriteErr> {
+        let s = self.seal().map_err(WriteErr::Before)?;
+        let r = write_atomic(&s.file, &s.bytes, s.dir_sync);
         if !matches!(r, Err(WriteErr::Before(_))) {
-            // On disk (an After failure counts as written).
-            self.dirty = false;
-            self.last_write = Some(now);
+            self.saved(&s, now);
         }
         r
+    }
+}
+
+/// A snapshot of the vault, encrypted, not yet on disk. Its generation
+/// orders it: an older snapshot never replaces a newer one on disk.
+struct Sealed {
+    gen: u64,
+    changes: u64,
+    file: PathBuf,
+    bytes: Vec<u8>,
+    dir_sync: fn(&Path) -> io::Result<()>,
+}
+
+/// The vault as the daemon shares it. Reading (a connector call, a lease,
+/// `secret list`) takes only the memory lock, which is never held across
+/// disk IO. Changes go through a [`Writer`]: one at a time, in order, with
+/// the snapshot sealed under the memory lock and written after it is
+/// released.
+pub struct Shared {
+    mem: std::sync::Mutex<VaultState>,
+    /// Held by the one [`Writer`]; the generation last written.
+    order: std::sync::Mutex<u64>,
+}
+
+impl Shared {
+    pub fn new(s: VaultState) -> Shared {
+        Shared {
+            mem: std::sync::Mutex::new(s),
+            order: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// The vault in memory. Never waits on disk IO.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, VaultState> {
+        self.mem.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The writer, once every earlier writer is done. Blocks: call it off
+    /// the runtime thread.
+    pub fn writer(&self) -> Writer<'_> {
+        Writer {
+            shared: self,
+            last: self.order.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+}
+
+/// The one writer of a [`Shared`] vault; changes made through it are
+/// serialized, so a check made through [`Writer::lock`] still holds when
+/// the change is made.
+pub struct Writer<'a> {
+    shared: &'a Shared,
+    last: std::sync::MutexGuard<'a, u64>,
+}
+
+fn unavailable() -> io::Error {
+    io::Error::other("the vault is unavailable")
+}
+
+impl Writer<'_> {
+    /// The vault in memory (see [`Shared::lock`]).
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, VaultState> {
+        self.shared.lock()
+    }
+
+    /// Change the vault in memory and seal it, under the memory lock.
+    fn change<T>(&mut self, f: impl FnOnce(&mut Vault) -> io::Result<T>) -> io::Result<T> {
+        let mut g = self.shared.lock();
+        let VaultState::Ready(v) = &mut *g else {
+            return Err(unavailable());
+        };
+        f(v)
+    }
+
+    /// Write `s` (no lock held but the writer's), unless a newer snapshot
+    /// is already on disk.
+    fn store(&mut self, s: &Sealed) -> Result<(), WriteErr> {
+        if s.gen <= *self.last {
+            return Ok(());
+        }
+        let r = write_atomic(&s.file, &s.bytes, s.dir_sync);
+        if !matches!(r, Err(WriteErr::Before(_))) {
+            *self.last = s.gen;
+        }
+        r
+    }
+
+    fn mark_saved(&self, s: &Sealed, now: Instant) {
+        if let VaultState::Ready(v) = &mut *self.shared.lock() {
+            v.saved(s, now);
+        }
+    }
+
+    /// [`Vault::put`], with the file written outside the memory lock.
+    pub fn put(&mut self, e: Entry) -> io::Result<()> {
+        let mut undo = None;
+        let s = self.change(|v| {
+            let (name, old) = v.insert(e)?;
+            match v.seal() {
+                Ok(s) => {
+                    undo = Some((name, old));
+                    Ok(s)
+                }
+                Err(err) => {
+                    v.restore(&name, old);
+                    Err(err)
+                }
+            }
+        })?;
+        self.commit(&s, |v| {
+            if let Some((name, old)) = undo {
+                v.restore(&name, old);
+            }
+        })
+    }
+
+    /// [`Vault::remove`], with the file written outside the memory lock.
+    pub fn remove(&mut self, name: &str) -> io::Result<bool> {
+        let mut undo = None;
+        let sealed = self.change(|v| {
+            let Some(old) = v.take(name) else {
+                return Ok(None);
+            };
+            match v.seal() {
+                Ok(s) => {
+                    undo = Some(old);
+                    Ok(Some(s))
+                }
+                Err(err) => {
+                    v.restore(name, Some(old));
+                    Err(err)
+                }
+            }
+        })?;
+        let Some(s) = sealed else {
+            return Ok(false);
+        };
+        self.commit(&s, |v| v.restore(name, undo))?;
+        Ok(true)
+    }
+
+    /// [`Vault::flush_if_due`], with the file written outside the memory
+    /// lock.
+    pub fn flush_if_due(&mut self, now: Instant) -> io::Result<bool> {
+        let s = {
+            let mut g = self.shared.lock();
+            let VaultState::Ready(v) = &mut *g else {
+                return Ok(false);
+            };
+            if !v.flush_due(now) {
+                return Ok(false);
+            }
+            v.seal()?
+        };
+        match self.store(&s) {
+            Ok(()) => self.mark_saved(&s, now),
+            Err(WriteErr::Before(e)) => return Err(e),
+            Err(WriteErr::After(e)) => {
+                self.mark_saved(&s, now);
+                warn_committed(&e)
+            }
+        }
+        Ok(true)
+    }
+
+    /// [`Vault::flush`], with the file written outside the memory lock.
+    pub fn flush(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let s = {
+            let mut g = self.shared.lock();
+            let VaultState::Ready(v) = &mut *g else {
+                return Ok(());
+            };
+            if !v.dirty() {
+                return Ok(());
+            }
+            v.seal()?
+        };
+        let r = self.store(&s);
+        if !matches!(r, Err(WriteErr::Before(_))) {
+            self.mark_saved(&s, now);
+        }
+        finish(r)
+    }
+
+    /// Write `s`: on success (or a failure after the rename) it is saved;
+    /// on a failure before the rename `undo` puts memory back as the file
+    /// still has it.
+    fn commit(&mut self, s: &Sealed, undo: impl FnOnce(&mut Vault)) -> io::Result<()> {
+        let now = Instant::now();
+        match self.store(s) {
+            Ok(()) => self.mark_saved(s, now),
+            Err(WriteErr::Before(err)) => {
+                if let VaultState::Ready(v) = &mut *self.shared.lock() {
+                    undo(v);
+                }
+                return Err(err);
+            }
+            Err(WriteErr::After(err)) => {
+                self.mark_saved(s, now);
+                warn_committed(&err)
+            }
+        }
+        Ok(())
     }
 }
 
@@ -714,6 +967,112 @@ mod tests {
         let on_disk = ready(&e);
         assert!(on_disk.get("gh").is_none());
         assert!(on_disk.get("gh2").is_some());
+    }
+
+    static IN_SLOW_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A dir fsync that takes 800 ms (a slow disk).
+    fn slow_sync(dir: &Path) -> io::Result<()> {
+        IN_SLOW_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(800));
+        real_dir_sync(dir)
+    }
+
+    #[test]
+    fn read_during_slow_write_does_not_block() {
+        let e = env();
+        let mut v = ready(&e);
+        v.put(entry("gh", "x")).unwrap();
+        v.dir_sync = slow_sync;
+        let shared = std::sync::Arc::new(Shared::new(VaultState::Ready(v)));
+        let s2 = std::sync::Arc::clone(&shared);
+        let writer = std::thread::spawn(move || s2.writer().put(entry("gh2", "y")));
+        let t = Instant::now();
+        while !IN_SLOW_WRITE.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "the write never began"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The write is on disk IO now: a connector call's read and touch
+        // go straight through.
+        let t = Instant::now();
+        {
+            let mut g = shared.lock();
+            let VaultState::Ready(v) = &mut *g else {
+                panic!("unavailable");
+            };
+            assert_eq!(v.get("gh").unwrap().fields["token"].as_str(), "x");
+            v.touch("gh", "2026-10-26T11:00:00Z");
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+        writer.join().unwrap().unwrap();
+        // The touch made after the snapshot was sealed is still pending.
+        let VaultState::Ready(v) = &*shared.lock() else {
+            panic!("unavailable");
+        };
+        assert!(v.dirty());
+        assert!(ready(&e).get("gh2").is_some());
+    }
+
+    #[test]
+    fn older_snapshot_never_overwrites_newer() {
+        let e = env();
+        let shared = Shared::new(VaultState::Ready(ready(&e)));
+        let mut w = shared.writer();
+        let (old, new) = {
+            let mut g = shared.lock();
+            let VaultState::Ready(v) = &mut *g else {
+                panic!("unavailable");
+            };
+            v.insert(entry("a", "1")).unwrap();
+            let old = v.seal().unwrap();
+            v.insert(entry("b", "2")).unwrap();
+            (old, v.seal().unwrap())
+        };
+        assert!(w.store(&new).is_ok());
+        assert!(w.store(&old).is_ok());
+        drop(w);
+        let on_disk = ready(&e);
+        assert!(on_disk.get("a").is_some() && on_disk.get("b").is_some());
+    }
+
+    #[test]
+    fn writer_keeps_commit_semantics() {
+        let e = env();
+        let shared = Shared::new(VaultState::Ready(ready(&e)));
+        shared.writer().put(entry("gh", "old")).unwrap();
+        // A failure before the rename: memory stays as the file is.
+        let moved = e.file.with_file_name("moved.bin");
+        std::fs::rename(&e.file, &moved).unwrap();
+        std::fs::create_dir(&e.file).unwrap();
+        std::fs::write(e.file.join("x"), b"x").unwrap();
+        assert!(shared.writer().put(entry("gh", "new")).is_err());
+        assert!(shared.writer().remove("gh").is_err());
+        std::fs::remove_dir_all(&e.file).unwrap();
+        std::fs::rename(&moved, &e.file).unwrap();
+        {
+            let VaultState::Ready(v) = &*shared.lock() else {
+                panic!("unavailable");
+            };
+            assert_eq!(v.get("gh").unwrap().fields["token"].as_str(), "old");
+        }
+        // A failure after it: done.
+        if let VaultState::Ready(v) = &mut *shared.lock() {
+            v.dir_sync = |_| Err(io::Error::other("injected"));
+        }
+        assert!(shared.writer().remove("gh").unwrap());
+        assert!(!shared.writer().remove("gh").unwrap());
+        assert!(ready(&e).get("gh").is_none());
+        // An unavailable vault refuses changes.
+        let gone = Shared::new(VaultState::Unavailable("x".into()));
+        assert!(gone.writer().put(entry("gh", "x")).is_err());
+        assert!(!gone.writer().flush_if_due(Instant::now()).unwrap());
     }
 
     #[test]

@@ -98,7 +98,7 @@ impl Env for DaemonEnv<'_> {
         service: &str,
         auth: &[AuthSpec],
     ) -> Result<AuthMaterial, &'static str> {
-        let mut g = self.ctx.vault.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.ctx.vault.lock();
         let VaultState::Ready(v) = &mut *g else {
             return Err("vault_unavailable");
         };
@@ -116,7 +116,7 @@ impl Env for DaemonEnv<'_> {
     }
 
     fn secret_values(&self, name: &str) -> Option<Vec<Zeroizing<String>>> {
-        let g = self.ctx.vault.lock().unwrap_or_else(|p| p.into_inner());
+        let g = self.ctx.vault.lock();
         let VaultState::Ready(v) = &*g else {
             return None;
         };

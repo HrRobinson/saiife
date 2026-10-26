@@ -128,7 +128,7 @@ pub struct Ctx {
     pub sessions: Sessions,
     pub proc: Box<dyn Proc + Send + Sync>,
     /// The credential vault (plan 10); `Unavailable` keeps the daemon up.
-    pub vault: Mutex<VaultState>,
+    pub vault: crate::vault::Shared,
     /// Where `vault.bin` lives (named in the `VaultUnavailable` message).
     pub vault_path: PathBuf,
     /// Connector limits, rebuilt at start from the last 24 h of records.
@@ -256,7 +256,7 @@ impl Ctx {
             policy: Mutex::new(i.policy),
             sessions: Sessions::new(),
             proc: i.proc,
-            vault: Mutex::new(i.vault),
+            vault: crate::vault::Shared::new(i.vault),
             vault_path: i.vault_path,
             limiter: i.limiter,
             upstream: i.upstream,

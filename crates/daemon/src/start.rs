@@ -603,7 +603,7 @@ async fn serve(
         }
         None => first.push(policy_record(&ctx, "loaded", loaded_files, None)),
     }
-    if let VaultState::Unavailable(reason) = &*ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
+    if let VaultState::Unavailable(reason) = &*ctx.vault.lock() {
         eprintln!("saiife: warning: vault unavailable: {reason}");
         let mut r = ctx.event("vault_unavailable");
         r.reason = Some(reason.clone());
@@ -664,11 +664,11 @@ async fn serve(
         tokio::select! {
             _ = vault_tick.tick() => {
                 let c = Arc::clone(&ctx);
+                // The file is written outside the vault's memory lock: a
+                // connector call reading the vault never waits on it.
                 tokio::task::spawn_blocking(move || {
-                    if let VaultState::Ready(v) = &mut *c.vault.lock().unwrap_or_else(|p| p.into_inner()) {
-                        if let Err(e) = v.flush_if_due(std::time::Instant::now()) {
-                            eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
-                        }
+                    if let Err(e) = c.vault.writer().flush_if_due(std::time::Instant::now()) {
+                        eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
                     }
                 });
             }
@@ -735,10 +735,9 @@ async fn serve(
         }
     }
     // Pending `last_used` marks go to disk before the stop record.
-    if let VaultState::Ready(v) = &mut *ctx.vault.lock().unwrap_or_else(|p| p.into_inner()) {
-        if let Err(e) = v.flush() {
-            eprintln!("saiife: warning: cannot write the vault at stop: {e}");
-        }
+    let c = Arc::clone(&ctx);
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || c.vault.writer().flush()).await {
+        eprintln!("saiife: warning: cannot write the vault at stop: {e}");
     }
     // Stop: the stop record and a checkpoint, synced.
     if writer_died {

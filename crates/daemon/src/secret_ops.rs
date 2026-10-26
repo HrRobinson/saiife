@@ -10,7 +10,7 @@
 //! secret too and are never echoed.
 
 use crate::ops::{now_ts, Ctx, Notice};
-use crate::vault::{valid_name, Entry, Kind, Vault, VaultState};
+use crate::vault::{valid_name, Entry, Kind, Vault, VaultState, Writer};
 use saiife_audit::DecisionKind;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_SECRET_ADD, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE,
@@ -152,20 +152,28 @@ fn execute(ctx: &Ctx, uid: u32, req: Request) -> Result<Map<String, Value>, Refu
     // Parse before touching the vault, so a bad request is a bad request
     // whatever state the vault is in.
     let parsed = parse(&req)?;
-    let mut guard = ctx.vault.lock().unwrap_or_else(|p| p.into_inner());
-    let vault = match &mut *guard {
-        VaultState::Ready(v) => v,
-        VaultState::Unavailable(_) => {
-            return Err((
-                ErrorCode::VaultUnavailable,
-                format!(
-                    "vault cannot be read; restore it or remove {} by hand",
-                    ctx.vault_path.display()
-                ),
-            ))
-        }
-    };
-    run(vault, uid, parsed, &ctx.backup_dir)
+    // One change at a time; the vault's memory lock is held only to read
+    // and to seal, never across the file write (connector calls read it).
+    let mut w = ctx.vault.writer();
+    if matches!(&*w.lock(), VaultState::Unavailable(_)) {
+        return Err((
+            ErrorCode::VaultUnavailable,
+            format!(
+                "vault cannot be read; restore it or remove {} by hand",
+                ctx.vault_path.display()
+            ),
+        ));
+    }
+    run(&mut w, uid, parsed, &ctx.backup_dir)
+}
+
+/// `f` of the vault in memory (it is `Ready`: checked under the writer,
+/// and nothing makes a ready vault unavailable).
+fn read<T>(w: &Writer<'_>, f: impl FnOnce(&Vault) -> T) -> Option<T> {
+    match &*w.lock() {
+        VaultState::Ready(v) => Some(f(v)),
+        VaultState::Unavailable(_) => None,
+    }
 }
 
 /// A backup's source path: absolute, no NUL, bounded.
@@ -365,7 +373,7 @@ fn parse_fields(
 }
 
 fn run(
-    vault: &mut Vault,
+    vault: &mut Writer<'_>,
     uid: u32,
     p: Parsed,
     backup_dir: &Path,
@@ -373,8 +381,8 @@ fn run(
     let io = |_e: std::io::Error| (ErrorCode::Internal, "cannot write the vault".to_string());
     match p {
         Parsed::List => {
-            let secrets: Vec<Value> = vault
-                .list()
+            let secrets: Vec<Value> = read(vault, Vault::list)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|m| {
                     json!({
@@ -399,7 +407,7 @@ fn run(
             services,
             backup,
         } => {
-            if vault.get(&name).is_some() {
+            if read(vault, |v| v.get(&name).is_some()).unwrap_or(false) {
                 return Err(bad(format!(
                     "secret {name} exists; use rotate to replace its value"
                 )));
@@ -443,11 +451,11 @@ fn run(
             Ok(m)
         }
         Parsed::Rotate { name, fields } => {
-            let Some(old) = vault.get(&name) else {
+            let Some(old) = read(vault, |v| v.get(&name).cloned()).flatten() else {
                 return Err(bad(format!("no secret named {name}")));
             };
             check_fields(old.kind, &fields)?;
-            let mut e = old.clone();
+            let mut e = old;
             e.fields = fields;
             vault.put(e).map_err(io)?;
             Ok(Map::new())
@@ -659,7 +667,7 @@ async fn take_value(ctx: &Arc<Ctx>, name: &str) -> Result<(Zeroizing<String>, Ki
     let c = Arc::clone(ctx);
     let n = name.to_string();
     tokio::task::spawn_blocking(move || {
-        let mut guard = c.vault.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = c.vault.lock();
         let vault = match &mut *guard {
             VaultState::Ready(v) => v,
             VaultState::Unavailable(_) => {
