@@ -4,12 +4,41 @@ use crate::manifest::{AmountSpec, Unit};
 use crate::BrokerError;
 use serde_json::Value;
 
-/// ISO 4217 minor-unit exponent (default 2).
-pub fn exponent(currency: &str) -> u32 {
-    match currency.to_ascii_uppercase().as_str() {
-        "JPY" | "KRW" | "CLP" | "ISK" | "VND" => 0,
-        "BHD" | "JOD" | "KWD" | "OMR" | "TND" => 3,
-        _ => 2,
+/// Minor-unit exponent of an active ISO 4217 currency (list as of the
+/// current amendment; funds codes included, metals and test codes excluded).
+/// `None` for an unknown code, which callers must deny.
+pub fn exponent(currency: &str) -> Option<u32> {
+    const ZERO: &[&str] = &[
+        "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "UYI", "VND",
+        "VUV", "XAF", "XOF", "XPF",
+    ];
+    const TWO: &[&str] = &[
+        "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+        "BGN", "BMD", "BND", "BOB", "BOV", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF",
+        "CHE", "CHF", "CHW", "CNY", "COP", "COU", "CRC", "CUP", "CVE", "CZK", "DKK", "DOP", "DZD",
+        "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GTQ", "GYD",
+        "HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IRR", "JMD", "KES", "KGS", "KHR", "KPW",
+        "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT",
+        "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK",
+        "NPR", "NZD", "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "QAR", "RON", "RSD", "RUB", "SAR",
+        "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP",
+        "SZL", "THB", "TJS", "TMT", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "USD", "USN", "UZS",
+        "VED", "VES", "WST", "XCD", "YER", "ZAR", "ZMW", "ZWG",
+    ];
+    const THREE: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
+    const FOUR: &[&str] = &["CLF", "UYW"];
+    let c = currency.to_ascii_uppercase();
+    let c = c.as_str();
+    if ZERO.contains(&c) {
+        Some(0)
+    } else if TWO.contains(&c) {
+        Some(2)
+    } else if THREE.contains(&c) {
+        Some(3)
+    } else if FOUR.contains(&c) {
+        Some(4)
+    } else {
+        None
     }
 }
 
@@ -18,7 +47,8 @@ fn bad(why: &str) -> BrokerError {
 }
 
 /// Collect every value at `path` (`a.b[].c`; `[]` fans out over an array).
-fn collect<'a>(v: &'a Value, path: &str) -> Vec<&'a Value> {
+/// Strict: every branch must yield a value, otherwise `BadAmount`.
+fn collect<'a>(v: &'a Value, path: &str) -> Result<Vec<&'a Value>, BrokerError> {
     let mut cur = vec![v];
     for seg in path.split('.') {
         let (key, fan) = match seg.strip_suffix("[]") {
@@ -31,12 +61,12 @@ fn collect<'a>(v: &'a Value, path: &str) -> Vec<&'a Value> {
             match item {
                 Some(Value::Array(a)) if fan => next.extend(a.iter()),
                 Some(x) if !fan => next.push(x),
-                _ => {}
+                _ => return Err(bad("path missing on a branch")),
             }
         }
         cur = next;
     }
-    cur
+    Ok(cur)
 }
 
 /// Parse `digits[.digits]` digit by digit into minor units.
@@ -77,7 +107,7 @@ fn parse_minor(text: &str, unit: Unit, exp: u32) -> Result<u64, BrokerError> {
 /// Extract `(minor units, upper-case currency)` from a request body.
 pub fn extract(spec: &AmountSpec, body: &Value) -> Result<(u64, String), BrokerError> {
     let mut currency: Option<String> = None;
-    for c in collect(body, &spec.currency_field) {
+    for c in collect(body, &spec.currency_field)? {
         let s = c
             .as_str()
             .ok_or_else(|| bad("currency is not a string"))?
@@ -92,8 +122,8 @@ pub fn extract(spec: &AmountSpec, body: &Value) -> Result<(u64, String), BrokerE
     if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(bad("currency is not a 3-letter code"));
     }
-    let exp = exponent(&currency);
-    let vals = collect(body, &spec.field);
+    let exp = exponent(&currency).ok_or_else(|| bad("unknown currency"))?;
+    let vals = collect(body, &spec.field)?;
     if vals.is_empty() {
         return Err(bad("amount missing"));
     }

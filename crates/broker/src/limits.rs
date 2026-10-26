@@ -75,11 +75,11 @@ impl Drop for Reservation {
 }
 
 fn is_write(k: OpKind) -> bool {
-    !matches!(k, OpKind::Read)
+    k == OpKind::Write
 }
 
-fn cap_minor(max_major: u64, currency: &str) -> u128 {
-    u128::from(max_major) * 10u128.pow(exponent(currency))
+fn cap_minor(max_major: u64, currency: &str) -> Option<u128> {
+    Some(u128::from(max_major) * 10u128.pow(exponent(currency)?))
 }
 
 impl Limiter {
@@ -105,31 +105,40 @@ impl Limiter {
 
     /// Check every configured limit against the (uid, service) bucket and
     /// the (uid, service, session) bucket, and reserve a slot. Errs with the
-    /// name of the limit hit.
+    /// name of the limit hit. Callers pass `amount_required = op.amount.is_some()`;
+    /// a required but absent amount is denied (`amount_missing`). An unknown
+    /// request or cap currency is denied (`amount_currency`).
     pub fn check_and_commit(
         &self,
         k: &Key,
         kind: OpKind,
         amount: Option<(u64, &str)>,
+        amount_required: bool,
         cfg: &LimitsCfg,
         now: OffsetDateTime,
     ) -> Result<Reservation, &'static str> {
+        if amount_required && amount.is_none() {
+            return Err("amount_missing");
+        }
         let mut st = lock(&self.state);
         let cutoff = now - Duration::seconds(DAY);
         st.entries.retain(|e| e.ev.at > cutoff);
 
         let amount = amount.map(|(m, c)| (m, c.to_ascii_uppercase()));
         if let Some((m, c)) = &amount {
+            if exponent(c).is_none() {
+                return Err("amount_currency");
+            }
             for cap in [&cfg.amount_per_request, &cfg.amount_per_day]
                 .into_iter()
                 .flatten()
             {
-                if !cap.currency.eq_ignore_ascii_case(c) {
+                if !cap.currency.eq_ignore_ascii_case(c) || exponent(&cap.currency).is_none() {
                     return Err("amount_currency");
                 }
             }
             if let Some(cap) = &cfg.amount_per_request {
-                if u128::from(*m) > cap_minor(cap.max, &cap.currency) {
+                if Some(u128::from(*m)) > cap_minor(cap.max, &cap.currency) {
                     return Err("amount_per_request");
                 }
             }
@@ -181,7 +190,7 @@ impl Limiter {
                     .filter(|(_, ec)| ec.eq_ignore_ascii_case(c))
                     .map(|(a, _)| u128::from(*a))
                     .sum();
-                if sum + u128::from(*m) > cap_minor(cap.max, &cap.currency) {
+                if Some(sum + u128::from(*m)) > cap_minor(cap.max, &cap.currency) {
                     return Err("amount_per_day");
                 }
             }
@@ -237,7 +246,8 @@ mod tests {
         c: &LimitsCfg,
         now: OffsetDateTime,
     ) -> Result<(), &'static str> {
-        l.check_and_commit(k, kind, a, c, now).map(|r| r.commit())
+        l.check_and_commit(k, kind, a, false, c, now)
+            .map(|r| r.commit())
     }
 
     #[test]
@@ -424,7 +434,7 @@ mod tests {
             .map(|_| {
                 let (l, c) = (l.clone(), c.clone());
                 std::thread::spawn(move || {
-                    l.check_and_commit(&key(1, None), OpKind::Read, None, &c, t0())
+                    l.check_and_commit(&key(1, None), OpKind::Read, None, false, &c, t0())
                         .map(|r| {
                             std::thread::sleep(std::time::Duration::from_millis(50));
                             r.commit()
@@ -441,6 +451,115 @@ mod tests {
     }
 
     #[test]
+    fn writes_per_hour_counts_only_write() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            writes_per_hour: Some(1),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        go(&l, &k, OpKind::Delete, None, &c, t0()).unwrap();
+        go(&l, &k, OpKind::Bulk, None, &c, t0()).unwrap();
+        go(&l, &k, OpKind::Write, None, &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Write, None, &c, t0()),
+            Err("writes_per_hour")
+        );
+        go(&l, &k, OpKind::Delete, None, &c, t0()).unwrap();
+    }
+
+    #[test]
+    fn event_exactly_60s_old_is_out() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
+        assert!(go(&l, &k, OpKind::Read, None, &c, t0() + Duration::seconds(59)).is_err());
+        go(&l, &k, OpKind::Read, None, &c, t0() + Duration::seconds(60)).unwrap();
+    }
+
+    #[test]
+    fn amount_per_day_ignores_other_currency_history() {
+        let l = Limiter::new();
+        let k = key(1, None);
+        let none = LimitsCfg::default();
+        go(&l, &k, OpKind::Write, Some((90_000, "USD")), &none, t0()).unwrap();
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "EUR"),
+            ..Default::default()
+        };
+        go(&l, &k, OpKind::Write, Some((50_000, "EUR")), &c, t0()).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((1, "EUR")), &c, t0()),
+            Err("amount_per_day")
+        );
+    }
+
+    #[test]
+    fn extract_refuses_missing_branches() {
+        use crate::amount::extract;
+        let spec = AmountSpec {
+            field: "t[].amount".into(),
+            currency_field: "t[].cur".into(),
+            unit: Unit::Minor,
+        };
+        for bad in [
+            json!({"t":[{"amount":100,"cur":"EUR"},{"note":"x","cur":"EUR"}]}),
+            json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5}]}),
+            json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5,"cur":"USD"}]}),
+        ] {
+            assert!(extract(&spec, &bad).is_err(), "{bad}");
+        }
+        let ok = json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5,"cur":"eur"}]});
+        assert_eq!(extract(&spec, &ok).unwrap(), (105, "EUR".to_string()));
+    }
+
+    #[test]
+    fn unknown_currency_denied_and_exponents() {
+        use crate::amount::exponent;
+        assert_eq!(exponent("JPY"), Some(0));
+        assert_eq!(exponent("KWD"), Some(3));
+        assert_eq!(exponent("EUR"), Some(2));
+        assert_eq!(exponent("XYZ"), None);
+        let l = Limiter::new();
+        let k = key(1, None);
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "EUR"),
+            ..Default::default()
+        };
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((1, "XYZ")), &c, t0()),
+            Err("amount_currency")
+        );
+        let c = LimitsCfg {
+            amount_per_day: cap(500, "XYZ"),
+            ..Default::default()
+        };
+        assert_eq!(
+            go(&l, &k, OpKind::Write, Some((1, "XYZ")), &c, t0()),
+            Err("amount_currency")
+        );
+    }
+
+    #[test]
+    fn missing_amount_fails_closed() {
+        let l = Limiter::new();
+        let k = key(1, None);
+        let c = LimitsCfg::default();
+        assert_eq!(
+            l.check_and_commit(&k, OpKind::Write, None, true, &c, t0())
+                .err(),
+            Some("amount_missing")
+        );
+        assert!(l
+            .check_and_commit(&k, OpKind::Write, None, false, &c, t0())
+            .is_ok());
+    }
+
+    #[test]
     fn dropped_reservation_releases() {
         let l = Limiter::new();
         let c = LimitsCfg {
@@ -449,7 +568,7 @@ mod tests {
         };
         let k = key(1, None);
         drop(
-            l.check_and_commit(&k, OpKind::Read, None, &c, t0())
+            l.check_and_commit(&k, OpKind::Read, None, false, &c, t0())
                 .unwrap(),
         );
         go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
