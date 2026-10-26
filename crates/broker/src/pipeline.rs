@@ -142,7 +142,7 @@ pub trait Env: Sync {
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
 /// parsers that keep the first and the last value would see different
 /// amounts). serde_json's recursion limit applies.
-pub fn strict_json(b: &[u8]) -> Result<Value, ()> {
+pub fn strict_json(b: &[u8]) -> Option<Value> {
     use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 
     struct Strict;
@@ -205,9 +205,9 @@ pub fn strict_json(b: &[u8]) -> Result<Value, ()> {
     }
 
     let mut de = serde_json::Deserializer::from_slice(b);
-    let v = Strict.deserialize(&mut de).map_err(|_| ())?;
-    de.end().map_err(|_| ())?;
-    Ok(v)
+    let v = Strict.deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(v)
 }
 
 /// One semaphore of [`POOL_SIZE`] per service.
@@ -425,14 +425,14 @@ async fn steps(
     if op.body.as_deref() == Some("json") {
         if let Some(b) = &body {
             match strict_json(b) {
-                Ok(v) => {
+                Some(v) => {
                     match serde_json::to_vec(&v) {
                         Ok(canon) => body = Some(Bytes::from(canon)),
                         Err(_) => return denied("bad_body"),
                     }
                     json_body = Some(v);
                 }
-                Err(()) => return denied("bad_body"),
+                None => return denied("bad_body"),
             }
         }
     }
