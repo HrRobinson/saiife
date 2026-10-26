@@ -235,6 +235,28 @@ async fn denied_call_params_masked_with_the_service_secret() {
 }
 
 #[tokio::test]
+async fn capability_qualifier_and_project_masked_in_the_record() {
+    let (_m, up) = mock().await;
+    // `files.get` with a qualifier filled from the agent's `name`.
+    let text = include_str!("../connectors/test-echo.toml").replace(
+        "path_params = { name = \"string\" }",
+        "path_params = { name = \"string\" }\nqualifier = \"file={name}\"",
+    );
+    let cat = Catalog::new(&[], vec![Manifest::parse(&text).unwrap()]);
+    let mut env = FakeEnv::ok();
+    env.secret = Err("secret_missing");
+    let snap = snapshot("");
+    let mut c = call("files.get", &[("name", TOKEN)]);
+    c.project = format!("/srv/{TOKEN}");
+    let (o, tr) = run(&c, &snap, &cat, &Limiter::new(), &env, Some(&up)).await;
+    assert_eq!(rule(&o), "secret_missing");
+    assert_eq!(tr.capability.as_deref(), Some("files:read:file=[MASKED]"));
+    let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert!(!r.contains(TOKEN), "{r}");
+    assert!(r.contains("/srv/[MASKED]"), "{r}");
+}
+
+#[tokio::test]
 async fn duplicate_key_in_json_body_is_bad_body() {
     let (m, up) = mock().await;
     let mut c = call("refunds.create", &[("order_id", "7")]);

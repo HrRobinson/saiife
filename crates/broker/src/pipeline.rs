@@ -274,6 +274,9 @@ pub struct Trace {
     /// The operation as the record's `input` names it, masked: the id, or
     /// `{method} {path}` of an unresolved proxy request.
     pub op_label: String,
+    /// The project as the client reported it, masked; `None` until [`run`]
+    /// set it (the record then masks it with the v1 patterns).
+    pub project: Option<String>,
     pub status: Option<u16>,
     pub resp_bytes: Option<usize>,
     pub duration_ms: u64,
@@ -312,8 +315,11 @@ pub async fn run(
     let outcome = steps(call, cfg, cat, lim, env, up, &mut tr, &mut masker).await;
     // Agent-supplied values go into the record masked with every vault
     // value in use (an agent may echo the token) and the v1 patterns: the
-    // operation id or proxy request (§8.5) and the params.
+    // operation id or proxy request (§8.5), the params, the capability (its
+    // qualifier is filled from the params) and the reported project.
     tr.operation = tr.operation.as_deref().map(|o| masker.mask_text(o));
+    tr.capability = tr.capability.as_deref().map(|c| masker.mask_text(c));
+    tr.project = Some(masker.mask_text(&call.project));
     tr.op_label = match (&tr.operation, &call.op) {
         (Some(id), _) => id.clone(),
         (None, OpRef::Named(id)) => masker.mask_text(id),
@@ -760,10 +766,14 @@ pub fn record(
             None,
         ),
     };
+    let project = match &tr.project {
+        Some(p) => p.clone(),
+        None => Masker::new(&[]).mask_text(&call.project),
+    };
     let mut r = Record::new(
         NewRecord {
             agent,
-            project: &call.project,
+            project: &project,
             session: call.session.as_deref(),
             tool: "api",
             input: &input,
