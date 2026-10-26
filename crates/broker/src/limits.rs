@@ -68,16 +68,6 @@ impl State {
     }
 }
 
-/// Whether `cfg` has a limit that counts past events (a window or a
-/// daily sum). Without one, nothing needs to be remembered.
-fn counts(cfg: &LimitsCfg) -> bool {
-    cfg.requests_per_minute.is_some()
-        || cfg.writes_per_hour.is_some()
-        || cfg.deletes_per_day.is_some()
-        || cfg.bulk_per_session.is_some()
-        || cfg.amount_per_day.is_some()
-}
-
 pub struct Limiter {
     state: Arc<Mutex<State>>,
     /// Set when the rebuild could not read every record of the window:
@@ -95,8 +85,7 @@ impl Default for Limiter {
 #[must_use = "commit the reservation once the request was sent"]
 pub struct Reservation {
     state: Arc<Mutex<State>>,
-    /// `None` when nothing was recorded (no counting limit configured).
-    slot: Option<(BucketKey, u64)>,
+    slot: (BucketKey, u64),
     committed: bool,
 }
 
@@ -116,10 +105,9 @@ impl Drop for Reservation {
         if self.committed {
             return;
         }
-        if let Some((key, id)) = &self.slot {
-            if let Some(b) = lock(&self.state).buckets.get_mut(key) {
-                b.retain(|e| e.id != *id);
-            }
+        let (key, id) = &self.slot;
+        if let Some(b) = lock(&self.state).buckets.get_mut(key) {
+            b.retain(|e| e.id != *id);
         }
     }
 }
@@ -276,14 +264,13 @@ impl Limiter {
             }
         }
 
-        // A service without a counting limit has nothing to remember.
-        let slot = counts(cfg).then(|| {
-            st.push(Event {
-                at: now,
-                key: k.clone(),
-                kind,
-                amount_minor: amount,
-            })
+        // Recorded even when no counting limit is configured: a reload
+        // that adds one must see the calls already made in its window.
+        let slot = st.push(Event {
+            at: now,
+            key: k.clone(),
+            kind,
+            amount_minor: amount,
         });
         Ok(Reservation {
             state: Arc::clone(&self.state),
@@ -642,52 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn service_without_counting_limits_remembers_nothing() {
-        let l = Limiter::new();
-        let k = key(1, None);
-        let per_request_only = LimitsCfg {
-            amount_per_request: cap(100, "EUR"),
-            ..Default::default()
-        };
-        for _ in 0..100 {
-            go(&l, &k, OpKind::Read, None, &LimitsCfg::default(), t0()).unwrap();
-            go(
-                &l,
-                &k,
-                OpKind::Write,
-                Some((1, "EUR")),
-                &per_request_only,
-                t0(),
-            )
-            .unwrap();
-        }
-        drop(
-            l.check_and_commit(&k, OpKind::Read, None, false, &LimitsCfg::default(), t0())
-                .unwrap(),
-        );
-        assert_eq!(remembered(&l), 0);
-        // Its checks still apply.
-        assert_eq!(
-            go(
-                &l,
-                &k,
-                OpKind::Write,
-                Some((10_001, "EUR")),
-                &per_request_only,
-                t0()
-            ),
-            Err("amount_per_request")
-        );
-        // A counting limit remembers.
-        let c = LimitsCfg {
-            requests_per_minute: Some(1),
-            ..Default::default()
-        };
-        go(&l, &k, OpKind::Read, None, &c, t0()).unwrap();
-        assert_eq!(remembered(&l), 1);
-    }
-
-    #[test]
     fn buckets_are_indexed_and_old_ones_swept() {
         let l = Limiter::new();
         let c = LimitsCfg {
@@ -718,8 +659,36 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(remembered(&l), 0);
-        assert!(lock(&l.state).buckets.is_empty());
+        // Only uid 1's `stripe` bucket is left, with the new calls.
+        let st = lock(&l.state);
+        assert_eq!(st.buckets.len(), 1);
+        assert_eq!(
+            st.buckets[&(1, "stripe".to_string())].len() as u64,
+            SWEEP_EVERY
+        );
+    }
+
+    #[test]
+    fn reload_that_adds_a_limit_counts_calls_already_made() {
+        let l = Limiter::new();
+        let k = key(1, Some("s"));
+        // No limit configured: every call is still remembered.
+        for _ in 0..3 {
+            go(&l, &k, OpKind::Read, None, &LimitsCfg::default(), t0()).unwrap();
+        }
+        assert_eq!(remembered(&l), 3);
+        // A reload adds `requests_per_minute = 4`: the window already
+        // holds 3, so one more call is allowed and the next is not.
+        let c = LimitsCfg {
+            requests_per_minute: Some(4),
+            ..Default::default()
+        };
+        let soon = t0() + Duration::seconds(10);
+        go(&l, &k, OpKind::Read, None, &c, soon).unwrap();
+        assert_eq!(
+            go(&l, &k, OpKind::Read, None, &c, soon),
+            Err("requests_per_minute")
+        );
     }
 
     #[test]
