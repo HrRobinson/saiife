@@ -324,6 +324,24 @@ const BUILTIN: &[(&str, &str)] = &[
     ("shopify.toml", include_str!("../connectors/shopify.toml")),
 ];
 
+/// The capability qualifier of `op` for one call: the manifest's template
+/// with every `{name}` filled from `params` (the validated call parameters).
+/// `None` when the operation has no qualifier or a placeholder has no value
+/// (a qualified `allow` then does not match, so the call fails closed).
+pub fn qualifier_for(op: &Operation, params: &BTreeMap<String, String>) -> Option<String> {
+    let tpl = op.qualifier.as_deref()?;
+    let mut out = String::new();
+    let mut rest = tpl;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let end = rest[i..].find('}')? + i;
+        out.push_str(params.get(&rest[i + 1..end])?);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// The built-in manifests, parsed once. A bad one panics, which the test
 /// `every_builtin_manifest_loads` turns into a build-time failure.
 pub fn builtin() -> &'static [Manifest] {

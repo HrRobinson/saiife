@@ -1,0 +1,13 @@
+{
+  "_source": "https://docs.github.com/en/rest/repos/repos#get-a-repository -- shape per vendor docs; not fetched",
+  "id": 1296269,
+  "node_id": "MDEwOlJlcG9zaXRvcnkxMjk2MjY5",
+  "name": "web",
+  "full_name": "acme/web",
+  "private": false,
+  "owner": { "login": "acme", "id": 1, "type": "Organization" },
+  "html_url": "https://github.com/acme/web",
+  "description": "The acme website",
+  "default_branch": "main",
+  "open_issues_count": 2
+}

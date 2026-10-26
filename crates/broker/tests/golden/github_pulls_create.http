@@ -1,0 +1,5 @@
+POST https://api.github.com/repos/acme/web/pulls
+accept: application/vnd.github+json
+authorization: <AUTH>
+content-type: application/json
+x-github-api-version: 2022-11-28
