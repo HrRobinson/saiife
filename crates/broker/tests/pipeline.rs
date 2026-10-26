@@ -701,3 +701,39 @@ async fn param_echoing_the_token_is_masked_in_the_record() {
     let r = serde_json::to_string(&record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
     assert!(!r.contains(TOKEN), "{r}");
 }
+
+/// The docs' outbound webhook: a fixed-URL POST with path `/`.
+#[test]
+fn webhook_operation_builds_the_fixed_url() {
+    let svc: saiife_policy::ServiceCfg = toml::from_str(
+        r#"connector = "http"
+base_url = "https://hooks.example.com/services/T000/B000"
+auth = { kind = "bearer" }
+[[operation]]
+id = "send"
+capability = "hook:write"
+kind = "write"
+method = "POST"
+path = "/"
+body = "json"
+"#,
+    )
+    .unwrap();
+    let m = saiife_broker::manifest::from_http_service("deploy-hook", &svc).unwrap();
+    let fields = [("token".to_string(), Zeroizing::new("tok-1234".to_string()))].into();
+    let auth = AuthMaterial::from_spec(&m.auth[0], fields);
+    let b = saiife_broker::request::build(
+        &m,
+        &m.operation[0],
+        &Default::default(),
+        &Default::default(),
+        &[],
+        Some(Bytes::from_static(b"{}")),
+        &auth,
+    )
+    .unwrap();
+    assert_eq!(
+        b.uri.to_string(),
+        "https://hooks.example.com/services/T000/B000/"
+    );
+}
