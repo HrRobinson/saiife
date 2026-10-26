@@ -15,6 +15,8 @@ pub mod ops;
 #[cfg(target_os = "linux")]
 pub mod server;
 #[cfg(target_os = "linux")]
+pub mod sessions;
+#[cfg(target_os = "linux")]
 mod start;
 #[cfg(target_os = "linux")]
 pub mod writer;

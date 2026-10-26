@@ -2,6 +2,7 @@
 
 use crate::disk;
 use crate::limits::{ConnLimits, Limits};
+use crate::sessions::{agent_ancestor, Proc, Sessions};
 use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_ipc::msg::{
@@ -71,6 +72,9 @@ pub struct Ctx {
     pub catalog: Vec<PackInfo>,
     pub started: Instant,
     pub policy: Mutex<PolicyState>,
+    /// Agent process -> session, for attributing connector requests.
+    pub sessions: Sessions,
+    pub proc: Box<dyn Proc + Send + Sync>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -88,6 +92,7 @@ pub struct CtxInit {
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
     pub policy: PolicyState,
+    pub proc: Box<dyn Proc + Send + Sync>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -111,6 +116,8 @@ impl Ctx {
             catalog: i.catalog,
             started: Instant::now(),
             policy: Mutex::new(i.policy),
+            sessions: Sessions::new(),
+            proc: i.proc,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -380,8 +387,14 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         "peer".into(),
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
+    let session = rec.session.clone();
     match ctx.writer.append(rec).await {
         Ok(seq) => {
+            if let Some(sid) = session {
+                if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
+                    ctx.sessions.record(a, &sid);
+                }
+            }
             let mut m = Map::new();
             m.insert("seq".into(), seq.into());
             ok(id, m)

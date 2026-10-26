@@ -210,6 +210,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         config_path: opts.config.clone(),
         catalog: opts.catalog,
         policy,
+        proc: Box::new(crate::sessions::RealProc::new("/proc")),
     }));
 
     let rt = tokio::runtime::Builder::new_current_thread()
