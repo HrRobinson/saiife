@@ -1,0 +1,4 @@
+GET https://api.github.com/repos/acme/web/pulls?base=main&state=open
+accept: application/vnd.github+json
+authorization: <AUTH>
+x-github-api-version: 2022-11-28

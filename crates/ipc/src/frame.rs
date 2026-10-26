@@ -3,12 +3,16 @@ use serde_json::{Map, Value};
 use std::io::{Read, Write};
 
 pub const MAX_FRAME: usize = 1_048_576;
+/// The largest frame the daemon sends and a client reads: an `api.call`
+/// answer carries up to `max_response_bytes` (5 MiB by default) as base64.
+/// Requests stay at [`MAX_FRAME`].
+pub const MAX_ANSWER_FRAME: usize = 16 * 1_048_576;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("empty frame")]
     Empty,
-    #[error("frame of {0} bytes exceeds the 1 MiB limit")]
+    #[error("frame of {0} bytes exceeds the size limit")]
     TooLarge(usize),
     #[error("frame body is not UTF-8")]
     NotUtf8,
@@ -24,11 +28,17 @@ pub enum FrameError {
 
 /// Header plus body bytes for `v`.
 pub fn encode(v: &Value) -> Result<Vec<u8>, FrameError> {
+    encode_max(v, MAX_FRAME)
+}
+
+/// [`encode`] with another size limit (the daemon's answers:
+/// [`MAX_ANSWER_FRAME`]).
+pub fn encode_max(v: &Value, max: usize) -> Result<Vec<u8>, FrameError> {
     let body = serde_json::to_vec(v).map_err(|_| FrameError::NotJson)?;
     if body.is_empty() {
         return Err(FrameError::Empty);
     }
-    if body.len() > MAX_FRAME {
+    if body.len() > max {
         return Err(FrameError::TooLarge(body.len()));
     }
     let mut out = Vec::with_capacity(4 + body.len());
@@ -39,10 +49,15 @@ pub fn encode(v: &Value) -> Result<Vec<u8>, FrameError> {
 
 /// Validated body length from a header.
 pub fn body_len(header: [u8; 4]) -> Result<usize, FrameError> {
+    body_len_max(header, MAX_FRAME)
+}
+
+/// [`body_len`] with another size limit.
+pub fn body_len_max(header: [u8; 4], max: usize) -> Result<usize, FrameError> {
     let n = u32::from_be_bytes(header) as usize;
     match n {
         0 => Err(FrameError::Empty),
-        n if n > MAX_FRAME => Err(FrameError::TooLarge(n)),
+        n if n > max => Err(FrameError::TooLarge(n)),
         n => Ok(n),
     }
 }
@@ -63,9 +78,15 @@ fn read_exact_closed(r: &mut impl Read, buf: &mut [u8]) -> Result<(), FrameError
 }
 
 pub fn read_frame(r: &mut impl Read) -> Result<Map<String, Value>, FrameError> {
+    read_frame_max(r, MAX_FRAME)
+}
+
+/// [`read_frame`] with another size limit (a client reading the daemon's
+/// answers: [`MAX_ANSWER_FRAME`]).
+pub fn read_frame_max(r: &mut impl Read, max: usize) -> Result<Map<String, Value>, FrameError> {
     let mut h = [0u8; 4];
     read_exact_closed(r, &mut h)?;
-    let n = body_len(h)?;
+    let n = body_len_max(h, max)?;
     let mut body = vec![0u8; n];
     read_exact_closed(r, &mut body)?;
     decode(&body)

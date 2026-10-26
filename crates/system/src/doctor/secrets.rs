@@ -44,7 +44,7 @@ pub const MAX_DEPTH: usize = 4;
 pub const SYMLINK: &str = "is a symlink or lies below one: not followed (check where it points)";
 
 /// Key-name parts that mark an MCP env or header value as a credential.
-const CREDENTIAL_KEYS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTHORIZATION"];
+pub const CREDENTIAL_KEYS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "AUTHORIZATION"];
 
 /// Scans `home` (an agent user's home, as reachable from here) and the
 /// `.env*` files under `project_roots`. Nothing is followed through a

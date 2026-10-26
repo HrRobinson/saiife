@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod daemon;
+pub mod tmp;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,12 +45,12 @@ impl Env {
     /// Fake `agents` on PATH and no `saiife` on PATH.
     pub fn bare(agents: &[&str]) -> Env {
         let env = Env {
-            project: tempfile::tempdir().unwrap(),
-            bin: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-            data: tempfile::tempdir().unwrap(),
-            audit: tempfile::tempdir().unwrap(),
-            managed: tempfile::tempdir().unwrap(),
+            project: tmp::short_tempdir(),
+            bin: tmp::short_tempdir(),
+            home: tmp::short_tempdir(),
+            data: tmp::short_tempdir(),
+            audit: tmp::short_tempdir(),
+            managed: tmp::short_tempdir(),
         };
         for a in agents {
             fake_exe(env.bin.path(), a, "exit 0");
@@ -133,7 +134,7 @@ pub fn stderr(o: &Output) -> String {
 /// the data dir go to a fresh temp dir (returned; keep it alive until the
 /// child exits), the audit log to `audit`.
 pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
-    let sandbox = tempfile::tempdir().unwrap();
+    let sandbox = tmp::short_tempdir();
     let home = sandbox.path().join("home");
     let data = sandbox.path().join("data");
     fs::create_dir_all(&home).unwrap();
@@ -162,7 +163,7 @@ pub struct FixtureHome {
 
 impl FixtureHome {
     pub fn new() -> FixtureHome {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tmp::short_tempdir();
         let root = fs::canonicalize(dir.path()).unwrap().join("u");
         fs::create_dir_all(root.join("app")).unwrap();
         assert_no_host_config(&root);

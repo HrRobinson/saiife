@@ -1,0 +1,3 @@
+PATCH https://api.hubapi.com/crm/v3/objects/contacts/51
+authorization: Bearer <AUTH>
+content-type: application/json

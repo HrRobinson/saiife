@@ -1,0 +1,16 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/order#get-orders-order-id (shape per vendor docs; not fetched)",
+  "order": {
+    "id": 450789469,
+    "name": "#1001",
+    "email": "bob.norman@mail.example.com",
+    "created_at": "2026-07-01T10:15:30-04:00",
+    "financial_status": "paid",
+    "currency": "EUR",
+    "total_price": "409.94",
+    "customer": { "id": 207119551, "email": "bob.norman@mail.example.com", "phone": "+4512345678" },
+    "line_items": [
+      { "id": 466157049, "title": "IPod Nano - 8gb", "quantity": 1, "price": "199.00" }
+    ]
+  }
+}

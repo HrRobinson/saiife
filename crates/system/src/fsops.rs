@@ -368,6 +368,42 @@ pub fn remove_empty_dir_at(dir: &OwnedFd, name: &OsStr) -> io::Result<bool> {
     }
 }
 
+/// What is wrong with `m` as a root-owned, tamper-proof path component:
+/// not owned by `root_uid`, or writable by group or others. Empty when it
+/// is fine. Shared by `saiife doctor` and the daemon's `secret.lease`.
+pub fn root_owned_problems(m: &std::fs::Metadata, root_uid: u32) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    if m.uid() != root_uid {
+        out.push(format!("owned by uid {}, not root", m.uid()));
+    }
+    let perm = m.mode() & 0o7777;
+    if perm & 0o022 != 0 {
+        out.push(format!("mode {perm:04o} is writable by group or others"));
+    }
+    out
+}
+
+/// `path` (absolute) and every parent down from `/`: no symlink, owned by
+/// uid 0, not writable by group or others. `Err` names the first fault.
+pub fn root_owned_chain(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{}: not an absolute path", path.display()));
+    }
+    let mut chain: Vec<&Path> = path.ancestors().collect();
+    chain.reverse();
+    for p in chain {
+        let m = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if m.file_type().is_symlink() {
+            return Err(format!("{}: is a symlink", p.display()));
+        }
+        if let Some(prob) = root_owned_problems(&m, 0).into_iter().next() {
+            return Err(format!("{}: {prob}", p.display()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

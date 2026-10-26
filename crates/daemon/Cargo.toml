@@ -14,6 +14,7 @@ path = "src/lib.rs"
 saiife-audit = { path = "../audit" }
 saiife-ipc = { path = "../ipc" }
 saiife-policy = { path = "../policy" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 toml = "0.8"
@@ -24,6 +25,33 @@ toml = "0.8"
 # 1.53.3 and later are younger than 14 days (2026-10-22).
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros"] }
 rustix = { version = "1", features = ["fs", "process", "net"] }
+saiife-system = { path = "../system" }
+# Newest releases older than 14 days (2026-10-26): chacha20poly1305 0.11.0
+# is from 2026-06-28, zeroize 1.9.1 from 2026-10-06.
+chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
+zeroize = { version = "=1.9.1", features = ["serde"] }
+getrandom = "0.3"
+# The connector gateway (plan 10, Task 9); versions as in saiife-broker.
+saiife-broker = { path = "../broker" }
+bytes = "=1.12.1"
+base64 = "=0.23.1"
+# The HTTP gateway on gateway.sock (Task 10); versions as in saiife-broker.
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+percent-encoding = "2"
+# Gateway bearer tokens are stored as SHA-256 (Task 11); as in saiife-audit.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The gateway tests: a hyper client over the socket and a loopback TLS
+# upstream; versions as in saiife-broker.
+tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }

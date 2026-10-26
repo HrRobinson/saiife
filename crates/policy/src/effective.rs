@@ -154,8 +154,8 @@ mod tests {
         [guard]\npacks = [\"db.postgres\"]\n\
         [audit]\ncheckpoint_interval = \"15m\"\n[audit.forward.siem]\ntype = \"syslog\"\naddress = \"x\"\n\
         [[scope]]\nname = \"s\"\nusers = [\"u\"]\nenv = \"prod\"\n\
-        [services.shopify]\nconnector = \"shopify\"\nallow = [\"a\"]\n";
-    const CFG_B: &str = "[services.shopify]\nallow = [\"a\"]\nconnector = \"shopify\"\n\
+        [services.shopify]\nconnector = \"shopify\"\nallow = [\"a:read\"]\n";
+    const CFG_B: &str = "[services.shopify]\nallow = [\"a:read\"]\nconnector = \"shopify\"\n\
         [[scope]]\nenv = \"prod\"\nusers = [\"u\"]\nname = \"s\"\n\
         [audit.forward.siem]\naddress = \"x\"\ntype = \"syslog\"\n\
         [guard]\npacks = [\"db.postgres\"]\n\
@@ -266,6 +266,23 @@ mod tests {
             hash_of(&c, &catalog(), None),
             hash_of(&c, &catalog(), Some(&m1))
         );
+    }
+
+    #[test]
+    fn policy_hash_changes_with_service() {
+        let a = cfg(CFG_A);
+        let b = cfg(&CFG_A.replace("allow = [\"a:read\"]", "allow = [\"b:read\"]"));
+        assert_ne!(a, b);
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&b, &catalog(), None));
+        // Secrets and limits are part of the hash too.
+        let c = cfg(&format!(
+            "{CFG_A}[secrets.k]\nrun_allow = [\"/usr/bin/curl\"]\n"
+        ));
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&c, &catalog(), None));
+        let d = cfg(&format!(
+            "{CFG_A}[services.shopify.limits]\nrequests_per_minute = 1\n"
+        ));
+        assert_ne!(hash_of(&a, &catalog(), None), hash_of(&d, &catalog(), None));
     }
 
     #[test]

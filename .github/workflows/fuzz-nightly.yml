@@ -1,0 +1,48 @@
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # Beats rust-toolchain.toml (stable).
+      RUSTUP_TOOLCHAIN: nightly-2026-10-01
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz
+      # cargo-fuzz 0.12.0's locked rustix does not build on this nightly;
+      # install it with stable. The fuzz runs below keep nightly.
+      - run: rustup toolchain install stable --profile minimal
+      - name: install cargo-fuzz
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo install cargo-fuzz --locked --version 0.12.0
+      - name: fuzz each target for 30 min
+        run: |
+          set -euo pipefail
+          for t in ipc_frame proxy_path params gateway_request; do
+            cargo fuzz run "$t" -- -max_total_time=1800
+          done
+      - name: upload crashes
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

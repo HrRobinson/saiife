@@ -1,0 +1,26 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/refund#post-orders-order-id-refunds (shape per vendor docs; not fetched)",
+  "_request": {
+    "refund": {
+      "currency": "EUR",
+      "notify": true,
+      "note": "wrong size",
+      "shipping": { "full_refund": true },
+      "refund_line_items": [{ "line_item_id": 466157049, "quantity": 1, "restock_type": "no_restock" }],
+      "transactions": [
+        { "parent_id": 801038806, "amount": "41.94", "kind": "refund", "gateway": "bogus" },
+        { "parent_id": 801038807, "amount": "10.00", "kind": "refund", "gateway": "gift_card" }
+      ]
+    }
+  },
+  "refund": {
+    "id": 509562969,
+    "order_id": 450789469,
+    "created_at": "2026-07-03T12:00:00-04:00",
+    "note": "wrong size",
+    "transactions": [
+      { "id": 179259969, "order_id": 450789469, "amount": "41.94", "kind": "refund", "currency": "EUR", "status": "success" },
+      { "id": 179259970, "order_id": 450789469, "amount": "10.00", "kind": "refund", "currency": "EUR", "status": "success" }
+    ]
+  }
+}

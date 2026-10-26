@@ -1,5 +1,5 @@
 //! Blocking client for the control socket, used by the managed hook.
-use crate::frame::{read_frame, write_frame, FrameError};
+use crate::frame::{read_frame_max, write_frame, FrameError, MAX_ANSWER_FRAME};
 use crate::msg::{OP_HELLO, PROTO, SOCKET_NAME};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::io::Errno;
@@ -214,7 +214,7 @@ impl Client {
                 "connection unusable after an earlier error".into(),
             ));
         }
-        let r = self.exchange(op, args, deadline);
+        let r = self.exchange(op, args, deadline, false);
         if let Err(e) = &r {
             // A refusal that answers our id leaves the stream in step.
             if !matches!(e, ClientError::Refused { .. }) || self.poisoned {
@@ -224,11 +224,33 @@ impl Client {
         r
     }
 
+    /// Like [`Client::call`], but a refusal that answers this call's id is
+    /// returned as the whole answer (`ok: false` with its extra fields,
+    /// such as `rule` or `limit`) instead of an error.
+    pub fn call_answer(
+        &mut self,
+        op: &str,
+        args: Map<String, Value>,
+        deadline: Instant,
+    ) -> Result<Map<String, Value>, ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "connection unusable after an earlier error".into(),
+            ));
+        }
+        let r = self.exchange(op, args, deadline, true);
+        if r.is_err() {
+            self.poisoned = true;
+        }
+        r
+    }
+
     fn exchange(
         &mut self,
         op: &str,
         args: Map<String, Value>,
         deadline: Instant,
+        keep_refusal: bool,
     ) -> Result<Map<String, Value>, ClientError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -242,9 +264,10 @@ impl Client {
             deadline,
         };
         write_frame(&mut io, &req.to_value())?;
-        let ans = read_frame(&mut io)?;
+        let ans = read_frame_max(&mut io, MAX_ANSWER_FRAME)?;
         let id_ok = ans.get("id").and_then(Value::as_u64) == Some(id);
         match ans.get("ok").and_then(Value::as_bool) {
+            Some(false) if keep_refusal && id_ok => Ok(ans),
             Some(false) => {
                 // Includes id-less answers such as the daemon's `bad_frame`.
                 self.poisoned = !id_ok;

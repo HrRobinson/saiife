@@ -5,7 +5,13 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
+pub mod api_ops;
+#[cfg(target_os = "linux")]
 pub mod disk;
+#[cfg(target_os = "linux")]
+pub mod gateway;
+#[cfg(target_os = "linux")]
+pub mod import_backup;
 #[cfg(target_os = "linux")]
 pub mod limits;
 #[cfg(target_os = "linux")]
@@ -13,9 +19,17 @@ pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
+pub mod secret_ops;
+#[cfg(target_os = "linux")]
 pub mod server;
 #[cfg(target_os = "linux")]
+pub mod sessions;
+#[cfg(target_os = "linux")]
 mod start;
+#[cfg(target_os = "linux")]
+pub mod tokens;
+#[cfg(target_os = "linux")]
+pub mod vault;
 #[cfg(target_os = "linux")]
 pub mod writer;
 
@@ -31,6 +45,8 @@ pub struct DaemonOptions {
     /// The built-in packs, for the policy hash.
     pub catalog: Vec<PackInfo>,
     pub directory: Box<dyn Directory + Send + Sync>,
+    /// Holds `vault-key` (systemd `$CREDENTIALS_DIRECTORY`); `None` means no vault key.
+    pub credentials_dir: Option<PathBuf>,
 }
 
 /// Run the daemon until SIGTERM or SIGINT. Startup refusals print one line

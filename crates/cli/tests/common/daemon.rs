@@ -108,11 +108,13 @@ pub fn refused_code(e: &ClientError) -> &str {
 impl TestDaemon {
     /// A temp dir with the config written, no daemon yet.
     pub fn prepare(opts: &Opts) -> TestDaemon {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = super::tmp::short_tempdir();
         let d = TestDaemon { tmp, child: None };
         fs::create_dir_all(d.path().join("etc")).unwrap();
         fs::create_dir_all(d.path().join("home")).unwrap();
         fs::create_dir_all(d.path().join("data")).unwrap();
+        fs::create_dir_all(d.creds_dir()).unwrap();
+        fs::write(d.creds_dir().join("vault-key"), [42u8; 32]).unwrap();
         d.write_config(opts);
         d
     }
@@ -143,6 +145,10 @@ impl TestDaemon {
         self.path().join("state")
     }
 
+    pub fn creds_dir(&self) -> PathBuf {
+        self.path().join("creds")
+    }
+
     pub fn config_text(&self, opts: &Opts) -> String {
         let user = opts.user.clone().unwrap_or_else(own_user);
         format!(
@@ -165,12 +171,15 @@ impl TestDaemon {
             .arg(self.config())
             .arg("--state-dir")
             .arg(self.state_dir())
+            .arg("--credentials-dir")
+            .arg(self.creds_dir())
             .env("HOME", self.path().join("home"))
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.audit_dir())
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
+            .env_remove("CREDENTIALS_DIRECTORY")
             .stdin(Stdio::null());
         cmd
     }

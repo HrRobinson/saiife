@@ -1,0 +1,10 @@
+{
+  "_source": "https://docs.github.com/en/rest/issues/issues#create-an-issue -- shape per vendor docs; not fetched",
+  "id": 2,
+  "number": 1348,
+  "state": "open",
+  "title": "Found a bug",
+  "body": "I'm having a problem with this.",
+  "user": { "login": "octocat", "id": 1 },
+  "html_url": "https://github.com/acme/web/issues/1348"
+}

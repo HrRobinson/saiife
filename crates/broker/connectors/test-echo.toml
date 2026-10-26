@@ -1,0 +1,47 @@
+id = "test-echo"
+version = 1
+title = "Test echo connector"
+base_url = "https://{shop}.echo.test/api"
+hosts = ["*.echo.test"]
+auth = [{ kind = "header", name = "X-Echo-Token", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.shop]
+type = "string"
+pattern = "^[a-z0-9-]+$"
+required = true
+
+[[operation]]
+id = "orders.list"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders.json"
+query = { status = "enum:open,closed,cancelled,any", limit = "int:1..250", since_id = "int", created_at_min = "datetime" }
+pagination = "link-header"
+
+[[operation]]
+id = "orders.get"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders/{order_id}"
+path_params = { order_id = "int" }
+
+[[operation]]
+id = "files.get"
+capability = "files:read"
+kind = "read"
+method = "GET"
+path = "/files/{name}"
+path_params = { name = "string" }
+
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/orders/{order_id}/refunds.json"
+path_params = { order_id = "int" }
+body = "json"
+amount = { field = "refund.transactions[].amount", currency_field = "refund.currency", unit = "major" }

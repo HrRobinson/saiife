@@ -10,6 +10,8 @@
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
+//! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
+//! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
@@ -22,17 +24,23 @@ use clap::{Parser, Subcommand};
 #[macro_use]
 mod out;
 
+mod api_cmd;
 mod audit_cmd;
 mod check;
 mod check_managed;
+mod connect_cmd;
 mod doctor_cmd;
 mod eval;
+#[cfg(target_os = "linux")]
+mod import_cmd;
 mod init_cmd;
 mod packs_cmd;
 mod paths;
 mod project;
 mod report;
 mod report_html;
+mod run_cmd;
+mod secret_cmd;
 mod status_cmd;
 mod system_cmd;
 mod system_view;
@@ -160,6 +168,9 @@ enum Cmd {
         /// Where the signing key lives (default $STATE_DIRECTORY, else /var/lib/saiife).
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
+        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY).
+        #[arg(long = "credentials-dir", value_name = "DIR", hide = true)]
+        credentials_dir: Option<std::path::PathBuf>,
     },
     /// Check the machine locked mode relies on: exit 0 all pass, 1 a
     /// warning, 2 a failure.
@@ -177,6 +188,42 @@ enum Cmd {
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
+    /// Locked mode (Linux, admin): add, list, rotate or remove the
+    /// secrets in the daemon's vault. Values never leave the daemon.
+    Secret {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: secret_cmd::SecretAction,
+    },
+    /// Locked mode (Linux, admin): set up a connector service. Stores its
+    /// secret and writes policy.d/<service>.toml with every operation
+    /// commented out (deny-all until you edit it).
+    Connect(connect_cmd::ConnectArgs),
+    /// Locked mode (Linux): run one allowed, root-owned command with a
+    /// secret in its environment; its output is masked.
+    ///
+    /// Trust boundary: any process of the agent's uid can lease a listed
+    /// secret from the daemon; the executable check binds only this honest
+    /// client. The boundary is the uid plus its scope. The command runs as
+    /// you and holds the value while it runs. Prefer a connector wherever
+    /// one exists, and list only purpose-built, argument-constrained
+    /// programs in run_allow.
+    Run {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+        /// The secret and the variable to set: NAME or NAME:ENV_VAR.
+        #[arg(long = "secret", value_name = "NAME[:ENV_VAR]", required = true)]
+        secrets: Vec<String>,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// Locked mode (Linux): call a connector operation through the daemon,
+    /// or list the ones you may call. The credential never reaches you.
+    Api(api_cmd::ApiArgs),
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -222,9 +269,35 @@ fn main() -> ExitCode {
         user,
         config,
         state_dir,
+        credentials_dir,
     } = cli.command
     {
-        return cmd_daemon(system, user, config, state_dir);
+        return cmd_daemon(system, user, config, state_dir, credentials_dir);
+    }
+    if let Cmd::Secret {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return secret_cmd::run(system_config, action);
+    }
+    if let Cmd::Connect(args) = cli.command {
+        return connect_cmd::run(args);
+    }
+    if let Cmd::Run {
+        system_config,
+        secrets,
+        command,
+    } = cli.command
+    {
+        return run_cmd::run(run_cmd::RunArgs {
+            system_config,
+            secrets,
+            command,
+        });
+    }
+    if let Cmd::Api(a) = cli.command {
+        return api_cmd::run(a);
     }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
@@ -271,6 +344,10 @@ fn main() -> ExitCode {
         | Cmd::Eval
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
+        | Cmd::Secret { .. }
+        | Cmd::Connect(..)
+        | Cmd::Run { .. }
+        | Cmd::Api(_)
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }
@@ -316,6 +393,7 @@ fn cmd_daemon(
     user: bool,
     config: Option<std::path::PathBuf>,
     state_dir: Option<std::path::PathBuf>,
+    credentials_dir: Option<std::path::PathBuf>,
 ) -> ExitCode {
     if !system || user {
         eprintln!(
@@ -346,6 +424,9 @@ fn cmd_daemon(
     saiife_daemon::run(saiife_daemon::DaemonOptions {
         config: config.unwrap_or_else(|| "/etc/saiife/config.toml".into()),
         state_dir,
+        credentials_dir: credentials_dir
+            .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
+            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty()),
         catalog,
         directory: Box::new(saiife_policy::Getent),
     })

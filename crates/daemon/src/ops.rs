@@ -2,14 +2,23 @@
 
 use crate::disk;
 use crate::limits::{ConnLimits, Limits};
+use crate::sessions::{agent_ancestor, Proc, Sessions};
+use crate::vault::VaultState;
 use crate::writer::{WriterConfig, WriterHandle};
 use saiife_audit::{DecisionKind, NewRecord, Record};
+use saiife_broker::limits::Limiter;
+use saiife_broker::pipeline::{PolicySnapshot, Pools};
+use saiife_broker::upstream::Upstream;
+use saiife_broker::Catalog;
 use saiife_ipc::msg::{
-    err, ok, ErrorCode, Request, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_STATUS, PROTO,
+    err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
+    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
+    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo,
+    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, Mode, PackInfo,
+    SystemConfig,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -29,6 +38,14 @@ pub use saiife_ipc::msg::MAX_RECORD_BYTES;
 /// At most one `rate_limited` / `low_disk` record per uid per this.
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 
+/// The connector side of a valid policy: the snapshot every call takes when
+/// it starts, and the connector catalog checked against it.
+#[derive(Debug)]
+pub struct GatewayPolicy {
+    pub snap: PolicySnapshot,
+    pub catalog: Catalog,
+}
+
 /// The policy in force.
 #[derive(Debug, Clone)]
 pub struct PolicyState {
@@ -37,18 +54,54 @@ pub struct PolicyState {
     pub ok: bool,
     pub min_free_mb: u64,
     pub admin_groups: Vec<String>,
+    /// The merged system config (scopes, `[secrets.*] run_allow`); `None`
+    /// while no valid policy was ever loaded.
+    pub system: Option<Arc<SystemConfig>>,
+    /// `None` while no valid policy was ever loaded (connectors are denied
+    /// with `policy_invalid`).
+    pub gateway: Option<Arc<GatewayPolicy>>,
 }
 
 impl PolicyState {
-    pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo]) -> PolicyState {
+    /// The state of a loaded policy whose services passed
+    /// [`check_services`].
+    pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo], connectors: Catalog) -> PolicyState {
         let (packs, _) = active_packs(&l.config, catalog, None);
+        let hash = policy_hash(&effective_policy(&l.config, &packs, None));
         PolicyState {
-            hash: Some(policy_hash(&effective_policy(&l.config, &packs, None))),
+            hash: Some(hash.clone()),
             ok: true,
             min_free_mb: l.config.audit.min_free_mb,
             admin_groups: l.config.admin.groups.clone(),
+            system: Some(Arc::new(l.config.clone())),
+            gateway: Some(Arc::new(GatewayPolicy {
+                snap: PolicySnapshot {
+                    config: l.config.clone(),
+                    hash,
+                    mode: Mode::Locked,
+                },
+                catalog: connectors,
+            })),
         }
     }
+}
+
+/// The connector catalog for a loaded policy: the built-in manifests plus
+/// the admin's in `<config dir>/connectors` (root-owned), with every
+/// `[services.*]` checked against it. An error makes the policy invalid
+/// (at a reload: `rejected`, the old policy stays). Warnings go to stderr.
+pub fn check_services(l: &LoadedPolicy, config_path: &std::path::Path) -> Result<Catalog, String> {
+    let dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/"))
+        .join("connectors");
+    let local = saiife_broker::manifest::load_local(&dir).map_err(|e| e.to_string())?;
+    let cat = Catalog::new(saiife_broker::builtin(), local);
+    let warnings = saiife_broker::catalog::validate(&l.config, &cat).map_err(|e| e.to_string())?;
+    for w in warnings {
+        eprintln!("saiife: warning: {w}");
+    }
+    Ok(cat)
 }
 
 type Cache<K, V> = Mutex<HashMap<K, (Instant, V)>>;
@@ -71,6 +124,29 @@ pub struct Ctx {
     pub catalog: Vec<PackInfo>,
     pub started: Instant,
     pub policy: Mutex<PolicyState>,
+    /// Agent process -> session, for attributing connector requests.
+    pub sessions: Sessions,
+    pub proc: Box<dyn Proc + Send + Sync>,
+    /// The credential vault (plan 10); `Unavailable` keeps the daemon up.
+    pub vault: crate::vault::Shared,
+    /// Where `vault.bin` lives (named in the `VaultUnavailable` message).
+    pub vault_path: PathBuf,
+    /// Connector limits, rebuilt at start from the last 24 h of records.
+    pub limiter: Limiter,
+    /// The upstream client (the native roots plus `<config dir>/ca`), or
+    /// why it could not be built.
+    pub upstream: Result<Upstream, String>,
+    /// At most 4 upstream calls in flight per service.
+    pub pools: Pools,
+    /// Where `secret.add` keeps the backups of imported files.
+    pub backup_dir: PathBuf,
+    /// Bearer tokens of the loopback TCP listener (`api.token`).
+    pub tokens: Arc<crate::tokens::Tokens>,
+    /// The `[gateway] tcp` the daemon started with, and what it bound.
+    pub tcp: Mutex<TcpState>,
+    /// Connector calls in flight; a stop waits for them (bounded) before
+    /// the stop record.
+    pub calls: InFlight,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -88,6 +164,73 @@ pub struct CtxInit {
     pub config_path: PathBuf,
     pub catalog: Vec<PackInfo>,
     pub policy: PolicyState,
+    pub proc: Box<dyn Proc + Send + Sync>,
+    pub vault: VaultState,
+    pub vault_path: PathBuf,
+    pub limiter: Limiter,
+    pub upstream: Result<Upstream, String>,
+    pub backup_dir: PathBuf,
+    pub tokens: Arc<crate::tokens::Tokens>,
+}
+
+/// A count of work in flight that a stop waits for.
+#[derive(Default)]
+pub struct InFlight {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// One unit of [`InFlight`] work, until dropped.
+pub struct Busy<'a>(&'a InFlight);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        if self
+            .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl InFlight {
+    pub fn enter(&self) -> Busy<'_> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Busy(self)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait until nothing is in flight, at most `limit`; `true` when idle.
+    pub async fn wait_idle(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // Registered before the check: a drop in between still wakes us.
+            idle.as_mut().enable();
+            if self.count() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+                return self.count() == 0;
+            }
+        }
+    }
+}
+
+/// The optional loopback TCP listener of the gateway.
+#[derive(Debug, Clone, Default)]
+pub struct TcpState {
+    /// `[gateway] tcp` at start (a reload cannot change it).
+    pub configured: String,
+    /// The address bound (the real port when `:0` was asked for).
+    pub bound: Option<std::net::SocketAddr>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -111,6 +254,17 @@ impl Ctx {
             catalog: i.catalog,
             started: Instant::now(),
             policy: Mutex::new(i.policy),
+            sessions: Sessions::new(),
+            proc: i.proc,
+            vault: crate::vault::Shared::new(i.vault),
+            vault_path: i.vault_path,
+            limiter: i.limiter,
+            upstream: i.upstream,
+            pools: Pools::new(),
+            backup_dir: i.backup_dir,
+            tokens: i.tokens,
+            tcp: Mutex::new(TcpState::default()),
+            calls: InFlight::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -176,7 +330,7 @@ impl Ctx {
 
     /// The user's groups, cached for at most 60 s. A failed lookup is an
     /// empty list (so: not an admin).
-    async fn groups_of(&self, user: &str) -> Vec<String> {
+    pub(crate) async fn groups_of(&self, user: &str) -> Vec<String> {
         if let Some((at, v)) = lock(&self.groups).get(user) {
             if at.elapsed() < LOOKUP_TTL {
                 return v.clone();
@@ -237,7 +391,28 @@ pub enum Notice {
     Connections,
     /// The audit volume is below `[audit] min_free_mb`.
     LowDisk,
+    /// The HTTP gateway refused a request before the pipeline (no
+    /// `connector` record is written for it).
+    Gateway(GatewayRefusal),
 }
+
+/// Why the HTTP gateway refused a request before the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GatewayRefusal {
+    /// 400 (or 408): a request that cannot be read as a call.
+    BadRequest,
+    /// 413: a body over 1 MiB.
+    TooLarge,
+    /// 401: no valid bearer token on the TCP listener.
+    Token,
+    /// 403: a browser-like request on the TCP listener.
+    Origin,
+    /// 405: the wrong method for the route.
+    Method,
+}
+
+/// The uid of a [`Notice`] about a TCP client that showed no valid token.
+pub const UNKNOWN_UID: u32 = u32::MAX;
 
 impl Notice {
     /// The record's `event`.
@@ -245,6 +420,7 @@ impl Notice {
         match self {
             Notice::Requests | Notice::Connections => "rate_limited",
             Notice::LowDisk => "low_disk",
+            Notice::Gateway(_) => "gateway_refused",
         }
     }
 
@@ -258,6 +434,21 @@ impl Notice {
                 "uid {uid} is over its connection limits (32 open per uid, or the daemon's total)"
             ),
             Notice::LowDisk => format!("uid {uid}: audit volume below [audit] min_free_mb"),
+            Notice::Gateway(r) => {
+                let who = if uid == UNKNOWN_UID {
+                    "a TCP client without a valid token".to_string()
+                } else {
+                    format!("uid {uid}")
+                };
+                let what = match r {
+                    GatewayRefusal::BadRequest => "a request that could not be read (400)",
+                    GatewayRefusal::TooLarge => "a request body over 1 MiB (413)",
+                    GatewayRefusal::Token => "a missing, expired or unknown token (401)",
+                    GatewayRefusal::Origin => "a browser-like request (403 origin)",
+                    GatewayRefusal::Method => "a method the route does not take (405)",
+                };
+                format!("the HTTP gateway refused {what} from {who}; at most one record a minute")
+            }
         }
     }
 }
@@ -305,12 +496,25 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         OP_AUDIT_APPEND => append(ctx, peer, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
+        OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
+        OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
+            crate::secret_ops::handle(ctx, peer, req).await
+        }
+        OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
+        OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
             &format!("unknown op {other:?}"),
         ),
     }
+}
+
+/// A client-supplied session id over the cap is not remembered (the
+/// record is still accepted).
+fn storable_session(s: Option<&str>) -> Option<String> {
+    s.filter(|s| s.len() <= crate::sessions::MAX_SESSION_ID)
+        .map(str::to_string)
 }
 
 async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
@@ -380,8 +584,14 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         "peer".into(),
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
+    let session = storable_session(rec.session.as_deref());
     match ctx.writer.append(rec).await {
         Ok(seq) => {
+            if let Some(sid) = session {
+                if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
+                    ctx.sessions.record(a, &sid);
+                }
+            }
             let mut m = Map::new();
             m.insert("seq".into(), seq.into());
             ok(id, m)
@@ -406,6 +616,9 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     m.insert("policy".into(), json!(p.hash));
     m.insert("policy_ok".into(), p.ok.into());
     m.insert("uptime_s".into(), ctx.started.elapsed().as_secs().into());
+    // The loopback TCP listener's address, `null` when there is none.
+    let tcp = lock(&ctx.tcp).bound;
+    m.insert("gateway_tcp".into(), json!(tcp.map(|a| a.to_string())));
     ok(id, m)
 }
 
@@ -431,6 +644,40 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_waits_for_calls_in_flight() {
+        let f = Arc::new(InFlight::default());
+        assert!(f.wait_idle(Duration::from_millis(10)).await);
+        let f2 = Arc::clone(&f);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let call = tokio::spawn(async move {
+            let _busy = f2.enter();
+            let _ = rx.await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(f.count(), 1);
+        // Bounded: still busy after the limit.
+        assert!(!f.wait_idle(Duration::from_millis(50)).await);
+        // Woken as soon as the last call ends.
+        let waiter = {
+            let f = Arc::clone(&f);
+            tokio::spawn(async move { f.wait_idle(Duration::from_secs(10)).await })
+        };
+        tokio::task::yield_now().await;
+        tx.send(()).unwrap();
+        call.await.unwrap();
+        assert!(waiter.await.unwrap());
+        assert_eq!(f.count(), 0);
+    }
+
+    #[test]
+    fn overlong_session_id_is_not_stored() {
+        assert_eq!(storable_session(Some("abc")).as_deref(), Some("abc"));
+        assert_eq!(storable_session(None), None);
+        let long = "x".repeat(crate::sessions::MAX_SESSION_ID + 1);
+        assert_eq!(storable_session(Some(&long)), None);
+    }
 
     #[test]
     fn notices_at_most_once_per_uid_and_kind_per_minute() {

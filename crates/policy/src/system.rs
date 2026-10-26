@@ -1,10 +1,12 @@
 //! `/etc/saiife/config.toml` (spec §8.1). Every section rejects unknown keys
 //! (typos in a security config are errors) and every default is the §8.1
-//! value. `forward`, `notify`, `services` and `example` stay raw tables until
-//! plans 10 to 12 type them.
+//! value. `forward`, `notify` and `example` stay raw tables until plans 11 and 12
+//! type them.
 
+use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -31,7 +33,10 @@ pub struct SystemConfig {
     #[serde(default)]
     pub gateway: GatewayCfg,
     #[serde(default)]
-    pub services: BTreeMap<String, toml::Table>,
+    pub services: BTreeMap<String, ServiceCfg>,
+    /// `[secrets.<name>]`: per-secret admin settings (`run_allow`).
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     pub scope: Vec<Scope>,
     #[serde(default)]
@@ -156,6 +161,30 @@ impl Default for GatewayCfg {
     }
 }
 
+impl GatewayCfg {
+    /// `tcp` as a socket address: `Ok(None)` when empty (no listener). An
+    /// address that is not an IP literal with a port, or whose IP is not
+    /// loopback (`127.0.0.0/8`, `::1`), is an error. Port 0 (an ephemeral
+    /// port, which the daemon reports in `status`) is accepted.
+    pub fn tcp_addr(&self) -> Result<Option<SocketAddr>, String> {
+        let t = self.tcp.trim();
+        if t.is_empty() {
+            return Ok(None);
+        }
+        let a: SocketAddr = t.parse().map_err(|_| {
+            format!(
+                "[gateway] tcp = {t:?} is not an IP address with a port (like \"127.0.0.1:7431\")"
+            )
+        })?;
+        if !a.ip().is_loopback() {
+            return Err(format!(
+                "[gateway] tcp = {t:?} is not a loopback address (127.0.0.0/8 or ::1)"
+            ));
+        }
+        Ok(Some(a))
+    }
+}
+
 /// One `[[scope]]`. A uid matches at most one scope (builder's call 6).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -208,6 +237,42 @@ mod tests {
         assert_eq!(c.audit.fsync, Fsync::Always);
         assert_eq!(c.approval.same_user, SameUser::Reauth);
         assert!(toml::from_str::<SystemConfig>("version = 2\n[guard]\nfail = \"Open\"\n").is_err());
+    }
+
+    #[test]
+    fn tcp_off_by_default() {
+        let c: SystemConfig = toml::from_str("version = 2\n").unwrap();
+        assert_eq!(c.gateway.tcp, "");
+        assert_eq!(c.gateway.tcp_addr(), Ok(None));
+    }
+
+    #[test]
+    fn non_loopback_tcp_is_config_error() {
+        let g = |t: &str| GatewayCfg {
+            tcp: t.into(),
+            ..GatewayCfg::default()
+        };
+        for ok in [
+            "127.0.0.1:7431",
+            "127.0.0.1:0",
+            "127.9.8.7:80",
+            "[::1]:7431",
+        ] {
+            assert!(g(ok).tcp_addr().unwrap().is_some(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0:7431",
+            "[::]:7431",
+            "192.168.1.5:7431",
+            "10.0.0.1:1",
+            "[::ffff:127.0.0.1]:7431",
+            "localhost:7431",
+            "127.0.0.1",
+            "7431",
+        ] {
+            assert!(g(bad).tcp_addr().is_err(), "{bad}");
+        }
+        assert!(g("0.0.0.0:1").tcp_addr().unwrap_err().contains("loopback"));
     }
 
     #[test]

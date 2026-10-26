@@ -3,11 +3,29 @@
 # Supports the spec's "no network calls" rule: network use fails inside the
 # namespace, so a test that needs the network cannot pass here.
 #
-# The user namespace maps the current user to itself (`--map-current-user`,
-# util-linux >= 2.38), not to root: the daemon tests start saiifed, which
-# refuses to run as uid 0.
+# The tests run as the current user, not as root: the daemon tests start
+# saiifed, which refuses to run as uid 0. A new network namespace has its
+# loopback interface down, and the broker's TLS tests need 127.0.0.1, so an
+# outer namespace mapped to root brings `lo` up, and a nested user namespace
+# (`--map-user`, util-linux >= 2.38) maps the current user back to itself.
+# Only loopback exists inside; there is still no route out.
 set -euo pipefail
-offline() { unshare --map-current-user --net "$@"; }
+offline() {
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  unshare --map-root-user --net bash -c '
+    ip link set lo up
+    exec unshare --user --map-user="$1" --map-group="$2" "${@:3}"
+  ' offline "$(id -u)" "$(id -g)" "$@"
+}
+# Test dirs live under a short base so unix socket paths fit in 108 bytes.
+# Set SAIIFE_TEST_TMP yourself; the default is <repo>/target/t.
+if [ -z "${SAIIFE_TEST_TMP:-}" ] && [ -n "${RUNNER_TEMP:-}" ]; then
+  SAIIFE_TEST_TMP="$RUNNER_TEMP/s"
+fi
+if [ -n "${SAIIFE_TEST_TMP:-}" ]; then
+  mkdir -p "$SAIIFE_TEST_TMP"
+  export SAIIFE_TEST_TMP
+fi
 cargo test --workspace --no-run --quiet
 # Sanity checks: inside the namespace there must be no network, and the
 # tests must not run as root.

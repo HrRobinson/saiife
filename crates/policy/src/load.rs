@@ -1,5 +1,7 @@
 //! Loading `config.toml` plus `policy.d/*.toml` (spec §8.1 "Merging").
 
+use crate::capability::validate_pattern;
+use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
 use crate::system::{Fail, McpCfg, Scope, SystemConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -36,6 +38,8 @@ pub enum PolicyError {
         first: String,
         second: String,
     },
+    #[error("secret {secret}: run_allow entry {} runs arbitrary code (interpreters and shells are refused)", entry.display())]
+    RunAllowInterpreter { secret: String, entry: PathBuf },
     #[error("user {user} matches more than one scope: {}", scopes.join(", "))]
     ScopeConflict { user: String, scopes: Vec<String> },
 }
@@ -57,7 +61,9 @@ struct DropIn {
     #[serde(default)]
     guard: DropGuard,
     #[serde(default)]
-    services: BTreeMap<String, toml::Table>,
+    services: BTreeMap<String, ServiceCfg>,
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     scope: Vec<Scope>,
     #[serde(default)]
@@ -98,6 +104,11 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         .keys()
         .map(|k| (k.clone(), config_name.clone()))
         .collect();
+    let mut secret_origin: BTreeMap<String, String> = cfg
+        .secrets
+        .keys()
+        .map(|k| (k.clone(), config_name.clone()))
+        .collect();
     let mut scope_origin: BTreeMap<String, String> = BTreeMap::new();
     for s in &cfg.scope {
         if let Some(first) = scope_origin.insert(s.name.clone(), config_name.clone()) {
@@ -133,6 +144,16 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
             service_origin.insert(svc.clone(), name.clone());
             cfg.services.insert(svc, t);
         }
+        for (sec, c) in d.secrets {
+            if let Some(first) = secret_origin.get(&sec) {
+                return Err(invalid(
+                    &path,
+                    format!("secret {sec:?} is already defined in {first}"),
+                ));
+            }
+            secret_origin.insert(sec.clone(), name.clone());
+            cfg.secrets.insert(sec, c);
+        }
         for s in d.scope {
             if let Some(first) = scope_origin.get(&s.name) {
                 return Err(dup_scope(&path, &s.name, first));
@@ -141,6 +162,28 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
             cfg.scope.push(s);
         }
         cfg.example.extend(d.example);
+    }
+
+    validate_services(config_file, &cfg, &service_origin)?;
+    cfg.gateway
+        .tcp_addr()
+        .map_err(|why| invalid(config_file, why))?;
+    for (name, sec) in &cfg.secrets {
+        if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
+            return Err(invalid(
+                config_file,
+                format!(
+                    "secret {name}: run_allow entry {} must be an absolute path",
+                    entry.display()
+                ),
+            ));
+        }
+        if let Some(entry) = sec.run_allow.iter().find(|p| is_interpreter(p)) {
+            return Err(PolicyError::RunAllowInterpreter {
+                secret: name.clone(),
+                entry: entry.clone(),
+            });
+        }
     }
 
     if cfg.locked && cfg.guard.fail == Fail::Open {
@@ -155,6 +198,48 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         files,
         warnings,
     })
+}
+
+/// Checks the typed services after the merge; errors name the file that
+/// defined the service.
+fn validate_services(
+    config_file: &Path,
+    cfg: &SystemConfig,
+    origin: &BTreeMap<String, String>,
+) -> Result<(), PolicyError> {
+    for (name, svc) in &cfg.services {
+        let file = origin
+            .get(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_file.to_path_buf());
+        let patterns = svc
+            .allow
+            .iter()
+            .chain(&svc.ask)
+            .chain(&svc.deny)
+            .chain(svc.rule.iter().map(|r| &r.capability));
+        for pat in patterns {
+            if let Err(why) = validate_pattern(pat) {
+                return Err(invalid(
+                    &file,
+                    format!("service {name}: capability pattern {pat:?}: {why}"),
+                ));
+            }
+        }
+        if let Some(a) = &svc.auth {
+            if !AUTH_KINDS.contains(&a.kind.as_str()) {
+                return Err(invalid(
+                    &file,
+                    format!(
+                        "service {name}: auth kind {:?} is not one of {}",
+                        a.kind,
+                        AUTH_KINDS.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn invalid(path: &Path, detail: impl Into<String>) -> PolicyError {
@@ -187,6 +272,23 @@ fn check_reserved(path: &Path, table: &toml::Table) -> Result<(), PolicyError> {
     if table.contains_key("profile") {
         return Err(reserved("profile"));
     }
+    for section in ["services", "secrets"] {
+        let Some(toml::Value::Table(entries)) = table.get(section) else {
+            continue;
+        };
+        for (name, v) in entries {
+            // `params` and `fixed` hold connector parameters, whose names are
+            // free; §18 reserves config keys only.
+            if let Some(at) = find_profile(v, section == "services") {
+                let key = if at.is_empty() {
+                    format!("{section}.{name}.profile")
+                } else {
+                    format!("{section}.{name}.{at}.profile")
+                };
+                return Err(reserved(&key));
+            }
+        }
+    }
     if let Some(toml::Value::Array(scopes)) = table.get("scope") {
         for s in scopes {
             if let toml::Value::Table(t) = s {
@@ -197,6 +299,33 @@ fn check_reserved(path: &Path, table: &toml::Table) -> Result<(), PolicyError> {
         }
     }
     Ok(())
+}
+
+/// Path (dotted, without the final `profile`) of the first `profile` key
+/// anywhere below `v`.
+fn find_profile(v: &toml::Value, skip_maps: bool) -> Option<String> {
+    match v {
+        toml::Value::Table(t) => {
+            if t.contains_key("profile") {
+                return Some(String::new());
+            }
+            for (k, child) in t {
+                if skip_maps && (k == "params" || k == "fixed") {
+                    continue;
+                }
+                if let Some(rest) = find_profile(child, false) {
+                    return Some(if rest.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{k}.{rest}")
+                    });
+                }
+            }
+            None
+        }
+        toml::Value::Array(a) => a.iter().find_map(|x| find_profile(x, false)),
+        _ => None,
+    }
 }
 
 /// Keys of the system config that a drop-in may not set. Keys the config

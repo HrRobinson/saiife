@@ -1,11 +1,16 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
-use crate::ops::{Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::ops::{check_services, Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::tokens::{self, Tokens};
+use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
-use crate::{notify, server, DaemonOptions};
+use crate::{gateway, notify, server, DaemonOptions};
 use saiife_audit::sign::AuditKey;
 use saiife_audit::{ChainWriter, WriterOptions};
-use saiife_ipc::msg::SOCKET_NAME;
+use saiife_broker::limits::Limiter;
+use saiife_broker::pipeline::limit_event;
+use saiife_broker::upstream::Upstream;
+use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -142,12 +147,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 
     // 3. The policy; an invalid one still lets the daemon accept audit.
     let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(opts.directory);
-    let loaded = load_and_check(&opts.config, directory.as_ref());
+    // The services are checked against the connector catalog as part of
+    // the policy: a broken one makes the whole policy invalid.
+    let loaded = load_and_check(&opts.config, directory.as_ref())
+        .map_err(|e| e.to_string())
+        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)));
     let (daemon_cfg, audit_cfg, policy, policy_err) = match &loaded {
-        Ok(l) => (
+        Ok((l, cat)) => (
             l.config.daemon.clone(),
             l.config.audit.clone(),
-            PolicyState::from_loaded(l, &opts.catalog),
+            PolicyState::from_loaded(l, &opts.catalog, cat.clone()),
             None,
         ),
         Err(e) => {
@@ -160,10 +169,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
                     ok: false,
                     min_free_mb: boot.audit.min_free_mb,
                     admin_groups: Vec::new(),
+                    system: None,
+                    gateway: None,
                 },
-                Some(e.to_string()),
+                Some(e.clone()),
             )
         }
+    };
+    let gateway_cfg = match &loaded {
+        Ok((l, _)) => l.config.gateway.clone(),
+        Err(_) => saiife_policy::GatewayCfg::default(),
     };
 
     // 4. The signing key.
@@ -198,6 +213,61 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     let (handle, join) = writer::spawn(cw, writer_cfg, check.last_checkpoint)
         .map_err(|e| format!("cannot start the audit writer: {e}"))?;
 
+    // The vault: an unavailable one never stops the daemon (fail closed
+    // for connectors, audit keeps working).
+    let vault_path = opts.state_dir.join("vault").join("vault.bin");
+    let vault = match &opts.credentials_dir {
+        Some(d) => vault::open(&d.join("vault-key"), &vault_path),
+        None => VaultState::Unavailable("no vault key".into()),
+    };
+
+    // Connector limits survive a restart: rebuilt from the last 24 h of
+    // connector records (spec §6.9.2).
+    let (limiter, rebuild_failed) = rebuild_limiter(&audit_cfg.dir);
+    let rebuild_note = rebuild_failed.map(|f| {
+        let (reason, fields) = f.note();
+        eprintln!("saiife: warning: {reason}");
+        ("limits_rebuild_failed", reason, fields)
+    });
+    let capped_note = (limiter.rebuild_dropped() > 0).then(|| {
+        let dropped = limiter.rebuild_dropped();
+        let reason = format!(
+            "{dropped} connector record(s) of the last 24 h were left out of the limits: a (uid, service) bucket holds at most {} events, and the oldest went",
+            saiife_broker::limits::BUCKET_CAP
+        );
+        eprintln!("saiife: warning: {reason}");
+        let mut m = serde_json::Map::new();
+        m.insert("dropped".into(), dropped.into());
+        ("limits_rebuild_capped", reason, m)
+    });
+    // The upstream client: the native roots plus `<config dir>/ca`, which
+    // must be root's (a CA there can impersonate any upstream). A refused
+    // directory is a `ca_refused` record; the native roots stay. The tests
+    // trust their loopback CA through that same directory (owner seam in
+    // `trusted_owner`), so the daemon has no seam for roots or names.
+    let ca_dir = opts.config.parent().unwrap_or(Path::new("/")).join("ca");
+    let ca_refused = check_ca_dir(&ca_dir, trusted_owner()).err();
+    if let Some(why) = &ca_refused {
+        eprintln!("saiife: warning: extra CAs not used: {why}");
+    }
+    let ca = ca_refused.is_none().then_some(ca_dir.as_path());
+    let upstream = Upstream::with_ca_dir(ca, gateway_cfg.upstream_timeout).map_err(|e| {
+        eprintln!("saiife: warning: connector calls will fail: {e}");
+        e.to_string()
+    });
+    // Import backups older than 7 days go at start (and daily in `serve`).
+    let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
+    crate::import_backup::purge(&backup_dir, crate::import_backup::now());
+    // The gateway's bearer tokens; an unreadable file is no tokens and a
+    // `tokens_reset` record.
+    let (tokens, tokens_reset) =
+        Tokens::open(tokens::path_in(&opts.state_dir), tokens::system_clock());
+    if let Some(why) = &tokens_reset {
+        eprintln!("saiife: warning: gateway tokens reset: {why}");
+    }
+    // Checked at load: loopback only. No valid policy, no listener.
+    let tcp = gateway_cfg.tcp_addr().ok().flatten();
+
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
         writer_cfg,
@@ -210,19 +280,34 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         config_path: opts.config.clone(),
         catalog: opts.catalog,
         policy,
+        proc: Box::new(crate::sessions::RealProc::new("/proc")),
+        vault,
+        vault_path,
+        limiter,
+        upstream,
+        backup_dir,
+        tokens: Arc::new(tokens),
     }));
+    ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
-    let loaded_files = loaded.as_ref().ok().map(files_json);
+    let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         daemon_cfg.socket_dir.clone(),
         check,
         policy_err,
         loaded_files,
+        [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
+            .into_iter()
+            .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
+            .chain(rebuild_note)
+            .chain(capped_note)
+            .collect(),
+        tcp,
     ));
     rt.shutdown_timeout(Duration::from_secs(1));
     drop(ctx);
@@ -285,6 +370,140 @@ fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
     Ok(changed)
 }
 
+/// Who must own `<config dir>/ca` and its files: root. A debug build (the
+/// test suite) honours `SAIIFE_TEST_CA_OWNER=<uid>`, so tests running as a
+/// normal user can use the directory; a release build has no such seam.
+fn trusted_owner() -> u32 {
+    #[cfg(debug_assertions)]
+    if let Some(uid) = std::env::var("SAIIFE_TEST_CA_OWNER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return uid;
+    }
+    0
+}
+
+/// The checks `load_local_with` makes on local manifests, for the CA
+/// directory: owned by `owner`, not writable by group or others, no
+/// symlinks, and every `*.pem` a regular file with the same owner and mode
+/// rules. A missing directory is fine (no extra CAs).
+fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let err = |p: &Path, why: &str| format!("{}: {why}", p.display());
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(dir, &e.to_string())),
+    };
+    if !meta.is_dir() {
+        return Err(err(dir, "not a directory (symlinks are not followed)"));
+    }
+    if meta.uid() != owner || meta.mode() & 0o022 != 0 {
+        return Err(err(dir, "must be owned by root and not writable by others"));
+    }
+    for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
+        let e = e.map_err(|e| err(dir, &e.to_string()))?;
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "pem") {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(&p).map_err(|e| err(&p, &e.to_string()))?;
+        if !m.file_type().is_file() {
+            return Err(err(&p, "not a regular file (symlinks are not followed)"));
+        }
+        if m.uid() != owner || m.mode() & 0o022 != 0 {
+            return Err(err(&p, "must be owned by root and not writable by others"));
+        }
+    }
+    Ok(())
+}
+
+/// The limiter from the connector records of the last 24 h (the two newest
+/// month files cover a month boundary).
+fn rebuild_limiter(audit_dir: &Path) -> (Limiter, Option<RebuildFailed>) {
+    rebuild_limiter_at(audit_dir, time::OffsetDateTime::now_utc())
+}
+
+/// What kept the limiter rebuild from reading every record of the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebuildFailed {
+    dir_error: Option<String>,
+    unreadable_files: usize,
+    skipped_lines: usize,
+}
+
+impl RebuildFailed {
+    /// A directory or a month file could not be read: whole stretches of
+    /// the window may be missing, so the limits fail closed. Skipped lines
+    /// alone (a torn line from a crash stays in the log for good) are only
+    /// a warning: failing closed on them would deny every connector call
+    /// for 24 h after each start.
+    fn fatal(&self) -> bool {
+        self.dir_error.is_some() || self.unreadable_files > 0
+    }
+
+    /// The `limits_rebuild_failed` record's reason and fields.
+    fn note(&self) -> (String, serde_json::Map<String, Value>) {
+        let reason = if self.fatal() {
+            format!(
+                "the connector limits could not be rebuilt from the audit log ({}{} unreadable file(s), {} skipped line(s)); connector calls are denied with limits_unavailable for 24 h or until a clean start",
+                self.dir_error
+                    .as_deref()
+                    .map(|e| format!("directory: {e}; "))
+                    .unwrap_or_default(),
+                self.unreadable_files,
+                self.skipped_lines
+            )
+        } else {
+            format!(
+                "the connector limits were rebuilt from the audit log with {} unreadable line(s) skipped; a call recorded on such a line is not counted (connector calls are not denied)",
+                self.skipped_lines
+            )
+        };
+        let mut m = serde_json::Map::new();
+        m.insert("fatal".into(), self.fatal().into());
+        m.insert("dir_error".into(), json!(self.dir_error));
+        m.insert("unreadable_files".into(), self.unreadable_files.into());
+        m.insert("skipped_lines".into(), self.skipped_lines.into());
+        (reason, m)
+    }
+}
+
+/// [`rebuild_limiter`] at `now`. A record dated after `now` (a clock that
+/// went back, or an edited log) is dropped: it would hold a slot for longer
+/// than its window. A directory or month file that could not be read fails
+/// closed ([`Limiter::rebuild_incomplete`]); skipped lines are reported but
+/// do not deny ([`RebuildFailed::fatal`]).
+fn rebuild_limiter_at(
+    audit_dir: &Path,
+    now: time::OffsetDateTime,
+) -> (Limiter, Option<RebuildFailed>) {
+    let cutoff = now - time::Duration::days(1);
+    let read = saiife_audit::store::read_recent(audit_dir, 2, |r| {
+        r.timestamp().is_none_or(|t| t > cutoff)
+    });
+    let events = read
+        .records
+        .iter()
+        .filter_map(limit_event)
+        .filter(|e| e.at <= now);
+    if read.dir_error.is_none() && read.unreadable_files == 0 && read.skipped_lines == 0 {
+        return (Limiter::rebuild(events, now), None);
+    }
+    let failed = RebuildFailed {
+        dir_error: read.dir_error.clone(),
+        unreadable_files: read.unreadable_files,
+        skipped_lines: read.skipped_lines,
+    };
+    let limiter = if failed.fatal() {
+        Limiter::rebuild_incomplete(events, now)
+    } else {
+        Limiter::rebuild(events, now)
+    };
+    (limiter, Some(failed))
+}
+
 fn files_json(l: &LoadedPolicy) -> Value {
     Value::Array(
         l.files
@@ -331,12 +550,13 @@ fn check_socket_dir(st: &rustix::fs::Stat, dir: &Path, uid: u32) -> Result<(), S
 }
 
 /// The socket dir (created 0755 when missing; an existing one must be
-/// this user's or root's and not group/other-writable) and a fresh
-/// `saiife.sock`, 0666. A stale socket is removed only when it is a socket
-/// of this uid that nobody answers on; anything else there is left alone.
-/// The dir is held open (`O_NOFOLLOW`) and every later step works relative
-/// to it, without following a symlink at `saiife.sock`.
-fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> {
+/// this user's or root's and not group/other-writable) and a fresh socket
+/// `name` in it (`saiife.sock`, `gateway.sock`), 0666. A stale socket is
+/// removed only when it is a socket of this uid that nobody answers on;
+/// anything else there is left alone. The dir is held open (`O_NOFOLLOW`)
+/// and every later step works relative to it, without following a symlink
+/// at `name`.
+fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBuf), String> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     let at = |e: &dyn std::fmt::Display| format!("{}: {e}", socket_dir.display());
     match std::fs::symlink_metadata(socket_dir) {
@@ -365,14 +585,14 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
         uid,
     )?;
 
-    let path = socket_dir.join(SOCKET_NAME);
+    let path = socket_dir.join(name);
     let at_sock = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    match rustix::fs::statat(&dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+    match rustix::fs::statat(&dirfd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) if st.st_mode & 0o170000 == 0o140000 && st.st_uid == uid => {
             if std::os::unix::net::UnixStream::connect(&path).is_ok() {
                 return Err(format!("another daemon is listening on {}", path.display()));
             }
-            rustix::fs::unlinkat(&dirfd, SOCKET_NAME, AtFlags::empty()).map_err(|e| at_sock(&e))?;
+            rustix::fs::unlinkat(&dirfd, name, AtFlags::empty()).map_err(|e| at_sock(&e))?;
         }
         Ok(_) => {
             return Err(format!(
@@ -384,7 +604,7 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
         Err(e) => return Err(at_sock(&e)),
     }
     let l = UnixListener::bind(&path).map_err(|e| at_sock(&e))?;
-    chmod_socket(&dirfd, uid).map_err(|e| at_sock(&e))?;
+    chmod_socket(&dirfd, name, uid).map_err(|e| at_sock(&e))?;
     Ok((l, path))
 }
 
@@ -392,13 +612,13 @@ fn bind(socket_dir: &Path, uid: u32) -> Result<(UnixListener, PathBuf), String> 
 /// `O_PATH | O_NOFOLLOW` handle is checked to be this uid's socket and
 /// changed through `/proc/self/fd`. Without `/proc`, `fchmodat` on the
 /// checked name in the held dir, which only this uid or root can change.
-fn chmod_socket(dirfd: &rustix::fd::OwnedFd, uid: u32) -> std::io::Result<()> {
+fn chmod_socket(dirfd: &rustix::fd::OwnedFd, name: &str, uid: u32) -> std::io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     use std::os::fd::AsRawFd;
     let mode = Mode::from_raw_mode(0o666);
     let fd = rustix::fs::openat(
         dirfd,
-        SOCKET_NAME,
+        name,
         OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
@@ -409,17 +629,37 @@ fn chmod_socket(dirfd: &rustix::fd::OwnedFd, uid: u32) -> std::io::Result<()> {
     match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
         Ok(()) => Ok(()),
         Err(_) => {
-            let st = rustix::fs::statat(dirfd, SOCKET_NAME, AtFlags::SYMLINK_NOFOLLOW)?;
+            let st = rustix::fs::statat(dirfd, name, AtFlags::SYMLINK_NOFOLLOW)?;
             if st.st_mode & 0o170000 != 0o140000 || st.st_uid != uid {
                 return Err(std::io::Error::other("not the socket this daemon bound"));
             }
-            Ok(rustix::fs::chmodat(
-                dirfd,
-                SOCKET_NAME,
-                mode,
-                AtFlags::empty(),
-            )?)
+            Ok(rustix::fs::chmodat(dirfd, name, mode, AtFlags::empty())?)
         }
+    }
+}
+
+/// A periodic blocking job that runs at most once at a time.
+#[derive(Default)]
+struct OneAtATime {
+    running: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OneAtATime {
+    /// Start `job` on a blocking thread unless the previous one is still
+    /// running (then `false`, and `job` is dropped). A finished previous
+    /// job is awaited first (it is done: this does not wait).
+    async fn start(&mut self, job: impl FnOnce() + Send + 'static) -> bool {
+        if let Some(h) = self.running.take() {
+            if !h.is_finished() {
+                self.running = Some(h);
+                return false;
+            }
+            if let Err(e) = h.await {
+                eprintln!("saiife: warning: a background job failed: {e}");
+            }
+        }
+        self.running = Some(tokio::task::spawn_blocking(job));
+        true
     }
 }
 
@@ -429,6 +669,10 @@ async fn serve(
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
+    // More start records: `(event, reason, fields)` (`ca_refused`,
+    // `tokens_reset`, `limits_rebuild_failed`, `limits_rebuild_capped`).
+    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
+    tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let signals = (
         signal(SignalKind::hangup()),
@@ -465,6 +709,18 @@ async fn serve(
         }
         None => first.push(policy_record(&ctx, "loaded", loaded_files, None)),
     }
+    if let VaultState::Unavailable(reason) = &*ctx.vault.lock() {
+        eprintln!("saiife: warning: vault unavailable: {reason}");
+        let mut r = ctx.event("vault_unavailable");
+        r.reason = Some(reason.clone());
+        first.push(r);
+    }
+    for (event, reason, fields) in notes {
+        let mut r = ctx.event(event);
+        r.reason = Some(reason);
+        r.extra.extend(fields);
+        first.push(r);
+    }
     for r in first {
         if let Err(e) = ctx.writer.append(r).await {
             eprintln!("saiife: cannot write to the audit log: {e}");
@@ -473,8 +729,8 @@ async fn serve(
         }
     }
 
-    // 7. The socket.
-    let (listener, sock_path) = match bind(&socket_dir, ctx.own_uid) {
+    // 7. The sockets: control and the HTTP gateway (§8.8), side by side.
+    let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("saiife: {e}");
@@ -482,12 +738,67 @@ async fn serve(
             return ExitCode::from(2);
         }
     };
+    let (gw_listener, gw_path) = match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("saiife: {e}");
+            drop(listener);
+            let _ = std::fs::remove_file(&sock_path);
+            let _ = ctx.writer.stop(None).await;
+            return ExitCode::from(2);
+        }
+    };
+    let gateway = tokio::spawn(gateway::serve(gw_listener, Arc::clone(&ctx)));
+    // The optional loopback TCP listener: a bind failure is a record and
+    // no listener; the Unix sockets stay.
+    let gateway_tcp = match tcp {
+        Some(addr) => start_tcp(&ctx, addr).await,
+        None => None,
+    };
 
     // 8. Ready.
     notify::ready();
     let mut writer_died = false;
+    // `last_used` marks reach the vault file from here, on a blocking
+    // thread, never from a connector request on the runtime thread.
+    let mut vault_tick = tokio::time::interval(Duration::from_secs(60));
+    vault_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut vault_flush = OneAtATime::default();
+    let day = Duration::from_secs(24 * 3600);
+    let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
+    let hour = Duration::from_secs(3600);
+    let mut token_tick = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
     loop {
         tokio::select! {
+            _ = vault_tick.tick() => {
+                let c = Arc::clone(&ctx);
+                // The file is written outside the vault's memory lock: a
+                // connector call reading the vault never waits on it. One
+                // flush at a time: on a hung disk the ticks are skipped
+                // instead of piling up blocked threads.
+                let started = vault_flush.start(move || {
+                    if let Err(e) = c.vault.writer().flush_if_due(std::time::Instant::now()) {
+                        eprintln!("saiife: warning: cannot write the vault's last_used marks: {e}");
+                    }
+                }).await;
+                if !started {
+                    eprintln!("saiife: warning: the vault's last flush is still running; skipping this one");
+                }
+            }
+            _ = purge_tick.tick() => {
+                let dir = ctx.backup_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::import_backup::purge(&dir, crate::import_backup::now())
+                });
+            }
+            _ = token_tick.tick() => {
+                let t = Arc::clone(&ctx.tokens);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = t.purge() {
+                        eprintln!("saiife: warning: cannot write the gateway tokens: {e}");
+                    }
+                });
+            }
             r = listener.accept() => match r {
                 Ok((s, _)) => {
                     tokio::spawn(server::connection(s, Arc::clone(&ctx)));
@@ -511,9 +822,37 @@ async fn serve(
         }
     }
 
-    // Stop: no new connections, the stop record and a checkpoint, synced.
+    // No new connections; connector calls in flight (which a client that
+    // went away no longer holds) finish and are recorded first, for at
+    // most the upstream timeout.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    gateway.abort();
+    let _ = gateway.await;
+    if let Some(t) = gateway_tcp {
+        t.abort();
+        let _ = t.await;
+    }
+    let _ = std::fs::remove_file(&gw_path);
+    if !writer_died {
+        let limit = ctx
+            .upstream
+            .as_ref()
+            .map(|u| u.timeout())
+            .unwrap_or(Duration::from_secs(30));
+        if !ctx.calls.wait_idle(limit).await {
+            eprintln!(
+                "saiife: warning: {} connector call(s) still in flight at stop",
+                ctx.calls.count()
+            );
+        }
+    }
+    // Pending `last_used` marks go to disk before the stop record.
+    let c = Arc::clone(&ctx);
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || c.vault.writer().flush()).await {
+        eprintln!("saiife: warning: cannot write the vault at stop: {e}");
+    }
+    // Stop: the stop record and a checkpoint, synced.
     if writer_died {
         use std::io::Write;
         let _ = writeln!(
@@ -531,6 +870,42 @@ async fn serve(
     }
 }
 
+/// Bind `addr` (loopback, checked at load) and serve the gateway on it.
+/// The bound address (the real port for `:0`) goes into `status` and a
+/// `gateway_tcp` record; a failure is a `gateway_tcp_failed` record.
+async fn start_tcp(
+    ctx: &Arc<Ctx>,
+    addr: std::net::SocketAddr,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let bound = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(|l| l.local_addr().map(|a| (l, a)));
+    let (rec, task) = match bound {
+        Ok((l, a)) => {
+            ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).bound = Some(a);
+            let mut r = ctx.event("gateway_tcp");
+            r.extra.insert("addr".into(), a.to_string().into());
+            let task = tokio::spawn(gateway::serve_tcp(
+                l,
+                Arc::clone(ctx),
+                gateway::Opts::default(),
+            ));
+            (r, Some(task))
+        }
+        Err(e) => {
+            let reason = format!("cannot listen on {addr}: {e}");
+            eprintln!("saiife: warning: gateway tcp: {reason}");
+            let mut r = ctx.event("gateway_tcp_failed");
+            r.reason = Some(reason);
+            (r, None)
+        }
+    };
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!("saiife: warning: cannot write the gateway_tcp record: {e}");
+    }
+    task
+}
+
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
 /// one step; an invalid one is refused and the old one stays. First the
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
@@ -540,14 +915,16 @@ async fn reload(ctx: &Arc<Ctx>) {
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
         regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
-        load_and_check(&c.config_path, c.directory.as_ref()).map_err(|e| e.to_string())
+        load_and_check(&c.config_path, c.directory.as_ref())
+            .map_err(|e| e.to_string())
+            .and_then(|l| check_services(&l, &c.config_path).map(|cat| (l, cat)))
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
     let mut recs = Vec::new();
     match loaded {
-        Ok(l) => {
-            let next = PolicyState::from_loaded(&l, &ctx.catalog);
+        Ok((l, cat)) => {
+            let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);
@@ -591,6 +968,9 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
     if c.daemon.socket_dir != ctx.socket_dir {
         out.push("[daemon] socket_dir changed".to_string());
     }
+    if c.gateway.tcp != ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured {
+        out.push("[gateway] tcp changed".to_string());
+    }
     if c.audit.dir != ctx.audit_dir {
         out.push("[audit] dir changed".to_string());
     }
@@ -630,6 +1010,225 @@ mod tests {
         );
         assert_eq!(regroup_audit_dir(&dir, &with), Some(0));
         assert_eq!(regroup_audit_dir(&d.path().join("missing"), &with), None);
+    }
+
+    fn connector_rec(at: time::OffsetDateTime) -> saiife_audit::Record {
+        let mut r = saiife_audit::Record::at(
+            saiife_audit::NewRecord {
+                agent: "",
+                project: "",
+                session: None,
+                tool: "api",
+                input: "erp invoices.list",
+                decision: saiife_audit::DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: "locked",
+                policy: None,
+                permission_mode: None,
+            },
+            "test",
+            at,
+        );
+        r.kind = Some("connector".into());
+        r.uid = Some(1001);
+        r.extra.insert("service".into(), "erp".into());
+        r.extra.insert("op_kind".into(), "read".into());
+        r
+    }
+
+    fn one_per_minute_hit(lim: &Limiter, now: time::OffsetDateTime) -> bool {
+        let k = saiife_broker::limits::Key {
+            uid: 1001,
+            service: "erp".into(),
+            session: None,
+        };
+        let cfg = saiife_policy::LimitsCfg {
+            requests_per_minute: Some(1),
+            ..Default::default()
+        };
+        lim.check_and_commit(
+            &k,
+            saiife_broker::manifest::OpKind::Read,
+            None,
+            false,
+            &cfg,
+            now,
+        )
+        .is_err()
+    }
+
+    #[test]
+    fn rebuild_counts_recent_records_and_drops_future_ones() {
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        // A record from the future (clock went back) is not a slot.
+        saiife_audit::store::append(d.path(), &connector_rec(now + time::Duration::minutes(5)))
+            .unwrap();
+        assert!(!one_per_minute_hit(
+            &rebuild_limiter_at(d.path(), now).0,
+            now
+        ));
+        // A record 10 s old is.
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        assert!(one_per_minute_hit(&lim, now));
+        assert_eq!(failed, None);
+        assert!(!lim.unavailable(now));
+    }
+
+    #[tokio::test]
+    async fn one_at_a_time_skips_while_the_last_job_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut one = OneAtATime::default();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&runs);
+        assert!(
+            one.start(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                let _ = wait.recv();
+            })
+            .await
+        );
+        // A hung job: the next ticks start nothing.
+        for _ in 0..3 {
+            let r = Arc::clone(&runs);
+            let started = one
+                .start(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+            assert!(!started);
+        }
+        release.send(()).unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !one.running.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < end, "the job never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Done: the next tick runs again.
+        let r = Arc::clone(&runs);
+        assert!(
+            one.start(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+        );
+        one.running.take().unwrap().await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rebuild_with_skipped_lines_warns_but_allows() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        // A line that is not a record: the window may hide a call.
+        let month = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&month)
+            .unwrap();
+        // A torn middle line (a crash mid-write, terminated at the next
+        // open), then a record after it.
+        f.write_all(b"{not a record\n").unwrap();
+        drop(f);
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(5)))
+            .unwrap();
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        let failed = failed.expect("the rebuild must report the skipped line");
+        assert_eq!(failed.skipped_lines, 1);
+        assert_eq!(failed.unreadable_files, 0);
+        assert!(!failed.fatal());
+        let (reason, fields) = failed.note();
+        assert!(!reason.contains("denied with"), "{reason}");
+        assert_eq!(fields["fatal"], false);
+        assert_eq!(fields["skipped_lines"], 1);
+        // Not denied, and the readable records still count.
+        assert!(!lim.unavailable(now));
+        assert!(one_per_minute_hit(&lim, now));
+    }
+
+    #[test]
+    fn rebuild_from_an_unreadable_log_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        saiife_audit::store::append(d.path(), &connector_rec(now - time::Duration::seconds(10)))
+            .unwrap();
+        let month = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .unwrap();
+        // A month file that cannot be opened: the window may hide calls.
+        std::fs::set_permissions(&month, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::File::open(&month).is_err();
+        let (lim, failed) = rebuild_limiter_at(d.path(), now);
+        std::fs::set_permissions(&month, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // (As root every file opens: nothing to check there.)
+        if unreadable {
+            let failed = failed.expect("the rebuild must report the unreadable file");
+            assert_eq!(failed.unreadable_files, 1);
+            assert!(failed.fatal());
+            let (reason, fields) = failed.note();
+            assert!(reason.contains("limits_unavailable"), "{reason}");
+            assert_eq!(fields["fatal"], true);
+            assert_eq!(fields["unreadable_files"], 1);
+            // Denied for a full window, then known again.
+            assert!(lim.unavailable(now));
+            assert!(lim.unavailable(now + time::Duration::hours(23)));
+            assert!(!lim.unavailable(now + time::Duration::hours(24)));
+        }
+        // An audit dir that cannot be listed fails closed too.
+        let file = d.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let (lim, failed) = rebuild_limiter_at(&file, now);
+        let failed = failed.unwrap();
+        assert!(failed.dir_error.is_some());
+        assert!(failed.fatal());
+        assert!(lim.unavailable(now));
+    }
+
+    #[test]
+    fn ca_dir_must_be_the_owners_and_hold_no_symlinks() {
+        let d = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let dir = d.path().join("ca");
+        // Missing: no extra CAs, fine.
+        check_ca_dir(&dir, me).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pem = dir.join("a.pem");
+        std::fs::write(&pem, "x").unwrap();
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o644)).unwrap();
+        check_ca_dir(&dir, me).unwrap();
+        // Not root's (the production owner).
+        assert!(check_ca_dir(&dir, 0).unwrap_err().contains("owned by root"));
+        // A group-writable file.
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(check_ca_dir(&dir, me).is_err());
+        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A symlinked pem.
+        std::os::unix::fs::symlink(&pem, dir.join("b.pem")).unwrap();
+        assert!(check_ca_dir(&dir, me).unwrap_err().contains("symlink"));
+        std::fs::remove_file(dir.join("b.pem")).unwrap();
+        // A world-writable dir; a symlinked dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_ca_dir(&dir, me).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = d.path().join("ca-link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_ca_dir(&link, me).is_err());
     }
 
     #[test]

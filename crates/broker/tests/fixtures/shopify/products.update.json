@@ -1,0 +1,10 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/product#put-products-product-id (shape per vendor docs; not fetched)",
+  "_request": { "product": { "id": 632910392, "title": "New product title" } },
+  "product": {
+    "id": 632910392,
+    "title": "New product title",
+    "vendor": "Apple",
+    "status": "active"
+  }
+}

@@ -1,0 +1,105 @@
+# Shopify Admin REST API, version 2026-07.
+# Paths checked against the Admin REST reference (shape per vendor docs; not
+# fetched, no internet in the build):
+#   https://shopify.dev/docs/api/admin-rest/2026-07/resources/order
+#   https://shopify.dev/docs/api/admin-rest/2026-07/resources/product
+#   https://shopify.dev/docs/api/admin-rest/2026-07/resources/customer
+#   https://shopify.dev/docs/api/admin-rest/2026-07/resources/refund
+#   https://shopify.dev/docs/api/admin-rest/2026-07/resources/pricerule
+#   https://shopify.dev/docs/api/usage/pagination-rest   (Link header, page_info)
+id = "shopify"
+version = 1
+title = "Shopify Admin API"
+base_url = "https://{shop}.myshopify.com/admin/api/2026-07"
+hosts = ["*.myshopify.com"]
+auth = [{ kind = "header", name = "X-Shopify-Access-Token", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept", "Idempotency-Key"]
+
+[params.shop]                    # set by the admin in the service config, never by the agent
+type = "string"
+pattern = "^[a-z0-9-]+$"
+required = true
+
+[[operation]]
+id = "orders.list"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders.json"
+query = { status = "enum:open,closed,cancelled,any", limit = "int:1..250", since_id = "int", created_at_min = "datetime", page_info = "string:[A-Za-z0-9_-]{1,512}" }
+pagination = "link-header"
+
+[[operation]]
+id = "orders.get"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders/{order_id}.json"
+path_params = { order_id = "int" }
+
+[[operation]]
+id = "products.list"
+capability = "products:read"
+kind = "read"
+method = "GET"
+path = "/products.json"
+query = { status = "enum:active,archived,draft", limit = "int:1..250", since_id = "int", created_at_min = "datetime", page_info = "string:[A-Za-z0-9_-]{1,512}" }
+pagination = "link-header"
+
+[[operation]]
+id = "products.get"
+capability = "products:read"
+kind = "read"
+method = "GET"
+path = "/products/{product_id}.json"
+path_params = { product_id = "int" }
+
+[[operation]]
+id = "products.update"
+capability = "products:write"
+kind = "write"
+method = "PUT"
+path = "/products/{product_id}.json"
+path_params = { product_id = "int" }
+body = "json"
+
+[[operation]]
+id = "customers.list"
+capability = "customers:read"
+kind = "read"
+method = "GET"
+path = "/customers.json"
+query = { limit = "int:1..250", since_id = "int", created_at_min = "datetime", page_info = "string:[A-Za-z0-9_-]{1,512}" }
+pagination = "link-header"
+
+# Shopify's REST API has no export endpoint (exports are GraphQL bulk
+# operations). The bulk-sized REST read is the customer search at 250 per
+# page, so "export" maps to it; it has its own capability and kind `bulk`.
+[[operation]]
+id = "customers.export"
+capability = "customers:export"
+kind = "bulk"
+method = "GET"
+path = "/customers/search.json"
+query = { query = "string:.{1,256}", limit = "int:1..250", order = "string:[a-z_]+ (asc|desc)", page_info = "string:[A-Za-z0-9_-]{1,512}" }
+pagination = "link-header"
+
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/orders/{order_id}/refunds.json"
+path_params = { order_id = "int" }
+body = "json"
+amount = { field = "refund.transactions[].amount", currency_field = "refund.currency", unit = "major" }
+
+# The price rule is the discount; its codes are a second call
+# (POST /price_rules/{id}/discount_codes.json) that this version leaves out.
+[[operation]]
+id = "discounts.create"
+capability = "discounts:write"
+kind = "write"
+method = "POST"
+path = "/price_rules.json"
+body = "json"

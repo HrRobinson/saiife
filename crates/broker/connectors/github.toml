@@ -1,0 +1,95 @@
+# GitHub REST API. Paths checked against https://docs.github.com/en/rest
+#   repos:    https://docs.github.com/en/rest/repos/repos#get-a-repository
+#   issues:   https://docs.github.com/en/rest/issues/issues
+#   comments: https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+#   pulls:    https://docs.github.com/en/rest/pulls/pulls
+# Pagination: https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+# The agent sends `Accept: application/vnd.github+json` and
+# `X-GitHub-Api-Version: 2022-11-28`; the manifest schema has no fixed
+# headers, so they are passed through `request_headers`.
+id = "github"
+version = 1
+title = "GitHub REST"
+base_url = "https://api.github.com"
+hosts = ["api.github.com"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept", "X-GitHub-Api-Version"]
+
+[[operation]]
+id = "repos.get"
+capability = "repos:read"
+qualifier = "repo={owner}/{repo}"
+kind = "read"
+method = "GET"
+path = "/repos/{owner}/{repo}"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+
+[[operation]]
+id = "issues.list"
+capability = "issues:read"
+qualifier = "repo={owner}/{repo}"
+kind = "read"
+method = "GET"
+path = "/repos/{owner}/{repo}/issues"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+query = { state = "enum:open,closed,all", labels = "string:.{1,256}", assignee = "string:.{1,256}", since = "datetime", per_page = "int:1..100", page = "int:1..100000" }
+pagination = "link-header"
+
+[[operation]]
+id = "issues.get"
+capability = "issues:read"
+qualifier = "repo={owner}/{repo}"
+kind = "read"
+method = "GET"
+path = "/repos/{owner}/{repo}/issues/{issue_number}"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", issue_number = "int" }
+
+[[operation]]
+id = "issues.create"
+capability = "issues:write"
+qualifier = "repo={owner}/{repo}"
+kind = "write"
+method = "POST"
+path = "/repos/{owner}/{repo}/issues"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+body = "json"
+
+[[operation]]
+id = "issues.comment"
+capability = "issues:write"
+qualifier = "repo={owner}/{repo}"
+kind = "write"
+method = "POST"
+path = "/repos/{owner}/{repo}/issues/{issue_number}/comments"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", issue_number = "int" }
+body = "json"
+
+[[operation]]
+id = "pulls.list"
+capability = "pulls:read"
+qualifier = "repo={owner}/{repo}"
+kind = "read"
+method = "GET"
+path = "/repos/{owner}/{repo}/pulls"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+query = { state = "enum:open,closed,all", head = "string:.{1,256}", base = "string:.{1,256}", per_page = "int:1..100", page = "int:1..100000" }
+pagination = "link-header"
+
+[[operation]]
+id = "pulls.get"
+capability = "pulls:read"
+qualifier = "repo={owner}/{repo}"
+kind = "read"
+method = "GET"
+path = "/repos/{owner}/{repo}/pulls/{pull_number}"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}", pull_number = "int" }
+
+[[operation]]
+id = "pulls.create"
+capability = "pulls:write"
+qualifier = "repo={owner}/{repo}"
+kind = "write"
+method = "POST"
+path = "/repos/{owner}/{repo}/pulls"
+path_params = { owner = "string:[A-Za-z0-9._-]{1,100}", repo = "string:[A-Za-z0-9._-]{1,100}" }
+body = "json"

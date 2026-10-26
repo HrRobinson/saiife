@@ -1,0 +1,11 @@
+{
+  "_source": "https://shopify.dev/docs/api/admin-rest/2026-07/resources/product#get-products-product-id (shape per vendor docs; not fetched)",
+  "product": {
+    "id": 632910392,
+    "title": "IPod Nano - 8GB",
+    "vendor": "Apple",
+    "product_type": "Cult Products",
+    "status": "active",
+    "variants": [{ "id": 808950810, "title": "Pink", "price": "199.00", "sku": "IPOD2008PINK" }]
+  }
+}

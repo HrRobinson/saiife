@@ -1,0 +1,84 @@
+# HubSpot CRM v3 objects. Paths checked against the vendor reference (shape per
+# vendor docs; not fetched, no network in this build):
+#   https://developers.hubspot.com/docs/api/crm/contacts
+#   https://developers.hubspot.com/docs/api/crm/companies
+#   https://developers.hubspot.com/docs/api/crm/deals
+id = "hubspot"
+version = 1
+title = "HubSpot CRM"
+base_url = "https://api.hubapi.com"
+hosts = ["api.hubapi.com"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[[operation]]
+id = "contacts.list"
+capability = "contacts:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/contacts"
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+pagination = { cursor = { param = "after", next = "paging.next.after" } }
+
+[[operation]]
+id = "contacts.get"
+capability = "contacts:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/contacts/{contact_id}"
+path_params = { contact_id = "int" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+
+[[operation]]
+id = "contacts.update"
+capability = "contacts:write"
+kind = "write"
+method = "PATCH"
+path = "/crm/v3/objects/contacts/{contact_id}"
+path_params = { contact_id = "int" }
+body = "json"
+
+[[operation]]
+id = "companies.list"
+capability = "companies:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/companies"
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+pagination = { cursor = { param = "after", next = "paging.next.after" } }
+
+[[operation]]
+id = "companies.get"
+capability = "companies:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/companies/{company_id}"
+path_params = { company_id = "int" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+
+[[operation]]
+id = "deals.list"
+capability = "deals:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/deals"
+query = { limit = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}", properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+pagination = { cursor = { param = "after", next = "paging.next.after" } }
+
+[[operation]]
+id = "deals.get"
+capability = "deals:read"
+kind = "read"
+method = "GET"
+path = "/crm/v3/objects/deals/{deal_id}"
+path_params = { deal_id = "int" }
+query = { properties = "string:[A-Za-z0-9_,]{1,512}", archived = "bool" }
+
+[[operation]]
+id = "deals.update"
+capability = "deals:write"
+kind = "write"
+method = "PATCH"
+path = "/crm/v3/objects/deals/{deal_id}"
+path_params = { deal_id = "int" }
+body = "json"

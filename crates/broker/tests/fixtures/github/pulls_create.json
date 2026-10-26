@@ -1,0 +1,11 @@
+{
+  "_source": "https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request -- shape per vendor docs; not fetched",
+  "id": 2,
+  "number": 1349,
+  "state": "open",
+  "title": "Amazing new feature",
+  "user": { "login": "octocat", "id": 1 },
+  "head": { "ref": "new-topic", "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e" },
+  "base": { "ref": "main", "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e" },
+  "html_url": "https://github.com/acme/web/pull/1349"
+}
