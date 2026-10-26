@@ -218,7 +218,7 @@ impl Limiter {
         let mut st = lock(&self.state);
         let cutoff = now - Duration::seconds(DAY);
         st.checks += 1;
-        if st.checks % SWEEP_EVERY == 0 {
+        if st.checks.is_multiple_of(SWEEP_EVERY) {
             st.sweep(cutoff);
         }
         let bucket_key: BucketKey = (k.uid, k.service.clone());
