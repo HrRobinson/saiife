@@ -1,6 +1,6 @@
 //! The deny > ask > allow decision (spec §6.9.1).
 
-use crate::capability::{glob, matches, Capability};
+use crate::capability::{glob_with, matches_with, Capability};
 use crate::project::{Mode, ServiceOverlay};
 use crate::service::{Action, RuleCfg, ServiceCfg};
 use std::collections::BTreeMap;
@@ -19,7 +19,11 @@ pub enum Verdict {
 
 /// Any matching `deny` wins, then `ask`, then `allow`; nothing matching is
 /// `Deny { rule: "default_deny" }`. The overlay's `allow` counts only
-/// outside locked mode.
+/// outside locked mode. Deny and ask patterns and `when` globs match broadly
+/// (`*` crosses `/`; a missing param or qualifier matches); allow matches
+/// narrowly (`*` stays within one `/` level; missing means no match). `**`
+/// crosses `/` everywhere and globs ignore ASCII case. See
+/// `capability::matches_with`.
 pub fn decide(
     svc: &ServiceCfg,
     overlay: Option<&ServiceOverlay>,
@@ -34,15 +38,17 @@ pub fn decide(
         Some(o) => (&o.ask, &o.deny),
         None => (&[], &[]),
     };
+    // Deny and ask match broadly (fail closed); allow matches narrowly.
     let stage = |action: Action, simple: &[&[String]]| -> Option<String> {
+        let broad = action != Action::Allow;
         for list in simple {
-            if let Some(p) = list.iter().find(|p| matches(p, req.capability)) {
+            if let Some(p) = list.iter().find(|p| matches_with(p, req.capability, broad)) {
                 return Some(p.clone());
             }
         }
         svc.rule
             .iter()
-            .find(|r| r.action == action && rule_matches(r, req))
+            .find(|r| r.action == action && rule_matches(r, req, broad))
             .map(|r| r.capability.clone())
     };
     if let Some(p) = stage(Action::Deny, &[&svc.deny, o_deny]) {
@@ -61,13 +67,16 @@ pub fn decide(
     }
 }
 
-/// The capability matches and every `when` entry names a present param
-/// whose value matches the glob.
-fn rule_matches(r: &RuleCfg, req: &Request) -> bool {
-    matches(&r.capability, req.capability)
-        && r.when
-            .iter()
-            .all(|(k, g)| req.params.get(k).is_some_and(|v| glob(g, v)))
+/// The capability matches and every `when` entry matches its param (an
+/// ASCII case-insensitive glob). A missing param is no match for an allow
+/// rule and a match for a deny or ask rule (`broad`), which also lets `*`
+/// cross `/`.
+fn rule_matches(r: &RuleCfg, req: &Request, broad: bool) -> bool {
+    matches_with(&r.capability, req.capability, broad)
+        && r.when.iter().all(|(k, g)| match req.params.get(k) {
+            Some(v) => glob_with(g, v, broad),
+            None => broad,
+        })
 }
 
 #[cfg(test)]
@@ -168,12 +177,19 @@ action = "ask"
             d("issues:write", &[("repo", "acme/secret")]),
             deny("deny:issues:write")
         );
-        // A missing param means no match.
-        assert_eq!(d("issues:write", &[]), deny("default_deny"));
+        // A missing param is no match for an allow rule, but the deny rule
+        // on `repo` applies when the param is absent (fail closed).
+        assert_eq!(d("issues:write", &[]), deny("deny:issues:write"));
         assert_eq!(
             d("issues:write", &[("org", "acme/web")]),
-            deny("default_deny")
+            deny("deny:issues:write")
         );
+        // Case-insensitive.
+        assert_eq!(
+            d("issues:write", &[("repo", "ACME/secret")]),
+            deny("deny:issues:write")
+        );
+        assert_eq!(d("issues:write", &[("repo", "ACME/web")]), Verdict::Allow);
         // Every `when` entry must match.
         assert_eq!(
             d("pulls:write", &[("repo", "acme/web"), ("base", "main")]),
@@ -238,6 +254,30 @@ action = "ask"
         assert_eq!(
             run(&s, Some(&o), Mode::Locked, "orders:read", &[]),
             Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn deny_and_ask_fail_closed() {
+        let s = svc(
+            "connector = \"x\"\nallow = [\"s3:*\"]\ndeny = [\"s3:read:arn:aws:s3:::secret/*\", \"s3:delete:b=x\"]\nask = [\"s3:write:b=y\"]\n",
+        );
+        let d = |c| run(&s, None, Mode::Locked, c, &[]);
+        // `*` crosses `/` in deny.
+        assert_eq!(
+            d("s3:read:arn:aws:s3:::secret/a/b"),
+            deny("deny:s3:read:arn:aws:s3:::secret/*")
+        );
+        // A qualified deny/ask applies to an unqualified request.
+        assert_eq!(d("s3:delete"), deny("deny:s3:delete:b=x"));
+        assert_eq!(d("s3:write"), Verdict::Ask);
+        // Case-insensitive qualifier.
+        assert_eq!(d("s3:delete:b=X"), deny("deny:s3:delete:b=x"));
+        // A qualified allow does not cover an unqualified request.
+        let s = svc("connector = \"x\"\nallow = [\"issues:write:repo=acme/*\"]\n");
+        assert_eq!(
+            run(&s, None, Mode::Locked, "issues:write", &[]),
+            deny("default_deny")
         );
     }
 

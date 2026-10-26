@@ -132,6 +132,9 @@ const INTERPRETERS: &[&str] = &[
     "perl",
     "ruby",
     "node",
+    "nodejs",
+    "pypy",
+    "pypy3",
     "deno",
     "bun",
     "php",
@@ -145,7 +148,11 @@ pub fn is_interpreter(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    INTERPRETERS.contains(&name) || name.starts_with("python3.")
+    // Lowercase, and a version suffix (digits and dots) does not help:
+    // `python2`, `ruby3.2`, `perl5.36`, `lua5.4`, `php8.2`, `python3.12`.
+    let lower = name.to_ascii_lowercase();
+    let base = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS.contains(&lower.as_str()) || INTERPRETERS.contains(&base)
 }
 
 /// Auth kinds a service may use.

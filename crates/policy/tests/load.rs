@@ -495,3 +495,85 @@ fn spec_shopify_dropin_types() {
     assert_eq!(s.limits.amount_per_day.as_ref().unwrap().max, 500);
     assert_eq!(s.redact.fields, vec!["customer.email"]);
 }
+
+#[test]
+fn patterns_are_validated_at_load() {
+    for (field, pat) in [
+        ("deny", "customers:exprot"),
+        ("allow", "orders"),
+        ("ask", "Orders:read"),
+        ("allow", "*"),
+        ("deny", "orders:read:"),
+    ] {
+        let (_d, cfg) = etc(
+            "version = 2\n",
+            &[(
+                "10-s.toml",
+                &format!("[services.s]\nconnector = \"c\"\n{field} = [\"{pat}\"]\n"),
+            )],
+        );
+        let e = load_system(&cfg).unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, PolicyError::Invalid { .. }), "{pat}: {msg}");
+        assert!(msg.contains("10-s.toml") && msg.contains(pat), "{msg}");
+    }
+    let (_d, cfg) = etc(
+        "version = 2\n[services.s]\nconnector = \"c\"\n[[services.s.rule]]\ncapability = \"issues:wirte\"\naction = \"deny\"\n",
+        &[],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::Invalid { .. })
+    ));
+}
+
+#[test]
+fn profile_as_param_name_is_fine() {
+    let (_d, cfg) = etc(
+        "version = 2\n[services.s]\nconnector = \"c\"\nparams = { profile = \"p\" }\nfixed = { profile = \"q\" }\n",
+        &[],
+    );
+    let c = load_system(&cfg).unwrap().config;
+    assert_eq!(c.services["s"].params["profile"], "p");
+    // A service named like a map is still checked.
+    let (_d, cfg) = etc(
+        "version = 2\n[services.params]\nconnector = \"c\"\nprofile = \"x\"\n",
+        &[],
+    );
+    assert!(matches!(
+        load_system(&cfg),
+        Err(PolicyError::Reserved { .. })
+    ));
+}
+
+#[test]
+fn run_allow_hardening() {
+    for bad in [
+        "/usr/bin/python2",
+        "/usr/bin/ruby3.2",
+        "/usr/bin/perl5.36",
+        "/usr/bin/lua5.4",
+        "/usr/bin/php8.2",
+        "/usr/bin/python3.12",
+        "/usr/bin/nodejs",
+        "/usr/bin/pypy3",
+        "/usr/bin/pypy",
+        "/bin/BASH",
+        "/bin/Python3",
+    ] {
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[secrets.k]\nrun_allow = [\"{bad}\"]\n"),
+            &[],
+        );
+        assert!(
+            matches!(
+                load_system(&cfg),
+                Err(PolicyError::RunAllowInterpreter { .. })
+            ),
+            "{bad}"
+        );
+    }
+    let (_d, cfg) = etc("version = 2\n[secrets.k]\nrun_allow = [\"curl\"]\n", &[]);
+    let e = load_system(&cfg).unwrap_err();
+    assert!(e.to_string().contains("absolute"), "{e}");
+}

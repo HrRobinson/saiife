@@ -39,12 +39,52 @@ impl Capability {
     }
 }
 
-/// Does `pattern` match `cap`? A pattern is `resource:verb[:qualifier]`;
-/// `*` as the resource or the verb matches exactly one segment. The
-/// qualifier is a glob where `*` does not cross `/`. A pattern without a
-/// qualifier matches any qualifier. Anything else (including `*` alone)
-/// matches nothing.
+/// Checks a capability pattern: `resource:verb[:qualifier]` where the
+/// resource is a name `[a-z0-9_-]+` or `*`, the verb is one of [`VERBS`] or
+/// `*`, and the qualifier, if present, is not empty.
+pub fn validate_pattern(pattern: &str) -> Result<(), String> {
+    let mut it = pattern.splitn(3, ':');
+    let res = it.next().unwrap_or("");
+    let verb = it
+        .next()
+        .ok_or_else(|| "expected resource:verb[:qualifier]".to_string())?;
+    let qual = it.next();
+    let name_ok = !res.is_empty()
+        && res
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'));
+    if res != "*" && !name_ok {
+        return Err("resource must be a name ([a-z0-9_-]+) or *".to_string());
+    }
+    if verb != "*" && !VERBS.contains(&verb) {
+        return Err("verb must be read, write, delete, export, admin or *".to_string());
+    }
+    if qual == Some("") {
+        return Err("empty qualifier".to_string());
+    }
+    Ok(())
+}
+
+/// Allow-stage match of `pattern` against `cap`; see [`matches_with`].
 pub fn matches(pattern: &str, cap: &Capability) -> bool {
+    matches_with(pattern, cap, false)
+}
+
+/// Does `pattern` match `cap`? A pattern is `resource:verb[:qualifier]`;
+/// `*` as the resource or the verb matches exactly one segment. Anything
+/// else (including `*` alone) matches nothing. The qualifier is an ASCII
+/// case-insensitive glob; a pattern without a qualifier matches any
+/// qualifier.
+///
+/// `broad` selects the restrictive stages (deny and ask), which must err
+/// towards matching:
+/// - narrow (allow): `*` in the qualifier stays within one `/` level, and a
+///   qualified pattern does not match a request without a qualifier;
+/// - broad (deny, ask): `*` crosses `/`, and a qualified pattern matches a
+///   request without a qualifier (fail closed).
+///
+/// `**` crosses `/` in both.
+pub fn matches_with(pattern: &str, cap: &Capability, broad: bool) -> bool {
     let mut it = pattern.splitn(3, ':');
     let (Some(res), Some(verb)) = (it.next(), it.next()) else {
         return false;
@@ -61,30 +101,52 @@ pub fn matches(pattern: &str, cap: &Capability) -> bool {
     }
     match (qual, &cap.qualifier) {
         (None, _) => true,
-        (Some(_), None) => false,
-        (Some(p), Some(q)) => glob(p, q),
+        (Some(_), None) => broad,
+        (Some(p), Some(q)) => glob_with(p, q, broad),
     }
 }
 
-/// Glob match where `*` matches any run of characters except `/`; every
-/// other character matches itself.
+/// Glob match where `*` matches any run of characters except `/`, `**`
+/// matches any run, and every other character matches itself, ASCII
+/// case-insensitively.
 pub fn glob(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    // reach[j]: p[..i] matches t[..j] for the current i.
+    glob_with(pattern, text, false)
+}
+
+/// As [`glob`]; with `star_crosses`, a single `*` crosses `/` as well.
+pub fn glob_with(pattern: &str, text: &str, star_crosses: bool) -> bool {
+    // Tokens: Some(c) literal, None = star; the bool says it crosses `/`.
+    let mut toks: Vec<(Option<char>, bool)> = Vec::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '*' {
+            let mut n = 1;
+            while chars.next_if_eq(&'*').is_some() {
+                n += 1;
+            }
+            toks.push((None, star_crosses || n > 1));
+        } else {
+            toks.push((Some(c.to_ascii_lowercase()), false));
+        }
+    }
+    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    // reach[j]: the tokens so far match t[..j].
     let mut reach = vec![false; t.len() + 1];
     reach[0] = true;
-    for &pc in &p {
+    for (tok, crosses) in toks {
         let mut next = vec![false; t.len() + 1];
-        if pc == '*' {
-            let mut run = false;
-            for j in 0..=t.len() {
-                run = (run && j > 0 && t[j - 1] != '/') || reach[j];
-                next[j] = run;
+        match tok {
+            None => {
+                let mut run = false;
+                for j in 0..=t.len() {
+                    run = (run && j > 0 && (crosses || t[j - 1] != '/')) || reach[j];
+                    next[j] = run;
+                }
             }
-        } else {
-            for j in 0..t.len() {
-                next[j + 1] = reach[j] && t[j] == pc;
+            Some(pc) => {
+                for j in 0..t.len() {
+                    next[j + 1] = reach[j] && t[j] == pc;
+                }
             }
         }
         reach = next;
@@ -167,5 +229,59 @@ mod tests {
         assert!(glob("a**b", "axb"));
         assert!(glob("*x*", "aaxbb"));
         assert!(!glob("abc", "abd"));
+    }
+
+    #[test]
+    fn validate_pattern_cases() {
+        for ok in [
+            "orders:read",
+            "*:delete",
+            "orders:*",
+            "*:*",
+            "issues:write:repo=acme/*",
+            "s3:read:arn:aws:s3:::b/*",
+        ] {
+            assert!(validate_pattern(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "*",
+            "a",
+            "customers:exprot",
+            "Orders:read",
+            "or ders:read",
+            ":read",
+            "orders:",
+            "orders:read:",
+            "o*:read",
+        ] {
+            assert!(validate_pattern(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn broad_matching_fails_closed() {
+        // `*` crosses `/` in deny and ask, not in allow.
+        let p = "s3:read:arn:aws:s3:::secret/*";
+        let c = cap("s3:read:arn:aws:s3:::secret/a/b");
+        assert!(matches_with(p, &c, true));
+        assert!(!matches_with(p, &c, false));
+        // `**` crosses in both.
+        assert!(matches("s3:read:arn:aws:s3:::secret/**", &c));
+        // A qualified pattern matches an unqualified request only when broad.
+        assert!(matches_with(
+            "issues:write:repo=acme/*",
+            &cap("issues:write"),
+            true
+        ));
+        assert!(!matches_with(
+            "issues:write:repo=acme/*",
+            &cap("issues:write"),
+            false
+        ));
+        // Case-insensitive qualifier in both.
+        let c = cap("issues:write:repo=ACME/Secret");
+        assert!(matches("issues:write:repo=acme/secret", &c));
+        assert!(matches_with("issues:write:repo=acme/secret", &c, true));
     }
 }

@@ -1,5 +1,6 @@
 //! Loading `config.toml` plus `policy.d/*.toml` (spec §8.1 "Merging").
 
+use crate::capability::validate_pattern;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
 use crate::system::{Fail, McpCfg, Scope, SystemConfig};
 use serde::Deserialize;
@@ -165,6 +166,15 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
 
     validate_services(config_file, &cfg, &service_origin)?;
     for (name, sec) in &cfg.secrets {
+        if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
+            return Err(invalid(
+                config_file,
+                format!(
+                    "secret {name}: run_allow entry {} must be an absolute path",
+                    entry.display()
+                ),
+            ));
+        }
         if let Some(entry) = sec.run_allow.iter().find(|p| is_interpreter(p)) {
             return Err(PolicyError::RunAllowInterpreter {
                 secret: name.clone(),
@@ -199,6 +209,20 @@ fn validate_services(
             .get(name)
             .map(PathBuf::from)
             .unwrap_or_else(|| config_file.to_path_buf());
+        let patterns = svc
+            .allow
+            .iter()
+            .chain(&svc.ask)
+            .chain(&svc.deny)
+            .chain(svc.rule.iter().map(|r| &r.capability));
+        for pat in patterns {
+            if let Err(why) = validate_pattern(pat) {
+                return Err(invalid(
+                    &file,
+                    format!("service {name}: capability pattern {pat:?}: {why}"),
+                ));
+            }
+        }
         if let Some(a) = &svc.auth {
             if !AUTH_KINDS.contains(&a.kind.as_str()) {
                 return Err(invalid(
@@ -246,12 +270,17 @@ fn check_reserved(path: &Path, table: &toml::Table) -> Result<(), PolicyError> {
         return Err(reserved("profile"));
     }
     for section in ["services", "secrets"] {
-        if let Some(v) = table.get(section) {
-            if let Some(at) = find_profile(v) {
+        let Some(toml::Value::Table(entries)) = table.get(section) else {
+            continue;
+        };
+        for (name, v) in entries {
+            // `params` and `fixed` hold connector parameters, whose names are
+            // free; §18 reserves config keys only.
+            if let Some(at) = find_profile(v, section == "services") {
                 let key = if at.is_empty() {
-                    format!("{section}.profile")
+                    format!("{section}.{name}.profile")
                 } else {
-                    format!("{section}.{at}.profile")
+                    format!("{section}.{name}.{at}.profile")
                 };
                 return Err(reserved(&key));
             }
@@ -271,14 +300,17 @@ fn check_reserved(path: &Path, table: &toml::Table) -> Result<(), PolicyError> {
 
 /// Path (dotted, without the final `profile`) of the first `profile` key
 /// anywhere below `v`.
-fn find_profile(v: &toml::Value) -> Option<String> {
+fn find_profile(v: &toml::Value, skip_maps: bool) -> Option<String> {
     match v {
         toml::Value::Table(t) => {
             if t.contains_key("profile") {
                 return Some(String::new());
             }
             for (k, child) in t {
-                if let Some(rest) = find_profile(child) {
+                if skip_maps && (k == "params" || k == "fixed") {
+                    continue;
+                }
+                if let Some(rest) = find_profile(child, false) {
                     return Some(if rest.is_empty() {
                         k.clone()
                     } else {
@@ -288,7 +320,7 @@ fn find_profile(v: &toml::Value) -> Option<String> {
             }
             None
         }
-        toml::Value::Array(a) => a.iter().find_map(find_profile),
+        toml::Value::Array(a) => a.iter().find_map(|x| find_profile(x, false)),
         _ => None,
     }
 }
