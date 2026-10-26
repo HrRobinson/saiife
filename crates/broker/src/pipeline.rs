@@ -457,8 +457,11 @@ async fn steps(
     let Ok(mut cap) = Capability::parse(&op.capability) else {
         return denied("policy_invalid");
     };
-    if let Some(q) = &op.qualifier {
-        cap.qualifier = fill_qualifier(q, &params);
+    // The manifest's qualifier filled from the parameters; `None` when one
+    // is missing (a deny/ask with a qualifier then still matches, an allow
+    // does not).
+    if op.qualifier.is_some() {
+        cap.qualifier = crate::manifest::qualifier_for(op, &params);
     }
     tr.capability = Some(match &cap.qualifier {
         Some(q) => format!("{}:{}:{q}", cap.resource, cap.verb),
@@ -627,22 +630,6 @@ async fn steps(
     Outcome::Done { finished, next }
 }
 
-/// `{name}` in a manifest qualifier filled from the parameters; `None` when
-/// one is missing (a deny/ask with a qualifier then still matches, an allow
-/// does not).
-fn fill_qualifier(q: &str, params: &BTreeMap<String, String>) -> Option<String> {
-    let mut out = String::new();
-    let mut rest = q;
-    while let Some(i) = rest.find('{') {
-        out.push_str(&rest[..i]);
-        let end = rest[i..].find('}')? + i;
-        out.push_str(params.get(&rest[i + 1..end])?);
-        rest = &rest[end + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
-}
-
 /// The parameters of the next page (decision 8), from a cursor in the
 /// masked JSON body or the `rel="next"` link. Only the operation's own
 /// query parameters are taken from a link.
@@ -652,19 +639,11 @@ fn next_page(
     f: &Finished,
 ) -> Option<BTreeMap<String, String>> {
     match op.pagination.as_ref()? {
-        Pagination::Cursor { param, next } => {
+        p @ Pagination::Cursor { .. } => {
             let v: Value = serde_json::from_slice(&f.body).ok()?;
-            let mut cur = &v;
-            for part in next.split('.') {
-                cur = cur.get(part)?;
-            }
-            let value = match cur {
-                Value::String(s) if !s.is_empty() => s.clone(),
-                Value::Number(n) => n.to_string(),
-                _ => return None,
-            };
+            let (param, value) = crate::request::next_cursor(p, &v)?;
             let mut out = given.clone();
-            out.insert(param.clone(), value);
+            out.insert(param, value);
             Some(out)
         }
         Pagination::LinkHeader => {
@@ -700,7 +679,11 @@ fn next_page(
                 let (Some(k), Some(v)) = (dec(k), dec(v)) else {
                     continue;
                 };
-                if op.query.contains_key(&k) {
+                // `next` reaches a header and a CLI line: printable ASCII
+                // without spaces, at most 256 bytes, like `next_cursor`.
+                let printable =
+                    !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x21..0x7f).contains(&b));
+                if op.query.contains_key(&k) && printable {
                     out.insert(k, v);
                 }
             }
@@ -902,17 +885,6 @@ pub fn list_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn qualifier_filled_or_none() {
-        let p: BTreeMap<String, String> =
-            [("owner".into(), "acme".into()), ("repo".into(), "x".into())].into();
-        assert_eq!(
-            fill_qualifier("repo={owner}/{repo}", &p).as_deref(),
-            Some("repo=acme/x")
-        );
-        assert_eq!(fill_qualifier("repo={owner}/{nope}", &p), None);
-    }
 
     #[test]
     fn call_debug_hides_values() {

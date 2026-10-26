@@ -40,7 +40,8 @@ struct Loopback(u16);
 
 impl Resolver for Loopback {
     fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
-        if host.ends_with(".echo.test") {
+        if host.ends_with(".echo.test") || host == "acme.myshopify.com" || host == "api.github.com"
+        {
             Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, self.0))])
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "unknown test host"))
@@ -105,10 +106,14 @@ async fn mock() -> (Mock, Upstream) {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec!["acme.echo.test".to_string()])
-        .unwrap()
-        .signed_by(&leaf_key, &ca)
-        .unwrap();
+    let leaf = CertificateParams::new(vec![
+        "acme.echo.test".to_string(),
+        "acme.myshopify.com".to_string(),
+        "api.github.com".to_string(),
+    ])
+    .unwrap()
+    .signed_by(&leaf_key, &ca)
+    .unwrap();
     let leaf_der: CertificateDer<'static> = leaf.der().clone();
     let key = PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
 
@@ -889,4 +894,120 @@ async fn full_pool_is_a_limit_and_closed_pool_fails_closed() {
     .await;
     assert!(matches!(o, Outcome::UpstreamFailed { .. }), "{o:?}");
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+// ------------------------------------------------- built-in connectors
+
+fn builtin_catalog() -> Catalog {
+    Catalog::new(saiife_broker::builtin(), vec![])
+}
+
+fn snap_of(text: &str) -> PolicySnapshot {
+    PolicySnapshot {
+        config: toml::from_str(&format!("version = 2\nlocked = true\n{text}")).unwrap(),
+        hash: "sha256:test".into(),
+        mode: Mode::Locked,
+    }
+}
+
+fn env_for(service: &str) -> FakeEnv {
+    let mut env = FakeEnv::ok();
+    if let Ok(Some(s)) = &mut env.scope {
+        s.services = vec![service.into()];
+    }
+    env
+}
+
+fn named_call(service: &str, op: &str, params: &[(&str, &str)], body: Option<&str>) -> Call {
+    let mut c = call(op, params);
+    c.service = service.into();
+    c.body = body.map(|b| Bytes::from(b.to_string()));
+    c
+}
+
+/// Shopify refunds under `amount_per_day = 500 EUR`: 200 and 250 go
+/// through, the next 100 would make 550 and is denied before sending.
+#[tokio::test]
+async fn refund_amount_cap_end_to_end() {
+    let (m, up) = mock().await;
+    let snap = snap_of(
+        r#"[services.shop]
+connector = "shopify"
+secret = "shop-tok"
+params = { shop = "acme" }
+allow = ["refunds:write"]
+[services.shop.limits]
+amount_per_day = { max = 500, currency = "EUR" }
+"#,
+    );
+    let (cat, lim, env) = (builtin_catalog(), Limiter::new(), env_for("shop"));
+    let refund = |amount: &str| {
+        named_call(
+            "shop",
+            "refunds.create",
+            &[("order_id", "450789469")],
+            Some(&format!(
+                r#"{{"refund":{{"currency":"EUR","transactions":[{{"amount":"{amount}"}}]}}}}"#
+            )),
+        )
+    };
+    for a in ["200.00", "250.00"] {
+        let (o, tr) = run(&refund(a), &snap, &cat, &lim, &env, Some(&up)).await;
+        assert!(matches!(o, Outcome::Done { .. }), "{a}: {o:?}");
+        assert!(tr.sent);
+    }
+    let (o, tr) = run(&refund("100.00"), &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(
+        matches!(
+            o,
+            Outcome::Limited {
+                limit: "amount_per_day"
+            }
+        ),
+        "{o:?}"
+    );
+    assert_eq!(tr.amount, Some((10_000, "EUR".to_string())));
+    assert_eq!(m.hits.load(Ordering::SeqCst), 2);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].0,
+        "/admin/api/2026-07/orders/450789469/refunds.json"
+    );
+    assert_eq!(seen[0].1["x-shopify-access-token"], TOKEN);
+}
+
+/// GitHub `issues:write:repo=acme/*`: the qualifier from the manifest is
+/// filled from the path parameters and decides the call.
+#[tokio::test]
+async fn qualifier_policy_end_to_end() {
+    let (m, up) = mock().await;
+    let snap = snap_of(
+        r#"[services.gh]
+connector = "github"
+secret = "gh-tok"
+allow = ["issues:write:repo=acme/*"]
+"#,
+    );
+    let (cat, lim, env) = (builtin_catalog(), Limiter::new(), env_for("gh"));
+    let issue = |owner: &str| {
+        named_call(
+            "gh",
+            "issues.create",
+            &[("owner", owner), ("repo", "web")],
+            Some(r#"{"title":"t"}"#),
+        )
+    };
+    let (o, tr) = run(&issue("acme"), &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(tr.capability.as_deref(), Some("issues:write:repo=acme/web"));
+    let (o, tr) = run(&issue("other"), &snap, &cat, &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "default_deny");
+    assert_eq!(
+        tr.capability.as_deref(),
+        Some("issues:write:repo=other/web")
+    );
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen[0].0, "/repos/acme/web/issues");
+    assert_eq!(seen[0].1["authorization"], format!("Bearer {TOKEN}"));
 }
