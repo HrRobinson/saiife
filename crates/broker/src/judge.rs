@@ -4,12 +4,12 @@
 //! runs `[[example]]` requests through it.
 
 use crate::catalog::Catalog;
-use crate::manifest::qualifier_for;
+use crate::manifest::{qualifier_for, Operation};
 use crate::pipeline::rule_of;
 use crate::{params, resolve};
 use saiife_policy::capability::Capability;
 use saiife_policy::decide::{decide, Request, Verdict};
-use saiife_policy::{Mode, PolicyError, Scope, SystemConfig};
+use saiife_policy::{Mode, PolicyError, Scope, ServiceCfg, ServiceOverlay, SystemConfig};
 use std::collections::BTreeMap;
 
 /// A request that cannot be judged because it names nothing that exists
@@ -65,19 +65,36 @@ pub fn judge(
         Ok(p) => p,
         Err(e) => return deny(rule_of(&e)),
     };
-    let Ok(mut cap) = Capability::parse(&operation.capability) else {
-        return deny("policy_invalid");
-    };
-    if operation.qualifier.is_some() {
-        cap.qualifier = qualifier_for(operation, &checked);
+    match policy_verdict(operation, svc, None, Mode::Locked, &checked) {
+        Ok((_, v)) => Ok(v),
+        Err(rule) => deny(rule),
     }
-    Ok(decide(
+}
+
+/// Pipeline step 6, shared with the real pipeline: the operation's
+/// capability (its qualifier filled from the validated parameters; `None`
+/// when one is missing, so a deny/ask with a qualifier still matches and an
+/// allow does not) and the deny > ask > allow verdict. `Err` is the deny
+/// rule (`policy_invalid`: the manifest's capability does not parse).
+pub(crate) fn policy_verdict(
+    op: &Operation,
+    svc: &ServiceCfg,
+    overlay: Option<&ServiceOverlay>,
+    mode: Mode,
+    params: &BTreeMap<String, String>,
+) -> Result<(Capability, Verdict), &'static str> {
+    let mut cap = Capability::parse(&op.capability).map_err(|_| "policy_invalid")?;
+    if op.qualifier.is_some() {
+        cap.qualifier = qualifier_for(op, params);
+    }
+    let verdict = decide(
         svc,
-        None,
-        Mode::Locked,
+        overlay,
+        mode,
         &Request {
             capability: &cap,
-            params: &checked,
+            params,
         },
-    ))
+    );
+    Ok((cap, verdict))
 }

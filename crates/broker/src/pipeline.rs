@@ -721,28 +721,15 @@ async fn steps(
     }
 
     // 6. Policy.
-    let Ok(mut cap) = Capability::parse(&op.capability) else {
-        return denied("policy_invalid");
-    };
-    // The manifest's qualifier filled from the parameters; `None` when one
-    // is missing (a deny/ask with a qualifier then still matches, an allow
-    // does not).
-    if op.qualifier.is_some() {
-        cap.qualifier = crate::manifest::qualifier_for(op, &params);
-    }
+    let (cap, verdict) =
+        match crate::judge::policy_verdict(op, svc, call.overlay.as_ref(), snap.mode, &params) {
+            Ok(v) => v,
+            Err(rule) => return denied(rule),
+        };
     tr.capability = Some(match &cap.qualifier {
         Some(q) => format!("{}:{}:{q}", cap.resource, cap.verb),
         None => format!("{}:{}", cap.resource, cap.verb),
     });
-    let verdict = decide(
-        svc,
-        call.overlay.as_ref(),
-        snap.mode,
-        &Request {
-            capability: &cap,
-            params: &params,
-        },
-    );
     // Approved: `ask` or `allow` now both send.
     let ask = match verdict {
         Verdict::Deny { rule } => return changed(&rule),

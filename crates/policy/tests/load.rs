@@ -175,7 +175,7 @@ fn dropins_join_scopes_and_examples() {
         "version = 2\n[[scope]]\nname = \"a\"\n",
         &[(
             "x.toml",
-            "[[scope]]\nname = \"b\"\n[[example]]\nuser = \"u\"\n",
+            "[[scope]]\nname = \"b\"\n[[example]]\nuser = \"u\"\ncommand = \"ls\"\nexpect = \"allow\"\n",
         )],
     );
     let p = load_system(&cfg).unwrap();

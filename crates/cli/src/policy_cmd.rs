@@ -364,10 +364,8 @@ pub fn test(file: &Path, dir: &dyn Directory) -> Outcome {
     }
     let cfg = &c.loaded.config;
     if cfg.example.is_empty() {
-        o.err.push_str(&format!(
-            "saiife: warning: {} has no [[example]]\n",
-            file.display()
-        ));
+        o.err.push_str("saiife: no [[example]] entries to test\n");
+        o.code = 1;
         return o;
     }
     let (mut malformed, mut failed, mut passed) = (0, 0, 0);
@@ -392,7 +390,7 @@ pub fn test(file: &Path, dir: &dyn Directory) -> Outcome {
                 .push_str(&format!("ERROR example {n}: unknown user {:?}\n", ex.user));
             continue;
         }
-        let actual = match run_case(cfg, &c.catalog, file, dir, &ex.user, &case) {
+        let actual = match run_case(cfg, &c.catalog, dir, &ex.user, &case) {
             Ok(a) => a,
             Err(why) => {
                 malformed += 1;
@@ -434,7 +432,6 @@ struct Actual {
 fn run_case(
     cfg: &SystemConfig,
     cat: &Catalog,
-    file: &Path,
     dir: &dyn Directory,
     user: &str,
     case: &Case,
@@ -473,7 +470,12 @@ fn run_case(
             })
             .to_string();
             let locked = cfg.locked.then(|| LockedPaths {
-                etc: file.parent().unwrap_or(Path::new("/")).to_path_buf(),
+                // Always where the policy is deployed, not where the file
+                // under test happens to be.
+                etc: Path::new(SYSTEM_CONFIG)
+                    .parent()
+                    .unwrap_or(Path::new("/"))
+                    .to_path_buf(),
                 audit_dir: cfg.audit.dir.clone(),
                 socket_dir: cfg.daemon.socket_dir.clone(),
             });
@@ -511,15 +513,12 @@ fn current_user() -> Option<String> {
     Getent.name_of(rustix::process::getuid().as_raw())
 }
 
-/// Locked mode: the system config loads and says `locked = true`.
-fn is_locked(config: &Path) -> bool {
-    load_system(config).is_ok_and(|l| l.config.locked)
-}
-
 fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitCode {
     let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
-    if is_locked(&config) {
-        return show_locked(&config, effective, user);
+    // A running daemon knows the policy in force, whatever state the file
+    // on disk is in.
+    if let Some(code) = show_from_daemon(&config, effective, &user) {
+        return code;
     }
     // Developer mode: the file, as far as there is one.
     let cfg = match load_system(&config) {
@@ -565,9 +564,8 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
 }
 
 #[cfg(not(target_os = "linux"))]
-fn show_locked(_config: &Path, _effective: bool, _user: Option<String>) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
-    ExitCode::from(5)
+fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) -> Option<ExitCode> {
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -576,17 +574,37 @@ fn reload(_config: Option<PathBuf>) -> ExitCode {
     ExitCode::from(5)
 }
 
+/// `Some` when a daemon answered (or refused); `None` when there is none
+/// to ask. The socket directory and user come from the config when it
+/// loads, else the defaults.
 #[cfg(target_os = "linux")]
-fn show_locked(config: &Path, effective: bool, user: Option<String>) -> ExitCode {
-    use crate::secret_cmd::linux::call;
+fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Option<ExitCode> {
+    use saiife_ipc::client::{system_uid, Client, ClientError};
+    use std::time::Instant;
+    // Where the daemon is: `[daemon]` of the file even when the rest of it
+    // is invalid (read as a plain table), else the defaults.
+    let d = saiife_policy::DaemonCfg::default();
+    let table = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok());
+    let section = table.as_ref().and_then(|t| t.get("daemon"));
+    let field = |k: &str| section.and_then(|s| s.get(k)).and_then(|v| v.as_str());
+    let name = field("user").map_or(d.user.clone(), str::to_string);
+    let dir = field("socket_dir").map_or(d.socket_dir.clone(), PathBuf::from);
+    let uid = system_uid(&name)?;
+    let mut c = Client::connect(&dir, uid, Instant::now() + Duration::from_secs(2)).ok()?;
     let mut args = serde_json::Map::new();
     if let Some(u) = user {
-        args.insert("user".into(), u.into());
+        args.insert("user".into(), u.clone().into());
     }
     if effective {
         args.insert("effective".into(), true.into());
     }
-    match call(config, "policy.show", args) {
+    match c.call(
+        "policy.show",
+        args,
+        Instant::now() + Duration::from_secs(10),
+    ) {
         Ok(a) => {
             let view = a.get("view").cloned().unwrap_or(Value::Null);
             print_show(
@@ -594,9 +612,16 @@ fn show_locked(config: &Path, effective: bool, user: Option<String>) -> ExitCode
                 a.get("hash").and_then(Value::as_str),
                 a.get("effective"),
             );
-            ExitCode::SUCCESS
+            Some(ExitCode::SUCCESS)
         }
-        Err(s) => stop(s),
+        Err(ClientError::Refused { message, .. }) => {
+            eprintln!("saiife: {message}");
+            Some(ExitCode::from(2))
+        }
+        Err(e) => {
+            eprintln!("saiife: cannot reach the saiife daemon: {e}");
+            Some(ExitCode::from(5))
+        }
     }
 }
 
@@ -927,5 +952,26 @@ expect = "deny"
         let o = test(&f, &dir());
         assert_eq!(o.code, 1, "{o:?}");
         assert!(o.out.contains("FAIL example 2"), "{o:?}");
+    }
+
+    #[test]
+    fn test_command_example_protects_the_deployed_path() {
+        // The file under test is somewhere else; the paths core.lock guards
+        // are the deployed ones.
+        let text = format!(
+            "{}\n[[example]]\nuser = \"alice\"\ncommand = \"rm /etc/saiife/config.toml\"\nexpect = \"deny\"\n",
+            SHOP.replace("version = 2", "version = 2\nlocked = true")
+        );
+        let (_d, f) = write(&text);
+        let o = test(&f, &dir());
+        assert_eq!(o.code, 0, "{o:?}");
+    }
+
+    #[test]
+    fn test_without_examples_exit_1() {
+        let (_d, f) = write(SHOP);
+        let o = test(&f, &dir());
+        assert_eq!(o.code, 1, "{o:?}");
+        assert!(o.err.contains("no [[example]] entries to test"), "{o:?}");
     }
 }

@@ -173,6 +173,20 @@ fn reload_admin_only() {
 }
 
 #[test]
+fn show_asks_the_daemon_even_when_the_file_is_broken() {
+    let d = world(false);
+    let hash = d.status()["policy"].as_str().unwrap().to_string();
+    // The file no longer loads (an unknown key), the daemon still runs.
+    let mut text = fs::read_to_string(d.config()).unwrap();
+    text.push_str("\n[guard]\nbogus = 1\n");
+    fs::write(d.config(), text).unwrap();
+    let o = saiife(&d, &["show"]);
+    assert_eq!(code(&o), 0, "{} / {}", stderr(&o), d.stderr_text());
+    assert!(stdout(&o).contains(&hash), "{}", stdout(&o));
+    assert!(stdout(&o).contains("scope: mine"), "{}", stdout(&o));
+}
+
+#[test]
 fn developer_mode_show_reads_the_file() {
     let tmp = common::tmp::short_tempdir();
     let cfg = tmp.path().join("config.toml");
