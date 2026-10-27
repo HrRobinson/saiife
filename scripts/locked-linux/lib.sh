@@ -9,6 +9,7 @@
 
 AGENT_USER="agent-ci"
 AGENT_HOME=/home/agent-ci
+APPROVER_USER="approver-ci"
 OPT_BIN=/opt/saiife/bin/saiife
 AUDIT_DIR=/var/log/saiife/audit
 SOCKET=/run/saiife/saiife.sock
@@ -68,6 +69,7 @@ on_exit() {
             tar -C "$LOGS" -xf - 2>/dev/null || true
         cp -r "$WORK" "$LOGS/work" 2>/dev/null || true
     fi
+    cleanup_approvals || true
     rm -rf "$WORK"
 }
 
@@ -434,6 +436,178 @@ phase_doctor() {
     [[ "$status" == warn ]] || fail "doctor check files.binary: ${status:-missing}, want warn (test build installed)"
     ok "doctor files.binary: warn (test build installed)"
     ok "doctor exit $code"
+}
+
+# ----------------------------------------------------- approvals (plan 11)
+
+APPROVALS_CFG_BACKUP=""
+# Set by `saiife_as`.
+SA_CODE=0
+SA_OUT=""
+SA_ERR=""
+
+# `saiife_as <user> <cwd> <args...>`: the installed saiife as `user`. Sets
+# SA_CODE, SA_OUT and SA_ERR. No tty, no stdin: nobody can answer a prompt.
+# A hang is cut off after 150 s (the reauth timeout is 120 s).
+saiife_as() {
+    local user="$1" cwd="$2"
+    shift 2
+    SA_CODE=0
+    # The runner's shell opens the output files on purpose.
+    # shellcheck disable=SC2024
+    sudo -n -u "$user" env -C "$cwd" timeout 150 "$OPT_BIN" "$@" \
+        </dev/null >"$WORK/sa.out" 2>"$WORK/sa.err" || SA_CODE=$?
+    SA_OUT="$(cat "$WORK/sa.out")"
+    SA_ERR="$(cat "$WORK/sa.err")"
+}
+
+# Put back the config this phase changed and remove the approver user.
+# Idempotent: also runs from on_exit, whatever state the phase stopped in.
+cleanup_approvals() {
+    if [[ -n "$APPROVALS_CFG_BACKUP" && -e "$APPROVALS_CFG_BACKUP" ]]; then
+        as_root cp -p "$APPROVALS_CFG_BACKUP" /etc/saiife/config.toml || true
+        as_root rm -f "$APPROVALS_CFG_BACKUP" || true
+    fi
+    if getent passwd "$APPROVER_USER" >/dev/null 2>&1; then
+        as_root userdel -r "$APPROVER_USER" >/dev/null 2>&1 || true
+    fi
+}
+
+# The newest `refused` approval record's rule for request `$1` ("" if none).
+last_refusal_rule() {
+    records | jq -r --argjson id "$1" \
+        'select(.kind == "approval" and .approval == $id and .action == "refused") | .rule' | tail -n 1
+}
+
+# The actions recorded for request `$1`, in order, comma separated.
+approval_actions() {
+    records | jq -r --argjson id "$1" 'select(.kind == "approval" and .approval == $id) | .action' | paste -sd, -
+}
+
+# The hook now answers a force-push with a request (the ask rule is live).
+hook_asks() {
+    hook "$@"
+    [[ "$HOOK_CODE" == 2 && "$HOOK_ERR" == *"Needs approval: request #"* ]]
+}
+
+# The force-push is blocked outright again (the ask rule is gone).
+hook_denied_not_asked() {
+    hook "$@"
+    [[ "$HOOK_CODE" == 2 && "$HOOK_ERR" == *"BLOCKED by"* ]]
+}
+
+# The request id in the hook's stderr.
+asked_id() {
+    local id
+    id="$(sed -n 's/.*Needs approval: request #\([0-9][0-9]*\)\..*/\1/p' <<<"$HOOK_ERR" | head -n 1)"
+    [[ -n "$id" ]] || fail "no request id in the hook message: $HOOK_ERR"
+    printf '%s\n' "$id"
+}
+
+# `expect_pending <id> <what>`: the requester's `approvals list --json` has
+# the request, pending, for the agent user (one JSON array, or one object
+# per line).
+expect_pending() {
+    saiife_as "$AGENT_USER" "$AGENT_HOME" approvals list --json
+    [[ "$SA_CODE" == 0 ]] || fail "$2: approvals list exited $SA_CODE: $SA_ERR"
+    jq -s -e --arg id "$1" --arg u "$AGENT_USER" \
+        '[.[] | if type == "array" then .[] else . end | select((.id | tostring) == $id)] | length == 1 and .[0].state == "pending" and .[0].user == $u' \
+        <<<"$SA_OUT" >/dev/null || fail "$2: request #$1 is not pending for $AGENT_USER in: $SA_OUT"
+    ok "$2: request #$1 pending (approvals list --json)"
+}
+
+# `self_approve_refused_by <id> <rule>`: the agent approves its own request;
+# true once the CLI exits 2 and the newest refusal has that rule.
+self_approve_refused_by() {
+    saiife_as "$AGENT_USER" "$AGENT_HOME" approve "$1"
+    [[ "$SA_CODE" == 2 && "$(last_refusal_rule "$1")" == "$2" ]]
+}
+
+phase_approvals() {
+    phase "6b. approvals: polkit action, grants, same_user, reauth"
+    local action=/usr/share/polkit-1/actions/com.saiife.approve.policy
+    local code=0 status first third forced n
+
+    # The action file: root's, 0644, and the exact defaults.
+    expect_stat "$action" "root:root 644"
+    as_root grep -q '<action id="com.saiife.approve">' "$action" || fail "$action: no action com.saiife.approve"
+    for n in allow_any allow_inactive allow_active; do
+        as_root grep -qx "      <$n>auth_self</$n>" "$action" || fail "$action: $n is not auth_self"
+    done
+    if as_root grep -q 'auth_self_keep' "$action"; then
+        fail "$action names auth_self_keep"
+    fi
+    ok "$action: auth_self for allow_any, allow_inactive, allow_active"
+
+    # Polkit is installed on the runner, so doctor does not warn.
+    as_root "$OPT_BIN" doctor --json >"$WORK/doctor.json" 2>"$WORK/doctor.err" || code=$?
+    [[ "$code" == 0 || "$code" == 1 ]] || fail "doctor exited $code"
+    status="$(jq -r '.checks[] | select(.id == "reauth") | .status' "$WORK/doctor.json")"
+    [[ "$status" == pass ]] || fail "doctor check reauth: ${status:-missing}, want pass: $(jq -c '.checks[] | select(.id == "reauth")' "$WORK/doctor.json")"
+    ok "doctor reauth: pass"
+
+    # The approver, the config backup (put back by cleanup_approvals) and
+    # the ask rule. agent-ci is listed too, so that its own approval gets
+    # as far as the same_user rule.
+    as_root useradd -m -s /bin/bash "$APPROVER_USER"
+    APPROVALS_CFG_BACKUP="$WORK/config.pre-approvals"
+    as_root cp -p /etc/saiife/config.toml "$APPROVALS_CFG_BACKUP"
+    as_root tee -a /etc/saiife/config.toml >/dev/null <<EOF
+
+[guard]
+ask = ["core.git/force-push"]
+
+[approval]
+approvers = ["$APPROVER_USER", "$AGENT_USER"]
+same_user = "deny"
+EOF
+    as_root systemctl reload saiifed
+    forced="$(payload claude/bash-deny.json '.tool_input.command = "git push --force origin main"')"
+    # Until the reload lands the hook still says BLOCKED (no request is made).
+    wait_until 30 "the ask rule after the reload" hook_asks claude "$forced"
+    first="$(asked_id)"
+    ok "ask rule: git push --force -> request #$first ($HOOK_ERR)"
+    expect_pending "$first" "ask"
+
+    # The approver approves; the requester's retry is allowed once.
+    saiife_as "$APPROVER_USER" / approve "$first" --note "locked-linux CI"
+    [[ "$SA_CODE" == 0 ]] || fail "$APPROVER_USER: approve #$first exited $SA_CODE: $SA_ERR"
+    ok "$APPROVER_USER approved #$first"
+    expect_hook 0 "" "retry after the approval (the grant, used once)" claude "$forced"
+    hook claude "$forced"
+    [[ "$HOOK_CODE" == 2 && "$HOOK_ERR" == *"Needs approval: request #"* ]] ||
+        fail "third run: exit $HOOK_CODE, want a new request; stderr: $HOOK_ERR"
+    third="$(asked_id)"
+    [[ "$third" != "$first" ]] || fail "third run reused request #$first"
+    ok "third run: asked again, request #$third"
+    [[ "$(approval_actions "$first")" == *approved* ]] || fail "#$first: no approved record: $(approval_actions "$first")"
+
+    # same_user = "deny": the requester cannot approve its own request.
+    saiife_as "$AGENT_USER" "$AGENT_HOME" approve "$third"
+    [[ "$SA_CODE" == 2 ]] || fail "$AGENT_USER approving its own #$third exited $SA_CODE, want 2: $SA_ERR"
+    [[ "$(last_refusal_rule "$third")" == same_user ]] || fail "#$third: refusal rule is '$(last_refusal_rule "$third")', want same_user"
+    expect_pending "$third" "after the refused self-approval"
+    ok "same_user = deny: self-approval refused (exit 2, rule same_user)"
+
+    # same_user = "reauth": polkit asks, a runner has no tty and no agent,
+    # so pkcheck fails and the approval is refused.
+    as_root sed -i 's/^same_user = "deny"$/same_user = "reauth"/' /etc/saiife/config.toml
+    as_root grep -qx 'same_user = "reauth"' /etc/saiife/config.toml || fail "same_user was not set to reauth"
+    as_root systemctl reload saiifed
+    wait_until 60 "the self-approval to be refused by reauth_failed" self_approve_refused_by "$third" reauth_failed
+    ok "same_user = reauth: self-approval refused (exit 2, rule reauth_failed)"
+    expect_pending "$third" "after the failed reauth"
+    [[ "$(approval_actions "$third")" != *approved* ]] || fail "#$third was approved: $(approval_actions "$third")"
+
+    # Leave nothing pending, then put everything back.
+    saiife_as "$APPROVER_USER" / reject "$third"
+    [[ "$SA_CODE" == 0 ]] || fail "$APPROVER_USER: reject #$third exited $SA_CODE: $SA_ERR"
+    ok "$APPROVER_USER rejected #$third"
+    cleanup_approvals
+    as_root systemctl reload saiifed
+    wait_until 30 "the daemon after restoring the config" daemon_ready
+    wait_until 30 "the force-push to be blocked again, not asked" hook_denied_not_asked claude "$forced"
+    ok "config restored, $APPROVER_USER removed"
 }
 
 phase_reinstall_uninstall() {
