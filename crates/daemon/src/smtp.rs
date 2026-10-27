@@ -90,18 +90,39 @@ async fn expect(s: &mut Stream, ok: &[u16]) -> Result<Vec<String>, String> {
     } else {
         Err(format!(
             "unexpected reply {code} {}",
-            text.first().map_or("", |t| t.as_str())
+            reply_text(text.first().map_or("", |t| t.as_str()))
         ))
     }
 }
 
-async fn cmd(s: &mut Stream, line: &str, ok: &[u16]) -> Result<Vec<String>, String> {
+/// The server's words for a failure: printable ASCII, at most 80 characters.
+fn reply_text(t: &str) -> String {
+    plain(t).chars().take(80).collect()
+}
+
+async fn send_line(s: &mut Stream, line: &str) -> Result<(), String> {
     s.write_all(line.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     s.write_all(b"\r\n").await.map_err(|e| e.to_string())?;
-    s.flush().await.map_err(|e| e.to_string())?;
+    s.flush().await.map_err(|e| e.to_string())
+}
+
+async fn cmd(s: &mut Stream, line: &str, ok: &[u16]) -> Result<Vec<String>, String> {
+    send_line(s, line).await?;
     expect(s, ok).await
+}
+
+/// For the AUTH line: the reply text is never shown (a server may echo the
+/// credentials), only the code.
+async fn cmd_quiet(s: &mut Stream, line: &str, ok: u16) -> Result<(), String> {
+    send_line(s, line).await?;
+    let (code, _) = reply(s).await?;
+    if code == ok {
+        Ok(())
+    } else {
+        Err(format!("authentication refused (reply {code})"))
+    }
 }
 
 fn name_of(host: &str) -> Result<ServerName<'static>, String> {
@@ -143,8 +164,8 @@ fn data_section(m: &Mail<'_>) -> String {
 }
 
 fn address(a: &str) -> Result<&str, String> {
-    if a.is_empty() || a.contains(['\r', '\n', '<', '>', ' ']) {
-        return Err(format!("bad address {a:?}"));
+    if !saiife_policy::valid_address(a) {
+        return Err("an address is not plain printable ASCII".into());
     }
     Ok(a)
 }
@@ -214,12 +235,11 @@ pub async fn send(
     }
 
     step("EHLO", cmd(&mut s, "EHLO saiife", &[250])).await?;
-    let auth = Zeroizing::new(format!(
-        "AUTH PLAIN {}",
-        base64::engine::general_purpose::STANDARD
-            .encode(format!("\0{}\0{}", m.user, m.password).as_bytes())
-    ));
-    step("AUTH", cmd(&mut s, &auth, &[235])).await?;
+    let plain_auth = Zeroizing::new(format!("\0{}\0{}", m.user, m.password));
+    let b64 =
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(plain_auth.as_bytes()));
+    let auth = Zeroizing::new(format!("AUTH PLAIN {}", b64.as_str()));
+    step("AUTH", cmd_quiet(&mut s, &auth, 235)).await?;
     step("MAIL", cmd(&mut s, &format!("MAIL FROM:<{from}>"), &[250])).await?;
     for t in m.to {
         step("RCPT", cmd(&mut s, &format!("RCPT TO:<{t}>"), &[250, 251])).await?;
@@ -240,6 +260,13 @@ pub async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_text_is_short_printable_ascii() {
+        let t = reply_text(&format!("bad\r\nthing \u{e9} {}", "x".repeat(200)));
+        assert_eq!(t.chars().count(), 80);
+        assert!(t.chars().all(|c| (' '..='~').contains(&c)));
+    }
 
     #[test]
     fn data_is_dot_stuffed_ascii_crlf() {

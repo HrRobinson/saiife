@@ -72,6 +72,7 @@ impl std::fmt::Debug for UpstreamResponse {
 
 pub struct Upstream {
     tls: tokio_rustls::TlsConnector,
+    roots: RootCertStore,
     resolver: Arc<dyn Resolver>,
     timeout: Duration,
     /// Plain `http://` is sent only by unit tests that ask for it.
@@ -116,13 +117,17 @@ fn load_ca_dir(dir: &Path, roots: &mut RootCertStore) -> Result<(), BrokerError>
 }
 
 fn client_config(roots: RootCertStore) -> Result<ClientConfig, BrokerError> {
+    client_config_alpn(roots, &[b"http/1.1"])
+}
+
+fn client_config_alpn(roots: RootCertStore, alpn: &[&[u8]]) -> Result<ClientConfig, BrokerError> {
     let mut cfg =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|e| up("TLS", e))?
             .with_root_certificates(roots)
             .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(cfg)
 }
 
@@ -287,7 +292,8 @@ impl Upstream {
             return Err(BrokerError::Upstream("no trusted root certificates".into()));
         }
         Ok(Upstream {
-            tls: tokio_rustls::TlsConnector::from(Arc::new(client_config(roots)?)),
+            tls: tokio_rustls::TlsConnector::from(Arc::new(client_config(roots.clone())?)),
+            roots,
             resolver: Arc::new(SystemResolver),
             timeout,
             #[cfg(test)]
@@ -301,9 +307,11 @@ impl Upstream {
         resolver: Arc<dyn Resolver>,
         timeout: Duration,
     ) -> Upstream {
-        let cfg = client_config(roots).expect("the ring provider supports the default versions");
+        let cfg =
+            client_config(roots.clone()).expect("the ring provider supports the default versions");
         Upstream {
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
+            roots,
             resolver,
             timeout,
             #[cfg(test)]
@@ -325,10 +333,18 @@ impl Upstream {
         scheme == "https"
     }
 
-    /// The TLS connector with this client's roots (SMTP over TLS reuses the
-    /// same trust: native roots plus the admin's CA directory).
+    /// The TLS connector with this client's roots and the HTTP/1.1 ALPN.
     pub fn tls_connector(&self) -> tokio_rustls::TlsConnector {
         self.tls.clone()
+    }
+
+    /// A connector with this client's roots (native roots plus the admin's
+    /// CA directory) offering exactly `alpn` (none for SMTP: a server that
+    /// insists on ALPN must not see `http/1.1`).
+    pub fn tls_connector_with_alpn(&self, alpn: &[&[u8]]) -> tokio_rustls::TlsConnector {
+        let cfg = client_config_alpn(self.roots.clone(), alpn)
+            .expect("the ring provider supports the default versions");
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
     }
 
     /// The resolver this client uses.

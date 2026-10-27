@@ -19,19 +19,20 @@ use saiife_policy::{CommandCfg, Event, NotifyCfg, SmtpCfg, TargetCfg, WebhookCfg
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
 /// Events held before the oldest is dropped.
 pub const QUEUE: usize = 256;
 /// One send per target per event kind in this window (not `approval_created`).
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
-/// A delivery attempt (webhook, command) takes at most this long.
+/// A webhook call or a command takes at most this long.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// One attempt at any target (SMTP included) takes at most this long.
+pub const DEADLINE: Duration = Duration::from_secs(30);
 /// The summary is cut to this many characters.
 pub const SUMMARY_MAX: usize = 200;
 
@@ -142,12 +143,56 @@ struct Trust {
     whole_chain: bool,
 }
 
-struct Inner {
-    queue: Mutex<VecDeque<NotifyEvent>>,
+/// What delivery is configured with beyond the policy.
+#[derive(Clone, Copy)]
+struct Opts {
+    trust: Trust,
+    /// How long a command may run (debug builds can shorten it).
+    cmd_timeout: Duration,
+}
+
+/// A bounded FIFO that drops its oldest entry when full.
+struct Queue<T> {
+    q: Mutex<VecDeque<T>>,
     wake: tokio::sync::Notify,
+}
+
+impl<T> Queue<T> {
+    fn new() -> Queue<T> {
+        Queue {
+            q: Mutex::new(VecDeque::new()),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Pushes `t`; the oldest entry when the queue was full.
+    fn push(&self, t: T) -> Option<T> {
+        let mut q = lock(&self.q);
+        let old = if q.len() >= QUEUE {
+            q.pop_front()
+        } else {
+            None
+        };
+        q.push_back(t);
+        drop(q);
+        self.wake.notify_one();
+        old
+    }
+
+    fn pop(&self) -> Option<T> {
+        lock(&self.q).pop_front()
+    }
+
+    fn len(&self) -> usize {
+        lock(&self.q).len()
+    }
+}
+
+struct Inner {
+    queue: Queue<NotifyEvent>,
     dropped: Mutex<BTreeMap<Event, u64>>,
     dropped_total: AtomicU64,
-    trust: Trust,
+    opts: Opts,
 }
 
 #[derive(Clone)]
@@ -167,20 +212,22 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Notifier {
     pub fn new() -> Notifier {
-        Notifier::with_trust(Trust {
-            owner: 0,
-            whole_chain: true,
+        Notifier::with_opts(Opts {
+            trust: Trust {
+                owner: 0,
+                whole_chain: true,
+            },
+            cmd_timeout: TIMEOUT,
         })
     }
 
-    fn with_trust(trust: Trust) -> Notifier {
+    fn with_opts(opts: Opts) -> Notifier {
         Notifier {
             inner: Arc::new(Inner {
-                queue: Mutex::new(VecDeque::new()),
-                wake: tokio::sync::Notify::new(),
+                queue: Queue::new(),
                 dropped: Mutex::new(BTreeMap::new()),
                 dropped_total: AtomicU64::new(0),
-                trust,
+                opts,
             }),
         }
     }
@@ -190,25 +237,28 @@ impl Notifier {
     /// build has no such seam.
     #[cfg(debug_assertions)]
     pub fn with_trusted_owner(uid: u32) -> Notifier {
-        Notifier::with_trust(Trust {
-            owner: uid,
-            whole_chain: false,
+        Notifier::with_trusted_owner_and_timeout(uid, TIMEOUT)
+    }
+
+    /// [`Notifier::with_trusted_owner`] with a shorter command timeout.
+    #[cfg(debug_assertions)]
+    pub fn with_trusted_owner_and_timeout(uid: u32, cmd_timeout: Duration) -> Notifier {
+        Notifier::with_opts(Opts {
+            trust: Trust {
+                owner: uid,
+                whole_chain: false,
+            },
+            cmd_timeout,
         })
     }
 
     /// Queue `ev`; never blocks and never fails. A full queue drops its
     /// oldest event (counted, and recorded by the delivery task).
     pub fn send(&self, ev: NotifyEvent) {
-        let mut q = lock(&self.inner.queue);
-        if q.len() >= QUEUE {
-            if let Some(old) = q.pop_front() {
-                *lock(&self.inner.dropped).entry(old.event).or_default() += 1;
-                self.inner.dropped_total.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(old) = self.inner.queue.push(ev) {
+            *lock(&self.inner.dropped).entry(old.event).or_default() += 1;
+            self.inner.dropped_total.fetch_add(1, Ordering::Relaxed);
         }
-        q.push_back(ev);
-        drop(q);
-        self.inner.wake.notify_one();
     }
 
     /// Events dropped because the queue was full, since start.
@@ -216,52 +266,88 @@ impl Notifier {
         self.inner.dropped_total.load(Ordering::Relaxed)
     }
 
-    /// Events waiting for delivery.
+    /// Events waiting for the dispatcher.
     pub fn queued(&self) -> usize {
-        lock(&self.inner.queue).len()
+        self.inner.queue.len()
     }
 
-    /// Starts the delivery task on the current runtime. It ends when `env`
-    /// is gone.
+    /// Starts the delivery tasks on the current runtime: one dispatcher and
+    /// one worker per target, so a dead target stalls only itself. They end
+    /// when `env` is gone.
     pub fn start<E: Env>(&self, env: Weak<E>) -> tokio::task::JoinHandle<()> {
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(delivery(inner, env))
+        tokio::spawn(dispatcher(inner, env))
     }
+}
+
+/// Whether `c` is a Unicode format character (category Cf).
+fn is_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2
+        | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
 fn cut(s: &str, max: usize) -> String {
     let one_line: String = s
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     if one_line.chars().count() <= max {
         return one_line;
     }
     let mut t: String = one_line.chars().take(max - 1).collect();
-    t.push('…');
+    t.push('\u{2026}');
     t
 }
 
-async fn delivery<E: Env>(inner: Arc<Inner>, env: Weak<E>) {
+/// What a worker is handed: the event and the target as configured now.
+type Job = (NotifyEvent, TargetCfg);
+
+/// One target's queue, with the events its full queue lost.
+struct TargetQ {
+    queue: Queue<Job>,
+    dropped: Mutex<BTreeMap<Event, u64>>,
+    closed: AtomicBool,
+}
+
+async fn dispatcher<E: Env>(inner: Arc<Inner>, env: Weak<E>) {
     let mut last_sent: HashMap<(String, Event), Instant> = HashMap::new();
+    let mut workers: HashMap<String, Arc<TargetQ>> = HashMap::new();
     loop {
-        let ev = lock(&inner.queue).pop_front();
+        let ev = inner.queue.pop();
         let Some(mut ev) = ev else {
-            inner.wake.notified().await;
+            inner.queue.wake.notified().await;
             continue;
         };
         // Masked here, off the caller's thread (the mask patterns compile
         // on first use); only masked text leaves this task.
         ev.summary = cut(&saiife_audit::mask::mask(&ev.summary), SUMMARY_MAX);
         let Some(env) = env.upgrade() else {
+            close_all(&workers);
             return;
         };
         flush_dropped(&inner, &*env);
         let cfg = env.cfg();
+        // Workers of targets that are gone from the policy end.
+        workers.retain(|name, w| {
+            let keep = cfg.targets.contains_key(name);
+            if !keep {
+                w.closed.store(true, Ordering::Relaxed);
+                w.queue.wake.notify_one();
+            }
+            keep
+        });
         if !cfg.on.contains(&ev.event) {
             continue;
         }
-        let mut set = JoinSet::new();
         for (name, target) in cfg.targets {
             if ev.event != Event::ApprovalCreated {
                 let now = Instant::now();
@@ -281,19 +367,61 @@ async fn delivery<E: Env>(inner: Arc<Inner>, env: Weak<E>) {
                 }
                 last_sent.insert(key, now);
             }
-            let env = Arc::clone(&env);
-            let ev = ev.clone();
-            let trust = inner.trust;
-            set.spawn(async move {
-                let r = deliver(&*env, &target, &ev, trust).await;
-                let (result, reason) = match &r {
-                    Ok(()) => ("sent", None),
-                    Err(why) => ("failed", Some(why.as_str())),
-                };
-                env.append(notify_record(&*env, &ev, &name, result, reason));
+            let tq = workers.entry(name.clone()).or_insert_with(|| {
+                let tq = Arc::new(TargetQ {
+                    queue: Queue::new(),
+                    dropped: Mutex::new(BTreeMap::new()),
+                    closed: AtomicBool::new(false),
+                });
+                tokio::spawn(worker(
+                    Arc::clone(&tq),
+                    name.clone(),
+                    env_weak(&env),
+                    inner.opts,
+                ));
+                tq
             });
+            if let Some((old, _)) = tq.queue.push((ev.clone(), target)) {
+                *lock(&tq.dropped).entry(old.event).or_default() += 1;
+            }
         }
-        while set.join_next().await.is_some() {}
+    }
+}
+
+fn env_weak<E: Env>(env: &Arc<E>) -> Weak<E> {
+    Arc::downgrade(env)
+}
+
+fn close_all(workers: &HashMap<String, Arc<TargetQ>>) {
+    for w in workers.values() {
+        w.closed.store(true, Ordering::Relaxed);
+        w.queue.wake.notify_one();
+    }
+}
+
+/// Delivers one target's events in order. A hang here holds up only this
+/// target's queue (which drops its oldest when full).
+async fn worker<E: Env>(tq: Arc<TargetQ>, name: String, env: Weak<E>, opts: Opts) {
+    loop {
+        let job = tq.queue.pop();
+        let Some(env) = env.upgrade() else {
+            return;
+        };
+        flush_target_dropped(&tq, &name, &*env);
+        let Some((ev, target)) = job else {
+            if tq.closed.load(Ordering::Relaxed) {
+                return;
+            }
+            drop(env);
+            tq.queue.wake.notified().await;
+            continue;
+        };
+        let r = deliver(&*env, &target, &ev, opts).await;
+        let (result, reason) = match &r {
+            Ok(()) => ("sent", None),
+            Err(why) => ("failed", Some(why.as_str())),
+        };
+        env.append(notify_record(&*env, &ev, &name, result, reason));
     }
 }
 
@@ -301,10 +429,19 @@ async fn delivery<E: Env>(inner: Arc<Inner>, env: Weak<E>) {
 /// flush, with the count.
 fn flush_dropped(inner: &Inner, env: &dyn Env) {
     let drops = std::mem::take(&mut *lock(&inner.dropped));
+    drop_records(drops, "*", env);
+}
+
+fn flush_target_dropped(tq: &TargetQ, name: &str, env: &dyn Env) {
+    let drops = std::mem::take(&mut *lock(&tq.dropped));
+    drop_records(drops, name, env);
+}
+
+fn drop_records(drops: BTreeMap<Event, u64>, target: &str, env: &dyn Env) {
     for (event, n) in drops {
         let mut r = env.new_record(&format!("notify {}", event.as_str()));
         r.extra.insert("event".into(), event.as_str().into());
-        r.extra.insert("target".into(), "*".into());
+        r.extra.insert("target".into(), target.into());
         r.extra.insert("result".into(), "dropped".into());
         r.extra.insert("count".into(), n.into());
         r.reason = Some("queue_full".into());
@@ -344,14 +481,16 @@ async fn deliver(
     env: &dyn Env,
     target: &TargetCfg,
     ev: &NotifyEvent,
-    trust: Trust,
+    opts: Opts,
 ) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..2 {
-        match attempt(env, target, ev, trust).await {
-            Ok(()) => return Ok(()),
-            Err(Fail::Permanent(why)) => return Err(why),
-            Err(Fail::Transient(why)) => last = why,
+        // One total deadline per attempt, whatever the target does.
+        match tokio::time::timeout(DEADLINE, attempt(env, target, ev, opts)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(Fail::Permanent(why))) => return Err(why),
+            Ok(Err(Fail::Transient(why))) => last = why,
+            Err(_) => return Err(format!("no answer within {}s", DEADLINE.as_secs())),
         }
     }
     Err(last)
@@ -367,12 +506,12 @@ async fn attempt(
     env: &dyn Env,
     target: &TargetCfg,
     ev: &NotifyEvent,
-    trust: Trust,
+    opts: Opts,
 ) -> Result<(), Fail> {
     match target {
         TargetCfg::Webhook(w) => webhook(env, w, ev).await,
         TargetCfg::Smtp(s) => smtp(env, s, ev).await,
-        TargetCfg::Command(c) => command(c, ev, trust).await,
+        TargetCfg::Command(c) => command(c, ev, opts).await,
     }
 }
 
@@ -414,9 +553,21 @@ async fn webhook(env: &dyn Env, w: &WebhookCfg, ev: &NotifyEvent) -> Result<(), 
     };
     match tokio::time::timeout(TIMEOUT, up.send(built, 4096)).await {
         Err(_) => Err(Transient("the webhook timed out".into())),
-        Ok(Err(e)) => Err(Transient(clean(e.to_string()))),
+        // A POST redirect is refused, never followed; retrying cannot help.
+        Ok(Err(saiife_broker::BrokerError::RedirectRefused)) => Err(Permanent(
+            "the webhook redirected; redirects are not followed".into(),
+        )),
+        Ok(Err(e)) => {
+            let text = clean(e.to_string());
+            if text.contains("only https is sent") {
+                Err(Permanent(text))
+            } else {
+                Err(Transient(text))
+            }
+        }
         Ok(Ok(r)) if (200..300).contains(&r.status) => Ok(()),
-        // A redirect is an error `send` already made; any other status is a no.
+        // A 4xx (or any non-5xx) answer is a no that a repeat will not change.
+        Ok(Ok(r)) if r.status < 500 => Err(Permanent(format!("the webhook answered {}", r.status))),
         Ok(Ok(r)) => Err(Transient(format!("the webhook answered {}", r.status))),
     }
 }
@@ -457,7 +608,7 @@ async fn smtp(env: &dyn Env, s: &SmtpCfg, ev: &NotifyEvent) -> Result<(), Fail> 
     let mail = crate::smtp::Mail {
         host: &s.host,
         port: s.port,
-        starttls: s.starttls,
+        starttls: s.starttls(),
         from: &s.from,
         to: &s.to,
         user,
@@ -466,7 +617,8 @@ async fn smtp(env: &dyn Env, s: &SmtpCfg, ev: &NotifyEvent) -> Result<(), Fail> 
         body: &body,
     };
     let masker = Masker::new(&[user, pass]);
-    crate::smtp::send(up.tls_connector(), up.resolver(), &mail)
+    // SMTP offers no ALPN: a server that insists on it must not see `http/1.1`.
+    crate::smtp::send(up.tls_connector_with_alpn(&[]), up.resolver(), &mail)
         .await
         .map_err(|e| Transient(masker.mask_text(&e)))
 }
@@ -497,13 +649,16 @@ fn check_command(path: &Path, trust: Trust) -> Result<(), String> {
     Ok(())
 }
 
-async fn command(c: &CommandCfg, ev: &NotifyEvent, trust: Trust) -> Result<(), Fail> {
+async fn command(c: &CommandCfg, ev: &NotifyEvent, opts: Opts) -> Result<(), Fail> {
     use Fail::*;
-    check_command(&c.path, trust)
+    check_command(&c.path, opts.trust)
         .map_err(|why| Permanent(format!("command refused, not root-owned: {why}")))?;
     let mut child = tokio::process::Command::new(&c.path)
         .env_clear()
         .current_dir("/")
+        // Its own process group (pgid = its pid), so a timeout can end the
+        // program and whatever it started.
+        .process_group(0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -521,11 +676,21 @@ async fn command(c: &CommandCfg, ev: &NotifyEvent, trust: Trust) -> Result<(), F
         }
         child.wait().await
     };
-    match tokio::time::timeout(TIMEOUT, run).await {
-        Err(_) => Err(Transient("the command timed out".into())),
+    match tokio::time::timeout(opts.cmd_timeout, run).await {
+        Err(_) => {
+            // The child is not reaped yet, so its pid still names its group.
+            if let Some(pid) = child
+                .id()
+                .and_then(|p| rustix::process::Pid::from_raw(p as i32))
+            {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            Err(Permanent("the command timed out".into()))
+        }
         Ok(Err(e)) => Err(Transient(format!("the command failed: {e}"))),
         Ok(Ok(st)) if st.success() => Ok(()),
-        Ok(Ok(st)) => Err(Transient(format!("the command exited with {st}"))),
+        Ok(Ok(st)) => Err(Permanent(format!("the command exited with {st}"))),
     }
 }
 
@@ -539,6 +704,11 @@ mod tests {
         let long = "x".repeat(500);
         let c = cut(&long, SUMMARY_MAX);
         assert_eq!(c.chars().count(), SUMMARY_MAX);
-        assert!(c.ends_with('…'));
+        assert!(c.ends_with('\u{2026}'));
+        // Line separators and format characters become spaces.
+        assert_eq!(
+            cut("a\u{2028}b\u{2029}c\u{202e}d\u{200b}e\u{feff}f\u{ad}g", 50),
+            "a b c d e f g"
+        );
     }
 }

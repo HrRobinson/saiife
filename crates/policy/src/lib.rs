@@ -31,7 +31,8 @@ pub use service::{
     SecretCfg, ServiceCfg,
 };
 pub use system::{
-    AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg, Event, Fail, Fsync, GatewayCfg,
-    GuardCfg, McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SystemConfig, TargetCfg, WebhookCfg,
+    valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg, Event, Fail, Fsync,
+    GatewayCfg, GuardCfg, McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SystemConfig, TargetCfg,
+    WebhookCfg,
 };
 pub use users::{Directory, FixedDirectory, Getent, GroupEntry, UserEntry};

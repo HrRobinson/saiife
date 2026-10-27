@@ -71,7 +71,9 @@ fn pki() -> Pki {
     }
 }
 
-fn acceptor(p: &Pki, alpn_http: bool) -> tokio_rustls::TlsAcceptor {
+/// `alpn` is what the server accepts; a client offering anything else (and
+/// offering some) is refused with a `no_application_protocol` alert.
+fn acceptor(p: &Pki, alpn: &[&[u8]]) -> tokio_rustls::TlsAcceptor {
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -83,9 +85,7 @@ fn acceptor(p: &Pki, alpn_http: bool) -> tokio_rustls::TlsAcceptor {
         PrivateKeyDer::Pkcs8(p.key.clone_key()),
     )
     .unwrap();
-    if alpn_http {
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-    }
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
 }
 
@@ -266,6 +266,14 @@ async fn hook_handle(
             tokio::time::sleep(Duration::from_secs(5)).await;
             Response::new(Full::new(Bytes::new()))
         }
+        "/four" => Response::builder()
+            .status(404)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+        "/five" => Response::builder()
+            .status(503)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         _ => Response::new(Full::new(Bytes::from_static(b"ok"))),
     };
     Ok(resp)
@@ -274,7 +282,7 @@ async fn hook_handle(
 async fn hook_server(p: &Pki) -> (u16, Arc<Hook>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let acc = acceptor(p, true);
+    let acc = acceptor(p, &[b"http/1.1"]);
     let hook = Arc::new(Hook::default());
     let h2 = hook.clone();
     tokio::spawn(async move {
@@ -384,6 +392,71 @@ async fn webhook_redirect_not_followed() {
             .all(|(p, _, _)| p == "/redirect"),
         "a redirect was followed"
     );
+    // Permanent: no second attempt.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(hook.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn permanent_failures_are_not_retried_server_errors_are() {
+    let p = pki();
+    let (port, hook) = hook_server(&p).await;
+    let w = world(
+        |_| {
+            format!(
+                "[targets.four]\ntype = \"webhook\"\nurl = \"https://{HOOK_HOST}:{port}/four\"\n\
+                 [targets.five]\ntype = \"webhook\"\nurl = \"https://{HOOK_HOST}:{port}/five\"\n"
+            )
+        },
+        p,
+    );
+    let n = Notifier::new();
+    n.start(Arc::downgrade(&w.env));
+    n.send(ev(Event::ApprovalCreated, 1, "x"));
+    let failed = w.wait(2, |r| result_is(r, "failed")).await;
+    assert_eq!(failed.len(), 2, "{:?}", w.records());
+    let count = |path: &str| {
+        hook.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| p == path)
+            .count()
+    };
+    assert_eq!(count("/four"), 1, "a 4xx was retried");
+    assert_eq!(count("/five"), 2, "a 5xx gets one retry");
+}
+
+#[tokio::test]
+async fn dead_target_does_not_stall_the_others() {
+    let p = pki();
+    let (port, hook) = hook_server(&p).await;
+    let w = world(
+        |_| {
+            format!(
+                "[targets.a]\ntype = \"webhook\"\nurl = \"https://{HOOK_HOST}:{port}/slow\"\n\
+                 [targets.b]\ntype = \"webhook\"\nurl = \"https://{HOOK_HOST}:{port}/b\"\n"
+            )
+        },
+        p,
+    );
+    let n = Notifier::new();
+    n.start(Arc::downgrade(&w.env));
+    let t = Instant::now();
+    n.send(ev(Event::ApprovalCreated, 1, "first"));
+    n.send(ev(Event::ApprovalCreated, 2, "second"));
+    let sent = w
+        .wait(2, |r| result_is(r, "sent") && r["target"] == "b")
+        .await;
+    assert_eq!(sent.len(), 2, "{:?}", w.records());
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "b waited {:?}",
+        t.elapsed()
+    );
+    // `a` is still stuck on its first event: nothing of it has finished.
+    assert!(w.records().iter().all(|r| r["target"] != "a"));
+    let _ = hook;
 }
 
 #[tokio::test]
@@ -479,6 +552,8 @@ async fn rate_limit_per_kind_except_approval_created() {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Implicit,
+    /// Implicit TLS, and AUTH is answered 535 with text that echoes the login.
+    BadAuth,
     StartTls,
     Plain,
 }
@@ -510,7 +585,7 @@ async fn smtp_session(
     m: Arc<Mail>,
 ) {
     let mut tls = false;
-    let mut s: Stream = if mode == Mode::Implicit {
+    let mut s: Stream = if matches!(mode, Mode::Implicit | Mode::BadAuth) {
         let Ok(t) = acc.accept(tcp).await else {
             return;
         };
@@ -543,6 +618,12 @@ async fn smtp_session(
             };
             tls = true;
             s = boxed(t);
+        } else if up.starts_with("AUTH PLAIN") && mode == Mode::BadAuth {
+            put(
+                &mut s,
+                &format!("535 5.7.8 rejected mailer {SMTP_PASS} {line}\r\n"),
+            )
+            .await;
         } else if up.starts_with("AUTH PLAIN") {
             put(&mut s, "235 authenticated\r\n").await;
         } else if up.starts_with("MAIL FROM") || up.starts_with("RCPT TO") {
@@ -574,7 +655,7 @@ async fn smtp_session(
 async fn smtp_server(p: &Pki, mode: Mode) -> (u16, Arc<Mail>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let acc = acceptor(p, false);
+    let acc = acceptor(p, &[b"smtp"]);
     let mail = Arc::new(Mail::default());
     let m2 = mail.clone();
     tokio::spawn(async move {
@@ -689,6 +770,26 @@ async fn smtp_plaintext_refused() {
     assert!(mail.data.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn smtp_auth_refusal_text_is_not_recorded() {
+    let p = pki();
+    let (port, mail) = smtp_server(&p, Mode::BadAuth).await;
+    let w = world(|_| smtp_cfg(port, false), p);
+    let n = Notifier::new();
+    n.start(Arc::downgrade(&w.env));
+    n.send(ev(Event::ApprovalCreated, 3, "x"));
+    let failed = w.wait(1, |r| result_is(r, "failed")).await;
+    assert_eq!(failed.len(), 1, "{:?}", w.records());
+    let reason = failed[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("authentication refused"), "{reason}");
+    let all = serde_json::to_string(&w.records()).unwrap();
+    assert!(
+        !all.contains(SMTP_PASS) && !all.contains("AUTH PLAIN") && !all.contains("rejected"),
+        "{all}"
+    );
+    assert!(mail.data.lock().unwrap().is_empty());
+}
+
 // -------------------------------------------------------------- command
 
 fn scratch() -> tempfile::TempDir {
@@ -764,4 +865,72 @@ async fn user_owned_command_refused() {
         "{failed:?}"
     );
     assert!(!std::path::Path::new(&format!("{}.out", sh.display())).exists());
+}
+
+fn runs(sh: &std::path::Path) -> usize {
+    std::fs::read_to_string(format!("{}.runs", sh.display()))
+        .map(|t| t.lines().count())
+        .unwrap_or(0)
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn command_timeout_kills_its_group_and_is_not_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = scratch();
+    let sh = d.path().join("hang.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh\necho x >> \"$0.runs\"\n/bin/sleep 60 &\necho $! > \"$0.pid\"\nwait\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let w = command_world(&sh);
+    let uid = rustix::process::getuid().as_raw();
+    let n = Notifier::with_trusted_owner_and_timeout(uid, Duration::from_millis(500));
+    n.start(Arc::downgrade(&w.env));
+    n.send(ev(Event::Lockdown, 9, "x"));
+    let failed = w.wait(1, |r| result_is(r, "failed")).await;
+    assert_eq!(failed.len(), 1, "{:?}", w.records());
+    assert!(failed[0]["reason"].as_str().unwrap().contains("timed out"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(runs(&sh), 1, "a timeout was retried");
+    // The program's child (its group) is gone, or at most a zombie.
+    let pid: u32 = std::fs::read_to_string(format!("{}.pid", sh.display()))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|t| t.rsplit(") ").next().and_then(|r| r.chars().next()));
+        if state.is_none() || state == Some('Z') {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "the grandchild {pid} is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn command_nonzero_exit_is_not_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = scratch();
+    let sh = d.path().join("fail.sh");
+    std::fs::write(&sh, "#!/bin/sh\necho x >> \"$0.runs\"\nexit 3\n").unwrap();
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let w = command_world(&sh);
+    let n = Notifier::with_trusted_owner(rustix::process::getuid().as_raw());
+    n.start(Arc::downgrade(&w.env));
+    n.send(ev(Event::Lockdown, 9, "x"));
+    let failed = w.wait(1, |r| result_is(r, "failed")).await;
+    assert_eq!(failed.len(), 1, "{:?}", w.records());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(runs(&sh), 1);
 }

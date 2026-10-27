@@ -273,7 +273,9 @@ pub struct WebhookCfg {
 }
 
 /// `secret` names a vault secret of kind `basic` (`AUTH PLAIN`).
-/// `starttls = false` means implicit TLS (port 465).
+/// `starttls = false` means implicit TLS (port 465). When absent it follows
+/// the port: implicit TLS on 465, STARTTLS on anything else (587, 25).
+/// `starttls = false` on 587 or 25 is refused at load.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SmtpCfg {
@@ -282,8 +284,24 @@ pub struct SmtpCfg {
     pub from: String,
     pub to: Vec<String>,
     pub secret: String,
-    #[serde(default)]
-    pub starttls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starttls: Option<bool>,
+}
+
+impl SmtpCfg {
+    /// STARTTLS (true) or implicit TLS (false), after the port default.
+    pub fn starttls(&self) -> bool {
+        self.starttls.unwrap_or(self.port != 465)
+    }
+}
+
+/// A mail address the notifier will put in an SMTP command: 1 to 254
+/// printable ASCII characters, none of `,;"<>` and no space.
+pub fn valid_address(a: &str) -> bool {
+    !a.is_empty()
+        && a.len() <= 254
+        && a.bytes()
+            .all(|b| b.is_ascii_graphic() && !b",;\"<>".contains(&b))
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -314,9 +332,13 @@ impl NotifyCfg {
                     if s.to.is_empty() {
                         return bad("to needs at least one address");
                     }
-                    let clean = |a: &String| !a.is_empty() && !a.contains(['\r', '\n', '<', '>']);
-                    if !clean(&s.from) || !s.to.iter().all(clean) {
-                        return bad("addresses must not hold line breaks or angle brackets");
+                    if !valid_address(&s.from) || !s.to.iter().all(|a| valid_address(a)) {
+                        return bad(
+                            "addresses must be printable ASCII without space or any of , ; \" < >",
+                        );
+                    }
+                    if s.starttls == Some(false) && matches!(s.port, 587 | 25) {
+                        return bad("starttls = false is refused on port 587 and 25");
                     }
                 }
                 TargetCfg::Command(c) => {
@@ -398,6 +420,37 @@ mod tests {
             "type = \"smtp\"\nhost = \"m.test\"\nport = 465\nfrom = \"a@b\"\nsecret = \"s\"\n";
         assert!(v(&format!("{smtp}to = [\"c@d\"]\n")).is_ok());
         assert!(v(&format!("{smtp}to = []\n")).is_err());
+        for bad in [
+            "a b@c.test",
+            "a,b@c.test",
+            "a;b@c.test",
+            "\\\"a\\\"@c.test",
+            "<a@c.test>",
+            "\\u00e9@c.test",
+            "a\\n@c.test",
+            "a\\u0001@c.test",
+        ] {
+            assert!(v(&format!("{smtp}to = [\"{bad}\"]\n")).is_err(), "{bad}");
+        }
+        // starttls follows the port; false is refused on 587 and 25.
+        let on = |port: u16, extra: &str| {
+            format!("type = \"smtp\"\nhost = \"m.test\"\nport = {port}\nfrom = \"a@b\"\nto = [\"c@d\"]\nsecret = \"s\"\n{extra}")
+        };
+        assert!(v(&on(587, "starttls = false\n")).is_err());
+        assert!(v(&on(25, "starttls = false\n")).is_err());
+        assert!(v(&on(587, "")).is_ok() && v(&on(465, "starttls = false\n")).is_ok());
+        let st = |port, extra: &str| {
+            let c = toml::from_str::<SystemConfig>(&format!(
+                "version = 2\n[notify.targets.a]\n{}",
+                on(port, extra)
+            ))
+            .unwrap();
+            match &c.notify.targets["a"] {
+                TargetCfg::Smtp(s) => s.starttls(),
+                _ => unreachable!(),
+            }
+        };
+        assert!(st(587, "") && st(25, "") && !st(465, ""));
     }
 
     #[test]
