@@ -296,8 +296,8 @@ pub fn run(
         }
         let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
-        // Daemon restarts and forwarding outages belong to the host, so
-        // --project/--agent/--blocked do not hide them.
+        // Connector, approval, error_denied, restart and outage sections
+        // honour --since only; --project/--agent/--blocked do not hide them.
         let host_filter = Filter {
             since: since_time,
             project: None,
@@ -309,7 +309,7 @@ pub fn run(
             .iter()
             .filter(|r| host_filter.matches(r))
             .collect();
-        model.set_host_events(&host);
+        model.set_host_events(&host, now, project.is_some() || agent.is_some() || blocked);
         model.chain = report::chain_line(&saiife_audit::verify(&dir));
         model.last_checkpoint = report::last_checkpoint(&all.records);
         if all.skipped_lines > 0 {

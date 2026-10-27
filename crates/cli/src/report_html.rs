@@ -236,6 +236,14 @@ fn or_para(empty: bool, msg: &str, t: impl FnOnce() -> String) -> String {
     }
 }
 
+fn with_note(r: &Report, body: String) -> String {
+    if r.sections_not_narrowed {
+        format!("{body}<p class=\"note\">not narrowed by --agent/--project/--blocked</p>\n")
+    } else {
+        body
+    }
+}
+
 fn connector_section(r: &Report) -> String {
     or_para(
         r.connectors.is_empty(),
@@ -248,6 +256,7 @@ fn connector_section(r: &Report) -> String {
                     "Denied",
                     "Limits hit",
                     "Approvals",
+                    "Sent after approval",
                     "Source",
                 ],
                 r.connectors
@@ -259,6 +268,7 @@ fn connector_section(r: &Report) -> String {
                             cell(None, &x.denies.to_string()),
                             cell(None, &x.limits_hit.to_string()),
                             cell(None, &x.approvals.to_string()),
+                            cell(None, &x.sent_after_approval.to_string()),
                             cell(None, SOURCE_SAIIFE),
                         ]
                     })
@@ -311,6 +321,7 @@ fn approvals_section(r: &Report) -> String {
                     "Decider",
                     "Decision",
                     "Time to decision",
+                    "Outcome",
                     "Type",
                     "Summary",
                     "Source",
@@ -325,6 +336,7 @@ fn approvals_section(r: &Report) -> String {
                             cell(None, &x.decider),
                             cell(None, &x.decision),
                             cell(None, &x.time_to_decision),
+                            cell(None, &x.outcome),
                             cell(None, &x.kind),
                             cell(Some("input"), &x.summary),
                             cell(None, x.source),
@@ -402,14 +414,7 @@ fn outages_section(r: &Report) -> String {
                         vec![
                             cell(None, &x.target),
                             cell(None, &x.from),
-                            cell(
-                                if x.to == "still failing" {
-                                    Some("bad")
-                                } else {
-                                    None
-                                },
-                                &x.to,
-                            ),
+                            cell(if x.to == "ongoing" { Some("bad") } else { None }, &x.to),
                             cell(None, &x.duration),
                             cell(None, x.source),
                         ]
@@ -550,17 +555,17 @@ pub fn render(r: &Report) -> String {
     out.push_str(&section(
         "Connector activity",
         "Requests to brokered services, per service. Seen by saiife: the agent does not report these.",
-        &connector_section(r),
+        &with_note(r, connector_section(r)),
     ));
     out.push_str(&section(
         "Approvals",
         "Requests that waited for a person, with who decided and how long it took.",
-        &approvals_section(r),
+        &with_note(r, approvals_section(r)),
     ));
     out.push_str(&section(
         "Blocked by an error (error_denied)",
         "Actions saiife refused because something failed while checking them.",
-        &error_denied_section(r),
+        &with_note(r, error_denied_section(r)),
     ));
     out.push_str(&section(
         "Daemon restarts",
@@ -652,6 +657,7 @@ mod tests {
             restarts: vec![],
             outages: vec![],
             forward_drops: vec![],
+            sections_not_narrowed: false,
         }
     }
 
