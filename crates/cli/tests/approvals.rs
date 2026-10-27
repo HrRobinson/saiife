@@ -197,6 +197,7 @@ capability = "invoices:write"
 kind = "write"
 method = "POST"
 path = "/invoices"
+query = ["ref"]
 body = "json"
 
 [services.pay]
@@ -250,6 +251,12 @@ fn world() -> World {
 }
 
 fn world_with(erp_extra: &str) -> World {
+    world_capped(erp_extra, None)
+}
+
+/// [`world_with`], the approval store keeping results of at most
+/// `result_cap` sealed bytes.
+fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
     let m = mock();
     let tmp = common::tmp::short_tempdir();
     let t = tmp.path();
@@ -345,6 +352,10 @@ fn world_with(erp_extra: &str) -> World {
                 || 1_800_000_000,
             ))),
             approvals: saiife_daemon::approvals::Store::open(&dir_in(&t.join("state")))
+                .map(|s| match result_cap {
+                    Some(c) => s.with_result_cap(c),
+                    None => s,
+                })
                 .map_err(|e| e.to_string()),
             lockdown: saiife_daemon::lockdown::Store::memory(),
         }))
@@ -832,6 +843,8 @@ fn records_linked_by_approval_id() {
     assert_eq!(conn[1]["approval"], id);
     assert_eq!(conn[1]["via"], "approval");
     assert_eq!(conn[1]["approved_by"], BOSS);
+    assert_eq!(conn[1]["asked_via"], "cli");
+    assert_eq!(w.wait_record(id, "sent")["asked_via"], "cli");
     assert_eq!(conn[1]["status"], 201);
     assert_eq!(conn[1]["uid"], own_uid());
     // No record holds the vault value.
@@ -1018,4 +1031,157 @@ fn lockdown_at_send_send_failed() {
     w.wait_state(id, State::SendFailed);
     assert_eq!(w.wait_record(id, "send_failed")["rule"], "lockdown");
     assert!(w.m.hits().is_empty());
+}
+
+/// `api.call` as the requester (this process's uid) at the ops level.
+fn ops_ask(w: &World, body: &str) -> Value {
+    use base64::Engine as _;
+    w.op(
+        own_uid(),
+        "api.call",
+        json!({"service": "erp", "operation": "invoices.create",
+               "body_b64": base64::engine::general_purpose::STANDARD.encode(body)}),
+    )
+}
+
+/// A sealed result over the store's cap is not kept: a small
+/// `result_too_large` note is, the request stays `sent`, and the `sent`
+/// record says so. A result under the cap is kept whole.
+#[test]
+fn result_too_large_to_keep_is_a_note() {
+    let cap = 16 * 1024;
+    let w = world_capped("", Some(cap));
+    // About 4 KiB echoed back: kept.
+    let small = format!(r#"{{"note": "{}"}}"#, "s".repeat(4000));
+    let a = w.ask(&small);
+    assert_eq!(w.decide(BOSS, a, "approve")["ok"], true);
+    w.wait_state(a, State::Sent);
+    let o = w.api(&["result", &a.to_string()]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // Near the cap and over it once sealed (base64 in the answer).
+    let big = format!(r#"{{"note": "{}"}}"#, "b".repeat(cap - 100));
+    let b = w.ask(&big);
+    assert_eq!(w.decide(BOSS, b, "approve")["ok"], true);
+    w.wait_state(b, State::Sent);
+    assert_eq!(w.m.hits().len(), 2);
+    let rec = w.wait_record(b, "sent");
+    assert_eq!(rec["result_too_large"], true, "{rec}");
+    assert_eq!(rec["status"], 201);
+    let res = w.op(own_uid(), "api.result", json!({"request": b}));
+    assert_eq!(res["state"], "sent", "{res}");
+    assert_eq!(res["result"]["error"], "result_too_large", "{res}");
+    assert_eq!(res["result"]["status"], 201, "{res}");
+    assert!(res["result"]["resp_bytes"].as_u64().unwrap() > (cap - 100) as u64);
+    let o = w.api(&["result", &b.to_string()]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("too large to keep"), "{}", stderr(&o));
+    // The result file is the raw sealed bytes, not base64 in JSON.
+    let raw = fs::read(dir_in(&w.path().join("state")).join(format!("{a}.result"))).unwrap();
+    assert!(raw.starts_with(b"SAIIFER2"));
+}
+
+/// `approval.show` has the whole masked body (up to 1 MiB): a large key
+/// that sorts first hides nothing. A body shown cut must be approved with
+/// `ack_truncated`.
+#[test]
+fn show_has_the_whole_body_and_a_cut_one_needs_an_ack() {
+    let w = world();
+    let body = format!(
+        r#"{{"aaa": "{}", "zz_to": "mallory", "zz_amount": 9999}}"#,
+        "p".repeat(100_000)
+    );
+    let id = w.ask(&body);
+    let a = w.op(BOSS, "approval.show", json!({"request": id}));
+    let shown = a["item"]["body_display"].as_str().unwrap();
+    assert_eq!(shown, canonical(&body));
+    assert!(shown.contains(r#""zz_to":"mallory""#));
+    assert_eq!(a["item"]["body_truncated"], false);
+    let l = w.op(BOSS, "approval.list", json!({}));
+    assert!(
+        l["items"][0]["body_display"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 201
+    );
+
+    // A request whose body was shown cut (over 1 MiB masked).
+    let file = dir_in(&w.path().join("state")).join(format!("{id}.json"));
+    let mut v: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    v["body_truncated"] = json!(true);
+    fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    let a = w.decide(BOSS, id, "approve");
+    assert_eq!(a["rule"], "truncated_not_acknowledged", "{a}");
+    assert_eq!(
+        w.wait_record(id, "refused")["rule"],
+        "truncated_not_acknowledged"
+    );
+    assert_eq!(w.state(id), Some(State::Pending));
+    let a = w.op(
+        BOSS,
+        "approval.decide",
+        json!({"request": id, "action": "approve", "ack_truncated": true}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    w.wait_state(id, State::Sent);
+}
+
+/// The `created` record could not be written: the request is expired at
+/// once, so nobody can approve it.
+#[test]
+fn unrecorded_ask_is_expired_at_once() {
+    let w = world();
+    // No signing key here: the stop says the checkpoint failed, and stops.
+    let _ = w.rt.block_on(w.ctx.writer.stop(None));
+    let a = ops_ask(&w, BODY_A);
+    assert_eq!(a["ok"], false, "{a}");
+    let all = w.ctx.approvals.as_ref().unwrap().list(Default::default());
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].state, State::Expired);
+    let d = w.decide(BOSS, all[0].id, "approve");
+    assert_eq!(d["ok"], false, "{d}");
+    assert!(w.m.hits().is_empty());
+}
+
+/// At most 20 pending requests per uid; the next is denied
+/// (`approvals_full`) and recorded.
+#[test]
+fn at_most_20_pending_per_uid() {
+    let w = world();
+    for _ in 0..20 {
+        assert!(ops_ask(&w, BODY_A)["pending"].is_u64());
+    }
+    let a = ops_ask(&w, BODY_A);
+    assert_eq!(a["rule"], "approvals_full", "{a}");
+    let conn: Vec<Value> = w
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "connector")
+        .collect();
+    assert_eq!(conn.last().unwrap()["rule"], "approvals_full");
+    // One decided frees a place.
+    assert_eq!(w.decide(BOSS, 1, "reject")["ok"], true);
+    assert!(ops_ask(&w, BODY_A)["pending"].is_u64());
+}
+
+/// An approved `/v1/proxy` request is sent with the method, path and
+/// query of the original.
+#[test]
+fn approved_proxy_request_sends_the_same_method_path_and_query() {
+    let w = world();
+    let raw = w.http(&format!(
+        "POST /v1/proxy/erp/invoices?ref=abc-7 HTTP/1.1\r\nHost: saiife\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY_A}",
+        BODY_A.len()
+    ));
+    assert_eq!(http_status(&raw), 202, "{raw}");
+    let id = http_body(&raw)["pending"].as_u64().unwrap();
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::Sent);
+    let hits = w.m.hits();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "POST /api/invoices?ref=abc-7");
+    assert_eq!(hits[0].1, canonical(BODY_A));
+    let rec = w.wait_record(id, "sent");
+    assert_eq!(rec["asked_via"], "http");
 }

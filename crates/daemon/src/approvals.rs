@@ -119,6 +119,10 @@ pub struct Request {
     pub body_display: Option<String>,
     #[serde(default)]
     pub body_sha256: Option<String>,
+    /// The masked body was over 1 MiB and `body_display` is cut: approving
+    /// needs `ack_truncated`.
+    #[serde(default)]
+    pub body_truncated: bool,
     #[serde(default)]
     pub amount: Option<Amount>,
     #[serde(default)]
@@ -161,11 +165,24 @@ pub struct Amount {
     pub currency: String,
 }
 
+/// [`Store::create_capped`]: the requester has too many pending requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingFull;
+
+impl std::fmt::Display for PendingFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("too many pending approval requests for this uid")
+    }
+}
+
+impl std::error::Error for PendingFull {}
+
 /// What a connector request will send, as the approver sees it (masked).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SendDisplay {
     pub body_display: Option<String>,
     pub body_sha256: Option<String>,
+    pub body_truncated: bool,
     pub amount: Option<Amount>,
     pub headers: Vec<(String, String)>,
 }
@@ -348,10 +365,15 @@ pub fn record_for(
     base
 }
 
-#[derive(Serialize, Deserialize)]
+/// The magic of a result file: `SAIIFER2 || stored (24-byte timestamp) ||
+/// sealed bytes`, raw (no base64).
+const RESULT_MAGIC: &[u8; 8] = b"SAIIFER2";
+/// The width of [`ts`].
+const TS_LEN: usize = 24;
+
 struct ResultFile {
     stored: String,
-    sealed: String,
+    sealed: Vec<u8>,
 }
 
 /// Where an atomic write failed: before the rename the old file is
@@ -379,6 +401,8 @@ pub struct Store {
     dir_sync: DirSync,
     /// Files the sweep warned about, so it warns once per start.
     warned: Mutex<HashSet<String>>,
+    /// The largest sealed result kept, in bytes (smaller in tests).
+    result_cap: usize,
 }
 
 impl std::fmt::Debug for Store {
@@ -432,7 +456,19 @@ impl Store {
             lock: Mutex::new(()),
             dir_sync: Box::new(real_dir_sync),
             warned: Mutex::new(HashSet::new()),
+            result_cap: MAX_FILE_BYTES as usize - RESULT_MAGIC.len() - TS_LEN,
         })
+    }
+
+    /// This store with a smaller result cap (a seam for tests).
+    pub fn with_result_cap(mut self, cap: usize) -> Store {
+        self.result_cap = cap.min(self.result_cap);
+        self
+    }
+
+    /// The largest sealed result [`Store::put_result`] keeps, in bytes.
+    pub fn result_cap(&self) -> usize {
+        self.result_cap
     }
 
     fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -548,7 +584,35 @@ impl Store {
         ttl: Duration,
         now: SystemTime,
     ) -> io::Result<Request> {
+        self.create_capped(req, seal, ttl, now, None)
+    }
+
+    /// [`Store::create`], refused with a [`PendingFull`] error when the
+    /// requester already has `max_pending` pending requests (counted under
+    /// the store's lock, so concurrent creates cannot pass the cap).
+    pub fn create_capped(
+        &self,
+        req: NewRequest,
+        seal: impl FnOnce(u64) -> Result<Option<Vec<u8>>, VaultError>,
+        ttl: Duration,
+        now: SystemTime,
+        max_pending: Option<usize>,
+    ) -> io::Result<Request> {
         let _g = self.guard();
+        if let Some(max) = max_pending {
+            let now_s = ts(now);
+            let pending = self
+                .list(Filter {
+                    uid: Some(req.uid),
+                    states: vec![State::Pending],
+                })
+                .iter()
+                .filter(|r| r.expires > now_s)
+                .count();
+            if pending >= max {
+                return Err(io::Error::other(PendingFull));
+            }
+        }
         let id = self.next_id()?;
         let sealed = seal(id).map_err(io::Error::other)?;
         let next = id
@@ -574,6 +638,7 @@ impl Store {
             grant_key: req.grant_key,
             body_display: req.send.body_display,
             body_sha256: req.send.body_sha256,
+            body_truncated: req.send.body_truncated,
             amount: req.send.amount,
             headers: req.send.headers,
             request_sealed: sealed.map(|s| b64().encode(s)),
@@ -661,15 +726,27 @@ impl Store {
 
     /// Keep the sealed (masked) result of `id` as `<id>.result` and point
     /// the request's `result_ref` at it.
+    /// A result over [`Store::result_cap`] is refused (`InvalidInput`):
+    /// the caller stores a small one instead.
     pub fn put_result(&self, id: u64, sealed: Vec<u8>, now: SystemTime) -> io::Result<()> {
+        if sealed.len() > self.result_cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the result ({} bytes) is over the cap of {} bytes",
+                    sealed.len(),
+                    self.result_cap
+                ),
+            ));
+        }
         let _g = self.guard();
         let mut r = self.read(id)?;
         let name = format!("{id}.result");
-        let file = ResultFile {
-            stored: ts(now),
-            sealed: b64().encode(sealed),
-        };
-        let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
+        let stored = ts(now);
+        let mut bytes = Vec::with_capacity(RESULT_MAGIC.len() + TS_LEN + sealed.len());
+        bytes.extend_from_slice(RESULT_MAGIC);
+        bytes.extend_from_slice(stored.as_bytes());
+        bytes.extend_from_slice(&sealed);
         self.write_atomic(&name, &bytes)
             .map_err(WriteErr::into_io)?;
         r.result_ref = Some(name);
@@ -678,12 +755,23 @@ impl Store {
 
     fn read_result(&self, id: u64) -> io::Result<ResultFile> {
         let bytes = read_capped(&self.result_path(id))?;
-        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "not a result file");
+        let rest = bytes
+            .strip_prefix(RESULT_MAGIC.as_slice())
+            .ok_or_else(bad)?;
+        if rest.len() < TS_LEN {
+            return Err(bad());
+        }
+        let (stored, sealed) = rest.split_at(TS_LEN);
+        Ok(ResultFile {
+            stored: std::str::from_utf8(stored).map_err(|_| bad())?.to_string(),
+            sealed: sealed.to_vec(),
+        })
     }
 
     /// The sealed result of `id`, while it is kept.
     pub fn get_result(&self, id: u64) -> Option<Vec<u8>> {
-        b64().decode(self.read_result(id).ok()?.sealed).ok()
+        Some(self.read_result(id).ok()?.sealed)
     }
 
     /// One stderr line per file per start.
@@ -1295,6 +1383,43 @@ mod tests {
             e.store.create(new_req(1), no_seal, HOUR, t0()).unwrap().id,
             r.id + 1
         );
+    }
+
+    #[test]
+    fn pending_cap_counts_only_live_pending_of_the_uid() {
+        let e = env();
+        let s = &e.store;
+        let cap = |uid, at| s.create_capped(new_req(uid), no_seal, MIN, at, Some(2));
+        cap(1, t0()).unwrap();
+        cap(1, t0()).unwrap();
+        let err = cap(1, t0()).unwrap_err();
+        assert!(err
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<PendingFull>()
+            .is_some());
+        // Another uid has its own count.
+        cap(2, t0()).unwrap();
+        // Decided or expired ones do not count.
+        decide(s, 1, State::Pending, State::Rejected).unwrap();
+        cap(1, t0()).unwrap();
+        assert!(cap(1, t0()).is_err());
+        cap(1, t0() + 2 * MIN).unwrap();
+    }
+
+    #[test]
+    fn results_are_raw_and_capped() {
+        let e = env();
+        let s = e.store.with_result_cap(100);
+        let r = s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
+        let err = s.put_result(r.id, vec![9; 101], t0()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(s.get_result(r.id), None);
+        s.put_result(r.id, vec![9; 100], t0()).unwrap();
+        assert_eq!(s.get_result(r.id), Some(vec![9; 100]));
+        let raw = std::fs::read(dir_in(e.t.path()).join("1.result")).unwrap();
+        assert_eq!(raw.len(), 8 + 24 + 100);
+        assert!(raw.starts_with(RESULT_MAGIC));
     }
 
     #[test]

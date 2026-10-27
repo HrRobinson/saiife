@@ -397,6 +397,14 @@ mod linux {
                 Stop(1, format!("upstream failed ({why})"))
             }
             "bad_request" | "forbidden" => Stop(2, s("message").to_string()),
+            // Sent, but the result was too large to keep for later.
+            "result_too_large" => Stop(
+                1,
+                format!(
+                    "sent (upstream status {}), but the result was too large to keep",
+                    ans.get("status").map(|v| v.to_string()).unwrap_or_default()
+                ),
+            ),
             _ => Stop(5, s("message").to_string()),
         }
     }

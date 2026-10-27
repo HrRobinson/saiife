@@ -371,6 +371,19 @@ mod tests {
         // Root-owned stand-ins that are never executed: available() only
         // inspects the paths.
         let root_file = PathBuf::from("/etc/passwd");
+        // In a user namespace (scripts/test-offline.sh) root's files show
+        // the overflow uid: there is no root-owned stand-in to test with.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = fs::metadata(&root_file).map(|m| m.uid()).ok();
+            if owner != Some(0) {
+                eprintln!(
+                    "skipped the root-owned half: {} is owned by {owner:?} here, not uid 0 (a user namespace?)",
+                    root_file.display()
+                );
+                return;
+            }
+        }
         let polkitd = vec![d.path().join("no-polkitd"), root_file.clone()];
         assert!(PkCheck::with_paths(&root_file, &root_file)
             .with_polkitd(polkitd.clone())

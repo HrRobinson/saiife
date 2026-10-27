@@ -549,9 +549,11 @@ async fn pending_display_shows_what_will_be_sent_masked() {
     let (m, up) = mock().await;
     let env = FakeEnv::ok();
     let mut c = call("refunds.create", &[("order_id", "7")]);
+    // The padding attack: a large key that sorts first in the canonical
+    // JSON must not push the fields that matter out of the display.
     let raw = format!(
-        r#"{{"refund":{{"currency":"EUR","note":"{TOKEN}","transactions":[{{"amount":"5.00"}}]}},"zpad":"{}"}}"#,
-        "y".repeat(5000)
+        r#"{{"refund":{{"currency":"EUR","note":"{TOKEN}","transactions":[{{"amount":"5.00"}}]}},"aaa":"{}"}}"#,
+        "y".repeat(200_000)
     );
     c.body = Some(Bytes::from(raw.clone()));
     c.headers = vec![("X-Trace".into(), format!("t-{TOKEN}"))];
@@ -571,8 +573,12 @@ async fn pending_display_shows_what_will_be_sent_masked() {
     let shown = p.body_display.unwrap();
     assert!(shown.contains(r#""note":"[MASKED]""#), "{shown}");
     assert!(!shown.contains(TOKEN));
-    assert!(shown.ends_with("bytes in all]"), "{shown}");
-    assert!(shown.len() < 4200);
+    // The whole body, in the canonical key order (whichever serde_json
+    // gives in this build): the padding and every field after it.
+    assert!(shown.contains(r#""aaa":"yyy"#));
+    assert!(shown.contains(r#""transactions":[{"amount":"5.00"}]"#));
+    assert!(!p.body_truncated);
+    assert!(shown.len() > 200_000);
     assert_eq!(
         p.headers,
         vec![("X-Trace".to_string(), "t-[MASKED]".to_string())]

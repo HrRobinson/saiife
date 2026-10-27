@@ -153,9 +153,12 @@ pub struct PendingCall {
     pub params: Masked<BTreeMap<String, String>>,
     /// Masked.
     pub project: String,
-    /// The body that will be sent (the canonical JSON), masked and cut at
-    /// [`BODY_DISPLAY_MAX`] bytes with a marker: what the approver reads.
+    /// The body that will be sent (the canonical JSON), masked, whole up
+    /// to [`BODY_DISPLAY_MAX`] bytes (then cut with a marker): what the
+    /// approver reads.
     pub body_display: Option<String>,
+    /// `body_display` was cut: an approval must acknowledge it.
+    pub body_truncated: bool,
     /// SHA-256 (hex) of the exact body bytes that will be sent.
     pub body_sha256: Option<String>,
     /// `(minor units, currency)` of an operation that moves money.
@@ -164,20 +167,24 @@ pub struct PendingCall {
     pub headers: Vec<(String, String)>,
 }
 
-/// The longest masked body an approval request shows, in bytes.
-pub const BODY_DISPLAY_MAX: usize = 4096;
+/// The longest masked body an approval request shows, in bytes: the whole
+/// body below it, so no field can hide past a cut.
+pub const BODY_DISPLAY_MAX: usize = 1024 * 1024;
 
-/// `s` cut at [`BODY_DISPLAY_MAX`] bytes (on a char boundary), with a
-/// marker saying how long it was.
-pub fn cut_display(s: &str) -> String {
-    if s.len() <= BODY_DISPLAY_MAX {
-        return s.to_string();
+/// `s` whole, or cut at `max` bytes (on a char boundary) with a marker
+/// saying how long it was; `true` when cut.
+pub fn cut_display(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
     }
-    let mut end = BODY_DISPLAY_MAX;
+    let mut end = max;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated: {} bytes in all]", &s[..end], s.len())
+    (
+        format!("{}…[truncated: {} bytes in all]", &s[..end], s.len()),
+        true,
+    )
 }
 
 /// The future of [`Env::create_approval`].
@@ -731,6 +738,12 @@ async fn steps(
         ) {
             return Outcome::Limited { limit };
         }
+        let display = body.as_ref().map(|b| {
+            cut_display(
+                &masker.mask_text(&String::from_utf8_lossy(b)),
+                BODY_DISPLAY_MAX,
+            )
+        });
         let pending = PendingCall {
             stored: StoredCall {
                 uid: call.uid,
@@ -752,9 +765,8 @@ async fn steps(
             capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),
             params: masker.mask_params(&given),
             project: masker.mask_text(&call.project),
-            body_display: body
-                .as_ref()
-                .map(|b| cut_display(&masker.mask_text(&String::from_utf8_lossy(b)))),
+            body_display: display.as_ref().map(|d| d.0.clone()),
+            body_truncated: display.is_some_and(|d| d.1),
             body_sha256: body.as_ref().map(|b| hex(&Sha256::digest(b))),
             amount: tr.amount.clone(),
             headers: call
@@ -1165,6 +1177,15 @@ pub fn list_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_display_cuts_on_a_char_boundary_and_says_so() {
+        assert_eq!(cut_display("abc", 3), ("abc".to_string(), false));
+        let (s, cut) = cut_display("aé€", 2);
+        assert!(cut);
+        assert_eq!(s, "a…[truncated: 6 bytes in all]");
+        assert_eq!(BODY_DISPLAY_MAX, 1024 * 1024);
+    }
 
     #[test]
     fn call_debug_hides_values() {

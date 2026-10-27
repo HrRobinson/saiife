@@ -15,7 +15,7 @@
 
 use crate::api_ops::{answer, DaemonEnv, Groups};
 use crate::approvals::{
-    aad, result_aad, state_name, Amount, ApprovalType, Filter, NewRequest,
+    aad, result_aad, state_name, Amount, ApprovalType, Filter, NewRequest, PendingFull,
     Request as ApprovalRequest, SendDisplay, State, Store, StoreError,
 };
 use crate::approvers::{may_decide, Refusal};
@@ -37,6 +37,9 @@ use zeroize::Zeroizing;
 /// between the approval and the send. It is never sent again by itself
 /// (that could send a write twice).
 pub const INTERRUPTED: &str = "interrupted";
+/// At most this many pending requests per uid; more are denied
+/// (`approvals_full`), so an agent cannot flood its approvers.
+pub const MAX_PENDING_PER_UID: usize = 20;
 
 fn now() -> SystemTime {
     crate::import_backup::now()
@@ -124,6 +127,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         send: SendDisplay {
             body_display: p.body_display.clone(),
             body_sha256: p.body_sha256.clone(),
+            body_truncated: p.body_truncated,
             amount: p
                 .amount
                 .clone()
@@ -133,16 +137,23 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     };
     let created = on_store(ctx, move |c, s| {
         // Store lock, then the vault's (inside `seal`): the only order.
-        s.create(
+        s.create_capped(
             new,
             |id| c.vault.seal(&aad(id), &exact).map(Some),
             ttl,
             now(),
+            Some(MAX_PENDING_PER_UID),
         )
     })
     .await;
     let r = match created {
         Some(Ok(r)) => r,
+        Some(Err(e))
+            if e.get_ref()
+                .is_some_and(|x| x.downcast_ref::<PendingFull>().is_some()) =>
+        {
+            return Err("approvals_full".into());
+        }
         Some(Err(e)) => {
             let vault = e
                 .get_ref()
@@ -333,6 +344,35 @@ impl Reauth for NoStartTime<'_> {
     }
 }
 
+/// Refuse a decision on `r` by `by`: an `approval`/`refused` record with
+/// `rule`, and `forbidden` with the rule.
+async fn refuse(
+    ctx: &Arc<Ctx>,
+    r: &ApprovalRequest,
+    by: u32,
+    id: u64,
+    rule: &str,
+    why: &str,
+) -> Value {
+    let mut rec = decided_record(ctx, r, "refused", by);
+    rec.rule = Some(rule.into());
+    rec.reason = Some(why.into());
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!(
+            "saiife: warning: cannot record a refused approval of #{}: {e}",
+            r.id
+        );
+    }
+    let mut m = Map::new();
+    m.insert("rule".into(), rule.into());
+    err_with(
+        id,
+        ErrorCode::Forbidden,
+        &format!("refused ({rule}): {why}"),
+        m,
+    )
+}
+
 /// An `approval` record of `action` for `r`, decided by `by`.
 fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: u32) -> Record {
     let mut rec = ctx.approval_record(r, action);
@@ -381,6 +421,21 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         );
     };
 
+    // A body too large to show whole is approved only knowingly. Checked
+    // first: no re-authentication prompt for an approval refused anyway.
+    let ack = req.args.get("ack_truncated").and_then(Value::as_bool) == Some(true);
+    if approve && r.body_truncated && !ack {
+        return refuse(
+            ctx,
+            &r,
+            peer.uid,
+            id,
+            "truncated_not_acknowledged",
+            "the body is over 1 MiB and shown cut; approve with ack_truncated (--accept-truncated)",
+        )
+        .await;
+    }
+
     // Who may decide: the daemon's own name for the peer uid, never the
     // client's; the lookups and any re-authentication off the runtime.
     let refusal = match ctx.name_of(peer.uid).await {
@@ -414,20 +469,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
     };
     if let Some(why) = refusal {
-        let mut rec = decided_record(ctx, &r, "refused", peer.uid);
-        rec.rule = Some(why.rule().into());
-        rec.reason = Some(why.to_string());
-        if let Err(e) = ctx.writer.append(rec).await {
-            eprintln!("saiife: warning: cannot record a refused approval of #{rid}: {e}");
-        }
-        let mut m = Map::new();
-        m.insert("rule".into(), why.rule().into());
-        return err_with(
-            id,
-            ErrorCode::Forbidden,
-            &format!("refused ({}): {why}", why.rule()),
-            m,
-        );
+        return refuse(ctx, &r, peer.uid, id, why.rule(), &why.to_string()).await;
     }
 
     let to = if approve {
@@ -517,6 +559,9 @@ struct Detail {
     reason: Option<String>,
     limit: Option<String>,
     status: Option<u16>,
+    resp_bytes: Option<usize>,
+    /// How the request came in (`cli`, `http`).
+    asked_via: Option<String>,
 }
 
 fn rule_record(rule: &str, message: &str) -> Detail {
@@ -525,53 +570,118 @@ fn rule_record(rule: &str, message: &str) -> Detail {
         reason: Some(message.into()),
         limit: None,
         status: None,
+        resp_bytes: None,
+        asked_via: None,
     }
 }
 
-/// Store the sealed result (if any), move to `to`, write the record.
-async fn finish(ctx: &Arc<Ctx>, r: &ApprovalRequest, to: State, result: Option<Value>, d: Detail) {
-    let rid = r.id;
-    let stored = on_store(ctx, move |c, s| {
-        if let Some(v) = result {
-            let bytes = Zeroizing::new(serde_json::to_vec(&v).unwrap_or_default());
-            // Store first (its lock released), then the vault.
-            match c.vault.seal(&result_aad(rid), &bytes) {
-                Ok(sealed) => {
-                    if let Err(e) = s.put_result(rid, sealed, now()) {
-                        eprintln!("saiife: warning: cannot keep the result of #{rid}: {e}");
-                    }
-                }
-                Err(e) => eprintln!("saiife: warning: cannot seal the result of #{rid}: {e}"),
+/// Seal `v` as the result of `rid` and keep it. A sealed result over the
+/// store's cap is replaced by a small `result_too_large` one (`true`).
+fn keep_result(
+    c: &Ctx,
+    s: &Store,
+    rid: u64,
+    v: &Value,
+    status: Option<u16>,
+    resp_bytes: Option<usize>,
+) -> bool {
+    let seal = |v: &Value| {
+        let bytes = Zeroizing::new(serde_json::to_vec(v).unwrap_or_default());
+        c.vault.seal(&result_aad(rid), &bytes)
+    };
+    // Store calls hold the store's lock only inside; the vault's is taken
+    // and released in `seal`, never around a store call.
+    let mut too_large = false;
+    let sealed = match seal(v) {
+        Ok(sealed) if sealed.len() > s.result_cap() => {
+            too_large = true;
+            eprintln!(
+                "saiife: warning: the result of approval #{rid} ({} bytes sealed) is over the store's cap of {} bytes; keeping a note instead",
+                sealed.len(),
+                s.result_cap()
+            );
+            seal(&json!({"ok": false, "error": "result_too_large",
+                "message": "the result was too large to keep",
+                "status": status, "resp_bytes": resp_bytes}))
+        }
+        other => other,
+    };
+    match sealed {
+        Ok(sealed) => {
+            if let Err(e) = s.put_result(rid, sealed, now()) {
+                eprintln!("saiife: warning: cannot keep the result of #{rid}: {e}");
             }
         }
-        s.transition(rid, &[State::Approved], to, None, None, now())
+        Err(e) => eprintln!("saiife: warning: cannot seal the result of #{rid}: {e}"),
+    }
+    too_large
+}
+
+/// Store the sealed result (if any), move to `to`, and write the record
+/// of the state the store actually holds.
+async fn finish(ctx: &Arc<Ctx>, r: &ApprovalRequest, to: State, result: Option<Value>, d: Detail) {
+    let rid = r.id;
+    let (status, resp_bytes) = (d.status, d.resp_bytes);
+    let stored = on_store(ctx, move |c, s| {
+        let too_large = result
+            .as_ref()
+            .is_some_and(|v| keep_result(c, s, rid, v, status, resp_bytes));
+        let moved = s.transition(rid, &[State::Approved], to, None, None, now());
+        let now_held = match &moved {
+            Ok(r) => Some(r.clone()),
+            Err(_) => s.get(rid),
+        };
+        (moved.map(|_| ()), now_held, too_large)
     })
     .await;
-    let r = match stored {
-        Some(Ok(r)) => r,
-        other => {
-            eprintln!(
-                "saiife: warning: approval #{rid} could not be marked {}: {other:?}",
-                state_name(to)
-            );
-            r.clone()
-        }
+    let (moved, held, too_large) = match stored {
+        Some(x) => x,
+        None => (Err(StoreError::Unknown), None, false),
     };
-    let action = state_name(to);
+    if let Err(e) = &moved {
+        eprintln!(
+            "saiife: warning: approval #{rid} could not be marked {}: {e}",
+            state_name(to)
+        );
+    }
+    let r = held.unwrap_or_else(|| r.clone());
+    // The record says what the store holds: `sent` / `send_failed` once
+    // moved; otherwise the intended action, with the state still held.
+    let action = match r.state {
+        State::Sent | State::SendFailed => state_name(r.state),
+        _ => state_name(to),
+    };
     let mut rec = ctx.approval_record(&r, action);
     if let Some(by) = r.decided_by {
         rec.extra.insert("by_uid".into(), by.into());
     }
-    if to == State::SendFailed {
-        rec.decision = DecisionKind::Deny;
-    }
     rec.rule = d.rule;
     rec.reason = d.reason;
+    if r.state != to {
+        rec.extra
+            .insert("stored_state".into(), state_name(r.state).into());
+        rec.rule = Some("store_failed".into());
+        rec.reason = Some(format!(
+            "the request could not be marked {}; it is {}",
+            state_name(to),
+            state_name(r.state)
+        ));
+    }
+    if action == "send_failed" || r.state != to {
+        rec.decision = DecisionKind::Deny;
+    }
     if let Some(l) = d.limit {
         rec.extra.insert("limit".into(), l.into());
     }
     if let Some(s) = d.status {
         rec.extra.insert("status".into(), s.into());
+    }
+    if let Some(v) = d.asked_via {
+        rec.extra.insert("asked_via".into(), v.into());
+    }
+    if too_large {
+        rec.extra.insert("result_too_large".into(), true.into());
+        rec.extra.insert("resp_bytes".into(), json!(resp_bytes));
     }
     if let Err(e) = ctx.writer.append(rec).await {
         eprintln!("saiife: warning: cannot record approval #{rid} {action}: {e}");
@@ -647,12 +757,16 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     let up = ctx.upstream.as_ref().ok();
     let (call, outcome, trace) =
         pipeline::send_approved(&stored, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
+    let asked_via = stored.via.clone();
     drop(stored);
 
-    // The connector record of the send: `via = approval`, linked by id.
+    // The connector record of the send: `via = approval`, linked by id,
+    // with how the request first came in.
     let mut rec = pipeline::record(&call, &g.snap, &trace, &outcome, &r.agent, VERSION);
     rec.extra.insert("approval".into(), rid.into());
     rec.extra.insert("approved_by".into(), by.into());
+    rec.extra
+        .insert("asked_via".into(), asked_via.clone().into());
     let recorded = ctx.writer.append(rec).await;
 
     let detail = Detail {
@@ -670,6 +784,8 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
             _ => None,
         },
         status: trace.status,
+        resp_bytes: trace.resp_bytes,
+        asked_via: Some(asked_via),
     };
     let sent = matches!(outcome, Outcome::Done { .. }) || outcome.is_post_send_deny();
     let to = if sent { State::Sent } else { State::SendFailed };
@@ -693,7 +809,7 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
     let Ok(store) = &ctx.approvals else {
         return Vec::new();
     };
-    let message = "the daemon stopped after the approval and before the send; ask again";
+    let message = "the daemon stopped between the approval and the end of the send: it may have been sent; check the service before asking again";
     let mut out = Vec::new();
     for r in store.list(Filter {
         uid: None,
