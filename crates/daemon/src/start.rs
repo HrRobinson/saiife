@@ -756,6 +756,7 @@ async fn serve(
             eprintln!(
                 "saiife: warning: audit chain check at start: {d}; continuing from the end of the log"
             );
+            ctx.notify_chain_break(d);
             format!("broken: {d}")
         }
     };

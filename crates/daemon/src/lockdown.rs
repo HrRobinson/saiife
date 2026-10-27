@@ -343,6 +343,24 @@ pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             &format!("lockdown {action} is set, but its record could not be written: {e}"),
         );
     }
+    let summary = if on {
+        format!(
+            "lockdown on ({}) by uid {}: {}",
+            scope.as_str(),
+            peer.uid,
+            ctx.lockdown.get().map(|l| l.reason).unwrap_or_default()
+        )
+    } else {
+        format!("lockdown off by uid {}", peer.uid)
+    };
+    ctx.notify(
+        saiife_policy::Event::Lockdown,
+        None,
+        None,
+        None,
+        Some(peer.uid),
+        &summary,
+    );
     let mut m = Map::new();
     m.insert("lockdown".into(), status_json(ctx.lockdown.get().as_ref()));
     ok(id, m)

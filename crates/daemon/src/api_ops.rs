@@ -453,6 +453,15 @@ pub(crate) async fn execute(
         ),
     };
 
+    if let Outcome::Limited { limit } = &outcome {
+        ctx.notify_limit(
+            uid,
+            &call.service,
+            trace.operation.as_deref().unwrap_or(""),
+            limit,
+        );
+    }
+
     // 11. Record (before the answer: an unrecorded result is withheld).
     let mut rec = pipeline::record(&call, &snap.snap, &trace, &outcome, &agent, VERSION);
     if snap.snap.hash.is_empty() {

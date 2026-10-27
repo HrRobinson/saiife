@@ -160,6 +160,8 @@ pub struct Ctx {
     pub reauth: Arc<dyn crate::reauth::Reauth>,
     /// One-use command grants (`[guard] ask`, spec §6.10.4).
     pub grants: crate::grants::Grants,
+    /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
+    pub signals: crate::signals::Signals,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -288,6 +290,7 @@ impl Ctx {
             approvals: i.approvals,
             reauth: Arc::new(crate::reauth::PkCheck::new()),
             grants: i.grants,
+            signals: Default::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -682,6 +685,9 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             rec.reason = locked.clone();
         }
         rec.rule = Some("lockdown".into());
+    }
+    if rec.decision == DecisionKind::ErrorDenied {
+        ctx.note_error_denied(peer.uid);
     }
     match ctx.writer.append(rec).await {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),

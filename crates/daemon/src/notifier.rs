@@ -266,6 +266,12 @@ impl Notifier {
         self.inner.dropped_total.load(Ordering::Relaxed)
     }
 
+    /// A copy of the events waiting for the dispatcher (tests look at what
+    /// a producer queued).
+    pub fn queued_events(&self) -> Vec<NotifyEvent> {
+        lock(&self.inner.queue.q).iter().cloned().collect()
+    }
+
     /// Events waiting for the dispatcher.
     pub fn queued(&self) -> usize {
         self.inner.queue.len()

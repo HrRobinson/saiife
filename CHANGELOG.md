@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Locked mode (Linux): approvals. A connector capability in a service's `ask` list, or a command denied by a rule in the new `[guard] ask`, waits for a person in `[approval] approvers`. `saiife api` exits 3 with the request id (`--wait` polls for the result, `saiife api result <id>` fetches it; HTTP answers 202 and `GET /v1/requests/{id}`). New `saiife approvals [show]`, `saiife approve` (`--accept-truncated`) and `saiife reject`. `same_user = "reauth"` lets one person approve their own requests through polkit (`com.saiife.approve`); the default `"deny"` needs a second account. An approved command becomes a one-use grant for that exact command in the project, for 15 minutes. At most 20 pending requests per user. See `docs/approvals.md`.
+- Guard records keep `rule` (the regex) and gain `rule_id`; only `core.git`, `db.postgres` and the Kubernetes delete-namespace rule have ids in v2.0.
+- New `[notify]`: webhook, SMTP and command targets for `approval_created`, `limit_reached`, `error_denied_burst`, `chain_break` and `lockdown` (`forward_failing` is defined; nothing sends it yet). Masked one-line summaries only, never a body or a secret. See `docs/notifications.md`.
+- New `saiife lockdown on|off` (root, `[admin]` groups and approvers): denies connector requests, or with `--scope all` every hook call too. It survives restarts and is recorded and notified. See `docs/threats.md`.
+- `saiife doctor` warns when re-authentication is unavailable.
+
 - Locked mode (Linux) gets an encrypted vault and a connector gateway. New `saiife secret add|list|rotate|remove|import` store credentials (token, basic, header) in a vault the agent cannot read; `import` moves plaintext credentials out of a home and keeps a 7-day backup. New `saiife connect <service>` writes a deny-all policy file; with `--secret <name>` it reuses an existing secret that allows the service.
 - New `saiife api <service> <operation>`: the daemon checks the call against the policy and limits, adds the vault credential, sends it and masks the answer. Connectors for Shopify, HubSpot, GitHub and a generic HTTP service; see `docs/connectors/README.md`.
 - New HTTP gateway on `gateway.sock`, and an optional loopback TCP listener with `saiife api token` (12 h bearer tokens bound to your uid).

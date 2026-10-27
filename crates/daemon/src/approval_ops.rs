@@ -203,6 +203,19 @@ async fn store_new(
         .await;
         return Err("unrecorded".into());
     }
+    // A new request only (a dedupe hit returned above).
+    ctx.notify(
+        saiife_policy::Event::ApprovalCreated,
+        Some(r.id),
+        r.service.as_deref(),
+        r.operation.as_deref(),
+        Some(r.uid),
+        &format!(
+            "approval #{} needed: {}",
+            r.id,
+            crate::approvals::summary(&r)
+        ),
+    );
     Ok(r.id)
 }
 

@@ -1854,3 +1854,140 @@ fn raw_mismatch_is_refused_and_recorded() {
         .expect("a raw_mismatch record");
     assert_eq!(rec["uid"], own_uid());
 }
+
+// ------------------------------------------------- notification producers (Task 10)
+
+impl World {
+    /// The events queued so far of kind `e` (the delivery task is not
+    /// started in these worlds, so the queue holds them).
+    fn events(&self, e: saiife_policy::Event) -> Vec<saiife_daemon::notifier::NotifyEvent> {
+        self.ctx
+            .notifier
+            .queued_events()
+            .into_iter()
+            .filter(|n| n.event == e)
+            .collect()
+    }
+}
+
+/// A new connector request and a new command request each queue one
+/// `approval_created`; a command asked twice (a dedupe hit) queues one.
+#[test]
+fn approval_created_notifies() {
+    use saiife_policy::Event::ApprovalCreated;
+    let w = world();
+    let id = w.ask(BODY_A);
+    let evs = w.events(ApprovalCreated);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(evs[0].id, Some(id));
+    assert_eq!(evs[0].service.as_deref(), Some("erp"));
+    assert_eq!(evs[0].operation.as_deref(), Some("invoices.create"));
+    assert_eq!(evs[0].uid, Some(own_uid()));
+    assert!(evs[0].summary.chars().count() <= 200);
+    assert!(!evs[0].summary.contains("acme"));
+
+    let w = world_ask(ASK_FORCE_PUSH);
+    let o = w.hook(FORCE_PUSH);
+    let id = needs_approval_id(&o);
+    let evs = w.events(ApprovalCreated);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(evs[0].id, Some(id));
+    assert!(evs[0].summary.contains("force"), "{:?}", evs[0].summary);
+    // The same command again is the same request: no second event.
+    assert_eq!(needs_approval_id(&w.hook(FORCE_PUSH)), id);
+    assert_eq!(w.events(ApprovalCreated).len(), 1);
+}
+
+/// The first call over a limit queues `limit_reached`; more in the same
+/// window do not.
+#[test]
+fn limit_reached_notifies_once_per_window() {
+    use saiife_policy::Event::LimitReached;
+    let w = world_with("[services.erp.limits]\nrequests_per_minute = 1\n");
+    let list = |w: &World| {
+        w.op(
+            own_uid(),
+            "api.call",
+            json!({"service": "erp", "operation": "invoices.list"}),
+        )
+    };
+    assert_eq!(list(&w)["ok"], true);
+    assert!(w.events(LimitReached).is_empty());
+    for _ in 0..3 {
+        let r = list(&w);
+        assert_eq!(r["ok"], false, "{r}");
+    }
+    let evs = w.events(LimitReached);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(evs[0].service.as_deref(), Some("erp"));
+    assert_eq!(evs[0].uid, Some(own_uid()));
+    assert!(evs[0].summary.contains("requests_per_minute"));
+}
+
+/// 10 `error_denied` guard records from one uid inside 60 s queue one
+/// `error_denied_burst`; the next 10 do not (10 min quiet).
+#[test]
+fn error_denied_burst_after_10_in_60s() {
+    use saiife_policy::Event::ErrorDeniedBurst;
+    let w = world();
+    let append = |w: &World| {
+        let mut r = common::daemon::guard_rec("ls");
+        r["decision"] = "error_denied".into();
+        let v = w.op(own_uid(), "audit.append", json!({"rec": r}));
+        assert_eq!(v["ok"], true, "{v}");
+    };
+    for _ in 0..9 {
+        append(&w);
+    }
+    assert!(w.events(ErrorDeniedBurst).is_empty());
+    append(&w);
+    let evs = w.events(ErrorDeniedBurst);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(evs[0].uid, Some(own_uid()));
+    for _ in 0..10 {
+        append(&w);
+    }
+    assert_eq!(w.events(ErrorDeniedBurst).len(), 1);
+}
+
+/// The start-time chain failure queues `chain_break`, masked and short.
+#[test]
+fn chain_break_notifies_at_start() {
+    use saiife_policy::Event::ChainBreak;
+    let w = world();
+    let token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+    w.ctx.notify_chain_break(&format!(
+        "record 7 does not follow record 6 Bearer {token} {}",
+        "x".repeat(400)
+    ));
+    let evs = w.events(ChainBreak);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert!(evs[0].summary.chars().count() <= 200);
+    assert!(!evs[0].summary.contains(token));
+}
+
+/// Lockdown on and off by an approver each queue one `lockdown`; a refused
+/// attempt queues none.
+#[test]
+fn lockdown_notifies() {
+    use saiife_policy::Event::Lockdown;
+    let w = world();
+    let r = w.op(
+        BOSS,
+        "lockdown.set",
+        json!({"on": true, "scope": "all", "reason": "drill"}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let evs = w.events(Lockdown);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert!(evs[0].summary.contains("on") && evs[0].summary.contains("drill"));
+    assert_eq!(evs[0].uid, Some(BOSS));
+    let r = w.op(CAROL, "lockdown.set", json!({"on": false}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(w.events(Lockdown).len(), 1);
+    let r = w.op(BOSS, "lockdown.set", json!({"on": false}));
+    assert_eq!(r["ok"], true, "{r}");
+    let evs = w.events(Lockdown);
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert!(evs[1].summary.contains("off"));
+}

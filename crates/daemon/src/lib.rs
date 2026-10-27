@@ -39,6 +39,8 @@ pub mod server;
 #[cfg(target_os = "linux")]
 pub mod sessions;
 #[cfg(target_os = "linux")]
+pub mod signals;
+#[cfg(target_os = "linux")]
 pub mod smtp;
 #[cfg(target_os = "linux")]
 mod start;
