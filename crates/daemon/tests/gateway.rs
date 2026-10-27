@@ -378,6 +378,8 @@ allow = ["orders:read"]
         limiter: Limiter::new(),
         upstream: Ok(up),
         tokens: Arc::new(tokens),
+        approvals: saiife_daemon::approvals::Store::open(&state.join("approvals"))
+            .map_err(|e| e.to_string()),
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.

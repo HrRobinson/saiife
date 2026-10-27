@@ -258,6 +258,17 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // Import backups older than 7 days go at start (and daily in `serve`).
     let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
     crate::import_backup::purge(&backup_dir, crate::import_backup::now());
+    // The approval requests; pending ones past their expiry are expired at
+    // start (and every 30 s in `serve`). A store that cannot be opened
+    // keeps the daemon up and denies every `ask`.
+    let approvals = crate::approvals::Store::open(&crate::approvals::dir_in(&opts.state_dir))
+        .map_err(|e| {
+            eprintln!("saiife: warning: approvals unavailable: {e}");
+            e.to_string()
+        });
+    if let Ok(store) = &approvals {
+        store.sweep(crate::import_backup::now());
+    }
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) =
@@ -287,6 +298,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         upstream,
         backup_dir,
         tokens: Arc::new(tokens),
+        approvals,
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
@@ -771,6 +783,11 @@ async fn serve(
     let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
     let hour = Duration::from_secs(3600);
     let mut token_tick = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
+    let sweep_every = crate::approvals::SWEEP_EVERY;
+    let mut sweep_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + sweep_every, sweep_every);
+    sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sweep = OneAtATime::default();
     loop {
         tokio::select! {
             _ = vault_tick.tick() => {
@@ -793,6 +810,19 @@ async fn serve(
                 tokio::task::spawn_blocking(move || {
                     crate::import_backup::purge(&dir, crate::import_backup::now())
                 });
+            }
+            _ = sweep_tick.tick() => {
+                if ctx.approvals.is_ok() {
+                    let c = Arc::clone(&ctx);
+                    // One sweep at a time, off the runtime thread. The
+                    // `approval`/`expired` records for what it returns come
+                    // with the approval ops (plan 11, Task 3).
+                    sweep.start(move || {
+                        if let Ok(store) = &c.approvals {
+                            store.sweep(crate::import_backup::now());
+                        }
+                    }).await;
+                }
             }
             _ = token_tick.tick() => {
                 let t = Arc::clone(&ctx.tokens);

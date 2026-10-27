@@ -149,6 +149,9 @@ pub struct Ctx {
     pub calls: InFlight,
     /// Notifications (webhook, SMTP, command); started by `serve`.
     pub notifier: crate::notifier::Notifier,
+    /// The approval request store (`<state>/approvals/`), or why it could
+    /// not be opened: then every `ask` is denied (fail closed).
+    pub approvals: Result<crate::approvals::Store, String>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -173,6 +176,7 @@ pub struct CtxInit {
     pub upstream: Result<Upstream, String>,
     pub backup_dir: PathBuf,
     pub tokens: Arc<crate::tokens::Tokens>,
+    pub approvals: Result<crate::approvals::Store, String>,
 }
 
 /// A count of work in flight that a stop waits for.
@@ -268,6 +272,7 @@ impl Ctx {
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
             notifier: crate::notifier::Notifier::new(),
+            approvals: i.approvals,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),

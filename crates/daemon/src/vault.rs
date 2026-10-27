@@ -499,7 +499,71 @@ impl Shared {
             last: self.order.lock().unwrap_or_else(|p| p.into_inner()),
         }
     }
+
+    /// Seal `plain` with the vault key for another daemon-owned file (an
+    /// approval request, its result): `nonce (24) || XChaCha20-Poly1305(key,
+    /// nonce, aad, plain)`, a fresh nonce each time. The key never leaves
+    /// the vault; an unavailable vault is an error (fail closed).
+    pub fn seal(&self, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, VaultError> {
+        let g = self.lock();
+        let VaultState::Ready(v) = &*g else {
+            return Err(VaultError::Unavailable);
+        };
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| VaultError::Random)?;
+        let ct = cipher(&v.key)
+            .encrypt(&XNonce::from(nonce), Payload { msg: plain, aad })
+            .map_err(|_| VaultError::Crypto)?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Open what [`Shared::seal`] made with the same `aad`. A short,
+    /// altered or differently bound input is `Crypto`; an unavailable vault
+    /// is `Unavailable`.
+    pub fn open_sealed(&self, aad: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let g = self.lock();
+        let VaultState::Ready(v) = &*g else {
+            return Err(VaultError::Unavailable);
+        };
+        if sealed.len() < NONCE_LEN + 16 {
+            return Err(VaultError::Crypto);
+        }
+        let (n, ct) = sealed.split_at(NONCE_LEN);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(n);
+        cipher(&v.key)
+            .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad })
+            .map(Zeroizing::new)
+            .map_err(|_| VaultError::Crypto)
+    }
 }
+
+/// Why [`Shared::seal`] or [`Shared::open_sealed`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultError {
+    /// No vault key, or the vault could not be decrypted.
+    Unavailable,
+    /// No random nonce.
+    Random,
+    /// Encryption failed, or the sealed bytes are short, altered or bound
+    /// to other AAD.
+    Crypto,
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VaultError::Unavailable => "the vault is unavailable",
+            VaultError::Random => "no random nonce",
+            VaultError::Crypto => "sealed data cannot be opened",
+        })
+    }
+}
+
+impl std::error::Error for VaultError {}
 
 /// The one writer of a [`Shared`] vault; changes made through it are
 /// serialized, so a check made through [`Writer::lock`] still holds when

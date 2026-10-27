@@ -7,6 +7,8 @@
 #[cfg(target_os = "linux")]
 pub mod api_ops;
 #[cfg(target_os = "linux")]
+pub mod approvals;
+#[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod gateway;
