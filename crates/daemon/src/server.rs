@@ -81,10 +81,10 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     // The peer's start time, read now (one small `/proc` read): a same-user
     // approval's re-authentication names this process, and polkit and the
     // daemon check it was not replaced by another with the same pid.
-    let conn = ops::Conn {
+    let conn = ops::Conn::new(
         peer,
-        start_time: crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
-    };
+        crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
+    );
     let mut greeted = false;
     loop {
         let next = if greeted {

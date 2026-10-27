@@ -546,24 +546,46 @@ pub fn hello(id: u64) -> Value {
 /// process's start time read when the connection was accepted (for the
 /// re-authentication of a same-user approval; `None` when unknown, which
 /// refuses that).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Conn {
     pub peer: PeerCred,
     pub start_time: Option<u64>,
+    /// What this connection's hook steps answered, for `audit.append`.
+    pub steps: Arc<Mutex<HookSteps>>,
+}
+
+impl Conn {
+    pub fn new(peer: PeerCred, start_time: Option<u64>) -> Conn {
+        Conn {
+            peer,
+            start_time,
+            steps: Arc::default(),
+        }
+    }
+}
+
+/// The last answers of a connection's `grant.consume` and
+/// `approval.create`. A guard record with decision `approved` must name the
+/// approval the same connection's last `grant.consume` granted, and one
+/// with `ask` the request its last `approval.create` made; each is used up
+/// by that record. So a client cannot write an `approved` or `ask` record
+/// for a call the daemon never granted or asked about.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HookSteps {
+    pub granted: Option<u64>,
+    pub created: Option<u64>,
+}
+
+impl Conn {
+    pub(crate) fn steps(&self) -> std::sync::MutexGuard<'_, HookSteps> {
+        lock(&self.steps)
+    }
 }
 
 /// Every op but `hello` (which the connection handles itself), for a
 /// caller whose process start time is not known.
 pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
-    dispatch_conn(
-        ctx,
-        &Conn {
-            peer: *peer,
-            start_time: None,
-        },
-        req,
-    )
-    .await
+    dispatch_conn(ctx, &Conn::new(*peer, None), req).await
 }
 
 /// Every op but `hello`.
@@ -573,7 +595,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello(req.id),
-        OP_AUDIT_APPEND => append(ctx, peer, req).await,
+        OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
         OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
@@ -598,8 +620,9 @@ fn storable_session(s: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
+    let peer = &conn.peer;
     let forbidden = |m: &str| err(id, ErrorCode::Forbidden, m);
     let Some(raw) = req.args.get("rec").and_then(Value::as_object) else {
         return err(
@@ -642,6 +665,28 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             "client_ts".into(),
             t.chars().take(32).collect::<String>().into(),
         );
+    }
+    // `approved` and `ask` only as this connection's hook steps answered
+    // (each answer is used up here, whatever the record says).
+    let approval = rec.extra.get("approval").and_then(Value::as_u64);
+    let step = {
+        let mut s = conn.steps();
+        match rec.decision {
+            DecisionKind::Approved => Some(("approved", s.granted.take(), "grant.consume granted")),
+            DecisionKind::Ask => Some(("ask", s.created.take(), "approval.create made")),
+            _ => None,
+        }
+    };
+    if let Some((decision, last, what)) = step {
+        if approval.is_none() || last != approval {
+            return err(
+                id,
+                ErrorCode::BadRequest,
+                &format!(
+                    "a guard record with decision {decision} must name the approval this connection's last {what}"
+                ),
+            );
+        }
     }
     let min_free = ctx.policy().min_free_mb;
     let gate = match disk::free_mb(&ctx.audit_dir) {

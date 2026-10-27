@@ -227,8 +227,20 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_APPROVAL_LIST => list(ctx, &conn.peer, req).await,
         OP_APPROVAL_SHOW => show(ctx, &conn.peer, req).await,
         OP_APPROVAL_DECIDE => decide(ctx, conn, req).await,
-        OP_GRANT_CONSUME => grant_consume(ctx, &conn.peer, req).await,
-        OP_APPROVAL_CREATE => command_create(ctx, &conn.peer, req).await,
+        OP_GRANT_CONSUME => {
+            let (v, granted) = grant_consume(ctx, &conn.peer, req).await;
+            conn.steps().granted = granted;
+            v
+        }
+        OP_APPROVAL_CREATE => {
+            let v = command_create(ctx, &conn.peer, req).await;
+            conn.steps().created = v
+                .get("ok")
+                .filter(|o| **o == Value::Bool(true))
+                .and_then(|_| v.get("request"))
+                .and_then(Value::as_u64);
+            v
+        }
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -696,24 +708,27 @@ fn locked_down(ctx: &Ctx, id: u64) -> Option<Value> {
 /// `grant.consume {rec}`: use up the caller's grant for this exact call.
 /// `{granted: true, approval}` once; `{granted: false}` when there is
 /// none (or it lapsed). A failure to save the use is an error: the call
-/// is not allowed.
-async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+/// is not allowed. The second value is the approval granted, if any.
+async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> (Value, Option<u64>) {
     let id = req.id;
     let f = match call_fields(&req) {
         Ok(f) => f,
-        Err(v) => return v,
+        Err(v) => return (v, None),
     };
     if let Some(v) = locked_down(ctx, id) {
-        return v;
+        return (v, None);
     }
     if !project_ok(&f) {
         let mut m = Map::new();
         m.insert("rule".into(), "project_mismatch".into());
-        return err_with(
-            id,
-            ErrorCode::Denied,
-            "project_mismatch: the project is not the cwd or above it",
-            m,
+        return (
+            err_with(
+                id,
+                ErrorCode::Denied,
+                "project_mismatch: the project is not the cwd or above it",
+                m,
+            ),
+            None,
         );
     }
     let key = f.key(peer.uid);
@@ -722,7 +737,7 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
     let mut m = Map::new();
-    match used {
+    let granted = match used {
         Ok(Some(approval)) => {
             // The use is on record before the call is allowed.
             if let Err(e) = ctx
@@ -730,27 +745,31 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 .append(grant_used_record(ctx, peer, approval, &f).await)
                 .await
             {
-                return err(
+                let v = err(
                     id,
                     ErrorCode::Unrecorded,
                     &format!("the use of approval #{approval} could not be recorded: {e}"),
                 );
+                return (v, None);
             }
             m.insert("granted".into(), true.into());
             m.insert("approval".into(), approval.into());
+            Some(approval)
         }
         Ok(None) => {
             m.insert("granted".into(), false.into());
+            None
         }
         Err(e) => {
-            return err(
+            let v = err(
                 id,
                 ErrorCode::Unavailable,
                 &format!("the command grants are unavailable: {e}"),
-            )
+            );
+            return (v, None);
         }
-    }
-    ok(id, m)
+    };
+    (ok(id, m), granted)
 }
 
 /// The `approval`/`grant_used` record of approval `approval`, used by

@@ -465,14 +465,25 @@ impl World {
 
     /// One op as `uid` (pid: this process; start time unknown).
     fn op(&self, uid: u32, op: &str, args: Value) -> Value {
-        let conn = Conn {
-            peer: PeerCred {
+        let conn = self.conn(uid);
+        self.op_on(&conn, op, args)
+    }
+
+    /// A connection as `uid` (pid: this process; start time unknown), for
+    /// several ops on one connection.
+    fn conn(&self, uid: u32) -> Conn {
+        Conn::new(
+            PeerCred {
                 uid,
                 gid: uid,
                 pid: std::process::id(),
             },
-            start_time: None,
-        };
+            None,
+        )
+    }
+
+    /// One op on `conn`.
+    fn op_on(&self, conn: &Conn, op: &str, args: Value) -> Value {
         let Value::Object(args) = args else {
             panic!("args must be an object")
         };
@@ -481,7 +492,7 @@ impl World {
             op: op.into(),
             args,
         };
-        self.rt.block_on(dispatch_conn(&self.ctx, &conn, req))
+        self.rt.block_on(dispatch_conn(&self.ctx, conn, req))
     }
 
     fn decide(&self, uid: u32, id: u64, action: &str) -> Value {

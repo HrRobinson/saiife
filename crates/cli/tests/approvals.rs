@@ -434,14 +434,25 @@ impl World {
 
     /// One op as `uid` (pid: this process; start time unknown).
     fn op(&self, uid: u32, op: &str, args: Value) -> Value {
-        let conn = Conn {
-            peer: PeerCred {
+        let conn = self.conn(uid);
+        self.op_on(&conn, op, args)
+    }
+
+    /// A connection as `uid` (pid: this process; start time unknown), for
+    /// several ops on one connection.
+    fn conn(&self, uid: u32) -> Conn {
+        Conn::new(
+            PeerCred {
                 uid,
                 gid: uid,
                 pid: std::process::id(),
             },
-            start_time: None,
-        };
+            None,
+        )
+    }
+
+    /// One op on `conn`.
+    fn op_on(&self, conn: &Conn, op: &str, args: Value) -> Value {
         let Value::Object(args) = args else {
             panic!("args must be an object")
         };
@@ -450,7 +461,7 @@ impl World {
             op: op.into(),
             args,
         };
-        self.rt.block_on(dispatch_conn(&self.ctx, &conn, req))
+        self.rt.block_on(dispatch_conn(&self.ctx, conn, req))
     }
 
     fn decide(&self, uid: u32, id: u64, action: &str) -> Value {
@@ -1406,6 +1417,58 @@ fn hook_after_approval_allows_once_then_asks_again() {
     assert_eq!(again.status.code(), Some(2), "{}", stderr(&again));
     let next = needs_approval_id(&again);
     assert!(next != first && next != other);
+}
+
+/// `audit.append` takes a guard record with decision `approved` only for
+/// the approval the same connection's last `grant.consume` granted, and
+/// `ask` only for the request its last `approval.create` made; each answer
+/// is used once. Anything else is `bad_request` (the hook denies).
+#[test]
+fn approved_and_ask_records_need_this_connections_hook_step() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let args = w.call_args(FORCE_PUSH, FORCE_PUSH, "force-push");
+    let rec = |decision: &str, approval: u64| {
+        let mut r = args["rec"].clone();
+        r["decision"] = decision.into();
+        r["approval"] = approval.into();
+        json!({ "rec": r })
+    };
+    let bad = |v: &Value| {
+        assert_eq!(v["ok"], false, "{v}");
+        assert_eq!(v["error"], "bad_request", "{v}");
+    };
+    // No step on this connection: neither is taken.
+    let c = w.conn(own_uid());
+    bad(&w.op_on(&c, "audit.append", rec("approved", 1)));
+    bad(&w.op_on(&c, "audit.append", rec("ask", 1)));
+
+    // `ask` for the request this connection made, once.
+    let made = w.op_on(&c, "approval.create", args.clone());
+    let id = made["request"].as_u64().unwrap_or_else(|| panic!("{made}"));
+    bad(&w.op_on(&c, "audit.append", rec("ask", id + 1)));
+    // The wrong id used the answer up.
+    bad(&w.op_on(&c, "audit.append", rec("ask", id)));
+    w.op_on(&c, "approval.create", args.clone());
+    assert_eq!(w.op_on(&c, "audit.append", rec("ask", id))["ok"], true);
+    bad(&w.op_on(&c, "audit.append", rec("ask", id)));
+    // Another connection's answer does not count.
+    w.op_on(&c, "approval.create", args.clone());
+    bad(&w.op(own_uid(), "audit.append", rec("ask", id)));
+
+    // `approved` only after a granted grant.consume on this connection.
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::Sent);
+    let c = w.conn(own_uid());
+    bad(&w.op_on(&c, "audit.append", rec("approved", id)));
+    let g = w.op_on(&c, "grant.consume", args.clone());
+    assert_eq!(g["granted"], true, "{g}");
+    let other = w.conn(own_uid());
+    bad(&w.op_on(&other, "audit.append", rec("approved", id)));
+    assert_eq!(w.op_on(&c, "audit.append", rec("approved", id))["ok"], true);
+    bad(&w.op_on(&c, "audit.append", rec("approved", id)));
+    // A grant.consume that grants nothing clears the step.
+    assert_eq!(w.op_on(&c, "grant.consume", args.clone())["granted"], false);
+    bad(&w.op_on(&c, "audit.append", rec("approved", id)));
 }
 
 /// The requester cannot approve its own command under `same_user =
