@@ -268,7 +268,10 @@ listed_paths() {
 prepare_host() {
     phase "0. host preparation (runner image)"
     local d mode owner
-    for d in /opt /etc /etc/systemd /etc/systemd/system /var /var/lib /run /usr/local; do
+    # /usr/share and /usr/share/polkit-1: the polkit action file, so the
+    # approvals phase runs with polkit re-authentication.
+    for d in /opt /etc /etc/systemd /etc/systemd/system /var /var/lib /run /usr/local \
+        /usr /usr/share /usr/share/polkit-1 /usr/share/polkit-1/actions; do
         [[ -d "$d" ]] || continue
         owner="$(stat -c '%U' "$d")"
         mode="$(stat -c '%a' "$d")"
