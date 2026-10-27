@@ -277,6 +277,12 @@ impl Transport for HttpsTransport {
     fn max_batch(&self) -> (usize, usize) {
         (MAX_RECORDS, MAX_BYTES)
     }
+
+    /// One POST per body: a Splunk HEC batch whose wrapped events pass
+    /// 1 MiB takes more than one, each under its own [`SEND_TIMEOUT`].
+    fn requests(&self, lines: &[Bytes]) -> usize {
+        bodies_raw(self.format, lines, &mut Vec::new()).len()
+    }
 }
 
 /// Loopback TLS for the transport tests: an `rcgen` CA, a leaf for
@@ -510,6 +516,8 @@ mod tests {
         assert_eq!(t.max_batch(), (500, 1 << 20));
         // 1200 small records: 500, 500, 200, in order.
         let lines: Vec<Bytes> = (0..1200).map(|i| rec(i, 0)).collect();
+        // The worker's batch timeout counts the POSTs a batch takes.
+        assert_eq!(t.requests(&lines), 3);
         t.send(&lines).await.unwrap();
         let counts: Vec<usize> = m
             .seen
@@ -530,6 +538,7 @@ mod tests {
             .map(|i| rec(i, 300 * 1024))
             .chain([rec(9, 1100 * 1024)])
             .collect();
+        assert_eq!(t.requests(&lines), 3);
         t.send(&lines).await.unwrap();
         let seen = m.seen.lock().unwrap().clone();
         let counts: Vec<usize> = seen
@@ -546,6 +555,7 @@ mod tests {
         m.seen.lock().unwrap().clear();
         let t = transport(&p, &m, HttpsFormat::SplunkHec, None, no_secrets());
         let lines: Vec<Bytes> = (0..4).map(|i| rec(i, 300 * 1024)).collect();
+        assert_eq!(t.requests(&lines), 2);
         t.send(&lines).await.unwrap();
         let seen = m.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);

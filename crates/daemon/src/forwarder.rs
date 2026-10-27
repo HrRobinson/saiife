@@ -83,6 +83,15 @@ pub trait Transport: Send + Sync {
     /// `(records, bytes)`: the most a batch may hold. A single line longer
     /// than the byte limit is sent alone.
     fn max_batch(&self) -> (usize, usize);
+    /// How many requests `send(lines)` makes, one after the other, each
+    /// under its own [`SEND_TIMEOUT`]. The worker allows its batch timeout
+    /// once per request, so a batch that takes several (a Splunk HEC batch
+    /// whose wrapped events pass 1 MiB) is never cut short while each
+    /// request is still within its own timeout.
+    fn requests(&self, lines: &[Bytes]) -> usize {
+        let _ = lines;
+        1
+    }
 }
 
 /// Builds the transport of a target, or says why it cannot.
@@ -92,11 +101,21 @@ pub type MakeTransport =
 /// The timeout of one send to a network target (syslog over TLS, https).
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The worker gives up on a send that has not ended after this long (a
-/// target that hangs instead of failing) and retries it with backoff, so
-/// a stall is recorded as `failing` like any other outage. Longer than
-/// [`SEND_TIMEOUT`], so a network transport's own timeout says why first.
+/// The worker gives up on a send that has not ended after this long per
+/// request of the batch ([`Transport::requests`]: a target that hangs
+/// instead of failing) and retries it with backoff, so a stall is
+/// recorded as `failing` like any other outage. Longer than
+/// [`SEND_TIMEOUT`], so a network transport's own timeout says why first:
+/// a batch of `n` requests gets `n` × 60 s, which covers `n` × 30 s of
+/// requests plus margin.
 pub const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The worker's limit for a batch of `requests` requests: `per_request`
+/// for each (saturating).
+pub fn batch_limit(per_request: Duration, requests: usize) -> Duration {
+    let n = u32::try_from(requests.max(1)).unwrap_or(u32::MAX);
+    per_request.checked_mul(n).unwrap_or(Duration::MAX)
+}
 
 /// The daemon's transports for `[audit.forward.<name>]` (plan 12 decisions
 /// 3 to 5). The config was validated when the policy loaded. Nothing here
@@ -774,11 +793,12 @@ impl Worker {
                 continue;
             }
             // A stop drops a send in flight: its batch goes again next time.
+            let limit = batch_limit(self.send_timeout, self.transport.requests(&batch.lines));
             let sent = tokio::select! {
-                r = tokio::time::timeout(self.send_timeout, self.transport.send(&batch.lines)) => {
+                r = tokio::time::timeout(limit, self.transport.send(&batch.lines)) => {
                     r.unwrap_or_else(|_| Err(SendError::Retry(format!(
                         "timed out after {} s",
-                        self.send_timeout.as_secs_f64()
+                        limit.as_secs_f64()
                     ))))
                 }
                 _ = stopped(&mut self.stop) => return,
@@ -1106,6 +1126,49 @@ pub mod testing {
 
         fn max_batch(&self) -> (usize, usize) {
             self.inner.batch
+        }
+    }
+
+    /// Each send takes `delay` (real time) and says it makes `requests`
+    /// requests; `cut` counts the sends dropped before they ended (the
+    /// worker's timeout).
+    #[derive(Clone)]
+    pub struct SlowTransport {
+        pub inner: MemoryTransport,
+        pub delay: Duration,
+        pub requests: usize,
+        pub calls: Arc<AtomicUsize>,
+        pub cut: Arc<AtomicUsize>,
+    }
+
+    /// Counts into `cut` unless disarmed before it is dropped.
+    struct CutGuard(Option<Arc<AtomicUsize>>);
+
+    impl Drop for CutGuard {
+        fn drop(&mut self) {
+            if let Some(c) = self.0.take() {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl Transport for SlowTransport {
+        fn send<'a>(&'a self, lines: &'a [Bytes]) -> SendFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut guard = CutGuard(Some(Arc::clone(&self.cut)));
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                guard.0 = None;
+                self.inner.send(lines).await
+            })
+        }
+
+        fn max_batch(&self) -> (usize, usize) {
+            self.inner.batch
+        }
+
+        fn requests(&self, _lines: &[Bytes]) -> usize {
+            self.requests
         }
     }
 
@@ -1596,6 +1659,44 @@ mod tests {
             "{:?}",
             failing.reason
         );
+        fw.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn the_batch_timeout_covers_every_request_of_a_batch() {
+        assert_eq!(batch_limit(BATCH_TIMEOUT, 0), BATCH_TIMEOUT);
+        assert_eq!(batch_limit(BATCH_TIMEOUT, 3), Duration::from_secs(180));
+        // Saturates instead of overflowing.
+        assert!(batch_limit(BATCH_TIMEOUT, usize::MAX) > Duration::from_secs(1 << 32));
+        assert_eq!(batch_limit(Duration::MAX, 2), Duration::MAX);
+        // Each send lasts 100 ms against 50 ms per request: one that makes
+        // 20 requests (1 s) goes through at the first try ...
+        let h = H::new();
+        h.append(3).await;
+        let slow = |requests| SlowTransport {
+            inner: MemoryTransport::new((500, 1 << 20)),
+            delay: Duration::from_millis(100),
+            requests,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cut: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let t = slow(20);
+        let fw = h.forwarders_timing_out(make_with(t.clone()), Duration::from_millis(50));
+        fw.apply(&one("a")).await;
+        until("forwarded", || !t.inner.got().is_empty()).await;
+        until("connected", || !h.host.events().is_empty()).await;
+        assert_eq!(h.host.events(), ["connected"]);
+        // No send was cut by the worker's timeout.
+        assert_eq!(t.cut.load(Ordering::SeqCst), 0);
+        fw.stop_all().await;
+        // ... while one request of 100 ms is past its 50 ms.
+        let h = H::new();
+        h.append(3).await;
+        let t = slow(1);
+        let fw = h.forwarders_timing_out(make_with(t.clone()), Duration::from_millis(50));
+        fw.apply(&one("a")).await;
+        until("cut twice", || t.cut.load(Ordering::SeqCst) >= 2).await;
+        assert!(t.inner.got().is_empty());
         fw.stop_all().await;
     }
 
