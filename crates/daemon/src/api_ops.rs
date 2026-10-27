@@ -11,7 +11,9 @@ use crate::vault::{Kind, VaultState};
 use base64::Engine as _;
 use bytes::Bytes;
 use saiife_broker::manifest::AuthSpec;
-use saiife_broker::pipeline::{self, Call, Env, OpRef, Outcome, PolicySnapshot, Trace, Via};
+use saiife_broker::pipeline::{
+    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, Trace, Via,
+};
 use saiife_broker::request::AuthMaterial;
 use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request, OP_API_LIST, OP_API_RESULT};
@@ -38,7 +40,7 @@ const MAX_PROJECT: usize = 4096;
 
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match req.op.as_str() {
-        OP_API_RESULT => err(req.id, ErrorCode::Unavailable, "approvals come in plan 11"),
+        OP_API_RESULT => crate::approval_ops::api_result(ctx, peer, req).await,
         OP_API_LIST => list(ctx, peer, req).await,
         _ => call(ctx, peer, req).await,
     }
@@ -46,7 +48,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 
 /// The caller's directory view for one request: its groups, looked up
 /// (cached, off the runtime thread) before the pipeline runs.
-struct Groups(Vec<String>);
+pub(crate) struct Groups(pub(crate) Vec<String>);
 
 impl Directory for Groups {
     fn user(&self, _name: &str) -> Option<UserEntry> {
@@ -63,10 +65,13 @@ impl Directory for Groups {
     }
 }
 
-struct DaemonEnv<'a> {
-    ctx: &'a Ctx,
-    config: &'a SystemConfig,
-    groups: Groups,
+pub(crate) struct DaemonEnv<'a> {
+    pub(crate) ctx: &'a Arc<Ctx>,
+    pub(crate) config: &'a SystemConfig,
+    pub(crate) groups: Groups,
+    /// The requester's agent (`comm` of its agent process), for an
+    /// approval request.
+    pub(crate) agent: String,
 }
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
@@ -88,6 +93,10 @@ fn kind_str(k: Kind) -> &'static str {
 }
 
 impl Env for DaemonEnv<'_> {
+    fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
+        self.ctx.lockdown.get()
+    }
+
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError> {
         scope_for(self.config, &self.groups, user).map(|s| s.cloned())
     }
@@ -131,6 +140,10 @@ impl Env for DaemonEnv<'_> {
 
     fn pool(&self, service: &str) -> Arc<Semaphore> {
         self.ctx.pools.get(service)
+    }
+
+    fn create_approval<'b>(&'b self, p: &'b PendingCall) -> ApprovalFuture<'b> {
+        Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
     }
 }
 
@@ -282,7 +295,8 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         }
         Some(_) => return Err("project must be a path"),
     };
-    // `wait_ms` is accepted and ignored until plan 11.
+    // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
+    // `api.result` from the client.
     let call = Call {
         uid: 0,
         user: String::new(),
@@ -419,6 +433,7 @@ pub(crate) async fn execute(
                 ctx,
                 config: &g.snap.config,
                 groups: Groups(groups),
+                agent: agent.clone(),
             };
             // Without an upstream client steps 3–8 still run; step 9
             // denies with `upstream_unavailable`.
@@ -438,6 +453,15 @@ pub(crate) async fn execute(
         ),
     };
 
+    if let Outcome::Limited { limit } = &outcome {
+        ctx.notify_limit(
+            uid,
+            &call.service,
+            trace.operation.as_deref().unwrap_or(""),
+            limit,
+        );
+    }
+
     // 11. Record (before the answer: an unrecorded result is withheld).
     let mut rec = pipeline::record(&call, &snap.snap, &trace, &outcome, &agent, VERSION);
     if snap.snap.hash.is_empty() {
@@ -455,7 +479,7 @@ pub(crate) async fn execute(
     Ok(outcome)
 }
 
-fn answer(id: u64, outcome: Outcome) -> Value {
+pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
     let one = |k: &str, v: Value| -> Map<String, Value> {
         let mut m = Map::new();
         m.insert(k.into(), v);
@@ -502,12 +526,18 @@ fn answer(id: u64, outcome: Outcome) -> Value {
                 one("rule", rule.into()),
             )
         }
-        Outcome::Denied { rule } => err_with(
-            id,
-            ErrorCode::Denied,
-            &format!("denied ({rule})"),
-            one("rule", rule.into()),
-        ),
+        Outcome::Denied { rule } => {
+            let why = saiife_broker::pipeline::deny_reason(&rule);
+            let msg = match why {
+                Some(why) => format!("denied ({rule}): {why}"),
+                None => format!("denied ({rule})"),
+            };
+            let mut m = one("rule", rule.into());
+            if let Some(why) = why {
+                m.insert("reason".into(), why.into());
+            }
+            err_with(id, ErrorCode::Denied, &msg, m)
+        }
         Outcome::Limited { limit } => err_with(
             id,
             ErrorCode::Limited,
@@ -520,6 +550,8 @@ fn answer(id: u64, outcome: Outcome) -> Value {
             &format!("upstream failed: {reason}"),
             one("reason", reason.into()),
         ),
+        // Exit 3: the request waits for approval.
+        Outcome::Pending { id: pending } => ok(id, one("pending", pending.into())),
     }
 }
 
@@ -532,6 +564,23 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
     if let Err(code) = disk_ok(ctx, uid) {
         ctx.notice(uid, Notice::LowDisk);
         return err(id, code, LOW_DISK);
+    }
+    // No credential of any kind is handed out during a lockdown.
+    if let Some(l) = ctx.lockdown.get() {
+        let why = crate::lockdown::message(&l);
+        let mut r = ctx.event("gateway_token");
+        r.decision = saiife_audit::DecisionKind::Deny;
+        r.rule = Some("lockdown".into());
+        r.reason = Some(why.clone());
+        r.extra.insert("token_uid".into(), uid.into());
+        if let Err(e) = ctx.writer.append(r).await {
+            eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
+        }
+        let mut v = err(id, ErrorCode::Denied, &format!("lockdown: {why}"));
+        if let Some(o) = v.as_object_mut() {
+            o.insert("rule".into(), "lockdown".into());
+        }
+        return v;
     }
     if !has_scope(ctx, uid).await {
         return err(

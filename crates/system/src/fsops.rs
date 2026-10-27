@@ -207,7 +207,7 @@ pub fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 
 /// Removes a path `install` listed: a file, or a directory when it is empty
 /// (a non-empty one is kept and gives false). A missing path is skipped
-/// (false); a symlink is refused.
+/// (false); a symlink is unlinked, never followed.
 pub fn remove_if_listed(path: &Path) -> io::Result<bool> {
     let Some(m) = lstat(path)? else {
         return Ok(false);

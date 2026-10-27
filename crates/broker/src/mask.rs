@@ -212,6 +212,35 @@ impl Masker {
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         saiife_audit::mask::mask(&masked)
     }
+
+    /// Every key and value of `m` through [`Masker::mask_text`]: the only
+    /// way to make a non-empty [`Masked`] map.
+    pub fn mask_params(
+        &self,
+        m: &std::collections::BTreeMap<String, String>,
+    ) -> Masked<std::collections::BTreeMap<String, String>> {
+        Masked(
+            m.iter()
+                .map(|(k, v)| (self.mask_text(k), self.mask_text(v)))
+                .collect(),
+        )
+    }
+}
+
+/// A value that went through a [`Masker`] (or is empty, the `Default`).
+/// The field is private: raw parameters cannot be passed where a display
+/// copy is stored (an approval request's `params`, plan 11).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Masked<T>(T);
+
+impl<T> Masked<T> {
+    pub fn get(&self) -> &T {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
 }
 
 /// Byte regex for `v` with each byte raw or percent-encoded in any hex case

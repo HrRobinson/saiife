@@ -1,8 +1,9 @@
 //! Loading `config.toml` plus `policy.d/*.toml` (spec §8.1 "Merging").
 
 use crate::capability::validate_pattern;
+use crate::effective::PackInfo;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
-use crate::system::{Fail, McpCfg, Scope, SystemConfig};
+use crate::system::{Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -168,6 +169,9 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     cfg.gateway
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
+    cfg.notify
+        .validate()
+        .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {
         if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
             return Err(invalid(
@@ -186,6 +190,24 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         }
     }
 
+    cfg.approval
+        .check_approvers()
+        .map_err(|why| invalid(config_file, why))?;
+    // The shape here; that each names a rule of an active pack needs the
+    // pack catalog ([`check_guard_ask`], run by the daemon).
+    if let Some(e) = cfg.guard.ask.iter().find(|e| split_ask(e).is_none()) {
+        return Err(invalid(
+            config_file,
+            format!("[guard] ask entry {e:?} is not <pack>/<rule>"),
+        ));
+    }
+    // `cfg.guard.ask` is the merged value here (config.toml plus every
+    // drop-in), so an `ask` rule from policy.d/ triggers the warning too.
+    // Without any `ask` rule nothing can need approval, so no warning.
+    if cfg.approval.approvers.is_empty() && !cfg.guard.ask.is_empty() {
+        warnings.push(format!("{config_name}: {NO_APPROVERS_WARNING}"));
+    }
+
     if cfg.locked && cfg.guard.fail == Fail::Open {
         cfg.guard.fail = Fail::Closed;
         warnings.push(format!(
@@ -198,6 +220,42 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         files,
         warnings,
     })
+}
+
+/// The `<pack>/<rule>` of a `[guard] ask` entry (`core.git/force-push`).
+pub fn split_ask(entry: &str) -> Option<(&str, &str)> {
+    let (pack, rule) = entry.split_once('/')?;
+    (!pack.is_empty() && !rule.is_empty() && !rule.contains('/')).then_some((pack, rule))
+}
+
+/// Every `[guard] ask` entry names a `[[deny]]` rule id ([`PackInfo`]
+/// `rules`) of a pack active under `cfg` (a default-on pack, `core.lock`
+/// when locked, or one in `[guard] packs`; project packs never count).
+/// `Err` names the first entry that does not: the policy is invalid.
+pub fn check_guard_ask(cfg: &SystemConfig, catalog: &[PackInfo]) -> Result<(), String> {
+    if cfg.guard.ask.is_empty() {
+        return Ok(());
+    }
+    let (active, _) = crate::effective::active_packs(cfg, catalog, None);
+    for e in &cfg.guard.ask {
+        let Some((pack, rule)) = split_ask(e) else {
+            return Err(format!("[guard] ask entry {e:?} is not <pack>/<rule>"));
+        };
+        match active.iter().find(|p| p.id == pack) {
+            None => {
+                return Err(format!(
+                    "[guard] ask entry {e:?}: pack {pack} is not active"
+                ))
+            }
+            Some(p) if !p.rules.iter().any(|r| r == rule) => {
+                return Err(format!(
+                    "[guard] ask entry {e:?}: pack {pack} has no rule {rule}"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Checks the typed services after the merge; errors name the file that

@@ -18,25 +18,31 @@ version = 1
 triggers = ["DROP", "drop", "TRUNCATE", "truncate", "DELETE", "delete", "psql", "dropdb"]
 
 [[deny]]
+id = "drop-database"
 pattern = '(?i)\bdrop\s+database\b'
 reason = "DROP DATABASE permanently destroys an entire database"
 
 [[deny]]
+id = "drop-schema"
 pattern = '(?i)\bdrop\s+schema\b'
 reason = "DROP SCHEMA destroys a schema and every object in it"
 
 [[deny]]
+id = "drop-table"
 pattern = '(?i)\bdrop\s+table\b'
 reason = "DROP TABLE permanently destroys a table and all its data"
 
 [[deny]]
+id = "truncate"
 pattern = '(?i)\btruncate\s+(?:table\s+)?[\w."]+'
 reason = "TRUNCATE empties a table irreversibly (no WHERE, no per-row rollback)"
 
 [[deny]]
+id = "delete-without-where"
 pattern = '(?i)\bdelete\s+from\s+[\w."]+\s*(?:;|$)'
 reason = "DELETE without a WHERE clause removes every row in the table"
 
 [[deny]]
+id = "dropdb"
 pattern = '(?i)^(?:sudo\s+)?dropdb\b'
 reason = "dropdb destroys an entire PostgreSQL database"

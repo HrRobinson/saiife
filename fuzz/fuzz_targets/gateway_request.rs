@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
     // Whatever is routed came as origin-form, without a fragment.
     if matches!(
         t,
-        Target::Api { .. } | Target::Proxy { .. } | Target::Services | Target::Requests
+        Target::Api { .. } | Target::Proxy { .. } | Target::Services | Target::Request(_)
     ) {
         assert!(raw.starts_with('/') && !raw.contains('#'));
     }

@@ -78,6 +78,29 @@ pub fn builtin_packs() -> (Vec<Pack>, Vec<PackWarning>) {
     Catalog::builtin().load_all()
 }
 
+/// Whether the built-in pack `pack`'s `[[deny]]` rule `id` (alone, with the
+/// pack's `[[allow]]` carve-outs) denies `command`. An unknown pack or
+/// rule, or an engine over its budget, is `false`.
+pub fn builtin_rule_denies(pack: &str, id: &str, command: &str) -> bool {
+    // Compiled once per process (the daemon asks for every request).
+    static PACKS: std::sync::OnceLock<Vec<Pack>> = std::sync::OnceLock::new();
+    let packs = PACKS.get_or_init(|| builtin_packs().0);
+    let Some(only) = packs
+        .iter()
+        .find(|p| p.id == pack)
+        .and_then(|p| p.only_deny_id(id))
+    else {
+        return false;
+    };
+    let engine = crate::engine::Engine::new(vec![only]);
+    match engine.evaluate(command) {
+        crate::engine::Decision::Deny {
+            pack: p, pattern, ..
+        } => p == pack && engine.rule_id(&p, &pattern) == Some(id),
+        _ => false,
+    }
+}
+
 /// Pack sources whose headers (`id`, `default_on`) are read up front and
 /// whose rules are compiled only on request. Compiling every rule regex is
 /// most of a hook call's fixed cost, and a hook needs only the active packs.
@@ -194,6 +217,31 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_rule_denies_only_with_that_rule() {
+        let fp = |cmd| builtin_rule_denies("core.git", "force-push", cmd);
+        assert!(fp("git push --force origin main"));
+        // The pack's carve-out still applies; other commands do not match.
+        assert!(!fp("git push --force-with-lease origin main"));
+        assert!(!fp("echo hi"));
+        assert!(!fp("git reset --hard"));
+        assert!(!builtin_rule_denies(
+            "core.git",
+            "no-such",
+            "git push --force"
+        ));
+        assert!(!builtin_rule_denies(
+            "no.pack",
+            "force-push",
+            "git push --force"
+        ));
+        assert!(builtin_rule_denies(
+            "db.postgres",
+            "drop-database",
+            "psql -c 'DROP DATABASE prod'"
+        ));
+    }
 
     /// The headers name exactly the packs a full load compiles, with the
     /// same version and default, without compiling anything.

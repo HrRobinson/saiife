@@ -10,6 +10,7 @@ use crate::default_config::default_config;
 use crate::fsops;
 use crate::host::{valid_name, Host};
 use crate::layout::*;
+use crate::polkit::polkit_present;
 use crate::supported::{check_supported, Support};
 use crate::unit::{unit_text, vault_key_mode};
 use saiife_agents::{claude, codex, gemini, Agent, AgentError, Change};
@@ -163,9 +164,27 @@ pub fn install(
         files: Vec::new(),
         agents: Vec::new(),
     });
+    // Polkit presence, decided once: the default `same_user`, the action
+    // file and the warning all follow it.
+    // An unsafe parent of the action dir (say a 0777 /usr/share) is not
+    // a reason to abort: the action is skipped and approvals fall back to
+    // a second account (`same_user = "deny"` for a new config).
+    let mut warnings = warnings;
+    let polkit = if !polkit_present(layout, host) {
+        warnings.push(REAUTH_UNAVAILABLE.to_string());
+        false
+    } else if let Some(why) = polkit_dir_problem(layout, host) {
+        warnings.push(format!(
+            "polkit action not installed: {why}; approvals need a second account"
+        ));
+        false
+    } else {
+        true
+    };
     let mut run = Run {
         layout,
         host,
+        polkit,
         saved: previous,
         rec,
         report: InstallReport {
@@ -189,6 +208,8 @@ pub fn install(
     let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
     run.config(new_config.as_deref(), &opts.approvers)?;
+    // 5b. The polkit action, when polkit is there.
+    run.polkit()?;
     // 6. The vault key.
     run.vault_key(key_mode)?;
     // 7. The unit.
@@ -437,6 +458,39 @@ pub(crate) fn check_trusted_owner_mode(
     Ok(())
 }
 
+/// Why root may not write the polkit action below [`POLKIT_DIR`]: the first
+/// existing dir on the way (from `/usr`) that is not a directory, not
+/// root's or writable by group or others, as `<path> is ...`. Dirs that do
+/// not exist yet would be created by install, so the walk stops there.
+fn polkit_dir_problem(layout: &Layout, host: &dyn Host) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let root_uid = host.user("root").map(|u| u.uid)?;
+    let mut logical = PathBuf::from("/");
+    for comp in Path::new(POLKIT_DIR).components().skip(1) {
+        logical.push(comp);
+        let shown = logical.display();
+        let Ok(p) = layout.try_at(&logical) else {
+            return Some(format!("{shown} is outside the install root"));
+        };
+        let m = match fsops::lstat(&p) {
+            Ok(None) => return None,
+            Ok(Some(m)) => m,
+            Err(e) => return Some(format!("{shown} cannot be read ({e})")),
+        };
+        if !m.is_dir() {
+            return Some(format!("{shown} is not a directory"));
+        }
+        let mode = m.mode() & 0o7777;
+        if m.uid() != root_uid {
+            return Some(format!("{shown} is owned by uid {}, not root", m.uid()));
+        }
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Some(format!("{shown} is writable by group or others"));
+        }
+    }
+    None
+}
+
 /// An existing state dir, key dir or audit key must be the daemon user's,
 /// with the spec modes. They are never adopted otherwise.
 fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
@@ -509,6 +563,8 @@ fn validated_config(path: &Path) -> Result<String, InstallError> {
 struct Run<'a> {
     layout: &'a Layout,
     host: &'a dyn Host,
+    /// [`polkit_present`], decided once per run.
+    polkit: bool,
     saved: Option<Installed>,
     rec: Installed,
     report: InstallReport,
@@ -714,11 +770,27 @@ impl Run<'_> {
                         .file(CONFIG, &current, 0o644, FileKind::Config, "config")
                         .map(|_| ());
                 }
-                None => default_config(self.layout, approvers),
+                None => default_config(self.layout, approvers, self.polkit),
             },
         };
         self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
             .map(|_| ())
+    }
+
+    /// The polkit action file (root:root 0644), only when `pkcheck` exists.
+    fn polkit(&mut self) -> Result<(), InstallError> {
+        if !self.polkit {
+            return Ok(());
+        }
+        self.dir(POLKIT_DIR, 0o755, false)?;
+        self.file(
+            POLKIT_ACTION,
+            POLKIT_POLICY.as_bytes(),
+            0o644,
+            FileKind::Polkit,
+            "polkit",
+        )
+        .map(|_| ())
     }
 
     fn vault_key(&mut self, mode: VaultKeyMode) -> Result<(), InstallError> {
@@ -941,6 +1013,153 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stand-in `pkcheck` in the fake root (never run).
+    pub(crate) fn add_pkcheck(e: &Env) {
+        let p = e.at(PKCHECK);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let d = e.at(crate::polkit::POLKITD_PATHS[0]);
+        fs::create_dir_all(d.parent().unwrap()).unwrap();
+        fs::write(&d, b"polkitd").unwrap();
+    }
+
+    #[test]
+    fn polkit_needs_polkitd_and_a_sound_pkcheck() {
+        let e = env(255);
+        assert!(!polkit_present(&e.layout, &e.host));
+        add_pkcheck(&e);
+        assert!(polkit_present(&e.layout, &e.host));
+        // Group-writable pkcheck.
+        fs::set_permissions(e.at(PKCHECK), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!polkit_present(&e.layout, &e.host));
+        fs::set_permissions(e.at(PKCHECK), fs::Permissions::from_mode(0o755)).unwrap();
+        // Not root's.
+        let uid = e.host.user("root").unwrap().uid;
+        crate::testing::set_root_uid(&e.host, uid + 1);
+        assert!(!polkit_present(&e.layout, &e.host));
+        crate::testing::set_root_uid(&e.host, uid);
+        // No polkitd.
+        fs::remove_file(e.at(crate::polkit::POLKITD_PATHS[0])).unwrap();
+        assert!(!polkit_present(&e.layout, &e.host));
+    }
+
+    #[test]
+    fn pkcheck_without_polkitd_chooses_deny_and_warns() {
+        let e = env(255);
+        add_pkcheck(&e);
+        fs::remove_file(e.at(crate::polkit::POLKITD_PATHS[0])).unwrap();
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE));
+    }
+
+    #[test]
+    fn warns_on_every_path_without_polkit() {
+        let e = env(255);
+        e.install();
+        // Existing config, second run.
+        let r = e.install();
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+        // --config: the admin's file is kept, the warning still shows.
+        let cfg = e.src.path().join("c.toml");
+        fs::write(&cfg, fs::read_to_string(e.at(CONFIG)).unwrap()).unwrap();
+        let mut o = all_agents();
+        o.config = Some(cfg);
+        let r = e.run(&o).unwrap();
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+    }
+
+    #[test]
+    fn install_writes_polkit_action_when_pkcheck_present() {
+        let e = env(255);
+        add_pkcheck(&e);
+        let r = e.install();
+        let p = e.at(POLKIT_ACTION);
+        assert_eq!(fs::read_to_string(&p).unwrap(), POLKIT_POLICY);
+        assert_eq!(mode(&p), 0o644);
+        assert_eq!(chowned(&e.host, &p), vec![root_ids(&e.host)]);
+        let rec = e.installed();
+        let f = rec
+            .files
+            .iter()
+            .find(|f| f.path == Path::new(POLKIT_ACTION))
+            .unwrap();
+        assert_eq!(f.kind, FileKind::Polkit);
+        assert!(f.created);
+        assert!(f.sha256.is_some());
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("same_user = \"reauth\"\n"), "{cfg}");
+        assert!(!r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE));
+        // Idempotent.
+        let again = e.install();
+        assert!(again.unchanged.iter().any(|u| u == POLKIT_ACTION));
+    }
+
+    /// A 0777 `/usr/share` (as on some CI runners) does not abort the
+    /// install: the action is skipped, a new config says `deny`, and the
+    /// warning says why.
+    #[test]
+    fn unsafe_polkit_parent_skips_the_action_and_warns() {
+        let e = env(255);
+        add_pkcheck(&e);
+        let share = e.at("/usr/share");
+        fs::create_dir_all(&share).unwrap();
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o777)).unwrap();
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(!e.at("/usr/share/polkit-1").exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.kind == FileKind::Polkit));
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("# same_user = \"deny\"\n"), "{cfg}");
+        assert!(
+            r.warnings.iter().any(|w| w
+                == "polkit action not installed: /usr/share is writable by group or others; approvals need a second account"),
+            "{r:?}"
+        );
+        assert!(!r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+        // A safe parent again: the action is written.
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o755)).unwrap();
+        let r = e.install();
+        assert!(e.at(POLKIT_ACTION).exists());
+        assert!(
+            !r.warnings.iter().any(|w| w.starts_with("polkit action")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn install_skips_and_sets_deny_without_pkcheck() {
+        let e = env(255);
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.kind == FileKind::Polkit));
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("# same_user = \"deny\"\n"), "{cfg}");
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+    }
+
+    #[test]
+    fn action_file_never_auth_self_keep() {
+        assert!(!POLKIT_POLICY.contains("auth_self_keep"));
+        assert!(!POLKIT_POLICY.contains("auth_admin"));
+        for k in ["allow_any", "allow_inactive", "allow_active"] {
+            assert!(
+                POLKIT_POLICY.contains(&format!("<{k}>auth_self</{k}>")),
+                "{k}"
+            );
+        }
+        assert!(POLKIT_POLICY.contains("<action id=\"com.saiife.approve\">"));
+    }
+
     pub(crate) const UBUNTU_2404: &str =
         "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
 
@@ -1034,7 +1253,8 @@ pub(crate) mod tests {
             fs::read(e.at(BINARY)).unwrap(),
             fs::read(&e.binary).unwrap()
         );
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // No pkcheck in the fake root: the only warning is about reauth.
+        assert_eq!(r.warnings, [REAUTH_UNAVAILABLE], "{:?}", r.warnings);
         assert_eq!(
             fs::read_to_string(e.at(UNIT)).unwrap(),
             crate::unit_text(255)
@@ -1563,7 +1783,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let r = e.install();
-        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert_eq!(r.warnings[1], REAUTH_UNAVAILABLE);
         assert!(
             r.warnings[0].contains("dynamically linked"),
             "{:?}",

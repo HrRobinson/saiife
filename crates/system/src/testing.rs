@@ -175,3 +175,21 @@ pub fn fake_install(root: &Path) -> Installed {
     write_installed(&l(INSTALLED), &installed).unwrap();
     installed
 }
+
+/// Gives the fake host's `root` user the uid `uid` (to test a file that is
+/// "not root's").
+#[doc(hidden)]
+pub fn set_root_uid(host: &FakeHost, uid: u32) {
+    let gid = host.group_id("root").unwrap_or(0);
+    host.set(|s| {
+        s.users.insert(
+            "root".into(),
+            crate::host::UserInfo {
+                uid,
+                gid,
+                home: "/root".into(),
+                shell: "/bin/bash".into(),
+            },
+        );
+    });
+}

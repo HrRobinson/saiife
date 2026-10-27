@@ -102,7 +102,7 @@ pub fn uninstall(
     }
 
     // 4. The unit, daemon-reload, the binary.
-    for kind in [FileKind::Unit, FileKind::Binary] {
+    for kind in [FileKind::Unit, FileKind::Polkit, FileKind::Binary] {
         for f in rec.files.iter().rev().filter(|f| f.kind == kind) {
             if fsops::remove_if_listed(&at(&f.path)?).map_err(step("files"))? {
                 out.push(format!("removed {}", f.path.display()));
@@ -433,6 +433,20 @@ mod tests {
         assert!(s.groups.contains_key(AUDIT_GROUP));
         // A second run has nothing to do.
         assert!(un(&e, false).is_empty());
+    }
+
+    #[test]
+    fn uninstall_removes_action_file() {
+        let e = env(255);
+        crate::install::tests::add_pkcheck(&e);
+        e.install();
+        assert!(e.at(POLKIT_ACTION).exists());
+        let out = un(&e, false);
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(out.iter().any(|l| l.contains(POLKIT_ACTION)), "{out:?}");
+        // pkcheck is not ours.
+        assert!(e.at(PKCHECK).exists());
+        assert!(!e.at("/usr/share/polkit-1").exists());
     }
 
     #[test]

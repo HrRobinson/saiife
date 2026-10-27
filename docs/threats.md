@@ -102,3 +102,40 @@ These apply to every pack:
 - Cutting off the newest records cannot be detected without a checkpoint kept
   somewhere the agent cannot write. That needs locked mode (v2) with a forwarded
   checkpoint; developer mode has none.
+
+## Lockdown (locked mode)
+
+`saiife lockdown on [--scope all|connectors] [--reason TEXT]` is the kill
+switch for when something looks wrong and you want the agents to stop first and
+ask questions later. `saiife lockdown off` lifts it, and `saiife lockdown`
+shows the state.
+
+- **Who.** Turning it on: root, users in an `[admin]` group and `[approval]
+  approvers`. An approver who is not an admin may only turn it on when it is
+  off, or widen it (`connectors` to `all`). Turning it off, narrowing it, or
+  replacing an active lockdown (even the same scope with a new reason): root
+  and users in an `[admin]` group, or an approver who passes polkit
+  re-authentication (`same_user = "reauth"`; the
+  CLI says what it is for and starts `pkttyagent` first). Under
+  `same_user = "deny"`, or when re-authentication is unavailable, an approver
+  who is not an admin cannot make those changes (`reauth_required`,
+  `reauth_unavailable`). Anyone else is refused, and every refusal is
+  recorded. So an agent running as an approver's user cannot lift lockdown
+  without the user's password.
+- **`connectors`.** Every connector request is denied (rule `lockdown`), no
+  gateway token is issued, and approved requests are not sent. Requests that
+  were waiting stay waiting.
+- **`all`** (the default). That, and every hook call is denied with `saiife
+  lockdown is on: <reason>`. The guard record is still written, with the
+  decision `deny` and the rule `lockdown`, and keeps the verdict the guard would
+  have given. The agents stop working until it is lifted.
+- **It lasts.** The flag is a file in the daemon's state directory and survives
+  a restart. If the flag cannot be saved, `lockdown on` says so, and the
+  daemon is locked until it restarts but not after.
+- **It is a record and a notification.** Each change writes a `lockdown`
+  record (who, scope, reason) and sends the `lockdown` event, see
+  [notifications](notifications.md).
+
+What it does not do: it does not stop a process that is already running a
+command, and it does not touch the network. It stops saiife from letting new
+calls through. In developer mode there is no lockdown.

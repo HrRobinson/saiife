@@ -70,6 +70,10 @@ use crate::prefilter::Prefilter;
 /// A compiled matching rule: a regex plus the reason shown when it fires.
 #[derive(Debug, Clone)]
 pub struct Rule {
+    /// The rule's name within its pack (`force-push`), for `[guard] ask`
+    /// (`core.git/force-push`): see [`valid_rule_id`]; unique in the pack.
+    /// Optional; a rule without one cannot be put under `ask`.
+    pub id: Option<String>,
     pub pattern: String,
     pub regex: Regex,
     pub reason: String,
@@ -734,6 +738,40 @@ impl Pack {
         }
     }
 
+    /// This pack without the `[[deny]]` rules whose id is in `ids` (a lazy
+    /// pack is compiled now). For telling whether a call is denied only
+    /// by `[guard] ask` rules.
+    pub fn without_deny_ids(&self, ids: &[&str]) -> Pack {
+        let mut p = self.clone();
+        p.allow = self.allow_rules().to_vec();
+        p.deny = self
+            .deny_rules()
+            .iter()
+            .filter(|r| r.id.as_deref().is_none_or(|i| !ids.contains(&i)))
+            .cloned()
+            .collect();
+        p.lazy = None;
+        p
+    }
+
+    /// This pack with only its `[[deny]]` rule `id` (its `[[allow]]`
+    /// carve-outs kept, no path rules), or `None` if it has no such rule.
+    /// For checking that a claimed rule really matches a command.
+    pub fn only_deny_id(&self, id: &str) -> Option<Pack> {
+        let rule = self
+            .deny_rules()
+            .iter()
+            .find(|r| r.id.as_deref() == Some(id))?
+            .clone();
+        let mut p = self.clone();
+        p.allow = self.allow_rules().to_vec();
+        p.deny = vec![rule];
+        p.allow_path = Vec::new();
+        p.deny_path = Vec::new();
+        p.lazy = None;
+        Some(p)
+    }
+
     /// The rules are compiled on first use.
     pub fn is_lazy(&self) -> bool {
         self.lazy.is_some()
@@ -814,6 +852,8 @@ struct RawMeta {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRule {
+    #[serde(default)]
+    id: Option<String>,
     pattern: String,
     #[serde(default)]
     reason: Option<String>,
@@ -887,7 +927,28 @@ fn compile_rules(
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Vec<Rule>, PackError> {
     let mut out = Vec::with_capacity(raw.len());
-    for r in raw {
+    let mut ids = std::collections::HashSet::new();
+    for mut r in raw {
+        // A bad or repeated id is dropped, never the rule (that would
+        // fail open).
+        if let Some(id) = r.id.take() {
+            if !valid_rule_id(&id) {
+                warnings.push(PackWarning {
+                    source: source.to_string(),
+                    message: format!(
+                        "rule {:?}: id {id:?} ignored (lowercase letters, digits and -)",
+                        r.pattern
+                    ),
+                });
+            } else if !ids.insert(id.clone()) {
+                warnings.push(PackWarning {
+                    source: source.to_string(),
+                    message: format!("rule {:?}: id {id:?} ignored (used twice)", r.pattern),
+                });
+            } else {
+                r.id = Some(id);
+            }
+        }
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.pattern));
         }
@@ -984,6 +1045,7 @@ fn compile_rules(
         let when_option = table.clone().filter(|_| gates);
         match Regex::new(&r.pattern) {
             Ok(regex) => out.push(Rule {
+                id: r.id,
                 when_option,
                 table,
                 pattern: r.pattern,
@@ -1002,6 +1064,15 @@ fn compile_rules(
         }
     }
     Ok(out)
+}
+
+/// A rule id: 1 to 64 of `a-z`, `0-9` and `-`, not starting with `-`.
+pub fn valid_rule_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Check a path rule list. A rule with a bad glob is dropped with a warning;
@@ -1464,6 +1535,43 @@ mod tests {
         let p = load_pack_str("<t>", toml, &mut w).unwrap();
         assert_eq!(p.deny.len(), 1);
         assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn rule_ids_are_kept_and_bad_ones_dropped() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\nid = \"a-1\"\npattern = \"x\"\nreason = \"r\"\n[[deny]]\nid = \"Bad Id\"\npattern = \"y\"\nreason = \"r\"\n[[deny]]\nid = \"a-1\"\npattern = \"z\"\nreason = \"r\"\n[[deny]]\npattern = \"w\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_str("<t>", toml, &mut w).unwrap();
+        // The rules stay (dropping one would fail open); only the ids go.
+        let ids: Vec<_> = p.deny.iter().map(|r| r.id.as_deref()).collect();
+        assert_eq!(ids, [Some("a-1"), None, None, None]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(valid_rule_id("force-push") && valid_rule_id("x9"));
+        for bad in ["", "-x", "A", "a_b", "a/b", &"a".repeat(65)] {
+            assert!(!valid_rule_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn spec_ask_rules_have_ids() {
+        let (packs, _) = crate::builtins::builtin_packs();
+        let has = |pack: &str, id: &str| {
+            packs
+                .iter()
+                .filter(|p| p.id == pack)
+                .flat_map(|p| p.deny_rules())
+                .any(|r| r.id.as_deref() == Some(id))
+        };
+        assert!(has("core.git", "force-push"));
+        assert!(has("db.postgres", "drop-database"));
+        assert!(has("container.k8s", "delete-namespace"));
+        let engine = crate::engine::Engine::new(packs.clone());
+        match engine.evaluate("git push --force origin main") {
+            crate::engine::Decision::Deny { pack, pattern, .. } => {
+                assert_eq!(engine.rule_id(&pack, &pattern), Some("force-push"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

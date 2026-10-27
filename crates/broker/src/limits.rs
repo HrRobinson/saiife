@@ -243,10 +243,56 @@ impl Limiter {
         cfg: &LimitsCfg,
         now: OffsetDateTime,
     ) -> Result<Reservation, &'static str> {
+        let mut st = lock(&self.state);
+        let amount = self.check(&mut st, k, kind, amount, amount_required, cfg, now)?;
+        // Recorded even when no counting limit is configured: a reload
+        // that adds one must see the calls already made in its window.
+        let slot = st.push(Event {
+            at: now,
+            key: k.clone(),
+            kind,
+            amount_minor: amount,
+        });
+        Ok(Reservation {
+            state: Arc::clone(&self.state),
+            slot,
+            committed: false,
+        })
+    }
+
+    /// The checks of [`Limiter::check_and_commit`] without reserving a slot
+    /// (plan 11 decision 1): a request waiting for approval that could
+    /// never be sent is denied at once with its limit. Nothing is counted.
+    pub fn would_allow(
+        &self,
+        k: &Key,
+        kind: OpKind,
+        amount: Option<(u64, &str)>,
+        amount_required: bool,
+        cfg: &LimitsCfg,
+        now: OffsetDateTime,
+    ) -> Result<(), &'static str> {
+        let mut st = lock(&self.state);
+        self.check(&mut st, k, kind, amount, amount_required, cfg, now)
+            .map(|_| ())
+    }
+
+    /// Every limit against the buckets in `st`; the amount (currency upper
+    /// case) a slot would carry.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &self,
+        st: &mut State,
+        k: &Key,
+        kind: OpKind,
+        amount: Option<(u64, &str)>,
+        amount_required: bool,
+        cfg: &LimitsCfg,
+        now: OffsetDateTime,
+    ) -> Result<Option<(u64, String)>, &'static str> {
         if amount_required && amount.is_none() {
             return Err("amount_missing");
         }
-        let mut st = lock(&self.state);
         let cutoff = now - Duration::seconds(DAY);
         st.checks += 1;
         if st.checks.is_multiple_of(SWEEP_EVERY) {
@@ -339,19 +385,7 @@ impl Limiter {
             }
         }
 
-        // Recorded even when no counting limit is configured: a reload
-        // that adds one must see the calls already made in its window.
-        let slot = st.push(Event {
-            at: now,
-            key: k.clone(),
-            kind,
-            amount_minor: amount,
-        });
-        Ok(Reservation {
-            state: Arc::clone(&self.state),
-            slot,
-            committed: false,
-        })
+        Ok(amount)
     }
 }
 
@@ -921,6 +955,30 @@ mod tests {
         assert_eq!(
             go(&l, &k, OpKind::Delete, None, &c, t0()),
             Err("deletes_per_day")
+        );
+    }
+
+    #[test]
+    fn would_allow_checks_without_counting() {
+        let l = Limiter::new();
+        let c = LimitsCfg {
+            writes_per_hour: Some(1),
+            ..Default::default()
+        };
+        let k = key(1, None);
+        // Asked about any number of times, nothing is reserved.
+        for _ in 0..5 {
+            l.would_allow(&k, OpKind::Write, None, false, &c, t0())
+                .unwrap();
+        }
+        go(&l, &k, OpKind::Write, None, &c, t0()).unwrap();
+        assert_eq!(
+            l.would_allow(&k, OpKind::Write, None, false, &c, t0()),
+            Err("writes_per_hour")
+        );
+        assert_eq!(
+            l.would_allow(&k, OpKind::Write, None, true, &c, t0()),
+            Err("amount_missing")
         );
     }
 }

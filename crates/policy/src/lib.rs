@@ -23,7 +23,7 @@ pub use capability::Capability;
 pub use decide::{decide, Request, Verdict};
 pub use duration::parse_duration;
 pub use effective::{active_packs, canonical_json, effective_policy, policy_hash, PackInfo};
-pub use load::{load_system, LoadedPolicy, PolicyError};
+pub use load::{check_guard_ask, load_system, split_ask, LoadedPolicy, PolicyError};
 pub use project::{merge_project, parse_project, Merged, Mode, ProjectOverlay, ServiceOverlay};
 pub use scope::{check_scopes, load_and_check, scope_for};
 pub use service::{
@@ -31,7 +31,8 @@ pub use service::{
     SecretCfg, ServiceCfg,
 };
 pub use system::{
-    AdminCfg, ApprovalCfg, AuditCfg, DaemonCfg, Fail, Fsync, GatewayCfg, GuardCfg, McpCfg,
-    SameUser, Scope, SystemConfig,
+    valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg, Event, Fail, Fsync,
+    GatewayCfg, GuardCfg, McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SystemConfig, TargetCfg,
+    WebhookCfg,
 };
 pub use users::{Directory, FixedDirectory, Getent, GroupEntry, UserEntry};

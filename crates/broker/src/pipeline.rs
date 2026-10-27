@@ -3,7 +3,8 @@
 //!
 //! Steps 3–8 never touch the network: a request denied there costs no
 //! upstream call. The daemon does step 1 (identity, session, project) and
-//! hands over a [`Call`]; step 2 (lockdown) comes with plan 11.
+//! hands over a [`Call`]. Step 8 stores an `ask` request ([`Env::create_approval`]);
+//! [`send_approved`] sends it once approved.
 //!
 //! The policy is the [`PolicySnapshot`] taken when the call starts, so a
 //! reload in flight cannot mix two policies, and the `connector` record
@@ -13,7 +14,7 @@ use crate::amount;
 use crate::catalog::Catalog;
 use crate::limits::{Event, Key, Limiter};
 use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination};
-use crate::mask::{finish, Finished, Masker};
+use crate::mask::{finish, Finished, Masked, Masker};
 use crate::params;
 use crate::request::{build, AuthMaterial};
 use crate::resolve;
@@ -57,6 +58,8 @@ pub enum OpRef {
 pub enum Via {
     Cli,
     Http,
+    /// The daemon sending a stored request after its approval.
+    Approval,
 }
 
 impl Via {
@@ -64,9 +67,136 @@ impl Via {
         match self {
             Via::Cli => "cli",
             Via::Http => "http",
+            Via::Approval => "approval",
         }
     }
 }
+
+/// The exact request kept while it waits for approval (spec §8.10
+/// `request_sealed`): what step 8 resolved and validated, from the agent.
+/// The daemon serializes it to JSON and seals it with the vault key; after
+/// approval [`send_approved`] sends only this, whatever the agent sends
+/// later. Values are unmasked: `Debug` shows names and sizes only.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredCall {
+    pub uid: u32,
+    pub user: String,
+    pub session: Option<String>,
+    pub project: String,
+    pub service: String,
+    /// The resolved operation id (a proxy request is stored by its id).
+    pub operation: String,
+    /// The parameters as given (proxy captures included), validated at
+    /// creation and validated again at send.
+    pub params: BTreeMap<String, String>,
+    /// Base64 of the body as it would be sent: the canonical JSON when the
+    /// operation takes JSON.
+    pub body_b64: Option<String>,
+    /// SHA-256 (hex) of the exact body bytes the approver was shown the
+    /// hash of. At send the bytes about to go upstream must hash to it,
+    /// or nothing is sent (`body_changed`): a change in how a body is
+    /// canonicalized between the ask and the send cannot send something
+    /// other than what was approved.
+    #[serde(default)]
+    pub body_sha256: Option<String>,
+    pub headers: Vec<(String, String)>,
+    /// The project's tightening overlay, applied again at send.
+    pub overlay: Option<ServiceOverlay>,
+    /// How the request came in (`cli` or `http`).
+    pub via: String,
+}
+
+impl std::fmt::Debug for StoredCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCall")
+            .field("uid", &self.uid)
+            .field("service", &self.service)
+            .field("operation", &self.operation)
+            .field("params", &self.params.keys().collect::<Vec<_>>())
+            .field("body_len", &self.body_b64.as_ref().map(String::len))
+            .finish()
+    }
+}
+
+impl StoredCall {
+    /// The call [`send_approved`] runs: the named operation, `via =
+    /// approval`; `false` (and no body) when the stored body is not base64.
+    pub fn call(&self) -> (Call, bool) {
+        use base64::Engine as _;
+        let (body, ok) = match &self.body_b64 {
+            Some(b) => match base64::engine::general_purpose::STANDARD.decode(b) {
+                Ok(v) => (Some(Bytes::from(v)), true),
+                Err(_) => (None, false),
+            },
+            None => (None, true),
+        };
+        let call = Call {
+            uid: self.uid,
+            user: self.user.clone(),
+            session: self.session.clone(),
+            project: self.project.clone(),
+            service: self.service.clone(),
+            op: OpRef::Named(self.operation.clone()),
+            params: self.params.clone(),
+            body,
+            headers: self.headers.clone(),
+            overlay: self.overlay.clone(),
+            via: Via::Approval,
+        };
+        (call, ok)
+    }
+}
+
+/// What step 8 hands the daemon for a new approval request: the exact
+/// request (to seal) and the display copy, masked with every vault value
+/// of the service and the v1 patterns.
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    pub stored: StoredCall,
+    /// Masked.
+    pub operation: String,
+    /// Masked; the qualifier filled from the parameters.
+    pub capability: Option<String>,
+    pub params: Masked<BTreeMap<String, String>>,
+    /// Masked.
+    pub project: String,
+    /// The body that will be sent (the canonical JSON), masked, whole up
+    /// to [`BODY_DISPLAY_MAX`] bytes (then cut with a marker): what the
+    /// approver reads.
+    pub body_display: Option<String>,
+    /// `body_display` was cut: an approval must acknowledge it.
+    pub body_truncated: bool,
+    /// SHA-256 (hex) of the exact body bytes that will be sent.
+    pub body_sha256: Option<String>,
+    /// `(minor units, currency)` of an operation that moves money.
+    pub amount: Option<(u64, String)>,
+    /// The agent's headers (forwarded as the manifest allows), masked.
+    pub headers: Vec<(String, String)>,
+}
+
+/// The longest masked body an approval request shows, in bytes: the whole
+/// body below it, so no field can hide past a cut.
+pub const BODY_DISPLAY_MAX: usize = 1024 * 1024;
+
+/// `s` whole, or cut at `max` bytes (on a char boundary) with a marker
+/// saying how long it was; `true` when cut.
+pub fn cut_display(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        format!("{}…[truncated: {} bytes in all]", &s[..end], s.len()),
+        true,
+    )
+}
+
+/// The future of [`Env::create_approval`].
+pub type ApprovalFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send + 'a>>;
 
 /// One connector request after step 1 (identity from the peer
 /// credentials, the session by attribution, the project as reported).
@@ -116,8 +246,39 @@ pub struct PolicySnapshot {
     pub mode: Mode,
 }
 
+/// What lockdown stops (spec §6.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockScope {
+    /// Every connector request.
+    Connectors,
+    /// Connector requests and every hook call.
+    All,
+}
+
+impl LockScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockScope::Connectors => "connectors",
+            LockScope::All => "all",
+        }
+    }
+}
+
+/// The lockdown flag in force.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Lockdown {
+    pub scope: LockScope,
+    pub reason: String,
+    pub by_uid: u32,
+    pub since: String,
+}
+
 /// What the pipeline needs from the daemon.
 pub trait Env: Sync {
+    /// Step 2: the lockdown flag, `None` when it is off. Either scope
+    /// denies a connector request.
+    fn lockdown(&self) -> Option<Lockdown>;
     /// The caller's single scope (decision 6); `ScopeConflict` when it
     /// matches more than one.
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError>;
@@ -137,6 +298,10 @@ pub trait Env: Sync {
     fn secret_values(&self, name: &str) -> Option<Vec<Zeroizing<String>>>;
     /// The per-service upstream pool ([`Pools`]).
     fn pool(&self, service: &str) -> Arc<Semaphore>;
+    /// Step 8: store `p` as a pending approval request (sealed, with its
+    /// `approval`/`created` record); the id, or the deny rule
+    /// (`approvals_unavailable`, `vault_unavailable`, ...). Nothing is sent.
+    fn create_approval<'a>(&'a self, p: &'a PendingCall) -> ApprovalFuture<'a>;
 }
 
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
@@ -246,6 +411,22 @@ pub enum Outcome {
     UpstreamFailed {
         reason: String,
     },
+    /// An `ask` rule matched: the request waits for approval as `id`
+    /// (exit 3, HTTP 202). Nothing was sent or counted.
+    Pending {
+        id: u64,
+    },
+}
+
+/// Step 8: the body would be shown masked, so it cannot be approved.
+pub const MASKED_CONTENT_RULE: &str = "masked_content";
+
+/// The fixed explanation a deny rule carries, if any.
+pub fn deny_reason(rule: &str) -> Option<&'static str> {
+    match rule {
+        MASKED_CONTENT_RULE => Some("cannot be approved: the request contains masked content"),
+        _ => None,
+    }
 }
 
 impl Outcome {
@@ -305,6 +486,51 @@ pub async fn run(
     env: &dyn Env,
     up: Option<&Upstream>,
 ) -> (Outcome, Trace) {
+    run_stage(call, Stage::New, cfg, cat, lim, env, up).await
+}
+
+/// Send a stored request after its approval (spec §6.10.1 step 4): the
+/// call is re-run against the policy in force now (`cfg`, decision 2).
+/// Lockdown denies (`lockdown`); a scope that no longer lists the service
+/// or a `deny` verdict is `policy_changed`; `ask` or `allow` sends. The
+/// limits are checked and counted for real (decision 1): over one is
+/// `Limited`. Returns the call (`via = approval`) for its record.
+pub async fn send_approved(
+    stored: &StoredCall,
+    cfg: &PolicySnapshot,
+    cat: &Catalog,
+    lim: &Limiter,
+    env: &dyn Env,
+    up: Option<&Upstream>,
+) -> (Call, Outcome, Trace) {
+    let (call, body_ok) = stored.call();
+    if !body_ok {
+        return (call, denied("stored_request_invalid"), Trace::default());
+    }
+    let stage = Stage::Approved {
+        body_sha256: stored.body_sha256.as_deref(),
+    };
+    let (o, t) = run_stage(&call, stage, cfg, cat, lim, env, up).await;
+    (call, o, t)
+}
+
+/// A new request, or one approved earlier (with the hash of the body its
+/// approver was shown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage<'a> {
+    New,
+    Approved { body_sha256: Option<&'a str> },
+}
+
+async fn run_stage(
+    call: &Call,
+    stage: Stage<'_>,
+    cfg: &PolicySnapshot,
+    cat: &Catalog,
+    lim: &Limiter,
+    env: &dyn Env,
+    up: Option<&Upstream>,
+) -> (Outcome, Trace) {
     let started = Instant::now();
     let mut tr = Trace {
         body_bytes: call.body.as_ref().map_or(0, Bytes::len),
@@ -312,7 +538,7 @@ pub async fn run(
         ..Trace::default()
     };
     let mut masker = Masker::new(&[]);
-    let outcome = steps(call, cfg, cat, lim, env, up, &mut tr, &mut masker).await;
+    let outcome = steps(call, stage, cfg, cat, lim, env, up, &mut tr, &mut masker).await;
     // Agent-supplied values go into the record masked with every vault
     // value in use (an agent may echo the token) and the v1 patterns: the
     // operation id or proxy request (§8.5), the params, the capability (its
@@ -359,6 +585,7 @@ fn rule_of(e: &BrokerError) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 async fn steps(
     call: &Call,
+    stage: Stage<'_>,
     snap: &PolicySnapshot,
     cat: &Catalog,
     lim: &Limiter,
@@ -382,20 +609,33 @@ async fn steps(
             *masker = Masker::new(&refs);
         }
     }
+    // 2. Lockdown (either scope). The flag is read once, here: a request
+    // already past this point when lockdown is turned on runs to its end
+    // (it was admitted before the flag); every later request is denied.
+    // `lockdown.set` does not wait for requests in flight.
+    if env.lockdown().is_some() {
+        return denied("lockdown");
+    }
+    // An approved request the policy in force no longer lets through
+    // (decision 2): its scope or its verdict changed since it was asked.
+    let changed = |rule: &str| match stage {
+        Stage::New => denied(rule),
+        Stage::Approved { .. } => denied("policy_changed"),
+    };
     // 3. Scope.
     let scope = match env.scope(&call.user) {
         Ok(Some(s)) => s,
-        Ok(None) => return denied("no_scope"),
-        Err(PolicyError::ScopeConflict { .. }) => return denied("scope_conflict"),
+        Ok(None) => return changed("no_scope"),
+        Err(PolicyError::ScopeConflict { .. }) => return changed("scope_conflict"),
         Err(_) => return denied("policy_invalid"),
     };
     tr.env = scope.env.clone();
     if !scope.services.iter().any(|s| s == &call.service) {
-        return denied("no_scope");
+        return changed("no_scope");
     }
     let Some(svc) = cfg.services.get(&call.service) else {
         // Listed in the scope but not defined: nothing to call.
-        return denied("no_scope");
+        return changed("no_scope");
     };
     let m: std::borrow::Cow<'_, Manifest> = match cat.manifest_for(&call.service, svc) {
         Ok(m) => m,
@@ -459,6 +699,14 @@ async fn steps(
         }
     }
 
+    // An approved request sends only the bytes whose hash its approver saw.
+    if let Stage::Approved { body_sha256 } = stage {
+        let now = body.as_ref().map(|b| hex(&Sha256::digest(b)));
+        if now.as_deref() != body_sha256 {
+            return denied("body_changed");
+        }
+    }
+
     // 6. Policy.
     let Ok(mut cap) = Capability::parse(&op.capability) else {
         return denied("policy_invalid");
@@ -482,9 +730,10 @@ async fn steps(
             params: &params,
         },
     );
+    // Approved: `ask` or `allow` now both send.
     let ask = match verdict {
-        Verdict::Deny { rule } => return Outcome::Denied { rule },
-        Verdict::Ask => true,
+        Verdict::Deny { rule } => return changed(&rule),
+        Verdict::Ask => stage == Stage::New,
         Verdict::Allow => false,
     };
 
@@ -505,6 +754,70 @@ async fn steps(
     if lim.unavailable(now) {
         return denied("limits_unavailable");
     }
+    // 8. Ask (decision 1): the limits are checked without reserving, so a
+    // request that could never be sent is denied now with its limit; the
+    // send counts it for real. Then the request is stored and waits.
+    if ask {
+        if let Err(limit) = lim.would_allow(
+            &key,
+            op.kind,
+            tr.amount.as_ref().map(|(m, c)| (*m, c.as_str())),
+            op.amount.is_some(),
+            &svc.limits,
+            now,
+        ) {
+            return Outcome::Limited { limit };
+        }
+        // The approver must see what will be sent: a body the masker
+        // changes (a vault value, or a v1 pattern that may swallow JSON
+        // after it) cannot be shown faithfully, so it cannot be approved.
+        // The same rule as for commands.
+        let mut display = None;
+        if let Some(b) = body.as_ref() {
+            let raw = String::from_utf8_lossy(b);
+            let masked = masker.mask_text(&raw);
+            if masked != raw {
+                return denied(MASKED_CONTENT_RULE);
+            }
+            display = Some(cut_display(&masked, BODY_DISPLAY_MAX));
+        }
+        let pending = PendingCall {
+            stored: StoredCall {
+                uid: call.uid,
+                user: call.user.clone(),
+                session: call.session.clone(),
+                project: call.project.clone(),
+                service: call.service.clone(),
+                operation: op.id.clone(),
+                params: given.clone(),
+                body_b64: body.as_ref().map(|b| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(b)
+                }),
+                body_sha256: body.as_ref().map(|b| hex(&Sha256::digest(b))),
+                headers: call.headers.clone(),
+                overlay: call.overlay.clone(),
+                via: call.via.as_str().to_string(),
+            },
+            operation: masker.mask_text(&op.id),
+            capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),
+            params: masker.mask_params(&given),
+            project: masker.mask_text(&call.project),
+            body_display: display.as_ref().map(|d| d.0.clone()),
+            body_truncated: display.is_some_and(|d| d.1),
+            body_sha256: body.as_ref().map(|b| hex(&Sha256::digest(b))),
+            amount: tr.amount.clone(),
+            headers: call
+                .headers
+                .iter()
+                .map(|(k, v)| (masker.mask_text(k), masker.mask_text(v)))
+                .collect(),
+        };
+        return match env.create_approval(&pending).await {
+            Ok(id) => Outcome::Pending { id },
+            Err(rule) => Outcome::Denied { rule },
+        };
+    }
     let reservation = match lim.check_and_commit(
         &key,
         op.kind,
@@ -516,12 +829,6 @@ async fn steps(
         Ok(r) => r,
         Err(limit) => return Outcome::Limited { limit },
     };
-
-    // 8. Ask: approvals come with plan 11 (decision 1). The reservation is
-    // dropped, so nothing is counted.
-    if ask {
-        return denied("approval_not_available");
-    }
 
     // 9. Send. Without an upstream client (it could not be built at start)
     // nothing can be sent: a deny, after every earlier check ran.
@@ -749,7 +1056,12 @@ pub fn record(
     }
     let (decision, rule, reason, limit) = match outcome {
         Outcome::Done { .. } => (DecisionKind::Allow, None, None, None),
-        Outcome::Denied { rule } => (DecisionKind::Deny, Some(rule.clone()), None, None),
+        Outcome::Denied { rule } => (
+            DecisionKind::Deny,
+            Some(rule.clone()),
+            deny_reason(rule).map(str::to_string),
+            None,
+        ),
         Outcome::Limited { limit } => (
             DecisionKind::Deny,
             None,
@@ -760,6 +1072,12 @@ pub fn record(
             DecisionKind::Allow,
             None,
             Some(format!("upstream failed: {reason}")),
+            None,
+        ),
+        Outcome::Pending { id } => (
+            DecisionKind::Ask,
+            None,
+            Some(format!("waiting for approval #{id}")),
             None,
         ),
     };
@@ -804,6 +1122,9 @@ pub fn record(
     e.insert("secret".into(), json!(tr.secret));
     e.insert("limit".into(), json!(limit));
     e.insert("via".into(), call.via.as_str().into());
+    if let Outcome::Pending { id } = outcome {
+        e.insert("approval".into(), (*id).into());
+    }
     e.insert("op_kind".into(), json!(tr.op_kind.map(op_kind_str)));
     e.insert(
         "amount".into(),
@@ -899,6 +1220,15 @@ pub fn list_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_display_cuts_on_a_char_boundary_and_says_so() {
+        assert_eq!(cut_display("abc", 3), ("abc".to_string(), false));
+        let (s, cut) = cut_display("aé€", 2);
+        assert!(cut);
+        assert_eq!(s, "a…[truncated: 6 bytes in all]");
+        assert_eq!(BODY_DISPLAY_MAX, 1024 * 1024);
+    }
 
     #[test]
     fn call_debug_hides_values() {

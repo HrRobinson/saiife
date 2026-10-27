@@ -68,8 +68,11 @@ fn toml_str(s: &str) -> String {
 /// the caller) are written uncommented. Under a test root the daemon user,
 /// socket dir and audit dir are written uncommented too, pointing below the
 /// root, so a test never points at the real `/run` or `/var`.
-pub fn default_config(layout: &Layout, approvers: &[String]) -> String {
+pub fn default_config(layout: &Layout, approvers: &[String], reauth: bool) -> String {
     let mut set: Vec<(&str, &str, String)> = Vec::new();
+    if reauth {
+        set.push(("approval", "same_user", toml_str("reauth")));
+    }
     if !approvers.is_empty() {
         let list: Vec<String> = approvers.iter().map(|a| toml_str(a)).collect();
         set.push(("approval", "approvers", format!("[{}]", list.join(", "))));
@@ -156,7 +159,7 @@ mod tests {
 
     #[test]
     fn system_default_is_locked_and_all_defaults() {
-        let t = default_config(&Layout::system(), &[]);
+        let t = default_config(&Layout::system(), &[], false);
         assert!(t.starts_with("version = 2\nlocked = true\n"), "{t}");
         assert_eq!(load(&t), defaults());
         // Every key shown is a real key holding its default.
@@ -178,6 +181,7 @@ mod tests {
         let t = default_config(
             &Layout::system(),
             &["alice".into(), "group:saiife-approvers".into()],
+            false,
         );
         let c = load(&t);
         assert_eq!(c.approval.approvers, ["alice", "group:saiife-approvers"]);
@@ -191,10 +195,20 @@ mod tests {
     }
 
     #[test]
+    fn reauth_default_when_polkit_exists() {
+        use saiife_policy::SameUser;
+        let t = default_config(&Layout::system(), &[], true);
+        assert_eq!(load(&t).approval.same_user, SameUser::Reauth);
+        assert!(t.contains("same_user = \"reauth\"\n"), "{t}");
+        let t = default_config(&Layout::system(), &[], false);
+        assert_eq!(load(&t).approval.same_user, SameUser::Deny);
+    }
+
+    #[test]
     fn test_root_points_below_the_root() {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::under(d.path());
-        let t = default_config(&l, &[]);
+        let t = default_config(&l, &[], false);
         let c = load(&t);
         assert_eq!(c.daemon.socket_dir, l.root().join("run/saiife"));
         assert_eq!(c.audit.dir, l.root().join("var/log/saiife/audit"));

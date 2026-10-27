@@ -797,7 +797,15 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         Err(e) => Err(e.to_string()),
     };
     match daemon {
-        Ok(line) => outln!("  daemon: running, {line}"),
+        Ok((line, lockdown, pending)) => {
+            outln!("  daemon: running, {line}");
+            outln!("  lockdown: {}", lockdown_line(&lockdown));
+            // Spec §7 `status`: the caller's pending approvals, the count
+            // and the newest 3 ids.
+            if let Some(ids) = pending {
+                outln!("  approvals: {}", pending_line(&ids));
+            }
+        }
         Err(e) => {
             st.failed = true;
             outln!(
@@ -814,6 +822,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
                     id: p.id.clone(),
                     version: p.version,
                     default_on: p.default_on,
+                    rules: Vec::new(),
                 })
                 .collect();
             let (packs, _) = active_packs(&l.config, &catalog, None);
@@ -871,14 +880,50 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     Some(st)
 }
 
+/// The lockdown flag from the daemon's `status` answer, for one line.
+/// `none pending`, or `N pending (#c #b #a)` with the newest 3 ids.
+fn pending_line(ids: &[u64]) -> String {
+    if ids.is_empty() {
+        return "none pending".into();
+    }
+    let mut newest: Vec<u64> = ids.to_vec();
+    newest.sort_unstable_by(|a, b| b.cmp(a));
+    let shown: Vec<String> = newest.iter().take(3).map(|i| format!("#{i}")).collect();
+    format!("{} pending ({})", ids.len(), shown.join(" "))
+}
+
+fn lockdown_line(l: &serde_json::Value) -> String {
+    let Some(o) = l.as_object() else {
+        return "off".into();
+    };
+    let s = |k: &str| sanitize(o.get(k).and_then(|v| v.as_str()).unwrap_or(""));
+    let uid = o.get("by_uid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let reason = s("reason");
+    let reason = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {reason}")
+    };
+    format!(
+        "ON (scope {}) since {} by uid {uid}{reason}",
+        s("scope"),
+        s("since")
+    )
+}
+
 /// `chain <id>, head seq <n>, last checkpoint seq <m>` from the daemon's
-/// `status`, or why it did not answer.
+/// The daemon's `status` line, its lockdown flag (`null` when off) and the
+/// ids of the caller's pending approval requests (`None`: not listed).
+type DaemonStatus = (String, serde_json::Value, Option<Vec<u64>>);
+
+/// `status`, its lockdown flag and the caller's pending requests, or why
+/// it did not answer.
 #[cfg(target_os = "linux")]
 fn daemon_status(
     layout: &Layout,
     host: &dyn Host,
     cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<String, String> {
+) -> Result<DaemonStatus, String> {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
     use saiife_system::layout::{DAEMON_USER, RUN_DIR};
@@ -904,19 +949,38 @@ fn daemon_status(
         return Err(format!("the daemon user {user} does not exist"));
     };
     let deadline = Instant::now() + Duration::from_secs(2);
-    let m = Client::connect(&dir, uid, deadline)
-        .and_then(|mut c| c.call(OP_STATUS, Map::new(), deadline))
+    let mut c = Client::connect(&dir, uid, deadline).map_err(|e| e.to_string())?;
+    let m = c
+        .call(OP_STATUS, Map::new(), deadline)
         .map_err(|e| e.to_string())?;
+    // The caller's own pending requests; `None` when they cannot be listed.
+    let mut args = Map::new();
+    args.insert("states".into(), serde_json::json!(["pending"]));
+    args.insert("own".into(), true.into());
+    let pending = c
+        .call(saiife_ipc::msg::OP_APPROVAL_LIST, args, deadline)
+        .ok()
+        .and_then(|a| {
+            a.get("items")?
+                .as_array()?
+                .iter()
+                .map(|i| i.get("id")?.as_u64())
+                .collect::<Option<Vec<u64>>>()
+        });
     let show = |k: &str| match m.get(k) {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => "none".to_string(),
         Some(v) => v.to_string(),
     };
-    Ok(format!(
-        "chain {}, head seq {}, last checkpoint seq {}",
-        show("chain"),
-        show("head_seq"),
-        show("last_checkpoint_seq")
+    Ok((
+        format!(
+            "chain {}, head seq {}, last checkpoint seq {}",
+            show("chain"),
+            show("head_seq"),
+            show("last_checkpoint_seq")
+        ),
+        m.get("lockdown").cloned().unwrap_or(Value::Null),
+        pending,
     ))
 }
 
@@ -925,7 +989,7 @@ fn daemon_status(
     _layout: &Layout,
     _host: &dyn Host,
     _cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<String, String> {
+) -> Result<DaemonStatus, String> {
     Err(saiife_system::NOT_LINUX.to_string())
 }
 
@@ -987,6 +1051,13 @@ fn fingerprint_problems(layout: &Layout, i: &Installed) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_line_counts_and_shows_the_newest_three() {
+        assert_eq!(pending_line(&[]), "none pending");
+        assert_eq!(pending_line(&[7]), "1 pending (#7)");
+        assert_eq!(pending_line(&[3, 9, 4, 12]), "4 pending (#12 #9 #4)");
+    }
 
     #[test]
     fn inactive_lines_name_the_unbound_variable_and_its_packs() {

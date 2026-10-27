@@ -12,8 +12,9 @@ use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
-    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
-    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
+    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -142,11 +143,27 @@ pub struct Ctx {
     pub backup_dir: PathBuf,
     /// Bearer tokens of the loopback TCP listener (`api.token`).
     pub tokens: Arc<crate::tokens::Tokens>,
+    /// The lockdown flag (spec §6.18).
+    pub lockdown: crate::lockdown::Store,
     /// The `[gateway] tcp` the daemon started with, and what it bound.
     pub tcp: Mutex<TcpState>,
     /// Connector calls in flight; a stop waits for them (bounded) before
     /// the stop record.
     pub calls: InFlight,
+    /// Notifications (webhook, SMTP, command); started by `serve`.
+    pub notifier: crate::notifier::Notifier,
+    /// The approval request store (`<state>/approvals/`), or why it could
+    /// not be opened: then every `ask` is denied (fail closed).
+    pub approvals: Result<crate::approvals::Store, String>,
+    /// Same-user re-authentication for approvals (polkit `pkcheck`; tests
+    /// replace it before the context is shared).
+    pub reauth: Arc<dyn crate::reauth::Reauth>,
+    /// Per-uid re-authentication cooldowns after a failed prompt.
+    pub reauth_cooldowns: Mutex<crate::reauth::Cooldowns>,
+    /// One-use command grants (`[guard] ask`, spec §6.10.4).
+    pub grants: crate::grants::Grants,
+    /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
+    pub signals: crate::signals::Signals,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -171,6 +188,11 @@ pub struct CtxInit {
     pub upstream: Result<Upstream, String>,
     pub backup_dir: PathBuf,
     pub tokens: Arc<crate::tokens::Tokens>,
+    pub approvals: Result<crate::approvals::Store, String>,
+    /// The lockdown flag (spec §6.18).
+    pub lockdown: crate::lockdown::Store,
+    /// One-use command grants (`<state>/state/grants.json`).
+    pub grants: crate::grants::Grants,
 }
 
 /// A count of work in flight that a stop waits for.
@@ -263,8 +285,15 @@ impl Ctx {
             pools: Pools::new(),
             backup_dir: i.backup_dir,
             tokens: i.tokens,
+            lockdown: i.lockdown,
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
+            notifier: crate::notifier::Notifier::new(),
+            approvals: i.approvals,
+            reauth: Arc::new(crate::reauth::PkCheck::new()),
+            reauth_cooldowns: Mutex::default(),
+            grants: i.grants,
+            signals: Default::default(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -300,6 +329,30 @@ impl Ctx {
         r.uid = Some(self.own_uid);
         r.user = Some(self.own_user.clone());
         r
+    }
+
+    /// An `approval` record of `action` for request `r` (§6.10.1): the
+    /// requester, the id (`id` and `approval`) and the masked summary.
+    pub fn approval_record(&self, r: &crate::approvals::Request, action: &str) -> Record {
+        let base = self.record("approval", &crate::approvals::summary(r));
+        crate::approvals::record_for(base, r, action)
+    }
+
+    /// Write an `approval`/`expired` record for each request a sweep (or
+    /// a late decision) expired. A failed write is one stderr line.
+    pub async fn record_expired(&self, reqs: Vec<crate::approvals::Request>) {
+        for r in reqs {
+            if let Err(e) = self
+                .writer
+                .append(self.approval_record(&r, "expired"))
+                .await
+            {
+                eprintln!(
+                    "saiife: warning: cannot record the expiry of approval #{}: {e}",
+                    r.id
+                );
+            }
+        }
     }
 
     /// A `daemon` record with `event`.
@@ -489,11 +542,60 @@ pub fn hello(id: u64) -> Value {
     ok(id, m)
 }
 
-/// Every op but `hello` (which the connection handles itself).
+/// A control connection's caller: its peer credentials, and the peer
+/// process's start time read when the connection was accepted (for the
+/// re-authentication of a same-user approval; `None` when unknown, which
+/// refuses that).
+#[derive(Debug, Clone)]
+pub struct Conn {
+    pub peer: PeerCred,
+    pub start_time: Option<u64>,
+    /// What this connection's hook steps answered, for `audit.append`.
+    pub steps: Arc<Mutex<HookSteps>>,
+}
+
+impl Conn {
+    pub fn new(peer: PeerCred, start_time: Option<u64>) -> Conn {
+        Conn {
+            peer,
+            start_time,
+            steps: Arc::default(),
+        }
+    }
+}
+
+/// The last answers of a connection's `grant.consume` and
+/// `approval.create`. A guard record with decision `approved` must name the
+/// approval the same connection's last `grant.consume` granted, and one
+/// with `ask` the request its last `approval.create` made; each is used up
+/// by that record. So a client cannot write an `approved` or `ask` record
+/// for a call the daemon never granted or asked about.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HookSteps {
+    pub granted: Option<u64>,
+    pub created: Option<u64>,
+}
+
+impl Conn {
+    pub(crate) fn steps(&self) -> std::sync::MutexGuard<'_, HookSteps> {
+        lock(&self.steps)
+    }
+}
+
+/// Every op but `hello` (which the connection handles itself), for a
+/// caller whose process start time is not known.
 pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+    dispatch_conn(ctx, &Conn::new(*peer, None), req).await
+}
+
+/// Every op but `hello`.
+pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
+    let peer = &conn.peer;
     match req.op.as_str() {
+        OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
+        | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello(req.id),
-        OP_AUDIT_APPEND => append(ctx, peer, req).await,
+        OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
         OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
@@ -502,6 +604,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
+        OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -517,8 +620,9 @@ fn storable_session(s: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
+    let peer = &conn.peer;
     let forbidden = |m: &str| err(id, ErrorCode::Forbidden, m);
     let Some(raw) = req.args.get("rec").and_then(Value::as_object) else {
         return err(
@@ -562,6 +666,28 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             t.chars().take(32).collect::<String>().into(),
         );
     }
+    // `approved` and `ask` only as this connection's hook steps answered
+    // (each answer is used up here, whatever the record says).
+    let approval = rec.extra.get("approval").and_then(Value::as_u64);
+    let step = {
+        let mut s = conn.steps();
+        match rec.decision {
+            DecisionKind::Approved => Some(("approved", s.granted.take(), "grant.consume granted")),
+            DecisionKind::Ask => Some(("ask", s.created.take(), "approval.create made")),
+            _ => None,
+        }
+    };
+    if let Some((decision, last, what)) = step {
+        if approval.is_none() || last != approval {
+            return err(
+                id,
+                ErrorCode::BadRequest,
+                &format!(
+                    "a guard record with decision {decision} must name the approval this connection's last {what}"
+                ),
+            );
+        }
+    }
     let min_free = ctx.policy().min_free_mb;
     let gate = match disk::free_mb(&ctx.audit_dir) {
         Ok(mb) => disk::disk_gate(mb, min_free, peer.uid, ctx.own_uid),
@@ -585,7 +711,34 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
     let session = storable_session(rec.session.as_deref());
+    // Decision 8: with lockdown `all` the guard record is still written,
+    // but as a deny (`rule = lockdown`), and the hook gets `lockdown`.
+    let locked = ctx
+        .lockdown
+        .get()
+        .filter(|l| l.scope == saiife_broker::pipeline::LockScope::All)
+        .map(|l| format!("saiife lockdown is on: {}", l.reason));
+    if locked.is_some() {
+        // Keep the verdict the guard reached: `would_have`. A call the
+        // guard denied anyway keeps its decision and reason; the rule
+        // becomes `lockdown` (`lockdown = true` marks that).
+        rec.extra.insert(
+            "would_have".into(),
+            json!({"decision": rec.decision, "pack": rec.pack, "rule": rec.rule}),
+        );
+        if matches!(rec.decision, DecisionKind::Deny | DecisionKind::ErrorDenied) {
+            rec.extra.insert("lockdown".into(), true.into());
+        } else {
+            rec.decision = DecisionKind::Deny;
+            rec.reason = locked.clone();
+        }
+        rec.rule = Some("lockdown".into());
+    }
+    if rec.decision == DecisionKind::ErrorDenied {
+        ctx.note_error_denied(peer.uid);
+    }
     match ctx.writer.append(rec).await {
+        Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),
         Ok(seq) => {
             if let Some(sid) = session {
                 if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
@@ -619,6 +772,10 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     // The loopback TCP listener's address, `null` when there is none.
     let tcp = lock(&ctx.tcp).bound;
     m.insert("gateway_tcp".into(), json!(tcp.map(|a| a.to_string())));
+    m.insert(
+        "lockdown".into(),
+        crate::lockdown::status_json(ctx.lockdown.get().as_ref()),
+    );
     ok(id, m)
 }
 

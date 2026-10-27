@@ -151,7 +151,8 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // the policy: a broken one makes the whole policy invalid.
     let loaded = load_and_check(&opts.config, directory.as_ref())
         .map_err(|e| e.to_string())
-        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)));
+        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)))
+        .and_then(|(l, cat)| check_ask(&l, &opts.catalog).map(|()| (l, cat)));
     let (daemon_cfg, audit_cfg, policy, policy_err) = match &loaded {
         Ok((l, cat)) => (
             l.config.daemon.clone(),
@@ -258,12 +259,41 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // Import backups older than 7 days go at start (and daily in `serve`).
     let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
     crate::import_backup::purge(&backup_dir, crate::import_backup::now());
+    // The approval requests; pending ones past their expiry are expired at
+    // start (and every 30 s in `serve`). A store that cannot be opened
+    // keeps the daemon up and denies every `ask`.
+    let approvals = crate::approvals::Store::open(&crate::approvals::dir_in(&opts.state_dir))
+        .map_err(|e| {
+            eprintln!("saiife: warning: approvals unavailable: {e}");
+            e.to_string()
+        });
+    // Their `approval`/`expired` records go with the start records.
+    let expired_at_start = match &approvals {
+        Ok(store) => store.sweep(crate::import_backup::now()),
+        Err(_) => Vec::new(),
+    };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) =
         Tokens::open(tokens::path_in(&opts.state_dir), tokens::system_clock());
     if let Some(why) = &tokens_reset {
         eprintln!("saiife: warning: gateway tokens reset: {why}");
+    }
+    // The lockdown flag; an unreadable file is `all` (fail closed) and a
+    // `lockdown_unreadable` record.
+    let (lockdown, lockdown_unreadable) =
+        crate::lockdown::Store::open(crate::lockdown::path_in(&opts.state_dir));
+    if let Some(why) = &lockdown_unreadable {
+        eprintln!("saiife: warning: {why}: lockdown is on for all hooks and connectors");
+    }
+    // The command grants; an unusable file is no grants (each command
+    // needs approval again) and a `grants_unreadable` record.
+    let (grants, grants_unreadable) = crate::grants::Grants::open(
+        crate::grants::path_in(&opts.state_dir),
+        crate::import_backup::now(),
+    );
+    if let Some(why) = &grants_unreadable {
+        eprintln!("saiife: warning: {why}: approved commands need approval again");
     }
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
@@ -287,6 +317,9 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         upstream,
         backup_dir,
         tokens: Arc::new(tokens),
+        approvals,
+        lockdown,
+        grants,
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
@@ -295,18 +328,28 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
+    let notes: Vec<_> = [
+        ("ca_refused", ca_refused),
+        ("tokens_reset", tokens_reset),
+        ("lockdown_unreadable", lockdown_unreadable),
+        ("grants_unreadable", grants_unreadable),
+    ]
+    .into_iter()
+    .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
+    .chain(rebuild_note)
+    .chain(capped_note)
+    .collect();
+    let mut more = start_notes(&ctx, notes, &expired_at_start);
+    // Requests approved but not sent when the daemon stopped become
+    // `send_failed` (`interrupted`); none is sent again by itself.
+    more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         daemon_cfg.socket_dir.clone(),
         check,
         policy_err,
         loaded_files,
-        [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
-            .into_iter()
-            .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
-            .chain(rebuild_note)
-            .chain(capped_note)
-            .collect(),
+        more,
         tcp,
     ));
     rt.shutdown_timeout(Duration::from_secs(1));
@@ -663,15 +706,36 @@ impl OneAtATime {
     }
 }
 
+/// The start records after the vault's: one `daemon` record per note
+/// `(event, reason, fields)` (`ca_refused`, `tokens_reset`,
+/// `limits_rebuild_failed`, `limits_rebuild_capped`), then one
+/// `approval`/`expired` record per request the start sweep expired.
+fn start_notes(
+    ctx: &Ctx,
+    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
+    expired: &[crate::approvals::Request],
+) -> Vec<saiife_audit::Record> {
+    let mut out = Vec::new();
+    for (event, reason, fields) in notes {
+        let mut r = ctx.event(event);
+        r.reason = Some(reason);
+        r.extra.extend(fields);
+        out.push(r);
+    }
+    for r in expired {
+        out.push(ctx.approval_record(r, "expired"));
+    }
+    out
+}
+
 async fn serve(
     ctx: Arc<Ctx>,
     socket_dir: PathBuf,
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
-    // More start records: `(event, reason, fields)` (`ca_refused`,
-    // `tokens_reset`, `limits_rebuild_failed`, `limits_rebuild_capped`).
-    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
+    // More start records, after the vault's ([`start_notes`]).
+    more: Vec<saiife_audit::Record>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let signals = (
@@ -692,6 +756,7 @@ async fn serve(
             eprintln!(
                 "saiife: warning: audit chain check at start: {d}; continuing from the end of the log"
             );
+            ctx.notify_chain_break(d);
             format!("broken: {d}")
         }
     };
@@ -715,12 +780,7 @@ async fn serve(
         r.reason = Some(reason.clone());
         first.push(r);
     }
-    for (event, reason, fields) in notes {
-        let mut r = ctx.event(event);
-        r.reason = Some(reason);
-        r.extra.extend(fields);
-        first.push(r);
-    }
+    first.extend(more);
     for r in first {
         if let Err(e) = ctx.writer.append(r).await {
             eprintln!("saiife: cannot write to the audit log: {e}");
@@ -756,6 +816,9 @@ async fn serve(
         None => None,
     };
 
+    // The notification delivery task; it holds only a weak reference.
+    let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+
     // 8. Ready.
     notify::ready();
     let mut writer_died = false;
@@ -768,6 +831,11 @@ async fn serve(
     let mut purge_tick = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
     let hour = Duration::from_secs(3600);
     let mut token_tick = tokio::time::interval_at(tokio::time::Instant::now() + hour, hour);
+    let sweep_every = crate::approvals::SWEEP_EVERY;
+    let mut sweep_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + sweep_every, sweep_every);
+    sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sweep = OneAtATime::default();
     loop {
         tokio::select! {
             _ = vault_tick.tick() => {
@@ -790,6 +858,23 @@ async fn serve(
                 tokio::task::spawn_blocking(move || {
                     crate::import_backup::purge(&dir, crate::import_backup::now())
                 });
+            }
+            _ = sweep_tick.tick() => {
+                if ctx.approvals.is_ok() {
+                    let c = Arc::clone(&ctx);
+                    let rt = tokio::runtime::Handle::current();
+                    // One sweep at a time, off the runtime thread; what it
+                    // expired gets its `approval`/`expired` records back on
+                    // the runtime.
+                    sweep.start(move || {
+                        if let Ok(store) = &c.approvals {
+                            let gone = store.sweep(crate::import_backup::now());
+                            if !gone.is_empty() {
+                                rt.spawn(async move { c.record_expired(gone).await });
+                            }
+                        }
+                    }).await;
+                }
             }
             _ = token_tick.tick() => {
                 let t = Arc::clone(&ctx.tokens);
@@ -906,6 +991,18 @@ async fn start_tcp(
     task
 }
 
+/// Every `[guard] ask` entry names a rule of an active pack; otherwise the
+/// policy is invalid (named by its file).
+fn check_ask(
+    l: &saiife_policy::LoadedPolicy,
+    catalog: &[saiife_policy::PackInfo],
+) -> Result<(), String> {
+    saiife_policy::check_guard_ask(&l.config, catalog).map_err(|e| {
+        let file = l.files.first().map(|f| f.0.as_str()).unwrap_or("config");
+        format!("{file}: {e}")
+    })
+}
+
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
 /// one step; an invalid one is refused and the old one stays. First the
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
@@ -918,6 +1015,7 @@ async fn reload(ctx: &Arc<Ctx>) {
         load_and_check(&c.config_path, c.directory.as_ref())
             .map_err(|e| e.to_string())
             .and_then(|l| check_services(&l, &c.config_path).map(|cat| (l, cat)))
+            .and_then(|(l, cat)| check_ask(&l, &c.catalog).map(|()| (l, cat)))
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));

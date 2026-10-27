@@ -1172,8 +1172,10 @@ dependencies = [
  "saiife-system",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
+ "tokio",
  "toml",
  "zeroize",
 ]
@@ -1260,6 +1262,7 @@ dependencies = [
  "rustls",
  "saiife-audit",
  "saiife-broker",
+ "saiife-guard",
  "saiife-ipc",
  "saiife-policy",
  "saiife-system",

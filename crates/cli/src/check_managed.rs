@@ -9,6 +9,19 @@
 //! record. When it cannot, the reason goes to stderr only: nobody could
 //! write the record.
 //!
+//! A deny by a rule listed in `[guard] ask` (spec §6.10.4) takes one or
+//! two more round trips, inside the same 2 s ack budget: `grant.consume`
+//! (an approved grant for this exact call: allowed once, record
+//! `approved`), else `approval.create` (a pending request: denied with
+//! "Needs approval: request #<id>. ..." and record `ask`). The daemon
+//! keys the grant from the peer uid and the record's `agent`, `project`,
+//! `tool` and `input`, the project root (canonical) and the SHA-256 of the
+//! exact command judged (`raw_sha256`); the hook never sends a key or the
+//! raw text. Only a command whose record shows it whole (nothing masked,
+//! nothing cut) and that only `ask` rules deny (the worker's `askable`)
+//! can be approved; any other is a plain deny. Any error there denies as
+//! `error_denied`. Other calls make no extra round trip.
+//!
 //! This path never reads `SAIIFE_AUDIT_DIR` or `SAIIFE_DATA_DIR` and never
 //! opens `.chain.lock`: in locked mode the daemon is the only writer.
 
@@ -106,7 +119,9 @@ mod imp {
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
     use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
-    use saiife_ipc::msg::{MAX_RECORD_BYTES, OP_AUDIT_APPEND};
+    use saiife_ipc::msg::{
+        ErrorCode, MAX_RECORD_BYTES, OP_APPROVAL_CREATE, OP_AUDIT_APPEND, OP_GRANT_CONSUME,
+    };
     use saiife_policy::{
         active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
         Mode, PackInfo, SystemConfig,
@@ -200,6 +215,10 @@ mod imp {
         tool: Option<String>,
         pack: Option<String>,
         rule: Option<String>,
+        /// The deny rule's id in its pack (`force-push`), if it has one.
+        rule_id: Option<String>,
+        /// Denied only by `[guard] ask` rules (the worker's `askable`).
+        askable: bool,
         reason: Option<String>,
         outcome: Outcome,
     }
@@ -213,6 +232,8 @@ mod imp {
                 tool: None,
                 pack: None,
                 rule: None,
+                rule_id: None,
+                askable: false,
                 reason: Some(reason.clone()),
                 outcome: Outcome::Error(reason),
             }
@@ -226,6 +247,8 @@ mod imp {
                 tool: None,
                 pack: Some("guard.mcp".into()),
                 rule: Some("mcp_server_not_allowed".into()),
+                rule_id: None,
+                askable: false,
                 outcome: Outcome::Deny(format!("BLOCKED by guard.mcp: {reason}")),
                 reason: Some(reason),
             }
@@ -257,6 +280,8 @@ mod imp {
                 tool: a.tool,
                 pack: a.pack,
                 rule: a.rule,
+                rule_id: a.rule_id,
+                askable: a.askable,
                 reason: a.reason,
                 outcome,
             }
@@ -302,6 +327,8 @@ mod imp {
         // `error_denied` record, as long as the daemon was reached.
         let mut client: Option<Client> = None;
         let mut policy: Option<String> = None;
+        // The canonical cwd and project root, for a grant's scope.
+        let mut key_project: Option<(String, String)> = None;
         let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judge_call(
                 (&cfg, config),
@@ -311,7 +338,7 @@ mod imp {
                 input,
                 forced,
                 &mut client,
-                &mut policy,
+                (&mut policy, &mut key_project),
             )
         }));
         let judged = match judged {
@@ -333,7 +360,59 @@ mod imp {
             judged = Judged::error(String::new(), TOO_LARGE.into());
             rec = minimal_record(agent, &policy);
         }
-        if let Err(e) = append(&mut client, rec) {
+        // One budget for the approval steps and the ack.
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        if asked(&cfg, &judged) {
+            let shown_whole =
+                rec.get("input").and_then(Value::as_str) == Some(judged.input.as_str());
+            let raw_sha256 = sha256_hex(judged.input.as_bytes());
+            let step = match (judged.askable, shown_whole, &key_project) {
+                // Another rule denies too (a compound command): a plain deny.
+                (false, _, _) => Ok(()),
+                (true, false, _) => {
+                    cannot_approve(&mut rec, &mut judged, CANNOT_APPROVE);
+                    Ok(())
+                }
+                (true, true, None) => {
+                    cannot_approve(&mut rec, &mut judged, NO_PROJECT_ROOT);
+                    Ok(())
+                }
+                // The daemon checks the scope lexically: it sends the
+                // canonical cwd as the record's project.
+                (true, true, Some((cwd, root))) => {
+                    set_field(&mut rec, "project", cwd).and_then(|()| {
+                        ask_step(
+                            &mut client,
+                            (&mut rec, &mut judged),
+                            (&raw_sha256, root),
+                            deadline,
+                        )
+                    })
+                }
+            };
+            match step {
+                Ok(()) => {}
+                // Lockdown `all`: the deny stands; the ack says why.
+                Err(ClientError::Refused { code, .. }) if code == ErrorCode::Lockdown.as_str() => {}
+                Err(e) => {
+                    let why = format!("the approval step failed ({})", describe(&e));
+                    judged = Judged::error(judged.input.clone(), why);
+                    rec = record(agent, &ctx, &policy, &judged);
+                    if !fit(&mut rec) {
+                        judged = Judged::error(String::new(), TOO_LARGE.into());
+                        rec = minimal_record(agent, &policy);
+                    }
+                }
+            }
+        }
+        if let Err(e) = append(&mut client, rec, deadline) {
+            // Lockdown `all`: the daemon wrote the record as a deny.
+            if let ClientError::Refused { code, message } = &e {
+                if code == ErrorCode::Lockdown.as_str() {
+                    let _ = writeln!(std::io::stderr(), "{message}");
+                    return ExitCode::from(2);
+                }
+            }
             return blocked(&format!(
                 "the audit daemon did not record this call ({})",
                 describe(&e)
@@ -365,7 +444,7 @@ mod imp {
         input: Result<String, String>,
         forced: Option<String>,
         client: &mut Option<Client>,
-        policy: &mut Option<String>,
+        (policy, key_project): (&mut Option<String>, &mut Option<(String, String)>),
     ) -> Result<Judged, String> {
         // An unusable cwd is never looked up: no project, no worker.
         let cwd = eval::check_cwd(ctx.cwd.as_deref());
@@ -376,6 +455,20 @@ mod imp {
         };
         let (packs, hash) = policy_for(cfg, start.as_deref());
         *policy = Some(hash);
+        if !cfg.guard.ask.is_empty() {
+            // The project in a grant's key: its root as found for the
+            // project config (else the cwd), and the cwd, both canonical
+            // here (the daemon cannot see this user's files).
+            let canon = |p: &Path| {
+                std::fs::canonicalize(p)
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+            };
+            *key_project = start.as_deref().and_then(|s| {
+                let root = find_project_root(s).unwrap_or_else(|| s.to_path_buf());
+                Some((canon(s)?, canon(&root)?))
+            });
+        }
 
         let failed = forced
             .or_else(|| input.as_ref().err().cloned())
@@ -392,6 +485,7 @@ mod imp {
                 budget_ms: cfg.guard.budget_ms,
                 locked: Some(locked_paths(cfg, config)),
                 event: event.map(str::to_string),
+                ask: cfg.guard.ask.clone(),
             })),
             _ => None,
         };
@@ -540,6 +634,7 @@ mod imp {
                 id,
                 version,
                 default_on,
+                rules: Vec::new(),
             })
             .collect();
         let (packs, warnings) = active_packs(cfg, &catalog, merged.as_ref());
@@ -742,6 +837,10 @@ mod imp {
         let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
         if let Some(m) = v.as_object_mut() {
             m.remove("ts");
+            // A pack's own short name for the rule (`force-push`).
+            if let Some(id) = &j.rule_id {
+                m.insert("rule_id".into(), id.clone().into());
+            }
         }
         v
     }
@@ -845,11 +944,140 @@ mod imp {
         }
     }
 
-    /// `audit.append`, acknowledged with a `seq` within `ACK_TIMEOUT`.
-    fn append(client: &mut Client, rec: Value) -> Result<(), ClientError> {
+    /// A deny by a rule `[guard] ask` lists (`pack/rule_id`).
+    fn asked(cfg: &SystemConfig, j: &Judged) -> bool {
+        if j.decision != DecisionKind::Deny || cfg.guard.ask.is_empty() {
+            return false;
+        }
+        let (Some(pack), Some(id)) = (&j.pack, &j.rule_id) else {
+            return false;
+        };
+        cfg.guard
+            .ask
+            .iter()
+            .any(|a| saiife_policy::split_ask(a) == Some((pack.as_str(), id.as_str())))
+    }
+
+    /// The approval steps for an asked deny (spec §6.10.4), by `deadline`:
+    /// a grant makes `rec` `approved` and the call allowed; otherwise a
+    /// new request makes `rec` `ask` with its id and the call denied with
+    /// the spec's message. `Err`: neither happened; `rec` and `j` are as
+    /// they were.
+    fn ask_step(
+        client: &mut Client,
+        (rec, j): (&mut Value, &mut Judged),
+        (raw_sha256, project): (&str, &str),
+        deadline: Instant,
+    ) -> Result<(), ClientError> {
+        let mut args = Map::new();
+        args.insert("rec".into(), rec.clone());
+        args.insert("raw_sha256".into(), raw_sha256.into());
+        args.insert("project".into(), project.into());
+        let ans = client.call(OP_GRANT_CONSUME, args.clone(), deadline)?;
+        let (decision, approval, outcome, reason) = match ans.get("granted") {
+            Some(Value::Bool(true)) => {
+                let Some(a) = ans.get("approval").and_then(Value::as_u64) else {
+                    return Err(ClientError::Protocol("a grant without its approval".into()));
+                };
+                (DecisionKind::Approved, a, Outcome::Allow, None)
+            }
+            Some(Value::Bool(false)) => {
+                let ans = match client.call(OP_APPROVAL_CREATE, args, deadline) {
+                    Err(ClientError::Refused { code, message })
+                        if code == ErrorCode::Denied.as_str()
+                            && message.starts_with("approvals_full") =>
+                    {
+                        set_reason(rec, TOO_MANY_PENDING)?;
+                        j.outcome = Outcome::Deny(TOO_MANY_PENDING.into());
+                        return Ok(());
+                    }
+                    other => other?,
+                };
+                let Some(id) = ans.get("request").and_then(Value::as_u64) else {
+                    return Err(ClientError::Protocol("the answer has no request".into()));
+                };
+                let msg = format!(
+                    "Needs approval: request #{id}. Run the same command again after it is approved."
+                );
+                let reason = format!("needs approval: request #{id}");
+                (DecisionKind::Ask, id, Outcome::Deny(msg), Some(reason))
+            }
+            _ => return Err(ClientError::Protocol("the answer has no granted".into())),
+        };
+        let mut next = rec.clone();
+        if let Some(m) = next.as_object_mut() {
+            m.insert(
+                "decision".into(),
+                serde_json::to_value(decision).unwrap_or_default(),
+            );
+            m.insert("approval".into(), approval.into());
+            if let Some(r) = reason {
+                m.insert("reason".into(), r.into());
+            }
+        }
+        // The reason changed: still within the limit (only ever cut).
+        if !fit(&mut next) {
+            return Err(ClientError::Protocol(TOO_LARGE.into()));
+        }
+        *rec = next;
+        j.decision = decision;
+        j.outcome = outcome;
+        Ok(())
+    }
+
+    /// The hook's answer when the requester already has 20 pending requests.
+    const TOO_MANY_PENDING: &str =
+        "Too many pending approval requests (20); ask an approver to decide the open ones.";
+    /// The reason of an ask-rule deny whose record does not show the exact
+    /// command: what an approver saw would not be what runs.
+    const CANNOT_APPROVE: &str =
+        "cannot be approved: the command contains masked or overlong content";
+
+    /// The reason when the project root or cwd cannot be resolved.
+    const NO_PROJECT_ROOT: &str = "cannot be approved: project root unavailable";
+
+    /// `rec`'s reason replaced; `Err` if it then does not fit.
+    fn set_reason(rec: &mut Value, reason: &str) -> Result<(), ClientError> {
+        set_field(rec, "reason", reason)
+    }
+
+    /// `rec`'s field `key` set to `value`; `Err` if it then does not fit.
+    fn set_field(rec: &mut Value, key: &str, value: &str) -> Result<(), ClientError> {
+        let mut next = rec.clone();
+        if let Some(m) = next.as_object_mut() {
+            m.insert(key.into(), value.into());
+        }
+        if !fit(&mut next) {
+            return Err(ClientError::Protocol(TOO_LARGE.into()));
+        }
+        *rec = next;
+        Ok(())
+    }
+
+    /// An ask-rule deny that cannot be approved: a plain deny saying why.
+    fn cannot_approve(rec: &mut Value, j: &mut Judged, why: &str) {
+        let pack = j.pack.clone().unwrap_or_else(|| "saiife".into());
+        // Only ever shorter than the guard's reason plus a record that fit.
+        let _ = set_reason(rec, why);
+        j.outcome = Outcome::Deny(format!("BLOCKED by {pack}: {why}"));
+    }
+
+    /// Lowercase hex SHA-256 (of the exact command the worker judged:
+    /// unmasked, uncut).
+    fn sha256_hex(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    }
+
+    /// `audit.append`, acknowledged with a `seq` by `deadline` (at most
+    /// `ACK_TIMEOUT` from the first send).
+    fn append(client: &mut Client, rec: Value, deadline: Instant) -> Result<(), ClientError> {
         let mut args = Map::new();
         args.insert("rec".into(), rec);
-        let ans = client.call(OP_AUDIT_APPEND, args, Instant::now() + ACK_TIMEOUT)?;
+        let ans = client.call(OP_AUDIT_APPEND, args, deadline)?;
         match ans.get("seq").and_then(Value::as_u64) {
             Some(_) => Ok(()),
             None => Err(ClientError::Protocol("the ack has no seq".into())),

@@ -68,6 +68,10 @@ pub struct EvalRequest {
     /// The hook event when it is not a tool call (`config-change`).
     #[serde(default)]
     pub event: Option<String>,
+    /// `[guard] ask` (`pack/rule_id`): a shell command one of these denies
+    /// is checked again without all of them (`askable`).
+    #[serde(default)]
+    pub ask: Vec<String>,
 }
 
 /// What the worker answers on stdout.
@@ -80,6 +84,15 @@ pub struct EvalAnswer {
     pub pack: Option<String>,
     pub rule: Option<String>,
     pub reason: Option<String>,
+    /// The deny rule's id in its pack (`force-push`), when it has one: what
+    /// `[guard] ask` names (`core.git/force-push`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// A deny by an `ask` rule that every other rule allows: the command is
+    /// denied only by `[guard] ask` rules, so it may be approved. A
+    /// compound command with another deny in it is not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub askable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +282,7 @@ pub fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decisio
 /// `judge_with` on a host with the default system paths.
 #[cfg(test)]
 pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
-    judge_with(payload, packs, budget, None)
+    judge_with(payload, packs, budget, None, &[])
 }
 
 /// Judge one hook payload with exactly `packs` compiled and `budget` for
@@ -281,6 +294,7 @@ pub fn judge_with(
     packs: &[String],
     budget: Duration,
     locked: Option<&LockedPaths>,
+    ask: &[String],
 ) -> EvalAnswer {
     let ctx = context_from_hook_json_bounded(payload, PARSE_MAX_BYTES);
     let answer = |verdict, input: String, reason: &str| EvalAnswer {
@@ -290,6 +304,8 @@ pub fn judge_with(
         pack: None,
         rule: None,
         reason: Some(reason.to_string()),
+        rule_id: None,
+        askable: false,
     };
     if let Err(reason) = check_cwd(ctx.cwd.as_deref()) {
         return answer(Verdict::Unjudged, String::new(), &reason);
@@ -316,7 +332,23 @@ pub fn judge_with(
         Plan::Shell { command } => {
             let (engine, _) = engine();
             let d = engine.evaluate(&command);
-            from_decision(command, ctx.tool.clone(), d)
+            let rule_id = match &d {
+                Decision::Deny { pack, pattern, .. } => {
+                    engine.rule_id(pack, pattern).map(str::to_string)
+                }
+                _ => None,
+            };
+            let askable = match (&d, &rule_id) {
+                (Decision::Deny { pack, .. }, Some(id)) => {
+                    askable(&engine, &command, pack, id, ask)
+                }
+                _ => false,
+            };
+            EvalAnswer {
+                rule_id,
+                askable,
+                ..from_decision(command, ctx.tool.clone(), d)
+            }
         }
         Plan::Files(call) => {
             let (engine, vars) = engine();
@@ -324,6 +356,22 @@ pub fn judge_with(
             from_decision(call.input(), ctx.tool.clone(), d)
         }
     }
+}
+
+/// Whether a deny of `command` by `pack/id` may be approved: `pack/id` is
+/// in `ask`, and the engine without every `ask` rule allows the command
+/// (no other deny anywhere in it). One more evaluation, on ask paths only.
+fn askable(engine: &Engine, command: &str, pack: &str, id: &str, ask: &[String]) -> bool {
+    let listed: Vec<(&str, &str)> = ask.iter().filter_map(|a| a.split_once('/')).collect();
+    if !listed.contains(&(pack, id)) {
+        return false;
+    }
+    matches!(
+        engine.without_deny_rules(&listed).evaluate(command),
+        Decision::Allow {
+            trace: AllowTrace::NoMatch | AllowTrace::AllowRule { .. }
+        }
+    )
 }
 
 /// The engine with exactly `packs` compiled (every default-on pack is
@@ -387,6 +435,8 @@ fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer
         pack,
         rule,
         reason,
+        rule_id: None,
+        askable: false,
     }
 }
 
@@ -441,6 +491,8 @@ pub fn judge_config_change(payload: &str) -> EvalAnswer {
             pack: deny.then(|| "core.self".to_string()),
             rule: deny.then(|| "config-change".to_string()),
             reason: Some(reason),
+            rule_id: None,
+            askable: false,
         }
     };
     if !v.as_ref().is_some_and(serde_json::Value::is_object) {
@@ -647,6 +699,7 @@ pub fn worker_main() -> ExitCode {
             &req.packs,
             Duration::from_millis(req.budget_ms),
             req.locked.as_ref(),
+            &req.ask,
         ),
         Some("config-change") => judge_config_change(&req.payload),
         Some(other) => EvalAnswer {
@@ -656,6 +709,8 @@ pub fn worker_main() -> ExitCode {
             pack: None,
             rule: None,
             reason: Some(format!("unknown hook event {other:?}")),
+            rule_id: None,
+            askable: false,
         },
     };
     let mut out = std::io::stdout().lock();
@@ -799,6 +854,39 @@ mod tests {
         assert!(want.0.is_some());
         assert_eq!((a.pack, a.rule), want);
         assert_eq!(a.input, key);
+    }
+
+    #[test]
+    fn askable_only_when_ask_rules_alone_deny() {
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let ask = ["core.git/force-push".to_string()];
+        let run = |cmd: &str, ask: &[String]| {
+            judge_with(
+                &payload(cwd, "Bash", serde_json::json!({ "command": cmd })),
+                &defaults(),
+                BUDGET,
+                None,
+                ask,
+            )
+        };
+        let a = run("git push --force origin main", &ask);
+        assert_eq!(a.rule_id.as_deref(), Some("force-push"));
+        assert!(a.askable, "{a:?}");
+        // Not listed: not askable.
+        assert!(!run("git push --force origin main", &[]).askable);
+        // Another deny in the same line: not askable, whichever is first.
+        for cmd in [
+            "git push --force origin main; rm -rf /",
+            "git push --force origin main && git reset --hard",
+        ] {
+            let a = run(cmd, &ask);
+            assert_eq!(a.verdict, Verdict::Deny, "{cmd}");
+            assert!(!a.askable, "{cmd}: {a:?}");
+        }
+        // Both under ask: askable.
+        let both = [ask[0].clone(), "core.git/reset-hard".to_string()];
+        assert!(run("git push --force origin main && git reset --hard", &both).askable);
     }
 
     #[test]
@@ -1320,6 +1408,8 @@ mod tests {
             pack: None,
             rule: None,
             reason: None,
+            rule_id: None,
+            askable: false,
         };
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["verdict"], "unjudged");

@@ -77,12 +77,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         ));
     }
     out.push(peer_pidfd());
-    out.push(Check::new(
-        "reauth",
-        Status::Info,
-        "re-authentication",
-        "not configured",
-    ));
+    out.push(reauth(ctx));
     out.push(Check::new(
         "forwarding",
         Status::Info,
@@ -440,6 +435,35 @@ fn files_binary(ctx: &Ctx) -> Check {
             TITLE,
             format!("{BINARY}: no saiife build marker; its build is unknown"),
         ),
+    }
+}
+
+/// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
+/// present and sound, and the `com.saiife.approve` action file installed as
+/// a root-owned 0644 regular file with exactly the expected content. A
+/// polkit rule that mentions the action is a warning: it may pre-authorize
+/// approvals.
+fn reauth(ctx: &Ctx) -> Check {
+    const ID: &str = "reauth";
+    const TITLE: &str = "re-authentication";
+    let rules = crate::polkit::rules_mentioning_action(ctx.layout);
+    if !rules.is_empty() {
+        return Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!(
+                "{} ({})",
+                crate::polkit::RULE_MENTIONS_ACTION,
+                rules.join(", ")
+            ),
+        );
+    }
+    let problems = crate::polkit::action_problems(ctx.layout, ctx.host);
+    if crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty() {
+        Check::new(ID, Status::Pass, TITLE, "polkit action com.saiife.approve")
+    } else {
+        Check::new(ID, Status::Warn, TITLE, REAUTH_UNAVAILABLE)
     }
 }
 
@@ -919,6 +943,84 @@ mod tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    #[cfg(target_os = "linux")]
+    fn add_polkit(t: &T, action: bool) {
+        let p = t.at(PKCHECK);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let d = t.at(crate::polkit::POLKITD_PATHS[1]);
+        fs::create_dir_all(d.parent().unwrap()).unwrap();
+        fs::write(&d, b"polkitd").unwrap();
+        if action {
+            let a = t.at(POLKIT_ACTION);
+            fs::create_dir_all(a.parent().unwrap()).unwrap();
+            fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
+            fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_warns_reauth_unavailable() {
+        let t = T::installed();
+        let r = t.doctor();
+        assert_status(&r, "reauth", Status::Warn);
+        assert_eq!(
+            get(&r, "reauth").detail,
+            "re-authentication unavailable: approvals need a second account"
+        );
+        // pkcheck without the action file still warns.
+        add_polkit(&t, false);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        add_polkit(&t, true);
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        // A wrong mode, a symlink, or a non-root owner each warn.
+        t.chmod(POLKIT_ACTION, 0o664);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        t.chmod(POLKIT_ACTION, 0o644);
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        let a = t.at(POLKIT_ACTION);
+        let real = a.with_extension("real");
+        fs::rename(&a, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &a).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        fs::remove_file(&a).unwrap();
+        fs::rename(&real, &a).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        // Other content (an older file without the owner annotation).
+        fs::write(
+            &a,
+            crate::layout::POLKIT_POLICY.replace("unix-user:saiife", "unix-user:root"),
+        )
+        .unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        // A polkit rule naming the action.
+        let rules = t.at("/etc/polkit-1/rules.d");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(
+            rules.join("49-saiife.rules"),
+            "if (action.id == \"com.saiife.approve\") return polkit.Result.YES;",
+        )
+        .unwrap();
+        let r = t.doctor();
+        assert_status(&r, "reauth", Status::Warn);
+        assert!(
+            get(&r, "reauth").detail.contains(
+                "a polkit rule mentions com.saiife.approve; it may pre-authorize approvals"
+            ),
+            "{:?}",
+            get(&r, "reauth")
+        );
+        fs::remove_file(rules.join("49-saiife.rules")).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        let uid = t.host.user("root").unwrap().uid;
+        crate::testing::set_root_uid(&t.host, uid + 1);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+    }
+
     // Linux only: on macOS `system.supported` fails (locked mode needs Linux).
     #[cfg(target_os = "linux")]
     #[test]
@@ -949,10 +1051,11 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(fails, ["daemon.unit", "daemon.health"], "{}", r.to_text());
-        for id in ["vault.key", "peer.pidfd", "reauth", "forwarding"] {
+        for id in ["vault.key", "peer.pidfd", "forwarding"] {
             assert_status(&r, id, Status::Info);
         }
-        assert_eq!(get(&r, "reauth").detail, "not configured");
+        assert_status(&r, "reauth", Status::Warn);
+        assert_eq!(get(&r, "reauth").detail, REAUTH_UNAVAILABLE);
         assert_eq!(get(&r, "forwarding").detail, "not configured");
         assert!(!r.checks.iter().any(|c| c.id.starts_with("mcp.")));
         // Doctor asked systemd, through the host, and changed nothing.

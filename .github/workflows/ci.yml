@@ -98,6 +98,10 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - name: install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # jq and polkit for the approvals phase of scripts/locked-linux: 24.04
+      # has polkitd (and pkexec), 22.04 only policykit-1.
+      - name: install jq and polkit
+        run: sudo apt-get install -y jq polkitd pkexec || sudo apt-get install -y jq policykit-1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Static (musl), like the release, but with debug assertions on: the
       # SAIIFE_EVAL_FAULT test seam exists only there. run.sh installs it

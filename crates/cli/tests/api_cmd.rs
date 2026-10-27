@@ -474,14 +474,138 @@ fn default_deny_denied() {
     assert!(w.m.hits().is_empty());
 }
 
-#[test]
-fn ask_denied_until_plan_11() {
-    let w = world();
+/// `ask` (plan 11): exit 3 with the id and how to get the result. The
+/// approval itself needs a second uid; `tests/approvals.rs` covers it.
+fn ask(w: &World) -> u64 {
     let body = w.d.path().join("body.json");
     fs::write(&body, br#"{"amount": 5}"#).unwrap();
     let at = format!("@{}", body.display());
-    let o = api(&w, &["erp", "invoices.create", "--body", &at]);
-    assert_eq!(denied_rule(&o), "approval_not_available");
+    let o = api(w, &["erp", "invoices.create", "--body", &at]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let e = stderr(&o);
+    let id: u64 = e
+        .lines()
+        .find_map(|l| l.strip_prefix("saiife: pending approval #"))
+        .and_then(|r| r.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no pending line: {e}"));
+    assert!(
+        e.contains(&format!(
+            "saiife: pending approval #{id} (saiife api result {id})"
+        )),
+        "{e}"
+    );
+    id
+}
+
+#[test]
+fn ask_is_pending_exit_3_no_upstream_call() {
+    let w = world();
+    let id = ask(&w);
+    assert!(w.m.hits().is_empty());
+    let o = api(&w, &["result", &id.to_string()]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let r: Vec<Value> =
+        w.d.of_kind("approval")
+            .into_iter()
+            .filter(|r| r["approval"] == json!(id))
+            .collect();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0]["action"], "created");
+    assert_eq!(r[0]["decision"], "ask");
+    let c = connector(&w.d);
+    assert_eq!(c[0]["decision"], "ask");
+    assert_eq!(c[0]["approval"], json!(id));
+    // The request file is the daemon's, 0600, with the request sealed.
+    let file = w.d.state_dir().join(format!("approvals/{id}.json"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let v: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(v["state"], "pending");
+    assert!(v["request_sealed"].as_str().is_some_and(|s| !s.is_empty()));
+    // Over HTTP: 202 at once, whatever `wait` says (decision 3).
+    let body = r#"{"body":{"amount":5},"wait":"10m"}"#;
+    let out = gateway(
+        &w.d,
+        &format!(
+            "POST /v1/api/erp/invoices.create HTTP/1.1\r\nHost: saiife\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(out.starts_with("HTTP/1.1 202"), "{out}");
+    assert!(
+        out.contains(&format!(r#"{{"pending":{}}}"#, id + 1)),
+        "{out}"
+    );
+    assert!(w.m.hits().is_empty());
+}
+
+/// A request not decided within `[approval] timeout` (30 min) expires: the
+/// start sweep of a daemon whose clock (`SAIIFE_DAEMON_NOW`) is an hour on
+/// expires it, with its record; the result is 410 and exit 2.
+#[test]
+fn expired_after_timeout() {
+    let mut w = world();
+    let id = ask(&w);
+    signal(&w.d, rustix::process::Signal::TERM);
+    assert!(w.d.wait_exit(Duration::from_secs(10)).is_some());
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let uid = common::daemon::own_uid().to_string();
+    w.d.spawn_and_wait_with(&[
+        ("SAIIFE_TEST_CA_OWNER", &uid),
+        ("SAIIFE_DAEMON_NOW", &later.to_string()),
+    ]);
+    let expired: Vec<Value> =
+        w.d.of_kind("approval")
+            .into_iter()
+            .filter(|r| r["approval"] == json!(id) && r["action"] == "expired")
+            .collect();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0]["decision"], "expired");
+    let o = api(&w, &["result", &id.to_string()]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("request #{id} was expired")));
+    let out = gateway(
+        &w.d,
+        &format!("GET /v1/requests/{id} HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(out.starts_with("HTTP/1.1 410"), "{out}");
+    assert!(out.ends_with(r#"{"state":"expired"}"#), "{out}");
+    assert!(w.m.hits().is_empty());
+}
+
+/// A request left `approved` by a stop between the approval and the send
+/// is not sent at the next start: `send_failed`, `rule = interrupted`.
+#[test]
+fn approved_but_unsent_at_start_is_interrupted() {
+    let mut w = world();
+    let id = ask(&w);
+    signal(&w.d, rustix::process::Signal::TERM);
+    assert!(w.d.wait_exit(Duration::from_secs(10)).is_some());
+    // What a crash right after the approval leaves behind.
+    let file = w.d.state_dir().join(format!("approvals/{id}.json"));
+    let mut v: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    v["state"] = json!("approved");
+    v["decided_by"] = json!(4242);
+    fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    spawn(&mut w.d);
+    let failed: Vec<Value> =
+        w.d.of_kind("approval")
+            .into_iter()
+            .filter(|r| r["approval"] == json!(id) && r["action"] == "send_failed")
+            .collect();
+    assert_eq!(failed.len(), 1, "{}", w.d.stderr_text());
+    assert_eq!(failed[0]["rule"], "interrupted");
+    assert_eq!(failed[0]["by_uid"], 4242);
+    let o = api(&w, &["result", &id.to_string()]);
+    assert_eq!(denied_rule(&o), "interrupted");
     assert!(w.m.hits().is_empty());
 }
 
@@ -956,13 +1080,27 @@ fn broken_service_config_at_start_denies_policy_invalid() {
 }
 
 #[test]
-fn api_result_unavailable_until_plan_11() {
+fn api_result_of_unknown_request() {
     let w = world();
     let mut c = w.d.client();
     let e = c
         .call("api.result", serde_json::Map::new(), common::daemon::dl())
         .unwrap_err();
-    assert_eq!(common::daemon::refused_code(&e), "unavailable");
+    assert_eq!(common::daemon::refused_code(&e), "bad_request");
+    let o = api(&w, &["result", "999"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("no approval request #999"),
+        "{}",
+        stderr(&o)
+    );
+    let o = api(&w, &["result", "x"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let out = gateway(
+        &w.d,
+        "GET /v1/requests/999 HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n",
+    );
+    assert!(out.starts_with("HTTP/1.1 404"), "{out}");
 }
 
 /// Without the owner seam the CA dir is not root's: the daemon starts
