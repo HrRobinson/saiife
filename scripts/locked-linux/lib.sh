@@ -523,6 +523,69 @@ self_approve_refused_by() {
     [[ "$SA_CODE" == 2 && "$(last_refusal_rule "$1")" == "$2" ]]
 }
 
+# The refusal for a same-uid approval without a polkit agent.
+self_approve_refused_by_reauth() {
+    saiife_as "$AGENT_USER" "$AGENT_HOME" approve "$1"
+    local rule
+    rule="$(last_refusal_rule "$1")"
+    [[ "$SA_CODE" == 2 && ( "$rule" == reauth_failed || "$rule" == reauth_unavailable ) ]]
+}
+
+policy_count() {
+    records | jq -c 'select(.kind == "policy")' | wc -l
+}
+
+policy_grew_since() {
+    [[ "$(policy_count)" -gt "$1" ]]
+}
+
+# `wait_diag <seconds> <what> <command...>`: like wait_until, but a timeout
+# prints the last stderr of the hook and of saiife, and the newest refusal.
+wait_diag() {
+    local secs="$1" what="$2"
+    shift 2
+    local end=$((SECONDS + secs))
+    until "$@"; do
+        if ((SECONDS >= end)); then
+            echo "  last hook stderr: $HOOK_ERR" >&2
+            echo "  last saiife stderr: $SA_ERR (exit $SA_CODE)" >&2
+            echo "  newest refusal rule: $(records | jq -r 'select(.kind == "approval" and .action == "refused") | .rule' | tail -n 1)" >&2
+            fail "timed out after ${secs}s waiting for $what"
+        fi
+        sleep 0.5
+    done
+}
+
+# `systemctl reload saiifed`, then wait for the new `policy` record and
+# fail unless it was loaded (a refused config keeps the old policy).
+reload_checked() {
+    local before result
+    before="$(policy_count)"
+    as_root systemctl reload saiifed
+    if ! wait_until_quiet 30 policy_grew_since "$before"; then
+        as_root journalctl -u saiifed -n 30 --no-pager >&2 || true
+        fail "no new policy record 30s after the reload"
+    fi
+    result="$(records | jq -r 'select(.kind == "policy") | .result' | tail -n 1)"
+    if [[ "$result" == rejected ]]; then
+        records | jq -c 'select(.kind == "policy")' | tail -n 1 >&2
+        as_root journalctl -u saiifed -n 30 --no-pager >&2 || true
+        fail "the daemon rejected the reloaded config"
+    fi
+    ok "reload: policy $result"
+}
+
+# `wait_until_quiet <seconds> <command...>`: true when the command passes in time.
+wait_until_quiet() {
+    local secs="$1"
+    shift
+    local end=$((SECONDS + secs))
+    until "$@"; do
+        ((SECONDS < end)) || return 1
+        sleep 0.5
+    done
+}
+
 phase_approvals() {
     phase "6b. approvals: polkit action, grants, same_user, reauth"
     local action=/usr/share/polkit-1/actions/com.saiife.approve.policy
@@ -552,7 +615,16 @@ phase_approvals() {
     as_root useradd -m -s /bin/bash "$APPROVER_USER"
     APPROVALS_CFG_BACKUP="$WORK/config.pre-approvals"
     as_root cp -p /etc/saiife/config.toml "$APPROVALS_CFG_BACKUP"
-    as_root tee -a /etc/saiife/config.toml >/dev/null <<EOF
+    # The log upload reads it as the runner user; it holds no secrets.
+    as_root chmod a+r "$APPROVALS_CFG_BACKUP"
+    # The installed config without any [guard] / [approval] table (and
+    # their sub-tables), then ours: a duplicate table would make the
+    # reload fail.
+    as_root cat /etc/saiife/config.toml | awk '
+        /^[ \t]*\[/ { skip = ($0 ~ /^[ \t]*\[(guard|approval)(\.[^]]*)?\][ \t]*(#.*)?$/) }
+        !skip { print }
+    ' >"$WORK/config.approvals"
+    cat >>"$WORK/config.approvals" <<EOF
 
 [guard]
 ask = ["core.git/force-push"]
@@ -561,10 +633,12 @@ ask = ["core.git/force-push"]
 approvers = ["$APPROVER_USER", "$AGENT_USER"]
 same_user = "deny"
 EOF
-    as_root systemctl reload saiifed
+    # tee rewrites the file in place: owner and mode stay root:root 644.
+    as_root tee /etc/saiife/config.toml <"$WORK/config.approvals" >/dev/null
+    reload_checked
     forced="$(payload claude/bash-deny.json '.tool_input.command = "git push --force origin main"')"
     # Until the reload lands the hook still says BLOCKED (no request is made).
-    wait_until 30 "the ask rule after the reload" hook_asks claude "$forced"
+    wait_diag 30 "the ask rule after the reload" hook_asks claude "$forced"
     first="$(asked_id)"
     ok "ask rule: git push --force -> request #$first ($HOOK_ERR)"
     expect_pending "$first" "ask"
@@ -593,9 +667,11 @@ EOF
     # so pkcheck fails and the approval is refused.
     as_root sed -i 's/^same_user = "deny"$/same_user = "reauth"/' /etc/saiife/config.toml
     as_root grep -qx 'same_user = "reauth"' /etc/saiife/config.toml || fail "same_user was not set to reauth"
-    as_root systemctl reload saiifed
-    wait_until 60 "the self-approval to be refused by reauth_failed" self_approve_refused_by "$third" reauth_failed
-    ok "same_user = reauth: self-approval refused (exit 2, rule reauth_failed)"
+    reload_checked
+    # With no polkit agent pkcheck fails (reauth_failed) or exits 2 (reauth_unavailable):
+    # both are a refusal.
+    wait_diag 60 "the self-approval to be refused by reauth" self_approve_refused_by_reauth "$third"
+    ok "same_user = reauth: self-approval refused (exit 2, rule $(last_refusal_rule "$third"))"
     expect_pending "$third" "after the failed reauth"
     [[ "$(approval_actions "$third")" != *approved* ]] || fail "#$third was approved: $(approval_actions "$third")"
 
@@ -604,9 +680,9 @@ EOF
     [[ "$SA_CODE" == 0 ]] || fail "$APPROVER_USER: reject #$third exited $SA_CODE: $SA_ERR"
     ok "$APPROVER_USER rejected #$third"
     cleanup_approvals
-    as_root systemctl reload saiifed
-    wait_until 30 "the daemon after restoring the config" daemon_ready
-    wait_until 30 "the force-push to be blocked again, not asked" hook_denied_not_asked claude "$forced"
+    reload_checked
+    wait_diag 30 "the daemon after restoring the config" daemon_ready
+    wait_diag 30 "the force-push to be blocked again, not asked" hook_denied_not_asked claude "$forced"
     ok "config restored, $APPROVER_USER removed"
 }
 
