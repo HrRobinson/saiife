@@ -334,6 +334,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
             clock: Arc::new(crate::forwarder::SystemClock::default()),
             host,
             make: Arc::new(move |name, cfg| crate::forwarder::transport_for(name, cfg, &weak)),
+            send_timeout: crate::forwarder::BATCH_TIMEOUT,
         });
     }
 

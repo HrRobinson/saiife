@@ -50,10 +50,16 @@ ca = "/etc/saiife/ca/siem.pem"   # optional extra CA for tls://
   truncated at a character boundary and ends with `…[truncated]` (a
   truncated line cannot be verified). If `/dev/log` is a stream socket,
   every message goes over it with octet-counting framing instead, uncut.
+  Note that syslog-ng's `unix-stream()` source expects newline framing by
+  default; point a `unix:` target at a datagram socket (`unix-dgram()`), or
+  use a framing-aware source.
 - `tls://host:port`: TCP and TLS with octet-counting framing (RFC 6587 and
   5425), no ALPN, one connection per batch, 30 s per batch. The certificate
   must be valid for `host`. Trust comes from the system roots plus `ca` if
-  it is set, else plus the files in `/etc/saiife/ca`. Syslog has no
+  it is set, else plus the files in `/etc/saiife/ca`. The trust store is
+  read at the first send: a rotated `ca` file (or new files in
+  `/etc/saiife/ca`) is picked up after the target's config changes or the
+  daemon restarts. Syslog has no
   acknowledgement: a batch counts as delivered once it was written and the
   TLS session closed cleanly.
 
@@ -68,7 +74,15 @@ path = "/mnt/audit-share"
 Records are appended to `<path>/<host id>-YYYY-MM.jsonl`, where the month
 is the record's own, as in the local month files. The directory must
 exist; saiife does not create it (a share that is not mounted is a failing
-target, not a directory on the local disk). Each file is flushed to disk after each
+target, not a directory on the local disk).
+
+The directory must not be writable by group or others unless it has the
+sticky bit, and must not itself be a symlink. A month file is written only
+if it is a regular file with one link, owned by the daemon's user; anything
+else (a symlink, a hard link, a file someone else created) makes the target
+failing with a message that names the file. A write that hangs (an NFS
+server that went away) is given up on after 60 s and retried; no second
+write starts while the first is still stuck. Each file is flushed to disk after each
 batch. This suits an NFS or SMB share, or a directory a log agent (Fluent
 Bit, Vector) reads. Put it on a host where this machine's root cannot rewrite
 the files.
@@ -85,7 +99,13 @@ ca = "/etc/saiife/ca/splunk.pem"
 ```
 
 - A POST carries at most 500 records or 1 MiB of body, whichever comes
-  first (one record over 1 MiB is sent alone).
+  first (one record over 1 MiB is sent alone). If the target refuses such a
+  record, the `failing` reason names its `seq` and size: raise the SIEM's
+  request body limit (Splunk HEC: `max_content_length`), or the target stays
+  failing on that record.
+- A batch can take several POSTs (Splunk HEC escaping makes a body larger
+  than its lines). If a later POST fails, the whole batch is sent again,
+  including the parts already accepted: delivery is at least once.
 - `auth_secret` names a secret in the vault. Its value is sent as the
   `Authorization` header. It never appears in a log or an audit record.
 - `format = "json"` sends a JSON array whose elements are the exact JSONL
@@ -124,7 +144,9 @@ history was not rewritten.
 - **Never in the way.** Forwarding does not slow the audit writer or the
   hooks. A target that is down for hours builds a backlog on disk; nothing
   waits for it.
-- **Retries.** Exponential backoff from 1 s to 60 s, forever.
+- **Retries.** Exponential backoff from 1 s to 60 s, forever. A send that
+  neither succeeds nor fails within 60 s (a target that hangs) counts as a
+  failure too.
 - **Backlog limit.** The backlog is the audit itself, so nothing is lost
   until retention (`[audit] retention_months`) deletes a month file the
   cursor still needs. Then one `backlog_dropped` record names the range of

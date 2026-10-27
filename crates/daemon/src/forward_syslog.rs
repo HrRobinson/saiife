@@ -88,6 +88,9 @@ pub struct SyslogTransport {
     facility: u8,
     hostname: String,
     client: TargetClient,
+    /// The whole batch, local or remote, ends within this ([`SEND_TIMEOUT`]):
+    /// a local socket nobody reads blocks a send, it never fails it.
+    timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for SyslogTransport {
@@ -145,7 +148,14 @@ impl SyslogTransport {
             facility,
             hostname: header_field(&hostname, 255),
             client,
+            timeout: SEND_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_send_timeout(mut self, t: std::time::Duration) -> Self {
+        self.timeout = t;
+        self
     }
 
     /// The whole RFC 5424 message of one line.
@@ -266,9 +276,17 @@ impl Transport for SyslogTransport {
     fn send<'a>(&'a self, lines: &'a [Bytes]) -> SendFuture<'a> {
         Box::pin(async move {
             match &self.dest {
-                Dest::Unix(p) => self.send_unix(p, lines).await,
+                Dest::Unix(p) => {
+                    match tokio::time::timeout(self.timeout, self.send_unix(p, lines)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(SendError::Retry(format!(
+                            "{}: timed out (nobody reads the socket)",
+                            p.display()
+                        ))),
+                    }
+                }
                 Dest::Tls { host, port } => {
-                    match tokio::time::timeout(SEND_TIMEOUT, self.send_tls(host, *port, lines))
+                    match tokio::time::timeout(self.timeout, self.send_tls(host, *port, lines))
                         .await
                     {
                         Ok(r) => r.map_err(SendError::Retry),
@@ -410,6 +428,35 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].ends_with(big.as_bytes()));
         assert!(frames[1].ends_with(LINE.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn syslog_local_socket_nobody_reads_times_out() {
+        let d = tempfile::tempdir().unwrap();
+        // A datagram socket that never reads: its queue fills, sends block.
+        let path = d.path().join("dgram");
+        let _server = UnixDatagram::bind(&path).unwrap();
+        let t = local(path, SyslogFormat::Rfc5424Json)
+            .with_send_timeout(std::time::Duration::from_millis(200));
+        let line = Bytes::from(format!(r#"{{"seq":1,"input":"{}"}}"#, "x".repeat(4000)));
+        let lines = vec![line; 5000];
+        let err = t.send(&lines).await.unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("timed out")),
+            "{err:?}"
+        );
+        // A stream socket that accepts and never reads.
+        let path = d.path().join("stream");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let t = local(path, SyslogFormat::Rfc5424Json)
+            .with_send_timeout(std::time::Duration::from_millis(200));
+        let err = t.send(&lines).await.unwrap_err();
+        assert!(
+            matches!(&err, SendError::Retry(w) if w.contains("timed out")),
+            "{err:?}"
+        );
+        drop(held);
     }
 
     /// `LEN SP MSG` frames.

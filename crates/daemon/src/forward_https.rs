@@ -5,10 +5,13 @@
 //!
 //! - A POST carries at most 500 records and at most 1 MiB of body. A batch
 //!   that would be larger is sent as several POSTs, in order; one record
-//!   longer than 1 MiB goes alone.
+//!   longer than 1 MiB goes alone (refused, the error names its `seq` and
+//!   size and says to raise the SIEM's body limit). When a later POST of a
+//!   batch fails, the whole batch goes again, the accepted parts included:
+//!   at least once.
 //! - `json`: the body is a JSON array whose elements are the lines,
-//!   embedded byte for byte (each line is checked to be one JSON value
-//!   first). A line that is not JSON (it cannot be in a chain that
+//!   embedded byte for byte (each line is checked to be UTF-8 and one JSON
+//!   value first). A line that is not JSON (it cannot be in a chain that
 //!   verifies, but a foreign line can sit in a month file) would make the
 //!   array invalid, so it is sent as a JSON string holding the line instead
 //!   (invalid UTF-8 replaced): the batch still goes through, the SIEM still
@@ -65,9 +68,11 @@ impl std::fmt::Debug for HttpsTransport {
 }
 
 /// One line as an element of the `json` array: the line itself when it is
-/// one JSON value, else the line as a JSON string.
+/// UTF-8 and one JSON value, else the line as a JSON string.
 fn json_element(line: &[u8], out: &mut Vec<u8>) {
-    if serde_json::from_slice::<serde::de::IgnoredAny>(line).is_ok() {
+    let raw = std::str::from_utf8(line)
+        .is_ok_and(|l| serde_json::from_str::<serde::de::IgnoredAny>(l).is_ok());
+    if raw {
         out.extend_from_slice(line);
     } else {
         let s = serde_json::to_string(&String::from_utf8_lossy(line)).unwrap_or_default();
@@ -82,9 +87,38 @@ fn hec_element(line: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(b", \"sourcetype\": \"saiife\"}");
 }
 
+/// One POST: its body, and the record when it is a single one over
+/// [`MAX_BYTES`] (`(seq, body bytes)`), for the error if it is refused.
+pub struct Body {
+    pub bytes: Vec<u8>,
+    pub oversized: Option<(Option<u64>, usize)>,
+}
+
 /// The bodies of a batch, in order: each at most [`MAX_RECORDS`] records
 /// and [`MAX_BYTES`] bytes, except a single record that is larger alone.
-pub fn bodies(format: HttpsFormat, lines: &[Bytes]) -> Vec<Vec<u8>> {
+pub fn bodies(format: HttpsFormat, lines: &[Bytes]) -> Vec<Body> {
+    let seq = |line: &[u8]| {
+        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(line)
+            .ok()
+            .and_then(|m| m.get("seq").and_then(|s| s.as_u64()))
+    };
+    let mut first: Vec<&Bytes> = Vec::new();
+    let raw = bodies_raw(format, lines, &mut first);
+    raw.into_iter()
+        .zip(first)
+        .map(|((bytes, n), line)| {
+            let oversized = (n == 1 && bytes.len() > MAX_BYTES).then(|| (seq(line), bytes.len()));
+            Body { bytes, oversized }
+        })
+        .collect()
+}
+
+/// `(body, records)` per POST; `first` gets each POST's first line.
+fn bodies_raw<'l>(
+    format: HttpsFormat,
+    lines: &'l [Bytes],
+    first: &mut Vec<&'l Bytes>,
+) -> Vec<(Vec<u8>, usize)> {
     let (open, sep, close): (&[u8], &[u8], &[u8]) = match format {
         HttpsFormat::Json => (b"[", b",", b"]"),
         HttpsFormat::SplunkHec => (b"", b"\n", b""),
@@ -102,10 +136,11 @@ pub fn bodies(format: HttpsFormat, lines: &[Bytes]) -> Vec<Vec<u8>> {
         let grown = body.len() + sep.len() + el.len() + close.len();
         if n > 0 && (n == MAX_RECORDS || grown > MAX_BYTES) {
             body.extend_from_slice(close);
-            out.push(std::mem::take(&mut body));
+            out.push((std::mem::take(&mut body), n));
             n = 0;
         }
         if n == 0 {
+            first.push(line);
             body.extend_from_slice(open);
         } else {
             body.extend_from_slice(sep);
@@ -115,7 +150,7 @@ pub fn bodies(format: HttpsFormat, lines: &[Bytes]) -> Vec<Vec<u8>> {
     }
     if n > 0 {
         body.extend_from_slice(close);
-        out.push(body);
+        out.push((body, n));
     }
     out
 }
@@ -222,7 +257,18 @@ impl Transport for HttpsTransport {
     fn send<'a>(&'a self, lines: &'a [Bytes]) -> SendFuture<'a> {
         Box::pin(async move {
             for body in bodies(self.format, lines) {
-                self.post(body).await?;
+                match (self.post(body.bytes).await, body.oversized) {
+                    (Ok(()), _) => {}
+                    (Err(SendError::Retry(why)), Some((seq, size))) => {
+                        let seq =
+                            seq.map_or_else(|| "without a seq".into(), |s| format!("seq {s}"));
+                        return Err(SendError::Retry(format!(
+                            "{why}; record {seq} alone is a {size}-byte body, over the 1 MiB \
+                             batch limit: raise the SIEM's request body limit"
+                        )));
+                    }
+                    (Err(e), _) => return Err(e),
+                }
             }
             Ok(())
         })
@@ -504,6 +550,42 @@ mod tests {
         let seen = m.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);
         assert!(seen.iter().all(|s| s.body.len() <= 1 << 20));
+    }
+
+    #[tokio::test]
+    async fn https_json_non_utf8_line_is_a_string() {
+        let p = pki();
+        let m = mock(&p, false).await;
+        let t = transport(&p, &m, HttpsFormat::Json, None, no_secrets());
+        let bad = Bytes::from_static(b"{\"a\":\"x\xff\"}");
+        t.send(&[rec(1, 0), bad]).await.unwrap();
+        let seen = m.seen.lock().unwrap().clone();
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&seen[0].body).unwrap();
+        assert!(v[0].is_object());
+        assert_eq!(
+            v[1],
+            serde_json::Value::String("{\"a\":\"x\u{fffd}\"}".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn https_oversized_record_refused_names_seq_and_size() {
+        let p = pki();
+        let m = mock(&p, false).await;
+        *m.status.lock().unwrap() = 413;
+        let t = transport(&p, &m, HttpsFormat::Json, None, no_secrets());
+        let err = t.send(&[rec(77, 1100 * 1024)]).await.unwrap_err();
+        let SendError::Retry(w) = &err else {
+            panic!("{err:?}")
+        };
+        assert!(w.contains("413") && w.contains("seq 77"), "{w}");
+        assert!(
+            w.contains("-byte body") && w.contains("raise the SIEM"),
+            "{w}"
+        );
+        // A normal record refused says only the answer.
+        let err = t.send(&[rec(78, 0)]).await.unwrap_err();
+        assert!(!format!("{err}").contains("raise"), "{err}");
     }
 
     #[tokio::test]

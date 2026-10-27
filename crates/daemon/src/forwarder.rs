@@ -92,6 +92,12 @@ pub type MakeTransport =
 /// The timeout of one send to a network target (syslog over TLS, https).
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The worker gives up on a send that has not ended after this long (a
+/// target that hangs instead of failing) and retries it with backoff, so
+/// a stall is recorded as `failing` like any other outage. Longer than
+/// [`SEND_TIMEOUT`], so a network transport's own timeout says why first.
+pub const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The daemon's transports for `[audit.forward.<name>]` (plan 12 decisions
 /// 3 to 5). The config was validated when the policy loaded. Nothing here
 /// touches the network or the vault: a network target builds its TLS client
@@ -633,6 +639,7 @@ struct Worker {
     cursor_path: PathBuf,
     host: Weak<dyn Host>,
     clock: Arc<dyn Clock>,
+    send_timeout: Duration,
     appended: watch::Receiver<u64>,
     stop: watch::Receiver<bool>,
 }
@@ -768,7 +775,12 @@ impl Worker {
             }
             // A stop drops a send in flight: its batch goes again next time.
             let sent = tokio::select! {
-                r = self.transport.send(&batch.lines) => r,
+                r = tokio::time::timeout(self.send_timeout, self.transport.send(&batch.lines)) => {
+                    r.unwrap_or_else(|_| Err(SendError::Retry(format!(
+                        "timed out after {} s",
+                        self.send_timeout.as_secs_f64()
+                    ))))
+                }
                 _ = stopped(&mut self.stop) => return,
             };
             match sent {
@@ -836,6 +848,8 @@ pub struct Setup {
     pub clock: Arc<dyn Clock>,
     pub host: Weak<dyn Host>,
     pub make: MakeTransport,
+    /// [`BATCH_TIMEOUT`] (tests use less).
+    pub send_timeout: Duration,
 }
 
 /// How long a stopping worker may take before it is aborted.
@@ -942,6 +956,7 @@ impl Forwarders {
                         cursor_path: cursor_path(&setup.state_dir, name),
                         host: setup.host.clone(),
                         clock: Arc::clone(&setup.clock),
+                        send_timeout: setup.send_timeout,
                         appended: setup.appended.clone(),
                         stop,
                     };
@@ -1062,6 +1077,29 @@ pub mod testing {
                     && self.fails.fetch_sub(1, Ordering::SeqCst) > 0);
             if fail {
                 return Box::pin(async { Err(SendError::Retry("target down".into())) });
+            }
+            self.inner.send(lines)
+        }
+
+        fn max_batch(&self) -> (usize, usize) {
+            self.inner.batch
+        }
+    }
+
+    /// Never ends its first `hangs` sends, then works like a
+    /// [`MemoryTransport`].
+    #[derive(Clone)]
+    pub struct HangingTransport {
+        pub inner: MemoryTransport,
+        pub hangs: Arc<AtomicUsize>,
+    }
+
+    impl Transport for HangingTransport {
+        fn send<'a>(&'a self, lines: &'a [Bytes]) -> SendFuture<'a> {
+            let hang = self.hangs.load(Ordering::SeqCst) > 0
+                && self.hangs.fetch_sub(1, Ordering::SeqCst) > 0;
+            if hang {
+                return Box::pin(std::future::pending());
             }
             self.inner.send(lines)
         }
@@ -1237,6 +1275,10 @@ mod tests {
         }
 
         fn forwarders(&self, make: MakeTransport) -> Forwarders {
+            self.forwarders_timing_out(make, BATCH_TIMEOUT)
+        }
+
+        fn forwarders_timing_out(&self, make: MakeTransport, send_timeout: Duration) -> Forwarders {
             let f = Forwarders::default();
             let host: Arc<dyn Host> = self.host.clone();
             f.configure(Setup {
@@ -1246,6 +1288,7 @@ mod tests {
                 clock: self.clock.clone(),
                 host: Arc::downgrade(&host),
                 make,
+                send_timeout,
             });
             f
         }
@@ -1526,6 +1569,33 @@ mod tests {
         })
         .await;
         assert!(h.host.notes.lock().unwrap().is_empty());
+        fw.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_hanging_send_times_out_and_is_failing() {
+        // Hangs at 0, 1, 3, 7, 15, 31 s (fake time): the 6th is past 30 s.
+        let h = H::new();
+        h.append(3).await;
+        let t = HangingTransport {
+            inner: MemoryTransport::new((500, 1 << 20)),
+            hangs: Arc::new(std::sync::atomic::AtomicUsize::new(6)),
+        };
+        let fw = h.forwarders_timing_out(make_with(t.clone()), Duration::from_millis(20));
+        fw.apply(&one("a")).await;
+        until("forwarded", || !t.inner.got().is_empty()).await;
+        until("recovered", || h.host.events().len() == 2).await;
+        assert_eq!(h.host.events(), ["failing", "recovered"]);
+        let failing = lock(&h.host.records)[0].clone();
+        assert!(
+            failing
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("timed out"),
+            "{:?}",
+            failing.reason
+        );
         fw.stop_all().await;
     }
 
