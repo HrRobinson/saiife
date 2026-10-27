@@ -628,3 +628,46 @@ fn non_loopback_tcp_is_config_error_at_load() {
     let p = load_system(&cfg).unwrap();
     assert_eq!(p.config.gateway.tcp_addr().unwrap().unwrap().port(), 0);
 }
+
+#[test]
+fn approvers_are_validated() {
+    let (_d, cfg) = etc(
+        "version = 2\n[approval]\napprovers = [\"alice\", \"group:ops\"]\n",
+        &[],
+    );
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.approval.approvers, vec!["alice", "group:ops"]);
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+    for bad in ["\"group:\"", "\"a b\"", "\"-x\"", "\"\""] {
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[approval]\napprovers = [{bad}]\n"),
+            &[],
+        );
+        match load_system(&cfg) {
+            Err(PolicyError::Invalid { detail, .. }) => {
+                assert!(detail.contains("approvers"), "{bad}: {detail}")
+            }
+            other => panic!("{bad}: expected Invalid, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn empty_approvers_with_ask_warns() {
+    // No ask rules: nothing to approve, no warning.
+    let (_d, cfg) = etc("version = 2\n", &[]);
+    assert!(load_system(&cfg).unwrap().warnings.is_empty());
+    let (_d, cfg) = etc(
+        "version = 2\n[guard]\nask = [\"core.git/force-push\"]\n[approval]\napprovers = []\n",
+        &[],
+    );
+    let p = load_system(&cfg).unwrap();
+    assert!(p.config.approval.approvers.is_empty());
+    assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+    assert!(
+        p.warnings[0].contains("approvers is empty: nobody can approve"),
+        "{:?}",
+        p.warnings
+    );
+}

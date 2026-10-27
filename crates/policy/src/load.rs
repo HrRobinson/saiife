@@ -2,7 +2,7 @@
 
 use crate::capability::validate_pattern;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
-use crate::system::{Fail, McpCfg, Scope, SystemConfig};
+use crate::system::{Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -187,6 +187,13 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
                 entry: entry.clone(),
             });
         }
+    }
+
+    cfg.approval
+        .check_approvers()
+        .map_err(|why| invalid(config_file, why))?;
+    if cfg.approval.approvers.is_empty() && !cfg.guard.ask.is_empty() {
+        warnings.push(format!("{config_name}: {NO_APPROVERS_WARNING}"));
     }
 
     if cfg.locked && cfg.guard.fail == Fail::Open {

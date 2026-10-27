@@ -141,6 +141,36 @@ impl Default for ApprovalCfg {
     }
 }
 
+impl ApprovalCfg {
+    /// Each `approvers` entry is a user name or `group:<name>`; a name is not
+    /// empty, does not start with `-` and holds no `:`, whitespace or control
+    /// characters. `Err` names the first bad entry.
+    pub fn check_approvers(&self) -> Result<(), String> {
+        for e in &self.approvers {
+            let name = e.strip_prefix("group:").unwrap_or(e);
+            if !valid_name(name) {
+                return Err(format!(
+                    "[approval] approvers entry {e:?} is not a user name or group:<name>"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A user or group name (as `users::valid_name`).
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name
+            .chars()
+            .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+}
+
+/// The load warning when `[guard] ask` routes calls to approval but
+/// `[approval] approvers` is empty.
+pub const NO_APPROVERS_WARNING: &str = "[approval] approvers is empty: nobody can approve requests";
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GatewayCfg {
@@ -451,6 +481,31 @@ mod tests {
             }
         };
         assert!(st(587, "") && st(25, "") && !st(465, ""));
+    }
+
+    #[test]
+    fn approvers_entries_are_names_or_groups() {
+        let a = |v: &[&str]| ApprovalCfg {
+            approvers: v.iter().map(|s| s.to_string()).collect(),
+            ..ApprovalCfg::default()
+        };
+        a(&[]).check_approvers().unwrap();
+        a(&["alice", "group:ops", "svc-bot", "j.doe"])
+            .check_approvers()
+            .unwrap();
+        for bad in [
+            "",
+            "group:",
+            "-x",
+            "group:-x",
+            "a b",
+            "a:b",
+            "group:a:b",
+            "x\n",
+        ] {
+            let e = a(&["alice", bad]).check_approvers().unwrap_err();
+            assert!(e.contains("approvers"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

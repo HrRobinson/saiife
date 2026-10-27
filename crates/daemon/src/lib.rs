@@ -9,6 +9,8 @@ pub mod api_ops;
 #[cfg(target_os = "linux")]
 pub mod approvals;
 #[cfg(target_os = "linux")]
+pub mod approvers;
+#[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod gateway;
@@ -24,6 +26,8 @@ pub mod notifier;
 pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
+#[cfg(target_os = "linux")]
+pub mod reauth;
 #[cfg(target_os = "linux")]
 pub mod secret_ops;
 #[cfg(target_os = "linux")]
