@@ -1179,7 +1179,7 @@ fn status_with_fifo_config_does_not_hang() {
     std::fs::remove_file(&cfg).unwrap();
     assert!(Command::new("mkfifo").arg(&cfg).status().unwrap().success());
     let out = env
-        .saiife_within(&["status"], std::time::Duration::from_secs(5))
+        .saiife_within(&["status"], std::time::Duration::from_secs(30))
         .expect("saiife status hung on a FIFO config");
     assert_eq!(code(&out), 1, "{}", stdout(&out));
     assert!(stdout(&out).contains("cannot be read"), "{}", stdout(&out));

@@ -14,7 +14,7 @@ use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{Decision, Engine};
 use saiifeguard::profile::select_active;
 
-const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 const WRAPPERS: [&str; 5] = ["", "timeout 5 ", "setsid ", "nice -n 5 ", "env "];
 

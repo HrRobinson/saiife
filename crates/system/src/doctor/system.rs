@@ -446,24 +446,28 @@ fn files_binary(ctx: &Ctx) -> Check {
 fn reauth(ctx: &Ctx) -> Check {
     const ID: &str = "reauth";
     const TITLE: &str = "re-authentication";
-    let rules = crate::polkit::rules_mentioning_action(ctx.layout);
-    if !rules.is_empty() {
-        return Check::new(
-            ID,
-            Status::Warn,
-            TITLE,
-            format!(
-                "{} ({})",
-                crate::polkit::RULE_MENTIONS_ACTION,
-                rules.join(", ")
-            ),
-        );
-    }
+    let (rules, unreadable) = crate::polkit::scan_rules(ctx.layout);
     let problems = crate::polkit::action_problems(ctx.layout, ctx.host);
-    if crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty() {
+    let sound = crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty();
+    // Every finding is reported; one never hides another.
+    let mut notes = Vec::new();
+    if !sound {
+        notes.push(REAUTH_UNAVAILABLE.to_string());
+    }
+    if !rules.is_empty() {
+        notes.push(format!(
+            "{} ({})",
+            crate::polkit::RULE_MENTIONS_ACTION,
+            rules.join(", ")
+        ));
+    }
+    for d in &unreadable {
+        notes.push(format!("cannot read {d} (run as root)"));
+    }
+    if notes.is_empty() {
         Check::new(ID, Status::Pass, TITLE, "polkit action com.saiife.approve")
     } else {
-        Check::new(ID, Status::Warn, TITLE, REAUTH_UNAVAILABLE)
+        Check::new(ID, Status::Warn, TITLE, notes.join("; "))
     }
 }
 
@@ -1014,8 +1018,32 @@ mod tests {
             "{:?}",
             get(&r, "reauth")
         );
+        // A rule does not hide an action-file problem (both reported).
+        fs::write(&a, "tampered").unwrap();
+        let r = t.doctor();
+        let d = &get(&r, "reauth").detail;
+        assert!(
+            d.contains(REAUTH_UNAVAILABLE) && d.contains("mentions com.saiife.approve"),
+            "{d}"
+        );
+        fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
         fs::remove_file(rules.join("49-saiife.rules")).unwrap();
         assert_status(&t.doctor(), "reauth", Status::Pass);
+        // A rules directory that cannot be read is not a silent pass.
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&rules, fs::Permissions::from_mode(0o000)).unwrap();
+            let r = t.doctor();
+            fs::set_permissions(&rules, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_status(&r, "reauth", Status::Warn);
+            assert!(
+                get(&r, "reauth")
+                    .detail
+                    .contains("cannot read /etc/polkit-1/rules.d (run as root)"),
+                "{:?}",
+                get(&r, "reauth")
+            );
+        }
         let uid = t.host.user("root").unwrap().uid;
         crate::testing::set_root_uid(&t.host, uid + 1);
         assert_status(&t.doctor(), "reauth", Status::Warn);

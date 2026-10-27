@@ -80,10 +80,24 @@ pub fn action_problems(layout: &Layout, host: &dyn Host) -> Vec<String> {
 /// password. Regular files only (a symlink is not followed), each read up
 /// to 1 MiB; an unreadable directory or file is skipped.
 pub fn rules_mentioning_action(layout: &Layout) -> Vec<String> {
+    scan_rules(layout).0
+}
+
+/// [`rules_mentioning_action`], and the rules directories that exist but
+/// cannot be read (permission denied: not running as root), which the scan
+/// could not look in.
+pub fn scan_rules(layout: &Layout) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for dir in POLKIT_RULES_DIRS {
-        let Ok(entries) = std::fs::read_dir(layout.at(dir)) else {
-            continue;
+        let entries = match std::fs::read_dir(layout.at(dir)) {
+            Ok(e) => e,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    unreadable.push((*dir).to_string());
+                }
+                continue;
+            }
         };
         for e in entries.flatten().take(MAX_RULES_FILES) {
             let p = e.path();
@@ -108,7 +122,7 @@ pub fn rules_mentioning_action(layout: &Layout) -> Vec<String> {
         }
     }
     out.sort();
-    out
+    (out, unreadable)
 }
 
 #[cfg(test)]

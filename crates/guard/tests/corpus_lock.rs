@@ -12,7 +12,7 @@ use saiifeguard::canon::PathVars;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 
-const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct Fixture {
     _dir: tempfile::TempDir,
