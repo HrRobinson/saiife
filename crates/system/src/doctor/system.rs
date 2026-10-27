@@ -77,12 +77,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         ));
     }
     out.push(peer_pidfd());
-    out.push(Check::new(
-        "reauth",
-        Status::Info,
-        "re-authentication",
-        "not configured",
-    ));
+    out.push(reauth(ctx));
     out.push(Check::new(
         "forwarding",
         Status::Info,
@@ -440,6 +435,22 @@ fn files_binary(ctx: &Ctx) -> Check {
             TITLE,
             format!("{BINARY}: no saiife build marker; its build is unknown"),
         ),
+    }
+}
+
+/// Re-authentication for approvals needs polkit: `pkcheck` present and
+/// root-owned, and the `com.saiife.approve` action installed.
+fn reauth(ctx: &Ctx) -> Check {
+    const ID: &str = "reauth";
+    const TITLE: &str = "re-authentication";
+    let root_uid = ctx.host.user("root").map(|u| u.uid);
+    let pkcheck_ok = fs::metadata(ctx.layout.at(PKCHECK))
+        .is_ok_and(|m| m.is_file() && Some(m.uid()) == root_uid);
+    let action_ok = fs::symlink_metadata(ctx.layout.at(POLKIT_ACTION)).is_ok_and(|m| m.is_file());
+    if pkcheck_ok && action_ok {
+        Check::new(ID, Status::Pass, TITLE, "polkit action com.saiife.approve")
+    } else {
+        Check::new(ID, Status::Warn, TITLE, REAUTH_UNAVAILABLE)
     }
 }
 
@@ -919,6 +930,34 @@ mod tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    fn add_polkit(t: &T, action: bool) {
+        let p = t.at(PKCHECK);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"#!/bin/sh\n").unwrap();
+        if action {
+            let a = t.at(POLKIT_ACTION);
+            fs::create_dir_all(a.parent().unwrap()).unwrap();
+            fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_warns_reauth_unavailable() {
+        let t = T::installed();
+        let r = t.doctor();
+        assert_status(&r, "reauth", Status::Warn);
+        assert_eq!(
+            get(&r, "reauth").detail,
+            "re-authentication unavailable: approvals need a second account"
+        );
+        // pkcheck without the action file still warns.
+        add_polkit(&t, false);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        add_polkit(&t, true);
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+    }
+
     // Linux only: on macOS `system.supported` fails (locked mode needs Linux).
     #[cfg(target_os = "linux")]
     #[test]
@@ -949,10 +988,11 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(fails, ["daemon.unit", "daemon.health"], "{}", r.to_text());
-        for id in ["vault.key", "peer.pidfd", "reauth", "forwarding"] {
+        for id in ["vault.key", "peer.pidfd", "forwarding"] {
             assert_status(&r, id, Status::Info);
         }
-        assert_eq!(get(&r, "reauth").detail, "not configured");
+        assert_status(&r, "reauth", Status::Warn);
+        assert_eq!(get(&r, "reauth").detail, REAUTH_UNAVAILABLE);
         assert_eq!(get(&r, "forwarding").detail, "not configured");
         assert!(!r.checks.iter().any(|c| c.id.starts_with("mcp.")));
         // Doctor asked systemd, through the host, and changed nothing.

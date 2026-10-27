@@ -189,6 +189,8 @@ pub fn install(
     let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
     run.config(new_config.as_deref(), &opts.approvers)?;
+    // 5b. The polkit action, when polkit is there.
+    run.polkit()?;
     // 6. The vault key.
     run.vault_key(key_mode)?;
     // 7. The unit.
@@ -714,11 +716,33 @@ impl Run<'_> {
                         .file(CONFIG, &current, 0o644, FileKind::Config, "config")
                         .map(|_| ());
                 }
-                None => default_config(self.layout, approvers),
+                None => {
+                    let reauth = self.at(PKCHECK).exists();
+                    if !reauth {
+                        self.report.warnings.push(REAUTH_UNAVAILABLE.to_string());
+                    }
+                    default_config(self.layout, approvers, reauth)
+                }
             },
         };
         self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
             .map(|_| ())
+    }
+
+    /// The polkit action file (root:root 0644), only when `pkcheck` exists.
+    fn polkit(&mut self) -> Result<(), InstallError> {
+        if !self.at(PKCHECK).exists() {
+            return Ok(());
+        }
+        self.dir(POLKIT_DIR, 0o755, false)?;
+        self.file(
+            POLKIT_ACTION,
+            POLKIT_POLICY.as_bytes(),
+            0o644,
+            FileKind::Polkit,
+            "polkit",
+        )
+        .map(|_| ())
     }
 
     fn vault_key(&mut self, mode: VaultKeyMode) -> Result<(), InstallError> {
@@ -941,6 +965,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stand-in `pkcheck` in the fake root (never run).
+    pub(crate) fn add_pkcheck(e: &Env) {
+        let p = e.at(PKCHECK);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn install_writes_polkit_action_when_pkcheck_present() {
+        let e = env(255);
+        add_pkcheck(&e);
+        let r = e.install();
+        let p = e.at(POLKIT_ACTION);
+        assert_eq!(fs::read_to_string(&p).unwrap(), POLKIT_POLICY);
+        assert_eq!(mode(&p), 0o644);
+        assert_eq!(chowned(&e.host, &p), vec![root_ids(&e.host)]);
+        let rec = e.installed();
+        let f = rec
+            .files
+            .iter()
+            .find(|f| f.path == Path::new(POLKIT_ACTION))
+            .unwrap();
+        assert_eq!(f.kind, FileKind::Polkit);
+        assert!(f.created);
+        assert!(f.sha256.is_some());
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("same_user = \"reauth\"\n"), "{cfg}");
+        assert!(!r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE));
+        // Idempotent.
+        let again = e.install();
+        assert!(again.unchanged.iter().any(|u| u == POLKIT_ACTION));
+    }
+
+    #[test]
+    fn install_skips_and_sets_deny_without_pkcheck() {
+        let e = env(255);
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.kind == FileKind::Polkit));
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("# same_user = \"deny\"\n"), "{cfg}");
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+    }
+
+    #[test]
+    fn action_file_never_auth_self_keep() {
+        assert!(!POLKIT_POLICY.contains("auth_self_keep"));
+        assert!(!POLKIT_POLICY.contains("auth_admin"));
+        for k in ["allow_any", "allow_inactive", "allow_active"] {
+            assert!(
+                POLKIT_POLICY.contains(&format!("<{k}>auth_self</{k}>")),
+                "{k}"
+            );
+        }
+        assert!(POLKIT_POLICY.contains("<action id=\"com.saiife.approve\">"));
+    }
+
     pub(crate) const UBUNTU_2404: &str =
         "NAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nID=ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
 
@@ -1034,7 +1120,8 @@ pub(crate) mod tests {
             fs::read(e.at(BINARY)).unwrap(),
             fs::read(&e.binary).unwrap()
         );
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // No pkcheck in the fake root: the only warning is about reauth.
+        assert_eq!(r.warnings, [REAUTH_UNAVAILABLE], "{:?}", r.warnings);
         assert_eq!(
             fs::read_to_string(e.at(UNIT)).unwrap(),
             crate::unit_text(255)
@@ -1563,7 +1650,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         let r = e.install();
-        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert_eq!(r.warnings[1], REAUTH_UNAVAILABLE);
         assert!(
             r.warnings[0].contains("dynamically linked"),
             "{:?}",

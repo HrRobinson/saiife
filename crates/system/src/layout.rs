@@ -16,7 +16,34 @@ pub const POLICY_D: &str = "/etc/saiife/policy.d";
 pub const CREDSTORE: &str = "/etc/saiife/credstore";
 pub const VAULT_KEY: &str = "/etc/saiife/credstore/vault-key";
 pub const INSTALLED: &str = "/etc/saiife/installed.toml";
+/// The polkit action file for approval re-authentication (spec §6.10.2).
+pub const POLKIT_DIR: &str = "/usr/share/polkit-1/actions";
+pub const POLKIT_ACTION: &str = "/usr/share/polkit-1/actions/com.saiife.approve.policy";
+/// Present (and root-owned) when polkit re-authentication can work.
+pub const PKCHECK: &str = "/usr/bin/pkcheck";
+pub const POLKIT_ACTION_ID: &str = "com.saiife.approve";
+/// The warning when re-authentication is unavailable (install and doctor).
+pub const REAUTH_UNAVAILABLE: &str =
+    "re-authentication unavailable: approvals need a second account";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
+
+/// The polkit action file, byte for byte. `auth_self`, never
+/// `auth_self_keep`: every approval asks for the password again.
+pub const POLKIT_POLICY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>saiife</vendor>
+  <action id="com.saiife.approve">
+    <description>Approve a saiife request</description>
+    <message>Authentication is required to approve a saiife request</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
+"#;
 pub const STATE_DIR: &str = "/var/lib/saiife";
 pub const KEYS_DIR: &str = "/var/lib/saiife/keys";
 pub const AUDIT_KEY: &str = "/var/lib/saiife/keys/audit.ed25519";

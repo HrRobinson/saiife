@@ -31,6 +31,8 @@ pub enum FileKind {
     Config,
     VaultKey,
     Managed,
+    /// The polkit action file (`com.saiife.approve`).
+    Polkit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

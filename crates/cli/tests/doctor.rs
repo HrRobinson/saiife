@@ -47,10 +47,11 @@ fn doctor_json_exit_matches_report() {
     assert_eq!(out.status.code(), Some(2));
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("PASS  keys  audit signing key\n"), "{text}");
+    // The fake tree has no polkit: one re-authentication warning.
     // On macOS system.supported fails too (locked mode needs Linux).
     let fails = if cfg!(target_os = "linux") { 2 } else { 3 };
     assert!(
-        text.ends_with(&format!("doctor: {fails} failures, 0 warnings\n")),
+        text.ends_with(&format!("doctor: {fails} failures, 1 warnings\n")),
         "{text}"
     );
 }
