@@ -3,12 +3,15 @@
 //! `pkcheck --action-id com.saiife.approve --process <pid>,<start>,<uid>
 //! --allow-user-interaction` for the approving CLI process, with an empty
 //! environment except `PATH`, and kills it (its own child) at the timeout.
-//! Exit 0 is authorized; any other exit is denied; a spawn failure or a
+//! Exit 0 is authorized; exit 4 (pkcheck's own error, e.g. no polkit
+//! daemon) is unavailable; any other exit is denied; a spawn failure or a
 //! timeout is an error. Every non-`Authorized` result refuses the approval.
 
 use crate::sessions::Proc;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The polkit action id `system install` registers.
@@ -22,8 +25,50 @@ pub const REAUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The only environment `pkcheck` gets.
 pub const PKCHECK_PATH_ENV: &str = "/usr/bin:/bin";
 
+/// Where a polkit daemon binary may live (as Task 8's `polkit_present`).
+pub const POLKITD: [&str; 3] = [
+    "/usr/lib/polkit-1/polkitd",
+    "/usr/libexec/polkitd",
+    "/usr/lib/policykit-1/polkitd",
+];
+/// pkcheck's exit status for "an error occurred" (polkit not running...).
+const PKCHECK_EXIT_ERROR: i32 = 4;
+
 /// How often a running `pkcheck` is polled for its exit.
 const POLL: Duration = Duration::from_millis(10);
+
+/// The uids with a re-authentication in flight: at most one each, so one
+/// password prompt cannot authorize several queued approvals.
+fn in_flight() -> &'static Mutex<HashSet<u32>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Held while `uid`'s re-authentication runs; dropping it frees the slot.
+#[derive(Debug)]
+pub struct InFlight(u32);
+
+impl InFlight {
+    /// `None` when `uid` already has a re-authentication in flight.
+    pub fn begin(uid: u32) -> Option<InFlight> {
+        let inserted = in_flight()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(uid);
+        // Built only on success, after the lock is released: a dropped
+        // `InFlight` frees its uid's slot.
+        inserted.then(|| InFlight(uid))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        in_flight()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReauthResult {
@@ -47,6 +92,7 @@ pub trait Reauth: Send + Sync {
 pub struct PkCheck {
     pkcheck: PathBuf,
     action_file: PathBuf,
+    polkitd: Vec<PathBuf>,
 }
 
 impl Default for PkCheck {
@@ -66,7 +112,14 @@ impl PkCheck {
         PkCheck {
             pkcheck: pkcheck.into(),
             action_file: action_file.into(),
+            polkitd: POLKITD.iter().map(PathBuf::from).collect(),
         }
+    }
+
+    /// Other polkit daemon locations than [`POLKITD`], for tests.
+    pub fn with_polkitd(mut self, candidates: Vec<PathBuf>) -> PkCheck {
+        self.polkitd = candidates;
+        self
     }
 
     /// The argv after the program name (decision 7).
@@ -82,12 +135,13 @@ impl PkCheck {
 }
 
 impl Reauth for PkCheck {
-    /// The binary is a regular file whose whole path is root-owned and not
-    /// group/other-writable, and the action file exists.
+    /// `pkcheck` and the action file are regular files whose whole paths are
+    /// root-owned and not group/other-writable, and a polkit daemon binary
+    /// is installed.
     fn available(&self) -> bool {
-        is_regular(&self.pkcheck)
-            && saiife_system::fsops::root_owned_chain(&self.pkcheck).is_ok()
-            && is_regular(&self.action_file)
+        root_owned_file(&self.pkcheck)
+            && root_owned_file(&self.action_file)
+            && polkitd_present(&self.polkitd)
     }
 
     fn check(&self, pid: u32, start: u64, uid: u32, timeout: Duration) -> ReauthResult {
@@ -109,10 +163,10 @@ impl Reauth for PkCheck {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return if status.success() {
-                        ReauthResult::Authorized
-                    } else {
-                        ReauthResult::Denied
+                    return match status.code() {
+                        Some(0) => ReauthResult::Authorized,
+                        Some(PKCHECK_EXIT_ERROR) => ReauthResult::Unavailable,
+                        _ => ReauthResult::Denied,
                     };
                 }
                 Ok(None) => {}
@@ -137,8 +191,10 @@ impl Reauth for PkCheck {
     }
 }
 
-/// Spawns `cmd`, retrying a few times on `ETXTBSY` (a binary just written
-/// while another thread's fork briefly held it open for writing).
+/// Spawns `cmd`, retrying a few times on `ETXTBSY`. The retry exists for
+/// the tests' fake `pkcheck` scripts: a script just written can be briefly
+/// held open for writing by another test thread's fork. The real
+/// `/usr/bin/pkcheck` is never written, so production never retries.
 fn spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     const ETXTBSY: i32 = 26;
     let mut tries = 0;
@@ -157,6 +213,15 @@ fn is_regular(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.file_type().is_file())
         .unwrap_or(false)
+}
+
+fn root_owned_file(p: &Path) -> bool {
+    is_regular(p) && saiife_system::fsops::root_owned_chain(p).is_ok()
+}
+
+/// Whether any of `candidates` is a regular file (a polkit daemon binary).
+pub fn polkitd_present<P: AsRef<Path>>(candidates: &[P]) -> bool {
+    candidates.iter().any(|p| is_regular(p.as_ref()))
 }
 
 /// The start time (field 22 of `/proc/<pid>/stat`) of the approving CLI,
@@ -219,7 +284,7 @@ mod tests {
     #[test]
     fn pkcheck_nonzero_is_denied() {
         let d = tmp();
-        for code in [1, 2, 3, 127] {
+        for code in [1, 2, 3, 5, 127] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
             assert_eq!(
                 pk.check(1, 2, 3, Duration::from_secs(10)),
@@ -227,6 +292,27 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn pkcheck_exit_4_is_unavailable() {
+        let d = tmp();
+        let pk = PkCheck::with_paths(fake(d.path(), 4, 0), d.path().join("action"));
+        assert_eq!(
+            pk.check(1, 2, 3, Duration::from_secs(10)),
+            ReauthResult::Unavailable
+        );
+    }
+
+    #[test]
+    fn in_flight_is_one_per_uid() {
+        // A uid no other test uses: the set is process-wide.
+        let a = InFlight::begin(990_001).unwrap();
+        assert!(InFlight::begin(990_001).is_none());
+        let b = InFlight::begin(990_002).unwrap();
+        drop(a);
+        let again = InFlight::begin(990_001).unwrap();
+        drop((b, again));
     }
 
     #[test]
@@ -264,6 +350,32 @@ mod tests {
         assert!(!PkCheck::with_paths(&bin, &action).available());
         // Relative paths never pass the chain check.
         assert!(!PkCheck::with_paths("pkcheck", &action).available());
+
+        // Root-owned stand-ins that are never executed: available() only
+        // inspects the paths.
+        let root_file = PathBuf::from("/etc/passwd");
+        let polkitd = vec![d.path().join("no-polkitd"), root_file.clone()];
+        assert!(PkCheck::with_paths(&root_file, &root_file)
+            .with_polkitd(polkitd.clone())
+            .available());
+        // The action file must be root-owned too.
+        assert!(!PkCheck::with_paths(&root_file, &action)
+            .with_polkitd(polkitd)
+            .available());
+        // No polkit daemon binary.
+        assert!(!PkCheck::with_paths(&root_file, &root_file)
+            .with_polkitd(vec![d.path().join("no-polkitd")])
+            .available());
+    }
+
+    #[test]
+    fn polkitd_present_needs_a_regular_file() {
+        let d = tmp();
+        let f = d.path().join("polkitd");
+        assert!(!polkitd_present(&[&f]));
+        fs::write(&f, "").unwrap();
+        assert!(polkitd_present(&[d.path().join("x"), f.clone()]));
+        assert!(!polkitd_present(&[d.path()]));
     }
 
     #[test]

@@ -192,6 +192,9 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     cfg.approval
         .check_approvers()
         .map_err(|why| invalid(config_file, why))?;
+    // `cfg.guard.ask` is the merged value here (config.toml plus every
+    // drop-in), so an `ask` rule from policy.d/ triggers the warning too.
+    // Without any `ask` rule nothing can need approval, so no warning.
     if cfg.approval.approvers.is_empty() && !cfg.guard.ask.is_empty() {
         warnings.push(format!("{config_name}: {NO_APPROVERS_WARNING}"));
     }
