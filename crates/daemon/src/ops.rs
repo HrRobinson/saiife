@@ -12,9 +12,9 @@ use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
-    OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY,
-    OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE,
-    OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
+    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -158,6 +158,8 @@ pub struct Ctx {
     /// Same-user re-authentication for approvals (polkit `pkcheck`; tests
     /// replace it before the context is shared).
     pub reauth: Arc<dyn crate::reauth::Reauth>,
+    /// One-use command grants (`[guard] ask`, spec §6.10.4).
+    pub grants: crate::grants::Grants,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -185,6 +187,8 @@ pub struct CtxInit {
     pub approvals: Result<crate::approvals::Store, String>,
     /// The lockdown flag (spec §6.18).
     pub lockdown: crate::lockdown::Store,
+    /// One-use command grants (`<state>/state/grants.json`).
+    pub grants: crate::grants::Grants,
 }
 
 /// A count of work in flight that a stop waits for.
@@ -283,6 +287,7 @@ impl Ctx {
             notifier: crate::notifier::Notifier::new(),
             approvals: i.approvals,
             reauth: Arc::new(crate::reauth::PkCheck::new()),
+            grants: i.grants,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -559,9 +564,8 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let peer = &conn.peer;
     match req.op.as_str() {
-        OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE => {
-            crate::approval_ops::handle(ctx, conn, req).await
-        }
+        OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
+        | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
         OP_HELLO => hello(req.id),
         OP_AUDIT_APPEND => append(ctx, peer, req).await,
         OP_STATUS => status(ctx, req.id),

@@ -151,7 +151,8 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // the policy: a broken one makes the whole policy invalid.
     let loaded = load_and_check(&opts.config, directory.as_ref())
         .map_err(|e| e.to_string())
-        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)));
+        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)))
+        .and_then(|(l, cat)| check_ask(&l, &opts.catalog).map(|()| (l, cat)));
     let (daemon_cfg, audit_cfg, policy, policy_err) = match &loaded {
         Ok((l, cat)) => (
             l.config.daemon.clone(),
@@ -285,6 +286,15 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     if let Some(why) = &lockdown_unreadable {
         eprintln!("saiife: warning: {why}: lockdown is on for all hooks and connectors");
     }
+    // The command grants; an unusable file is no grants (each command
+    // needs approval again) and a `grants_unreadable` record.
+    let (grants, grants_unreadable) = crate::grants::Grants::open(
+        crate::grants::path_in(&opts.state_dir),
+        crate::import_backup::now(),
+    );
+    if let Some(why) = &grants_unreadable {
+        eprintln!("saiife: warning: {why}: approved commands need approval again");
+    }
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
 
@@ -309,6 +319,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         tokens: Arc::new(tokens),
         approvals,
         lockdown,
+        grants,
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
@@ -321,6 +332,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         ("ca_refused", ca_refused),
         ("tokens_reset", tokens_reset),
         ("lockdown_unreadable", lockdown_unreadable),
+        ("grants_unreadable", grants_unreadable),
     ]
     .into_iter()
     .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
@@ -978,6 +990,18 @@ async fn start_tcp(
     task
 }
 
+/// Every `[guard] ask` entry names a rule of an active pack; otherwise the
+/// policy is invalid (named by its file).
+fn check_ask(
+    l: &saiife_policy::LoadedPolicy,
+    catalog: &[saiife_policy::PackInfo],
+) -> Result<(), String> {
+    saiife_policy::check_guard_ask(&l.config, catalog).map_err(|e| {
+        let file = l.files.first().map(|f| f.0.as_str()).unwrap_or("config");
+        format!("{file}: {e}")
+    })
+}
+
 /// SIGHUP: load and check the policy again. A valid one replaces the old in
 /// one step; an invalid one is refused and the old one stays. First the
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
@@ -990,6 +1014,7 @@ async fn reload(ctx: &Arc<Ctx>) {
         load_and_check(&c.config_path, c.directory.as_ref())
             .map_err(|e| e.to_string())
             .and_then(|l| check_services(&l, &c.config_path).map(|cat| (l, cat)))
+            .and_then(|(l, cat)| check_ask(&l, &c.catalog).map(|()| (l, cat)))
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));

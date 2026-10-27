@@ -257,6 +257,16 @@ fn world_with(erp_extra: &str) -> World {
 /// [`world_with`], the approval store keeping results of at most
 /// `result_cap` sealed bytes.
 fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
+    world_full(erp_extra, result_cap, "")
+}
+
+/// [`world`] with `[guard] ask = [<ask>]` (command approvals, Task 4).
+fn world_ask(ask: &str) -> World {
+    world_full("", None, &format!("\n[guard]\nask = [{ask}]\n"))
+}
+
+/// The world; `tail` is appended to the config text.
+fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
     let m = mock();
     let tmp = common::tmp::short_tempdir();
     let t = tmp.path();
@@ -266,7 +276,8 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
         fs::create_dir_all(t.join(d)).unwrap();
     }
     fs::write(t.join("etc/ca/test-ca.pem"), &m.ca_pem).unwrap();
-    let policy = policy_of(t, m.port, &config_text(t, m.port, erp_extra));
+    let text = format!("{}{tail}", config_text(t, m.port, erp_extra));
+    let policy = policy_of(t, m.port, &text);
 
     let cw = ChainWriter::open(
         &t.join("audit"),
@@ -358,6 +369,11 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
                 })
                 .map_err(|e| e.to_string()),
             lockdown: saiife_daemon::lockdown::Store::memory(),
+            grants: saiife_daemon::grants::Grants::open(
+                saiife_daemon::grants::path_in(&t.join("state")),
+                std::time::SystemTime::now(),
+            )
+            .0,
         }))
     });
     // The control socket (the CLI's) and the HTTP gateway.
@@ -1184,4 +1200,315 @@ fn approved_proxy_request_sends_the_same_method_path_and_query() {
     assert_eq!(hits[0].1, canonical(BODY_A));
     let rec = w.wait_record(id, "sent");
     assert_eq!(rec["asked_via"], "http");
+}
+
+// ------------------------------------------------- command approvals (Task 4)
+
+const FORCE_PUSH: &str = "git push --force origin main";
+const ASK_FORCE_PUSH: &str = "\"core.git/force-push\"";
+
+impl World {
+    /// One `saiife check --managed` call for a Bash `command` in the
+    /// project, as the requester.
+    fn hook(&self, command: &str) -> Output {
+        let payload = json!({
+            "session_id": "s-cmd",
+            "cwd": self.path().join("project"),
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .env("HOME", self.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("SAIIFE_DATA_DIR", self.path().join("data"))
+            .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
+            .current_dir(self.path().join("project"))
+            .args(["check", "--managed", "--agent", "claude", "--system-config"])
+            .arg(self.path().join("etc/config.toml"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut sin = child.stdin.take().unwrap();
+        let wr = std::thread::spawn(move || {
+            let _ = sin.write_all(payload.as_bytes());
+        });
+        let out = child.wait_with_output().unwrap();
+        wr.join().unwrap();
+        out
+    }
+
+    /// The guard records, in order.
+    fn guard_records(&self) -> Vec<Value> {
+        self.records()
+            .into_iter()
+            .filter(|r| r["kind"] == "guard")
+            .collect()
+    }
+
+    fn project(&self) -> String {
+        self.path().join("project").display().to_string()
+    }
+}
+
+/// The request id of `Needs approval: request #<id>. ...`, checking the
+/// whole line is the spec's message.
+fn needs_approval_id(o: &Output) -> u64 {
+    let e = stderr(o);
+    let line = e
+        .lines()
+        .find(|l| l.starts_with("Needs approval: request #"))
+        .unwrap_or_else(|| panic!("no needs-approval line: {e}"));
+    let id: u64 = line["Needs approval: request #".len()..]
+        .split('.')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        line,
+        format!("Needs approval: request #{id}. Run the same command again after it is approved.")
+    );
+    id
+}
+
+/// A force-push under `[guard] ask`: a pending command request (with the
+/// daemon's key), the exact spec message, exit 2, and a guard record
+/// `ask` linked by the id.
+#[test]
+fn hook_ask_rule_creates_request_and_denies_with_message() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let o = w.hook(FORCE_PUSH);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    let id = needs_approval_id(&o);
+    let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
+    assert_eq!(r.state, State::Pending);
+    assert_eq!(r.kind, saiife_daemon::approvals::ApprovalType::Command);
+    assert_eq!(r.uid, own_uid());
+    assert_eq!(r.agent, "claude");
+    assert_eq!(r.input.as_deref(), Some(FORCE_PUSH));
+    assert!(r.request_sealed.is_none());
+    let want =
+        saiife_daemon::grants::grant_key(own_uid(), "claude", &w.project(), "Bash", FORCE_PUSH);
+    assert_eq!(
+        r.grant_key.as_deref(),
+        Some(saiife_daemon::grants::hex(&want).as_str())
+    );
+    // `show` never gives the key away.
+    let shown = w.op(BOSS, "approval.show", json!({"request": id}));
+    assert_eq!(shown["item"]["type"], "command", "{shown}");
+    assert!(shown["item"].get("grant_key").is_none(), "{shown}");
+
+    let g = w.guard_records();
+    let last = g.last().unwrap();
+    assert_eq!(last["decision"], "ask", "{last}");
+    assert_eq!(last["approval"], id);
+    assert_eq!(last["pack"], "core.git");
+    assert_eq!(last["rule_id"], "force-push");
+    assert_eq!(last["reason"], format!("needs approval: request #{id}"));
+    let created = w.wait_record(id, "created");
+    assert_eq!(created["type"], "command");
+    assert_eq!(created["input"], FORCE_PUSH);
+    assert_eq!(created["uid"], own_uid());
+}
+
+/// Approved once: the same command runs once (record `approved` with the
+/// id), then needs approval again. A trailing space is another command.
+#[test]
+fn hook_after_approval_allows_once_then_asks_again() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let first = needs_approval_id(&w.hook(FORCE_PUSH));
+    let a = w.decide(BOSS, first, "approve");
+    assert_eq!(a["ok"], true, "{a}");
+    w.wait_state(first, State::Sent);
+    assert_eq!(w.ctx.grants.len(), 1);
+    let sent = w.wait_record(first, "sent");
+    assert_eq!(sent["by_uid"], BOSS);
+
+    // Not the approved command: a request of its own; the grant stays.
+    let spaced = w.hook(&format!("{FORCE_PUSH} "));
+    assert_eq!(spaced.status.code(), Some(2), "{}", stderr(&spaced));
+    let other = needs_approval_id(&spaced);
+    assert_ne!(other, first);
+    assert_eq!(w.ctx.grants.len(), 1);
+
+    let o = w.hook(FORCE_PUSH);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "approved", "{last}");
+    assert_eq!(last["approval"], first);
+    assert_eq!(last["input"], FORCE_PUSH);
+    assert!(w.ctx.grants.is_empty());
+
+    let again = w.hook(FORCE_PUSH);
+    assert_eq!(again.status.code(), Some(2), "{}", stderr(&again));
+    let next = needs_approval_id(&again);
+    assert!(next != first && next != other);
+}
+
+/// The requester cannot approve its own command under `same_user =
+/// "deny"`: refused, still pending, no grant, the command still blocked.
+#[test]
+fn self_approval_of_command_refused() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let id = needs_approval_id(&w.hook(FORCE_PUSH));
+    let text = format!(
+        "{}\n[guard]\nask = [{ASK_FORCE_PUSH}]\n",
+        config_text(w.path(), w.m.port, "")
+    )
+    .replace(
+        "approvers = [\"boss\"]",
+        &format!("approvers = [\"boss\", {:?}]", own_user()),
+    );
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &text);
+    let a = w.decide(own_uid(), id, "approve");
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "same_user", "{a}");
+    assert_eq!(w.state(id), Some(State::Pending));
+    assert!(w.ctx.grants.is_empty());
+    let o = w.hook(FORCE_PUSH);
+    assert_eq!(o.status.code(), Some(2));
+    assert_ne!(needs_approval_id(&o), id);
+}
+
+/// A deny rule not under `[guard] ask` is denied as before, without a
+/// grant lookup or a request.
+#[test]
+fn non_ask_deny_unchanged() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let o = w.hook("git reset --hard");
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).starts_with("BLOCKED by core.git: "),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(w.ctx.grants.consume_count(), 0);
+    let all = w.ctx.approvals.as_ref().unwrap().list(Default::default());
+    assert!(all.is_empty(), "{all:?}");
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "deny");
+    assert!(last.get("approval").is_none(), "{last}");
+    // An allowed command makes no extra round trip either.
+    assert_eq!(w.hook("git status").status.code(), Some(0));
+    assert_eq!(w.ctx.grants.consume_count(), 0);
+    // The ask rule does.
+    w.hook(FORCE_PUSH);
+    assert_eq!(w.ctx.grants.consume_count(), 1);
+}
+
+/// A request that cannot be stored fails closed: `error_denied`.
+#[test]
+fn ask_without_store_is_error_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world_ask(ASK_FORCE_PUSH);
+    let dir = dir_in(&w.path().join("state"));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = w.hook(FORCE_PUSH);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        stderr(&o).contains("BLOCKED (fail closed)"),
+        "{}",
+        stderr(&o)
+    );
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "error_denied", "{last}");
+}
+
+/// `approval.create` takes only a call one of the `[guard] ask` rules
+/// denied, and never a key from the client.
+#[test]
+fn approval_create_takes_only_ask_rules() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let rec = |rule_id: &str| {
+        let mut r = common::daemon::guard_rec(FORCE_PUSH);
+        r["decision"] = "deny".into();
+        r["pack"] = "core.git".into();
+        r["rule_id"] = rule_id.into();
+        r["grant_key"] = "00".repeat(32).into();
+        r
+    };
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        json!({"rec": rec("reset-hard")}),
+    );
+    assert_eq!(a["ok"], false, "{a}");
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        json!({"rec": rec("force-push")}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    let id = a["request"].as_u64().unwrap();
+    let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
+    let want = saiife_daemon::grants::grant_key(own_uid(), "claude", "/p", "Bash", FORCE_PUSH);
+    assert_eq!(
+        r.grant_key.as_deref(),
+        Some(saiife_daemon::grants::hex(&want).as_str())
+    );
+}
+
+/// `[guard] ask` naming a rule no active pack has makes the policy
+/// invalid: the daemon accepts audit only.
+#[test]
+fn unknown_guard_ask_rule_is_config_error() {
+    use common::daemon::{Opts, TestDaemon};
+    let d = TestDaemon::start(Opts {
+        extra: "[guard]\nask = [\"core.git/no-such-rule\"]\n".into(),
+        ..Default::default()
+    });
+    let st = d.status();
+    assert_eq!(st["policy_ok"], false, "{st:?}");
+    assert!(
+        d.stderr_text().contains("core.git/no-such-rule"),
+        "{}",
+        d.stderr_text()
+    );
+    // A pack that is not active is an error too.
+    let d = TestDaemon::start(Opts {
+        extra: "[guard]\nask = [\"db.postgres/drop-database\"]\n".into(),
+        ..Default::default()
+    });
+    assert_eq!(d.status()["policy_ok"], false);
+    // Listed in an active pack: fine.
+    let d = TestDaemon::start(Opts {
+        extra: "[guard]\npacks = [\"db.postgres\"]\nask = [\"core.git/force-push\", \"db.postgres/drop-database\"]\n".into(),
+        ..Default::default()
+    });
+    assert_eq!(d.status()["policy_ok"], true, "{}", d.stderr_text());
+}
+
+/// Hook latency with `[guard] ask` set (run with `--release --ignored`):
+/// an allowed call, a deny not under ask (no extra round trip) and an ask
+/// (two extra round trips). Prints the median and p95 in ms.
+#[test]
+#[ignore]
+fn bench_managed_hook_with_ask() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let n = 19;
+    let time = |cmd: &str| {
+        let mut t: Vec<f64> = (0..n)
+            .map(|_| {
+                let s = Instant::now();
+                w.hook(cmd);
+                s.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (t[n / 2], t[(n * 95 / 100).min(n - 1)])
+    };
+    for (name, cmd) in [
+        ("allow", "git status && ls -la src"),
+        ("deny", "git reset --hard"),
+        ("ask", FORCE_PUSH),
+    ] {
+        let (p50, p95) = time(cmd);
+        eprintln!("bench {name}: median {p50:.1} ms, p95 {p95:.1} ms");
+    }
 }

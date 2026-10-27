@@ -381,6 +381,7 @@ allow = ["orders:read"]
         approvals: saiife_daemon::approvals::Store::open(&state.join("approvals"))
             .map_err(|e| e.to_string()),
         lockdown: saiife_daemon::lockdown::Store::memory(),
+        grants: saiife_daemon::grants::Grants::memory(),
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.

@@ -37,6 +37,7 @@ reason = "'kubectl drain' cordons a node and evicts every pod running on it"
 # complete token — `pv/name`, `pvc,other` and a trailing space/EOL all count,
 # but a pod NAMED `pv` (`kubectl delete pod pv`) does not, because `pod` sits
 # between `delete` and the kind.
+id = "delete-namespace"
 pattern = '^(?:sudo\s+)?kubectl\s+(?:\S+\s+)*delete\s+(?:-\S+\s+)*(?:persistentvolumeclaims?|persistentvolumes?|namespaces?|pvc|pv|ns)(?:[\s/,]|$)'
 reason = "'kubectl delete namespace/pv/pvc' cascades to every object it contains (irreversible data loss)"
 

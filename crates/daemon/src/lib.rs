@@ -17,6 +17,8 @@ pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod gateway;
 #[cfg(target_os = "linux")]
+pub mod grants;
+#[cfg(target_os = "linux")]
 pub mod import_backup;
 #[cfg(target_os = "linux")]
 pub mod limits;

@@ -80,6 +80,10 @@ pub struct EvalAnswer {
     pub pack: Option<String>,
     pub rule: Option<String>,
     pub reason: Option<String>,
+    /// The deny rule's id in its pack (`force-push`), when it has one: what
+    /// `[guard] ask` names (`core.git/force-push`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +294,7 @@ pub fn judge_with(
         pack: None,
         rule: None,
         reason: Some(reason.to_string()),
+        rule_id: None,
     };
     if let Err(reason) = check_cwd(ctx.cwd.as_deref()) {
         return answer(Verdict::Unjudged, String::new(), &reason);
@@ -316,7 +321,16 @@ pub fn judge_with(
         Plan::Shell { command } => {
             let (engine, _) = engine();
             let d = engine.evaluate(&command);
-            from_decision(command, ctx.tool.clone(), d)
+            let rule_id = match &d {
+                Decision::Deny { pack, pattern, .. } => {
+                    engine.rule_id(pack, pattern).map(str::to_string)
+                }
+                _ => None,
+            };
+            EvalAnswer {
+                rule_id,
+                ..from_decision(command, ctx.tool.clone(), d)
+            }
         }
         Plan::Files(call) => {
             let (engine, vars) = engine();
@@ -387,6 +401,7 @@ fn from_decision(input: String, tool: Option<String>, d: Decision) -> EvalAnswer
         pack,
         rule,
         reason,
+        rule_id: None,
     }
 }
 
@@ -441,6 +456,7 @@ pub fn judge_config_change(payload: &str) -> EvalAnswer {
             pack: deny.then(|| "core.self".to_string()),
             rule: deny.then(|| "config-change".to_string()),
             reason: Some(reason),
+            rule_id: None,
         }
     };
     if !v.as_ref().is_some_and(serde_json::Value::is_object) {
@@ -656,6 +672,7 @@ pub fn worker_main() -> ExitCode {
             pack: None,
             rule: None,
             reason: Some(format!("unknown hook event {other:?}")),
+            rule_id: None,
         },
     };
     let mut out = std::io::stdout().lock();
@@ -1320,6 +1337,7 @@ mod tests {
             pack: None,
             rule: None,
             reason: None,
+            rule_id: None,
         };
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v["verdict"], "unjudged");

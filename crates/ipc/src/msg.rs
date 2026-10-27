@@ -30,6 +30,15 @@ pub const OP_APPROVAL_LIST: &str = "approval.list";
 pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// `{request, action: "approve"|"reject", note?}` -> `{request, state}`.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
+/// The managed hook, for a call a `[guard] ask` rule denied: use up the
+/// caller's grant for it. `{rec}` (the guard record it will send; the
+/// daemon computes the key from the peer uid and `agent`, `project`,
+/// `tool`, `input`) -> `{granted: bool, approval?}`.
+pub const OP_GRANT_CONSUME: &str = "grant.consume";
+/// The managed hook, when there was no grant: a command request for the
+/// call. `{rec}` (with `pack` and `rule_id` naming the `[guard] ask`
+/// rule) -> `{request}`.
+pub const OP_APPROVAL_CREATE: &str = "approval.create";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with

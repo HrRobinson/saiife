@@ -106,7 +106,7 @@ impl Store {
 
 /// The dir holding the flag file: a real directory, ours, not group- or world-writable. A
 /// missing dir is fine (the flag is off). Nothing is created or fixed.
-fn check_parent(file: &Path) -> io::Result<()> {
+pub(crate) fn check_parent(file: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Some(dir) = file.parent() else {
         return Ok(());

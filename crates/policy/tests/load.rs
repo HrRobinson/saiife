@@ -671,3 +671,55 @@ fn empty_approvers_with_ask_warns() {
         p.warnings
     );
 }
+
+#[test]
+fn guard_ask_entries_are_pack_slash_rule() {
+    for bad in [
+        "\"core.git\"",
+        "\"/force-push\"",
+        "\"core.git/\"",
+        "\"a/b/c\"",
+    ] {
+        let (_d, cfg) = etc(&format!("version = 2\n[guard]\nask = [{bad}]\n"), &[]);
+        match load_system(&cfg) {
+            Err(PolicyError::Invalid { detail, .. }) => {
+                assert!(detail.contains("[guard] ask entry"), "{bad}: {detail}")
+            }
+            other => panic!("{bad}: expected Invalid, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unknown_guard_ask_rule_is_config_error() {
+    use saiife_policy::{check_guard_ask, PackInfo};
+    let pack = |id: &str, default_on, rules: &[&str]| PackInfo {
+        id: id.into(),
+        version: 1,
+        default_on,
+        rules: rules.iter().map(|r| r.to_string()).collect(),
+    };
+    let catalog = [
+        pack("core.git", true, &["force-push", "reset-hard"]),
+        pack("db.postgres", false, &["drop-database"]),
+    ];
+    let cfg_with = |extra: &str| {
+        let (_d, cfg) = etc(&format!("version = 2\n[guard]\n{extra}\n"), &[]);
+        load_system(&cfg).unwrap().config
+    };
+    let ok = cfg_with("ask = [\"core.git/force-push\"]");
+    assert_eq!(check_guard_ask(&ok, &catalog), Ok(()));
+    let e = check_guard_ask(&cfg_with("ask = [\"core.git/no-such\"]"), &catalog).unwrap_err();
+    assert!(
+        e.contains("core.git/no-such") && e.contains("no rule"),
+        "{e}"
+    );
+    // A pack that exists but is not active.
+    let e =
+        check_guard_ask(&cfg_with("ask = [\"db.postgres/drop-database\"]"), &catalog).unwrap_err();
+    assert!(e.contains("not active"), "{e}");
+    let on = cfg_with("packs = [\"db.postgres\"]\nask = [\"db.postgres/drop-database\"]");
+    assert_eq!(check_guard_ask(&on, &catalog), Ok(()));
+    // No ask: nothing to check.
+    assert_eq!(check_guard_ask(&cfg_with(""), &[]), Ok(()));
+}

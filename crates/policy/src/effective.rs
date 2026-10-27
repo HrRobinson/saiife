@@ -11,6 +11,9 @@ pub struct PackInfo {
     pub id: String,
     pub version: u32,
     pub default_on: bool,
+    /// The ids of its `[[deny]]` rules that have one (for `[guard] ask`);
+    /// empty where nobody checks them (the hook).
+    pub rules: Vec<String>,
 }
 
 /// The pack locked mode always turns on.
@@ -141,6 +144,7 @@ mod tests {
             id: id.into(),
             version,
             default_on,
+            rules: Vec::new(),
         };
         vec![
             p("core.git", 1, true),
@@ -314,6 +318,7 @@ mod tests {
             id: "core.lock".into(),
             version: 1,
             default_on: false,
+            rules: Vec::new(),
         });
         let ids = |text: &str, cat: &[PackInfo]| -> Vec<String> {
             let (packs, w) = active_packs(&cfg(text), cat, None);

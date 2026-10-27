@@ -25,7 +25,8 @@ use crate::vault::VaultError;
 use saiife_audit::{DecisionKind, Record};
 use saiife_broker::pipeline::{self, Outcome, PendingCall, StoredCall};
 use saiife_ipc::msg::{
-    err, err_with, ok, ErrorCode, Request, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW,
+    err, err_with, ok, ErrorCode, Request, MAX_RECORD_BYTES, OP_APPROVAL_CREATE,
+    OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_GRANT_CONSUME,
 };
 use saiife_ipc::peer::PeerCred;
 use serde_json::{json, Map, Value};
@@ -135,11 +136,26 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
             headers: p.headers.clone(),
         },
     };
+    store_new(ctx, new, Some(exact), ttl).await
+}
+
+/// Store request `new` (with `exact` sealed to its id, when given) under
+/// the per-uid cap and write its `approval`/`created` record. Errs with
+/// the deny rule; nothing is left pending on an error.
+async fn store_new(
+    ctx: &Arc<Ctx>,
+    new: NewRequest,
+    exact: Option<Zeroizing<Vec<u8>>>,
+    ttl: Duration,
+) -> Result<u64, String> {
     let created = on_store(ctx, move |c, s| {
         // Store lock, then the vault's (inside `seal`): the only order.
         s.create_capped(
             new,
-            |id| c.vault.seal(&aad(id), &exact).map(Some),
+            |id| match &exact {
+                Some(b) => c.vault.seal(&aad(id), b).map(Some),
+                None => Ok(None),
+            },
             ttl,
             now(),
             Some(MAX_PENDING_PER_UID),
@@ -194,6 +210,8 @@ pub async fn handle(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_APPROVAL_LIST => list(ctx, &conn.peer, req).await,
         OP_APPROVAL_SHOW => show(ctx, &conn.peer, req).await,
         OP_APPROVAL_DECIDE => decide(ctx, conn, req).await,
+        OP_GRANT_CONSUME => grant_consume(ctx, &conn.peer, req).await,
+        OP_APPROVAL_CREATE => command_create(ctx, &conn.peer, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -506,7 +524,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         .append(decided_record(ctx, &r, action, peer.uid))
         .await;
     if let Err(e) = recorded {
-        if approve && r.kind == ApprovalType::Connector {
+        if approve {
             // An approval that is not on record is not acted on.
             fail(
                 ctx,
@@ -526,11 +544,228 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         let c = Arc::clone(ctx);
         let by = peer.uid;
         tokio::spawn(async move { send(c, r, by).await });
+    } else if approve {
+        // A command: the grant is kept before the answer, so the command
+        // can run as soon as the approver is told.
+        if let Err(why) = grant(ctx, &r).await {
+            return err(
+                id,
+                ErrorCode::Internal,
+                &format!("request #{rid} is approved, but its grant could not be kept: {why}"),
+            );
+        }
     }
     let mut m = Map::new();
     m.insert("request".into(), rid.into());
     m.insert("state".into(), action.into());
     ok(id, m)
+}
+
+// ------------------------------------------------------------ commands
+
+/// The fields of the guard record a hook sends with `grant.consume` and
+/// `approval.create` (spec §6.10.4).
+struct CallFields {
+    agent: String,
+    project: String,
+    tool: String,
+    /// Masked and cut, as the record shows it.
+    input: String,
+    session: Option<String>,
+    /// `pack/rule_id`, when the record names both.
+    ask: Option<String>,
+}
+
+impl CallFields {
+    /// The grant key for this call by `uid`: computed here, never taken
+    /// from the client.
+    fn key(&self, uid: u32) -> [u8; 32] {
+        crate::grants::grant_key(uid, &self.agent, &self.project, &self.tool, &self.input)
+    }
+}
+
+/// `rec` of `req`: `agent`, `project`, `tool` and `input` are strings.
+fn call_fields(req: &Request) -> Result<CallFields, Value> {
+    let bad = |m: &str| err(req.id, ErrorCode::BadRequest, m);
+    let Some(rec) = req.args.get("rec").and_then(Value::as_object) else {
+        return Err(bad("takes the guard record in rec"));
+    };
+    if !matches!(serde_json::to_vec(rec), Ok(b) if b.len() <= MAX_RECORD_BYTES) {
+        return Err(bad(&format!("rec is larger than {MAX_RECORD_BYTES} bytes")));
+    }
+    let text = |k: &str| rec.get(k).and_then(Value::as_str).map(str::to_string);
+    let (Some(agent), Some(project), Some(tool), Some(input)) =
+        (text("agent"), text("project"), text("tool"), text("input"))
+    else {
+        return Err(bad("rec needs agent, project, tool and input"));
+    };
+    let ask = match (text("pack"), text("rule_id")) {
+        (Some(p), Some(r)) => Some(format!("{p}/{r}")),
+        _ => None,
+    };
+    Ok(CallFields {
+        agent,
+        project,
+        tool,
+        input,
+        session: text("session"),
+        ask,
+    })
+}
+
+/// Lockdown `all` answers every hook step with `lockdown`: no grant is
+/// used up and no request made while it is on.
+fn locked_down(ctx: &Ctx, id: u64) -> Option<Value> {
+    ctx.lockdown
+        .get()
+        .filter(|l| l.scope == saiife_broker::pipeline::LockScope::All)
+        .map(|l| err(id, ErrorCode::Lockdown, &crate::lockdown::message(&l)))
+}
+
+/// `grant.consume {rec}`: use up the caller's grant for this exact call.
+/// `{granted: true, approval}` once; `{granted: false}` when there is
+/// none (or it lapsed). A failure to save the use is an error: the call
+/// is not allowed.
+async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+    let id = req.id;
+    let f = match call_fields(&req) {
+        Ok(f) => f,
+        Err(v) => return v,
+    };
+    if let Some(v) = locked_down(ctx, id) {
+        return v;
+    }
+    let key = f.key(peer.uid);
+    let c = Arc::clone(ctx);
+    let used = tokio::task::spawn_blocking(move || c.grants.consume(&key, now()))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    let mut m = Map::new();
+    match used {
+        Ok(Some(approval)) => {
+            m.insert("granted".into(), true.into());
+            m.insert("approval".into(), approval.into());
+        }
+        Ok(None) => {
+            m.insert("granted".into(), false.into());
+        }
+        Err(e) => {
+            return err(
+                id,
+                ErrorCode::Unavailable,
+                &format!("the command grants are unavailable: {e}"),
+            )
+        }
+    }
+    ok(id, m)
+}
+
+/// `approval.create {rec}`: a command request for a call a `[guard] ask`
+/// rule denied (`pack` and `rule_id` in `rec` name it), keyed for the
+/// caller's uid. `{request}`; the request counts toward the per-uid cap.
+async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+    let id = req.id;
+    let f = match call_fields(&req) {
+        Ok(f) => f,
+        Err(v) => return v,
+    };
+    let Some(sys) = ctx.policy().system else {
+        return err(id, ErrorCode::Unavailable, "no valid policy is loaded");
+    };
+    let asked = f
+        .ask
+        .as_ref()
+        .is_some_and(|a| sys.guard.ask.iter().any(|x| x == a));
+    if !asked {
+        return err(
+            id,
+            ErrorCode::Denied,
+            "not_ask: the call's rule is not in [guard] ask",
+        );
+    }
+    if let Some(v) = locked_down(ctx, id) {
+        return v;
+    }
+    if ctx.approvals.is_err() {
+        return unavailable(id, ctx);
+    }
+    let new = NewRequest {
+        uid: peer.uid,
+        user: ctx.name_of(peer.uid).await.unwrap_or_default(),
+        session: f.session.clone(),
+        agent: f.agent.clone(),
+        project: f.project.clone(),
+        kind: ApprovalType::Command,
+        service: None,
+        operation: None,
+        capability: None,
+        params: Default::default(),
+        input: Some(f.input.clone()),
+        grant_key: Some(crate::grants::hex(&f.key(peer.uid))),
+        send: SendDisplay::default(),
+    };
+    match store_new(ctx, new, None, sys.approval.timeout).await {
+        Ok(rid) => {
+            let mut m = Map::new();
+            m.insert("request".into(), rid.into());
+            ok(id, m)
+        }
+        Err(rule) => {
+            let code = match rule.as_str() {
+                "approvals_full" => ErrorCode::Denied,
+                "unrecorded" => ErrorCode::Unrecorded,
+                _ => ErrorCode::Unavailable,
+            };
+            let mut m = Map::new();
+            m.insert("rule".into(), rule.clone().into());
+            err_with(
+                id,
+                code,
+                &format!("{rule}: no approval request was made"),
+                m,
+            )
+        }
+    }
+}
+
+/// Keep the grant of approved command request `r` for `[approval]
+/// grant_ttl`, then move it to `sent` (its record says so). A grant that
+/// cannot be kept is `send_failed` (`grants_unavailable`).
+async fn grant(ctx: &Arc<Ctx>, r: &ApprovalRequest) -> Result<(), String> {
+    let Some(key) = r.grant_key.as_deref().and_then(crate::grants::unhex) else {
+        let why = "the request has no valid grant key";
+        fail(ctx, r, "grant_invalid", why).await;
+        return Err(why.into());
+    };
+    let ttl = ctx
+        .policy()
+        .system
+        .map(|s| s.approval.grant_ttl)
+        .unwrap_or_else(|| saiife_policy::ApprovalCfg::default().grant_ttl);
+    let c = Arc::clone(ctx);
+    let rid = r.id;
+    let kept = tokio::task::spawn_blocking(move || c.grants.insert(key, rid, now() + ttl))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    match kept {
+        Ok(()) => {
+            let none = Detail {
+                rule: None,
+                reason: None,
+                limit: None,
+                status: None,
+                resp_bytes: None,
+                asked_via: None,
+            };
+            finish(ctx, r, State::Sent, None, none).await;
+            Ok(())
+        }
+        Err(e) => {
+            let why = format!("the grant could not be saved: {e}");
+            fail(ctx, r, "grants_unavailable", &why).await;
+            Err(why)
+        }
+    }
 }
 
 // ------------------------------------------------------------ send

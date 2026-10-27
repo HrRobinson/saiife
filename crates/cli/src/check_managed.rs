@@ -9,6 +9,15 @@
 //! record. When it cannot, the reason goes to stderr only: nobody could
 //! write the record.
 //!
+//! A deny by a rule listed in `[guard] ask` (spec §6.10.4) takes one or
+//! two more round trips, inside the same 2 s ack budget: `grant.consume`
+//! (an approved grant for this exact call: allowed once, record
+//! `approved`), else `approval.create` (a pending request: denied with
+//! "Needs approval: request #<id>. ..." and record `ask`). The daemon
+//! keys the grant from the peer uid and the record's `agent`, `project`,
+//! `tool` and `input`; the hook never sends a key. Any error there denies
+//! as `error_denied`. Other calls make no extra round trip.
+//!
 //! This path never reads `SAIIFE_AUDIT_DIR` or `SAIIFE_DATA_DIR` and never
 //! opens `.chain.lock`: in locked mode the daemon is the only writer.
 
@@ -106,7 +115,9 @@ mod imp {
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
     use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
-    use saiife_ipc::msg::{ErrorCode, MAX_RECORD_BYTES, OP_AUDIT_APPEND};
+    use saiife_ipc::msg::{
+        ErrorCode, MAX_RECORD_BYTES, OP_APPROVAL_CREATE, OP_AUDIT_APPEND, OP_GRANT_CONSUME,
+    };
     use saiife_policy::{
         active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
         Mode, PackInfo, SystemConfig,
@@ -200,6 +211,8 @@ mod imp {
         tool: Option<String>,
         pack: Option<String>,
         rule: Option<String>,
+        /// The deny rule's id in its pack (`force-push`), if it has one.
+        rule_id: Option<String>,
         reason: Option<String>,
         outcome: Outcome,
     }
@@ -213,6 +226,7 @@ mod imp {
                 tool: None,
                 pack: None,
                 rule: None,
+                rule_id: None,
                 reason: Some(reason.clone()),
                 outcome: Outcome::Error(reason),
             }
@@ -226,6 +240,7 @@ mod imp {
                 tool: None,
                 pack: Some("guard.mcp".into()),
                 rule: Some("mcp_server_not_allowed".into()),
+                rule_id: None,
                 outcome: Outcome::Deny(format!("BLOCKED by guard.mcp: {reason}")),
                 reason: Some(reason),
             }
@@ -257,6 +272,7 @@ mod imp {
                 tool: a.tool,
                 pack: a.pack,
                 rule: a.rule,
+                rule_id: a.rule_id,
                 reason: a.reason,
                 outcome,
             }
@@ -333,7 +349,25 @@ mod imp {
             judged = Judged::error(String::new(), TOO_LARGE.into());
             rec = minimal_record(agent, &policy);
         }
-        if let Err(e) = append(&mut client, rec) {
+        // One budget for the approval steps and the ack.
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        if asked(&cfg, &judged) {
+            match ask_step(&mut client, &mut rec, &mut judged, deadline) {
+                Ok(()) => {}
+                // Lockdown `all`: the deny stands; the ack says why.
+                Err(ClientError::Refused { code, .. }) if code == ErrorCode::Lockdown.as_str() => {}
+                Err(e) => {
+                    let why = format!("the approval step failed ({})", describe(&e));
+                    judged = Judged::error(judged.input.clone(), why);
+                    rec = record(agent, &ctx, &policy, &judged);
+                    if !fit(&mut rec) {
+                        judged = Judged::error(String::new(), TOO_LARGE.into());
+                        rec = minimal_record(agent, &policy);
+                    }
+                }
+            }
+        }
+        if let Err(e) = append(&mut client, rec, deadline) {
             // Lockdown `all`: the daemon wrote the record as a deny.
             if let ClientError::Refused { code, message } = &e {
                 if code == ErrorCode::Lockdown.as_str() {
@@ -547,6 +581,7 @@ mod imp {
                 id,
                 version,
                 default_on,
+                rules: Vec::new(),
             })
             .collect();
         let (packs, warnings) = active_packs(cfg, &catalog, merged.as_ref());
@@ -749,6 +784,10 @@ mod imp {
         let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
         if let Some(m) = v.as_object_mut() {
             m.remove("ts");
+            // A pack's own short name for the rule (`force-push`).
+            if let Some(id) = &j.rule_id {
+                m.insert("rule_id".into(), id.clone().into());
+            }
         }
         v
     }
@@ -852,11 +891,81 @@ mod imp {
         }
     }
 
-    /// `audit.append`, acknowledged with a `seq` within `ACK_TIMEOUT`.
-    fn append(client: &mut Client, rec: Value) -> Result<(), ClientError> {
+    /// A deny by a rule `[guard] ask` lists (`pack/rule_id`).
+    fn asked(cfg: &SystemConfig, j: &Judged) -> bool {
+        if j.decision != DecisionKind::Deny || cfg.guard.ask.is_empty() {
+            return false;
+        }
+        let (Some(pack), Some(id)) = (&j.pack, &j.rule_id) else {
+            return false;
+        };
+        cfg.guard
+            .ask
+            .iter()
+            .any(|a| saiife_policy::split_ask(a) == Some((pack.as_str(), id.as_str())))
+    }
+
+    /// The approval steps for an asked deny (spec §6.10.4), by `deadline`:
+    /// a grant makes `rec` `approved` and the call allowed; otherwise a
+    /// new request makes `rec` `ask` with its id and the call denied with
+    /// the spec's message. `Err`: neither happened; `rec` and `j` are as
+    /// they were.
+    fn ask_step(
+        client: &mut Client,
+        rec: &mut Value,
+        j: &mut Judged,
+        deadline: Instant,
+    ) -> Result<(), ClientError> {
+        let mut args = Map::new();
+        args.insert("rec".into(), rec.clone());
+        let ans = client.call(OP_GRANT_CONSUME, args.clone(), deadline)?;
+        let (decision, approval, outcome, reason) = match ans.get("granted") {
+            Some(Value::Bool(true)) => {
+                let Some(a) = ans.get("approval").and_then(Value::as_u64) else {
+                    return Err(ClientError::Protocol("a grant without its approval".into()));
+                };
+                (DecisionKind::Approved, a, Outcome::Allow, None)
+            }
+            Some(Value::Bool(false)) => {
+                let ans = client.call(OP_APPROVAL_CREATE, args, deadline)?;
+                let Some(id) = ans.get("request").and_then(Value::as_u64) else {
+                    return Err(ClientError::Protocol("the answer has no request".into()));
+                };
+                let msg = format!(
+                    "Needs approval: request #{id}. Run the same command again after it is approved."
+                );
+                let reason = format!("needs approval: request #{id}");
+                (DecisionKind::Ask, id, Outcome::Deny(msg), Some(reason))
+            }
+            _ => return Err(ClientError::Protocol("the answer has no granted".into())),
+        };
+        let mut next = rec.clone();
+        if let Some(m) = next.as_object_mut() {
+            m.insert(
+                "decision".into(),
+                serde_json::to_value(decision).unwrap_or_default(),
+            );
+            m.insert("approval".into(), approval.into());
+            if let Some(r) = reason {
+                m.insert("reason".into(), r.into());
+            }
+        }
+        // The reason changed: still within the limit (only ever cut).
+        if !fit(&mut next) {
+            return Err(ClientError::Protocol(TOO_LARGE.into()));
+        }
+        *rec = next;
+        j.decision = decision;
+        j.outcome = outcome;
+        Ok(())
+    }
+
+    /// `audit.append`, acknowledged with a `seq` by `deadline` (at most
+    /// `ACK_TIMEOUT` from the first send).
+    fn append(client: &mut Client, rec: Value, deadline: Instant) -> Result<(), ClientError> {
         let mut args = Map::new();
         args.insert("rec".into(), rec);
-        let ans = client.call(OP_AUDIT_APPEND, args, Instant::now() + ACK_TIMEOUT)?;
+        let ans = client.call(OP_AUDIT_APPEND, args, deadline)?;
         match ans.get("seq").and_then(Value::as_u64) {
             Some(_) => Ok(()),
             None => Err(ClientError::Protocol("the ack has no seq".into())),

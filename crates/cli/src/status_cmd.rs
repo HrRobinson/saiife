@@ -822,6 +822,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
                     id: p.id.clone(),
                     version: p.version,
                     default_on: p.default_on,
+                    rules: Vec::new(),
                 })
                 .collect();
             let (packs, _) = active_packs(&l.config, &catalog, None);

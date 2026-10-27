@@ -28,21 +28,26 @@ reason = "force-with-lease is the safe force-push (refuses on stale remote)"
 # --- deny rules (first match wins) -------------------------------------------
 
 [[deny]]
+id = "reset-hard"
 pattern = '^git\s+reset\s+--hard\b'
 reason = "git reset --hard discards all uncommitted changes irreversibly"
 
 [[deny]]
+id = "clean-force"
 pattern = '^git\s+clean\s+-[a-zA-Z]*f'
 reason = "git clean -f permanently deletes untracked files (no recovery)"
 
 [[deny]]
+id = "force-push"
 pattern = '^git\s+push\b.*(?:--force\b|(?:^|\s)-f(?:\s|$))'
 reason = "force-push can overwrite a shared branch's history; use --force-with-lease"
 
 [[deny]]
+id = "branch-force-delete"
 pattern = '^git\s+branch\s+-D\b'
 reason = "git branch -D force-deletes a branch even if it is unmerged"
 
 [[deny]]
+id = "checkout-dot"
 pattern = '^git\s+checkout\s+(?:--\s+)?\.\s*$'
 reason = "git checkout . mass-discards every unstaged change in the tree"
