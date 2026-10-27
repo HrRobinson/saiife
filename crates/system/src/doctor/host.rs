@@ -685,7 +685,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// §5.6: `/proc` must not hide agent processes from the daemon.
 /// The nft binaries looked for, in order.
 const NFT_PATHS: [&str; 3] = ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft"];
 const NFT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -712,7 +711,8 @@ fn dedicated(ctx: &Ctx, passwd: &str, u: &AgentUser) -> bool {
         None => false,
         Some(sh) => {
             let base = sh.rsplit('/').next().unwrap_or("");
-            base.is_empty() || base == "nologin" || base == "false"
+            // An empty shell field means /bin/sh: a login shell.
+            base == "nologin" || base == "false"
         }
     }
 }
@@ -734,6 +734,9 @@ fn egress_table(ctx: &Ctx) -> Egress {
     let Some(nft) = NFT_PATHS.iter().find(|p| ctx.layout.at(p).is_file()) else {
         return Egress::Unknown("nft is not installed: egress rules not checked");
     };
+    // Only on the real machine is the binary's owner meaningful (a test tree
+    // is owned by the test user), so the root-owned, not group/other-writable
+    // guard applies there; elsewhere the fake host stands in for `nft`.
     if ctx.layout.is_system() {
         use std::os::unix::fs::MetadataExt;
         let safe = fs::metadata(ctx.layout.at(nft))
@@ -772,6 +775,7 @@ fn egress_check(u: &AgentUser, e: Egress, id: String) -> Check {
     }
 }
 
+/// §5.6: `/proc` must not hide agent processes from the daemon.
 fn hidepid(ctx: &Ctx) -> Check {
     const ID: &str = "proc.hidepid";
     const TITLE: &str = "/proc shows every process to the daemon";
@@ -1249,6 +1253,20 @@ mod tests {
             .calls
             .iter()
             .any(|c| c == "/usr/sbin/nft list tables"));
+    }
+
+    #[test]
+    fn egress_empty_shell_is_a_login_account() {
+        let mut t = T::new(true);
+        t.user("bot", 5001, 5001, true);
+        let p = t.at("/etc/passwd");
+        let text = fs::read_to_string(&p)
+            .unwrap()
+            .replace("/home/bot:/bin/sh", "/home/bot:");
+        fs::write(&p, text).unwrap();
+        t.append_config(SCOPE);
+        fake_nft(&t, "");
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "user.bot.egress"));
     }
 
     #[test]

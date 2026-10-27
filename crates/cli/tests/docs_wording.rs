@@ -5,7 +5,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const PHRASE: &str = "the agent never holds a credential";
 const REQUIRED: &str = "the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model";
 
 fn root() -> PathBuf {
@@ -35,18 +34,28 @@ fn flat(text: &str) -> String {
         .to_lowercase()
 }
 
-/// Each use of the phrase that is not followed by "for a brokered service".
+/// Each use of "never hold(s) (a) credential(s)" that is not followed by
+/// "for a brokered service" (any subject: "the agent", "agents", ...).
 fn offenders(text: &str) -> Vec<String> {
     let t = flat(text);
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(i) = t[from..].find(PHRASE) {
-        let at = from + i + PHRASE.len();
-        let tail = &t[at..];
-        if !tail.starts_with(" for a brokered service") {
-            out.push(t[from + i..(at + 40).min(t.len())].to_string());
+    while let Some(i) = t[from..].find("never hold") {
+        let start = from + i;
+        let mut rest = &t[start + "never hold".len()..];
+        from = start + 1;
+        rest = rest.strip_prefix('s').unwrap_or(rest);
+        rest = rest
+            .strip_prefix(" a")
+            .or(rest.strip_prefix(" any"))
+            .unwrap_or(rest);
+        let Some(rest) = rest.strip_prefix(" credential") else {
+            continue;
+        };
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        if !rest.starts_with(" for a brokered service") {
+            out.push(t[start..(start + 70).min(t.len())].to_string());
         }
-        from = at;
     }
     out
 }
@@ -62,6 +71,7 @@ fn checker_flags_a_bare_claim() {
         offenders("The agent never holds a credential for a brokered\nservice; it holds")
             .is_empty()
     );
+    assert_eq!(offenders("Agents never hold credentials.").len(), 1);
     assert!(offenders("> the agent never holds a credential for a brokered service").is_empty());
 }
 

@@ -41,6 +41,9 @@ addresses with your own.
 
 ```nft
 # /etc/nftables.d/saiife-egress.nft
+table inet saiife_egress
+delete table inet saiife_egress
+
 table inet saiife_egress {
     # Addresses of the model provider. Look them up and keep them current
     # (see "Keeping the provider set current").
@@ -105,7 +108,13 @@ Notes on the rules:
   account, add them as sets the same way. Each one is a hole, so keep the
   list short. Anything the agent can reach, it can send data to.
 - If your resolver is on `127.0.0.53` (systemd-resolved), the loopback rule
-  covers DNS and the `resolvers4` set can stay empty or be removed.
+  covers DNS. Delete the whole `set resolvers4 { ... }` block together with
+  the two rules that use it (`ip daddr @resolvers4 udp dport 53 accept` and
+  `ip daddr @resolvers4 tcp dport 53 accept`). Do not leave the set with an
+  empty `elements = { }`: that is a syntax error.
+- The first two lines of the file (`table ...` then `delete table ...`) make
+  loading idempotent: the table is created if missing, then removed, then
+  defined again, so reloading never fails or stacks rules.
 
 ## Loading it
 
@@ -132,6 +141,29 @@ sudo -u agent-shop saiife api --list                           # should work
 
 The dropped packets are counted and logged with the prefix
 `saiife-egress-drop `, which helps when something legitimate is blocked.
+
+## If the agent stops working
+
+Check the log for drops, which carry the prefix `saiife-egress-drop `:
+
+```sh
+journalctl -k | grep saiife-egress-drop      # or: dmesg | grep saiife-egress-drop
+```
+
+The destination address and port of the dropped packet tell you what to add
+to a set. A stale provider address is the usual cause (see below).
+
+## Rollback
+
+To remove the rules at once, as root:
+
+```sh
+nft delete table inet saiife_egress
+```
+
+To keep them off after a reboot, remove the `include` line for
+`/etc/nftables.d/saiife-egress.nft` from `/etc/nftables.conf` (or delete the
+file). `saiife doctor` then shows the info hint again for dedicated accounts.
 
 ## Keeping the provider set current
 

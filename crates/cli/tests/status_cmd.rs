@@ -1232,6 +1232,10 @@ mod locked {
         let (c, text) = status_at(root.path());
         assert!(text.contains("Locked mode\n"), "{text}");
         assert!(
+            text.contains("the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model"),
+            "{text}"
+        );
+        assert!(
             text.contains("  mode: locked (installed 2026-10-22T00:00:00Z, saiife "),
             "{text}"
         );
