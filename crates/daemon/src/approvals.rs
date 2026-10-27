@@ -598,7 +598,40 @@ impl Store {
         now: SystemTime,
         max_pending: Option<usize>,
     ) -> io::Result<Request> {
+        self.create_dedup(req, seal, ttl, now, max_pending)
+            .map(|(r, _)| r)
+    }
+
+    /// [`Store::create_capped`], except that a command request whose
+    /// `grant_key` matches one of the requester's pending (unexpired)
+    /// requests gives that request back (`false`: nothing was created),
+    /// under the store's lock, before the cap is counted.
+    pub fn create_dedup(
+        &self,
+        req: NewRequest,
+        seal: impl FnOnce(u64) -> Result<Option<Vec<u8>>, VaultError>,
+        ttl: Duration,
+        now: SystemTime,
+        max_pending: Option<usize>,
+    ) -> io::Result<(Request, bool)> {
         let _g = self.guard();
+        if req.kind == ApprovalType::Command && req.grant_key.is_some() {
+            let now_s = ts(now);
+            let same = self
+                .list(Filter {
+                    uid: Some(req.uid),
+                    states: vec![State::Pending],
+                })
+                .into_iter()
+                .find(|r| {
+                    r.kind == ApprovalType::Command
+                        && r.grant_key == req.grant_key
+                        && r.expires > now_s
+                });
+            if let Some(r) = same {
+                return Ok((r, false));
+            }
+        }
         if let Some(max) = max_pending {
             let now_s = ts(now);
             let pending = self
@@ -651,7 +684,7 @@ impl Store {
             let _ = std::fs::remove_file(self.json_path(id));
             return Err(e.into_io());
         }
-        Ok(r)
+        Ok((r, true))
     }
 
     /// Request `id`, or `None` when there is none or it cannot be read.

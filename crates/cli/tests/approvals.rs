@@ -1250,9 +1250,49 @@ impl World {
             .collect()
     }
 
+    /// The project as the key holds it: canonical (no `.saiife/config.toml`
+    /// here, so the cwd).
     fn project(&self) -> String {
-        self.path().join("project").display().to_string()
+        fs::canonicalize(self.path().join("project"))
+            .unwrap()
+            .display()
+            .to_string()
     }
+
+    fn requests(&self) -> Vec<saiife_daemon::approvals::Request> {
+        self.ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .list(Default::default())
+    }
+}
+
+fn sha_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The key the daemon must compute for `input` run by this user.
+fn key_for(project: &str, input: &str, raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let raw: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
+    let k = saiife_daemon::grants::grant_key(own_uid(), "claude", project, "Bash", input, &raw);
+    saiife_daemon::grants::hex(&k)
+}
+
+/// The args of `grant.consume` / `approval.create` for `input`, as the hook
+/// sends them, with `raw` as the exact command.
+fn call_args(input: &str, raw: &str, rule_id: &str) -> Value {
+    let mut r = common::daemon::guard_rec(input);
+    r["decision"] = "deny".into();
+    r["pack"] = "core.git".into();
+    r["rule_id"] = rule_id.into();
+    r["grant_key"] = "00".repeat(32).into();
+    json!({"rec": r, "raw_sha256": sha_hex(raw), "project": "/p"})
 }
 
 /// The request id of `Needs approval: request #<id>. ...`, checking the
@@ -1292,12 +1332,8 @@ fn hook_ask_rule_creates_request_and_denies_with_message() {
     assert_eq!(r.agent, "claude");
     assert_eq!(r.input.as_deref(), Some(FORCE_PUSH));
     assert!(r.request_sealed.is_none());
-    let want =
-        saiife_daemon::grants::grant_key(own_uid(), "claude", &w.project(), "Bash", FORCE_PUSH);
-    assert_eq!(
-        r.grant_key.as_deref(),
-        Some(saiife_daemon::grants::hex(&want).as_str())
-    );
+    let want = key_for(&w.project(), FORCE_PUSH, FORCE_PUSH);
+    assert_eq!(r.grant_key.as_deref(), Some(want.as_str()));
     // `show` never gives the key away.
     let shown = w.op(BOSS, "approval.show", json!({"request": id}));
     assert_eq!(shown["item"]["type"], "command", "{shown}");
@@ -1370,9 +1406,11 @@ fn self_approval_of_command_refused() {
     assert_eq!(a["rule"], "same_user", "{a}");
     assert_eq!(w.state(id), Some(State::Pending));
     assert!(w.ctx.grants.is_empty());
+    // Asking again gives the same pending request, not a new one.
     let o = w.hook(FORCE_PUSH);
     assert_eq!(o.status.code(), Some(2));
-    assert_ne!(needs_approval_id(&o), id);
+    assert_eq!(needs_approval_id(&o), id);
+    assert_eq!(w.requests().len(), 1);
 }
 
 /// A deny rule not under `[guard] ask` is denied as before, without a
@@ -1425,33 +1463,213 @@ fn ask_without_store_is_error_denied() {
 #[test]
 fn approval_create_takes_only_ask_rules() {
     let w = world_ask(ASK_FORCE_PUSH);
-    let rec = |rule_id: &str| {
-        let mut r = common::daemon::guard_rec(FORCE_PUSH);
-        r["decision"] = "deny".into();
-        r["pack"] = "core.git".into();
-        r["rule_id"] = rule_id.into();
-        r["grant_key"] = "00".repeat(32).into();
-        r
-    };
-    let a = w.op(
-        own_uid(),
-        "approval.create",
-        json!({"rec": rec("reset-hard")}),
-    );
-    assert_eq!(a["ok"], false, "{a}");
-    let a = w.op(
-        own_uid(),
-        "approval.create",
-        json!({"rec": rec("force-push")}),
-    );
+    let create = |args: Value| w.op(own_uid(), "approval.create", args);
+    // A rule that is not under ask.
+    let a = create(call_args(FORCE_PUSH, FORCE_PUSH, "reset-hard"));
+    assert_eq!(a["rule"], "not_ask", "{a}");
+    // An ask rule that does not deny the submitted command.
+    let a = create(call_args("echo hi", "echo hi", "force-push"));
+    assert_eq!(a["rule"], "ask_rule_mismatch", "{a}");
+    let refused: Vec<Value> = w
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "approval" && r["action"] == "refused")
+        .collect();
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert_eq!(refused[1]["rule"], "ask_rule_mismatch");
+    assert_eq!(refused[1]["uid"], own_uid());
+    // No raw hash: refused.
+    let mut no_raw = call_args(FORCE_PUSH, FORCE_PUSH, "force-push");
+    no_raw.as_object_mut().unwrap().remove("raw_sha256");
+    assert_eq!(create(no_raw)["error"], "bad_request");
+    assert!(w.requests().is_empty());
+
+    let a = create(call_args(FORCE_PUSH, FORCE_PUSH, "force-push"));
     assert_eq!(a["ok"], true, "{a}");
     let id = a["request"].as_u64().unwrap();
     let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
-    let want = saiife_daemon::grants::grant_key(own_uid(), "claude", "/p", "Bash", FORCE_PUSH);
     assert_eq!(
         r.grant_key.as_deref(),
-        Some(saiife_daemon::grants::hex(&want).as_str())
+        Some(key_for("/p", FORCE_PUSH, FORCE_PUSH).as_str())
     );
+}
+
+/// The grant is for the exact command: the same shown input with another
+/// raw command (what a masked span could hide) is not granted.
+#[test]
+fn grant_is_bound_to_the_raw_command() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
+    );
+    let id = a["request"].as_u64().unwrap();
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    let consume = |raw: &str| {
+        w.op(
+            own_uid(),
+            "grant.consume",
+            call_args(FORCE_PUSH, raw, "force-push"),
+        )
+    };
+    let other = consume("GH_TOKEN=$(echo x) git push --force origin main");
+    assert_eq!(other["granted"], false, "{other}");
+    let used = consume(FORCE_PUSH);
+    assert_eq!(used["granted"], true, "{used}");
+    assert_eq!(used["approval"], id);
+    // The use is on record.
+    let rec = w.wait_record(id, "grant_used");
+    assert_eq!(rec["uid"], own_uid());
+    assert_eq!(consume(FORCE_PUSH)["granted"], false);
+}
+
+/// A command with a masked span cannot be approved: a plain deny saying
+/// so, no request. The attack: `GH_TOKEN=abc ...` shows as
+/// `GH_TOKEN=[MASKED] ...`, as would `GH_TOKEN=$(echo x) ...`.
+#[test]
+fn masked_command_is_a_plain_deny() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    for (i, cmd) in [
+        "GH_TOKEN=abc git push --force origin main",
+        "GH_TOKEN=$(echo x) git push --force origin main",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let o = w.hook(cmd);
+        assert_eq!(o.status.code(), Some(2), "{cmd}: {}", stderr(&o));
+        assert!(!stderr(&o).contains("Needs approval"), "{}", stderr(&o));
+        let last = w.guard_records().pop().unwrap();
+        assert_eq!(last["decision"], "deny", "{last}");
+        assert!(last.get("approval").is_none(), "{last}");
+        if i == 0 {
+            assert_eq!(
+                last["reason"],
+                "cannot be approved: the command contains masked or overlong content",
+                "{last}"
+            );
+        }
+    }
+    assert!(w.requests().is_empty());
+    assert_eq!(w.ctx.grants.consume_count(), 0);
+}
+
+/// A command over the record's 4096 characters is shown cut: a plain deny.
+#[test]
+fn overlong_command_is_a_plain_deny() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let cmd = format!("{FORCE_PUSH} {}", "x".repeat(4100));
+    let o = w.hook(&cmd);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("cannot be approved: the command contains masked or overlong content"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(w.requests().is_empty());
+}
+
+/// A compound command another rule denies too is a plain deny.
+#[test]
+fn compound_command_with_a_hard_deny_is_a_plain_deny() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let o = w.hook(&format!("{FORCE_PUSH}; rm -rf /"));
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("Needs approval"), "{}", stderr(&o));
+    assert!(w.requests().is_empty());
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "deny", "{last}");
+}
+
+/// At most 20 pending requests: the 21st command gets the spec'd hint.
+#[test]
+fn too_many_pending_commands_say_so() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    for i in 0..20 {
+        let a = w.op(
+            own_uid(),
+            "approval.create",
+            call_args(FORCE_PUSH, &format!("{FORCE_PUSH} #{i}"), "force-push"),
+        );
+        assert_eq!(a["ok"], true, "{a}");
+    }
+    let o = w.hook(FORCE_PUSH);
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "Too many pending approval requests (20); ask an approver to decide the open ones."
+    );
+    let last = w.guard_records().pop().unwrap();
+    assert_eq!(last["decision"], "deny", "{last}");
+}
+
+/// A command approved but not marked sent when the daemon stopped: at
+/// start its grant is revoked and it is `send_failed` (`interrupted`).
+#[test]
+fn interrupted_command_approval_revokes_its_grant() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
+    );
+    let id = a["request"].as_u64().unwrap();
+    let store = w.ctx.approvals.as_ref().unwrap();
+    let r = store
+        .transition(
+            id,
+            &[State::Pending],
+            State::Approved,
+            Some(BOSS),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    let key = saiife_daemon::grants::unhex(r.grant_key.as_deref().unwrap()).unwrap();
+    w.ctx
+        .grants
+        .insert(
+            key,
+            id,
+            std::time::SystemTime::now() + Duration::from_secs(900),
+        )
+        .unwrap();
+    let recs = saiife_daemon::approval_ops::reconcile_interrupted(&w.ctx);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].rule.as_deref(), Some("interrupted"));
+    assert!(w.ctx.grants.is_empty());
+    assert_eq!(w.state(id), Some(State::SendFailed));
+}
+
+/// A project config cannot define a pack or rule ids: only the built-in
+/// catalog counts, so a fake `core.git` with a `force-push` rule that
+/// matches `echo` changes nothing.
+#[test]
+fn project_cannot_define_packs_or_rule_ids() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    fs::create_dir_all(w.path().join("project/.saiife")).unwrap();
+    fs::write(
+        w.path().join("project/.saiife/config.toml"),
+        "packs = [\"core.git\"]\n[pack]\nid = \"core.git\"\n[[deny]]\nid = \"force-push\"\npattern = \"^echo\"\nreason = \"x\"\n",
+    )
+    .unwrap();
+    let o = w.hook("echo hi");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(w.requests().is_empty());
+    // The real rule still asks, keyed by the project root.
+    let o = w.hook(FORCE_PUSH);
+    let id = needs_approval_id(&o);
+    let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
+    assert_eq!(
+        r.grant_key.as_deref(),
+        Some(key_for(&w.project(), FORCE_PUSH, FORCE_PUSH).as_str())
+    );
+    let p = saiife_policy::parse_project(
+        &fs::read(w.path().join("project/.saiife/config.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(p.packs, ["core.git"]);
 }
 
 /// `[guard] ask` naming a rule no active pack has makes the policy

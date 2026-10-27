@@ -738,6 +738,40 @@ impl Pack {
         }
     }
 
+    /// This pack without the `[[deny]]` rules whose id is in `ids` (a lazy
+    /// pack is compiled now). For telling whether a call is denied only
+    /// by `[guard] ask` rules.
+    pub fn without_deny_ids(&self, ids: &[&str]) -> Pack {
+        let mut p = self.clone();
+        p.allow = self.allow_rules().to_vec();
+        p.deny = self
+            .deny_rules()
+            .iter()
+            .filter(|r| r.id.as_deref().is_none_or(|i| !ids.contains(&i)))
+            .cloned()
+            .collect();
+        p.lazy = None;
+        p
+    }
+
+    /// This pack with only its `[[deny]]` rule `id` (its `[[allow]]`
+    /// carve-outs kept, no path rules), or `None` if it has no such rule.
+    /// For checking that a claimed rule really matches a command.
+    pub fn only_deny_id(&self, id: &str) -> Option<Pack> {
+        let rule = self
+            .deny_rules()
+            .iter()
+            .find(|r| r.id.as_deref() == Some(id))?
+            .clone();
+        let mut p = self.clone();
+        p.allow = self.allow_rules().to_vec();
+        p.deny = vec![rule];
+        p.allow_path = Vec::new();
+        p.deny_path = Vec::new();
+        p.lazy = None;
+        Some(p)
+    }
+
     /// The rules are compiled on first use.
     pub fn is_lazy(&self) -> bool {
         self.lazy.is_some()

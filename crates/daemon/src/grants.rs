@@ -1,14 +1,15 @@
 //! One-use command grants (spec §6.10.4): approving a command request
-//! (`[guard] ask`) leaves a grant keyed by
-//! SHA-256(uid, agent, project, tool, input); the next hook call with
-//! exactly that key uses it up and is allowed once.
+//! (`[guard] ask`) leaves a grant keyed by SHA-256(uid, agent, project,
+//! tool, input, raw_sha256); the next hook call with exactly that key uses
+//! it up and is allowed once.
 //!
-//! The **daemon** computes the key, from the peer uid and the fields of the
-//! record the hook sends (`grant.consume`, `approval.create`); a client
-//! never names a key. `input` is the record's input: masked and cut as the
-//! record shows it. Two commands that differ only inside a masked span (a
-//! token's value) therefore share a key. That is accepted: masking hides
-//! secrets, not commands, so what the approver saw is what runs.
+//! The **daemon** computes the key, from the peer uid and what the hook
+//! sends (`grant.consume`, `approval.create`): the record's `agent`, `tool`
+//! and `input`, the canonical project root, and `raw_sha256`, the SHA-256
+//! of the exact command judged (never its text). A client never names a
+//! key. `raw_sha256` binds the grant to the exact command; the hook also
+//! offers approval only when the record's `input` is that command whole
+//! (nothing masked or cut), so what the approver saw is what runs.
 //!
 //! Grants live in memory and in `<state>/state/grants.json` (0600, written
 //! atomically; the dir is checked like lockdown's: ours, not group- or
@@ -35,10 +36,17 @@ pub fn path_in(state_dir: &Path) -> PathBuf {
     state_dir.join("state").join(FILE_NAME)
 }
 
-/// SHA-256 over `uid` (4 bytes, big-endian), `agent`, `project`, `tool` and
-/// `input` (UTF-8), each prefixed by its length as a u32 big-endian, in
-/// that order.
-pub fn grant_key(uid: u32, agent: &str, project: &str, tool: &str, input: &str) -> [u8; 32] {
+/// SHA-256 over `uid` (4 bytes, big-endian), `agent`, `project`, `tool`,
+/// `input` (UTF-8) and `raw_sha256` (32 bytes), each prefixed by its length
+/// as a u32 big-endian, in that order.
+pub fn grant_key(
+    uid: u32,
+    agent: &str,
+    project: &str,
+    tool: &str,
+    input: &str,
+    raw_sha256: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Sha256::new();
     let uid = uid.to_be_bytes();
     for part in [
@@ -47,6 +55,7 @@ pub fn grant_key(uid: u32, agent: &str, project: &str, tool: &str, input: &str) 
         project.as_bytes(),
         tool.as_bytes(),
         input.as_bytes(),
+        &raw_sha256[..],
     ] {
         // Every part is far below 4 GiB (records are at most 64 KiB).
         h.update((part.len() as u32).to_be_bytes());
@@ -177,6 +186,16 @@ impl Grants {
         Ok(hit.map(|g| g.approval))
     }
 
+    /// Drop the grant for `key`, if any (an interrupted approval). `Err`:
+    /// the removal could not be saved; it is gone from memory all the same.
+    pub fn revoke(&self, key: &[u8; 32]) -> io::Result<()> {
+        let mut cur = lock(&self.cur);
+        if cur.remove(key).is_none() {
+            return Ok(());
+        }
+        self.save(&cur)
+    }
+
     /// How many `consume` calls were made since start.
     pub fn consume_count(&self) -> u64 {
         self.consumes.load(Ordering::Relaxed)
@@ -279,8 +298,12 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(1_800_000_000)
     }
 
+    fn raw(input: &str) -> [u8; 32] {
+        Sha256::digest(input.as_bytes()).into()
+    }
+
     fn key(uid: u32, input: &str) -> [u8; 32] {
-        grant_key(uid, "claude", "/srv/p", "Bash", input)
+        grant_key(uid, "claude", "/srv/p", "Bash", input, &raw(input))
     }
 
     fn ttl() -> Duration {
@@ -319,9 +342,12 @@ mod tests {
     #[test]
     fn fields_are_length_prefixed() {
         // Moving a byte from one field to the next changes the key.
-        let a = grant_key(UID, "ab", "c", "Bash", CMD);
-        let b = grant_key(UID, "a", "bc", "Bash", CMD);
+        let a = grant_key(UID, "ab", "c", "Bash", CMD, &raw(CMD));
+        let b = grant_key(UID, "a", "bc", "Bash", CMD, &raw(CMD));
         assert_ne!(a, b);
+        // The same shown input, another exact command: another key.
+        let c = grant_key(UID, "claude", "/srv/p", "Bash", CMD, &raw("other"));
+        assert_ne!(key(UID, CMD), c);
         // The spec's layout, spelled out.
         let mut h = Sha256::new();
         for part in [
@@ -330,6 +356,7 @@ mod tests {
             b"/srv/p",
             b"Bash",
             CMD.as_bytes(),
+            &raw(CMD)[..],
         ] {
             h.update((part.len() as u32).to_be_bytes());
             h.update(part);
@@ -337,6 +364,17 @@ mod tests {
         let want: [u8; 32] = h.finalize().into();
         assert_eq!(key(UID, CMD), want);
         assert_eq!(unhex(&hex(&want)), Some(want));
+    }
+
+    #[test]
+    fn revoke_drops_the_grant() {
+        let d = tempfile::tempdir().unwrap();
+        let p = path_in(d.path());
+        let (g, _) = Grants::open(p.clone(), t0());
+        g.insert(key(UID, CMD), 42, t0() + ttl()).unwrap();
+        g.revoke(&key(UID, CMD)).unwrap();
+        assert!(g.is_empty());
+        assert!(Grants::open(p, t0()).0.is_empty());
     }
 
     #[test]

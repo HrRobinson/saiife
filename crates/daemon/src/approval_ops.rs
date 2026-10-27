@@ -150,7 +150,7 @@ async fn store_new(
 ) -> Result<u64, String> {
     let created = on_store(ctx, move |c, s| {
         // Store lock, then the vault's (inside `seal`): the only order.
-        s.create_capped(
+        s.create_dedup(
             new,
             |id| match &exact {
                 Some(b) => c.vault.seal(&aad(id), b).map(Some),
@@ -163,7 +163,9 @@ async fn store_new(
     })
     .await;
     let r = match created {
-        Some(Ok(r)) => r,
+        // The same command is already waiting: its id, no new record.
+        Some(Ok((r, false))) => return Ok(r.id),
+        Some(Ok((r, true))) => r,
         Some(Err(e))
             if e.get_ref()
                 .is_some_and(|x| x.downcast_ref::<PendingFull>().is_some()) =>
@@ -567,20 +569,41 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
 /// `approval.create` (spec §6.10.4).
 struct CallFields {
     agent: String,
+    /// The record's project (the cwd), shown to approvers.
     project: String,
+    /// The canonical project root (arg `project`): what the key holds.
+    key_project: String,
     tool: String,
-    /// Masked and cut, as the record shows it.
+    /// As the record shows it (the hook sends only whole, unmasked ones).
     input: String,
+    /// SHA-256 of the exact command judged (arg `raw_sha256`).
+    raw_sha256: [u8; 32],
     session: Option<String>,
-    /// `pack/rule_id`, when the record names both.
-    ask: Option<String>,
+    pack: Option<String>,
+    rule_id: Option<String>,
 }
 
 impl CallFields {
     /// The grant key for this call by `uid`: computed here, never taken
     /// from the client.
     fn key(&self, uid: u32) -> [u8; 32] {
-        crate::grants::grant_key(uid, &self.agent, &self.project, &self.tool, &self.input)
+        crate::grants::grant_key(
+            uid,
+            &self.agent,
+            &self.key_project,
+            &self.tool,
+            &self.input,
+            &self.raw_sha256,
+        )
+    }
+
+    /// `pack/rule_id`, when the record names both.
+    fn ask(&self) -> Option<String> {
+        Some(format!(
+            "{}/{}",
+            self.pack.as_ref()?,
+            self.rule_id.as_ref()?
+        ))
     }
 }
 
@@ -599,17 +622,25 @@ fn call_fields(req: &Request) -> Result<CallFields, Value> {
     else {
         return Err(bad("rec needs agent, project, tool and input"));
     };
-    let ask = match (text("pack"), text("rule_id")) {
-        (Some(p), Some(r)) => Some(format!("{p}/{r}")),
-        _ => None,
+    let raw_sha256 = req
+        .args
+        .get("raw_sha256")
+        .and_then(Value::as_str)
+        .and_then(crate::grants::unhex);
+    let key_project = req.args.get("project").and_then(Value::as_str);
+    let (Some(raw_sha256), Some(key_project)) = (raw_sha256, key_project) else {
+        return Err(bad("takes raw_sha256 (64 hex) and project"));
     };
     Ok(CallFields {
         agent,
         project,
+        key_project: key_project.to_string(),
         tool,
         input,
+        raw_sha256,
         session: text("session"),
-        ask,
+        pack: text("pack"),
+        rule_id: text("rule_id"),
     })
 }
 
@@ -643,6 +674,18 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let mut m = Map::new();
     match used {
         Ok(Some(approval)) => {
+            // The use is on record before the call is allowed.
+            if let Err(e) = ctx
+                .writer
+                .append(grant_used_record(ctx, peer, approval, &f).await)
+                .await
+            {
+                return err(
+                    id,
+                    ErrorCode::Unrecorded,
+                    &format!("the use of approval #{approval} could not be recorded: {e}"),
+                );
+            }
             m.insert("granted".into(), true.into());
             m.insert("approval".into(), approval.into());
         }
@@ -660,6 +703,67 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     ok(id, m)
 }
 
+/// The `approval`/`grant_used` record of approval `approval`, used by
+/// `peer` for call `f`.
+async fn grant_used_record(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    approval: u64,
+    f: &CallFields,
+) -> Record {
+    let stored = on_store(ctx, move |_, s| s.get(approval)).await.flatten();
+    let mut rec = match &stored {
+        Some(r) => ctx.approval_record(r, "grant_used"),
+        None => {
+            let mut rec = ctx.record("approval", &f.input);
+            rec.extra.insert("action".into(), "grant_used".into());
+            rec.extra.insert("id".into(), approval.into());
+            rec.extra.insert("approval".into(), approval.into());
+            rec.extra.insert("type".into(), "command".into());
+            rec.uid = Some(peer.uid);
+            rec.agent = f.agent.clone();
+            rec.project = f.project.clone();
+            rec
+        }
+    };
+    rec.decision = DecisionKind::Allow;
+    rec
+}
+
+/// Refuse an `approval.create` with `rule` (`not_ask`,
+/// `ask_rule_mismatch`): an `approval`/`refused` record (no request is
+/// made) and `denied` with the rule.
+async fn refuse_create(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    id: u64,
+    f: &CallFields,
+    rule: &str,
+    why: &str,
+) -> Value {
+    let mut rec = ctx.record("approval", &f.input);
+    rec.uid = Some(peer.uid);
+    rec.user = ctx.name_of(peer.uid).await;
+    rec.agent = f.agent.clone();
+    rec.project = f.project.clone();
+    rec.session = f.session.clone();
+    rec.decision = DecisionKind::Deny;
+    rec.pack = f.pack.clone();
+    rec.rule = Some(rule.into());
+    rec.reason = Some(why.into());
+    rec.extra.insert("action".into(), "refused".into());
+    rec.extra.insert("type".into(), "command".into());
+    if let Some(r) = &f.rule_id {
+        rec.extra.insert("rule_id".into(), r.clone().into());
+    }
+    if let Err(e) = ctx.writer.append(rec).await {
+        eprintln!("saiife: warning: cannot record a refused command request: {e}");
+    }
+    let mut m = Map::new();
+    m.insert("rule".into(), rule.into());
+    err_with(id, ErrorCode::Denied, &format!("{rule}: {why}"), m)
+}
+
 /// `approval.create {rec}`: a command request for a call a `[guard] ask`
 /// rule denied (`pack` and `rule_id` in `rec` name it), keyed for the
 /// caller's uid. `{request}`; the request counts toward the per-uid cap.
@@ -673,18 +777,43 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         return err(id, ErrorCode::Unavailable, "no valid policy is loaded");
     };
     let asked = f
-        .ask
-        .as_ref()
-        .is_some_and(|a| sys.guard.ask.iter().any(|x| x == a));
+        .ask()
+        .is_some_and(|a| sys.guard.ask.contains(&a));
     if !asked {
-        return err(
+        return refuse_create(
+            ctx,
+            peer,
             id,
-            ErrorCode::Denied,
-            "not_ask: the call's rule is not in [guard] ask",
-        );
+            &f,
+            "not_ask",
+            "the call's rule is not in [guard] ask",
+        )
+        .await;
     }
     if let Some(v) = locked_down(ctx, id) {
         return v;
+    }
+    // The claimed rule must deny the submitted command itself.
+    let (pack, rule_id, input) = (
+        f.pack.clone().unwrap_or_default(),
+        f.rule_id.clone().unwrap_or_default(),
+        f.input.clone(),
+    );
+    let matches = tokio::task::spawn_blocking(move || {
+        saiifeguard::builtins::builtin_rule_denies(&pack, &rule_id, &input)
+    })
+    .await
+    .unwrap_or(false);
+    if !matches {
+        return refuse_create(
+            ctx,
+            peer,
+            id,
+            &f,
+            "ask_rule_mismatch",
+            "the claimed [guard] ask rule does not deny this command",
+        )
+        .await;
     }
     if ctx.approvals.is_err() {
         return unavailable(id, ctx);
@@ -1050,6 +1179,18 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
         uid: None,
         states: vec![State::Approved],
     }) {
+        // A command's grant may or may not have been kept: revoke it, so
+        // the command needs a new approval.
+        if r.kind == ApprovalType::Command {
+            if let Some(key) = r.grant_key.as_deref().and_then(crate::grants::unhex) {
+                if let Err(e) = ctx.grants.revoke(&key) {
+                    eprintln!(
+                        "saiife: warning: cannot save the revoked grant of #{}: {e}",
+                        r.id
+                    );
+                }
+            }
+        }
         let result = failure_result(INTERRUPTED, message);
         let bytes = Zeroizing::new(serde_json::to_vec(&result).unwrap_or_default());
         if let Ok(sealed) = ctx.vault.seal(&result_aad(r.id), &bytes) {

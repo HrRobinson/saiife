@@ -346,6 +346,30 @@ impl Engine {
             .and_then(|r| r.id.as_deref())
     }
 
+    /// This engine (same paths and budget) without the `[[deny]]` rules
+    /// `(pack, id)` names. A command it allows was denied only by them.
+    pub fn without_deny_rules(&self, rules: &[(&str, &str)]) -> Engine {
+        let packs = self
+            .packs
+            .iter()
+            .map(|p| {
+                let ids: Vec<&str> = rules
+                    .iter()
+                    .filter(|(pack, _)| *pack == p.id)
+                    .map(|(_, id)| *id)
+                    .collect();
+                if ids.is_empty() {
+                    p.clone()
+                } else {
+                    p.without_deny_ids(&ids)
+                }
+            })
+            .collect();
+        Engine::new(packs)
+            .with_paths(self.vars.clone())
+            .with_budget(self.budget)
+    }
+
     /// Evaluate a raw command line and return the decision.
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
         self.path_rules();

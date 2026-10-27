@@ -22,6 +22,9 @@ saiife-broker = { path = "../broker" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+# The hash of the exact command a grant is for (`raw_sha256`); also the
+# body hash the approvals tests check.
+sha2 = "0.10"
 # The developer hook reads /etc/saiife/config.toml as a raw table.
 toml = "0.8"
 time = { version = "0.3", features = ["formatting", "macros"] }
@@ -50,5 +53,3 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 # The approvals tests serve an in-process daemon context to the CLI (an
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
-# The body hash an approver is shown, checked against what was sent.
-sha2 = "0.10"
