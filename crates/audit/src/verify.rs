@@ -190,27 +190,51 @@ pub struct ExternalReport {
     /// The forwarded copy on its own; its breaks mean the copy is damaged,
     /// not the local log.
     pub external: VerifyReport,
-    /// `head_seq` of each checkpoint the copy vouches for that the local
-    /// log lacks: the local history was rewritten or cut.
+    /// `head_seq` of each checkpoint of the copy that the local log lacks,
+    /// where the copy is intact around it: the local history was rewritten
+    /// or cut.
     pub missing_checkpoints: Vec<u64>,
+    /// `head_seq` of each checkpoint of the copy that the local log lacks,
+    /// where the copy is damaged next to it (its own line, or a `prev` or
+    /// `seq` break on the line after it): either side may have changed.
+    pub missing_near_damage: Vec<u64>,
+    /// Lines of the copy whose `seq` the local log has, but with other
+    /// bytes. Since both chains are verified, a matching line vouches for
+    /// everything before it; a differing one means a rewritten history.
+    pub rewritten: Vec<HeadMismatch>,
     /// `(local max seq, external max seq)` when the copy goes further than
     /// the local log: its tail was cut off.
     pub cut_tail: Option<(u64, u64)>,
-    /// Checkpoints of the copy compared with the local log. A checkpoint
-    /// is left out when the copy itself does not vouch for it: its line, or
-    /// the line after it, has a break.
+    /// Checkpoints of the copy compared with the local log (all of them).
     pub compared: u64,
+    /// The host id prefix of the copy's month files, when it is not this
+    /// machine's: the copy may be another host's log.
+    pub external_host: Option<String>,
+}
+
+/// A line of the copy whose bytes the local log does not have at its `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadMismatch {
+    pub seq: u64,
+    /// `seq` of the newest checkpoint before it that both sides share.
+    pub after_checkpoint: Option<u64>,
+    /// The copy vouches for the line: the next line's `prev` hashes it. The
+    /// copy's last line is not vouched for (nothing follows it), so a
+    /// mismatch there may be either side's change.
+    pub vouched: bool,
 }
 
 impl ExternalReport {
     /// 2 if either side could not be read, else 1 on any break (local,
-    /// external, missing checkpoint, cut tail), else 0.
+    /// external, missing checkpoint, rewritten line, cut tail), else 0.
     pub fn exit_code(&self) -> u8 {
         if !self.local.read_errors.is_empty() || !self.external.read_errors.is_empty() {
             2
         } else if !self.local.breaks.is_empty()
             || !self.external.breaks.is_empty()
             || !self.missing_checkpoints.is_empty()
+            || !self.missing_near_damage.is_empty()
+            || !self.rewritten.is_empty()
             || self.cut_tail.is_some()
         {
             1
@@ -224,25 +248,28 @@ impl ExternalReport {
 /// one JSONL file with the lines as forwarded, or a directory of month
 /// files (`YYYY-MM.jsonl`, or the file target's `<host id>-YYYY-MM.jsonl`).
 ///
-/// Both are chain-verified on their own. Then every checkpoint the copy
-/// vouches for must be in the local log with the same `head_seq`, `head`
-/// and `sig`, and the local log must reach the copy's highest `seq`.
+/// Both are chain-verified on their own. Then:
+/// - every checkpoint of the copy must be in the local log with the same
+///   `head_seq`, `head` and `sig`;
+/// - the last line of every intact stretch of the copy (and the copy's
+///   last line) must be in the local log byte for byte at its `seq`, which
+///   catches a tail rewritten after the last checkpoint;
+/// - the local log must reach the copy's highest `seq`.
+///
+/// The copy is read first, collecting the few `seq`s to compare, then the
+/// local log in one pass; neither is held in memory.
 pub fn verify_external(local: &Path, external: &Path) -> ExternalReport {
     let mut out = ExternalReport::default();
-    let mut local_state = State::default();
-    match store::month_files(local) {
-        Ok(files) => check_files(&files, &mut local_state, &mut out.local),
-        Err(e) => out
-            .local
-            .read_errors
-            .push(format!("cannot list {}: {e}", local.display())),
-    }
     let mut ext_state = State {
         partial: true,
         ..State::default()
     };
     match external_files(external) {
-        Ok(files) => check_files(&files, &mut ext_state, &mut out.external),
+        Ok((files, host)) => {
+            out.external_host = host;
+            check_files(&files, &mut ext_state, &mut out.external);
+            ext_state.seen.end_run();
+        }
         Err(e) => out.external.read_errors.push(e),
     }
     if out.external.read_errors.is_empty() && out.external.chained == 0 {
@@ -250,10 +277,20 @@ pub fn verify_external(local: &Path, external: &Path) -> ExternalReport {
             .read_errors
             .push(format!("{} holds no chained records", external.display()));
     }
+    let mut local_state = State::default();
+    local_state.seen.watch = ext_state.seen.heads.iter().map(|h| h.seq).collect();
+    match store::month_files(local) {
+        Ok(files) => check_files(&files, &mut local_state, &mut out.local),
+        Err(e) => out
+            .local
+            .read_errors
+            .push(format!("cannot list {}: {e}", local.display())),
+    }
     if out.exit_code() == 2 {
         return out;
     }
 
+    // Checkpoints.
     let have: BTreeSet<&CheckpointId> = local_state
         .seen
         .checkpoints
@@ -261,19 +298,49 @@ pub fn verify_external(local: &Path, external: &Path) -> ExternalReport {
         .map(|(_, c)| c)
         .collect();
     let broken = &ext_state.seen.broken;
+    let mut shared = Vec::new();
     for (line, cp) in &ext_state.seen.checkpoints {
-        // A changed line breaks itself (a bad signature) or the line after
-        // it (`prev`): either way the copy no longer vouches for it.
-        if broken.contains(line) || broken.contains(&(line + 1)) {
+        out.compared += 1;
+        if have.contains(cp) {
+            shared.push(cp.head_seq.saturating_add(1));
             continue;
         }
-        out.compared += 1;
-        if !have.contains(cp) {
+        // A changed checkpoint line breaks itself (a bad signature) or the
+        // line after it (`prev`, or `seq` when that line was dropped).
+        let damaged = broken.contains_key(line)
+            || matches!(
+                broken.get(&(line + 1)),
+                Some(BreakKind::PrevMismatch | BreakKind::SeqGap { .. })
+            );
+        if damaged {
+            out.missing_near_damage.push(cp.head_seq);
+        } else {
             out.missing_checkpoints.push(cp.head_seq);
         }
     }
+
+    // Heads.
+    let local_max = local_state.seen.max_seq;
+    for h in &ext_state.seen.heads {
+        if local_max.is_none_or(|m| m < h.seq) {
+            continue; // past the local end: `cut_tail`
+        }
+        let same = local_state
+            .seen
+            .found
+            .get(&h.seq)
+            .is_some_and(|v| v.contains(&h.hash));
+        if !same {
+            out.rewritten.push(HeadMismatch {
+                seq: h.seq,
+                after_checkpoint: shared.iter().copied().filter(|&c| c < h.seq).max(),
+                vouched: h.vouched,
+            });
+        }
+    }
+
     if let Some(ext_max) = ext_state.seen.max_seq {
-        match local_state.seen.max_seq {
+        match local_max {
             Some(local_max) if local_max >= ext_max => {}
             local_max => out.cut_tail = Some((local_max.unwrap_or(0), ext_max)),
         }
@@ -283,13 +350,14 @@ pub fn verify_external(local: &Path, external: &Path) -> ExternalReport {
 
 /// The files of a forwarded copy, in order. A directory holds the month
 /// files of one host: plain `YYYY-MM.jsonl`, or `<prefix>-YYYY-MM.jsonl`
-/// with one prefix (this host's id when there are several).
-fn external_files(p: &Path) -> Result<Vec<PathBuf>, String> {
+/// with one prefix (this host's id when there are several). Also returns
+/// that prefix when it is not this host's id.
+fn external_files(p: &Path) -> Result<(Vec<PathBuf>, Option<String>), String> {
     let cannot = |e: &dyn std::fmt::Display| format!("cannot read {}: {e}", p.display());
     let p = std::fs::canonicalize(p).map_err(|e| cannot(&e))?;
     let meta = std::fs::metadata(&p).map_err(|e| cannot(&e))?;
     if meta.is_file() {
-        return Ok(vec![p]);
+        return Ok((vec![p], None));
     }
     if !meta.is_dir() {
         return Err(cannot(&"not a file or directory"));
@@ -316,25 +384,30 @@ fn external_files(p: &Path) -> Result<Vec<PathBuf>, String> {
         };
         hosts.entry(prefix.to_string()).or_default().push(path);
     }
+    let this = crate::chain::host_id().unwrap_or_default();
+    let mut other_host = None;
     let mut files = match hosts.len() {
         0 => return Err(cannot(&"no month files (YYYY-MM.jsonl) in it")),
-        1 => hosts.into_values().next().unwrap_or_default(),
-        _ => {
-            let this = crate::chain::host_id().unwrap_or_default();
-            match hosts.remove(&this) {
-                Some(files) => files,
-                None => {
-                    let names: Vec<&str> = hosts.keys().map(|h| h.as_str()).collect();
-                    return Err(cannot(&format!(
-                        "it holds the month files of several hosts ({}); pass one host's files",
-                        names.join(", ")
-                    )));
-                }
+        1 => {
+            let (host, files) = hosts.into_iter().next().unwrap_or_default();
+            if !host.is_empty() && host != this {
+                other_host = Some(host);
             }
+            files
         }
+        _ => match hosts.remove(&this) {
+            Some(files) => files,
+            None => {
+                let names: Vec<&str> = hosts.keys().map(|h| h.as_str()).collect();
+                return Err(cannot(&format!(
+                    "it holds the month files of several hosts ({}); pass one host's files",
+                    names.join(", ")
+                )));
+            }
+        },
     };
     files.sort();
-    Ok(files)
+    Ok((files, other_host))
 }
 
 #[derive(Default)]
@@ -372,13 +445,38 @@ struct Seen {
     lines: usize,
     /// Every checkpoint, with the 0-based physical line it is on.
     checkpoints: Vec<(usize, CheckpointId)>,
-    /// Physical lines that have a break.
-    broken: BTreeSet<usize>,
+    /// Physical lines that have a break, with the break.
+    broken: BTreeMap<usize, BreakKind>,
     max_seq: Option<u64>,
     /// A partial copy only: hashes of the last `RESEND_WINDOW` chained
-    /// lines, to recognise lines sent again.
+    /// lines. A chained line whose exact bytes are among them
+    /// is a resend (delivery is at least once) and is skipped before it is
+    /// judged: it neither advances the chain state (`prev_hash`,
+    /// `expected`) nor counts as a break, so the line after a resent run
+    /// is checked against the original it repeats. Only byte-identical
+    /// lines qualify, so an edited repeat is still judged (and breaks);
+    /// a repeat older than the window is judged too, and breaks as a
+    /// `seq` gap. The local log never skips anything.
     recent: HashSet<String>,
     recent_order: VecDeque<String>,
+    /// A partial copy only: the newest chained, unbroken line of the
+    /// current intact stretch, and the one before it.
+    run_last: Option<(u64, String)>,
+    run_prev: Option<(u64, String)>,
+    /// A partial copy only: the lines to look up in the local log.
+    heads: Vec<Head>,
+    /// The local log only: the `seq`s to note the line hashes of (from the
+    /// copy's `heads`), and those hashes (several when a chain restarts).
+    watch: BTreeSet<u64>,
+    found: BTreeMap<u64, Vec<String>>,
+}
+
+/// A line of the copy to look up in the local log by `seq`.
+struct Head {
+    seq: u64,
+    hash: String,
+    /// The next line's `prev` confirmed this line's bytes.
+    vouched: bool,
 }
 
 /// How far back a resent line is recognised. A forwarder resends at most
@@ -386,6 +484,40 @@ struct Seen {
 const RESEND_WINDOW: usize = 10_000;
 
 impl Seen {
+    /// Track the intact stretches of a copy. A line inside a stretch is
+    /// vouched for by the next line's `prev`, so the second-to-last line of
+    /// each stretch is a vouched head; at the end of the copy its last line
+    /// is a head too, though nothing vouches for it.
+    fn track_run(&mut self, seq: Option<u64>, hash: &str, broken: bool) {
+        match seq {
+            _ if broken => {
+                if let Some((seq, hash)) = self.run_prev.take() {
+                    self.heads.push(Head {
+                        seq,
+                        hash,
+                        vouched: true,
+                    });
+                }
+                self.run_last = None;
+            }
+            Some(seq) => self.run_prev = self.run_last.replace((seq, hash.to_string())),
+            None => {} // a v1 line before the chain
+        }
+    }
+
+    /// The end of the copy.
+    fn end_run(&mut self) {
+        let last = self.run_last.take();
+        self.track_run(None, "", true);
+        if let Some((seq, hash)) = last {
+            self.heads.push(Head {
+                seq,
+                hash,
+                vouched: false,
+            });
+        }
+    }
+
     fn remember(&mut self, hash: String) {
         if self.recent.insert(hash.clone()) {
             self.recent_order.push_back(hash);
@@ -431,12 +563,18 @@ impl State {
         let (seq, kind) = self.judge(line, prev_hash.as_deref(), &hash, report);
         if let Some(seq) = seq {
             self.seen.max_seq = self.seen.max_seq.max(Some(seq));
-            if self.partial {
+            if self.seen.watch.contains(&seq) {
+                self.seen.found.entry(seq).or_default().push(hash.clone());
+            }
+        }
+        if self.partial {
+            self.seen.track_run(seq, &hash, kind.is_some());
+            if seq.is_some() {
                 self.seen.remember(hash);
             }
         }
         if let Some(kind) = kind {
-            self.seen.broken.insert(self.seen.lines - 1);
+            self.seen.broken.insert(self.seen.lines - 1, kind.clone());
             report.breaks.push(Break {
                 file: file.to_string(),
                 line: n,

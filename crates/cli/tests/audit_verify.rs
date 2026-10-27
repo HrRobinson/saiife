@@ -63,6 +63,10 @@ fn verify_empty_log_exit_0() {
     let (code, out) = verify(dir.path());
     assert_eq!(code, 0, "{out}");
     assert!(out.starts_with("audit chain: intact"), "{out}");
+    assert!(
+        out.contains(&format!("  log: {}", dir.path().display())),
+        "{out}"
+    );
 }
 
 #[test]
@@ -186,6 +190,51 @@ fn external_copy_matches() {
     assert!(out.contains("external copy: intact"), "{out}");
     assert!(
         out.contains("all 2 checkpoints of the external copy are in the local log"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("\n  log: {}\n", dir.path().display())),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("\nexternal: {}\n", copy.display())),
+        "{out}"
+    );
+}
+
+#[test]
+fn external_copy_shows_a_tail_rewritten_after_the_last_checkpoint() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let ext = tempfile::tempdir().unwrap();
+    let full = locked_fixture();
+    let copy = ext.path().join("forwarded.jsonl");
+    std::fs::write(&copy, &full).unwrap();
+    // Keep seq 0..=4 (through the first checkpoint), forge seq 5..=7 with
+    // a recomputed chain: records are not signed, so no key is needed.
+    let mut l: Vec<String> = full.lines().take(5).map(String::from).collect();
+    let template: serde_json::Value = serde_json::from_str(&l[3]).unwrap();
+    for seq in 5..=7u64 {
+        let mut v = template.clone();
+        v["seq"] = seq.into();
+        v["input"] = format!("harmless {seq}").into();
+        let prev: String = Sha256::digest(l.last().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        v["prev"] = prev.into();
+        l.push(v.to_string());
+    }
+    std::fs::write(dir.path().join("2026-11.jsonl"), l.join("\n") + "\n").unwrap();
+    assert_eq!(verify(dir.path()).0, 0, "the forged log chains on its own");
+    let (code, out) = verify_external(dir.path(), &copy);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("local log REWRITTEN after seq 4: its seq 6 differs from the external copy"),
+        "{out}"
+    );
+    assert!(
+        out.contains("seq 7 differs between the local log and the last line"),
         "{out}"
     );
 }

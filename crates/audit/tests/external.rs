@@ -107,6 +107,8 @@ fn assert_ok(r: &ExternalReport) {
     assert!(r.local.breaks.is_empty(), "{r:?}");
     assert!(r.external.breaks.is_empty(), "{r:?}");
     assert!(r.missing_checkpoints.is_empty(), "{r:?}");
+    assert!(r.missing_near_damage.is_empty(), "{r:?}");
+    assert!(r.rewritten.is_empty(), "{r:?}");
     assert_eq!(r.cut_tail, None, "{r:?}");
 }
 
@@ -267,9 +269,10 @@ fn external_edited_reported_as_external() {
     assert_eq!(r.exit_code(), 1, "{r:?}");
     assert!(r.local.breaks.is_empty(), "{r:?}");
     assert!(
-        r.missing_checkpoints.is_empty(),
+        r.missing_checkpoints.is_empty() && r.rewritten.is_empty(),
         "a damaged copy never accuses the local log: {r:?}"
     );
+    assert_eq!(r.missing_near_damage, vec![21], "{r:?}");
     assert_eq!(r.cut_tail, None);
     assert!(r.external.breaks.len() >= 2, "{r:?}");
     assert!(r
@@ -277,7 +280,7 @@ fn external_edited_reported_as_external() {
         .breaks
         .iter()
         .all(|b| b.file == "siem-export.jsonl"));
-    assert_eq!(r.compared, 1, "only the October checkpoint is vouched for");
+    assert_eq!(r.compared, 2);
 
     // The last line of the copy is a checkpoint with a changed signature
     // (nothing after it to notice): its own check catches it.
@@ -295,8 +298,146 @@ fn external_edited_reported_as_external() {
     let r = verify_external(local.path(), &copy);
     assert_eq!(r.exit_code(), 1, "{r:?}");
     assert!(r.missing_checkpoints.is_empty(), "{r:?}");
+    assert_eq!(r.missing_near_damage, vec![21], "{r:?}");
+    assert!(r.rewritten.is_empty(), "{r:?}");
     assert!(!r.external.breaks.is_empty(), "{r:?}");
     assert!(r.local.breaks.is_empty(), "{r:?}");
+}
+
+#[test]
+fn checkpoint_next_to_damage_is_still_compared() {
+    // The line after the October checkpoint is dropped from the copy: the
+    // copy breaks there (`seq` gap), but the checkpoint itself is intact
+    // and found locally, so nothing is reported against the local log.
+    let local = build();
+    let ext = tempfile::tempdir().unwrap();
+    let copy = forward_as_file(local.path(), ext.path());
+    let mut l = lines(ext.path(), "siem-export.jsonl");
+    assert!(l[11].contains("\"head_seq\":10"));
+    l.remove(12);
+    write_lines(&copy, &l);
+    let r = verify_external(local.path(), &copy);
+    assert_eq!(r.exit_code(), 1, "the copy is damaged: {r:?}");
+    assert_eq!(r.compared, 2);
+    assert!(r.missing_checkpoints.is_empty(), "{r:?}");
+    assert!(r.missing_near_damage.is_empty(), "{r:?}");
+    assert!(r.rewritten.is_empty(), "{r:?}");
+    assert!(r.local.breaks.is_empty(), "{r:?}");
+    assert_eq!(r.external.breaks.len(), 1, "{r:?}");
+
+    // The same damage next to a checkpoint the local log lacks (its
+    // history rewritten under another key): listed, never dropped.
+    for f in [OCT, NOV] {
+        fs::remove_file(local.path().join(f)).unwrap();
+    }
+    build_with(local.path(), AuditKey::generate().unwrap(), "innocent");
+    let r = verify_external(local.path(), &copy);
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    assert_eq!(r.missing_near_damage, vec![10], "{r:?}");
+    assert_eq!(r.missing_checkpoints, vec![21], "{r:?}");
+}
+
+/// Truncate the local log right after the checkpoint at `seq`, then append
+/// re-chained forged records with the same `seq`s (no key needed: records
+/// are not signed, only checkpoints are).
+fn rewrite_tail_after(local: &Path, keep_through_line: usize, upto: usize) {
+    let mut l = lines(local, NOV);
+    let n_forged = upto - keep_through_line;
+    l.truncate(keep_through_line + 1);
+    let template = l[keep_through_line - 1].clone();
+    let tv: Value = serde_json::from_str(&template).unwrap();
+    let mut seq = serde_json::from_str::<Value>(&l[keep_through_line]).unwrap()["seq"]
+        .as_u64()
+        .unwrap();
+    for i in 0..n_forged {
+        seq += 1;
+        let mut v = tv.clone();
+        v["seq"] = seq.into();
+        v["input"] = format!("harmless-{i}").into();
+        v["prev"] = sha256_hex(l.last().unwrap().as_bytes()).into();
+        l.push(serde_json::to_string(&v).unwrap());
+    }
+    write_lines(&local.join(NOV), &l);
+}
+
+#[test]
+fn local_tail_rewritten_after_last_checkpoint_detected() {
+    let local = build();
+    let ext = tempfile::tempdir().unwrap();
+    let copy = forward_as_file(local.path(), ext.path());
+    // NOV: lines 0..=9 are seq 12..=21, line 10 the checkpoint (seq 22),
+    // lines 11..=13 seq 23..=25. Keep through the checkpoint, forge 23..=25.
+    rewrite_tail_after(local.path(), 10, 13);
+    let lv = verify(local.path());
+    assert_eq!(lv.exit_code(), 0, "the forged tail chains: {lv:?}");
+    assert_eq!(lv.head.as_ref().unwrap().0, 25);
+    let r = verify_external(local.path(), &copy);
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    assert!(
+        r.missing_checkpoints.is_empty() && r.cut_tail.is_none(),
+        "{r:?}"
+    );
+    assert!(r.external.breaks.is_empty(), "{r:?}");
+    assert_eq!(
+        r.rewritten,
+        vec![
+            saiife_audit::HeadMismatch {
+                seq: 24,
+                after_checkpoint: Some(22),
+                vouched: true
+            },
+            saiife_audit::HeadMismatch {
+                seq: 25,
+                after_checkpoint: Some(22),
+                vouched: false
+            },
+        ]
+    );
+}
+
+#[test]
+fn local_tail_rewritten_with_a_damaged_copy_segment() {
+    // The copy is damaged in October (a record edited), the local log is
+    // rewritten after the November checkpoint: the intact stretch of the
+    // copy after the damage still exposes the rewrite.
+    let local = build();
+    let ext = tempfile::tempdir().unwrap();
+    let copy = forward_as_file(local.path(), ext.path());
+    let mut l = lines(ext.path(), "siem-export.jsonl");
+    l[4] = l[4].replace("cmd-4", "cmd-Y");
+    write_lines(&copy, &l);
+    rewrite_tail_after(local.path(), 10, 13);
+    let r = verify_external(local.path(), &copy);
+    assert_eq!(r.exit_code(), 1, "{r:?}");
+    assert_eq!(r.external.breaks.len(), 1, "{r:?}");
+    assert!(r.local.breaks.is_empty(), "{r:?}");
+    let vouched: Vec<u64> = r
+        .rewritten
+        .iter()
+        .filter(|h| h.vouched)
+        .map(|h| h.seq)
+        .collect();
+    assert_eq!(vouched, vec![24], "{r:?}");
+
+    // Without the rewrite, the damaged copy blames nothing local: the
+    // stretch before the damage ends on a line the copy vouches for.
+    let local = build_same_as(&copy);
+    let r = verify_external(local.path(), &copy);
+    assert!(r.rewritten.is_empty(), "{r:?}");
+}
+
+/// A local log whose lines are the copy's, except the copy's damage
+/// (record 4) is undone.
+fn build_same_as(copy: &Path) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let l: Vec<String> = fs::read_to_string(copy)
+        .unwrap()
+        .lines()
+        .map(|x| x.replace("cmd-Y", "cmd-4"))
+        .collect();
+    write_lines(&dir.path().join(OCT), &l[..12]);
+    write_lines(&dir.path().join(NOV), &l[12..]);
+    dir
 }
 
 #[test]
@@ -313,13 +454,19 @@ fn external_dir_with_month_files() {
     assert_ok(&r);
     assert_eq!(r.external.chained, 26);
     assert_eq!(r.compared, 2);
+    // Named after a host that is not this one: noted, not an error.
+    if saiife_audit::chain::host_id().as_deref() != Some(host) {
+        assert_eq!(r.external_host.as_deref(), Some(host));
+    }
 
     // Plain `YYYY-MM.jsonl` names (a copy of the audit dir) work as well.
     let plain = tempfile::tempdir().unwrap();
     for f in [OCT, NOV] {
         fs::copy(local.path().join(f), plain.path().join(f)).unwrap();
     }
-    assert_ok(&verify_external(local.path(), plain.path()));
+    let r = verify_external(local.path(), plain.path());
+    assert_ok(&r);
+    assert_eq!(r.external_host, None);
 
     // And a cut is caught through a dir too.
     fs::remove_file(local.path().join(NOV)).unwrap();

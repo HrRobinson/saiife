@@ -24,13 +24,14 @@ pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode
             return ExitCode::from(2);
         }
     };
+    let log_line = format!("  log: {}", sanitize(&dir.display().to_string()));
     let Some(external) = external else {
         let report = saiife_audit::verify(&dir);
-        outln!("{}", render_verify(&report));
+        outln!("{}\n{log_line}", render_verify(&report));
         return ExitCode::from(report.exit_code());
     };
     let report = saiife_audit::verify_external(&dir, external);
-    outln!("{}", render_external(&report));
+    outln!("{}", render_external(&report, &dir, external));
     ExitCode::from(report.exit_code())
 }
 
@@ -39,21 +40,25 @@ const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
 const AUDIT_GROUP: &str = "saiife-audit";
 const NOT_AN_AUDITOR: &str = "audit files need the saiife-audit group; ask an auditor";
 
-/// The log `verify` checks: `$SAIIFE_AUDIT_DIR` when set; in locked mode
-/// `[audit] dir` of the system config, for root and `saiife-audit` members
-/// only; else the user's own log.
+/// The log `verify` checks. In locked mode it is `[audit] dir` of the
+/// system config, for root and `saiife-audit` members only;
+/// `$SAIIFE_AUDIT_DIR` overrides it in debug builds alone (tests, CI), so
+/// a release build always checks the log the daemon writes. Otherwise it
+/// is the user's own log (`$SAIIFE_AUDIT_DIR` honoured).
 fn verify_dir(config: &Path) -> Result<PathBuf, String> {
-    let explicit = std::env::var_os(store::DIR_ENV).is_some_and(|d| Path::new(&d).is_absolute());
-    if !explicit {
-        if let Some(dir) = locked_audit_dir(config)? {
-            return if is_auditor() {
-                Ok(dir)
-            } else {
-                Err(NOT_AN_AUDITOR.into())
-            };
+    let Some(dir) = locked_audit_dir(config)? else {
+        return store::default_dir().ok_or_else(|| "no audit directory".to_string());
+    };
+    if cfg!(debug_assertions) {
+        if let Some(d) = std::env::var_os(store::DIR_ENV).filter(|d| Path::new(d).is_absolute()) {
+            return Ok(PathBuf::from(d));
         }
     }
-    store::default_dir().ok_or_else(|| "no audit directory".to_string())
+    if is_auditor() {
+        Ok(dir)
+    } else {
+        Err(NOT_AN_AUDITOR.into())
+    }
 }
 
 /// `[audit] dir` when the system config says `locked = true`; `None` when
@@ -112,9 +117,13 @@ fn is_auditor() -> bool {
 /// The local report, then how it compares with the forwarded copy. Problems
 /// in the copy itself are labelled `external copy damaged`, never blamed
 /// on the local log.
-pub fn render_external(r: &saiife_audit::ExternalReport) -> String {
+pub fn render_external(r: &saiife_audit::ExternalReport, log: &Path, external: &Path) -> String {
     let mut out = render_verify(&r.local);
-    out.push('\n');
+    out.push_str(&format!(
+        "\n  log: {}\nexternal: {}\n",
+        sanitize(&log.display().to_string()),
+        sanitize(&external.display().to_string())
+    ));
     let e = &r.external;
     if !e.read_errors.is_empty() {
         let errs: Vec<String> = e.read_errors.iter().map(|x| sanitize(x)).collect();
@@ -151,19 +160,59 @@ pub fn render_external(r: &saiife_audit::ExternalReport) -> String {
             "  the copy starts mid-chain: its checkpoints are vouched for by the local log\n",
         );
     }
+    if let Some(host) = &r.external_host {
+        out.push_str(&format!(
+            "  note: the copy's files are named for host {}\u{2026}, not this machine\n",
+            sanitize(&host.chars().take(12).collect::<String>())
+        ));
+    }
+    let seq_list = |seqs: &[u64]| {
+        let shown: Vec<String> = seqs.iter().take(MAX_BREAKS).map(u64::to_string).collect();
+        let more = if seqs.len() > MAX_BREAKS {
+            ", \u{2026}"
+        } else {
+            ""
+        };
+        format!("{}{more}", shown.join(", "))
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
     if !r.missing_checkpoints.is_empty() {
         let n = r.missing_checkpoints.len();
-        let seqs: Vec<String> = r
-            .missing_checkpoints
-            .iter()
-            .take(MAX_BREAKS)
-            .map(u64::to_string)
-            .collect();
-        let more = if n > MAX_BREAKS { ", \u{2026}" } else { "" };
         out.push_str(&format!(
-            "local log REWRITTEN OR CUT: {n} checkpoint{} of the external copy not in it (head seq {}{more})\n",
-            if n == 1 { "" } else { "s" },
-            seqs.join(", ")
+            "local log REWRITTEN OR CUT: {n} checkpoint{} of the external copy not in it (head seq {})\n",
+            plural(n),
+            seq_list(&r.missing_checkpoints)
+        ));
+    }
+    if !r.missing_near_damage.is_empty() {
+        let n = r.missing_near_damage.len();
+        out.push_str(&format!(
+            "{n} checkpoint{} of the external copy missing locally (copy damaged nearby; head seq {})\n",
+            plural(n),
+            seq_list(&r.missing_near_damage)
+        ));
+    }
+    for h in r.rewritten.iter().take(MAX_BREAKS) {
+        if h.vouched {
+            let after = h
+                .after_checkpoint
+                .map(|c| format!(" after seq {c}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "local log REWRITTEN{after}: its seq {} differs from the external copy\n",
+                h.seq
+            ));
+        } else {
+            out.push_str(&format!(
+                "seq {} differs between the local log and the last line of the external copy (one of them was changed)\n",
+                h.seq
+            ));
+        }
+    }
+    if r.rewritten.len() > MAX_BREAKS {
+        out.push_str(&format!(
+            "  \u{2026} and {} more differing lines\n",
+            r.rewritten.len() - MAX_BREAKS
         ));
     }
     if let Some((local, ext)) = r.cut_tail {
@@ -171,23 +220,20 @@ pub fn render_external(r: &saiife_audit::ExternalReport) -> String {
             "local log CUT OFF: it ends at seq {local}, the external copy reaches seq {ext}\n"
         ));
     }
-    if r.missing_checkpoints.is_empty() && r.cut_tail.is_none() {
+    if r.missing_checkpoints.is_empty()
+        && r.missing_near_damage.is_empty()
+        && r.rewritten.is_empty()
+        && r.cut_tail.is_none()
+    {
         match r.compared {
             0 => out.push_str(
-                "local log reaches the end of the external copy; no checkpoint of the copy to compare\n",
+                "local log holds the external copy's lines; no checkpoint of the copy to compare\n",
             ),
             1 => out.push_str("the checkpoint of the external copy is in the local log\n"),
             n => out.push_str(&format!(
                 "all {n} checkpoints of the external copy are in the local log\n"
             )),
         }
-    }
-    let skipped = e.checkpoints.saturating_sub(r.compared);
-    if skipped > 0 {
-        let s = if skipped == 1 { "" } else { "s" };
-        out.push_str(&format!(
-            "  {skipped} checkpoint{s} of the copy not compared: damaged in the copy\n"
-        ));
     }
     out.truncate(out.trim_end().len());
     out
