@@ -517,9 +517,14 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         ctx.notice(peer.uid, Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
-    let verdict = match check_lease(ctx, peer.uid, &name, &exe).await {
-        Ok(services) => take_value(ctx, &name, services).await,
-        Err(d) => Err(d),
+    // Under any lockdown scope no secret value is handed out.
+    let verdict = if let Some(l) = ctx.lockdown.get() {
+        Err(deny("lockdown", crate::lockdown::message(&l)))
+    } else {
+        match check_lease(ctx, peer.uid, &name, &exe).await {
+            Ok(services) => take_value(ctx, &name, services).await,
+            Err(d) => Err(d),
+        }
     };
     let mut r = use_record(ctx, peer, &name, &exe).await;
     match verdict {

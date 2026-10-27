@@ -1171,6 +1171,10 @@ fn corrupt_token_file_resets() {
         |d| {
             let dir = d.state_dir().join("state");
             fs::create_dir_all(&dir).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             fs::write(dir.join("gateway-tokens.json"), "{not json").unwrap();
             spawn(d);
         },

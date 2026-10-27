@@ -537,6 +537,23 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
         ctx.notice(uid, Notice::LowDisk);
         return err(id, code, LOW_DISK);
     }
+    // No credential of any kind is handed out during a lockdown.
+    if let Some(l) = ctx.lockdown.get() {
+        let why = crate::lockdown::message(&l);
+        let mut r = ctx.event("gateway_token");
+        r.decision = saiife_audit::DecisionKind::Deny;
+        r.rule = Some("lockdown".into());
+        r.reason = Some(why.clone());
+        r.extra.insert("token_uid".into(), uid.into());
+        if let Err(e) = ctx.writer.append(r).await {
+            eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
+        }
+        let mut v = err(id, ErrorCode::Denied, &format!("lockdown: {why}"));
+        if let Some(o) = v.as_object_mut() {
+            o.insert("rule".into(), "lockdown".into());
+        }
+        return v;
+    }
     if !has_scope(ctx, uid).await {
         return err(
             id,

@@ -413,7 +413,10 @@ async fn steps(
             *masker = Masker::new(&refs);
         }
     }
-    // 2. Lockdown (either scope).
+    // 2. Lockdown (either scope). The flag is read once, here: a request
+    // already past this point when lockdown is turned on runs to its end
+    // (it was admitted before the flag); every later request is denied.
+    // `lockdown.set` does not wait for requests in flight.
     if env.lockdown().is_some() {
         return denied("lockdown");
     }

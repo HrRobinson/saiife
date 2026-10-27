@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 pub const FILE_NAME: &str = "lockdown.json";
 /// The reason of the fail-closed flag.
 pub const UNREADABLE: &str = "lockdown file unreadable";
+/// The reason when `<state>/state` is a symlink, not ours or not 0700.
+pub const UNSAFE_DIR: &str = "lockdown dir unsafe";
 /// The longest reason kept, in characters.
 const MAX_REASON_CHARS: usize = 256;
 const MAX_FILE_BYTES: u64 = 16 * 1024;
@@ -53,17 +55,23 @@ impl Store {
     /// flag is `all` (fail closed), and the second value says why, for the
     /// start record.
     pub fn open(path: PathBuf) -> (Store, Option<String>) {
-        let (cur, why) = match read(&path) {
-            Ok(l) => (l, None),
-            Err(e) => (
+        let closed = |reason: &str, e: io::Error| {
+            (
                 Some(Lockdown {
                     scope: LockScope::All,
-                    reason: UNREADABLE.into(),
+                    reason: reason.into(),
                     by_uid: 0,
                     since: now_ts(),
                 }),
-                Some(format!("{UNREADABLE}: {e}")),
-            ),
+                Some(format!("{reason}: {e}")),
+            )
+        };
+        let (cur, why) = match check_parent(&path) {
+            Err(e) => closed(UNSAFE_DIR, e),
+            Ok(()) => match read(&path) {
+                Ok(l) => (l, None),
+                Err(e) => closed(UNREADABLE, e),
+            },
         };
         (
             Store {
@@ -94,6 +102,44 @@ impl Store {
         }
         saved
     }
+}
+
+/// The dir holding the flag file: a real directory, ours, mode 0700. A
+/// missing dir is fine (the flag is off). Nothing is created or fixed.
+fn check_parent(file: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(dir) = file.parent() else {
+        return Ok(());
+    };
+    let md = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !md.file_type().is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    if md.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other(format!(
+            "{} is not owned by this user",
+            dir.display()
+        )));
+    }
+    if md.permissions().mode() & 0o7777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "{} is not mode 0700",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// What a denied hook, lease or token says.
+pub fn message(l: &Lockdown) -> String {
+    format!("saiife lockdown is on: {}", l.reason)
 }
 
 fn read(path: &Path) -> io::Result<Option<Lockdown>> {
@@ -165,7 +211,8 @@ pub fn status_json(l: Option<&Lockdown>) -> Value {
 /// A reason as stored: control characters become spaces, at most
 /// [`MAX_REASON_CHARS`] characters.
 fn clean_reason(s: &str) -> String {
-    s.chars()
+    saiife_audit::mask::mask(s)
+        .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_REASON_CHARS)
         .collect()
@@ -245,7 +292,7 @@ pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     );
     if on {
         rec.extra.insert("scope".into(), scope.as_str().into());
-        rec.reason = Some(saiife_audit::mask::mask(&reason));
+        rec.reason = Some(reason.clone());
     }
     if !allowed {
         rec.decision = DecisionKind::Deny;
@@ -276,9 +323,13 @@ pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     if let Err(e) = &saved {
         rec.decision = DecisionKind::Deny;
         rec.rule = Some("lockdown_not_saved".into());
-        problem = Some(format!(
-            "lockdown {action}: the flag file could not be written: {e}"
-        ));
+        rec.extra.insert("applied".into(), on.into());
+        rec.extra.insert("saved".into(), false.into());
+        problem = Some(if on {
+            format!("lockdown is ON but not saved; it will not survive a restart ({e})")
+        } else {
+            format!("lockdown is still ON: the flag file could not be removed ({e})")
+        });
     }
     let recorded = ctx.writer.append(rec).await;
     if let Some(m) = problem {
@@ -333,6 +384,11 @@ mod tests {
         let d = tmp();
         let p = path_in(d.path());
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            p.parent().unwrap(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::write(&p, b"{not json").unwrap();
         let (s, why) = Store::open(p);
         let l = s.get().unwrap();

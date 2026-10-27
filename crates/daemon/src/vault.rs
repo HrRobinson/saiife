@@ -142,10 +142,16 @@ pub(crate) fn check_dir(dir: &Path, create: bool) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     if !md.file_type().is_dir() {
-        return Err(io::Error::other("the vault dir is not a directory"));
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
     }
     if md.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::other("the vault dir is not owned by this user"));
+        return Err(io::Error::other(format!(
+            "{} is not owned by this user",
+            dir.display()
+        )));
     }
     if md.permissions().mode() & 0o7777 != 0o700 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;

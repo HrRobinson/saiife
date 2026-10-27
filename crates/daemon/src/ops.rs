@@ -631,9 +631,20 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         .filter(|l| l.scope == saiife_broker::pipeline::LockScope::All)
         .map(|l| format!("saiife lockdown is on: {}", l.reason));
     if locked.is_some() {
-        rec.decision = DecisionKind::Deny;
+        // Keep the verdict the guard reached: `would_have`. A call the
+        // guard denied anyway keeps its decision and reason; the rule
+        // becomes `lockdown` (`lockdown = true` marks that).
+        rec.extra.insert(
+            "would_have".into(),
+            json!({"decision": rec.decision, "pack": rec.pack, "rule": rec.rule}),
+        );
+        if matches!(rec.decision, DecisionKind::Deny | DecisionKind::ErrorDenied) {
+            rec.extra.insert("lockdown".into(), true.into());
+        } else {
+            rec.decision = DecisionKind::Deny;
+            rec.reason = locked.clone();
+        }
         rec.rule = Some("lockdown".into());
-        rec.reason = locked.clone();
     }
     match ctx.writer.append(rec).await {
         Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),
