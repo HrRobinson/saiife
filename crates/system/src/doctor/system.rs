@@ -438,16 +438,14 @@ fn files_binary(ctx: &Ctx) -> Check {
     }
 }
 
-/// Re-authentication for approvals needs polkit: `pkcheck` present and
-/// root-owned, and the `com.saiife.approve` action installed.
+/// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
+/// present and sound, and the `com.saiife.approve` action file installed as
+/// a root-owned 0644 regular file.
 fn reauth(ctx: &Ctx) -> Check {
     const ID: &str = "reauth";
     const TITLE: &str = "re-authentication";
-    let root_uid = ctx.host.user("root").map(|u| u.uid);
-    let pkcheck_ok = fs::metadata(ctx.layout.at(PKCHECK))
-        .is_ok_and(|m| m.is_file() && Some(m.uid()) == root_uid);
-    let action_ok = fs::symlink_metadata(ctx.layout.at(POLKIT_ACTION)).is_ok_and(|m| m.is_file());
-    if pkcheck_ok && action_ok {
+    let problems = crate::polkit::action_problems(ctx.layout, ctx.host);
+    if crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty() {
         Check::new(ID, Status::Pass, TITLE, "polkit action com.saiife.approve")
     } else {
         Check::new(ID, Status::Warn, TITLE, REAUTH_UNAVAILABLE)
@@ -934,10 +932,15 @@ mod tests {
         let p = t.at(PKCHECK);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let d = t.at(crate::polkit::POLKITD_PATHS[1]);
+        fs::create_dir_all(d.parent().unwrap()).unwrap();
+        fs::write(&d, b"polkitd").unwrap();
         if action {
             let a = t.at(POLKIT_ACTION);
             fs::create_dir_all(a.parent().unwrap()).unwrap();
             fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
+            fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
         }
     }
 
@@ -956,6 +959,22 @@ mod tests {
         assert_status(&t.doctor(), "reauth", Status::Warn);
         add_polkit(&t, true);
         assert_status(&t.doctor(), "reauth", Status::Pass);
+        // A wrong mode, a symlink, or a non-root owner each warn.
+        t.chmod(POLKIT_ACTION, 0o664);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        t.chmod(POLKIT_ACTION, 0o644);
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        let a = t.at(POLKIT_ACTION);
+        let real = a.with_extension("real");
+        fs::rename(&a, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &a).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        fs::remove_file(&a).unwrap();
+        fs::rename(&real, &a).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        let uid = t.host.user("root").unwrap().uid;
+        crate::testing::set_root_uid(&t.host, uid + 1);
+        assert_status(&t.doctor(), "reauth", Status::Warn);
     }
 
     // Linux only: on macOS `system.supported` fails (locked mode needs Linux).

@@ -10,6 +10,7 @@ use crate::default_config::default_config;
 use crate::fsops;
 use crate::host::{valid_name, Host};
 use crate::layout::*;
+use crate::polkit::polkit_present;
 use crate::supported::{check_supported, Support};
 use crate::unit::{unit_text, vault_key_mode};
 use saiife_agents::{claude, codex, gemini, Agent, AgentError, Change};
@@ -163,9 +164,17 @@ pub fn install(
         files: Vec::new(),
         agents: Vec::new(),
     });
+    // Polkit presence, decided once: the default `same_user`, the action
+    // file and the warning all follow it.
+    let polkit = polkit_present(layout, host);
+    let mut warnings = warnings;
+    if !polkit {
+        warnings.push(REAUTH_UNAVAILABLE.to_string());
+    }
     let mut run = Run {
         layout,
         host,
+        polkit,
         saved: previous,
         rec,
         report: InstallReport {
@@ -511,6 +520,8 @@ fn validated_config(path: &Path) -> Result<String, InstallError> {
 struct Run<'a> {
     layout: &'a Layout,
     host: &'a dyn Host,
+    /// [`polkit_present`], decided once per run.
+    polkit: bool,
     saved: Option<Installed>,
     rec: Installed,
     report: InstallReport,
@@ -716,13 +727,7 @@ impl Run<'_> {
                         .file(CONFIG, &current, 0o644, FileKind::Config, "config")
                         .map(|_| ());
                 }
-                None => {
-                    let reauth = self.at(PKCHECK).exists();
-                    if !reauth {
-                        self.report.warnings.push(REAUTH_UNAVAILABLE.to_string());
-                    }
-                    default_config(self.layout, approvers, reauth)
-                }
+                None => default_config(self.layout, approvers, self.polkit),
             },
         };
         self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
@@ -731,7 +736,7 @@ impl Run<'_> {
 
     /// The polkit action file (root:root 0644), only when `pkcheck` exists.
     fn polkit(&mut self) -> Result<(), InstallError> {
-        if !self.at(PKCHECK).exists() {
+        if !self.polkit {
             return Ok(());
         }
         self.dir(POLKIT_DIR, 0o755, false)?;
@@ -971,6 +976,55 @@ pub(crate) mod tests {
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, b"#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        let d = e.at(crate::polkit::POLKITD_PATHS[0]);
+        fs::create_dir_all(d.parent().unwrap()).unwrap();
+        fs::write(&d, b"polkitd").unwrap();
+    }
+
+    #[test]
+    fn polkit_needs_polkitd_and_a_sound_pkcheck() {
+        let e = env(255);
+        assert!(!polkit_present(&e.layout, &e.host));
+        add_pkcheck(&e);
+        assert!(polkit_present(&e.layout, &e.host));
+        // Group-writable pkcheck.
+        fs::set_permissions(e.at(PKCHECK), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(!polkit_present(&e.layout, &e.host));
+        fs::set_permissions(e.at(PKCHECK), fs::Permissions::from_mode(0o755)).unwrap();
+        // Not root's.
+        let uid = e.host.user("root").unwrap().uid;
+        crate::testing::set_root_uid(&e.host, uid + 1);
+        assert!(!polkit_present(&e.layout, &e.host));
+        crate::testing::set_root_uid(&e.host, uid);
+        // No polkitd.
+        fs::remove_file(e.at(crate::polkit::POLKITD_PATHS[0])).unwrap();
+        assert!(!polkit_present(&e.layout, &e.host));
+    }
+
+    #[test]
+    fn pkcheck_without_polkitd_chooses_deny_and_warns() {
+        let e = env(255);
+        add_pkcheck(&e);
+        fs::remove_file(e.at(crate::polkit::POLKITD_PATHS[0])).unwrap();
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE));
+    }
+
+    #[test]
+    fn warns_on_every_path_without_polkit() {
+        let e = env(255);
+        e.install();
+        // Existing config, second run.
+        let r = e.install();
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+        // --config: the admin's file is kept, the warning still shows.
+        let cfg = e.src.path().join("c.toml");
+        fs::write(&cfg, fs::read_to_string(e.at(CONFIG)).unwrap()).unwrap();
+        let mut o = all_agents();
+        o.config = Some(cfg);
+        let r = e.run(&o).unwrap();
+        assert!(r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod fsops;
 pub mod host;
 pub mod install;
 pub mod layout;
+pub mod polkit;
 pub mod supported;
 #[doc(hidden)]
 pub mod testing;
