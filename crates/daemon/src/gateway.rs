@@ -1034,10 +1034,13 @@ fn respond(outcome: Outcome, route: Route) -> Resp {
                 json!({"error": "withheld", "rule": rule}),
             )
         }
-        Outcome::Denied { rule } => json_resp(
-            StatusCode::FORBIDDEN,
-            json!({"error": "denied", "rule": rule}),
-        ),
+        Outcome::Denied { rule } => {
+            let mut b = json!({"error": "denied", "rule": rule});
+            if let Some(why) = saiife_broker::pipeline::deny_reason(&rule) {
+                b["reason"] = why.into();
+            }
+            json_resp(StatusCode::FORBIDDEN, b)
+        }
         Outcome::Limited { limit } => json_resp(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "limit", "limit": limit}),

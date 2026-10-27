@@ -452,14 +452,17 @@ impl World {
 
     /// `invoices.create` with `body` through the CLI: the pending id.
     fn ask(&self, body: &str) -> u64 {
+        self.ask_with(body, &[])
+    }
+
+    /// [`World::ask`] with more arguments (parameters).
+    fn ask_with(&self, body: &str, more: &[&str]) -> u64 {
         let f = self.path().join(format!("body-{}.json", body.len()));
         fs::write(&f, body).unwrap();
-        let o = self.api(&[
-            "erp",
-            "invoices.create",
-            "--body",
-            &format!("@{}", f.display()),
-        ]);
+        let at = format!("@{}", f.display());
+        let mut args = vec!["erp", "invoices.create", "--body", &at];
+        args.extend_from_slice(more);
+        let o = self.api(&args);
         assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
         pending_id(&o)
     }
@@ -693,8 +696,10 @@ fn fake_agent(dir: &Path) -> PathBuf {
 #[test]
 fn list_shows_pending_masked() {
     let w = world();
-    let body = format!(r#"{{"amount": 5, "memo": "{SECRET}"}}"#);
-    let id = w.ask(&body);
+    // A secret in the body is never stored for approval
+    // (`masked_content`); in a parameter it is masked for display.
+    let body = r#"{"amount": 5, "memo": "plain"}"#;
+    let id = w.ask_with(body, &[&format!("ref={SECRET}")]);
     // The own user is the requester: it sees its own request.
     let o = w.cli("approvals", &[]);
     ok(&o);
@@ -736,8 +741,8 @@ fn list_shows_pending_masked() {
 fn show_masks_params() {
     let w = world();
     let pad = "p".repeat(3000);
-    let body = format!(r#"{{"memo": "{SECRET}", "pad": "{pad}", "zz": "tail-marker"}}"#);
-    let id = w.ask(&body);
+    let body = format!(r#"{{"memo": "plain", "pad": "{pad}", "zz": "tail-marker"}}"#);
+    let id = w.ask_with(&body, &[&format!("ref={SECRET}")]);
     let o = w.cli("approvals", &["show", &id.to_string()]);
     ok(&o);
     let out = stdout(&o);

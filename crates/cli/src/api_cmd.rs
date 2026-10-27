@@ -385,6 +385,14 @@ mod linux {
     fn refusal(ans: &Map<String, Value>) -> Stop {
         let s = |k: &str| ans.get(k).and_then(Value::as_str).unwrap_or_default();
         match s("error") {
+            "denied" if !s("reason").is_empty() => Stop(
+                2,
+                format!(
+                    "denied ({}): {}",
+                    s("rule"),
+                    crate::text::sanitize(s("reason"))
+                ),
+            ),
             "denied" => Stop(2, format!("denied ({})", s("rule"))),
             "limited" => Stop(4, format!("limit reached ({})", s("limit"))),
             "upstream_failed" => {

@@ -552,7 +552,7 @@ async fn pending_display_shows_what_will_be_sent_masked() {
     // The padding attack: a large key that sorts first in the canonical
     // JSON must not push the fields that matter out of the display.
     let raw = format!(
-        r#"{{"refund":{{"currency":"EUR","note":"{TOKEN}","transactions":[{{"amount":"5.00"}}]}},"aaa":"{}"}}"#,
+        r#"{{"refund":{{"currency":"EUR","note":"plain","transactions":[{{"amount":"5.00"}}]}},"aaa":"{}"}}"#,
         "y".repeat(200_000)
     );
     c.body = Some(Bytes::from(raw.clone()));
@@ -571,8 +571,7 @@ async fn pending_display_shows_what_will_be_sent_masked() {
     assert_eq!(p.amount, Some((500, "EUR".to_string())));
     assert_eq!(p.body_sha256, tr.body_sha256);
     let shown = p.body_display.unwrap();
-    assert!(shown.contains(r#""note":"[MASKED]""#), "{shown}");
-    assert!(!shown.contains(TOKEN));
+    assert!(shown.contains(r#""note":"plain""#), "{shown}");
     // The whole body, in the canonical key order (whichever serde_json
     // gives in this build): the padding and every field after it.
     assert!(shown.contains(r#""aaa":"yyy"#));
@@ -584,6 +583,45 @@ async fn pending_display_shows_what_will_be_sent_masked() {
         vec![("X-Trace".to_string(), "t-[MASKED]".to_string())]
     );
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// A body the masker would change cannot be shown as it will be sent, so
+/// it cannot be approved: a v1 pattern's `\S+` would swallow the JSON
+/// after it (here the amount), and a vault value would be hidden.
+#[tokio::test]
+async fn ask_with_masked_body_refused_masked_content() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let snap = snapshot("");
+    for body in [
+        r#"{"refund":{"currency":"EUR","note":"API_TOKEN=x","transactions":[{"amount":"5.00"}]}}"#
+            .to_string(),
+        format!(
+            r#"{{"refund":{{"currency":"EUR","note":"{TOKEN}","transactions":[{{"amount":"5.00"}}]}}}}"#
+        ),
+    ] {
+        let mut c = call("refunds.create", &[("order_id", "7")]);
+        c.body = Some(Bytes::from(body));
+        let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+        assert_eq!(rule(&o), "masked_content");
+        let r = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+        assert_eq!(r["decision"], "deny");
+        assert_eq!(r["rule"], "masked_content");
+        assert_eq!(
+            r["reason"],
+            "cannot be approved: the request contains masked content"
+        );
+        assert!(!r.to_string().contains(TOKEN));
+    }
+    // No request was created, nothing was sent.
+    assert!(env.approvals.lock().unwrap().is_empty());
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+
+    // A plain body is still approvable.
+    let c = refund_call(&[("order_id", "7")]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    assert_eq!(env.approvals.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

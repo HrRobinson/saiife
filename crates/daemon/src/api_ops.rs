@@ -526,12 +526,18 @@ pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
                 one("rule", rule.into()),
             )
         }
-        Outcome::Denied { rule } => err_with(
-            id,
-            ErrorCode::Denied,
-            &format!("denied ({rule})"),
-            one("rule", rule.into()),
-        ),
+        Outcome::Denied { rule } => {
+            let why = saiife_broker::pipeline::deny_reason(&rule);
+            let msg = match why {
+                Some(why) => format!("denied ({rule}): {why}"),
+                None => format!("denied ({rule})"),
+            };
+            let mut m = one("rule", rule.into());
+            if let Some(why) = why {
+                m.insert("reason".into(), why.into());
+            }
+            err_with(id, ErrorCode::Denied, &msg, m)
+        }
         Outcome::Limited { limit } => err_with(
             id,
             ErrorCode::Limited,

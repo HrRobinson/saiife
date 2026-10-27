@@ -1026,17 +1026,38 @@ fn vault_unavailable_at_send_send_failed() {
 }
 
 /// The approver sees what will be sent: `approval.show` has the amount,
-/// the masked canonical body and its SHA-256, which is the hash of what
-/// the upstream gets after the approval (the sealed request is what is
-/// sent). `approval.list` has them too, the body cut short.
+/// the canonical body and its SHA-256, which is the hash of what the
+/// upstream gets after the approval (the sealed request is what is sent).
+/// `approval.list` has them too, the body cut short. A body the masker
+/// would change is never stored for approval (`masked_content`).
 #[test]
 fn show_displays_amount_masked_body_and_its_hash() {
     let w = world();
+    let f = w.path().join("refund.json");
+    let masked =
+        format!(r#"{{ "refund": {{"amount": "12.50", "currency": "EUR"}}, "memo": "{SECRET}" }}"#);
+    fs::write(&f, &masked).unwrap();
+    let o = w.api(&[
+        "pay",
+        "refunds.create",
+        "--body",
+        &format!("@{}", f.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(
+            "denied (masked_content): cannot be approved: the request contains masked content"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stderr(&o).contains(SECRET));
+    assert_eq!(w.op(BOSS, "approval.list", json!({}))["items"], json!([]));
+
     let body = format!(
-        r#"{{ "refund": {{"amount": "12.50", "currency": "EUR"}}, "memo": "{SECRET}", "pad": "{}" }}"#,
+        r#"{{ "refund": {{"amount": "12.50", "currency": "EUR"}}, "memo": "thanks", "pad": "{}" }}"#,
         "x".repeat(300)
     );
-    let f = w.path().join("refund.json");
     fs::write(&f, &body).unwrap();
     let o = w.api(&[
         "pay",
@@ -1055,9 +1076,8 @@ fn show_displays_amount_masked_body_and_its_hash() {
         "{a}"
     );
     let shown = item["body_display"].as_str().unwrap();
-    assert!(shown.contains(r#""memo":"[MASKED]""#), "{shown}");
+    assert!(shown.contains(r#""memo":"thanks""#), "{shown}");
     assert!(shown.contains(r#""amount":"12.50""#), "{shown}");
-    assert!(!a.to_string().contains(SECRET), "{a}");
     let hash = item["body_sha256"].as_str().unwrap().to_string();
     assert_eq!(item["headers"], json!([]));
     // The list shows the same, the body cut short.
@@ -1079,8 +1099,7 @@ fn show_displays_amount_masked_body_and_its_hash() {
     let got = sha2::Sha256::digest(hits[0].1.as_bytes());
     let got: String = got.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(got, hash);
-    // The sent body holds the real value: only the display copy is masked.
-    assert!(hits[0].1.contains(SECRET));
+    assert!(hits[0].1.contains(r#""memo":"thanks""#));
 }
 
 /// Review focus 4: a pending request approved during a lockdown is not

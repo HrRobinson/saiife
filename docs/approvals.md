@@ -24,6 +24,11 @@ Both go through the same store and the same records.
 5. Every step is a record of kind `approval`, linked by the request `id`
    (see [the records](#the-records)).
 
+A connector request whose body the masker would change (a vault value, or a
+text a masking pattern matches) is never stored for approval: the approver
+could not see what would be sent. It is a plain deny with the rule
+`masked_content`: "cannot be approved: the request contains masked content".
+
 A request that nobody decides expires after `[approval] timeout` (default
 `30m`). Results are kept 24 hours. A request can never be sent after it
 expired, was rejected or was sent.

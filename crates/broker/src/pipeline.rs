@@ -418,6 +418,17 @@ pub enum Outcome {
     },
 }
 
+/// Step 8: the body would be shown masked, so it cannot be approved.
+pub const MASKED_CONTENT_RULE: &str = "masked_content";
+
+/// The fixed explanation a deny rule carries, if any.
+pub fn deny_reason(rule: &str) -> Option<&'static str> {
+    match rule {
+        MASKED_CONTENT_RULE => Some("cannot be approved: the request contains masked content"),
+        _ => None,
+    }
+}
+
 impl Outcome {
     /// A deny given after the request was sent (the response is withheld):
     /// HTTP 502, exit 1.
@@ -757,12 +768,19 @@ async fn steps(
         ) {
             return Outcome::Limited { limit };
         }
-        let display = body.as_ref().map(|b| {
-            cut_display(
-                &masker.mask_text(&String::from_utf8_lossy(b)),
-                BODY_DISPLAY_MAX,
-            )
-        });
+        // The approver must see what will be sent: a body the masker
+        // changes (a vault value, or a v1 pattern that may swallow JSON
+        // after it) cannot be shown faithfully, so it cannot be approved.
+        // The same rule as for commands.
+        let mut display = None;
+        if let Some(b) = body.as_ref() {
+            let raw = String::from_utf8_lossy(b);
+            let masked = masker.mask_text(&raw);
+            if masked != raw {
+                return denied(MASKED_CONTENT_RULE);
+            }
+            display = Some(cut_display(&masked, BODY_DISPLAY_MAX));
+        }
         let pending = PendingCall {
             stored: StoredCall {
                 uid: call.uid,
@@ -1038,7 +1056,12 @@ pub fn record(
     }
     let (decision, rule, reason, limit) = match outcome {
         Outcome::Done { .. } => (DecisionKind::Allow, None, None, None),
-        Outcome::Denied { rule } => (DecisionKind::Deny, Some(rule.clone()), None, None),
+        Outcome::Denied { rule } => (
+            DecisionKind::Deny,
+            Some(rule.clone()),
+            deny_reason(rule).map(str::to_string),
+            None,
+        ),
         Outcome::Limited { limit } => (
             DecisionKind::Deny,
             None,
