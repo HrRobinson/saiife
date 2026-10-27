@@ -60,25 +60,35 @@ login unless you run a local model. See [Connectors](docs/connectors/README.md).
 
 ## Locked mode, audit forwarding and policy checks
 
-Locked mode is Linux only (macOS follows in v2.1). On supported Linux an admin can install saiife as root (`saiife system
-install`): for agents labelled lockable (currently Claude Code) the agent
-cannot turn the guard off, the audit is written by a
-daemon the agent cannot touch, and locked mode fails closed. The agent never
+Locked mode is Linux only (macOS follows in v2.1). On supported Linux an
+admin can install saiife as root (`saiife system install`): for agents
+labelled lockable (currently Claude Code) the agent cannot turn the guard
+off, the audit is written by a daemon the agent cannot touch, and locked
+mode fails closed. The agent never
 holds a credential for a brokered service; it holds its own model-provider
 login unless you run a local model.
 
-- Send a copy of the audit elsewhere so that a rewrite by root shows:
-  [Audit forwarding](docs/forwarding.md) (syslog, file, HTTPS), checked with
-  `saiife audit verify --external <file|dir>`.
+- Send a copy of the audit elsewhere, so that a cut or rewrite of records
+  that were already forwarded shows: [Audit forwarding](docs/forwarding.md)
+  (syslog, file, HTTPS), checked with `saiife audit verify --external
+  <file|dir>`.
 - Who may read the audit, and `audit.query` for everyone else:
   [Auditors](docs/auditors.md).
 - For a dedicated agent account, limit where it can send data:
   [Egress recipe](docs/egress.md) (nftables, Linux).
 - Check a policy before you load it: `saiife policy check <config.toml>`
-  validates it, including overlapping scopes; `saiife policy test
-  <config.toml>` runs its `[[example]]` entries and exits 1 on a mismatch;
-  `saiife policy show [--effective] [--user <name>]` prints the merged policy
-  and its hash; `saiife policy reload` (admin) reloads it.
+  validates it, including overlapping scopes, without loading it into a
+  daemon; `saiife policy test <config.toml>` runs its `[[example]]` entries
+  and exits 1 on a mismatch, an invalid policy or a file without examples,
+  and 2 on a malformed example, an unknown user or a file it cannot read.
+  In CI, where the agent accounts do not exist, give both `--passwd <file>
+  --group <file>` to resolve users from files.
+- `saiife policy show` prints your scope, its services and the policy hash,
+  from the daemon in locked mode (exit 5 if it cannot be reached; it never
+  falls back to the file there). `--user <name>` for anyone but yourself
+  and `--effective` (the whole merged policy) are for admins only.
+  `saiife policy reload` (admin) loads the policy again, like SIGHUP, and
+  prints `loaded` or `rejected: <reason>` (exit 1; the old policy stays).
 
 ## What it covers
 

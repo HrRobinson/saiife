@@ -159,6 +159,9 @@ named in `secret` lives in the root-owned vault and never reaches the agent;
 calls go through the gateway, which adds it. A project config can add `deny`
 and `ask` entries but cannot add an `allow`, define or change an operation,
 or change `base_url` or the secret. Services and their operations are
-defined by an admin in `/etc/saiife/policy.d/`. Use `saiife api erp
-invoices.list status=open`, or the gateway at `/v1/api`; the exit codes are
-those of `saiife api` (2 denied, 4 limit reached).
+defined by an admin in `/etc/saiife/config.toml` or `/etc/saiife/policy.d/`.
+Use `saiife api erp invoices.list status=open`, or the gateway at
+`POST /v1/api/{service}/{operation}`; the exit codes are those of `saiife
+api` (1 an upstream error or status 400 and up, 2 denied, 3 waiting for an
+approval, 4 limit reached, 5 saiife unavailable). `saiife api --list` shows
+the services and operations you may call.

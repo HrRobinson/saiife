@@ -3,7 +3,7 @@
 ## 0.2.0 — unreleased (waiting for red-team suite)
 
 - Audit forwarding (Linux, locked mode): the daemon sends a copy of the audit to syslog (RFC 5424, also over TLS), to a file, or to an HTTPS endpoint (batches, Splunk HEC). Each target has its own cursor and delivery is at-least-once. Configure it with `[audit.forward.*]`. See `docs/forwarding.md`.
-- New `saiife audit verify --external <file|dir>`: compares the local chain with a forwarded copy, so a rewrite by root shows.
+- New `saiife audit verify --external <file|dir>`: compares the local chain with a forwarded copy, so a cut or rewrite of records that were already forwarded shows.
 - Auditors: the `saiife-audit` group reads the audit, and a per-user `audit.query` lets others query their own records through the daemon. `saiife audit` gains `--kind` and `--service`. See `docs/auditors.md`.
 - New `saiife policy check|test|show|reload`: validate a policy (including overlapping scopes), run its `[[example]]` entries (exit 1 on a mismatch), print the merged policy and its hash, and reload it (admin).
 - `saiife audit --report` gains sections for connectors, approvals, `error_denied`, daemon restarts and forwarding outages.
