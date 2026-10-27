@@ -41,6 +41,89 @@ pub struct Report {
     pub last_checkpoint: String,
     pub policies: Vec<PolicyPeriod>,
     pub modes: Vec<HostMode>,
+    /// Connector requests per service (§6.19), "seen by saiife".
+    pub connectors: Vec<ConnectorActivity>,
+    pub connector_rows: Vec<ConnectorRow>,
+    pub approvals: Vec<ApprovalRow>,
+    /// Records with decision `error_denied`, of any kind.
+    pub error_denied: Vec<ErrorDeniedRow>,
+    /// Daemon starts that did not follow a clean stop.
+    pub restarts: Vec<RestartRow>,
+    pub outages: Vec<Outage>,
+    /// `forward` / `backlog_dropped` events.
+    pub forward_drops: Vec<ForwardDrop>,
+}
+
+/// Where a record came from, for the labels of §9.4.
+pub const SOURCE_GUARD: &str = "reported by the agent's hook";
+pub const SOURCE_SAIIFE: &str = "seen by saiife";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorActivity {
+    pub service: String,
+    pub requests: usize,
+    pub denies: usize,
+    pub limits_hit: usize,
+    pub approvals: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorRow {
+    pub time: String,
+    pub user: String,
+    pub service: String,
+    pub request: String,
+    pub decision: &'static str,
+    pub reason: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    pub id: String,
+    pub requester: String,
+    pub decider: String,
+    pub decision: String,
+    pub time_to_decision: String,
+    pub kind: String,
+    pub summary: String,
+    pub time: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDeniedRow {
+    pub time: String,
+    pub kind: String,
+    pub what: String,
+    pub reason: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartRow {
+    pub time: String,
+    pub host: String,
+    pub version: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outage {
+    pub target: String,
+    pub from: String,
+    /// `still failing` when no `recovered` follows.
+    pub to: String,
+    pub duration: String,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardDrop {
+    pub time: String,
+    pub target: String,
+    pub detail: String,
+    pub source: &'static str,
 }
 
 /// A run of consecutive records under one policy.
@@ -145,6 +228,7 @@ pub struct Row {
     pub input: String,
     pub pack: String,
     pub reason: String,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +299,253 @@ fn row(r: &Record, packs: &[Pack]) -> Row {
         },
         pack,
         reason: r.reason.clone().unwrap_or_default(),
+        source: SOURCE_GUARD,
+    }
+}
+
+fn extra_str<'a>(r: &'a Record, k: &str) -> Option<&'a str> {
+    r.extra.get(k).and_then(serde_json::Value::as_str)
+}
+
+fn at_minute(r: &Record) -> String {
+    r.timestamp().map(fmt_minute).unwrap_or_default()
+}
+
+fn who(r: &Record) -> String {
+    match (r.user.as_deref(), r.uid) {
+        (Some(u), _) if !u.is_empty() => u.to_string(),
+        (_, Some(uid)) => format!("uid {uid}"),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn fmt_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    match (secs / 3600, secs % 3600 / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
+fn connector_activity(sorted_asc: &[&Record]) -> (Vec<ConnectorActivity>, Vec<ConnectorRow>) {
+    let mut map: std::collections::BTreeMap<String, ConnectorActivity> = Default::default();
+    let mut rows = Vec::new();
+    for r in sorted_asc.iter().filter(|r| r.kind() == "connector") {
+        let service = extra_str(r, "service").unwrap_or("unknown").to_string();
+        let a = map
+            .entry(service.clone())
+            .or_insert_with(|| ConnectorActivity {
+                service: service.clone(),
+                requests: 0,
+                denies: 0,
+                limits_hit: 0,
+                approvals: 0,
+            });
+        a.requests += 1;
+        if r.decision == DecisionKind::Deny {
+            a.denies += 1;
+        }
+        if r.extra.get("limit").is_some_and(|l| !l.is_null()) {
+            a.limits_hit += 1;
+        }
+        if r.decision == DecisionKind::Ask {
+            a.approvals += 1;
+        }
+        rows.push(ConnectorRow {
+            time: at_minute(r),
+            user: who(r),
+            service,
+            request: if r.input.is_empty() {
+                "(no request recorded)".to_string()
+            } else {
+                r.input.clone()
+            },
+            decision: decision_label(r.decision),
+            reason: r.reason.clone().unwrap_or_default(),
+            source: SOURCE_SAIIFE,
+        });
+    }
+    rows.reverse();
+    (map.into_values().collect(), rows)
+}
+
+fn approval_rows(sorted_asc: &[&Record]) -> Vec<ApprovalRow> {
+    struct Acc {
+        created: Option<OffsetDateTime>,
+        row: ApprovalRow,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Acc> = Default::default();
+    for r in sorted_asc.iter().filter(|r| r.kind() == "approval") {
+        let id = r
+            .extra
+            .get("id")
+            .or_else(|| r.extra.get("approval"))
+            .map_or_else(
+                || "?".to_string(),
+                |v| v.to_string().trim_matches('"').to_string(),
+            );
+        let action = extra_str(r, "action").unwrap_or("");
+        let acc = map.entry(id.clone()).or_insert_with(|| {
+            order.push(id.clone());
+            Acc {
+                created: None,
+                row: ApprovalRow {
+                    id: id.clone(),
+                    requester: who(r),
+                    decider: String::new(),
+                    decision: "pending".to_string(),
+                    time_to_decision: "not decided in this period".to_string(),
+                    kind: String::new(),
+                    summary: String::new(),
+                    time: at_minute(r),
+                    source: SOURCE_SAIIFE,
+                },
+            }
+        });
+        if let Some(t) = extra_str(r, "type") {
+            acc.row.kind = t.to_string();
+        }
+        if !r.input.is_empty() {
+            acc.row.summary = r.input.clone();
+        }
+        if action == "created" {
+            acc.created = r.timestamp();
+            acc.row.requester = who(r);
+            acc.row.time = at_minute(r);
+        } else if !action.is_empty() {
+            acc.row.decision = action.to_string();
+            acc.row.decider = r
+                .extra
+                .get("by_uid")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(
+                    || {
+                        if action == "expired" {
+                            "(expired)".to_string()
+                        } else {
+                            "unknown".to_string()
+                        }
+                    },
+                    |u| format!("uid {u}"),
+                );
+            acc.row.time_to_decision = match (acc.created, r.timestamp()) {
+                (Some(a), Some(b)) => fmt_duration((b - a).whole_seconds()),
+                _ => "unknown".to_string(),
+            };
+        }
+    }
+    let mut out: Vec<ApprovalRow> = order
+        .into_iter()
+        .filter_map(|id| map.remove(&id).map(|a| a.row))
+        .collect();
+    out.reverse();
+    out
+}
+
+fn error_denied_rows(sorted: &[&Record]) -> Vec<ErrorDeniedRow> {
+    sorted
+        .iter()
+        .filter(|r| r.decision == DecisionKind::ErrorDenied)
+        .map(|r| ErrorDeniedRow {
+            time: at_minute(r),
+            kind: r.kind().to_string(),
+            what: r.input.clone(),
+            reason: r.reason.clone().unwrap_or_default(),
+            source: if r.kind() == "guard" {
+                SOURCE_GUARD
+            } else {
+                SOURCE_SAIIFE
+            },
+        })
+        .collect()
+}
+
+fn restart_rows(sorted: &[&Record]) -> Vec<RestartRow> {
+    sorted
+        .iter()
+        .filter(|r| {
+            r.kind() == "daemon"
+                && extra_str(r, "event") == Some("start")
+                && r.extra.get("previous_clean_stop") == Some(&serde_json::Value::Bool(false))
+        })
+        .map(|r| RestartRow {
+            time: at_minute(r),
+            host: r
+                .host
+                .as_deref()
+                .map_or_else(|| "unknown".to_string(), |h| h.chars().take(12).collect()),
+            version: r.saiife.clone(),
+            source: SOURCE_SAIIFE,
+        })
+        .collect()
+}
+
+/// `failing` to the next `recovered`, per target; plus dropped backlogs.
+fn forward_outages(sorted_asc: &[&Record]) -> (Vec<Outage>, Vec<ForwardDrop>) {
+    let mut open: std::collections::BTreeMap<String, OffsetDateTime> = Default::default();
+    let mut outages = Vec::new();
+    let mut drops = Vec::new();
+    let mut last: Option<OffsetDateTime> = None;
+    for r in sorted_asc.iter().filter(|r| r.kind() == "forward") {
+        let target = extra_str(r, "target").unwrap_or("unknown").to_string();
+        let ts = r.timestamp();
+        last = ts.or(last);
+        match (extra_str(r, "event"), ts) {
+            (Some("failing"), Some(t)) => {
+                open.entry(target).or_insert(t);
+            }
+            (Some("recovered"), Some(t)) => {
+                if let Some(from) = open.remove(&target) {
+                    outages.push(Outage {
+                        target,
+                        from: fmt_minute(from),
+                        to: fmt_minute(t),
+                        duration: fmt_duration((t - from).whole_seconds()),
+                        source: SOURCE_SAIIFE,
+                    });
+                }
+            }
+            (Some("backlog_dropped"), _) => drops.push(ForwardDrop {
+                time: at_minute(r),
+                target,
+                detail: [Some(r.input.as_str()), r.reason.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                source: SOURCE_SAIIFE,
+            }),
+            _ => {}
+        }
+    }
+    for (target, from) in open {
+        outages.push(Outage {
+            target,
+            from: fmt_minute(from),
+            to: "still failing".to_string(),
+            duration: last.map_or_else(String::new, |l| fmt_duration((l - from).whole_seconds())),
+            source: SOURCE_SAIIFE,
+        });
+    }
+    outages.reverse();
+    drops.reverse();
+    (outages, drops)
+}
+
+impl Report {
+    /// Replace the host-wide sections (restarts, forwarding outages) from
+    /// `records`; used when project/agent filters would hide the daemon's
+    /// own records.
+    pub fn set_host_events(&mut self, records: &[&Record]) {
+        let mut asc: Vec<&Record> = records.to_vec();
+        asc.sort_by_key(|r| r.timestamp());
+        let mut desc = asc.clone();
+        desc.reverse();
+        self.restarts = restart_rows(&desc);
+        (self.outages, self.forward_drops) = forward_outages(&asc);
     }
 }
 
@@ -318,13 +649,25 @@ pub fn build(
     now: OffsetDateTime,
 ) -> Report {
     // Newest first; a record whose ts does not parse sorts last.
-    let mut sorted: Vec<&Record> = records.to_vec();
+    let mut every: Vec<&Record> = records.to_vec();
+    every.sort_by_key(|r| Reverse(r.timestamp()));
+    // The guard sections list only what the agent's hook reported; the
+    // other kinds have their own sections below.
+    let guard: Vec<&Record> = records
+        .iter()
+        .copied()
+        .filter(|r| r.kind() == "guard")
+        .collect();
+    let mut sorted: Vec<&Record> = guard.clone();
     sorted.sort_by_key(|r| Reverse(r.timestamp()));
+    let all_records = records;
+    let records = &guard[..];
 
     let period = match since {
         Some(s) => format!("{} to {}", fmt_minute(s), fmt_minute(now)),
         None => {
-            let times: Vec<OffsetDateTime> = records.iter().filter_map(|r| r.timestamp()).collect();
+            let times: Vec<OffsetDateTime> =
+                all_records.iter().filter_map(|r| r.timestamp()).collect();
             match (times.iter().min(), times.iter().max()) {
                 (Some(a), Some(b)) => format!("{} to {}", fmt_minute(*a), fmt_minute(*b)),
                 _ => "no records".to_string(),
@@ -348,6 +691,14 @@ pub fn build(
     ascending.reverse();
     let policies = policy_periods(&ascending);
     let modes = host_modes(records);
+
+    let mut every_asc = every.clone();
+    every_asc.reverse();
+    let (connectors, connector_rows) = connector_activity(&every_asc);
+    let approvals = approval_rows(&every_asc);
+    let error_denied = error_denied_rows(&every);
+    let restarts = restart_rows(&every);
+    let (outages, forward_drops) = forward_outages(&every_asc);
 
     let projects: BTreeSet<&str> = records.iter().map(|r| r.project.as_str()).collect();
     let agents: BTreeSet<String> = records.iter().map(|r| agent_label(&r.agent)).collect();
@@ -375,6 +726,13 @@ pub fn build(
         last_checkpoint: "none".to_string(),
         policies,
         modes,
+        connectors,
+        connector_rows,
+        approvals,
+        error_denied,
+        restarts,
+        outages,
+        forward_drops,
     }
 }
 
@@ -936,5 +1294,204 @@ mod tests {
         let r = build(&refs, &packs, vec![], None, datetime!(2026-10-18 09:00 UTC));
         assert_eq!((r.blocked, r.blocked_rows.len()), (1, 1));
         assert_eq!(r.blocked_rows[0].decision, "Blocked (error)");
+    }
+
+    fn kind_rec(kind: &str, at: OffsetDateTime, extra: &[(&str, serde_json::Value)]) -> Record {
+        let mut r = rec("/p", "", DecisionKind::Allow, None, at);
+        r.kind = Some(kind.into());
+        r.uid = Some(1000);
+        r.user = Some("alice".into());
+        for (k, v) in extra {
+            r.extra.insert((*k).into(), v.clone());
+        }
+        r
+    }
+
+    fn conn(service: &str, d: DecisionKind, limit: Option<&str>, at: OffsetDateTime) -> Record {
+        let mut r = kind_rec(
+            "connector",
+            at,
+            &[
+                ("service", service.into()),
+                ("limit", limit.map_or(serde_json::Value::Null, Into::into)),
+            ],
+        );
+        r.decision = d;
+        r.input = format!("{service} read");
+        r
+    }
+
+    #[test]
+    fn connector_activity_counts() {
+        let t = datetime!(2026-10-20 10:00:00 UTC);
+        let rs = [
+            conn("shop", DecisionKind::Allow, None, t),
+            conn("shop", DecisionKind::Deny, None, t),
+            conn("shop", DecisionKind::Deny, Some("per_minute"), t),
+            conn("shop", DecisionKind::Ask, None, t),
+            conn("mail", DecisionKind::Allow, None, t),
+            rec("/p", "ls", DecisionKind::Allow, None, t),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, t);
+        let shop = &r.connectors[1];
+        assert_eq!(
+            (
+                shop.service.as_str(),
+                shop.requests,
+                shop.denies,
+                shop.limits_hit,
+                shop.approvals
+            ),
+            ("shop", 4, 2, 1, 1)
+        );
+        assert_eq!(r.connectors[0].service, "mail");
+        assert_eq!(r.connector_rows.len(), 5);
+        // Connector records do not count as guard decisions.
+        assert_eq!(r.total, 1);
+        assert_eq!(r.all_rows.len(), 1);
+    }
+
+    fn appr(id: u64, action: &str, at: OffsetDateTime, by: Option<u64>) -> Record {
+        let mut r = kind_rec(
+            "approval",
+            at,
+            &[
+                ("id", id.into()),
+                ("approval", id.into()),
+                ("action", action.into()),
+                ("type", "connector".into()),
+            ],
+        );
+        r.input = "shop refund".into();
+        if let Some(b) = by {
+            r.extra.insert("by_uid".into(), b.into());
+        }
+        r
+    }
+
+    #[test]
+    fn approvals_section_latency_and_decider() {
+        let rs = [
+            appr(1, "created", datetime!(2026-10-20 10:00:00 UTC), None),
+            appr(
+                1,
+                "approved",
+                datetime!(2026-10-20 10:02:05 UTC),
+                Some(1001),
+            ),
+            appr(2, "created", datetime!(2026-10-20 11:00:00 UTC), None),
+            appr(3, "created", datetime!(2026-10-20 12:00:00 UTC), None),
+            appr(3, "expired", datetime!(2026-10-20 13:00:00 UTC), None),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, datetime!(2026-10-21 00:00 UTC));
+        assert_eq!(r.approvals.len(), 3);
+        let by_id = |id: &str| r.approvals.iter().find(|a| a.id == id).unwrap();
+        let a = by_id("1");
+        assert_eq!(
+            (
+                a.decision.as_str(),
+                a.decider.as_str(),
+                a.time_to_decision.as_str()
+            ),
+            ("approved", "uid 1001", "2m 5s")
+        );
+        assert_eq!(
+            (a.requester.as_str(), a.kind.as_str(), a.summary.as_str()),
+            ("alice", "connector", "shop refund")
+        );
+        assert_eq!(by_id("2").decision, "pending");
+        assert_eq!(by_id("3").decision, "expired");
+        assert_eq!(by_id("3").time_to_decision, "1h 0m");
+        // Newest first.
+        assert_eq!(r.approvals[0].id, "3");
+    }
+
+    fn fwd(event: &str, target: &str, at: OffsetDateTime) -> Record {
+        kind_rec(
+            "forward",
+            at,
+            &[("event", event.into()), ("target", target.into())],
+        )
+    }
+
+    #[test]
+    fn restarts_and_outages_listed() {
+        let start = |clean: bool, at| {
+            kind_rec(
+                "daemon",
+                at,
+                &[
+                    ("event", "start".into()),
+                    ("previous_clean_stop", clean.into()),
+                ],
+            )
+        };
+        let rs = [
+            start(true, datetime!(2026-10-20 08:00:00 UTC)),
+            start(false, datetime!(2026-10-20 09:00:00 UTC)),
+            fwd("failing", "siem", datetime!(2026-10-20 10:00:00 UTC)),
+            fwd("recovered", "siem", datetime!(2026-10-20 10:45:00 UTC)),
+            fwd("failing", "files", datetime!(2026-10-20 11:00:00 UTC)),
+            fwd(
+                "backlog_dropped",
+                "files",
+                datetime!(2026-10-20 11:30:00 UTC),
+            ),
+            fwd("recovered", "orphan", datetime!(2026-10-20 11:40:00 UTC)),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, datetime!(2026-10-21 00:00 UTC));
+        assert_eq!(r.restarts.len(), 1);
+        assert_eq!(r.restarts[0].time, "2026-10-20 09:00 UTC");
+        assert_eq!(r.outages.len(), 2);
+        let siem = r.outages.iter().find(|o| o.target == "siem").unwrap();
+        assert_eq!(
+            (siem.to.as_str(), siem.duration.as_str()),
+            ("2026-10-20 10:45 UTC", "45m 0s")
+        );
+        let files = r.outages.iter().find(|o| o.target == "files").unwrap();
+        assert_eq!(files.to, "still failing");
+        assert_eq!(r.forward_drops.len(), 1);
+        // set_host_events rebuilds both from a record set.
+        let mut r2 = r.clone();
+        r2.restarts.clear();
+        r2.outages.clear();
+        r2.set_host_events(&refs);
+        assert_eq!((r2.restarts.len(), r2.outages.len()), (1, 2));
+    }
+
+    #[test]
+    fn error_denied_listed_for_every_kind() {
+        let t = datetime!(2026-10-20 10:00:00 UTC);
+        let rs = [
+            rec("/p", "x", DecisionKind::ErrorDenied, None, t),
+            conn("shop", DecisionKind::ErrorDenied, None, t),
+            conn("shop", DecisionKind::Allow, None, t),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, t);
+        assert_eq!(r.error_denied.len(), 2);
+        let sources: Vec<&str> = r.error_denied.iter().map(|e| e.source).collect();
+        assert!(sources.contains(&SOURCE_GUARD) && sources.contains(&SOURCE_SAIIFE));
+    }
+
+    #[test]
+    fn record_source_labels() {
+        let t = datetime!(2026-10-20 10:00:00 UTC);
+        let rs = [
+            rec("/p", "ls", DecisionKind::Allow, None, t),
+            conn("shop", DecisionKind::Allow, None, t),
+            appr(1, "created", t, None),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, t);
+        assert_eq!(r.all_rows[0].source, "reported by the agent's hook");
+        assert_eq!(r.connector_rows[0].source, "seen by saiife");
+        assert_eq!(r.approvals[0].source, "seen by saiife");
+        let html = crate::report_html::render(&r);
+        assert!(html.contains("reported by the agent&#39;s hook"));
+        assert!(html.contains("seen by saiife"));
     }
 }

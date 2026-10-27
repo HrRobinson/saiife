@@ -296,6 +296,20 @@ pub fn run(
         }
         let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
+        // Daemon restarts and forwarding outages belong to the host, so
+        // --project/--agent/--blocked do not hide them.
+        let host_filter = Filter {
+            since: since_time,
+            project: None,
+            agent: None,
+            blocked_only: false,
+        };
+        let host: Vec<&Record> = all
+            .records
+            .iter()
+            .filter(|r| host_filter.matches(r))
+            .collect();
+        model.set_host_events(&host);
         model.chain = report::chain_line(&saiife_audit::verify(&dir));
         model.last_checkpoint = report::last_checkpoint(&all.records);
         if all.skipped_lines > 0 {
