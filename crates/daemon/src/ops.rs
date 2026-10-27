@@ -13,8 +13,9 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
-    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_POLICY_RELOAD,
+    OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE,
+    OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -605,6 +606,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
+        OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,

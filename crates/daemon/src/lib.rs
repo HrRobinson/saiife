@@ -31,6 +31,8 @@ pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
+pub mod policy_ops;
+#[cfg(target_os = "linux")]
 pub mod reauth;
 #[cfg(target_os = "linux")]
 pub mod secret_ops;

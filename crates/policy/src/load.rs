@@ -3,7 +3,7 @@
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
-use crate::system::{Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
+use crate::system::{Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -68,7 +68,7 @@ struct DropIn {
     #[serde(default)]
     scope: Vec<Scope>,
     #[serde(default)]
-    example: Vec<toml::Table>,
+    example: Vec<Example>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -580,7 +580,7 @@ fn denied(rule: &str) -> Outcome {
 }
 
 /// The rule for a step 4–5 error.
-fn rule_of(e: &BrokerError) -> &'static str {
+pub(crate) fn rule_of(e: &BrokerError) -> &'static str {
     match e {
         BrokerError::BadPath(_) => "bad_path",
         BrokerError::UnknownOperation(_) => "unknown_operation",

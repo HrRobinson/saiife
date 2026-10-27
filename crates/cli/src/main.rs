@@ -12,6 +12,7 @@
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
 //! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
 //! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
+//! - `saiife policy check|test <file>` / `show` / `reload` -> check and test a policy file; show or reload the one in force
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
@@ -38,6 +39,7 @@ mod init_cmd;
 mod lockdown_cmd;
 mod packs_cmd;
 mod paths;
+mod policy_cmd;
 mod project;
 mod report;
 mod report_html;
@@ -273,6 +275,15 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<lockdown_cmd::LockdownAction>,
     },
+    /// Check and test a policy kept in a file (`check`, `test`), or show
+    /// and reload the one in force (`show`, `reload`: locked mode).
+    Policy {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: policy_cmd::PolicyAction,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -395,6 +406,13 @@ fn main() -> ExitCode {
     if let Cmd::Api(a) = cli.command {
         return api_cmd::run(a);
     }
+    if let Cmd::Policy {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return policy_cmd::run(system_config, action);
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -446,6 +464,7 @@ fn main() -> ExitCode {
         | Cmd::Api(_)
         | Cmd::Lockdown { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Policy { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {

@@ -894,7 +894,7 @@ async fn serve(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = hup.recv() => reload(&ctx).await,
+            _ = hup.recv() => { let _ = reload(&ctx).await; }
             // Outside a stop the writer never ends on its own: without it
             // every append fails, so exit and let the service manager
             // restart the daemon.
@@ -1008,7 +1008,7 @@ fn check_ask(
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
 /// sent the signal was spawned with `LogsDirectory=`, which gave the dir
 /// back to `saiife`.
-async fn reload(ctx: &Arc<Ctx>) {
+pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
         regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
@@ -1020,6 +1020,7 @@ async fn reload(ctx: &Arc<Ctx>) {
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
     let mut recs = Vec::new();
+    let mut result = Ok(());
     match loaded {
         Ok((l, cat)) => {
             let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
@@ -1039,7 +1040,8 @@ async fn reload(ctx: &Arc<Ctx>) {
         }
         Err(reason) => {
             eprintln!("saiife: warning: policy reload refused, keeping the old policy: {reason}");
-            recs.push(policy_record(ctx, "rejected", None, Some(reason)));
+            recs.push(policy_record(ctx, "rejected", None, Some(reason.clone())));
+            result = Err(reason);
         }
     }
     for rec in recs {
@@ -1047,6 +1049,7 @@ async fn reload(ctx: &Arc<Ctx>) {
             eprintln!("saiife: warning: cannot write the policy record: {e}");
         }
     }
+    result
 }
 
 /// Settings a reload cannot apply: what the daemon would refuse to start

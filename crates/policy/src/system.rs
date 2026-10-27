@@ -1,6 +1,6 @@
 //! `/etc/saiife/config.toml` (spec §8.1). Every section rejects unknown keys
 //! (typos in a security config are errors) and every default is the §8.1
-//! value. `example` stays a raw table list until plan 12 types them.
+//! value.
 
 use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub struct SystemConfig {
     #[serde(default)]
     pub scope: Vec<Scope>,
     #[serde(default)]
-    pub example: Vec<toml::Table>,
+    pub example: Vec<Example>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -414,6 +414,41 @@ pub struct Scope {
     pub services: Vec<String>,
     #[serde(default)]
     pub env: Option<String>,
+}
+
+/// One `[[example]]` (spec §8.1), run by `saiife policy test`: either a
+/// connector `request` (`<service> <op> [k=v ...]`) or a shell `command`
+/// (with the `agent` that runs it), for `user`, and the verdict expected.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Example {
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub expect: Expect,
+}
+
+/// The verdict an `[[example]]` expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Expect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl Expect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Expect::Allow => "allow",
+            Expect::Ask => "ask",
+            Expect::Deny => "deny",
+        }
+    }
 }
 
 /// What a notification is about (spec §6.10.3). Unknown names are errors.

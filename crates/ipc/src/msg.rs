@@ -22,6 +22,14 @@ pub const OP_API_RESULT: &str = "api.result";
 pub const OP_API_TOKEN: &str = "api.token";
 /// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
 pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
+/// What a user may see of the policy: `{user?, effective?}` -> the user's
+/// scope view, the policy `hash` and, with `effective`, the whole merged
+/// policy. Anyone sees their own scope; `user` (another) and `effective`
+/// are for root and `[admin] groups`.
+pub const OP_POLICY_SHOW: &str = "policy.show";
+/// Root and `[admin] groups`: load the policy again, as on SIGHUP.
+/// `{}` -> `{result: "loaded"}` or `{result: "rejected", reason}`.
+pub const OP_POLICY_RELOAD: &str = "policy.reload";
 /// Approval requests: approvers see all, a requester its own.
 /// `{states?: ["pending", ...], own?: bool}` -> `{items}`.
 pub const OP_APPROVAL_LIST: &str = "approval.list";
