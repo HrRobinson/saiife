@@ -989,12 +989,13 @@ async fn invalid_policy_403_requests_503_unknown_404() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0]["via"], "http");
 
-    let (st, _, b) = w.send("GET", "/v1/requests/42", &[], b"").await;
-    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&b).unwrap(),
-        json!({"error": "approvals come in plan 11"})
-    );
+    // No such request: 404, as for another uid's.
+    let (st, _, _) = w.send("GET", "/v1/requests/42", &[], b"").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = w.send("GET", "/v1/requests/042", &[], b"").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = w.send("POST", "/v1/requests/42", &[], b"").await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
     let (st, _, _) = w.send("GET", "/v1/nope", &[], b"").await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _, _) = w.send("GET", "/v1/../v1/services", &[], b"").await;

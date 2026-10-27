@@ -645,10 +645,7 @@ async fn route(
             let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
             call(ctx, caller, args, Route::Proxy, in_flight).await
         }
-        Target::Requests => json_resp(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": "approvals come in plan 11"}),
-        ),
+        Target::Request(id) => request_result(ctx, uid, id).await,
         Target::NotFound => not_found(),
     }
 }
@@ -676,9 +673,16 @@ pub enum Target {
     BadRequest(&'static str),
     Services,
     MethodNotAllowed(&'static str),
-    Api { service: String, op: String },
-    Proxy { service: String, upstream: String },
-    Requests,
+    Api {
+        service: String,
+        op: String,
+    },
+    Proxy {
+        service: String,
+        upstream: String,
+    },
+    /// `GET /v1/requests/{id}`.
+    Request(u64),
     NotFound,
 }
 
@@ -740,8 +744,17 @@ pub fn classify(method: &Method, uri: &http::Uri, raw: Option<&str>) -> Target {
             upstream,
         };
     }
-    if path.starts_with("/v1/requests/") {
-        return Target::Requests;
+    if let Some(id) = path.strip_prefix("/v1/requests/") {
+        if method != Method::GET {
+            return Target::MethodNotAllowed("GET");
+        }
+        // Canonical decimal ids only, as the store names its files.
+        return match id.parse::<u64>() {
+            Ok(n) if n > 0 && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit()) => {
+                Target::Request(n)
+            }
+            _ => Target::NotFound,
+        };
     }
     Target::NotFound
 }
@@ -847,7 +860,8 @@ fn api_args(service: &str, op: &str, body: &[u8]) -> Result<Map<String, Value>, 
     {
         return Err(r#"the body takes only "params", "body" and "wait""#);
     }
-    // `wait` is accepted and ignored until plan 11, as in `api.call`.
+    // `wait` is accepted and ignored (decision 3): the gateway answers 202
+    // at once, and the client polls `GET /v1/requests/{id}`.
     if !matches!(
         req.get("wait"),
         None | Some(Value::Null) | Some(Value::String(_))
@@ -1032,7 +1046,111 @@ fn respond(outcome: Outcome, route: Route) -> Resp {
             StatusCode::BAD_GATEWAY,
             json!({"error": "upstream_failed", "reason": reason}),
         ),
+        Outcome::Pending { id } => json_resp(StatusCode::ACCEPTED, json!({"pending": id})),
     }
+}
+
+/// `GET /v1/requests/{id}` (spec §8.8, decision 4): the requester only. 200
+/// with the result body and `X-Saiife-Upstream-Status` once it was sent,
+/// 202 while it waits, 404 for an unknown id or another uid's request, 410
+/// once it was rejected, expired or failed to send.
+async fn request_result(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Resp {
+    use crate::approval_ops::ResultView;
+    use crate::approvals::{state_name, State};
+    let view = match crate::approval_ops::result_for(ctx, uid, id).await {
+        Ok(v) => v,
+        Err(()) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "approvals are unavailable",
+            )
+        }
+    };
+    let pick = |mut b: Value, from: Option<&Value>, keys: &[&str]| {
+        for k in keys {
+            if let Some(v) = from.and_then(|r| r.get(*k)).filter(|v| !v.is_null()) {
+                b[*k] = v.clone();
+            }
+        }
+        b
+    };
+    match view {
+        ResultView::Unknown => error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("no request #{id} (or not yours)"),
+        ),
+        ResultView::Waiting(s) => json_resp(
+            StatusCode::ACCEPTED,
+            json!({"pending": id, "state": state_name(s)}),
+        ),
+        ResultView::Done {
+            state: State::Sent,
+            result: Some(r),
+        } if r.get("ok") == Some(&Value::Bool(true)) => sent_response(&r),
+        // Sent, but the answer was withheld (as for a direct call: 502).
+        ResultView::Done {
+            state: State::Sent,
+            result: Some(r),
+        } => json_resp(
+            StatusCode::BAD_GATEWAY,
+            pick(
+                json!({"error": "withheld"}),
+                Some(&r),
+                &["rule", "reason", "message"],
+            ),
+        ),
+        ResultView::Done {
+            state: State::Sent,
+            result: None,
+        } => json_resp(
+            StatusCode::GONE,
+            json!({"state": "sent", "message": "the result is kept for 24 h and is gone"}),
+        ),
+        ResultView::Done { state, result } => json_resp(
+            StatusCode::GONE,
+            pick(
+                json!({"state": state_name(state)}),
+                result.as_ref(),
+                &["rule", "limit", "reason", "message"],
+            ),
+        ),
+    }
+}
+
+/// The stored `api.call` answer of a send, as `/v1/api` would answer.
+fn sent_response(r: &Value) -> Resp {
+    let body = r
+        .get("body_b64")
+        .and_then(Value::as_str)
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        .unwrap_or_default();
+    let status = r.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let mut resp = Response::new(Full::new(Bytes::from(body)));
+    *resp.status_mut() = StatusCode::OK;
+    let h = resp.headers_mut();
+    let content_type = r
+        .get("headers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|p| {
+            let p = p.as_array()?;
+            if p.first()?.as_str()? == "content-type" {
+                p.get(1)?.as_str()
+            } else {
+                None
+            }
+        });
+    if let Some(ct) = content_type.and_then(|c| HeaderValue::from_str(c).ok()) {
+        h.insert(CONTENT_TYPE, ct);
+    }
+    h.insert("x-saiife-upstream-status", HeaderValue::from(status));
+    if r.get("truncated") == Some(&Value::Bool(true)) {
+        h.insert("x-saiife-truncated", HeaderValue::from_static("true"));
+    }
+    resp
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 //! `saiife api`: connector calls through the daemon (spec §6.7.2). Linux
 //! only. The upstream data goes to stdout, a one-line summary to stderr.
 //! Exit codes: 0 done, 1 upstream status >= 400 or an upstream failure, 2
-//! denied, 3 pending (plan 11), 4 limit reached, 5 saiife unavailable.
+//! denied, 3 pending approval, 4 limit reached, 5 saiife unavailable.
+//! `--wait` polls `api.result` every 2 s (at most 1 h, decision 3);
+//! `saiife api result <id>` fetches a result later.
 //!
 //! The project's `.saiife/config.toml` may tighten a service (`deny`,
 //! `ask`); it is read here and sent as `overlay` (decision 4). In locked
@@ -22,7 +24,7 @@ pub struct ApiArgs {
     /// The request body: `@<file>` or `-` for stdin.
     #[arg(long, value_name = "@FILE|-")]
     pub body: Option<String>,
-    /// Wait this long for an approval (approvals come with plan 11).
+    /// Wait this long (at most 1h) for an approval and the result.
     #[arg(long, value_name = "DURATION")]
     pub wait: Option<String>,
     /// The system config (default /etc/saiife/config.toml).
@@ -157,6 +159,15 @@ mod linux {
         if a.args.len() == 1 && a.args[0] == "token" {
             return token(&config, a.json);
         }
+        if a.args.first().map(String::as_str) == Some("result") {
+            let id = match a.args.as_slice() {
+                [_, id] => parse_id(id)?,
+                _ => return Err(refused("usage: saiife api result <request-id>")),
+            };
+            let wait = wait_limit(a.wait.as_deref())?;
+            let mut d = connect(&config)?;
+            return settle(&mut d, &a, id, wait);
+        }
         let [service, operation, rest @ ..] = a.args.as_slice() else {
             return Err(refused(
                 "usage: saiife api <service> <operation> [k=v ...] (or saiife api --list)",
@@ -171,15 +182,7 @@ mod linux {
                 _ => return Err(refused(format!("parameter {kv:?} is not k=v"))),
             }
         }
-        let wait_ms = match &a.wait {
-            Some(w) => Some(
-                parse_duration(w)
-                    .map_err(refused)?
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64,
-            ),
-            None => None,
-        };
+        let wait = wait_limit(a.wait.as_deref())?;
         let body = match a.body.as_deref() {
             None => None,
             Some("-") => Some(read_capped(std::io::stdin().lock(), "stdin")?),
@@ -209,8 +212,9 @@ mod linux {
                 base64::engine::general_purpose::STANDARD.encode(b).into(),
             );
         }
-        if let Some(w) = wait_ms {
-            args.insert("wait_ms".into(), w.into());
+        if let Some(w) = wait {
+            let ms = w.as_millis().min(u128::from(u64::MAX)) as u64;
+            args.insert("wait_ms".into(), ms.into());
         }
         // The daemon waits at most one upstream timeout for a pool slot and
         // one for the upstream; past both, plus slack, it is gone.
@@ -224,6 +228,100 @@ mod linux {
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
+        if let Some(id) = ans.get("pending").and_then(Value::as_u64) {
+            return match wait {
+                Some(w) => settle(&mut d, &a, id, Some(w)),
+                None => Err(pending(id)),
+            };
+        }
+        done(&a, &format!("{service} {operation}"), &ans, Some(ms))
+    }
+
+    /// The longest `--wait` (decision 3).
+    const MAX_WAIT: Duration = Duration::from_secs(3600);
+    /// How often `--wait` asks again.
+    const POLL_EVERY: Duration = Duration::from_secs(2);
+
+    /// `--wait <duration>`, at most an hour.
+    fn wait_limit(w: Option<&str>) -> Result<Option<Duration>, Stop> {
+        match w {
+            None => Ok(None),
+            Some(w) => Ok(Some(parse_duration(w).map_err(refused)?.min(MAX_WAIT))),
+        }
+    }
+
+    fn parse_id(s: &str) -> Result<u64, Stop> {
+        let s = s.strip_prefix('#').unwrap_or(s);
+        s.parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| refused(format!("{s:?} is not a request id")))
+    }
+
+    /// Exit 3: the request waits for approval.
+    fn pending(id: u64) -> Stop {
+        Stop(
+            3,
+            format!("pending approval #{id} (saiife api result {id})"),
+        )
+    }
+
+    /// The result of request `id` (`api.result`), polled every 2 s until it
+    /// is decided or `wait` is over (decision 3), as a direct call's exit
+    /// code: 3 while it waits, 2 once rejected or expired.
+    fn settle(d: &mut Daemon, a: &ApiArgs, id: u64, wait: Option<Duration>) -> Result<u8, Stop> {
+        let deadline = Instant::now() + wait.unwrap_or_default();
+        loop {
+            let mut args = Map::new();
+            args.insert("request".into(), id.into());
+            let ans = d
+                .client
+                .call_answer("api.result", args, Instant::now() + Duration::from_secs(10))
+                .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+            if ans.get("ok") != Some(&Value::Bool(true)) {
+                return Err(refusal(&ans));
+            }
+            let state = ans.get("state").and_then(Value::as_str).unwrap_or_default();
+            match state {
+                "pending" | "approved" => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(pending(id));
+                    }
+                    std::thread::sleep(left.min(POLL_EVERY));
+                }
+                "rejected" | "expired" => {
+                    return Err(refused(format!("request #{id} was {state}")));
+                }
+                "sent" | "send_failed" => {
+                    return match ans.get("result").and_then(Value::as_object) {
+                        Some(r) if r.get("ok") == Some(&Value::Bool(true)) => {
+                            done(a, &format!("request #{id}"), r, None)
+                        }
+                        Some(r) => Err(refusal(r)),
+                        None if state == "sent" => Err(Stop(
+                            1,
+                            format!("request #{id} was sent; its result is kept 24 h and is gone"),
+                        )),
+                        None => Err(refused(format!("request #{id}: send failed"))),
+                    };
+                }
+                other => {
+                    return Err(unavailable(format!(
+                        "request #{id} is in an unknown state {other:?}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// A done `api.call` answer: the body to stdout, a summary to stderr.
+    fn done(
+        a: &ApiArgs,
+        label: &str,
+        ans: &Map<String, Value>,
+        ms: Option<u128>,
+    ) -> Result<u8, Stop> {
         let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
         let body = ans
             .get("body_b64")
@@ -252,10 +350,10 @@ mod linux {
                 let _ = out.write_all(b"\n");
             }
         }
-        eprintln!(
-            "saiife: {service} {operation} → {status} ({} bytes, {ms} ms)",
-            body.len()
-        );
+        match ms {
+            Some(ms) => eprintln!("saiife: {label} → {status} ({} bytes, {ms} ms)", body.len()),
+            None => eprintln!("saiife: {label} → {status} ({} bytes)", body.len()),
+        }
         if truncated {
             eprintln!("saiife: the response was cut at max_response_bytes");
         }

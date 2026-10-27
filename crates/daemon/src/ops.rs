@@ -12,8 +12,9 @@ use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
-    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
-    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY,
+    OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE,
+    OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -154,6 +155,9 @@ pub struct Ctx {
     /// The approval request store (`<state>/approvals/`), or why it could
     /// not be opened: then every `ask` is denied (fail closed).
     pub approvals: Result<crate::approvals::Store, String>,
+    /// Same-user re-authentication for approvals (polkit `pkcheck`; tests
+    /// replace it before the context is shared).
+    pub reauth: Arc<dyn crate::reauth::Reauth>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -278,6 +282,7 @@ impl Ctx {
             calls: InFlight::default(),
             notifier: crate::notifier::Notifier::new(),
             approvals: i.approvals,
+            reauth: Arc::new(crate::reauth::PkCheck::new()),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -526,9 +531,37 @@ pub fn hello(id: u64) -> Value {
     ok(id, m)
 }
 
-/// Every op but `hello` (which the connection handles itself).
+/// A control connection's caller: its peer credentials, and the peer
+/// process's start time read when the connection was accepted (for the
+/// re-authentication of a same-user approval; `None` when unknown, which
+/// refuses that).
+#[derive(Debug, Clone, Copy)]
+pub struct Conn {
+    pub peer: PeerCred,
+    pub start_time: Option<u64>,
+}
+
+/// Every op but `hello` (which the connection handles itself), for a
+/// caller whose process start time is not known.
 pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+    dispatch_conn(
+        ctx,
+        &Conn {
+            peer: *peer,
+            start_time: None,
+        },
+        req,
+    )
+    .await
+}
+
+/// Every op but `hello`.
+pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
+    let peer = &conn.peer;
     match req.op.as_str() {
+        OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE => {
+            crate::approval_ops::handle(ctx, conn, req).await
+        }
         OP_HELLO => hello(req.id),
         OP_AUDIT_APPEND => append(ctx, peer, req).await,
         OP_STATUS => status(ctx, req.id),

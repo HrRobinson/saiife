@@ -11,7 +11,9 @@ use crate::vault::{Kind, VaultState};
 use base64::Engine as _;
 use bytes::Bytes;
 use saiife_broker::manifest::AuthSpec;
-use saiife_broker::pipeline::{self, Call, Env, OpRef, Outcome, PolicySnapshot, Trace, Via};
+use saiife_broker::pipeline::{
+    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, Trace, Via,
+};
 use saiife_broker::request::AuthMaterial;
 use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request, OP_API_LIST, OP_API_RESULT};
@@ -38,7 +40,7 @@ const MAX_PROJECT: usize = 4096;
 
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match req.op.as_str() {
-        OP_API_RESULT => err(req.id, ErrorCode::Unavailable, "approvals come in plan 11"),
+        OP_API_RESULT => crate::approval_ops::api_result(ctx, peer, req).await,
         OP_API_LIST => list(ctx, peer, req).await,
         _ => call(ctx, peer, req).await,
     }
@@ -46,7 +48,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 
 /// The caller's directory view for one request: its groups, looked up
 /// (cached, off the runtime thread) before the pipeline runs.
-struct Groups(Vec<String>);
+pub(crate) struct Groups(pub(crate) Vec<String>);
 
 impl Directory for Groups {
     fn user(&self, _name: &str) -> Option<UserEntry> {
@@ -63,10 +65,13 @@ impl Directory for Groups {
     }
 }
 
-struct DaemonEnv<'a> {
-    ctx: &'a Ctx,
-    config: &'a SystemConfig,
-    groups: Groups,
+pub(crate) struct DaemonEnv<'a> {
+    pub(crate) ctx: &'a Arc<Ctx>,
+    pub(crate) config: &'a SystemConfig,
+    pub(crate) groups: Groups,
+    /// The requester's agent (`comm` of its agent process), for an
+    /// approval request.
+    pub(crate) agent: String,
 }
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
@@ -135,6 +140,10 @@ impl Env for DaemonEnv<'_> {
 
     fn pool(&self, service: &str) -> Arc<Semaphore> {
         self.ctx.pools.get(service)
+    }
+
+    fn create_approval<'b>(&'b self, p: &'b PendingCall) -> ApprovalFuture<'b> {
+        Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
     }
 }
 
@@ -286,7 +295,8 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         }
         Some(_) => return Err("project must be a path"),
     };
-    // `wait_ms` is accepted and ignored until plan 11.
+    // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
+    // `api.result` from the client.
     let call = Call {
         uid: 0,
         user: String::new(),
@@ -423,6 +433,7 @@ pub(crate) async fn execute(
                 ctx,
                 config: &g.snap.config,
                 groups: Groups(groups),
+                agent: agent.clone(),
             };
             // Without an upstream client steps 3–8 still run; step 9
             // denies with `upstream_unavailable`.
@@ -459,7 +470,7 @@ pub(crate) async fn execute(
     Ok(outcome)
 }
 
-fn answer(id: u64, outcome: Outcome) -> Value {
+pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
     let one = |k: &str, v: Value| -> Map<String, Value> {
         let mut m = Map::new();
         m.insert(k.into(), v);
@@ -524,6 +535,8 @@ fn answer(id: u64, outcome: Outcome) -> Value {
             &format!("upstream failed: {reason}"),
             one("reason", reason.into()),
         ),
+        // Exit 3: the request waits for approval.
+        Outcome::Pending { id: pending } => ok(id, one("pending", pending.into())),
     }
 }
 

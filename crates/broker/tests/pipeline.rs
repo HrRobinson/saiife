@@ -13,7 +13,8 @@ use rustls::RootCertStore;
 use saiife_broker::limits::Limiter;
 use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::pipeline::{
-    limit_event, record, run, Call, Env, OpRef, Outcome, PolicySnapshot, Pools, Via,
+    limit_event, record, run, send_approved, ApprovalFuture, Call, Env, OpRef, Outcome,
+    PendingCall, PolicySnapshot, Pools, Via,
 };
 use saiife_broker::request::AuthMaterial;
 use saiife_broker::upstream::{Resolver, Upstream};
@@ -163,6 +164,8 @@ struct FakeEnv {
     pools: Pools,
     /// Replaces the per-service pool (a full or closed one).
     pool: Option<Arc<Semaphore>>,
+    /// Every request step 8 stored; ids from 42.
+    approvals: Mutex<Vec<PendingCall>>,
 }
 
 impl FakeEnv {
@@ -178,6 +181,7 @@ impl FakeEnv {
             secret: Ok(TOKEN),
             pools: Pools::new(),
             pool: None,
+            approvals: Mutex::new(Vec::new()),
         }
     }
 }
@@ -212,6 +216,13 @@ impl Env for FakeEnv {
     }
     fn pool(&self, service: &str) -> Arc<Semaphore> {
         self.pool.clone().unwrap_or_else(|| self.pools.get(service))
+    }
+    fn create_approval<'a>(&'a self, p: &'a PendingCall) -> ApprovalFuture<'a> {
+        Box::pin(async move {
+            let mut a = self.approvals.lock().unwrap();
+            a.push(p.clone());
+            Ok(41 + a.len() as u64)
+        })
     }
 }
 
@@ -480,16 +491,153 @@ async fn default_deny_denied() {
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn ask_denied_until_plan_11() {
-    let (m, up) = mock().await;
-    let mut c = call("refunds.create", &[("order_id", "7")]);
+fn refund_call(params: &[(&str, &str)]) -> Call {
+    let mut c = call("refunds.create", params);
+    // A duplicate-free body with spacing: what is stored is the canonical form.
     c.body = Some(Bytes::from_static(
-        br#"{"refund":{"currency":"EUR","transactions":[{"amount":"5.00"}]}}"#,
+        br#"{ "refund": {"currency":"EUR","transactions":[{"amount":"5.00"}]} }"#,
     ));
-    let o = go(&c, &snapshot(""), &FakeEnv::ok(), &up, &Limiter::new()).await;
-    assert_eq!(rule(&o), "approval_not_available");
+    c
+}
+
+#[tokio::test]
+async fn ask_creates_pending_no_upstream_call() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let snap = snapshot("");
+    let c = refund_call(&[("order_id", "7")]);
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { id: 42 }), "{o:?}");
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    let stored = env.approvals.lock().unwrap().pop().unwrap();
+    assert_eq!(stored.stored.operation, "refunds.create");
+    assert_eq!(stored.stored.uid, 1001);
+    assert_eq!(stored.stored.via, "cli");
+    assert_eq!(stored.capability.as_deref(), Some("refunds:write"));
+    assert_eq!(stored.params.get()["order_id"], "7");
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(stored.stored.body_b64.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(
+        &body[..],
+        br#"{"refund":{"currency":"EUR","transactions":[{"amount":"5.00"}]}}"#
+    );
+    // The connector record says ask, with the request's id.
+    let r = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(r["decision"], "ask");
+    assert_eq!(r["approval"], 42);
+
+    // The display copy is masked with the service's vault values.
+    let mut c2 = call("files.get", &[("name", TOKEN)]);
+    c2.project = format!("/srv/{TOKEN}");
+    let mut snap2 = snapshot("");
+    snap2.config.services.get_mut("shop").unwrap().ask = vec!["files:read".into()];
+    snap2.config.services.get_mut("shop").unwrap().allow = vec![];
+    let (o, _) = run(&c2, &snap2, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap().pop().unwrap();
+    assert_eq!(p.params.get()["name"], "[MASKED]");
+    assert_eq!(p.project, "/srv/[MASKED]");
+    // The stored request keeps the exact value (it is sealed).
+    assert_eq!(p.stored.params["name"], TOKEN);
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ask_over_limit_denied_at_creation() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let snap = snapshot("[services.shop.limits]\nwrites_per_hour = 1\n");
+    let lim = Limiter::new();
+    let c = refund_call(&[("order_id", "7")]);
+    // Asking reserves nothing: two requests can wait at once.
+    for _ in 0..2 {
+        let o = go(&c, &snap, &env, &up, &lim).await;
+        assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    }
+    let stored: Vec<_> = env
+        .approvals
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.stored.clone())
+        .collect();
+    // One write sent (allowed elsewhere) fills the hour.
+    let (call, o, _) = send_approved(&stored[0], &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(call.via, Via::Approval);
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+    // A request that could never be sent now is denied with its limit.
+    let o = go(&c, &snap, &env, &up, &lim).await;
+    assert!(
+        matches!(
+            o,
+            Outcome::Limited {
+                limit: "writes_per_hour"
+            }
+        ),
+        "{o:?}"
+    );
+    assert_eq!(env.approvals.lock().unwrap().len(), 2);
+    // At send the limit is checked for real: the second waits in vain.
+    let (_, o, tr) = send_approved(&stored[1], &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert!(
+        matches!(
+            o,
+            Outcome::Limited {
+                limit: "writes_per_hour"
+            }
+        ),
+        "{o:?}"
+    );
+    assert!(!tr.sent);
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn approved_request_rechecked_against_the_policy_now() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let lim = Limiter::new();
+    let o = go(
+        &refund_call(&[("order_id", "7")]),
+        &snapshot(""),
+        &env,
+        &up,
+        &lim,
+    )
+    .await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let stored = env.approvals.lock().unwrap()[0].stored.clone();
+    // Now denied: `policy_changed`, nothing sent.
+    let mut now_deny = snapshot("");
+    now_deny.config.services.get_mut("shop").unwrap().deny = vec!["refunds:*".into()];
+    let (_, o, _) = send_approved(&stored, &now_deny, &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "policy_changed");
+    // Out of scope now: `policy_changed` too.
+    let mut no_scope = FakeEnv::ok();
+    no_scope.scope = Ok(None);
+    let (_, o, _) = send_approved(
+        &stored,
+        &snapshot(""),
+        &catalog(),
+        &lim,
+        &no_scope,
+        Some(&up),
+    )
+    .await;
+    assert_eq!(rule(&o), "policy_changed");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    // Still `ask` (or now `allow`): sent, the stored body exactly.
+    let (_, o, tr) = send_approved(&stored, &snapshot(""), &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert!(tr.sent);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(
+        &seen[0].2[..],
+        br#"{"refund":{"currency":"EUR","transactions":[{"amount":"5.00"}]}}"#
+    );
 }
 
 #[tokio::test]

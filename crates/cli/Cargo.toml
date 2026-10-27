@@ -45,3 +45,8 @@ tempfile = "3"
 # Loopback HTTPS mock for `saiife api` (versions as in saiife-broker; ring only).
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The approvals tests serve an in-process daemon context to the CLI (an
+# approver with a second uid at the ops level); the version saiife-daemon uses.
+tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }

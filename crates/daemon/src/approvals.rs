@@ -133,7 +133,9 @@ pub struct NewRequest {
     pub service: Option<String>,
     pub operation: Option<String>,
     pub capability: Option<String>,
-    pub params: BTreeMap<String, String>,
+    /// The display copy: only a [`saiife_broker::mask::Masker`] (or
+    /// `Default`, empty) makes one, so raw parameters cannot be stored.
+    pub params: saiife_broker::mask::Masked<BTreeMap<String, String>>,
     pub input: Option<String>,
     pub grant_key: Option<String>,
 }
@@ -537,7 +539,7 @@ impl Store {
             service: req.service,
             operation: req.operation,
             capability: req.capability,
-            params: req.params,
+            params: req.params.into_inner(),
             input: req.input,
             grant_key: req.grant_key,
             request_sealed: sealed.map(|s| b64().encode(s)),
@@ -733,7 +735,7 @@ mod tests {
             service: Some("shopify".into()),
             operation: Some("products.update".into()),
             capability: Some("products:write".into()),
-            params,
+            params: saiife_broker::mask::Masker::new(&[]).mask_params(&params),
             input: None,
             grant_key: None,
         }
@@ -1264,10 +1266,14 @@ mod tests {
     fn expired_record_names_requester_and_id() {
         let e = env();
         let mut req = new_req(1001);
-        req.params.insert(
+        let mut raw = req.params.get().clone();
+        raw.insert(
             "token".into(),
             concat!("shp", "at_0123456789abcdef0123456789abcdef").into(),
         );
+        // Not a vault value or a v1 pattern: left as is in the display copy,
+        // and never in a record.
+        req.params = saiife_broker::mask::Masker::new(&[]).mask_params(&raw);
         let r = e.store.create(req, no_seal, MIN, t0()).unwrap();
         let gone = e.store.sweep(t0() + 2 * MIN).pop().unwrap();
         let base = saiife_audit::Record::at(

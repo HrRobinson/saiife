@@ -78,6 +78,13 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
             return;
         }
     };
+    // The peer's start time, read now (one small `/proc` read): a same-user
+    // approval's re-authentication names this process, and polkit and the
+    // daemon check it was not replaced by another with the same pid.
+    let conn = ops::Conn {
+        peer,
+        start_time: crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
+    };
     let mut greeted = false;
     loop {
         let next = if greeted {
@@ -125,7 +132,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
             continue;
         }
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
-            Ok(_in_flight) => ops::dispatch(&ctx, &peer, req).await,
+            Ok(_in_flight) => ops::dispatch_conn(&ctx, &conn, req).await,
             Err(code) => {
                 ctx.notice(peer.uid, Notice::Requests);
                 err(req.id, code, "too many requests from this uid")

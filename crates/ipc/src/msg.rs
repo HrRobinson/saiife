@@ -22,6 +22,14 @@ pub const OP_API_RESULT: &str = "api.result";
 pub const OP_API_TOKEN: &str = "api.token";
 /// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
 pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
+/// Approval requests: approvers see all, a requester its own.
+/// `{states?: ["pending", ...]}` -> `{items}`.
+pub const OP_APPROVAL_LIST: &str = "approval.list";
+/// `{request}` -> `{item}` (the masked request). The id is `request`: a
+/// frame's `id` is its own.
+pub const OP_APPROVAL_SHOW: &str = "approval.show";
+/// `{request, action: "approve"|"reject", note?}` -> `{request, state}`.
+pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with

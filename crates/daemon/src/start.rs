@@ -327,7 +327,10 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     .chain(rebuild_note)
     .chain(capped_note)
     .collect();
-    let more = start_notes(&ctx, notes, &expired_at_start);
+    let mut more = start_notes(&ctx, notes, &expired_at_start);
+    // Requests approved but not sent when the daemon stopped become
+    // `send_failed` (`interrupted`); none is sent again by itself.
+    more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         daemon_cfg.socket_dir.clone(),
