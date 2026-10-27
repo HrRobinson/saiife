@@ -182,12 +182,19 @@ impl saiife_daemon::reauth::Reauth for FakeReauth {
     }
 }
 
+/// The daemon allows one re-authentication per uid in this process at a
+/// time (`reauth_busy` otherwise), and every test here is the same uid:
+/// the tests that re-authenticate take turns.
+static REAUTH_SERIAL: Mutex<()> = Mutex::new(());
+
 struct World {
     reauth: Arc<FakeReauth>,
     rt: tokio::runtime::Runtime,
     ctx: Arc<Ctx>,
     m: Mock,
     tmp: tempfile::TempDir,
+    /// Held from the first [`World::own_reauth`] to the end of the test.
+    serial: std::cell::OnceCell<std::sync::MutexGuard<'static, ()>>,
 }
 
 fn config_text(tmp: &Path, port: u16, erp_extra: &str) -> String {
@@ -422,6 +429,7 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
         ctx,
         m,
         tmp,
+        serial: std::cell::OnceCell::new(),
     }
 }
 
@@ -653,6 +661,8 @@ impl World {
     /// Make the own user an approver who re-authenticates for its own
     /// requests (`same_user = "reauth"`); `ok` is the fake's answer.
     fn own_reauth(&self, ok: bool) {
+        self.serial
+            .get_or_init(|| REAUTH_SERIAL.lock().unwrap_or_else(|p| p.into_inner()));
         self.reauth.allow.store(ok, Ordering::SeqCst);
         let text = config_text(self.path(), self.m.port, "").replace(
             "approvers = [\"boss\"]",
