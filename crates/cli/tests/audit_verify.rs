@@ -303,6 +303,8 @@ fn locked_mode_needs_the_audit_group() {
     let out = c
         .env_remove("SAIIFE_AUDIT_DIR")
         .env_remove("XDG_DATA_HOME")
+        // Debug-build seam: the host's groups never matter.
+        .env("SAIIFE_TEST_AUDIT_GROUP", "saiife-test-no-such-group")
         .args(["audit", "verify", "--system-config"])
         .arg(&config)
         .output()
@@ -315,6 +317,27 @@ fn locked_mode_needs_the_audit_group() {
         "{text}"
     );
 
+    // An auditor (the same decision `saiife audit` uses) checks [audit] dir.
+    if cfg!(debug_assertions) {
+        let group = Command::new("id").arg("-gn").output().unwrap();
+        let group = String::from_utf8(group.stdout).unwrap();
+        let (mut c, _sb) = check_cmd(&audit);
+        let out = c
+            .env_remove("SAIIFE_AUDIT_DIR")
+            .env_remove("XDG_DATA_HOME")
+            .env("SAIIFE_TEST_AUDIT_GROUP", group.trim())
+            .args(["audit", "verify", "--system-config"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        assert!(
+            text.contains(&format!("log: {}", audit.display())),
+            "{text}"
+        );
+    }
+
     // Developer mode (no `locked = true`) keeps the user's own log.
     std::fs::write(&config, "version = 2\n").unwrap();
     let (mut c, _sb) = check_cmd(&audit);
@@ -326,4 +349,33 @@ fn locked_mode_needs_the_audit_group() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
+}
+
+/// Only a missing system config means developer mode: one that cannot be
+/// read (here: its directory is closed) is exit 2, naming the path.
+#[cfg(unix)]
+#[test]
+fn unreadable_system_config_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return; // root reads through any mode
+    }
+    let etc = tempfile::tempdir().unwrap();
+    let audit = etc.path().join("audit");
+    std::fs::create_dir(&audit).unwrap();
+    let closed = etc.path().join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    let config = closed.join("config.toml");
+    std::fs::write(&config, "version = 2\nlocked = true\n").unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (mut c, _sb) = check_cmd(&audit);
+    let out = c
+        .args(["audit", "verify", "--system-config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains(&config.display().to_string()), "{text}");
 }

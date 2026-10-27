@@ -169,3 +169,33 @@ fn auditor_refused_by_the_files_falls_back_to_the_daemon() {
     assert!(err.contains("audit.query"), "{err}");
     assert_eq!(o.status.code(), Some(5), "{err}");
 }
+
+/// Through audit.query too, the report's host sections honour --since
+/// only: --agent narrows the decisions, not the error_denied rows.
+#[test]
+fn report_host_sections_from_the_daemon_ignore_narrowing_filters() {
+    let d = TestDaemon::start(Opts::default());
+    let mut c = d.client();
+    let mut rec = guard_rec("echo err-denied-host");
+    rec["decision"] = "error_denied".into();
+    rec["reason"] = "guard worker crashed".into();
+    append(&mut c, rec).unwrap();
+    let report = d.path().join("h.html");
+    let o = audit(
+        &d,
+        NO_GROUP,
+        &[
+            "--agent",
+            "codex",
+            "--since",
+            "1d",
+            "--report",
+            report.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(text(&o).contains("(0 decisions)"), "{}", text(&o));
+    let html = std::fs::read_to_string(&report).unwrap();
+    assert!(html.contains("echo err-denied-host"), "{html}");
+    assert!(html.contains("not checked: your records come through the saiife daemon"));
+}

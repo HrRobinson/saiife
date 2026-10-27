@@ -6,51 +6,69 @@
 //! unchanged.
 
 use saiife_audit::Record;
-use saiife_policy::{load_system, SystemConfig};
+use saiife_policy::load_system;
 use std::path::{Path, PathBuf};
 
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
 pub const V1_LABEL: &str = "v1, before locked mode, not tamper-evident";
 /// The group whose members read the audit files (spec §5.2).
 pub use saiife_system::layout::AUDIT_GROUP;
-const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
 
-/// Where the records come from.
+/// Where the records come from: the one locked-mode decision behind both
+/// `saiife audit` and `saiife audit verify`.
 pub enum Source {
     /// No locked system config: the user's own audit dir, as before.
     Developer,
-    /// Locked mode, and the caller may read the files (`[audit] dir`).
-    Direct(Box<SystemConfig>),
-    /// Locked mode through the daemon.
-    Daemon(Box<SystemConfig>),
+    /// Locked mode, and the caller may read the files in `dir`.
+    Direct { dir: PathBuf, config: PathBuf },
+    /// Locked mode, not an auditor: through the daemon (`audit.query`).
+    Daemon { dir: PathBuf, config: PathBuf },
 }
 
-/// The source for this process. Only a config that does not exist
-/// (`NotFound`), or one without `locked = true`, is developer mode. Any
-/// other failure to look at or read it is an error naming the path (fail
-/// closed: a locked host never falls back to the home log alone).
-pub fn source(system_config: Option<PathBuf>) -> Result<Source, String> {
-    let path = system_config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Source::Developer),
-        Err(e) => {
-            return Err(format!(
-                "cannot read the system config {}: {e}",
-                path.display()
-            ))
-        }
-    }
-    let loaded = load_system(&path)
-        .map_err(|e| format!("cannot read the system config {}: {e}", path.display()))?;
-    if !loaded.config.locked {
+/// The source for this process, from `system_config` (default
+/// [`SYSTEM_CONFIG`]). Only a config that does not exist (`NotFound`), or
+/// one without `locked = true`, is developer mode. Any other failure to
+/// read it is an error naming the path (fail closed: a locked host never
+/// falls back to the home log alone).
+pub fn source(system_config: Option<&Path>) -> Result<Source, String> {
+    let config = system_config.unwrap_or(Path::new(SYSTEM_CONFIG));
+    let Some(dir) = locked_audit_dir(config)? else {
         return Ok(Source::Developer);
-    }
+    };
+    let config = config.to_path_buf();
     if is_auditor() {
-        Ok(Source::Direct(Box::new(loaded.config)))
+        Ok(Source::Direct { dir, config })
     } else {
-        Ok(Source::Daemon(Box::new(loaded.config)))
+        Ok(Source::Daemon { dir, config })
     }
+}
+
+/// `[audit] dir` when the system config says `locked = true`; `None` when
+/// the config does not exist or is not locked. Read as a raw table, like
+/// the hook's system view, so a policy error elsewhere does not hide the
+/// log. Errors name the path.
+pub fn locked_audit_dir(config: &Path) -> Result<Option<PathBuf>, String> {
+    let bad = |e: &str| format!("{}: {e}", config.display());
+    let Some(bytes) =
+        crate::system_view::read_regular(config, false, 1024 * 1024).map_err(|e| bad(&e))?
+    else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes).map_err(|_| bad("not valid UTF-8"))?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| bad(e.message()))?;
+    if table.get("locked").and_then(toml::Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let dir = match table.get("audit").and_then(|a| a.get("dir")) {
+        None => PathBuf::from(LOCKED_AUDIT_DIR),
+        Some(toml::Value::String(d)) if Path::new(d).is_absolute() => PathBuf::from(d),
+        Some(_) => return Err(bad("[audit] dir must be an absolute path")),
+    };
+    Ok(Some(dir))
 }
 
 /// Root, or `audit_gid` among the process's groups.
@@ -70,8 +88,9 @@ fn audit_group() -> String {
     AUDIT_GROUP.to_string()
 }
 
+/// Root, or a member of `saiife-audit` in this process's current groups.
 #[cfg(unix)]
-fn is_auditor() -> bool {
+pub fn is_auditor() -> bool {
     use rustix::process::{getegid, geteuid, getgroups};
     use saiife_policy::Directory;
     let mut gids: Vec<u32> = getgroups()
@@ -85,7 +104,7 @@ fn is_auditor() -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_auditor() -> bool {
+pub fn is_auditor() -> bool {
     false
 }
 
@@ -118,11 +137,14 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// Every page of the caller's records from the daemon, oldest first, and
 /// how many answer entries were not records.
 #[cfg(target_os = "linux")]
-pub fn query(cfg: &SystemConfig, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
+pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
     use saiife_ipc::client::{system_uid, Client};
     use serde_json::{Map, Value};
     use std::time::{Duration, Instant};
 
+    let loaded = load_system(config)
+        .map_err(|e| format!("cannot read the system config {}: {e}", config.display()))?;
+    let cfg = &loaded.config;
     let user = &cfg.daemon.user;
     let uid = system_uid(user).ok_or_else(|| format!("the daemon user {user} does not exist"))?;
     let mut c = Client::connect(
@@ -182,8 +204,8 @@ pub fn query(cfg: &SystemConfig, q: &QueryArgs) -> Result<(Vec<Record>, usize), 
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn query(cfg: &SystemConfig, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
-    let _ = (cfg, q);
+pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
+    let _ = (config, q, load_system);
     Err("locked mode needs Linux in this version (macOS: v2.1)".into())
 }
 
@@ -204,17 +226,11 @@ mod tests {
     fn no_locked_config_is_developer_mode() {
         let d = tempfile::tempdir().unwrap();
         let missing = d.path().join("config.toml");
-        assert!(matches!(
-            source(Some(missing.clone())),
-            Ok(Source::Developer)
-        ));
+        assert!(matches!(source(Some(&missing)), Ok(Source::Developer)));
         std::fs::write(&missing, "version = 2\n").unwrap();
-        assert!(matches!(
-            source(Some(missing.clone())),
-            Ok(Source::Developer)
-        ));
+        assert!(matches!(source(Some(&missing)), Ok(Source::Developer)));
         std::fs::write(&missing, "version = 2\nbogus = [\n").unwrap();
-        let e = source(Some(missing.clone())).err().unwrap();
+        let e = source(Some(&missing)).err().unwrap();
         assert!(e.contains(&missing.display().to_string()), "{e}");
     }
 
@@ -231,7 +247,7 @@ mod tests {
         let cfg = parent.join("config.toml");
         std::fs::write(&cfg, "version = 2\nlocked = true\n").unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let r = source(Some(cfg.clone()));
+        let r = source(Some(&cfg));
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         let e = r
             .err()
@@ -240,7 +256,31 @@ mod tests {
         // A file in place of the parent dir (ENOTDIR) is not NotFound either.
         let file = d.path().join("f");
         std::fs::write(&file, "x").unwrap();
-        assert!(source(Some(file.join("config.toml"))).is_err());
+        assert!(source(Some(&file.join("config.toml"))).is_err());
+    }
+
+    #[test]
+    fn locked_audit_dir_reads_the_system_config() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        assert_eq!(locked_audit_dir(&c), Ok(None), "no config: developer mode");
+        std::fs::write(&c, "version = 2\n[audit]\ndir = \"/srv/a\"\n").unwrap();
+        assert_eq!(locked_audit_dir(&c), Ok(None), "not locked");
+        std::fs::write(&c, "version = 2\nlocked = true\n").unwrap();
+        assert_eq!(
+            locked_audit_dir(&c),
+            Ok(Some(PathBuf::from("/var/log/saiife/audit")))
+        );
+        std::fs::write(
+            &c,
+            "version = 2\nlocked = true\n[audit]\ndir = \"/srv/a\"\n",
+        )
+        .unwrap();
+        assert_eq!(locked_audit_dir(&c), Ok(Some(PathBuf::from("/srv/a"))));
+        std::fs::write(&c, "version = 2\nlocked = true\n[audit]\ndir = \"rel\"\n").unwrap();
+        assert!(locked_audit_dir(&c).is_err());
+        std::fs::write(&c, "locked = [").unwrap();
+        assert!(locked_audit_dir(&c).is_err());
     }
 
     #[test]

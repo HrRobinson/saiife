@@ -17,7 +17,7 @@ use time::{Duration, OffsetDateTime};
 /// `saiife audit verify [--external <file|dir>]`: exit 0 intact, 1 broken,
 /// 2 unreadable. Prints counts and file names only, never record content.
 pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode {
-    let config = system_config.unwrap_or(Path::new(SYSTEM_CONFIG));
+    let config = system_config.unwrap_or(Path::new(audit_locked::SYSTEM_CONFIG));
     let dir = match verify_dir(config) {
         Ok(dir) => dir,
         Err(e) => {
@@ -36,83 +36,32 @@ pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode
     ExitCode::from(report.exit_code())
 }
 
-const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
-const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
-const AUDIT_GROUP: &str = "saiife-audit";
 const NOT_AN_AUDITOR: &str = "audit files need the saiife-audit group; ask an auditor";
 
-/// The log `verify` checks. In locked mode it is `[audit] dir` of the
+/// The log `verify` checks, from the one locked-mode decision
+/// ([`audit_locked::source`]). In locked mode it is `[audit] dir` of the
 /// system config, for root and `saiife-audit` members only;
 /// `$SAIIFE_AUDIT_DIR` overrides it in debug builds alone (tests, CI), so
 /// a release build always checks the log the daemon writes. Otherwise it
 /// is the user's own log (`$SAIIFE_AUDIT_DIR` honoured).
 fn verify_dir(config: &Path) -> Result<PathBuf, String> {
-    let Some(dir) = locked_audit_dir(config)? else {
-        return store::default_dir().ok_or_else(|| "no audit directory".to_string());
+    let (dir, auditor) = match audit_locked::source(Some(config))? {
+        Source::Developer => {
+            return store::default_dir().ok_or_else(|| "no audit directory".to_string());
+        }
+        Source::Direct { dir, .. } => (dir, true),
+        Source::Daemon { dir, .. } => (dir, false),
     };
     if cfg!(debug_assertions) {
         if let Some(d) = std::env::var_os(store::DIR_ENV).filter(|d| Path::new(d).is_absolute()) {
             return Ok(PathBuf::from(d));
         }
     }
-    if is_auditor() {
+    if auditor {
         Ok(dir)
     } else {
         Err(NOT_AN_AUDITOR.into())
     }
-}
-
-/// `[audit] dir` when the system config says `locked = true`; `None` when
-/// there is no config or it is not locked. Read as a raw table, like the
-/// hook's system view, so a policy error elsewhere does not hide the log.
-pub(crate) fn locked_audit_dir(config: &Path) -> Result<Option<PathBuf>, String> {
-    let bad = |e: &str| format!("{}: {e}", config.display());
-    let Some(bytes) =
-        crate::system_view::read_regular(config, false, 1024 * 1024).map_err(|e| bad(&e))?
-    else {
-        return Ok(None);
-    };
-    let text = String::from_utf8(bytes).map_err(|_| bad("not valid UTF-8"))?;
-    let table: toml::Table = text
-        .parse()
-        .map_err(|e: toml::de::Error| bad(e.message()))?;
-    if table.get("locked").and_then(toml::Value::as_bool) != Some(true) {
-        return Ok(None);
-    }
-    let dir = match table.get("audit").and_then(|a| a.get("dir")) {
-        None => PathBuf::from(LOCKED_AUDIT_DIR),
-        Some(toml::Value::String(d)) if Path::new(d).is_absolute() => PathBuf::from(d),
-        Some(_) => return Err(bad("[audit] dir must be an absolute path")),
-    };
-    Ok(Some(dir))
-}
-
-/// Root, or a member of `saiife-audit` in this process's current groups.
-#[cfg(target_os = "linux")]
-fn is_auditor() -> bool {
-    use rustix::process::{getegid, geteuid, getgroups};
-    use saiife_policy::users::{Directory, Getent};
-    if geteuid().is_root() {
-        return true;
-    }
-    let Some(group) = Getent.group(AUDIT_GROUP) else {
-        return false;
-    };
-    getegid().as_raw() == group.gid
-        || getgroups().is_ok_and(|gs| gs.iter().any(|g| g.as_raw() == group.gid))
-}
-
-/// Locked mode is Linux-only in this version: only root reads its files.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn is_auditor() -> bool {
-    let _ = AUDIT_GROUP;
-    rustix::process::geteuid().is_root()
-}
-
-#[cfg(not(unix))]
-fn is_auditor() -> bool {
-    let _ = AUDIT_GROUP;
-    false
 }
 
 /// The local report, then how it compares with the forwarded copy. Problems
@@ -530,19 +479,23 @@ fn load_main(
             };
             load_dir(dir)
         }
-        Source::Direct(cfg) => match std::fs::read_dir(&cfg.audit.dir) {
+        Source::Direct { dir, config } => match std::fs::read_dir(dir) {
             // An auditor by its groups whose read is refused anyway (a
             // group added since login, a changed mode): ask the daemon.
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 eprintln!(
                     "saiife: cannot read {} directly (permission denied); asking the saiife daemon instead",
-                    cfg.audit.dir.display()
+                    dir.display()
                 );
-                load_main(&Source::Daemon(cfg.clone()), home_dir, q)
+                let daemon = Source::Daemon {
+                    dir: dir.clone(),
+                    config: config.clone(),
+                };
+                load_main(&daemon, home_dir, q)
             }
-            _ => load_dir(&cfg.audit.dir),
+            _ => load_dir(dir),
         },
-        Source::Daemon(cfg) => match audit_locked::query(cfg, &q) {
+        Source::Daemon { config, .. } => match audit_locked::query(config, &q) {
             Ok((records, skipped)) => Ok(Loaded {
                 records,
                 skipped_lines: skipped,
@@ -568,7 +521,7 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let source = match audit_locked::source(a.system_config.clone()) {
+    let source = match audit_locked::source(a.system_config.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("saiife: {}", sanitize(&e));
@@ -578,8 +531,7 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
     let home_dir = store::default_dir();
     let locked_dir = match &source {
         Source::Developer => None,
-        Source::Direct(cfg) => Some(cfg.audit.dir.clone()),
-        Source::Daemon(cfg) => Some(cfg.audit.dir.clone()),
+        Source::Direct { dir, .. } | Source::Daemon { dir, .. } => Some(dir.clone()),
     };
     // Through the daemon only --since narrows the query: the report's
     // host sections need every record of the period, and the other
@@ -751,30 +703,6 @@ mod tests {
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
         )
-    }
-
-    #[test]
-    fn locked_audit_dir_reads_the_system_config() {
-        let d = tempfile::tempdir().unwrap();
-        let c = d.path().join("config.toml");
-        assert_eq!(locked_audit_dir(&c), Ok(None), "no config: developer mode");
-        std::fs::write(&c, "version = 2\n[audit]\ndir = \"/srv/a\"\n").unwrap();
-        assert_eq!(locked_audit_dir(&c), Ok(None), "not locked");
-        std::fs::write(&c, "version = 2\nlocked = true\n").unwrap();
-        assert_eq!(
-            locked_audit_dir(&c),
-            Ok(Some(PathBuf::from("/var/log/saiife/audit")))
-        );
-        std::fs::write(
-            &c,
-            "version = 2\nlocked = true\n[audit]\ndir = \"/srv/a\"\n",
-        )
-        .unwrap();
-        assert_eq!(locked_audit_dir(&c), Ok(Some(PathBuf::from("/srv/a"))));
-        std::fs::write(&c, "version = 2\nlocked = true\n[audit]\ndir = \"rel\"\n").unwrap();
-        assert!(locked_audit_dir(&c).is_err());
-        std::fs::write(&c, "locked = [").unwrap();
-        assert!(locked_audit_dir(&c).is_err());
     }
 
     #[test]
