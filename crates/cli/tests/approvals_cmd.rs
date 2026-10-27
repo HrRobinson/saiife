@@ -391,6 +391,7 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
                 })
                 .map_err(|e| e.to_string()),
             lockdown: saiife_daemon::lockdown::Store::memory(),
+            grants: saiife_daemon::grants::Grants::memory(),
         });
         ctx.reauth = reauth.clone();
         Arc::new(ctx)

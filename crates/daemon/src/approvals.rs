@@ -112,6 +112,10 @@ pub struct Request {
     /// The masked command (command requests).
     pub input: Option<String>,
     pub grant_key: Option<String>,
+    /// The project a command grant covers (its canonical root), shown to
+    /// approvers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// What will be sent, for the approver (connector requests): the
     /// masked body cut at 4 KiB, the SHA-256 of the exact body bytes, the
     /// amount and the masked agent headers.
@@ -153,6 +157,8 @@ pub struct NewRequest {
     pub params: saiife_broker::mask::Masked<BTreeMap<String, String>>,
     pub input: Option<String>,
     pub grant_key: Option<String>,
+    /// [`Request::scope`].
+    pub scope: Option<String>,
     /// The send's display fields ([`Request::body_display`] ...); empty
     /// (`Default`) for a command request.
     pub send: SendDisplay,
@@ -669,6 +675,7 @@ impl Store {
             params: req.params.into_inner(),
             input: req.input,
             grant_key: req.grant_key,
+            scope: req.scope,
             body_display: req.send.body_display,
             body_sha256: req.send.body_sha256,
             body_truncated: req.send.body_truncated,
@@ -893,6 +900,7 @@ mod tests {
             params: saiife_broker::mask::Masker::new(&[]).mask_params(&params),
             input: None,
             grant_key: None,
+            scope: None,
             send: SendDisplay::default(),
         }
     }

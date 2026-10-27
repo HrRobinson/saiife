@@ -125,6 +125,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         params: p.params.clone(),
         input: None,
         grant_key: None,
+        scope: None,
         send: SendDisplay {
             body_display: p.body_display.clone(),
             body_sha256: p.body_sha256.clone(),
@@ -644,6 +645,17 @@ fn call_fields(req: &Request) -> Result<CallFields, Value> {
     })
 }
 
+/// The record's project (the cwd) must be the key's project root or lie
+/// below it, both canonical here: a grant cannot be scoped to another
+/// tree than the one the command runs in.
+fn project_ok(f: &CallFields) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    match (canon(&f.project), canon(&f.key_project)) {
+        (Some(p), Some(root)) => p.starts_with(&root),
+        _ => false,
+    }
+}
+
 /// Lockdown `all` answers every hook step with `lockdown`: no grant is
 /// used up and no request made while it is on.
 fn locked_down(ctx: &Ctx, id: u64) -> Option<Value> {
@@ -665,6 +677,16 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     };
     if let Some(v) = locked_down(ctx, id) {
         return v;
+    }
+    if !project_ok(&f) {
+        let mut m = Map::new();
+        m.insert("rule".into(), "project_mismatch".into());
+        return err_with(
+            id,
+            ErrorCode::Denied,
+            "project_mismatch: the project is not the cwd or above it",
+            m,
+        );
     }
     let key = f.key(peer.uid);
     let c = Arc::clone(ctx);
@@ -776,9 +798,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
     let Some(sys) = ctx.policy().system else {
         return err(id, ErrorCode::Unavailable, "no valid policy is loaded");
     };
-    let asked = f
-        .ask()
-        .is_some_and(|a| sys.guard.ask.contains(&a));
+    let asked = f.ask().is_some_and(|a| sys.guard.ask.contains(&a));
     if !asked {
         return refuse_create(
             ctx,
@@ -792,6 +812,17 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
     }
     if let Some(v) = locked_down(ctx, id) {
         return v;
+    }
+    if !project_ok(&f) {
+        return refuse_create(
+            ctx,
+            peer,
+            id,
+            &f,
+            "project_mismatch",
+            "the project is not the cwd or above it",
+        )
+        .await;
     }
     // The claimed rule must deny the submitted command itself.
     let (pack, rule_id, input) = (
@@ -831,6 +862,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         params: Default::default(),
         input: Some(f.input.clone()),
         grant_key: Some(crate::grants::hex(&f.key(peer.uid))),
+        scope: Some(f.key_project.clone()),
         send: SendDisplay::default(),
     };
     match store_new(ctx, new, None, sys.approval.timeout).await {

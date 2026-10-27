@@ -1286,13 +1286,31 @@ fn key_for(project: &str, input: &str, raw: &str) -> String {
 
 /// The args of `grant.consume` / `approval.create` for `input`, as the hook
 /// sends them, with `raw` as the exact command.
-fn call_args(input: &str, raw: &str, rule_id: &str) -> Value {
-    let mut r = common::daemon::guard_rec(input);
-    r["decision"] = "deny".into();
-    r["pack"] = "core.git".into();
-    r["rule_id"] = rule_id.into();
-    r["grant_key"] = "00".repeat(32).into();
-    json!({"rec": r, "raw_sha256": sha_hex(raw), "project": "/p"})
+impl World {
+    /// The args of `grant.consume` / `approval.create` for `input` run in
+    /// the project, as the hook sends them, with `raw` as the exact command.
+    fn call_args(&self, input: &str, raw: &str, rule_id: &str) -> Value {
+        self.call_args_in(input, raw, rule_id, &self.project(), &self.project())
+    }
+
+    /// [`World::call_args`] with the record's `cwd` and the key's
+    /// `project` given.
+    fn call_args_in(
+        &self,
+        input: &str,
+        raw: &str,
+        rule_id: &str,
+        cwd: &str,
+        project: &str,
+    ) -> Value {
+        let mut r = common::daemon::guard_rec(input);
+        r["decision"] = "deny".into();
+        r["pack"] = "core.git".into();
+        r["rule_id"] = rule_id.into();
+        r["grant_key"] = "00".repeat(32).into();
+        r["project"] = cwd.into();
+        json!({"rec": r, "raw_sha256": sha_hex(raw), "project": project})
+    }
 }
 
 /// The request id of `Needs approval: request #<id>. ...`, checking the
@@ -1465,10 +1483,10 @@ fn approval_create_takes_only_ask_rules() {
     let w = world_ask(ASK_FORCE_PUSH);
     let create = |args: Value| w.op(own_uid(), "approval.create", args);
     // A rule that is not under ask.
-    let a = create(call_args(FORCE_PUSH, FORCE_PUSH, "reset-hard"));
+    let a = create(w.call_args(FORCE_PUSH, FORCE_PUSH, "reset-hard"));
     assert_eq!(a["rule"], "not_ask", "{a}");
     // An ask rule that does not deny the submitted command.
-    let a = create(call_args("echo hi", "echo hi", "force-push"));
+    let a = create(w.call_args("echo hi", "echo hi", "force-push"));
     assert_eq!(a["rule"], "ask_rule_mismatch", "{a}");
     let refused: Vec<Value> = w
         .records()
@@ -1479,18 +1497,18 @@ fn approval_create_takes_only_ask_rules() {
     assert_eq!(refused[1]["rule"], "ask_rule_mismatch");
     assert_eq!(refused[1]["uid"], own_uid());
     // No raw hash: refused.
-    let mut no_raw = call_args(FORCE_PUSH, FORCE_PUSH, "force-push");
+    let mut no_raw = w.call_args(FORCE_PUSH, FORCE_PUSH, "force-push");
     no_raw.as_object_mut().unwrap().remove("raw_sha256");
     assert_eq!(create(no_raw)["error"], "bad_request");
     assert!(w.requests().is_empty());
 
-    let a = create(call_args(FORCE_PUSH, FORCE_PUSH, "force-push"));
+    let a = create(w.call_args(FORCE_PUSH, FORCE_PUSH, "force-push"));
     assert_eq!(a["ok"], true, "{a}");
     let id = a["request"].as_u64().unwrap();
     let r = w.ctx.approvals.as_ref().unwrap().get(id).unwrap();
     assert_eq!(
         r.grant_key.as_deref(),
-        Some(key_for("/p", FORCE_PUSH, FORCE_PUSH).as_str())
+        Some(key_for(&w.project(), FORCE_PUSH, FORCE_PUSH).as_str())
     );
 }
 
@@ -1502,7 +1520,7 @@ fn grant_is_bound_to_the_raw_command() {
     let a = w.op(
         own_uid(),
         "approval.create",
-        call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
+        w.call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
     );
     let id = a["request"].as_u64().unwrap();
     assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
@@ -1510,7 +1528,7 @@ fn grant_is_bound_to_the_raw_command() {
         w.op(
             own_uid(),
             "grant.consume",
-            call_args(FORCE_PUSH, raw, "force-push"),
+            w.call_args(FORCE_PUSH, raw, "force-push"),
         )
     };
     let other = consume("GH_TOKEN=$(echo x) git push --force origin main");
@@ -1590,7 +1608,7 @@ fn too_many_pending_commands_say_so() {
         let a = w.op(
             own_uid(),
             "approval.create",
-            call_args(FORCE_PUSH, &format!("{FORCE_PUSH} #{i}"), "force-push"),
+            w.call_args(FORCE_PUSH, &format!("{FORCE_PUSH} #{i}"), "force-push"),
         );
         assert_eq!(a["ok"], true, "{a}");
     }
@@ -1612,7 +1630,7 @@ fn interrupted_command_approval_revokes_its_grant() {
     let a = w.op(
         own_uid(),
         "approval.create",
-        call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
+        w.call_args(FORCE_PUSH, FORCE_PUSH, "force-push"),
     );
     let id = a["request"].as_u64().unwrap();
     let store = w.ctx.approvals.as_ref().unwrap();
@@ -1729,4 +1747,45 @@ fn bench_managed_hook_with_ask() {
         let (p50, p95) = time(cmd);
         eprintln!("bench {name}: median {p50:.1} ms, p95 {p95:.1} ms");
     }
+}
+
+/// The record's project must be the key's project root or below it;
+/// otherwise `project_mismatch` (a create is recorded). The approver sees
+/// the root as `scope`.
+#[test]
+fn project_must_lie_in_the_grant_scope() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let root = w.project();
+    let sub = format!("{root}/sub");
+    fs::create_dir_all(&sub).unwrap();
+    let elsewhere = fs::canonicalize(w.path().join("home"))
+        .unwrap()
+        .display()
+        .to_string();
+    for (cwd, project) in [
+        (elsewhere.as_str(), root.as_str()),
+        (root.as_str(), sub.as_str()),
+    ] {
+        let args = w.call_args_in(FORCE_PUSH, FORCE_PUSH, "force-push", cwd, project);
+        let a = w.op(own_uid(), "approval.create", args.clone());
+        assert_eq!(a["rule"], "project_mismatch", "{a}");
+        let c = w.op(own_uid(), "grant.consume", args);
+        assert_eq!(c["rule"], "project_mismatch", "{c}");
+    }
+    assert!(w.requests().is_empty());
+    let refused = w
+        .records()
+        .into_iter()
+        .filter(|r| r["action"] == "refused" && r["rule"] == "project_mismatch")
+        .count();
+    assert_eq!(refused, 2);
+
+    // A cwd below the root is fine, and the scope is the root.
+    let args = w.call_args_in(FORCE_PUSH, FORCE_PUSH, "force-push", &sub, &root);
+    let a = w.op(own_uid(), "approval.create", args);
+    let id = a["request"].as_u64().unwrap_or_else(|| panic!("{a}"));
+    let shown = w.op(BOSS, "approval.show", json!({"request": id}));
+    assert_eq!(shown["item"]["scope"], root.as_str(), "{shown}");
+    let listed = w.op(BOSS, "approval.list", json!({}));
+    assert_eq!(listed["items"][0]["scope"], root.as_str(), "{listed}");
 }
