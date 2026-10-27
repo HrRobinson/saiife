@@ -1,23 +1,194 @@
 # Threat coverage
 
-This page says which risks saiife v1 covers and which it does not, for each
-way of working. It is meant for anyone who decides whether an AI coding agent
-may run on a company machine, including people who do not write code.
+This page says which risks saiife covers and which it does not, for each way
+of working. It is meant for anyone who decides whether an AI coding agent may
+run on a company machine, including people who do not write code.
 
-## The three threats
+## The wording rule
+
+saiife brokers credentials for external services (Shopify, HubSpot, GitHub,
+your own HTTP APIs). It does not broker the agent's own model login. The
+exact claim is: the agent never holds a credential for a brokered service; it
+holds its own model-provider login unless you run a local model.
+
+## The threats
 
 saiife looks at three kinds of agent behavior, from easiest to hardest to
 stop:
 
 | Threat | Example | Stopped by |
 | --- | --- | --- |
-| **Mistake** | Agent runs `rm -rf` on the wrong path, force-pushes, reads `.env` while debugging | v1 guard packs |
-| **Helpful bypass** | Agent on auto mode sees a block and "fixes" it by turning saiife off or editing its config | v1 `core.self` + tamper detection; fully in v2 admin lock |
-| **Determined bypass** | Agent writes and runs a script that reads secrets, or calls an API directly with a key it found | v2 connector gateway (agent never holds keys) + v3 isolated runner |
+| **Mistake** | Agent runs `rm -rf` on the wrong path, force-pushes, reads `.env` while debugging | The guard packs |
+| **Helpful bypass** | Agent on auto mode sees a block and "fixes" it by turning saiife off or editing its config | `core.self` in developer mode; root-owned managed hooks and config in locked mode |
+| **Determined bypass** | Agent writes and runs a script that reads secrets, or calls an API directly with a key it found | Locked mode: the connector gateway (no key for a brokered service) and an audit the agent cannot write; the [egress recipe](egress.md) for exfiltration |
 
-Only v1 exists today. v2 and v3 are designed but not built.
+## Pick your setup
 
-## How v1 works, in short
+saiife v2.0 has four ways of working. Each has its own table below.
+Legend: **covered**, **partly**, **not covered**.
+
+| Setup | Platform | Section |
+| --- | --- | --- |
+| Developer: hooks in your own account | any | [Developer](#setup-developer) |
+| Personal broker | after v2.0 | [Personal broker](#setup-personal-broker-after-v20) |
+| Locked, on a person's account | supported Linux | [Locked, person's account](#setup-locked-on-a-persons-account) |
+| Locked, on a dedicated agent account (recommended for unattended work) | supported Linux | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
+
+Supported Linux in v2.0 means Ubuntu 22.04+, Debian 12+ and RHEL 9+. Macs
+(until v2.1), Alpine and containers fall under Developer. An agent whose lock
+label is not "lockable" falls back to the Developer column for the first two
+rows, even on a locked machine. The label of each agent is on its page:
+[Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
+[Gemini CLI](agents/gemini.md).
+
+## Setup: Developer
+
+saiife runs as your own user and fails open. This is what v1 is built for,
+with a person nearby.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake (destructive or secret-reading command) | **Covered** by packs; fails open | A broken saiife lets the action run (`error_allowed`). |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) and `saiife status`. |
+| Agent obtains a brokered credential | Not covered | There is no broker. |
+| Agent uses an external service beyond rules | Not covered | |
+| Agent erases or rewrites the audit | Not covered | Careless edits are caught by the chain; a deliberate rewrite is not (no signing key). |
+| Agent's own script does local damage | Not covered | |
+| Agent reads your other files and logins | Not covered | |
+| Data exfiltration to arbitrary hosts | Not covered | |
+| Nested or patched agent without hooks | Not covered | |
+| Model-provider login used or copied by the agent | Not covered | |
+| MCP servers | Not covered | |
+| Attacker with root | Not covered | |
+| Tools the agent runs inside its own process without a hook (Codex hosted web search) | Not covered | No hook sees them. |
+
+### Developer: a person nearby
+
+You use the agent and watch what it does, and confirm risky steps when the
+agent asks.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Covered** | The packs block the common destructive and secret-reading actions. Each pack lists what it does not catch. |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways to turn saiife off. `saiife status` shows a removed or changed hook. You are there to notice. |
+| Determined bypass | **Not covered** | An agent that writes and runs its own script, or uses a key it found, is not seen. |
+
+### Developer: auto mode or unattended
+
+The agent runs commands without asking you, or runs while nobody watches.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Partly covered** | The packs still block known-dangerous actions. But if saiife fails, the action runs and nobody sees it until someone reads the audit log. |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways, but an agent that keeps trying may find a way the pack does not know. `saiife status` shows it only when someone runs it. |
+| Determined bypass | **Not covered** | As above. |
+
+For agents that run unattended, the developer setup is not enough on its own.
+Use locked mode, ideally on a dedicated account.
+
+## Setup: Personal broker (after v2.0)
+
+A per-user daemon holds credentials in the OS keychain. It ships after v2.0
+and is listed here so you can compare.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Covered** by packs; fails open | As Developer. |
+| Helpful bypass | **Partly covered** | |
+| Agent obtains a brokered credential | **Partly covered** | The key is in the keychain; a same-user script can read it (Linux). |
+| Agent uses an external service beyond rules | **Partly covered** | There is no boundary; workflow only. |
+| Agent erases or rewrites the audit | Not covered | As Developer. |
+| Agent's own script does local damage | Not covered | |
+| Agent reads your other files and logins | Not covered | |
+| Data exfiltration to arbitrary hosts | Not covered | |
+| Nested or patched agent without hooks | Not covered | |
+| Model-provider login used or copied by the agent | Not covered | |
+| MCP servers | Not covered | |
+| Attacker with root | Not covered | |
+| Tools without a hook | Not covered | |
+
+## Setup: Locked, on a person's account
+
+An admin installs saiife as root (`saiife system install`): managed hooks, a
+root-owned config, a daemon with its own user and the vault, and an audit the
+agent cannot write. The agent runs as you.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Covered**; fails closed | The gaps are in the [fail-closed matrix](#fail-closed-matrix). |
+| Helpful bypass | **Covered** | Managed settings outrank user and project ones and are root-owned. |
+| Agent obtains a brokered credential | **Covered** once imported | A credential that was never imported is still readable (`saiife secret import` moves them into the vault). |
+| Agent uses an external service beyond rules | **Covered** for brokered services | The daemon checks every call against your policy. |
+| Agent erases or rewrites the audit | **Covered** against the agent; **detected** against root with [forwarding](forwarding.md) | |
+| Agent's own script does local damage (`rm -rf` inside a script) | **Not covered** | Damage reaches your whole home. |
+| Agent reads your other files and logins (SSH keys, browser data, git credentials) | **Not covered** beyond `core.secrets` | |
+| Data exfiltration to arbitrary hosts | Not covered | |
+| Nested or patched agent without hooks | Not covered | It has no keys and writes no audit. |
+| Model-provider login used or copied by the agent | **Not covered, by design** | The agent holds its own model login. |
+| MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
+| Attacker with root | **Detected** with forwarding | |
+| Tools without a hook (Codex hosted web search) | Not covered | Not visible to any hook. |
+
+## Setup: Locked, on a dedicated account
+
+The same install, but the agent runs as a separate account (for example
+`agent-shop`) that has no login shell and none of your credentials. This is
+the recommended setup for unattended agents.
+
+| Threat | Coverage | Why |
+| --- | --- | --- |
+| Mistake | **Covered**; fails closed | |
+| Helpful bypass | **Covered** | |
+| Agent obtains a brokered credential | **Covered** | The account holds no other credentials. |
+| Agent uses an external service beyond rules | **Covered** | |
+| Agent erases or rewrites the audit | **Covered** against the agent; **detected** against root with forwarding | |
+| Agent's own script does local damage | **Not covered** | Damage is limited to what the agent account can write. |
+| Agent reads the person's other files and logins | **Covered by setup** | The account does not have them. |
+| Data exfiltration to arbitrary hosts | **Partly covered** with the [egress recipe](egress.md) (Linux); otherwise not covered | |
+| Nested or patched agent without hooks | Not covered | No keys, no audit. |
+| Model-provider login used or copied by the agent | **Not covered, by design**, unless the agent uses a local model (Ollama, vLLM): then there is no key | |
+| MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
+| Attacker with root | **Detected** with forwarding | |
+| Tools without a hook | Not covered | |
+
+What still applies in every setup: the guard's own limits (see
+[Limits of the guard as a whole](#limits-of-the-guard-as-a-whole) and each
+pack's "Not covered" section), such as `cd` not being tracked, dynamic
+program names and recursive reads of folders.
+
+## Fail-closed matrix
+
+In locked mode saiife fails closed. These are the cases where an agent's own
+hook machinery can still let a call run. saiife answers well inside the
+timeout (an internal deadline of 3 s), so the "runs" cells need the parent
+process itself to die or hang.
+
+| Failure | Claude Code | Codex | Gemini CLI |
+|---|---|---|---|
+| saiife reports an error (exit 2 and a reason) | blocked | blocked | blocked |
+| guard engine crash | blocked (a worker isolates it; the parent denies) | blocked (same) | blocked (same) |
+| `check` parent killed or crashes | blocked (`onFailure`) | **runs** | blocked if the exit code is not 0 or 1 (unverified for signals) |
+| hook timeout (10 s) | blocked | **runs** | **runs** |
+| daemon down or not answering in 2 s | blocked (saiife denies) | blocked | blocked |
+| binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway | **runs** | possibly blocked (exit 127, unverified) |
+
+## How much a record proves
+
+- Connector, approval, secret, policy, daemon and checkpoint records are
+  written by the daemon from its own knowledge. They are authoritative.
+- Guard records are a claim by a process running as the agent's user that it
+  judged a payload. A determined agent can add records for calls it never
+  made, or skip the hooks. It cannot remove or change records once written.
+  The report labels guard records "reported by the agent's hook" and
+  connector records "seen by saiife".
+- Root can stop the daemon, read the vault, rewrite the audit and sign new
+  checkpoints with the local key. The only defense is
+  [forwarding](forwarding.md): a copy elsewhere keeps the checkpoints root
+  signed before the rewrite, and `saiife audit verify --external` shows the
+  difference. The audit is tamper-proof against the agent and tamper-evident
+  against root, provided logs are forwarded.
+
+## How the developer setup works, in short
 
 - Before the agent runs a command or touches a file, it asks saiife. saiife
   blocks known-dangerous actions and lets everything else run.
@@ -29,44 +200,19 @@ Only v1 exists today. v2 and v3 are designed but not built.
 - If saiife breaks or is too slow, the agent's action runs anyway ("fails
   open"). This is on purpose while a person is nearby: a broken guard should
   not stop work. Such cases are recorded as `error_allowed` in the audit log
-  where saiife can record them.
+  where saiife can record them. Locked mode fails closed (`error_denied`).
 - saiife runs as your own user. Anything you can do, the agent can do, so a
   determined agent can get around it.
 
-## Setup 1: v1 with a person nearby
-
-You use the agent and watch what it does, and confirm risky steps when the
-agent asks. This is what v1 is built for.
-
-| Threat | Coverage | Why |
-| --- | --- | --- |
-| Mistake | **Covered** | The packs block the common destructive and secret-reading actions. Each pack lists what it does not catch. |
-| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways to turn saiife off. `saiife status` shows a removed or changed hook. You are there to notice. |
-| Determined bypass | **Not covered** | An agent that writes and runs its own script, or uses a key it found, is not seen. |
-
-## Setup 2: v1 on auto mode or unattended
-
-The agent runs commands without asking you, or runs while nobody watches.
-
-| Threat | Coverage | Why |
-| --- | --- | --- |
-| Mistake | **Partly covered** | The packs still block known-dangerous actions. But if saiife fails, the action runs and nobody sees it until someone reads the audit log. |
-| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) blocks the usual ways, but an agent that keeps trying may find a way the pack does not know. `saiife status` shows it only when someone runs it. |
-| Determined bypass | **Not covered** | As above. |
-
-For agents that run unattended, v1 is not enough on its own. That needs v2
-(an admin lock the agent cannot remove, and keys the agent never sees),
-which is not built yet. Until then, run `saiife status` and read the audit
-report regularly.
-
-## Not covered by v1
+## Not covered by the developer setup
 
 - **A determined agent running as your user.** It can write and run a script
   that reads a secret or rewrites the hook settings. saiife cannot stop this.
   `saiife status` shows changed hooks and settings afterwards.
-- **External services.** saiife cannot tell what an HTTP call does, so it has
-  no per-service rules (Shopify, HubSpot and so on). It does block reading
-  secrets out of cloud tools and secret managers.
+- **External services.** Without locked mode saiife cannot tell what an HTTP
+  call does, so it has no per-service rules (Shopify, HubSpot and so on). It
+  does block reading secrets out of cloud tools and secret managers. Locked
+  mode brokers them: see [Connectors](connectors/README.md).
 - **Tools the hook does not cover**, such as web fetch and MCP tools. Each
   agent page lists which tools are judged:
   [Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
@@ -100,8 +246,8 @@ These apply to every pack:
   `saiife audit verify` will call it intact. It catches accidental edits and
   clumsy tampering, not a deliberate rewrite.
 - Cutting off the newest records cannot be detected without a checkpoint kept
-  somewhere the agent cannot write. That needs locked mode (v2) with a forwarded
-  checkpoint; developer mode has none.
+  somewhere the agent cannot write. That needs locked mode with a forwarded
+  copy (`saiife audit verify --external`); developer mode has none.
 
 ## Lockdown (locked mode)
 

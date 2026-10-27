@@ -136,7 +136,7 @@ To use one, run `saiife connect <service>`. It stores the secret (or reuses
 an existing one with `--secret <name>`, if that secret allows the service)
 and writes a policy file that starts deny-all.
 
-## Note for plan 12
+## Answer frame size
 
 The control socket accepts requests of up to 1 MiB, but an answer may be up
 to 16 MiB (`MAX_ANSWER_FRAME`). A client that reads answers must allow for

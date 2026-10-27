@@ -58,10 +58,35 @@ the credential, sends the request and masks the answer. So the agent never
 holds a credential for a brokered service; it holds its own model-provider
 login unless you run a local model. See [Connectors](docs/connectors/README.md).
 
+## Locked mode, audit forwarding and policy checks
+
+On supported Linux an admin can install saiife as root (`saiife system
+install`): the agent cannot turn the guard off, the audit is written by a
+daemon the agent cannot touch, and locked mode fails closed. The agent never
+holds a credential for a brokered service; it holds its own model-provider
+login unless you run a local model.
+
+- Send a copy of the audit elsewhere so that a rewrite by root shows:
+  [Audit forwarding](docs/forwarding.md) (syslog, file, HTTPS), checked with
+  `saiife audit verify --external <file|dir>`.
+- Who may read the audit, and `audit.query` for everyone else:
+  [Auditors](docs/auditors.md).
+- For a dedicated agent account, limit where it can send data:
+  [Egress recipe](docs/egress.md) (nftables, Linux).
+- Check a policy before you load it: `saiife policy check <config.toml>`
+  validates it, including overlapping scopes; `saiife policy test
+  <config.toml>` runs its `[[example]]` entries and exits 1 on a mismatch;
+  `saiife policy show [--effective] [--user <name>]` prints the merged policy
+  and its hash; `saiife policy reload` (admin) reloads it.
+
 ## What it covers
 
 - [Threat coverage](docs/threats.md): which risks saiife covers, and which it
-  does not, for each way of working.
+  does not, for each of the four setups (developer, personal broker, locked on
+  a person's account, locked on a dedicated account).
+- [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
+  the [egress recipe](docs/egress.md).
+- [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).

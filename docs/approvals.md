@@ -168,6 +168,11 @@ ask` lists. In v2.0 only the `core.git` and `db.postgres` packs and the
 Kubernetes delete-namespace rule have ids, so only those can be put in `ask`. A
 project config cannot define packs or ids.
 
+The design spec's example guard record (section 8.5) shows `"rule":"force-push"`.
+Real records carry `rule` as the matched expression and `rule_id` as the
+stable name (`core.git/force-push`); use `rule_id` in `ask`, scripts and
+SIEM queries.
+
 ## Connector requests
 
 `saiife api <service> <operation> ...` exits with these codes:

@@ -50,7 +50,7 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Keys only `config.toml` may set; a drop-in setting one is `Invalid`.
 const CONFIG_ONLY: &[&str] = &[
-    "version", "locked", "daemon", "admin", "audit", "approval", "notify", "gateway",
+    "version", "locked", "daemon", "admin", "audit", "approval", "notify", "gateway", "doctor",
 ];
 const CONFIG_ONLY_GUARD: &[&str] = &["budget_ms", "fail"];
 

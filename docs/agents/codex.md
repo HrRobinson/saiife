@@ -101,7 +101,24 @@ is not running.
 
 Lock label: **unverified**. The [lock-check](../lock-check.md) for Codex has
 not been run with a logged-in account yet, so we do not know whether
-Codex can be locked.
+Codex can be locked. Until it has, treat Codex as running in the Developer
+setup even on a locked machine, and do not rely on the lock for it
+([threats](../threats.md)).
+
+Fail-closed matrix (Codex column, from the design; unverified live):
+
+| Failure | Result |
+|---|---|
+| saiife reports an error (exit 2 and a reason) | blocked |
+| guard engine crash | blocked (a worker isolates it; the parent denies) |
+| `check` parent killed or crashes | **runs** |
+| hook timeout (10 s) | **runs** |
+| daemon down or not answering in 2 s | blocked |
+| binary missing | **runs** |
+
+The three "runs" rows need the hook process itself to die, hang or be gone;
+saiife answers well inside the timeout (an internal deadline of 3 s).
+`saiife doctor` lists these gaps.
 
 ## Not yet verified live
 

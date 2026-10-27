@@ -29,6 +29,8 @@ pub struct SystemConfig {
     pub approval: ApprovalCfg,
     #[serde(default)]
     pub notify: NotifyCfg,
+    #[serde(default, skip_serializing_if = "DoctorCfg::is_default")]
+    pub doctor: DoctorCfg,
     #[serde(default)]
     pub gateway: GatewayCfg,
     #[serde(default)]
@@ -482,6 +484,21 @@ impl Event {
             Event::ForwardFailing => "forward_failing",
             Event::Lockdown => "lockdown",
         }
+    }
+}
+
+/// `[doctor]`: hints for `saiife doctor`; no effect on enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorCfg {
+    /// Users that are dedicated agent accounts although they have a login
+    /// shell. Accounts without one (`nologin`, `false`) are always dedicated.
+    pub dedicated_accounts: Vec<String>,
+}
+
+impl DoctorCfg {
+    fn is_default(&self) -> bool {
+        self.dedicated_accounts.is_empty()
     }
 }
 
