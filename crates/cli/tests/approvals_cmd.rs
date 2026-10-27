@@ -14,7 +14,8 @@
 //! a fixed passwd/group text naming the test user, `boss` and `carol`
 //! (4343, not an approver); the daemon looks `boss` up by uid itself.
 //! The upstream is a loopback HTTPS mock; nothing leaves 127.0.0.1.
-#![cfg(target_os = "linux")]
+// Debug builds only: the CLI honours SAIIFE_TEST_PKTTYAGENT only there, so a release test could start the real pkttyagent.
+#![cfg(all(target_os = "linux", debug_assertions))]
 #![allow(dead_code)]
 
 mod common;

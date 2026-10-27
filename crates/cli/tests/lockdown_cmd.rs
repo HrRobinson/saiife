@@ -2,7 +2,8 @@
 //! temp dirs, the CLI and the managed hook as separate processes. Nothing
 //! leaves loopback (no connector call reaches a network: lockdown denies
 //! at step 2); signals go to the test's own child through a syscall.
-#![cfg(target_os = "linux")]
+// Debug builds only: the CLI honours SAIIFE_TEST_PKTTYAGENT only there, so a release test could start the real pkttyagent.
+#![cfg(all(target_os = "linux", debug_assertions))]
 
 mod common;
 
