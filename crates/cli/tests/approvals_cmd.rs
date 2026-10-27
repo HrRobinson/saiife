@@ -537,6 +537,19 @@ impl World {
     }
 
     /// Wait (at most 10 s) for the `approval` record of `action` for `id`.
+    /// The `lockdown` record with `rule`, once written.
+    fn wait_lockdown_record(&self, rule: &str) -> Value {
+        let mut found = None;
+        wait_for(Duration::from_secs(10), || {
+            found = self
+                .records()
+                .into_iter()
+                .find(|r| r["kind"] == "lockdown" && r["rule"] == rule);
+            found.is_some()
+        });
+        found.unwrap_or_else(|| panic!("no lockdown record with {rule}: {:?}", self.records()))
+    }
+
     fn wait_record(&self, id: u64, action: &str) -> Value {
         let mut found = None;
         wait_for(Duration::from_secs(10), || {
@@ -606,6 +619,9 @@ impl World {
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
+            // Never the real /usr/bin/pkttyagent: a missing one by
+            // default (tests that want an agent set a fake).
+            .env("SAIIFE_TEST_PKTTYAGENT", self.path().join("no-pkttyagent"))
             .stdin(Stdio::null())
             .arg(cmd)
             .arg("--system-config")
@@ -857,6 +873,20 @@ fn refusal_prints_rule_and_exit_2() {
         "{}",
         stderr(&o)
     );
+    // What is approved is printed before any prompt, and with no
+    // pkttyagent (env cleared: a terminal-only session) a hint says so.
+    assert!(
+        stderr(&o).contains(&format!(
+            "saiife: approving request #{id}: connector erp invoices.create"
+        )),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("no-pkttyagent is missing"),
+        "{}",
+        stderr(&o)
+    );
     assert_eq!(w.state(id), Some(State::Pending));
     assert!(w.m.hits().is_empty());
     // polkit was told what is approved.
@@ -955,6 +985,56 @@ fn pkttyagent_started_and_stopped_for_same_uid_reauth() {
         .exists()),
         "the fake pkttyagent {pid} is still running"
     );
+}
+
+/// `lockdown off` by an approver who is not an admin needs polkit
+/// re-authentication: authorized turns it off, denied keeps it on
+/// (`reauth_failed`); root turns it off without one.
+#[test]
+fn lockdown_off_by_an_approver_needs_reauth() {
+    let w = world();
+    w.own_reauth(true);
+    let agent = fake_agent(w.path());
+    let lockdown = |args: &[&str]| {
+        let mut cmd = w.cli_cmd("lockdown", args);
+        cmd.env("SAIIFE_TEST_PKTTYAGENT", &agent);
+        cmd.output().unwrap()
+    };
+    ok(&lockdown(&["on", "--scope", "connectors"]));
+    let o = lockdown(&["off"]);
+    ok(&o);
+    assert!(
+        stderr(&o).contains("turning lockdown off"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(w.ctx.lockdown.get().is_none());
+    assert_eq!(
+        *w.reauth.details.lock().unwrap(),
+        vec!["lockdown off".to_string()]
+    );
+    // The CLI started its agent first.
+    assert!(w.path().join("agent.pid").exists());
+
+    ok(&lockdown(&["on", "--scope", "connectors"]));
+    w.own_reauth(false);
+    let o = lockdown(&["off"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("refused (reauth_failed)"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(w.ctx.lockdown.get().is_some(), "still on");
+    // The refusal is on record.
+    let rec = w.wait_lockdown_record("reauth_failed");
+    assert_eq!(rec["decision"], "deny", "{rec}");
+    assert_eq!(rec["action"], "off", "{rec}");
+
+    // Root needs no re-authentication.
+    let r = w.op(0, "lockdown.set", json!({"on": false}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(w.ctx.lockdown.get().is_none());
 }
 
 #[test]

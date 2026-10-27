@@ -368,7 +368,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 
 /// The re-authentication of a caller whose process start time is not
 /// known: available as the real one says, but every check is an error.
-struct NoStartTime<'a>(&'a dyn Reauth);
+pub(crate) struct NoStartTime<'a>(pub(crate) &'a dyn Reauth);
 
 impl Reauth for NoStartTime<'_> {
     fn available(&self) -> bool {

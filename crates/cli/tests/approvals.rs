@@ -1975,8 +1975,10 @@ fn chain_break_notifies_at_start() {
     assert!(!evs[0].summary.contains(token));
 }
 
-/// Lockdown on and off by an approver each queue one `lockdown`; a refused
-/// attempt queues none.
+/// Lockdown on by an approver and off by root each queue one `lockdown`; a
+/// refused attempt queues none. An approver who is not an admin cannot turn
+/// it off under `same_user = "deny"` (no re-authentication):
+/// `reauth_required`.
 #[test]
 fn lockdown_notifies() {
     use saiife_policy::Event::Lockdown;
@@ -1995,6 +1997,12 @@ fn lockdown_notifies() {
     assert_eq!(r["ok"], false, "{r}");
     assert_eq!(w.events(Lockdown).len(), 1);
     let r = w.op(BOSS, "lockdown.set", json!({"on": false}));
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(r["error"], "forbidden", "{r}");
+    assert_eq!(r["rule"], "reauth_required", "{r}");
+    assert!(w.ctx.lockdown.get().is_some(), "still on");
+    assert_eq!(w.events(Lockdown).len(), 1);
+    let r = w.op(0, "lockdown.set", json!({"on": false}));
     assert_eq!(r["ok"], true, "{r}");
     let evs = w.events(Lockdown);
     assert_eq!(evs.len(), 2, "{evs:?}");

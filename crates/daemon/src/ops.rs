@@ -582,7 +582,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
-        OP_LOCKDOWN_SET => crate::lockdown::set(ctx, peer, req).await,
+        OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,

@@ -61,6 +61,8 @@ fn base_cmd(d: &TestDaemon) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env("SAIIFE_DATA_DIR", d.path().join("data"))
         .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+        // Never the real /usr/bin/pkttyagent.
+        .env("SAIIFE_TEST_PKTTYAGENT", d.path().join("no-pkttyagent"))
         .current_dir(d.path().join("project"))
         .stdin(Stdio::null());
     c
@@ -248,8 +250,11 @@ fn non_approver_off_refused_and_recorded() {
     assert!(!d.state_dir().join("state/lockdown.json").exists());
 }
 
+/// An approver who is not an admin may turn lockdown on, but not off
+/// without re-authentication: under `same_user = "deny"` that is refused
+/// (`reauth_required`, exit 2, a deny record) and lockdown stays on.
 #[test]
-fn approver_may_set_lockdown() {
+fn approver_may_set_lockdown_but_not_lift_it_without_reauth() {
     let d = TestDaemon::start(Opts {
         extra: format!(
             "[admin]\ngroups = [\"saiife-no-such-group\"]\n\n[approval]\napprovers = [{:?}]\n",
@@ -261,10 +266,18 @@ fn approver_may_set_lockdown() {
     let o = lockdown(&d, &["on", "--scope", "connectors"]);
     assert_eq!(code(&o), 0, "{} / {}", stderr(&o), d.stderr_text());
     let o = lockdown(&d, &["off"]);
-    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("refused (reauth_required)"),
+        "{}",
+        stderr(&o)
+    );
     let recs = lockdown_records(&d);
     assert_eq!(recs.len(), 2, "{recs:?}");
-    assert!(recs.iter().all(|r| r["decision"] == "allow"), "{recs:?}");
+    assert_eq!(recs[0]["decision"], "allow", "{recs:?}");
+    assert_eq!(recs[1]["decision"], "deny", "{recs:?}");
+    assert_eq!(recs[1]["rule"], "reauth_required", "{recs:?}");
+    assert!(stdout(&lockdown(&d, &[])).contains("lockdown: on"));
 }
 
 #[test]

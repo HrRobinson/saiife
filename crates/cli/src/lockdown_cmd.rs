@@ -1,8 +1,11 @@
 //! `saiife lockdown [on|off]` (spec §6.18): the kill switch. `on` denies
 //! every connector request (`--scope connectors`) or also every hook call
 //! (`--scope all`, the default); `off` lifts it; no subcommand shows the
-//! state. For root, `[admin] groups` and `[approval] approvers`. Linux
-//! only. Exit codes: 0 ok, 2 refused, 5 the daemon cannot be reached.
+//! state. For root, `[admin] groups` and `[approval] approvers`; `off` by
+//! an approver who is not an admin needs polkit re-authentication
+//! (`same_user = "reauth"`), so the CLI says what it turns off and starts
+//! `pkttyagent` first (as `approve` does). Linux only. Exit codes: 0 ok,
+//! 2 refused, 5 the daemon cannot be reached.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -80,6 +83,14 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
         Some(LockdownAction::Off) => {
             let mut args = Map::new();
             args.insert("on".into(), json!(false));
+            // Root never re-authenticates; anyone else may be asked for a
+            // password, so say first what it is for.
+            let _agent = if rustix::process::geteuid().is_root() {
+                None
+            } else {
+                eprintln!("saiife: turning lockdown off (polkit may ask for your password)");
+                crate::approvals_cmd::start_agent()
+            };
             call(&config, "lockdown.set", args).map(|a| shown(&a, "lockdown"))
         }
     };

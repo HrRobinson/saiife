@@ -2,10 +2,13 @@
 //! the approver's side of ask-gated requests. Linux only.
 //!
 //! Exit codes: 0 done, 2 refused (the rule is printed), 5 the daemon
-//! cannot be reached. Before `approve` the CLI starts `pkttyagent` when
-//! the request is the caller's own (so `same_user = "reauth"` applies) and
-//! there is no graphical session to ask in (decision 7); it stops it, its
-//! own child, afterwards.
+//! cannot be reached (or could not record the decision: `unrecorded`).
+//! Before `approve` the CLI prints what is approved, then starts
+//! `pkttyagent` when the request is the caller's own (so
+//! `same_user = "reauth"` applies) and there is no graphical session to
+//! ask in (decision 7); it stops it, its own child, afterwards (SIGTERM,
+//! then SIGKILL after 1 s). `approvals show --json` prints the whole
+//! masked request: `--full` only changes the text output.
 
 #[cfg(not(target_os = "linux"))]
 use std::{path::PathBuf, process::ExitCode};
@@ -36,7 +39,8 @@ pub enum ApprovalsAction {
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
-        /// The whole masked body, not the first 2000 characters.
+        /// The whole masked body, not the first 2000 characters (text
+        /// output; `--json` always has the whole masked body).
         #[arg(long)]
         full: bool,
     },
@@ -70,6 +74,8 @@ pub fn decide(_config: Option<PathBuf>, _d: Decision) -> ExitCode {
     ExitCode::from(5)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::start_agent;
 #[cfg(target_os = "linux")]
 pub use linux::{decide, run};
 
@@ -160,7 +166,9 @@ mod linux {
         let s = |k: &str| ans.get(k).and_then(Value::as_str).unwrap_or_default();
         let message = sanitize(s("message"));
         match s("error") {
-            "unavailable" => Err(unavailable(message)),
+            // `unrecorded`: the decision is made but not on record; like
+            // an unreachable daemon, the caller must check (exit 5).
+            "unavailable" | "unrecorded" => Err(unavailable(message)),
             _ if !s("rule").is_empty() => Err(Stop::Refused(vec![
                 format!("refused ({})", sanitize(s("rule"))),
                 message,
@@ -399,8 +407,11 @@ mod linux {
         }
         // The re-authentication prompt is for an approval only, and only
         // when the request is the caller's own (`same_user = "reauth"`).
+        // What is approved is printed first, so a password prompt is never
+        // answered blind.
         let _agent = if action == "approve" {
             let shown = call(&mut c, "approval.show", args([("request", json!(id))]))?;
+            eprintln!("saiife: approving {}", request_summary(id, &shown["item"]));
             let uid = shown["item"]["uid"].as_u64();
             if uid == Some(u64::from(rustix::process::getuid().as_raw())) {
                 start_agent()
@@ -414,6 +425,21 @@ mod linux {
         let state = ans.get("state").and_then(Value::as_str).unwrap_or(action);
         outln!("request #{id} {state}");
         Ok(())
+    }
+
+    /// `request #<id>: <type> <service operation | command> [amount]`,
+    /// sanitized, for the line printed before a password prompt.
+    fn request_summary(id: u64, item: &Value) -> String {
+        let s = |k: &str| sanitize(item[k].as_str().unwrap_or(""));
+        let mut out = format!("request #{id}: {} {}", s("type"), what(item));
+        if let Some(a) = item["amount"].as_object() {
+            out.push_str(&format!(
+                " (amount {} {} minor units)",
+                a.get("minor").map(|v| v.to_string()).unwrap_or_default(),
+                sanitize(a.get("currency").and_then(Value::as_str).unwrap_or(""))
+            ));
+        }
+        out
     }
 
     /// `pkttyagent` is for a terminal-only session: `SSH_TTY` is set, or
@@ -435,23 +461,46 @@ mod linux {
         PathBuf::from(PKTTYAGENT)
     }
 
-    /// Our own `pkttyagent` child; killed and reaped through its handle
-    /// when dropped (never by name).
-    struct Agent(Child);
+    /// How long a stopped `pkttyagent` gets to exit on SIGTERM.
+    const AGENT_STOP: Duration = Duration::from_secs(1);
+
+    /// Our own `pkttyagent` child; stopped and reaped through its handle
+    /// when dropped (never by name): SIGTERM, then SIGKILL after 1 s.
+    pub(crate) struct Agent(Child);
 
     impl Drop for Agent {
         fn drop(&mut self) {
+            if let Ok(None) = self.0.try_wait() {
+                // Our own child's pid (not reaped yet, so not reused).
+                if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+                }
+                let deadline = Instant::now() + AGENT_STOP;
+                while Instant::now() < deadline {
+                    if !matches!(self.0.try_wait(), Ok(None)) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
     }
 
-    fn start_agent() -> Option<Agent> {
+    /// Start `pkttyagent` for this process when the session is
+    /// terminal-only; `None` when it is not needed or cannot run (then a
+    /// hint says how a prompt could appear).
+    pub(crate) fn start_agent() -> Option<Agent> {
         if !wants_agent(|k| std::env::var_os(k)) {
             return None;
         }
         let path = agent_path();
         if !path.is_file() {
+            eprintln!(
+                "saiife: hint: {} is missing, so no password prompt can appear in this terminal; install polkit's pkttyagent, or approve from a graphical session",
+                path.display()
+            );
             return None;
         }
         let child = Command::new(path)
@@ -463,7 +512,10 @@ mod linux {
             .stderr(Stdio::inherit())
             .spawn()
             .ok()?;
-        // Let it register with polkit before the daemon asks.
+        // Let it register with polkit before the daemon asks. pkttyagent
+        // has no readiness signal; 150 ms is enough for a local polkitd,
+        // and a late agent only means polkit finds none (reauth_unavailable,
+        // the safe side).
         std::thread::sleep(Duration::from_millis(150));
         Some(Agent(child))
     }

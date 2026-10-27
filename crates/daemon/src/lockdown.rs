@@ -4,10 +4,11 @@
 //! it, so it survives a restart. An unreadable file fails closed: scope
 //! `all`, reason `lockdown file unreadable`.
 
-use crate::ops::{now_ts, Ctx};
+use crate::approvers::Refusal;
+use crate::ops::{now_ts, Conn, Ctx};
 use saiife_audit::DecisionKind;
 use saiife_broker::pipeline::{LockScope, Lockdown};
-use saiife_ipc::msg::{err, ok, ErrorCode, Request};
+use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request};
 use saiife_ipc::peer::{comm, PeerCred};
 use serde_json::{json, Map, Value};
 use std::io::{self, Read, Write};
@@ -219,43 +220,68 @@ fn clean_reason(s: &str) -> String {
         .collect()
 }
 
-/// Who may approve (`[approval] approvers`: user names and `group:<name>`).
-/// A local helper until the approval module's own check replaces it. Any
-/// lookup failure is no.
-async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
-    let approvers = match ctx.policy().system {
-        Some(s) => s.approval.approvers.clone(),
-        None => return false,
+/// The polkit `--detail request` of `lockdown off`.
+pub const OFF_DETAIL: &str = "lockdown off";
+
+/// May the approver `conn` (not an admin) turn lockdown off? Lockdown has
+/// no requester, so the approver is treated as deciding its own request:
+/// under `same_user = "deny"` it is refused (`reauth_required`), under
+/// `"reauth"` it must pass polkit re-authentication (an unavailable one
+/// refuses). Runs off the runtime thread (the prompt can take 120 s).
+async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn) -> Result<(), Refusal> {
+    let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
+        return Err(Refusal::NotApprover);
     };
-    if approvers.is_empty() {
-        return false;
-    }
-    let Some(name) = ctx.name_of(uid).await else {
-        return false;
+    let Some(name) = ctx.name_of(conn.peer.uid).await else {
+        return Err(Refusal::NotApprover);
     };
-    let mut groups: Option<Vec<String>> = None;
-    for a in &approvers {
-        match a.strip_prefix("group:") {
-            Some(g) => {
-                if groups.is_none() {
-                    groups = Some(ctx.groups_of(&name).await);
-                }
-                if groups.iter().flatten().any(|x| x == g) {
-                    return true;
-                }
-            }
-            None if *a == name => return true,
-            None => {}
-        }
-    }
-    false
+    let c = Arc::clone(ctx);
+    let peer = conn.peer;
+    let start = conn.start_time;
+    tokio::task::spawn_blocking(move || {
+        // Without the caller's start time re-authentication cannot run
+        // (fail closed); `same_user = "deny"` refuses before it matters.
+        let no_start = crate::approval_ops::NoStartTime(c.reauth.as_ref());
+        let reauth: &dyn crate::reauth::Reauth = match start {
+            Some(_) => c.reauth.as_ref(),
+            None => &no_start,
+        };
+        crate::approvers::may_decide(
+            &cfg,
+            c.directory.as_ref(),
+            &name,
+            peer.uid,
+            reauth,
+            &peer,
+            start.unwrap_or(0),
+            c.proc.as_ref(),
+            &c.reauth_cooldowns,
+            OFF_DETAIL,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(Refusal::ReauthError(e.to_string())))
 }
 
-/// `lockdown.set {on, scope?, reason?}`: root, `[admin] groups` and
-/// approvers only. Everyone else gets `forbidden` and a `lockdown` record
-/// with decision `deny`.
-pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
+/// The rule and message of a refused `lockdown off` by an approver.
+fn off_refusal(r: &Refusal) -> (&'static str, String) {
+    match r {
+        Refusal::SameUserDenied => (
+            "reauth_required",
+            "lockdown off needs root, an [admin] group, or an approver who re-authenticates (same_user = \"reauth\")".into(),
+        ),
+        other => (other.rule(), other.to_string()),
+    }
+}
+
+/// `lockdown.set {on, scope?, reason?}`. On: root, `[admin] groups` and
+/// approvers. Off: root and `[admin] groups`, or an approver who passes
+/// polkit re-authentication (`same_user = "reauth"`), since turning the
+/// kill switch off is as strong as approving. Everyone else gets
+/// `forbidden` and a `lockdown` record with decision `deny`.
+pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
+    let peer: &PeerCred = &conn.peer;
     let Some(on) = req.args.get("on").and_then(Value::as_bool) else {
         return err(
             id,
@@ -282,7 +308,8 @@ pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     };
     let action = if on { "on" } else { "off" };
 
-    let allowed = ctx.is_admin(peer.uid).await || is_approver(ctx, peer.uid).await;
+    let admin = ctx.is_admin(peer.uid).await;
+    let allowed = admin || crate::approval_ops::is_approver(ctx, peer.uid).await;
     let mut rec = ctx.record("lockdown", action);
     rec.uid = Some(peer.uid);
     rec.user = ctx.name_of(peer.uid).await;
@@ -307,6 +334,25 @@ pub async fn set(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             ErrorCode::Forbidden,
             "lockdown is for root, [admin] groups and [approval] approvers",
         );
+    }
+    if !on && !admin {
+        if let Err(r) = may_turn_off(ctx, conn).await {
+            let (rule, why) = off_refusal(&r);
+            rec.decision = DecisionKind::Deny;
+            rec.rule = Some(rule.into());
+            rec.reason = Some(why.clone());
+            if let Err(e) = ctx.writer.append(rec).await {
+                eprintln!("saiifed: warning: cannot write lockdown record: {e}");
+            }
+            let mut m = Map::new();
+            m.insert("rule".into(), rule.into());
+            return err_with(
+                id,
+                ErrorCode::Forbidden,
+                &format!("refused ({rule}): {why}"),
+                m,
+            );
+        }
     }
 
     let next = on.then(|| Lockdown {

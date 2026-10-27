@@ -110,9 +110,15 @@ switch for when something looks wrong and you want the agents to stop first and
 ask questions later. `saiife lockdown off` lifts it, and `saiife lockdown`
 shows the state.
 
-- **Who.** Root, users in an `[admin]` group and `[approval] approvers`. Anyone
-  else is refused, and the refusal is recorded. An agent running as its own
-  user cannot turn lockdown off.
+- **Who.** Turning it on: root, users in an `[admin]` group and `[approval]
+  approvers`. Turning it off: root and users in an `[admin]` group, or an
+  approver who passes polkit re-authentication (`same_user = "reauth"`; the
+  CLI says what it is for and starts `pkttyagent` first). Under
+  `same_user = "deny"`, or when re-authentication is unavailable, an approver
+  who is not an admin cannot turn it off (`reauth_required`,
+  `reauth_unavailable`). Anyone else is refused, and every refusal is
+  recorded. So an agent running as an approver's user cannot lift lockdown
+  without the user's password.
 - **`connectors`.** Every connector request is denied (rule `lockdown`), no
   gateway token is issued, and approved requests are not sent. Requests that
   were waiting stay waiting.
