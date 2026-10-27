@@ -9,7 +9,9 @@
 //! examples pass, 1 a mismatch or an invalid policy, 2 a malformed
 //! example, an unknown user or an unreadable or malformed file. `show`
 //! and `reload` (locked mode, Linux): 0 ok, 1 a reload the daemon
-//! rejected, 2 refused, 5 the daemon cannot be reached.
+//! rejected, 2 refused, 5 the daemon cannot be reached (for `show` on a
+//! locked host too: it never falls back to the file there) or a reload
+//! that took effect but could not be recorded.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,10 +28,9 @@ use saiife_policy::{
 };
 use serde_json::Value;
 
+use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
 use crate::eval::{judge_with, Verdict as GuardVerdict};
 use crate::paths::LockedPaths;
-
-const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
 
 /// Where `check` and `test` find users.
 #[derive(Args, Clone, Default)]
@@ -520,6 +521,22 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
     if let Some(code) = show_from_daemon(&config, effective, &user) {
         return code;
     }
+    // No daemon answered. On a locked host (the same test as `saiife
+    // audit`) the file is not the policy in force: never fall back to it.
+    match locked_audit_dir(&config) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            eprintln!(
+                "saiife: cannot reach the saiife daemon; {} says locked = true, so only the daemon can show the policy in force",
+                config.display()
+            );
+            return ExitCode::from(5);
+        }
+        Err(e) => {
+            eprintln!("saiife: {}", crate::text::sanitize(&e));
+            return ExitCode::from(2);
+        }
+    }
     // Developer mode: the file, as far as there is one.
     let cfg = match load_system(&config) {
         Ok(l) => l.config,
@@ -654,16 +671,20 @@ fn reload(config: Option<PathBuf>) -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn stop(s: crate::secret_cmd::linux::Stop) -> ExitCode {
+    let (code, m) = exit_of(s);
+    eprintln!("saiife: {m}");
+    ExitCode::from(code)
+}
+
+/// The exit code and message for a stop. `Unrecorded` (the reload took
+/// effect but is not on record) is exit 5 like an unreachable daemon, as
+/// in `lockdown_cmd` and `approvals_cmd`: the caller must check.
+#[cfg(target_os = "linux")]
+fn exit_of(s: crate::secret_cmd::linux::Stop) -> (u8, String) {
     use crate::secret_cmd::linux::Stop;
     match s {
-        Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m) => {
-            eprintln!("saiife: {m}");
-            ExitCode::from(2)
-        }
-        Stop::Unavailable(m) | Stop::NotFound(m) => {
-            eprintln!("saiife: {m}");
-            ExitCode::from(5)
-        }
+        Stop::Refused(m) | Stop::Forbidden(m) => (2, m),
+        Stop::Unavailable(m) | Stop::NotFound(m) | Stop::Unrecorded(m) => (5, m),
     }
 }
 
@@ -973,5 +994,20 @@ expect = "deny"
         let o = test(&f, &dir());
         assert_eq!(o.code, 1, "{o:?}");
         assert!(o.err.contains("no [[example]] entries to test"), "{o:?}");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stop_tests {
+    use super::*;
+    use crate::secret_cmd::linux::Stop;
+
+    #[test]
+    fn unrecorded_exits_5_like_unavailable() {
+        assert_eq!(exit_of(Stop::Unrecorded("x".into())).0, 5);
+        assert_eq!(exit_of(Stop::Unavailable("x".into())).0, 5);
+        assert_eq!(exit_of(Stop::NotFound("x".into())).0, 5);
+        assert_eq!(exit_of(Stop::Refused("x".into())).0, 2);
+        assert_eq!(exit_of(Stop::Forbidden("x".into())).0, 2);
     }
 }

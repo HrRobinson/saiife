@@ -86,6 +86,16 @@ fn saiife(d: &TestDaemon, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// A `[daemon]` section no real daemon answers on: a socket dir under the
+/// test's temp dir and a user that does not exist, so a fixture never
+/// reaches a daemon running on the host.
+fn no_daemon(dir: &std::path::Path) -> String {
+    format!(
+        "[daemon]\nuser = \"saiife-test-none\"\nsocket_dir = {:?}\n",
+        dir.join("run")
+    )
+}
+
 fn code(o: &Output) -> i32 {
     o.status.code().unwrap_or(-1)
 }
@@ -190,7 +200,7 @@ fn show_asks_the_daemon_even_when_the_file_is_broken() {
 fn developer_mode_show_reads_the_file() {
     let tmp = common::tmp::short_tempdir();
     let cfg = tmp.path().join("config.toml");
-    fs::write(&cfg, "version = 2\n").unwrap();
+    fs::write(&cfg, format!("version = 2\n{}", no_daemon(tmp.path()))).unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["policy", "show", "--user", "nobody-x", "--system-config"])
         .arg(&cfg)
@@ -215,6 +225,48 @@ fn developer_mode_show_reads_the_file() {
     assert_eq!(code(&o), 5, "{}", stderr(&o));
 }
 
+#[test]
+fn locked_show_without_a_daemon_exits_5_not_the_file() {
+    let tmp = common::tmp::short_tempdir();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "version = 2\nlocked = true\n{}[[scope]]\nname = \"from-the-file\"\nusers = [\"nobody-x\"]\n",
+            no_daemon(tmp.path())
+        ),
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["policy", "show", "--user", "nobody-x", "--system-config"])
+        .arg(&cfg)
+        .env("HOME", tmp.path())
+        .current_dir(tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 5, "{} / {}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("cannot reach the saiife daemon")
+            && stderr(&o).contains("locked = true"),
+        "{}",
+        stderr(&o)
+    );
+    // A locked config that cannot be parsed is not developer mode either.
+    fs::write(&cfg, "version = 2\nlocked = [\n").unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["policy", "show", "--user", "nobody-x", "--system-config"])
+        .arg(&cfg)
+        .env("HOME", tmp.path())
+        .current_dir(tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(stdout(&o).is_empty(), "{}", stdout(&o));
+}
+
 /// `policy check` and `test` as CI runs them: the accounts come from files.
 #[test]
 fn check_and_test_binary_with_user_files() {
@@ -226,6 +278,7 @@ fn check_and_test_binary_with_user_files() {
     let text = |expect: &str| {
         format!(
             r#"version = 2
+{daemon}
 [[scope]]
 name = "shop"
 users = ["agent-shop"]
@@ -239,7 +292,8 @@ allow = ["orders:read"]
 user = "agent-shop"
 request = "shopify orders.list"
 expect = "{expect}"
-"#
+"#,
+            daemon = no_daemon(p),
         )
     };
     let run = |sub: &str| {
