@@ -172,6 +172,9 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     cfg.notify
         .validate()
         .map_err(|why| invalid(config_file, why))?;
+    cfg.audit
+        .validate()
+        .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {
         if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
             return Err(invalid(
