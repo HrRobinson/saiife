@@ -26,12 +26,9 @@ pub const REAUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The only environment `pkcheck` gets.
 pub const PKCHECK_PATH_ENV: &str = "/usr/bin:/bin";
 
-/// Where a polkit daemon binary may live (as Task 8's `polkit_present`).
-pub const POLKITD: [&str; 3] = [
-    "/usr/lib/polkit-1/polkitd",
-    "/usr/libexec/polkitd",
-    "/usr/lib/policykit-1/polkitd",
-];
+/// Where a polkit daemon binary may live: the one list shared with
+/// `system install` and `doctor`.
+pub use saiife_system::polkit::POLKITD_PATHS;
 /// pkcheck(1) exit statuses.
 const EXIT_AUTHORIZED: i32 = 0;
 const EXIT_NOT_AUTHORIZED: i32 = 1;
@@ -132,11 +129,11 @@ impl PkCheck {
         PkCheck {
             pkcheck: pkcheck.into(),
             action_file: action_file.into(),
-            polkitd: POLKITD.iter().map(PathBuf::from).collect(),
+            polkitd: POLKITD_PATHS.iter().map(PathBuf::from).collect(),
         }
     }
 
-    /// Other polkit daemon locations than [`POLKITD`], for tests.
+    /// Other polkit daemon locations than [`POLKITD_PATHS`], for tests.
     pub fn with_polkitd(mut self, candidates: Vec<PathBuf>) -> PkCheck {
         self.polkitd = candidates;
         self
