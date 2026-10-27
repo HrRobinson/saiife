@@ -177,9 +177,9 @@ pub fn cursor_path(state_dir: &Path, name: &str) -> PathBuf {
 
 /// The last line a target confirmed: its `seq` and the SHA-256 (hex) of
 /// its exact bytes (without the `\n`). The hash tells that line apart from
-/// a line with the same `seq` in a later chain (after a new genesis). A
-/// cursor of this task's first version holds the `seq` alone (`hash`
-/// `None`), and so does a cursor moved past records retention took.
+/// a line with the same `seq` in a later chain (after a new genesis). On
+/// disk the hash is always there; `hash: None` exists only in memory, after
+/// a `backlog_dropped`, and never matches a line (see [`locate`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
     pub seq: u64,
@@ -187,7 +187,8 @@ pub struct Cursor {
 }
 
 /// The cursor; `None` when there is no file yet. The file holds
-/// `"<seq> <sha256 hex>\n"` (or `"<seq>\n"`).
+/// `"<seq> <sha256 hex>\n"`; anything else is an error (the worker then
+/// starts at the oldest line, with a warning).
 pub fn read_cursor(path: &Path) -> Result<Option<Cursor>, String> {
     let mut s = String::new();
     match std::fs::File::open(path) {
@@ -206,16 +207,18 @@ pub fn read_cursor(path: &Path) -> Result<Option<Cursor>, String> {
         .and_then(|p| p.parse::<u64>().ok())
         .ok_or_else(bad)?;
     let hash = match parts.next() {
-        None => None,
         Some(h) if h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => {
-            Some(h.to_string())
+            h.to_string()
         }
-        Some(_) => return Err(bad()),
+        _ => return Err(bad()),
     };
     if parts.next().is_some() {
         return Err(bad());
     }
-    Ok(Some(Cursor { seq, hash }))
+    Ok(Some(Cursor {
+        seq,
+        hash: Some(hash),
+    }))
 }
 
 /// Temp file names are unique per process and write: two workers of the
@@ -223,8 +226,11 @@ pub fn read_cursor(path: &Path) -> Result<Option<Cursor>, String> {
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Write the cursor: a 0600 temp file, fsync, rename, fsync of the dir
-/// (created 0700 when missing).
+/// (created 0700 when missing). A cursor without a hash is refused.
 pub fn write_cursor(path: &Path, c: &Cursor) -> io::Result<()> {
+    let Some(hash) = &c.hash else {
+        return Err(io::Error::other("a cursor needs the hash of its line"));
+    };
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = path
         .parent()
@@ -239,10 +245,7 @@ pub fn write_cursor(path: &Path, c: &Cursor) -> io::Result<()> {
         .unwrap_or_default();
     let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-    let body = match &c.hash {
-        Some(h) => format!("{} {h}\n", c.seq),
-        None => format!("{}\n", c.seq),
-    };
+    let body = format!("{} {hash}\n", c.seq);
     let staged = (|| {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -310,15 +313,15 @@ type Located = (Pos, Option<(u64, u64)>);
 /// Where to go on after `cursor`, reading the log line by line (oldest
 /// file first, never a whole file in memory):
 /// - no cursor: the start of the oldest file;
-/// - the cursor's line is there (same `seq` and hash; a legacy cursor
-///   without a hash: the last line with that `seq`): just after it;
+/// - the cursor's line is there (same `seq` and hash): just after it;
 /// - else, when the oldest `seq` left is past the cursor, retention took
 ///   the cursor's line: the oldest line, and `Some((from, to))` names the
 ///   seqs it took (none when the oldest is the cursor's next `seq`);
 /// - else lines with a `seq` at most the cursor's are there but not its
-///   line: the chain was restarted (a new genesis). Go on at the newest
-///   genesis, or the oldest line when there is none. Nothing is recorded:
-///   nothing the log still holds is skipped on purpose.
+///   line: the chain was restarted (a new genesis), maybe more than once.
+///   Go on at the oldest line: at least once allows the duplicates, but no
+///   chain between the cursor's and the newest may be skipped. Nothing is
+///   recorded.
 ///
 /// `None`: no month file yet.
 fn locate(dir: &Path, cursor: Option<&Cursor>) -> Result<Option<Located>, String> {
@@ -334,7 +337,6 @@ fn locate(dir: &Path, cursor: Option<&Cursor>) -> Result<Option<Located>, String
         return Ok(Some((start, None)));
     };
     let mut matched: Option<Pos> = None;
-    let mut newest_genesis: Option<Pos> = None;
     let mut first_seq: Option<u64> = None;
     let mut buf = Vec::new();
     for f in &files {
@@ -351,7 +353,6 @@ fn locate(dir: &Path, cursor: Option<&Cursor>) -> Result<Option<Located>, String
             if n == 0 {
                 break;
             }
-            let at = off;
             off += n as u64;
             let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
             if blank(line) {
@@ -361,25 +362,14 @@ fn locate(dir: &Path, cursor: Option<&Cursor>) -> Result<Option<Located>, String
                 continue;
             };
             first_seq.get_or_insert(s);
-            if s == 0 {
-                newest_genesis = Some(Pos {
-                    file: f.clone(),
-                    offset: at,
-                });
-            }
-            if s == c.seq {
-                let here = Pos {
+            if matched.is_none()
+                && s == c.seq
+                && c.hash.as_deref().is_some_and(|h| line_hash(line) == h)
+            {
+                matched = Some(Pos {
                     file: f.clone(),
                     offset: off,
-                };
-                match &c.hash {
-                    Some(h) => {
-                        if matched.is_none() && line_hash(line) == *h {
-                            matched = Some(here);
-                        }
-                    }
-                    None => matched = Some(here),
-                }
+                });
             }
         }
     }
@@ -391,8 +381,7 @@ fn locate(dir: &Path, cursor: Option<&Cursor>) -> Result<Option<Located>, String
             let dropped = (s > c.seq.saturating_add(1)).then(|| (c.seq + 1, s - 1));
             (start, dropped)
         }
-        Some(_) => (newest_genesis.unwrap_or(start), None),
-        None => (start, None),
+        Some(_) | None => (start, None),
     }))
 }
 
@@ -513,8 +502,45 @@ async fn stopped(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|v| *v).await;
 }
 
+/// One per target name, kept across its workers: cursor reads and writes
+/// take `lock`, and a write goes to disk only while its worker's generation
+/// is still `gen`. A worker that was aborted (after [`STOP_WAIT`]) in the
+/// middle of a cursor write can so never write after its replacement read
+/// the cursor: its write either landed before that read or is skipped.
+/// The replacement may then start from an older cursor than the one the
+/// old worker last confirmed: duplicates, never a gap.
+#[derive(Default)]
+pub struct CursorGuard {
+    lock: Mutex<()>,
+    gen: std::sync::atomic::AtomicU64,
+}
+
+impl CursorGuard {
+    /// Start a new generation (the previous worker's writes are void).
+    fn next_gen(&self) -> u64 {
+        let _g = lock(&self.lock);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Write `c` if `gen` is still current; `Ok(false)` when skipped.
+    fn write(&self, gen: u64, path: &Path, c: &Cursor) -> io::Result<bool> {
+        let _g = lock(&self.lock);
+        if self.gen.load(std::sync::atomic::Ordering::SeqCst) != gen {
+            return Ok(false);
+        }
+        write_cursor(path, c).map(|()| true)
+    }
+
+    fn read(&self, path: &Path) -> Result<Option<Cursor>, String> {
+        let _g = lock(&self.lock);
+        read_cursor(path)
+    }
+}
+
 struct Worker {
     name: String,
+    guard: Arc<CursorGuard>,
+    gen: u64,
     transport: Box<dyn Transport>,
     audit_dir: PathBuf,
     cursor_path: PathBuf,
@@ -559,8 +585,9 @@ impl Worker {
     /// Never cancelled half-way: a stop is honoured only between steps.
     async fn save_cursor(&self, c: Cursor) {
         let p = self.cursor_path.clone();
-        match blocking(move || write_cursor(&p, &c)).await {
-            Ok(Ok(())) => {}
+        let (guard, gen) = (Arc::clone(&self.guard), self.gen);
+        match blocking(move || guard.write(gen, &p, &c)).await {
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => eprintln!(
                 "saiife: warning: forward {}: cannot write the cursor: {e}",
                 self.name
@@ -571,12 +598,13 @@ impl Worker {
 
     async fn run(mut self) {
         let p = self.cursor_path.clone();
-        let mut cursor = match blocking(move || read_cursor(&p)).await {
+        let guard = Arc::clone(&self.guard);
+        let mut cursor = match blocking(move || guard.read(&p)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) | Err(e) => {
                 // Starting over sends duplicates, never leaves a gap.
                 eprintln!(
-                    "saiife: warning: forward {}: {e}; sending the whole log again",
+                    "saiife: warning: forward {}: {e}; going on at the oldest line (the target gets duplicates)",
                     self.name
                 );
                 None
@@ -605,12 +633,13 @@ impl Worker {
                                     "retention deleted records this target had not received".into(),
                                 );
                             });
-                            let c = Cursor {
+                            // In memory only: no line to hash. A restart
+                            // before the next confirmed send records the
+                            // drop again.
+                            cursor = Some(Cursor {
                                 seq: to,
                                 hash: None,
-                            };
-                            cursor = Some(c.clone());
-                            self.save_cursor(c).await;
+                            });
                         }
                         pos = Some(p);
                     }
@@ -730,13 +759,17 @@ struct Task {
     join: tokio::task::JoinHandle<()>,
 }
 
-impl Task {
-    /// Ask the worker to stop and wait for it (it never stops half-way
-    /// through a cursor write); abort it after [`STOP_WAIT`].
-    async fn stop(self) {
-        let _ = self.stop.send(true);
-        let abort = self.join.abort_handle();
-        if tokio::time::timeout(STOP_WAIT, self.join).await.is_err() {
+/// Ask all `tasks` to stop at once and wait for them (a worker never stops
+/// half-way through a cursor write), all within one [`STOP_WAIT`]; the
+/// ones still running then are aborted.
+async fn stop_tasks(tasks: Vec<Task>) {
+    for t in &tasks {
+        let _ = t.stop.send(true);
+    }
+    let deadline = tokio::time::Instant::now() + STOP_WAIT;
+    for t in tasks {
+        let abort = t.join.abort_handle();
+        if tokio::time::timeout_at(deadline, t.join).await.is_err() {
             abort.abort();
         }
     }
@@ -752,6 +785,7 @@ struct Running {
 struct Inner {
     setup: Option<Setup>,
     running: BTreeMap<String, Running>,
+    guards: BTreeMap<String, Arc<CursorGuard>>,
 }
 
 /// The forwarding workers (`Ctx.forwarders`).
@@ -775,7 +809,7 @@ impl Forwarders {
     /// new or changed one starts from its cursor. A changed target keeps
     /// its cursor. Does nothing before [`Self::configure`].
     pub async fn apply(&self, targets: &BTreeMap<String, ForwardCfg>) {
-        let gone: Vec<Running> = {
+        let gone: Vec<(String, Running)> = {
             let mut g = lock(&self.inner);
             if g.setup.is_none() {
                 return;
@@ -785,15 +819,22 @@ impl Forwarders {
                 .into_iter()
                 .partition(|(name, r)| targets.get(name) == Some(&r.cfg));
             g.running = keep;
-            gone.into_values().collect()
+            gone.into_iter().collect()
         };
-        for r in gone {
-            if let Some(t) = r.task {
-                t.stop().await;
+        let names: Vec<String> = gone.iter().map(|(n, _)| n.clone()).collect();
+        stop_tasks(gone.into_iter().filter_map(|(_, r)| r.task).collect()).await;
+        let mut g = lock(&self.inner);
+        // A worker aborted mid-write writes nothing more.
+        for n in &names {
+            if let Some(guard) = g.guards.get(n) {
+                guard.next_gen();
             }
         }
-        let mut g = lock(&self.inner);
-        let Inner { setup, running } = &mut *g;
+        let Inner {
+            setup,
+            running,
+            guards,
+        } = &mut *g;
         let Some(setup) = setup.as_ref() else {
             return;
         };
@@ -804,8 +845,11 @@ impl Forwarders {
             let task = match (setup.make)(name, cfg) {
                 Ok(transport) => {
                     let (stop_tx, stop) = watch::channel(false);
+                    let guard = Arc::clone(guards.entry(name.clone()).or_default());
                     let w = Worker {
                         name: name.clone(),
+                        gen: guard.next_gen(),
+                        guard,
                         transport,
                         audit_dir: setup.audit_dir.clone(),
                         cursor_path: cursor_path(&setup.state_dir, name),
@@ -845,10 +889,9 @@ impl Forwarders {
     /// cursors stay.
     pub async fn stop_all(&self) {
         let all = std::mem::take(&mut lock(&self.inner).running);
-        for r in all.into_values() {
-            if let Some(t) = r.task {
-                t.stop().await;
-            }
+        stop_tasks(all.into_values().filter_map(|r| r.task).collect()).await;
+        for guard in lock(&self.inner).guards.values() {
+            guard.next_gen();
         }
     }
 
@@ -1424,8 +1467,12 @@ mod tests {
         fw.stop_all().await;
     }
 
-    fn bare(seq: u64) -> Cursor {
-        Cursor { seq, hash: None }
+    /// The cursor on `line(seq)`.
+    fn at(seq: u64) -> Cursor {
+        Cursor {
+            seq,
+            hash: Some(line_hash(line(seq).trim_end().as_bytes())),
+        }
     }
 
     /// A line of chain `tag` (lines of two chains with the same seq differ,
@@ -1442,42 +1489,61 @@ mod tests {
         }
     }
 
+    fn chain(tag: &str, seqs: std::ops::RangeInclusive<u64>) -> String {
+        seqs.map(|s| line_in(tag, s)).collect()
+    }
+
+    fn lines_of_str(log: &str) -> Vec<Vec<u8>> {
+        log.lines().map(|l| l.as_bytes().to_vec()).collect()
+    }
+
     #[tokio::test]
     async fn chain_restart_resumes_on_the_new_chain() {
-        let log: String = (0..=10)
-            .map(|s| line_in("old", s))
-            .chain((0..=3).map(|s| line_in("new", s)))
-            .collect();
-        let new_chain: Vec<Vec<u8>> = (0..=3)
-            .map(|s| line_in("new", s).trim_end().as_bytes().to_vec())
-            .collect();
-        let cases: [(Cursor, Vec<Vec<u8>>); 3] = [
+        let old_new = chain("old", 0..=10) + &chain("new", 0..=3);
+        // Chain A is gone (retention); B and C, each after a restart, are
+        // there.
+        let b_c = chain("B", 0..=5) + &chain("new", 0..=3);
+        // `None`: a cursor file that is not a cursor ("7\n").
+        type Case<'a> = (&'a str, Option<Cursor>, Vec<Vec<u8>>);
+        let cases: [Case<'_>; 4] = [
             // The cursor at the old chain's end: the whole new chain goes.
-            (hashed("old", 10), new_chain.clone()),
+            (
+                &old_new,
+                Some(hashed("old", 10)),
+                lines_of_str(&chain("new", 0..=3)),
+            ),
             // In the middle: the old chain's rest, then the new one.
             (
-                hashed("old", 5),
-                (6..=10)
-                    .map(|s| line_in("old", s).trim_end().as_bytes().to_vec())
-                    .chain(new_chain.clone())
-                    .collect(),
+                &old_new,
+                Some(hashed("old", 5)),
+                lines_of_str(&(chain("old", 6..=10) + &chain("new", 0..=3))),
             ),
-            // The cursor's line is not in the log, but lower seqs are: the
-            // chain restarted; go on at the newest genesis, drop nothing.
-            (hashed("gone", 9), new_chain.clone()),
+            // The cursor's line is gone but lower seqs are there: restarted
+            // chains. Everything from the oldest line goes; no middle chain
+            // is lost, nothing is recorded as dropped.
+            (&b_c, Some(hashed("A", 9)), lines_of_str(&b_c)),
+            // An unparseable cursor: the oldest line on, with a warning.
+            (&old_new, None, lines_of_str(&old_new)),
         ];
-        for (cursor, want) in cases {
+        for (log, cursor, want) in cases {
             let h = H::bare();
-            std::fs::write(h.audit.join("2000-01.jsonl"), &log).unwrap();
-            write_cursor(&cursor_path(&h.state, "a"), &cursor).unwrap();
+            std::fs::write(h.audit.join("2000-01.jsonl"), log).unwrap();
+            let p = cursor_path(&h.state, "a");
+            match &cursor {
+                Some(c) => write_cursor(&p, c).unwrap(),
+                None => {
+                    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                    std::fs::write(&p, "7\n").unwrap();
+                }
+            }
             let t = MemoryTransport::new((2, 1 << 20));
             let fw = h.forwarders(make_with(t.clone()));
             fw.apply(&one("a")).await;
-            until("the new chain forwarded", || as_vecs(&t.got()) == want).await;
+            until("the lines forwarded", || as_vecs(&t.got()) == want).await;
             until("connected", || !h.host.events().is_empty()).await;
             assert_eq!(h.host.events(), ["connected"], "{cursor:?}");
-            until("the cursor on the new chain's last line", || {
-                read_cursor(&cursor_path(&h.state, "a")).unwrap() == Some(hashed("new", 3))
+            until("the cursor on the newest chain's last line", || {
+                read_cursor(&p).ok().flatten() == Some(hashed("new", 3))
             })
             .await;
             fw.stop_all().await;
@@ -1489,6 +1555,22 @@ mod tests {
             assert!(t2.got().is_empty(), "{cursor:?}");
             fw.stop_all().await;
         }
+    }
+
+    #[test]
+    fn a_stale_workers_cursor_write_is_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let p = cursor_path(d.path(), "a");
+        let g = CursorGuard::default();
+        let old = g.next_gen();
+        assert!(g.write(old, &p, &hashed("x", 1)).unwrap());
+        // The replacement starts: the old worker's late write is void.
+        let new = g.next_gen();
+        assert_eq!(g.read(&p).unwrap(), Some(hashed("x", 1)));
+        assert!(!g.write(old, &p, &hashed("x", 9)).unwrap());
+        assert_eq!(g.read(&p).unwrap(), Some(hashed("x", 1)));
+        assert!(g.write(new, &p, &hashed("x", 2)).unwrap());
+        assert_eq!(g.read(&p).unwrap(), Some(hashed("x", 2)));
     }
 
     #[test]
@@ -1536,7 +1618,7 @@ mod tests {
         // At start: the cursor's next seq went with a deleted file.
         let h = H::bare();
         month(&h, "2000-02.jsonl", 11..=20);
-        write_cursor(&cursor_path(&h.state, "a"), &bare(5)).unwrap();
+        write_cursor(&cursor_path(&h.state, "a"), &at(5)).unwrap();
         let t = MemoryTransport::new((500, 1 << 20));
         let fw = h.forwarders(make_with(t.clone()));
         fw.apply(&one("a")).await;
@@ -1555,7 +1637,7 @@ mod tests {
         let h = H::bare();
         month(&h, "2000-01.jsonl", 1..=10);
         month(&h, "2000-02.jsonl", 11..=20);
-        write_cursor(&cursor_path(&h.state, "a"), &bare(5)).unwrap();
+        write_cursor(&cursor_path(&h.state, "a"), &at(5)).unwrap();
         let t = FlakyTransport::new(0);
         t.down.store(true, Ordering::SeqCst);
         let fw = h.forwarders(make_with(t.clone()));
@@ -1593,7 +1675,7 @@ mod tests {
         let h = H::bare();
         month(&h, "2000-01.jsonl", 1..=10);
         month(&h, "2000-02.jsonl", 11..=20);
-        write_cursor(&cursor_path(&h.state, "a"), &bare(12)).unwrap();
+        write_cursor(&cursor_path(&h.state, "a"), &at(12)).unwrap();
         let t = MemoryTransport::new((3, 1 << 20));
         let fw = h.forwarders(make_with(t.clone()));
         fw.apply(&one("a")).await;
@@ -1725,10 +1807,9 @@ mod tests {
         assert_eq!(read_cursor(&p).unwrap(), Some(c.clone()));
         let body = std::fs::read_to_string(&p).unwrap();
         assert_eq!(body, format!("42 {}\n", c.hash.unwrap()));
-        // The first version's bare seq is still read.
-        std::fs::write(&p, "7\n").unwrap();
-        assert_eq!(read_cursor(&p).unwrap(), Some(bare(7)));
-        for junk in ["x", "7 nothex", "7 abc", ""] {
+        // A bare seq is not a cursor; nor is one without a hash.
+        assert!(write_cursor(&p, &Cursor { seq: 7, hash: None }).is_err());
+        for junk in ["7\n", "x", "7 nothex", "7 abc", ""] {
             std::fs::write(&p, junk).unwrap();
             assert!(read_cursor(&p).is_err(), "{junk:?}");
         }
