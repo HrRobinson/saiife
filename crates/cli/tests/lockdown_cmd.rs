@@ -328,8 +328,8 @@ fn status_shows_lockdown() {
         text.contains("  lockdown: ON (scope connectors) since ") && text.contains(": drill\n"),
         "{text}"
     );
-    // TODO(plan 11, Task 3): the pending-approvals line, once `approval.list`
-    // exists.
+    // The caller's pending approval requests (spec §7 `status`).
+    assert!(text.contains("  approvals: none pending\n"), "{text}");
 }
 
 fn api_token(d: &TestDaemon) -> Output {

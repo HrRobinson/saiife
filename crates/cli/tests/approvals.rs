@@ -738,6 +738,11 @@ fn result_visible_to_requester_only() {
     assert_eq!(items.len(), 1, "{a}");
     assert_eq!(items[0]["id"], id);
     assert!(items[0].get("request_sealed").is_none(), "{a}");
+    // `own` (as `saiife status` asks): the approver's own requests only.
+    let a = w.op(BOSS, "approval.list", json!({"own": true}));
+    assert_eq!(a["items"], json!([]), "{a}");
+    let a = w.op(own_uid(), "approval.list", json!({"own": true}));
+    assert_eq!(a["items"].as_array().unwrap().len(), 1, "{a}");
     let a = w.op(own_uid(), "approval.show", json!({"request": id}));
     assert_eq!(a["item"]["operation"], "invoices.create", "{a}");
     let a = w.op(own_uid(), "api.result", json!({"request": id}));

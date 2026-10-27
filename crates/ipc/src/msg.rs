@@ -23,7 +23,7 @@ pub const OP_API_TOKEN: &str = "api.token";
 /// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
 pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
 /// Approval requests: approvers see all, a requester its own.
-/// `{states?: ["pending", ...]}` -> `{items}`.
+/// `{states?: ["pending", ...], own?: bool}` -> `{items}`.
 pub const OP_APPROVAL_LIST: &str = "approval.list";
 /// `{request}` -> `{item}` (the masked request). The id is `request`: a
 /// frame's `id` is its own.

@@ -237,7 +237,10 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         }
         Some(_) => return err(id, ErrorCode::BadRequest, "states is a list"),
     }
-    let uid = (!is_approver(ctx, peer.uid).await).then_some(peer.uid);
+    // `own: true`: only the caller's requests (`saiife status`), even for
+    // an approver.
+    let own = req.args.get("own").and_then(Value::as_bool) == Some(true);
+    let uid = (own || !is_approver(ctx, peer.uid).await).then_some(peer.uid);
     let Some(items) = on_store(ctx, move |_, s| s.list(Filter { uid, states })).await else {
         return unavailable(id, ctx);
     };
