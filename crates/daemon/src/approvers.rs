@@ -12,6 +12,8 @@ use saiife_policy::{ApprovalCfg, Directory, SameUser};
 use std::fmt;
 
 const GROUP_PREFIX: &str = "group:";
+/// The `ReauthError` detail when `approver_user` does not resolve to the peer uid.
+const MISMATCH: &str = "approver lookup mismatch";
 
 /// The warning when same-user re-authentication cannot run (spec §6.10.2).
 pub const REAUTH_UNAVAILABLE: &str =
@@ -79,8 +81,10 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
 ///
 /// - `approver_user` must be the daemon's own lookup of `peer.uid`
 ///   (`dir.name_of(peer.uid)`), never a client-supplied name. It is checked
-///   against `dir` again, and a name that does not resolve to `peer.uid` is
-///   `NotApprover`.
+///   against `dir` again. A name that does not resolve to `peer.uid` (a
+///   caller bug or a directory changing underneath) is
+///   `ReauthError("approver lookup mismatch")`, so it is logged as an error
+///   rather than as an unlisted approver.
 /// - `start_time` is the peer process's start time (`/proc/<pid>/stat`
 ///   field 22), read by the caller when the connection was accepted. After
 ///   polkit authorizes, it is read again through `proc`, and a changed start
@@ -101,7 +105,7 @@ pub fn may_decide(
 ) -> Result<(), Refusal> {
     let approver_uid = peer.uid;
     if dir.user(approver_user).map(|u| u.uid) != Some(approver_uid) {
-        return Err(Refusal::NotApprover);
+        return Err(Refusal::ReauthError(MISMATCH.to_string()));
     }
     if !is_approver(cfg, dir, approver_user) {
         return Err(Refusal::NotApprover);
@@ -254,6 +258,7 @@ mod tests {
             Result<(), Refusal>,
         );
         let not = Err(Refusal::NotApprover);
+        let mismatch = Err(Refusal::ReauthError("approver lookup mismatch".into()));
         #[rustfmt::skip]
         let rows: Vec<Row> = vec![
             // Not listed.
@@ -263,9 +268,10 @@ mod tests {
             // `group:` never matches a user name, and a user never a group.
             (&["group:alice"], Deny, 1001, "bob", 1000, ok(), false, not.clone()),
             (&["ops"], Deny, 1001, "bob", 1000, ok(), false, not.clone()),
-            // The name must resolve to the peer's uid; an unknown name fails.
-            (&["bob"], Deny, 1003, "bob", 1000, ok(), false, not.clone()),
-            (&["ghost"], Deny, 1003, "ghost", 1000, ok(), false, not.clone()),
+            // The name must resolve to the peer's uid: a mismatch or an
+            // unknown name is an error, not an unlisted approver.
+            (&["bob"], Deny, 1003, "bob", 1000, ok(), false, mismatch.clone()),
+            (&["ghost"], Deny, 1003, "ghost", 1000, ok(), false, mismatch.clone()),
             // A second uid, listed directly or by group.
             (&["bob"], Deny, 1001, "bob", 1000, ok(), false, Ok(())),
             (&["group:ops"], Deny, 1001, "bob", 1000, ok(), false, Ok(())),

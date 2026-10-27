@@ -3,9 +3,10 @@
 //! `pkcheck --action-id com.saiife.approve --process <pid>,<start>,<uid>
 //! --allow-user-interaction` for the approving CLI process, with an empty
 //! environment except `PATH`, and kills it (its own child) at the timeout.
-//! Exit 0 is authorized; exit 4 (pkcheck's own error, e.g. no polkit
-//! daemon) is unavailable; any other exit is denied; a spawn failure or a
-//! timeout is an error. Every non-`Authorized` result refuses the approval.
+//! Exit 0 is authorized; 1 and 3 and a signal are denied; 2 and 127 are
+//! unavailable; 126 and any other code, a spawn failure or a timeout are an
+//! error (see [`exit_result`]). Every non-`Authorized` result refuses the
+//! approval.
 
 use crate::sessions::Proc;
 use std::collections::HashSet;
@@ -31,8 +32,27 @@ pub const POLKITD: [&str; 3] = [
     "/usr/libexec/polkitd",
     "/usr/lib/policykit-1/polkitd",
 ];
-/// pkcheck's exit status for "an error occurred" (polkit not running...).
-const PKCHECK_EXIT_ERROR: i32 = 4;
+/// pkcheck(1) exit statuses.
+const EXIT_AUTHORIZED: i32 = 0;
+const EXIT_NOT_AUTHORIZED: i32 = 1;
+const EXIT_CHALLENGE: i32 = 2;
+const EXIT_DISMISSED: i32 = 3;
+const EXIT_BAD_OPTIONS: i32 = 126;
+const EXIT_ERROR: i32 = 127;
+
+/// Maps a pkcheck exit to a result (pkcheck(1)): 0 authorized; 1 (not
+/// authorized) and 3 (dismissed) denied; 2 (authentication needed, no agent
+/// answered) and 127 (an error, e.g. polkitd down) unavailable; 126 (bad
+/// options) and any other code an error; killed by a signal (`None`) denied.
+fn exit_result(code: Option<i32>) -> ReauthResult {
+    match code {
+        Some(EXIT_AUTHORIZED) => ReauthResult::Authorized,
+        Some(EXIT_NOT_AUTHORIZED | EXIT_DISMISSED) | None => ReauthResult::Denied,
+        Some(EXIT_CHALLENGE | EXIT_ERROR) => ReauthResult::Unavailable,
+        Some(EXIT_BAD_OPTIONS) => ReauthResult::Error("pkcheck: bad options".into()),
+        Some(c) => ReauthResult::Error(format!("pkcheck: unexpected exit {c}")),
+    }
+}
 
 /// How often a running `pkcheck` is polled for its exit.
 const POLL: Duration = Duration::from_millis(10);
@@ -163,11 +183,7 @@ impl Reauth for PkCheck {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return match status.code() {
-                        Some(0) => ReauthResult::Authorized,
-                        Some(PKCHECK_EXIT_ERROR) => ReauthResult::Unavailable,
-                        _ => ReauthResult::Denied,
-                    };
+                    return exit_result(status.code());
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -282,26 +298,30 @@ mod tests {
     }
 
     #[test]
-    fn pkcheck_nonzero_is_denied() {
+    fn pkcheck_exit_codes() {
+        use ReauthResult as R;
         let d = tmp();
-        for code in [1, 2, 3, 5, 127] {
+        let bad_options = R::Error("pkcheck: bad options".into());
+        for (code, want) in [
+            (1, R::Denied),
+            (3, R::Denied),
+            (2, R::Unavailable),
+            (127, R::Unavailable),
+            (126, bad_options),
+        ] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
-            assert_eq!(
-                pk.check(1, 2, 3, Duration::from_secs(10)),
-                ReauthResult::Denied,
-                "{code}"
-            );
+            assert_eq!(pk.check(1, 2, 3, Duration::from_secs(10)), want, "{code}");
         }
-    }
-
-    #[test]
-    fn pkcheck_exit_4_is_unavailable() {
-        let d = tmp();
-        let pk = PkCheck::with_paths(fake(d.path(), 4, 0), d.path().join("action"));
-        assert_eq!(
-            pk.check(1, 2, 3, Duration::from_secs(10)),
-            ReauthResult::Unavailable
-        );
+        for code in [4, 5, 125, 255] {
+            let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
+            match pk.check(1, 2, 3, Duration::from_secs(10)) {
+                R::Error(e) => assert!(e.contains(&format!("exit {code}")), "{code}: {e}"),
+                other => panic!("{code}: expected Error, got {other:?}"),
+            }
+        }
+        // Killed by a signal (no exit code): denied. Mapped directly, since
+        // the tests never signal a process other than through `Child`.
+        assert_eq!(exit_result(None), R::Denied);
     }
 
     #[test]
