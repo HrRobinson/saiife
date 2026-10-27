@@ -101,17 +101,23 @@ fn load_ca_dir(dir: &Path, roots: &mut RootCertStore) -> Result<(), BrokerError>
     }
     paths.sort();
     for p in paths {
-        let what = format!("CA file {}", p.display());
-        let file = std::fs::File::open(&p).map_err(|e| up(&what, e))?;
-        let mut n = 0;
-        for cert in rustls_pemfile::certs(&mut io::BufReader::new(file)) {
-            let cert = cert.map_err(|e| up(&what, e))?;
-            roots.add(cert).map_err(|e| up(&what, e))?;
-            n += 1;
-        }
-        if n == 0 {
-            return Err(up(&what, "holds no certificate"));
-        }
+        load_ca_file(&p, roots)?;
+    }
+    Ok(())
+}
+
+/// The certificates of one PEM file; a file without one is an error.
+fn load_ca_file(p: &Path, roots: &mut RootCertStore) -> Result<(), BrokerError> {
+    let what = format!("CA file {}", p.display());
+    let file = std::fs::File::open(p).map_err(|e| up(&what, e))?;
+    let mut n = 0;
+    for cert in rustls_pemfile::certs(&mut io::BufReader::new(file)) {
+        let cert = cert.map_err(|e| up(&what, e))?;
+        roots.add(cert).map_err(|e| up(&what, e))?;
+        n += 1;
+    }
+    if n == 0 {
+        return Err(up(&what, "holds no certificate"));
     }
     Ok(())
 }
@@ -317,6 +323,35 @@ impl Upstream {
             #[cfg(test)]
             allow_http: false,
         }
+    }
+
+    /// This client (its roots and resolver) with another timeout.
+    pub fn with_timeout(&self, timeout: Duration) -> Upstream {
+        Upstream {
+            tls: self.tls.clone(),
+            roots: self.roots.clone(),
+            resolver: Arc::clone(&self.resolver),
+            timeout,
+            #[cfg(test)]
+            allow_http: self.allow_http,
+        }
+    }
+
+    /// A client of its own for one destination (an audit forwarding
+    /// target's `ca`): the native roots plus the certificates in `ca_file`,
+    /// in place of the CA directory; this client's resolver; `timeout`.
+    pub fn with_ca_file(&self, ca_file: &Path, timeout: Duration) -> Result<Upstream, BrokerError> {
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        load_ca_file(ca_file, &mut roots)?;
+        Ok(Upstream {
+            tls: tokio_rustls::TlsConnector::from(Arc::new(client_config(roots.clone())?)),
+            roots,
+            resolver: Arc::clone(&self.resolver),
+            timeout,
+            #[cfg(test)]
+            allow_http: false,
+        })
     }
 
     #[cfg(test)]

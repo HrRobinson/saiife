@@ -89,23 +89,110 @@ pub trait Transport: Send + Sync {
 pub type MakeTransport =
     Arc<dyn Fn(&str, &ForwardCfg) -> Result<Box<dyn Transport>, String> + Send + Sync>;
 
-/// The daemon's transports for `[audit.forward.<name>]`. Task 3 fills this
-/// in; until then every type is refused, which the worker records as a
-/// `failing` target.
+/// The timeout of one send to a network target (syslog over TLS, https).
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The daemon's transports for `[audit.forward.<name>]` (plan 12 decisions
+/// 3 to 5). The config was validated when the policy loaded. Nothing here
+/// touches the network or the vault: a network target builds its TLS client
+/// and reads its secret at each send, so a CA file or a secret fixed later
+/// is picked up without a config change.
 pub fn transport_for(
     name: &str,
     cfg: &ForwardCfg,
     ctx: &Weak<crate::ops::Ctx>,
 ) -> Result<Box<dyn Transport>, String> {
-    let _ = (name, ctx);
-    let kind = match cfg {
-        ForwardCfg::Syslog { .. } => "syslog",
-        ForwardCfg::File { .. } => "file",
-        ForwardCfg::Https { .. } => "https",
-    };
-    Err(format!(
-        "forward type `{kind}` is not supported by this build"
-    ))
+    let _ = name;
+    match cfg {
+        ForwardCfg::Syslog {
+            address,
+            format,
+            facility,
+            ca,
+        } => {
+            let facility = saiife_policy::facility_code(facility.as_deref()).unwrap_or(16);
+            let dest = crate::forward_syslog::Dest::parse(address)?;
+            Ok(Box::new(crate::forward_syslog::SyslogTransport::new(
+                dest,
+                *format,
+                facility,
+                crate::signals::hostname(),
+                TargetClient::of_daemon(ctx, ca.clone()),
+            )))
+        }
+        ForwardCfg::File { path } => Ok(Box::new(crate::forward_file::FileTransport::new(
+            path.clone(),
+            saiife_audit::chain::host_id().unwrap_or_else(|| "unknown".into()),
+        ))),
+        ForwardCfg::Https {
+            url,
+            auth_secret,
+            format,
+            ca,
+        } => {
+            let weak = ctx.clone();
+            let secrets: crate::forward_https::Secrets = Arc::new(move |n: &str| {
+                let ctx = weak.upgrade()?;
+                crate::notifier::Env::secret(&*ctx, n)
+            });
+            Ok(Box::new(crate::forward_https::HttpsTransport::new(
+                url,
+                *format,
+                auth_secret.clone(),
+                secrets,
+                TargetClient::of_daemon(ctx, ca.clone()),
+            )?))
+        }
+    }
+}
+
+type MakeUpstream =
+    Box<dyn Fn() -> Result<saiife_broker::upstream::Upstream, String> + Send + Sync>;
+
+/// The TLS client of a network target (the broker's `Upstream`: rustls,
+/// the system roots plus `/etc/saiife/ca`, or plus the target's own `ca`),
+/// built at the first send and kept once it was built. A failure (an
+/// unreadable `ca`, say) is a retry, and the next send builds it again.
+pub struct TargetClient {
+    make: MakeUpstream,
+    built: Mutex<Option<Arc<saiife_broker::upstream::Upstream>>>,
+}
+
+impl TargetClient {
+    pub fn new(
+        make: impl Fn() -> Result<saiife_broker::upstream::Upstream, String> + Send + Sync + 'static,
+    ) -> TargetClient {
+        TargetClient {
+            make: Box::new(make),
+            built: Mutex::new(None),
+        }
+    }
+
+    /// The daemon's client with [`SEND_TIMEOUT`]; with `ca`, the native
+    /// roots plus that file in place of the CA directory.
+    fn of_daemon(ctx: &Weak<crate::ops::Ctx>, ca: Option<PathBuf>) -> TargetClient {
+        let ctx = ctx.clone();
+        TargetClient::new(move || {
+            let ctx = ctx.upgrade().ok_or("the daemon is stopping")?;
+            let base = ctx.upstream.as_ref().map_err(|e| e.clone())?;
+            match &ca {
+                Some(file) => base
+                    .with_ca_file(file, SEND_TIMEOUT)
+                    .map_err(|e| e.to_string()),
+                None => Ok(base.with_timeout(SEND_TIMEOUT)),
+            }
+        })
+    }
+
+    pub fn get(&self) -> Result<Arc<saiife_broker::upstream::Upstream>, String> {
+        let mut g = self.built.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = &*g {
+            return Ok(Arc::clone(u));
+        }
+        let u = Arc::new((self.make)()?);
+        *g = Some(Arc::clone(&u));
+        Ok(u)
+    }
 }
 
 /// The worker's clock: monotonic time and sleeping (tests replace it, so
@@ -1788,9 +1875,32 @@ mod tests {
     }
 
     #[test]
-    fn real_transports_wait_for_task_3() {
-        for cfg in targets(&["a"]).values() {
-            assert!(transport_for("a", cfg, &Weak::new()).is_err());
+    fn real_transports_build_for_each_type() {
+        let cfgs = [
+            ForwardCfg::File {
+                path: PathBuf::from("/x"),
+            },
+            ForwardCfg::Syslog {
+                address: "unix:/dev/log".into(),
+                format: saiife_policy::SyslogFormat::Rfc5424Json,
+                facility: None,
+                ca: None,
+            },
+            ForwardCfg::Syslog {
+                address: "tls://[::1]:6514".into(),
+                format: saiife_policy::SyslogFormat::Rfc5424,
+                facility: Some("local3".into()),
+                ca: Some(PathBuf::from("/etc/saiife/ca/x.pem")),
+            },
+            ForwardCfg::Https {
+                url: "https://siem.example.test/in".into(),
+                auth_secret: Some("hec".into()),
+                format: saiife_policy::HttpsFormat::SplunkHec,
+                ca: None,
+            },
+        ];
+        for cfg in &cfgs {
+            assert!(transport_for("a", cfg, &Weak::new()).is_ok(), "{cfg:?}");
         }
     }
 

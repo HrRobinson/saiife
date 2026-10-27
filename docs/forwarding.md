@@ -45,12 +45,17 @@ ca = "/etc/saiife/ca/siem.pem"   # optional extra CA for tls://
   plain `rfc5424` format is for log tools that want a readable line. For
   `saiife audit verify --external` use `rfc5424-json` (or `file` or
   `https`): the copy must hold the exact lines.
-- `unix:/dev/log`: one datagram per record. A message over 8 KiB goes over
-  TCP octet-counting to `/dev/log` if it is a stream socket, else it is
-  truncated with a marker (a truncated line cannot be verified).
+- The TIMESTAMP is the record's own `ts`.
+- `unix:/dev/log`: one datagram per record. A message over 8 KiB is
+  truncated at a character boundary and ends with `…[truncated]` (a
+  truncated line cannot be verified). If `/dev/log` is a stream socket,
+  every message goes over it with octet-counting framing instead, uncut.
 - `tls://host:port`: TCP and TLS with octet-counting framing (RFC 6587 and
-  5425). Trust comes from the system roots plus `ca` or the files in
-  `/etc/saiife/ca`.
+  5425), no ALPN, one connection per batch, 30 s per batch. The certificate
+  must be valid for `host`. Trust comes from the system roots plus `ca` if
+  it is set, else plus the files in `/etc/saiife/ca`. Syslog has no
+  acknowledgement: a batch counts as delivered once it was written and the
+  TLS session closed cleanly.
 
 ### File
 
@@ -60,8 +65,10 @@ type = "file"
 path = "/mnt/audit-share"
 ```
 
-Records are appended to `<path>/<host id>-YYYY-MM.jsonl`. The directory must
-exist; saiife does not create it. Each file is flushed to disk after each
+Records are appended to `<path>/<host id>-YYYY-MM.jsonl`, where the month
+is the record's own, as in the local month files. The directory must
+exist; saiife does not create it (a share that is not mounted is a failing
+target, not a directory on the local disk). Each file is flushed to disk after each
 batch. This suits an NFS or SMB share, or a directory a log agent (Fluent
 Bit, Vector) reads. Put it on a host where this machine's root cannot rewrite
 the files.
@@ -77,11 +84,14 @@ format = "splunk-hec"          # or "json" (the default)
 ca = "/etc/saiife/ca/splunk.pem"
 ```
 
-- A POST carries at most 500 records or 1 MiB, whichever comes first.
+- A POST carries at most 500 records or 1 MiB of body, whichever comes
+  first (one record over 1 MiB is sent alone).
 - `auth_secret` names a secret in the vault. Its value is sent as the
   `Authorization` header. It never appears in a log or an audit record.
 - `format = "json"` sends a JSON array whose elements are the exact JSONL
-  lines, embedded as JSON values byte for byte. `splunk-hec` sends one
+  lines, embedded as JSON values byte for byte. A line that is not JSON
+  (a foreign line in a month file; a chain that verifies has none) would
+  break the array, so it is sent as a JSON string holding the line. `splunk-hec` sends one
   object per record, newline-separated: `{"event": <the line as a JSON
   string>, "sourcetype": "saiife"}`, so Splunk keeps the exact bytes.
 - With a `token` secret the header is `Bearer <token>`; with a `header`
@@ -89,7 +99,9 @@ ca = "/etc/saiife/ca/splunk.pem"
 - A 2xx answer means accepted. 429, 5xx and network errors are retried. Any
   other 4xx counts as failing and is retried with backoff too; nothing is
   ever dropped because of a 4xx. The timeout is 30 s and redirects are not
-  followed.
+  followed (a 3xx is retried like a 4xx).
+- Trust: the system roots plus `ca` if it is set, else plus the files in
+  `/etc/saiife/ca`.
 - The URL must be `https://`.
 
 ## What is sent

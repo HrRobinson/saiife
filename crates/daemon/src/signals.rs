@@ -102,7 +102,7 @@ impl Signals {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
         std::fs::read_to_string("/proc/sys/kernel/hostname")
