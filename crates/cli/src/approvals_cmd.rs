@@ -69,7 +69,19 @@ pub fn run(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn decide(_config: Option<PathBuf>, _d: Decision) -> ExitCode {
+pub fn decide(_config: Option<PathBuf>, d: Decision) -> ExitCode {
+    match d {
+        Decision::Approve {
+            id,
+            note,
+            accept_truncated,
+        } => {
+            let _ = (id, note, accept_truncated);
+        }
+        Decision::Reject { id, note } => {
+            let _ = (id, note);
+        }
+    }
     eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
     ExitCode::from(5)
 }
