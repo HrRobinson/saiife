@@ -890,8 +890,10 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "rustix",
+ "rustls",
  "saiife-audit",
  "saiife-broker",
+ "saiife-guard",
  "saiife-ipc",
  "saiife-policy",
  "saiife-system",
@@ -900,6 +902,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tokio-rustls",
  "toml",
  "zeroize",
 ]
@@ -914,6 +917,17 @@ dependencies = [
  "saiife-broker",
  "saiife-daemon",
  "saiife-ipc",
+]
+
+[[package]]
+name = "saiife-guard"
+version = "0.1.1"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
