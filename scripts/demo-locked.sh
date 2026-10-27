@@ -35,6 +35,15 @@ DEMO_BUDGET_SECS=300
 DEMO_MOCK_PID=""
 DEMO_ACTIVE=0
 DEMO_CFG_BACKUP=""
+# Set at the start of phase_demo (the demo has no install step of its own:
+# the system install is phase 1 of run.sh, outside the budget).
+DEMO_STARTED=0
+
+# Fails once the demo has run longer than its budget.
+check_budget() {
+    local used=$((SECONDS - DEMO_STARTED))
+    ((used <= DEMO_BUDGET_SECS)) || fail "the demo is over its ${DEMO_BUDGET_SECS}s budget after $1 (${used}s)"
+}
 
 # The mock: a tiny static HTTPS server (python3 stdlib) on loopback. One
 # JSON line per request goes to $WORK/mock.log, with the credential header
@@ -135,6 +144,7 @@ cleanup_demo() {
     if [[ -n "$DEMO_MOCK_PID" ]]; then
         # Our own child (the mock), by the PID the shell gave it.
         kill "$DEMO_MOCK_PID" >/dev/null 2>&1 || true
+        wait "$DEMO_MOCK_PID" 2>/dev/null || true
         DEMO_MOCK_PID=""
     fi
     as_root "$OPT_BIN" secret remove shop-key >/dev/null 2>&1 || true
@@ -181,7 +191,8 @@ EOF
 
 phase_demo() {
     phase "6d. the 5-minute locked demo (shop connector, approvals, audit report)"
-    local started=$SECONDS key id body hookfile pid rec n
+    DEMO_STARTED=$SECONDS
+    local started=$DEMO_STARTED key id body hookfile pid rec n
     DEMO_ACTIVE=1
     : >"$WORK/demo-attempts.txt"
 
@@ -190,7 +201,10 @@ phase_demo() {
     demo_write_mock
     python3 "$WORK/mock.py" "$WORK" "$DEMO_PORT" >"$WORK/mock.out" 2>&1 &
     DEMO_MOCK_PID=$!
-    wait_until 20 "the HTTPS mock" demo_mock_ready
+    if ! wait_until_quiet 20 demo_mock_ready; then
+        cat "$WORK/mock.out" >&2 || true
+        fail "the HTTPS mock did not start within 20s"
+    fi
     ok "loopback HTTPS mock on $DEMO_URL"
 
     as_root install -d -m 755 -o root -g root /etc/saiife/ca
@@ -230,6 +244,8 @@ EOF
     [[ "$rec" != rejected ]] || fail "the daemon rejected the demo config"
     ok "shop connector configured (policy $rec): scope $AGENT_USER, ask products:write, approver $APPROVER_USER"
 
+    check_budget "the setup"
+
     # 2. Three attacks as agent-ci; each must fail and is recorded.
     echo "-- attacks as $AGENT_USER (recorded in $WORK/demo-attempts.txt)"
     hookfile=/etc/claude-code/managed-settings.d/50-saiife.json
@@ -244,6 +260,8 @@ EOF
     cat "$WORK/demo-attempts.txt"
     [[ "$(wc -l <"$WORK/demo-attempts.txt")" -eq 3 ]] || fail "the attempts were not all recorded"
 
+    check_budget "the attacks"
+
     # 3. A read: allowed, JSON on stdout, no credential in the output.
     demo_api "$AGENT_USER" /dev/null shop orders.list status=open
     [[ "$SA_CODE" == 0 ]] || fail "orders.list exited $SA_CODE, want 0: $SA_ERR"
@@ -251,9 +269,11 @@ EOF
     [[ "$SA_OUT$SA_ERR" != *"$key"* ]] || fail "the credential reached the agent"
     echo "$SA_OUT"
     ok "saiife api shop orders.list: allowed, JSON printed ($SA_ERR)"
-    jq -e --arg k "$key" 'select(.method == "GET" and .path == "/orders?status=open" and .key == $k)' "$WORK/mock.log" >/dev/null ||
-        fail "the mock did not see the vault credential on GET /orders: $(cat "$WORK/mock.log")"
+    n="$(jq -s --arg k "$key" 'map(select(.method == "GET" and .path == "/orders?status=open" and .key == $k)) | length' "$WORK/mock.log")"
+    [[ "$n" == 1 ]] || fail "the mock saw the GET /orders with the vault credential $n times, want 1: $(cat "$WORK/mock.log")"
     ok "the mock saw the vault credential; the agent never did"
+
+    check_budget "the read"
 
     # 4. A write: pending, approved by approver-ci, then done.
     body="$WORK/product.json"
@@ -272,13 +292,17 @@ EOF
     [[ "$SA_CODE" == 0 ]] || fail "api result $id exited $SA_CODE, want 0 (done): $SA_OUT $SA_ERR"
     jq -e '.updated == true' <<<"$SA_OUT" >/dev/null || fail "api result $id: unexpected body: $SA_OUT"
     ok "saiife api result $id: done ($SA_OUT)"
-    jq -e --arg k "$key" 'select(.method == "PATCH" and .path == "/products/42" and .key == $k and .body == "{\"price\":\"19.90\"}")' "$WORK/mock.log" >/dev/null ||
-        fail "the mock did not see the approved PATCH: $(cat "$WORK/mock.log")"
+    n="$(jq -s --arg k "$key" 'map(select(.method == "PATCH" and .path == "/products/42" and .key == $k and .body == "{\"price\":\"19.90\"}")) | length' "$WORK/mock.log")"
+    [[ "$n" == 1 ]] || fail "the mock saw the approved PATCH $n times, want 1: $(cat "$WORK/mock.log")"
     ok "the approved write reached the mock exactly once, with the vault credential"
+
+    check_budget "the write"
 
     # 5. The chain is intact.
     audit_verify
     grep -q 'intact' "$WORK/verify.out" || fail "audit verify did not say intact: $(cat "$WORK/verify.out")"
+
+    check_budget "audit verify"
 
     # 6. The HTML report.
     as_root env SAIIFE_AUDIT_DIR="$AUDIT_DIR" "$OPT_BIN" audit --report "$WORK/demo-report.html" ||
@@ -296,8 +320,12 @@ EOF
     fi
     ok "report written ($(wc -c <"$WORK/demo-report.html") bytes) with the connector and approvals sections"
 
+    check_budget "the report"
+
     # Keep the evidence for the job log, then put everything back.
-    mkdir -p "$LOGS" && cp "$WORK/demo-report.html" "$WORK/demo-attempts.txt" "$LOGS/" 2>/dev/null || true
+    if mkdir -p "$LOGS"; then
+        cp "$WORK/demo-report.html" "$WORK/demo-attempts.txt" "$LOGS/" 2>/dev/null || true
+    fi
     cleanup_demo
     reload_checked
     wait_diag 30 "the daemon after restoring the config" daemon_ready
