@@ -13,20 +13,210 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
 
-/// `saiife audit verify`: exit 0 intact, 1 broken, 2 unreadable. Prints
-/// counts and file names only, never record content.
-pub fn verify() -> ExitCode {
-    let Some(dir) = store::default_dir() else {
-        outln!("audit chain: could not read the log: no audit directory");
-        return ExitCode::from(2);
+/// `saiife audit verify [--external <file|dir>]`: exit 0 intact, 1 broken,
+/// 2 unreadable. Prints counts and file names only, never record content.
+pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode {
+    let config = system_config.unwrap_or(Path::new(SYSTEM_CONFIG));
+    let dir = match verify_dir(config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            outln!("audit chain: could not read the log: {}", sanitize(&e));
+            return ExitCode::from(2);
+        }
     };
-    let report = saiife_audit::verify(&dir);
-    outln!("{}", render_verify(&report));
+    let Some(external) = external else {
+        let report = saiife_audit::verify(&dir);
+        outln!("{}", render_verify(&report));
+        return ExitCode::from(report.exit_code());
+    };
+    let report = saiife_audit::verify_external(&dir, external);
+    outln!("{}", render_external(&report));
     ExitCode::from(report.exit_code())
 }
 
+const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
+const AUDIT_GROUP: &str = "saiife-audit";
+const NOT_AN_AUDITOR: &str = "audit files need the saiife-audit group; ask an auditor";
+
+/// The log `verify` checks: `$SAIIFE_AUDIT_DIR` when set; in locked mode
+/// `[audit] dir` of the system config, for root and `saiife-audit` members
+/// only; else the user's own log.
+fn verify_dir(config: &Path) -> Result<PathBuf, String> {
+    let explicit = std::env::var_os(store::DIR_ENV).is_some_and(|d| Path::new(&d).is_absolute());
+    if !explicit {
+        if let Some(dir) = locked_audit_dir(config)? {
+            return if is_auditor() {
+                Ok(dir)
+            } else {
+                Err(NOT_AN_AUDITOR.into())
+            };
+        }
+    }
+    store::default_dir().ok_or_else(|| "no audit directory".to_string())
+}
+
+/// `[audit] dir` when the system config says `locked = true`; `None` when
+/// there is no config or it is not locked. Read as a raw table, like the
+/// hook's system view, so a policy error elsewhere does not hide the log.
+pub(crate) fn locked_audit_dir(config: &Path) -> Result<Option<PathBuf>, String> {
+    let bad = |e: &str| format!("{}: {e}", config.display());
+    let Some(bytes) =
+        crate::system_view::read_regular(config, false, 1024 * 1024).map_err(|e| bad(&e))?
+    else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes).map_err(|_| bad("not valid UTF-8"))?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| bad(e.message()))?;
+    if table.get("locked").and_then(toml::Value::as_bool) != Some(true) {
+        return Ok(None);
+    }
+    let dir = match table.get("audit").and_then(|a| a.get("dir")) {
+        None => PathBuf::from(LOCKED_AUDIT_DIR),
+        Some(toml::Value::String(d)) if Path::new(d).is_absolute() => PathBuf::from(d),
+        Some(_) => return Err(bad("[audit] dir must be an absolute path")),
+    };
+    Ok(Some(dir))
+}
+
+/// Root, or a member of `saiife-audit` in this process's current groups.
+#[cfg(target_os = "linux")]
+fn is_auditor() -> bool {
+    use rustix::process::{getegid, geteuid, getgroups};
+    use saiife_policy::users::{Directory, Getent};
+    if geteuid().is_root() {
+        return true;
+    }
+    let Some(group) = Getent.group(AUDIT_GROUP) else {
+        return false;
+    };
+    getegid().as_raw() == group.gid
+        || getgroups().is_ok_and(|gs| gs.iter().any(|g| g.as_raw() == group.gid))
+}
+
+/// Locked mode is Linux-only in this version: only root reads its files.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_auditor() -> bool {
+    let _ = AUDIT_GROUP;
+    rustix::process::geteuid().is_root()
+}
+
+#[cfg(not(unix))]
+fn is_auditor() -> bool {
+    let _ = AUDIT_GROUP;
+    false
+}
+
+/// The local report, then how it compares with the forwarded copy. Problems
+/// in the copy itself are labelled `external copy damaged`, never blamed
+/// on the local log.
+pub fn render_external(r: &saiife_audit::ExternalReport) -> String {
+    let mut out = render_verify(&r.local);
+    out.push('\n');
+    let e = &r.external;
+    if !e.read_errors.is_empty() {
+        let errs: Vec<String> = e.read_errors.iter().map(|x| sanitize(x)).collect();
+        out.push_str(&format!(
+            "external copy: could not read it: {}",
+            errs.join("; ")
+        ));
+        return out;
+    }
+    if !r.local.read_errors.is_empty() {
+        out.truncate(out.trim_end().len());
+        return out;
+    }
+    if e.breaks.is_empty() {
+        let head = e.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
+        out.push_str(&format!(
+            "external copy: intact ({} chained records, up to seq {head})\n",
+            e.chained
+        ));
+    } else {
+        let n = e.breaks.len();
+        let s = if n == 1 { "" } else { "s" };
+        out.push_str(&format!("external copy damaged ({n} problem{s})\n"));
+        out.push_str(&render_breaks(&e.breaks));
+    }
+    if e.duplicates > 0 {
+        out.push_str(&format!(
+            "  {} resent lines skipped (forwarding delivers at least once)\n",
+            e.duplicates
+        ));
+    }
+    if e.chain.is_none() {
+        out.push_str(
+            "  the copy starts mid-chain: its checkpoints are vouched for by the local log\n",
+        );
+    }
+    if !r.missing_checkpoints.is_empty() {
+        let n = r.missing_checkpoints.len();
+        let seqs: Vec<String> = r
+            .missing_checkpoints
+            .iter()
+            .take(MAX_BREAKS)
+            .map(u64::to_string)
+            .collect();
+        let more = if n > MAX_BREAKS { ", \u{2026}" } else { "" };
+        out.push_str(&format!(
+            "local log REWRITTEN OR CUT: {n} checkpoint{} of the external copy not in it (head seq {}{more})\n",
+            if n == 1 { "" } else { "s" },
+            seqs.join(", ")
+        ));
+    }
+    if let Some((local, ext)) = r.cut_tail {
+        out.push_str(&format!(
+            "local log CUT OFF: it ends at seq {local}, the external copy reaches seq {ext}\n"
+        ));
+    }
+    if r.missing_checkpoints.is_empty() && r.cut_tail.is_none() {
+        match r.compared {
+            0 => out.push_str(
+                "local log reaches the end of the external copy; no checkpoint of the copy to compare\n",
+            ),
+            1 => out.push_str("the checkpoint of the external copy is in the local log\n"),
+            n => out.push_str(&format!(
+                "all {n} checkpoints of the external copy are in the local log\n"
+            )),
+        }
+    }
+    let skipped = e.checkpoints.saturating_sub(r.compared);
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
+        out.push_str(&format!(
+            "  {skipped} checkpoint{s} of the copy not compared: damaged in the copy\n"
+        ));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+const MAX_BREAKS: usize = 20;
+
+fn render_breaks(breaks: &[saiife_audit::Break]) -> String {
+    let mut out = String::new();
+    for b in breaks.iter().take(MAX_BREAKS) {
+        let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} line {}{}: {}\n",
+            sanitize(&b.file),
+            b.line,
+            seq,
+            b.kind.describe()
+        ));
+    }
+    if breaks.len() > MAX_BREAKS {
+        out.push_str(&format!(
+            "  \u{2026} and {} more\n",
+            breaks.len() - MAX_BREAKS
+        ));
+    }
+    out
+}
+
 pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
-    const MAX_BREAKS: usize = 20;
     if !r.read_errors.is_empty() {
         let errs: Vec<String> = r.read_errors.iter().map(|e| sanitize(e)).collect();
         return format!("audit chain: could not read the log: {}", errs.join("; "));
@@ -38,19 +228,7 @@ pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
         let n = r.breaks.len();
         let s = if n == 1 { "" } else { "s" };
         out.push_str(&format!("audit chain: BROKEN ({n} problem{s})\n"));
-        for b in r.breaks.iter().take(MAX_BREAKS) {
-            let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
-            out.push_str(&format!(
-                "  {} line {}{}: {}\n",
-                sanitize(&b.file),
-                b.line,
-                seq,
-                b.kind.describe()
-            ));
-        }
-        if n > MAX_BREAKS {
-            out.push_str(&format!("  \u{2026} and {} more\n", n - MAX_BREAKS));
-        }
+        out.push_str(&render_breaks(&r.breaks));
     }
     if r.chained > 0 {
         let head = r.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
@@ -388,6 +566,30 @@ mod tests {
             "0.1.0",
             datetime!(2026-10-13 08:14:02.381 UTC),
         )
+    }
+
+    #[test]
+    fn locked_audit_dir_reads_the_system_config() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        assert_eq!(locked_audit_dir(&c), Ok(None), "no config: developer mode");
+        std::fs::write(&c, "version = 2\n[audit]\ndir = \"/srv/a\"\n").unwrap();
+        assert_eq!(locked_audit_dir(&c), Ok(None), "not locked");
+        std::fs::write(&c, "version = 2\nlocked = true\n").unwrap();
+        assert_eq!(
+            locked_audit_dir(&c),
+            Ok(Some(PathBuf::from("/var/log/saiife/audit")))
+        );
+        std::fs::write(
+            &c,
+            "version = 2\nlocked = true\n[audit]\ndir = \"/srv/a\"\n",
+        )
+        .unwrap();
+        assert_eq!(locked_audit_dir(&c), Ok(Some(PathBuf::from("/srv/a"))));
+        std::fs::write(&c, "version = 2\nlocked = true\n[audit]\ndir = \"rel\"\n").unwrap();
+        assert!(locked_audit_dir(&c).is_err());
+        std::fs::write(&c, "locked = [").unwrap();
+        assert!(locked_audit_dir(&c).is_err());
     }
 
     #[test]

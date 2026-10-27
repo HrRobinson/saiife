@@ -283,7 +283,15 @@ enum Cmd {
 #[derive(Subcommand)]
 enum AuditAction {
     /// Check that the audit log has not been edited, reordered or cut.
-    Verify,
+    Verify {
+        /// A forwarded copy (one JSONL file, or a dir of month files): the
+        /// local log must hold every checkpoint it has and reach its end.
+        #[arg(long, value_name = "FILE|DIR")]
+        external: Option<std::path::PathBuf>,
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -454,9 +462,13 @@ fn main() -> ExitCode {
         Cmd::Status { root } => status_cmd::run(&packs, root),
         Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
-            action: Some(AuditAction::Verify),
+            action:
+                Some(AuditAction::Verify {
+                    external,
+                    system_config,
+                }),
             ..
-        } => audit_cmd::verify(),
+        } => audit_cmd::verify(external.as_deref(), system_config.as_deref()),
         Cmd::Audit {
             action: None,
             since,
