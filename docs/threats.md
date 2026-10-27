@@ -111,11 +111,14 @@ ask questions later. `saiife lockdown off` lifts it, and `saiife lockdown`
 shows the state.
 
 - **Who.** Turning it on: root, users in an `[admin]` group and `[approval]
-  approvers`. Turning it off: root and users in an `[admin]` group, or an
-  approver who passes polkit re-authentication (`same_user = "reauth"`; the
+  approvers`. An approver who is not an admin may only turn it on when it is
+  off, or widen it (`connectors` to `all`). Turning it off, narrowing it, or
+  replacing an active lockdown (even the same scope with a new reason): root
+  and users in an `[admin]` group, or an approver who passes polkit
+  re-authentication (`same_user = "reauth"`; the
   CLI says what it is for and starts `pkttyagent` first). Under
   `same_user = "deny"`, or when re-authentication is unavailable, an approver
-  who is not an admin cannot turn it off (`reauth_required`,
+  who is not an admin cannot make those changes (`reauth_required`,
   `reauth_unavailable`). Anyone else is refused, and every refusal is
   recorded. So an agent running as an approver's user cannot lift lockdown
   without the user's password.

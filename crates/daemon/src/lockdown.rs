@@ -92,7 +92,22 @@ impl Store {
     /// file cannot be written (then `Err` says so); turning off happens
     /// only once the file is gone.
     pub fn set(&self, next: Option<Lockdown>) -> io::Result<()> {
+        self.set_if(next, |_| true)
+            .expect("an unconditional change always applies")
+    }
+
+    /// [`Store::set`] only if `ok` accepts the flag as it is at the moment
+    /// of the change (checked under the change lock, so no other change
+    /// slips in between); `None` when it refused and nothing changed.
+    pub fn set_if(
+        &self,
+        next: Option<Lockdown>,
+        ok: impl FnOnce(Option<&Lockdown>) -> bool,
+    ) -> Option<io::Result<()>> {
         let _one = lock(&self.change);
+        if !ok(lock(&self.cur).as_ref()) {
+            return None;
+        }
         let saved = match (&self.path, &next) {
             (None, _) => Ok(()),
             (Some(p), Some(l)) => write(p, l),
@@ -101,7 +116,7 @@ impl Store {
         if saved.is_ok() || next.is_some() {
             *lock(&self.cur) = next;
         }
-        saved
+        Some(saved)
     }
 }
 
@@ -222,13 +237,29 @@ fn clean_reason(s: &str) -> String {
 
 /// The polkit `--detail request` of `lockdown off`.
 pub const OFF_DETAIL: &str = "lockdown off";
+/// The polkit `--detail request` of narrowing or replacing an active
+/// lockdown.
+pub const CHANGE_DETAIL: &str = "lockdown change";
+
+/// What an approver who is not an admin may do without re-authentication:
+/// turn lockdown on when it is off, or widen it (`connectors` to `all`).
+/// Anything else (off, narrowing, replacing an active lockdown, even with
+/// the same scope and a new reason) could weaken the kill switch, so it
+/// is as strong as turning it off.
+pub fn free_change(cur: Option<&Lockdown>, next: Option<LockScope>) -> bool {
+    match (cur, next) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(c), Some(n)) => c.scope == LockScope::Connectors && n == LockScope::All,
+    }
+}
 
 /// May the approver `conn` (not an admin) turn lockdown off? Lockdown has
 /// no requester, so the approver is treated as deciding its own request:
 /// under `same_user = "deny"` it is refused (`reauth_required`), under
 /// `"reauth"` it must pass polkit re-authentication (an unavailable one
 /// refuses). Runs off the runtime thread (the prompt can take 120 s).
-async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn) -> Result<(), Refusal> {
+async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn, detail: &'static str) -> Result<(), Refusal> {
     let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
         return Err(Refusal::NotApprover);
     };
@@ -256,29 +287,31 @@ async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn) -> Result<(), Refusal> {
             start.unwrap_or(0),
             c.proc.as_ref(),
             &c.reauth_cooldowns,
-            OFF_DETAIL,
+            detail,
         )
     })
     .await
     .unwrap_or_else(|e| Err(Refusal::ReauthError(e.to_string())))
 }
 
-/// The rule and message of a refused `lockdown off` by an approver.
-fn off_refusal(r: &Refusal) -> (&'static str, String) {
+/// The rule and message of a refused `lockdown off` (or change of an
+/// active lockdown) by an approver.
+fn off_refusal(r: &Refusal, what: &str) -> (&'static str, String) {
     match r {
         Refusal::SameUserDenied => (
             "reauth_required",
-            "lockdown off needs root, an [admin] group, or an approver who re-authenticates (same_user = \"reauth\")".into(),
+            format!("{what} needs root, an [admin] group, or an approver who re-authenticates (same_user = \"reauth\")"),
         ),
         other => (other.rule(), other.to_string()),
     }
 }
 
-/// `lockdown.set {on, scope?, reason?}`. On: root, `[admin] groups` and
-/// approvers. Off: root and `[admin] groups`, or an approver who passes
-/// polkit re-authentication (`same_user = "reauth"`), since turning the
-/// kill switch off is as strong as approving. Everyone else gets
-/// `forbidden` and a `lockdown` record with decision `deny`.
+/// `lockdown.set {on, scope?, reason?}`. Root and `[admin] groups` may do
+/// anything. An approver may turn it on when it is off or widen it
+/// (`connectors` to `all`); turning it off, narrowing it or replacing an
+/// active lockdown needs polkit re-authentication (`same_user = "reauth"`),
+/// since weakening the kill switch is as strong as approving. Everyone else
+/// gets `forbidden` and a `lockdown` record with decision `deny`.
 pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
     let peer: &PeerCred = &conn.peer;
@@ -335,36 +368,56 @@ pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             "lockdown is for root, [admin] groups and [approval] approvers",
         );
     }
-    if !on && !admin {
-        if let Err(r) = may_turn_off(ctx, conn).await {
-            let (rule, why) = off_refusal(&r);
-            rec.decision = DecisionKind::Deny;
-            rec.rule = Some(rule.into());
-            rec.reason = Some(why.clone());
-            if let Err(e) = ctx.writer.append(rec).await {
-                eprintln!("saiifed: warning: cannot write lockdown record: {e}");
-            }
-            let mut m = Map::new();
-            m.insert("rule".into(), rule.into());
-            return err_with(
-                id,
-                ErrorCode::Forbidden,
-                &format!("refused ({rule}): {why}"),
-                m,
-            );
-        }
-    }
-
     let next = on.then(|| Lockdown {
         scope,
         reason,
         by_uid: peer.uid,
         since: now_ts(),
     });
-    let c = Arc::clone(ctx);
-    let saved = tokio::task::spawn_blocking(move || c.lockdown.set(next))
+    let next_scope = on.then_some(scope);
+    // An approver's free change is checked against the flag at the moment
+    // it is applied; if the flag moved meanwhile (or the change was never
+    // free) it needs re-authentication like `off`.
+    let mut reauthed = admin;
+    let saved = loop {
+        if !reauthed && !free_change(ctx.lockdown.get().as_ref(), next_scope) {
+            let (detail, what) = if on {
+                (CHANGE_DETAIL, "narrowing or replacing an active lockdown")
+            } else {
+                (OFF_DETAIL, "lockdown off")
+            };
+            if let Err(r) = may_turn_off(ctx, conn, detail).await {
+                let (rule, why) = off_refusal(&r, what);
+                rec.decision = DecisionKind::Deny;
+                rec.rule = Some(rule.into());
+                rec.reason = Some(why.clone());
+                if let Err(e) = ctx.writer.append(rec).await {
+                    eprintln!("saiifed: warning: cannot write lockdown record: {e}");
+                }
+                let mut m = Map::new();
+                m.insert("rule".into(), rule.into());
+                return err_with(
+                    id,
+                    ErrorCode::Forbidden,
+                    &format!("refused ({rule}): {why}"),
+                    m,
+                );
+            }
+            reauthed = true;
+        }
+        let c = Arc::clone(ctx);
+        let n = next.clone();
+        let free = reauthed;
+        let r = tokio::task::spawn_blocking(move || {
+            c.lockdown
+                .set_if(n, |cur| free || free_change(cur, next_scope))
+        })
         .await
-        .unwrap_or_else(|e| Err(io::Error::other(e.to_string())));
+        .unwrap_or_else(|e| Some(Err(io::Error::other(e.to_string()))));
+        if let Some(r) = r {
+            break r;
+        }
+    };
     // The flag is changed (or not) before the record, as for `secret.*`.
     let mut problem = None;
     if let Err(e) = &saved {
@@ -480,6 +533,31 @@ mod tests {
         let link = d.path().join("link");
         std::os::unix::fs::symlink(p.parent().unwrap(), &link).unwrap();
         assert!(check_parent(&link.join(FILE_NAME)).is_err());
+    }
+
+    #[test]
+    fn free_change_is_on_from_off_or_widening_only() {
+        use LockScope::{All, Connectors};
+        let (all, con) = (flag(All), flag(Connectors));
+        assert!(free_change(None, Some(All)));
+        assert!(free_change(None, Some(Connectors)));
+        assert!(free_change(Some(&con), Some(All)));
+        assert!(!free_change(Some(&all), Some(Connectors)));
+        assert!(!free_change(Some(&all), Some(All)));
+        assert!(!free_change(Some(&con), Some(Connectors)));
+        assert!(!free_change(None, None));
+        assert!(!free_change(Some(&con), None));
+    }
+
+    #[test]
+    fn set_if_checks_the_flag_under_the_change_lock() {
+        let s = Store::memory();
+        s.set(Some(flag(LockScope::All))).unwrap();
+        let narrow = Some(flag(LockScope::Connectors));
+        assert!(s
+            .set_if(narrow, |cur| free_change(cur, Some(LockScope::Connectors)))
+            .is_none());
+        assert_eq!(s.get(), Some(flag(LockScope::All)));
     }
 
     #[test]

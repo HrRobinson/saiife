@@ -1,10 +1,11 @@
 //! `saiife lockdown [on|off]` (spec §6.18): the kill switch. `on` denies
 //! every connector request (`--scope connectors`) or also every hook call
 //! (`--scope all`, the default); `off` lifts it; no subcommand shows the
-//! state. For root, `[admin] groups` and `[approval] approvers`; `off` by
-//! an approver who is not an admin needs polkit re-authentication
-//! (`same_user = "reauth"`), so the CLI says what it turns off and starts
-//! `pkttyagent` first (as `approve` does). Linux only. Exit codes: 0 ok,
+//! state. For root, `[admin] groups` and `[approval] approvers`; `off`, or
+//! narrowing or replacing an active lockdown, by an approver who is not an
+//! admin needs polkit re-authentication (`same_user = "reauth"`), so the
+//! CLI says what it changes and starts `pkttyagent` first (as `approve`
+//! does). Linux only. Exit codes: 0 ok,
 //! 2 refused, 5 the daemon cannot be reached.
 
 use std::path::PathBuf;
@@ -78,6 +79,28 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             if let Some(r) = reason {
                 args.insert("reason".into(), json!(r));
             }
+            // Only turning it on when off, or widening `connectors` to
+            // `all`, is free; any other change of an active lockdown may
+            // ask for a password (the daemon decides; this only prepares).
+            let active = if rustix::process::geteuid().is_root() {
+                None
+            } else {
+                call(&config, "status", Map::new()).ok().and_then(|a| {
+                    a.get("lockdown")
+                        .and_then(|l| l.get("scope"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            };
+            let _agent = match active.as_deref() {
+                Some(cur) if !(cur == "connectors" && scope == "all") => {
+                    eprintln!(
+                        "saiife: changing an active lockdown (polkit may ask for your password)"
+                    );
+                    crate::approvals_cmd::start_agent()
+                }
+                _ => None,
+            };
             call(&config, "lockdown.set", args).map(|a| shown(&a, "lockdown"))
         }
         Some(LockdownAction::Off) => {

@@ -281,6 +281,74 @@ fn approver_may_set_lockdown_but_not_lift_it_without_reauth() {
     assert!(stdout(&lockdown(&d, &[])).contains("lockdown: on"));
 }
 
+/// An approver who is not an admin may widen lockdown (`connectors` to
+/// `all`) but not narrow it (`all` to `connectors`) or replace it (same
+/// scope, new reason) without re-authentication: refused and recorded,
+/// the flag unchanged.
+#[test]
+fn approver_may_widen_lockdown_but_not_narrow_or_replace_it() {
+    let d = TestDaemon::start(Opts {
+        extra: format!(
+            "[admin]\ngroups = [\"saiife-no-such-group\"]\n\n[approval]\napprovers = [{:?}]\n",
+            own_user()
+        ),
+        ..Opts::default()
+    });
+    fs::create_dir_all(d.path().join("project")).unwrap();
+    let o = lockdown(&d, &["on", "--scope", "connectors"]);
+    assert_eq!(code(&o), 0, "{} / {}", stderr(&o), d.stderr_text());
+    let o = lockdown(&d, &["on", "--scope", "all", "--reason", "wider"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("scope all"), "{}", stdout(&o));
+    for args in [
+        &["on", "--scope", "connectors"][..],
+        &["on", "--scope", "all", "--reason", "other"][..],
+    ] {
+        let o = lockdown(&d, args);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("refused (reauth_required)"),
+            "{}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).contains("changing an active lockdown"),
+            "{}",
+            stderr(&o)
+        );
+    }
+    let recs = lockdown_records(&d);
+    assert_eq!(recs.len(), 4, "{recs:?}");
+    assert_eq!(recs[1]["decision"], "allow", "{recs:?}");
+    for r in &recs[2..] {
+        assert_eq!(r["decision"], "deny", "{r}");
+        assert_eq!(r["action"], "on", "{r}");
+        assert_eq!(r["rule"], "reauth_required", "{r}");
+    }
+    assert_eq!(recs[2]["scope"], "connectors", "{recs:?}");
+    // Still `all`, with the widening's reason.
+    let s = stdout(&lockdown(&d, &[]));
+    assert!(
+        s.contains("lockdown: on (scope all)") && s.contains(": wider"),
+        "{s}"
+    );
+}
+
+/// An admin may narrow and replace an active lockdown.
+#[test]
+fn admin_may_narrow_lockdown() {
+    let d = world("");
+    let o = lockdown(&d, &["on"]);
+    assert_eq!(code(&o), 0, "{} / {}", stderr(&o), d.stderr_text());
+    let o = lockdown(&d, &["on", "--scope", "connectors", "--reason", "narrow"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let s = stdout(&lockdown(&d, &[]));
+    assert!(s.contains("lockdown: on (scope connectors)"), "{s}");
+    let recs = lockdown_records(&d);
+    assert_eq!(recs.len(), 2, "{recs:?}");
+    assert!(recs.iter().all(|r| r["decision"] == "allow"), "{recs:?}");
+}
+
 #[test]
 fn unreadable_flag_fails_closed_to_all() {
     let mut d = world("");

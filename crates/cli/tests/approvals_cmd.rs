@@ -1056,6 +1056,46 @@ fn lockdown_off_by_an_approver_needs_reauth() {
     assert!(w.ctx.lockdown.get().is_none());
 }
 
+/// Narrowing an active lockdown by an approver who is not an admin needs
+/// re-authentication (detail `lockdown change`): authorized narrows it,
+/// denied keeps it (`reauth_failed`, recorded).
+#[test]
+fn lockdown_narrowing_by_an_approver_needs_reauth() {
+    let w = world();
+    let agent = fake_agent(w.path());
+    let lockdown = |args: &[&str]| {
+        let mut cmd = w.cli_cmd("lockdown", args);
+        cmd.env("SAIIFE_TEST_PKTTYAGENT", &agent);
+        cmd.output().unwrap()
+    };
+    use saiife_broker::pipeline::LockScope;
+    let scope = || w.ctx.lockdown.get().map(|l| l.scope);
+    w.own_reauth(true);
+    ok(&lockdown(&["on"]));
+    ok(&lockdown(&["on", "--scope", "connectors"]));
+    assert_eq!(scope(), Some(LockScope::Connectors));
+    // Widening is free: no re-authentication.
+    ok(&lockdown(&["on", "--scope", "all"]));
+    assert_eq!(scope(), Some(LockScope::All));
+    assert_eq!(
+        *w.reauth.details.lock().unwrap(),
+        vec!["lockdown change".to_string()]
+    );
+
+    w.own_reauth(false);
+    let o = lockdown(&["on", "--scope", "connectors"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("refused (reauth_failed)"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(scope(), Some(LockScope::All));
+    let rec = w.wait_lockdown_record("reauth_failed");
+    assert_eq!(rec["decision"], "deny", "{rec}");
+    assert_eq!(rec["action"], "on", "{rec}");
+}
+
 #[test]
 fn pkttyagent_not_started_for_other_users_requests_or_a_desktop() {
     let w = world();
