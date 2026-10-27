@@ -943,6 +943,7 @@ mod tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    #[cfg(target_os = "linux")]
     fn add_polkit(t: &T, action: bool) {
         let p = t.at(PKCHECK);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
