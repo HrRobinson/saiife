@@ -51,6 +51,7 @@ phase_fail_closed
 phase_attacks
 phase_doctor
 phase_approvals
+phase_lockdown
 phase_reinstall_uninstall
 
 echo "== locked-linux: all phases passed (systemd $(systemd_version))"

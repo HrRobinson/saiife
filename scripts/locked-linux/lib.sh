@@ -69,6 +69,7 @@ on_exit() {
             tar -C "$LOGS" -xf - 2>/dev/null || true
         cp -r "$WORK" "$LOGS/work" 2>/dev/null || true
     fi
+    cleanup_lockdown || true
     cleanup_approvals || true
     rm -rf "$WORK"
 }
@@ -523,12 +524,33 @@ self_approve_refused_by() {
     [[ "$SA_CODE" == 2 && "$(last_refusal_rule "$1")" == "$2" ]]
 }
 
-# The refusal for a same-uid approval without a polkit agent.
+# The newest `refused` approval record's reason for request `$1`.
+last_refusal_reason() {
+    records | jq -r --argjson id "$1" \
+        'select(.kind == "approval" and .approval == $id and .action == "refused") | .reason // ""' | tail -n 1
+}
+
+# Fail at once if any refusal says polkit would not let the daemon check
+# another uid's process: the action file must name the daemon as its owner.
+no_untrusted_caller_refusal() {
+    local bad
+    bad="$(records | jq -r 'select(.kind == "approval" and .action == "refused") | .reason // "" | select(test("trusted callers"))' | head -n 1)"
+    [[ -z "$bad" ]] || fail "polkit refused the daemon as an untrusted caller (the action owner annotation is not in effect): $bad"
+}
+
+# The refusal for a same-uid approval without a polkit agent: with the
+# daemon as the action's owner, pkcheck runs and finds no agent to ask, so
+# the answer is reauth_failed. reauth_unavailable passes only when its
+# reason is not polkit refusing the caller; that one fails the job.
 self_approve_refused_by_reauth() {
     saiife_as "$AGENT_USER" "$AGENT_HOME" approve "$1"
-    local rule
+    no_untrusted_caller_refusal
+    local rule reason
     rule="$(last_refusal_rule "$1")"
-    [[ "$SA_CODE" == 2 && ( "$rule" == reauth_failed || "$rule" == reauth_unavailable ) ]]
+    reason="$(last_refusal_reason "$1")"
+    [[ "$SA_CODE" == 2 ]] || return 1
+    [[ "$rule" == reauth_failed ]] && return 0
+    [[ "$rule" == reauth_unavailable && "$reason" != *"trusted callers"* ]]
 }
 
 policy_count() {
@@ -600,7 +622,9 @@ phase_approvals() {
     if as_root grep -q 'auth_self_keep' "$action"; then
         fail "$action names auth_self_keep"
     fi
-    ok "$action: auth_self for allow_any, allow_inactive, allow_active"
+    as_root grep -q '<annotate key="org.freedesktop.policykit.owner">unix-user:saiife</annotate>' "$action" ||
+        fail "$action: the daemon user is not the action's owner"
+    ok "$action: auth_self for allow_any, allow_inactive, allow_active; owned by unix-user:saiife"
 
     # Polkit is installed on the runner, so doctor does not warn.
     as_root "$OPT_BIN" doctor --json >"$WORK/doctor.json" 2>"$WORK/doctor.err" || code=$?
@@ -671,7 +695,8 @@ EOF
     # With no polkit agent pkcheck fails (reauth_failed) or exits 2 (reauth_unavailable):
     # both are a refusal.
     wait_diag 60 "the self-approval to be refused by reauth" self_approve_refused_by_reauth "$third"
-    ok "same_user = reauth: self-approval refused (exit 2, rule $(last_refusal_rule "$third"))"
+    ok "same_user = reauth: self-approval refused (exit 2, rule $(last_refusal_rule "$third"): $(last_refusal_reason "$third"))"
+    no_untrusted_caller_refusal
     expect_pending "$third" "after the failed reauth"
     [[ "$(approval_actions "$third")" != *approved* ]] || fail "#$third was approved: $(approval_actions "$third")"
 
@@ -683,6 +708,90 @@ EOF
     reload_checked
     wait_diag 30 "the daemon after restoring the config" daemon_ready
     wait_diag 30 "the force-push to be blocked again, not asked" hook_denied_not_asked claude "$forced"
+    ok "config restored, $APPROVER_USER removed"
+}
+
+# ------------------------------------------------------ lockdown (plan 11)
+
+LOCKDOWN_ON=0
+
+# The newest `lockdown` record as compact JSON ("" if none).
+last_lockdown_record() {
+    records | jq -c 'select(.kind == "lockdown")' | tail -n 1
+}
+
+# Lift lockdown as root (best effort): also runs from on_exit.
+cleanup_lockdown() {
+    if [[ "$LOCKDOWN_ON" == 1 ]]; then
+        as_root "$OPT_BIN" lockdown off >/dev/null 2>&1 || true
+        LOCKDOWN_ON=0
+    fi
+}
+
+hook_locked_out() {
+    hook "$@"
+    [[ "$HOOK_CODE" == 2 && "$HOOK_ERR" == *"saiife lockdown is on"* ]]
+}
+
+phase_lockdown() {
+    phase "6c. lockdown: on, survives a restart, who may lift it"
+    local allow rec code=0
+    allow="$(payload claude/bash-allow.json)"
+
+    # An approver who is not an admin, under same_user = "deny".
+    as_root useradd -m -s /bin/bash "$APPROVER_USER"
+    APPROVALS_CFG_BACKUP="$WORK/config.pre-lockdown"
+    as_root cp -p /etc/saiife/config.toml "$APPROVALS_CFG_BACKUP"
+    as_root chmod a+r "$APPROVALS_CFG_BACKUP"
+    as_root cat /etc/saiife/config.toml | awk '
+        /^[ \t]*\[/ { skip = ($0 ~ /^[ \t]*\[approval(\.[^]]*)?\][ \t]*(#.*)?$/) }
+        !skip { print }
+    ' >"$WORK/config.lockdown"
+    cat >>"$WORK/config.lockdown" <<EOF
+
+[approval]
+approvers = ["$APPROVER_USER"]
+same_user = "deny"
+EOF
+    as_root tee /etc/saiife/config.toml <"$WORK/config.lockdown" >/dev/null
+    reload_checked
+
+    # Root turns it on: every hook call is denied with the reason.
+    LOCKDOWN_ON=1
+    as_root "$OPT_BIN" lockdown on --scope all --reason "locked-linux CI" || fail "root: lockdown on failed"
+    wait_diag 30 "the hook to be locked out" hook_locked_out claude "$allow"
+    ok "lockdown on (all): hook denied ($HOOK_ERR)"
+
+    # It survives a restart.
+    as_root systemctl restart saiifed
+    wait_diag 30 "the daemon after the restart" daemon_ready
+    wait_diag 30 "the hook to stay locked out after the restart" hook_locked_out claude "$allow"
+    ok "lockdown survives systemctl restart saiifed"
+
+    # Neither an agent user nor an approver who cannot re-authenticate may lift it.
+    saiife_as "$AGENT_USER" "$AGENT_HOME" lockdown off
+    [[ "$SA_CODE" == 2 ]] || fail "$AGENT_USER: lockdown off exited $SA_CODE, want 2: $SA_ERR"
+    rec="$(last_lockdown_record)"
+    jq -e '.action == "off" and .decision == "deny" and .rule == "forbidden"' <<<"$rec" >/dev/null ||
+        fail "$AGENT_USER: lockdown off record is not a forbidden deny: $rec"
+    ok "$AGENT_USER: lockdown off refused (exit 2, rule forbidden)"
+    saiife_as "$APPROVER_USER" / lockdown off
+    [[ "$SA_CODE" == 2 ]] || fail "$APPROVER_USER: lockdown off exited $SA_CODE, want 2: $SA_ERR"
+    rec="$(last_lockdown_record)"
+    jq -e '.action == "off" and .decision == "deny" and .rule == "reauth_required"' <<<"$rec" >/dev/null ||
+        fail "$APPROVER_USER: lockdown off record is not a reauth_required deny: $rec"
+    hook_locked_out claude "$allow" || fail "lockdown was lifted by $APPROVER_USER: $HOOK_ERR"
+    ok "$APPROVER_USER (approver, not admin, same_user = deny): lockdown off refused (rule reauth_required)"
+
+    # Root lifts it.
+    as_root "$OPT_BIN" lockdown off || code=$?
+    [[ "$code" == 0 ]] || fail "root: lockdown off exited $code"
+    LOCKDOWN_ON=0
+    expect_hook 0 "" "hook after root lifted lockdown" claude "$allow"
+
+    cleanup_approvals
+    reload_checked
+    wait_diag 30 "the daemon after restoring the config" daemon_ready
     ok "config restored, $APPROVER_USER removed"
 }
 
