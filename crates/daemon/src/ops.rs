@@ -158,6 +158,8 @@ pub struct Ctx {
     /// Same-user re-authentication for approvals (polkit `pkcheck`; tests
     /// replace it before the context is shared).
     pub reauth: Arc<dyn crate::reauth::Reauth>,
+    /// Per-uid re-authentication cooldowns after a failed prompt.
+    pub reauth_cooldowns: Mutex<crate::reauth::Cooldowns>,
     /// One-use command grants (`[guard] ask`, spec §6.10.4).
     pub grants: crate::grants::Grants,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
@@ -289,6 +291,7 @@ impl Ctx {
             notifier: crate::notifier::Notifier::new(),
             approvals: i.approvals,
             reauth: Arc::new(crate::reauth::PkCheck::new()),
+            reauth_cooldowns: Mutex::default(),
             grants: i.grants,
             signals: Default::default(),
             names: Mutex::new(HashMap::new()),

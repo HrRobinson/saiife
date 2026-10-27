@@ -1,15 +1,20 @@
 //! Same-user re-authentication through polkit (spec §6.10.2, plan 11
 //! decision 7). The daemon runs
 //! `pkcheck --action-id com.saiife.approve --process <pid>,<start>,<uid>
-//! --allow-user-interaction` for the approving CLI process, with an empty
-//! environment except `PATH`, and kills it (its own child) at the timeout.
+//! --allow-user-interaction --detail request <what>` for the approving CLI
+//! process, with an empty environment except `PATH`, and kills it (its own
+//! child) at the timeout. The action file names the daemon user as the
+//! action's owner (`org.freedesktop.policykit.owner`): polkit lets only
+//! root or an action owner check another user's process, and the daemon
+//! runs as `saiife`. The first line of pkcheck's stderr goes into the
+//! result, so a refusal says why.
 //! Exit 0 is authorized; 1 and 3 and a signal are denied; 2 and 127 are
 //! unavailable; 126 and any other code, a spawn failure or a timeout are an
 //! error (see [`exit_result`]). Every non-`Authorized` result refuses the
 //! approval.
 
 use crate::sessions::Proc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -41,13 +46,86 @@ const EXIT_ERROR: i32 = 127;
 /// authorized) and 3 (dismissed) denied; 2 (authentication needed, no agent
 /// answered) and 127 (an error, e.g. polkitd down) unavailable; 126 (bad
 /// options) and any other code an error; killed by a signal (`None`) denied.
-fn exit_result(code: Option<i32>) -> ReauthResult {
+/// `stderr` is the first line pkcheck wrote there (cleaned, maybe empty).
+fn exit_result(code: Option<i32>, stderr: &str) -> ReauthResult {
+    let with = |m: String| {
+        if stderr.is_empty() {
+            m
+        } else {
+            format!("{m}: {stderr}")
+        }
+    };
     match code {
         Some(EXIT_AUTHORIZED) => ReauthResult::Authorized,
-        Some(EXIT_NOT_AUTHORIZED | EXIT_DISMISSED) | None => ReauthResult::Denied,
-        Some(EXIT_CHALLENGE | EXIT_ERROR) => ReauthResult::Unavailable,
-        Some(EXIT_BAD_OPTIONS) => ReauthResult::Error("pkcheck: bad options".into()),
-        Some(c) => ReauthResult::Error(format!("pkcheck: unexpected exit {c}")),
+        Some(EXIT_NOT_AUTHORIZED | EXIT_DISMISSED) | None => ReauthResult::Denied(stderr.into()),
+        Some(EXIT_CHALLENGE | EXIT_ERROR) => ReauthResult::Unavailable(stderr.into()),
+        Some(EXIT_BAD_OPTIONS) => ReauthResult::Error(with("pkcheck: bad options".into())),
+        Some(c) => ReauthResult::Error(with(format!("pkcheck: unexpected exit {c}"))),
+    }
+}
+
+/// The longest stderr line kept, in characters.
+pub const MAX_STDERR_CHARS: usize = 200;
+/// How much of pkcheck's stderr is read at most.
+const MAX_STDERR_BYTES: u64 = 8 * 1024;
+
+/// The first non-empty line of `raw`: printable characters only, at most
+/// [`MAX_STDERR_CHARS`].
+pub fn first_line(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_STDERR_CHARS)
+        .collect()
+}
+
+/// The longest `--detail request` value, in characters.
+pub const MAX_DETAIL_CHARS: usize = 120;
+
+/// A `--detail request` value: control characters become spaces, at most
+/// [`MAX_DETAIL_CHARS`] characters. polkit shows it in the prompt.
+pub fn clean_detail(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DETAIL_CHARS)
+        .collect()
+}
+
+/// After a re-authentication that did not succeed (denied, dismissed, timed
+/// out, an error), the uid waits this long before polkit is asked again;
+/// each further failure doubles the wait, up to [`COOLDOWN_MAX`]. A success
+/// resets it. So an agent cannot flood its user with password prompts.
+pub const COOLDOWN_FIRST: Duration = Duration::from_secs(30);
+pub const COOLDOWN_MAX: Duration = Duration::from_secs(600);
+
+/// Per-uid re-authentication cooldowns.
+#[derive(Debug, Default)]
+pub struct Cooldowns {
+    /// uid -> (no prompt before, the next wait).
+    map: HashMap<u32, (Instant, Duration)>,
+}
+
+impl Cooldowns {
+    /// How long `uid` must still wait at `now`, if at all.
+    pub fn remaining(&self, uid: u32, now: Instant) -> Option<Duration> {
+        let (until, _) = self.map.get(&uid)?;
+        (*until > now).then(|| *until - now)
+    }
+
+    /// A failed re-authentication of `uid` at `now`.
+    pub fn failed(&mut self, uid: u32, now: Instant) {
+        let wait = self.map.get(&uid).map_or(COOLDOWN_FIRST, |(_, n)| *n);
+        self.map
+            .insert(uid, (now + wait, (wait * 2).min(COOLDOWN_MAX)));
+    }
+
+    /// A successful re-authentication of `uid`.
+    pub fn succeeded(&mut self, uid: u32) {
+        self.map.remove(&uid);
     }
 }
 
@@ -90,8 +168,11 @@ impl Drop for InFlight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReauthResult {
     Authorized,
-    Denied,
-    Unavailable,
+    /// Not authorized or dismissed; pkcheck's first stderr line, if any.
+    Denied(String),
+    /// No agent answered, or polkit could not check (e.g. it refused an
+    /// untrusted caller); pkcheck's first stderr line, if any.
+    Unavailable(String),
     Error(String),
 }
 
@@ -100,8 +181,16 @@ pub trait Reauth: Send + Sync {
     /// Whether re-authentication can run at all on this host.
     fn available(&self) -> bool;
     /// Asks whether the process `pid` (started at `start`, running as `uid`)
-    /// proved a human is present, within `timeout`.
-    fn check(&self, pid: u32, start: u64, uid: u32, timeout: Duration) -> ReauthResult;
+    /// proved a human is present, within `timeout`. `detail` names what is
+    /// approved; polkit shows it in the prompt.
+    fn check(
+        &self,
+        pid: u32,
+        start: u64,
+        uid: u32,
+        detail: &str,
+        timeout: Duration,
+    ) -> ReauthResult;
 }
 
 /// `pkcheck` from polkit.
@@ -140,13 +229,16 @@ impl PkCheck {
     }
 
     /// The argv after the program name (decision 7).
-    pub fn argv(pid: u32, start: u64, uid: u32) -> Vec<String> {
+    pub fn argv(pid: u32, start: u64, uid: u32, detail: &str) -> Vec<String> {
         vec![
             "--action-id".to_string(),
             ACTION_ID.to_string(),
             "--process".to_string(),
             format!("{pid},{start},{uid}"),
             "--allow-user-interaction".to_string(),
+            "--detail".to_string(),
+            "request".to_string(),
+            clean_detail(detail),
         ]
     }
 }
@@ -161,26 +253,47 @@ impl Reauth for PkCheck {
             && polkitd_present(&self.polkitd)
     }
 
-    fn check(&self, pid: u32, start: u64, uid: u32, timeout: Duration) -> ReauthResult {
+    fn check(
+        &self,
+        pid: u32,
+        start: u64,
+        uid: u32,
+        detail: &str,
+        timeout: Duration,
+    ) -> ReauthResult {
         let mut cmd = Command::new(&self.pkcheck);
-        cmd.args(PkCheck::argv(pid, start, uid))
+        cmd.args(PkCheck::argv(pid, start, uid, detail))
             .env_clear()
             .env("PATH", PKCHECK_PATH_ENV)
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = match spawn(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 return ReauthResult::Error(format!("{}: {e}", self.pkcheck.display()));
             }
         };
+        // Read stderr on the side (bounded), so a chatty pkcheck never
+        // blocks on a full pipe; the rest is drained and dropped.
+        let stderr = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut b = Vec::new();
+                let _ = (&mut e).take(MAX_STDERR_BYTES).read_to_end(&mut b);
+                let _ = std::io::copy(&mut e, &mut std::io::sink());
+                b
+            })
+        });
         let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return exit_result(status.code());
+                    // pkcheck has exited and does not fork: its stderr is
+                    // at EOF, so the join returns.
+                    let raw = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
+                    return exit_result(status.code(), &first_line(&raw));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -283,12 +396,18 @@ mod tests {
     fn pkcheck_argv_exact() {
         let d = tmp();
         let pk = PkCheck::with_paths(fake(d.path(), 0, 0), d.path().join("action"));
-        let r = pk.check(4242, 987654, 1000, Duration::from_secs(10));
+        let r = pk.check(
+            4242,
+            987654,
+            1000,
+            "#7 erp invoices.create\n",
+            Duration::from_secs(10),
+        );
         assert_eq!(r, ReauthResult::Authorized);
         let argv = fs::read_to_string(d.path().join("argv")).unwrap();
         assert_eq!(
             argv,
-            "--action-id\ncom.saiife.approve\n--process\n4242,987654,1000\n--allow-user-interaction\n"
+            "--action-id\ncom.saiife.approve\n--process\n4242,987654,1000\n--allow-user-interaction\n--detail\nrequest\n#7 erp invoices.create \n"
         );
         let env = fs::read_to_string(d.path().join("env")).unwrap();
         assert_eq!(env, "PATH=/usr/bin:/bin\n");
@@ -300,25 +419,109 @@ mod tests {
         let d = tmp();
         let bad_options = R::Error("pkcheck: bad options".into());
         for (code, want) in [
-            (1, R::Denied),
-            (3, R::Denied),
-            (2, R::Unavailable),
-            (127, R::Unavailable),
+            (1, R::Denied(String::new())),
+            (3, R::Denied(String::new())),
+            (2, R::Unavailable(String::new())),
+            (127, R::Unavailable(String::new())),
             (126, bad_options),
         ] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
-            assert_eq!(pk.check(1, 2, 3, Duration::from_secs(10)), want, "{code}");
+            assert_eq!(
+                pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+                want,
+                "{code}"
+            );
         }
         for code in [4, 5, 125, 255] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
-            match pk.check(1, 2, 3, Duration::from_secs(10)) {
+            match pk.check(1, 2, 3, "x", Duration::from_secs(10)) {
                 R::Error(e) => assert!(e.contains(&format!("exit {code}")), "{code}: {e}"),
                 other => panic!("{code}: expected Error, got {other:?}"),
             }
         }
         // Killed by a signal (no exit code): denied. Mapped directly, since
         // the tests never signal a process other than through `Child`.
-        assert_eq!(exit_result(None), R::Denied);
+        assert_eq!(exit_result(None, ""), R::Denied(String::new()));
+    }
+
+    /// A fake `pkcheck` that writes `stderr` there, then exits `code`.
+    fn fake_stderr(dir: &Path, code: i32, stderr: &str) -> PathBuf {
+        let script = dir.join("pkcheck-err");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s' '{stderr}' >&2\nexit {code}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn pkcheck_stderr_first_line_is_the_reason() {
+        use ReauthResult as R;
+        let d = tmp();
+        let trusted = "Error checking for authorization com.saiife.approve: GDBus.Error:org.freedesktop.PolicyKit1.Error.NotAuthorized: Only trusted callers (e.g. uid 0 or an action owner) can use CheckAuthorization() for a subject belonging to another user";
+        let pk = PkCheck::with_paths(
+            fake_stderr(d.path(), 127, &format!("\n{trusted}\nsecond line\n")),
+            d.path().join("action"),
+        );
+        match pk.check(1, 2, 3, "x", Duration::from_secs(10)) {
+            R::Unavailable(e) => {
+                assert!(e.contains("trusted callers"), "{e}");
+                assert!(!e.contains("second line"), "{e}");
+                assert!(e.chars().count() <= MAX_STDERR_CHARS, "{e}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        let pk = PkCheck::with_paths(
+            fake_stderr(d.path(), 1, "Not authorized.\u{1b}[2J"),
+            d.path().join("action"),
+        );
+        assert_eq!(
+            pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+            R::Denied("Not authorized.[2J".into())
+        );
+        let pk = PkCheck::with_paths(fake_stderr(d.path(), 126, "bad"), d.path().join("action"));
+        assert_eq!(
+            pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+            R::Error("pkcheck: bad options: bad".into())
+        );
+    }
+
+    #[test]
+    fn first_line_and_detail_are_cleaned_and_cut() {
+        assert_eq!(first_line(b"\n  \n a\tb \nc"), "ab");
+        assert_eq!(first_line(&[b'x'; 1000]).chars().count(), MAX_STDERR_CHARS);
+        assert_eq!(first_line(b""), "");
+        assert_eq!(clean_detail("#1 a\nb"), "#1 a b");
+        assert_eq!(
+            clean_detail(&"y".repeat(500)).chars().count(),
+            MAX_DETAIL_CHARS
+        );
+    }
+
+    #[test]
+    fn cooldown_doubles_up_to_ten_minutes_and_resets() {
+        let mut c = Cooldowns::default();
+        let t0 = Instant::now();
+        assert_eq!(c.remaining(1, t0), None);
+        c.failed(1, t0);
+        assert_eq!(c.remaining(1, t0), Some(Duration::from_secs(30)));
+        assert_eq!(c.remaining(2, t0), None);
+        let t1 = t0 + Duration::from_secs(30);
+        assert_eq!(c.remaining(1, t1), None);
+        c.failed(1, t1);
+        assert_eq!(c.remaining(1, t1), Some(Duration::from_secs(60)));
+        let mut t = t1;
+        for _ in 0..10 {
+            t += Duration::from_secs(3600);
+            c.failed(1, t);
+        }
+        assert_eq!(c.remaining(1, t), Some(COOLDOWN_MAX));
+        c.succeeded(1);
+        assert_eq!(c.remaining(1, t), None);
+        c.failed(1, t);
+        assert_eq!(c.remaining(1, t), Some(COOLDOWN_FIRST));
     }
 
     #[test]
@@ -337,7 +540,7 @@ mod tests {
         let d = tmp();
         let pk = PkCheck::with_paths(fake(d.path(), 0, 30), d.path().join("action"));
         let t0 = Instant::now();
-        let r = pk.check(1, 2, 3, Duration::from_millis(200));
+        let r = pk.check(1, 2, 3, "x", Duration::from_millis(200));
         assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
         match r {
             ReauthResult::Error(e) => assert!(e.contains("timed out"), "{e}"),
@@ -350,7 +553,7 @@ mod tests {
         let d = tmp();
         let pk = PkCheck::with_paths(d.path().join("nope"), d.path().join("action"));
         assert!(matches!(
-            pk.check(1, 2, 3, Duration::from_secs(1)),
+            pk.check(1, 2, 3, "x", Duration::from_secs(1)),
             ReauthResult::Error(_)
         ));
     }

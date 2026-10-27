@@ -28,19 +28,23 @@ pub const REAUTH_UNAVAILABLE: &str =
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
 
 /// The polkit action file, byte for byte. `auth_self`, never
-/// `auth_self_keep`: every approval asks for the password again.
+/// `auth_self_keep`: every approval asks for the password again. The
+/// daemon user ([`DAEMON_USER`]) is the action's owner: polkit lets only
+/// root or an action owner check another user's process (and pass
+/// details); `$(request)` is the `--detail request` the daemon sends.
 pub const POLKIT_POLICY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>saiife</vendor>
   <action id="com.saiife.approve">
     <description>Approve a saiife request</description>
-    <message>Authentication is required to approve a saiife request</message>
+    <message>Authentication is required to approve saiife request $(request)</message>
     <defaults>
       <allow_any>auth_self</allow_any>
       <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>
     </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:saiife</annotate>
   </action>
 </policyconfig>
 "#;

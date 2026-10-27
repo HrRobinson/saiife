@@ -5,11 +5,13 @@
 //! re-authentication; when that is unavailable it behaves as `"deny"`, with
 //! its own reason.
 
-use crate::reauth::{start_time_of, InFlight, Reauth, ReauthResult, REAUTH_TIMEOUT};
+use crate::reauth::{start_time_of, Cooldowns, InFlight, Reauth, ReauthResult, REAUTH_TIMEOUT};
 use crate::sessions::Proc;
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{ApprovalCfg, Directory, SameUser};
 use std::fmt;
+use std::sync::Mutex;
+use std::time::Instant;
 
 const GROUP_PREFIX: &str = "group:";
 /// The `ReauthError` detail when `approver_user` does not resolve to the peer uid.
@@ -23,11 +25,15 @@ pub const REAUTH_UNAVAILABLE: &str =
 pub enum Refusal {
     NotApprover,
     SameUserDenied,
-    ReauthUnavailable,
-    ReauthFailed,
+    /// pkcheck's first stderr line, if any.
+    ReauthUnavailable(String),
+    /// pkcheck's first stderr line, if any.
+    ReauthFailed(String),
     ReauthError(String),
     /// Another re-authentication for the same uid is still running.
     ReauthBusy,
+    /// A recent re-authentication failed: seconds left before the next.
+    ReauthCooldown(u64),
 }
 
 impl Refusal {
@@ -36,10 +42,11 @@ impl Refusal {
         match self {
             Refusal::NotApprover => "not_approver",
             Refusal::SameUserDenied => "same_user",
-            Refusal::ReauthUnavailable => "reauth_unavailable",
-            Refusal::ReauthFailed => "reauth_failed",
+            Refusal::ReauthUnavailable(_) => "reauth_unavailable",
+            Refusal::ReauthFailed(_) => "reauth_failed",
             Refusal::ReauthError(_) => "reauth_error",
             Refusal::ReauthBusy => "reauth_busy",
+            Refusal::ReauthCooldown(_) => "reauth_cooldown",
         }
     }
 }
@@ -51,11 +58,16 @@ impl fmt::Display for Refusal {
             Refusal::SameUserDenied => {
                 f.write_str("the requester cannot approve its own request (same_user = \"deny\")")
             }
-            Refusal::ReauthUnavailable => f.write_str(REAUTH_UNAVAILABLE),
-            Refusal::ReauthFailed => f.write_str("re-authentication failed"),
+            Refusal::ReauthUnavailable(d) if d.is_empty() => f.write_str(REAUTH_UNAVAILABLE),
+            Refusal::ReauthUnavailable(d) => write!(f, "{REAUTH_UNAVAILABLE} (pkcheck: {d})"),
+            Refusal::ReauthFailed(d) if d.is_empty() => f.write_str("re-authentication failed"),
+            Refusal::ReauthFailed(d) => write!(f, "re-authentication failed (pkcheck: {d})"),
             Refusal::ReauthError(e) => write!(f, "re-authentication error: {e}"),
             Refusal::ReauthBusy => {
                 f.write_str("another re-authentication for this user is still running")
+            }
+            Refusal::ReauthCooldown(s) => {
+                write!(f, "a recent re-authentication failed; try again in {s} s")
             }
         }
     }
@@ -92,6 +104,10 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
 /// - Same-user re-authentication **blocks for up to 120 s** (the password
 ///   prompt), so call this from `spawn_blocking`, never on a runtime
 ///   thread. At most one runs per uid; a concurrent one is `ReauthBusy`.
+/// - After one that was denied, dismissed, timed out or failed, the uid is
+///   in a cooldown (`cooldowns`, 30 s doubling to 10 min, reset by a
+///   success): `ReauthCooldown`, without asking polkit.
+/// - `detail` names what is decided (polkit's `--detail request`).
 #[allow(clippy::too_many_arguments)]
 pub fn may_decide(
     cfg: &ApprovalCfg,
@@ -102,6 +118,8 @@ pub fn may_decide(
     peer: &PeerCred,
     start_time: u64,
     proc: &dyn Proc,
+    cooldowns: &Mutex<Cooldowns>,
+    detail: &str,
 ) -> Result<(), Refusal> {
     let approver_uid = peer.uid;
     if dir.user(approver_user).map(|u| u.uid) != Some(approver_uid) {
@@ -117,12 +135,25 @@ pub fn may_decide(
         SameUser::Deny => Err(Refusal::SameUserDenied),
         SameUser::Reauth => {
             if !reauth.available() {
-                return Err(Refusal::ReauthUnavailable);
+                return Err(Refusal::ReauthUnavailable(String::new()));
             }
             let Some(_slot) = InFlight::begin(approver_uid) else {
                 return Err(Refusal::ReauthBusy);
             };
-            match reauth.check(peer.pid, start_time, approver_uid, REAUTH_TIMEOUT) {
+            let cool = || cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(left) = cool().remaining(approver_uid, Instant::now()) {
+                return Err(Refusal::ReauthCooldown(left.as_secs().max(1)));
+            }
+            let result = reauth.check(peer.pid, start_time, approver_uid, detail, REAUTH_TIMEOUT);
+            match &result {
+                ReauthResult::Authorized => cool().succeeded(approver_uid),
+                // No prompt was shown: nothing to cool down from.
+                ReauthResult::Unavailable(_) => {}
+                ReauthResult::Denied(_) | ReauthResult::Error(_) => {
+                    cool().failed(approver_uid, Instant::now())
+                }
+            }
+            match result {
                 ReauthResult::Authorized => match start_time_of(proc, peer.pid) {
                     Some(now) if now == start_time => Ok(()),
                     Some(_) => Err(Refusal::ReauthError(format!(
@@ -134,8 +165,8 @@ pub fn may_decide(
                         peer.pid
                     ))),
                 },
-                ReauthResult::Denied => Err(Refusal::ReauthFailed),
-                ReauthResult::Unavailable => Err(Refusal::ReauthUnavailable),
+                ReauthResult::Denied(d) => Err(Refusal::ReauthFailed(d)),
+                ReauthResult::Unavailable(d) => Err(Refusal::ReauthUnavailable(d)),
                 ReauthResult::Error(e) => Err(Refusal::ReauthError(e)),
             }
         }
@@ -162,10 +193,13 @@ mod tests {
     const PID: u32 = 5555;
     const START: u64 = 424242;
 
+    /// `(pid, start, uid, detail, timeout)` of one check.
+    type Call = (u32, u64, u32, String, Duration);
+
     struct FakeReauth {
         available: bool,
         result: ReauthResult,
-        calls: Mutex<Vec<(u32, u64, u32, Duration)>>,
+        calls: Mutex<Vec<Call>>,
     }
 
     impl FakeReauth {
@@ -182,8 +216,18 @@ mod tests {
         fn available(&self) -> bool {
             self.available
         }
-        fn check(&self, pid: u32, start: u64, uid: u32, timeout: Duration) -> ReauthResult {
-            self.calls.lock().unwrap().push((pid, start, uid, timeout));
+        fn check(
+            &self,
+            pid: u32,
+            start: u64,
+            uid: u32,
+            detail: &str,
+            timeout: Duration,
+        ) -> ReauthResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((pid, start, uid, detail.to_string(), timeout));
             self.result.clone()
         }
     }
@@ -285,21 +329,37 @@ mod tests {
             // Same uid, reauth.
             (&["alice"], Re, 1000, "alice", 1000, ok(), true, Ok(())),
             (&["group:ops"], Re, 1000, "alice", 1000, ok(), true, Ok(())),
-            (&["alice"], Re, 1000, "alice", 1000, fake(true, R::Denied), true, Err(Refusal::ReauthFailed)),
+            (&["alice"], Re, 1000, "alice", 1000, fake(true, R::Denied("no".into())), true, Err(Refusal::ReauthFailed("no".into()))),
             (&["alice"], Re, 1000, "alice", 1000, fake(true, R::Error("timed out".into())), true, Err(Refusal::ReauthError("timed out".into()))),
-            (&["alice"], Re, 1000, "alice", 1000, fake(true, R::Unavailable), true, Err(Refusal::ReauthUnavailable)),
-            (&["alice"], Re, 1000, "alice", 1000, fake(false, R::Authorized), false, Err(Refusal::ReauthUnavailable)),
+            (&["alice"], Re, 1000, "alice", 1000, fake(true, R::Unavailable("why".into())), true, Err(Refusal::ReauthUnavailable("why".into()))),
+            (&["alice"], Re, 1000, "alice", 1000, fake(false, R::Authorized), false, Err(Refusal::ReauthUnavailable(String::new()))),
         ];
         for (i, (approvers, same, uid, name, ruid, fake, runs, want)) in
             rows.into_iter().enumerate()
         {
             let c = cfg(approvers, same);
             let p = FakeProc::steady();
-            let got = may_decide(&c, &dir, name, ruid, &fake, &peer(uid), START, &p);
+            // A fresh cooldown table each row.
+            let got = may_decide(
+                &c,
+                &dir,
+                name,
+                ruid,
+                &fake,
+                &peer(uid),
+                START,
+                &p,
+                &Mutex::default(),
+                "#9 x",
+            );
             assert_eq!(got, want, "row {i}");
             let calls = fake.calls.lock().unwrap();
             if runs {
-                assert_eq!(*calls, vec![(PID, START, uid, REAUTH_TIMEOUT)], "row {i}");
+                assert_eq!(
+                    *calls,
+                    vec![(PID, START, uid, "#9 x".to_string(), REAUTH_TIMEOUT)],
+                    "row {i}"
+                );
             } else {
                 assert!(calls.is_empty(), "row {i}: reauth ran: {calls:?}");
             }
@@ -311,8 +371,21 @@ mod tests {
         let dir = FixedDirectory::from_text(PASSWD, GROUP);
         let c = cfg(&["recheck"], SameUser::Reauth);
         let ok = FakeReauth::new(true, ReauthResult::Authorized);
-        let run =
-            |p: &FakeProc| may_decide(&c, &dir, "recheck", 990102, &ok, &peer(990102), START, p);
+        let cd = Mutex::default();
+        let run = |p: &FakeProc| {
+            may_decide(
+                &c,
+                &dir,
+                "recheck",
+                990102,
+                &ok,
+                &peer(990102),
+                START,
+                p,
+                &cd,
+                "",
+            )
+        };
 
         // The pid was reused while the prompt was up.
         let changed = FakeProc::new(&[Some(START + 1)]);
@@ -332,7 +405,7 @@ mod tests {
         assert_eq!(same.reads.load(Ordering::SeqCst), 1);
 
         // A refused check never reads it.
-        let denied = FakeReauth::new(true, ReauthResult::Denied);
+        let denied = FakeReauth::new(true, ReauthResult::Denied(String::new()));
         let p = FakeProc::new(&[Some(START + 1)]);
         assert_eq!(
             may_decide(
@@ -343,9 +416,11 @@ mod tests {
                 &denied,
                 &peer(990102),
                 START,
-                &p
+                &p,
+                &Mutex::default(),
+                "",
             ),
-            Err(Refusal::ReauthFailed)
+            Err(Refusal::ReauthFailed(String::new()))
         );
         assert_eq!(p.reads.load(Ordering::SeqCst), 0);
     }
@@ -360,7 +435,7 @@ mod tests {
         fn available(&self) -> bool {
             true
         }
-        fn check(&self, _pid: u32, _start: u64, _uid: u32, _t: Duration) -> ReauthResult {
+        fn check(&self, _pid: u32, _s: u64, _uid: u32, _d: &str, _t: Duration) -> ReauthResult {
             self.entered.wait();
             self.release.wait();
             ReauthResult::Authorized
@@ -378,27 +453,19 @@ mod tests {
             release: Barrier::new(2),
         };
         let ok = FakeReauth::new(true, ReauthResult::Authorized);
+        let cd = Mutex::default();
+        let decide = |user: &str, uid: u32, r: &dyn Reauth| {
+            let p = FakeProc::steady();
+            may_decide(&c, &dir, user, uid, r, &peer(uid), START, &p, &cd, "")
+        };
         std::thread::scope(|s| {
-            let first = s.spawn(|| {
-                let p = FakeProc::steady();
-                may_decide(
-                    &c,
-                    &dir,
-                    "busy",
-                    990100,
-                    &blocking,
-                    &peer(990100),
-                    START,
-                    &p,
-                )
-            });
+            let first = s.spawn(|| decide("busy", 990100, &blocking));
             blocking.entered.wait();
             // Same uid while the first prompt is up: busy, no second check.
-            let p = FakeProc::steady();
-            let same = may_decide(&c, &dir, "busy", 990100, &ok, &peer(990100), START, &p);
+            let same = decide("busy", 990100, &ok);
             let checks = ok.calls.lock().unwrap().len();
             // Another uid is not blocked.
-            let other = may_decide(&c, &dir, "other", 990101, &ok, &peer(990101), START, &p);
+            let other = decide("other", 990101, &ok);
             // Release before asserting, so a failure panics instead of hanging.
             blocking.release.wait();
             assert_eq!(same, Err(Refusal::ReauthBusy));
@@ -407,11 +474,54 @@ mod tests {
             assert_eq!(first.join().unwrap(), Ok(()));
         });
         // The slot is free again.
-        let p = FakeProc::steady();
+        assert_eq!(decide("busy", 990100, &ok), Ok(()));
+    }
+
+    #[test]
+    fn a_failed_reauth_cools_down_and_a_success_resets() {
+        use ReauthResult as R;
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice"], SameUser::Reauth);
+        let cd = Mutex::default();
+        let run = |r: &FakeReauth| {
+            let p = FakeProc::steady();
+            may_decide(&c, &dir, "alice", 1000, r, &peer(1000), START, &p, &cd, "")
+        };
+        // Unavailable (no prompt shown) never cools down.
+        let unavailable = FakeReauth::new(true, R::Unavailable(String::new()));
         assert_eq!(
-            may_decide(&c, &dir, "busy", 990100, &ok, &peer(990100), START, &p),
-            Ok(())
+            run(&unavailable),
+            Err(Refusal::ReauthUnavailable(String::new()))
         );
+        let ok = FakeReauth::new(true, R::Authorized);
+        assert_eq!(run(&ok), Ok(()));
+        for failing in [R::Denied(String::new()), R::Error("timed out".into())] {
+            let f = FakeReauth::new(true, failing);
+            assert!(matches!(
+                run(&f),
+                Err(Refusal::ReauthFailed(_) | Refusal::ReauthError(_))
+            ));
+            // The next try is refused without asking polkit.
+            let again = FakeReauth::new(true, R::Authorized);
+            match run(&again) {
+                Err(Refusal::ReauthCooldown(s)) => assert!((1..=30).contains(&s), "{s}"),
+                other => panic!("expected a cooldown, got {other:?}"),
+            }
+            assert!(again.calls.lock().unwrap().is_empty());
+            // Waited out: a success clears it.
+            cd.lock().unwrap().succeeded(1000);
+            assert_eq!(run(&ok), Ok(()));
+        }
+        // The wait doubles: 30 s, then 60 s.
+        let mut t = cd.lock().unwrap();
+        let now = Instant::now();
+        t.failed(1000, now);
+        t.failed(1000, now + Duration::from_secs(31));
+        assert_eq!(
+            t.remaining(1000, now + Duration::from_secs(31)),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(Refusal::ReauthCooldown(5).rule(), "reauth_cooldown");
     }
 
     #[test]
@@ -419,18 +529,29 @@ mod tests {
         let all = [
             (Refusal::NotApprover, "not_approver"),
             (Refusal::SameUserDenied, "same_user"),
-            (Refusal::ReauthUnavailable, "reauth_unavailable"),
-            (Refusal::ReauthFailed, "reauth_failed"),
+            (
+                Refusal::ReauthUnavailable(String::new()),
+                "reauth_unavailable",
+            ),
+            (Refusal::ReauthFailed(String::new()), "reauth_failed"),
             (Refusal::ReauthError("e".into()), "reauth_error"),
             (Refusal::ReauthBusy, "reauth_busy"),
+            (Refusal::ReauthCooldown(3), "reauth_cooldown"),
         ];
         for (r, rule) in all {
             assert_eq!(r.rule(), rule);
             assert!(!r.to_string().is_empty());
         }
         assert_eq!(
-            Refusal::ReauthUnavailable.to_string(),
+            Refusal::ReauthUnavailable(String::new()).to_string(),
             "re-authentication unavailable: approvals need a second account"
         );
+        // pkcheck's reason is kept.
+        assert!(Refusal::ReauthUnavailable("Only trusted callers".into())
+            .to_string()
+            .contains("Only trusted callers"));
+        assert!(Refusal::ReauthFailed("Not authorized".into())
+            .to_string()
+            .contains("Not authorized"));
     }
 }

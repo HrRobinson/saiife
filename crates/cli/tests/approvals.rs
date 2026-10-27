@@ -1896,7 +1896,12 @@ fn approval_created_notifies() {
     let evs = w.events(ApprovalCreated);
     assert_eq!(evs.len(), 1, "{evs:?}");
     assert_eq!(evs[0].id, Some(id));
-    assert!(evs[0].summary.contains("force"), "{:?}", evs[0].summary);
+    // Only the rule leaves the host, never the command text.
+    assert_eq!(
+        evs[0].summary,
+        format!("approval #{id} needed: command request (core.git/force-push)")
+    );
+    assert!(!evs[0].summary.contains("origin main"));
     // The same command again is the same request: no second event.
     assert_eq!(needs_approval_id(&w.hook(FORCE_PUSH)), id);
     assert_eq!(w.events(ApprovalCreated).len(), 1);

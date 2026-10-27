@@ -126,6 +126,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         input: None,
         grant_key: None,
         scope: None,
+        ask_rule: None,
         send: SendDisplay {
             body_display: p.body_display.clone(),
             body_sha256: p.body_sha256.clone(),
@@ -213,7 +214,7 @@ async fn store_new(
         &format!(
             "approval #{} needed: {}",
             r.id,
-            crate::approvals::summary(&r)
+            crate::approvals::offhost_summary(&r)
         ),
     );
     Ok(r.id)
@@ -373,7 +374,7 @@ impl Reauth for NoStartTime<'_> {
     fn available(&self) -> bool {
         self.0.available()
     }
-    fn check(&self, _pid: u32, _start: u64, _uid: u32, _t: Duration) -> ReauthResult {
+    fn check(&self, _pid: u32, _s: u64, _uid: u32, _d: &str, _t: Duration) -> ReauthResult {
         ReauthResult::Error("the approver's process start time is unknown".into())
     }
 }
@@ -478,6 +479,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             let c = Arc::clone(ctx);
             let start = conn.start_time;
             let requester = r.uid;
+            let detail = crate::approvals::reauth_detail(&r);
             tokio::task::spawn_blocking(move || {
                 // Re-authentication names the approver's process: without
                 // its start time it cannot run (fail closed).
@@ -495,6 +497,8 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                     &peer,
                     start.unwrap_or(0),
                     c.proc.as_ref(),
+                    &c.reauth_cooldowns,
+                    &detail,
                 )
             })
             .await
@@ -901,6 +905,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         input: Some(f.input.clone()),
         grant_key: Some(crate::grants::hex(&f.key(peer.uid))),
         scope: Some(f.key_project.clone()),
+        ask_rule: f.ask(),
         send: SendDisplay::default(),
     };
     match store_new(ctx, new, None, sys.approval.timeout).await {

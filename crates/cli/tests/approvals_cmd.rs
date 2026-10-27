@@ -156,6 +156,8 @@ fn serve_one(
 /// The re-authentication seam: answers `allow`, instantly.
 struct FakeReauth {
     allow: AtomicBool,
+    /// The `--detail request` of every check.
+    details: Mutex<Vec<String>>,
 }
 
 impl saiife_daemon::reauth::Reauth for FakeReauth {
@@ -167,12 +169,14 @@ impl saiife_daemon::reauth::Reauth for FakeReauth {
         _pid: u32,
         _start: u64,
         _uid: u32,
+        detail: &str,
         _t: Duration,
     ) -> saiife_daemon::reauth::ReauthResult {
+        self.details.lock().unwrap().push(detail.to_string());
         if self.allow.load(Ordering::SeqCst) {
             saiife_daemon::reauth::ReauthResult::Authorized
         } else {
-            saiife_daemon::reauth::ReauthResult::Denied
+            saiife_daemon::reauth::ReauthResult::Denied(String::new())
         }
     }
 }
@@ -357,6 +361,7 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
         .unwrap();
     let reauth = Arc::new(FakeReauth {
         allow: AtomicBool::new(true),
+        details: Mutex::new(Vec::new()),
     });
     let ctx = rt.block_on(async {
         let mut ctx = Ctx::new(CtxInit {
@@ -759,6 +764,7 @@ fn show_prints_the_scope_of_a_command_request() {
                 input: Some("git push --force origin main".into()),
                 grant_key: Some("00".repeat(32)),
                 scope: Some("/srv/shop".into()),
+                ask_rule: Some("core.git/push-force".into()),
                 send: Default::default(),
             },
             |_| Ok(None),
@@ -853,6 +859,23 @@ fn refusal_prints_rule_and_exit_2() {
     );
     assert_eq!(w.state(id), Some(State::Pending));
     assert!(w.m.hits().is_empty());
+    // polkit was told what is approved.
+    assert_eq!(
+        *w.reauth.details.lock().unwrap(),
+        vec![format!("#{id} erp invoices.create")]
+    );
+    // A failed prompt cools the uid down: the next try is refused at once,
+    // without asking polkit again.
+    w.own_reauth(true);
+    let o = w.cli("approve", &[&id.to_string()]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("saiife: refused (reauth_cooldown)"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(w.reauth.details.lock().unwrap().len(), 1);
+    assert_eq!(w.state(id), Some(State::Pending));
     // An unknown id.
     let o = w.cli("approve", &["999"]);
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));

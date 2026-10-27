@@ -116,6 +116,11 @@ pub struct Request {
     /// approvers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The `[guard] ask` rule (`pack/rule_id`) that denied a command
+    /// request's command: what notifications and the polkit prompt name,
+    /// never the command itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_rule: Option<String>,
     /// What will be sent, for the approver (connector requests): the
     /// masked body cut at 4 KiB, the SHA-256 of the exact body bytes, the
     /// amount and the masked agent headers.
@@ -159,6 +164,8 @@ pub struct NewRequest {
     pub grant_key: Option<String>,
     /// [`Request::scope`].
     pub scope: Option<String>,
+    /// [`Request::ask_rule`].
+    pub ask_rule: Option<String>,
     /// The send's display fields ([`Request::body_display`] ...); empty
     /// (`Default`) for a command request.
     pub send: SendDisplay,
@@ -323,6 +330,29 @@ pub fn summary(r: &Request) -> String {
         .to_string(),
         ApprovalType::Command => r.input.clone().unwrap_or_default(),
     }
+}
+
+/// What may leave the host about `r` (a notification): the service and
+/// operation of a connector request; for a command only
+/// `command request (<pack>/<rule_id>)`, never the command text.
+pub fn offhost_summary(r: &Request) -> String {
+    match r.kind {
+        ApprovalType::Connector => summary(r),
+        ApprovalType::Command => format!(
+            "command request ({})",
+            r.ask_rule.as_deref().unwrap_or("unknown rule")
+        ),
+    }
+}
+
+/// The polkit `--detail request` of a decision on `r`:
+/// `#<id> <service> <operation>` or `#<id> <pack>/<rule_id>`.
+pub fn reauth_detail(r: &Request) -> String {
+    let what = match r.kind {
+        ApprovalType::Connector => summary(r),
+        ApprovalType::Command => r.ask_rule.clone().unwrap_or_else(|| "command".into()),
+    };
+    format!("#{} {what}", r.id)
 }
 
 /// Fill an `approval` record for `r`: `base` is the daemon's record of
@@ -676,6 +706,7 @@ impl Store {
             input: req.input,
             grant_key: req.grant_key,
             scope: req.scope,
+            ask_rule: req.ask_rule,
             body_display: req.send.body_display,
             body_sha256: req.send.body_sha256,
             body_truncated: req.send.body_truncated,
@@ -901,6 +932,7 @@ mod tests {
             input: None,
             grant_key: None,
             scope: None,
+            ask_rule: None,
             send: SendDisplay::default(),
         }
     }

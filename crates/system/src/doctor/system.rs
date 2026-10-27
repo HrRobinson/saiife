@@ -440,10 +440,25 @@ fn files_binary(ctx: &Ctx) -> Check {
 
 /// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
 /// present and sound, and the `com.saiife.approve` action file installed as
-/// a root-owned 0644 regular file.
+/// a root-owned 0644 regular file with exactly the expected content. A
+/// polkit rule that mentions the action is a warning: it may pre-authorize
+/// approvals.
 fn reauth(ctx: &Ctx) -> Check {
     const ID: &str = "reauth";
     const TITLE: &str = "re-authentication";
+    let rules = crate::polkit::rules_mentioning_action(ctx.layout);
+    if !rules.is_empty() {
+        return Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!(
+                "{} ({})",
+                crate::polkit::RULE_MENTIONS_ACTION,
+                rules.join(", ")
+            ),
+        );
+    }
     let problems = crate::polkit::action_problems(ctx.layout, ctx.host);
     if crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty() {
         Check::new(ID, Status::Pass, TITLE, "polkit action com.saiife.approve")
@@ -971,6 +986,34 @@ mod tests {
         assert_status(&t.doctor(), "reauth", Status::Warn);
         fs::remove_file(&a).unwrap();
         fs::rename(&real, &a).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        // Other content (an older file without the owner annotation).
+        fs::write(
+            &a,
+            crate::layout::POLKIT_POLICY.replace("unix-user:saiife", "unix-user:root"),
+        )
+        .unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Warn);
+        fs::write(&a, crate::layout::POLKIT_POLICY).unwrap();
+        assert_status(&t.doctor(), "reauth", Status::Pass);
+        // A polkit rule naming the action.
+        let rules = t.at("/etc/polkit-1/rules.d");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(
+            rules.join("49-saiife.rules"),
+            "if (action.id == \"com.saiife.approve\") return polkit.Result.YES;",
+        )
+        .unwrap();
+        let r = t.doctor();
+        assert_status(&r, "reauth", Status::Warn);
+        assert!(
+            get(&r, "reauth").detail.contains(
+                "a polkit rule mentions com.saiife.approve; it may pre-authorize approvals"
+            ),
+            "{:?}",
+            get(&r, "reauth")
+        );
+        fs::remove_file(rules.join("49-saiife.rules")).unwrap();
         assert_status(&t.doctor(), "reauth", Status::Pass);
         let uid = t.host.user("root").unwrap().uid;
         crate::testing::set_root_uid(&t.host, uid + 1);
