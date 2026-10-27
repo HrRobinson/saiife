@@ -145,6 +145,29 @@ pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
     sandbox
 }
 
+/// A system config path that does not exist, under `dir`: `saiife audit`,
+/// `audit verify` and `--report` given it are in developer mode whatever
+/// the host has in /etc/saiife.
+pub fn absent_system_config(dir: &Path) -> PathBuf {
+    dir.join("absent-system-config.toml")
+}
+
+/// [`hermetic`] for `saiife audit <args>` (the table, `--report` and
+/// `verify`): the args, then `--system-config` naming a file that does not
+/// exist, so no test reads /etc/saiife.
+pub fn hermetic_audit<I, S>(cmd: &mut Command, audit: &Path, args: I) -> TempDir
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let sandbox = hermetic(cmd, audit);
+    cmd.arg("audit")
+        .args(args)
+        .arg("--system-config")
+        .arg(absent_system_config(sandbox.path()));
+    sandbox
+}
+
 /// The `cwd` the recorded fixtures use.
 pub const FIXTURE_CWD: &str = "/home/u/app";
 

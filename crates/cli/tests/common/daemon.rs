@@ -288,10 +288,12 @@ impl TestDaemon {
         self.client().call("status", Map::new(), dl()).unwrap()
     }
 
-    /// `saiife audit verify` on this daemon's audit dir.
+    /// `saiife audit verify` on this daemon's audit dir, in developer mode
+    /// (the system config named does not exist: never /etc/saiife).
     pub fn verify(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_saiife"))
-            .args(["audit", "verify"])
+            .args(["audit", "verify", "--system-config"])
+            .arg(super::absent_system_config(self.path()))
             .env("HOME", self.path().join("home"))
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))

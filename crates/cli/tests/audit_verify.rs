@@ -41,8 +41,9 @@ fn hook(audit: &Path, cmd: &str) {
 }
 
 fn verify(audit: &Path) -> (i32, String) {
-    let (mut c, _sb) = check_cmd(audit);
-    let out = c.args(["audit", "verify"]).output().unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sb = common::hermetic_audit(&mut c, audit, ["verify"]);
+    let out = c.output().unwrap();
     (
         out.status.code().unwrap(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -165,12 +166,14 @@ fn locked_fixture() -> String {
 }
 
 fn verify_external(audit: &Path, external: &Path) -> (i32, String) {
-    let (mut c, _sb) = check_cmd(audit);
-    let out = c
-        .args(["audit", "verify", "--external"])
-        .arg(external)
-        .output()
-        .unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let ext = external.as_os_str();
+    let _sb = common::hermetic_audit(
+        &mut c,
+        audit,
+        ["verify".as_ref(), "--external".as_ref(), ext],
+    );
+    let out = c.output().unwrap();
     (
         out.status.code().unwrap(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
