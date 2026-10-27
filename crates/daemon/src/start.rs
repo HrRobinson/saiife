@@ -26,7 +26,7 @@ use tokio::signal::unix::{signal, SignalKind};
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// The group that may read the audit log (spec §5.2).
-use crate::audit_query::AUDIT_GROUP;
+use saiife_system::layout::AUDIT_GROUP;
 
 /// A startup refusal: one line on stderr, exit 2.
 struct Refuse(String);

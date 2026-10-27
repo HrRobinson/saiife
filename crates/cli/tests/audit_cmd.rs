@@ -4,6 +4,16 @@ use saiife_audit::store::{append, DIR_ENV};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use time::{Duration, OffsetDateTime};
 
+/// `saiife audit` in developer mode whatever the host has installed: the
+/// system config named does not exist.
+fn saiife_audit(dir: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("saiife").unwrap();
+    c.arg("audit")
+        .arg("--system-config")
+        .arg(dir.join("absent.toml"));
+    c
+}
+
 fn seed(dir: &std::path::Path) {
     let now = OffsetDateTime::now_utc();
     let mk = |input: &str, decision, pack, at| {
@@ -50,9 +60,7 @@ fn seed(dir: &std::path::Path) {
 fn shows_all_records_and_summary() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .arg("audit")
+    saiife_audit(dir.path())
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
@@ -66,16 +74,14 @@ fn shows_all_records_and_summary() {
 fn filters_blocked_and_since() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path());
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .args(["audit", "--blocked"])
+    saiife_audit(dir.path())
+        .args(["--blocked"])
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("1 decisions · 1 blocked"));
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .args(["audit", "--since", "7d"])
+    saiife_audit(dir.path())
+        .args(["--since", "7d"])
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
@@ -86,9 +92,7 @@ fn filters_blocked_and_since() {
 #[test]
 fn empty_log_says_so() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .arg("audit")
+    saiife_audit(dir.path())
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
@@ -98,9 +102,8 @@ fn empty_log_says_so() {
 #[test]
 fn bad_since_exits_2() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .args(["audit", "--since", "7w"])
+    saiife_audit(dir.path())
+        .args(["--since", "7w"])
         .env(DIR_ENV, dir.path())
         .assert()
         .code(2)
@@ -110,9 +113,8 @@ fn bad_since_exits_2() {
 #[test]
 fn since_overflow_exits_2_without_panicking() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .args(["audit", "--since", "99999999999d"])
+    saiife_audit(dir.path())
+        .args(["--since", "99999999999d"])
         .env(DIR_ENV, dir.path())
         .assert()
         .code(2)
@@ -132,9 +134,7 @@ fn invalid_utf8_does_not_hide_a_month_and_is_reported() {
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     std::io::Write::write_all(&mut f, b"{\"v\":1,\"input\":\"\xff\"}\n").unwrap();
     drop(f);
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .arg("audit")
+    saiife_audit(dir.path())
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
@@ -159,18 +159,15 @@ fn unknown_decision_is_shown_as_other() {
         r#"{{"v":1,"ts":"{ts}","agent":"claude","project":"/p","tool":"Bash","input":"curl evil","decision":"later","saiife":"2.0.0"}}"#
     );
     std::fs::write(dir.path().join(format!("{}.jsonl", &ts[..7])), line + "\n").unwrap();
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .arg("audit")
+    saiife_audit(dir.path())
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("OTHER"))
         .stdout(predicate::str::contains("curl evil"))
         .stdout(predicate::str::contains("unreadable").not());
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .args(["audit", "--blocked"])
+    saiife_audit(dir.path())
+        .args(["--blocked"])
         .env(DIR_ENV, dir.path())
         .assert()
         .success()
@@ -182,9 +179,7 @@ fn unreadable_audit_dir_is_an_error_not_an_empty_log() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("audit");
     std::fs::write(&file, "x").unwrap();
-    Command::cargo_bin("saiife")
-        .unwrap()
-        .arg("audit")
+    saiife_audit(dir.path())
         .env(DIR_ENV, &file)
         .assert()
         .code(1)

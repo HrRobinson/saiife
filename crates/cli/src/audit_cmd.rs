@@ -530,7 +530,18 @@ fn load_main(
             };
             load_dir(dir)
         }
-        Source::Direct(dir) => load_dir(dir),
+        Source::Direct(cfg) => match std::fs::read_dir(&cfg.audit.dir) {
+            // An auditor by its groups whose read is refused anyway (a
+            // group added since login, a changed mode): ask the daemon.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "saiife: cannot read {} directly (permission denied); asking the saiife daemon instead",
+                    cfg.audit.dir.display()
+                );
+                load_main(&Source::Daemon(cfg.clone()), home_dir, q)
+            }
+            _ => load_dir(&cfg.audit.dir),
+        },
         Source::Daemon(cfg) => match audit_locked::query(cfg, &q) {
             Ok((records, skipped)) => Ok(Loaded {
                 records,
@@ -567,7 +578,7 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
     let home_dir = store::default_dir();
     let locked_dir = match &source {
         Source::Developer => None,
-        Source::Direct(d) => Some(d.clone()),
+        Source::Direct(cfg) => Some(cfg.audit.dir.clone()),
         Source::Daemon(cfg) => Some(cfg.audit.dir.clone()),
     };
     // Through the daemon only --since narrows the query: the report's

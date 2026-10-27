@@ -168,6 +168,25 @@ pub fn read_all(dir: &Path) -> ReadResult {
     out
 }
 
+/// [`read_all`], but only the month files from `first` (`YYYY-MM`) on:
+/// older ones are not opened, so their problems are not counted.
+pub fn read_from_month(dir: &Path, first: &str) -> ReadResult {
+    let mut out = ReadResult::default();
+    let from = format!("{first}.jsonl");
+    match month_files(dir) {
+        Ok(files) => files
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n >= from.as_str())
+            })
+            .for_each(|p| read_month_file(p, &mut out)),
+        Err(e) => out.dir_error = Some(e),
+    }
+    out
+}
+
 /// Read at most `max_files` month files, newest first (`cut_short` says
 /// whether older ones were left unread). `want` sees every record of each file
 /// and returns `true` while it still needs older data; after the first file
@@ -442,6 +461,41 @@ mod tests {
         assert_eq!(got.records, vec![a, b]);
         assert_eq!(got.skipped_lines, 1);
         assert_eq!(got.unreadable_files, 0);
+    }
+
+    #[test]
+    fn read_from_month_skips_older_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-08-31 23:59 UTC),
+        );
+        let b = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-09-01 00:00 UTC),
+        );
+        let c = rec(
+            "/p",
+            "claude",
+            DecisionKind::Allow,
+            datetime!(2026-10-02 00:00 UTC),
+        );
+        for r in [&a, &b, &c] {
+            append(dir.path(), r).unwrap();
+        }
+        // An unreadable older file is never opened.
+        fs::write(dir.path().join("2026-07.jsonl"), "garbage\n").unwrap();
+        let got = read_from_month(dir.path(), "2026-09");
+        assert_eq!(got.records, vec![b, c]);
+        assert_eq!(got.skipped_lines, 0);
+        assert_eq!(read_from_month(dir.path(), "1970-01").records.len(), 3);
+        assert!(read_from_month(&dir.path().join("nope"), "2026-01")
+            .records
+            .is_empty());
     }
 
     #[test]

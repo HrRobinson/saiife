@@ -143,3 +143,29 @@ fn v1_home_log_labelled() {
     assert!(html.contains("echo locked-record"));
     assert!(!html.contains("old-home-record"));
 }
+
+#[test]
+fn auditor_refused_by_the_files_falls_back_to_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return; // root reads through any mode
+    }
+    let d = TestDaemon::start(Opts::default());
+    let mut c = d.client();
+    append(&mut c, guard_rec("echo fallback-record")).unwrap();
+    let dir = d.audit_dir();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+    // Not listable by this user: an auditor by its groups is refused.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let o = audit(&d, &own_group(), &[]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("(permission denied); asking the saiife daemon instead"),
+        "{err}"
+    );
+    // The daemon runs as the same user here, so it cannot list the dir
+    // either: the answer is its refusal, proving the query was sent.
+    assert!(err.contains("audit.query"), "{err}");
+    assert_eq!(o.status.code(), Some(5), "{err}");
+}

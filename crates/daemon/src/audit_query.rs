@@ -24,7 +24,11 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// The group that may read the whole audit log (spec §5.2).
-pub const AUDIT_GROUP: &str = "saiife-audit";
+pub use saiife_system::layout::AUDIT_GROUP;
+/// Queries reading the log at once, daemon-wide: each reads month files
+/// from disk, so a burst of them must not multiply the memory and I/O.
+pub const MAX_CONCURRENT: usize = 2;
+static QUERIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT);
 /// Most records in one answer.
 pub const MAX_LIMIT: u64 = 5000;
 /// Most bytes of record JSON in one answer: half the 16 MiB answer frame,
@@ -221,9 +225,20 @@ pub fn page(records: &[Record], scope: Scope, q: &Query) -> Page {
     }
 }
 
-/// [`page`] over the month files in `dir`.
+/// `YYYY-MM` of `t` in UTC: the first month file that can hold a record
+/// at or after `t`.
+fn month_of(t: OffsetDateTime) -> String {
+    let t = t.to_offset(time::UtcOffset::UTC);
+    format!("{:04}-{:02}", t.year(), u8::from(t.month()))
+}
+
+/// [`page`] over the month files in `dir`. With `since`, month files
+/// entirely before it are not read.
 pub fn run(dir: &Path, scope: Scope, q: &Query) -> Result<Page, String> {
-    let all = store::read_all(dir);
+    let all = match q.filter.since {
+        Some(t) => store::read_from_month(dir, &month_of(t)),
+        None => store::read_all(dir),
+    };
     if let Some(e) = all.dir_error {
         return Err(format!("the audit directory cannot be read: {e}"));
     }
@@ -250,6 +265,9 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let scope = match scope_for(q.all, uid, || auditor) {
         Ok(s) => s,
         Err(m) => return err(id, ErrorCode::Forbidden, &m),
+    };
+    let Ok(_permit) = QUERIES.acquire().await else {
+        return err(id, ErrorCode::Internal, "audit.query failed");
     };
     let dir = ctx.audit_dir.clone();
     let res = tokio::task::spawn_blocking(move || run(&dir, scope, &q)).await;
@@ -520,6 +538,16 @@ mod tests {
         std::fs::write(d.path().join("2026-10.jsonl"), lines.join("\n") + "\n").unwrap();
         let p = run(d.path(), Scope::Uid(ME), &q(json!({}))).unwrap();
         assert_eq!(inputs(&p), ["my-guard", "my-conn", "my-approval"]);
+        // since skips whole month files before it (never opened: a
+        // garbage older file is not even counted).
+        std::fs::write(d.path().join("2020-01.jsonl"), "garbage\n").unwrap();
+        let since = time::macros::datetime!(2026-01-01 00:00 UTC).unix_timestamp();
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"since": since}))).unwrap();
+        assert_eq!(p.records.len(), 3);
+        assert_eq!(
+            month_of(time::macros::datetime!(2026-03-31 23:30 -2)),
+            "2026-04"
+        );
         // A missing dir is no records, not an error.
         let p = run(&d.path().join("none"), Scope::Uid(ME), &q(json!({}))).unwrap();
         assert!(p.records.is_empty());

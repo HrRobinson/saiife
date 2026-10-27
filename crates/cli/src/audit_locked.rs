@@ -12,33 +12,42 @@ use std::path::{Path, PathBuf};
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
 pub const V1_LABEL: &str = "v1, before locked mode, not tamper-evident";
 /// The group whose members read the audit files (spec §5.2).
-pub const AUDIT_GROUP: &str = "saiife-audit";
+pub use saiife_system::layout::AUDIT_GROUP;
 const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
 
 /// Where the records come from.
 pub enum Source {
     /// No locked system config: the user's own audit dir, as before.
     Developer,
-    /// Locked mode, and the caller may read the files.
-    Direct(PathBuf),
+    /// Locked mode, and the caller may read the files (`[audit] dir`).
+    Direct(Box<SystemConfig>),
     /// Locked mode through the daemon.
     Daemon(Box<SystemConfig>),
 }
 
-/// The source for this process. A missing config, or one without
-/// `locked = true`, is developer mode; a config that exists but cannot be
-/// read is an error.
+/// The source for this process. Only a config that does not exist
+/// (`NotFound`), or one without `locked = true`, is developer mode. Any
+/// other failure to look at or read it is an error naming the path (fail
+/// closed: a locked host never falls back to the home log alone).
 pub fn source(system_config: Option<PathBuf>) -> Result<Source, String> {
     let path = system_config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
-    if std::fs::symlink_metadata(&path).is_err() {
-        return Ok(Source::Developer);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Source::Developer),
+        Err(e) => {
+            return Err(format!(
+                "cannot read the system config {}: {e}",
+                path.display()
+            ))
+        }
     }
-    let loaded = load_system(&path).map_err(|e| format!("cannot read the system config: {e}"))?;
+    let loaded = load_system(&path)
+        .map_err(|e| format!("cannot read the system config {}: {e}", path.display()))?;
     if !loaded.config.locked {
         return Ok(Source::Developer);
     }
     if is_auditor() {
-        Ok(Source::Direct(loaded.config.audit.dir.clone()))
+        Ok(Source::Direct(Box::new(loaded.config)))
     } else {
         Ok(Source::Daemon(Box::new(loaded.config)))
     }
@@ -205,7 +214,33 @@ mod tests {
             Ok(Source::Developer)
         ));
         std::fs::write(&missing, "version = 2\nbogus = [\n").unwrap();
-        assert!(source(Some(missing)).is_err());
+        let e = source(Some(missing.clone())).err().unwrap();
+        assert!(e.contains(&missing.display().to_string()), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_config_path_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // root reads through any mode
+        }
+        let d = tempfile::tempdir().unwrap();
+        let parent = d.path().join("etc");
+        std::fs::create_dir(&parent).unwrap();
+        let cfg = parent.join("config.toml");
+        std::fs::write(&cfg, "version = 2\nlocked = true\n").unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = source(Some(cfg.clone()));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = r
+            .err()
+            .expect("an unreadable config must not be developer mode");
+        assert!(e.contains(&cfg.display().to_string()), "{e}");
+        // A file in place of the parent dir (ENOTDIR) is not NotFound either.
+        let file = d.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(source(Some(file.join("config.toml"))).is_err());
     }
 
     #[test]
