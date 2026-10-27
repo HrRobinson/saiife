@@ -17,6 +17,8 @@ pub mod import_backup;
 #[cfg(target_os = "linux")]
 pub mod limits;
 #[cfg(target_os = "linux")]
+pub mod lockdown;
+#[cfg(target_os = "linux")]
 pub mod notifier;
 #[cfg(target_os = "linux")]
 pub mod notify;

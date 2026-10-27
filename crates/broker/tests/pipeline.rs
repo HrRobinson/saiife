@@ -183,6 +183,9 @@ impl FakeEnv {
 }
 
 impl Env for FakeEnv {
+    fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
+        None
+    }
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError> {
         match &self.scope {
             Ok(s) => Ok(s.clone()),

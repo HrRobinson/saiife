@@ -116,8 +116,39 @@ pub struct PolicySnapshot {
     pub mode: Mode,
 }
 
+/// What lockdown stops (spec §6.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockScope {
+    /// Every connector request.
+    Connectors,
+    /// Connector requests and every hook call.
+    All,
+}
+
+impl LockScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockScope::Connectors => "connectors",
+            LockScope::All => "all",
+        }
+    }
+}
+
+/// The lockdown flag in force.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Lockdown {
+    pub scope: LockScope,
+    pub reason: String,
+    pub by_uid: u32,
+    pub since: String,
+}
+
 /// What the pipeline needs from the daemon.
 pub trait Env: Sync {
+    /// Step 2: the lockdown flag, `None` when it is off. Either scope
+    /// denies a connector request.
+    fn lockdown(&self) -> Option<Lockdown>;
     /// The caller's single scope (decision 6); `ScopeConflict` when it
     /// matches more than one.
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError>;
@@ -381,6 +412,10 @@ async fn steps(
             let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
             *masker = Masker::new(&refs);
         }
+    }
+    // 2. Lockdown (either scope).
+    if env.lockdown().is_some() {
+        return denied("lockdown");
     }
     // 3. Scope.
     let scope = match env.scope(&call.user) {

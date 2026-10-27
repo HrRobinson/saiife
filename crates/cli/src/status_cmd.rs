@@ -797,7 +797,12 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         Err(e) => Err(e.to_string()),
     };
     match daemon {
-        Ok(line) => outln!("  daemon: running, {line}"),
+        Ok((line, lockdown)) => {
+            outln!("  daemon: running, {line}");
+            outln!("  lockdown: {}", lockdown_line(&lockdown));
+            // TODO(plan 11, Task 3): the caller's pending approvals (count,
+            // plus the newest 3 ids) from `approval.list` (spec §7 `status`).
+        }
         Err(e) => {
             st.failed = true;
             outln!(
@@ -871,14 +876,35 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     Some(st)
 }
 
+/// The lockdown flag from the daemon's `status` answer, for one line.
+fn lockdown_line(l: &serde_json::Value) -> String {
+    let Some(o) = l.as_object() else {
+        return "off".into();
+    };
+    let s = |k: &str| sanitize(o.get(k).and_then(|v| v.as_str()).unwrap_or(""));
+    let uid = o.get("by_uid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let reason = s("reason");
+    let reason = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {reason}")
+    };
+    format!(
+        "ON (scope {}) since {} by uid {uid}{reason}",
+        s("scope"),
+        s("since")
+    )
+}
+
 /// `chain <id>, head seq <n>, last checkpoint seq <m>` from the daemon's
-/// `status`, or why it did not answer.
+/// `status`, and its lockdown flag (`null` when off), or why it did not
+/// answer.
 #[cfg(target_os = "linux")]
 fn daemon_status(
     layout: &Layout,
     host: &dyn Host,
     cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<String, String> {
+) -> Result<(String, serde_json::Value), String> {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
     use saiife_system::layout::{DAEMON_USER, RUN_DIR};
@@ -912,11 +938,14 @@ fn daemon_status(
         Some(Value::Null) | None => "none".to_string(),
         Some(v) => v.to_string(),
     };
-    Ok(format!(
-        "chain {}, head seq {}, last checkpoint seq {}",
-        show("chain"),
-        show("head_seq"),
-        show("last_checkpoint_seq")
+    Ok((
+        format!(
+            "chain {}, head seq {}, last checkpoint seq {}",
+            show("chain"),
+            show("head_seq"),
+            show("last_checkpoint_seq")
+        ),
+        m.get("lockdown").cloned().unwrap_or(Value::Null),
     ))
 }
 
@@ -925,7 +954,7 @@ fn daemon_status(
     _layout: &Layout,
     _host: &dyn Host,
     _cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<String, String> {
+) -> Result<(String, serde_json::Value), String> {
     Err(saiife_system::NOT_LINUX.to_string())
 }
 

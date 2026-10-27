@@ -34,6 +34,7 @@ mod eval;
 #[cfg(target_os = "linux")]
 mod import_cmd;
 mod init_cmd;
+mod lockdown_cmd;
 mod packs_cmd;
 mod paths;
 mod project;
@@ -224,6 +225,16 @@ enum Cmd {
     /// Locked mode (Linux): call a connector operation through the daemon,
     /// or list the ones you may call. The credential never reaches you.
     Api(api_cmd::ApiArgs),
+    /// Locked mode (Linux, admin or approver): `on` denies every connector
+    /// request (`--scope connectors`) or also every hook call (`--scope
+    /// all`); `off` lifts it; no subcommand shows the state.
+    Lockdown {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<lockdown_cmd::LockdownAction>,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -296,6 +307,13 @@ fn main() -> ExitCode {
             command,
         });
     }
+    if let Cmd::Lockdown {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return lockdown_cmd::run(system_config, action);
+    }
     if let Cmd::Api(a) = cli.command {
         return api_cmd::run(a);
     }
@@ -348,6 +366,7 @@ fn main() -> ExitCode {
         | Cmd::Connect(..)
         | Cmd::Run { .. }
         | Cmd::Api(_)
+        | Cmd::Lockdown { .. }
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }

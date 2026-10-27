@@ -106,7 +106,7 @@ mod imp {
     use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
     use saiife_audit::{DecisionKind, NewRecord, Record};
     use saiife_ipc::client::{system_entry, system_uid, Client, ClientError};
-    use saiife_ipc::msg::{MAX_RECORD_BYTES, OP_AUDIT_APPEND};
+    use saiife_ipc::msg::{ErrorCode, MAX_RECORD_BYTES, OP_AUDIT_APPEND};
     use saiife_policy::{
         active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
         Mode, PackInfo, SystemConfig,
@@ -334,6 +334,13 @@ mod imp {
             rec = minimal_record(agent, &policy);
         }
         if let Err(e) = append(&mut client, rec) {
+            // Lockdown `all`: the daemon wrote the record as a deny.
+            if let ClientError::Refused { code, message } = &e {
+                if code == ErrorCode::Lockdown.as_str() {
+                    let _ = writeln!(std::io::stderr(), "{message}");
+                    return ExitCode::from(2);
+                }
+            }
             return blocked(&format!(
                 "the audit daemon did not record this call ({})",
                 describe(&e)

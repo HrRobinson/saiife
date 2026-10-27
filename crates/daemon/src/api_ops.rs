@@ -88,6 +88,10 @@ fn kind_str(k: Kind) -> &'static str {
 }
 
 impl Env for DaemonEnv<'_> {
+    fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
+        self.ctx.lockdown.get()
+    }
+
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError> {
         scope_for(self.config, &self.groups, user).map(|s| s.cloned())
     }

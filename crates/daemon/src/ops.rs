@@ -12,8 +12,8 @@ use saiife_broker::upstream::Upstream;
 use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
-    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
-    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_APPEND, OP_AUDIT_ROTATE_KEY, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
+    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -142,6 +142,8 @@ pub struct Ctx {
     pub backup_dir: PathBuf,
     /// Bearer tokens of the loopback TCP listener (`api.token`).
     pub tokens: Arc<crate::tokens::Tokens>,
+    /// The lockdown flag (spec §6.18).
+    pub lockdown: crate::lockdown::Store,
     /// The `[gateway] tcp` the daemon started with, and what it bound.
     pub tcp: Mutex<TcpState>,
     /// Connector calls in flight; a stop waits for them (bounded) before
@@ -177,6 +179,8 @@ pub struct CtxInit {
     pub backup_dir: PathBuf,
     pub tokens: Arc<crate::tokens::Tokens>,
     pub approvals: Result<crate::approvals::Store, String>,
+    /// The lockdown flag (spec §6.18).
+    pub lockdown: crate::lockdown::Store,
 }
 
 /// A count of work in flight that a stop waits for.
@@ -269,6 +273,7 @@ impl Ctx {
             pools: Pools::new(),
             backup_dir: i.backup_dir,
             tokens: i.tokens,
+            lockdown: i.lockdown,
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
             notifier: crate::notifier::Notifier::new(),
@@ -534,6 +539,7 @@ pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
+        OP_LOCKDOWN_SET => crate::lockdown::set(ctx, peer, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,
@@ -617,7 +623,20 @@ async fn append(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         json!({"pid": peer.pid, "comm": comm(peer.pid)}),
     );
     let session = storable_session(rec.session.as_deref());
+    // Decision 8: with lockdown `all` the guard record is still written,
+    // but as a deny (`rule = lockdown`), and the hook gets `lockdown`.
+    let locked = ctx
+        .lockdown
+        .get()
+        .filter(|l| l.scope == saiife_broker::pipeline::LockScope::All)
+        .map(|l| format!("saiife lockdown is on: {}", l.reason));
+    if locked.is_some() {
+        rec.decision = DecisionKind::Deny;
+        rec.rule = Some("lockdown".into());
+        rec.reason = locked.clone();
+    }
     match ctx.writer.append(rec).await {
+        Ok(_) if locked.is_some() => err(id, ErrorCode::Lockdown, &locked.unwrap_or_default()),
         Ok(seq) => {
             if let Some(sid) = session {
                 if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
@@ -651,6 +670,10 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     // The loopback TCP listener's address, `null` when there is none.
     let tcp = lock(&ctx.tcp).bound;
     m.insert("gateway_tcp".into(), json!(tcp.map(|a| a.to_string())));
+    m.insert(
+        "lockdown".into(),
+        crate::lockdown::status_json(ctx.lockdown.get().as_ref()),
+    );
     ok(id, m)
 }
 

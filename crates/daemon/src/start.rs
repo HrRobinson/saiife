@@ -278,6 +278,13 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     if let Some(why) = &tokens_reset {
         eprintln!("saiife: warning: gateway tokens reset: {why}");
     }
+    // The lockdown flag; an unreadable file is `all` (fail closed) and a
+    // `lockdown_unreadable` record.
+    let (lockdown, lockdown_unreadable) =
+        crate::lockdown::Store::open(crate::lockdown::path_in(&opts.state_dir));
+    if let Some(why) = &lockdown_unreadable {
+        eprintln!("saiife: warning: {why}: lockdown is on for all hooks and connectors");
+    }
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
 
@@ -301,6 +308,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         backup_dir,
         tokens: Arc::new(tokens),
         approvals,
+        lockdown,
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
@@ -309,12 +317,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
-    let notes: Vec<_> = [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
-        .into_iter()
-        .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
-        .chain(rebuild_note)
-        .chain(capped_note)
-        .collect();
+    let notes: Vec<_> = [
+        ("ca_refused", ca_refused),
+        ("tokens_reset", tokens_reset),
+        ("lockdown_unreadable", lockdown_unreadable),
+    ]
+    .into_iter()
+    .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
+    .chain(rebuild_note)
+    .chain(capped_note)
+    .collect();
     let more = start_notes(&ctx, notes, &expired_at_start);
     let code = rt.block_on(serve(
         Arc::clone(&ctx),

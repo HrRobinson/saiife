@@ -20,6 +20,8 @@ pub const OP_API_LIST: &str = "api.list";
 pub const OP_API_RESULT: &str = "api.result";
 /// A bearer token for the gateway's loopback TCP listener: `{token, expires}`.
 pub const OP_API_TOKEN: &str = "api.token";
+/// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
+pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with
@@ -97,6 +99,9 @@ pub enum ErrorCode {
     UpstreamFailed,
     /// The change was made, but its audit record could not be written.
     Unrecorded,
+    /// Lockdown (scope `all`) is on: the hook's record was written and the
+    /// call is denied; `message` says why.
+    Lockdown,
 }
 
 impl ErrorCode {
@@ -116,6 +121,7 @@ impl ErrorCode {
             ErrorCode::Limited => "limited",
             ErrorCode::UpstreamFailed => "upstream_failed",
             ErrorCode::Unrecorded => "unrecorded",
+            ErrorCode::Lockdown => "lockdown",
         }
     }
 }
