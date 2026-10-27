@@ -22,12 +22,32 @@ Both go through the same store and the same records.
    limits as they are now, then sent exactly as stored. A command request
    becomes a one-use grant.
 5. Every step is a record of kind `approval`, linked by the request `id`
-   (`created`, `approved`, `refused`, `rejected`, `expired`, `sent`,
-   `send_failed`).
+   (see [the records](#the-records)).
 
 A request that nobody decides expires after `[approval] timeout` (default
 `30m`). Results are kept 24 hours. A request can never be sent after it
 expired, was rejected or was sent.
+
+## The records
+
+Each `approval` record has `action`, `id` (also as `approval`), `by_uid` and
+`note` when a person decided, and `rule`/`reason` when something was refused
+or failed:
+
+| action | when |
+|---|---|
+| `created` | a request was made |
+| `approved` | an approver approved it |
+| `rejected` | an approver rejected it, or the requester withdrew it (note `cancelled by requester`) |
+| `refused` | a decision was refused (`not_approver`, `same_user`, `reauth_failed`, `reauth_unavailable`, `reauth_error`, `reauth_busy`, `reauth_cooldown`, `truncated_not_acknowledged`), or a command request was not made (`not_ask`, `ask_rule_mismatch`, `raw_mismatch`, `project_mismatch`); nothing changed |
+| `expired` | nobody decided in time |
+| `sent` | a connector request was sent; for a command, the one-use grant was kept (the command may run once) |
+| `grant_used` | the approved command ran: its grant was used up |
+| `send_failed` | an approved request was not sent; `rule` says why: `policy_changed`, a `limit`, `lockdown`, `body_changed` (the body about to be sent no longer hashes to the one shown), `vault_unavailable`, `grants_unavailable`, or `interrupted` (the daemon stopped between the approval and the send; it is never sent by itself, and a command's grant is revoked) |
+
+A result that could not be kept (it could not be sealed or written) is
+`result_unavailable`: `saiife api result` says so, and `GET
+/v1/requests/{id}` answers 410 with `"error": "result_unavailable"`.
 
 A caller may have at most 20 pending requests. The 21st is denied at once with
 `approvals_full` (a command says: "Too many pending approval requests (20); ask
@@ -58,21 +78,39 @@ grant_ttl = "15m"
 - `same_user = "reauth"`: an approver may decide their own request after
   re-authenticating through polkit (below). Use this on a machine with one
   person and no second account.
+- The requester may always withdraw its own request with `saiife reject`: no
+  approver list, no re-authentication. It is recorded as `rejected` with the
+  note `cancelled by requester`.
 
 ## Re-authentication and the fallback
 
 With `same_user = "reauth"` the daemon runs `pkcheck --action-id
-com.saiife.approve` for the approving CLI process. The polkit action is
-installed by `saiife system install` in
+com.saiife.approve` for the approving CLI process, with `--detail request
+"#<id> <service> <operation>"` (or `#<id> <pack>/<rule>` for a command, or
+`lockdown off`), which the prompt shows. The polkit action is installed by
+`saiife system install` in
 `/usr/share/polkit-1/actions/com.saiife.approve.policy`, with `auth_self` for
 all three kinds of session (never `auth_self_keep`, so every approval asks
-again). The wait is 120 seconds. Anything but "authorized" refuses the decision
-with `reauth_failed`; an error or an unreadable answer is `reauth_error`.
+again). It names the daemon user (`unix-user:saiife`) as the action's owner:
+polkit lets only root or an action owner check another user's process.
+`saiife doctor` checks the file byte for byte. The wait is 120 seconds.
+Anything but "authorized" refuses the decision with `reauth_failed`; an error
+or an unreadable answer is `reauth_error`. The first line of pkcheck's error
+output is kept in the refusal's reason.
+
+After a prompt that was denied, dismissed, timed out or failed, the approver's
+uid cools down: the next decision that needs a prompt is refused with
+`reauth_cooldown` for 30 seconds, then 60, doubling up to 10 minutes; a
+success resets it. So an agent cannot flood its user with password prompts.
+Before it starts `pkttyagent`, `saiife approve` prints what it approves (id,
+type, service and operation or command, amount).
 
 The approving CLI starts `pkttyagent --fallback` for you when it runs in a
 terminal-only session (`SSH_TTY` is set, or neither `DISPLAY` nor
 `WAYLAND_DISPLAY` is). That is the fallback: a text password prompt where no
-desktop agent can show a dialog. The CLI stops its own helper afterwards.
+desktop agent can show a dialog. The CLI stops its own helper afterwards
+(SIGTERM, then SIGKILL after a second). When `/usr/bin/pkttyagent` is missing
+it says so.
 
 When polkit or the action file is missing, `same_user = "reauth"` cannot work.
 Decisions are refused with `reauth_unavailable`, and `saiife doctor` warns:
@@ -81,10 +119,13 @@ Decisions are refused with `reauth_unavailable`, and `saiife doctor` warns:
 Only one re-authentication runs per approver at a time; a second decision
 while one is waiting is refused with `reauth_busy`.
 
-The action file decides how strong this check is. It is root-owned, so an agent
-user cannot edit it, and `core.lock` also denies write attempts through tool
-calls (the file and the `/usr/share/polkit-1/actions` folder). Reading it is
-allowed: the file is public.
+The action file decides how strong this check is, and a polkit rule could
+answer yes for the action without a password. Both are root-owned, so an agent
+user cannot edit them, and `core.lock` also denies write attempts through tool
+calls to `/etc/polkit-1`, `/run/polkit-1`, `/usr/local/share/polkit-1` and
+`/usr/share/polkit-1`. Reading them is allowed: the files are public. `saiife
+doctor` warns when a rule in one of their `rules.d` folders mentions
+`com.saiife.approve`.
 
 ## Command grants
 
@@ -160,11 +201,14 @@ saiife reject  <id> [--note TEXT]
 - `approvals` lists pending requests by default; `--all` adds the decided ones.
 - `show` prints what would be sent, masked: the service, operation, amount,
   headers and body (the first 2000 characters, plus the SHA-256 of the whole
-  body). `--full` prints the whole masked body.
+  body). `--full` prints the whole masked body. `--json` always has the whole
+  masked body (`--full` changes only the text output).
 - `approve` of a request whose body is over 1 MiB and was shown cut is refused
   unless you pass `--accept-truncated`: you decide on a body you have not seen
   whole, and the record says so.
-- A refused decision exits 2; an unreachable daemon exits 5.
+- A refused decision exits 2; an unreachable daemon exits 5, and so does a
+  decision the daemon made but could not record (`unrecorded`): check
+  `saiife approvals show`.
 
 ## Limits at send time
 

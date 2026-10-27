@@ -91,5 +91,7 @@ send time.
 A notification carries the event, the request id, the service, the operation,
 the user id, the host, and a one-line summary that is masked and at most 200
 characters. It never carries request parameters, bodies, headers, results,
-credentials, or a link that approves anything. To approve, a person runs
+credentials, or a link that approves anything. For a command request the
+summary names only the rule that asked (`command request (core.git/force-push)`),
+never the command text. To approve, a person runs
 `saiife approve` on the machine, and has to be an approver there.
