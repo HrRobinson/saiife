@@ -1144,6 +1144,12 @@ pub mod testing {
     /// Counts into `cut` unless disarmed before it is dropped.
     struct CutGuard(Option<Arc<AtomicUsize>>);
 
+    impl CutGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
     impl Drop for CutGuard {
         fn drop(&mut self) {
             if let Some(c) = self.0.take() {
@@ -1158,7 +1164,7 @@ pub mod testing {
             let mut guard = CutGuard(Some(Arc::clone(&self.cut)));
             Box::pin(async move {
                 tokio::time::sleep(self.delay).await;
-                guard.0 = None;
+                guard.disarm();
                 self.inner.send(lines).await
             })
         }
