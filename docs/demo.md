@@ -113,3 +113,30 @@ If a check fails with no hook call recorded, either the test folder or hook
 is not trusted yet (run `--setup`), or the agent does not pass saiife's
 `SAIIFE_*` settings on to the hook, so the records went to your default
 audit log (`saiife audit --agent codex` or `--agent gemini`).
+
+## The locked demo (CI only)
+
+`scripts/demo-locked.sh` is the five-minute end-to-end demo of locked mode.
+It cannot be run on a normal machine: it installs a system service and
+creates users, so it is a phase of `scripts/locked-linux/run.sh` and runs
+only in the `locked-linux` CI job (the script refuses anywhere else). It
+must finish in under 5 minutes; the job fails if it does not.
+
+1. A `shop` generic `http` connector is set up against a tiny HTTPS mock on
+   `127.0.0.1`. The mock's CA is copied, root-owned, to `/etc/saiife/ca`.
+   There is no internet. The mock's credential is in the vault.
+2. As the unprivileged agent user `agent-ci` it tries to remove the managed
+   hook, to kill the daemon (by the unit's `MainPID` only) and to read the
+   vault key. Each must fail. The attempts are written to
+   `demo-attempts.txt` and the job log.
+3. `saiife api shop orders.list` is allowed and prints JSON.
+4. `saiife api shop products.update product_id=42 --body -` is pending
+   (exit 3). `approver-ci` runs `saiife approve <id>`, then
+   `saiife api result <id>` is done, and the mock saw the write exactly once.
+5. `saiife audit verify` reports the chain intact.
+6. `saiife audit --report` writes an HTML file with the connector and
+   approvals sections. The report and the attempts are copied to the job's
+   log directory.
+
+The demo puts the system config, `policy.d/shop.toml`, `/etc/saiife/ca`, the
+secret and the approver user back when it ends, also when it fails.
