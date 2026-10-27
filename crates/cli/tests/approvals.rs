@@ -654,7 +654,7 @@ fn self_approval_refused_and_recorded() {
     let a = w.op(
         own_uid(),
         "approval.decide",
-        json!({"request": id, "action": "reject"}),
+        json!({"request": id, "action": "approve"}),
     );
     assert_eq!(a["ok"], false, "{a}");
     assert_eq!(a["rule"], "same_user");
@@ -667,12 +667,45 @@ fn self_approval_refused_and_recorded() {
     assert_eq!(refused[0]["rule"], "not_approver");
     assert_eq!(refused[1]["rule"], "same_user");
     assert_eq!(refused[1]["by_uid"], own_uid());
-    assert_eq!(refused[1]["decision"], "rejected");
     // A uid that is neither an approver nor the requester.
     let a = w.decide(CAROL, id, "approve");
     assert_eq!(a["ok"], false, "{a}");
     // carol cannot even see the request: it answers as unknown.
     assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(w.state(id), Some(State::Pending));
+    assert!(w.m.hits().is_empty());
+}
+
+/// The requester may withdraw (reject) its own request without being an
+/// approver and without re-authentication: `rejected`, by its own uid,
+/// note "cancelled by requester".
+#[test]
+fn requester_may_cancel_its_own_request() {
+    let w = world();
+    let id = w.ask(BODY_A);
+    // Not listed in approvers at all.
+    let a = w.decide(own_uid(), id, "reject");
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(a["state"], "rejected", "{a}");
+    assert_eq!(w.state(id), Some(State::Rejected));
+    let rec = w.wait_record(id, "rejected");
+    assert_eq!(rec["by_uid"], own_uid(), "{rec}");
+    assert_eq!(rec["note"], "cancelled by requester", "{rec}");
+    // With a note of its own.
+    let id = w.ask(BODY_B);
+    let a = w.op(
+        own_uid(),
+        "approval.decide",
+        json!({"request": id, "action": "reject", "note": "wrong amount"}),
+    );
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(
+        w.wait_record(id, "rejected")["note"],
+        "cancelled by requester: wrong amount"
+    );
+    // Another user's request is still not the requester's to cancel.
+    let id = w.ask(BODY_A);
+    assert_eq!(w.decide(CAROL, id, "reject")["ok"], false);
     assert_eq!(w.state(id), Some(State::Pending));
     assert!(w.m.hits().is_empty());
 }
@@ -983,6 +1016,13 @@ fn vault_unavailable_at_send_send_failed() {
     m.insert("request".into(), id.into());
     let a = w.op(own_uid(), "api.result", Value::Object(m));
     assert_eq!(a["state"], "send_failed", "{a}");
+    // The failure's result could not be sealed either: the requester is
+    // told result_unavailable, not that it was kept and is gone.
+    assert_eq!(a["result"]["error"], "result_unavailable", "{a}");
+    let resp = w.get_request(id);
+    assert!(resp.starts_with("HTTP/1.1 410"), "{resp}");
+    assert!(resp.contains("\"result_unavailable\""), "{resp}");
+    assert!(!resp.contains("24 h"), "{resp}");
 }
 
 /// The approver sees what will be sent: `approval.show` has the amount,

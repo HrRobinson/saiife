@@ -852,7 +852,11 @@ fn approve_and_reject_round_trip() {
         stdout(&o)
     );
     assert_eq!(w.state(b), Some(State::Rejected));
-    assert_eq!(w.wait_record(b, "rejected")["note"], "no");
+    // Its own request: a withdrawal, noted as such.
+    assert_eq!(
+        w.wait_record(b, "rejected")["note"],
+        "cancelled by requester: no"
+    );
     assert_eq!(w.m.hits().len(), 1, "a rejected request is never sent");
 
     // Deciding again is refused with the state (exit 2).
@@ -864,17 +868,15 @@ fn approve_and_reject_round_trip() {
 #[test]
 fn refusal_prints_rule_and_exit_2() {
     let w = world();
-    // Not an approver.
+    // Not an approver (a reject of its own request is a withdrawal).
     let id = w.ask(BODY_A);
-    for cmd in ["approve", "reject"] {
-        let o = w.cli(cmd, &[&id.to_string()]);
-        assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
-        assert!(
-            stderr(&o).contains("saiife: refused (not_approver)"),
-            "{}",
-            stderr(&o)
-        );
-    }
+    let o = w.cli("approve", &[&id.to_string()]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("saiife: refused (not_approver)"),
+        "{}",
+        stderr(&o)
+    );
     // Re-authentication denied.
     w.own_reauth(false);
     let o = w.cli("approve", &[&id.to_string()]);

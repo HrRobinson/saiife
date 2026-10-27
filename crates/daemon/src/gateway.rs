@@ -1089,6 +1089,18 @@ async fn request_result(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Resp {
             state: State::Sent,
             result: Some(r),
         } if r.get("ok") == Some(&Value::Bool(true)) => sent_response(&r),
+        // The result could not be kept (sealing or writing it failed).
+        ResultView::Done {
+            state,
+            result: Some(r),
+        } if r.get("error").and_then(Value::as_str) == Some("result_unavailable") => json_resp(
+            StatusCode::GONE,
+            pick(
+                json!({"state": state_name(state)}),
+                Some(&r),
+                &["error", "message"],
+            ),
+        ),
         // Sent, but the answer was withheld (as for a direct call: 502).
         ResultView::Done {
             state: State::Sent,

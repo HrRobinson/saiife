@@ -91,6 +91,9 @@ fn allowed(from: State, to: State) -> bool {
     )
 }
 
+/// The `result_ref` of a request whose result could not be kept.
+pub const RESULT_UNAVAILABLE: &str = "unavailable";
+
 /// One request file (§8.10).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -821,6 +824,17 @@ impl Store {
         self.write_atomic(&name, &bytes)
             .map_err(WriteErr::into_io)?;
         r.result_ref = Some(name);
+        self.commit_request(&r)
+    }
+
+    /// Note that the result of `id` could not be kept (it could not be
+    /// sealed or written): its `result_ref` becomes
+    /// [`RESULT_UNAVAILABLE`], so the requester is told `result_unavailable`
+    /// rather than that it was kept and is gone.
+    pub fn mark_result_unavailable(&self, id: u64) -> io::Result<()> {
+        let _g = self.guard();
+        let mut r = self.read(id)?;
+        r.result_ref = Some(RESULT_UNAVAILABLE.to_string());
         self.commit_request(&r)
     }
 

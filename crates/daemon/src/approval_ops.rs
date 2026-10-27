@@ -38,6 +38,8 @@ use zeroize::Zeroizing;
 /// between the approval and the send. It is never sent again by itself
 /// (that could send a write twice).
 pub const INTERRUPTED: &str = "interrupted";
+/// The note of a request its requester rejected (withdrew).
+pub const CANCELLED: &str = "cancelled by requester";
 /// At most this many pending requests per uid; more are denied
 /// (`approvals_full`), so an agent cannot flood its approvers.
 pub const MAX_PENDING_PER_UID: usize = 20;
@@ -483,39 +485,60 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         .await;
     }
 
+    // The requester may always withdraw its own request: a rejection that
+    // lets nothing through needs no approver and no re-authentication.
+    let cancel = !approve && r.uid == peer.uid;
+    let note = if cancel {
+        Some(match note {
+            // (Within the note limit; a note too long for the prefix is dropped.)
+            Some(n)
+                if !n.is_empty() && n.len() + CANCELLED.len() + 2 <= crate::approvals::NOTE_MAX =>
+            {
+                format!("{CANCELLED}: {n}")
+            }
+            _ => CANCELLED.to_string(),
+        })
+    } else {
+        note
+    };
+
     // Who may decide: the daemon's own name for the peer uid, never the
     // client's; the lookups and any re-authentication off the runtime.
-    let refusal = match ctx.name_of(peer.uid).await {
-        None => Some(Refusal::NotApprover),
-        Some(name) => {
-            let c = Arc::clone(ctx);
-            let start = conn.start_time;
-            let requester = r.uid;
-            let detail = crate::approvals::reauth_detail(&r);
-            tokio::task::spawn_blocking(move || {
-                // Re-authentication names the approver's process: without
-                // its start time it cannot run (fail closed).
-                let no_start = NoStartTime(c.reauth.as_ref());
-                let reauth: &dyn Reauth = match start {
-                    Some(_) => c.reauth.as_ref(),
-                    None => &no_start,
-                };
-                may_decide(
-                    &cfg,
-                    c.directory.as_ref(),
-                    &name,
-                    requester,
-                    reauth,
-                    &peer,
-                    start.unwrap_or(0),
-                    c.proc.as_ref(),
-                    &c.reauth_cooldowns,
-                    &detail,
-                )
-            })
-            .await
-            .unwrap_or_else(|e| Err(Refusal::ReauthError(e.to_string())))
-            .err()
+    let refusal = if cancel {
+        None
+    } else {
+        match ctx.name_of(peer.uid).await {
+            None => Some(Refusal::NotApprover),
+            Some(name) => {
+                let c = Arc::clone(ctx);
+                let start = conn.start_time;
+                let requester = r.uid;
+                let detail = crate::approvals::reauth_detail(&r);
+                tokio::task::spawn_blocking(move || {
+                    // Re-authentication names the approver's process: without
+                    // its start time it cannot run (fail closed).
+                    let no_start = NoStartTime(c.reauth.as_ref());
+                    let reauth: &dyn Reauth = match start {
+                        Some(_) => c.reauth.as_ref(),
+                        None => &no_start,
+                    };
+                    may_decide(
+                        &cfg,
+                        c.directory.as_ref(),
+                        &name,
+                        requester,
+                        reauth,
+                        &peer,
+                        start.unwrap_or(0),
+                        c.proc.as_ref(),
+                        &c.reauth_cooldowns,
+                        &detail,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(Refusal::ReauthError(e.to_string())))
+                .err()
+            }
         }
     };
     if let Some(why) = refusal {
@@ -1064,15 +1087,32 @@ fn keep_result(
         }
         other => other,
     };
-    match sealed {
-        Ok(sealed) => {
-            if let Err(e) = s.put_result(rid, sealed, now()) {
-                eprintln!("saiife: warning: cannot keep the result of #{rid}: {e}");
-            }
-        }
-        Err(e) => eprintln!("saiife: warning: cannot seal the result of #{rid}: {e}"),
+    let problem = match sealed {
+        Ok(sealed) => s
+            .put_result(rid, sealed, now())
+            .err()
+            .map(|e| format!("cannot keep the result of #{rid}: {e}")),
+        Err(e) => Some(format!("cannot seal the result of #{rid}: {e}")),
+    };
+    if let Some(p) = problem {
+        eprintln!("saiife: warning: {p}");
+        result_unavailable(s, rid);
     }
     too_large
+}
+
+/// Mark `rid`'s result as not kept (best effort: a store that cannot be
+/// written leaves no result either way).
+fn result_unavailable(s: &Store, rid: u64) {
+    if let Err(e) = s.mark_result_unavailable(rid) {
+        eprintln!("saiife: warning: cannot note that the result of #{rid} is unavailable: {e}");
+    }
+}
+
+/// What the requester gets for a result that could not be kept.
+pub(crate) fn unavailable_result() -> Value {
+    json!({"ok": false, "error": "result_unavailable",
+        "message": "the result could not be kept (it could not be sealed or written)"})
 }
 
 /// Store the sealed result (if any), move to `to`, and write the record
@@ -1295,8 +1335,13 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
         }
         let result = failure_result(INTERRUPTED, message);
         let bytes = Zeroizing::new(serde_json::to_vec(&result).unwrap_or_default());
-        if let Ok(sealed) = ctx.vault.seal(&result_aad(r.id), &bytes) {
-            let _ = store.put_result(r.id, sealed, now());
+        let kept = ctx
+            .vault
+            .seal(&result_aad(r.id), &bytes)
+            .map_err(|_| ())
+            .and_then(|sealed| store.put_result(r.id, sealed, now()).map_err(|_| ()));
+        if kept.is_err() {
+            result_unavailable(store, r.id);
         }
         match store.transition(
             r.id,
@@ -1350,11 +1395,16 @@ pub(crate) async fn result_for(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Result<Res
         if r.uid != uid {
             return None;
         }
-        let result = matches!(r.state, State::Sent | State::SendFailed)
+        let done = matches!(r.state, State::Sent | State::SendFailed);
+        let result = done
             .then(|| s.get_result(rid))
             .flatten()
             .and_then(|sealed| c.vault.open_sealed(&result_aad(rid), &sealed).ok())
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .or_else(|| {
+                (done && r.result_ref.as_deref() == Some(crate::approvals::RESULT_UNAVAILABLE))
+                    .then(unavailable_result)
+            });
         Some((r, result))
     })
     .await
