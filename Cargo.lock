@@ -1172,6 +1172,7 @@ dependencies = [
  "saiife-system",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "tokio",

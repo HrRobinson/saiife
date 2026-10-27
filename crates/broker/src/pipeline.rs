@@ -153,6 +153,31 @@ pub struct PendingCall {
     pub params: Masked<BTreeMap<String, String>>,
     /// Masked.
     pub project: String,
+    /// The body that will be sent (the canonical JSON), masked and cut at
+    /// [`BODY_DISPLAY_MAX`] bytes with a marker: what the approver reads.
+    pub body_display: Option<String>,
+    /// SHA-256 (hex) of the exact body bytes that will be sent.
+    pub body_sha256: Option<String>,
+    /// `(minor units, currency)` of an operation that moves money.
+    pub amount: Option<(u64, String)>,
+    /// The agent's headers (forwarded as the manifest allows), masked.
+    pub headers: Vec<(String, String)>,
+}
+
+/// The longest masked body an approval request shows, in bytes.
+pub const BODY_DISPLAY_MAX: usize = 4096;
+
+/// `s` cut at [`BODY_DISPLAY_MAX`] bytes (on a char boundary), with a
+/// marker saying how long it was.
+pub fn cut_display(s: &str) -> String {
+    if s.len() <= BODY_DISPLAY_MAX {
+        return s.to_string();
+    }
+    let mut end = BODY_DISPLAY_MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated: {} bytes in all]", &s[..end], s.len())
 }
 
 /// The future of [`Env::create_approval`].
@@ -727,6 +752,16 @@ async fn steps(
             capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),
             params: masker.mask_params(&given),
             project: masker.mask_text(&call.project),
+            body_display: body
+                .as_ref()
+                .map(|b| cut_display(&masker.mask_text(&String::from_utf8_lossy(b)))),
+            body_sha256: body.as_ref().map(|b| hex(&Sha256::digest(b))),
+            amount: tr.amount.clone(),
+            headers: call
+                .headers
+                .iter()
+                .map(|(k, v)| (masker.mask_text(k), masker.mask_text(v)))
+                .collect(),
         };
         return match env.create_approval(&pending).await {
             Ok(id) => Outcome::Pending { id },

@@ -545,6 +545,42 @@ async fn ask_creates_pending_no_upstream_call() {
 }
 
 #[tokio::test]
+async fn pending_display_shows_what_will_be_sent_masked() {
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let mut c = call("refunds.create", &[("order_id", "7")]);
+    let raw = format!(
+        r#"{{"refund":{{"currency":"EUR","note":"{TOKEN}","transactions":[{{"amount":"5.00"}}]}},"zpad":"{}"}}"#,
+        "y".repeat(5000)
+    );
+    c.body = Some(Bytes::from(raw.clone()));
+    c.headers = vec![("X-Trace".into(), format!("t-{TOKEN}"))];
+    let (o, tr) = run(
+        &c,
+        &snapshot(""),
+        &catalog(),
+        &Limiter::new(),
+        &env,
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap().pop().unwrap();
+    assert_eq!(p.amount, Some((500, "EUR".to_string())));
+    assert_eq!(p.body_sha256, tr.body_sha256);
+    let shown = p.body_display.unwrap();
+    assert!(shown.contains(r#""note":"[MASKED]""#), "{shown}");
+    assert!(!shown.contains(TOKEN));
+    assert!(shown.ends_with("bytes in all]"), "{shown}");
+    assert!(shown.len() < 4200);
+    assert_eq!(
+        p.headers,
+        vec![("X-Trace".to_string(), "t-[MASKED]".to_string())]
+    );
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn ask_over_limit_denied_at_creation() {
     let (m, up) = mock().await;
     let env = FakeEnv::ok();

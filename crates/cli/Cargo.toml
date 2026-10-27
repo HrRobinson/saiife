@@ -50,3 +50,5 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 # The approvals tests serve an in-process daemon context to the CLI (an
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+# The body hash an approver is shown, checked against what was sent.
+sha2 = "0.10"

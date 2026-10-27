@@ -21,7 +21,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_broker::limits::Limiter;
 use saiife_daemon::approvals::{dir_in, State};
-use saiife_daemon::ops::{check_services, dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
+use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
 use saiife_daemon::sessions::RealProc;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
 use saiife_daemon::writer::{self, WriterConfig};
@@ -173,7 +173,7 @@ approvers = ["boss"]
 [[scope]]
 name = "agents"
 users = [{user:?}]
-services = ["erp"]
+services = ["erp", "pay"]
 
 [services.erp]
 connector = "http"
@@ -198,6 +198,11 @@ kind = "write"
 method = "POST"
 path = "/invoices"
 body = "json"
+
+[services.pay]
+connector = "test-pay"
+secret = "erp-key"
+ask = ["refunds:write"]
 "#,
         user = own_user(),
         run = tmp.join("run").display().to_string(),
@@ -205,12 +210,38 @@ body = "json"
     )
 }
 
-/// The policy state of `text` (written to `etc/config.toml`).
-fn policy_of(tmp: &Path, text: &str) -> PolicyState {
+/// An admin manifest whose operation moves money (an `amount`).
+fn pay_manifest(port: u16) -> saiife_broker::Manifest {
+    saiife_broker::Manifest::parse(&format!(
+        r#"id = "test-pay"
+version = 1
+title = "Test payments"
+base_url = "https://127.0.0.1:{port}/api"
+hosts = ["127.0.0.1"]
+auth = [{{ kind = "header", name = "X-Api-Key", secret_field = "value" }}]
+request_headers = ["Content-Type", "Accept"]
+
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/refunds"
+body = "json"
+amount = {{ field = "refund.amount", currency_field = "refund.currency", unit = "major" }}
+"#
+    ))
+    .unwrap()
+}
+
+/// The policy state of `text` (written to `etc/config.toml`), with the
+/// built-in connectors and `test-pay`.
+fn policy_of(tmp: &Path, port: u16, text: &str) -> PolicyState {
     let config = tmp.join("etc/config.toml");
     fs::write(&config, text).unwrap();
     let l = saiife_policy::load_system(&config).unwrap();
-    let cat = check_services(&l, &config).unwrap();
+    let cat = saiife_broker::Catalog::new(saiife_broker::builtin(), vec![pay_manifest(port)]);
+    saiife_broker::catalog::validate(&l.config, &cat).unwrap();
     PolicyState::from_loaded(&l, &[], cat)
 }
 
@@ -228,7 +259,7 @@ fn world_with(erp_extra: &str) -> World {
         fs::create_dir_all(t.join(d)).unwrap();
     }
     fs::write(t.join("etc/ca/test-ca.pem"), &m.ca_pem).unwrap();
-    let policy = policy_of(t, &config_text(t, m.port, erp_extra));
+    let policy = policy_of(t, m.port, &config_text(t, m.port, erp_extra));
 
     let cw = ChainWriter::open(
         &t.join("audit"),
@@ -260,7 +291,7 @@ fn world_with(erp_extra: &str) -> World {
         name: "erp-key".into(),
         kind: Kind::Header,
         fields: [("value".to_string(), Zeroizing::new(SECRET.to_string()))].into(),
-        allowed_services: vec!["erp".into()],
+        allowed_services: vec!["erp".into(), "pay".into()],
         created_by: 0,
         created: "2026-10-27T00:00:00Z".into(),
         last_used: None,
@@ -581,7 +612,7 @@ fn self_approval_refused_and_recorded() {
         "approvers = [\"boss\"]",
         &format!("approvers = [\"boss\", {:?}]", own_user()),
     );
-    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), &text);
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &text);
     let a = w.op(
         own_uid(),
         "approval.decide",
@@ -626,10 +657,18 @@ fn approve_sends_stored_body_not_new_one() {
     assert_eq!(hits[0].1, canonical(BODY_A));
     // The second waits for its own approval.
     assert_eq!(w.state(second), Some(State::Pending));
-    // The request file holds the exact request only sealed.
-    let file =
-        fs::read_to_string(dir_in(&w.path().join("state")).join(format!("{second}.json"))).unwrap();
-    assert!(!file.contains("mallory"), "{file}");
+    // Each request shows its own body to the approver (masked; the exact
+    // request is sealed).
+    let file: Value = serde_json::from_slice(
+        &fs::read(dir_in(&w.path().join("state")).join(format!("{second}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["body_display"], canonical(BODY_B));
+    let first_file: Value = serde_json::from_slice(
+        &fs::read(dir_in(&w.path().join("state")).join(format!("{first}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_file["body_display"], canonical(BODY_A));
 }
 
 #[test]
@@ -664,7 +703,7 @@ fn policy_changed_to_deny_send_failed() {
     let w = world();
     let id = w.ask(BODY_A);
     let text = config_text(w.path(), w.m.port, "deny = [\"invoices:write\"]\n");
-    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), &text);
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &text);
     assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
     w.wait_state(id, State::SendFailed);
     assert!(w.m.hits().is_empty());
@@ -900,6 +939,64 @@ fn vault_unavailable_at_send_send_failed() {
     m.insert("request".into(), id.into());
     let a = w.op(own_uid(), "api.result", Value::Object(m));
     assert_eq!(a["state"], "send_failed", "{a}");
+}
+
+/// The approver sees what will be sent: `approval.show` has the amount,
+/// the masked canonical body and its SHA-256, which is the hash of what
+/// the upstream gets after the approval (the sealed request is what is
+/// sent). `approval.list` has them too, the body cut short.
+#[test]
+fn show_displays_amount_masked_body_and_its_hash() {
+    let w = world();
+    let body = format!(
+        r#"{{ "refund": {{"amount": "12.50", "currency": "EUR"}}, "memo": "{SECRET}", "pad": "{}" }}"#,
+        "x".repeat(300)
+    );
+    let f = w.path().join("refund.json");
+    fs::write(&f, &body).unwrap();
+    let o = w.api(&[
+        "pay",
+        "refunds.create",
+        "--body",
+        &format!("@{}", f.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let id = pending_id(&o);
+
+    let a = w.op(BOSS, "approval.show", json!({"request": id}));
+    let item = &a["item"];
+    assert_eq!(
+        item["amount"],
+        json!({"minor": 1250, "currency": "EUR"}),
+        "{a}"
+    );
+    let shown = item["body_display"].as_str().unwrap();
+    assert!(shown.contains(r#""memo":"[MASKED]""#), "{shown}");
+    assert!(shown.contains(r#""amount":"12.50""#), "{shown}");
+    assert!(!a.to_string().contains(SECRET), "{a}");
+    let hash = item["body_sha256"].as_str().unwrap().to_string();
+    assert_eq!(item["headers"], json!([]));
+    // The list shows the same, the body cut short.
+    let l = w.op(BOSS, "approval.list", json!({}));
+    let li = &l["items"][0];
+    assert_eq!(li["body_sha256"], hash);
+    assert_eq!(li["amount"]["minor"], 1250);
+    assert!(
+        li["body_display"].as_str().unwrap().chars().count() <= 201,
+        "{l}"
+    );
+
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::Sent);
+    let hits = w.m.hits();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].0, "POST /api/refunds");
+    use sha2::Digest as _;
+    let got = sha2::Sha256::digest(hits[0].1.as_bytes());
+    let got: String = got.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(got, hash);
+    // The sent body holds the real value: only the display copy is masked.
+    assert!(hits[0].1.contains(SECRET));
 }
 
 /// Review focus 4: a pending request approved during a lockdown is not

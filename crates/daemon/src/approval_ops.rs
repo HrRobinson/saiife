@@ -15,8 +15,8 @@
 
 use crate::api_ops::{answer, DaemonEnv, Groups};
 use crate::approvals::{
-    aad, result_aad, state_name, ApprovalType, Filter, NewRequest, Request as ApprovalRequest,
-    State, Store, StoreError,
+    aad, result_aad, state_name, Amount, ApprovalType, Filter, NewRequest,
+    Request as ApprovalRequest, SendDisplay, State, Store, StoreError,
 };
 use crate::approvers::{may_decide, Refusal};
 use crate::ops::{Conn, Ctx, VERSION};
@@ -121,6 +121,15 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
         params: p.params.clone(),
         input: None,
         grant_key: None,
+        send: SendDisplay {
+            body_display: p.body_display.clone(),
+            body_sha256: p.body_sha256.clone(),
+            amount: p
+                .amount
+                .clone()
+                .map(|(minor, currency)| Amount { minor, currency }),
+            headers: p.headers.clone(),
+        },
     };
     let created = on_store(ctx, move |c, s| {
         // Store lock, then the vault's (inside `seal`): the only order.
@@ -209,6 +218,24 @@ pub fn item(r: &ApprovalRequest) -> Value {
     v
 }
 
+/// The longest masked body `approval.list` shows, in characters.
+const LIST_BODY_CHARS: usize = 200;
+
+/// [`item`] for `approval.list`: the body cut short, no headers (`show`
+/// has both in full).
+pub fn brief(r: &ApprovalRequest) -> Value {
+    let mut v = item(r);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("headers");
+        if let Some(Value::String(b)) = o.get_mut("body_display") {
+            if b.chars().count() > LIST_BODY_CHARS {
+                *b = format!("{}…", b.chars().take(LIST_BODY_CHARS).collect::<String>());
+            }
+        }
+    }
+    v
+}
+
 fn parse_state(s: &str) -> Option<State> {
     [
         State::Pending,
@@ -247,7 +274,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let mut m = Map::new();
     m.insert(
         "items".into(),
-        Value::Array(items.iter().map(item).collect()),
+        Value::Array(items.iter().map(brief).collect()),
     );
     ok(id, m)
 }

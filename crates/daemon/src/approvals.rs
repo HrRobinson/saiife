@@ -112,6 +112,17 @@ pub struct Request {
     /// The masked command (command requests).
     pub input: Option<String>,
     pub grant_key: Option<String>,
+    /// What will be sent, for the approver (connector requests): the
+    /// masked body cut at 4 KiB, the SHA-256 of the exact body bytes, the
+    /// amount and the masked agent headers.
+    #[serde(default)]
+    pub body_display: Option<String>,
+    #[serde(default)]
+    pub body_sha256: Option<String>,
+    #[serde(default)]
+    pub amount: Option<Amount>,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -138,6 +149,25 @@ pub struct NewRequest {
     pub params: saiife_broker::mask::Masked<BTreeMap<String, String>>,
     pub input: Option<String>,
     pub grant_key: Option<String>,
+    /// The send's display fields ([`Request::body_display`] ...); empty
+    /// (`Default`) for a command request.
+    pub send: SendDisplay,
+}
+
+/// The amount of an operation that moves money.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Amount {
+    pub minor: u64,
+    pub currency: String,
+}
+
+/// What a connector request will send, as the approver sees it (masked).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SendDisplay {
+    pub body_display: Option<String>,
+    pub body_sha256: Option<String>,
+    pub amount: Option<Amount>,
+    pub headers: Vec<(String, String)>,
 }
 
 /// Which requests [`Store::list`] returns: `None`/empty means any.
@@ -542,6 +572,10 @@ impl Store {
             params: req.params.into_inner(),
             input: req.input,
             grant_key: req.grant_key,
+            body_display: req.send.body_display,
+            body_sha256: req.send.body_sha256,
+            amount: req.send.amount,
+            headers: req.send.headers,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
@@ -738,6 +772,7 @@ mod tests {
             params: saiife_broker::mask::Masker::new(&[]).mask_params(&params),
             input: None,
             grant_key: None,
+            send: SendDisplay::default(),
         }
     }
 
