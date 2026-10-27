@@ -1,16 +1,21 @@
 //! Approval requests (spec §6.10.1, §8.10): one `<id>.json` per request,
 //! 0600 in `<state>/approvals/` (0700, checked like the vault dir), with
-//! the id counter in `next_id` (fsynced; ids never repeat) and a result in
-//! `<id>.result`. The exact request to send (`request_sealed`) and the
-//! result are sealed with the vault key ([`crate::vault::Shared::seal`]),
-//! bound to the id by [`aad`] / [`result_aad`]; the display copy is masked
-//! by the caller. Every change happens under one mutex and re-reads the
-//! file, so two deciders never both win. The calls do blocking disk IO:
-//! call them off the runtime thread.
+//! the id counter in `next_id` (fsynced) and a result in `<id>.result`.
+//! The exact request to send (`request_sealed`) and the result are sealed
+//! with the vault key ([`crate::vault::Shared::seal`]), bound to the id by
+//! [`aad`] / [`result_aad`]; the display copy is masked by the caller.
+//! Every change happens under one mutex and re-reads the file, so two
+//! deciders never both win. The calls do blocking disk IO: call them off
+//! the runtime thread.
+//!
+//! Ids never repeat: a new id is above both `next_id` and every request
+//! file, and an unreadable `next_id` is an error, not a restart. They can
+//! repeat only if `next_id` is deleted by the daemon user (or root) after
+//! the requests it counted have been swept.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -75,6 +80,17 @@ pub enum State {
     SendFailed,
 }
 
+/// The only moves [`Store::transition`] makes.
+fn allowed(from: State, to: State) -> bool {
+    matches!(
+        (from, to),
+        (
+            State::Pending,
+            State::Approved | State::Rejected | State::Expired
+        ) | (State::Approved, State::Sent | State::SendFailed)
+    )
+}
+
 /// One request file (§8.10).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -133,18 +149,36 @@ pub struct Filter {
 pub enum StoreError {
     /// No such request.
     Unknown,
-    /// The request is in this state, not one of those asked for.
-    WrongState(State),
-    /// The note is longer than [`NOTE_MAX`] or holds a control character.
+    /// The request is in `state`, not one of those asked for, or the move
+    /// is not an allowed edge. `newly_expired` is the request when this
+    /// call found it past `expires` and expired it: the caller records it.
+    WrongState {
+        state: State,
+        newly_expired: Option<Box<Request>>,
+    },
+    /// The note is longer than [`NOTE_MAX`] or holds a control or format
+    /// character.
     BadNote(&'static str),
     Io(io::Error),
+}
+
+impl StoreError {
+    /// The state of a `WrongState`.
+    pub fn wrong_state(&self) -> Option<State> {
+        match self {
+            StoreError::WrongState { state, .. } => Some(*state),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::Unknown => f.write_str("no such approval request"),
-            StoreError::WrongState(s) => write!(f, "the request is {}", state_name(*s)),
+            StoreError::WrongState { state, .. } => {
+                write!(f, "the request is {}", state_name(*state))
+            }
             StoreError::BadNote(why) => f.write_str(why),
             StoreError::Io(e) => write!(f, "the approval store: {e}"),
         }
@@ -165,13 +199,45 @@ pub fn state_name(s: State) -> &'static str {
     }
 }
 
-/// Refuse a note over [`NOTE_MAX`] bytes or with a control character.
+/// Unicode format (Cf) characters, and the line and paragraph separators:
+/// invisible or reordering text that could disguise a note.
+fn is_format(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x2028..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// Refuse a note over [`NOTE_MAX`] bytes or with a control or format
+/// character.
 pub fn check_note(note: &str) -> Result<(), StoreError> {
     if note.len() > NOTE_MAX {
         return Err(StoreError::BadNote("the note is longer than 1 KiB"));
     }
-    if note.chars().any(char::is_control) {
-        return Err(StoreError::BadNote("the note holds a control character"));
+    if note.chars().any(|c| c.is_control() || is_format(c)) {
+        return Err(StoreError::BadNote(
+            "the note holds a control or format character",
+        ));
     }
     Ok(())
 }
@@ -189,16 +255,98 @@ pub fn ts(t: SystemTime) -> String {
         .unwrap_or_else(|| "0000-00-00T00:00:00.000Z".into())
 }
 
+/// The masked one-line summary of a request for its records:
+/// `service operation`, or the masked command.
+pub fn summary(r: &Request) -> String {
+    match r.kind {
+        ApprovalType::Connector => format!(
+            "{} {}",
+            r.service.as_deref().unwrap_or(""),
+            r.operation.as_deref().unwrap_or("")
+        )
+        .trim()
+        .to_string(),
+        ApprovalType::Command => r.input.clone().unwrap_or_default(),
+    }
+}
+
+/// Fill an `approval` record for `r`: `base` is the daemon's record of
+/// kind `approval` with the masked [`summary`] as input; this adds the
+/// requester (`uid`, `user`, agent, project, session), `action`, `id`,
+/// `approval`, and `by_uid`/`note` when decided.
+pub fn record_for(
+    mut base: saiife_audit::Record,
+    r: &Request,
+    action: &str,
+) -> saiife_audit::Record {
+    use saiife_audit::DecisionKind;
+    base.kind = Some("approval".into());
+    base.uid = Some(r.uid);
+    base.user = Some(r.user.clone());
+    base.agent = r.agent.clone();
+    base.project = r.project.clone();
+    base.session = r.session.clone();
+    base.decision = match action {
+        "expired" => DecisionKind::Expired,
+        "approved" => DecisionKind::Approved,
+        "rejected" | "refused" => DecisionKind::Rejected,
+        "created" => DecisionKind::Ask,
+        _ => base.decision,
+    };
+    base.extra.insert("action".into(), action.into());
+    base.extra.insert("id".into(), r.id.into());
+    base.extra.insert("approval".into(), r.id.into());
+    let kind = match r.kind {
+        ApprovalType::Connector => "connector",
+        ApprovalType::Command => "command",
+    };
+    base.extra.insert("type".into(), kind.into());
+    if let Some(s) = &r.service {
+        base.extra.insert("service".into(), s.clone().into());
+    }
+    if let Some(o) = &r.operation {
+        base.extra.insert("operation".into(), o.clone().into());
+    }
+    if let Some(b) = r.decided_by {
+        base.extra.insert("by_uid".into(), b.into());
+    }
+    if let Some(n) = &r.note {
+        base.extra.insert("note".into(), n.clone().into());
+    }
+    base
+}
+
 #[derive(Serialize, Deserialize)]
 struct ResultFile {
     stored: String,
     sealed: String,
 }
 
+/// Where an atomic write failed: before the rename the old file is
+/// intact; after it the new file is in place but the dir fsync failed.
+enum WriteErr {
+    Before(io::Error),
+    After(io::Error),
+}
+
+impl WriteErr {
+    fn into_io(self) -> io::Error {
+        match self {
+            WriteErr::Before(e) | WriteErr::After(e) => e,
+        }
+    }
+}
+
+type DirSync = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
 pub struct Store {
     dir: PathBuf,
     /// Held by every change, across its disk IO.
     lock: Mutex<()>,
+    /// The fsync of the dir after a rename (a seam for tests).
+    dir_sync: DirSync,
+    /// Files the sweep warned about, so it warns once per start.
+    warned: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -211,10 +359,11 @@ fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 
-/// `<digits>.<ext>` -> the id.
+/// `<id>.<ext>` -> the id, for canonical names only (`1.json`, never
+/// `01.json` or `0.json`).
 fn id_of(name: &str, ext: &str) -> Option<u64> {
     let stem = name.strip_suffix(ext)?.strip_suffix('.')?;
-    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+    if stem.is_empty() || stem.starts_with('0') || !stem.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     stem.parse().ok()
@@ -228,6 +377,10 @@ fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
     }
     Ok(buf)
+}
+
+fn real_dir_sync(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 impl Store {
@@ -245,6 +398,8 @@ impl Store {
         Ok(Store {
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
+            dir_sync: Box::new(real_dir_sync),
+            warned: Mutex::new(HashSet::new()),
         })
     }
 
@@ -261,7 +416,7 @@ impl Store {
     }
 
     /// Temp file (0600, no symlink), fsync, rename, fsync the dir.
-    fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+    fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), WriteErr> {
         let tmp = self.dir.join(format!(".{name}.tmp"));
         let _ = std::fs::remove_file(&tmp);
         let staged = (|| {
@@ -277,14 +432,30 @@ impl Store {
         })();
         if let Err(e) = staged {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+            return Err(WriteErr::Before(e));
         }
-        std::fs::File::open(&self.dir)?.sync_all()
+        (self.dir_sync)(&self.dir).map_err(WriteErr::After)
     }
 
-    fn write_request(&self, r: &Request) -> io::Result<()> {
-        let bytes = serde_json::to_vec(r).map_err(io::Error::other)?;
+    fn write_request(&self, r: &Request) -> Result<(), WriteErr> {
+        let bytes = serde_json::to_vec(r).map_err(|e| WriteErr::Before(io::Error::other(e)))?;
         self.write_atomic(&format!("{}.json", r.id), &bytes)
+    }
+
+    /// Write a changed request; a failed dir fsync after the rename counts
+    /// as committed (the file is in place), with one stderr line.
+    fn commit_request(&self, r: &Request) -> io::Result<()> {
+        match self.write_request(r) {
+            Ok(()) => Ok(()),
+            Err(WriteErr::After(e)) => {
+                eprintln!(
+                    "saiife: warning: approval #{} written but the directory sync failed: {e}",
+                    r.id
+                );
+                Ok(())
+            }
+            Err(WriteErr::Before(e)) => Err(e),
+        }
     }
 
     /// The file of request `id`, or `NotFound`; a file whose id differs
@@ -335,7 +506,9 @@ impl Store {
     /// Store a new pending request. `seal` gets the new id and returns the
     /// sealed exact request (bound to that id with [`aad`]), or `None` for
     /// a command request; a seal failure stores nothing and uses no id.
-    /// The counter is fsynced before the request file is written.
+    /// The counter is fsynced before the request file is written; any
+    /// failure writing the request removes `<id>.json` again, so an error
+    /// never leaves a pending request behind that could be approved.
     pub fn create(
         &self,
         req: NewRequest,
@@ -349,7 +522,8 @@ impl Store {
         let next = id
             .checked_add(1)
             .ok_or_else(|| io::Error::other("approval ids exhausted"))?;
-        self.write_atomic(NEXT_ID, format!("{next}\n").as_bytes())?;
+        self.write_atomic(NEXT_ID, format!("{next}\n").as_bytes())
+            .map_err(WriteErr::into_io)?;
         let r = Request {
             id,
             created: ts(now),
@@ -372,7 +546,10 @@ impl Store {
             note: None,
             result_ref: None,
         };
-        self.write_request(&r)?;
+        if let Err(e) = self.write_request(&r) {
+            let _ = std::fs::remove_file(self.json_path(id));
+            return Err(e.into_io());
+        }
         Ok(r)
     }
 
@@ -398,8 +575,11 @@ impl Store {
     }
 
     /// Move `id` from one of `from` to `to`, re-read from disk under the
-    /// store's lock: of two racing deciders exactly one wins. `by` and
-    /// `note` are set when given and kept otherwise.
+    /// store's lock: of two racing deciders exactly one wins. Only the
+    /// edges Pending -> Approved | Rejected | Expired and Approved -> Sent
+    /// | SendFailed are made. A pending request past `expires` at `now` is
+    /// expired here instead (`WrongState(Expired)` with `newly_expired`).
+    /// `by` and `note` are set when given and kept otherwise.
     pub fn transition(
         &self,
         id: u64,
@@ -407,6 +587,7 @@ impl Store {
         to: State,
         by: Option<u32>,
         note: Option<String>,
+        now: SystemTime,
     ) -> Result<Request, StoreError> {
         if let Some(n) = &note {
             check_note(n)?;
@@ -417,8 +598,19 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(StoreError::Unknown),
             Err(e) => return Err(StoreError::Io(e)),
         };
-        if !from.contains(&r.state) {
-            return Err(StoreError::WrongState(r.state));
+        if r.state == State::Pending && to != State::Expired && r.expires <= ts(now) {
+            r.state = State::Expired;
+            self.commit_request(&r).map_err(StoreError::Io)?;
+            return Err(StoreError::WrongState {
+                state: State::Expired,
+                newly_expired: Some(Box::new(r)),
+            });
+        }
+        if !from.contains(&r.state) || !allowed(r.state, to) {
+            return Err(StoreError::WrongState {
+                state: r.state,
+                newly_expired: None,
+            });
         }
         r.state = to;
         if by.is_some() {
@@ -427,7 +619,7 @@ impl Store {
         if note.is_some() {
             r.note = note;
         }
-        self.write_request(&r).map_err(StoreError::Io)?;
+        self.commit_request(&r).map_err(StoreError::Io)?;
         Ok(r)
     }
 
@@ -442,9 +634,10 @@ impl Store {
             sealed: b64().encode(sealed),
         };
         let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
-        self.write_atomic(&name, &bytes)?;
+        self.write_atomic(&name, &bytes)
+            .map_err(WriteErr::into_io)?;
         r.result_ref = Some(name);
-        self.write_request(&r)
+        self.commit_request(&r)
     }
 
     fn read_result(&self, id: u64) -> io::Result<ResultFile> {
@@ -457,10 +650,19 @@ impl Store {
         b64().decode(self.read_result(id).ok()?.sealed).ok()
     }
 
+    /// One stderr line per file per start.
+    fn warn_once(&self, name: String, e: &io::Error) {
+        let mut w = self.warned.lock().unwrap_or_else(|p| p.into_inner());
+        if w.insert(name.clone()) {
+            eprintln!("saiife: warning: approval file {name} cannot be read: {e}");
+        }
+    }
+
     /// Expire pending requests past `expires` (returned, for their records),
     /// drop results kept longer than [`RESULT_KEEP`] (and results without a
     /// request), and delete decided requests [`REQUEST_KEEP`] after they
-    /// expired.
+    /// expired. Corrupt or oversize request files are left in place and
+    /// warned about once.
     pub fn sweep(&self, now: SystemTime) -> Vec<Request> {
         let _g = self.guard();
         let now_s = ts(now);
@@ -468,13 +670,18 @@ impl Store {
         let old_res = ts(now.checked_sub(RESULT_KEEP).unwrap_or(UNIX_EPOCH));
         let mut expired = Vec::new();
         for id in self.ids("json") {
-            let Ok(mut r) = self.read(id) else {
-                continue;
+            let mut r = match self.read(id) {
+                Ok(r) => r,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    self.warn_once(format!("{id}.json"), &e);
+                    continue;
+                }
             };
             if r.state == State::Pending {
                 if r.expires <= now_s {
                     r.state = State::Expired;
-                    match self.write_request(&r) {
+                    match self.commit_request(&r) {
                         Ok(()) => expired.push(r),
                         Err(e) => {
                             eprintln!("saiife: warning: cannot expire approval #{id}: {e}")
@@ -502,6 +709,7 @@ mod tests {
     use super::*;
     use crate::vault::{Shared, VaultState};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     const MIN: Duration = Duration::from_secs(60);
@@ -558,6 +766,11 @@ mod tests {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
     }
 
+    /// Decide `id` at `t0()`.
+    fn decide(s: &Store, id: u64, from: State, to: State) -> Result<Request, StoreError> {
+        s.transition(id, &[from], to, Some(2), None, t0())
+    }
+
     #[test]
     fn ids_monotonic_across_reopen() {
         let e = env();
@@ -569,11 +782,8 @@ mod tests {
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.create(new_req(1), no_seal, HOUR, t0()).unwrap().id, 3);
         // Swept away, the ids still do not come back.
-        s.transition(3, &[State::Pending], State::Rejected, Some(2), None)
-            .unwrap();
-        for id in [1, 2] {
-            s.transition(id, &[State::Pending], State::Rejected, Some(2), None)
-                .unwrap();
+        for id in [1, 2, 3] {
+            decide(&s, id, State::Pending, State::Rejected).unwrap();
         }
         s.sweep(t0() + 8 * DAY);
         assert!(s.list(Filter::default()).is_empty());
@@ -624,20 +834,89 @@ mod tests {
         let e = env();
         let r = e.store.create(new_req(1), no_seal, MIN, t0()).unwrap();
         assert_eq!(e.store.sweep(t0() + 2 * MIN).len(), 1);
-        match e
-            .store
-            .transition(r.id, &[State::Pending], State::Approved, Some(2), None)
-        {
-            Err(StoreError::WrongState(State::Expired)) => {}
+        match decide(&e.store, r.id, State::Pending, State::Approved) {
+            Err(StoreError::WrongState {
+                state: State::Expired,
+                newly_expired: None,
+            }) => {}
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            e.store
-                .transition(99, &[State::Pending], State::Approved, Some(2), None),
+            decide(&e.store, 99, State::Pending, State::Approved),
             Err(StoreError::Unknown)
         ));
         assert_eq!(e.store.get(r.id).unwrap().state, State::Expired);
         assert_eq!(e.store.get(r.id).unwrap().decided_by, None);
+    }
+
+    #[test]
+    fn approving_past_expiry_unswept_expires_it() {
+        let e = env();
+        let r = e.store.create(new_req(1), no_seal, MIN, t0()).unwrap();
+        let err = e
+            .store
+            .transition(
+                r.id,
+                &[State::Pending],
+                State::Approved,
+                Some(2),
+                None,
+                t0() + 2 * MIN,
+            )
+            .unwrap_err();
+        let StoreError::WrongState {
+            state: State::Expired,
+            newly_expired: Some(gone),
+        } = err
+        else {
+            panic!("{err:?}")
+        };
+        assert_eq!(
+            (gone.id, gone.state, gone.decided_by),
+            (r.id, State::Expired, None)
+        );
+        assert_eq!(e.store.get(r.id).unwrap().state, State::Expired);
+        // Already expired: the sweep does not report it again.
+        assert!(e.store.sweep(t0() + 3 * MIN).is_empty());
+        // Before expiry the same call wins.
+        let r2 = e.store.create(new_req(1), no_seal, MIN, t0()).unwrap();
+        assert!(decide(&e.store, r2.id, State::Pending, State::Approved).is_ok());
+    }
+
+    #[test]
+    fn only_allowed_edges() {
+        let e = env();
+        let s = &e.store;
+        let id = s.create(new_req(1), no_seal, HOUR, t0()).unwrap().id;
+        let all = [
+            State::Pending,
+            State::Approved,
+            State::Rejected,
+            State::Expired,
+            State::Sent,
+            State::SendFailed,
+        ];
+        // Pending -> Sent / Pending -> Pending are refused even if asked for.
+        for to in [State::Sent, State::SendFailed, State::Pending] {
+            let err = s.transition(id, &all, to, None, None, t0()).unwrap_err();
+            assert_eq!(err.wrong_state(), Some(State::Pending), "{to:?}");
+        }
+        decide(s, id, State::Pending, State::Approved).unwrap();
+        for to in [
+            State::Pending,
+            State::Rejected,
+            State::Expired,
+            State::Approved,
+        ] {
+            let err = s.transition(id, &all, to, None, None, t0()).unwrap_err();
+            assert_eq!(err.wrong_state(), Some(State::Approved), "{to:?}");
+        }
+        s.transition(id, &all, State::Sent, None, None, t0())
+            .unwrap();
+        for to in all {
+            let err = s.transition(id, &all, to, None, None, t0()).unwrap_err();
+            assert_eq!(err.wrong_state(), Some(State::Sent), "{to:?}");
+        }
     }
 
     #[test]
@@ -653,7 +932,7 @@ mod tests {
                     let (s, go) = (Arc::clone(&store), Arc::clone(&go));
                     std::thread::spawn(move || {
                         go.wait();
-                        s.transition(id, &[State::Pending], to, Some(2), None)
+                        decide(&s, id, State::Pending, to)
                     })
                 })
                 .collect();
@@ -661,10 +940,7 @@ mod tests {
             let won: Vec<_> = rs.iter().filter_map(|r| r.as_ref().ok()).collect();
             assert_eq!(won.len(), 1, "{rs:?}");
             let lost = rs.iter().find_map(|r| r.as_ref().err()).unwrap();
-            assert!(
-                matches!(lost, StoreError::WrongState(s) if *s == won[0].state),
-                "{lost:?}"
-            );
+            assert_eq!(lost.wrong_state(), Some(won[0].state), "{lost:?}");
             assert_eq!(store.get(id).unwrap().state, won[0].state);
             drop(e.t);
         }
@@ -677,8 +953,7 @@ mod tests {
         let p = s.create(new_req(1), no_seal, MIN, t0()).unwrap();
         let a = s.create(new_req(1), no_seal, MIN, t0()).unwrap();
         let later = s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
-        s.transition(a.id, &[State::Pending], State::Approved, Some(2), None)
-            .unwrap();
+        decide(s, a.id, State::Pending, State::Approved).unwrap();
         assert!(s.sweep(t0() + MIN / 2).is_empty());
         let gone = s.sweep(t0() + 2 * MIN);
         assert_eq!(gone.iter().map(|r| r.id).collect::<Vec<_>>(), vec![p.id]);
@@ -703,13 +978,29 @@ mod tests {
     }
 
     #[test]
+    fn sweep_leaves_corrupt_and_oversize_files() {
+        let e = env();
+        let dir = dir_in(e.t.path());
+        std::fs::write(dir.join("5.json"), b"{not json").unwrap();
+        let big = std::fs::File::create(dir.join("6.json")).unwrap();
+        big.set_len(MAX_FILE_BYTES + 1).unwrap();
+        assert!(e.store.sweep(t0()).is_empty());
+        assert!(e.store.sweep(t0()).is_empty());
+        let w = e.store.warned.lock().unwrap();
+        assert_eq!(
+            w.iter().cloned().collect::<std::collections::BTreeSet<_>>(),
+            ["5.json".to_string(), "6.json".to_string()].into()
+        );
+        assert!(dir.join("5.json").exists() && dir.join("6.json").exists());
+    }
+
+    #[test]
     fn results_dropped_after_24h() {
         let e = env();
         let s = &e.store;
         let r = s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
-        s.transition(r.id, &[State::Pending], State::Approved, Some(2), None)
-            .unwrap();
-        s.transition(r.id, &[State::Approved], State::Sent, None, None)
+        decide(s, r.id, State::Pending, State::Approved).unwrap();
+        s.transition(r.id, &[State::Approved], State::Sent, None, None, t0())
             .unwrap();
         s.put_result(r.id, b"sealed".to_vec(), t0() + MIN).unwrap();
         assert_eq!(s.get(r.id).unwrap().decided_by, Some(2));
@@ -804,21 +1095,98 @@ mod tests {
         );
     }
 
+    /// A dir fsync that fails on call number `n` (from 1), counting all.
+    fn failing_sync(s: &mut Store, n: usize) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        s.dir_sync = Box::new(move |_| {
+            if c.fetch_add(1, Ordering::SeqCst) + 1 == n {
+                Err(io::Error::other("injected dir sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        calls
+    }
+
+    #[test]
+    fn failed_create_leaves_no_pending_request() {
+        let mut e = env();
+        // Sync 1 is next_id, sync 2 the request file (after its rename).
+        failing_sync(&mut e.store, 2);
+        assert!(e.store.create(new_req(1), no_seal, HOUR, t0()).is_err());
+        let dir = dir_in(e.t.path());
+        assert!(!dir.join("1.json").exists());
+        assert!(e.store.list(Filter::default()).is_empty());
+        assert!(matches!(
+            decide(&e.store, 1, State::Pending, State::Approved),
+            Err(StoreError::Unknown)
+        ));
+        // The id is used up, not reused.
+        assert_eq!(
+            e.store.create(new_req(1), no_seal, HOUR, t0()).unwrap().id,
+            2
+        );
+        // A failed counter sync fails the create too, with no request.
+        failing_sync(&mut e.store, 1);
+        assert!(e.store.create(new_req(1), no_seal, HOUR, t0()).is_err());
+        assert!(!dir.join("3.json").exists());
+    }
+
+    #[test]
+    fn transition_dir_sync_failure_counts_as_committed() {
+        let mut e = env();
+        let id = e.store.create(new_req(1), no_seal, HOUR, t0()).unwrap().id;
+        let calls = failing_sync(&mut e.store, 1);
+        let r = decide(&e.store, id, State::Pending, State::Approved).unwrap();
+        assert_eq!(r.state, State::Approved);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(e.store.get(id).unwrap().state, State::Approved);
+        // And it stays decided: a second decider loses.
+        assert_eq!(
+            decide(&e.store, id, State::Pending, State::Rejected)
+                .unwrap_err()
+                .wrong_state(),
+            Some(State::Approved)
+        );
+    }
+
     #[test]
     fn note_capped_and_control_chars_refused() {
         let e = env();
         let s = &e.store;
         let id = s.create(new_req(1), no_seal, HOUR, t0()).unwrap().id;
-        for bad in [
+        let bad = [
             "a".repeat(NOTE_MAX + 1),
             "line\nbreak".into(),
             "\u{1b}[31m".into(),
             "tab\t".into(),
-        ] {
-            assert!(matches!(
-                s.transition(id, &[State::Pending], State::Approved, Some(2), Some(bad)),
-                Err(StoreError::BadNote(_))
-            ),);
+            "\u{7f}".into(),
+            "\u{85}".into(),
+            "ok\u{202E}evil".into(),
+            "\u{202A}".into(),
+            "\u{2066}x\u{2069}".into(),
+            "zero\u{200B}width".into(),
+            "\u{FEFF}".into(),
+            "\u{2028}".into(),
+            "\u{2029}".into(),
+            "\u{E0041}".into(),
+        ];
+        for b in bad {
+            assert!(
+                matches!(
+                    s.transition(
+                        id,
+                        &[State::Pending],
+                        State::Approved,
+                        Some(2),
+                        Some(b.clone()),
+                        t0()
+                    ),
+                    Err(StoreError::BadNote(_))
+                ),
+                "{b:?}"
+            );
         }
         assert_eq!(s.get(id).unwrap().state, State::Pending);
         let ok = "é".repeat(NOTE_MAX / 2);
@@ -829,6 +1197,7 @@ mod tests {
                 State::Approved,
                 Some(2),
                 Some(ok.clone()),
+                t0(),
             )
             .unwrap();
         assert_eq!(r.note.as_deref(), Some(ok.as_str()));
@@ -841,8 +1210,7 @@ mod tests {
         let s = &e.store;
         s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
         s.create(new_req(2), no_seal, HOUR, t0()).unwrap();
-        s.transition(2, &[State::Pending], State::Rejected, Some(3), None)
-            .unwrap();
+        decide(s, 2, State::Pending, State::Rejected).unwrap();
         let ids = |f| s.list(f).iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!(ids(Filter::default()), vec![1, 2]);
         assert_eq!(
@@ -863,5 +1231,75 @@ mod tests {
         let dir = dir_in(e.t.path());
         std::fs::copy(dir.join("1.json"), dir.join("9.json")).unwrap();
         assert!(s.get(9).is_none());
+    }
+
+    #[test]
+    fn only_canonical_names_are_ids() {
+        assert_eq!(id_of("1.json", "json"), Some(1));
+        assert_eq!(id_of("42.result", "result"), Some(42));
+        for n in [
+            "01.json",
+            "0.json",
+            "00.json",
+            ".json",
+            "1.json.tmp",
+            "+1.json",
+            "1x.json",
+        ] {
+            assert_eq!(id_of(n, "json"), None, "{n}");
+        }
+        // A non-canonical copy is not listed and does not move the counter.
+        let e = env();
+        let dir = dir_in(e.t.path());
+        let r = e.store.create(new_req(1), no_seal, HOUR, t0()).unwrap();
+        std::fs::copy(dir.join("1.json"), dir.join("01.json")).unwrap();
+        assert_eq!(e.store.list(Filter::default()).len(), 1);
+        assert_eq!(
+            e.store.create(new_req(1), no_seal, HOUR, t0()).unwrap().id,
+            r.id + 1
+        );
+    }
+
+    #[test]
+    fn expired_record_names_requester_and_id() {
+        let e = env();
+        let mut req = new_req(1001);
+        req.params.insert(
+            "token".into(),
+            concat!("shp", "at_0123456789abcdef0123456789abcdef").into(),
+        );
+        let r = e.store.create(req, no_seal, MIN, t0()).unwrap();
+        let gone = e.store.sweep(t0() + 2 * MIN).pop().unwrap();
+        let base = saiife_audit::Record::at(
+            saiife_audit::NewRecord {
+                agent: "",
+                project: "",
+                session: None,
+                tool: "approval",
+                input: &summary(&gone),
+                decision: saiife_audit::DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: "locked",
+                policy: None,
+                permission_mode: None,
+            },
+            "test",
+            time::OffsetDateTime::now_utc(),
+        );
+        let rec = record_for(base, &gone, "expired");
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["kind"], "approval");
+        assert_eq!(v["action"], "expired");
+        assert_eq!(v["id"], r.id);
+        assert_eq!(v["approval"], r.id);
+        assert_eq!(v["uid"], 1001);
+        assert_eq!(v["user"], "agent-shop");
+        assert_eq!(v["agent"], "claude");
+        assert_eq!(v["decision"], "expired");
+        assert_eq!(v["input"], "shopify products.update");
+        assert!(!v.to_string().contains("shpat_"), "{v}");
+        assert!(v.get("by_uid").is_none());
     }
 }

@@ -310,6 +310,30 @@ impl Ctx {
         r
     }
 
+    /// An `approval` record of `action` for request `r` (§6.10.1): the
+    /// requester, the id (`id` and `approval`) and the masked summary.
+    pub fn approval_record(&self, r: &crate::approvals::Request, action: &str) -> Record {
+        let base = self.record("approval", &crate::approvals::summary(r));
+        crate::approvals::record_for(base, r, action)
+    }
+
+    /// Write an `approval`/`expired` record for each request a sweep (or
+    /// a late decision) expired. A failed write is one stderr line.
+    pub async fn record_expired(&self, reqs: Vec<crate::approvals::Request>) {
+        for r in reqs {
+            if let Err(e) = self
+                .writer
+                .append(self.approval_record(&r, "expired"))
+                .await
+            {
+                eprintln!(
+                    "saiife: warning: cannot record the expiry of approval #{}: {e}",
+                    r.id
+                );
+            }
+        }
+    }
+
     /// A `daemon` record with `event`.
     pub fn event(&self, event: &str) -> Record {
         let mut r = self.record("daemon", event);

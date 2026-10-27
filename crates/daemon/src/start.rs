@@ -266,9 +266,11 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
-    if let Ok(store) = &approvals {
-        store.sweep(crate::import_backup::now());
-    }
+    // Their `approval`/`expired` records go with the start records.
+    let expired_at_start = match &approvals {
+        Ok(store) => store.sweep(crate::import_backup::now()),
+        Err(_) => Vec::new(),
+    };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
     let (tokens, tokens_reset) =
@@ -307,18 +309,20 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
+    let notes: Vec<_> = [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
+        .into_iter()
+        .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
+        .chain(rebuild_note)
+        .chain(capped_note)
+        .collect();
+    let more = start_notes(&ctx, notes, &expired_at_start);
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         daemon_cfg.socket_dir.clone(),
         check,
         policy_err,
         loaded_files,
-        [("ca_refused", ca_refused), ("tokens_reset", tokens_reset)]
-            .into_iter()
-            .filter_map(|(e, r)| Some((e, r?, serde_json::Map::new())))
-            .chain(rebuild_note)
-            .chain(capped_note)
-            .collect(),
+        more,
         tcp,
     ));
     rt.shutdown_timeout(Duration::from_secs(1));
@@ -675,15 +679,36 @@ impl OneAtATime {
     }
 }
 
+/// The start records after the vault's: one `daemon` record per note
+/// `(event, reason, fields)` (`ca_refused`, `tokens_reset`,
+/// `limits_rebuild_failed`, `limits_rebuild_capped`), then one
+/// `approval`/`expired` record per request the start sweep expired.
+fn start_notes(
+    ctx: &Ctx,
+    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
+    expired: &[crate::approvals::Request],
+) -> Vec<saiife_audit::Record> {
+    let mut out = Vec::new();
+    for (event, reason, fields) in notes {
+        let mut r = ctx.event(event);
+        r.reason = Some(reason);
+        r.extra.extend(fields);
+        out.push(r);
+    }
+    for r in expired {
+        out.push(ctx.approval_record(r, "expired"));
+    }
+    out
+}
+
 async fn serve(
     ctx: Arc<Ctx>,
     socket_dir: PathBuf,
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
-    // More start records: `(event, reason, fields)` (`ca_refused`,
-    // `tokens_reset`, `limits_rebuild_failed`, `limits_rebuild_capped`).
-    notes: Vec<(&'static str, String, serde_json::Map<String, Value>)>,
+    // More start records, after the vault's ([`start_notes`]).
+    more: Vec<saiife_audit::Record>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
     let signals = (
@@ -727,12 +752,7 @@ async fn serve(
         r.reason = Some(reason.clone());
         first.push(r);
     }
-    for (event, reason, fields) in notes {
-        let mut r = ctx.event(event);
-        r.reason = Some(reason);
-        r.extra.extend(fields);
-        first.push(r);
-    }
+    first.extend(more);
     for r in first {
         if let Err(e) = ctx.writer.append(r).await {
             eprintln!("saiife: cannot write to the audit log: {e}");
@@ -814,12 +834,16 @@ async fn serve(
             _ = sweep_tick.tick() => {
                 if ctx.approvals.is_ok() {
                     let c = Arc::clone(&ctx);
-                    // One sweep at a time, off the runtime thread. The
-                    // `approval`/`expired` records for what it returns come
-                    // with the approval ops (plan 11, Task 3).
+                    let rt = tokio::runtime::Handle::current();
+                    // One sweep at a time, off the runtime thread; what it
+                    // expired gets its `approval`/`expired` records back on
+                    // the runtime.
                     sweep.start(move || {
                         if let Ok(store) = &c.approvals {
-                            store.sweep(crate::import_backup::now());
+                            let gone = store.sweep(crate::import_backup::now());
+                            if !gone.is_empty() {
+                                rt.spawn(async move { c.record_expired(gone).await });
+                            }
                         }
                     }).await;
                 }

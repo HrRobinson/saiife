@@ -324,6 +324,52 @@ fn checkpoint_after_every_n_records() {
 }
 
 #[test]
+fn start_sweep_records_expired_approvals() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut d = TestDaemon::prepare(&Opts::default());
+    let dir = d.state_dir().join("approvals");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let req = |id: u64, expires: &str| {
+        json!({"id": id, "created": "2020-01-01T00:00:00.000Z", "expires": expires,
+            "uid": 1001, "user": "agent-shop", "session": null, "agent": "claude",
+            "project": "/p", "type": "connector", "service": "shopify",
+            "operation": "products.update", "capability": "products:write",
+            "params": {"id": "42"}, "input": null, "grant_key": null,
+            "request_sealed": null, "state": "pending", "decided_by": null,
+            "note": null, "result_ref": null})
+    };
+    std::fs::write(
+        dir.join("7.json"),
+        req(7, "2020-01-01T00:30:00.000Z").to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("8.json"),
+        req(8, "2999-01-01T00:00:00.000Z").to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("next_id"), "9\n").unwrap();
+    d.spawn_and_wait();
+    let recs = d.of_kind("approval");
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r["action"], json!("expired"));
+    assert_eq!(r["id"], json!(7));
+    assert_eq!(r["approval"], json!(7));
+    assert_eq!(r["uid"], json!(1001));
+    assert_eq!(r["user"], json!("agent-shop"));
+    assert_eq!(r["input"], json!("shopify products.update"));
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("7.json")).unwrap()).unwrap();
+    assert_eq!(on_disk["state"], json!("expired"));
+    let on_disk: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("8.json")).unwrap()).unwrap();
+    assert_eq!(on_disk["state"], json!("pending"));
+    assert_verifies(&d);
+}
+
+#[test]
 fn good_vault_key_writes_no_vault_event() {
     let d = TestDaemon::start(Opts::default());
     assert!(d.events("vault_unavailable").is_empty());
