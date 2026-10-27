@@ -458,7 +458,7 @@ fn unsafe_state_dir_fails_closed_to_all() {
     assert!(d.wait_exit(Duration::from_secs(10)).is_some());
     let dir = d.state_dir().join("state");
     fs::create_dir_all(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o770)).unwrap();
     d.spawn_and_wait();
     let o = hook(&d);
     assert_eq!(code(&o), 2, "{}", stderr(&o));

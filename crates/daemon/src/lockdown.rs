@@ -104,7 +104,7 @@ impl Store {
     }
 }
 
-/// The dir holding the flag file: a real directory, ours, mode 0700. A
+/// The dir holding the flag file: a real directory, ours, not group- or world-writable. A
 /// missing dir is fine (the flag is off). Nothing is created or fixed.
 fn check_parent(file: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -128,9 +128,10 @@ fn check_parent(file: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
-    if md.permissions().mode() & 0o7777 != 0o700 {
+    // Not writable by group or others (the rule of `check_state_paths`).
+    if md.permissions().mode() & 0o022 != 0 {
         return Err(io::Error::other(format!(
-            "{} is not mode 0700",
+            "{} is writable by group or others",
             dir.display()
         )));
     }
@@ -384,16 +385,37 @@ mod tests {
         let d = tmp();
         let p = path_in(d.path());
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::set_permissions(
-            p.parent().unwrap(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
         std::fs::write(&p, b"{not json").unwrap();
         let (s, why) = Store::open(p);
         let l = s.get().unwrap();
         assert_eq!((l.scope, l.reason.as_str()), (LockScope::All, UNREADABLE));
         assert!(why.unwrap().starts_with(UNREADABLE));
+    }
+
+    #[test]
+    fn parent_dir_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        let p = path_in(d.path());
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        for (mode, ok) in [
+            (0o700, true),
+            (0o750, true),
+            (0o755, true),
+            (0o770, false),
+            (0o757, false),
+        ] {
+            std::fs::set_permissions(p.parent().unwrap(), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            assert_eq!(check_parent(&p).is_ok(), ok, "{mode:o}");
+            let (s, why) = Store::open(p.clone());
+            assert_eq!(why.is_none(), ok, "{mode:o}");
+            assert_eq!(s.get().is_none(), ok, "{mode:o}");
+        }
+        // A symlink is refused whatever it points at.
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(p.parent().unwrap(), &link).unwrap();
+        assert!(check_parent(&link.join(FILE_NAME)).is_err());
     }
 
     #[test]
