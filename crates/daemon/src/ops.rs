@@ -153,6 +153,9 @@ pub struct Ctx {
     pub calls: InFlight,
     /// Notifications (webhook, SMTP, command); started by `serve`.
     pub notifier: crate::notifier::Notifier,
+    /// The audit forwarding workers (`[audit.forward.*]`); configured and
+    /// started by the daemon's start, matched to the policy at reload.
+    pub forwarders: crate::forwarder::Forwarders,
     /// The approval request store (`<state>/approvals/`), or why it could
     /// not be opened: then every `ask` is denied (fail closed).
     pub approvals: Result<crate::approvals::Store, String>,
@@ -290,6 +293,7 @@ impl Ctx {
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
             notifier: crate::notifier::Notifier::new(),
+            forwarders: crate::forwarder::Forwarders::default(),
             approvals: i.approvals,
             reauth: Arc::new(crate::reauth::PkCheck::new()),
             reauth_cooldowns: Mutex::default(),

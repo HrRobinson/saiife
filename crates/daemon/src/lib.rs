@@ -17,6 +17,8 @@ pub mod audit_query;
 #[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
+pub mod forwarder;
+#[cfg(target_os = "linux")]
 pub mod gateway;
 #[cfg(target_os = "linux")]
 pub mod grants;

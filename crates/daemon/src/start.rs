@@ -323,6 +323,20 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
+    // The forwarding workers start in `serve`, after the start records.
+    {
+        let weak = Arc::downgrade(&ctx);
+        let host: std::sync::Weak<dyn crate::forwarder::Host> = weak.clone();
+        ctx.forwarders.configure(crate::forwarder::Setup {
+            audit_dir: audit_cfg.dir.clone(),
+            state_dir: opts.state_dir.clone(),
+            appended: ctx.writer.appends(),
+            clock: Arc::new(crate::forwarder::SystemClock::default()),
+            host,
+            make: Arc::new(move |name, cfg| crate::forwarder::transport_for(name, cfg, &weak)),
+        });
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -818,6 +832,11 @@ async fn serve(
 
     // The notification delivery task; it holds only a weak reference.
     let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+    // Audit forwarding, per the policy loaded at start (none while it is
+    // invalid; a valid reload starts it).
+    if let Some(sys) = ctx.policy().system {
+        ctx.forwarders.apply(&sys.audit.forward);
+    }
 
     // 8. Ready.
     notify::ready();
@@ -912,6 +931,9 @@ async fn serve(
     // most the upstream timeout.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    // The forwarders stop first: the stop record waits for the next start
+    // (the cursors are on disk).
+    ctx.forwarders.stop_all();
     gateway.abort();
     let _ = gateway.await;
     if let Some(t) = gateway_tcp {
@@ -1025,6 +1047,7 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
         Ok((l, cat)) => {
             let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
+            ctx.forwarders.apply(&l.config.audit.forward);
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);
             if !changed.is_empty() {

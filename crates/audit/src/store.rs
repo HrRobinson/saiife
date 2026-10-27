@@ -121,7 +121,7 @@ pub struct ReadResult {
 
 /// The `YYYY-MM.jsonl` files in `dir`, oldest first. A missing directory is an
 /// empty list; any other failure to list it is the error text.
-pub(crate) fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn month_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -235,7 +235,7 @@ pub(crate) fn read_regular(p: &Path) -> Option<Vec<u8>> {
 
 /// `p` opened for reading if it is a regular file, with the same checks as
 /// `read_regular`.
-pub(crate) fn open_regular(p: &Path) -> Option<fs::File> {
+pub fn open_regular(p: &Path) -> Option<fs::File> {
     if !fs::symlink_metadata(p).ok()?.is_file() {
         return None;
     }
