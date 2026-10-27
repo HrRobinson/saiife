@@ -834,8 +834,11 @@ async fn serve(
     let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
     // Audit forwarding, per the policy loaded at start (none while it is
     // invalid; a valid reload starts it).
-    if let Some(sys) = ctx.policy().system {
-        ctx.forwarders.apply(&sys.audit.forward);
+    match ctx.policy().system {
+        Some(sys) => ctx.forwarders.apply(&sys.audit.forward).await,
+        None => eprintln!(
+            "saiife: warning: audit forwarding is off until a valid policy loads ([audit.forward.*] is read from it)"
+        ),
     }
 
     // 8. Ready.
@@ -933,7 +936,7 @@ async fn serve(
     let _ = std::fs::remove_file(&sock_path);
     // The forwarders stop first: the stop record waits for the next start
     // (the cursors are on disk).
-    ctx.forwarders.stop_all();
+    ctx.forwarders.stop_all().await;
     gateway.abort();
     let _ = gateway.await;
     if let Some(t) = gateway_tcp {
@@ -1047,7 +1050,7 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
         Ok((l, cat)) => {
             let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
-            ctx.forwarders.apply(&l.config.audit.forward);
+            ctx.forwarders.apply(&l.config.audit.forward).await;
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);
             if !changed.is_empty() {
