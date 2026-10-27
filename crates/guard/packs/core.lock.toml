@@ -399,8 +399,9 @@ reason = "removing or moving Gemini CLI's system settings removes the saiife hoo
 # --- polkit: the approval action and every rule --------------------------------
 # The action's `auth_self` settings are what make a same-user approval ask
 # for a password, and a rule in `rules.d` (under /etc or /usr/share) can
-# answer YES for it without one. Both trees are closed to writes; reading
-# stays allowed (the files are public).
+# answer YES for it without one (polkit reads rules from /etc, /run,
+# /usr/local/share and /usr/share). All four trees are closed to writes;
+# reading stays allowed (the files are public).
 [[deny_path]]
 glob = "/usr/share/polkit-1/**"
 access = "write"
@@ -420,3 +421,23 @@ reason = "a polkit rule can pre-authorize approvals; an agent may not add or cha
 glob = "/etc/polkit-1"
 access = "write"
 reason = "removing or moving polkit's local rules changes how approvals are re-authenticated"
+
+[[deny_path]]
+glob = "/run/polkit-1/**"
+access = "write"
+reason = "a polkit rule can pre-authorize approvals; an agent may not add or change one"
+
+[[deny_path]]
+glob = "/run/polkit-1"
+access = "write"
+reason = "removing or moving polkit's runtime rules changes how approvals are re-authenticated"
+
+[[deny_path]]
+glob = "/usr/local/share/polkit-1/**"
+access = "write"
+reason = "polkit's actions and rules decide how an approval is re-authenticated; changing them lets an agent approve its own requests"
+
+[[deny_path]]
+glob = "/usr/local/share/polkit-1"
+access = "write"
+reason = "removing or moving polkit's local actions and rules changes how approvals are re-authenticated"

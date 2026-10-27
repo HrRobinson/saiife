@@ -9,7 +9,12 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 /// Where polkit reads its JavaScript rules from.
-pub const POLKIT_RULES_DIRS: &[&str] = &["/etc/polkit-1/rules.d", "/usr/share/polkit-1/rules.d"];
+pub const POLKIT_RULES_DIRS: &[&str] = &[
+    "/etc/polkit-1/rules.d",
+    "/run/polkit-1/rules.d",
+    "/usr/local/share/polkit-1/rules.d",
+    "/usr/share/polkit-1/rules.d",
+];
 /// The most of one rules file read when looking for the action id.
 const MAX_RULES_FILE_BYTES: u64 = 1024 * 1024;
 /// The most rules files looked at per directory.
@@ -120,7 +125,9 @@ mod tests {
             fs::create_dir_all(layout.at(dir)).unwrap();
         }
         let etc = layout.at(POLKIT_RULES_DIRS[0]);
-        let usr = layout.at(POLKIT_RULES_DIRS[1]);
+        let run = layout.at(POLKIT_RULES_DIRS[1]);
+        let local = layout.at(POLKIT_RULES_DIRS[2]);
+        let usr = layout.at(POLKIT_RULES_DIRS[3]);
         fs::write(etc.join("10-other.rules"), "polkit.addRule(function(){});").unwrap();
         assert!(rules_mentioning_action(&layout).is_empty());
         fs::write(
@@ -129,12 +136,16 @@ mod tests {
         )
         .unwrap();
         fs::write(usr.join("50-x.rules"), "// com.saiife.approve").unwrap();
+        fs::write(run.join("10-r.rules"), "com.saiife.approve").unwrap();
+        fs::write(local.join("10-l.rules"), "x com.saiife.approve x").unwrap();
         // A symlink is not followed.
         std::os::unix::fs::symlink(etc.join("49-yes.rules"), usr.join("60-link.rules")).unwrap();
         assert_eq!(
             rules_mentioning_action(&layout),
             vec![
                 "/etc/polkit-1/rules.d/49-yes.rules".to_string(),
+                "/run/polkit-1/rules.d/10-r.rules".to_string(),
+                "/usr/local/share/polkit-1/rules.d/10-l.rules".to_string(),
                 "/usr/share/polkit-1/rules.d/50-x.rules".to_string(),
             ]
         );

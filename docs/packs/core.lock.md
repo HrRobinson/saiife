@@ -67,8 +67,9 @@ agent's file tools and through shell commands:
   `managed-settings.d/` and `managed-settings.json`,
   `/etc/codex/requirements.toml`, `/etc/gemini-cli/settings.json`, and the
   `/etc/codex` and `/etc/gemini-cli` folders.
-- polkit's trees, `/usr/share/polkit-1` and `/etc/polkit-1` with everything
-  in them: the approval action
+- polkit's trees, `/etc/polkit-1`, `/run/polkit-1`,
+  `/usr/local/share/polkit-1` and `/usr/share/polkit-1` with everything in
+  them: the approval action
   (`/usr/share/polkit-1/actions/com.saiife.approve.policy`) and every rule in
   `rules.d`. Weakening the action, or a rule that answers yes for it, would
   let an agent approve its own requests. The files are public, so reading

@@ -547,6 +547,12 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "/etc/polkit-1/rules.d/49-x.rules",
         "/etc/polkit-1/rules.d",
         "/etc/polkit-1",
+        "/run/polkit-1/rules.d/49-x.rules",
+        "/run/polkit-1/rules.d",
+        "/run/polkit-1",
+        "/usr/local/share/polkit-1/rules.d/49-x.rules",
+        "/usr/local/share/polkit-1/actions/x.policy",
+        "/usr/local/share/polkit-1",
         "~/.config/systemd/user/x.service",
         "~/Library/LaunchAgents/x.plist",
         "~/.config/autostart/x.desktop",
@@ -577,6 +583,10 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "mv /etc/polkit-1 /tmp/x",
         "rm -rf /usr/share/polkit-1",
         "tee /etc/polkit-1/rules.d/10-x.rules",
+        "cp yes.rules /run/polkit-1/rules.d/00-yes.rules",
+        "echo x > /run/polkit-1/rules.d/00-yes.rules",
+        "cp yes.rules /usr/local/share/polkit-1/rules.d/00-yes.rules",
+        "rm -rf /usr/local/share/polkit-1",
     ] {
         assert_lock_denies(&e, cmd);
     }
@@ -594,6 +604,8 @@ fn everyday_work_and_reading_the_setup_are_allowed() {
         "cat /etc/codex/requirements.toml",
         "cat /usr/share/polkit-1/actions/com.saiife.approve.policy",
         "ls /etc/polkit-1/rules.d",
+        "ls /run/polkit-1/rules.d",
+        "cat /usr/local/share/polkit-1/rules.d/x.rules",
         "cat /usr/share/polkit-1/rules.d/50-default.rules",
         "journalctl -u nginx",
         "kill 1234",
