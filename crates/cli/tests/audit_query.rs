@@ -236,4 +236,18 @@ fn report_host_sections_from_the_daemon_ignore_narrowing_filters() {
     let html = std::fs::read_to_string(&report).unwrap();
     assert!(html.contains("echo err-denied-host"), "{html}");
     assert!(html.contains("not checked: your records come through the saiife daemon"));
+    // audit.query never returns daemon or forward records: those sections
+    // say they are for auditors, not that there were none.
+    assert_eq!(
+        html.matches("Not shown: auditors only.").count(),
+        2,
+        "{html}"
+    );
+    assert!(!html.contains("No unclean daemon restarts in this period."));
+    assert!(!html.contains("No forwarding outages in this period."));
+    // An auditor's report (files read directly) lists them as usual.
+    let o = audit(&d, &own_group(), &["--report", report.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let html = std::fs::read_to_string(&report).unwrap();
+    assert!(!html.contains("Not shown: auditors only."), "{html}");
 }

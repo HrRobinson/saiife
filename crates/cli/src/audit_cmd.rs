@@ -609,6 +609,9 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
             .filter(|r| host_filter.matches(r))
             .collect();
         model.set_host_events(&host, now, project.is_some() || agent.is_some() || blocked);
+        // Through the daemon (no dir to verify) the answer holds only the
+        // caller's own records: no daemon or forward records to list.
+        model.auditors_only_sections = main.verify_dir.is_none();
         model.chain = match &main.verify_dir {
             Some(dir) => report::chain_line(&saiife_audit::verify(dir)),
             None => "not checked: your records come through the saiife daemon (auditors run saiife audit verify)".to_string(),

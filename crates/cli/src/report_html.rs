@@ -373,6 +373,9 @@ fn error_denied_section(r: &Report) -> String {
 }
 
 fn restarts_section(r: &Report) -> String {
+    if r.auditors_only_sections {
+        return or_para(true, crate::report::AUDITORS_ONLY, String::new);
+    }
     or_para(
         r.restarts.is_empty(),
         "No unclean daemon restarts in this period.",
@@ -396,6 +399,9 @@ fn restarts_section(r: &Report) -> String {
 }
 
 fn outages_section(r: &Report) -> String {
+    if r.auditors_only_sections {
+        return or_para(true, crate::report::AUDITORS_ONLY, String::new);
+    }
     let mut out = or_para(
         r.outages.is_empty(),
         "No forwarding outages in this period.",
@@ -414,7 +420,14 @@ fn outages_section(r: &Report) -> String {
                         vec![
                             cell(None, &x.target),
                             cell(None, &x.from),
-                            cell(if x.to == "ongoing" { Some("bad") } else { None }, &x.to),
+                            cell(
+                                if x.to == "ongoing" { Some("bad") } else { None },
+                                &if x.note.is_empty() {
+                                    x.to.clone()
+                                } else {
+                                    format!("{} ({})", x.to, x.note)
+                                },
+                            ),
                             cell(None, &x.duration),
                             cell(None, x.source),
                         ]
@@ -658,6 +671,7 @@ mod tests {
             outages: vec![],
             forward_drops: vec![],
             sections_not_narrowed: false,
+            auditors_only_sections: false,
         }
     }
 

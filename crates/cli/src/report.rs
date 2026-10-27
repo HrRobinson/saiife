@@ -55,7 +55,16 @@ pub struct Report {
     /// True when --agent/--project/--blocked was given: the connector,
     /// approval, error_denied, restart and outage sections ignore those.
     pub sections_not_narrowed: bool,
+    /// True when the records came through the daemon (a non-auditor):
+    /// `audit.query` never returns daemon or forward records, so the
+    /// restart and outage sections say they are for auditors only
+    /// instead of claiming there were none.
+    pub auditors_only_sections: bool,
 }
+
+/// What the restart and outage sections say in a report built from the
+/// daemon's answer (a non-auditor).
+pub const AUDITORS_ONLY: &str = "Not shown: auditors only.";
 
 /// Where a record came from, for the labels of §9.4.
 pub const SOURCE_GUARD: &str = "reported by the agent's hook";
@@ -121,11 +130,18 @@ pub struct RestartRow {
 pub struct Outage {
     pub target: String,
     pub from: String,
-    /// `ongoing` when no `recovered` follows.
+    /// `ongoing` when no `recovered` (or `connected`) follows.
     pub to: String,
     pub duration: String,
+    /// Why the outage ended without a `recovered`, or empty.
+    pub note: String,
     pub source: &'static str,
 }
+
+/// The note on an outage that a later `connected` closed: the worker was
+/// started again (daemon restart or config reload) and its first send
+/// went through, so no `recovered` was recorded.
+pub const RECOVERED_AFTER_RESTART: &str = "recovered after a daemon restart or reload";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardDrop {
@@ -509,6 +525,8 @@ fn restart_rows(sorted: &[&Record]) -> Vec<RestartRow> {
 }
 
 /// `failing` to the next `recovered`, per target; plus dropped backlogs.
+/// A `connected` closes an open outage too: a restarted worker records
+/// `connected`, not `recovered`, on its first good send.
 fn forward_outages(sorted_asc: &[&Record], now: OffsetDateTime) -> (Vec<Outage>, Vec<ForwardDrop>) {
     let mut open: std::collections::BTreeMap<String, OffsetDateTime> = Default::default();
     let mut outages = Vec::new();
@@ -531,6 +549,7 @@ fn forward_outages(sorted_asc: &[&Record], now: OffsetDateTime) -> (Vec<Outage>,
                         from: "began before the report period".to_string(),
                         to: fmt_minute(t),
                         duration: "unknown".to_string(),
+                        note: String::new(),
                         source: SOURCE_SAIIFE,
                     });
                 } else if let Some(from) = open.remove(&target) {
@@ -539,6 +558,19 @@ fn forward_outages(sorted_asc: &[&Record], now: OffsetDateTime) -> (Vec<Outage>,
                         from: fmt_minute(from),
                         to: fmt_minute(t),
                         duration: fmt_duration((t - from).whole_seconds()),
+                        note: String::new(),
+                        source: SOURCE_SAIIFE,
+                    });
+                }
+            }
+            (Some("connected"), Some(t)) => {
+                if let Some(from) = open.remove(&target) {
+                    outages.push(Outage {
+                        target,
+                        from: fmt_minute(from),
+                        to: fmt_minute(t),
+                        duration: fmt_duration((t - from).whole_seconds()),
+                        note: RECOVERED_AFTER_RESTART.to_string(),
                         source: SOURCE_SAIIFE,
                     });
                 }
@@ -546,12 +578,7 @@ fn forward_outages(sorted_asc: &[&Record], now: OffsetDateTime) -> (Vec<Outage>,
             (Some("backlog_dropped"), _) => drops.push(ForwardDrop {
                 time: at_minute(r),
                 target,
-                detail: [Some(r.input.as_str()), r.reason.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("; "),
+                detail: drop_detail(r),
                 source: SOURCE_SAIIFE,
             }),
             _ => {}
@@ -564,12 +591,34 @@ fn forward_outages(sorted_asc: &[&Record], now: OffsetDateTime) -> (Vec<Outage>,
             // Still open at the end of the report: runs to `now`.
             to: "ongoing".to_string(),
             duration: fmt_duration((now - from).whole_seconds()),
+            note: String::new(),
             source: SOURCE_SAIIFE,
         });
     }
     outages.reverse();
     drops.reverse();
     (outages, drops)
+}
+
+/// A `backlog_dropped` record as one line: the seq range the forwarder
+/// wrote (`from_seq`–`to_seq`), then its input and reason.
+fn drop_detail(r: &Record) -> String {
+    let seq = |k: &str| r.extra.get(k).and_then(serde_json::Value::as_u64);
+    let range = match (seq("from_seq"), seq("to_seq")) {
+        (Some(a), Some(b)) if a == b => Some(format!("seq {a}")),
+        (Some(a), Some(b)) => Some(format!("seq {a}\u{2013}{b}")),
+        _ => None,
+    };
+    [
+        range.as_deref(),
+        Some(r.input.as_str()),
+        r.reason.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 impl Report {
@@ -776,6 +825,7 @@ pub fn build(
         outages,
         forward_drops,
         sections_not_narrowed: false,
+        auditors_only_sections: false,
     }
 }
 
@@ -1511,6 +1561,107 @@ mod tests {
         r2.outages.clear();
         r2.set_host_events(&refs, datetime!(2026-10-21 00:00 UTC), false);
         assert_eq!((r2.restarts.len(), r2.outages.len()), (1, 3));
+    }
+
+    #[test]
+    fn connected_closes_an_open_outage() {
+        // A worker restarted (daemon restart or reload) records `connected`
+        // on its first good send, never `recovered`.
+        let rs = [
+            fwd("connected", "siem", datetime!(2026-10-20 09:00:00 UTC)),
+            fwd("failing", "siem", datetime!(2026-10-20 10:00:00 UTC)),
+            fwd("connected", "siem", datetime!(2026-10-20 10:20:00 UTC)),
+            fwd("failing", "siem", datetime!(2026-10-20 11:00:00 UTC)),
+            fwd("recovered", "siem", datetime!(2026-10-20 11:05:00 UTC)),
+            // A `connected` with no open outage is not an outage.
+            fwd("connected", "files", datetime!(2026-10-20 12:00:00 UTC)),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, datetime!(2026-10-21 00:00 UTC));
+        assert_eq!(r.outages.len(), 2, "{:?}", r.outages);
+        let by_restart = r.outages.iter().find(|o| !o.note.is_empty()).unwrap();
+        assert_eq!(
+            (
+                by_restart.from.as_str(),
+                by_restart.to.as_str(),
+                by_restart.duration.as_str(),
+                by_restart.note.as_str()
+            ),
+            (
+                "2026-10-20 10:00 UTC",
+                "2026-10-20 10:20 UTC",
+                "20m 0s",
+                "recovered after a daemon restart or reload"
+            )
+        );
+        let plain = r.outages.iter().find(|o| o.note.is_empty()).unwrap();
+        assert_eq!(plain.to, "2026-10-20 11:05 UTC");
+        let html = crate::report_html::render(&r);
+        assert!(
+            html.contains("2026-10-20 10:20 UTC (recovered after a daemon restart or reload)"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn backlog_dropped_shows_the_seq_range() {
+        let t = datetime!(2026-10-20 11:30:00 UTC);
+        let rs = [
+            kind_rec(
+                "forward",
+                t,
+                &[
+                    ("event", "backlog_dropped".into()),
+                    ("target", "siem".into()),
+                    ("from_seq", 6.into()),
+                    ("to_seq", 10.into()),
+                ],
+            ),
+            kind_rec(
+                "forward",
+                t,
+                &[
+                    ("event", "backlog_dropped".into()),
+                    ("target", "one".into()),
+                    ("from_seq", 7.into()),
+                    ("to_seq", 7.into()),
+                ],
+            ),
+        ];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let r = build(&refs, &[], vec![], None, t);
+        let detail = |target: &str| {
+            r.forward_drops
+                .iter()
+                .find(|d| d.target == target)
+                .unwrap()
+                .detail
+                .clone()
+        };
+        assert!(
+            detail("siem").starts_with("seq 6\u{2013}10"),
+            "{}",
+            detail("siem")
+        );
+        assert!(detail("one").starts_with("seq 7"), "{}", detail("one"));
+        assert!(!detail("one").contains('\u{2013}'));
+        assert!(crate::report_html::render(&r).contains("seq 6\u{2013}10"));
+    }
+
+    #[test]
+    fn daemon_sourced_report_hides_host_sections() {
+        let rs = [fwd("failing", "siem", datetime!(2026-10-20 10:00:00 UTC))];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let mut r = build(&refs, &[], vec![], None, datetime!(2026-10-21 00:00 UTC));
+        let html = crate::report_html::render(&r);
+        assert!(!html.contains(AUDITORS_ONLY));
+        assert!(html.contains("No unclean daemon restarts in this period."));
+        r.outages.clear();
+        r.auditors_only_sections = true;
+        let html = crate::report_html::render(&r);
+        assert_eq!(html.matches(AUDITORS_ONLY).count(), 2, "{html}");
+        assert!(!html.contains("No unclean daemon restarts in this period."));
+        assert!(!html.contains("No forwarding outages in this period."));
     }
 
     #[test]
