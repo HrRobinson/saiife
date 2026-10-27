@@ -25,6 +25,7 @@ use clap::{Parser, Subcommand};
 mod out;
 
 mod api_cmd;
+mod approvals_cmd;
 mod audit_cmd;
 mod check;
 mod check_managed;
@@ -225,6 +226,43 @@ enum Cmd {
     /// Locked mode (Linux): call a connector operation through the daemon,
     /// or list the ones you may call. The credential never reaches you.
     Api(api_cmd::ApiArgs),
+    /// Locked mode (Linux): list, show and decide ask-gated requests.
+    /// `approvals [list] [--all|--pending] [--json]`, `approvals show <id>`.
+    Approvals {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        list: approvals_cmd::ListArgs,
+        #[command(subcommand)]
+        action: Option<approvals_cmd::ApprovalsAction>,
+    },
+    /// Locked mode (Linux, approver): approve request <id>. For your own
+    /// request (`same_user = "reauth"`) you are asked to authenticate.
+    Approve {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+        /// The request's id.
+        id: u64,
+        /// A note, recorded with the decision.
+        #[arg(long)]
+        note: Option<String>,
+        /// Approve a request whose body is over 1 MiB and was shown cut.
+        #[arg(long)]
+        accept_truncated: bool,
+    },
+    /// Locked mode (Linux, approver): reject request <id>.
+    Reject {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+        /// The request's id.
+        id: u64,
+        /// A note, recorded with the decision.
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Locked mode (Linux, admin or approver): `on` denies every connector
     /// request (`--scope connectors`) or also every hook call (`--scope
     /// all`); `off` lifts it; no subcommand shows the state.
@@ -314,6 +352,38 @@ fn main() -> ExitCode {
     {
         return lockdown_cmd::run(system_config, action);
     }
+    if let Cmd::Approvals {
+        system_config,
+        list,
+        action,
+    } = cli.command
+    {
+        return approvals_cmd::run(system_config, list, action);
+    }
+    if let Cmd::Approve {
+        system_config,
+        id,
+        note,
+        accept_truncated,
+    } = cli.command
+    {
+        return approvals_cmd::decide(
+            system_config,
+            approvals_cmd::Decision::Approve {
+                id,
+                note,
+                accept_truncated,
+            },
+        );
+    }
+    if let Cmd::Reject {
+        system_config,
+        id,
+        note,
+    } = cli.command
+    {
+        return approvals_cmd::decide(system_config, approvals_cmd::Decision::Reject { id, note });
+    }
     if let Cmd::Api(a) = cli.command {
         return api_cmd::run(a);
     }
@@ -367,6 +437,9 @@ fn main() -> ExitCode {
         | Cmd::Run { .. }
         | Cmd::Api(_)
         | Cmd::Lockdown { .. }
+        | Cmd::Approvals { .. }
+        | Cmd::Approve { .. }
+        | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {
             unreachable!("handled above")
         }
