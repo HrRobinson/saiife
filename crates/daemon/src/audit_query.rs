@@ -6,11 +6,14 @@
 //! (decision 6: no cache). The uid scope comes first; the filters only
 //! narrow it.
 //!
-//! Records come in `seq` order, at most `limit` (≤ 5000) and at most
-//! [`MAX_ANSWER_BYTES`] of JSON per answer, so an answer always fits the
-//! control socket's 16 MiB frame. `more` says there are further matches:
-//! ask again with `after_seq = next_seq`. Records without a `seq` (v1
-//! lines) cannot be paged and are not returned.
+//! Records come in log order (month file, then line), at most `limit`
+//! (≤ 5000) and at most [`MAX_ANSWER_BYTES`] of JSON per answer, so an
+//! answer always fits the control socket's 16 MiB frame. `more` says there
+//! are further matches: ask again with `after = next`. `next` is an opaque
+//! position in the log (month file and line), so paging stays exact when a
+//! chain restarts and seqs repeat. `after_seq` (answered by `next_seq`)
+//! still works, but only on a log with a single chain. Records without a
+//! `seq` (v1 lines) are not returned.
 
 use crate::ops::Ctx;
 use saiife_audit::store::{self, Filter};
@@ -57,6 +60,41 @@ pub struct Query {
     pub all: bool,
     pub limit: u64,
     pub after_seq: Option<u64>,
+    /// Only records after this position (the previous page's `next`).
+    pub after: Option<Pos>,
+}
+
+/// A record's place in the log: its month file (`YYYY-MM`) and its line
+/// index in that file. Months sort as text, so this order is log order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub month: String,
+    pub line: u64,
+}
+
+impl Pos {
+    /// `YYYY-MM:<line>`, the wire form of `next` and `after`.
+    pub fn cursor(&self) -> String {
+        format!("{}:{}", self.month, self.line)
+    }
+
+    /// The inverse of [`Pos::cursor`]; anything else is an error.
+    pub fn parse(s: &str) -> Result<Pos, String> {
+        let bad = || "after must be the next value of an earlier answer".to_string();
+        let (month, line) = s.split_once(':').ok_or_else(bad)?;
+        let m = month.as_bytes();
+        let month_ok = m.len() == 7
+            && m[..4].iter().all(u8::is_ascii_digit)
+            && m[4] == b'-'
+            && m[5..].iter().all(u8::is_ascii_digit);
+        if !month_ok || line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        Ok(Pos {
+            month: month.to_string(),
+            line: line.parse().map_err(|_| bad())?,
+        })
+    }
 }
 
 /// One page of the answer.
@@ -64,8 +102,10 @@ pub struct Query {
 pub struct Page {
     pub records: Vec<Value>,
     pub more: bool,
-    /// The `after_seq` of the next page, when `more`.
+    /// The `after_seq` of the next page, when `more` (single-chain logs).
     pub next_seq: Option<u64>,
+    /// The `after` of the next page, when `more`.
+    pub next: Option<String>,
 }
 
 /// Root, or a member of [`AUDIT_GROUP`] by the directory's current answer.
@@ -120,7 +160,7 @@ fn opt_u64(args: &Map<String, Value>, k: &str) -> Result<Option<u64>, String> {
 }
 
 /// `{since?, kind?, service?, agent?, project?, blocked?, all?, limit?,
-/// after_seq?}`. `since` is a Unix time in seconds; `limit` is 1..=5000
+/// after_seq?, after?}`. `since` is a Unix time in seconds; `limit` is 1..=5000
 /// (default 5000).
 pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
     let since = match args.get("since") {
@@ -149,6 +189,9 @@ pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
         all: opt_bool(args, "all")?,
         limit,
         after_seq: opt_u64(args, "after_seq")?,
+        after: opt_str(args, "after")?
+            .map(|a| Pos::parse(&a))
+            .transpose()?,
     })
 }
 
@@ -183,21 +226,38 @@ fn stub(r: &Record) -> Value {
     })
 }
 
-/// One page of `records` for `scope` and `q`. The scope is applied before
-/// anything else; records without a `seq` are skipped.
+/// [`page_at`] with each record placed by its index in `records`, all in
+/// one month (for callers that hold records, not month files).
 pub fn page(records: &[Record], scope: Scope, q: &Query) -> Page {
-    let mut hits: Vec<&Record> = records
+    let placed: Vec<(Pos, &Record)> = records
         .iter()
-        .filter(|r| in_scope(r, scope))
-        .filter(|r| r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a)))
-        .filter(|r| matches(r, q))
+        .enumerate()
+        .map(|(i, r)| {
+            let pos = Pos {
+                month: "0000-00".into(),
+                line: i as u64,
+            };
+            (pos, r)
+        })
         .collect();
-    hits.sort_by_key(|r| r.seq);
+    page_at(&placed, scope, q)
+}
+
+/// One page of `records` (in log order, each with its place) for `scope`
+/// and `q`. The scope is applied before anything else; records without a
+/// `seq` are skipped.
+pub fn page_at(records: &[(Pos, &Record)], scope: Scope, q: &Query) -> Page {
+    let hits = records
+        .iter()
+        .filter(|(_, r)| in_scope(r, scope))
+        .filter(|(p, _)| q.after.as_ref().is_none_or(|a| p > a))
+        .filter(|(_, r)| r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a)))
+        .filter(|(_, r)| matches(r, q));
     let mut out = Vec::new();
     let mut bytes = 0usize;
     let mut more = false;
-    let mut last = None;
-    for r in hits {
+    let mut last: Option<(&Pos, Option<u64>)> = None;
+    for (pos, r) in hits {
         if out.len() as u64 >= q.limit {
             more = true;
             break;
@@ -215,13 +275,19 @@ pub fn page(records: &[Record], scope: Scope, q: &Query) -> Page {
             break;
         }
         bytes += n;
-        last = r.seq;
+        last = Some((pos, r.seq));
         out.push(v);
     }
+    let (next, next_seq) = match (more, last) {
+        (false, _) => (None, None),
+        (true, Some((p, s))) => (Some(p.cursor()), s),
+        (true, None) => (q.after.as_ref().map(Pos::cursor), q.after_seq),
+    };
     Page {
         records: out,
         more,
-        next_seq: if more { last.or(q.after_seq) } else { None },
+        next_seq,
+        next,
     }
 }
 
@@ -232,17 +298,53 @@ fn month_of(t: OffsetDateTime) -> String {
     format!("{:04}-{:02}", t.year(), u8::from(t.month()))
 }
 
-/// [`page`] over the month files in `dir`. With `since`, month files
-/// entirely before it are not read.
+/// [`page_at`] over the month files in `dir`, each record placed by its
+/// month file and line index. Month files entirely before `since`, or
+/// before the `after` position, are not read.
 pub fn run(dir: &Path, scope: Scope, q: &Query) -> Result<Page, String> {
-    let all = match q.filter.since {
-        Some(t) => store::read_from_month(dir, &month_of(t)),
-        None => store::read_all(dir),
-    };
-    if let Some(e) = all.dir_error {
-        return Err(format!("the audit directory cannot be read: {e}"));
+    let files =
+        store::month_files(dir).map_err(|e| format!("the audit directory cannot be read: {e}"))?;
+    let mut first = q.filter.since.map(month_of).unwrap_or_default();
+    if let Some(a) = &q.after {
+        first = first.max(a.month.clone());
     }
-    Ok(page(&all.records, scope, q))
+    let mut owned: Vec<(Pos, Record)> = Vec::new();
+    for p in files {
+        let Some(month) = p.file_stem().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if month < first {
+            continue;
+        }
+        let Some(body) = read_file(&p) else {
+            continue; // unreadable: skipped, as store::read_all does
+        };
+        for (i, line) in body.split(|&b| b == b'\n').enumerate() {
+            let pos = Pos {
+                month: month.clone(),
+                line: i as u64,
+            };
+            if q.after.as_ref().is_some_and(|a| &pos <= a)
+                || line.iter().all(u8::is_ascii_whitespace)
+            {
+                continue;
+            }
+            if let Ok(r) = serde_json::from_slice::<Record>(line) {
+                owned.push((pos, r));
+            }
+        }
+    }
+    let placed: Vec<(Pos, &Record)> = owned.iter().map(|(p, r)| (p.clone(), r)).collect();
+    Ok(page_at(&placed, scope, q))
+}
+
+/// A month file's bytes, if it is a regular file (no symlinks, no FIFOs).
+fn read_file(p: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = store::open_regular(p)?;
+    let mut body = Vec::new();
+    f.read_to_end(&mut body).ok()?;
+    Some(body)
 }
 
 /// The `audit.query` op.
@@ -278,6 +380,9 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             m.insert("more".into(), p.more.into());
             if let Some(n) = p.next_seq {
                 m.insert("next_seq".into(), n.into());
+            }
+            if let Some(n) = p.next {
+                m.insert("next".into(), n.into());
             }
             ok(id, m)
         }
@@ -494,6 +599,76 @@ mod tests {
         }
         assert_eq!(q(json!({})).limit, MAX_LIMIT);
         assert!(parse(json!({"after_seq": "1"}).as_object().unwrap()).is_err());
+    }
+
+    /// Pages every record of `scope` out of `dir` by the `next` cursor.
+    fn page_all(dir: &Path, scope: Scope, limit: u64) -> (Vec<String>, usize) {
+        let (mut seen, mut pages, mut after) = (Vec::new(), 0, None::<String>);
+        loop {
+            let mut a = json!({ "limit": limit });
+            if let Some(c) = &after {
+                a["after"] = c.clone().into();
+            }
+            let p = run(dir, scope, &q(a)).unwrap();
+            pages += 1;
+            seen.extend(inputs(&p));
+            if !p.more {
+                assert_eq!(p.next, None);
+                break;
+            }
+            assert!(p.next.is_some() && p.next != after, "{p:?}");
+            after = p.next;
+            assert!(pages < 50);
+        }
+        (seen, pages)
+    }
+
+    #[test]
+    fn paging_crosses_a_chain_restart() {
+        // Two chains: the second restarts at seq 0, so seqs 0..=4 appear
+        // twice. Every page cut, including one inside the shared seqs,
+        // must return each record exactly once, in log order.
+        let d = tempfile::tempdir().unwrap();
+        let mut lines = Vec::new();
+        let mut want = Vec::new();
+        for chain in ["a", "b"] {
+            lines.push(serde_json::to_string(&rec(0, "genesis", None, "")).unwrap());
+            for s in 1..=4 {
+                let input = format!("{chain}{s}");
+                lines.push(serde_json::to_string(&rec(s, "guard", Some(ME), &input)).unwrap());
+                want.push(input);
+            }
+        }
+        std::fs::write(d.path().join("2026-09.jsonl"), lines[..7].join("\n") + "\n").unwrap();
+        std::fs::write(d.path().join("2026-10.jsonl"), lines[7..].join("\n") + "\n").unwrap();
+        for limit in 1..=9 {
+            let (seen, _) = page_all(d.path(), Scope::Uid(ME), limit);
+            assert_eq!(seen, want, "limit {limit}");
+        }
+        // The cut right after a2 (seq 2) still brings b1 and b2 (seqs 1
+        // and 2 of the second chain), which after_seq = 2 would skip.
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"limit": 2}))).unwrap();
+        assert_eq!(inputs(&p), ["a1", "a2"]);
+        assert_eq!(p.next_seq, Some(2));
+        let next = p.next.unwrap();
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"after": next}))).unwrap();
+        assert_eq!(inputs(&p), ["a3", "a4", "b1", "b2", "b3", "b4"]);
+        assert!(!p.more);
+        // A cursor that is not one of ours is refused.
+        for bad in ["", "7", "2026-10", "2026-1:3", "2026-10:x", "2026-10:-1"] {
+            assert!(
+                parse(json!({ "after": bad }).as_object().unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse(json!({"after": 3}).as_object().unwrap()).is_err());
+        // A cut inside the second month file resumes there.
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"limit": 8}))).unwrap();
+        assert!(!p.more);
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"limit": 7}))).unwrap();
+        let next = p.next.unwrap();
+        let p = run(d.path(), Scope::Uid(ME), &q(json!({"after": next}))).unwrap();
+        assert_eq!(inputs(&p), ["b4"]);
     }
 
     #[test]

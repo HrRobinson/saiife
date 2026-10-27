@@ -12,7 +12,9 @@ pub const OP_STATUS: &str = "status";
 pub const OP_AUDIT_ROTATE_KEY: &str = "audit.rotate_key";
 /// The caller's own audit records (an auditor: all with `all: true`).
 /// `{since?, kind?, service?, agent?, project?, blocked?, all?, limit?
-/// (<= 5000), after_seq?}` -> `{records, more, next_seq?}`.
+/// (<= 5000), after?, after_seq?}` -> `{records, more, next?, next_seq?}`.
+/// `next` is an opaque log position to pass back as `after`; `after_seq`
+/// and `next_seq` page by seq and are only exact on a single-chain log.
 pub const OP_AUDIT_QUERY: &str = "audit.query";
 pub const OP_SECRET_ADD: &str = "secret.add";
 pub const OP_SECRET_ROTATE: &str = "secret.rotate";

@@ -98,6 +98,44 @@ fn cli_locked_non_auditor_uses_daemon() {
 }
 
 #[test]
+fn cli_pages_across_a_chain_restart() {
+    // Two chains of 3000 guard records each in an old month file: the
+    // second restarts, and the 5000-record page cut falls inside the seqs
+    // both chains share, between the two records of seq 2501. Paging by
+    // seq would lose or repeat records; every one must come back once.
+    let d = TestDaemon::start(Opts::default());
+    let mut lines = String::new();
+    for (chain, first) in [("a", 2u64), ("b", 1)] {
+        for s in first..first + 3000 {
+            let mut r: Record =
+                serde_json::from_value(guard_rec(&format!("echo {chain}{s}"))).unwrap();
+            r.seq = Some(s);
+            r.kind = Some("guard".into());
+            r.uid = Some(common::daemon::own_uid());
+            lines.push_str(&serde_json::to_string(&r).unwrap());
+            lines.push('\n');
+        }
+    }
+    std::fs::write(d.audit_dir().join("2020-01.jsonl"), lines).unwrap();
+    let o = audit(&d, NO_GROUP, &[]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = text(&o);
+    assert!(
+        out.contains("6000 decisions"),
+        "{}",
+        &out[out.len().saturating_sub(2000)..]
+    );
+    let mut seen: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.split("echo ").nth(1)?.split_whitespace().next())
+        .collect();
+    assert_eq!(seen.len(), 6000);
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 6000, "a record came back twice");
+}
+
+#[test]
 fn cli_locked_non_auditor_without_daemon_exits_5() {
     let mut d = TestDaemon::start(Opts::default());
     if let Some(mut child) = d.child.take() {

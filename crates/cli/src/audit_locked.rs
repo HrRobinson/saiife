@@ -167,11 +167,13 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
     put("service", q.service.clone().map(Value::from));
     base.insert("limit".into(), 5000.into());
     let (mut out, mut skipped) = (Vec::new(), 0usize);
-    let mut after: Option<u64> = None;
+    // Paged by the daemon's opaque `next` position, not by seq: seqs
+    // repeat when a chain restarts.
+    let mut after: Option<String> = None;
     loop {
         let mut args = base.clone();
-        if let Some(a) = after {
-            args.insert("after_seq".into(), a.into());
+        if let Some(a) = &after {
+            args.insert("after".into(), a.clone().into());
         }
         let ans = c
             .call(
@@ -194,8 +196,8 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
         if ans.get("more") != Some(&Value::Bool(true)) {
             break;
         }
-        let next = ans.get("next_seq").and_then(Value::as_u64);
-        if next.is_none() || next <= after {
+        let next = ans.get("next").and_then(Value::as_str).map(str::to_string);
+        if next.is_none() || next == after {
             return Err("audit.query: the daemon's answer did not move on".into());
         }
         after = next;
@@ -205,7 +207,25 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
 
 #[cfg(not(target_os = "linux"))]
 pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
-    let _ = (config, q, load_system);
+    // Read every field, so the non-Linux build has no dead fields.
+    let QueryArgs {
+        since,
+        project,
+        agent,
+        blocked,
+        kind,
+        service,
+    } = q;
+    let _ = (
+        config,
+        load_system,
+        since,
+        project,
+        agent,
+        blocked,
+        kind,
+        service,
+    );
     Err("locked mode needs Linux in this version (macOS: v2.1)".into())
 }
 

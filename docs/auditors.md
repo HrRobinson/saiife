@@ -27,8 +27,11 @@ a filter can narrow the answer but never widen it. Masked inputs of other
 users stay private.
 
 The request can ask for `all: true`; that is refused unless the caller is an
-auditor or root. Answers are paged (at most 5000 records, with `more` and a
-`next_seq` to continue).
+auditor or root. Answers are paged: at most 5000 records, with `more` and
+an opaque `next` position to send back as `after`. The position is the
+month file and line, not a seq, so paging stays exact when a chain restarts
+and seqs repeat. (`after_seq` and `next_seq` still work, but only on a log
+with a single chain.)
 
 ## The commands
 
