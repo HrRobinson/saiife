@@ -314,7 +314,8 @@ impl TestDaemon {
         files.sort();
         let mut out = Vec::new();
         for f in files {
-            for l in fs::read_to_string(f).unwrap().lines() {
+            let text = fs::read_to_string(f).unwrap();
+            for l in super::complete_lines(&text) {
                 out.push(serde_json::from_str(l).unwrap());
             }
         }

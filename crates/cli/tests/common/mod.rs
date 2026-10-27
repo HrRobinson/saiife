@@ -168,6 +168,14 @@ where
     sandbox
 }
 
+/// The complete lines of an audit file being written: a last line
+/// without its `\n` is an append still in progress (a reader racing the
+/// daemon's writer), not a record yet, and is left out.
+pub fn complete_lines(text: &str) -> impl Iterator<Item = &str> {
+    let end = text.rfind('\n').map_or(0, |i| i + 1);
+    text[..end].lines()
+}
+
 /// The `cwd` the recorded fixtures use.
 pub const FIXTURE_CWD: &str = "/home/u/app";
 
