@@ -131,6 +131,41 @@ fn open_dir(dir: &Path) -> Result<OwnedFd, String> {
 /// Opens `name` in `dir` for appending, creating it (then fsyncing `dir`)
 /// when it is not there. Refuses anything but a regular file with one link
 /// owned by `owner`.
+/// Rounds of open-then-create before a month file that keeps appearing
+/// and vanishing is a failing send (retried with backoff) instead of a
+/// busy loop.
+pub const OPEN_TRIES: usize = 5;
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenError {
+    Errno(rustix::io::Errno),
+    /// The file vanished before each open and existed at each create.
+    Raced,
+}
+
+/// Open an existing file with `open`, else create it with `create`
+/// (exclusive). When it was created by someone else in between (EEXIST),
+/// open that one, at most [`OPEN_TRIES`] rounds. `true` when we created it.
+fn open_or_create(
+    mut open: impl FnMut() -> rustix::io::Result<OwnedFd>,
+    mut create: impl FnMut() -> rustix::io::Result<OwnedFd>,
+) -> Result<(OwnedFd, bool), OpenError> {
+    for _ in 0..OPEN_TRIES {
+        match open() {
+            Ok(fd) => return Ok((fd, false)),
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(OpenError::Errno(e)),
+        }
+        match create() {
+            Ok(fd) => return Ok((fd, true)),
+            // Created by someone else in between: open that one (and judge it).
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(e) => return Err(OpenError::Errno(e)),
+        }
+    }
+    Err(OpenError::Raced)
+}
+
 fn open_month(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -142,28 +177,24 @@ fn open_month(
     // No symlink; a FIFO planted there does not block the open.
     let flags =
         OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let mut created = false;
-    let fd = loop {
-        match rustix::fs::openat(dir, name, flags, Mode::empty()) {
-            Ok(fd) => break fd,
-            Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(what(e)),
-        }
-        match rustix::fs::openat(
-            dir,
-            name,
-            flags | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(0o640),
-        ) {
-            Ok(fd) => {
-                created = true;
-                break fd;
-            }
-            // Created by someone else in between: open that one (and judge it).
-            Err(rustix::io::Errno::EXIST) => continue,
-            Err(e) => return Err(what(e)),
-        }
-    };
+    let (fd, created) = open_or_create(
+        || rustix::fs::openat(dir, name, flags, Mode::empty()),
+        || {
+            rustix::fs::openat(
+                dir,
+                name,
+                flags | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o640),
+            )
+        },
+    )
+    .map_err(|e| match e {
+        OpenError::Errno(e) => what(e),
+        OpenError::Raced => format!(
+            "{}: created and removed by someone else {OPEN_TRIES} times while opening it; retrying later",
+            path.display()
+        ),
+    })?;
     let st = rustix::fs::fstat(&fd).map_err(what)?;
     if st.st_mode & 0o170000 != 0o100000 {
         return Err(format!("{} is not a regular file; refused", path.display()));
@@ -284,6 +315,46 @@ impl Transport for FileTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_or_create_gives_up_after_five_races() {
+        use rustix::io::Errno;
+        let (mut opens, mut creates) = (0, 0);
+        let r = open_or_create(
+            || {
+                opens += 1;
+                Err(Errno::NOENT)
+            },
+            || {
+                creates += 1;
+                Err(Errno::EXIST)
+            },
+        );
+        assert_eq!(r.unwrap_err(), OpenError::Raced);
+        assert_eq!((opens, creates), (OPEN_TRIES, OPEN_TRIES));
+        assert_eq!(OPEN_TRIES, 5);
+        // A race that settles is opened, and the file is not ours.
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("f");
+        std::fs::write(&f, "").unwrap();
+        let mut n = 0;
+        let (_fd, created) = open_or_create(
+            || {
+                n += 1;
+                if n < 3 {
+                    Err(Errno::NOENT)
+                } else {
+                    Ok(OwnedFd::from(std::fs::File::open(&f).unwrap()))
+                }
+            },
+            || Err(Errno::EXIST),
+        )
+        .unwrap();
+        assert!(!created);
+        // Any other error stops at once.
+        let r = open_or_create(|| Err(Errno::ACCESS), || unreachable!());
+        assert_eq!(r.unwrap_err(), OpenError::Errno(Errno::ACCESS));
+    }
 
     fn line(seq: u64, ts: &str) -> Bytes {
         Bytes::from(format!(
