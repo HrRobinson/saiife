@@ -1033,8 +1033,10 @@ fn check_ask(
 /// one step; an invalid one is refused and the old one stays. First the
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
 /// sent the signal was spawned with `LogsDirectory=`, which gave the dir
-/// back to `saiife`.
+/// back to `saiife`. One reload at a time (`ctx.reloads`): a second one,
+/// from SIGHUP or `policy.reload`, waits for the first to finish.
 pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
+    let _one_at_a_time = ctx.reloads.lock().await;
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
         regroup_audit_dir(&c.audit_dir, c.directory.as_ref());

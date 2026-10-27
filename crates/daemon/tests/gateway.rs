@@ -1163,6 +1163,56 @@ async fn pre_pipeline_refusals_leave_one_notice_per_kind_a_minute() {
     assert!(w.connector_records().is_empty());
 }
 
+/// `policy.reload` as root (always an admin).
+async fn reload_op(ctx: &Arc<Ctx>, id: u64) -> Value {
+    let peer = PeerCred {
+        uid: 0,
+        gid: 0,
+        pid: std::process::id(),
+    };
+    let req = IpcRequest {
+        id,
+        op: "policy.reload".into(),
+        args: Default::default(),
+    };
+    saiife_daemon::ops::dispatch(ctx, &peer, req).await
+}
+
+#[tokio::test]
+async fn concurrent_reloads_run_one_at_a_time_in_order() {
+    let w = world().await;
+    let policy_records = |w: &World| w.audit_text().matches("\"kind\":\"policy\"").count();
+    // A reload in progress holds the lock: hold it here, as one would.
+    let held = w.ctx.reloads.lock().await;
+    let done = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = Vec::new();
+    for id in [1u64, 2] {
+        let (ctx, done) = (Arc::clone(&w.ctx), Arc::clone(&done));
+        tasks.push(tokio::spawn(async move {
+            let a = reload_op(&ctx, id).await;
+            done.lock().unwrap().push(id);
+            a
+        }));
+        // Queue them in a known order.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        done.lock().unwrap().is_empty(),
+        "a reload ran while another held the lock"
+    );
+    assert_eq!(policy_records(&w), 0);
+    drop(held);
+    for t in tasks {
+        let a = t.await.unwrap();
+        // No config file in this world: each reload is refused, recorded.
+        assert_eq!(a["ok"], true, "{a}");
+        assert_eq!(a["result"], "rejected", "{a}");
+    }
+    assert_eq!(*done.lock().unwrap(), [1, 2]);
+    assert_eq!(policy_records(&w), 2);
+}
+
 #[tokio::test]
 async fn api_token_withheld_without_its_record_or_below_the_disk_floor() {
     let w = world().await;

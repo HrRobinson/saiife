@@ -168,6 +168,10 @@ pub struct Ctx {
     pub grants: crate::grants::Grants,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
     pub signals: crate::signals::Signals,
+    /// Held for the whole of a policy reload (SIGHUP and `policy.reload`),
+    /// so two reloads never interleave: each loads, applies and records
+    /// in turn, in the order they asked (the lock is fair).
+    pub reloads: tokio::sync::Mutex<()>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -299,6 +303,7 @@ impl Ctx {
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
             signals: Default::default(),
+            reloads: tokio::sync::Mutex::new(()),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
