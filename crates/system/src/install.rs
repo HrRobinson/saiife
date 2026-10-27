@@ -166,11 +166,21 @@ pub fn install(
     });
     // Polkit presence, decided once: the default `same_user`, the action
     // file and the warning all follow it.
-    let polkit = polkit_present(layout, host);
+    // An unsafe parent of the action dir (say a 0777 /usr/share) is not
+    // a reason to abort: the action is skipped and approvals fall back to
+    // a second account (`same_user = "deny"` for a new config).
     let mut warnings = warnings;
-    if !polkit {
+    let polkit = if !polkit_present(layout, host) {
         warnings.push(REAUTH_UNAVAILABLE.to_string());
-    }
+        false
+    } else if let Some(why) = polkit_dir_problem(layout, host) {
+        warnings.push(format!(
+            "polkit action not installed: {why}; approvals need a second account"
+        ));
+        false
+    } else {
+        true
+    };
     let mut run = Run {
         layout,
         host,
@@ -446,6 +456,39 @@ pub(crate) fn check_trusted_owner_mode(
         ));
     }
     Ok(())
+}
+
+/// Why root may not write the polkit action below [`POLKIT_DIR`]: the first
+/// existing dir on the way (from `/usr`) that is not a directory, not
+/// root's or writable by group or others, as `<path> is ...`. Dirs that do
+/// not exist yet would be created by install, so the walk stops there.
+fn polkit_dir_problem(layout: &Layout, host: &dyn Host) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let root_uid = host.user("root").map(|u| u.uid)?;
+    let mut logical = PathBuf::from("/");
+    for comp in Path::new(POLKIT_DIR).components().skip(1) {
+        logical.push(comp);
+        let shown = logical.display();
+        let Ok(p) = layout.try_at(&logical) else {
+            return Some(format!("{shown} is outside the install root"));
+        };
+        let m = match fsops::lstat(&p) {
+            Ok(None) => return None,
+            Ok(Some(m)) => m,
+            Err(e) => return Some(format!("{shown} cannot be read ({e})")),
+        };
+        if !m.is_dir() {
+            return Some(format!("{shown} is not a directory"));
+        }
+        let mode = m.mode() & 0o7777;
+        if m.uid() != root_uid {
+            return Some(format!("{shown} is owned by uid {}, not root", m.uid()));
+        }
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Some(format!("{shown} is writable by group or others"));
+        }
+    }
+    None
 }
 
 /// An existing state dir, key dir or audit key must be the daemon user's,
@@ -1051,6 +1094,42 @@ pub(crate) mod tests {
         // Idempotent.
         let again = e.install();
         assert!(again.unchanged.iter().any(|u| u == POLKIT_ACTION));
+    }
+
+    /// A 0777 `/usr/share` (as on some CI runners) does not abort the
+    /// install: the action is skipped, a new config says `deny`, and the
+    /// warning says why.
+    #[test]
+    fn unsafe_polkit_parent_skips_the_action_and_warns() {
+        let e = env(255);
+        add_pkcheck(&e);
+        let share = e.at("/usr/share");
+        fs::create_dir_all(&share).unwrap();
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o777)).unwrap();
+        let r = e.install();
+        assert!(!e.at(POLKIT_ACTION).exists());
+        assert!(!e.at("/usr/share/polkit-1").exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.kind == FileKind::Polkit));
+        let cfg = fs::read_to_string(e.at(CONFIG)).unwrap();
+        assert!(cfg.contains("# same_user = \"deny\"\n"), "{cfg}");
+        assert!(
+            r.warnings.iter().any(|w| w
+                == "polkit action not installed: /usr/share is writable by group or others; approvals need a second account"),
+            "{r:?}"
+        );
+        assert!(!r.warnings.iter().any(|w| w == REAUTH_UNAVAILABLE), "{r:?}");
+        // A safe parent again: the action is written.
+        fs::set_permissions(&share, fs::Permissions::from_mode(0o755)).unwrap();
+        let r = e.install();
+        assert!(e.at(POLKIT_ACTION).exists());
+        assert!(
+            !r.warnings.iter().any(|w| w.starts_with("polkit action")),
+            "{r:?}"
+        );
     }
 
     #[test]
