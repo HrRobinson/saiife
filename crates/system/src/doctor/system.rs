@@ -82,9 +82,40 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         "forwarding",
         Status::Info,
         "audit forwarding",
-        "not configured",
+        forwarding_detail(&ctx.config),
     ));
     out
+}
+
+/// The `[audit.forward.*]` targets of the system config, by name and
+/// type. Their live state (`connected`, `failing`, ...) is in the audit
+/// log as `forward` records, not here: doctor does not ask the targets.
+fn forwarding_detail(config: &Result<saiife_policy::LoadedPolicy, String>) -> String {
+    use saiife_policy::ForwardCfg;
+    let Ok(p) = config else {
+        return "unknown: the system config does not load".into();
+    };
+    let targets = &p.config.audit.forward;
+    if targets.is_empty() {
+        return "not configured".into();
+    }
+    let names: Vec<String> = targets
+        .iter()
+        .map(|(name, t)| {
+            let kind = match t {
+                ForwardCfg::Syslog { .. } => "syslog",
+                ForwardCfg::File { .. } => "file",
+                ForwardCfg::Https { .. } => "https",
+            };
+            format!("{name} ({kind})")
+        })
+        .collect();
+    let s = if names.len() == 1 { "" } else { "s" };
+    format!(
+        "{} target{s}: {}; their state is in the audit log (forward records)",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 // ------------------------------------------------------------ helpers
@@ -875,6 +906,26 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn forwarding_names_the_configured_targets() {
+        let d = TempDir::new().unwrap();
+        let cfg = d.path().join("config.toml");
+        let load = |text: &str| {
+            fs::write(&cfg, text).unwrap();
+            saiife_policy::load_system(&cfg).map_err(|e| e.to_string())
+        };
+        let detail = |text: &str| super::forwarding_detail(&load(text));
+        assert_eq!(detail("version = 2\n"), "not configured");
+        assert_eq!(
+            detail(
+                "version = 2\n[audit.forward.siem]\ntype = \"https\"\nurl = \"https://h.test/e\"\n\
+                 [audit.forward.copy]\ntype = \"file\"\npath = \"/mnt/x\"\n"
+            ),
+            "2 targets: copy (file), siem (https); their state is in the audit log (forward records)"
+        );
+        assert!(super::forwarding_detail(&Err("bad".into())).starts_with("unknown"));
+    }
 
     struct T {
         _dir: TempDir,
