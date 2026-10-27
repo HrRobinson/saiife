@@ -67,10 +67,12 @@ agent's file tools and through shell commands:
   `managed-settings.d/` and `managed-settings.json`,
   `/etc/codex/requirements.toml`, `/etc/gemini-cli/settings.json`, and the
   `/etc/codex` and `/etc/gemini-cli` folders.
-- The polkit action for approvals,
-  `/usr/share/polkit-1/actions/com.saiife.approve.policy`, and the
-  `/usr/share/polkit-1/actions` folder. Weakening it would let an agent
-  approve its own requests. The file is public, so reading it stays allowed.
+- polkit's trees, `/usr/share/polkit-1` and `/etc/polkit-1` with everything
+  in them: the approval action
+  (`/usr/share/polkit-1/actions/com.saiife.approve.policy`) and every rule in
+  `rules.d`. Weakening the action, or a rule that answers yes for it, would
+  let an agent approve its own requests. The files are public, so reading
+  them stays allowed.
 - User services and autostart entries: `systemd/user/`,
   `systemd/user.control/` and `autostart/` under `~/.config` (and under
   `$XDG_CONFIG_HOME`, when it is set), `~/.local/share/systemd/user/`,
@@ -81,7 +83,7 @@ agent's file tools and through shell commands:
 ## Allowed on purpose
 
 - Reading saiife's config, the audit log, the unit, the managed agent
-  settings and the polkit action file. Only changes are blocked (except for `/var/lib/saiife`).
+  settings and polkit's actions and rules. Only changes are blocked (except for `/var/lib/saiife`).
 - Read-only queries: `systemctl status`, `show`, `is-active`, `is-enabled`,
   `is-failed`, `cat`, `list-units` and `list-unit-files` of saiifed or of
   any pattern (`systemctl list-units '*'`), `crontab -l`, `at -l` and
