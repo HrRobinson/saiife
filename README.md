@@ -60,7 +60,7 @@ login unless you run a local model. See [Connectors](docs/connectors/README.md).
 
 ## Locked mode, audit forwarding and policy checks
 
-On supported Linux an admin can install saiife as root (`saiife system
+Locked mode is Linux only (macOS follows in v2.1). On supported Linux an admin can install saiife as root (`saiife system
 install`): for agents labelled lockable (currently Claude Code) the agent
 cannot turn the guard off, the audit is written by a
 daemon the agent cannot touch, and locked mode fails closed. The agent never
