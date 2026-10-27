@@ -147,6 +147,8 @@ pub struct Ctx {
     /// Connector calls in flight; a stop waits for them (bounded) before
     /// the stop record.
     pub calls: InFlight,
+    /// Notifications (webhook, SMTP, command); started by `serve`.
+    pub notifier: crate::notifier::Notifier,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -265,6 +267,7 @@ impl Ctx {
             tokens: i.tokens,
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
+            notifier: crate::notifier::Notifier::new(),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),

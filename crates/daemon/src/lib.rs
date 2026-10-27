@@ -15,6 +15,8 @@ pub mod import_backup;
 #[cfg(target_os = "linux")]
 pub mod limits;
 #[cfg(target_os = "linux")]
+pub mod notifier;
+#[cfg(target_os = "linux")]
 pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
@@ -24,6 +26,8 @@ pub mod secret_ops;
 pub mod server;
 #[cfg(target_os = "linux")]
 pub mod sessions;
+#[cfg(target_os = "linux")]
+pub mod smtp;
 #[cfg(target_os = "linux")]
 mod start;
 #[cfg(target_os = "linux")]

@@ -756,6 +756,9 @@ async fn serve(
         None => None,
     };
 
+    // The notification delivery task; it holds only a weak reference.
+    let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+
     // 8. Ready.
     notify::ready();
     let mut writer_died = false;

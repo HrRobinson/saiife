@@ -325,6 +325,17 @@ impl Upstream {
         scheme == "https"
     }
 
+    /// The TLS connector with this client's roots (SMTP over TLS reuses the
+    /// same trust: native roots plus the admin's CA directory).
+    pub fn tls_connector(&self) -> tokio_rustls::TlsConnector {
+        self.tls.clone()
+    }
+
+    /// The resolver this client uses.
+    pub fn resolver(&self) -> Arc<dyn Resolver> {
+        Arc::clone(&self.resolver)
+    }
+
     /// The timeout of one [`Upstream::send`].
     pub fn timeout(&self) -> Duration {
         self.timeout
