@@ -763,6 +763,10 @@ fn limit_reached_at_send_send_failed() {
     assert_eq!(w.m.hits().len(), 1);
     let r = w.wait_record(b, "send_failed");
     assert_eq!(r["limit"], "writes_per_hour");
+    // The limit that stopped the send is announced too.
+    let evs = w.events(saiife_policy::Event::LimitReached);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert!(evs[0].summary.contains("writes_per_hour"));
     let o = w.api(&["result", &b.to_string()]);
     assert_eq!(o.status.code(), Some(4), "{}", stderr(&o));
     assert!(

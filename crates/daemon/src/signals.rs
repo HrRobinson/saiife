@@ -188,3 +188,88 @@ impl Ctx {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(t0: Instant, s: u64) -> Instant {
+        t0 + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn burst_needs_10_in_60s_and_is_quiet_for_10_min() {
+        let s = Signals::default();
+        let t0 = Instant::now();
+        for i in 0..9 {
+            assert!(!s.burst_due(1, at(t0, i)));
+        }
+        assert!(s.burst_due(1, at(t0, 9)));
+        // A second burst inside the quiet time is not announced.
+        for i in 10..30 {
+            assert!(!s.burst_due(1, at(t0, i)));
+        }
+        // After 10 minutes the next burst is.
+        for i in 0..9 {
+            assert!(!s.burst_due(1, at(t0, 700 + i)));
+        }
+        assert!(s.burst_due(1, at(t0, 709)));
+        // Slow records (one every 10 s) never make a burst.
+        let s = Signals::default();
+        for i in 0..50 {
+            assert!(!s.burst_due(2, at(t0, i * 10)));
+        }
+        // Another uid is counted on its own.
+        let s = Signals::default();
+        for i in 0..9 {
+            s.burst_due(1, at(t0, i));
+            assert!(!s.burst_due(2, at(t0, i)));
+        }
+    }
+
+    #[test]
+    fn limit_keys_are_distinct_and_windows_expire() {
+        let s = Signals::default();
+        let t0 = Instant::now();
+        assert!(s.limit_due(1, "erp", "requests_per_minute", t0));
+        assert!(!s.limit_due(1, "erp", "requests_per_minute", at(t0, 59)));
+        assert!(s.limit_due(1, "erp", "writes_per_hour", at(t0, 1)));
+        assert!(s.limit_due(1, "pay", "requests_per_minute", at(t0, 1)));
+        assert!(s.limit_due(2, "erp", "requests_per_minute", at(t0, 1)));
+        // The minute is over; the hour and the day are not.
+        assert!(s.limit_due(1, "erp", "requests_per_minute", at(t0, 61)));
+        assert!(!s.limit_due(1, "erp", "writes_per_hour", at(t0, 3000)));
+        assert!(s.limit_due(1, "erp", "writes_per_hour", at(t0, 3602)));
+        assert!(s.limit_due(1, "erp", "deletes_per_day", t0));
+        assert!(!s.limit_due(1, "erp", "deletes_per_day", at(t0, 80_000)));
+        assert!(s.limit_due(1, "erp", "deletes_per_day", at(t0, 86_401)));
+    }
+
+    #[test]
+    fn windows_per_kind() {
+        let m = Duration::from_secs(60);
+        assert_eq!(window_of("amount_per_request"), m);
+        assert_eq!(window_of("requests_per_minute"), m);
+        assert_eq!(window_of("writes_per_hour"), Duration::from_secs(3600));
+        assert_eq!(window_of("bulk_per_session"), Duration::from_secs(86_400));
+        assert_eq!(window_of("amount_per_day"), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn key_cap_bounds_memory() {
+        let s = Signals::default();
+        let t0 = Instant::now();
+        for i in 0..(MAX_KEYS as u32 + 100) {
+            // Past the cap a new key is still announced, but not stored.
+            assert!(s.limit_due(i, "erp", "writes_per_hour", t0));
+        }
+        assert_eq!(lock(&s.limits).len(), MAX_KEYS);
+        // Expired keys are swept to make room.
+        assert!(s.limit_due(999_999, "erp", "writes_per_hour", at(t0, 4000)));
+        assert!(lock(&s.limits).len() < MAX_KEYS);
+        for uid in 0..(MAX_KEYS as u32 + 5) {
+            s.burst_due(uid, t0);
+        }
+        assert_eq!(lock(&s.bursts).len(), MAX_KEYS);
+    }
+}

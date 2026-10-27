@@ -395,3 +395,16 @@ reason = "Gemini CLI's system settings hold the saiife hook"
 glob = "/etc/gemini-cli"
 access = "write"
 reason = "removing or moving Gemini CLI's system settings removes the saiife hook"
+
+# --- the polkit action for approvals ------------------------------------------
+# Its `auth_self` settings are what make a same-user approval ask for a
+# password. Reading it stays allowed: the file is public.
+[[deny_path]]
+glob = "/usr/share/polkit-1/actions/com.saiife.approve.policy"
+access = "write"
+reason = "the polkit action decides how an approval is re-authenticated; weakening it lets an agent approve its own requests"
+
+[[deny_path]]
+glob = "/usr/share/polkit-1/actions"
+access = "write"
+reason = "removing or moving the polkit actions dir removes the approval re-authentication"

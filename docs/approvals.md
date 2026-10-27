@@ -78,9 +78,13 @@ When polkit or the action file is missing, `same_user = "reauth"` cannot work.
 Decisions are refused with `reauth_unavailable`, and `saiife doctor` warns:
 `re-authentication unavailable: approvals need a second account`.
 
-Because the action file decides how strong this check is, treat it like the
-rest of `/etc/saiife`: it is root-owned and `core.lock` blocks agents from
-reading or editing it.
+Only one re-authentication runs per approver at a time; a second decision
+while one is waiting is refused with `reauth_busy`.
+
+The action file decides how strong this check is. It is root-owned, so an agent
+user cannot edit it, and `core.lock` also denies write attempts through tool
+calls (the file and the `/usr/share/polkit-1/actions` folder). Reading it is
+allowed: the file is public.
 
 ## Command grants
 

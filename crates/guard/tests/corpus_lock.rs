@@ -540,6 +540,8 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "/etc/codex",
         "/etc/gemini-cli/settings.json",
         "/etc/gemini-cli",
+        "/usr/share/polkit-1/actions/com.saiife.approve.policy",
+        "/usr/share/polkit-1/actions",
         "~/.config/systemd/user/x.service",
         "~/Library/LaunchAgents/x.plist",
         "~/.config/autostart/x.desktop",
@@ -563,6 +565,8 @@ fn writes_to_saiifes_system_paths_are_denied() {
         "echo x > /etc/codex/requirements.toml",
         "rm -rf /etc/gemini-cli",
         "mv /etc/claude-code /tmp/x",
+        "sed -i s/auth_self/yes/ /usr/share/polkit-1/actions/com.saiife.approve.policy",
+        "rm /usr/share/polkit-1/actions/com.saiife.approve.policy",
     ] {
         assert_lock_denies(&e, cmd);
     }
@@ -578,6 +582,7 @@ fn everyday_work_and_reading_the_setup_are_allowed() {
         "ls /etc/saiife",
         "cat /etc/saiife/config.toml",
         "cat /etc/codex/requirements.toml",
+        "cat /usr/share/polkit-1/actions/com.saiife.approve.policy",
         "journalctl -u nginx",
         "kill 1234",
         "kill -9 %1",

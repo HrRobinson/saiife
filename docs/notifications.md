@@ -69,8 +69,12 @@ left out.
 | `forward_failing` | defined for audit-log forwarding; nothing sends it yet |
 | `lockdown` | lockdown is turned on or off |
 
-The window of `limit_reached` is the limit's own: a minute for
-`requests_per_minute`, an hour for `writes_per_hour`, a day for the day limits.
+`limit_reached` is sent once per window for each user, service and limit. The
+window is the limit's own: 60 seconds for `requests_per_minute`,
+`amount_per_request` and the other limit errors without a period; 1 hour for
+`writes_per_hour`; 1 day for `deletes_per_day`, `amount_per_day` and
+`bulk_per_session`. It is also sent when a limit stops an approved request at
+send time.
 
 ## Rate limits
 

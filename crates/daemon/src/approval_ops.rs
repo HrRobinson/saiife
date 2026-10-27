@@ -1193,6 +1193,14 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
         pipeline::send_approved(&stored, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
     let asked_via = stored.via.clone();
     drop(stored);
+    if let Outcome::Limited { limit } = &outcome {
+        ctx.notify_limit(
+            r.uid,
+            r.service.as_deref().unwrap_or(""),
+            r.operation.as_deref().unwrap_or(""),
+            limit,
+        );
+    }
 
     // The connector record of the send: `via = approval`, linked by id,
     // with how the request first came in.
