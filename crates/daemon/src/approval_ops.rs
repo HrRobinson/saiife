@@ -645,15 +645,26 @@ fn call_fields(req: &Request) -> Result<CallFields, Value> {
     })
 }
 
+/// An absolute path in normal form: no `.` or `..` components, no `//`,
+/// no trailing `/` (except `/` itself).
+fn normal_absolute(p: &str) -> bool {
+    p == "/"
+        || (p.starts_with('/')
+            && !p.ends_with('/')
+            && p[1..]
+                .split('/')
+                .all(|c| !c.is_empty() && c != "." && c != ".."))
+}
+
 /// The record's project (the cwd) must be the key's project root or lie
-/// below it, both canonical here: a grant cannot be scoped to another
-/// tree than the one the command runs in.
+/// below it, at a component boundary: a grant cannot be scoped to another
+/// tree than the one the command runs in. Checked lexically: the hook
+/// canonicalizes both, and the daemon (another uid, `ProtectHome=`) does no
+/// filesystem access here.
 fn project_ok(f: &CallFields) -> bool {
-    let canon = |p: &str| std::fs::canonicalize(p).ok();
-    match (canon(&f.project), canon(&f.key_project)) {
-        (Some(p), Some(root)) => p.starts_with(&root),
-        _ => false,
-    }
+    normal_absolute(&f.project)
+        && normal_absolute(&f.key_project)
+        && std::path::Path::new(&f.project).starts_with(&f.key_project)
 }
 
 /// Lockdown `all` answers every hook step with `lockdown`: no grant is
@@ -821,6 +832,20 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
             &f,
             "project_mismatch",
             "the project is not the cwd or above it",
+        )
+        .await;
+    }
+    // The shown input must be the exact command: never ask an approver
+    // about one the grant could not be used for.
+    let shown: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(f.input.as_bytes()).into();
+    if shown != f.raw_sha256 {
+        return refuse_create(
+            ctx,
+            peer,
+            id,
+            &f,
+            "raw_mismatch",
+            "the input is not the exact command (sha256 differs)",
         )
         .await;
     }

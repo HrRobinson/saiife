@@ -327,7 +327,8 @@ mod imp {
         // `error_denied` record, as long as the daemon was reached.
         let mut client: Option<Client> = None;
         let mut policy: Option<String> = None;
-        let mut key_project: Option<String> = None;
+        // The canonical cwd and project root, for a grant's scope.
+        let mut key_project: Option<(String, String)> = None;
         let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             judge_call(
                 (&cfg, config),
@@ -368,15 +369,25 @@ mod imp {
             let step = match (judged.askable, shown_whole, &key_project) {
                 // Another rule denies too (a compound command): a plain deny.
                 (false, _, _) => Ok(()),
-                (true, true, Some(project)) => ask_step(
-                    &mut client,
-                    (&mut rec, &mut judged),
-                    (&raw_sha256, project),
-                    deadline,
-                ),
-                (true, _, _) => {
-                    cannot_approve(&mut rec, &mut judged);
+                (true, false, _) => {
+                    cannot_approve(&mut rec, &mut judged, CANNOT_APPROVE);
                     Ok(())
+                }
+                (true, true, None) => {
+                    cannot_approve(&mut rec, &mut judged, NO_PROJECT_ROOT);
+                    Ok(())
+                }
+                // The daemon checks the scope lexically: it sends the
+                // canonical cwd as the record's project.
+                (true, true, Some((cwd, root))) => {
+                    set_field(&mut rec, "project", cwd).and_then(|()| {
+                        ask_step(
+                            &mut client,
+                            (&mut rec, &mut judged),
+                            (&raw_sha256, root),
+                            deadline,
+                        )
+                    })
                 }
             };
             match step {
@@ -433,7 +444,7 @@ mod imp {
         input: Result<String, String>,
         forced: Option<String>,
         client: &mut Option<Client>,
-        (policy, key_project): (&mut Option<String>, &mut Option<String>),
+        (policy, key_project): (&mut Option<String>, &mut Option<(String, String)>),
     ) -> Result<Judged, String> {
         // An unusable cwd is never looked up: no project, no worker.
         let cwd = eval::check_cwd(ctx.cwd.as_deref());
@@ -446,12 +457,16 @@ mod imp {
         *policy = Some(hash);
         if !cfg.guard.ask.is_empty() {
             // The project in a grant's key: its root as found for the
-            // project config (else the cwd), canonical.
-            *key_project = start.as_deref().and_then(|s| {
-                let root = find_project_root(s).unwrap_or_else(|| s.to_path_buf());
-                std::fs::canonicalize(root)
+            // project config (else the cwd), and the cwd, both canonical
+            // here (the daemon cannot see this user's files).
+            let canon = |p: &Path| {
+                std::fs::canonicalize(p)
                     .ok()
                     .and_then(|p| p.to_str().map(str::to_string))
+            };
+            *key_project = start.as_deref().and_then(|s| {
+                let root = find_project_root(s).unwrap_or_else(|| s.to_path_buf());
+                Some((canon(s)?, canon(&root)?))
             });
         }
 
@@ -1018,11 +1033,19 @@ mod imp {
     const CANNOT_APPROVE: &str =
         "cannot be approved: the command contains masked or overlong content";
 
+    /// The reason when the project root or cwd cannot be resolved.
+    const NO_PROJECT_ROOT: &str = "cannot be approved: project root unavailable";
+
     /// `rec`'s reason replaced; `Err` if it then does not fit.
     fn set_reason(rec: &mut Value, reason: &str) -> Result<(), ClientError> {
+        set_field(rec, "reason", reason)
+    }
+
+    /// `rec`'s field `key` set to `value`; `Err` if it then does not fit.
+    fn set_field(rec: &mut Value, key: &str, value: &str) -> Result<(), ClientError> {
         let mut next = rec.clone();
         if let Some(m) = next.as_object_mut() {
-            m.insert("reason".into(), reason.into());
+            m.insert(key.into(), value.into());
         }
         if !fit(&mut next) {
             return Err(ClientError::Protocol(TOO_LARGE.into()));
@@ -1032,11 +1055,11 @@ mod imp {
     }
 
     /// An ask-rule deny that cannot be approved: a plain deny saying why.
-    fn cannot_approve(rec: &mut Value, j: &mut Judged) {
+    fn cannot_approve(rec: &mut Value, j: &mut Judged, why: &str) {
         let pack = j.pack.clone().unwrap_or_else(|| "saiife".into());
         // Only ever shorter than the guard's reason plus a record that fit.
-        let _ = set_reason(rec, CANNOT_APPROVE);
-        j.outcome = Outcome::Deny(format!("BLOCKED by {pack}: {CANNOT_APPROVE}"));
+        let _ = set_reason(rec, why);
+        j.outcome = Outcome::Deny(format!("BLOCKED by {pack}: {why}"));
     }
 
     /// Lowercase hex SHA-256 (of the exact command the worker judged:

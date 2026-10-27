@@ -303,6 +303,10 @@ mod linux {
             s("agent")
         );
         outln!("  project    {}", s("project"));
+        if item["scope"].is_string() {
+            // The project tree a command grant covers.
+            outln!("  scope      {}", s("scope"));
+        }
         outln!("  type       {}", s("type"));
         if item["type"] == "command" {
             outln!("  command    {}", s("input"));

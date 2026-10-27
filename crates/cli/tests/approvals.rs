@@ -1605,11 +1605,10 @@ fn compound_command_with_a_hard_deny_is_a_plain_deny() {
 fn too_many_pending_commands_say_so() {
     let w = world_ask(ASK_FORCE_PUSH);
     for i in 0..20 {
-        let a = w.op(
-            own_uid(),
-            "approval.create",
-            w.call_args(FORCE_PUSH, &format!("{FORCE_PUSH} #{i}"), "force-push"),
-        );
+        let a = w.op(own_uid(), "approval.create", {
+            let cmd = format!("git push --force origin b{i}");
+            w.call_args(&cmd, &cmd, "force-push")
+        });
         assert_eq!(a["ok"], true, "{a}");
     }
     let o = w.hook(FORCE_PUSH);
@@ -1765,6 +1764,14 @@ fn project_must_lie_in_the_grant_scope() {
     for (cwd, project) in [
         (elsewhere.as_str(), root.as_str()),
         (root.as_str(), sub.as_str()),
+        // Lexical: a component boundary, absolute, normal form.
+        ("/srv/shopping", "/srv/shop"),
+        ("/srv/shop/../etc", "/srv/shop"),
+        ("/srv/shop/./x", "/srv/shop"),
+        ("/srv//shop/x", "/srv/shop"),
+        ("/srv/shop/x/", "/srv/shop"),
+        ("srv/shop/x", "srv/shop"),
+        ("/srv/shop/x", "/srv/shop/"),
     ] {
         let args = w.call_args_in(FORCE_PUSH, FORCE_PUSH, "force-push", cwd, project);
         let a = w.op(own_uid(), "approval.create", args.clone());
@@ -1778,7 +1785,39 @@ fn project_must_lie_in_the_grant_scope() {
         .into_iter()
         .filter(|r| r["action"] == "refused" && r["rule"] == "project_mismatch")
         .count();
-    assert_eq!(refused, 2);
+    assert_eq!(refused, 9);
+
+    // The daemon does no filesystem access here: paths that do not exist
+    // pass, and the scope is the root as sent.
+    let ghost = "/nonexistent-saiife-test/shop";
+    let args = w.call_args_in(
+        FORCE_PUSH,
+        FORCE_PUSH,
+        "force-push",
+        &format!("{ghost}/deep/dir"),
+        ghost,
+    );
+    let a = w.op(own_uid(), "approval.create", args.clone());
+    let gid = a["request"].as_u64().unwrap_or_else(|| panic!("{a}"));
+    assert_eq!(
+        w.ctx
+            .approvals
+            .as_ref()
+            .unwrap()
+            .get(gid)
+            .unwrap()
+            .scope
+            .as_deref(),
+        Some(ghost)
+    );
+    assert_eq!(w.op(own_uid(), "grant.consume", args)["granted"], false);
+    // The root itself as the cwd is fine too.
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        w.call_args_in(FORCE_PUSH, FORCE_PUSH, "force-push", "/", "/"),
+    );
+    assert!(a["request"].is_u64(), "{a}");
 
     // A cwd below the root is fine, and the scope is the root.
     let args = w.call_args_in(FORCE_PUSH, FORCE_PUSH, "force-push", &sub, &root);
@@ -1787,5 +1826,31 @@ fn project_must_lie_in_the_grant_scope() {
     let shown = w.op(BOSS, "approval.show", json!({"request": id}));
     assert_eq!(shown["item"]["scope"], root.as_str(), "{shown}");
     let listed = w.op(BOSS, "approval.list", json!({}));
-    assert_eq!(listed["items"][0]["scope"], root.as_str(), "{listed}");
+    let item = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .unwrap();
+    assert_eq!(item["scope"], root.as_str(), "{listed}");
+}
+
+/// `approval.create` refuses (recorded) a request whose shown input is
+/// not the exact command its `raw_sha256` names.
+#[test]
+fn raw_mismatch_is_refused_and_recorded() {
+    let w = world_ask(ASK_FORCE_PUSH);
+    let a = w.op(
+        own_uid(),
+        "approval.create",
+        w.call_args(FORCE_PUSH, &format!("{FORCE_PUSH} "), "force-push"),
+    );
+    assert_eq!(a["rule"], "raw_mismatch", "{a}");
+    assert!(w.requests().is_empty());
+    let rec = w
+        .records()
+        .into_iter()
+        .find(|r| r["action"] == "refused" && r["rule"] == "raw_mismatch")
+        .expect("a raw_mismatch record");
+    assert_eq!(rec["uid"], own_uid());
 }

@@ -733,6 +733,49 @@ fn show_masks_params() {
     assert!(v.get("request_sealed").is_none());
 }
 
+/// A command request shows the project tree its grant covers (`scope`),
+/// in text and in `--json`.
+#[test]
+fn show_prints_the_scope_of_a_command_request() {
+    use saiife_daemon::approvals::{ApprovalType, NewRequest};
+    let w = world();
+    let r = w
+        .ctx
+        .approvals
+        .as_ref()
+        .unwrap()
+        .create(
+            NewRequest {
+                uid: own_uid(),
+                user: own_user(),
+                session: None,
+                agent: "claude".into(),
+                project: "/srv/shop/sub".into(),
+                kind: ApprovalType::Command,
+                service: None,
+                operation: None,
+                capability: None,
+                params: Default::default(),
+                input: Some("git push --force origin main".into()),
+                grant_key: Some("00".repeat(32)),
+                scope: Some("/srv/shop".into()),
+                send: Default::default(),
+            },
+            |_| Ok(None),
+            Duration::from_secs(600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+    let o = w.cli("approvals", &["show", &r.id.to_string()]);
+    ok(&o);
+    let out = stdout(&o);
+    assert!(out.contains("  scope      /srv/shop\n"), "{out}");
+    assert!(out.contains("git push --force origin main"), "{out}");
+    let v = json_out(&w.cli("approvals", &["show", &r.id.to_string(), "--json"]));
+    assert_eq!(v["scope"], "/srv/shop", "{v}");
+    assert!(v.get("grant_key").is_none(), "{v}");
+}
+
 #[test]
 fn show_warns_when_the_full_body_was_cut() {
     let w = world();

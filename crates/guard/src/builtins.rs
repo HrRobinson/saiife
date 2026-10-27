@@ -82,7 +82,9 @@ pub fn builtin_packs() -> (Vec<Pack>, Vec<PackWarning>) {
 /// pack's `[[allow]]` carve-outs) denies `command`. An unknown pack or
 /// rule, or an engine over its budget, is `false`.
 pub fn builtin_rule_denies(pack: &str, id: &str, command: &str) -> bool {
-    let (packs, _) = Catalog::builtin().load_active(&[pack.to_string()]);
+    // Compiled once per process (the daemon asks for every request).
+    static PACKS: std::sync::OnceLock<Vec<Pack>> = std::sync::OnceLock::new();
+    let packs = PACKS.get_or_init(|| builtin_packs().0);
     let Some(only) = packs
         .iter()
         .find(|p| p.id == pack)
