@@ -92,6 +92,13 @@ pub struct StoredCall {
     /// Base64 of the body as it would be sent: the canonical JSON when the
     /// operation takes JSON.
     pub body_b64: Option<String>,
+    /// SHA-256 (hex) of the exact body bytes the approver was shown the
+    /// hash of. At send the bytes about to go upstream must hash to it,
+    /// or nothing is sent (`body_changed`): a change in how a body is
+    /// canonicalized between the ask and the send cannot send something
+    /// other than what was approved.
+    #[serde(default)]
+    pub body_sha256: Option<String>,
     pub headers: Vec<(String, String)>,
     /// The project's tightening overlay, applied again at send.
     pub overlay: Option<ServiceOverlay>,
@@ -489,20 +496,24 @@ pub async fn send_approved(
     if !body_ok {
         return (call, denied("stored_request_invalid"), Trace::default());
     }
-    let (o, t) = run_stage(&call, Stage::Approved, cfg, cat, lim, env, up).await;
+    let stage = Stage::Approved {
+        body_sha256: stored.body_sha256.as_deref(),
+    };
+    let (o, t) = run_stage(&call, stage, cfg, cat, lim, env, up).await;
     (call, o, t)
 }
 
-/// A new request, or one approved earlier.
+/// A new request, or one approved earlier (with the hash of the body its
+/// approver was shown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
+enum Stage<'a> {
     New,
-    Approved,
+    Approved { body_sha256: Option<&'a str> },
 }
 
 async fn run_stage(
     call: &Call,
-    stage: Stage,
+    stage: Stage<'_>,
     cfg: &PolicySnapshot,
     cat: &Catalog,
     lim: &Limiter,
@@ -563,7 +574,7 @@ fn rule_of(e: &BrokerError) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 async fn steps(
     call: &Call,
-    stage: Stage,
+    stage: Stage<'_>,
     snap: &PolicySnapshot,
     cat: &Catalog,
     lim: &Limiter,
@@ -598,7 +609,7 @@ async fn steps(
     // (decision 2): its scope or its verdict changed since it was asked.
     let changed = |rule: &str| match stage {
         Stage::New => denied(rule),
-        Stage::Approved => denied("policy_changed"),
+        Stage::Approved { .. } => denied("policy_changed"),
     };
     // 3. Scope.
     let scope = match env.scope(&call.user) {
@@ -674,6 +685,14 @@ async fn steps(
                 }
                 None => return denied("bad_body"),
             }
+        }
+    }
+
+    // An approved request sends only the bytes whose hash its approver saw.
+    if let Stage::Approved { body_sha256 } = stage {
+        let now = body.as_ref().map(|b| hex(&Sha256::digest(b)));
+        if now.as_deref() != body_sha256 {
+            return denied("body_changed");
         }
     }
 
@@ -757,6 +776,7 @@ async fn steps(
                     use base64::Engine as _;
                     base64::engine::general_purpose::STANDARD.encode(b)
                 }),
+                body_sha256: body.as_ref().map(|b| hex(&Sha256::digest(b))),
                 headers: call.headers.clone(),
                 overlay: call.overlay.clone(),
                 via: call.via.as_str().to_string(),

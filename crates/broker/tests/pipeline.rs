@@ -682,6 +682,60 @@ async fn approved_request_rechecked_against_the_policy_now() {
     );
 }
 
+/// The sealed request carries the hash of the body the approver saw; at
+/// send the bytes about to go upstream must match it. A canonicalization
+/// that changed between the ask and the send (the seam: stored bytes that
+/// no longer canonicalize to the approved hash) is `body_changed`, and
+/// nothing is sent.
+#[tokio::test]
+async fn approved_body_must_hash_to_what_was_shown() {
+    use base64::Engine as _;
+    let (m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let lim = Limiter::new();
+    let o = go(
+        &refund_call(&[("order_id", "7")]),
+        &snapshot(""),
+        &env,
+        &up,
+        &lim,
+    )
+    .await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[0].clone();
+    // The sealed copy holds the same hash the approver is shown.
+    assert!(p.stored.body_sha256.is_some());
+    assert_eq!(p.stored.body_sha256, p.body_sha256);
+
+    // Same canonical bytes, other spelling: still the approved body.
+    let mut spaced = p.stored.clone();
+    spaced.body_b64 = Some(
+        base64::engine::general_purpose::STANDARD
+            .encode(br#"{ "refund" : {"currency":"EUR", "transactions":[{"amount":"5.00"}]} }"#),
+    );
+    // A canonicalizer that now writes other bytes for the stored body.
+    let mut other = p.stored.clone();
+    other.body_b64 = Some(
+        base64::engine::general_purpose::STANDARD
+            .encode(br#"{"refund":{"currency":"EUR","transactions":[{"amount":"500.00"}]}}"#),
+    );
+    let (_, o, tr) = send_approved(&other, &snapshot(""), &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "body_changed");
+    assert!(!tr.sent);
+    // No hash on record but a body: not sent either (fail closed).
+    let mut unhashed = p.stored.clone();
+    unhashed.body_sha256 = None;
+    let (_, o, _) =
+        send_approved(&unhashed, &snapshot(""), &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "body_changed");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+
+    let (_, o, tr) = send_approved(&spaced, &snapshot(""), &catalog(), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert!(tr.sent);
+    assert_eq!(tr.body_sha256, p.body_sha256);
+}
+
 #[tokio::test]
 async fn project_overlay_tightens_and_cannot_widen() {
     let (m, up) = mock().await;
