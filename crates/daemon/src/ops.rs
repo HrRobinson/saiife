@@ -599,6 +599,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
+        saiife_ipc::msg::OP_AUDIT_QUERY => crate::audit_query::handle(ctx, peer, req).await,
         OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
         OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
             crate::secret_ops::handle(ctx, peer, req).await

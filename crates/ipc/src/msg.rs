@@ -10,6 +10,10 @@ pub const OP_HELLO: &str = "hello";
 pub const OP_AUDIT_APPEND: &str = "audit.append";
 pub const OP_STATUS: &str = "status";
 pub const OP_AUDIT_ROTATE_KEY: &str = "audit.rotate_key";
+/// The caller's own audit records (an auditor: all with `all: true`).
+/// `{since?, kind?, service?, agent?, project?, blocked?, all?, limit?
+/// (<= 5000), after_seq?}` -> `{records, more, next_seq?}`.
+pub const OP_AUDIT_QUERY: &str = "audit.query";
 pub const OP_SECRET_ADD: &str = "secret.add";
 pub const OP_SECRET_ROTATE: &str = "secret.rotate";
 pub const OP_SECRET_REMOVE: &str = "secret.remove";

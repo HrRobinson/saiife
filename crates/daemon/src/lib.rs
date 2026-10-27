@@ -13,6 +13,8 @@ pub mod approvals;
 #[cfg(target_os = "linux")]
 pub mod approvers;
 #[cfg(target_os = "linux")]
+pub mod audit_query;
+#[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod gateway;

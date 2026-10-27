@@ -28,6 +28,7 @@ mod out;
 mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
+mod audit_locked;
 mod check;
 mod check_managed;
 mod connect_cmd;
@@ -154,6 +155,15 @@ enum Cmd {
         /// Only blocked actions.
         #[arg(long)]
         blocked: bool,
+        /// Only records of this kind (locked mode).
+        #[arg(long, value_parser = ["connector", "approval", "guard"])]
+        kind: Option<String>,
+        /// Only records of this connector service (locked mode).
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
         /// Write a self-contained HTML report instead of the table (default name: saiife-report-YYYY-MM-DD.html here).
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
@@ -494,13 +504,21 @@ fn main() -> ExitCode {
             project,
             agent,
             blocked,
+            kind,
+            service,
+            system_config,
             report,
         } => audit_cmd::run(
-            since.as_deref(),
-            project.as_deref(),
-            agent.as_deref(),
-            blocked,
-            report.as_deref(),
+            audit_cmd::RunArgs {
+                since: since.as_deref(),
+                project: project.as_deref(),
+                agent: agent.as_deref(),
+                blocked,
+                kind: kind.as_deref(),
+                service: service.as_deref(),
+                report: report.as_deref(),
+                system_config,
+            },
             &packs,
         ),
     }
