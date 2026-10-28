@@ -850,6 +850,18 @@ built from the vendor's documented responses.
 `/etc/saiife/policy.d/<service>.toml` with every operation listed and
 commented out. The service starts with everything denied.
 
+Built (plan 14):
+
+- OAuth2 uses a paste flow only: `secret add --kind oauth2` (and `connect`)
+  takes `client_id`, `client_secret` and `refresh_token`. There is no device
+  flow in this version.
+- The Sentry token mask shape is `sntry[su]_` (the real prefixes are
+  `sntrys_` and `sntryu_`).
+- `policy check` accepts a concrete qualifier rule such as
+  `messages:read:channel=C0123` for an operation whose qualifier is a
+  template (`channel={channel}`): a `{placeholder}` counts as a wildcard when
+  the rule is matched against the operation.
+
 ### 6.9 Policy engine and limits
 
 #### 6.9.1 Capabilities and rules
@@ -1045,6 +1057,18 @@ services.shopify.ask = ["products:write"]
 - Developer and personal broker modes: `saiife env use <name>` writes
   `env = "<name>"` into `.saiife/config.toml`.
 - `saiife env list` shows the environments and which one applies here.
+
+Built (plan 14):
+
+- An environment may widen policy as well as narrow it: its `allow`, `ask`,
+  `deny` and `rule` lists replace the base lists, and `params`, `fixed` and
+  `limits` merge key by key.
+- `[environments]` may appear only in `config.toml`, not in `policy.d` or a
+  project file.
+- Environment names match `[a-z0-9_-]{1,64}`.
+- A malformed `env` value is a bad request in locked mode too; it never falls
+  back to another environment.
+- `env use --scope` is root only (the spec's "admin rights").
 
 ### 6.12 Collections (v1 §9.5 "agent-facing API client + collections"; after v2.0, plan 14)
 

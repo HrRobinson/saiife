@@ -109,8 +109,33 @@ fn new_pages_exist_and_are_linked_from_the_readme() {
         "docs/auditors.md",
         "docs/egress.md",
         "docs/threats.md",
+        "docs/environments.md",
+        "docs/collections.md",
     ] {
         assert!(root.join(page).is_file(), "{page} missing");
         assert!(readme.contains(page), "README does not link {page}");
+    }
+}
+
+#[test]
+fn new_pages_linked() {
+    let root = root();
+    let index = fs::read_to_string(root.join("docs/connectors/README.md")).unwrap();
+    for page in ["environments.md", "collections.md"] {
+        assert!(root.join("docs").join(page).is_file(), "{page} missing");
+        assert!(
+            index.contains(&format!("(../{page})")),
+            "the connector index does not link {page}"
+        );
+    }
+    // Every connector page is listed in the index.
+    for e in fs::read_dir(root.join("docs/connectors")).unwrap() {
+        let name = e.unwrap().file_name().into_string().unwrap();
+        if name != "README.md" && name.ends_with(".md") {
+            assert!(
+                index.contains(&format!("({name})")),
+                "the connector index does not list {name}"
+            );
+        }
     }
 }

@@ -110,6 +110,8 @@ model.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
+- [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
+  and [collections](docs/collections.md).
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).

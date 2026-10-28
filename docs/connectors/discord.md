@@ -72,10 +72,16 @@ requests_per_minute = 50
 writes_per_hour = 30
 ```
 
-To limit the agent to one channel, replace `messages:read` with
-`messages:read:channel=1100000000000000001`, and allow `messages:write` the
-same way if it may post unattended. A call for any other channel is then
-denied. Likewise `channels:read:guild=<id>` names a guild.
+To limit the agent to one channel, name it in the rule. A call for any other
+channel is then denied. Likewise `channels:read:guild=<id>` names a guild:
+
+```toml
+[services.discord]
+connector = "discord"
+secret = "discord-bot"
+allow = ["channels:read", "messages:read:channel=1100000000000000001"]
+ask   = ["messages:write:channel=1100000000000000001"]
+```
 
 ## Limits
 

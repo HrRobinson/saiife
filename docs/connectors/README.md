@@ -134,6 +134,18 @@ path and query, passed to the matching operation).
 - [GitLab](gitlab.md): projects, issues, merge requests and pipelines.
 - [Sentry](sentry.md): projects, issues and events.
 - [PagerDuty](pagerduty.md): incidents, notes, services and on-calls.
+- [Stripe](stripe.md): customers, charges, payment intents, invoices and refunds (amount
+  caps).
+- [Slack](slack.md): conversations, messages and users.
+- [Discord](discord.md): guilds, channels and messages.
+- [Linear](linear.md): issues, projects and teams over fixed GraphQL
+  operations.
+- [Intercom](intercom.md): contacts and conversations.
+- [Zendesk](zendesk.md): tickets, ticket comments, users and search.
+- [Airtable](airtable.md): records (list, get, create, update, delete).
+- [Segment](segment.md): track, identify, group and batch events.
+- [WooCommerce](woocommerce.md): orders, products, customers and refunds
+  (amount caps).
 - [Email](email.md): send with SMTP, read with IMAP.
 - [Salesforce](salesforce.md): SOQL queries, object metadata and records
   (OAuth2).
@@ -143,6 +155,18 @@ path and query, passed to the matching operation).
 To use one, run `saiife connect <service>`. It stores the secret (or reuses
 an existing one with `--secret <name>`, if that secret allows the service)
 and writes a policy file that starts deny-all.
+
+## Environments
+
+An environment overlays packs and service settings on the system config and
+is bound to a scope, for example one for staging and one for production. See
+[environments](../environments.md).
+
+## Collections
+
+A collection is a saved list of calls in `.saiife/collections/`, run with
+`saiife api collection run <name>`. Each step goes through the full pipeline.
+See [collections](../collections.md).
 
 ## OAuth2 secrets
 

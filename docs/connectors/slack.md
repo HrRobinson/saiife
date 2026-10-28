@@ -84,11 +84,16 @@ writes_per_hour = 30
 fields = ["profile.email", "profile.phone"]
 ```
 
-To limit the agent to one channel, replace `messages:read` with
-`messages:read:channel=C0123456789` (and allow `messages:write` the same way
-if it may post unattended). A call for any other channel is then denied. This
-is a pattern on the qualifier, so it belongs in the policy you write, not in
-the suggested blocks above, which name no channel.
+To limit the agent to one channel, name it in the rule. A call for any other
+channel is then denied:
+
+```toml
+[services.slack]
+connector = "slack"
+secret = "slack-bot"
+allow = ["channels:read", "messages:read:channel=C0123456789"]
+ask   = ["messages:write:channel=C0123456789"]
+```
 
 ## Limits
 
