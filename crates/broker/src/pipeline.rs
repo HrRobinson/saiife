@@ -684,33 +684,17 @@ async fn steps(
         Ok(p) => p,
         Err(e) => return denied(rule_of(&e)),
     };
-    let mut body = call.body.clone().filter(|b| !b.is_empty());
-    if body.is_some() && op.body.is_none() {
-        return denied("bad_param");
+    let prepared = match prepare_body(op, &params, call.body.as_ref()) {
+        Ok(p) => p,
+        Err(rule) => return denied(rule),
+    };
+    if let Some(b) = &prepared.bytes {
+        // The record describes what is sent.
+        tr.body_bytes = b.len();
+        tr.body_sha256 = prepared.sha256();
     }
-    // A JSON body is parsed once, strictly (a duplicate key is refused),
-    // and the re-serialized tree is what goes upstream: the amount checked
-    // is the amount sent, whatever parser the upstream uses.
-    let mut json_body: Option<Value> = None;
-    if op.body.as_deref() == Some("json") {
-        if let Some(b) = &body {
-            match strict_json(b) {
-                Some(v) => {
-                    match serde_json::to_vec(&v) {
-                        Ok(canon) => {
-                            // The record describes what is sent.
-                            tr.body_bytes = canon.len();
-                            tr.body_sha256 = Some(hex(&Sha256::digest(&canon)));
-                            body = Some(Bytes::from(canon));
-                        }
-                        Err(_) => return denied("bad_body"),
-                    }
-                    json_body = Some(v);
-                }
-                None => return denied("bad_body"),
-            }
-        }
-    }
+    let body = prepared.bytes.clone();
+    let json_body = prepared.json.as_ref();
 
     // An approved request sends only the bytes whose hash its approver saw.
     if let Stage::Approved { body_sha256 } = stage {
@@ -739,7 +723,7 @@ async fn steps(
 
     // 7. Limits. An operation that moves money must carry its amount.
     if let Some(spec) = &op.amount {
-        match json_body.as_ref().map(|v| amount::extract(spec, v)) {
+        match json_body.map(|v| amount::extract(spec, v, &svc.params)) {
             Some(Ok(a)) => tr.amount = Some(a),
             _ => return denied("bad_amount"),
         }
@@ -788,7 +772,10 @@ async fn steps(
                 service: call.service.clone(),
                 operation: op.id.clone(),
                 params: given.clone(),
-                body_b64: body.as_ref().map(|b| {
+                // The agent's body as canonical JSON (none for a built
+                // body): at send it is prepared again, and the bytes must
+                // hash to `body_sha256`.
+                body_b64: prepared.input.as_ref().map(|b| {
                     use base64::Engine as _;
                     base64::engine::general_purpose::STANDARD.encode(b)
                 }),
@@ -865,11 +852,12 @@ async fn steps(
     built
         .headers
         .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if json_body.is_some() {
-        // The body is the canonical JSON: say so, whatever the agent sent.
+    if let Some(ct) = prepared.content_type {
+        // The body is the canonical JSON or its form encoding: say so,
+        // whatever the agent sent.
         built
             .headers
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
     }
     let max = svc
         .limits
@@ -954,57 +942,101 @@ fn next_page(
     f: &Finished,
 ) -> Option<BTreeMap<String, String>> {
     match op.pagination.as_ref()? {
-        p @ Pagination::Cursor { .. } => {
+        p @ (Pagination::Cursor { .. } | Pagination::Offset { .. }) => {
             let v: Value = serde_json::from_slice(&f.body).ok()?;
             let (param, value) = crate::request::next_cursor(p, &v)?;
             let mut out = given.clone();
             out.insert(param, value);
             Some(out)
         }
-        Pagination::LinkHeader => {
-            let link = f.headers.get_all("link").iter().find_map(|v| {
-                v.to_str().ok()?.split(',').find_map(|part| {
-                    let (url, attrs) = part.split_once(';')?;
-                    let is_next = attrs.split(';').any(|a| {
-                        let a = a.trim().to_ascii_lowercase();
-                        a == "rel=\"next\"" || a == "rel=next"
-                    });
-                    is_next.then(|| {
-                        url.trim()
-                            .trim_start_matches('<')
-                            .trim_end_matches('>')
-                            .to_string()
-                    })
-                })
-            })?;
-            let query = link.split_once('?')?.1;
-            let mut out: BTreeMap<String, String> = given
-                .iter()
-                .filter(|(k, _)| op.path_params.contains_key(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for pair in query.split('&') {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                let dec = |s: &str| {
-                    percent_encoding::percent_decode_str(&s.replace('+', " "))
-                        .decode_utf8()
-                        .ok()
-                        .map(|c| c.into_owned())
-                };
-                let (Some(k), Some(v)) = (dec(k), dec(v)) else {
-                    continue;
-                };
-                // `next` reaches a header and a CLI line: printable ASCII
-                // without spaces, at most 256 bytes, like `next_cursor`.
-                let printable =
-                    !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x21..0x7f).contains(&b));
-                if op.query.contains_key(&k) && printable {
-                    out.insert(k, v);
-                }
-            }
-            Some(out)
-        }
+        Pagination::LinkHeader => crate::request::next_from_link(op, given, &f.headers),
     }
+}
+
+/// The request body of one call, ready to send (step 5).
+#[derive(Clone, Default)]
+pub struct PreparedBody {
+    /// The bytes sent upstream.
+    pub bytes: Option<Bytes>,
+    /// The JSON the bytes encode, which the amount is read from.
+    pub json: Option<Value>,
+    /// The agent's body as canonical JSON, stored with an approval request
+    /// and prepared again at send. `None` for a built body.
+    pub input: Option<Bytes>,
+    /// The `Content-Type` the broker sets.
+    pub content_type: Option<&'static str>,
+}
+
+impl std::fmt::Debug for PreparedBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBody")
+            .field("bytes_len", &self.bytes.as_ref().map(Bytes::len))
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
+impl PreparedBody {
+    /// SHA-256 (hex) of the bytes sent.
+    pub fn sha256(&self) -> Option<String> {
+        self.bytes.as_ref().map(|b| hex(&Sha256::digest(b)))
+    }
+}
+
+/// Builds the body of `op` (decision 2). An operation with `body_params`,
+/// `body_const` or `graphql` builds its body from the validated `params`
+/// and refuses one from the agent (`bad_param`); otherwise the agent's body
+/// is parsed once, strictly (a duplicate key is `bad_body`), and its
+/// canonical JSON, or for `body = "form"` that JSON form-encoded, is what
+/// goes upstream: the amount checked is the amount sent, whatever parser
+/// the upstream uses.
+pub fn prepare_body(
+    op: &Operation,
+    params: &BTreeMap<String, String>,
+    raw: Option<&Bytes>,
+) -> Result<PreparedBody, &'static str> {
+    let raw = raw.filter(|b| !b.is_empty());
+    if raw.is_some() && (op.body.is_none() || op.builds_body()) {
+        return Err("bad_param");
+    }
+    let (json, input) = if op.builds_body() {
+        (
+            crate::request::build_body(op, params).map_err(|e| rule_of(&e))?,
+            None,
+        )
+    } else {
+        match raw {
+            None => (None, None),
+            Some(b) => {
+                let v = strict_json(b).ok_or("bad_body")?;
+                let canon = serde_json::to_vec(&v).map_err(|_| "bad_body")?;
+                (Some(v), Some(Bytes::from(canon)))
+            }
+        }
+    };
+    let Some(v) = json else {
+        return Ok(PreparedBody::default());
+    };
+    let (bytes, content_type) = match op.body.as_deref() {
+        Some("json") => (
+            serde_json::to_vec(&v).map_err(|_| "bad_body")?,
+            "application/json",
+        ),
+        Some("form") => (
+            crate::request::form_encode(&v)
+                .map_err(|_| "bad_body")?
+                .into_bytes(),
+            "application/x-www-form-urlencoded",
+        ),
+        // `text` is mail only, which never comes here.
+        _ => return Err("bad_body"),
+    };
+    Ok(PreparedBody {
+        bytes: Some(Bytes::from(bytes)),
+        json: Some(v),
+        input,
+        content_type: Some(content_type),
+    })
 }
 
 fn hex(b: &[u8]) -> String {

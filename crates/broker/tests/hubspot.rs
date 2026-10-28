@@ -288,7 +288,8 @@ fn pagination_is_a_cursor_on_after() {
             op(id).pagination,
             Some(Pagination::Cursor {
                 param: "after".into(),
-                next: "paging.next.after".into()
+                next: "paging.next.after".into(),
+                more: None,
             }),
             "{id}"
         );

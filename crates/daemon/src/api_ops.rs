@@ -74,11 +74,15 @@ pub(crate) struct DaemonEnv<'a> {
 }
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
-/// bearer or a header reading `token`, `header` one reading `value`.
+/// bearer, a header or a `basic_token` reading `token`, `header` one reading
+/// `value`.
 fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     auth.iter().find(|a| match kind {
         Kind::Basic => a.kind == "basic",
-        Kind::Token => matches!(a.kind.as_str(), "bearer" | "header") && a.secret_field == "token",
+        Kind::Token => {
+            matches!(a.kind.as_str(), "bearer" | "header" | "basic_token")
+                && a.secret_field == "token"
+        }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
     })
 }
@@ -736,15 +740,27 @@ mod tests {
             kind: "header".into(),
             name: Some("X-Api-Key".into()),
             secret_field: "value".into(),
+            prefix: None,
+            token_path: None,
         };
         let bearer = AuthSpec {
             kind: "bearer".into(),
             name: None,
             secret_field: "token".into(),
+            prefix: None,
+            token_path: None,
         };
         let both = [header.clone(), bearer.clone()];
         assert_eq!(spec_for(Kind::Header, &both), Some(&header));
         assert_eq!(spec_for(Kind::Token, &both), Some(&bearer));
         assert_eq!(spec_for(Kind::Basic, &both), None);
+        // A Segment-style write key is a vault token.
+        let basic_token = AuthSpec {
+            kind: "basic_token".into(),
+            ..bearer.clone()
+        };
+        let one = [basic_token.clone()];
+        assert_eq!(spec_for(Kind::Token, &one), Some(&basic_token));
+        assert_eq!(spec_for(Kind::Basic, &one), None);
     }
 }

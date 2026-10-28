@@ -2,6 +2,7 @@
 //! check of `[services.*]` against them.
 
 use crate::manifest::{from_http_service, Manifest, HTTP_CONNECTOR};
+use crate::request::bare_hostname;
 use crate::BrokerError;
 use saiife_policy::capability::{matches_with, Capability};
 use saiife_policy::{ServiceCfg, SystemConfig};
@@ -65,6 +66,14 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
                     name: format!("{name}.{p}"),
                     reason,
                 })?;
+            // A param that is the whole upstream host: no userinfo, port,
+            // path, upper case or trailing dot can ride along (decision 1).
+            if m.whole_host_param() == Some(p.as_str()) && !bare_hostname(v) {
+                return Err(BrokerError::BadValue {
+                    name: format!("{name}.{p}"),
+                    reason: "not a bare lower-case hostname".into(),
+                });
+            }
         }
         let caps: Vec<Capability> = m
             .operation

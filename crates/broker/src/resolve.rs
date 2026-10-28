@@ -92,7 +92,13 @@ pub fn proxy<'m>(
     // with prefix/suffix, 0 bare placeholder. Compared from the left; two
     // equally specific matches are ambiguous.
     let mut cands: Vec<(Vec<u8>, &Operation, BTreeMap<String, String>)> = Vec::new();
-    for op in m.operation.iter().filter(|o| o.method == method) {
+    // A GraphQL operation is named-only: its fixed document is the body,
+    // so a proxied request can never reach it.
+    for op in m
+        .operation
+        .iter()
+        .filter(|o| o.method == method && o.graphql.is_none())
+    {
         let Ok(tpl) = template_segments(&op.path) else {
             continue;
         };

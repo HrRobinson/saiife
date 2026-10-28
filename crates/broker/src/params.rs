@@ -236,7 +236,8 @@ fn type_of(op: &Operation, name: &str) -> Result<Option<(ParamType, bool)>, Brok
     if let Some(t) = op.path_params.get(name) {
         return Ok(Some((ParamType::parse(t, None)?, true)));
     }
-    if let Some(t) = op.query.get(name) {
+    // Body params are checked like query params (decision 2).
+    if let Some(t) = op.query.get(name).or_else(|| op.body_params.get(name)) {
         return Ok(Some((ParamType::parse(t, None)?, false)));
     }
     Ok(None)

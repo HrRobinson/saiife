@@ -455,7 +455,10 @@ fn refund_amount_is_extracted_from_the_documented_body() {
     assert_eq!(spec.unit, Unit::Major);
     // Two transactions in EUR: 41.94 + 10.00.
     let body = &fixture("refunds.create")["_request"];
-    assert_eq!(extract(&spec, body).unwrap(), (5194, "EUR".to_string()));
+    assert_eq!(
+        extract(&spec, body, &Default::default()).unwrap(),
+        (5194, "EUR".to_string())
+    );
     // Other operations carry no amount spec.
     for id in ["products.update", "discounts.create"] {
         assert!(named(m, id).unwrap().amount.is_none(), "{id}");
@@ -474,7 +477,7 @@ fn refund_amount_cap_arithmetic() {
     let refund = |amount: &str| -> u64 {
         let body = serde_json::json!({"refund": {"currency": "EUR",
             "transactions": [{"amount": amount, "kind": "refund"}]}});
-        extract(&spec, &body).unwrap().0
+        extract(&spec, &body, &Default::default()).unwrap().0
     };
     assert!(refund("499.99") <= cap_minor);
     assert!(refund("500.00") <= cap_minor);
@@ -482,7 +485,7 @@ fn refund_amount_cap_arithmetic() {
     // Two transactions add up.
     let body = serde_json::json!({"refund": {"currency": "eur", "transactions": [
         {"amount": "300.00"}, {"amount": "250.00"}]}});
-    let (total, cur) = extract(&spec, &body).unwrap();
+    let (total, cur) = extract(&spec, &body, &Default::default()).unwrap();
     assert_eq!((total, cur.as_str()), (55000, "EUR"));
     assert!(total > cap_minor);
 }
@@ -500,6 +503,9 @@ fn refund_without_amount_or_currency_is_an_error() {
         serde_json::json!({"refund": {"currency": "EUR", "transactions": [{"amount": "x"}]}}),
         serde_json::json!({}),
     ] {
-        assert!(extract(&spec, &body).is_err(), "{body}");
+        assert!(
+            extract(&spec, &body, &Default::default()).is_err(),
+            "{body}"
+        );
     }
 }

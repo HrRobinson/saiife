@@ -76,7 +76,7 @@ connector = "shopify"
 secret = "shopify-prod"
 params = { shop = "acme" }
 allow = ["orders:read", "products:read"]
-deny  = ["customers:export", "*:delete"]
+deny  = ["customers:export"]
 
 [services.shopify.limits]
 requests_per_minute = 60
@@ -97,8 +97,7 @@ connector = "shopify"
 secret = "shopify-prod"
 params = { shop = "acme" }
 allow = ["orders:read", "products:read"]
-ask   = ["products:write", "refunds:write", "discounts:write"]
-deny  = ["customers:export", "*:delete"]
+ask   = ["products:write", "refunds:write", "discounts:write", "customers:export"]
 
 [services.shopify.limits]
 requests_per_minute = 60
