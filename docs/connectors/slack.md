@@ -43,6 +43,7 @@ Notes:
   attachments or other fields.
 - **Pagination** is a cursor: pass `response_metadata.next_cursor` back as
   `cursor`. An empty cursor is the last page.
+- Slack text can contain `<!channel>` and `<!here>`, so a post can notify a whole channel. That is why `messages:write` belongs under `ask`.
 - Agents may send `Accept`; every other request header is dropped.
 
 ## Suggested policy: read-only

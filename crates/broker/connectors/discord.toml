@@ -13,7 +13,7 @@ base_url = "https://discord.com/api/v10"
 hosts = ["discord.com"]
 auth = [{ kind = "header", name = "Authorization", prefix = "Bot ", secret_field = "token" }]
 request_headers = ["Accept"]
-headers = { User-Agent = "DiscordBot (https://saiife.dev, 1)" }
+headers = { User-Agent = "DiscordBot (https://saiife.com, 1)" }
 
 [[operation]]
 id = "guilds.channels"

@@ -53,6 +53,7 @@ Notes:
   a body of its own: the broker builds the form body (`amount=500&charge=ch_...`).
   **A refund without `amount` is denied** (`bad_amount`), because a full
   refund has no amount the caps could count.
+- **Warning: multi-currency accounts.** The amount cap is counted in the admin `currency`, but Stripe applies a refund in the charge's currency. On a multi-currency account, keep refunds under `ask`, or use one service per currency.
 - **Set amount caps in the account currency.** The currency is the admin
   `currency` parameter; the agent cannot choose it.
 
