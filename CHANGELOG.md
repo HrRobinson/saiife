@@ -2,6 +2,7 @@
 
 ## 0.2.0 — unreleased (waiting for red-team suite)
 
+- Personal broker (Linux): `saiife daemon --user` runs the broker as your own user, with the vault key in the Secret Service (GNOME Keyring, KWallet) and `vault.bin` sealed under it. `--print-unit systemd|launchd` prints a login unit. Not a security boundary: a script of the same user can read the key. The audit chain is unsigned and `saiife audit --broker` reads it; `secret import` and `audit.rotate_key` are refused; macOS is refused until the v2.1 daemon port. New `saiife-keychain` crate (Secret Service over zbus, macOS Keychain backend compile-checked). `core.self` and `core.secrets` gain mistake-layer rules for the broker. See `docs/personal-broker.md`.
 - Audit forwarding (Linux, locked mode): the daemon sends a copy of the audit to syslog (RFC 5424, also over TLS), to a file, or to an HTTPS endpoint (batches, Splunk HEC). Each target has its own cursor and delivery is at-least-once. Configure it with `[audit.forward.*]`. See `docs/forwarding.md`.
 - New `saiife audit verify --external <file|dir>`: compares the local chain with a forwarded copy, so a cut or rewrite of records that were already forwarded shows.
 - Auditors: the `saiife-audit` group reads the audit, and a per-user `audit.query` lets others query their own records through the daemon. `saiife audit` gains `--kind` and `--service`. See `docs/auditors.md`.

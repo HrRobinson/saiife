@@ -52,6 +52,15 @@ jobs:
       - name: lock-check harness (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/lock-check/test-lib.sh
+      # The personal broker's vault key in a real Secret Service
+      # (gnome-keyring, throwaway HOME and keyring). CI only.
+      - name: personal broker Secret Service smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring libsecret-tools dbus
+          cargo build --quiet --bin saiife
+          SAIIFE_BIN="$PWD/target/debug/saiife" bash scripts/personal-broker/ss-smoke.sh
 
   offline:
     runs-on: ubuntu-latest
@@ -71,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/personal-broker/*.sh
 
   # Locked mode on real machines (spec §13 "Daemon integration"): `system
   # install` as root, the §5.2 owners and modes, managed hooks run as an

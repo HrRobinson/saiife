@@ -58,6 +58,16 @@ the credential, sends the request and masks the answer. So the agent never
 holds a credential for a brokered service; it holds its own model-provider
 login unless you run a local model. See [Connectors](docs/connectors/README.md).
 
+## Personal broker
+
+`saiife daemon --user` runs a broker as your own user, with the vault key in
+the OS keychain (Linux, Secret Service). It is for trying connectors on your
+own machine; **not a security boundary**: a script of the same user can read
+the key. The agent never holds a credential for a brokered service; it holds
+its own model-provider login unless you run a local model, but in this mode
+that is a workflow aid, not a control. See
+[Personal broker](docs/personal-broker.md).
+
 ## Locked mode, audit forwarding and policy checks
 
 Locked mode is Linux only (macOS follows in v2.1). On supported Linux an
@@ -95,6 +105,8 @@ model.
 - [Threat coverage](docs/threats.md): which risks saiife covers, and which it
   does not, for each of the four setups (developer, personal broker, locked on
   a person's account, locked on a dedicated account).
+- [Personal broker](docs/personal-broker.md): `saiife daemon --user`, what it
+  protects and what it does not.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
