@@ -100,29 +100,39 @@ fn mask_values(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Vec<
         Kind::Token => "basic_token",
         k => kind_str(k),
     };
+    // The id fields of a cloud secret are not secrets: a short one (a
+    // project called `prod`) would over-mask, so they count from 8 bytes.
+    // The key, secret and token fields are always masked.
+    let fields: BTreeMap<String, Zeroizing<String>> = fields
+        .iter()
+        .filter(|(k, v)| !CLOUD_ID_FIELDS.contains(&k.as_str()) || v.len() >= CLOUD_ID_MIN)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let mut out = AuthMaterial {
         kind: kind.to_string(),
         name: None,
         fields: fields.clone(),
     }
     .values();
-    if let Some(body) = fields.get("private_key").and_then(|k| pem_body(k)) {
-        // The key as a bare base64 run: what is left when an upstream
-        // echoes it without its framing or line breaks.
-        out.push(body);
+    if let Some(k) = fields.get("private_key") {
+        for f in saiife_broker::mask::pem_forms(k) {
+            if !out.iter().any(|o| **o == *f) {
+                out.push(f);
+            }
+        }
     }
     out
 }
 
-/// The base64 of a PEM block without framing lines and line breaks.
-pub(crate) fn pem_body(pem: &str) -> Option<Zeroizing<String>> {
-    let body: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .flat_map(|l| l.trim().chars())
-        .collect();
-    (body.len() >= 4).then(|| Zeroizing::new(body))
-}
+const CLOUD_ID_FIELDS: [&str; 6] = [
+    "access_key_id",
+    "client_email",
+    "project_id",
+    "tenant_id",
+    "client_id",
+    "private_key_id",
+];
+const CLOUD_ID_MIN: usize = 8;
 
 fn kind_str(k: Kind) -> &'static str {
     match k {
@@ -985,9 +995,13 @@ mod tests {
     fn mask_values_cover_every_cloud_field() {
         let pem = concat!(
             "-----BEGIN ",
-            "PRIVATE KEY-----\nTESTBODYTESTBODY0001\nTESTBODYTESTBODY0002\n-----END ",
+            "PRIVATE KEY-----\n",
+            "TESTBODYTESTBODYTESTBODYTESTBODY0001\n",
+            "TESTBODYTESTBODYTESTBODYTESTBODY0002\n-----END ",
             "PRIVATE KEY-----\n"
         );
+        const LINE1: &str = "TESTBODYTESTBODYTESTBODYTESTBODY0001";
+        const LINE2: &str = "TESTBODYTESTBODYTESTBODYTESTBODY0002";
         let sets: [(Kind, Vec<(&str, &str)>); 3] = [
             (
                 Kind::Aws,
@@ -1032,11 +1046,33 @@ mod tests {
                 assert!(!masked.contains(v), "{k}");
             }
             if kind == Kind::GcpSa {
-                // The key echoed as one base64 run, framing and breaks gone.
-                let run = "TESTBODYTESTBODY0001TESTBODYTESTBODY0002";
-                assert!(!masker.mask_text(&format!("k={run}")).contains(run));
+                // The key echoed as one base64 run, one line, or escaped
+                // as in Google's key file JSON.
+                let run = format!("{LINE1}{LINE2}");
+                let esc = pem.replace('\n', "\\n");
+                for echo in [run.as_str(), LINE1, LINE2, esc.as_str()] {
+                    let masked = masker.mask_text(&format!("k={echo}"));
+                    assert!(!masked.contains(LINE1) && !masked.contains(LINE2), "{echo}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn short_cloud_ids_are_not_masked_but_secrets_always_are() {
+        let fields: BTreeMap<String, Zeroizing<String>> = [
+            ("tenant_id", "prod"),
+            ("client_id", "dev"),
+            ("client_secret", "abcd"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+        .collect();
+        let vals: Vec<String> = mask_values(Kind::AzureSp, &fields)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert_eq!(vals, ["abcd"]);
     }
 
     #[test]

@@ -156,16 +156,10 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
             }
         }
     }
-    // A PEM key (a service account's) is also hidden as its bare base64
-    // run, which is what is left when the framing and line breaks go.
-    if value.contains("-----BEGIN ") {
-        let body: String = value
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .flat_map(|l| l.trim().chars())
-            .collect();
-        if body.len() >= 4 {
-            out.push(zeroize::Zeroizing::new(body));
+    // A PEM key (a service account's) is also hidden in its other forms.
+    for f in saiife_broker::mask::pem_forms(value) {
+        if !out.iter().any(|o| **o == *f) {
+            out.push(f);
         }
     }
     out
@@ -427,18 +421,27 @@ mod tests {
     }
 
     #[test]
-    fn pem_key_is_masked_as_its_bare_base64_too() {
-        let pem = concat!(
-            "-----BEGIN ",
-            "PRIVATE KEY-----\nTESTBODYTESTBODY0001\nTESTBODYTESTBODY0002\n-----END ",
-            "PRIVATE KEY-----\n"
+    fn pem_key_is_masked_in_every_form() {
+        let l1 = "TESTBODYTESTBODYTESTBODYTESTBODY0001";
+        let l2 = "TESTBODYTESTBODYTESTBODYTESTBODY0002";
+        let pem = format!(
+            "{}{}\n{l1}\n{l2}\n{}{}\n",
+            "-----BEGIN ", "PRIVATE KEY-----", "-----END ", "PRIVATE KEY-----"
         );
-        let v: Vec<String> = mask_values("gcp_sa", pem)
+        let v: Vec<String> = mask_values("gcp_sa", &pem)
             .iter()
             .map(|v| v.to_string())
             .collect();
-        assert!(v.contains(&pem.to_string()));
-        assert!(v.contains(&"TESTBODYTESTBODY0001TESTBODYTESTBODY0002".to_string()));
+        for want in [
+            pem.clone(),
+            pem.trim_end().to_string(),
+            pem.replace('\n', "\\n"),
+            format!("{l1}{l2}"),
+            l1.to_string(),
+            l2.to_string(),
+        ] {
+            assert!(v.contains(&want), "missing {want:?}");
+        }
         assert_eq!(mask_values("token", "plain-value").len(), 1);
     }
 

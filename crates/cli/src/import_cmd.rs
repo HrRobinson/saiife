@@ -874,9 +874,12 @@ fn parse_aws(lines: &[&[u8]]) -> Vec<Cand> {
         if l.is_empty() || l.starts_with('#') || l.starts_with(';') {
             continue;
         }
-        if let Some(h) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        // A line that starts with `[` is a header; the name is what lies
+        // before the first `]` (anything after it, a comment, is ignored).
+        if let Some(h) = l.strip_prefix('[') {
+            let name = h.split(']').next().unwrap_or(h);
             profs.push(Prof {
-                name: h.trim().to_string(),
+                name: name.trim().to_string(),
                 ..Prof::default()
             });
             continue;
@@ -887,7 +890,7 @@ fn parse_aws(lines: &[&[u8]]) -> Vec<Cand> {
         let slot = match k.trim().to_ascii_lowercase().as_str() {
             "aws_access_key_id" => &mut p.id,
             "aws_secret_access_key" => &mut p.secret,
-            "aws_session_token" => &mut p.token,
+            "aws_session_token" | "aws_security_token" => &mut p.token,
             _ => continue,
         };
         let Some(v) = unquote(v, false).filter(|v| is_plain_value(v)) else {
@@ -898,11 +901,23 @@ fn parse_aws(lines: &[&[u8]]) -> Vec<Cand> {
         }
         *slot = Some((i, v));
     }
-    let mut seen = BTreeSet::new();
+    // A profile named twice is ambiguous: every section of that name is
+    // left alone (which one would the SDKs use?), and the admin is told.
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for p in &profs {
+        *count.entry(p.name.clone()).or_default() += 1;
+    }
+    for (n, c) in &count {
+        if *c > 1 {
+            outln!(
+                "note: AWS profile {} appears {c} times; left alone",
+                sanitize(n)
+            );
+        }
+    }
     let mut out = Vec::new();
     for p in profs {
-        // A profile named twice is ambiguous too.
-        if !seen.insert(p.name.clone()) {
+        if count[&p.name] > 1 {
             continue;
         }
         let (Some((li, id)), Some((ls, secret)), false) = (p.id, p.secret, p.dup) else {
@@ -1192,6 +1207,83 @@ mod tests {
         assert_eq!(n[0].name, "u-npm-registry.npmjs.org");
         let v = parse_vault(b"hvs.abcd\n", "u");
         assert_eq!((v[0].value.as_str(), v[0].line), ("hvs.abcd", None));
+    }
+
+    fn aws(text: &str) -> Vec<Cand> {
+        parse_aws(&lines(text))
+    }
+
+    fn aws_names(c: &[Cand]) -> Vec<String> {
+        c.iter().map(|c| c.name.clone()).collect()
+    }
+
+    const AK: &str = concat!("AKI", "A", "TESTTESTTEST0001");
+    const SK: &str = concat!("test-secret-", "access-key-0001");
+
+    fn prof(name: &str) -> String {
+        format!("[{name}]\naws_access_key_id = {AK}\naws_secret_access_key = {SK}\n")
+    }
+
+    #[test]
+    fn aws_profiles_become_candidates() {
+        let c = aws(&format!("{}\n{}", prof("default"), prof("dev team")));
+        assert_eq!(aws_names(&c), ["aws-default", "aws-dev-team"]);
+        assert_eq!(c[0].service, Some("aws-s3"));
+        assert_eq!(c[0].cloud.as_ref().unwrap().lines, [1, 2]);
+        // A header with a trailing comment still opens the profile.
+        let c = aws(&format!("[default] # x\n{}", &prof("default")[10..]));
+        assert_eq!(aws_names(&c), ["aws-default"]);
+    }
+
+    #[test]
+    fn aws_duplicated_profile_is_left_alone() {
+        let t = format!("{}{}{}", prof("a"), prof("b"), prof("a"));
+        assert_eq!(aws_names(&aws(&t)), ["aws-b"]);
+    }
+
+    #[test]
+    fn aws_repeated_key_is_left_alone() {
+        let t = format!("{}aws_secret_access_key = other-secret-value\n", prof("a"));
+        assert!(aws(&t).is_empty());
+    }
+
+    #[test]
+    fn aws_no_trailing_newline_and_crlf() {
+        let t = prof("a").trim_end().to_string();
+        assert_eq!(aws_names(&aws(&t)), ["aws-a"]);
+        let crlf = prof("a").replace('\n', "\r\n");
+        let c = aws(&crlf);
+        assert_eq!(aws_names(&c), ["aws-a"]);
+        let f = &c[0].cloud.as_ref().unwrap().fields;
+        assert_eq!(f["access_key_id"].as_str(), AK);
+        assert_eq!(f["secret_access_key"].as_str(), SK);
+    }
+
+    #[test]
+    fn aws_keys_before_any_header_are_ignored() {
+        let t = format!("aws_access_key_id = {AK}\naws_secret_access_key = {SK}\n");
+        assert!(aws(&t).is_empty());
+        // And they do not leak into the first profile.
+        let t = format!("aws_access_key_id = {AK}\n[a]\naws_secret_access_key = {SK}\n");
+        assert!(aws(&t).is_empty());
+    }
+
+    #[test]
+    fn aws_variable_reference_is_not_a_credential() {
+        let t = format!("[a]\naws_access_key_id = {AK}\naws_secret_access_key = $SECRET\n");
+        assert!(aws(&t).is_empty());
+        let t = format!("[a]\naws_access_key_id = {AK}\naws_secret_access_key = ${{SECRET}}\n");
+        assert!(aws(&t).is_empty());
+    }
+
+    #[test]
+    fn aws_security_token_is_the_session_token() {
+        let tok = concat!("test-session-", "token-0001");
+        let t = format!("{}aws_security_token = {tok}\n", prof("a"));
+        let c = aws(&t);
+        let cl = c[0].cloud.as_ref().unwrap();
+        assert_eq!(cl.fields["session_token"].as_str(), tok);
+        assert_eq!(cl.lines, [1, 2, 3]);
     }
 
     #[test]

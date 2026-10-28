@@ -40,6 +40,51 @@ pub const MASK: &str = "[MASKED]";
 /// Values shorter than this would mask noise (and the vault refuses them).
 const MIN_VALUE_LEN: usize = 4;
 
+/// The shortest bare base64 run of a PEM key that is masked on its own.
+pub const PEM_MIN_RUN: usize = 64;
+/// The shortest single base64 line of a PEM key that is masked on its own.
+pub const PEM_MIN_LINE: usize = 16;
+
+/// Every form of a PEM block worth hiding: the whole text (and without its
+/// trailing line break), the run without framing, each base64 line of
+/// `PEM_MIN_LINE` characters or more, and the whole with line breaks
+/// escaped as in Google's key file JSON. Empty for a value that is not a
+/// PEM block.
+pub fn pem_forms(pem: &str) -> Vec<Zeroizing<String>> {
+    if !pem.contains("-----BEGIN ") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = vec![pem.to_string()];
+    let trimmed = pem.trim_end();
+    if trimmed.len() != pem.len() {
+        out.push(trimmed.to_string());
+    }
+    let escaped = pem.replace('\r', "\\r").replace('\n', "\\n");
+    let esc_trim = escaped.trim_end_matches("\\n").trim_end_matches("\\r");
+    if esc_trim.len() != escaped.len() {
+        out.push(esc_trim.to_string());
+    }
+    out.push(escaped);
+    let lines: Vec<&str> = pem
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect();
+    let run: String = lines.concat();
+    if run.len() >= PEM_MIN_RUN {
+        out.push(run);
+    }
+    out.extend(
+        lines
+            .iter()
+            .filter(|l| l.len() >= PEM_MIN_LINE)
+            .map(|l| l.to_string()),
+    );
+    out.sort();
+    out.dedup();
+    out.into_iter().map(Zeroizing::new).collect()
+}
+
 /// RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~".
 const NOT_UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')

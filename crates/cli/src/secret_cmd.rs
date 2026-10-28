@@ -462,15 +462,7 @@ pub(crate) mod linux {
             }
         }
         for (k, v) in &f {
-            let min = if matches!(
-                *k,
-                "username"
-                    | "client_id"
-                    | "tenant_id"
-                    | "client_email"
-                    | "project_id"
-                    | "access_key_id"
-            ) {
+            let min = if matches!(*k, "username" | "client_id") {
                 1
             } else {
                 MIN_VALUE_BYTES
