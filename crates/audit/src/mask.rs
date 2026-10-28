@@ -33,15 +33,16 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // prefix and mask the secret remainder.
         (
             concat!(
-                r"(hooks\.slack\.com/services/|discord(?:app)?\.com/api/webhooks/[0-9]+/)[A-Za-z0-9_/-]+",
+                r"(?i:(hooks\.slack\.com/(?:services|triggers|workflows)/|discord(?:app)?\.com/api/(?:v\d+/)?webhooks/[0-9]+/))[A-Za-z0-9_/-]+",
                 r"|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
                 r"|whsec_[A-Za-z0-9]{24,}",
                 r"|xox[abposr]-[A-Za-z0-9-]{10,}",
+                r"|xoxe(?:\.xox[a-z])?-[A-Za-z0-9-]{10,}",
                 r"|xapp-[A-Za-z0-9-]{10,}",
                 r"|lin_(?:api|oauth)_[A-Za-z0-9]{32,}",
                 r"|sntry[su]_[A-Za-z0-9+/=_-]{20,}",
                 r"|gl(?:pat|dt|ptt|rt|oas)-[A-Za-z0-9_-]{20,}",
-                r"|[MN][A-Za-z0-9_-]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}",
+                r"|\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,38}",
                 r"|00D[A-Za-z0-9]{12,15}![A-Za-z0-9._]{80,}",
                 r"|dG9rO[A-Za-z0-9+/=_-]{20,}",
                 r"|pat[A-Za-z0-9]{14}\.[a-f0-9]{64}",
@@ -398,6 +399,45 @@ mod tests {
         }
         let bad = format!("{}_{}", concat!("sntr", "y"), body);
         assert_eq!(mask(&bad), bad);
+    }
+
+    #[test]
+    fn slack_discord_bypasses_closed() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        // Case-insensitive host, extra Slack paths, versioned Discord API.
+        for u in [
+            format!("HTTPS://Hooks.Slack.COM/Services/T1/B2/{}", al('z', 24)),
+            format!("https://hooks.slack.com/triggers/T1/B2/{}", al('z', 24)),
+            format!("https://hooks.slack.com/workflows/T1/B2/{}", al('z', 24)),
+            format!("https://DISCORD.com/api/v10/webhooks/42/{}", al('Q', 40)),
+        ] {
+            let m = mask(&u);
+            assert!(m.ends_with("/[MASKED]"), "{m}");
+            assert!(!m.contains("zzzz") && !m.contains("QQQQ"), "{m}");
+        }
+        // Discord bot token starting with O, 7-char middle, 27-char first.
+        for tok in [
+            format!("O{}.{}.{}", al('a', 25), al('b', 6), al('c', 30)),
+            format!("M{}.{}.{}", al('a', 26), al('b', 7), al('c', 38)),
+        ] {
+            assert_eq!(mask(&format!("t={tok} x")), "t=[MASKED] x");
+        }
+        // A token ending in `-` leaks nothing.
+        let dash = format!("M{}.{}.{}-", al('a', 25), al('b', 6), al('c', 29));
+        assert_eq!(mask(&format!("t={dash} x")), "t=[MASKED] x");
+        // Slack refresh tokens.
+        let plain = format!("{}-{}", concat!("xo", "xe"), "1-abcdefghijkl");
+        let dotted = format!(
+            "{}.{}-{}",
+            concat!("xo", "xe"),
+            concat!("xo", "xp"),
+            "1-abcdefghijkl"
+        );
+        assert_eq!(mask(&plain), "[MASKED]");
+        assert_eq!(mask(&dotted), "[MASKED]");
+        // JWT-like strings must stay untouched (they start with eyJ).
+        let jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
+        assert_eq!(mask(&jwt), jwt);
     }
 
     #[test]
