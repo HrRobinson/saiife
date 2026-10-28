@@ -919,6 +919,15 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     let mut m = Map::new();
     m.insert("mode".into(), ctx.mode.as_str().into());
     m.insert("daemon".into(), VERSION.into());
+    // The personal broker's config path: `saiife connect` writes there, even
+    // when the CLI's XDG_CONFIG_HOME differs from the broker's (a systemd
+    // user unit started with another environment).
+    if ctx.mode == Mode::Personal {
+        m.insert(
+            "config".into(),
+            ctx.config_path.to_string_lossy().into_owned().into(),
+        );
+    }
     m.insert("chain".into(), json!(snap.chain));
     m.insert("head_seq".into(), json!(snap.head.as_ref().map(|h| h.0)));
     m.insert("head".into(), json!(snap.head.as_ref().map(|h| &h.1)));

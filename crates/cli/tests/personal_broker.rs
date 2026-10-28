@@ -875,6 +875,43 @@ fn connect_personal_writes_policy_0600_and_secret() {
     assert_eq!(r.status.code(), Some(0), "{}{}", out(&r), err(&r));
 }
 
+/// The CLI's XDG_CONFIG_HOME differs from the broker's (a systemd user unit
+/// started with another environment): connect warns and writes where the
+/// broker reads, which its `status` names.
+#[test]
+fn connect_personal_uses_the_brokers_config_and_warns() {
+    let b = TestBroker::start(None);
+    let st = b.call("status", json!({})).unwrap();
+    assert_eq!(st["config"], json!(b.config().display().to_string()));
+    let other = b.path().join("other-config");
+    let o = b
+        .cli(&[
+            "connect",
+            "shopify",
+            "--param",
+            "shop=acme",
+            "--from-env",
+            "PB_TOKEN",
+        ])
+        .env("XDG_CONFIG_HOME", &other)
+        .env("PB_TOKEN", secret_value())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains(&format!(
+            "the personal broker reads {}",
+            b.config().display()
+        )),
+        "{}",
+        err(&o)
+    );
+    assert!(b.config_dir().join("policy.d/shopify.toml").exists());
+    assert!(!other.exists());
+    let r = b.run_cli(&["policy", "reload"]);
+    assert_eq!(r.status.code(), Some(0), "{}{}", out(&r), err(&r));
+}
+
 #[test]
 fn connect_personal_without_config_says_start_broker() {
     let b = TestBroker::prepare();

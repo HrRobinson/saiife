@@ -37,6 +37,31 @@ systemctl --user daemon-reload
 systemctl --user enable --now saiife-broker
 ```
 
+The systemd user manager does not read your shell profile. If you set
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME` or `XDG_DATA_HOME` there, the broker
+started by the unit uses the defaults (`~/.config`, `~/.local/state`,
+`~/.local/share`) while your shell's `saiife` uses your values, and the two
+look at different files. Give both the same environment, either for every
+login in `~/.config/environment.d/*.conf`:
+
+```
+XDG_CONFIG_HOME=/home/you/.cfg
+XDG_STATE_HOME=/home/you/.state
+```
+
+or for the running manager only, before the `enable --now` above:
+
+```
+systemctl --user import-environment XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
+```
+
+When they still differ, `saiife connect` warns ("the personal broker reads
+…, but this shell resolves …") and writes the policy file where the broker
+reads it, which the broker names in its `status` answer. `saiife secret`
+and `saiife api` go through the socket, so they are not affected.
+`saiife audit --broker` reads the audit dir itself, so it needs the same
+`XDG_DATA_HOME` as the broker.
+
 `saiife daemon --user --print-unit launchd` prints a launchd plist. It is for
 after the v2.1 daemon port; it does not work on a Mac today.
 

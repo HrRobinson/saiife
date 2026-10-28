@@ -79,8 +79,43 @@ mod linux {
         Err(Stop::Refused(m.into()))
     }
 
+    /// A running personal broker names its config in `status`. When that is
+    /// not the path this shell resolves (the broker was started with other
+    /// `XDG_*`, e.g. from a systemd user unit), warn and use the broker's:
+    /// that is the file it reloads. A broker that does not answer leaves
+    /// the target as it is.
+    fn broker_config(t: &mut Target) {
+        if !matches!(t, Target::Personal { .. }) {
+            return;
+        }
+        let Ok(st) = call_to(t, "status", serde_json::Map::new()) else {
+            return;
+        };
+        let Some(theirs) = st
+            .get("config")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        else {
+            return;
+        };
+        if let Target::Personal { config, .. } = t {
+            if *config != theirs {
+                eprintln!(
+                    "saiife: warning: the personal broker reads {}, but this shell resolves {}; \
+                     writing to the broker's. Give the CLI and the broker the same \
+                     XDG_CONFIG_HOME and XDG_STATE_HOME (docs/personal-broker.md)",
+                    theirs.display(),
+                    config.display()
+                );
+                *config = theirs;
+            }
+        }
+    }
+
     pub(super) fn go(a: ConnectArgs) -> Result<(), Stop> {
-        let t = target(a.config.as_deref())?;
+        let mut t = target(a.config.as_deref())?;
+        broker_config(&mut t);
         // The personal broker writes its config on its first start.
         if let Target::Personal { config, .. } = &t {
             if std::fs::symlink_metadata(config).is_err() {
