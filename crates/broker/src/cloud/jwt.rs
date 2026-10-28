@@ -109,11 +109,19 @@ pub fn assertion(
         "iat": iat,
         "exp": iat + ASSERTION_TTL_SECS,
     });
-    let mut jwt = Zeroizing::new(String::with_capacity(1024));
-    jwt.push_str(&URL_SAFE_NO_PAD.encode(header.to_string()));
+    let (header, claims) = (header.to_string(), claims.to_string());
+    let sig_len = k.pair.public().modulus_len();
+    // Sized once, so the buffer never reallocates and leaves no copy behind.
+    let b64 = |n: usize| base64::encoded_len(n, false).unwrap_or(usize::MAX);
+    let cap = b64(header.len())
+        .saturating_add(b64(claims.len()))
+        .saturating_add(b64(sig_len))
+        .saturating_add(2);
+    let mut jwt = Zeroizing::new(String::with_capacity(cap));
+    URL_SAFE_NO_PAD.encode_string(&header, &mut jwt);
     jwt.push('.');
-    jwt.push_str(&URL_SAFE_NO_PAD.encode(claims.to_string()));
-    let mut sig = vec![0u8; k.pair.public().modulus_len()];
+    URL_SAFE_NO_PAD.encode_string(&claims, &mut jwt);
+    let mut sig = Zeroizing::new(vec![0u8; sig_len]);
     k.pair
         .sign(
             &RSA_PKCS1_SHA256,
@@ -123,6 +131,7 @@ pub fn assertion(
         )
         .map_err(|_| CloudError::Key("gcp_sa: signing the assertion failed".into()))?;
     jwt.push('.');
-    jwt.push_str(&URL_SAFE_NO_PAD.encode(&sig));
+    URL_SAFE_NO_PAD.encode_string(&*sig, &mut jwt);
+    debug_assert!(jwt.len() <= cap);
     Ok(jwt)
 }

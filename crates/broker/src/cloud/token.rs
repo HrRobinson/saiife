@@ -68,13 +68,23 @@ fn form_post(uri: Uri, body: &Zeroizing<String>) -> Built {
     }
 }
 
-fn push_pair(body: &mut Zeroizing<String>, name: &str, value: &str) {
-    if !body.is_empty() {
-        body.push('&');
+/// The `application/x-www-form-urlencoded` body of `pairs`, zeroized on
+/// drop. It is sized up front for the worst case (each value byte
+/// percent-encoded to three), so it never reallocates and leaves no copy
+/// of a secret behind.
+fn form_body(pairs: &[(&str, &str)]) -> Zeroizing<String> {
+    let cap = pairs.iter().map(|(n, v)| n.len() + 2 + 3 * v.len()).sum();
+    let mut body = Zeroizing::new(String::with_capacity(cap));
+    for (name, value) in pairs {
+        if !body.is_empty() {
+            body.push('&');
+        }
+        body.push_str(name);
+        body.push('=');
+        body.extend(utf8_percent_encode(value, FORM));
     }
-    body.push_str(name);
-    body.push('=');
-    body.extend(utf8_percent_encode(value, FORM));
+    debug_assert!(body.len() <= cap);
+    body
 }
 
 /// The GCP exchange: `POST https://oauth2.googleapis.com/token` with
@@ -82,9 +92,7 @@ fn push_pair(body: &mut Zeroizing<String>, name: &str, value: &str) {
 /// `Debug` of the result never shows the body.
 pub fn gcp_request(k: &GcpKey, scope: &str, now: OffsetDateTime) -> Result<Built, CloudError> {
     let jwt = assertion(k, scope, now)?;
-    let mut body = Zeroizing::new(String::with_capacity(jwt.len() + 128));
-    push_pair(&mut body, "grant_type", JWT_BEARER);
-    push_pair(&mut body, "assertion", &jwt);
+    let body = form_body(&[("grant_type", JWT_BEARER), ("assertion", &jwt)]);
     let uri = Uri::from_static(GCP_TOKEN_URL);
     Ok(form_post(uri, &body))
 }
@@ -151,11 +159,12 @@ pub fn azure_request(
     let uri: Uri = format!("https://{authority}/{tenant}/oauth2/v2.0/token")
         .parse()
         .map_err(|_| CloudError::Key("azure_sp: tenant_id is not a GUID or a domain".into()))?;
-    let mut body = Zeroizing::new(String::with_capacity(256));
-    push_pair(&mut body, "grant_type", "client_credentials");
-    push_pair(&mut body, "client_id", client_id);
-    push_pair(&mut body, "client_secret", client_secret);
-    push_pair(&mut body, "scope", scope);
+    let body = form_body(&[
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("scope", scope),
+    ]);
     Ok(form_post(uri, &body))
 }
 
@@ -206,28 +215,36 @@ fn bad(why: &str) -> CloudError {
 /// `token_type` `Bearer`, an `access_token` of printable ASCII up to 8 KiB
 /// and an `expires_in` (a number or a numeric string) in `1..=86400`.
 pub fn parse_token_response(status: u16, body: &[u8]) -> Result<Token, CloudError> {
-    let v: Option<serde_json::Value> = serde_json::from_slice(body).ok();
-    let o = v.as_ref().and_then(|v| v.as_object());
-    let error = o.and_then(|o| o.get("error")).filter(|e| !e.is_null());
-    if !(200..300).contains(&status) || error.is_some() {
-        let code = match error {
-            Some(e) => sanitize_code(e.as_str().unwrap_or("")),
-            None => format!("http_{status}"),
-        };
+    if !(200..300).contains(&status) {
+        let code = error_code(body).unwrap_or_else(|| format!("http_{status}"));
         return Err(CloudError::Endpoint { code });
     }
-    let o = o.ok_or_else(|| bad("not a JSON object"))?;
-    let token_type = o.get("token_type").and_then(|t| t.as_str());
-    if !token_type.is_some_and(|t| t.eq_ignore_ascii_case("bearer")) {
+    let a: Answer = match serde_json::from_slice(body) {
+        Ok(a) => a,
+        // A 2xx that is not a token answer may still be an error answer.
+        Err(_) => {
+            return Err(match error_code(body) {
+                Some(code) => CloudError::Endpoint { code },
+                None => bad("not a usable JSON token answer"),
+            })
+        }
+    };
+    if let Some(e) = a.error.filter(|e| !e.is_null()) {
+        let code = sanitize_code(e.as_str().unwrap_or(""));
+        return Err(CloudError::Endpoint { code });
+    }
+    if !a
+        .token_type
+        .is_some_and(|t| t.eq_ignore_ascii_case("bearer"))
+    {
         return Err(bad("token_type is not Bearer"));
     }
-    let access = o
-        .get("access_token")
-        .and_then(|t| t.as_str())
+    let access = a
+        .access_token
         .filter(|t| (1..=MAX_TOKEN).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_graphic()))
         .ok_or_else(|| bad("no usable access_token"))?;
-    let secs = o
-        .get("expires_in")
+    let secs = a
+        .expires_in
         .and_then(|e| {
             e.as_u64()
                 .or_else(|| e.as_str().and_then(|s| s.parse::<u64>().ok()))
@@ -235,10 +252,41 @@ pub fn parse_token_response(status: u16, body: &[u8]) -> Result<Token, CloudErro
         .filter(|s| (1..=MAX_EXPIRES_IN).contains(s))
         .ok_or_else(|| bad("expires_in is missing or out of range"))?;
     Ok(Token {
-        access: Zeroizing::new(access.to_string()),
+        access,
         refresh: None,
         ttl: Duration::from_secs(secs),
     })
+}
+
+/// A token endpoint's success answer. The access token is read straight
+/// into a zeroizing buffer; unknown fields are skipped, never kept. It has
+/// no `Debug`.
+#[derive(serde::Deserialize)]
+struct Answer {
+    #[serde(default, deserialize_with = "zeroizing")]
+    access_token: Option<Zeroizing<String>>,
+    #[serde(default)]
+    token_type: Option<String>,
+    /// A number or a numeric string.
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+/// The token string moves into `Zeroizing` without another copy.
+fn zeroizing<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    Ok(<Option<String> as serde::Deserialize>::deserialize(d)?.map(Zeroizing::new))
+}
+
+/// The sanitized `error` code of an error answer, if it names one. Only
+/// this branch reads an answer as a `serde_json::Value`.
+fn error_code(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let e = v.as_object()?.get("error").filter(|e| !e.is_null())?;
+    Some(sanitize_code(e.as_str().unwrap_or("")))
 }
 
 /// Sends a token request built by [`gcp_request`] or [`azure_request`] and
