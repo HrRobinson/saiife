@@ -225,7 +225,7 @@ struct Setup {
     /// Services `s0`.. like `shop` (same secret, same scope), each with
     /// its own 4 upstream slots.
     extra_services: usize,
-    /// The scope's `env`.
+    /// The scope's `env` (none when empty).
     scope_env: &'static str,
     /// `[environments.*]` TOML. When set, the gateway policy is built as
     /// the daemon builds it (one snapshot per environment).
@@ -241,7 +241,7 @@ impl Default for Setup {
             upstream_timeout: Duration::from_secs(5),
             policy: true,
             extra_services: 0,
-            scope_env: "prod",
+            scope_env: "",
             envs: "",
         }
     }
@@ -335,7 +335,7 @@ locked = true
 name = "agents"
 users = [{users}]
 services = ["shop"{extra_names}]
-env = "{scope_env}"
+{scope_env}
 
 [services.shop]
 connector = "test-echo"
@@ -352,7 +352,11 @@ allow = ["orders:read"]
 {envs}"#,
         users = s.users,
         extra = s.shop_extra,
-        scope_env = s.scope_env,
+        scope_env = if s.scope_env.is_empty() {
+            String::new()
+        } else {
+            format!("env = {:?}", s.scope_env)
+        },
         envs = s.envs,
     );
     let config: SystemConfig = toml::from_str(&text).unwrap();
@@ -1840,11 +1844,7 @@ async fn record_carries_env_and_its_hash() {
     assert_eq!(recs[0]["secret"], "echo-tok-staging");
 
     // A scope bound to no environment runs under the base, env null.
-    let w = world_with(Setup {
-        scope_env: "prod",
-        ..Setup::default()
-    })
-    .await;
+    let w = world().await;
     let a = ipc_call(&w, orders(None)).await;
     assert_eq!(a["ok"], true, "{a}");
     let recs = w.connector_records();
@@ -1876,7 +1876,7 @@ async fn developer_mode_project_env_selects_snapshot() {
     let w = env_world("prod").await;
     let g = w.ctx.policy().gateway.unwrap();
     let dir = NoDirectory;
-    let pick = |mode, env| g.select_env(mode, &dir, "agent", env);
+    let pick = |mode, env| g.select_env(mode, &dir, "agent", env).unwrap();
     assert_eq!(
         pick(Mode::Developer, Some("staging")),
         (Some("staging"), None)
@@ -1895,6 +1895,44 @@ async fn developer_mode_project_env_selects_snapshot() {
         Some("echo-tok-staging")
     );
     assert_eq!(g.snapshot_for(Some("qa")).hash, g.snap.hash);
+    // An approved send passes the env stored with the request: in
+    // developer mode it is sent under that snapshot again; locked mode
+    // ignores it and takes the scope's.
+    let stored: Option<&str> = Some("staging");
+    assert_eq!(pick(Mode::Developer, stored), (Some("staging"), None));
+    assert_eq!(pick(Mode::Locked, stored), (Some("prod"), None));
+}
+
+/// A locked scope bound to an environment with no snapshot (a policy that
+/// skipped `load_system`) fails closed: `policy_invalid`, nothing sent, an
+/// empty list; never the base config.
+#[tokio::test]
+async fn locked_unknown_env_denied_policy_invalid() {
+    let w = env_world("qa").await;
+    let g = w.ctx.policy().gateway.unwrap();
+    assert_eq!(
+        g.select_env(Mode::Locked, &NoDirectory, "agent", None),
+        Err("policy_invalid")
+    );
+    let a = ipc_call(&w, orders(None)).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["rule"], "policy_invalid", "{a}");
+    assert_eq!(w.hits(), 0);
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["rule"], "policy_invalid");
+    assert_eq!(recs[0]["env"], Value::Null);
+    let (st, _, _) = w.api("shop/orders.list", json!({"params": {}})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(w.hits(), 0);
+    let v = ipc_list(&w, json!({})).await;
+    assert_eq!(v["services"], json!([]), "{v}");
+    // Developer mode's undefined project env is the warned fallback.
+    let (e, warn) = g
+        .select_env(Mode::Developer, &NoDirectory, "agent", Some("qa"))
+        .unwrap();
+    assert_eq!(e, None);
+    assert!(warn.is_some());
 }
 
 #[tokio::test]
@@ -1935,6 +1973,8 @@ fn env_snapshot_failing_to_apply_denies_connectors() {
     };
     let st = PolicyState::from_loaded(&l, &[], Catalog::new(&[], vec![]));
     assert!(st.gateway.is_none());
+    // And status does not report it healthy.
+    assert!(!st.ok);
 }
 
 /// Each environment applied to the base passes the connector-catalog

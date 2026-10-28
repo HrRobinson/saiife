@@ -234,7 +234,9 @@ pub(crate) fn gateway_mode(_ctx: &Ctx) -> saiife_policy::Mode {
 
 /// The optional `env` argument of `api.call` and `api.list`: the project's
 /// environment, as the client read it from `.saiife/config.toml`. Only
-/// developer mode acts on it.
+/// developer mode acts on it, but a malformed one is a bad request in every
+/// mode, locked included: the shape is checked before the mode decides
+/// whether the value counts.
 pub(crate) fn parse_env(args: &Map<String, Value>) -> Result<Option<String>, &'static str> {
     match args.get("env") {
         None | Some(Value::Null) => Ok(None),
@@ -492,21 +494,30 @@ pub(crate) async fn execute_in(
             Some(g) => {
                 let groups = Groups(groups);
                 // The environment snapshot this call runs under (spec §6.11).
-                let (env_name, w) =
-                    g.select_env(gateway_mode(ctx), &groups, &call.user, project_env);
-                warning = w;
-                let snap = g.snapshot_for(env_name);
-                let env = DaemonEnv {
-                    ctx,
-                    config: &snap.config,
-                    groups,
-                    agent: agent.clone(),
-                };
-                // Without an upstream client steps 3–8 still run; step 9
-                // denies with `upstream_unavailable`.
-                let up = ctx.upstream.as_ref().ok();
-                let (o, t) = pipeline::run(&call, snap, &g.catalog, &ctx.limiter, &env, up).await;
-                (o, t, Arc::clone(g), env_name.map(str::to_string))
+                match g.select_env(gateway_mode(ctx), &groups, &call.user, project_env) {
+                    Ok((env_name, w)) => {
+                        warning = w;
+                        let snap = g.snapshot_for(env_name);
+                        let env = DaemonEnv {
+                            ctx,
+                            config: &snap.config,
+                            groups,
+                            agent: agent.clone(),
+                        };
+                        // Without an upstream client steps 3–8 still run;
+                        // step 9 denies with `upstream_unavailable`.
+                        let up = ctx.upstream.as_ref().ok();
+                        let (o, t) =
+                            pipeline::run(&call, snap, &g.catalog, &ctx.limiter, &env, up).await;
+                        (o, t, Arc::clone(g), env_name.map(str::to_string))
+                    }
+                    Err(rule) => (
+                        Outcome::Denied { rule: rule.into() },
+                        Trace::default(),
+                        Arc::clone(g),
+                        None,
+                    ),
+                }
             }
             None => (
                 Outcome::Denied {
@@ -750,10 +761,15 @@ pub(crate) async fn services_in(
     let user = ctx.name_of(uid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
         let groups = Groups(ctx.groups_of(&user).await);
-        let (env_name, w) = g.select_env(gateway_mode(ctx), &groups, &user, project_env);
-        warning = w;
-        let snap = g.snapshot_for(env_name);
-        if let Ok(Some(scope)) = scope_for(&snap.config, &groups, &user) {
+        // A locked scope env with no snapshot lists nothing (a call is
+        // denied `policy_invalid`).
+        let chosen = g.select_env(gateway_mode(ctx), &groups, &user, project_env);
+        let snap = chosen.as_ref().ok().map(|(e, _)| g.snapshot_for(*e));
+        if let Ok((_, w)) = chosen {
+            warning = w;
+        }
+        let scope = snap.and_then(|s| scope_for(&s.config, &groups, &user).ok().flatten());
+        if let (Some(snap), Some(scope)) = (snap, scope) {
             for name in &scope.services {
                 if let Some(ops) =
                     pipeline::list_operations(name, snap, &g.catalog, overlays.get(name))

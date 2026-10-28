@@ -107,6 +107,12 @@ pub struct StoredCall {
     pub overlay: Option<ServiceOverlay>,
     /// How the request came in (`cli` or `http`).
     pub via: String,
+    /// The environment of the snapshot the request was asked under
+    /// ([`PolicySnapshot::env`]). Developer mode sends under it again;
+    /// locked mode chooses from the scope at send. Absent in requests
+    /// stored before environments existed (read as `None`).
+    #[serde(default)]
+    pub env: Option<String>,
 }
 
 impl std::fmt::Debug for StoredCall {
@@ -791,6 +797,7 @@ async fn steps(
                 headers: call.headers.clone(),
                 overlay: call.overlay.clone(),
                 via: call.via.as_str().to_string(),
+                env: snap.env.clone(),
             },
             operation: masker.mask_text(&op.id),
             capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),

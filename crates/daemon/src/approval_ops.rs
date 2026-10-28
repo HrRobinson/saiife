@@ -1252,15 +1252,24 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     } else {
         ctx.groups_of(&stored.user).await
     };
-    // The environment in force now, as for a new call. The project's `env`
-    // is not stored with the request (developer mode, plan 16).
+    // The environment, chosen as for a new call: locked mode takes the
+    // scope's as it is now; developer mode the one the request was asked
+    // under (stored with it).
     let groups = Groups(groups);
-    let (env_name, _) = g.select_env(
+    let Ok((env_name, _)) = g.select_env(
         crate::api_ops::gateway_mode(&ctx),
         &groups,
         &stored.user,
-        None,
-    );
+        stored.env.as_deref(),
+    ) else {
+        return fail(
+            &ctx,
+            &r,
+            crate::ops::UNKNOWN_ENV_RULE,
+            "the scope's environment has no policy snapshot",
+        )
+        .await;
+    };
     let snap = g.snapshot_for(env_name);
     let env = DaemonEnv {
         ctx: &ctx,

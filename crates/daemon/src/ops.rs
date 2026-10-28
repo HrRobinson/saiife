@@ -113,7 +113,10 @@ impl GatewayPolicy {
     }
 
     /// The snapshot of environment `env`; the base one for `None` or a
-    /// name with no snapshot.
+    /// name with no snapshot. Callers take the name from [`select_env`],
+    /// which never hands a locked caller a name without a snapshot.
+    ///
+    /// [`select_env`]: GatewayPolicy::select_env
     pub fn snapshot_for(&self, env: Option<&str>) -> &PolicySnapshot {
         env.and_then(|e| self.by_env.get(e)).unwrap_or(&self.snap)
     }
@@ -123,18 +126,28 @@ impl GatewayPolicy {
     /// project `env` is ignored (the project path never chooses it).
     /// `Developer` (the personal broker, spec §6.11): the project `env`
     /// the client sends; an undefined one falls back to the base config
-    /// with a warning.
+    /// with a warning (the only path that falls back to the base).
+    ///
+    /// `Err(rule)`: a locked scope bound to an environment with no
+    /// snapshot (impossible after `load_system`); the call is denied
+    /// rather than run under the looser base config.
     pub fn select_env<'a>(
         &'a self,
         mode: PolicyMode,
         dir: &dyn Directory,
         user: &str,
         project_env: Option<&'a str>,
-    ) -> (Option<&'a str>, Option<String>) {
+    ) -> Result<(Option<&'a str>, Option<String>), &'static str> {
         match mode {
-            // A scope conflict leaves the base: step 3 denies the call.
-            PolicyMode::Locked => (env_for(&self.snap.config, dir, user).ok().flatten(), None),
-            PolicyMode::Developer => match project_env {
+            PolicyMode::Locked => match env_for(&self.snap.config, dir, user) {
+                Ok(Some(e)) => match self.by_env.get_key_value(e) {
+                    Some((k, _)) => Ok((Some(k.as_str()), None)),
+                    None => Err(UNKNOWN_ENV_RULE),
+                },
+                // A scope conflict leaves the base: step 3 denies the call.
+                Ok(None) | Err(_) => Ok((None, None)),
+            },
+            PolicyMode::Developer => Ok(match project_env {
                 None => (None, None),
                 Some(e) if self.by_env.contains_key(e) => (Some(e), None),
                 Some(e) => (
@@ -143,10 +156,13 @@ impl GatewayPolicy {
                         "environment {e:?} is not defined; the base config is used"
                     )),
                 ),
-            },
+            }),
         }
     }
 }
+
+/// The deny rule of a locked call whose scope environment has no snapshot.
+pub const UNKNOWN_ENV_RULE: &str = "policy_invalid";
 
 /// The policy in force.
 #[derive(Debug, Clone)]
@@ -182,7 +198,8 @@ impl PolicyState {
     ///
     /// Each environment gets its own snapshot. One that does not apply
     /// (impossible after `load_system`) leaves connectors denied rather
-    /// than running its callers under the base config.
+    /// than running its callers under the base config, and the policy not
+    /// `ok` (status reports it).
     pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo], connectors: Catalog) -> PolicyState {
         PolicyState::from_loaded_in(l, catalog, connectors, Mode::Locked)
     }
@@ -207,7 +224,7 @@ impl PolicyState {
         };
         PolicyState {
             hash: Some(hash),
-            ok: true,
+            ok: gateway.is_some(),
             min_free_mb: l.config.audit.min_free_mb,
             admin_groups: l.config.admin.groups.clone(),
             system: Some(Arc::new(l.config.clone())),

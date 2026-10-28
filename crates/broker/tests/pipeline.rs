@@ -514,6 +514,7 @@ async fn ask_creates_pending_no_upstream_call() {
     assert_eq!(stored.stored.operation, "refunds.create");
     assert_eq!(stored.stored.uid, 1001);
     assert_eq!(stored.stored.via, "cli");
+    assert_eq!(stored.stored.env, None);
     assert_eq!(stored.capability.as_deref(), Some("refunds:write"));
     assert_eq!(stored.params.get()["order_id"], "7");
     use base64::Engine as _;
@@ -1546,4 +1547,33 @@ async fn manifest_change_between_ask_and_send_is_body_changed() {
     assert_eq!(rule(&o), "body_changed");
     assert!(!tr.sent);
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// The pending request keeps the environment of the snapshot it was asked
+/// under; a blob stored before the field existed still reads (env None).
+#[tokio::test]
+async fn stored_call_keeps_env_and_old_blobs_read() {
+    let (_m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let mut snap = snapshot("");
+    snap.env = Some("staging".into());
+    let c = refund_call(&[("order_id", "7")]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let stored = env.approvals.lock().unwrap().pop().unwrap().stored;
+    assert_eq!(stored.env.as_deref(), Some("staging"));
+
+    let mut v = serde_json::to_value(&stored).unwrap();
+    assert_eq!(v["env"], "staging");
+    let back: saiife_broker::pipeline::StoredCall = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back.env.as_deref(), Some("staging"));
+    // An old blob: no `env` key.
+    v.as_object_mut().unwrap().remove("env");
+    let old: saiife_broker::pipeline::StoredCall = serde_json::from_value(v).unwrap();
+    assert_eq!(old.env, None);
+    assert_eq!(old.operation, "refunds.create");
+    let again = serde_json::to_value(&old).unwrap();
+    let old2: saiife_broker::pipeline::StoredCall = serde_json::from_value(again).unwrap();
+    assert_eq!(old2.env, None);
+    assert_eq!(old2.params, old.params);
 }
