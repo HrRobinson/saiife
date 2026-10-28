@@ -13,7 +13,7 @@
 
 use crate::vault::{self, VaultState};
 use saiife_keychain::{Keychain, VAULT_KEY, VAULT_KEY_LABEL};
-use saiife_policy::{AdminCfg, DaemonCfg, Scope, SystemConfig};
+use saiife_policy::{scope_for, AdminCfg, DaemonCfg, Directory, Scope, SystemConfig};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,16 @@ pub fn vault_key(kc: &dyn Keychain, vault_file: &Path) -> Result<VaultKey, Strin
             getrandom::fill(&mut key[..]).map_err(|e| format!("cannot make a vault key: {e}"))?;
             kc.set(&VAULT_KEY, VAULT_KEY_LABEL, &key[..])
                 .map_err(|e| e.to_string())?;
-            Ok(VaultKey(key))
+            // Use the key only once the keychain really holds it: a key kept
+            // in memory alone would seal a vault nobody can open again.
+            match kc.get(&VAULT_KEY) {
+                Err(e) => Err(e.to_string()),
+                Ok(None) => Err("the keychain did not keep the new vault key".into()),
+                Ok(Some(back)) if back.as_slice() != key.as_slice() => {
+                    Err("the keychain returned a different vault key than was stored".into())
+                }
+                Ok(Some(_)) => Ok(VaultKey(key)),
+            }
         }
     }
 }
@@ -99,14 +108,47 @@ pub fn open_vault(kc: &dyn Keychain, vault_file: &Path) -> VaultState {
 
 /// Write [`PERSONAL_CONFIG`] (0600, in a 0700 dir) when `path` is missing.
 /// An existing file is never touched. `true` when the file was created.
+/// The parent dir must be a real dir (no symlink) owned by the euid, mode
+/// 0700; anything else is an error. A failed write leaves no file behind.
 pub fn ensure_config(path: &Path) -> io::Result<bool> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+    write_config(path, |f| {
+        f.write_all(PERSONAL_CONFIG.as_bytes())?;
+        f.sync_all()
+    })
+}
+
+fn write_config(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<bool> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("the config path has no directory"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let md = std::fs::symlink_metadata(dir)?;
+    if !md.file_type().is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    if md.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other(format!(
+            "{} is not owned by this user",
+            dir.display()
+        )));
+    }
+    if md.permissions().mode() & 0o7777 != 0o700 {
+        return Err(io::Error::other(format!(
+            "{} must be mode 0700",
+            dir.display()
+        )));
     }
     // `create_new` never follows or replaces anything already there.
     let mut f = match std::fs::OpenOptions::new()
@@ -119,15 +161,24 @@ pub fn ensure_config(path: &Path) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
     };
-    f.write_all(PERSONAL_CONFIG.as_bytes())?;
-    f.sync_all()?;
+    if let Err(e) = write(&mut f) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     Ok(true)
 }
 
 /// Fit a loaded config to personal mode (decision 5) and return the
 /// warnings. `raw` is the config file as written, to tell which sections
-/// the user set.
-pub fn apply(cfg: &mut SystemConfig, raw: &toml::Table, p: &PersonalCfg) -> Vec<String> {
+/// the user set. `dir` resolves `group:<name>` scope entries, as the
+/// daemon's scope matching does.
+pub fn apply(
+    cfg: &mut SystemConfig,
+    raw: &toml::Table,
+    p: &PersonalCfg,
+    dir: &dyn Directory,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if raw.contains_key("daemon") {
         warnings.push(format!(
@@ -162,11 +213,15 @@ pub fn apply(cfg: &mut SystemConfig, raw: &toml::Table, p: &PersonalCfg) -> Vec<
             services: cfg.services.keys().cloned().collect(),
             env: None,
         });
-    } else if !cfg.scope.iter().any(|s| s.users.contains(&p.own_user)) {
-        warnings.push(format!(
-            "personal broker: no [[scope]] names your user {}; connector calls will find no scope",
-            p.own_user
-        ));
+    } else {
+        match scope_for(cfg, dir, &p.own_user) {
+            Ok(Some(_)) => {}
+            Ok(None) => warnings.push(format!(
+                "personal broker: no [[scope]] names your user {} or one of its groups; connector calls will find no scope",
+                p.own_user
+            )),
+            Err(e) => warnings.push(format!("personal broker: {e}")),
+        }
     }
     warnings
 }
@@ -200,10 +255,11 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let kc = FakeKeychain::new();
         let a = vault_key(&kc, &file(&t)).unwrap().into_inner();
-        assert_eq!(kc.calls(), vec!["get", "set"]);
+        // get, set, then the read-back get.
+        assert_eq!(kc.calls(), vec!["get", "set", "get"]);
         assert_ne!(*a, [0u8; 32]);
         let b = vault_key(&kc, &file(&t)).unwrap().into_inner();
-        assert_eq!(kc.calls(), vec!["get", "set", "get"]);
+        assert_eq!(kc.calls(), vec!["get", "set", "get", "get"]);
         assert_eq!(*a, *b);
         assert_eq!(
             kc.get(&VAULT_KEY).unwrap().unwrap().as_slice(),
@@ -391,6 +447,13 @@ mod tests {
         }
     }
 
+    fn dir() -> saiife_policy::FixedDirectory {
+        saiife_policy::FixedDirectory::from_text(
+            "alice:x:1000:1000::/home/alice:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n",
+            "alice:x:1000:\nbob:x:1001:\ndevs:x:2000:alice,bob\n",
+        )
+    }
+
     fn parse(text: &str) -> (SystemConfig, toml::Table) {
         let raw: toml::Table = text.parse().unwrap();
         (toml::from_str(text).unwrap(), raw)
@@ -409,7 +472,7 @@ secret = "mail"
     #[test]
     fn apply_synthesizes_personal_scope() {
         let (mut cfg, raw) = parse(&format!("version = 2\n{SERVICES}"));
-        let w = apply(&mut cfg, &raw, &pcfg());
+        let w = apply(&mut cfg, &raw, &pcfg(), &dir());
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(
             cfg.scope,
@@ -422,7 +485,7 @@ secret = "mail"
             }]
         );
         let (mut cfg, raw) = parse("version = 2\n");
-        apply(&mut cfg, &raw, &pcfg());
+        apply(&mut cfg, &raw, &pcfg(), &dir());
         assert_eq!(cfg.scope.len(), 1);
         assert!(cfg.scope[0].services.is_empty());
     }
@@ -434,7 +497,7 @@ secret = "mail"
         );
         let (mut cfg, raw) = parse(&text);
         let before = cfg.scope.clone();
-        let w = apply(&mut cfg, &raw, &pcfg());
+        let w = apply(&mut cfg, &raw, &pcfg(), &dir());
         assert_eq!(cfg.scope, before);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("alice"), "{w:?}");
@@ -443,21 +506,21 @@ secret = "mail"
         );
         let (mut cfg, raw) = parse(&text);
         let before = cfg.scope.clone();
-        assert!(apply(&mut cfg, &raw, &pcfg()).is_empty());
+        assert!(apply(&mut cfg, &raw, &pcfg(), &dir()).is_empty());
         assert_eq!(cfg.scope, before);
     }
 
     #[test]
     fn apply_overrides_paths_and_warns_on_daemon_admin_audit_dir() {
         let (mut cfg, raw) = parse("version = 2\n");
-        assert!(apply(&mut cfg, &raw, &pcfg()).is_empty());
+        assert!(apply(&mut cfg, &raw, &pcfg(), &dir()).is_empty());
         assert_eq!(cfg.daemon.socket_dir, pcfg().socket_dir);
         assert_eq!(cfg.audit.dir, pcfg().audit_dir);
 
         let (mut cfg, raw) = parse(
             "version = 2\n[daemon]\nsocket_dir = \"/srv/x\"\n[admin]\ngroups = [\"wheel\"]\n[audit]\ndir = \"/srv/audit\"\nretention_months = 3\n",
         );
-        let w = apply(&mut cfg, &raw, &pcfg());
+        let w = apply(&mut cfg, &raw, &pcfg(), &dir());
         assert_eq!(w.len(), 3, "{w:?}");
         assert!(w[0].contains("[daemon]"), "{w:?}");
         assert!(w[1].contains("[admin]"), "{w:?}");
@@ -468,8 +531,173 @@ secret = "mail"
         // Other [audit] keys are kept, and alone they warn about nothing.
         assert_eq!(cfg.audit.retention_months, 3);
         let (mut cfg, raw) = parse("version = 2\n[audit]\nretention_months = 3\n");
-        assert!(apply(&mut cfg, &raw, &pcfg()).is_empty());
+        assert!(apply(&mut cfg, &raw, &pcfg(), &dir()).is_empty());
         assert_eq!(cfg.audit.retention_months, 3);
+    }
+
+    #[test]
+    fn apply_resolves_group_scopes_through_directory() {
+        let text = format!(
+            "version = 2\n{SERVICES}\n[[scope]]\nname = \"team\"\nusers = [\"group:devs\"]\nservices = [\"github\"]\n"
+        );
+        let (mut cfg, raw) = parse(&text);
+        let before = cfg.scope.clone();
+        // alice is in devs: no warning.
+        assert!(apply(&mut cfg, &raw, &pcfg(), &dir()).is_empty());
+        assert_eq!(cfg.scope, before);
+        // Without that membership the group does not name her.
+        let lonely = saiife_policy::FixedDirectory::from_text(
+            "alice:x:1000:1000::/home/alice:/bin/sh\n",
+            "alice:x:1000:\ndevs:x:2000:bob\n",
+        );
+        let (mut cfg, raw) = parse(&text);
+        let w = apply(&mut cfg, &raw, &pcfg(), &lonely);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("alice") && w[0].contains("groups"), "{w:?}");
+        // Two scopes match her: the conflict is the warning.
+        let text = format!(
+            "{text}\n[[scope]]\nname = \"mine\"\nusers = [\"alice\"]\nservices = [\"mail\"]\n"
+        );
+        let (mut cfg, raw) = parse(&text);
+        let w = apply(&mut cfg, &raw, &pcfg(), &dir());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("team") && w[0].contains("mine"), "{w:?}");
+    }
+
+    #[test]
+    fn ensure_config_refuses_unsafe_dir() {
+        let t = tempfile::tempdir().unwrap();
+        // Loose mode on an existing dir: refused, nothing written.
+        let loose = t.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = ensure_config(&loose.join("config.toml")).unwrap_err();
+        assert!(e.to_string().contains("0700"), "{e}");
+        assert!(!loose.join("config.toml").exists());
+        // A symlinked dir: refused, nothing written through it.
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = ensure_config(&link.join("config.toml")).unwrap_err();
+        assert!(e.to_string().contains("not a directory"), "{e}");
+        assert!(!real.join("config.toml").exists());
+        // Not owned by the euid (when running as non-root, / is root's).
+        if rustix::process::geteuid().as_raw() != 0 {
+            let e = write_config(Path::new("/config.toml"), |_| Ok(())).unwrap_err();
+            assert!(e.to_string().contains("not owned by this user"), "{e}");
+        }
+    }
+
+    #[test]
+    fn ensure_config_failed_write_leaves_no_file() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("broker").join("config.toml");
+        let e = write_config(&p, |f| {
+            use std::io::Write;
+            f.write_all(b"version")?;
+            Err(io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "disk full");
+        assert!(!p.exists());
+        // The next start writes it cleanly.
+        assert!(ensure_config(&p).unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), PERSONAL_CONFIG);
+    }
+
+    /// A keychain whose `set` reports success but keeps `stored` (nothing,
+    /// or other bytes).
+    struct LyingSet {
+        inner: FakeKeychain,
+        stored: Option<Vec<u8>>,
+    }
+    impl Keychain for LyingSet {
+        fn get(
+            &self,
+            id: &saiife_keychain::ItemId,
+        ) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+            self.inner.get(id)
+        }
+        fn set(
+            &self,
+            id: &saiife_keychain::ItemId,
+            label: &str,
+            _: &[u8],
+        ) -> Result<(), KeychainError> {
+            match &self.stored {
+                Some(b) => self.inner.set(id, label, b),
+                None => Ok(()),
+            }
+        }
+        fn delete(&self, id: &saiife_keychain::ItemId) -> Result<bool, KeychainError> {
+            self.inner.delete(id)
+        }
+        fn backend(&self) -> &'static str {
+            "lying"
+        }
+    }
+
+    #[test]
+    fn fresh_key_is_read_back() {
+        let t = tempfile::tempdir().unwrap();
+        let dropped = LyingSet {
+            inner: FakeKeychain::new(),
+            stored: None,
+        };
+        assert_eq!(
+            vault_key(&dropped, &file(&t)).unwrap_err(),
+            "the keychain did not keep the new vault key"
+        );
+        let other = LyingSet {
+            inner: FakeKeychain::new(),
+            stored: Some(KEY.to_vec()),
+        };
+        let e = vault_key(&other, &file(&t)).unwrap_err();
+        assert_eq!(
+            e,
+            "the keychain returned a different vault key than was stored"
+        );
+        assert!(!e.contains("0123456789"));
+        assert_eq!(other.inner.calls(), vec!["get", "set", "get"]);
+        // A failing read-back is an error too.
+        let kc = FakeKeychain::new();
+        let flaky = FailSecondGet(kc, std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            vault_key(&flaky, &file(&t)).unwrap_err(),
+            "keychain locked: read-back"
+        );
+        // Nothing reached the vault file.
+        assert!(!file(&t).exists());
+    }
+
+    /// The second `get` fails as locked.
+    struct FailSecondGet(FakeKeychain, std::sync::atomic::AtomicUsize);
+    impl Keychain for FailSecondGet {
+        fn get(
+            &self,
+            id: &saiife_keychain::ItemId,
+        ) -> Result<Option<Zeroizing<Vec<u8>>>, KeychainError> {
+            if self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                return Err(KeychainError::Locked("read-back".into()));
+            }
+            self.0.get(id)
+        }
+        fn set(
+            &self,
+            id: &saiife_keychain::ItemId,
+            label: &str,
+            s: &[u8],
+        ) -> Result<(), KeychainError> {
+            self.0.set(id, label, s)
+        }
+        fn delete(&self, id: &saiife_keychain::ItemId) -> Result<bool, KeychainError> {
+            self.0.delete(id)
+        }
+        fn backend(&self) -> &'static str {
+            "flaky"
+        }
     }
 
     #[test]
