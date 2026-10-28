@@ -123,7 +123,17 @@ mod linux {
     /// project config is ignored with a warning; it can only have
     /// tightened); the personal broker decides as developer mode, so a
     /// project `allow` counts too (spec §6.9.1).
-    fn project(d: &Daemon) -> (String, BTreeMap<String, saiife_policy::ServiceOverlay>) {
+    ///
+    /// The third value is the project `env` the call asks for: only the
+    /// personal broker acts on it (the locked daemon takes the scope's), so
+    /// it is sent to the broker only.
+    fn project(
+        d: &Daemon,
+    ) -> (
+        String,
+        BTreeMap<String, saiife_policy::ServiceOverlay>,
+        Option<String>,
+    ) {
         let cfg = &d.cfg;
         let mode = if d.target.is_locked() {
             Mode::Locked
@@ -137,23 +147,36 @@ mod linux {
             .or(cwd.as_ref())
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let services = root
-            .and_then(|r| match read_config_bytes(&r) {
-                Ok(Some(b)) => match parse_project(&b) {
-                    Ok(p) => Some(merge_project(&cfg.guard.packs, &p, mode).services),
-                    Err(e) => {
-                        eprintln!("saiife: warning: project config ignored ({e})");
-                        None
-                    }
-                },
-                Ok(None) => None,
+        let parsed = root.and_then(|r| match read_config_bytes(&r) {
+            Ok(Some(b)) => match parse_project(&b) {
+                Ok(p) => Some(p),
                 Err(e) => {
                     eprintln!("saiife: warning: project config ignored ({e})");
                     None
                 }
-            })
+            },
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("saiife: warning: project config ignored ({e})");
+                None
+            }
+        });
+        let env = parsed
+            .as_ref()
+            .filter(|_| !d.target.is_locked())
+            .and_then(|p| p.env.clone());
+        let services = parsed
+            .map(|p| merge_project(&cfg.guard.packs, &p, mode).services)
             .unwrap_or_default();
-        (shown, services)
+        (shown, services, env)
+    }
+
+    /// The broker's `warning` (an undefined project `env`: the base config
+    /// was used), on stderr.
+    fn env_warning(ans: &Map<String, Value>) {
+        if let Some(w) = ans.get("warning").and_then(Value::as_str) {
+            eprintln!("saiife: warning: {}", crate::text::sanitize(w));
+        }
     }
 
     fn go(a: ApiArgs) -> Result<u8, Stop> {
@@ -231,7 +254,7 @@ mod linux {
         body: Option<Vec<u8>>,
         collection: Option<&str>,
     ) -> Result<(u8, Map<String, Value>), Stop> {
-        let (project, overlays) = project(d);
+        let (project, overlays, env) = project(d);
         let mut args = Map::new();
         args.insert("service".into(), service.into());
         args.insert("operation".into(), operation.into());
@@ -249,6 +272,9 @@ mod linux {
         if let Some(c) = collection {
             args.insert("collection".into(), c.into());
         }
+        if let Some(e) = env {
+            args.insert("env".into(), e.into());
+        }
         // The daemon waits at most one upstream timeout for a pool slot and
         // one for the upstream; past both, plus slack, it is gone.
         let timeout = d.cfg.gateway.upstream_timeout * 2 + Duration::from_secs(15);
@@ -261,6 +287,7 @@ mod linux {
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
+        env_warning(&ans);
         if ans.get("pending").and_then(Value::as_u64).is_some() {
             return Ok((3, ans));
         }
@@ -653,9 +680,12 @@ mod linux {
             return Err(refused("usage: saiife api --list [<service>]"));
         }
         let mut d = connect(config)?;
-        let (_, overlays) = project(&d);
+        let (_, overlays, env) = project(&d);
         let mut args = Map::new();
         args.insert("overlays".into(), json!(overlays));
+        if let Some(e) = env {
+            args.insert("env".into(), e.into());
+        }
         let ans = d
             .client
             .call_answer("api.list", args, Instant::now() + Duration::from_secs(10))
@@ -663,6 +693,7 @@ mod linux {
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
+        env_warning(&ans);
         let services: Vec<Value> = ans
             .get("services")
             .and_then(Value::as_array)

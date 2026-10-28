@@ -21,7 +21,7 @@ use saiife_broker::pipeline::PolicySnapshot;
 use saiife_broker::upstream::{Resolver, Upstream};
 use saiife_broker::{Catalog, Manifest};
 use saiife_daemon::gateway::{self, Opts};
-use saiife_daemon::ops::{Ctx, CtxInit, GatewayPolicy, PolicyState};
+use saiife_daemon::ops::{Ctx, CtxInit, GatewayPolicy, Mode as DaemonMode, PolicyState};
 use saiife_daemon::sessions::RealProc;
 use saiife_daemon::tokens::Tokens;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
@@ -230,6 +230,8 @@ struct Setup {
     /// `[environments.*]` TOML. When set, the gateway policy is built as
     /// the daemon builds it (one snapshot per environment).
     envs: &'static str,
+    /// The daemon: the locked one, or the personal broker (plan 16).
+    daemon_mode: DaemonMode,
 }
 
 impl Default for Setup {
@@ -243,6 +245,7 @@ impl Default for Setup {
             extra_services: 0,
             scope_env: "",
             envs: "",
+            daemon_mode: DaemonMode::Locked,
         }
     }
 }
@@ -374,7 +377,7 @@ allow = ["orders:read"]
                         &config,
                         &[],
                         Catalog::new(&[], vec![manifest.clone()]),
-                        Mode::Locked,
+                        s.daemon_mode.policy_mode(),
                     )
                     .unwrap(),
                 );
@@ -383,7 +386,7 @@ allow = ["orders:read"]
                 snap: PolicySnapshot {
                     config,
                     hash: "sha256:test".into(),
-                    mode: Mode::Locked,
+                    mode: s.daemon_mode.policy_mode(),
                     env: None,
                 },
                 by_env: Default::default(),
@@ -419,6 +422,7 @@ allow = ["orders:read"]
             .map_err(|e| e.to_string()),
         lockdown: saiife_daemon::lockdown::Store::memory(),
         grants: saiife_daemon::grants::Grants::memory(),
+        mode: s.daemon_mode,
         ..CtxInit::minimal(handle, writer_cfg, Arc::new(NoDirectory), &state)
     }));
 
@@ -1853,9 +1857,9 @@ async fn record_carries_env_and_its_hash() {
 }
 
 /// Locked mode: the project `env` the client sends is ignored and the
-/// scope's environment wins. (The developer-mode half, where that arg
-/// chooses the snapshot through `Ctx.mode`, lands with plan 16; the choice
-/// itself is `developer_mode_project_env_selects_snapshot`.)
+/// scope's environment wins. (The personal-broker half, where that arg
+/// chooses the snapshot through `Ctx.mode`, is
+/// `developer_mode_project_env_picks_snapshot`.)
 #[tokio::test]
 async fn locked_mode_project_env_arg_ignored() {
     let w = env_world("prod").await;
@@ -1869,6 +1873,56 @@ async fn locked_mode_project_env_arg_ignored() {
     let a = ipc_call(&w, orders(Some("Bad Name"))).await;
     assert_eq!(a["ok"], false, "{a}");
     assert_eq!(w.hits(), 1);
+}
+
+/// The personal broker (`Ctx.mode` personal) decides as developer mode:
+/// the project `env` the client sends picks the snapshot, and the scope's
+/// own `env` does not; no `env` is the base config, and an undefined one
+/// falls back to the base with a warning.
+#[tokio::test]
+async fn developer_mode_project_env_picks_snapshot() {
+    let w = world_with(Setup {
+        scope_env: "prod",
+        envs: ENVS,
+        daemon_mode: DaemonMode::Personal,
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(w.ctx.mode, DaemonMode::Personal);
+    let g = w.ctx.policy().gateway.unwrap();
+    assert_eq!(g.snap.mode, Mode::Developer);
+
+    let a = ipc_call(&w, orders(Some("staging"))).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("warning").is_none(), "{a}");
+    assert_eq!(last_token(&w), STAGING_TOKEN);
+
+    let a = ipc_call(&w, orders(None)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(last_token(&w), TOKEN);
+
+    let a = ipc_call(&w, orders(Some("qa"))).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let warn = a["warning"].as_str().unwrap_or_default();
+    assert!(warn.contains("not defined"), "{a}");
+    assert_eq!(last_token(&w), TOKEN);
+
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 3);
+    assert_eq!(recs[0]["env"], "staging");
+    assert_eq!(
+        recs[0]["policy"],
+        g.snapshot_for(Some("staging")).hash.as_str()
+    );
+    assert_eq!(recs[0]["secret"], "echo-tok-staging");
+    assert_eq!(recs[1]["env"], Value::Null);
+    assert_eq!(recs[2]["env"], Value::Null);
+    // `api.list` takes the same choice.
+    let v = ipc_list(&w, json!({"env": "staging"})).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v.get("warning").is_none(), "{v}");
+    let text = w.audit_text();
+    assert!(!text.contains(TOKEN) && !text.contains(STAGING_TOKEN));
 }
 
 #[tokio::test]

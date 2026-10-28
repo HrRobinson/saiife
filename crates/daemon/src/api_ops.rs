@@ -259,10 +259,12 @@ fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>,
 }
 
 /// The mode connector calls choose their environment under (see
-/// [`GatewayPolicy::select_env`]). Locked until the personal broker
-/// (plan 16) gives the context its own mode.
-pub(crate) fn gateway_mode(_ctx: &Ctx) -> saiife_policy::Mode {
-    saiife_policy::Mode::Locked
+/// [`GatewayPolicy::select_env`]): the daemon's own, as the policy
+/// decides it. The locked daemon takes the scope's environment; the
+/// personal broker decides as developer mode, so the project `env` the
+/// client sends picks the snapshot.
+pub(crate) fn gateway_mode(ctx: &Ctx) -> saiife_policy::Mode {
+    ctx.mode.policy_mode()
 }
 
 /// The optional `env` argument of `api.call` and `api.list`: the project's
