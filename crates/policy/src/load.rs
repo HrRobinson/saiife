@@ -2,6 +2,7 @@
 
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
+use crate::mcp::McpServerCfg;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
 use crate::system::{
     Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING, RESERVED_SERVICES,
@@ -77,6 +78,8 @@ struct DropIn {
     #[serde(default)]
     services: BTreeMap<String, ServiceCfg>,
     #[serde(default)]
+    mcp: BTreeMap<String, McpServerCfg>,
+    #[serde(default)]
     secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     scope: Vec<Scope>,
@@ -115,6 +118,11 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     let config_name = config_file.display().to_string();
     let mut service_origin: BTreeMap<String, String> = cfg
         .services
+        .keys()
+        .map(|k| (k.clone(), config_name.clone()))
+        .collect();
+    let mut mcp_origin: BTreeMap<String, String> = cfg
+        .mcp
         .keys()
         .map(|k| (k.clone(), config_name.clone()))
         .collect();
@@ -158,6 +166,17 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
             service_origin.insert(svc.clone(), name.clone());
             cfg.services.insert(svc, t);
         }
+        for (srv, c) in d.mcp {
+            if let Some(first) = mcp_origin.get(&srv) {
+                return Err(PolicyError::DuplicateService {
+                    name: format!("mcp:{srv}"),
+                    first: first.clone(),
+                    second: name,
+                });
+            }
+            mcp_origin.insert(srv.clone(), name.clone());
+            cfg.mcp.insert(srv, c);
+        }
         for (sec, c) in d.secrets {
             if let Some(first) = secret_origin.get(&sec) {
                 return Err(invalid(
@@ -180,6 +199,7 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
 
     validate_services(config_file, &cfg, &service_origin)?;
     validate_environments(config_file, &cfg, &service_origin)?;
+    validate_mcp(config_file, &cfg, &mcp_origin)?;
     cfg.gateway
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
@@ -321,6 +341,45 @@ fn validate_services(
                     ),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// `[mcp.*]` (plan 17 decisions 12 to 14): locked mode only, valid servers,
+/// and no server both brokered and listed in `[guard.mcp] allow_servers`.
+fn validate_mcp(
+    config_file: &Path,
+    cfg: &SystemConfig,
+    origin: &BTreeMap<String, String>,
+) -> Result<(), PolicyError> {
+    if !cfg.mcp.is_empty() && !cfg.locked {
+        return Err(invalid(
+            config_file,
+            "the MCP gateway needs locked mode: in personal broker mode its servers would run as you",
+        ));
+    }
+    for (name, srv) in &cfg.mcp {
+        let file = origin
+            .get(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_file.to_path_buf());
+        srv.validate(name).map_err(|why| invalid(&file, why))?;
+    }
+    for s in &cfg.guard.mcp.allow_servers {
+        if s == "saiife" {
+            return Err(invalid(
+                config_file,
+                "[guard.mcp] allow_servers may not contain \"saiife\" (it is the brokered server)",
+            ));
+        }
+        if cfg.mcp.contains_key(s) {
+            return Err(invalid(
+                config_file,
+                format!(
+                    "MCP server {s} is both unbrokered ([guard.mcp] allow_servers) and brokered ([mcp.{s}]); remove it from allow_servers"
+                ),
+            ));
         }
     }
     Ok(())

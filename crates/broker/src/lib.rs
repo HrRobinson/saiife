@@ -46,6 +46,8 @@ pub enum BrokerError {
     Manifest(String),
     #[error("unknown connector {0:?}")]
     UnknownConnector(String),
+    #[error("{0}")]
+    UnknownScopeEntry(String),
     #[error("missing required parameter {0:?}")]
     MissingParam(String),
     #[error("bad amount: {0}")]

@@ -3,6 +3,7 @@
 //! value.
 
 use crate::environment::EnvironmentCfg;
+use crate::mcp::McpServerCfg;
 use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -36,6 +37,9 @@ pub struct SystemConfig {
     pub gateway: GatewayCfg,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceCfg>,
+    /// `[mcp.<name>]`: gateway servers (plan 17). Locked mode only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerCfg>,
     /// `[secrets.<name>]`: per-secret admin settings (`run_allow`).
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretCfg>,
