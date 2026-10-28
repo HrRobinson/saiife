@@ -625,20 +625,27 @@ impl Ctx {
     }
 
     /// The user's groups, cached for at most 60 s. A failed lookup is an
-    /// empty list (so: not an admin).
+    /// empty list (so: not an admin), and is not cached.
     pub(crate) async fn groups_of(&self, user: &str) -> Vec<String> {
+        self.try_groups_of(user).await.unwrap_or_default()
+    }
+
+    /// [`Ctx::groups_of`], a failed lookup an error. Only an answer is
+    /// cached: a lookup that failed is tried again on the next call, never
+    /// remembered as "no groups" for the TTL.
+    pub async fn try_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
         if let Some((at, v)) = lock(&self.groups).get(user) {
             if at.elapsed() < LOOKUP_TTL {
-                return v.clone();
+                return Ok(v.clone());
             }
         }
         let dir = Arc::clone(&self.directory);
         let name = user.to_string();
-        let v = tokio::task::spawn_blocking(move || dir.groups_of(&name))
+        let v = tokio::task::spawn_blocking(move || dir.try_groups_of(&name))
             .await
-            .unwrap_or_default();
+            .map_err(|e| format!("group lookup did not finish: {e}"))??;
         lock(&self.groups).insert(user.to_string(), (Instant::now(), v.clone()));
-        v
+        Ok(v)
     }
 
     /// Who must own `<config dir>/ca` and `connectors/`: root for the

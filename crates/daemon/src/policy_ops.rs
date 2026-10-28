@@ -4,7 +4,7 @@ use crate::ops::Ctx;
 use saiife_ipc::msg::{err, ok, ErrorCode, Request, OP_POLICY_RELOAD, OP_POLICY_SHOW};
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{
-    active_packs, effective_policy, env_for, env_hashes, environment, view::user_view,
+    active_packs, effective_policy, env_hashes, environment, scope::try_scope_for, view::user_view,
 };
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
@@ -66,9 +66,13 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let cfg = Arc::clone(&system);
     let view = tokio::task::spawn_blocking(move || {
         dir.user(&name)?;
-        let env = env_for(&cfg, dir.as_ref(), &name)
-            .map(|e| e.map(str::to_string))
-            .map_err(|e| e.to_string());
+        // A failed group lookup is an error (`Err` outside), never "no
+        // scope, no environment"; a scope conflict is the view's own
+        // `scope_error` (`Err` inside).
+        let env = try_scope_for(&cfg, dir.as_ref(), &name).map(|s| {
+            s.map(|s| s.and_then(|s| s.env.clone()))
+                .map_err(|e| e.to_string())
+        });
         Some((user_view(&cfg, dir.as_ref(), &name), env))
     })
     .await
@@ -76,6 +80,16 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     .flatten();
     let Some((view, env)) = view else {
         return err(id, ErrorCode::BadRequest, &format!("no user {user:?}"));
+    };
+    let env = match env {
+        Ok(e) => e,
+        Err(e) => {
+            return err(
+                id,
+                ErrorCode::Unavailable,
+                &format!("the scope of {user} cannot be resolved: group lookup failed: {e}"),
+            )
+        }
     };
     let mut m = Map::new();
     m.insert("view".into(), view);

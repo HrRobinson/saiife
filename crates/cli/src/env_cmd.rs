@@ -15,7 +15,8 @@ use std::process::ExitCode;
 use clap::Subcommand;
 use saiife_agents::config::{find_project_root, read_config_bytes, CONFIG_REL};
 use saiife_policy::environment::valid_env_name;
-use saiife_policy::{env_for, load_system, parse_project, Getent, SystemConfig};
+use saiife_policy::scope::try_scope_for;
+use saiife_policy::{load_system, parse_project, Directory, Getent, SystemConfig};
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
@@ -168,9 +169,7 @@ fn list(place: &Place, as_json: bool) -> Result<Done, Failure> {
             let cfg = load(config)?;
             let user =
                 current_user_name().ok_or((2, "cannot tell which user you are".to_string()))?;
-            let applies = env_for(&cfg, &Getent, &user)
-                .map_err(|e| (2, e.to_string()))?
-                .map(str::to_string);
+            let applies = scope_env(&cfg, &Getent, &user)?;
             (cfg, applies)
         }
         Place::Developer { system } => {
@@ -219,8 +218,21 @@ fn list(place: &Place, as_json: bool) -> Result<Done, Failure> {
     Ok(Done::Code(0))
 }
 
+/// The environment of `user`'s scope. A failed group lookup is an error,
+/// never "no environment": the listing would mark the base config as the
+/// one that applies.
+fn scope_env(
+    cfg: &SystemConfig,
+    dir: &dyn Directory,
+    user: &str,
+) -> Result<Option<String>, Failure> {
+    let scope = try_scope_for(cfg, dir, user)
+        .map_err(|e| (2, format!("cannot tell which scope {user} is in: {e}")))?
+        .map_err(|e| (2, e.to_string()))?;
+    Ok(scope.and_then(|s| s.env.clone()))
+}
+
 fn current_user_name() -> Option<String> {
-    use saiife_policy::Directory;
     Getent.name_of(rustix::process::getuid().as_raw())
 }
 
@@ -495,6 +507,47 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory whose group lookups fail.
+    struct FailingGroups;
+
+    impl Directory for FailingGroups {
+        fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+            None
+        }
+        fn name_of(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+            None
+        }
+        fn groups_of(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn try_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+            Err("nss down".into())
+        }
+    }
+
+    /// `env list` in locked mode: a failed group lookup is an error, not
+    /// "no environment applies".
+    #[test]
+    fn list_scope_env_lookup_failure_is_an_error() {
+        let cfg: SystemConfig = toml::from_str(
+            "version = 2\n[[scope]]\nname = \"s\"\nusers = [\"group:devs\"]\nenv = \"e\"\n\
+             [environments.e]\n",
+        )
+        .unwrap();
+        let (code, m) = scope_env(&cfg, &FailingGroups, "alice").unwrap_err();
+        assert_eq!(code, 2);
+        assert!(m.contains("nss down"), "{m}");
+        // With the lookup answering, the scope's environment.
+        let d = saiife_policy::FixedDirectory::from_text(
+            "alice:x:1000:1000::/home/alice:/bin/sh\n",
+            "devs:x:1000:\n",
+        );
+        assert_eq!(scope_env(&cfg, &d, "alice").unwrap().as_deref(), Some("e"));
+    }
 
     #[test]
     fn release_ignores_assume_root_seam() {
