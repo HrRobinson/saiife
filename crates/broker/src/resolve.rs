@@ -76,6 +76,12 @@ pub fn proxy<'m>(
     method: &str,
     raw_path_and_query: &str,
 ) -> Result<(&'m Operation, BTreeMap<String, String>), BrokerError> {
+    // A mail operation is named-only: there is no path to send.
+    if m.transport == crate::manifest::Transport::Mail {
+        return Err(BrokerError::UnknownOperation(
+            "a proxy path (mail operations are named only)".into(),
+        ));
+    }
     check_raw(raw_path_and_query)?;
     let (path, query) = match raw_path_and_query.split_once('?') {
         Some((p, q)) => (p, Some(q)),

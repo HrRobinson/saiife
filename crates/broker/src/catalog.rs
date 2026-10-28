@@ -68,7 +68,9 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
                 })?;
             // A param that is the whole upstream host: no userinfo, port,
             // path, upper case or trailing dot can ride along (decision 1).
-            if m.whole_host_param() == Some(p.as_str()) && !bare_hostname(v) {
+            if (m.whole_host_param() == Some(p.as_str()) || m.host_params().contains(&p.as_str()))
+                && !bare_hostname(v)
+            {
                 return Err(BrokerError::BadValue {
                     name: format!("{name}.{p}"),
                     reason: "not a bare lower-case hostname".into(),

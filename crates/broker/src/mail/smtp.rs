@@ -1,28 +1,30 @@
-//! A minimal SMTP client for notifications (plan 11, decision 9): implicit
-//! TLS (port 465) or STARTTLS (587, 25), then `EHLO`, `AUTH PLAIN`, `MAIL`,
-//! `RCPT`, `DATA`. Each step has its own 10 s timeout. Nothing is sent
-//! before TLS: a server that does not offer STARTTLS is refused, and the
-//! credentials never travel in the clear. No other auth method exists.
+//! A minimal SMTP client (plan 11, decision 9; moved from the daemon in
+//! plan 14, Task 6): implicit TLS (port 465) or STARTTLS (587, 25), then
+//! `EHLO`, `AUTH PLAIN`, `MAIL`, `RCPT`, `DATA`. Each step has its own
+//! 10 s timeout. Nothing is sent before TLS: a server that does not offer
+//! STARTTLS is refused, and the credentials never travel in the clear. No
+//! other auth method exists.
+//!
+//! The daemon's notifier uses [`send`] (ASCII text to its configured
+//! recipients); the `mail.send` connector operation uses [`send_data`]
+//! with a message from [`super::message::compose`] and one recipient.
 
+use super::{boxed, connect, name_of, read_line, step, Stream};
 use base64::Engine as _;
-use rustls::pki_types::ServerName;
-use saiife_broker::upstream::Resolver;
-use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
+use crate::upstream::Resolver;
+
 /// The timeout of each protocol step.
 pub const STEP: Duration = Duration::from_secs(10);
-/// A reply line longer than this, or a reply of more lines, is refused.
-const MAX_LINE: usize = 1024;
+/// A reply of more lines than this is refused.
 const MAX_LINES: usize = 64;
 
-/// One message to send.
+/// One notification to send.
 pub struct Mail<'a> {
     pub host: &'a str,
     pub port: u16,
@@ -36,21 +38,26 @@ pub struct Mail<'a> {
     pub body: &'a str,
 }
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-type Stream = BufReader<Pin<Box<dyn Io>>>;
-
-fn boxed<T: Io + 'static>(t: T) -> Stream {
-    BufReader::new(Box::pin(t) as Pin<Box<dyn Io>>)
+/// Where a ready DATA section goes, and the login.
+pub struct Envelope<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    /// `false`: implicit TLS. `true`: STARTTLS (required, never optional).
+    pub starttls: bool,
+    pub from: &'a str,
+    pub to: &'a [String],
+    pub user: &'a str,
+    pub password: &'a str,
 }
 
-async fn step<T>(
-    what: &str,
-    f: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    match tokio::time::timeout(STEP, f).await {
-        Ok(r) => r.map_err(|e| format!("{what}: {e}")),
-        Err(_) => Err(format!("{what}: timed out")),
+impl std::fmt::Debug for Envelope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Envelope")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("starttls", &self.starttls)
+            .field("recipients", &self.to.len())
+            .finish()
     }
 }
 
@@ -58,18 +65,17 @@ async fn step<T>(
 async fn reply(s: &mut Stream) -> Result<(u16, Vec<String>), String> {
     let mut lines = Vec::new();
     loop {
-        let mut line = String::new();
-        let n = (&mut *s)
-            .take(MAX_LINE as u64 + 1)
-            .read_line(&mut line)
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("the server closed the connection".into());
-        }
-        if line.len() > MAX_LINE || lines.len() >= MAX_LINES {
+        let raw = read_line(s).await.map_err(|e| {
+            if e == "line too long" {
+                "reply too long".to_string()
+            } else {
+                e
+            }
+        })?;
+        if lines.len() >= MAX_LINES {
             return Err("reply too long".into());
         }
+        let line = String::from_utf8_lossy(&raw);
         let line = line.trim_end_matches(['\r', '\n']);
         let code: u16 = line
             .get(..3)
@@ -125,10 +131,6 @@ async fn cmd_quiet(s: &mut Stream, line: &str, ok: u16) -> Result<(), String> {
     }
 }
 
-fn name_of(host: &str) -> Result<ServerName<'static>, String> {
-    ServerName::try_from(host.to_string()).map_err(|e| format!("TLS server name: {e}"))
-}
-
 /// Text that is safe in a header or a body line: ASCII printable and tab,
 /// anything else (including CR and LF) a space.
 pub fn plain(s: &str) -> String {
@@ -170,42 +172,46 @@ fn address(a: &str) -> Result<&str, String> {
     Ok(a)
 }
 
-/// Sends `m`. `tls` carries the client's roots; `resolver` maps the host.
-/// Errors are one line and never hold the credentials.
+/// Sends the notification `m`. `tls` carries the client's roots;
+/// `resolver` maps the host. Errors are one line and never hold the
+/// credentials.
 pub async fn send(
     tls: TlsConnector,
     resolver: Arc<dyn Resolver>,
     m: &Mail<'_>,
 ) -> Result<(), String> {
-    let from = address(m.from)?;
-    for t in m.to {
+    let env = Envelope {
+        host: m.host,
+        port: m.port,
+        starttls: m.starttls,
+        from: m.from,
+        to: m.to,
+        user: m.user,
+        password: m.password,
+    };
+    send_data(tls, resolver, &env, &data_section(m)).await
+}
+
+/// Sends `data`, a DATA section already dot-stuffed and ended with
+/// `.\r\n`, to every recipient of `e`. Errors are one line and never hold
+/// the credentials.
+pub async fn send_data(
+    tls: TlsConnector,
+    resolver: Arc<dyn Resolver>,
+    e: &Envelope<'_>,
+    data: &str,
+) -> Result<(), String> {
+    let from = address(e.from)?;
+    for t in e.to {
         address(t)?;
     }
-    let host = m.host.to_string();
-    let port = m.port;
-    let addrs: Vec<SocketAddr> = step("resolve", async {
-        let r = resolver;
-        tokio::task::spawn_blocking(move || r.resolve(&host, port))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    let tcp = step("connect", async {
-        let mut last = "no address".to_string();
-        for a in addrs {
-            match TcpStream::connect(a).await {
-                Ok(s) => return Ok(s),
-                Err(e) => last = e.to_string(),
-            }
-        }
-        Err(last)
-    })
-    .await?;
-    let _ = tcp.set_nodelay(true);
+    if !data.ends_with("\r\n.\r\n") && data != ".\r\n" {
+        return Err("the message is not a DATA section".into());
+    }
+    let tcp = connect(resolver, e.host, e.port).await?;
 
     let mut s: Stream;
-    if m.starttls {
+    if e.starttls {
         s = boxed(tcp);
         step("greeting", expect(&mut s, &[220])).await?;
         let caps = step("EHLO", cmd(&mut s, "EHLO saiife", &[250])).await?;
@@ -218,14 +224,14 @@ pub async fn send(
             return Err("the server sent data before the TLS handshake".into());
         }
         let raw = s.into_inner();
-        let name = name_of(m.host)?;
+        let name = name_of(e.host)?;
         let t = step("TLS", async {
             tls.connect(name, raw).await.map_err(|e| e.to_string())
         })
         .await?;
         s = boxed(t);
     } else {
-        let name = name_of(m.host)?;
+        let name = name_of(e.host)?;
         let t = step("TLS", async {
             tls.connect(name, tcp).await.map_err(|e| e.to_string())
         })
@@ -235,18 +241,18 @@ pub async fn send(
     }
 
     step("EHLO", cmd(&mut s, "EHLO saiife", &[250])).await?;
-    let plain_auth = Zeroizing::new(format!("\0{}\0{}", m.user, m.password));
+    let plain_auth = Zeroizing::new(format!("\0{}\0{}", e.user, e.password));
     let b64 =
         Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(plain_auth.as_bytes()));
     let auth = Zeroizing::new(format!("AUTH PLAIN {}", b64.as_str()));
     step("AUTH", cmd_quiet(&mut s, &auth, 235)).await?;
     step("MAIL", cmd(&mut s, &format!("MAIL FROM:<{from}>"), &[250])).await?;
-    for t in m.to {
+    for t in e.to {
         step("RCPT", cmd(&mut s, &format!("RCPT TO:<{t}>"), &[250, 251])).await?;
     }
     step("DATA", cmd(&mut s, "DATA", &[354])).await?;
     step("message", async {
-        s.write_all(data_section(m).as_bytes())
+        s.write_all(data.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
         s.flush().await.map_err(|e| e.to_string())?;
@@ -288,5 +294,21 @@ mod tests {
         assert!(d.contains("th \r\n"), "{d}");
         assert!(d.ends_with("\r\n.\r\n"));
         assert!(!d.contains("\r\nBcc:"));
+    }
+
+    #[test]
+    fn envelope_debug_hides_the_login() {
+        let to = vec!["a@b.test".to_string()];
+        let e = Envelope {
+            host: "h",
+            port: 1,
+            starttls: true,
+            from: "x@y.test",
+            to: &to,
+            user: "mailbox-user",
+            password: "hunter2-mail-pw",
+        };
+        let d = format!("{e:?}");
+        assert!(!d.contains("hunter2") && !d.contains("mailbox-user"), "{d}");
     }
 }

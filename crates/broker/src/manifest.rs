@@ -25,6 +25,8 @@ pub struct Manifest {
     pub id: String,
     pub version: u32,
     pub title: String,
+    /// `https://...`; empty (absent) for `transport = "mail"`.
+    #[serde(default)]
     pub base_url: String,
     /// Literal hosts and `*.suffix` globs, or whole-host placeholders
     /// `{param}` (decision 1).
@@ -45,8 +47,8 @@ pub struct Manifest {
     pub operation: Vec<Operation>,
 }
 
-/// How the connector reaches its upstream. `mail` (SMTP and IMAP) is
-/// refused by [`Manifest::check`] until it is built.
+/// How the connector reaches its upstream: HTTPS, or `mail` (SMTP send and
+/// read-only IMAP, [`crate::mail`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -101,7 +103,11 @@ pub struct Operation {
     #[serde(default)]
     pub qualifier: Option<String>,
     pub kind: OpKind,
+    /// Empty (absent) for a mail operation.
+    #[serde(default)]
     pub method: String,
+    /// Empty (absent) for a mail operation.
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub path_params: BTreeMap<String, String>,
@@ -284,19 +290,22 @@ impl Manifest {
         if self.hosts.is_empty() || self.hosts.iter().any(|h| h.is_empty()) {
             return Err(bad(id, "hosts must list at least one host"));
         }
-        if !self.base_url.starts_with("https://") {
-            return Err(bad(id, "base_url must be https://"));
-        }
         for (name, spec) in &self.params {
             spec.param_type()
                 .map_err(|e| bad(id, format!("param {name}: {e}")))?;
         }
-        if self.transport == Transport::Mail {
-            return Err(bad(id, "transport mail is not supported in this build"));
-        }
-        for var in braces(&self.base_url).map_err(|e| bad(id, e))? {
-            if !self.params.contains_key(var) {
-                return Err(bad(id, format!("base_url uses undeclared param {var}")));
+        let mail = self.transport == Transport::Mail;
+        if mail {
+            // No base_url, the two host params, basic auth, the mail ops.
+            crate::mail::check_manifest(self).map_err(|e| bad(id, e))?;
+        } else {
+            if !self.base_url.starts_with("https://") {
+                return Err(bad(id, "base_url must be https://"));
+            }
+            for var in braces(&self.base_url).map_err(|e| bad(id, e))? {
+                if !self.params.contains_key(var) {
+                    return Err(bad(id, format!("base_url uses undeclared param {var}")));
+                }
             }
         }
         self.check_hosts().map_err(|e| bad(id, e))?;
@@ -309,9 +318,10 @@ impl Manifest {
         for op in &self.operation {
             // A GraphQL operation is named-only (never matched by path), so
             // several may share one endpoint.
+            // A mail operation has no path at all.
             let segs = match op.graphql {
-                None => template_segments(&op.path).ok(),
-                Some(_) => None,
+                None if !mail => template_segments(&op.path).ok(),
+                _ => None,
             };
             if let Some(segs) = segs {
                 if !shapes.insert((op.method.clone(), shape(&segs))) {
@@ -338,20 +348,26 @@ impl Manifest {
         if op.qualifier.as_deref() == Some("") {
             return Err("empty qualifier".into());
         }
-        if !METHODS.contains(&op.method.as_str()) {
+        let mail = self.transport == Transport::Mail;
+        if !mail && !METHODS.contains(&op.method.as_str()) {
             return Err(format!(
                 "method {:?} is not one of {}",
                 op.method,
                 METHODS.join(", ")
             ));
         }
-        let vars: BTreeSet<&str> = template_segments(&op.path)?
-            .into_iter()
-            .filter_map(|s| match s {
-                Seg::Var { name, .. } => Some(name),
-                Seg::Lit(_) => None,
-            })
-            .collect();
+        // A mail operation has no method or path (checked in `mail`).
+        let vars: BTreeSet<&str> = if mail {
+            BTreeSet::new()
+        } else {
+            template_segments(&op.path)?
+                .into_iter()
+                .filter_map(|s| match s {
+                    Seg::Var { name, .. } => Some(name),
+                    Seg::Lit(_) => None,
+                })
+                .collect()
+        };
         let declared: BTreeSet<&str> = op.path_params.keys().map(String::as_str).collect();
         if vars != declared {
             return Err("path placeholders and path_params differ".into());
@@ -499,6 +515,16 @@ impl Manifest {
         self.base_host_template().and_then(whole_placeholder)
     }
 
+    /// Every service param that is a whole host: `{param}` entries of
+    /// `hosts` (for mail, `smtp_host` and `imap_host`). Each value must be
+    /// a bare hostname.
+    pub fn host_params(&self) -> Vec<&str> {
+        self.hosts
+            .iter()
+            .filter_map(|h| whole_placeholder(h))
+            .collect()
+    }
+
     /// Decision 1: either fixed hosts and globs, or whole-host `{param}`
     /// entries, each a required param with an anchored pattern, one of which
     /// is exactly the base URL host.
@@ -533,6 +559,11 @@ impl Manifest {
                     ))
                 }
             }
+        }
+        // A mail manifest has no base_url; its hosts are the SMTP and IMAP
+        // host params (checked in `mail`).
+        if self.transport == Transport::Mail {
+            return Ok(());
         }
         match self.whole_host_param() {
             Some(p) if placeholders.contains(&p) => Ok(()),

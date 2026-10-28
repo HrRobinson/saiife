@@ -13,7 +13,7 @@
 use crate::amount;
 use crate::catalog::Catalog;
 use crate::limits::{Event, Key, Limiter};
-use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination};
+use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination, Transport};
 use crate::mask::{finish, Finished, Masked, Masker};
 use crate::params;
 use crate::request::{build, AuthMaterial};
@@ -860,29 +860,46 @@ async fn steps(
         let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
         *masker = Masker::new(&refs);
     }
-    let mut built = match build(
-        &m,
-        op,
-        &svc.params,
-        &params,
-        &call.headers,
-        body.clone(),
-        &auth,
-    ) {
-        Ok(b) => b,
-        Err(e) => return denied(rule_of(&e)),
+    // ---- mail transport (plan 14, Task 6) ----
+    // A mail call builds no HTTP request: its params are checked here,
+    // before anything counts, and the credential is kept for `mail::run`.
+    let mail = m.transport == Transport::Mail;
+    if mail {
+        if let Err(e) = crate::mail::check_call(op, &svc.params, &params, body.as_ref()) {
+            return denied(rule_of(&e));
+        }
+    }
+    let (mut built, mail_auth) = if mail {
+        (None, Some(auth))
+    } else {
+        let b = match build(
+            &m,
+            op,
+            &svc.params,
+            &params,
+            &call.headers,
+            body.clone(),
+            &auth,
+        ) {
+            Ok(b) => b,
+            Err(e) => return denied(rule_of(&e)),
+        };
+        drop(auth);
+        (Some(b), None)
     };
-    drop(auth);
-    // Compressed bytes never reach the masker: ask for none.
-    built
-        .headers
-        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if let Some(ct) = prepared.content_type {
-        // The body is the canonical JSON or its form encoding: say so,
-        // whatever the agent sent.
+    // ---- end mail transport ----
+    if let Some(built) = built.as_mut() {
+        // Compressed bytes never reach the masker: ask for none.
         built
             .headers
-            .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        if let Some(ct) = prepared.content_type {
+            // The body is the canonical JSON or its form encoding: say so,
+            // whatever the agent sent.
+            built
+                .headers
+                .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+        }
     }
     let max = svc
         .limits
@@ -911,7 +928,27 @@ async fn steps(
     let sent = {
         let _permit = permit;
         tr.sent = true;
-        up.send(built, read_limit).await
+        // ---- mail transport (plan 14, Task 6): SMTP or IMAP, not HTTPS ----
+        match (built, mail_auth) {
+            (Some(b), _) => up.send(b, read_limit).await,
+            (None, Some(a)) => {
+                let r = crate::mail::run(
+                    up,
+                    &m,
+                    op,
+                    &svc.params,
+                    &params,
+                    body.clone(),
+                    &a,
+                    read_limit,
+                )
+                .await;
+                drop(a);
+                r
+            }
+            (None, None) => Err(BrokerError::Upstream("no request was built".into())),
+        }
+        // ---- end mail transport ----
     };
     let resp = match sent {
         Ok(r) => r,
@@ -1024,6 +1061,21 @@ pub fn prepare_body(
     if raw.is_some() && (op.body.is_none() || op.builds_body()) {
         return Err("bad_param");
     }
+    // `text` (mail only): UTF-8, at most 256 KiB, sent as given.
+    if op.body.as_deref() == Some("text") {
+        let Some(b) = raw else {
+            return Ok(PreparedBody::default());
+        };
+        if b.len() > crate::mail::MAX_BODY || std::str::from_utf8(b).is_err() {
+            return Err("bad_body");
+        }
+        return Ok(PreparedBody {
+            bytes: Some(b.clone()),
+            json: None,
+            input: Some(b.clone()),
+            content_type: Some("text/plain; charset=utf-8"),
+        });
+    }
     let (json, input) = if op.builds_body() {
         (
             crate::request::build_body(op, params).map_err(|e| rule_of(&e))?,
@@ -1053,7 +1105,6 @@ pub fn prepare_body(
                 .into_bytes(),
             "application/x-www-form-urlencoded",
         ),
-        // `text` is mail only, which never comes here.
         _ => return Err("bad_body"),
     };
     Ok(PreparedBody {

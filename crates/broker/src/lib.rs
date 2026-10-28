@@ -12,6 +12,7 @@ pub mod amount;
 pub mod catalog;
 pub mod judge;
 pub mod limits;
+pub mod mail;
 pub mod manifest;
 pub mod mask;
 pub mod params;

@@ -17,7 +17,7 @@ toml = "0.8"
 regex = "1"
 thiserror = "1"
 percent-encoding = "2"
-time = "0.3"
+time = { version = "0.3", features = ["formatting"] }
 saiife-policy = { path = "../policy" }
 # Upstream client (Task 7). Newest releases older than 14 days (2026-10-26):
 # hyper 1.12.0 is from 2026-10-06, hyper-util 0.1.21 from 2026-09-24,
@@ -29,7 +29,7 @@ saiife-policy = { path = "../policy" }
 # rustls uses the ring provider only: the static musl build has no C/cmake
 # toolchain for aws-lc-rs.
 # 1.53.3 and later are younger than 14 days (2026-10-22).
-tokio = { version = "=1.53.2", features = ["rt", "net", "time", "sync"] }
+tokio = { version = "=1.53.2", features = ["rt", "net", "time", "sync", "io-util"] }
 hyper = { version = "=1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
 http = "=1.5.0"
@@ -48,6 +48,13 @@ zeroize = "=1.9.1"
 # The pipeline records the SHA-256 of a request body (Task 9); the version
 # already in Cargo.lock.
 sha2 = "0.10"
+# The mail transport (plan 14, Task 6). Newest releases older than 14 days
+# (2026-10-28): imap-proto 0.16.7 is from 2026-04-21 and uses nom ^7, the
+# nom 7.1.3 already in Cargo.lock (0.17.0, from 2026-09-28, would pull nom
+# 8); mail-parser 0.11.9 is from 2026-09-09 (1.0.0, from 2026-10-24, is
+# younger). Both are pure Rust.
+imap-proto = "=0.16.7"
+mail-parser = { version = "=0.11.9", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

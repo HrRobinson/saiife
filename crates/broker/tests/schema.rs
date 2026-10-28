@@ -1153,7 +1153,7 @@ fn pagination_param_must_be_an_op_param() {
 }
 
 #[test]
-fn transport_mail_refused_until_task_6() {
+fn transport_mail_with_a_base_url_refused() {
     let text = "id = \"m\"\nversion = 1\ntitle = \"M\"\nbase_url = \"https://m.test\"\nhosts = [\"m.test\"]\ntransport = \"mail\"\n";
     assert!(Manifest::parse(text).is_err());
     let text = text.replace("\"mail\"", "\"https\"");
