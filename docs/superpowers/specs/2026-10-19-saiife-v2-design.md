@@ -1072,6 +1072,9 @@ Built (plan 14):
 - In developer and personal-broker mode an environment changes connector
   calls only; its guard packs apply in locked mode. A developer-mode `policy
   show` prints a line saying it does not reflect the project env.
+- In personal-broker mode the HTTP gateway socket uses the base config, not
+  the project env: only `saiife api` sends the project's `env`, so agents
+  should use it. Binding an environment to an `api.token` is a later item.
 
 ### 6.12 Collections (v1 §9.5 "agent-facing API client + collections"; after v2.0, plan 14)
 

@@ -62,6 +62,12 @@ only; its guard packs apply in locked mode. The guard hook and `saiife policy
 show` do not read the project's `env` there, and `policy show` says so on its
 last line.
 
+**The HTTP gateway.** Under the personal broker, a call on `gateway.sock`
+carries no project, so it runs under the base config, not the project's
+`env`. Agents that should get the project's environment use `saiife api`,
+which sends it. Binding an environment to an `api token` is planned for a
+later version.
+
 ## Commands
 
 ```
