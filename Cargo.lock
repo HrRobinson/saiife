@@ -1530,6 +1530,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-mcp"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "saiife-policy"
 version = "0.2.0"
 dependencies = [
