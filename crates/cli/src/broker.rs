@@ -250,6 +250,7 @@ mod tests {
                 .or_else(|| std::env::var_os("TMPDIR"))
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
+            fs::create_dir_all(&base).unwrap();
             let tmp = tempfile::Builder::new()
                 .prefix("bk")
                 .tempdir_in(base)

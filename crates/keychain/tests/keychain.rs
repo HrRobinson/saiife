@@ -214,7 +214,9 @@ mod dir {
         if own_uid() != 0 {
             let before = mode(root);
             let e = DirKeychain::new(root).unwrap_err();
-            assert!(e.to_string().contains("owned by uid 0"), "{e}");
+            // Usually uid 0; in a user namespace (the offline CI job) it is
+            // the overflow uid. Either way: someone else's.
+            assert!(e.to_string().contains("is owned by uid "), "{e}");
             assert_eq!(mode(root), before);
         }
     }
