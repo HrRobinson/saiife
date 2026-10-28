@@ -46,9 +46,12 @@ agent's file tools and through shell commands (`rm`, `mv`, `cp`, `sed -i`,
   `~/.local/state/saiife/broker` and `~/.local/share/saiife/broker` (or
   `$XDG_CONFIG_HOME/saiife/broker`). Reading them stays allowed.
 
-**The personal broker.** `systemctl --user stop|disable|mask|kill|restart|edit`
-of `saiife-broker`, and `launchctl bootout|unload|kill|remove` of
-`com.saiife.broker`. `status` and `list` stay allowed. This catches mistakes
+**The personal broker.** `systemctl stop|disable|mask|kill|restart|try-restart|
+reload-or-restart|isolate|set-property|revert|edit` of a unit whose name starts
+with `saiife` (with `--user` before or after the verb), `systemctl --user exit`,
+`launchctl bootout|unload|kill|remove|stop|disable` of `com.saiife.broker`, and
+`pkill`, `killall` or `kill` with a `saiife` argument. Writing the broker's
+unit file and launchd plist is blocked too. `status` and `list` stay allowed. This catches mistakes
 and helpful bypasses; it is not a boundary, because the broker runs as your
 own user.
 
@@ -63,6 +66,11 @@ own user.
 
 ## Not covered
 
+- The personal broker is protected against mistakes only. Not seen:
+  `busctl` calls to `StopUnit`, killing a process by a pid read from a file,
+  scripts that call the Secret Service (for example with `secretstorage`),
+  `security export`, and writes under `$XDG_STATE_HOME` or `$XDG_DATA_HOME`
+  when they point away from `~/.local/state` and `~/.local/share`.
 - `saiife init --off` in your own terminal works. That terminal is not hooked,
   so saiife does not judge it.
 - A shell function named `saiife` is not detected (an alias is).

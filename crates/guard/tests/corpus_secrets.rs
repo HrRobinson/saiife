@@ -1076,3 +1076,26 @@ fn the_personal_brokers_vault_key_is_not_readable_through_the_keychain() {
         ],
     );
 }
+
+#[test]
+fn keychain_dump_gaps_round_one() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "secret-tool search --all",
+        "secret-tool search --all --unlock",
+        "security find-generic-password -w",
+        "security find-generic-password -ga",
+        "security dump-keychain -d",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    assert_allows(
+        &e,
+        &[
+            "secret-tool search service github",
+            "secret-tool search --all service github",
+            "security find-generic-password -s github -w",
+        ],
+    );
+}

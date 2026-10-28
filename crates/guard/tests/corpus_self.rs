@@ -955,3 +955,55 @@ fn the_personal_broker_cannot_be_stopped_or_edited_by_the_agent() {
         assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
     }
 }
+
+#[test]
+fn broker_stop_gaps_round_one() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "systemctl stop --user saiife-broker",
+        "systemctl --user stop saiife-broker --now",
+        "systemctl stop saiife-broker --user",
+        "systemctl --user try-restart saiife-broker.service",
+        "systemctl --user reload-or-restart saiife-broker",
+        "systemctl --user isolate saiife-broker.service",
+        "systemctl --user set-property saiife-broker.service CPUQuota=1%",
+        "systemctl --user revert saiife-broker.service",
+        "systemctl --user stop saiife-daemon",
+        "systemctl --user exit",
+        "launchctl stop com.saiife.broker",
+        "launchctl disable gui/501/com.saiife.broker",
+        "pkill -f 'saiife daemon --user'",
+        "pkill saiife",
+        "killall saiife",
+        "kill $(pgrep -f saiife)",
+        "rm -rf ~/.config/saiife",
+        "rm -rf ~/.local/state/saiife",
+        "rm ~/.config/systemd/user/saiife-broker.service",
+        "rm ~/Library/LaunchAgents/com.saiife.broker.plist",
+        "rm ~/.config/systemd/user/default.target.wants/saiife-broker.service",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "systemctl --user stop pipewire",
+        "systemctl stop --user pipewire.service",
+        "systemctl --user restart gpg-agent",
+        "systemctl --user status saiife-broker",
+        "pkill -f node",
+        "killall firefox",
+        "kill 1234",
+        "launchctl stop com.example.thing",
+        "rm -rf ~/.config/other",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+    for path in [
+        "~/.config/systemd/user/saiife-broker.service",
+        "~/Library/LaunchAgents/com.saiife.broker.plist",
+    ] {
+        assert!(e.evaluate_path(Access::Write, path).is_deny(), "{path}");
+        assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
+    }
+}
