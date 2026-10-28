@@ -596,11 +596,15 @@ fn approved_but_unsent_at_start_is_interrupted() {
     v["decided_by"] = json!(4242);
     fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
     spawn(&mut w.d);
-    let failed: Vec<Value> =
+    let failed_records = || -> Vec<Value> {
         w.d.of_kind("approval")
             .into_iter()
             .filter(|r| r["approval"] == json!(id) && r["action"] == "send_failed")
-            .collect();
+            .collect()
+    };
+    // The record is written at start, maybe just after the socket is up.
+    wait_for(Duration::from_secs(10), || !failed_records().is_empty());
+    let failed = failed_records();
     assert_eq!(failed.len(), 1, "{}", w.d.stderr_text());
     assert_eq!(failed[0]["rule"], "interrupted");
     assert_eq!(failed[0]["by_uid"], 4242);

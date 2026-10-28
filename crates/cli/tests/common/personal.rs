@@ -145,7 +145,8 @@ impl TestBroker {
 
     /// A saiife CLI command (`args`) with the broker's environment, run in
     /// `<tmp>/p`: no `--system-config`, so the resolver picks the personal
-    /// broker (this host has no locked `/etc/saiife/config.toml`).
+    /// broker. `SAIIFE_TEST_SYSTEM_CONFIG` names an absent file, so the
+    /// host's own `/etc/saiife/config.toml` never decides (debug builds).
     pub fn cli(&self, args: &[&str]) -> Command {
         let project = self.path().join("p");
         fs::create_dir_all(&project).unwrap();
@@ -165,6 +166,10 @@ impl TestBroker {
             .env("SAIIFE_DATA_DIR", self.path().join("hookdata"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("hookaudit"))
             .env("SAIIFE_TEST_PKTTYAGENT", self.path().join("no-pkttyagent"))
+            .env(
+                "SAIIFE_TEST_SYSTEM_CONFIG",
+                super::absent_system_config(self.path()),
+            )
             .env_remove("SAIIFE_TEST_KEYCHAIN")
             .env_remove("SAIIFE_TEST_CA_OWNER")
             .stdin(Stdio::null());

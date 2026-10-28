@@ -999,7 +999,13 @@ fn audit_broker_lists_and_verifies() {
     }
     assert!(vt.contains(&b.audit_dir().display().to_string()), "{vt}");
     // Without --broker the developer log is read, not the broker's.
-    let dev = b.run_cli(&["audit", "verify"]);
+    let absent = common::absent_system_config(b.path());
+    let dev = b.run_cli(&[
+        "audit",
+        "verify",
+        "--system-config",
+        absent.to_str().unwrap(),
+    ]);
     assert!(!out(&dev).contains(&b.audit_dir().display().to_string()));
 }
 
@@ -1059,4 +1065,92 @@ fn broker_down_message() {
         "{}",
         err(&o)
     );
+}
+
+/// A locked daemon (own uid, an admin) for the resolver tests.
+fn locked_admin() -> TestDaemon {
+    TestDaemon::start(Opts {
+        extra: format!("[admin]\ngroups = [{:?}]\n", common::daemon::own_group()),
+        ..Opts::default()
+    })
+}
+
+#[test]
+fn locked_system_config_wins_over_running_broker() {
+    let d = locked_admin();
+    let b = TestBroker::start(None);
+    add_secret(&b, "gh", &["github"]);
+    // The host's system config says locked: the CLI goes to the locked
+    // daemon, never to the broker that is up on $XDG_RUNTIME_DIR.
+    let list = b
+        .cli(&["secret", "list", "--json"])
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", d.config())
+        .output()
+        .unwrap();
+    assert_eq!(list.status.code(), Some(0), "{}", err(&list));
+    let v: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["secrets"], json!([]), "the broker answered: {v}");
+    let f = value_file(&b, "v", &secret_value());
+    let add = b
+        .cli(&[
+            "secret",
+            "add",
+            "locked-one",
+            "--kind",
+            "token",
+            "--service",
+            "github",
+            "--from-file",
+            f.to_str().unwrap(),
+        ])
+        .env("SAIIFE_TEST_SYSTEM_CONFIG", d.config())
+        .output()
+        .unwrap();
+    assert_eq!(add.status.code(), Some(0), "{}", err(&add));
+    assert_eq!(names(&b), ["gh"]);
+    let locked_adds = d
+        .records()
+        .into_iter()
+        .filter(|r| r["event"] == "secret_add")
+        .count();
+    assert_eq!(locked_adds, 1, "{:?}", d.records());
+    // The broker saw one add only: the test's own `gh`.
+    let broker_adds = b
+        .records()
+        .into_iter()
+        .filter(|r| r["event"] == "secret_add")
+        .count();
+    assert_eq!(broker_adds, 1);
+}
+
+#[test]
+fn locked_daemon_at_personal_socket_is_not_a_broker() {
+    let d = locked_admin();
+    let b = TestBroker::prepare();
+    b.write_config("version = 2\n");
+    // The locked daemon's bound socket dir, moved to where the broker's
+    // would be and made 0700: every dir and uid check passes, only the
+    // hello (`mode = "locked"`) tells it apart.
+    fs::rename(d.socket_dir(), b.socket_dir()).unwrap();
+    fs::set_permissions(b.socket_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    let f = value_file(&b, "v", &secret_value());
+    let o = b.run_cli(&[
+        "secret",
+        "add",
+        "gh",
+        "--kind",
+        "token",
+        "--service",
+        "github",
+        "--from-file",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(err(&o).contains("not a personal broker"), "{}", err(&o));
+    let adds: Vec<Value> = d
+        .records()
+        .into_iter()
+        .filter(|r| r["event"] == "secret_add")
+        .collect();
+    assert!(adds.is_empty(), "{adds:?}");
 }

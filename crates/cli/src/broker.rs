@@ -62,8 +62,10 @@ pub(crate) fn resolve(
     if crate::audit_locked::locked_audit_dir(system_config)?.is_some() {
         return locked(system_config);
     }
+    // Only a marker that is certainly absent lets the broker in: any other
+    // failure to look (permission, I/O) is an error.
     let marker = system_config.with_file_name("installed.toml");
-    if std::fs::symlink_metadata(&marker).is_ok() {
+    if installed(&marker)? {
         return Err(format!(
             "locked mode is installed ({}) but {} does not say locked = true; the personal broker is not used on a locked host",
             marker.display(),
@@ -71,6 +73,19 @@ pub(crate) fn resolve(
         ));
     }
     personal(env)
+}
+
+/// Whether the locked-install marker exists: `false` only when it is
+/// certainly absent (`NotFound`); any other failure to look is an error.
+fn installed(marker: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(marker) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "cannot tell whether locked mode is installed ({}): {e}",
+            marker.display()
+        )),
+    }
 }
 
 /// The locked-mode target of `config`, which must say `locked = true`
@@ -109,17 +124,29 @@ fn owner_err(path: &Path, detail: impl Into<String>) -> ClientError {
     }
 }
 
-/// A connection to the target. For the personal broker the runtime dir
-/// and the socket dir must be the user's own (never root's or another
-/// uid's), the socket and the peer must be the user's uid, and the hello
-/// must say `mode = "personal"`.
+/// `c` when its hello says `mode = want`; else `Protocol(why)`.
+fn hello_mode(c: Client, want: &str, why: &str) -> Result<Client, ClientError> {
+    match c.hello_answer().get("mode").and_then(|m| m.as_str()) {
+        Some(m) if m == want => Ok(c),
+        _ => Err(ClientError::Protocol(why.into())),
+    }
+}
+
+/// A connection to the target. The hello must say the target's mode
+/// (`locked` or `personal`). For the personal broker the runtime dir and
+/// the socket dir must be the user's own (never root's or another uid's),
+/// and the socket and the peer must be the user's uid.
 pub(crate) fn connect(t: &Target, deadline: Instant) -> Result<Client, ClientError> {
     match t {
         Target::Locked {
             socket_dir,
             owner_uid,
             ..
-        } => Client::connect(socket_dir, *owner_uid, deadline),
+        } => hello_mode(
+            Client::connect(socket_dir, *owner_uid, deadline)?,
+            "locked",
+            "not the locked-mode daemon",
+        ),
         Target::Personal {
             socket_dir,
             owner_uid,
@@ -150,11 +177,11 @@ pub(crate) fn connect(t: &Target, deadline: Instant) -> Result<Client, ClientErr
             if let Err(e) = std::fs::symlink_metadata(&sock) {
                 return Err(ClientError::Connect(e));
             }
-            let c = Client::connect(socket_dir, *owner_uid, deadline)?;
-            match c.hello_answer().get("mode").and_then(|m| m.as_str()) {
-                Some("personal") => Ok(c),
-                _ => Err(ClientError::Protocol("not a personal broker".into())),
-            }
+            hello_mode(
+                Client::connect(socket_dir, *owner_uid, deadline)?,
+                "personal",
+                "not a personal broker",
+            )
         }
     }
 }
@@ -176,11 +203,22 @@ pub(crate) fn unreachable(t: &Target, e: &ClientError) -> String {
 /// The resolver for this process: the real `/etc/saiife/config.toml` and
 /// environment.
 pub(crate) fn resolve_here(config_flag: Option<&Path>) -> Result<Target, String> {
-    resolve(
-        config_flag,
-        Path::new(crate::audit_locked::SYSTEM_CONFIG),
-        &|k| std::env::var_os(k),
-    )
+    resolve(config_flag, &system_config(), &|k| std::env::var_os(k))
+}
+
+/// `/etc/saiife/config.toml`; debug builds take `SAIIFE_TEST_SYSTEM_CONFIG`
+/// (an absolute path), so a test never depends on the host's config.
+#[cfg(debug_assertions)]
+fn system_config() -> PathBuf {
+    std::env::var_os("SAIIFE_TEST_SYSTEM_CONFIG")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(crate::audit_locked::SYSTEM_CONFIG))
+}
+
+#[cfg(not(debug_assertions))]
+fn system_config() -> PathBuf {
+    PathBuf::from(crate::audit_locked::SYSTEM_CONFIG)
 }
 
 #[cfg(test)]
@@ -282,6 +320,15 @@ mod tests {
         fs::write(etc.with_file_name("installed.toml"), "").unwrap();
         let e = resolve(None, &etc, &w.env()).unwrap_err();
         assert!(e.contains("locked mode is installed"), "{e}");
+        // A marker that cannot be looked at (not NotFound) refuses too.
+        let odd = w.root.join("file-not-dir");
+        fs::write(&odd, "").unwrap();
+        let e = installed(&odd.join("installed.toml")).unwrap_err();
+        assert!(
+            e.contains("cannot tell whether locked mode is installed"),
+            "{e}"
+        );
+        assert_eq!(installed(&w.root.join("absent.toml")), Ok(false));
     }
 
     #[test]
