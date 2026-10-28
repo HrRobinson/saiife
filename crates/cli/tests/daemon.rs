@@ -30,15 +30,17 @@ fn assert_verifies(d: &TestDaemon) -> String {
 
 #[test]
 fn daemon_requires_system_flag() {
-    for args in [&["daemon"][..], &["daemon", "--user"][..]] {
+    // No flag, or both: exit 2, naming the flags.
+    for args in [&["daemon"][..], &["daemon", "--system", "--user"][..]] {
         let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
             .args(args)
+            .env_remove("XDG_RUNTIME_DIR")
             .output()
             .unwrap();
         assert_eq!(o.status.code(), Some(2), "{args:?}");
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(err.contains("--system"), "{err}");
-        assert!(err.contains("after v2.0"), "{err}");
+        assert!(err.contains("--user"), "{err}");
     }
 }
 

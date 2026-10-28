@@ -974,6 +974,16 @@ impl ChainWriter {
         self.host.as_deref()
     }
 
+    /// The `mode` this writer stamps on its own records (`WriterOptions`).
+    pub fn mode(&self) -> &str {
+        &self.opts.mode
+    }
+
+    /// Whether this writer has a signing key (checkpoints, key rotation).
+    pub fn signs(&self) -> bool {
+        self.opts.key.is_some()
+    }
+
     /// Records appended since the last checkpoint.
     pub fn records_since_checkpoint(&self) -> u64 {
         self.since_checkpoint

@@ -270,7 +270,10 @@ impl Writer {
         }
     }
 
-    fn append(&mut self, rec: Record) -> Result<u64, String> {
+    fn append(&mut self, mut rec: Record) -> Result<u64, String> {
+        // Every record says which daemon wrote it: connector records the
+        // broker pipeline labels by its policy mode included (decision 4).
+        rec.mode = Some(self.cw.mode().into());
         // Test seam, debug builds only: the writer dies on a guard record.
         #[cfg(debug_assertions)]
         if rec.kind() == "guard"
@@ -304,6 +307,11 @@ impl Writer {
 
     fn checkpoint(&mut self) -> Result<Option<u64>, String> {
         self.last_checkpoint_at = Instant::now();
+        // A chain without a signing key (the personal broker, §6.4.4) has
+        // no checkpoints: nothing to do.
+        if !self.cw.signs() {
+            return Ok(None);
+        }
         let r = self.cw.checkpoint(time::OffsetDateTime::now_utc());
         self.publish();
         let seq = r.map_err(|e| format!("audit checkpoint failed: {e}"))?;

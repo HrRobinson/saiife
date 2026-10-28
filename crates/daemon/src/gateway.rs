@@ -179,6 +179,11 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
+    // The personal broker serves its own uid only (decision 3): another
+    // uid, root included, is closed before the request is read.
+    if ctx.mode == crate::ops::Mode::Personal && !crate::personal::admits(ctx.own_uid, peer.uid) {
+        return;
+    }
     // The control socket's open-connection caps, shared: idle HTTP
     // connections count against the same 32 per uid.
     let _slot = match ctx.conns.try_open(peer.uid) {
@@ -1220,5 +1225,45 @@ mod tests {
         ]
         .into();
         assert_eq!(next_header(&n).unwrap(), "since_id=42&status=a%20b%26c");
+    }
+}
+
+#[cfg(test)]
+mod personal_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Serve one end of a socket pair as `ctx`, send a request from the
+    /// other; what came back before EOF.
+    async fn answer_bytes(ctx: Arc<Ctx>) -> Vec<u8> {
+        let (mut ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(theirs, ctx, Opts::default()));
+        let _ = ours
+            .write_all(b"GET /v1/services HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n")
+            .await;
+        let mut got = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the connection was not closed");
+        let _ = task.await;
+        got
+    }
+
+    #[tokio::test]
+    async fn foreign_uid_gateway_closed() {
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) =
+            crate::ops::test_ctx(t.path(), crate::ops::Mode::Personal, me.wrapping_add(1));
+        let got = answer_bytes(ctx).await;
+        assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+        // The own uid gets an HTTP answer on the same kind of pair.
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Personal, me);
+        let got = answer_bytes(ctx).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "{}",
+            String::from_utf8_lossy(&got)
+        );
     }
 }

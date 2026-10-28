@@ -1349,6 +1349,7 @@ dependencies = [
  "saiife-daemon",
  "saiife-guard",
  "saiife-ipc",
+ "saiife-keychain",
  "saiife-policy",
  "saiife-system",
  "serde",

@@ -69,6 +69,10 @@ async fn on_store<T: Send + 'static>(
 /// group). Lookups are the context's cached, off-thread ones; any failure
 /// is no.
 pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
+    // The personal broker: its own user approves (§6.10.2).
+    if ctx.mode == crate::ops::Mode::Personal {
+        return uid == ctx.own_uid;
+    }
     let approvers = match ctx.policy().system {
         Some(s) => s.approval.approvers.clone(),
         None => return false,
@@ -506,6 +510,8 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // client's; the lookups and any re-authentication off the runtime.
     let refusal = if cancel {
         None
+    } else if ctx.mode == crate::ops::Mode::Personal {
+        crate::approvers::personal_may_decide(ctx.own_uid, peer.uid).err()
     } else {
         match ctx.name_of(peer.uid).await {
             None => Some(Refusal::NotApprover),

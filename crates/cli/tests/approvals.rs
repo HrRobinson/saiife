@@ -19,7 +19,6 @@ use common::daemon::{own_group, own_uid, own_user, wait_for};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use saiife_audit::{ChainWriter, WriterOptions};
-use saiife_broker::limits::Limiter;
 use saiife_daemon::approvals::{dir_in, State};
 use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
 use saiife_daemon::sessions::RealProc;
@@ -356,43 +355,36 @@ fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
         .build()
         .unwrap();
     let ctx = rt.block_on(async {
+        let writer_cfg = WriterConfig {
+            checkpoint_every: 1000,
+            checkpoint_interval: Duration::from_secs(900),
+            fsync: Fsync::Always,
+        };
+        let directory = Arc::new(FixedDirectory::from_text(&passwd, &group));
+        let state = t.join("state");
         Arc::new(Ctx::new(CtxInit {
-            writer: handle,
-            writer_cfg: WriterConfig {
-                checkpoint_every: 1000,
-                checkpoint_interval: Duration::from_secs(900),
-                fsync: Fsync::Always,
-            },
-            directory: Arc::new(FixedDirectory::from_text(&passwd, &group)),
             own_uid: uid,
             own_user: me,
             audit_dir: t.join("audit"),
             socket_dir: t.join("run"),
-            key_path: t.join("state/keys/audit.ed25519"),
             config_path: t.join("etc/config.toml"),
-            catalog: Vec::new(),
             policy,
             proc: Box::new(RealProc::new(t.join("proc"))),
             vault,
             vault_path,
-            limiter: Limiter::new(),
             upstream,
             backup_dir: t.join("state/import-backup"),
             tokens: Arc::new(saiife_daemon::tokens::Tokens::memory_with_clock(Arc::new(
                 || 1_800_000_000,
             ))),
-            approvals: saiife_daemon::approvals::Store::open(&dir_in(&t.join("state")))
+            approvals: saiife_daemon::approvals::Store::open(&dir_in(&state))
                 .map(|s| match result_cap {
                     Some(c) => s.with_result_cap(c),
                     None => s,
                 })
                 .map_err(|e| e.to_string()),
             lockdown: saiife_daemon::lockdown::Store::memory(),
-            grants: saiife_daemon::grants::Grants::open(
-                saiife_daemon::grants::path_in(&t.join("state")),
-                std::time::SystemTime::now(),
-            )
-            .0,
+            ..CtxInit::minimal(handle, writer_cfg, directory, &state)
         }))
     });
     // The control socket (the CLI's) and the HTTP gateway.

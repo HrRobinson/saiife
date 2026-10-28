@@ -260,6 +260,9 @@ pub fn free_change(cur: Option<&Lockdown>, next: Option<LockScope>) -> bool {
 /// `"reauth"` it must pass polkit re-authentication (an unavailable one
 /// refuses). Runs off the runtime thread (the prompt can take 120 s).
 async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn, detail: &'static str) -> Result<(), Refusal> {
+    if ctx.mode == crate::ops::Mode::Personal {
+        return crate::approvers::personal_may_decide(ctx.own_uid, conn.peer.uid);
+    }
     let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
         return Err(Refusal::NotApprover);
     };

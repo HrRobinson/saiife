@@ -19,8 +19,7 @@ use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request, OP_API_LIST, OP_API_RESULT};
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    scope_for, Directory, GroupEntry, Mode, PolicyError, Scope, ServiceOverlay, SystemConfig,
-    UserEntry,
+    scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceOverlay, SystemConfig, UserEntry,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -321,11 +320,11 @@ fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
 }
 
 /// A snapshot for the record of a call made without a valid policy.
-fn no_policy_snapshot(hash: Option<String>) -> PolicySnapshot {
+fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
     PolicySnapshot {
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
-        mode: Mode::Locked,
+        mode: mode.policy_mode(),
     }
 }
 
@@ -447,7 +446,7 @@ pub(crate) async fn execute(
             },
             Trace::default(),
             Arc::new(GatewayPolicy {
-                snap: no_policy_snapshot(state.hash.clone()),
+                snap: no_policy_snapshot(state.hash.clone(), ctx.mode),
                 catalog: Default::default(),
             }),
         ),
@@ -676,6 +675,17 @@ pub(crate) async fn services_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_policy_snapshot_mode_follows_ctx() {
+        use crate::ops::Mode;
+        use saiife_policy::Mode as PolicyMode;
+        let p = no_policy_snapshot(Some("sha256:x".into()), Mode::Personal);
+        assert_eq!(p.mode, PolicyMode::Developer);
+        assert_eq!(p.hash, "sha256:x");
+        let l = no_policy_snapshot(None, Mode::Locked);
+        assert_eq!(l.mode, PolicyMode::Locked);
+    }
 
     #[test]
     fn parse_call_refuses_without_echoing_values() {
