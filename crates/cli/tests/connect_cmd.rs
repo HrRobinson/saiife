@@ -369,6 +369,124 @@ fn salesforce_connect_stores_an_oauth2_secret() {
     validate(&loaded.config, &Catalog::new(builtin(), vec![])).expect("validates");
 }
 
+/// A cloud secret file's JSON for the vault kind `kind`, built at runtime
+/// so no token-shaped literal is in the source.
+fn cloud_secret_json(kind: &str) -> String {
+    let akid = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+    let guid = "0123abcd-4567-89ab-cdef-0123456789ab";
+    let pem = [
+        "-----BEGIN ",
+        "PRIVATE KEY-----\nTESTBODYTESTBODY0001\n-----END ",
+        "PRIVATE KEY-----\n",
+    ]
+    .concat();
+    match kind {
+        "aws" => serde_json::json!({
+            "access_key_id": akid,
+            "secret_access_key": format!("sk-{}", "k9".repeat(18)),
+        }),
+        "azure_sp" => serde_json::json!({
+            "tenant_id": guid, "client_id": guid,
+            "client_secret": format!("cs-{}", "z3".repeat(12)),
+        }),
+        "gcp_sa" => serde_json::json!({
+            "client_email": "sa@p.iam.gserviceaccount.com",
+            "private_key": pem,
+            "private_key_id": "abcd1234",
+        }),
+        _ => unreachable!(),
+    }
+    .to_string()
+}
+
+fn vault_kind(auth: &str) -> Option<&'static str> {
+    match auth {
+        "aws_sigv4" => Some("aws"),
+        "gcp_sa" => Some("gcp_sa"),
+        "azure_sp" => Some("azure_sp"),
+        _ => None,
+    }
+}
+
+fn secret_kinds(d: &TestDaemon) -> BTreeMap<String, String> {
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["secret", "list", "--json", "--system-config"])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("XDG_RUNTIME_DIR", d.path().join("no-runtime"))
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    v["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().unwrap().to_string(),
+                s["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn connect_aws_writes_commented_sts_block() {
+    let d = admin();
+    let file = d.path().join("aws.json");
+    fs::write(&file, cloud_secret_json("aws")).unwrap();
+    let o = connect(
+        &d,
+        &[
+            "aws-s3",
+            "--param",
+            "region=eu-west-1",
+            "--from-file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(secret_kinds(&d)["aws-s3"], "aws");
+    let text = fs::read_to_string(policy_file(&d, "aws-s3.toml")).unwrap();
+    for line in [
+        "# mode = \"sts\"",
+        "# [services.aws-s3.cloud]",
+        "# role_arn = ",
+        "# run_allow = ",
+        "docs/connectors/aws-s3.md",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    // Every STS line is a comment: the service stays in sign mode.
+    let loaded = load_system(&d.config()).expect("loads");
+    assert_eq!(
+        loaded.config.services["aws-s3"].mode,
+        saiife_policy::CloudMode::Sign
+    );
+    assert!(!text.contains("IOSFODNN7EXAMPLE"));
+}
+
+#[test]
+fn connect_gcp_needs_from_file() {
+    let d = admin();
+    for extra in [&[][..], &["--from-env", "CONNECT_TEST_TOKEN"][..]] {
+        let mut args = vec!["gcp-storage"];
+        args.extend_from_slice(extra);
+        let o = connect(&d, &args);
+        assert_eq!(o.status.code(), Some(2));
+        assert!(err(&o).contains("--from-file"), "{}", err(&o));
+    }
+    assert!(secrets(&d).is_empty());
+    assert!(!policy_file(&d, "gcp-storage.toml").exists());
+    let file = d.path().join("sa.json");
+    fs::write(&file, cloud_secret_json("gcp_sa")).unwrap();
+    let o = connect(&d, &["gcp-storage", "--from-file", file.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(secret_kinds(&d)["gcp-storage"], "gcp_sa");
+}
+
 /// A value that passes the manifest's own check for each required param.
 fn test_params(m: &saiife_broker::manifest::Manifest) -> Vec<String> {
     const TRIES: [&str; 10] = [
@@ -419,7 +537,15 @@ fn connect_every_builtin_generates_deny_all() {
         let mut args = vec![m.id.as_str()];
         let given = test_params(m);
         args.extend(given.iter().map(String::as_str));
-        args.extend(["--from-env", "CONNECT_TEST_VALUE"]);
+        let file = d.path().join(format!("{}.secret.json", m.id));
+        let kind = m.auth.first().and_then(|a| vault_kind(&a.kind));
+        match kind {
+            Some(k) => {
+                fs::write(&file, cloud_secret_json(k)).unwrap();
+                args.extend(["--from-file", file.to_str().unwrap()]);
+            }
+            None => args.extend(["--from-env", "CONNECT_TEST_VALUE"]),
+        }
         let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
             .arg("connect")
             .args(&args)

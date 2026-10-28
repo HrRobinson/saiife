@@ -45,6 +45,9 @@ pub enum BrokerError {
     UnknownOperation(String),
     #[error("manifest: {0}")]
     Manifest(String),
+    /// A `[services.*]` setting that does not fit its connector.
+    #[error("service config: {0}")]
+    Config(String),
     #[error("unknown connector {0:?}")]
     UnknownConnector(String),
     #[error("missing required parameter {0:?}")]
