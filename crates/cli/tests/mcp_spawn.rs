@@ -33,11 +33,16 @@ fn tempdir() -> TempDir {
 
 struct T {
     dir: TempDir,
+    /// `$CREDENTIALS_DIRECTORY` for the helper, as systemd sets it.
+    creds: Option<PathBuf>,
 }
 
 impl T {
     fn new() -> T {
-        let t = T { dir: tempdir() };
+        let t = T {
+            dir: tempdir(),
+            creds: None,
+        };
         std::fs::create_dir(t.home()).unwrap();
         std::fs::set_permissions(t.home(), std::fs::Permissions::from_mode(0o700)).unwrap();
         t
@@ -56,6 +61,7 @@ impl T {
             // The fake is the test binary: its dir must be readable.
             read_paths: vec![Path::new(BIN).parent().unwrap().to_path_buf()],
             sandbox,
+            protected: vec![],
         }
     }
 }
@@ -118,6 +124,7 @@ fn run_raw(t: &T, stdin: &[u8], sh_fds: &[i32]) -> Out {
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
         .current_dir(t.dir.path())
         .stdin(Stdio::piped())
+        .envs(t.creds.iter().map(|c| ("CREDENTIALS_DIRECTORY", c)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = c.spawn().unwrap();
@@ -448,4 +455,86 @@ fn exec_outside_allow_list_refused() {
         out.stderr
     );
     assert!(!out.stderr.contains(BIN), "{}", out.stderr);
+}
+
+/// A refused spawn: exit 126, this reason, and the server never ran.
+fn assert_read_path_refused(out: &Out, why: &str) {
+    if landlock_abi() == 0 {
+        return assert_fallback_refused(out);
+    }
+    assert_eq!(out.code, Some(126), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(&format!("a read path {why}")),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stdout.is_empty(), "the server ran: {}", out.stdout);
+}
+
+/// Policy load saw a harmless path; by spawn time it is a symlink to a
+/// protected dir (here a temp stand-in for the daemon's state dir, passed
+/// in the spec as the daemon passes its real layout). The helper resolves
+/// the opened path and refuses.
+#[test]
+fn read_path_symlinked_to_protected_after_load_refused_at_spawn() {
+    let t = T::new();
+    let state = t.dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("vault.age"), "vault-contents").unwrap();
+    let harmless = t.dir.path().join("docs");
+    std::fs::create_dir(&harmless).unwrap();
+    std::fs::write(harmless.join("a.txt"), "doc").unwrap();
+    let link = t.dir.path().join("shared");
+    std::os::unix::fs::symlink(&harmless, &link).unwrap();
+
+    let mut spec = t.spec(Sandbox::Landlock);
+    spec.read_paths.push(link.clone());
+    spec.protected = vec![state.clone()];
+    // As loaded: the link points somewhere harmless and is allowed.
+    let out = run(
+        &t,
+        &spec,
+        &[("read_file", json!({"path": link.join("a.txt")}))],
+    );
+    if landlock_abi() == 0 {
+        return assert_fallback_refused(&out);
+    }
+    assert_eq!(out.text(2), "doc");
+
+    // Re-pointed after load.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&state, &link).unwrap();
+    let out = run(
+        &t,
+        &spec,
+        &[("read_file", json!({"path": link.join("vault.age")}))],
+    );
+    assert_read_path_refused(&out, "reaches saiife's own files");
+    assert!(!out.stderr.contains("vault"), "{}", out.stderr);
+
+    // A dir that holds a protected one is refused too.
+    let mut spec2 = t.spec(Sandbox::Landlock);
+    spec2.read_paths.push(t.dir.path().to_path_buf());
+    spec2.protected = vec![state];
+    assert_read_path_refused(&run(&t, &spec2, &[]), "reaches saiife's own files");
+}
+
+#[test]
+fn read_path_in_credentials_directory_refused() {
+    let mut t = T::new();
+    let creds = t.dir.path().join("credentials");
+    std::fs::create_dir(&creds).unwrap();
+    std::fs::write(creds.join("vault-key"), "key").unwrap();
+    t.creds = Some(creds.clone());
+    let mut spec = t.spec(Sandbox::Landlock);
+    spec.read_paths.push(creds);
+    assert_read_path_refused(&run(&t, &spec, &[]), "reaches saiife's own files");
+}
+
+#[test]
+fn read_path_that_cannot_be_opened_fails_closed() {
+    let t = T::new();
+    let mut spec = t.spec(Sandbox::Landlock);
+    spec.read_paths.push(t.dir.path().join("absent"));
+    assert_read_path_refused(&run(&t, &spec, &[]), "cannot be opened");
 }

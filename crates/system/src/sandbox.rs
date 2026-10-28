@@ -25,10 +25,10 @@
 //! daemon and the helper need no `unsafe` to hand over a descriptor.
 
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, RestrictionStatus,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd,
+    RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
-use saiife_policy::mcp::child_env_var_allowed;
+use saiife_policy::mcp::{child_env_var_allowed, PROTECTED_DIRS};
 pub use saiife_policy::Sandbox;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
@@ -88,6 +88,11 @@ pub struct SpawnSpec {
     /// Extra read-only paths (`[mcp.<name>] read_paths`).
     pub read_paths: Vec<PathBuf>,
     pub sandbox: Sandbox,
+    /// The daemon's own dirs as it really runs (config, state, audit log,
+    /// sockets, credentials): no read path may reach them. Added to
+    /// [`PROTECTED_DIRS`] and `$CREDENTIALS_DIRECTORY`, never instead.
+    #[serde(default)]
+    pub protected: Vec<PathBuf>,
 }
 
 /// Names only: never the secret values.
@@ -101,6 +106,7 @@ impl fmt::Debug for SpawnSpec {
             .field("home", &self.home)
             .field("read_paths", &self.read_paths)
             .field("sandbox", &self.sandbox)
+            .field("protected", &self.protected)
             .finish()
     }
 }
@@ -120,6 +126,9 @@ pub enum SandboxError {
     Ruleset,
     #[error("the Landlock ruleset is not fully enforced")]
     NotEnforced,
+    /// A `read_paths` entry, checked at spawn.
+    #[error("a read path {0}")]
+    ReadPath(&'static str),
 }
 
 impl SandboxError {
@@ -130,6 +139,7 @@ impl SandboxError {
             SandboxError::NoNewPrivs => "no_new_privs_failed",
             SandboxError::Unavailable => "sandbox_unavailable",
             SandboxError::Ruleset | SandboxError::NotEnforced => "sandbox_failed",
+            SandboxError::ReadPath(_) => "read_path_refused",
         }
     }
 }
@@ -146,6 +156,9 @@ impl SpawnSpec {
         }
         if self.read_paths.iter().any(|p| !p.is_absolute()) {
             return bad("a read path is not absolute");
+        }
+        if self.protected.iter().any(|p| !p.is_absolute()) {
+            return bad("a protected dir is not absolute");
         }
         if self.args.iter().any(|a| a.contains('\0')) {
             return bad("an argument holds a NUL");
@@ -383,14 +396,93 @@ pub fn apply(spec: &SpawnSpec) -> Result<(), SandboxError> {
     if n == 0 {
         return Err(SandboxError::Unavailable);
     }
-    let status = restrict(spec, abi_of(n)).map_err(|_| SandboxError::Ruleset)?;
+    let abi = abi_of(n);
+    let extra = checked_read_paths(spec, abi)?;
+    let status = restrict(spec, abi, extra).map_err(|_| SandboxError::Ruleset)?;
     if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
         return Err(SandboxError::NotEnforced);
     }
     Ok(())
 }
 
-fn restrict(spec: &SpawnSpec, abi: ABI) -> Result<RestrictionStatus, landlock::RulesetError> {
+/// The dirs no `read_paths` entry may equal, sit beneath or contain:
+/// [`PROTECTED_DIRS`] (the fallback defaults), `$CREDENTIALS_DIRECTORY`
+/// when the helper inherited it, and the daemon's own layout from the
+/// spec ([`SpawnSpec::protected`]), each also as resolved on disk.
+pub fn protected_dirs(spec: &SpawnSpec) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = PROTECTED_DIRS.iter().map(PathBuf::from).collect();
+    if let Some(c) = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
+        if c.is_absolute() {
+            out.push(c);
+        }
+    }
+    out.extend(spec.protected.iter().cloned());
+    let resolved: Vec<PathBuf> = out
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    out.extend(resolved);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn overlaps(real: &Path, protected: &[PathBuf]) -> bool {
+    real == Path::new("/")
+        || protected
+            .iter()
+            .any(|d| real.starts_with(d) || d.starts_with(real))
+}
+
+/// The `read_paths` rules, checked against the protected dirs at spawn
+/// time (policy load checked the names; a symlink may have changed since).
+/// Each path is opened once (`O_PATH`); its real location is read back
+/// from that descriptor (`/proc/self/fd/N`) and compared by path and by
+/// device and inode; the Landlock rule is built from the same descriptor,
+/// so what was checked is what is allowed. A path that cannot be opened
+/// or resolved fails closed.
+fn checked_read_paths(
+    spec: &SpawnSpec,
+    abi: ABI,
+) -> Result<Vec<PathBeneath<PathFd>>, SandboxError> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let protected = protected_dirs(spec);
+    let protected_ids: Vec<(u64, u64)> = protected
+        .iter()
+        .filter_map(|d| rustix::fs::stat(d).ok())
+        .map(|s| (s.st_dev, s.st_ino))
+        .collect();
+    let read = AccessFs::from_read(abi);
+    let mut rules = Vec::with_capacity(spec.read_paths.len());
+    for p in &spec.read_paths {
+        let fd = PathFd::new(p).map_err(|_| SandboxError::ReadPath("cannot be opened"))?;
+        let real = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()))
+            .map_err(|_| SandboxError::ReadPath("cannot be resolved"))?;
+        let st =
+            rustix::fs::fstat(&fd).map_err(|_| SandboxError::ReadPath("cannot be resolved"))?;
+        if !real.is_absolute()
+            || overlaps(&real, &protected)
+            || protected_ids.contains(&(st.st_dev, st.st_ino))
+        {
+            return Err(SandboxError::ReadPath("reaches saiife's own files"));
+        }
+        let is_dir =
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory;
+        let access = if is_dir {
+            read
+        } else {
+            read & AccessFs::from_file(abi)
+        };
+        rules.push(PathBeneath::new(fd, access));
+    }
+    Ok(rules)
+}
+
+fn restrict(
+    spec: &SpawnSpec,
+    abi: ABI,
+    checked: Vec<PathBeneath<PathFd>>,
+) -> Result<RestrictionStatus, landlock::RulesetError> {
     let read = AccessFs::from_read(abi);
     let all = AccessFs::from_all(abi);
     // Home and /dev/null are writable but never executable: a server may
@@ -408,7 +500,6 @@ fn restrict(spec: &SpawnSpec, abi: ABI) -> Result<RestrictionStatus, landlock::R
         .map(PathBuf::from)
         .collect();
     read_paths.extend(proc_self);
-    read_paths.extend(spec.read_paths.iter().cloned());
     let rw_paths = [spec.home.clone(), PathBuf::from("/dev/null")];
 
     let mut r = Ruleset::default()
@@ -420,6 +511,7 @@ fn restrict(spec: &SpawnSpec, abi: ABI) -> Result<RestrictionStatus, landlock::R
     // Paths that do not exist are left out: nothing there to allow.
     r.create()?
         .add_rules(path_beneath_rules(&read_paths, read))?
+        .add_rules(checked.into_iter().map(Ok::<_, landlock::RulesetError>))?
         .add_rules(path_beneath_rules(&rw_paths, rw))?
         .restrict_self()
 }
@@ -438,6 +530,7 @@ mod tests {
             )],
             home: PathBuf::from("/var/lib/saiife/mcp/x"),
             read_paths: vec![],
+            protected: vec![],
             sandbox: Sandbox::Landlock,
         }
     }

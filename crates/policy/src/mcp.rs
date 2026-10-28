@@ -73,28 +73,41 @@ pub fn valid_server_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// saiife's own dirs: a gateway child may never be given read access to
-/// them, or to a dir that holds them.
-pub const PROTECTED_DIRS: [&str; 4] = [
+/// saiife's own dirs in the default layout: a gateway child may never be
+/// given read access to them, or to a dir that holds them.
+/// `/run/credentials` is where systemd puts the vault key credential.
+/// These are the fallback: the spawn helper also checks the daemon's real
+/// layout and `$CREDENTIALS_DIRECTORY` (saiife_system::sandbox).
+pub const PROTECTED_DIRS: [&str; 5] = [
     "/etc/saiife",
     "/var/lib/saiife",
     "/var/log/saiife",
     "/run/saiife",
+    "/run/credentials",
 ];
+
+/// [`PROTECTED_DIRS`] plus `$CREDENTIALS_DIRECTORY` when it is set (the
+/// daemon under systemd loads policy with it).
+fn protected_now() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = PROTECTED_DIRS.iter().map(PathBuf::from).collect();
+    if let Some(c) = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from) {
+        if c.is_absolute() {
+            v.push(c);
+        }
+    }
+    v
+}
 
 /// Whether a `read_paths` entry would open saiife's own files to the
 /// server: `/`, any `..`, or a path equal to, beneath or above a
-/// [`PROTECTED_DIRS`] entry. Compared lexically and, when the path
-/// exists, also after resolving symlinks.
+/// protected dir ([`protected_now`]). Compared lexically and, when the
+/// path exists, also after resolving symlinks. The spawn helper checks
+/// again on the opened path, so a symlink changed after load is caught.
 fn exposes_saiife(p: &Path) -> bool {
     use std::path::Component;
-    let hits = |p: &Path| {
-        p == Path::new("/")
-            || PROTECTED_DIRS.iter().any(|d| {
-                let d = Path::new(d);
-                p.starts_with(d) || d.starts_with(p)
-            })
-    };
+    let dirs = protected_now();
+    let hits =
+        |p: &Path| p == Path::new("/") || dirs.iter().any(|d| p.starts_with(d) || d.starts_with(p));
     p.components().any(|c| c == Component::ParentDir)
         || hits(p)
         || std::fs::canonicalize(p).is_ok_and(|r| hits(&r))
@@ -299,6 +312,8 @@ mod tests {
             "/run",
             "/run/saiife",
             "/run/saiife/sockets",
+            "/run/credentials",
+            "/run/credentials/saiife.service",
             "/usr/share/../../etc/saiife",
             "/opt/x/..",
         ];

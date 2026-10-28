@@ -81,6 +81,7 @@ mod tests {
             home: PathBuf::from("/h"),
             read_paths: vec![],
             sandbox: Sandbox::Landlock,
+            protected: vec![],
         }
     }
 
