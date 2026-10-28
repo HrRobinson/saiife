@@ -4,8 +4,8 @@
 pub mod jwt;
 pub mod session_policy;
 pub mod sigv4;
-pub mod token;
 pub mod sts;
+pub mod token;
 
 use crate::BrokerError;
 
