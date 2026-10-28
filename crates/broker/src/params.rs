@@ -251,8 +251,20 @@ fn type_of(op: &Operation, name: &str) -> Result<Option<(ParamType, Place)>, Bro
     }
     // Body params are checked like query params (decision 2), except that
     // `\n` and `\t` are allowed.
+    // A param that fills the capability qualifier never takes a line break
+    // or a tab: a multi-line qualifier would be read differently by the
+    // policy matcher and by whatever shows or records it.
     if let Some(t) = op.body_params.get(name) {
-        return Ok(Some((ParamType::parse(t, None)?, Place::Body)));
+        let in_qualifier = op
+            .qualifier
+            .as_deref()
+            .is_some_and(|q| q.contains(&format!("{{{name}}}")));
+        let place = if in_qualifier {
+            Place::Query
+        } else {
+            Place::Body
+        };
+        return Ok(Some((ParamType::parse(t, None)?, place)));
     }
     Ok(None)
 }

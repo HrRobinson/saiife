@@ -1078,6 +1078,47 @@ body_params = { content = "string" }
 }
 
 #[test]
+fn qualifier_params_refuse_control_characters() {
+    let m = body_manifest(
+        r#"
+[[operation]]
+id = "chat.postMessage"
+capability = "messages:write"
+qualifier = "channel={channel}"
+kind = "write"
+method = "POST"
+path = "/chat.postMessage"
+body = "json"
+body_params = { channel = "string", text = "string" }
+"#,
+    );
+    let op = named(&m, "chat.postMessage").unwrap();
+    for ch in ["general\nrandom", "general\trandom", "general\r"] {
+        let err = saiife_broker::params::validate(
+            op,
+            &map(&[("channel", ch), ("text", "hi")]),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BrokerError::BadValue { ref name, .. } if name == "channel"),
+            "{ch:?}: {err:?}"
+        );
+    }
+    // The message text in the same op may still span lines.
+    let p = saiife_broker::params::validate(
+        op,
+        &map(&[("channel", "general"), ("text", "line 1\nline 2\tend")]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        saiife_broker::manifest::qualifier_for(op, &p).as_deref(),
+        Some("channel=general")
+    );
+}
+
+#[test]
 fn host_param_refuses_ip_literals() {
     for ip in ["169.254.169.254", "127.0.0.1", "10.0.0.1", "::1", "fe80::1"] {
         assert!(!saiife_broker::request::bare_hostname(ip), "{ip}");
