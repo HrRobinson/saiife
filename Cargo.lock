@@ -1301,6 +1301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-keychain"
+version = "0.2.0"
+dependencies = [
+ "security-framework",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "saiife-policy"
 version = "0.2.0"
 dependencies = [
