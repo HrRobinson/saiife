@@ -30,11 +30,16 @@ sees the key or the token. The manifest is
 | `storage.objects.get` | `storage:read` | read | `GET /storage/v1/b/{bucket}/o/{object}` | `storage.objects.get` |
 | `storage.objects.download` | `storage:read` | read | `GET /storage/v1/b/{bucket}/o/{object}?alt=media` | `storage.objects.get` |
 | `storage.objects.insert` | `storage:write` | write | `POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={name}` | `storage.objects.create` |
-| `storage.objects.delete` | `storage:delete` | write | `DELETE /storage/v1/b/{bucket}/o/{object}` | `storage.objects.delete` |
+| `storage.objects.delete` | `storage:delete` | delete | `DELETE /storage/v1/b/{bucket}/o/{object}` | `storage.objects.delete` |
 
 The qualifier is `projects/_/buckets/{bucket}` for the list and
 `projects/_/buckets/{bucket}/objects/{object}` (or `{name}` for an upload)
 for the object operations.
+
+The upload's qualifier is filled from the `name` query parameter. Query
+parameters are not enforced as required, so an upload without `name` has no
+object in its qualifier: a qualified `allow` does not match it, and the call
+is denied (it fails closed). Google refuses such an upload as well.
 
 Parameters:
 

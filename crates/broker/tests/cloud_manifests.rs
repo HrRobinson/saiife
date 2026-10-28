@@ -330,18 +330,20 @@ fn cloud_ops_have_iam_action() {
     assert_eq!(total, want.len());
 }
 
-/// Every operation that changes something is a write (so it can go under
-/// `ask`), and every read is a GET or HEAD.
+/// Every read is a GET or HEAD, every DELETE is a delete op (so
+/// `deletes_per_day` counts it) and every other change is a write. The
+/// docs put both kinds under `ask`.
 #[test]
 fn cloud_changes_are_writes() {
     for m in builtin().iter().filter(|m| IDS.contains(&m.id.as_str())) {
         for op in &m.operation {
-            let safe = op.method == "GET" || op.method == "HEAD";
-            if safe {
-                assert_eq!(op.kind, OpKind::Read, "{}: {}", m.id, op.id);
-            } else {
-                assert_eq!(op.kind, OpKind::Write, "{}: {}", m.id, op.id);
-            }
+            let want = match op.method.as_str() {
+                "GET" | "HEAD" => OpKind::Read,
+                // Counted by `deletes_per_day`.
+                "DELETE" => OpKind::Delete,
+                _ => OpKind::Write,
+            };
+            assert_eq!(op.kind, want, "{}: {}", m.id, op.id);
         }
     }
 }

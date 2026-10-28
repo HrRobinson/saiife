@@ -79,7 +79,7 @@ iam_action = "s3:PutObject"
 id = "s3.delete_object"
 capability = "s3:delete"
 qualifier = "arn:aws:s3:::{bucket}/{key}"
-kind = "write"
+kind = "delete"
 method = "DELETE"
 path = "/{bucket}/{key}"
 path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", key = "objectkey" }

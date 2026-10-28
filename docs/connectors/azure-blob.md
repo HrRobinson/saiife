@@ -32,7 +32,7 @@ embedded at build time.
 | `blobs.list` | `blobs:read` | read | `GET /{container}?restype=container&comp=list` | `.../containers/blobs/read` |
 | `blobs.get` | `blobs:read` | read | `GET /{container}/{blob}` | `.../containers/blobs/read` |
 | `blobs.put` | `blobs:write` | write | `PUT /{container}/{blob}` | `.../containers/blobs/write` |
-| `blobs.delete` | `blobs:delete` | write | `DELETE /{container}/{blob}` | `.../containers/blobs/delete` |
+| `blobs.delete` | `blobs:delete` | delete | `DELETE /{container}/{blob}` | `.../containers/blobs/delete` |
 
 The data actions start with
 `Microsoft.Storage/storageAccounts/blobServices`. The qualifier is

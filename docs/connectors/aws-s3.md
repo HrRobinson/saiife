@@ -38,7 +38,7 @@ manifest is `crates/broker/connectors/aws-s3.toml`, embedded at build time.
 | `s3.get_object` | `s3:read` | read | `GET /{bucket}/{key}` | `s3:GetObject` |
 | `s3.head_object` | `s3:read` | read | `HEAD /{bucket}/{key}` | `s3:GetObject` |
 | `s3.put_object` | `s3:write` | write | `PUT /{bucket}/{key}` | `s3:PutObject` |
-| `s3.delete_object` | `s3:delete` | write | `DELETE /{bucket}/{key}` | `s3:DeleteObject` |
+| `s3.delete_object` | `s3:delete` | delete | `DELETE /{bucket}/{key}` | `s3:DeleteObject` |
 
 The qualifier is the S3 ARN: `arn:aws:s3:::{bucket}` for the list and
 `arn:aws:s3:::{bucket}/{key}` for the object operations.
