@@ -608,7 +608,7 @@ fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) ->
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn reload(_config: Option<PathBuf>) -> ExitCode {
+fn reload(_config: Option<PathBuf>) -> ExitCode {
     eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
     ExitCode::from(5)
 }
@@ -675,7 +675,7 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn reload(config: Option<PathBuf>) -> ExitCode {
+fn reload(config: Option<PathBuf>) -> ExitCode {
     use crate::secret_cmd::linux::{call_to, target};
     let t = match target(config.as_deref()) {
         Ok(t) => t,
