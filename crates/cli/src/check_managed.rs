@@ -670,7 +670,8 @@ mod imp {
         Ok((packs.into_iter().map(|p| p.id).collect(), hash))
     }
 
-    /// Whether `nsswitch.conf` takes groups from local files only, so
+    /// Whether `nsswitch.conf` takes groups from `files` alone (not compat or
+    /// systemd, which can add groups `/etc/group` lacks), so
     /// `/etc/group` is the whole answer and no process needs to run.
     fn groups_are_local(nsswitch: Option<&str>) -> bool {
         let Some(text) = nsswitch else {
@@ -683,7 +684,7 @@ mod imp {
                 let mut any = false;
                 let local = sources.split_whitespace().all(|s| {
                     any = true;
-                    matches!(s, "files" | "compat" | "systemd")
+                    s == "files"
                 });
                 local && any
             })
@@ -1166,7 +1167,7 @@ mod imp {
 
         const PASSWD: &str = "alice:x:1000:1000::/h:/bin/sh\n";
         const GROUP: &str = "alice:x:1000:\ndevs:x:2000:alice\n";
-        const FILES: &str = "passwd: files\ngroup: files systemd\n";
+        const FILES: &str = "passwd: files\ngroup: files\n";
 
         fn envcfg(users: &str) -> SystemConfig {
             toml::from_str(&format!(
@@ -1228,8 +1229,11 @@ mod imp {
 
         #[test]
         fn local_groups_follow_nsswitch() {
-            assert!(groups_are_local(Some("group: files systemd # c\n")));
-            assert!(groups_are_local(Some("passwd: sss\ngroup: compat\n")));
+            assert!(groups_are_local(Some("group: files # c\n")));
+            // compat (NIS +/- entries) and systemd (userdb, homed) can add
+            // groups /etc/group does not list: those go to NSS.
+            assert!(!groups_are_local(Some("group: files systemd\n")));
+            assert!(!groups_are_local(Some("passwd: sss\ngroup: compat\n")));
             assert!(!groups_are_local(Some("group: files sss\n")));
             assert!(!groups_are_local(Some("passwd: files\n")));
             assert!(!groups_are_local(None));
