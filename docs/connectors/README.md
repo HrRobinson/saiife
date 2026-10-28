@@ -131,6 +131,9 @@ path and query, passed to the matching operation).
 - [Shopify](shopify.md): orders, products, customers, refunds, discounts.
 - [HubSpot](hubspot.md): contacts, companies and deals.
 - [GitHub](github.md): repositories, issues and pull requests.
+- [GitLab](gitlab.md): projects, issues, merge requests and pipelines.
+- [Sentry](sentry.md): projects, issues and events.
+- [PagerDuty](pagerduty.md): incidents, notes, services and on-calls.
 - [Generic HTTP connector and outbound webhooks](http.md): any other API,
   configured by hand.
 

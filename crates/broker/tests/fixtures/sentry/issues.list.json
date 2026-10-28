@@ -1,0 +1,8 @@
+{
+  "_source": "https://docs.sentry.io/api/events/list-a-projects-issues/ and https://docs.sentry.io/api/pagination/ (shape per vendor docs; not fetched)",
+  "_link": "<https://sentry.acme.test/api/0/projects/acme/web/issues/?&cursor=100:0:1>; rel=\"previous\"; results=\"false\"; cursor=\"100:0:1\", <https://sentry.acme.test/api/0/projects/acme/web/issues/?&cursor=100:100:0>; rel=\"next\"; results=\"true\"; cursor=\"100:100:0\"",
+  "_link_last": "<https://sentry.acme.test/api/0/projects/acme/web/issues/?&cursor=100:200:1>; rel=\"previous\"; results=\"true\"; cursor=\"100:200:1\", <https://sentry.acme.test/api/0/projects/acme/web/issues/?&cursor=100:300:0>; rel=\"next\"; results=\"false\"; cursor=\"100:300:0\"",
+  "body": [
+    { "id": "1234567", "shortId": "WEB-1A", "title": "TypeError: undefined is not a function", "level": "error", "status": "unresolved", "count": "42", "project": { "slug": "web" } }
+  ]
+}
