@@ -42,6 +42,15 @@ agent's file tools and through shell commands (`rm`, `mv`, `cp`, `sed -i`,
   `.gemini` folders themselves.
 - saiife's audit folder, its data folder (audit trail and integrity records)
   and the saiife program, plus any parent folder of these.
+- The personal broker's folders: `~/.config/saiife/broker`,
+  `~/.local/state/saiife/broker` and `~/.local/share/saiife/broker` (or
+  `$XDG_CONFIG_HOME/saiife/broker`). Reading them stays allowed.
+
+**The personal broker.** `systemctl --user stop|disable|mask|kill|restart|edit`
+of `saiife-broker`, and `launchctl bootout|unload|kill|remove` of
+`com.saiife.broker`. `status` and `list` stay allowed. This catches mistakes
+and helpful bypasses; it is not a boundary, because the broker runs as your
+own user.
 
 ## Allowed on purpose
 
@@ -90,6 +99,10 @@ The limits that apply to every pack are in
 ## Examples
 
 ```saiife-examples
+deny systemctl --user stop saiife-broker.service
+deny launchctl bootout gui/501/com.saiife.broker
+allow systemctl --user status saiife-broker
+allow cat ~/.config/saiife/broker/config.toml
 deny saiife init --off
 deny bash -c 'saiife init --off'
 deny alias saiife=true

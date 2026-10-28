@@ -52,6 +52,12 @@ and `ps e`. They print tokens and keys along with everything else.
   `op item get`), Doppler (`doppler secrets`).
 - The GitHub CLI token (`gh auth token`, `gh auth status --show-token`) and
   git's stored passwords (`git credential fill`, credential helper `get`).
+- The personal broker's vault key in the keychain: `secret-tool lookup` or
+  `search` naming saiife, `security find-generic-password` naming saiife,
+  `security dump-keychain`, and `gdbus`, `busctl`, `dbus-send` or `qdbus`
+  calls to `org.freedesktop.secrets` with `GetSecret` or `SearchItems`. This
+  is a mistake layer: a script of the same user can still call the Secret
+  Service.
 
 ## Allowed on purpose
 
@@ -108,6 +114,10 @@ The limits that apply to every pack are in
 ## Examples
 
 ```saiife-examples
+deny secret-tool lookup application saiife
+deny security find-generic-password -s saiife -w
+allow secret-tool lookup application other
+allow security find-generic-password -s github
 deny env
 deny printenv
 deny export -p

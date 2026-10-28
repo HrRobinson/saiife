@@ -20,11 +20,11 @@ id = "core.self"
 name = "Core: self-protection"
 description = "Guards saiife itself: turning it off, editing its config, agent hook settings, binary, audit log and integrity records."
 default_on = true
-version = 1
+version = 2
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -85,6 +85,15 @@ reason = "enabling or disabling Codex's hooks from the command line can leave th
 after_env_change = true
 pattern = '^(?:claude|codex|gemini|saiife)(?:\s|$)'
 reason = "changing PATH, HOME, XDG_DATA_HOME or an agent config dir (or running eval/source, whose effect cannot be seen) and then starting an agent or saiife can bypass the guard or hide its audit trail"
+
+# --- the personal broker (plan 16) --------------------------------------------
+[[deny]]
+pattern = '^systemctl\s+(?:\S+\s+)*--user\s+(?:\S+\s+)*(?:stop|disable|mask|kill|restart|edit)\s+(?:\S+\s+)*saiife-broker'
+reason = "an agent may not stop or change the saiife broker; do it in your own terminal"
+
+[[deny]]
+pattern = '^launchctl\s+(?:\S+\s+)*(?:bootout|unload|kill|remove)\s+(?:\S+\s+)*\S*com\.saiife\.broker'
+reason = "an agent may not stop or change the saiife broker; do it in your own terminal"
 
 # --- write tools and shell writes ---------------------------------------------
 [[deny_path]]
@@ -163,3 +172,43 @@ access = "write"
 ancestors = true
 reason = "removing or moving a parent of the saiife binary removes the guard"
 
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/saiife/broker/**"
+access = "write"
+reason = "the personal broker's config, state and audit trail may only be changed by you"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/saiife/broker"
+access = "write"
+reason = "removing or moving the personal broker's folder removes its config, state or audit trail"
+
+[[deny_path]]
+glob = "~/.config/saiife/broker/**"
+access = "write"
+reason = "the personal broker's config, state and audit trail may only be changed by you"
+
+[[deny_path]]
+glob = "~/.config/saiife/broker"
+access = "write"
+reason = "removing or moving the personal broker's folder removes its config, state or audit trail"
+
+[[deny_path]]
+glob = "~/.local/state/saiife/broker/**"
+access = "write"
+reason = "the personal broker's config, state and audit trail may only be changed by you"
+
+[[deny_path]]
+glob = "~/.local/state/saiife/broker"
+access = "write"
+reason = "removing or moving the personal broker's folder removes its config, state or audit trail"
+
+[[deny_path]]
+glob = "~/.local/share/saiife/broker/**"
+access = "write"
+reason = "the personal broker's config, state and audit trail may only be changed by you"
+
+[[deny_path]]
+glob = "~/.local/share/saiife/broker"
+access = "write"
+reason = "removing or moving the personal broker's folder removes its config, state or audit trail"

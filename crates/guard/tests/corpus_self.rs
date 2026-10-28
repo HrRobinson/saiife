@@ -910,3 +910,48 @@ fn everyday_commands_from_the_round_4_brief_stay_allowed() {
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[test]
+fn the_personal_broker_cannot_be_stopped_or_edited_by_the_agent() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "systemctl --user stop saiife-broker.service",
+        "systemctl --user disable saiife-broker",
+        "systemctl --user mask saiife-broker.service",
+        "systemctl --user kill saiife-broker",
+        "systemctl --user restart saiife-broker",
+        "systemctl --user edit saiife-broker",
+        "launchctl bootout gui/501/com.saiife.broker",
+        "launchctl unload ~/Library/LaunchAgents/com.saiife.broker.plist",
+        "launchctl kill TERM gui/501/com.saiife.broker",
+        "launchctl remove com.saiife.broker",
+        "echo x >> ~/.config/saiife/broker/config.toml",
+        "rm -rf ~/.local/state/saiife/broker",
+        "rm ~/.local/share/saiife/broker/audit/x.jsonl",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "systemctl --user status saiife-broker",
+        "systemctl --user is-active saiife-broker.service",
+        "cat ~/.config/saiife/broker/config.toml",
+        "launchctl list com.saiife.broker",
+        "ls ~/.local/state/saiife/broker",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+    for path in [
+        "~/.config/saiife/broker/config.toml",
+        "~/.config/saiife/broker/policy.d/x.toml",
+        "~/.local/state/saiife/broker/vault/vault.bin",
+        "~/.local/share/saiife/broker/audit/2026-10.jsonl",
+    ] {
+        match e.evaluate_path(Access::Write, path) {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "core.self", "{path}"),
+            d => panic!("expected DENY for write of {path:?}, got {d:?}"),
+        }
+        assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
+    }
+}
