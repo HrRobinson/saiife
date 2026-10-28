@@ -2,7 +2,10 @@
 
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
-use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
+use crate::service::{
+    is_interpreter, valid_external_id, valid_role_arn, CloudMode, SecretCfg, ServiceCfg,
+    AUTH_KINDS, AZURE_AUTHORITIES,
+};
 use crate::system::{
     Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING, RESERVED_SERVICES,
 };
@@ -321,6 +324,53 @@ fn validate_services(
                     ),
                 ));
             }
+        }
+        validate_cloud(&file, name, svc)?;
+    }
+    Ok(())
+}
+
+/// `mode` and `[services.<name>.cloud]` (plan 15). The checks that need the
+/// manifest are the daemon's.
+fn validate_cloud(file: &Path, name: &str, svc: &ServiceCfg) -> Result<(), PolicyError> {
+    let c = &svc.cloud;
+    let bad = |why: String| Err(invalid(file, format!("service {name}: {why}")));
+    if let Some(a) = &c.role_arn {
+        if !valid_role_arn(a) {
+            return bad(format!("cloud.role_arn {a:?} is not an IAM role ARN"));
+        }
+    }
+    if let Some(e) = &c.external_id {
+        if !valid_external_id(e) {
+            return bad("cloud.external_id has characters or a length STS refuses".into());
+        }
+    }
+    if let Some(h) = &c.authority_host {
+        if !AZURE_AUTHORITIES.contains(&h.as_str()) {
+            return bad(format!(
+                "cloud.authority_host {h:?} is not one of {}",
+                AZURE_AUTHORITIES.join(", ")
+            ));
+        }
+    }
+    if let Some(p) = c.run_allow.iter().find(|p| !p.is_absolute()) {
+        return bad(format!(
+            "cloud.run_allow entry {} must be an absolute path",
+            p.display()
+        ));
+    }
+    if let Some(p) = c.run_allow.iter().find(|p| is_interpreter(p)) {
+        return bad(format!(
+            "cloud.run_allow entry {} is an interpreter or shell",
+            p.display()
+        ));
+    }
+    if svc.mode == CloudMode::Sts {
+        if c.role_arn.is_none() {
+            return bad("mode = \"sts\" needs cloud.role_arn".into());
+        }
+        if c.run_allow.is_empty() {
+            return bad("mode = \"sts\" needs a non-empty cloud.run_allow".into());
         }
     }
     Ok(())

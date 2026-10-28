@@ -34,6 +34,77 @@ pub struct ServiceCfg {
     pub redact: RedactCfg,
     #[serde(default)]
     pub operation: Vec<HttpOperationCfg>,
+    /// `sign` (default) or `sts` (cloud connectors).
+    #[serde(default)]
+    pub mode: CloudMode,
+    #[serde(default)]
+    pub cloud: CloudCfg,
+}
+
+/// How a cloud connector gets its credential: sign requests with the stored
+/// key (`sign`, the default), or hand out short-lived STS credentials to a
+/// `run --cloud` child (`sts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudMode {
+    #[default]
+    Sign,
+    Sts,
+}
+
+/// `[services.<name>.cloud]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CloudCfg {
+    pub role_arn: Option<String>,
+    pub external_id: Option<String>,
+    pub run_allow: Vec<PathBuf>,
+    pub authority_host: Option<String>,
+}
+
+/// The Azure authorities a service may use (plan 15 decision 6).
+pub const AZURE_AUTHORITIES: &[&str] = &[
+    "login.microsoftonline.com",
+    "login.microsoftonline.us",
+    "login.chinacloudapi.cn",
+];
+
+fn all_bytes(s: &str, ok: impl Fn(u8) -> bool) -> bool {
+    s.bytes().all(ok)
+}
+
+/// `^arn:aws(-cn|-us-gov)?:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$`
+pub fn valid_role_arn(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("arn:aws") else {
+        return false;
+    };
+    let rest = rest
+        .strip_prefix("-cn")
+        .or_else(|| rest.strip_prefix("-us-gov"))
+        .unwrap_or(rest);
+    let Some(rest) = rest.strip_prefix(":iam::") else {
+        return false;
+    };
+    let Some((acct, role)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some(name) = role.strip_prefix("role/") else {
+        return false;
+    };
+    acct.len() == 12
+        && acct.bytes().all(|b| b.is_ascii_digit())
+        && (1..=512).contains(&name.len())
+        && all_bytes(name, |b| {
+            b.is_ascii_alphanumeric() || b"+=,.@_/-".contains(&b)
+        })
+}
+
+/// `^[A-Za-z0-9+=,.@:/_-]{2,1224}$`
+pub fn valid_external_id(s: &str) -> bool {
+    (2..=1224).contains(&s.len())
+        && all_bytes(s, |b| {
+            b.is_ascii_alphanumeric() || b"+=,.@:/_-".contains(&b)
+        })
 }
 
 /// How the secret is attached to an upstream request. Kinds: `header`,
