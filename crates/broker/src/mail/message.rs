@@ -8,6 +8,7 @@
 //!   mail-parser: `{uid, from, to, cc, subject, date, text, html,
 //!   attachments: [{name, type, size}]}`. Attachment content never leaves.
 
+use crate::mask::Masker;
 use base64::Engine as _;
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use serde_json::{json, Value};
@@ -192,7 +193,12 @@ fn json_size(v: &Value) -> usize {
 /// A fifteenth of `max` is kept free, so masking in step 10 (which may
 /// lengthen a short value) does not push the answer past `max` and break
 /// the JSON there.
-pub fn get_json(uid: u32, raw: &[u8], max: usize) -> Value {
+///
+/// `text`, `html` and the subject are masked with `masker` (the
+/// credential's values and the v1 patterns) **before** they are measured
+/// and cut: a cut inside a secret would leave a prefix step 10 can no
+/// longer recognize. Step 10 masks the whole answer again.
+pub fn get_json(uid: u32, raw: &[u8], max: usize, masker: &Masker) -> Value {
     let Some(msg) = MessageParser::default().parse(raw) else {
         return json!({
             "uid": uid, "from": [], "to": [], "cc": [], "subject": null,
@@ -222,7 +228,7 @@ pub fn get_json(uid: u32, raw: &[u8], max: usize) -> Value {
         "from": addresses(msg.from()),
         "to": addresses(msg.to()),
         "cc": addresses(msg.cc()),
-        "subject": msg.subject(),
+        "subject": msg.subject().map(|s| masker.mask_text(s)),
         "date": msg.date().map(|d| d.to_rfc3339()),
         "text": null,
         "html": null,
@@ -247,7 +253,9 @@ pub fn get_json(uid: u32, raw: &[u8], max: usize) -> Value {
     let mut left = room.saturating_sub(json_size(&v));
     for (key, body) in [("text", text), ("html", html)] {
         let Some(body) = body else { continue };
-        let (kept, was_cut) = cut_escaped(body, left);
+        // Masked first, then cut.
+        let body = masker.mask_text(body);
+        let (kept, was_cut) = cut_escaped(&body, left);
         left = left.saturating_sub(kept.chars().map(json_len).sum::<usize>());
         cut |= was_cut;
         v[key] = Value::String(kept.to_string());
@@ -378,7 +386,7 @@ mod tests {
              --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--b--\r\n"
         );
         for max in [0, 100, 1000, 20_000, 60_000] {
-            let v = get_json(7, raw.as_bytes(), max);
+            let v = get_json(7, raw.as_bytes(), max, &Masker::new(&[]));
             let out = serde_json::to_string(&v).unwrap();
             if max >= 1000 {
                 assert!(out.len() <= max, "{max}: {}", out.len());
@@ -389,9 +397,51 @@ mod tests {
             assert_eq!(back["uid"], 7);
         }
         // With room for all, nothing is cut and nothing says so.
-        let v = get_json(7, raw.as_bytes(), 10_000_000);
+        let v = get_json(7, raw.as_bytes(), 10_000_000, &Masker::new(&[]));
         assert!(v.get("truncated").is_none());
         assert_eq!(v["text"].as_str().unwrap().trim_end(), text.trim_end());
+    }
+
+    /// Every prefix of `secret` of 4 or more characters.
+    fn prefixes(secret: &str) -> Vec<&str> {
+        (4..=secret.len()).map(|n| &secret[..n]).collect()
+    }
+
+    #[test]
+    fn secret_at_the_cut_never_leaks_a_prefix() {
+        let secret = concat!("mail", "-pw-", "Zq8", "vault-value").to_string();
+        let masker = Masker::new(&[secret.as_str()]);
+        let text = format!("{}{secret}{}", "a".repeat(300), "b".repeat(300));
+        let html = format!("<p>{}{secret}{}</p>", "c".repeat(200), "d".repeat(200));
+        let raw = format!(
+            "From: a@acme.com\r\nSubject: about {secret}\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n\
+             --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--b--\r\n"
+        );
+        // Every max from "nothing fits" to "all fits", so the cut lands at
+        // every offset of the secret in text and in html.
+        let mut cut_lengths = std::collections::BTreeSet::new();
+        for max in 300..2000 {
+            let v = get_json(7, raw.as_bytes(), max, &masker);
+            let out = serde_json::to_string(&v).unwrap();
+            for p in prefixes(&secret) {
+                assert!(!out.contains(p), "max {max} leaks {p:?}: {out}");
+            }
+            if v["truncated"] == true {
+                cut_lengths.insert(v["text"].as_str().map_or(0, str::len));
+            }
+        }
+        // The sweep did cut the text at many lengths.
+        assert!(cut_lengths.len() > 300, "{}", cut_lengths.len());
+        // Unmasked, the same sweep would leak: the test can see a leak.
+        let mut leaked = false;
+        for max in 300..2000 {
+            let v = get_json(7, raw.as_bytes(), max, &Masker::new(&[]));
+            let t = v["text"].as_str().unwrap_or("");
+            leaked |= prefixes(&secret).iter().any(|p| t.ends_with(p)) && !t.contains(&secret);
+        }
+        assert!(leaked);
     }
 
     #[test]

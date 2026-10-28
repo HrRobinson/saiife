@@ -16,6 +16,7 @@
 use super::message;
 use super::{boxed, connect, list_query, name_of, read_line, step, uid_of, Creds, Server, Stream};
 use crate::manifest::Operation;
+use crate::mask::Masker;
 use crate::upstream::Upstream;
 use base64::Engine as _;
 use imap_proto::types::{
@@ -523,12 +524,13 @@ pub(crate) async fn run(
     params: &BTreeMap<String, String>,
     c: &Creds<'_>,
     read_limit: usize,
+    masker: &Masker,
 ) -> Result<(u16, Value), String> {
     let mut sess = open(up, srv, c, read_limit).await?;
     let out = match op.id.as_str() {
         "folders.list" => folders(&mut sess).await,
         "mail.list" => list(&mut sess, params).await,
-        "mail.get" => get(&mut sess, params).await,
+        "mail.get" => get(&mut sess, params, masker).await,
         other => Err(format!("{other} is not an IMAP operation")),
     };
     // A clean goodbye after a success, briefly; after a failure the
@@ -749,6 +751,7 @@ async fn list(
 async fn get(
     sess: &mut Session,
     params: &BTreeMap<String, String>,
+    masker: &Masker,
 ) -> Result<(u16, Value), String> {
     let folder = params.get("folder").map(String::as_str).unwrap_or("INBOX");
     let uid = params
@@ -788,6 +791,7 @@ async fn get(
                 uid,
                 &r,
                 sess.read_limit.saturating_sub(crate::pipeline::READ_SLACK),
+                masker,
             ),
         ),
         None => (

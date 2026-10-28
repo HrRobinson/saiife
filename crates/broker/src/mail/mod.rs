@@ -431,7 +431,7 @@ pub async fn run(
             }
             _ => {
                 let srv = server(svc, "imap")?;
-                imap::run(up, &srv, op, params, &creds, read_limit)
+                imap::run(up, &srv, op, params, &creds, read_limit, &masker)
                     .await
                     .map_err(MailError::Server)
             }

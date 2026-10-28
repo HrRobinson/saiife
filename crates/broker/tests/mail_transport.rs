@@ -309,6 +309,8 @@ enum Imap {
     EchoPassword,
     /// `mail.get` answers with a BODYSTRUCTURE nested 1000 deep.
     DeepNest,
+    /// Message 104's text holds the mailbox password.
+    SecretBody,
     /// 5,000 messages (UIDs 1 to 5000, unseen 3, 7 and 4990), and an
     /// `EXAMINE` without `UIDNEXT`.
     Big,
@@ -575,7 +577,17 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             }
             let uid: u32 = cmd.split(' ').nth(2).unwrap_or("").parse().unwrap_or(0);
             if uid == 104 {
-                let m = message_104();
+                let m = if mode == Imap::SecretBody {
+                    format!(
+                        "From: a@acme.com\r\nSubject: s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+                         {}{}{}\r\n",
+                        "a".repeat(300),
+                        pass(),
+                        "b".repeat(300)
+                    )
+                } else {
+                    message_104()
+                };
                 put(
                     &mut s,
                     &format!(
@@ -1395,4 +1407,42 @@ async fn mail_get_is_cut_to_max_response_bytes() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+async fn mail_get_cut_inside_the_password_leaks_no_prefix() {
+    let p = pki();
+    let (ip, _log) = imap_server(&p, Imap::SecretBody).await;
+    let up = upstream(&p, Duration::from_secs(5));
+    let cat = catalog_of(MANIFEST);
+    let secret = pass();
+    let c = call("mail.get", &[("folder", "INBOX"), ("uid", "104")], None);
+    let mut lengths = std::collections::BTreeSet::new();
+    // Limits that cut the text before, inside and after the password.
+    for max in (400..900).step_by(2) {
+        let mut snap = snapshot((1, "implicit"), (ip, "implicit"));
+        snap.config
+            .services
+            .get_mut("mail")
+            .unwrap()
+            .limits
+            .max_response_bytes = Some(max);
+        let (o, tr) = go(&c, &snap, &cat, &up).await;
+        let Outcome::Done { finished, .. } = &o else {
+            panic!("{o:?}")
+        };
+        let out = String::from_utf8_lossy(&finished.body).into_owned();
+        for n in 4..=secret.len() {
+            assert!(
+                !out.contains(&secret[..n]),
+                "max {max} leaks {:?}: {out}",
+                &secret[..n]
+            );
+        }
+        let v: serde_json::Value = serde_json::from_slice(&finished.body).unwrap();
+        lengths.insert(v["text"].as_str().map_or(0, str::len));
+        assert_no_secret(&c, &snap, &tr, &o);
+    }
+    // The cut moved across the whole password.
+    assert!(lengths.len() > 100, "{}", lengths.len());
 }
