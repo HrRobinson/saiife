@@ -1,0 +1,20 @@
+{
+  "encoding": "UTF-8",
+  "maxBatchSize": 200,
+  "sobjects": [
+    {
+      "name": "Account",
+      "label": "Account",
+      "keyPrefix": "001",
+      "queryable": true,
+      "createable": true,
+      "updateable": true,
+      "deletable": true,
+      "urls": {
+        "sobject": "/services/data/v60.0/sobjects/Account",
+        "describe": "/services/data/v60.0/sobjects/Account/describe",
+        "rowTemplate": "/services/data/v60.0/sobjects/Account/{ID}"
+      }
+    }
+  ]
+}

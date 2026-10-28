@@ -1,0 +1,23 @@
+{
+  "totalSize": 3214,
+  "done": false,
+  "nextRecordsUrl": "/services/data/v60.0/query/01gD0000002HU6KIAW-2000",
+  "records": [
+    {
+      "attributes": {
+        "type": "Account",
+        "url": "/services/data/v60.0/sobjects/Account/001D000000IRFmaIAH"
+      },
+      "Id": "001D000000IRFmaIAH",
+      "Name": "Edge Communications"
+    },
+    {
+      "attributes": {
+        "type": "Account",
+        "url": "/services/data/v60.0/sobjects/Account/001D000000IomazIAB"
+      },
+      "Id": "001D000000IomazIAB",
+      "Name": "Burlington Textiles Corp of America"
+    }
+  ]
+}

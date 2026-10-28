@@ -240,6 +240,7 @@ mod linux {
     fn secret_kind(m: &Manifest) -> &'static str {
         match m.auth.first() {
             Some(a) if a.kind == "basic" => "basic",
+            Some(a) if a.kind == "oauth2" => "oauth2",
             Some(a) if a.secret_field == "value" => "header",
             _ => "token",
         }

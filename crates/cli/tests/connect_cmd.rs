@@ -309,3 +309,62 @@ fn existing_secret_for_another_service_is_refused() {
     );
     assert!(!policy_file(&d, "shopify.toml").exists());
 }
+
+#[test]
+fn salesforce_connect_stores_an_oauth2_secret() {
+    let d = admin();
+    // Built at runtime: no token-shaped literal in the source.
+    let refresh = format!("5Aep{}", "x7".repeat(20));
+    let secret = format!("cs-{}", "q4".repeat(16));
+    let value = serde_json::json!({
+        "client_id": "3MVG9connect.test",
+        "client_secret": secret,
+        "refresh_token": refresh,
+    })
+    .to_string();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args([
+            "connect",
+            "salesforce",
+            "--param",
+            "instance_host=acme.my.salesforce.com",
+            "--param",
+            "api_version=v60.0",
+            "--from-env",
+            "CONNECT_TEST_OAUTH",
+            "--config",
+        ])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", d.path().join("data"))
+        .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+        .env("CONNECT_TEST_OAUTH", &value)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let printed = format!("{}{}", err(&o), String::from_utf8_lossy(&o.stdout));
+    for needle in [&refresh, &secret] {
+        assert!(!printed.contains(needle.as_str()));
+    }
+
+    let l = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["secret", "list", "--json", "--system-config"])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(l.status.success(), "{}", err(&l));
+    let v: Value = serde_json::from_slice(&l.stdout).unwrap();
+    let s = &v["secrets"][0];
+    assert_eq!(s["name"], "salesforce");
+    assert_eq!(s["kind"], "oauth2");
+
+    let text = fs::read_to_string(policy_file(&d, "salesforce.toml")).unwrap();
+    assert!(!text.contains(&refresh) && !text.contains(&secret));
+    let loaded = load_system(&d.config()).expect("loads");
+    validate(&loaded.config, &Catalog::new(builtin(), vec![])).expect("validates");
+}

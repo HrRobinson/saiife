@@ -135,6 +135,8 @@ path and query, passed to the matching operation).
 - [Sentry](sentry.md): projects, issues and events.
 - [PagerDuty](pagerduty.md): incidents, notes, services and on-calls.
 - [Email](email.md): send with SMTP, read with IMAP.
+- [Salesforce](salesforce.md): SOQL queries, object metadata and records
+  (OAuth2).
 - [Generic HTTP connector and outbound webhooks](http.md): any other API,
   configured by hand.
 
