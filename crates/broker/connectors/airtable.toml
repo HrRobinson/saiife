@@ -1,0 +1,64 @@
+# Airtable Web API. Reference: https://airtable.com/developers/web/api/introduction
+#   list:   https://airtable.com/developers/web/api/list-records
+#   get:    https://airtable.com/developers/web/api/get-record
+#   create: https://airtable.com/developers/web/api/create-records
+#   update: https://airtable.com/developers/web/api/update-record
+#   delete: https://airtable.com/developers/web/api/delete-record
+# There is no `bases.list`: `GET /meta/bases` has the same shape as
+# `GET /{base_id}/{table}`, so proxy resolution would be ambiguous.
+id = "airtable"
+version = 1
+title = "Airtable"
+base_url = "https://api.airtable.com/v0"
+hosts = ["api.airtable.com"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[[operation]]
+id = "records.list"
+capability = "records:read"
+qualifier = "base={base_id}"
+kind = "read"
+method = "GET"
+path = "/{base_id}/{table}"
+path_params = { base_id = "string:app[A-Za-z0-9]{8,32}", table = "string:[A-Za-z0-9_ -]{1,64}" }
+query = { pageSize = "int:1..100", maxRecords = "int:1..100000", view = "string:[A-Za-z0-9_ -]{1,64}", filterByFormula = "string:.{1,1000}", offset = "string:[A-Za-z0-9_=/-]{1,256}" }
+pagination = { cursor = { param = "offset", next = "offset" } }
+
+[[operation]]
+id = "records.get"
+capability = "records:read"
+qualifier = "base={base_id}"
+kind = "read"
+method = "GET"
+path = "/{base_id}/{table}/{record_id}"
+path_params = { base_id = "string:app[A-Za-z0-9]{8,32}", table = "string:[A-Za-z0-9_ -]{1,64}", record_id = "string:rec[A-Za-z0-9]{8,32}" }
+
+[[operation]]
+id = "records.create"
+capability = "records:write"
+qualifier = "base={base_id}"
+kind = "write"
+method = "POST"
+path = "/{base_id}/{table}"
+path_params = { base_id = "string:app[A-Za-z0-9]{8,32}", table = "string:[A-Za-z0-9_ -]{1,64}" }
+body = "json"
+
+[[operation]]
+id = "records.update"
+capability = "records:write"
+qualifier = "base={base_id}"
+kind = "write"
+method = "PATCH"
+path = "/{base_id}/{table}/{record_id}"
+path_params = { base_id = "string:app[A-Za-z0-9]{8,32}", table = "string:[A-Za-z0-9_ -]{1,64}", record_id = "string:rec[A-Za-z0-9]{8,32}" }
+body = "json"
+
+[[operation]]
+id = "records.delete"
+capability = "records:delete"
+qualifier = "base={base_id}"
+kind = "delete"
+method = "DELETE"
+path = "/{base_id}/{table}/{record_id}"
+path_params = { base_id = "string:app[A-Za-z0-9]{8,32}", table = "string:[A-Za-z0-9_ -]{1,64}", record_id = "string:rec[A-Za-z0-9]{8,32}" }

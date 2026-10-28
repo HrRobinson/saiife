@@ -1,0 +1,12 @@
+{
+  "_source": "Shape per vendor docs (https://linear.app/developers/pagination); values are synthetic.",
+  "data": {
+    "issues": {
+      "nodes": [
+        {"id": "2f1a7c10-3b2d-4c55-9a77-0d1e2f3a4b5c", "identifier": "ENG-101", "title": "Login fails on Safari", "url": "https://linear.app/acme/issue/ENG-101", "state": {"name": "Todo"}},
+        {"id": "7e6d5c4b-3a29-4817-96f5-e4d3c2b1a098", "identifier": "ENG-102", "title": "Slow search", "url": "https://linear.app/acme/issue/ENG-102", "state": {"name": "In Progress"}}
+      ],
+      "pageInfo": {"hasNextPage": true, "endCursor": "7e6d5c4b-3a29-4817-96f5-e4d3c2b1a098"}
+    }
+  }
+}

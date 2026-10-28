@@ -338,7 +338,7 @@ fn next_cursor_refuses_unsafe_values() {
     assert_eq!(next_cursor(&p, &with(Value::String(long))), None);
     let ok = "a".repeat(256);
     assert!(next_cursor(&p, &with(Value::String(ok))).is_some());
-    for bad in ["52\r\nX-Evil: 1", "a b", "a&b=c", "a/b", "é"] {
+    for bad in ["52\r\nX-Evil: 1", "a b", "a&b=c", "a\\b", "é"] {
         assert_eq!(
             next_cursor(&p, &with(Value::String(bad.into()))),
             None,

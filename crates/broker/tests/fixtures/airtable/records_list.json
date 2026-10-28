@@ -1,0 +1,8 @@
+{
+  "_source": "Shape per vendor docs (https://airtable.com/developers/web/api/list-records); values are synthetic.",
+  "records": [
+    {"id": "recAbCdEfGh12345", "createdTime": "2026-01-12T09:30:11.000Z", "fields": {"Name": "Ada", "Status": "Todo"}},
+    {"id": "recZyXwVuTs67890", "createdTime": "2026-01-13T10:00:00.000Z", "fields": {"Name": "Alan", "Status": "Done"}}
+  ],
+  "offset": "itrJpWBvDzAuqzZ6j/recZyXwVuTs67890"
+}

@@ -1,0 +1,67 @@
+# Linear GraphQL API. Reference: https://linear.app/developers/graphql
+#   pagination: https://linear.app/developers/pagination
+#   issues:     https://linear.app/developers/graphql#queries-and-mutations
+# Every operation is `POST /graphql` with a fixed document; the agent supplies
+# variables only and can never send GraphQL of its own. The credential is a
+# personal API key, sent raw in `Authorization` (no `Bearer` prefix).
+id = "linear"
+version = 1
+title = "Linear"
+base_url = "https://api.linear.app"
+hosts = ["api.linear.app"]
+auth = [{ kind = "header", name = "Authorization", secret_field = "token" }]
+request_headers = ["Accept"]
+
+[[operation]]
+id = "teams.list"
+capability = "teams:read"
+kind = "read"
+method = "POST"
+path = "/graphql"
+body = "json"
+graphql = "query($first: Int, $after: String) { teams(first: $first, after: $after) { nodes { id key name } pageInfo { hasNextPage endCursor } } }"
+body_params = { first = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}" }
+pagination = { cursor = { param = "after", next = "data.teams.pageInfo.endCursor", more = "data.teams.pageInfo.hasNextPage" } }
+
+[[operation]]
+id = "issues.list"
+capability = "issues:read"
+qualifier = "team={team}"
+kind = "read"
+method = "POST"
+path = "/graphql"
+body = "json"
+graphql = "query($team: String!, $first: Int, $after: String) { issues(first: $first, after: $after, filter: { team: { key: { eq: $team } } }) { nodes { id identifier title url state { name } } pageInfo { hasNextPage endCursor } } }"
+body_params = { team = "string:[A-Za-z0-9_-]{1,32}", first = "int:1..100", after = "string:[A-Za-z0-9_.=-]{1,256}" }
+pagination = { cursor = { param = "after", next = "data.issues.pageInfo.endCursor", more = "data.issues.pageInfo.hasNextPage" } }
+
+[[operation]]
+id = "issues.get"
+capability = "issues:read"
+kind = "read"
+method = "POST"
+path = "/graphql"
+body = "json"
+graphql = "query($id: String!) { issue(id: $id) { id identifier title description url state { name } team { key } } }"
+body_params = { id = "string:[A-Za-z0-9-]{1,64}" }
+
+[[operation]]
+id = "issues.create"
+capability = "issues:write"
+qualifier = "team={team_id}"
+kind = "write"
+method = "POST"
+path = "/graphql"
+body = "json"
+graphql = "mutation($team_id: String!, $title: String!, $description: String) { issueCreate(input: { teamId: $team_id, title: $title, description: $description }) { success issue { id identifier url } } }"
+body_params = { team_id = "string:[A-Za-z0-9-]{1,64}", title = "string:.{1,256}", description = "string" }
+
+[[operation]]
+id = "issues.comment"
+capability = "issues:write"
+kind = "write"
+method = "POST"
+path = "/graphql"
+body = "json"
+graphql = "mutation($issue_id: String!, $body: String!) { commentCreate(input: { issueId: $issue_id, body: $body }) { success comment { id } } }"
+body_params = { issue_id = "string:[A-Za-z0-9-]{1,64}", body = "string" }

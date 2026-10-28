@@ -1,0 +1,9 @@
+{
+  "_source": "Shape per vendor docs (https://developers.intercom.com/docs/references/rest-api/api.intercom.io/contacts); values are synthetic.",
+  "type": "list",
+  "data": [
+    {"type": "contact", "id": "530370b477ad7120001f", "role": "user", "email": "grace@example.test", "name": "Grace"}
+  ],
+  "total_count": 3,
+  "pages": {"type": "pages", "page": 2, "per_page": 2, "total_pages": 2}
+}
