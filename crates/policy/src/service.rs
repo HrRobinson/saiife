@@ -35,9 +35,9 @@ pub struct ServiceCfg {
     #[serde(default)]
     pub operation: Vec<HttpOperationCfg>,
     /// `sign` (default) or `sts` (cloud connectors).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "CloudMode::is_sign")]
     pub mode: CloudMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "CloudCfg::is_default")]
     pub cloud: CloudCfg,
 }
 
@@ -50,6 +50,18 @@ pub enum CloudMode {
     #[default]
     Sign,
     Sts,
+}
+
+impl CloudMode {
+    fn is_sign(&self) -> bool {
+        *self == Self::Sign
+    }
+}
+
+impl CloudCfg {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[services.<name>.cloud]`.

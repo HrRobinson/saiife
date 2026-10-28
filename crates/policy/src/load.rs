@@ -193,20 +193,20 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         .validate()
         .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {
-        if let Some(entry) = sec.run_allow.iter().find(|p| !p.is_absolute()) {
-            return Err(invalid(
-                config_file,
-                format!(
-                    "secret {name}: run_allow entry {} must be an absolute path",
-                    entry.display()
-                ),
-            ));
-        }
-        if let Some(entry) = sec.run_allow.iter().find(|p| is_interpreter(p)) {
-            return Err(PolicyError::RunAllowInterpreter {
-                secret: name.clone(),
-                entry: entry.clone(),
-            });
+        match run_allow_problem(&sec.run_allow) {
+            None => {}
+            Some((RunAllowBad::Interpreter, entry)) => {
+                return Err(PolicyError::RunAllowInterpreter {
+                    secret: name.clone(),
+                    entry: entry.clone(),
+                })
+            }
+            Some((bad, entry)) => {
+                return Err(invalid(
+                    config_file,
+                    format!("secret {name}: {}", bad.describe(entry)),
+                ))
+            }
         }
     }
 
@@ -332,45 +332,71 @@ fn validate_services(
 
 /// `mode` and `[services.<name>.cloud]` (plan 15). The checks that need the
 /// manifest are the daemon's.
+/// What is wrong with a `run_allow` entry.
+enum RunAllowBad {
+    Relative,
+    NoName,
+    Interpreter,
+}
+
+impl RunAllowBad {
+    fn describe(&self, entry: &Path) -> String {
+        let e = entry.display();
+        match self {
+            Self::Relative => format!("run_allow entry {e} must be an absolute path"),
+            Self::NoName => format!("run_allow entry {e} names no program (no file name)"),
+            Self::Interpreter => format!("run_allow entry {e} is an interpreter or shell"),
+        }
+    }
+}
+
+/// The first bad `run_allow` entry, shared by `[secrets]` and
+/// `[services.*.cloud]`: not absolute, no file name (`/`, `/usr/bin/..`),
+/// or an interpreter.
+fn run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
+    list.iter().find_map(|p| {
+        if !p.is_absolute() {
+            Some((RunAllowBad::Relative, p))
+        } else if p.file_name().is_none() {
+            Some((RunAllowBad::NoName, p))
+        } else if is_interpreter(p) {
+            Some((RunAllowBad::Interpreter, p))
+        } else {
+            None
+        }
+    })
+}
+
 fn validate_cloud(file: &Path, name: &str, svc: &ServiceCfg) -> Result<(), PolicyError> {
     let c = &svc.cloud;
-    let bad = |why: String| Err(invalid(file, format!("service {name}: {why}")));
+    let bad_cloud = |why: String| Err(invalid(file, format!("service {name}: {why}")));
     if let Some(a) = &c.role_arn {
         if !valid_role_arn(a) {
-            return bad(format!("cloud.role_arn {a:?} is not an IAM role ARN"));
+            return bad_cloud(format!("cloud.role_arn {a:?} is not an IAM role ARN"));
         }
     }
     if let Some(e) = &c.external_id {
         if !valid_external_id(e) {
-            return bad("cloud.external_id has characters or a length STS refuses".into());
+            return bad_cloud("cloud.external_id has characters or a length STS refuses".into());
         }
     }
     if let Some(h) = &c.authority_host {
         if !AZURE_AUTHORITIES.contains(&h.as_str()) {
-            return bad(format!(
+            return bad_cloud(format!(
                 "cloud.authority_host {h:?} is not one of {}",
                 AZURE_AUTHORITIES.join(", ")
             ));
         }
     }
-    if let Some(p) = c.run_allow.iter().find(|p| !p.is_absolute()) {
-        return bad(format!(
-            "cloud.run_allow entry {} must be an absolute path",
-            p.display()
-        ));
-    }
-    if let Some(p) = c.run_allow.iter().find(|p| is_interpreter(p)) {
-        return bad(format!(
-            "cloud.run_allow entry {} is an interpreter or shell",
-            p.display()
-        ));
+    if let Some((bad, entry)) = run_allow_problem(&c.run_allow) {
+        return bad_cloud(format!("cloud.{}", bad.describe(entry)));
     }
     if svc.mode == CloudMode::Sts {
         if c.role_arn.is_none() {
-            return bad("mode = \"sts\" needs cloud.role_arn".into());
+            return bad_cloud("mode = \"sts\" needs cloud.role_arn".into());
         }
         if c.run_allow.is_empty() {
-            return bad("mode = \"sts\" needs a non-empty cloud.run_allow".into());
+            return bad_cloud("mode = \"sts\" needs a non-empty cloud.run_allow".into());
         }
     }
     Ok(())

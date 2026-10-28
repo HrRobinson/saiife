@@ -875,3 +875,34 @@ fn policy_hash_changes_with_mode() {
     assert_ne!(h(&sts), h(&body));
     assert_ne!(h(""), h(&body));
 }
+
+const OLD_CFG: &str =
+    "version = 2\n[services.s3]\nconnector = \"aws-s3\"\nallow = [\"objects:read\"]\n";
+
+#[test]
+fn cloud_keys_keep_old_hashes() {
+    use saiife_policy::{active_packs, effective_policy, policy_hash};
+    let (_d, cfg) = etc(OLD_CFG, &[]);
+    let p = load_system(&cfg).unwrap();
+    let (packs, _) = active_packs(&p.config, &[], None);
+    let h = policy_hash(&effective_policy(&p.config, &packs, None, None));
+    // Computed on the tree before the cloud keys existed.
+    assert_eq!(
+        h,
+        "sha256:79401deacbde1d240dbe27a75fd2545ddf4ee4b513a5af949c7265ada1be2b9b"
+    );
+}
+
+#[test]
+fn run_allow_without_file_name_refused() {
+    for bad in ["/", "/usr/bin/.."] {
+        let e = refused(&format!("[services.s3.cloud]\nrun_allow = [{bad:?}]\n"));
+        assert!(e.contains("no file name"), "{bad}: {e}");
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[secrets.k]\nrun_allow = [{bad:?}]\n"),
+            &[],
+        );
+        let e = load_system(&cfg).unwrap_err().to_string();
+        assert!(e.contains("no file name"), "{bad}: {e}");
+    }
+}
