@@ -1481,6 +1481,59 @@ mod tests {
         assert!(!e.contains("no-such-rule"), "{e}");
     }
 
+    /// The personal broker's one load path (`load_policy` with a
+    /// `PersonalCfg`) validates every environment against the connector
+    /// catalog (plan 14's `check_catalog`, through `check_services_owned`)
+    /// and builds one snapshot per environment (`GatewayPolicy::build`),
+    /// deciding as developer mode.
+    #[test]
+    fn personal_config_envs_validated_via_load_policy() {
+        let d = tempfile::tempdir().unwrap();
+        let config = d.path().join("config.toml");
+        let p = PersonalCfg {
+            own_user: "me".into(),
+            own_uid: rustix::process::getuid().as_raw(),
+            socket_dir: d.path().join("run"),
+            audit_dir: d.path().join("audit"),
+        };
+        let dir = saiife_policy::FixedDirectory::from_text("", "");
+        let write = |staging_host: &str| {
+            std::fs::write(
+                &config,
+                format!(
+                    "version = 2\n\n[services.gl]\nconnector = \"gitlab\"\n\
+                     secret = \"gl\"\nparams = {{ host = \"gitlab.example.com\" }}\n\
+                     allow = [\"issues:read\"]\n\n\
+                     [environments.staging]\n\
+                     services.gl.params = {{ host = {staging_host:?} }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        // The base is fine; the environment's host is an IP literal, which
+        // the gitlab manifest's host param refuses.
+        write("127.0.0.1");
+        let e = load_policy(Mode::Personal, &config, &dir, &[], Some(&p)).unwrap_err();
+        assert!(e.contains("environment staging"), "{e}");
+        // A valid one loads, with its own snapshot that decides as
+        // developer mode.
+        write("gitlab-staging.example.com");
+        let (_, _, state) = load_policy(Mode::Personal, &config, &dir, &[], Some(&p)).unwrap();
+        assert!(state.ok);
+        let g = state.gateway.expect("connectors are served");
+        assert_eq!(g.snap.mode, saiife_policy::Mode::Developer);
+        let staging = g.snapshot_for(Some("staging"));
+        assert_eq!(staging.env.as_deref(), Some("staging"));
+        assert_eq!(staging.mode, saiife_policy::Mode::Developer);
+        assert_eq!(
+            staging.config.services["gl"].params["host"],
+            "gitlab-staging.example.com"
+        );
+        assert_ne!(staging.hash, g.snap.hash);
+        // The implicit personal scope covers the service in both.
+        assert_eq!(staging.config.scope[0].users, ["me"]);
+    }
+
     #[test]
     fn state_lock_is_single_instance() {
         let d = tempfile::tempdir().unwrap();
