@@ -247,20 +247,57 @@ pub fn page(records: &[Record], scope: Scope, q: &Query) -> Page {
 /// and `q`. The scope is applied before anything else; records without a
 /// `seq` are skipped.
 pub fn page_at(records: &[(Pos, &Record)], scope: Scope, q: &Query) -> Page {
-    let hits = records
-        .iter()
-        .filter(|(_, r)| in_scope(r, scope))
-        .filter(|(p, _)| q.after.as_ref().is_none_or(|a| p > a))
-        .filter(|(_, r)| r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a)))
-        .filter(|(_, r)| matches(r, q));
-    let mut out = Vec::new();
-    let mut bytes = 0usize;
-    let mut more = false;
-    let mut last: Option<(&Pos, Option<u64>)> = None;
-    for (pos, r) in hits {
-        if out.len() as u64 >= q.limit {
-            more = true;
+    let mut pager = Pager::new(scope, q);
+    for (pos, r) in records {
+        if pager.offer(pos, r) {
             break;
+        }
+    }
+    pager.finish()
+}
+
+/// Builds one page from records offered one at a time, in log order, so a
+/// caller can stop reading the log as soon as the page is complete.
+struct Pager<'q> {
+    scope: Scope,
+    q: &'q Query,
+    out: Vec<Value>,
+    bytes: usize,
+    more: bool,
+    last: Option<(Pos, Option<u64>)>,
+}
+
+impl<'q> Pager<'q> {
+    fn new(scope: Scope, q: &'q Query) -> Self {
+        Pager {
+            scope,
+            q,
+            out: Vec::new(),
+            bytes: 0,
+            more: false,
+            last: None,
+        }
+    }
+
+    /// Offers the record at `pos`. The scope is checked first, then the
+    /// position (`after`, `after_seq`), then the filters. True when the
+    /// page is complete: one more match was seen, so `more` is set and
+    /// nothing after it needs reading.
+    fn offer(&mut self, pos: &Pos, r: &Record) -> bool {
+        if self.more {
+            return true;
+        }
+        let q = self.q;
+        if !in_scope(r, self.scope)
+            || q.after.as_ref().is_some_and(|a| pos <= a)
+            || !r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a))
+            || !matches(r, q)
+        {
+            return false;
+        }
+        if self.out.len() as u64 >= q.limit {
+            self.more = true;
+            return true;
         }
         let mut v = serde_json::to_value(r).unwrap_or_else(|_| stub(r));
         let mut n = serde_json::to_vec(&v)
@@ -270,24 +307,29 @@ pub fn page_at(records: &[(Pos, &Record)], scope: Scope, q: &Query) -> Page {
             v = stub(r);
             n = serde_json::to_vec(&v).map(|b| b.len()).unwrap_or(0);
         }
-        if bytes + n > MAX_ANSWER_BYTES {
-            more = true;
-            break;
+        if self.bytes + n > MAX_ANSWER_BYTES {
+            self.more = true;
+            return true;
         }
-        bytes += n;
-        last = Some((pos, r.seq));
-        out.push(v);
+        self.bytes += n;
+        self.last = Some((pos.clone(), r.seq));
+        self.out.push(v);
+        false
     }
-    let (next, next_seq) = match (more, last) {
-        (false, _) => (None, None),
-        (true, Some((p, s))) => (Some(p.cursor()), s),
-        (true, None) => (q.after.as_ref().map(Pos::cursor), q.after_seq),
-    };
-    Page {
-        records: out,
-        more,
-        next_seq,
-        next,
+
+    fn finish(self) -> Page {
+        let q = self.q;
+        let (next, next_seq) = match (self.more, self.last) {
+            (false, _) => (None, None),
+            (true, Some((p, s))) => (Some(p.cursor()), s),
+            (true, None) => (q.after.as_ref().map(Pos::cursor), q.after_seq),
+        };
+        Page {
+            records: self.out,
+            more: self.more,
+            next_seq,
+            next,
+        }
     }
 }
 
@@ -300,51 +342,65 @@ fn month_of(t: OffsetDateTime) -> String {
 
 /// [`page_at`] over the month files in `dir`, each record placed by its
 /// month file and line index. Month files entirely before `since`, or
-/// before the `after` position, are not read.
+/// before the `after` position, are not read. Each file is read a line at
+/// a time and reading stops once the page is complete, so a query holds at
+/// most one page and one line, whatever the size of the log.
 pub fn run(dir: &Path, scope: Scope, q: &Query) -> Result<Page, String> {
+    scan(dir, scope, q, &mut |_| {})
+}
+
+/// [`run`], calling `on_line` with the position of each line it reads.
+fn scan(
+    dir: &Path,
+    scope: Scope,
+    q: &Query,
+    on_line: &mut dyn FnMut(&Pos),
+) -> Result<Page, String> {
+    use std::io::BufRead;
     let files =
         store::month_files(dir).map_err(|e| format!("the audit directory cannot be read: {e}"))?;
     let mut first = q.filter.since.map(month_of).unwrap_or_default();
     if let Some(a) = &q.after {
         first = first.max(a.month.clone());
     }
-    let mut owned: Vec<(Pos, Record)> = Vec::new();
-    for p in files {
+    let mut pager = Pager::new(scope, q);
+    let mut line = Vec::new();
+    'files: for p in files {
         let Some(month) = p.file_stem().and_then(|n| n.to_str()).map(str::to_string) else {
             continue;
         };
         if month < first {
             continue;
         }
-        let Some(body) = read_file(&p) else {
+        // A regular file only (no symlinks, no FIFOs).
+        let Some(f) = store::open_regular(&p) else {
             continue; // unreadable: skipped, as store::read_all does
         };
-        for (i, line) in body.split(|&b| b == b'\n').enumerate() {
-            let pos = Pos {
-                month: month.clone(),
-                line: i as u64,
-            };
-            if q.after.as_ref().is_some_and(|a| &pos <= a)
-                || line.iter().all(u8::is_ascii_whitespace)
-            {
-                continue;
+        let mut rd = std::io::BufReader::new(f);
+        let mut pos = Pos { month, line: 0 };
+        loop {
+            line.clear();
+            match rd.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break, // unreadable from here: the rest is skipped
             }
-            if let Ok(r) = serde_json::from_slice::<Record>(line) {
-                owned.push((pos, r));
+            on_line(&pos);
+            // Lines up to the `after` position were answered before. A
+            // half-written last line does not parse and is skipped.
+            let skip = q.after.as_ref().is_some_and(|a| &pos <= a)
+                || line.iter().all(u8::is_ascii_whitespace);
+            if !skip {
+                if let Ok(r) = serde_json::from_slice::<Record>(&line) {
+                    if pager.offer(&pos, &r) {
+                        break 'files;
+                    }
+                }
             }
+            pos.line += 1;
         }
     }
-    let placed: Vec<(Pos, &Record)> = owned.iter().map(|(p, r)| (p.clone(), r)).collect();
-    Ok(page_at(&placed, scope, q))
-}
-
-/// A month file's bytes, if it is a regular file (no symlinks, no FIFOs).
-fn read_file(p: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut f = store::open_regular(p)?;
-    let mut body = Vec::new();
-    f.read_to_end(&mut body).ok()?;
-    Some(body)
+    Ok(pager.finish())
 }
 
 /// The `audit.query` op.
@@ -701,6 +757,84 @@ mod tests {
         assert_eq!(p.records[0]["seq"], 1);
         assert!(p.records[0].get("blob").is_none());
         assert!(!p.more);
+    }
+
+    #[test]
+    fn run_stops_reading_at_the_page() {
+        // Three month files of 2000 lines each, a third of them another
+        // user's. A page of 3 reads up to the 4th match and no further:
+        // the later lines and month files are never read.
+        let d = tempfile::tempdir().unwrap();
+        let mut want = Vec::new();
+        for month in ["2026-09", "2026-10", "2026-11"] {
+            let lines: Vec<String> = (0..2000u64)
+                .map(|i| {
+                    let uid = if i % 3 == 1 { OTHER } else { ME };
+                    let input = format!("{month}/{i}");
+                    if uid == ME {
+                        want.push(input.clone());
+                    }
+                    serde_json::to_string(&rec(i, "guard", Some(uid), &input)).unwrap()
+                })
+                .collect();
+            std::fs::write(
+                d.path().join(format!("{month}.jsonl")),
+                lines.join("\n") + "\n",
+            )
+            .unwrap();
+        }
+        let read = |a: Value| {
+            let mut seen = Vec::new();
+            let p = scan(d.path(), Scope::Uid(ME), &q(a), &mut |pos| {
+                seen.push(pos.cursor())
+            })
+            .unwrap();
+            (p, seen)
+        };
+        let (p, seen) = read(json!({"limit": 3}));
+        assert_eq!(inputs(&p), want[..3]);
+        assert!(p.more);
+        assert_eq!(p.next.as_deref(), Some("2026-09:3"));
+        // Lines 0..=5: matches at 0, 2, 3 and the one more at 5.
+        assert_eq!(
+            seen,
+            [
+                "2026-09:0",
+                "2026-09:1",
+                "2026-09:2",
+                "2026-09:3",
+                "2026-09:4",
+                "2026-09:5"
+            ]
+        );
+        // A page that starts in the second month never opens the first and
+        // stops long before the third.
+        let (p, seen) = read(json!({"limit": 3, "after": "2026-10:1000"}));
+        assert_eq!(inputs(&p), ["2026-10/1001", "2026-10/1002", "2026-10/1004"]);
+        assert!(p.more);
+        assert!(seen.iter().all(|c| c.starts_with("2026-10:")), "{seen:?}");
+        assert_eq!(seen.last().map(String::as_str), Some("2026-10:1005"));
+        assert_eq!(seen.len(), 1006);
+        // The byte cap stops reading too: one record over half the cap
+        // fills the page, and the next match is the last line read (of 3).
+        let big = "z".repeat(MAX_ANSWER_BYTES / 2 + 1);
+        let lines: Vec<String> = (0..3u64)
+            .map(|i| {
+                let mut r = rec(i, "guard", Some(ME), "b");
+                r.extra.insert("blob".into(), big.clone().into());
+                serde_json::to_string(&r).unwrap()
+            })
+            .collect();
+        let e = tempfile::tempdir().unwrap();
+        std::fs::write(e.path().join("2026-12.jsonl"), lines.join("\n") + "\n").unwrap();
+        let mut n = 0;
+        let p = scan(e.path(), Scope::Uid(ME), &q(json!({})), &mut |_| n += 1).unwrap();
+        assert_eq!(p.records.len(), 1);
+        assert!(p.more);
+        assert_eq!(n, 2);
+        // Paging to the end still returns every record once, in log order.
+        let (all, _) = page_all(d.path(), Scope::Uid(ME), MAX_LIMIT);
+        assert_eq!(all, want);
     }
 
     #[test]
