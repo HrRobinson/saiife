@@ -56,10 +56,12 @@ pub struct ServiceOverride {
     pub redact: Option<RedactCfg>,
 }
 
-/// An environment name: `[a-z0-9_-]{1,64}`. It is written into records and
-/// into `.saiife/config.toml`.
+/// An environment name: `[a-z0-9_-]{1,64}`, not `base` (approvals show the
+/// base config as "env base"). It is written into records and into
+/// `.saiife/config.toml`.
 pub fn valid_env_name(name: &str) -> bool {
-    !name.is_empty()
+    name != "base"
+        && !name.is_empty()
         && name.len() <= 64
         && name
             .bytes()
@@ -208,6 +210,7 @@ mod tests {
         assert!(valid_env_name("eu-west_2"));
         assert!(valid_env_name(&"a".repeat(64)));
         assert!(!valid_env_name(&"a".repeat(65)));
+        assert!(!valid_env_name("base"));
         for bad in ["", "Prod", "a b", "a/b", "a.b", "a\n"] {
             assert!(!valid_env_name(bad), "{bad:?}");
         }

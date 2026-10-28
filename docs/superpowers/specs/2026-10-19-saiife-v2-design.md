@@ -1073,7 +1073,7 @@ Built (plan 14):
   `limits` merge key by key.
 - `[environments]` may appear only in `config.toml`, not in `policy.d` or a
   project file.
-- Environment names match `[a-z0-9_-]{1,64}`.
+- Environment names match `[a-z0-9_-]{1,64}` and may not be `base` (approvals show the base config as "env base").
 - A malformed `env` value is a bad request in locked mode too; it never falls
   back to another environment.
 - `env use --scope` is root only (the spec's "admin rights").
