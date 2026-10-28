@@ -64,9 +64,9 @@ Locked mode is Linux only (macOS follows in v2.1). On supported Linux an
 admin can install saiife as root (`saiife system install`): for agents
 labelled lockable (currently Claude Code) the agent cannot turn the guard
 off, the audit is written by a daemon the agent cannot touch, and locked
-mode fails closed. The agent never
-holds a credential for a brokered service; it holds its own model-provider
-login unless you run a local model.
+mode fails closed. The agent never holds a credential for a brokered
+service; it holds its own model-provider login unless you run a local
+model.
 
 - Send a copy of the audit elsewhere, so that a cut or rewrite of records
   that were already forwarded shows: [Audit forwarding](docs/forwarding.md)
