@@ -2,8 +2,10 @@
 //! Azure token mints and AWS STS.
 
 pub mod jwt;
+pub mod session_policy;
 pub mod sigv4;
 pub mod token;
+pub mod sts;
 
 use crate::BrokerError;
 
