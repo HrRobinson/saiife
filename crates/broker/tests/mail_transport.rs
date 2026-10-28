@@ -311,6 +311,9 @@ enum Imap {
     DeepNest,
     /// Message 104's text holds the mailbox password.
     SecretBody,
+    /// `mail.get` first gets an unasked-for, valid BODYSTRUCTURE this many
+    /// parentheses deep, then the message.
+    Nest(usize),
     /// 5,000 messages (UIDs 1 to 5000, unseen 3, 7 and 4990), and an
     /// `EXAMINE` without `UIDNEXT`.
     Big,
@@ -560,6 +563,14 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             }
             put(&mut s, &format!("{out}{tag} OK FETCH done\r\n")).await;
         } else if upper.starts_with("UID FETCH") {
+            if let Imap::Nest(depth) = mode {
+                // Multiparts around one text part; the FETCH list is one level.
+                let mut b = "(\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)".to_string();
+                for _ in 0..depth - 2 {
+                    b = format!("({b} \"mixed\")");
+                }
+                put(&mut s, &format!("* 4 FETCH (BODYSTRUCTURE {b})\r\n")).await;
+            }
             if mode == Imap::DeepNest {
                 put(
                     &mut s,
@@ -1445,4 +1456,42 @@ async fn mail_get_cut_inside_the_password_leaks_no_prefix() {
     }
     // The cut moved across the whole password.
     assert!(lengths.len() > 100, "{}", lengths.len());
+}
+
+/// `mail.get` through the whole client on a 2 MiB thread, with an extra
+/// BODYSTRUCTURE response `depth` parentheses deep.
+fn get_with_nesting(depth: usize) -> Outcome {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(Box::pin(async move {
+                let p = pki();
+                let (ip, _log) = imap_server(&p, Imap::Nest(depth)).await;
+                let snap = snapshot((1, "implicit"), (ip, "implicit"));
+                let c = call("mail.get", &[("folder", "INBOX"), ("uid", "104")], None);
+                Box::pin(go(
+                    &c,
+                    &snap,
+                    &catalog_of(MANIFEST),
+                    &upstream(&p, Duration::from_secs(5)),
+                ))
+                .await
+                .0
+            }))
+        })
+        .unwrap()
+        .join()
+        .expect("the call fits the stack")
+}
+
+#[test]
+fn valid_bodystructure_32_deep_accepted_33_refused() {
+    let o = get_with_nesting(32);
+    assert_eq!(done(&o).0, 200);
+    let o = get_with_nesting(33);
+    assert!(failed(&o).contains("nested too deep"), "{o:?}");
 }

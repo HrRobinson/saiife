@@ -36,7 +36,12 @@ const LOGOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// The deepest parenthesis nesting a response may have. imap-proto's
 /// parsers (BODYSTRUCTURE above all) recurse without a limit, so a deeper
 /// response is refused before it is parsed.
-const MAX_DEPTH: usize = 64;
+///
+/// 32: a valid 64-deep BODYSTRUCTURE needs about 1.0 to 1.3 MiB of stack in
+/// a debug build, too close to a 2 MiB tokio worker. Real messages rarely
+/// nest past about 10 (`valid_bodystructure_at_the_limit` parses 32 on a
+/// 2 MiB thread).
+const MAX_DEPTH: usize = 32;
 /// `mail.list` searches descending UID windows of this many UIDs. A
 /// window's `* SEARCH` line (at most 500 UIDs of 10 digits and a space)
 /// stays below the 8 KiB line limit.
@@ -817,12 +822,52 @@ mod tests {
         ));
     }
 
+    /// A valid BODYSTRUCTURE `depth` parentheses deep in all, the FETCH list
+    /// included: multiparts around one text part.
+    pub(crate) fn nested_bodystructure(depth: usize) -> String {
+        let levels = depth - 2;
+        let mut b = "(\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)".to_string();
+        for _ in 0..levels {
+            b = format!("({b} \"mixed\")");
+        }
+        format!("* 1 FETCH (UID 9 BODYSTRUCTURE {b})\r\n")
+    }
+
+    #[test]
+    fn valid_bodystructure_at_the_limit() {
+        // On a 2 MiB thread (a tokio worker's stack), through the guard and
+        // imap-proto.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let ok = nested_bodystructure(MAX_DEPTH);
+                match parse(ok.as_bytes()) {
+                    Ok(Response::Fetch(1, attrs)) => assert!(attrs
+                        .iter()
+                        .any(|a| matches!(a, AttributeValue::BodyStructure(_)))),
+                    other => panic!("depth {MAX_DEPTH} refused: {other:?}"),
+                }
+                let deep = nested_bodystructure(MAX_DEPTH + 1);
+                assert_eq!(
+                    parse(deep.as_bytes()).err(),
+                    Some("response refused: nested too deep or malformed")
+                );
+            })
+            .unwrap()
+            .join()
+            .expect("parsed within the stack");
+    }
+
     #[test]
     fn depth_guard() {
-        let deep = format!("* 1 FETCH (BODYSTRUCTURE {}\r\n", "(".repeat(65));
+        let deep = format!("* 1 FETCH (BODYSTRUCTURE {}\r\n", "(".repeat(MAX_DEPTH + 1));
         assert!(!depth_ok(deep.as_bytes()));
         assert!(parse(deep.as_bytes()).is_err());
-        let ok = format!("* 1 FETCH (X {}{}\r\n", "(".repeat(63), ")".repeat(64));
+        let ok = format!(
+            "* 1 FETCH (X {}{}\r\n",
+            "(".repeat(MAX_DEPTH - 1),
+            ")".repeat(MAX_DEPTH)
+        );
         assert!(depth_ok(ok.as_bytes()));
         // Parentheses in quoted strings and literals do not count.
         let quoted = format!("* 1 FETCH (X \"{}\\\"\")\r\n", "(".repeat(100));
