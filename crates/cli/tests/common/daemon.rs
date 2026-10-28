@@ -177,6 +177,7 @@ impl TestDaemon {
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.audit_dir())
+            .env("XDG_RUNTIME_DIR", self.path().join("no-runtime"))
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
             .env_remove("CREDENTIALS_DIRECTORY")
@@ -298,6 +299,7 @@ impl TestDaemon {
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.audit_dir())
+            .env("XDG_RUNTIME_DIR", self.path().join("no-runtime"))
             .output()
             .unwrap()
     }

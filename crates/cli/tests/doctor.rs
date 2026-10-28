@@ -15,6 +15,7 @@ fn doctor(root: &Path, args: &[&str]) -> std::process::Output {
         .arg("--root")
         .arg(root)
         .env("HOME", root.join("home"))
+        .env("XDG_RUNTIME_DIR", root.join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap()
@@ -164,6 +165,7 @@ fn doctor_as_user_checks_self() {
         .args(["doctor", "--json", "--root"])
         .arg(tmp.path())
         .env("HOME", home.path())
+        .env("XDG_RUNTIME_DIR", home.path().join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
@@ -193,6 +195,7 @@ fn doctor_as_user_checks_self() {
         .args(["doctor", "--root"])
         .arg(tmp.path())
         .env("HOME", home.path())
+        .env("XDG_RUNTIME_DIR", home.path().join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();

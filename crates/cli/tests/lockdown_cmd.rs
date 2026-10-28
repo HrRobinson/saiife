@@ -59,6 +59,7 @@ fn world(extra: &str) -> TestDaemon {
 fn base_cmd(d: &TestDaemon) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
     c.env("HOME", d.path().join("home"))
+        .env("XDG_RUNTIME_DIR", d.path().join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .env("SAIIFE_DATA_DIR", d.path().join("data"))
         .env("SAIIFE_AUDIT_DIR", d.audit_dir())

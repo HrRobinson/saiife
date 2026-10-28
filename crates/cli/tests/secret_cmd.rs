@@ -24,6 +24,7 @@ fn saiife(d: &TestDaemon, args: &[&str], envs: &[(&str, &str)]) -> Output {
         .arg(d.config())
         .args(args)
         .env("HOME", d.path().join("home"))
+        .env("XDG_RUNTIME_DIR", d.path().join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .env("SAIIFE_DATA_DIR", d.path().join("data"))
         .env("SAIIFE_AUDIT_DIR", d.audit_dir())

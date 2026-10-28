@@ -81,8 +81,15 @@ impl Env {
             .env("HOME", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .env("SAIIFE_AUDIT_DIR", self.audit.path())
-            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path());
+            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path())
+            .env("XDG_RUNTIME_DIR", self.no_runtime_dir());
         cmd
+    }
+
+    /// A runtime dir that does not exist, under the test HOME: no test can
+    /// reach a real `$XDG_RUNTIME_DIR/saiife/saiife.sock` (plan 16).
+    pub fn no_runtime_dir(&self) -> PathBuf {
+        self.home.path().join("no-runtime")
     }
 
     /// `saiife` in the project root, killed after `limit`: `None` if it was

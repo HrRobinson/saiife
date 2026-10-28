@@ -419,6 +419,7 @@ impl World {
     fn api_cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
         c.env("HOME", self.path().join("home"))
+            .env("XDG_RUNTIME_DIR", self.path().join("no-runtime"))
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
@@ -1312,6 +1313,7 @@ impl World {
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
             .env("HOME", self.path().join("home"))
+            .env("XDG_RUNTIME_DIR", self.path().join("no-runtime"))
             .env("PATH", "/usr/bin:/bin")
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.path().join("audit"))
