@@ -80,7 +80,23 @@ fn valid_env_var(v: &str) -> bool {
 }
 
 fn reserved_env_var(v: &str) -> bool {
-    matches!(v, "PATH" | "HOME" | "LANG") || v.starts_with("LD_")
+    matches!(
+        v,
+        "PATH"
+            | "HOME"
+            | "LANG"
+            | "NODE_OPTIONS"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "BASH_ENV"
+            | "ENV"
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "NLSPATH"
+            | "HOSTALIASES"
+            | "TMPDIR"
+    ) || v.starts_with("LD_")
+        || v.starts_with("DYLD_")
 }
 
 impl McpServerCfg {
@@ -97,6 +113,18 @@ impl McpServerCfg {
                 "command {} must be an absolute path",
                 self.command.display()
             )));
+        }
+        let has_ctl = |s: &str| s.chars().any(char::is_control);
+        match self.command.to_str() {
+            Some(c) if !has_ctl(c) => {}
+            _ => {
+                return Err(at(
+                    "command holds a control character or is not UTF-8".to_string()
+                ))
+            }
+        }
+        if let Some(a) = self.args.iter().find(|a| has_ctl(a)) {
+            return Err(at(format!("args entry {a:?} holds a control character")));
         }
         for (var, secret) in &self.env {
             if !valid_env_var(var) {
@@ -143,8 +171,8 @@ impl McpServerCfg {
                 )));
             }
         }
-        if self.timeout > MAX_TIMEOUT {
-            return Err(at("timeout is at most 300s".to_string()));
+        if self.timeout < Duration::from_secs(1) || self.timeout > MAX_TIMEOUT {
+            return Err(at("timeout must be between 1s and 300s".to_string()));
         }
         Ok(())
     }
@@ -160,6 +188,11 @@ pub fn decide_tool(
     mode: Mode,
     tool: &str,
 ) -> Verdict {
+    if tool.is_empty() {
+        return Verdict::Deny {
+            rule: "default_deny".to_string(),
+        };
+    }
     let o_allow: &[String] = match (overlay, mode) {
         (Some(o), Mode::Developer) => &o.allow,
         _ => &[],
@@ -274,6 +307,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_slashed_tool_names() {
+        let c = cfg("allow=[\"*\"]");
+        assert_eq!(
+            decide_tool(&c, None, Mode::Locked, ""),
+            deny("default_deny")
+        );
+        assert_eq!(
+            decide_tool(&c, None, Mode::Locked, "a/b"),
+            deny("default_deny")
+        );
+    }
+
+    #[test]
+    fn control_chars_in_command_and_args_refused() {
+        let mut c = cfg("");
+        c.command = "/usr/bin/x\0y".into();
+        assert!(c.validate("x").is_err());
+        let mut c = cfg("");
+        c.args = vec!["ok".into(), "a\nb".into()];
+        assert!(c.validate("x").is_err());
+    }
+
+    #[test]
+    fn more_reserved_env_vars_refused() {
+        for v in [
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "BASH_ENV",
+            "ENV",
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "HOSTALIASES",
+            "TMPDIR",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            let c = cfg(&format!("env = {{ \"{v}\" = \"s\" }}"));
+            assert!(c.validate("x").is_err(), "{v}");
+        }
+    }
+
+    #[test]
     fn read_tools_kind() {
         let c = cfg("read_tools=[\"list_*\", \"get_issue\"]");
         assert_eq!(tool_kind(&c, "list_issues"), "read");
@@ -336,5 +412,8 @@ mod tests {
         assert_eq!(cfg("").timeout, Duration::from_secs(30));
         assert!(cfg("timeout = \"301s\"").validate("x").is_err());
         assert!(cfg("timeout = \"5m\"").validate("x").is_ok());
+        let mut c = cfg("");
+        c.timeout = Duration::ZERO;
+        assert!(c.validate("x").is_err());
     }
 }

@@ -82,6 +82,36 @@ fn bad_mcp_dropin_values_refused() {
     }
 }
 
+#[test]
+fn allow_servers_overlap_ignores_case() {
+    let (_d, cfg) = etc(
+        LOCKED,
+        &[
+            ("mcp-linear.toml", LINEAR),
+            ("x.toml", "[guard.mcp]\nallow_servers = [\"Linear\"]\n"),
+        ],
+    );
+    assert!(load_system(&cfg).is_err());
+    let (_d, cfg) = etc(
+        LOCKED,
+        &[("x.toml", "[guard.mcp]\nallow_servers = [\"SAIIFE\"]\n")],
+    );
+    assert!(load_system(&cfg).is_err());
+}
+
+/// `[mcp.*]` is skipped when empty, so a config without it serializes (and
+/// hashes) as it did before plan 17.
+#[test]
+fn no_mcp_hash_is_unchanged() {
+    let (_d, cfg) = etc(LOCKED, &[]);
+    let p = load_system(&cfg).unwrap();
+    let v = saiife_policy::effective_policy(&p.config, &[], None, None);
+    assert_eq!(
+        saiife_policy::policy_hash(&v), // Same value on main (1c975b5) for this config.
+        "sha256:2865f5d87de5b97228c121d4ee0cd5b8c78b75ba2b1f06486c39823035848892"
+    );
+}
+
 /// Plan 17 is silent on environments, so `[mcp.*]` is not overridable there:
 /// `EnvironmentCfg` has no such key and rejects it.
 #[test]

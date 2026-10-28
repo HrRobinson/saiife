@@ -367,13 +367,13 @@ fn validate_mcp(
         srv.validate(name).map_err(|why| invalid(&file, why))?;
     }
     for s in &cfg.guard.mcp.allow_servers {
-        if s == "saiife" {
+        if s.eq_ignore_ascii_case("saiife") {
             return Err(invalid(
                 config_file,
                 "[guard.mcp] allow_servers may not contain \"saiife\" (it is the brokered server)",
             ));
         }
-        if cfg.mcp.contains_key(s) {
+        if let Some(s) = cfg.mcp.keys().find(|k| k.eq_ignore_ascii_case(s)) {
             return Err(invalid(
                 config_file,
                 format!(
