@@ -659,6 +659,11 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         more,
         tcp,
     ));
+    // An oauth2 refresh in flight finishes first: its rotated refresh token
+    // may be the only valid one, and it must reach the vault.
+    if !rt.block_on(ctx.oauth.drain(crate::oauth::DRAIN)) {
+        eprintln!("saiifed: warning: an oauth2 refresh was still running at shutdown");
+    }
     rt.shutdown_timeout(Duration::from_secs(1));
     drop(ctx);
     let _ = join.join();

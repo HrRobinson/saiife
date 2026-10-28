@@ -141,12 +141,22 @@ fn usable(t: &str) -> bool {
 /// Parses a token response. `instance_url`, when present, must be an
 /// `https` URL whose host is `expect_host` (the configured instance), or
 /// the response is refused: an access token for another instance is never
-/// used, and a refresh token from such a response is never stored.
-pub fn parse_token(body: &[u8], expect_host: &str) -> Result<Token, RefreshError> {
+/// used, and a refresh token from such a response is never stored. With
+/// `require_instance` (the manifest declares an instance host, see
+/// [`instance_required`]) a response without `instance_url` is refused too.
+pub fn parse_token(
+    body: &[u8],
+    expect_host: &str,
+    require_instance: bool,
+) -> Result<Token, RefreshError> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| RefreshError::BadResponse)?;
     let o = v.as_object().ok_or(RefreshError::BadResponse)?;
-    if let Some(inst) = o.get("instance_url") {
+    let inst = o.get("instance_url").filter(|v| !v.is_null());
+    if inst.is_none() && require_instance {
+        return Err(RefreshError::InstanceMismatch);
+    }
+    if let Some(inst) = inst {
         let inst = inst.as_str().ok_or(RefreshError::BadResponse)?;
         let uri: Uri = inst.parse().map_err(|_| RefreshError::InstanceMismatch)?;
         let ok = uri.scheme_str() == Some("https")
@@ -190,6 +200,12 @@ pub fn parse_token(body: &[u8], expect_host: &str) -> Result<Token, RefreshError
         refresh: refresh.map(|r| Zeroizing::new(r.to_string())),
         ttl,
     })
+}
+
+/// The manifest declares an instance host (its base URL host is a whole
+/// `{param}`), so a token response must name the instance it is for.
+pub fn instance_required(m: &Manifest) -> bool {
+    m.whole_host_param().is_some()
 }
 
 /// The token is due for a refresh: it is `age` old and lived `ttl`.
@@ -274,6 +290,7 @@ path = "/limits"
         let t = parse_token(
             br#"{"access_token":"at-1234","refresh_token":"rt-5678","instance_url":"https://acme.sf.test","token_type":"Bearer","expires_in":3600}"#,
             "acme.sf.test",
+            true,
         )
         .unwrap();
         assert_eq!(t.access.as_str(), "at-1234");
@@ -282,9 +299,20 @@ path = "/limits"
         let d = format!("{t:?}");
         assert!(!d.contains("at-1234") && !d.contains("rt-5678"), "{d}");
 
-        let t = parse_token(br#"{"access_token":"at-1234"}"#, "acme.sf.test").unwrap();
+        let t = parse_token(br#"{"access_token":"at-1234"}"#, "acme.sf.test", false).unwrap();
         assert_eq!(t.ttl, DEFAULT_TTL);
         assert!(t.refresh.is_none());
+        // An instance host declared: the response must name it.
+        assert!(instance_required(&manifest()));
+        for missing in [
+            &br#"{"access_token":"at-1234"}"#[..],
+            br#"{"access_token":"at-1234","instance_url":null}"#,
+        ] {
+            assert_eq!(
+                parse_token(missing, "acme.sf.test", true).unwrap_err(),
+                RefreshError::InstanceMismatch
+            );
+        }
 
         for bad in [
             &br#"{"access_token":"at-1234","instance_url":"https://evil.sf.test"}"#[..],
@@ -293,7 +321,7 @@ path = "/limits"
             br#"{"access_token":"at-1234","instance_url":"https://acme.sf.test.evil.test"}"#,
         ] {
             assert_eq!(
-                parse_token(bad, "acme.sf.test").unwrap_err(),
+                parse_token(bad, "acme.sf.test", false).unwrap_err(),
                 RefreshError::InstanceMismatch
             );
         }
@@ -307,7 +335,7 @@ path = "/limits"
             br#"{"refresh_token":"rt-5678"}"#,
         ] {
             assert_eq!(
-                parse_token(bad, "acme.sf.test").unwrap_err(),
+                parse_token(bad, "acme.sf.test", false).unwrap_err(),
                 RefreshError::BadResponse
             );
         }

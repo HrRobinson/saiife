@@ -142,6 +142,25 @@ To use one, run `saiife connect <service>`. It stores the secret (or reuses
 an existing one with `--secret <name>`, if that secret allows the service)
 and writes a policy file that starts deny-all.
 
+## OAuth2 secrets
+
+An `oauth2` secret holds `client_id`, `client_secret` and `refresh_token`
+(`saiife secret add <name> --kind oauth2`). The daemon gets access tokens
+from the connector's token endpoint on the service's own host and keeps
+them in memory only. When the manifest's host is an instance parameter, a
+token response must name that instance in `instance_url`, or it is refused.
+After a 401 the daemon refreshes once and sends the request once more. A
+failed refresh starts a backoff of 5 seconds to 5 minutes (see
+[notifications](../notifications.md#events)).
+
+Some services issue a new refresh token on each refresh. The daemon writes
+it to the vault before it uses the new access token, and at shutdown it
+waits up to 5 seconds for a refresh in flight. If that write fails, stderr
+says `<secret>: rotated refresh token not persisted; do not restart the
+daemon`; fix the vault and the next call writes it. If the token was lost
+anyway (refresh calls fail with `http_400` or `http_401`), get a new
+refresh token from the service and run `saiife secret rotate <secret>`.
+
 ## Answer frame size
 
 The control socket accepts requests of up to 1 MiB, but an answer may be up

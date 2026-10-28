@@ -482,7 +482,12 @@ pub(crate) mod linux {
                     .into(),
             )
         };
-        let o: Map<String, Value> = serde_json::from_str(v).map_err(|_| shape())?;
+        // A duplicate key is refused: `{"refresh_token":"a","refresh_token":"b"}`
+        // would otherwise keep one of the two silently.
+        let o = match saiife_broker::pipeline::strict_json(v.as_bytes()) {
+            Some(Value::Object(o)) => o,
+            _ => return Err(shape()),
+        };
         if o.len() != KEYS.len() {
             return Err(shape());
         }

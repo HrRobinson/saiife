@@ -621,15 +621,43 @@ async fn instance_url_mismatch_refused() {
 }
 
 #[tokio::test]
-async fn refresh_failed_record_and_notify_once_per_hour() {
-    let w = world(|s| s.token_status = 400).await;
-    for _ in 0..3 {
-        assert_eq!(rule(&w.call().await), "refresh_failed");
-    }
-    assert_eq!(w.posts().len(), 3);
+async fn instance_url_required_for_an_instance_host() {
+    // The manifest's host is `{instance_host}`: a response that names no
+    // instance is refused.
+    let w = world(|s| {
+        s.instance = String::new();
+        s.rotate = true;
+    })
+    .await;
+    assert_eq!(rule(&w.call().await), "refresh_failed");
     assert!(w.api().is_empty());
+    assert_eq!(w.vault_refresh(), initial_refresh());
+    assert_eq!(w.refresh_failed()[0]["reason"], "instance_mismatch");
+}
+
+#[tokio::test]
+async fn failed_refresh_backs_off() {
+    let w = Arc::new(world(|s| s.token_status = 400).await);
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let w = Arc::clone(&w);
+        tasks.push(tokio::spawn(async move { w.call().await }));
+    }
+    for t in tasks {
+        assert_eq!(rule(&t.await.unwrap()), "refresh_failed");
+    }
+    assert_eq!(w.posts().len(), 1, "one POST per backoff window");
+    assert_eq!(w.refresh_failed().len(), 1, "one record per window");
+    assert!(w.api().is_empty());
+
+    // The first window (5 s) has passed: one POST again, then a 10 s
+    // window.
+    tokio::time::sleep(Duration::from_millis(5100)).await;
+    assert_eq!(rule(&w.call().await), "refresh_failed");
+    assert_eq!(rule(&w.call().await), "refresh_failed");
+    assert_eq!(w.posts().len(), 2);
     let f = w.refresh_failed();
-    assert_eq!(f.len(), 3, "every failure is recorded");
+    assert_eq!(f.len(), 2);
     for r in &f {
         assert_eq!(r["reason"], "http_400");
         assert_eq!(r["name"], SECRET);
@@ -646,10 +674,116 @@ async fn refresh_failed_record_and_notify_once_per_hour() {
     assert_eq!(ev.len(), 1, "at most one notification per secret per hour");
     assert_eq!(ev[0].reason.as_deref(), Some("http_400"));
     assert_eq!(ev[0].service.as_deref(), Some("sf"));
+
+    // `forget` (secret rotate/remove) ends the backoff.
+    w.st.lock().unwrap().token_status = 200;
+    assert_eq!(rule(&w.call().await), "refresh_failed");
+    assert_eq!(w.posts().len(), 2);
+    w.ctx.oauth.forget(SECRET);
+    assert_eq!(status(&w.call().await), 200);
+    assert_eq!(w.posts().len(), 3);
 }
 
 #[tokio::test]
-async fn tokens_never_in_records_or_errors() {
+async fn refresh_started_before_shutdown_still_persists() {
+    let w = world(|s| {
+        s.rotate = true;
+        s.delay_ms = 500;
+    })
+    .await;
+    let ctx = Arc::clone(&w.ctx);
+    // The daemon's own runtime (the mock runs on the test's): a call starts
+    // a refresh, then `serve` returns and the caller is gone.
+    let left = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let c = Arc::clone(&ctx);
+            let call = tokio::spawn(async move {
+                let req = IpcRequest {
+                    id: 1,
+                    op: "api.call".into(),
+                    args: json!({"service": "sf", "operation": "limits"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                };
+                saiife_daemon::ops::dispatch(&c, &peer(), req).await
+            });
+            while ctx.oauth.in_flight() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            call.abort();
+        });
+        let left = ctx.oauth.in_flight();
+        // What `start` does before `shutdown_timeout`.
+        assert!(rt.block_on(ctx.oauth.drain(saiife_daemon::oauth::DRAIN)));
+        rt.shutdown_timeout(Duration::from_secs(1));
+        left
+    })
+    .await
+    .unwrap();
+    assert_eq!(left, 1, "the refresh was in flight at shutdown");
+    assert_eq!(w.posts(), vec![initial_refresh()]);
+    assert_eq!(w.vault_refresh(), format!("rt-rot-1-{}", "c3".repeat(8)));
+    assert!(w.api().is_empty(), "the caller was gone");
+}
+
+/// Set in the child run of [`tokens_never_in_records_errors_or_stderr`].
+const LEAK_CHILD: &str = "SAIIFE_OAUTH2_LEAK_CHILD";
+
+/// Every token value could appear in the daemon's stderr; the test binary
+/// runs this test again as a child (`--nocapture`, so `eprintln!` reaches
+/// the real stderr) and reads what it wrote.
+#[test]
+fn tokens_never_in_records_errors_or_stderr() {
+    if std::env::var_os(LEAK_CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(leak_scenario());
+        return;
+    }
+    let o = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "tokens_never_in_records_errors_or_stderr",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LEAK_CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success(), "child failed:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 passed"),
+        "the child ran nothing:\n{stdout}"
+    );
+    // The persist failure was said, by name.
+    assert!(
+        stderr.contains(&format!(
+            "{SECRET}: rotated refresh token not persisted; do not restart the daemon"
+        )),
+        "{stderr}"
+    );
+    let mut needles: Vec<String> = vec![client_secret(), initial_refresh()];
+    for n in 1..=20 {
+        needles.push(format!("at-{n}-{}", "q7".repeat(8)));
+        needles.push(format!("rt-rot-{n}-{}", "c3".repeat(8)));
+    }
+    for n in &needles {
+        assert!(!stderr.contains(n.as_str()), "{n} leaked to stderr");
+        assert!(!stdout.contains(n.as_str()), "{n} leaked to stdout");
+    }
+}
+
+async fn leak_scenario() {
     let w = world(|s| s.rotate = true).await;
     let mut answers = Vec::new();
     answers.push(w.call().await);

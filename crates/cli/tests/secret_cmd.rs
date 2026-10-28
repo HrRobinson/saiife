@@ -438,6 +438,28 @@ fn secret_add_oauth2_fields() {
     );
     assert_eq!(o.status.code(), Some(2));
     assert!(err(&o).contains("client_id, client_secret and refresh_token"));
+    // A key twice: refused, though the object has three distinct keys.
+    let dup = format!(
+        r#"{{"client_id":"cid","client_secret":"{secret}","refresh_token":"{refresh}","refresh_token":"rt-dup-{}"}}"#,
+        "d0".repeat(8)
+    );
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "sf3",
+            "--kind",
+            "oauth2",
+            "--service",
+            "sf",
+            "--from-env",
+            "SV",
+        ],
+        &[("SV", &dup)],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("client_id, client_secret and refresh_token"));
+    assert!(!err(&o).contains(&refresh) && !err(&o).contains("rt-dup-"));
     // Rotate reads the same shape (the stored kind says so).
     let f = d.path().join("oauth.json");
     let refresh2 = format!("rt-{}", "c5".repeat(10));
