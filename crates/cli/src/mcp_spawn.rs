@@ -28,11 +28,20 @@ fn spawn() -> Result<std::convert::Infallible, String> {
     let spec = sandbox::read_spec_from_stdin().map_err(|e| e.to_string())?;
     rustix::process::setsid().map_err(|_| "cannot start a new session".to_string())?;
     // std opens everything close-on-exec, so this is normally empty: a
-    // descriptor someone leaked to us is closed by the shell below.
+    // descriptor someone leaked to us is closed by the shell below, which
+    // can name only single-digit ones: anything higher is refused.
     let leaked =
         sandbox::inherited_fds().map_err(|_| "cannot list open descriptors".to_string())?;
+    if leaked.iter().any(|&fd| fd > sandbox::MAX_CLOSABLE_FD) {
+        return Err("an inherited descriptor above 9".to_string());
+    }
     std::env::set_current_dir(&spec.home).map_err(|_| "cannot enter the home dir".to_string())?;
     sandbox::apply(&spec).map_err(|e| e.to_string())?;
+    if spec.sandbox == sandbox::Sandbox::Landlock {
+        if let Some(gap) = sandbox::sandbox_strength().gap() {
+            eprintln!("saiife: __mcp-spawn: weaker sandbox: {gap}");
+        }
+    }
     let err = command(&spec, &leaked).exec();
     Err(format!("cannot exec the server: {}", err.kind()))
 }

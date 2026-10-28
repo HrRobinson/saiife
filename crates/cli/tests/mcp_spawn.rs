@@ -94,7 +94,8 @@ impl Out {
 }
 
 /// Runs the helper with `stdin` as its whole input. `sh_fds` opens these
-/// extra descriptors (on /dev/null, without close-on-exec) through a shell.
+/// extra descriptors (on /dev/null, without close-on-exec) through bash,
+/// which, unlike dash, takes multi-digit descriptors.
 fn run_raw(t: &T, stdin: &[u8], sh_fds: &[i32]) -> Out {
     let mut c = if sh_fds.is_empty() {
         let mut c = Command::new(BIN);
@@ -102,7 +103,7 @@ fn run_raw(t: &T, stdin: &[u8], sh_fds: &[i32]) -> Out {
         c
     } else {
         let opens: Vec<String> = sh_fds.iter().map(|f| format!("{f}</dev/null")).collect();
-        let mut c = Command::new("/bin/sh");
+        let mut c = Command::new("/bin/bash");
         c.arg("-c")
             .arg(format!("exec \"$0\" __mcp-spawn {}", opens.join(" ")))
             .arg(BIN);
@@ -308,6 +309,49 @@ fn fds_above_2_closed() {
         }
         assert_eq!(out.introspect(2)["fds"], json!([0, 1, 2]), "{sandbox:?}");
     }
+    // A descriptor above 9 cannot be closed by a POSIX shell (dash reads
+    // `12<&-` as the word 12): the helper refuses instead of leaking it.
+    for fds in [&[12][..], &[5, 12]] {
+        let out = run_raw(
+            &t,
+            &session(&t.spec(Sandbox::Off), &[("introspect", json!({}))]),
+            fds,
+        );
+        assert_eq!(out.code, Some(126), "{fds:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("an inherited descriptor above 9"),
+            "{}",
+            out.stderr
+        );
+        assert!(out.stdout.is_empty(), "the server ran: {}", out.stdout);
+    }
+}
+
+#[test]
+fn home_is_not_executable() {
+    let t = T::new();
+    // A program the server could have written into its own home.
+    let prog = t.home().join("dropped");
+    std::fs::write(&prog, "#!/bin/sh\necho ran-from-home\n").unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut spec = t.spec(Sandbox::Landlock);
+    spec.command = prog.clone();
+    spec.args.clear();
+    let out = run(&t, &spec, &[]);
+    if landlock_abi() == 0 {
+        return assert_fallback_refused(&out);
+    }
+    assert_eq!(out.code, Some(126), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("cannot exec the server"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stdout.contains("ran-from-home"));
+    // Unconfined, the same program runs: the denial is the sandbox's.
+    spec.sandbox = Sandbox::Off;
+    let out = run(&t, &spec, &[]);
+    assert!(out.stdout.contains("ran-from-home"), "{}", out.stderr);
 }
 
 #[test]

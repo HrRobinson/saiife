@@ -6,11 +6,18 @@
 //! confinement: `no_new_privs`, and a Landlock ruleset that allows reading
 //! and executing the system's program and library dirs, a few files under
 //! `/etc`, its own `/proc/<pid>`, `/dev/null`, `/dev/urandom` and its
-//! `read_paths`, and writing only its home and `/dev/null`. Everything
-//! else (`/etc/saiife`, the vault, the credentials, the audit and state
-//! dirs, the sockets dir listing) is denied. With Landlock ABI 6 or later
-//! it also may not signal or reach abstract Unix sockets outside its
-//! domain. Network access is not restricted: servers call their APIs.
+//! `read_paths`, and writing (never executing) only its home and
+//! `/dev/null`. Everything else (`/etc/saiife`, the vault, the
+//! credentials, the audit and state dirs, the sockets dir listing) is
+//! denied; policy load refuses `read_paths` that would reach saiife's own
+//! dirs. Network access is not restricted: servers call their APIs.
+//!
+//! **Weaker on older kernels.** Signal and abstract Unix socket scoping
+//! needs Landlock ABI 6 (Linux 6.12). Below that the child is confined on
+//! the filesystem only: it may still signal processes of the daemon user
+//! and connect to abstract Unix sockets. [`sandbox_strength`] reports this
+//! (`filesystem` vs `filesystem+scopes`) for doctor and status, and the
+//! helper says so on stderr when it starts a server.
 //!
 //! The spec travels on the helper's stdin as one frame (a 4-byte
 //! big-endian length, then JSON), read with unbuffered reads so the rest
@@ -29,6 +36,11 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+
+/// The highest inherited descriptor the helper can close: it closes them
+/// with a POSIX shell redirection (`N<&-`), and POSIX shells such as dash
+/// take only one digit there. A higher one makes the helper refuse.
+pub const MAX_CLOSABLE_FD: i32 = 9;
 
 /// The largest spec frame the helper reads.
 pub const MAX_SPEC_BYTES: usize = 64 * 1024;
@@ -232,7 +244,10 @@ fn spawn_helper_from(seam: Option<OsString>) -> PathBuf {
 
 /// The open descriptors above 2 that an exec would keep (no
 /// `FD_CLOEXEC`), from `/proc/self/fdinfo`. The helper closes them before
-/// it execs the server.
+/// it execs the server, or refuses to start it when one is above
+/// [`MAX_CLOSABLE_FD`].
+///
+/// [`MAX_CLOSABLE_FD`]: crate::sandbox::MAX_CLOSABLE_FD
 pub fn inherited_fds() -> io::Result<Vec<i32>> {
     const O_CLOEXEC: u32 = 0o2_000_000;
     let mut out = Vec::new();
@@ -277,6 +292,54 @@ pub fn landlock_abi() -> u32 {
         .into_iter()
         .find(|(abi, _)| supports(*abi))
         .map_or(0, |(_, n)| n)
+}
+
+/// How strongly a `sandbox = "landlock"` child is confined on this kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Strength {
+    /// No Landlock (ABI 0): the child does not start.
+    None,
+    /// ABI 1 to 5: the filesystem rules only. The child may still signal
+    /// processes and connect to abstract Unix sockets outside its domain.
+    Filesystem,
+    /// ABI 6 or later: the filesystem rules, plus signal and abstract Unix
+    /// socket scoping.
+    FilesystemAndScopes,
+}
+
+impl Strength {
+    pub fn from_abi(abi: u32) -> Strength {
+        match abi {
+            0 => Strength::None,
+            1..=5 => Strength::Filesystem,
+            _ => Strength::FilesystemAndScopes,
+        }
+    }
+
+    /// Stable, machine-readable: `none`, `filesystem`, `filesystem+scopes`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Strength::None => "none",
+            Strength::Filesystem => "filesystem",
+            Strength::FilesystemAndScopes => "filesystem+scopes",
+        }
+    }
+
+    /// What is missing, for doctor and status; `None` at full strength.
+    pub fn gap(self) -> Option<&'static str> {
+        match self {
+            Strength::None => Some("no Landlock: sandboxed servers do not start"),
+            Strength::Filesystem => {
+                Some("Landlock ABI below 6: no signal or abstract Unix socket scoping")
+            }
+            Strength::FilesystemAndScopes => None,
+        }
+    }
+}
+
+/// The confinement this kernel gives a sandboxed child (doctor, status).
+pub fn sandbox_strength() -> Strength {
+    Strength::from_abi(landlock_abi())
 }
 
 /// Whether the kernel takes every right of `abi`, as a hard requirement.
@@ -330,6 +393,9 @@ pub fn apply(spec: &SpawnSpec) -> Result<(), SandboxError> {
 fn restrict(spec: &SpawnSpec, abi: ABI) -> Result<RestrictionStatus, landlock::RulesetError> {
     let read = AccessFs::from_read(abi);
     let all = AccessFs::from_all(abi);
+    // Home and /dev/null are writable but never executable: a server may
+    // not drop a program into its home and run it.
+    let rw = all & !AccessFs::Execute;
     // `/proc/self` is resolved here: the helper's pid is the server's,
     // since exec keeps it.
     let proc_self = std::fs::read_link("/proc/self")
@@ -354,7 +420,7 @@ fn restrict(spec: &SpawnSpec, abi: ABI) -> Result<RestrictionStatus, landlock::R
     // Paths that do not exist are left out: nothing there to allow.
     r.create()?
         .add_rules(path_beneath_rules(&read_paths, read))?
-        .add_rules(path_beneath_rules(&rw_paths, all))?
+        .add_rules(path_beneath_rules(&rw_paths, rw))?
         .restrict_self()
 }
 
@@ -456,5 +522,21 @@ mod tests {
     #[test]
     fn abi_is_in_range() {
         assert!(landlock_abi() <= 6);
+        assert_eq!(sandbox_strength(), Strength::from_abi(landlock_abi()));
+    }
+
+    #[test]
+    fn strength_below_abi_6_is_filesystem_only() {
+        assert_eq!(Strength::from_abi(0), Strength::None);
+        for n in 1..=5 {
+            let s = Strength::from_abi(n);
+            assert_eq!(s.as_str(), "filesystem");
+            assert!(s
+                .gap()
+                .unwrap()
+                .contains("no signal or abstract Unix socket"));
+        }
+        assert_eq!(Strength::from_abi(6).as_str(), "filesystem+scopes");
+        assert_eq!(Strength::from_abi(6).gap(), None);
     }
 }

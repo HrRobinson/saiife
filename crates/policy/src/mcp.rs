@@ -11,7 +11,7 @@ use crate::project::{Mode, ServiceOverlay};
 use crate::service::LimitsCfg;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Longest a tool call may take (`timeout`).
@@ -71,6 +71,33 @@ pub fn valid_server_name(s: &str) -> bool {
         && s.len() <= 32
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// saiife's own dirs: a gateway child may never be given read access to
+/// them, or to a dir that holds them.
+pub const PROTECTED_DIRS: [&str; 4] = [
+    "/etc/saiife",
+    "/var/lib/saiife",
+    "/var/log/saiife",
+    "/run/saiife",
+];
+
+/// Whether a `read_paths` entry would open saiife's own files to the
+/// server: `/`, any `..`, or a path equal to, beneath or above a
+/// [`PROTECTED_DIRS`] entry. Compared lexically and, when the path
+/// exists, also after resolving symlinks.
+fn exposes_saiife(p: &Path) -> bool {
+    use std::path::Component;
+    let hits = |p: &Path| {
+        p == Path::new("/")
+            || PROTECTED_DIRS.iter().any(|d| {
+                let d = Path::new(d);
+                p.starts_with(d) || d.starts_with(p)
+            })
+    };
+    p.components().any(|c| c == Component::ParentDir)
+        || hits(p)
+        || std::fs::canonicalize(p).is_ok_and(|r| hits(&r))
 }
 
 /// Whether `v` may name a child's secret variable: `[A-Z_][A-Z0-9_]*` and
@@ -150,6 +177,14 @@ impl McpServerCfg {
             return Err(at(format!(
                 "read_paths entry {} must be an absolute path",
                 p.display()
+            )));
+        }
+        if let Some(p) = self.read_paths.iter().find(|p| exposes_saiife(p)) {
+            return Err(at(format!(
+                "read_paths entry {} would let the server read saiife's own files \
+                 (it is /, holds a .. component, or equals or contains one of {})",
+                p.display(),
+                PROTECTED_DIRS.join(", ")
             )));
         }
         for (key, list) in [
@@ -246,6 +281,41 @@ mod tests {
 
     fn cfg(extra: &str) -> McpServerCfg {
         toml::from_str(&format!("command = \"/usr/bin/x\"\n{extra}")).unwrap()
+    }
+
+    #[test]
+    fn read_paths_never_expose_saiife_dirs() {
+        let refused = [
+            "/",
+            "/etc",
+            "/etc/saiife",
+            "/etc/saiife/policy.d",
+            "/var",
+            "/var/lib",
+            "/var/lib/saiife",
+            "/var/lib/saiife/vault",
+            "/var/log/saiife",
+            "/var/log",
+            "/run",
+            "/run/saiife",
+            "/run/saiife/sockets",
+            "/usr/share/../../etc/saiife",
+            "/opt/x/..",
+        ];
+        for p in refused {
+            let c = cfg(&format!("read_paths = [\"{p}\"]"));
+            let e = c.validate("linear").unwrap_err();
+            assert!(e.contains("saiife's own files"), "{p}: {e}");
+        }
+        for p in [
+            "/usr/share/zoneinfo",
+            "/etc/saiifex",
+            "/var/lib/node",
+            "/srv/mcp",
+        ] {
+            let c = cfg(&format!("read_paths = [\"{p}\"]"));
+            assert!(c.validate("linear").is_ok(), "{p}");
+        }
     }
 
     fn deny(rule: &str) -> Verdict {
