@@ -13,17 +13,24 @@ fn exe_str(exe: &Path) -> Result<&str, String> {
             exe.display()
         ));
     }
-    exe.to_str()
-        .ok_or_else(|| format!("the executable path {} is not valid UTF-8", exe.display()))
+    let s = exe
+        .to_str()
+        .ok_or_else(|| format!("the executable path {} is not valid UTF-8", exe.display()))?;
+    if s.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "the executable path {s:?} contains a control character"
+        ));
+    }
+    Ok(s)
 }
 
 pub fn user_unit_text(exe: &Path) -> Result<String, String> {
     let s = exe_str(exe)?;
     if s.chars()
-        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\' || c == '$')
     {
         return Err(format!(
-            "the executable path {s} contains whitespace, a quote or a backslash; \
+            "the executable path {s} contains whitespace, a quote, a backslash or a $; \
              move the binary to a plain path"
         ));
     }
@@ -135,8 +142,19 @@ WantedBy=default.target
             "/opt/a\tb",
             "/opt/\"q\"/s",
             "/opt/a\\b",
+            "/opt/$HOME/saiife",
+            "/opt/${HOME}/saiife",
+            "/opt/a\nExecStartPre=/bin/evil",
         ] {
             assert!(user_unit_text(Path::new(p)).is_err(), "{p}");
+        }
+    }
+
+    #[test]
+    fn control_characters_refused_in_both() {
+        for p in ["/opt/a\0b", "/opt/a\x01b", "/opt/a\x7fb", "/opt/a\rb"] {
+            assert!(user_unit_text(Path::new(p)).is_err(), "{p:?}");
+            assert!(launchd_plist_text(Path::new(p)).is_err(), "{p:?}");
         }
     }
 
