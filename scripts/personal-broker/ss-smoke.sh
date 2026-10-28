@@ -3,7 +3,8 @@
 # Service (gnome-keyring) and survives a broker restart. Do not run this on a
 # developer machine: it starts a keyring daemon and a broker.
 #
-# Needs: dbus-run-session, gnome-keyring-daemon, secret-tool, a built saiife.
+# Needs: dbus-run-session, gnome-keyring-daemon, secret-tool,
+# python3-secretstorage, a built saiife.
 # Usage: SAIIFE_BIN=target/debug/saiife bash scripts/personal-broker/ss-smoke.sh
 set -euo pipefail
 
@@ -87,11 +88,26 @@ if [ "$n" != 1 ]; then
   echo "expected 1 vault-key item, found $n" >&2
   exit 1
 fi
-# secret-tool prints the stored bytes as they are, with no added newline; a
-# trailing newline is tolerated anyway.
-len="$(secret-tool lookup application saiife saiife-item vault-key | wc -c)"
-if [ "$len" != 32 ] && [ "$len" != 33 ]; then
-  echo "expected a 32-byte key, got $len bytes" >&2
+# The key is raw application/octet-stream bytes, usually not valid UTF-8, so
+# `secret-tool lookup` cannot print it. Read it as bytes through
+# python3-secretstorage instead.
+len="$(python3 -I - <<'PY'
+import secretstorage
+
+conn = secretstorage.dbus_init()
+items = list(
+    secretstorage.search_items(
+        conn, {"application": "saiife", "saiife-item": "vault-key"}
+    )
+)
+if len(items) != 1:
+    print("items=%d" % len(items))
+else:
+    print(len(items[0].get_secret()))
+PY
+)"
+if [ "$len" != 32 ]; then
+  echo "expected a 32-byte key, got $len" >&2
   exit 1
 fi
 
