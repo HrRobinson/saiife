@@ -321,7 +321,9 @@ fn locked_mode_needs_the_audit_group() {
     );
 
     // An auditor (the same decision `saiife audit` uses) checks [audit] dir.
-    if cfg!(debug_assertions) {
+    // Linux only: locked mode is Linux only, and the group lookup uses
+    // getent, which macOS does not have.
+    if cfg!(debug_assertions) && cfg!(target_os = "linux") {
         let group = Command::new("id").arg("-gn").output().unwrap();
         let group = String::from_utf8(group.stdout).unwrap();
         let (mut c, _sb) = check_cmd(&audit);
