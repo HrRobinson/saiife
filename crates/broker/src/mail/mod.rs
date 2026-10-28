@@ -207,9 +207,45 @@ fn server(svc: &BTreeMap<String, String>, proto: &str) -> Result<Server, BrokerE
 /// part and domain, printable ASCII without space, `,`, `;`, `"`, `<` or
 /// `>` (so no CR, LF or second recipient can ride along).
 pub(crate) fn address_ok(a: &str) -> bool {
-    saiife_policy::valid_address(a)
-        && a.split('@').count() == 2
-        && a.split('@').all(|p| !p.is_empty())
+    if !saiife_policy::valid_address(a) {
+        return false;
+    }
+    let mut parts = a.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    // No source routes or percent hacks in the local part; a domain of
+    // proper labels (no empty label, no trailing dot, no edge hyphen).
+    !local.is_empty()
+        && !local.contains(['%', '!'])
+        && domain.len() <= 253
+        && domain.split('.').all(|l| {
+            (1..=63).contains(&l.len())
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
+}
+
+/// Fills what the policy must see before it decides: an omitted `folder`
+/// is `INBOX` (so `folder=INBOX` rules apply to it), and the domain of `to`
+/// is lower-cased (so `A@ACME.COM` matches `*@acme.com`).
+pub fn normalize(op: &Operation, params: &mut BTreeMap<String, String>) {
+    match op.id.as_str() {
+        "mail.list" | "mail.get" => {
+            params
+                .entry("folder".to_string())
+                .or_insert_with(|| "INBOX".to_string());
+        }
+        "mail.send" => {
+            if let Some(to) = params.get_mut("to") {
+                if let Some((local, domain)) = to.split_once('@') {
+                    *to = format!("{local}@{}", domain.to_ascii_lowercase());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Text without any control character (CR and LF included).
@@ -592,6 +628,12 @@ mod tests {
             "a@acme.com b@evil.test",
             "<a@acme.com>",
             "a@b@c",
+            "a@acme.com.",
+            "a@-acme.com",
+            "a@acme-.com",
+            "a@acme..com",
+            "user%evil.com@acme.com",
+            "evil.com!a@acme.com",
             "@acme.com",
             "a@",
             "",

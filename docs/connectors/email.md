@@ -78,9 +78,9 @@ requests_per_minute = 30
 writes_per_hour = 10
 ```
 
-## Sending to one domain without asking
+## Sending to one domain only
 
-To let the agent write to your own domain and ask for everything else:
+To let the agent write to your own domain and refuse every other recipient:
 
 ```toml
 [services.email]
@@ -88,13 +88,25 @@ connector = "email"
 secret = "mailbox"
 params = { smtp_host = "smtp.acme.com", imap_host = "imap.acme.com", from = "bot@acme.com" }
 allow = ["mail:read", "folders:read"]
-ask   = ["mail:write"]
 
 [[services.email.rule]]
 capability = "mail:write"
 when = { to = "*@acme.com" }
 action = "allow"
 ```
+
+Notes on matching:
+
+- The recipient is checked strictly: a domain of proper labels (no empty
+  label, no trailing dot, no leading or trailing `-`), and no `%` or `!` in
+  the local part.
+- The domain of `to` is lower-cased before the rule looks, so `A@ACME.COM`
+  matches `*@acme.com`. Apart from that, `when` matching is case-sensitive:
+  the local part keeps its case, so write patterns for the case you expect.
+- If `mail:write` is also under `ask`, every send is asked about, matching
+  rule or not: `ask` is the stricter verdict.
+- An omitted `folder` is `INBOX` before the policy decides, so a rule on
+  `folder=INBOX` also covers calls that leave it out.
 
 ## Limits
 

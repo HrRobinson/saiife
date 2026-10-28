@@ -703,10 +703,12 @@ async fn steps(
     };
     tr.operation = Some(op.id.clone());
     tr.op_kind = Some(op.kind);
-    let params = match params::validate(op, &given, &svc.fixed) {
+    let mut params = match params::validate(op, &given, &svc.fixed) {
         Ok(p) => p,
         Err(e) => return denied(rule_of(&e)),
     };
+    // Mail: defaults and case are settled before the policy looks.
+    crate::mail::normalize(op, &mut params);
     let prepared = match prepare_body(op, &params, call.body.as_ref()) {
         Ok(p) => p,
         Err(rule) => return denied(rule),

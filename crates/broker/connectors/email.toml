@@ -42,7 +42,7 @@ capability = "mail:write"
 qualifier = "to={to}"
 kind = "write"
 body = "text"
-query = { to = 'string:[^@\s,;<>]{1,64}@[A-Za-z0-9.-]{1,253}', subject = "string:.{1,998}" }
+query = { to = 'string:[^@\s,;<>%!]{1,64}@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*', subject = "string:.{1,998}" }
 
 [[operation]]
 id = "folders.list"
