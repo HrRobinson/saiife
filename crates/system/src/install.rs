@@ -224,6 +224,8 @@ pub fn install(
     }
     if claude {
         run.mcp_allowlist()?;
+    } else {
+        run.drop_stale_mcp()?;
     }
     run.save()?;
     // 9. Start (or restart) the daemon.
@@ -913,6 +915,21 @@ impl Run<'_> {
         self.save()
     }
 
+    /// A reinstall without Claude removes the drop-in an earlier run wrote,
+    /// and its entry in installed.toml.
+    fn drop_stale_mcp(&mut self) -> Result<(), InstallError> {
+        let path = Path::new(CLAUDE_MCP);
+        if !self.rec.files.iter().any(|f| f.path == path) {
+            return Ok(());
+        }
+        let p = self.at(CLAUDE_MCP);
+        if fsops::remove_if_listed(&p).map_err(step("managed"))? {
+            self.changed(format!("removed {CLAUDE_MCP}"));
+        }
+        self.rec.files.retain(|f| f.path != path);
+        self.save()
+    }
+
     /// The Claude Code MCP allowlist drop-in, from `[guard.mcp]` in the
     /// config as it is now (so the hook and Claude Code agree). An
     /// unreadable config leaves only `saiife` allowed, and says so.
@@ -1460,7 +1477,7 @@ pub(crate) mod tests {
         // The default config lists no servers: only `saiife`.
         assert_eq!(
             fs::read_to_string(e.at(CLAUDE_MCP)).unwrap(),
-            "{\n  \"allowedMcpServers\": [\n    {\n      \"serverName\": \"saiife\"\n    }\n  ]\n}\n"
+            "{\n  \"allowedMcpServers\": [\n    {\n      \"serverCommand\": [\n        \"/opt/saiife/bin/saiife\",\n        \"mcp\"\n      ]\n    }\n  ]\n}\n"
         );
         let cfg =
             "version = 2\nlocked = true\n\n[guard.mcp]\nallow_servers = [\"github\", \"jira\"]\n";
@@ -1471,7 +1488,8 @@ pub(crate) mod tests {
         assert_eq!(
             v,
             serde_json::json!({"allowedMcpServers": [
-                {"serverName": "saiife"}, {"serverName": "github"}, {"serverName": "jira"}
+                {"serverCommand": [BINARY, "mcp"]},
+                {"serverName": "github"}, {"serverName": "jira"}
             ]})
         );
         let f = e
@@ -1488,6 +1506,31 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn dropin_pins_saiife_by_command_not_name() {
+        let e = env(255);
+        e.install();
+        let text = fs::read_to_string(e.at(CLAUDE_MCP)).unwrap();
+        assert!(text.contains("\"serverCommand\""), "{text}");
+        assert!(!text.contains("\"serverName\": \"saiife\""), "{text}");
+    }
+
+    #[test]
+    fn reinstall_without_claude_removes_stale_dropin() {
+        let e = env(255);
+        e.install();
+        assert!(e.at(CLAUDE_MCP).exists());
+        let mut o = all_agents();
+        o.agents = vec![Agent::Codex];
+        e.run(&o).unwrap();
+        assert!(!e.at(CLAUDE_MCP).exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.path == Path::new(CLAUDE_MCP)));
     }
 
     #[test]

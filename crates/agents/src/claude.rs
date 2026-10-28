@@ -55,22 +55,28 @@ pub fn managed_settings() -> &'static str {
     MANAGED_SETTINGS
 }
 
-/// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only the
-/// MCP servers it names. `saiife` (the broker's own server) comes first,
-/// then `allow_servers` in order, without repeats.
+/// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only
+/// what it names. The broker's own server is pinned by command, so a
+/// project `.mcp.json` cannot define its own `saiife` server; the admin's
+/// `allow_servers` (gateway servers) follow by name, in order, without
+/// repeats. `saiife` is never allowed by name.
 pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
-    let mut names: Vec<&str> = vec!["saiife"];
+    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [SAIIFE_BINARY, "mcp"] })];
+    let mut seen: Vec<&str> = Vec::new();
     for s in allow_servers {
-        if !names.contains(&s.as_str()) {
-            names.push(s);
+        if s != "saiife" && !seen.contains(&s.as_str()) {
+            seen.push(s);
+            entries.push(json!({ "serverName": s }));
         }
     }
-    let entries: Vec<Value> = names.iter().map(|n| json!({ "serverName": n })).collect();
     let mut text =
         serde_json::to_string_pretty(&json!({ "allowedMcpServers": entries })).unwrap_or_default();
     text.push('\n');
     text
 }
+
+/// The installed binary (the same path the hook command uses).
+const SAIIFE_BINARY: &str = "/opt/saiife/bin/saiife";
 
 fn group() -> Value {
     json!({
@@ -521,19 +527,21 @@ mod mcp_tests {
     use super::*;
 
     #[test]
-    fn managed_mcp_settings_lists_saiife_first_without_repeats() {
-        let v: Value = serde_json::from_str(&managed_mcp_settings(&[
+    fn managed_mcp_settings_pins_saiife_by_command() {
+        let text = managed_mcp_settings(&[
             "github".into(),
             "saiife".into(),
             "jira".into(),
             "github".into(),
-        ]))
-        .unwrap();
+        ]);
+        let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v,
             json!({"allowedMcpServers": [
-                {"serverName": "saiife"}, {"serverName": "github"}, {"serverName": "jira"}
+                {"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]},
+                {"serverName": "github"}, {"serverName": "jira"}
             ]})
         );
+        assert!(!text.contains("\"serverName\": \"saiife\""));
     }
 }

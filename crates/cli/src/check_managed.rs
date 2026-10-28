@@ -241,11 +241,11 @@ mod imp {
 
         /// An `allow` for the reserved server `saiife`: the daemon judges
         /// its calls.
-        fn mcp_brokered() -> Judged {
+        fn mcp_brokered(input: String) -> Judged {
             let reason = "brokered: judged by the saiife daemon".to_string();
             Judged {
                 decision: DecisionKind::Allow,
-                input: String::new(),
+                input,
                 tool: None,
                 pack: Some("guard.mcp".into()),
                 rule: Some("mcp_brokered".into()),
@@ -582,7 +582,7 @@ mod imp {
         };
         match eval::mcp_check(agent, tool, &identity, &cfg.guard.mcp.allow_servers) {
             McpCheck::NotMcp | McpCheck::Allowed => None,
-            McpCheck::Brokered => Some(Judged::mcp_brokered()),
+            McpCheck::Brokered => Some(Judged::mcp_brokered(recorded_input(payload))),
             McpCheck::Denied(s) => Some(Judged::mcp_denied(format!(
                 "MCP server {s} is not in [guard.mcp] allow_servers"
             ))),

@@ -132,6 +132,12 @@ With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
   server is listed too.
 - MCP tool calls go through the hook, and managed settings can block MCP
   servers outright.
+- `system install` writes `/etc/claude-code/managed-settings.d/60-saiife-mcp.json`.
+  It allows saiife's own MCP server only by command
+  (`{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}`), so a project
+  `.mcp.json` cannot define its own server named `saiife`, plus the
+  `[guard.mcp] allow_servers` by name. A Claude Code that ignores
+  `serverCommand` makes saiife's MCP unavailable (it fails closed).
 
 ### Fail-closed matrix (Claude Code)
 
