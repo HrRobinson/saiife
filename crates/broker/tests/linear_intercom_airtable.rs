@@ -572,8 +572,13 @@ fn intercom_base64_cursor_plus_is_encoded() {
         b.uri.to_string(),
         "https://api.eu.intercom.io/conversations?starting_after=ab%2Bcd%3D%3D"
     );
-    // No other connector's cursor pattern accepts `+`.
-    for m in builtin().iter().filter(|m| m.id != "intercom") {
+    // No other connector's cursor pattern accepts `+`, except GCS, whose
+    // `nextPageToken` is standard base64 like Intercom's (and is encoded the
+    // same way, as `%2B`).
+    for m in builtin()
+        .iter()
+        .filter(|m| m.id != "intercom" && m.id != "gcp-storage")
+    {
         for o in &m.operation {
             if let Some(Pagination::Cursor { param, .. }) = &o.pagination {
                 let ty = o.query.get(param).or_else(|| o.body_params.get(param));

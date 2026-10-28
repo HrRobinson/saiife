@@ -371,7 +371,7 @@ fn salesforce_connect_stores_an_oauth2_secret() {
 
 /// A value that passes the manifest's own check for each required param.
 fn test_params(m: &saiife_broker::manifest::Manifest) -> Vec<String> {
-    const TRIES: [&str; 9] = [
+    const TRIES: [&str; 10] = [
         "acme.example.com",
         "acme",
         "api.intercom.io",
@@ -381,6 +381,7 @@ fn test_params(m: &saiife_broker::manifest::Manifest) -> Vec<String> {
         "USD",
         "ops@example.com",
         "acme.my.salesforce.com",
+        "eu-west-1",
     ];
     let mut out = Vec::new();
     for (name, spec) in &m.params {

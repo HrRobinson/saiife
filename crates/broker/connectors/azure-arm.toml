@@ -1,0 +1,68 @@
+# Azure Resource Manager (management plane).
+#   Resource Groups - List:      https://learn.microsoft.com/en-us/rest/api/resources/resource-groups/list   (api-version 2021-04-01)
+#   Resources - List:            https://learn.microsoft.com/en-us/rest/api/resources/resources/list        (api-version 2021-04-01)
+#   Virtual Machines - List All: https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/list-all (api-version 2025-04-01)
+#   Virtual Machines - Restart:  https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/restart  (api-version 2025-04-01)
+#   RBAC actions:                https://learn.microsoft.com/en-us/azure/role-based-access-control/permissions/compute
+#                                https://learn.microsoft.com/en-us/azure/role-based-access-control/permissions/management-and-governance
+# Auth: an OAuth2 access token minted for a service principal held in the
+# vault (`azure_sp`). `api-version` is a fixed query parameter of each
+# operation. Answers carry a `nextLink` (a full URL), which is not followed:
+# use `$top` and `$filter`.
+#
+# Subscription ids, resource group and VM names are case-insensitive in
+# Azure, while a policy `allow` compares case exactly. The patterns accept
+# lower case only, so each resource has one spelling in the qualifier.
+id = "azure-arm"
+version = 1
+title = "Azure Resource Manager"
+base_url = "https://management.azure.com"
+hosts = ["management.azure.com"]
+auth = [{ kind = "azure_sp", scope = "https://management.azure.com/.default" }]
+
+[[operation]]
+id = "resourcegroups.list"
+capability = "resourcegroups:read"
+qualifier = "/subscriptions/{subscription_id}"
+kind = "read"
+method = "GET"
+path = "/subscriptions/{subscription_id}/resourcegroups"
+path_params = { subscription_id = "string:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" }
+query = { "$filter" = "string:.{1,1024}", "$top" = "int:1..1000" }
+fixed_query = { "api-version" = "2021-04-01" }
+iam_action = "Microsoft.Resources/subscriptions/resourceGroups/read"
+
+[[operation]]
+id = "resources.list"
+capability = "resources:read"
+qualifier = "/subscriptions/{subscription_id}"
+kind = "read"
+method = "GET"
+path = "/subscriptions/{subscription_id}/resources"
+path_params = { subscription_id = "string:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" }
+query = { "$filter" = "string:.{1,1024}", "$expand" = "string:[A-Za-z,]{1,128}", "$top" = "int:1..1000" }
+fixed_query = { "api-version" = "2021-04-01" }
+iam_action = "Microsoft.Resources/subscriptions/resources/read"
+
+[[operation]]
+id = "vms.list"
+capability = "vms:read"
+qualifier = "/subscriptions/{subscription_id}"
+kind = "read"
+method = "GET"
+path = "/subscriptions/{subscription_id}/providers/Microsoft.Compute/virtualMachines"
+path_params = { subscription_id = "string:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" }
+query = { statusOnly = "bool" }
+fixed_query = { "api-version" = "2025-04-01" }
+iam_action = "Microsoft.Compute/virtualMachines/read"
+
+[[operation]]
+id = "vms.restart"
+capability = "vms:write"
+qualifier = "/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}"
+kind = "write"
+method = "POST"
+path = "/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}/restart"
+path_params = { subscription_id = "string:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", resource_group = "string:[a-z0-9._()-]{1,90}", vm_name = "string:[a-z0-9][a-z0-9._-]{0,63}" }
+fixed_query = { "api-version" = "2025-04-01" }
+iam_action = "Microsoft.Compute/virtualMachines/restart/action"

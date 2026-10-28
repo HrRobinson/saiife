@@ -1,0 +1,4 @@
+GET https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15
+authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261028/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=4307068d7326da777676bb583c7ba2779c2754265be110e668259d4764649ffb
+host: sts.us-east-1.amazonaws.com
+x-amz-date: 20261028T123456Z

@@ -1,0 +1,86 @@
+# Amazon S3 (REST API), path-style addressing (plan 15 decision 3).
+# Paths and parameters checked against the AWS S3 API reference:
+#   ListObjectsV2: https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+#   GetObject:     https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
+#   HeadObject:    https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html
+#   PutObject:     https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+#   DeleteObject:  https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
+#   Endpoints:     https://docs.aws.amazon.com/general/latest/gr/s3.html
+#   Path-style:    https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html
+#   IAM actions:   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html
+# Signed with SigV4 for the service `s3` in `params.region`. A bucket in
+# another region answers 301, which is `redirect_refused`.
+#
+# Request headers: only `Content-Type` and `Range`. Every header present is
+# signed, and policy does not see headers, so nothing that changes what a
+# call does may ever be listed here: no x-amz-copy-source (a PUT becomes
+# CopyObject), x-amz-acl, x-amz-grant-*, x-amz-server-side-encryption*,
+# x-amz-tagging, x-amz-object-lock-*, x-amz-mfa, x-amz-request-payer,
+# x-amz-expected-bucket-owner, x-amz-website-redirect-location and the like.
+# Answers are XML (or the object's bytes), passed through as text;
+# ListObjectsV2 is paged by hand with `continuation-token`.
+id = "aws-s3"
+version = 1
+title = "Amazon S3"
+base_url = "https://s3.{region}.amazonaws.com"
+hosts = ["s3.{region}.amazonaws.com"]
+auth = [{ kind = "aws_sigv4", service = "s3" }]
+request_headers = ["Content-Type", "Range"]
+
+[params.region]                  # set by the admin, never by the agent
+type = "string"
+pattern = "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$"
+required = true
+
+[[operation]]
+id = "s3.list_objects"
+capability = "s3:read"
+qualifier = "arn:aws:s3:::{bucket}"
+kind = "read"
+method = "GET"
+path = "/{bucket}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]" }
+query = { prefix = "string:.{1,1024}", delimiter = "string:.{1,16}", max-keys = "int:1..1000", continuation-token = "string:[A-Za-z0-9+/=_.-]{1,2048}", start-after = "string:.{1,1024}" }
+fixed_query = { "list-type" = "2" }
+iam_action = "s3:ListBucket"
+
+[[operation]]
+id = "s3.get_object"
+capability = "s3:read"
+qualifier = "arn:aws:s3:::{bucket}/{key}"
+kind = "read"
+method = "GET"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", key = "objectkey" }
+iam_action = "s3:GetObject"
+
+[[operation]]
+id = "s3.head_object"
+capability = "s3:read"
+qualifier = "arn:aws:s3:::{bucket}/{key}"
+kind = "read"
+method = "HEAD"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", key = "objectkey" }
+iam_action = "s3:GetObject"
+
+[[operation]]
+id = "s3.put_object"
+capability = "s3:write"
+qualifier = "arn:aws:s3:::{bucket}/{key}"
+kind = "write"
+method = "PUT"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", key = "objectkey" }
+body = "raw"
+iam_action = "s3:PutObject"
+
+[[operation]]
+id = "s3.delete_object"
+capability = "s3:delete"
+qualifier = "arn:aws:s3:::{bucket}/{key}"
+kind = "write"
+method = "DELETE"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", key = "objectkey" }
+iam_action = "s3:DeleteObject"

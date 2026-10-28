@@ -1,0 +1,3 @@
+GET https://storage.googleapis.com/storage/v1/b/acme-data/o/2026%2F10%2Freport.json?alt=media
+authorization: Bearer fake-minted-access-token
+range: bytes=0-99

@@ -1,0 +1,9 @@
+PUT https://s3.eu-west-1.amazonaws.com/acme-logs/2026/10/report.json
+authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261028/eu-west-1/s3/aws4_request, SignedHeaders=content-type;host;range;x-amz-content-sha256;x-amz-date, Signature=e150e2b7340ae8b66e85bcfadc6172d44d8e283723b3b14d913b389407aa702d
+content-type: application/octet-stream
+host: s3.eu-west-1.amazonaws.com
+range: bytes=0-99
+x-amz-content-sha256: 4062edaf750fb8074e7e83e0c9028c94e32468a8b6f1614774328ef045150f93
+x-amz-date: 20261028T123456Z
+
+{"ok":true}

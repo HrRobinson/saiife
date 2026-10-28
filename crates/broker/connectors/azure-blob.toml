@@ -1,0 +1,77 @@
+# Azure Blob Storage (data plane), service version 2026-04-06.
+#   List Blobs:      https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs
+#   Get Blob:        https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob
+#   Put Blob:        https://learn.microsoft.com/en-us/rest/api/storageservices/put-blob
+#   Delete Blob:     https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob
+#   x-ms-version:    https://learn.microsoft.com/en-us/rest/api/storageservices/versioning-for-the-azure-storage-services
+#   OAuth + actions: https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-azure-active-directory
+#   Naming:          https://learn.microsoft.com/en-us/rest/api/storageservices/naming-and-referencing-containers--blobs--and-metadata
+# Auth: an OAuth2 access token minted for a service principal held in the
+# vault (`azure_sp`); Entra ID auth needs x-ms-version 2017-11-09 or later.
+# `x-ms-version` (and `x-ms-blob-type` on put) are fixed per operation.
+#
+# Request headers: only `Content-Type` and `Range`. Nothing that changes what
+# a call does may be listed: no x-ms-copy-source (Put Blob From URL),
+# x-ms-delete-snapshots, x-ms-lease-*, x-ms-access-tier, x-ms-encryption-*,
+# x-ms-tags, x-ms-immutability-* or x-ms-legal-hold. Answers are XML (or the
+# blob's bytes), passed through as text; List Blobs is paged by hand with
+# `marker` (the answer's NextMarker).
+id = "azure-blob"
+version = 1
+title = "Azure Blob Storage"
+base_url = "https://{account}.blob.core.windows.net"
+hosts = ["{account}.blob.core.windows.net"]
+auth = [{ kind = "azure_sp", scope = "https://storage.azure.com/.default" }]
+request_headers = ["Content-Type", "Range"]
+
+[params.account]                 # set by the admin, never by the agent
+type = "string"
+pattern = "^[a-z0-9]{3,24}$"
+required = true
+
+[[operation]]
+id = "blobs.list"
+capability = "blobs:read"
+qualifier = "{container}"
+kind = "read"
+method = "GET"
+path = "/{container}"
+path_params = { container = "string:[a-z0-9][a-z0-9-]{1,61}[a-z0-9]" }
+query = { prefix = "string:.{1,1024}", delimiter = "string:.{1,16}", marker = "string:[A-Za-z0-9+/=_.!*-]{1,4096}", maxresults = "int:1..5000" }
+fixed_query = { restype = "container", comp = "list" }
+headers = { "x-ms-version" = "2026-04-06" }
+iam_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+
+[[operation]]
+id = "blobs.get"
+capability = "blobs:read"
+qualifier = "{container}/{blob}"
+kind = "read"
+method = "GET"
+path = "/{container}/{blob}"
+path_params = { container = "string:[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", blob = "objectkey" }
+headers = { "x-ms-version" = "2026-04-06" }
+iam_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
+
+[[operation]]
+id = "blobs.put"
+capability = "blobs:write"
+qualifier = "{container}/{blob}"
+kind = "write"
+method = "PUT"
+path = "/{container}/{blob}"
+path_params = { container = "string:[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", blob = "objectkey" }
+body = "raw"
+headers = { "x-ms-version" = "2026-04-06", "x-ms-blob-type" = "BlockBlob" }
+iam_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+
+[[operation]]
+id = "blobs.delete"
+capability = "blobs:delete"
+qualifier = "{container}/{blob}"
+kind = "write"
+method = "DELETE"
+path = "/{container}/{blob}"
+path_params = { container = "string:[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", blob = "objectkey" }
+headers = { "x-ms-version" = "2026-04-06" }
+iam_action = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete"
