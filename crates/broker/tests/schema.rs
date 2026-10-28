@@ -2003,3 +2003,177 @@ fn iam_action_charset() {
         );
     }
 }
+
+// --------------------------------------------- cloud, fix round 1 (Task 5)
+
+#[test]
+fn agent_sigv4_headers_dropped_and_unlistable() {
+    // Listing a signer header for the agent is a manifest error.
+    for h in ["X-Amz-Date", "x-amz-security-token", "X-AMZ-CONTENT-SHA256"] {
+        let err = s3_with(
+            r#"request_headers = ["Content-Type", "X-Agent", "X-Both"]"#,
+            &format!(r#"request_headers = ["Content-Type", "{h}"]"#),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerError::Manifest(_)), "{h}: {err:?}");
+    }
+    // Built directly from a manifest that lists them anyway, the agent's
+    // values never reach the request.
+    let mut m = s3();
+    m.request_headers
+        .extend(["X-Amz-Date".to_string(), "x-amz-security-token".to_string()]);
+    let b = cloud_build(
+        &m,
+        "s3.get_object",
+        &[("region", "us-east-1")],
+        &[("bucket", "bkt"), ("key", "a")],
+        &[
+            ("x-amz-date", "20000101T000000Z"),
+            ("X-Amz-Security-Token", "agent"),
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("X-Agent", "kept"),
+        ],
+        None,
+    )
+    .unwrap();
+    assert!(b.headers.get("x-amz-date").is_none());
+    assert!(b.headers.get("x-amz-security-token").is_none());
+    assert!(b.headers.get("x-amz-content-sha256").is_none());
+    assert_eq!(b.headers.get("x-agent").unwrap(), "kept");
+    // Without SigV4 auth such a header is an ordinary listed one.
+    let m = auth_manifest(r#"{ kind = "bearer", secret_field = "token" }"#, "").unwrap();
+    let mut m = m;
+    m.request_headers.push("X-Amz-Date".into());
+    assert!(Manifest::check(&m).is_ok());
+}
+
+#[test]
+fn object_param_last_in_qualifier() {
+    let from = "qualifier = \"arn:aws:s3:::{bucket}/{key}\"";
+    for bad in [
+        // The key could hold `x/other` and pose as the bucket.
+        "qualifier = \"{key}/{bucket}\"",
+        "qualifier = \"key={key},bucket={bucket}\"",
+    ] {
+        let err = s3_with(from, bad).unwrap_err();
+        assert!(matches!(err, BrokerError::Manifest(_)), "{bad}: {err:?}");
+    }
+    // Last, with or without fixed text after it, is fine.
+    assert!(s3_with(from, "qualifier = \"{bucket}/{key}\"").is_ok());
+    assert!(s3_with(from, "qualifier = \"{bucket}:{key}:obj\"").is_ok());
+    // An objectname in the query follows the same rule.
+    let gcs_from = "kind = \"write\"\nmethod = \"POST\"";
+    assert_eq!(GCS_LIKE.matches(gcs_from).count(), 1);
+    let with_q = |q: &str| {
+        Manifest::parse(&GCS_LIKE.replace(gcs_from, &format!("qualifier = \"{q}\"\n{gcs_from}")))
+    };
+    assert!(with_q("{bucket}/{name}").is_ok());
+    assert!(with_q("{name}/{bucket}").is_err());
+}
+
+#[test]
+fn object_value_invalid_utf8_decoding_refused() {
+    let m = s3();
+    // Overlong `.` (`%c0%ae`), a lone continuation byte, a bare `%ff`,
+    // and the same one level deeper: refused, never replaced by U+FFFD.
+    for bad in [
+        "a/%c0%ae%c0%ae/b",
+        "%c0%ae",
+        "a/%80",
+        "a%ff",
+        "a/%25c0%25ae/b",
+    ] {
+        let err = validate_op(&m, "s3.get_object", &[("bucket", "bkt"), ("key", bad)]).unwrap_err();
+        assert!(
+            matches!(err, BrokerError::BadValue { ref name, ref reason } if name == "key" && reason.contains("UTF-8")),
+            "{bad:?}: {err:?}"
+        );
+        assert!(cloud_build(
+            &m,
+            "s3.get_object",
+            &[("region", "us-east-1")],
+            &[("bucket", "bkt"), ("key", bad)],
+            &[],
+            None,
+        )
+        .is_err());
+    }
+    // Valid encoded UTF-8 is fine.
+    assert!(validate_op(
+        &m,
+        "s3.get_object",
+        &[("bucket", "bkt"), ("key", "a/%C3%BC")]
+    )
+    .is_ok());
+}
+
+#[test]
+fn fixed_query_tells_sub_resources_apart() {
+    let acl_op = r#"
+[[operation]]
+id = "s3.get_object_acl"
+capability = "s3:read"
+kind = "read"
+method = "GET"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9.-]{3,63}", key = "objectkey" }
+fixed_query = { acl = "" }
+iam_action = "s3:GetObjectAcl"
+
+[[operation]]
+id = "s3.head_object"
+capability = "s3:read"
+kind = "read"
+method = "HEAD"
+path = "/{bucket}/{key}"
+path_params = { bucket = "string:[a-z0-9.-]{3,63}", key = "objectkey" }
+iam_action = "s3:GetObject"
+"#;
+    let m = Manifest::parse(&format!("{S3_LIKE}{acl_op}")).unwrap();
+    // Same method and path, different fixed query: both load, and the
+    // proxy picks by the query.
+    assert_eq!(proxy(&m, "GET", "/bkt/a/b").unwrap().0.id, "s3.get_object");
+    let (op, params) = proxy(&m, "GET", "/bkt/a/b?acl").unwrap();
+    assert_eq!(op.id, "s3.get_object_acl");
+    assert_eq!(params, map(&[("bucket", "bkt"), ("key", "a/b")]));
+    assert!(matches!(
+        proxy(&m, "GET", "/bkt/a/b?acl=x").unwrap_err(),
+        BrokerError::BadPath(_)
+    ));
+    let b = cloud_build(
+        &m,
+        "s3.get_object_acl",
+        &[("region", "us-east-1")],
+        &[("bucket", "bkt"), ("key", "a/b")],
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(b.uri.query(), Some("acl="));
+    // HEAD is a method now.
+    assert_eq!(proxy(&m, "HEAD", "/bkt/a").unwrap().0.id, "s3.head_object");
+    let b = cloud_build(
+        &m,
+        "s3.head_object",
+        &[("region", "us-east-1")],
+        &[("bucket", "bkt"), ("key", "a")],
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(b.method, http::Method::HEAD);
+    // The same fixed query twice is still one shape too many.
+    let dup = acl_op.replace("s3.get_object_acl", "s3.get_object_acl2");
+    let dup = dup
+        .split("[[operation]]\nid = \"s3.head_object\"")
+        .next()
+        .unwrap();
+    assert!(Manifest::parse(&format!("{S3_LIKE}{acl_op}{dup}")).is_err());
+    // And so is an equal path with no fixed query.
+    let plain_dup = S3_LIKE
+        .split("[[operation]]")
+        .nth(2)
+        .unwrap()
+        .replace("s3.get_object", "s3.get_object2");
+    assert!(Manifest::parse(&format!("{S3_LIKE}[[operation]]{plain_dup}")).is_err());
+}

@@ -96,8 +96,17 @@ pub fn proxy<'m>(
 
     // Candidates with their specificity per segment: 2 literal, 1 placeholder
     // with prefix/suffix, 0 bare placeholder. Compared from the left; two
-    // equally specific matches are ambiguous.
-    let mut cands: Vec<(Vec<u8>, &Operation, BTreeMap<String, String>)> = Vec::new();
+    // equally specific matches are ambiguous. Equally specific paths are
+    // then told apart by their fixed query (S3's `GET /{key}?acl` next to
+    // GetObject): first an op whose fixed names the query all carries, then
+    // the one with the most of them.
+    let query_names: std::collections::BTreeSet<String> = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|p| decode(&p.split('=').next()?.replace('+', " ")).ok())
+        .collect();
+    type Rank = (Vec<u8>, bool, usize);
+    let mut cands: Vec<(Rank, &Operation, BTreeMap<String, String>)> = Vec::new();
     // A GraphQL operation is named-only: its fixed document is the body,
     // so a proxied request can never reach it. So is one with an
     // `objectname`, whose `/` is `%2F`, which no raw path may hold.
@@ -172,7 +181,13 @@ pub fn proxy<'m>(
             if tail.is_some() {
                 spec.push(0);
             }
-            cands.push((spec, op, caps));
+            let present = op
+                .fixed_query
+                .keys()
+                .filter(|k| query_names.contains(*k))
+                .count();
+            let rank = (spec, present == op.fixed_query.len(), present);
+            cands.push((rank, op, caps));
         }
     }
     cands.sort_by(|a, b| b.0.cmp(&a.0));

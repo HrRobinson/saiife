@@ -150,7 +150,8 @@ pub const MAX_OBJECT_KEY: usize = 1024;
 /// path structure: it is not empty, at most 1024 bytes, and has no control
 /// character, no `\`, no empty segment and no `.` or `..` segment, as
 /// given and after each of up to four rounds of percent-decoding (an
-/// upstream that decodes once more never sees a traversal either).
+/// upstream that decodes once more never sees a traversal either). A round
+/// that does not decode to UTF-8 is refused.
 pub fn object_value_problem(v: &str) -> Option<&'static str> {
     if v.is_empty() {
         return Some("empty");
@@ -174,11 +175,16 @@ pub fn object_value_problem(v: &str) -> Option<&'static str> {
                 return Some("has a . or .. segment");
             }
         }
-        let next = percent_decode_str(&cur).decode_utf8_lossy().into_owned();
-        if next == cur {
+        // Strict: a decoding that is not UTF-8 (an overlong `%c0%ae` for
+        // `.`) is refused, never replaced, so no upstream decoder can read
+        // the bytes differently from what was checked.
+        let Ok(next) = percent_decode_str(&cur).decode_utf8() else {
+            return Some("percent-decodes to invalid UTF-8");
+        };
+        if next == cur.as_str() {
             return None;
         }
-        cur = next;
+        cur = next.into_owned();
     }
     Some("too deeply percent-encoded")
 }

@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 pub const SCHEMA_VERSION: u32 = 1;
 /// The connector name of the generic HTTP connector; no manifest may use it.
 pub const HTTP_CONNECTOR: &str = "http";
-const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 const AUTH_KINDS: &[&str] = &[
     "header",
     "bearer",
@@ -28,7 +28,7 @@ const AUTH_KINDS: &[&str] = &[
 /// from the whole vault entry, so none takes a `secret_field`.
 pub const CLOUD_AUTH_KINDS: &[&str] = &["aws_sigv4", "gcp_sa", "azure_sp"];
 /// Headers the SigV4 signer sets: never a manifest's or an operation's.
-const SIGV4_HEADERS: &[&str] = &["x-amz-date", "x-amz-security-token", "x-amz-content-sha256"];
+pub const SIGV4_HEADERS: &[&str] = &["x-amz-date", "x-amz-security-token", "x-amz-content-sha256"];
 /// The body formats of `Operation::body`. `text` is for `transport = "mail"`;
 /// `raw` is the agent's bytes as they are, never parsed.
 const BODY_FORMATS: &[&str] = &["json", "form", "text", "raw"];
@@ -377,6 +377,20 @@ impl Manifest {
             check_auth(a).map_err(|e| bad(id, e))?;
         }
         self.check_headers(&self.headers).map_err(|e| bad(id, e))?;
+        // The SigV4 signer owns its headers: the agent may not be allowed
+        // to send one.
+        if self.signs_sigv4() {
+            if let Some(h) = self
+                .request_headers
+                .iter()
+                .find(|h| SIGV4_HEADERS.contains(&h.to_ascii_lowercase().as_str()))
+            {
+                return Err(bad(
+                    id,
+                    format!("request_headers: {h} is set by the SigV4 signer"),
+                ));
+            }
+        }
         let mut seen = BTreeSet::new();
         let mut shapes = BTreeSet::new();
         for op in &self.operation {
@@ -389,10 +403,16 @@ impl Manifest {
                 None
             };
             if let Some(segs) = segs {
-                if !shapes.insert((op.method.clone(), shape(&segs))) {
+                // The fixed query tells sub-resources apart (S3's
+                // `GET /{key}?acl` next to GetObject); the proxy picks the
+                // operation whose fixed names the query carries.
+                if !shapes.insert((op.method.clone(), shape(&segs), op.fixed_query.clone())) {
                     return Err(bad(
                         id,
-                        format!("operation {}: same method and path shape as another", op.id),
+                        format!(
+                            "operation {}: same method, path shape and fixed query as another",
+                            op.id
+                        ),
                     ));
                 }
             }
@@ -695,6 +715,11 @@ impl Manifest {
         }
     }
 
+    /// The manifest authenticates with `aws_sigv4`.
+    pub fn signs_sigv4(&self) -> bool {
+        self.auth.iter().any(|a| a.kind == "aws_sigv4")
+    }
+
     /// A host placeholder's param: declared, required, with an anchored
     /// pattern.
     fn host_param_ok(&self, p: &str) -> Result<(), String> {
@@ -725,7 +750,7 @@ impl Manifest {
                 _ => "authorization".to_string(),
             })
             .collect();
-        let sigv4 = self.auth.iter().any(|a| a.kind == "aws_sigv4");
+        let sigv4 = self.signs_sigv4();
         for (name, value) in headers {
             let h = http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| format!("header {name:?}: not a valid header name"))?;
@@ -884,8 +909,10 @@ impl LabelHost<'_> {
 /// `None` for a host without braces; otherwise the in-label placeholder of
 /// `h`, or why `h` is not one: exactly one `{name}` in one label (with an
 /// optional lower-case LDH prefix and suffix in that label), every other
-/// label lower-case LDH, and at least two fixed labels after it, so the
-/// value never picks the registrable domain.
+/// label lower-case LDH, and at least two fixed labels after it. That
+/// keeps the value off a plain `example.com` domain, but it is a heuristic:
+/// a multi-label public suffix (`co.uk`) is not detected. Manifests are
+/// admin-controlled, so this guards against mistakes, not a hostile author.
 pub(crate) fn label_placeholder(h: &str) -> Result<Option<LabelHost<'_>>, String> {
     if !h.contains(['{', '}']) {
         return Ok(None);
@@ -958,6 +985,26 @@ fn check_object_params(op: &Operation) -> Result<(), String> {
         .any(|t| t == OBJECT_KEY || t == OBJECT_NAME)
     {
         return Err("objectkey and objectname are not body params".into());
+    }
+    // An object value holds `/`, so in the qualifier it could pose as the
+    // placeholders after it (`{key}` = `x/other-bucket`): it must be the
+    // last one.
+    if let Some(q) = op.qualifier.as_deref() {
+        let vars = braces(q)?;
+        let is_object = |v: &str| {
+            op.path_params
+                .get(v)
+                .or_else(|| op.query.get(v))
+                .is_some_and(|t| t == OBJECT_KEY || t == OBJECT_NAME)
+        };
+        if let Some(i) = vars.iter().position(|v| is_object(v)) {
+            if i + 1 != vars.len() {
+                return Err(format!(
+                    "qualifier: object param {} must be the last placeholder",
+                    vars[i]
+                ));
+            }
+        }
     }
     Ok(())
 }

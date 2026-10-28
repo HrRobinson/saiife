@@ -4,7 +4,7 @@
 
 use crate::manifest::{
     dns_label, label_placeholder, template_segments, AuthSpec, Manifest, Operation, Pagination,
-    Seg, CLOUD_AUTH_KINDS,
+    Seg, CLOUD_AUTH_KINDS, SIGV4_HEADERS,
 };
 use crate::params::{object_value_problem, ParamType};
 use crate::BrokerError;
@@ -440,6 +440,7 @@ pub fn build(
 
     let auth = auth_header(m, auth)?;
     let mut headers = HeaderMap::new();
+    let sigv4 = m.signs_sigv4();
     for (name, value) in agent_headers {
         if has_crlf_nul(value) {
             return Err(bad_value(name, "header value contains CR, LF or NUL"));
@@ -454,7 +455,10 @@ pub fn build(
             .iter()
             .any(|h| h.eq_ignore_ascii_case(lower));
         let is_auth = auth.as_ref().is_some_and(|(n, _)| n == hname);
-        if listed && !is_auth && !ALWAYS_DROPPED.contains(&lower) {
+        // The SigV4 signer owns these (the manifest check refuses listing
+        // them too).
+        let signer_owned = sigv4 && SIGV4_HEADERS.contains(&lower);
+        if listed && !is_auth && !signer_owned && !ALWAYS_DROPPED.contains(&lower) {
             // A repeated header: the last one wins.
             headers.insert(hname, hvalue);
         }
