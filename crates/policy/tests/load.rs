@@ -175,7 +175,7 @@ fn dropins_join_scopes_and_examples() {
         "version = 2\n[[scope]]\nname = \"a\"\n",
         &[(
             "x.toml",
-            "[[scope]]\nname = \"b\"\n[[example]]\nuser = \"u\"\n",
+            "[[scope]]\nname = \"b\"\n[[example]]\nuser = \"u\"\ncommand = \"ls\"\nexpect = \"allow\"\n",
         )],
     );
     let p = load_system(&cfg).unwrap();
@@ -722,4 +722,18 @@ fn unknown_guard_ask_rule_is_config_error() {
     assert_eq!(check_guard_ask(&on, &catalog), Ok(()));
     // No ask: nothing to check.
     assert_eq!(check_guard_ask(&cfg_with(""), &[]), Ok(()));
+}
+
+#[test]
+fn http_forward_target_is_invalid() {
+    let (_d, cfg) = etc(
+        "version = 2\n[audit.forward.a]\ntype = \"https\"\nurl = \"http://h.test/\"\n",
+        &[],
+    );
+    match load_system(&cfg) {
+        Err(PolicyError::Invalid { detail, .. }) => {
+            assert!(detail.contains("audit.forward.a"), "{detail}")
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
 }

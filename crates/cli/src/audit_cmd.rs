@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::audit_locked::{self, Source};
 use crate::{report, report_html};
 use saiifeguard::Pack;
 
@@ -13,20 +14,205 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
 
-/// `saiife audit verify`: exit 0 intact, 1 broken, 2 unreadable. Prints
-/// counts and file names only, never record content.
-pub fn verify() -> ExitCode {
-    let Some(dir) = store::default_dir() else {
-        outln!("audit chain: could not read the log: no audit directory");
-        return ExitCode::from(2);
+/// `saiife audit verify [--external <file|dir>]`: exit 0 intact, 1 broken,
+/// 2 unreadable. Prints counts and file names only, never record content.
+pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode {
+    let config = system_config.unwrap_or(Path::new(audit_locked::SYSTEM_CONFIG));
+    let dir = match verify_dir(config) {
+        Ok(dir) => dir,
+        Err(e) => {
+            outln!("audit chain: could not read the log: {}", sanitize(&e));
+            return ExitCode::from(2);
+        }
     };
-    let report = saiife_audit::verify(&dir);
-    outln!("{}", render_verify(&report));
+    let log_line = format!("  log: {}", sanitize(&dir.display().to_string()));
+    let Some(external) = external else {
+        let report = saiife_audit::verify(&dir);
+        outln!("{}\n{log_line}", render_verify(&report));
+        return ExitCode::from(report.exit_code());
+    };
+    let report = saiife_audit::verify_external(&dir, external);
+    outln!("{}", render_external(&report, &dir, external));
     ExitCode::from(report.exit_code())
 }
 
+const NOT_AN_AUDITOR: &str = "audit files need the saiife-audit group; ask an auditor";
+
+/// The log `verify` checks, from the one locked-mode decision
+/// ([`audit_locked::source`]). In locked mode it is `[audit] dir` of the
+/// system config, for root and `saiife-audit` members only;
+/// `$SAIIFE_AUDIT_DIR` overrides it in debug builds alone (tests, CI), so
+/// a release build always checks the log the daemon writes. Otherwise it
+/// is the user's own log (`$SAIIFE_AUDIT_DIR` honoured).
+fn verify_dir(config: &Path) -> Result<PathBuf, String> {
+    let (dir, auditor) = match audit_locked::source(Some(config))? {
+        Source::Developer => {
+            return store::default_dir().ok_or_else(|| "no audit directory".to_string());
+        }
+        Source::Direct { dir, .. } => (dir, true),
+        Source::Daemon { dir, .. } => (dir, false),
+    };
+    if cfg!(debug_assertions) {
+        if let Some(d) = std::env::var_os(store::DIR_ENV).filter(|d| Path::new(d).is_absolute()) {
+            return Ok(PathBuf::from(d));
+        }
+    }
+    if auditor {
+        Ok(dir)
+    } else {
+        Err(NOT_AN_AUDITOR.into())
+    }
+}
+
+/// The local report, then how it compares with the forwarded copy. Problems
+/// in the copy itself are labelled `external copy damaged`, never blamed
+/// on the local log.
+pub fn render_external(r: &saiife_audit::ExternalReport, log: &Path, external: &Path) -> String {
+    let mut out = render_verify(&r.local);
+    out.push_str(&format!(
+        "\n  log: {}\nexternal: {}\n",
+        sanitize(&log.display().to_string()),
+        sanitize(&external.display().to_string())
+    ));
+    let e = &r.external;
+    if !e.read_errors.is_empty() {
+        let errs: Vec<String> = e.read_errors.iter().map(|x| sanitize(x)).collect();
+        out.push_str(&format!(
+            "external copy: could not read it: {}",
+            errs.join("; ")
+        ));
+        return out;
+    }
+    if !r.local.read_errors.is_empty() {
+        out.truncate(out.trim_end().len());
+        return out;
+    }
+    if e.breaks.is_empty() {
+        let head = e.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
+        out.push_str(&format!(
+            "external copy: intact ({} chained records, up to seq {head})\n",
+            e.chained
+        ));
+    } else {
+        let n = e.breaks.len();
+        let s = if n == 1 { "" } else { "s" };
+        out.push_str(&format!("external copy damaged ({n} problem{s})\n"));
+        out.push_str(&render_breaks(&e.breaks));
+    }
+    if e.duplicates > 0 {
+        out.push_str(&format!(
+            "  {} resent lines skipped (forwarding delivers at least once)\n",
+            e.duplicates
+        ));
+    }
+    if e.chain.is_none() {
+        out.push_str(
+            "  the copy starts mid-chain: its checkpoints are vouched for by the local log\n",
+        );
+    }
+    if let Some(host) = &r.external_host {
+        out.push_str(&format!(
+            "  note: the copy's files are named for host {}\u{2026}, not this machine\n",
+            sanitize(&host.chars().take(12).collect::<String>())
+        ));
+    }
+    let seq_list = |seqs: &[u64]| {
+        let shown: Vec<String> = seqs.iter().take(MAX_BREAKS).map(u64::to_string).collect();
+        let more = if seqs.len() > MAX_BREAKS {
+            ", \u{2026}"
+        } else {
+            ""
+        };
+        format!("{}{more}", shown.join(", "))
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if !r.missing_checkpoints.is_empty() {
+        let n = r.missing_checkpoints.len();
+        out.push_str(&format!(
+            "local log REWRITTEN OR CUT: {n} checkpoint{} of the external copy not in it (head seq {})\n",
+            plural(n),
+            seq_list(&r.missing_checkpoints)
+        ));
+    }
+    if !r.missing_near_damage.is_empty() {
+        let n = r.missing_near_damage.len();
+        out.push_str(&format!(
+            "{n} checkpoint{} of the external copy missing locally (copy damaged nearby; head seq {})\n",
+            plural(n),
+            seq_list(&r.missing_near_damage)
+        ));
+    }
+    for h in r.rewritten.iter().take(MAX_BREAKS) {
+        if h.vouched {
+            let after = h
+                .after_checkpoint
+                .map(|c| format!(" after seq {c}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "local log REWRITTEN{after}: its seq {} differs from the external copy\n",
+                h.seq
+            ));
+        } else {
+            out.push_str(&format!(
+                "seq {} differs between the local log and the last line of the external copy (one of them was changed)\n",
+                h.seq
+            ));
+        }
+    }
+    if r.rewritten.len() > MAX_BREAKS {
+        out.push_str(&format!(
+            "  \u{2026} and {} more differing lines\n",
+            r.rewritten.len() - MAX_BREAKS
+        ));
+    }
+    if let Some((local, ext)) = r.cut_tail {
+        out.push_str(&format!(
+            "local log CUT OFF: it ends at seq {local}, the external copy reaches seq {ext}\n"
+        ));
+    }
+    if r.missing_checkpoints.is_empty()
+        && r.missing_near_damage.is_empty()
+        && r.rewritten.is_empty()
+        && r.cut_tail.is_none()
+    {
+        match r.compared {
+            0 => out.push_str(
+                "local log holds the external copy's lines; no checkpoint of the copy to compare\n",
+            ),
+            1 => out.push_str("the checkpoint of the external copy is in the local log\n"),
+            n => out.push_str(&format!(
+                "all {n} checkpoints of the external copy are in the local log\n"
+            )),
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+const MAX_BREAKS: usize = 20;
+
+fn render_breaks(breaks: &[saiife_audit::Break]) -> String {
+    let mut out = String::new();
+    for b in breaks.iter().take(MAX_BREAKS) {
+        let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
+        out.push_str(&format!(
+            "  {} line {}{}: {}\n",
+            sanitize(&b.file),
+            b.line,
+            seq,
+            b.kind.describe()
+        ));
+    }
+    if breaks.len() > MAX_BREAKS {
+        out.push_str(&format!(
+            "  \u{2026} and {} more\n",
+            breaks.len() - MAX_BREAKS
+        ));
+    }
+    out
+}
+
 pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
-    const MAX_BREAKS: usize = 20;
     if !r.read_errors.is_empty() {
         let errs: Vec<String> = r.read_errors.iter().map(|e| sanitize(e)).collect();
         return format!("audit chain: could not read the log: {}", errs.join("; "));
@@ -38,19 +224,7 @@ pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
         let n = r.breaks.len();
         let s = if n == 1 { "" } else { "s" };
         out.push_str(&format!("audit chain: BROKEN ({n} problem{s})\n"));
-        for b in r.breaks.iter().take(MAX_BREAKS) {
-            let seq = b.seq.map(|s| format!(", seq {s}")).unwrap_or_default();
-            out.push_str(&format!(
-                "  {} line {}{}: {}\n",
-                sanitize(&b.file),
-                b.line,
-                seq,
-                b.kind.describe()
-            ));
-        }
-        if n > MAX_BREAKS {
-            out.push_str(&format!("  \u{2026} and {} more\n", n - MAX_BREAKS));
-        }
+        out.push_str(&render_breaks(&r.breaks));
     }
     if r.chained > 0 {
         let head = r.head.as_ref().map(|(s, _)| *s).unwrap_or(0);
@@ -245,14 +419,101 @@ fn since_cutoff(s: &str) -> Result<OffsetDateTime, String> {
         .ok_or_else(|| since_error(s))
 }
 
-pub fn run(
-    since_text: Option<&str>,
-    project: Option<&str>,
-    agent: Option<&str>,
-    blocked: bool,
-    report_path: Option<&str>,
-    packs: &[Pack],
-) -> ExitCode {
+/// `saiife audit [filters]`.
+pub struct RunArgs<'a> {
+    pub since: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub blocked: bool,
+    /// `connector`, `approval` or `guard`.
+    pub kind: Option<&'a str>,
+    pub service: Option<&'a str>,
+    pub report: Option<&'a str>,
+    /// The system config (default /etc/saiife/config.toml); locked mode
+    /// when it exists with `locked = true`.
+    pub system_config: Option<PathBuf>,
+}
+
+/// Records read from one place, with what had to be skipped.
+struct Loaded {
+    records: Vec<Record>,
+    skipped_lines: usize,
+    unreadable_files: usize,
+    /// Shown in "No audit records found in …".
+    place: String,
+    /// The dir `--report` verifies; `None` through the daemon.
+    verify_dir: Option<PathBuf>,
+}
+
+/// Every record in `dir`; `Err` (exit 1) when the dir cannot be listed.
+fn load_dir(dir: &Path) -> Result<Loaded, ExitCode> {
+    let all = store::read_all(dir);
+    if let Some(e) = &all.dir_error {
+        eprintln!(
+            "saiife: the audit directory {} cannot be read: {e}",
+            dir.display()
+        );
+        return Err(ExitCode::from(1));
+    }
+    Ok(Loaded {
+        records: all.records,
+        skipped_lines: all.skipped_lines,
+        unreadable_files: all.unreadable_files,
+        place: dir.display().to_string(),
+        verify_dir: Some(dir.to_path_buf()),
+    })
+}
+
+/// The records of `source`: the files, or the caller's own through the
+/// daemon (exit 5 when it cannot be reached).
+fn load_main(
+    source: &Source,
+    home_dir: Option<&Path>,
+    q: audit_locked::QueryArgs,
+) -> Result<Loaded, ExitCode> {
+    match source {
+        Source::Developer => {
+            let Some(dir) = home_dir else {
+                eprintln!("saiife: could not determine the audit directory");
+                return Err(ExitCode::from(2));
+            };
+            load_dir(dir)
+        }
+        Source::Direct { dir, config } => match std::fs::read_dir(dir) {
+            // An auditor by its groups whose read is refused anyway (a
+            // group added since login, a changed mode): ask the daemon.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "saiife: cannot read {} directly (permission denied); asking the saiife daemon instead",
+                    dir.display()
+                );
+                let daemon = Source::Daemon {
+                    dir: dir.clone(),
+                    config: config.clone(),
+                };
+                load_main(&daemon, home_dir, q)
+            }
+            _ => load_dir(dir),
+        },
+        Source::Daemon { config, .. } => match audit_locked::query(config, &q) {
+            Ok((records, skipped)) => Ok(Loaded {
+                records,
+                skipped_lines: skipped,
+                unreadable_files: 0,
+                place: "your records from the saiife daemon".to_string(),
+                verify_dir: None,
+            }),
+            Err(e) => {
+                eprintln!("saiife: {}", sanitize(&e));
+                Err(ExitCode::from(5))
+            }
+        },
+    }
+}
+
+pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
+    let (since_text, project, agent) = (a.since, a.project, a.agent);
+    let (blocked, report_path) = (a.blocked, a.report);
     let since_time = match since_text.map(since_cutoff).transpose() {
         Ok(t) => t,
         Err(e) => {
@@ -260,9 +521,43 @@ pub fn run(
             return ExitCode::from(2);
         }
     };
-    let Some(dir) = store::default_dir() else {
-        eprintln!("saiife: could not determine the audit directory");
-        return ExitCode::from(2);
+    let source = match audit_locked::source(a.system_config.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("saiife: {}", sanitize(&e));
+            return ExitCode::from(2);
+        }
+    };
+    let home_dir = store::default_dir();
+    let locked_dir = match &source {
+        Source::Developer => None,
+        Source::Direct { dir, .. } | Source::Daemon { dir, .. } => Some(dir.clone()),
+    };
+    // Through the daemon only --since narrows the query: the report's
+    // host sections need every record of the period, and the other
+    // filters are applied here, as for files read directly.
+    let q = audit_locked::QueryArgs {
+        since: since_time.map(|t| t.unix_timestamp()),
+        ..Default::default()
+    };
+    let main = match load_main(&source, home_dir.as_deref(), q) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    // Locked mode: the user's home log too, labelled (spec §6.4.5). A home
+    // log that cannot be listed is left out.
+    let home = match (&locked_dir, &home_dir) {
+        (Some(l), Some(h)) if !audit_locked::same_dir(l, h) => {
+            let all = store::read_all(h);
+            all.dir_error.is_none().then(|| Loaded {
+                records: all.records,
+                skipped_lines: all.skipped_lines,
+                unreadable_files: all.unreadable_files,
+                place: h.display().to_string(),
+                verify_dir: None,
+            })
+        }
+        _ => None,
     };
     let filter = Filter {
         since: since_time,
@@ -270,15 +565,13 @@ pub fn run(
         agent: agent.map(str::to_string),
         blocked_only: blocked,
     };
-    let all = store::read_all(&dir);
-    if let Some(e) = &all.dir_error {
-        eprintln!(
-            "saiife: the audit directory {} cannot be read: {e}",
-            dir.display()
-        );
-        return ExitCode::from(1);
-    }
-    let shown: Vec<&Record> = all.records.iter().filter(|r| filter.matches(r)).collect();
+    let keep =
+        |r: &&Record| filter.matches(r) && audit_locked::kind_service_match(r, a.kind, a.service);
+    let shown: Vec<&Record> = main.records.iter().filter(keep).collect();
+    let home_shown: Vec<&Record> = home
+        .as_ref()
+        .map(|h| h.records.iter().filter(keep).collect())
+        .unwrap_or_default();
     if let Some(target) = report_path {
         let now = OffsetDateTime::now_utc();
         let mut filters = Vec::new();
@@ -291,23 +584,56 @@ pub fn run(
         if let Some(a) = agent {
             filters.push(format!("agent: {}", report::agent_label(a)));
         }
+        if let Some(k) = a.kind {
+            filters.push(format!("kind: {k}"));
+        }
+        if let Some(s) = a.service {
+            filters.push(format!("service: {s}"));
+        }
         if blocked {
             filters.push("only blocked actions".to_string());
         }
         let mut model = report::build(&shown, packs, filters, since_time, now);
         model.blocked_only = blocked;
-        model.chain = report::chain_line(&saiife_audit::verify(&dir));
-        model.last_checkpoint = report::last_checkpoint(&all.records);
-        if all.skipped_lines > 0 {
+        // Connector, approval, error_denied, restart and outage sections
+        // honour --since only; --project/--agent/--blocked do not hide them.
+        let host_filter = Filter {
+            since: since_time,
+            project: None,
+            agent: None,
+            blocked_only: false,
+        };
+        let host: Vec<&Record> = main
+            .records
+            .iter()
+            .filter(|r| host_filter.matches(r))
+            .collect();
+        model.set_host_events(&host, now, project.is_some() || agent.is_some() || blocked);
+        // Through the daemon (no dir to verify) the answer holds only the
+        // caller's own records: no daemon or forward records to list.
+        model.auditors_only_sections = main.verify_dir.is_none();
+        model.chain = match &main.verify_dir {
+            Some(dir) => report::chain_line(&saiife_audit::verify(dir)),
+            None => "not checked: your records come through the saiife daemon (auditors run saiife audit verify)".to_string(),
+        };
+        model.last_checkpoint = report::last_checkpoint(&main.records);
+        if main.skipped_lines > 0 {
             model.log_problems.push(format!(
                 "{} unreadable log lines were skipped; the log may be damaged or edited.",
-                all.skipped_lines
+                main.skipped_lines
             ));
         }
-        if all.unreadable_files > 0 {
+        if main.unreadable_files > 0 {
             model.log_problems.push(format!(
                 "{} log files could not be read.",
-                all.unreadable_files
+                main.unreadable_files
+            ));
+        }
+        if !home_shown.is_empty() {
+            model.log_problems.push(format!(
+                "{} records of your home log ({}) are not in this report.",
+                home_shown.len(),
+                audit_locked::V1_LABEL
             ));
         }
         let html = report_html::render(&model);
@@ -336,15 +662,21 @@ pub fn run(
         };
     }
     if shown.is_empty() {
-        outln!("No audit records found in {}.", dir.display());
+        outln!("No audit records found in {}.", main.place);
     } else {
         out!("{}", render_table(&shown));
     }
-    if all.skipped_lines > 0 {
-        outln!("{} unreadable lines skipped", all.skipped_lines);
+    if main.skipped_lines > 0 {
+        outln!("{} unreadable lines skipped", main.skipped_lines);
     }
-    if all.unreadable_files > 0 {
-        outln!("{} unreadable files skipped", all.unreadable_files);
+    if main.unreadable_files > 0 {
+        outln!("{} unreadable files skipped", main.unreadable_files);
+    }
+    if let Some(h) = &home {
+        if !home_shown.is_empty() {
+            outln!("\n{} ({}):", audit_locked::V1_LABEL, sanitize(&h.place));
+            out!("{}", render_table(&home_shown));
+        }
     }
     ExitCode::SUCCESS
 }

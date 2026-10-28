@@ -86,11 +86,28 @@ pub fn first_line(raw: &[u8]) -> String {
 /// The longest `--detail request` value, in characters.
 pub const MAX_DETAIL_CHARS: usize = 120;
 
+/// Unicode Cf (format) characters, bidi controls among them: they can
+/// reorder or hide text in the prompt.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2028}' | '\u{2029}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
 /// A `--detail request` value: control characters become spaces, at most
 /// [`MAX_DETAIL_CHARS`] characters. polkit shows it in the prompt.
 pub fn clean_detail(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || is_format_char(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .take(MAX_DETAIL_CHARS)
         .collect()
 }
@@ -134,26 +151,56 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// The uids with a re-authentication in flight: at most one each, so one
 /// password prompt cannot authorize several queued approvals.
-fn in_flight() -> &'static Mutex<HashSet<u32>> {
-    static IN_FLIGHT: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+fn in_flight() -> &'static Mutex<HashSet<u64>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
     IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// Held while `uid`'s re-authentication runs; dropping it frees the slot.
 #[derive(Debug)]
-pub struct InFlight(u32);
+pub struct InFlight(u64);
 
 impl InFlight {
     /// `None` when `uid` already has a re-authentication in flight.
     pub fn begin(uid: u32) -> Option<InFlight> {
+        let key = slot_key(uid);
         let inserted = in_flight()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(uid);
+            .insert(key);
         // Built only on success, after the lock is released: a dropped
         // `InFlight` frees its uid's slot.
-        inserted.then(|| InFlight(uid))
+        inserted.then_some(InFlight(key))
     }
+}
+
+/// Test only: uids at or above this keep one global slot (tests that need
+/// two threads to meet on one slot use them); lower fixture uids are scoped
+/// per test thread. Caveat: the scope is the thread's name, so unnamed
+/// threads (spawned helpers) share one scope per uid; the test harness
+/// names its test threads.
+#[cfg(test)]
+const GLOBAL_UID_FLOOR: u32 = 990_000;
+
+/// The slot for `uid`. In production that is the uid itself. Under test the
+/// slot set would be shared by every parallel test, so a uid below
+/// [`GLOBAL_UID_FLOOR`] (the shared fixture users) is scoped to the calling test's
+/// thread; the high uids stay global for the tests that need two threads
+/// to meet on one slot.
+#[cfg(not(test))]
+fn slot_key(uid: u32) -> u64 {
+    u64::from(uid)
+}
+
+#[cfg(test)]
+fn slot_key(uid: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if uid >= GLOBAL_UID_FLOOR {
+        return u64::from(uid);
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().name().hash(&mut h);
+    (h.finish() << 32) | u64::from(uid)
 }
 
 impl Drop for InFlight {
@@ -495,6 +542,11 @@ mod tests {
         assert_eq!(first_line(b""), "");
         assert_eq!(clean_detail("#1 a\nb"), "#1 a b");
         assert_eq!(
+            clean_detail("a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}e\u{E0041}f"),
+            "a b c d e f"
+        );
+        assert_eq!(clean_detail("p\u{2028}q\u{2029}r"), "p q r");
+        assert_eq!(
             clean_detail(&"y".repeat(500)).chars().count(),
             MAX_DETAIL_CHARS
         );
@@ -546,6 +598,21 @@ mod tests {
             ReauthResult::Error(e) => assert!(e.contains("timed out"), "{e}"),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fixture_uid_slots_are_per_test_thread() {
+        let mine = InFlight::begin(1000).unwrap();
+        assert!(InFlight::begin(1000).is_none());
+        // Another (parallel) test using the same fixture uid is not busy.
+        std::thread::Builder::new()
+            .name("some-other-test".into())
+            .spawn(|| assert!(InFlight::begin(1000).is_some()))
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(mine);
+        assert!(InFlight::begin(1000).is_some());
     }
 
     #[test]

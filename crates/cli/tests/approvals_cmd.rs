@@ -543,9 +543,8 @@ impl World {
         files
             .iter()
             .flat_map(|f| {
-                fs::read_to_string(f)
-                    .unwrap()
-                    .lines()
+                let text = fs::read_to_string(f).unwrap();
+                common::complete_lines(&text)
                     .map(|l| serde_json::from_str(l).unwrap())
                     .collect::<Vec<Value>>()
             })

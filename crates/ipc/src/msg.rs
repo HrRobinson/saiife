@@ -10,6 +10,12 @@ pub const OP_HELLO: &str = "hello";
 pub const OP_AUDIT_APPEND: &str = "audit.append";
 pub const OP_STATUS: &str = "status";
 pub const OP_AUDIT_ROTATE_KEY: &str = "audit.rotate_key";
+/// The caller's own audit records (an auditor: all with `all: true`).
+/// `{since?, kind?, service?, agent?, project?, blocked?, all?, limit?
+/// (<= 5000), after?, after_seq?}` -> `{records, more, next?, next_seq?}`.
+/// `next` is an opaque log position to pass back as `after`; `after_seq`
+/// and `next_seq` page by seq and are only exact on a single-chain log.
+pub const OP_AUDIT_QUERY: &str = "audit.query";
 pub const OP_SECRET_ADD: &str = "secret.add";
 pub const OP_SECRET_ROTATE: &str = "secret.rotate";
 pub const OP_SECRET_REMOVE: &str = "secret.remove";
@@ -22,6 +28,14 @@ pub const OP_API_RESULT: &str = "api.result";
 pub const OP_API_TOKEN: &str = "api.token";
 /// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
 pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
+/// What a user may see of the policy: `{user?, effective?}` -> the user's
+/// scope view, the policy `hash` and, with `effective`, the whole merged
+/// policy. Anyone sees their own scope; `user` (another) and `effective`
+/// are for root and `[admin] groups`.
+pub const OP_POLICY_SHOW: &str = "policy.show";
+/// Root and `[admin] groups`: load the policy again, as on SIGHUP.
+/// `{}` -> `{result: "loaded"}` or `{result: "rejected", reason}`.
+pub const OP_POLICY_RELOAD: &str = "policy.reload";
 /// Approval requests: approvers see all, a requester its own.
 /// `{states?: ["pending", ...], own?: bool}` -> `{items}`.
 pub const OP_APPROVAL_LIST: &str = "approval.list";

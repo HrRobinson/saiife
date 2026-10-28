@@ -182,6 +182,8 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             ));
         }
     }
+    let passwd = passwd_text(ctx);
+    let mut egress: Option<Egress> = None;
     let mut any_finding = false;
     let mut incomplete: Vec<String> = Vec::new();
     if users.is_empty() {
@@ -216,6 +218,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             }));
         }
         out.push(model_login(u, id("model-login")));
+        if dedicated(ctx, &passwd, u) {
+            let table = *egress.get_or_insert_with(|| egress_table(ctx));
+            out.push(egress_check(u, table, id("egress")));
+        }
         out.push(leftover_hooks(ctx, u, id("leftover-hooks")));
     }
     out.push(hidepid(ctx));
@@ -679,6 +685,96 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The nft binaries looked for, in order.
+const NFT_PATHS: [&str; 3] = ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft"];
+const NFT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The table the egress recipe (docs/egress.md) creates.
+const EGRESS_TABLE: &str = "saiife_egress";
+const EGRESS_HINT: &str = "no egress rules for this dedicated account: it can send data to any host. See docs/egress.md for an nftables recipe (Linux)";
+
+/// A dedicated agent account: no login shell, or named in
+/// `[doctor] dedicated_accounts`.
+fn dedicated(ctx: &Ctx, passwd: &str, u: &AgentUser) -> bool {
+    if let Ok(p) = &ctx.config {
+        if p.config.doctor.dedicated_accounts.contains(&u.name) {
+            return true;
+        }
+    }
+    let shell = passwd
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 7 && f[0] == u.name).then(|| f[6].to_string())
+        })
+        .or_else(|| ctx.host.user(&u.name).map(|i| i.shell));
+    match shell {
+        None => false,
+        Some(sh) => {
+            let base = sh.rsplit('/').next().unwrap_or("");
+            // An empty shell field means /bin/sh: a login shell.
+            base == "nologin" || base == "false"
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Egress {
+    Present,
+    Missing,
+    /// Why nothing could be said.
+    Unknown(&'static str),
+}
+
+/// Looks for the `saiife_egress` table with `nft list tables`: only as
+/// root, only from a root-owned binary on the real machine.
+fn egress_table(ctx: &Ctx) -> Egress {
+    if !ctx.as_root {
+        return Egress::Unknown("not checked (run as root)");
+    }
+    let Some(nft) = NFT_PATHS.iter().find(|p| ctx.layout.at(p).is_file()) else {
+        return Egress::Unknown("nft is not installed: egress rules not checked");
+    };
+    // Only on the real machine is the binary's owner meaningful (a test tree
+    // is owned by the test user), so the root-owned, not group/other-writable
+    // guard applies there; elsewhere the fake host stands in for `nft`.
+    if ctx.layout.is_system() {
+        use std::os::unix::fs::MetadataExt;
+        let safe = fs::metadata(ctx.layout.at(nft))
+            .map(|m| m.uid() == 0 && m.mode() & 0o022 == 0)
+            .unwrap_or(false);
+        if !safe {
+            return Egress::Unknown("nft is not root-owned: egress rules not checked");
+        }
+    }
+    match ctx.host.run(nft, &["list", "tables"], NFT_TIMEOUT) {
+        Ok(o) if o.status == 0 => {
+            if o.stdout
+                .lines()
+                .any(|l| l.split_whitespace().last() == Some(EGRESS_TABLE))
+            {
+                Egress::Present
+            } else {
+                Egress::Missing
+            }
+        }
+        _ => Egress::Unknown("nft list tables failed: egress rules not checked"),
+    }
+}
+
+fn egress_check(u: &AgentUser, e: Egress, id: String) -> Check {
+    let title = format!("egress rules for {}", u.name);
+    match e {
+        Egress::Present => Check::new(id, Status::Pass, title, ""),
+        Egress::Missing => Check::new(id, Status::Info, title, EGRESS_HINT),
+        Egress::Unknown(why) => Check::new(
+            id,
+            Status::Info,
+            title,
+            format!("{why}; see docs/egress.md"),
+        ),
+    }
+}
+
 /// §5.6: `/proc` must not hide agent processes from the daemon.
 fn hidepid(ctx: &Ctx) -> Check {
     const ID: &str = "proc.hidepid";
@@ -1119,6 +1215,98 @@ mod tests {
         t.user("alice", 5001, 5001, true);
         t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"alice\"]\n");
         assert_eq!(t.users(), ["me"]);
+    }
+
+    fn nologin_user(t: &mut T, name: &str, uid: u32) {
+        t.user(name, uid, uid, true);
+        let p = t.at("/etc/passwd");
+        let text = fs::read_to_string(&p).unwrap().replace(
+            &format!("/home/{name}:/bin/sh"),
+            &format!("/home/{name}:/usr/sbin/nologin"),
+        );
+        fs::write(&p, text).unwrap();
+    }
+
+    fn fake_nft(t: &T, tables: &str) {
+        fs::create_dir_all(t.at("/usr/sbin")).unwrap();
+        fs::write(t.at("/usr/sbin/nft"), "").unwrap();
+        t.canned("/usr/sbin/nft list tables", 0, tables);
+    }
+
+    const SCOPE: &str = "\n[[scope]]\nname = \"a\"\nusers = [\"bot\", \"alice\"]\n";
+
+    #[test]
+    fn egress_missing_is_info_with_pointer() {
+        let mut t = T::new(true);
+        nologin_user(&mut t, "bot", 5001);
+        t.user("alice", 5002, 5002, true);
+        t.append_config(SCOPE);
+        fake_nft(&t, "table inet filter\n");
+        let r = t.doctor();
+        let x = get(&r, "user.bot.egress");
+        assert_eq!(x.status, Status::Info);
+        assert!(x.detail.contains("docs/egress.md"), "{}", x.detail);
+        assert!(!r.checks.iter().any(|c| c.id == "user.alice.egress"));
+        assert!(t
+            .host
+            .state()
+            .calls
+            .iter()
+            .any(|c| c == "/usr/sbin/nft list tables"));
+    }
+
+    #[test]
+    fn egress_empty_shell_is_a_login_account() {
+        let mut t = T::new(true);
+        t.user("bot", 5001, 5001, true);
+        let p = t.at("/etc/passwd");
+        let text = fs::read_to_string(&p)
+            .unwrap()
+            .replace("/home/bot:/bin/sh", "/home/bot:");
+        fs::write(&p, text).unwrap();
+        t.append_config(SCOPE);
+        fake_nft(&t, "");
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "user.bot.egress"));
+    }
+
+    #[test]
+    fn egress_table_present_passes() {
+        let mut t = T::new(true);
+        nologin_user(&mut t, "bot", 5001);
+        t.append_config(SCOPE);
+        fake_nft(&t, "table inet filter\ntable inet saiife_egress\n");
+        assert_eq!(status(&t.doctor(), "user.bot.egress"), Status::Pass);
+    }
+
+    #[test]
+    fn egress_listed_login_account_is_dedicated() {
+        let mut t = T::new(true);
+        t.user("alice", 5002, 5002, true);
+        t.append_config(&format!(
+            "{SCOPE}\n[doctor]\ndedicated_accounts = [\"alice\"]\n"
+        ));
+        fake_nft(&t, "");
+        assert_eq!(status(&t.doctor(), "user.alice.egress"), Status::Info);
+    }
+
+    #[test]
+    fn egress_without_nft_or_root_runs_nothing() {
+        let mut t = T::new(true);
+        nologin_user(&mut t, "bot", 5001);
+        t.append_config(SCOPE);
+        let x = get(&t.doctor(), "user.bot.egress").detail.clone();
+        assert!(x.contains("nft is not installed"), "{x}");
+        let mut t = T::new(false);
+        nologin_user(&mut t, "bot", 5001);
+        t.append_config(SCOPE);
+        fake_nft(&t, "");
+        let r = t.doctor_opts(DoctorOptions {
+            user: Some("bot".into()),
+            home: None,
+        });
+        let x = r.checks.iter().find(|c| c.id == "user.bot.egress");
+        assert!(x.is_none_or(|c| c.detail.contains("run as root")));
+        assert!(t.host.state().calls.iter().all(|c| !c.contains("nft")));
     }
 
     #[test]

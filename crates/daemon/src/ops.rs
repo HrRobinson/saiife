@@ -13,8 +13,9 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_SECRET_ADD,
-    OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_POLICY_RELOAD,
+    OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE,
+    OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
@@ -152,6 +153,9 @@ pub struct Ctx {
     pub calls: InFlight,
     /// Notifications (webhook, SMTP, command); started by `serve`.
     pub notifier: crate::notifier::Notifier,
+    /// The audit forwarding workers (`[audit.forward.*]`); configured and
+    /// started by the daemon's start, matched to the policy at reload.
+    pub forwarders: crate::forwarder::Forwarders,
     /// The approval request store (`<state>/approvals/`), or why it could
     /// not be opened: then every `ask` is denied (fail closed).
     pub approvals: Result<crate::approvals::Store, String>,
@@ -164,6 +168,10 @@ pub struct Ctx {
     pub grants: crate::grants::Grants,
     /// Dedupe state of the `limit_reached` and `error_denied_burst` producers.
     pub signals: crate::signals::Signals,
+    /// Held for the whole of a policy reload (SIGHUP and `policy.reload`),
+    /// so two reloads never interleave: each loads, applies and records
+    /// in turn, in the order they asked (the lock is fair).
+    pub reloads: tokio::sync::Mutex<()>,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -289,11 +297,13 @@ impl Ctx {
             tcp: Mutex::new(TcpState::default()),
             calls: InFlight::default(),
             notifier: crate::notifier::Notifier::new(),
+            forwarders: crate::forwarder::Forwarders::default(),
             approvals: i.approvals,
             reauth: Arc::new(crate::reauth::PkCheck::new()),
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
             signals: Default::default(),
+            reloads: tokio::sync::Mutex::new(()),
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -598,6 +608,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
+        saiife_ipc::msg::OP_AUDIT_QUERY => crate::audit_query::handle(ctx, peer, req).await,
         OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
         OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
             crate::secret_ops::handle(ctx, peer, req).await
@@ -605,6 +616,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
+        OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
         other => err(
             req.id,
             ErrorCode::UnknownOp,

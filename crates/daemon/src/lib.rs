@@ -13,7 +13,17 @@ pub mod approvals;
 #[cfg(target_os = "linux")]
 pub mod approvers;
 #[cfg(target_os = "linux")]
+pub mod audit_query;
+#[cfg(target_os = "linux")]
 pub mod disk;
+#[cfg(target_os = "linux")]
+pub mod forward_file;
+#[cfg(target_os = "linux")]
+pub mod forward_https;
+#[cfg(target_os = "linux")]
+pub mod forward_syslog;
+#[cfg(target_os = "linux")]
+pub mod forwarder;
 #[cfg(target_os = "linux")]
 pub mod gateway;
 #[cfg(target_os = "linux")]
@@ -30,6 +40,8 @@ pub mod notifier;
 pub mod notify;
 #[cfg(target_os = "linux")]
 pub mod ops;
+#[cfg(target_os = "linux")]
+pub mod policy_ops;
 #[cfg(target_os = "linux")]
 pub mod reauth;
 #[cfg(target_os = "linux")]

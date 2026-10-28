@@ -753,6 +753,9 @@ struct LockedState {
 /// The `Locked mode` block (spec §7 `status`), printed when
 /// `<root>/etc/saiife/installed.toml` exists; `None` otherwise (developer
 /// mode). Pending approvals and lockdown come in plan 11.
+/// Spec section 10, verbatim.
+const WORDING_RULE: &str = "note: the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model";
+
 fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     let installed_path = layout.at(INSTALLED);
     // A dangling or symlinked record still means locked mode (and fails).
@@ -762,6 +765,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         managed: Vec::new(),
     };
     outln!("\nLocked mode");
+    outln!("  {WORDING_RULE}");
     let installed = match read_installed(&installed_path) {
         Ok(Some(i)) => {
             outln!(

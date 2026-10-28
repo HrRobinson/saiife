@@ -34,10 +34,13 @@ fn commands_exit_quietly_when_the_reader_goes_away() {
     let env = Env::new(&["claude"]);
     let out = env.saiife(&["init"]);
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    // Developer mode whatever the host has installed.
+    let absent = env.home.path().join("absent.toml");
+    let absent = absent.to_str().unwrap();
     for args in [
         &["status"][..],
         &["packs"],
-        &["audit"],
+        &["audit", "--system-config", absent],
         &["explain", "git status"],
         &["init"],
     ] {

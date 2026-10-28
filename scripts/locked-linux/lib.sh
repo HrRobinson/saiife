@@ -70,6 +70,7 @@ on_exit() {
         cp -r "$WORK" "$LOGS/work" 2>/dev/null || true
     fi
     cleanup_lockdown || true
+    cleanup_demo || true
     cleanup_approvals || true
     rm -rf "$WORK"
 }

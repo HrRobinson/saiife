@@ -18,6 +18,7 @@ pub mod scope;
 pub mod service;
 pub mod system;
 pub mod users;
+pub mod view;
 
 pub use capability::Capability;
 pub use decide::{decide, Request, Verdict};
@@ -31,8 +32,8 @@ pub use service::{
     SecretCfg, ServiceCfg,
 };
 pub use system::{
-    valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg, Event, Fail, Fsync,
-    GatewayCfg, GuardCfg, McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SystemConfig, TargetCfg,
-    WebhookCfg,
+    facility_code, valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg,
+    DoctorCfg, Event, Example, Expect, Fail, ForwardCfg, Fsync, GatewayCfg, GuardCfg, HttpsFormat,
+    McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SyslogFormat, SystemConfig, TargetCfg, WebhookCfg,
 };
 pub use users::{Directory, FixedDirectory, Getent, GroupEntry, UserEntry};

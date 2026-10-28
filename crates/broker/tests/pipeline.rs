@@ -1349,3 +1349,58 @@ allow = ["issues:write:repo=acme/*"]
     assert_eq!(seen[0].0, "/repos/acme/web/issues");
     assert_eq!(seen[0].1["authorization"], format!("Bearer {TOKEN}"));
 }
+
+/// `saiife policy test` (`judge`) and the real pipeline reach the same
+/// verdict and deny rule for the same call.
+#[tokio::test]
+async fn judge_and_pipeline_agree() {
+    use saiife_broker::judge::judge;
+    use saiife_policy::decide::Verdict;
+    let (_m, up) = mock().await;
+    let extra = "deny = [\"files:read\"]\n[[services.shop.rule]]\ncapability = \"orders:read\"\nwhen = { order_id = \"9\" }\naction = \"ask\"";
+    let snap = snapshot(extra);
+    let cat = catalog();
+    let scope = FakeEnv::ok().scope.unwrap().unwrap();
+    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("orders.list", vec![]),
+        ("orders.get", vec![("order_id", "5")]),
+        ("orders.get", vec![("order_id", "9")]),
+        ("orders.get", vec![("order_id", "abc")]),
+        ("orders.get", vec![]),
+        ("files.get", vec![("name", "x")]),
+        ("orders.list", vec![("bogus", "1")]),
+    ];
+    for (op, params) in cases {
+        let c = call(op, &params);
+        let o = go(&c, &snap, &FakeEnv::ok(), &up, &Limiter::new()).await;
+        let want = match o {
+            Outcome::Done { .. } => Verdict::Allow,
+            Outcome::Pending { .. } => Verdict::Ask,
+            Outcome::Denied { rule } => Verdict::Deny { rule },
+            other => panic!("{op}: {other:?}"),
+        };
+        let got = judge(&snap.config, &cat, Ok(Some(&scope)), "shop", op, &c.params).unwrap();
+        assert_eq!(got, want, "{op} {params:?}");
+    }
+    // No scope.
+    let mut env = FakeEnv::ok();
+    env.scope = Ok(None);
+    let c = call("orders.list", &[]);
+    let o = go(&c, &snap, &env, &up, &Limiter::new()).await;
+    assert_eq!(rule(&o), "no_scope");
+    let got = judge(
+        &snap.config,
+        &cat,
+        Ok(None),
+        "shop",
+        "orders.list",
+        &c.params,
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        Verdict::Deny {
+            rule: "no_scope".into()
+        }
+    );
+}

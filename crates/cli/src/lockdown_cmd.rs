@@ -44,7 +44,7 @@ pub fn run(_config: Option<PathBuf>, _action: Option<LockdownAction>) -> ExitCod
 
 #[cfg(target_os = "linux")]
 pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode {
-    use crate::secret_cmd::linux::{call, Stop};
+    use crate::secret_cmd::linux::call;
     use serde_json::{json, Map, Value};
 
     let config = config.unwrap_or_else(|| PathBuf::from("/etc/saiife/config.toml"));
@@ -119,13 +119,35 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,
-        Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m)) => {
+        Err(stop) => {
+            let (code, m) = exit_of(stop);
             eprintln!("saiife: {m}");
-            ExitCode::from(2)
+            ExitCode::from(code)
         }
-        Err(Stop::Unavailable(m) | Stop::NotFound(m)) => {
-            eprintln!("saiife: {m}");
-            ExitCode::from(5)
-        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// The exit code and message for a stop. `Unrecorded` (the change is made
+/// but not on record) is exit 5 like an unreachable daemon, as in
+/// `approvals_cmd`: the caller must check.
+fn exit_of(stop: crate::secret_cmd::linux::Stop) -> (u8, String) {
+    use crate::secret_cmd::linux::Stop;
+    match stop {
+        Stop::Refused(m) | Stop::Forbidden(m) => (2, m),
+        Stop::Unavailable(m) | Stop::NotFound(m) | Stop::Unrecorded(m) => (5, m),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod exit_tests {
+    use super::*;
+    use crate::secret_cmd::linux::Stop;
+
+    #[test]
+    fn unrecorded_exits_5_like_unavailable() {
+        assert_eq!(exit_of(Stop::Unrecorded("x".into())).0, 5);
+        assert_eq!(exit_of(Stop::Unavailable("x".into())).0, 5);
+        assert_eq!(exit_of(Stop::Refused("x".into())).0, 2);
     }
 }

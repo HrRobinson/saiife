@@ -133,6 +133,21 @@ With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
 - MCP tool calls go through the hook, and managed settings can block MCP
   servers outright.
 
+### Fail-closed matrix (Claude Code)
+
+| Failure | Result |
+|---|---|
+| saiife reports an error (exit 2 and a reason) | blocked |
+| guard engine crash | blocked (a worker isolates it; the parent denies) |
+| `check` parent killed or crashes | blocked (`onFailure`) |
+| hook timeout (10 s) | blocked |
+| daemon down or not answering in 2 s | blocked (saiife denies) |
+| binary missing | cannot happen to a locked install (root-owned); blocked by `onFailure` anyway |
+
+saiife answers well inside the timeout (an internal deadline of 3 s). The
+full matrix for all three agents is in [threats](../threats.md#fail-closed-matrix).
+What is and is not covered per setup is in [threats](../threats.md).
+
 ## Not yet verified live
 
 These come from product docs or research and still need a check on a live

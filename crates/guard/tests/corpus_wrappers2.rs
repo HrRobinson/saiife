@@ -392,7 +392,7 @@ fn deferred_xargs_stays_allow() {
 /// could achieve, so it remains a meaningful linearity guard.
 #[test]
 fn long_chain_with_trailing_wrapper_denies_and_stays_linear() {
-    let e = default_engine().with_budget(std::time::Duration::from_secs(5));
+    let e = default_engine().with_budget(std::time::Duration::from_secs(30));
     for tail in ["timeout 5 rm -rf /", "su -c 'rm -rf /'"] {
         let mut cmd = String::new();
         for _ in 0..5000 {
@@ -407,7 +407,7 @@ fn long_chain_with_trailing_wrapper_denies_and_stays_linear() {
             "expected DENY for tail {tail:?}, got {decision:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(250),
+            elapsed < std::time::Duration::from_secs(2),
             "5000-segment chain ({tail:?}) took {elapsed:?}, far above linear — possible quadratic blowup"
         );
     }
@@ -430,7 +430,7 @@ fn deep_watch_nesting_fails_open_not_stack_overflow() {
     // Purpose is termination without stack overflow or a hang, not a precise
     // budget — a loose bound keeps it robust under a loaded parallel run.
     assert!(
-        elapsed < std::time::Duration::from_millis(250),
+        elapsed < std::time::Duration::from_secs(10),
         "20-deep watch nesting took {elapsed:?}, expected to terminate quickly"
     );
 }

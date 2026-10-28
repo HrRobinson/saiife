@@ -64,6 +64,8 @@ pub struct WriterHandle {
     /// Closed when the writer thread ends (its sender is dropped then,
     /// also when the thread unwinds from a panic).
     alive: watch::Receiver<()>,
+    /// The head `seq`, changed after each write (the forwarder's wake-up).
+    appended: watch::Receiver<u64>,
 }
 
 impl WriterHandle {
@@ -119,6 +121,12 @@ impl WriterHandle {
         while rx.changed().await.is_ok() {}
     }
 
+    /// Changes after each record the writer puts in the log (its value is
+    /// the head `seq`); the forwarder waits on it instead of polling only.
+    pub fn appends(&self) -> watch::Receiver<u64> {
+        self.appended.clone()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -155,9 +163,11 @@ pub fn spawn(
         last_checkpoint_seq: last_checkpoint,
         ..Snapshot::default()
     }));
+    let (appended_tx, appended) = watch::channel(0);
     let w = Writer {
         cw,
         cfg,
+        appended: appended_tx,
         state: Arc::clone(&state),
         last_checkpoint_at: Instant::now(),
         unsynced: false,
@@ -172,12 +182,21 @@ pub fn spawn(
             let _alive = alive_tx;
             w.run(rx)
         })?;
-    Ok((WriterHandle { tx, state, alive }, join))
+    Ok((
+        WriterHandle {
+            tx,
+            state,
+            alive,
+            appended,
+        },
+        join,
+    ))
 }
 
 struct Writer {
     cw: ChainWriter,
     cfg: WriterConfig,
+    appended: watch::Sender<u64>,
     state: Arc<Mutex<Snapshot>>,
     last_checkpoint_at: Instant,
     /// Writes not yet synced (fsync = "checkpoint").
@@ -378,6 +397,16 @@ impl Writer {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         s.chain = self.cw.chain_id().map(str::to_string);
         s.head = self.cw.head().map(|(n, h)| (n, h.to_string()));
+        drop(s);
+        // The line is in the file (one `write_all`) before this: a woken
+        // reader finds it.
+        if let Some((seq, _)) = self.cw.head() {
+            self.appended.send_if_modified(|v| {
+                let new = *v != seq;
+                *v = seq;
+                new
+            });
+        }
     }
 }
 

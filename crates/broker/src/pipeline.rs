@@ -419,6 +419,19 @@ pub enum Outcome {
 }
 
 /// Step 8: the body would be shown masked, so it cannot be approved.
+/// The body as the approver will see it, when that is exactly what will be
+/// sent: `None` if the masker would change it, or it is not UTF-8. The
+/// vault forms are compared on the raw bytes (a lossy UTF-8 view would
+/// hide a change inside invalid bytes), then the v1 patterns on the text.
+fn faithful_display(masker: &Masker, b: &[u8]) -> Option<String> {
+    if masker.mask_bytes(b) != b {
+        return None;
+    }
+    // Unreachable for body = "json" today (canonical JSON by now); defence in depth.
+    let text = std::str::from_utf8(b).ok()?;
+    (masker.mask_text(text) == text).then(|| text.to_string())
+}
+
 pub const MASKED_CONTENT_RULE: &str = "masked_content";
 
 /// The fixed explanation a deny rule carries, if any.
@@ -567,7 +580,7 @@ fn denied(rule: &str) -> Outcome {
 }
 
 /// The rule for a step 4–5 error.
-fn rule_of(e: &BrokerError) -> &'static str {
+pub(crate) fn rule_of(e: &BrokerError) -> &'static str {
     match e {
         BrokerError::BadPath(_) => "bad_path",
         BrokerError::UnknownOperation(_) => "unknown_operation",
@@ -708,28 +721,15 @@ async fn steps(
     }
 
     // 6. Policy.
-    let Ok(mut cap) = Capability::parse(&op.capability) else {
-        return denied("policy_invalid");
-    };
-    // The manifest's qualifier filled from the parameters; `None` when one
-    // is missing (a deny/ask with a qualifier then still matches, an allow
-    // does not).
-    if op.qualifier.is_some() {
-        cap.qualifier = crate::manifest::qualifier_for(op, &params);
-    }
+    let (cap, verdict) =
+        match crate::judge::policy_verdict(op, svc, call.overlay.as_ref(), snap.mode, &params) {
+            Ok(v) => v,
+            Err(rule) => return denied(rule),
+        };
     tr.capability = Some(match &cap.qualifier {
         Some(q) => format!("{}:{}:{q}", cap.resource, cap.verb),
         None => format!("{}:{}", cap.resource, cap.verb),
     });
-    let verdict = decide(
-        svc,
-        call.overlay.as_ref(),
-        snap.mode,
-        &Request {
-            capability: &cap,
-            params: &params,
-        },
-    );
     // Approved: `ask` or `allow` now both send.
     let ask = match verdict {
         Verdict::Deny { rule } => return changed(&rule),
@@ -774,12 +774,10 @@ async fn steps(
         // The same rule as for commands.
         let mut display = None;
         if let Some(b) = body.as_ref() {
-            let raw = String::from_utf8_lossy(b);
-            let masked = masker.mask_text(&raw);
-            if masked != raw {
-                return denied(MASKED_CONTENT_RULE);
+            match faithful_display(masker, b) {
+                Some(text) => display = Some(cut_display(&text, BODY_DISPLAY_MAX)),
+                None => return denied(MASKED_CONTENT_RULE),
             }
-            display = Some(cut_display(&masked, BODY_DISPLAY_MAX));
         }
         let pending = PendingCall {
             stored: StoredCall {
@@ -1220,6 +1218,23 @@ pub fn list_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faithful_display_compares_bytes_and_refuses_non_utf8() {
+        let m = Masker::new(&["s3cr3t-vault-value"]);
+        assert_eq!(
+            faithful_display(&m, b"{\"a\":1}").as_deref(),
+            Some("{\"a\":1}")
+        );
+        // Not UTF-8: refused even though nothing is masked.
+        assert_eq!(faithful_display(&m, b"{\"a\":\"\xff\xfe\"}"), None);
+        // A vault value, also beside invalid bytes (a lossy view would
+        // have replaced the bytes and hidden the difference).
+        assert_eq!(faithful_display(&m, b"x s3cr3t-vault-value y"), None);
+        assert_eq!(faithful_display(&m, b"\xff s3cr3t-vault-value"), None);
+        // A v1 pattern.
+        assert_eq!(faithful_display(&m, b"API_TOKEN=x"), None);
+    }
 
     #[test]
     fn cut_display_cuts_on_a_char_boundary_and_says_so() {

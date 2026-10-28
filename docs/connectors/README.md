@@ -1,6 +1,8 @@
 # Connectors
 
-In locked mode (Linux), an agent never holds an API credential. It asks the
+In locked mode (Linux), the agent never holds a credential for a brokered
+service; it holds its own model-provider login unless you run a local model.
+For a brokered service it asks the
 saiife daemon to make the call. The daemon checks the call against the
 policy, adds the credential from its vault, sends the request, and masks
 the response before the agent sees it. Every call writes one `connector`
@@ -136,7 +138,7 @@ To use one, run `saiife connect <service>`. It stores the secret (or reuses
 an existing one with `--secret <name>`, if that secret allows the service)
 and writes a policy file that starts deny-all.
 
-## Note for plan 12
+## Answer frame size
 
 The control socket accepts requests of up to 1 MiB, but an answer may be up
 to 16 MiB (`MAX_ANSWER_FRAME`). A client that reads answers must allow for

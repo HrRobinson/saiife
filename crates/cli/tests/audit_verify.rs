@@ -41,8 +41,9 @@ fn hook(audit: &Path, cmd: &str) {
 }
 
 fn verify(audit: &Path) -> (i32, String) {
-    let (mut c, _sb) = check_cmd(audit);
-    let out = c.args(["audit", "verify"]).output().unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let _sb = common::hermetic_audit(&mut c, audit, ["verify"]);
+    let out = c.output().unwrap();
     (
         out.status.code().unwrap(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -63,6 +64,10 @@ fn verify_empty_log_exit_0() {
     let (code, out) = verify(dir.path());
     assert_eq!(code, 0, "{out}");
     assert!(out.starts_with("audit chain: intact"), "{out}");
+    assert!(
+        out.contains(&format!("  log: {}", dir.path().display())),
+        "{out}"
+    );
 }
 
 #[test]
@@ -149,4 +154,233 @@ fn verify_prints_last_checkpoint() {
     assert!(out.contains("last checkpoint: seq 6"), "{out}");
     assert!(out.contains("key ed25519:"), "{out}");
     assert!(!out.contains("developer mode:"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// `--external <file|dir>`: the local log against a forwarded copy.
+
+fn locked_fixture() -> String {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../audit/tests/fixtures/v2-locked/2026-11.jsonl");
+    std::fs::read_to_string(src).unwrap()
+}
+
+fn verify_external(audit: &Path, external: &Path) -> (i32, String) {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_saiife"));
+    let ext = external.as_os_str();
+    let _sb = common::hermetic_audit(
+        &mut c,
+        audit,
+        ["verify".as_ref(), "--external".as_ref(), ext],
+    );
+    let out = c.output().unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn external_copy_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("2026-11.jsonl"), locked_fixture()).unwrap();
+    let copy = ext.path().join("forwarded.jsonl");
+    std::fs::write(&copy, locked_fixture()).unwrap();
+    let (code, out) = verify_external(dir.path(), &copy);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("audit chain: intact"), "{out}");
+    assert!(out.contains("external copy: intact"), "{out}");
+    assert!(
+        out.contains("all 2 checkpoints of the external copy are in the local log"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("\n  log: {}\n", dir.path().display())),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("\nexternal: {}\n", copy.display())),
+        "{out}"
+    );
+}
+
+#[test]
+fn external_copy_shows_a_tail_rewritten_after_the_last_checkpoint() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let ext = tempfile::tempdir().unwrap();
+    let full = locked_fixture();
+    let copy = ext.path().join("forwarded.jsonl");
+    std::fs::write(&copy, &full).unwrap();
+    // Keep seq 0..=4 (through the first checkpoint), forge seq 5..=7 with
+    // a recomputed chain: records are not signed, so no key is needed.
+    let mut l: Vec<String> = full.lines().take(5).map(String::from).collect();
+    let template: serde_json::Value = serde_json::from_str(&l[3]).unwrap();
+    for seq in 5..=7u64 {
+        let mut v = template.clone();
+        v["seq"] = seq.into();
+        v["input"] = format!("harmless {seq}").into();
+        let prev: String = Sha256::digest(l.last().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        v["prev"] = prev.into();
+        l.push(v.to_string());
+    }
+    std::fs::write(dir.path().join("2026-11.jsonl"), l.join("\n") + "\n").unwrap();
+    assert_eq!(verify(dir.path()).0, 0, "the forged log chains on its own");
+    let (code, out) = verify_external(dir.path(), &copy);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("local log REWRITTEN after seq 4: its seq 6 differs from the external copy"),
+        "{out}"
+    );
+    assert!(
+        out.contains("seq 7 differs between the local log and the last line"),
+        "{out}"
+    );
+}
+
+#[test]
+fn external_copy_shows_a_cut_local_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let ext = tempfile::tempdir().unwrap();
+    let full = locked_fixture();
+    let cut: String = full.lines().take(6).map(|l| format!("{l}\n")).collect();
+    std::fs::write(dir.path().join("2026-11.jsonl"), cut).unwrap();
+    std::fs::write(ext.path().join("2026-11.jsonl"), full).unwrap();
+    assert_eq!(verify(dir.path()).0, 0, "the cut log is valid on its own");
+    let (code, out) = verify_external(dir.path(), ext.path());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("REWRITTEN OR CUT"), "{out}");
+    assert!(out.contains("head seq 5"), "{out}");
+    assert!(
+        out.contains("local log CUT OFF: it ends at seq 5, the external copy reaches seq 7"),
+        "{out}"
+    );
+}
+
+#[test]
+fn damaged_external_copy_is_labelled_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("2026-11.jsonl"), locked_fixture()).unwrap();
+    let copy = ext.path().join("forwarded.jsonl");
+    let mut l: Vec<String> = locked_fixture().lines().map(String::from).collect();
+    l[2] = l[2].replacen("\"seq\":2,", "\"seq\":2, ", 1);
+    std::fs::write(&copy, l.join("\n") + "\n").unwrap();
+    let (code, out) = verify_external(dir.path(), &copy);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.starts_with("audit chain: intact"), "{out}");
+    assert!(out.contains("external copy damaged (1 problem)"), "{out}");
+    assert!(out.contains("forwarded.jsonl line 4"), "{out}");
+    assert!(!out.contains("REWRITTEN OR CUT"), "{out}");
+}
+
+#[test]
+fn unreadable_external_copy_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("2026-11.jsonl"), locked_fixture()).unwrap();
+    let (code, out) = verify_external(dir.path(), &dir.path().join("missing.jsonl"));
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("external copy: could not read it"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn locked_mode_needs_the_audit_group() {
+    if rustix::process::geteuid().is_root() {
+        return; // root reads the audit files
+    }
+    let etc = tempfile::tempdir().unwrap();
+    let audit = etc.path().join("audit");
+    std::fs::create_dir(&audit).unwrap();
+    let config = etc.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!("version = 2\nlocked = true\n\n[audit]\ndir = {audit:?}\n"),
+    )
+    .unwrap();
+    let (mut c, _sb) = check_cmd(&audit);
+    let out = c
+        .env_remove("SAIIFE_AUDIT_DIR")
+        .env_remove("XDG_DATA_HOME")
+        // Debug-build seam: the host's groups never matter.
+        .env("SAIIFE_TEST_AUDIT_GROUP", "saiife-test-no-such-group")
+        .args(["audit", "verify", "--system-config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("audit files need the saiife-audit group; ask an auditor"),
+        "{text}"
+    );
+
+    // An auditor (the same decision `saiife audit` uses) checks [audit] dir.
+    // Linux only: locked mode is Linux only, and the group lookup uses
+    // getent, which macOS does not have.
+    if cfg!(debug_assertions) && cfg!(target_os = "linux") {
+        let group = Command::new("id").arg("-gn").output().unwrap();
+        let group = String::from_utf8(group.stdout).unwrap();
+        let (mut c, _sb) = check_cmd(&audit);
+        let out = c
+            .env_remove("SAIIFE_AUDIT_DIR")
+            .env_remove("XDG_DATA_HOME")
+            .env("SAIIFE_TEST_AUDIT_GROUP", group.trim())
+            .args(["audit", "verify", "--system-config"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        assert!(
+            text.contains(&format!("log: {}", audit.display())),
+            "{text}"
+        );
+    }
+
+    // Developer mode (no `locked = true`) keeps the user's own log.
+    std::fs::write(&config, "version = 2\n").unwrap();
+    let (mut c, _sb) = check_cmd(&audit);
+    let out = c
+        .env_remove("SAIIFE_AUDIT_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .args(["audit", "verify", "--system-config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Only a missing system config means developer mode: one that cannot be
+/// read (here: its directory is closed) is exit 2, naming the path.
+#[cfg(unix)]
+#[test]
+fn unreadable_system_config_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        return; // root reads through any mode
+    }
+    let etc = tempfile::tempdir().unwrap();
+    let audit = etc.path().join("audit");
+    std::fs::create_dir(&audit).unwrap();
+    let closed = etc.path().join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    let config = closed.join("config.toml");
+    std::fs::write(&config, "version = 2\nlocked = true\n").unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (mut c, _sb) = check_cmd(&audit);
+    let out = c
+        .args(["audit", "verify", "--system-config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains(&config.display().to_string()), "{text}");
 }

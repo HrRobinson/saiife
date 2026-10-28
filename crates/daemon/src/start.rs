@@ -26,7 +26,7 @@ use tokio::signal::unix::{signal, SignalKind};
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// The group that may read the audit log (spec §5.2).
-const AUDIT_GROUP: &str = "saiife-audit";
+use saiife_system::layout::AUDIT_GROUP;
 
 /// A startup refusal: one line on stderr, exit 2.
 struct Refuse(String);
@@ -322,6 +322,21 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         grants,
     }));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
+
+    // The forwarding workers start in `serve`, after the start records.
+    {
+        let weak = Arc::downgrade(&ctx);
+        let host: std::sync::Weak<dyn crate::forwarder::Host> = weak.clone();
+        ctx.forwarders.configure(crate::forwarder::Setup {
+            audit_dir: audit_cfg.dir.clone(),
+            state_dir: opts.state_dir.clone(),
+            appended: ctx.writer.appends(),
+            clock: Arc::new(crate::forwarder::SystemClock::default()),
+            host,
+            make: Arc::new(move |name, cfg| crate::forwarder::transport_for(name, cfg, &weak)),
+            send_timeout: crate::forwarder::BATCH_TIMEOUT,
+        });
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -818,6 +833,14 @@ async fn serve(
 
     // The notification delivery task; it holds only a weak reference.
     let _notifier = ctx.notifier.start(Arc::downgrade(&ctx));
+    // Audit forwarding, per the policy loaded at start (none while it is
+    // invalid; a valid reload starts it).
+    match ctx.policy().system {
+        Some(sys) => ctx.forwarders.apply(&sys.audit.forward).await,
+        None => eprintln!(
+            "saiife: warning: audit forwarding is off until a valid policy loads ([audit.forward.*] is read from it)"
+        ),
+    }
 
     // 8. Ready.
     notify::ready();
@@ -894,7 +917,7 @@ async fn serve(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = hup.recv() => reload(&ctx).await,
+            _ = hup.recv() => { let _ = reload(&ctx).await; }
             // Outside a stop the writer never ends on its own: without it
             // every append fails, so exit and let the service manager
             // restart the daemon.
@@ -912,6 +935,9 @@ async fn serve(
     // most the upstream timeout.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    // The forwarders stop first: the stop record waits for the next start
+    // (the cursors are on disk).
+    ctx.forwarders.stop_all().await;
     gateway.abort();
     let _ = gateway.await;
     if let Some(t) = gateway_tcp {
@@ -1007,8 +1033,10 @@ fn check_ask(
 /// one step; an invalid one is refused and the old one stays. First the
 /// audit dir goes back to `saiife-audit`: the `ExecReload=` command that
 /// sent the signal was spawned with `LogsDirectory=`, which gave the dir
-/// back to `saiife`.
-async fn reload(ctx: &Arc<Ctx>) {
+/// back to `saiife`. One reload at a time (`ctx.reloads`): a second one,
+/// from SIGHUP or `policy.reload`, waits for the first to finish.
+pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
+    let _one_at_a_time = ctx.reloads.lock().await;
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
         regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
@@ -1020,10 +1048,12 @@ async fn reload(ctx: &Arc<Ctx>) {
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
     let mut recs = Vec::new();
+    let mut result = Ok(());
     match loaded {
         Ok((l, cat)) => {
             let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
+            ctx.forwarders.apply(&l.config.audit.forward).await;
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);
             if !changed.is_empty() {
@@ -1039,7 +1069,8 @@ async fn reload(ctx: &Arc<Ctx>) {
         }
         Err(reason) => {
             eprintln!("saiife: warning: policy reload refused, keeping the old policy: {reason}");
-            recs.push(policy_record(ctx, "rejected", None, Some(reason)));
+            recs.push(policy_record(ctx, "rejected", None, Some(reason.clone())));
+            result = Err(reason);
         }
     }
     for rec in recs {
@@ -1047,6 +1078,7 @@ async fn reload(ctx: &Arc<Ctx>) {
             eprintln!("saiife: warning: cannot write the policy record: {e}");
         }
     }
+    result
 }
 
 /// Settings a reload cannot apply: what the daemon would refuse to start

@@ -1,7 +1,9 @@
 //! Render a [`Report`] as one self-contained HTML page: inline CSS, no
 //! script, no external resource. Every printed field goes through [`escape`].
 
-use crate::report::{HostMode, PackView, PolicyPeriod, ProjectPacksView, Report, Row};
+use crate::report::{
+    HostMode, PackView, PolicyPeriod, ProjectPacksView, Report, Row, SOURCE_SAIIFE,
+};
 use crate::text::sanitize;
 
 const CSS: &str = "\
@@ -226,6 +228,234 @@ fn mode_section(m: &[HostMode]) -> String {
     )
 }
 
+fn or_para(empty: bool, msg: &str, t: impl FnOnce() -> String) -> String {
+    if empty {
+        format!("<p>{}</p>\n", escape(msg))
+    } else {
+        t()
+    }
+}
+
+fn with_note(r: &Report, body: String) -> String {
+    if r.sections_not_narrowed {
+        format!("{body}<p class=\"note\">not narrowed by --agent/--project/--blocked</p>\n")
+    } else {
+        body
+    }
+}
+
+fn connector_section(r: &Report) -> String {
+    or_para(
+        r.connectors.is_empty(),
+        "No connector requests in this period.",
+        || {
+            let mut out = simple_table(
+                &[
+                    "Service",
+                    "Requests",
+                    "Denied",
+                    "Limits hit",
+                    "Approvals",
+                    "Sent after approval",
+                    "Source",
+                ],
+                r.connectors
+                    .iter()
+                    .map(|x| {
+                        vec![
+                            cell(None, &x.service),
+                            cell(None, &x.requests.to_string()),
+                            cell(None, &x.denies.to_string()),
+                            cell(None, &x.limits_hit.to_string()),
+                            cell(None, &x.approvals.to_string()),
+                            cell(None, &x.sent_after_approval.to_string()),
+                            cell(None, SOURCE_SAIIFE),
+                        ]
+                    })
+                    .collect(),
+            );
+            out.push_str(&format!(
+                "<details>\n<summary>Show all {} connector requests</summary>\n{}</details>\n",
+                r.connector_rows.len(),
+                simple_table(
+                    &[
+                        "Time (UTC)",
+                        "User",
+                        "Service",
+                        "Request",
+                        "Decision",
+                        "Why",
+                        "Source"
+                    ],
+                    r.connector_rows
+                        .iter()
+                        .map(|x| {
+                            vec![
+                                cell(None, &x.time),
+                                cell(None, &x.user),
+                                cell(None, &x.service),
+                                cell(Some("input"), &x.request),
+                                cell(None, x.decision),
+                                cell(None, &x.reason),
+                                cell(None, x.source),
+                            ]
+                        })
+                        .collect(),
+                )
+            ));
+            out
+        },
+    )
+}
+
+fn approvals_section(r: &Report) -> String {
+    or_para(
+        r.approvals.is_empty(),
+        "No approvals in this period.",
+        || {
+            simple_table(
+                &[
+                    "Id",
+                    "Requested (UTC)",
+                    "Requester",
+                    "Decider",
+                    "Decision",
+                    "Time to decision",
+                    "Outcome",
+                    "Type",
+                    "Summary",
+                    "Source",
+                ],
+                r.approvals
+                    .iter()
+                    .map(|x| {
+                        vec![
+                            cell(None, &x.id),
+                            cell(None, &x.time),
+                            cell(None, &x.requester),
+                            cell(None, &x.decider),
+                            cell(None, &x.decision),
+                            cell(None, &x.time_to_decision),
+                            cell(None, &x.outcome),
+                            cell(None, &x.kind),
+                            cell(Some("input"), &x.summary),
+                            cell(None, x.source),
+                        ]
+                    })
+                    .collect(),
+            )
+        },
+    )
+}
+
+fn error_denied_section(r: &Report) -> String {
+    or_para(
+        r.error_denied.is_empty(),
+        "No error-blocked actions in this period.",
+        || {
+            simple_table(
+                &["Time (UTC)", "Kind", "Action", "Why", "Source"],
+                r.error_denied
+                    .iter()
+                    .map(|x| {
+                        vec![
+                            cell(None, &x.time),
+                            cell(None, &x.kind),
+                            cell(Some("input"), &x.what),
+                            cell(None, &x.reason),
+                            cell(None, x.source),
+                        ]
+                    })
+                    .collect(),
+            )
+        },
+    )
+}
+
+fn restarts_section(r: &Report) -> String {
+    if r.auditors_only_sections {
+        return or_para(true, crate::report::AUDITORS_ONLY, String::new);
+    }
+    or_para(
+        r.restarts.is_empty(),
+        "No unclean daemon restarts in this period.",
+        || {
+            simple_table(
+                &["Time (UTC)", "Host", "Version", "Source"],
+                r.restarts
+                    .iter()
+                    .map(|x| {
+                        vec![
+                            cell(None, &x.time),
+                            cell(None, &x.host),
+                            cell(None, &x.version),
+                            cell(None, x.source),
+                        ]
+                    })
+                    .collect(),
+            )
+        },
+    )
+}
+
+fn outages_section(r: &Report) -> String {
+    if r.auditors_only_sections {
+        return or_para(true, crate::report::AUDITORS_ONLY, String::new);
+    }
+    let mut out = or_para(
+        r.outages.is_empty(),
+        "No forwarding outages in this period.",
+        || {
+            simple_table(
+                &[
+                    "Target",
+                    "Failing from (UTC)",
+                    "Recovered (UTC)",
+                    "Duration",
+                    "Source",
+                ],
+                r.outages
+                    .iter()
+                    .map(|x| {
+                        vec![
+                            cell(None, &x.target),
+                            cell(None, &x.from),
+                            cell(
+                                if x.to == "ongoing" { Some("bad") } else { None },
+                                &if x.note.is_empty() {
+                                    x.to.clone()
+                                } else {
+                                    format!("{} ({})", x.to, x.note)
+                                },
+                            ),
+                            cell(None, &x.duration),
+                            cell(None, x.source),
+                        ]
+                    })
+                    .collect(),
+            )
+        },
+    );
+    if !r.forward_drops.is_empty() {
+        out.push_str("<p><strong>Records dropped before they were forwarded:</strong></p>\n");
+        out.push_str(&simple_table(
+            &["Time (UTC)", "Target", "Detail", "Source"],
+            r.forward_drops
+                .iter()
+                .map(|x| {
+                    vec![
+                        cell(None, &x.time),
+                        cell(None, &x.target),
+                        cell(None, &x.detail),
+                        cell(None, x.source),
+                    ]
+                })
+                .collect(),
+        ));
+    }
+    out
+}
+
 pub fn render(r: &Report) -> String {
     let blocked = or_none(
         &r.blocked_rows,
@@ -237,6 +467,7 @@ pub fn render(r: &Report) -> String {
                 "Action",
                 "Rule pack",
                 "Why",
+                "Source",
             ],
             &r.blocked_rows,
             |x| {
@@ -247,6 +478,7 @@ pub fn render(r: &Report) -> String {
                     cell(Some("input"), &x.input),
                     cell(None, &x.pack),
                     cell(None, &x.reason),
+                    cell(None, x.source),
                 ]
             },
         ),
@@ -257,7 +489,7 @@ pub fn render(r: &Report) -> String {
         or_none(
             &r.fail_open_rows,
             table(
-                &["Time (UTC)", "Agent", "Project", "Action", "Why"],
+                &["Time (UTC)", "Agent", "Project", "Action", "Why", "Source"],
                 &r.fail_open_rows,
                 |x| {
                     vec![
@@ -266,6 +498,7 @@ pub fn render(r: &Report) -> String {
                         cell(None, &x.project),
                         cell(Some("input"), &x.input),
                         cell(None, &x.reason),
+                        cell(None, x.source),
                     ]
                 },
             ),
@@ -291,7 +524,8 @@ pub fn render(r: &Report) -> String {
                 "Project",
                 "Tool",
                 "Decision",
-                "Action"
+                "Action",
+                "Source"
             ],
             &r.all_rows,
             |x| {
@@ -302,6 +536,7 @@ pub fn render(r: &Report) -> String {
                     cell(None, &x.tool),
                     cell(None, x.decision),
                     cell(Some("input"), &x.input),
+                    cell(None, x.source),
                 ]
             },
         )
@@ -329,6 +564,31 @@ pub fn render(r: &Report) -> String {
         "Allowed without a check (fail-open)",
         "Actions saiife let through without judging them, for example because it could not read the request. Each one is a gap in protection.",
         &fail_open,
+    ));
+    out.push_str(&section(
+        "Connector activity",
+        "Requests to brokered services, per service. Seen by saiife: the agent does not report these.",
+        &with_note(r, connector_section(r)),
+    ));
+    out.push_str(&section(
+        "Approvals",
+        "Requests that waited for a person, with who decided and how long it took.",
+        &with_note(r, approvals_section(r)),
+    ));
+    out.push_str(&section(
+        "Blocked by an error (error_denied)",
+        "Actions saiife refused because something failed while checking them.",
+        &with_note(r, error_denied_section(r)),
+    ));
+    out.push_str(&section(
+        "Daemon restarts",
+        "Starts of the saiife daemon that did not follow a clean stop.",
+        &restarts_section(r),
+    ));
+    out.push_str(&section(
+        "Forwarding outages",
+        "Periods in which a log forwarding target was failing, from the first failure to the recovery.",
+        &outages_section(r),
     ));
     out.push_str(&section(
         "Protection rules in use",
@@ -378,6 +638,7 @@ mod tests {
             input: input.into(),
             pack: "Core: secrets".into(),
             reason: reason.into(),
+            source: crate::report::SOURCE_GUARD,
         }
     }
 
@@ -402,6 +663,15 @@ mod tests {
             last_checkpoint: String::new(),
             policies: vec![],
             modes: vec![],
+            connectors: vec![],
+            connector_rows: vec![],
+            approvals: vec![],
+            error_denied: vec![],
+            restarts: vec![],
+            outages: vec![],
+            forward_drops: vec![],
+            sections_not_narrowed: false,
+            auditors_only_sections: false,
         }
     }
 
@@ -569,5 +839,61 @@ mod tests {
         assert!(html.contains("&lt;/td&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("&quot;onload=&quot;x"));
         assert!(!html.contains("\"onload=\"x"));
+    }
+
+    #[test]
+    fn hostile_text_inert_in_new_sections() {
+        use crate::report::build;
+        use saiife_audit::{DecisionKind, NewRecord, Record};
+        use time::macros::datetime;
+        let evil = "<script>alert(1)</script>\u{202e}\u{1b}[31m";
+        let mk = |kind: &str, decision, at| {
+            let mut r = Record::at(
+                NewRecord {
+                    agent: "claude",
+                    project: "/p",
+                    session: None,
+                    tool: "api",
+                    input: evil,
+                    decision,
+                    pack: None,
+                    rule: None,
+                    reason: Some(evil),
+                    mode: "locked",
+                    policy: None,
+                    permission_mode: None,
+                },
+                "0.2.0",
+                at,
+            );
+            r.kind = Some(kind.into());
+            r.user = Some(evil.into());
+            r
+        };
+        let t = datetime!(2026-10-20 10:00:00 UTC);
+        let mut conn = mk("connector", DecisionKind::Deny, t);
+        conn.extra.insert("service".into(), evil.into());
+        let mut appr = mk("approval", DecisionKind::Ask, t);
+        appr.extra.insert("id".into(), 7.into());
+        appr.extra.insert("action".into(), "created".into());
+        appr.extra.insert("type".into(), evil.into());
+        let mut start = mk("daemon", DecisionKind::Allow, t);
+        start.extra.insert("event".into(), "start".into());
+        start
+            .extra
+            .insert("previous_clean_stop".into(), false.into());
+        start.host = Some(evil.into());
+        let mut fail = mk("forward", DecisionKind::Allow, t);
+        fail.extra.insert("event".into(), "failing".into());
+        fail.extra.insert("target".into(), evil.into());
+        let denied = mk("connector", DecisionKind::ErrorDenied, t);
+        let rs = [conn, appr, start, fail, denied];
+        let refs: Vec<&Record> = rs.iter().collect();
+        let model = build(&refs, &[], vec![], None, datetime!(2026-10-21 09:00 UTC));
+        let html = render(&model);
+        assert!(!html.contains("<script"));
+        assert!(!html.contains('\u{202e}'));
+        assert!(!html.contains('\u{1b}'));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }

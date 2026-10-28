@@ -186,6 +186,10 @@ finish, the project hook keeps judging and `saiife status` says so. In a project
 never removed), and `saiife init --off` removes leftover project hooks and
 keeps the config.
 
+Once it runs, you can forward the audit elsewhere
+([forwarding](forwarding.md)), give auditors read access ([auditors](auditors.md))
+and limit a dedicated agent account's network ([egress](egress.md)).
+
 ### Check it
 
 ```sh

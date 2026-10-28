@@ -3,7 +3,7 @@
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
-use crate::system::{Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
+use crate::system::{Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -50,7 +50,7 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Keys only `config.toml` may set; a drop-in setting one is `Invalid`.
 const CONFIG_ONLY: &[&str] = &[
-    "version", "locked", "daemon", "admin", "audit", "approval", "notify", "gateway",
+    "version", "locked", "daemon", "admin", "audit", "approval", "notify", "gateway", "doctor",
 ];
 const CONFIG_ONLY_GUARD: &[&str] = &["budget_ms", "fail"];
 
@@ -68,7 +68,7 @@ struct DropIn {
     #[serde(default)]
     scope: Vec<Scope>,
     #[serde(default)]
-    example: Vec<toml::Table>,
+    example: Vec<Example>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -170,6 +170,9 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
     cfg.notify
+        .validate()
+        .map_err(|why| invalid(config_file, why))?;
+    cfg.audit
         .validate()
         .map_err(|why| invalid(config_file, why))?;
     for (name, sec) in &cfg.secrets {

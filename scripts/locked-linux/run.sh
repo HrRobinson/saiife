@@ -37,6 +37,8 @@ export BIN HERE REPO LOGS
 
 # shellcheck source=scripts/locked-linux/lib.sh
 source "$HERE/lib.sh"
+# shellcheck source=scripts/demo-locked.sh
+source "$REPO/scripts/demo-locked.sh"
 
 mkdir -p "$LOGS"
 WORK="$(mktemp -d)"
@@ -52,6 +54,7 @@ phase_attacks
 phase_doctor
 phase_approvals
 phase_lockdown
+phase_demo
 phase_reinstall_uninstall
 
 echo "== locked-linux: all phases passed (systemd $(systemd_version))"

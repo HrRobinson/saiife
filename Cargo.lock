@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "saiife"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "base64 0.23.1",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-agents"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "rustix",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-audit"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-broker"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "base64 0.23.1",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-daemon"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-guard"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-ipc"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rustix",
  "serde",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-policy"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "saiife-system"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "rustix",

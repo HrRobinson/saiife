@@ -1,6 +1,6 @@
 //! `/etc/saiife/config.toml` (spec §8.1). Every section rejects unknown keys
 //! (typos in a security config are errors) and every default is the §8.1
-//! value. `forward` and `example` stay raw tables until plan 12 types them.
+//! value.
 
 use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub struct SystemConfig {
     pub approval: ApprovalCfg,
     #[serde(default)]
     pub notify: NotifyCfg,
+    #[serde(default, skip_serializing_if = "DoctorCfg::is_default")]
+    pub doctor: DoctorCfg,
     #[serde(default)]
     pub gateway: GatewayCfg,
     #[serde(default)]
@@ -39,7 +41,7 @@ pub struct SystemConfig {
     #[serde(default)]
     pub scope: Vec<Scope>,
     #[serde(default)]
-    pub example: Vec<toml::Table>,
+    pub example: Vec<Example>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -102,7 +104,7 @@ pub struct AuditCfg {
     pub checkpoint_interval: Duration,
     pub min_free_mb: u64,
     pub fsync: Fsync,
-    pub forward: BTreeMap<String, toml::Table>,
+    pub forward: BTreeMap<String, ForwardCfg>,
 }
 
 impl Default for AuditCfg {
@@ -116,6 +118,191 @@ impl Default for AuditCfg {
             fsync: Fsync::Checkpoint,
             forward: BTreeMap::new(),
         }
+    }
+}
+
+/// `[audit.forward.<name>]` (spec §6.5): where a copy of the audit log goes.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ForwardCfg {
+    Syslog {
+        /// `unix:/dev/log` or `tls://host:port`.
+        address: String,
+        #[serde(default)]
+        format: SyslogFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        facility: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca: Option<PathBuf>,
+    },
+    File {
+        path: PathBuf,
+    },
+    Https {
+        url: String,
+        /// Vault secret holding the `Authorization` header value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_secret: Option<String>,
+        #[serde(default)]
+        format: HttpsFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ca: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SyslogFormat {
+    #[default]
+    #[serde(rename = "rfc5424")]
+    Rfc5424,
+    #[serde(rename = "rfc5424-json")]
+    Rfc5424Json,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum HttpsFormat {
+    #[default]
+    #[serde(rename = "json")]
+    Json,
+    #[serde(rename = "splunk-hec")]
+    SplunkHec,
+}
+
+fn has_ws(s: &str) -> bool {
+    s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `host:port` (split on the last `:`), port 1..=65535. An IPv6 host must be
+/// bracketed. With `port_required` false the port may be absent (URLs).
+fn valid_host_port(hp: &str, port_required: bool) -> bool {
+    if hp.is_empty() || has_ws(hp) || hp.contains(['/', '@', '?', '#']) {
+        return false;
+    }
+    let (host, port) = if hp.starts_with('[') {
+        match hp.find(']') {
+            Some(i) if i + 1 == hp.len() => (hp, None),
+            Some(i) => match hp[i + 1..].strip_prefix(':') {
+                Some(p) => (&hp[..=i], Some(p)),
+                None => return false,
+            },
+            None => return false,
+        }
+    } else {
+        match hp.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hp, None),
+        }
+    };
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner.strip_suffix(']').is_some_and(|i| {
+            !i.is_empty()
+                && i.chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        })
+    } else {
+        !host.is_empty() && !host.contains([':', '[', ']'])
+    };
+    let port_ok = match port {
+        Some(p) => p.parse::<u16>().is_ok_and(|n| n >= 1) && p.bytes().all(|b| b.is_ascii_digit()),
+        None => !port_required,
+    };
+    host_ok && port_ok
+}
+
+fn valid_https_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if has_ws(url) {
+        return false;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    valid_host_port(&rest[..end], false)
+}
+
+/// The syslog facility number for a validated name (RFC 5424): `user` 1,
+/// `daemon` 3, `local0`..`local7` 16..23. `None` for anything else; the
+/// forwarder uses `facility_code(f).unwrap_or(16)` (default `local0`).
+pub fn facility_code(name: Option<&str>) -> Option<u8> {
+    match name {
+        None => Some(16),
+        Some("user") => Some(1),
+        Some("daemon") => Some(3),
+        Some(f) => {
+            let n: u8 = f.strip_prefix("local")?.parse().ok()?;
+            let canonical = f.len() == "local0".len();
+            (n <= 7 && canonical).then_some(16 + n)
+        }
+    }
+}
+
+impl AuditCfg {
+    /// The checks a parse cannot make; `Err` names the target.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, t) in &self.forward {
+            let bad = |why: &str| Err(format!("[audit.forward.{name}]: {why}"));
+            if name.is_empty()
+                || name.len() > 32
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            {
+                return bad("target name must match [a-z0-9_-]{1,32}");
+            }
+            let abs = |p: &PathBuf| p.is_absolute();
+            match t {
+                ForwardCfg::Syslog {
+                    address,
+                    facility,
+                    ca,
+                    ..
+                } => {
+                    let unix = address.starts_with("unix:");
+                    let ok = match address.strip_prefix("unix:") {
+                        Some(p) => p.starts_with('/') && p.len() > 1 && !has_ws(p),
+                        None => address
+                            .strip_prefix("tls://")
+                            .is_some_and(|hp| valid_host_port(hp, true)),
+                    };
+                    if !ok {
+                        return bad("address must be unix:/absolute/path or tls://host:port");
+                    }
+                    if unix && ca.is_some() {
+                        return bad("ca applies to tls:// addresses only");
+                    }
+                    if let Some(f) = facility {
+                        if facility_code(Some(f)).is_none() {
+                            return bad("facility must be local0..local7, user or daemon");
+                        }
+                    }
+                    if ca.as_ref().is_some_and(|p| !abs(p)) {
+                        return bad("ca must be an absolute path");
+                    }
+                }
+                ForwardCfg::File { path } => {
+                    if !abs(path) {
+                        return bad("path must be absolute");
+                    }
+                }
+                ForwardCfg::Https {
+                    url,
+                    auth_secret,
+                    ca,
+                    ..
+                } => {
+                    if !valid_https_url(url) {
+                        return bad("url must be https://host[:port]/... with a host");
+                    }
+                    if auth_secret.as_deref() == Some("") {
+                        return bad("auth_secret must not be empty");
+                    }
+                    if ca.as_ref().is_some_and(|p| !abs(p)) {
+                        return bad("ca must be an absolute path");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -231,6 +418,41 @@ pub struct Scope {
     pub env: Option<String>,
 }
 
+/// One `[[example]]` (spec §8.1), run by `saiife policy test`: either a
+/// connector `request` (`<service> <op> [k=v ...]`) or a shell `command`
+/// (with the `agent` that runs it), for `user`, and the verdict expected.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Example {
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub expect: Expect,
+}
+
+/// The verdict an `[[example]]` expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Expect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl Expect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Expect::Allow => "allow",
+            Expect::Ask => "ask",
+            Expect::Deny => "deny",
+        }
+    }
+}
+
 /// What a notification is about (spec §6.10.3). Unknown names are errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -262,6 +484,21 @@ impl Event {
             Event::ForwardFailing => "forward_failing",
             Event::Lockdown => "lockdown",
         }
+    }
+}
+
+/// `[doctor]`: hints for `saiife doctor`; no effect on enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorCfg {
+    /// Users that are dedicated agent accounts although they have a login
+    /// shell. Accounts without one (`nologin`, `false`) are always dedicated.
+    pub dedicated_accounts: Vec<String>,
+}
+
+impl DoctorCfg {
+    fn is_default(&self) -> bool {
+        self.dedicated_accounts.is_empty()
     }
 }
 
@@ -417,6 +654,199 @@ mod tests {
         assert_eq!(c.audit.fsync, Fsync::Always);
         assert_eq!(c.approval.same_user, SameUser::Reauth);
         assert!(toml::from_str::<SystemConfig>("version = 2\n[guard]\nfail = \"Open\"\n").is_err());
+    }
+
+    fn fwd(body: &str) -> Result<SystemConfig, toml::de::Error> {
+        toml::from_str(&format!("version = 2\n{body}"))
+    }
+
+    fn fwd_valid(body: &str) -> Result<(), String> {
+        fwd(body).unwrap().audit.validate()
+    }
+
+    #[test]
+    fn forward_types_parse() {
+        let c = fwd(concat!(
+            "[audit.forward.siem]\ntype = \"syslog\"\naddress = \"tls://log.test:6514\"\n",
+            "format = \"rfc5424-json\"\nfacility = \"local3\"\nca = \"/etc/saiife/ca/x.pem\"\n",
+            "[audit.forward.local]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\n",
+            "[audit.forward.copy]\ntype = \"file\"\npath = \"/mnt/x\"\n",
+            "[audit.forward.hec]\ntype = \"https\"\nurl = \"https://h.test/e\"\n",
+            "auth_secret = \"splunk\"\nformat = \"splunk-hec\"\n",
+        ))
+        .unwrap();
+        assert!(c.audit.validate().is_ok());
+        assert_eq!(c.audit.forward.len(), 4);
+        assert!(matches!(
+            &c.audit.forward["siem"],
+            ForwardCfg::Syslog { format: SyslogFormat::Rfc5424Json, facility: Some(f), .. } if f == "local3"
+        ));
+        assert!(matches!(
+            &c.audit.forward["local"],
+            ForwardCfg::Syslog {
+                format: SyslogFormat::Rfc5424,
+                facility: None,
+                ca: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &c.audit.forward["hec"],
+            ForwardCfg::Https {
+                format: HttpsFormat::SplunkHec,
+                auth_secret: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_key_is_error() {
+        assert!(fwd("[audit.forward.a]\ntype = \"file\"\npath = \"/x\"\nextra = 1\n").is_err());
+        assert!(fwd("[audit.forward.a]\ntype = \"file\"\n").is_err());
+        assert!(fwd("[audit.forward.a]\ntype = \"kafka\"\n").is_err());
+        assert!(fwd("[audit.forward.a]\npath = \"/x\"\n").is_err());
+        assert!(fwd(
+            "[audit.forward.a]\ntype = \"https\"\nurl = \"https://h\"\nformat = \"xml\"\n"
+        )
+        .is_err());
+        // keys of another type are unknown here
+        assert!(
+            fwd("[audit.forward.a]\ntype = \"file\"\npath = \"/x\"\nurl = \"https://h\"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn http_url_refused() {
+        assert!(
+            fwd_valid("[audit.forward.a]\ntype = \"https\"\nurl = \"http://h.test/\"\n").is_err()
+        );
+        assert!(fwd_valid("[audit.forward.a]\ntype = \"https\"\nurl = \"https://\"\n").is_err());
+        assert!(
+            fwd_valid("[audit.forward.a]\ntype = \"https\"\nurl = \"https://h.test/\"\n").is_ok()
+        );
+        assert!(
+            fwd_valid("[audit.forward.a]\ntype = \"syslog\"\naddress = \"tcp://h:514\"\n").is_err()
+        );
+        assert!(
+            fwd_valid("[audit.forward.a]\ntype = \"syslog\"\naddress = \"tls://h\"\n").is_err()
+        );
+        assert!(
+            fwd_valid("[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:dev/log\"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn url_negatives() {
+        for u in [
+            "https:///x",
+            "https://:443",
+            "https://ho st/",
+            "https://user@/",
+            "https://h.test:0/",
+            "https://h.test:99999/",
+            "https://h.test:/",
+            "https://::1/",
+        ] {
+            let b = format!("[audit.forward.a]\ntype = \"https\"\nurl = \"{u}\"\n");
+            assert!(fwd_valid(&b).is_err(), "{u}");
+        }
+        for u in [
+            "https://h.test",
+            "https://h.test:8443/x?y#z",
+            "https://[::1]:8443/",
+        ] {
+            let b = format!("[audit.forward.a]\ntype = \"https\"\nurl = \"{u}\"\n");
+            assert!(fwd_valid(&b).is_ok(), "{u}");
+        }
+    }
+
+    #[test]
+    fn bad_syslog_address_refused() {
+        for a in [
+            "tls://h",
+            "tls://h:0",
+            "tls://h:65536",
+            "tls://:6514",
+            "tls://h/x:6514",
+            "tls://h h:6514",
+            "tls://::1:6514",
+            "tls://[::1]",
+            "unix:/",
+            "unix:dev/log",
+            "unix:",
+            "udp://h:514",
+        ] {
+            let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
+            assert!(fwd_valid(&b).is_err(), "{a}");
+        }
+        for a in [
+            "tls://[::1]:6514",
+            "tls://h.test:6514",
+            "tls://h:65535",
+            "unix:/dev/log",
+        ] {
+            let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
+            assert!(fwd_valid(&b).is_ok(), "{a}");
+        }
+        let b =
+            "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nca = \"/x.pem\"\n";
+        assert!(fwd_valid(b).is_err());
+    }
+
+    #[test]
+    fn facility_codes() {
+        assert_eq!(facility_code(None), Some(16));
+        assert_eq!(facility_code(Some("user")), Some(1));
+        assert_eq!(facility_code(Some("daemon")), Some(3));
+        assert_eq!(facility_code(Some("local0")), Some(16));
+        assert_eq!(facility_code(Some("local7")), Some(23));
+        assert_eq!(facility_code(Some("local8")), None);
+        assert_eq!(facility_code(Some("local07")), None);
+        assert_eq!(facility_code(Some("kern")), None);
+    }
+
+    #[test]
+    fn relative_path_refused() {
+        assert!(fwd_valid("[audit.forward.a]\ntype = \"file\"\npath = \"out\"\n").is_err());
+        assert!(fwd_valid(
+            "[audit.forward.a]\ntype = \"https\"\nurl = \"https://h\"\nca = \"ca.pem\"\n"
+        )
+        .is_err());
+        assert!(fwd_valid(
+            "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nca = \"ca.pem\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bad_facility_refused() {
+        for f in ["local8", "kern", "LOCAL0", "local", ""] {
+            let b = format!(
+                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nfacility = \"{f}\"\n"
+            );
+            assert!(fwd_valid(&b).is_err(), "{f}");
+        }
+        for f in ["local0", "local7", "user", "daemon"] {
+            let b = format!(
+                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nfacility = \"{f}\"\n"
+            );
+            assert!(fwd_valid(&b).is_ok(), "{f}");
+        }
+    }
+
+    #[test]
+    fn bad_target_name_refused() {
+        for n in ["Siem", "a.b", "has space", &"a".repeat(33)] {
+            let b = format!("[audit.forward.\"{n}\"]\ntype = \"file\"\npath = \"/x\"\n");
+            assert!(fwd_valid(&b).is_err(), "{n}");
+        }
+        for n in ["a", "siem_1-b", &"a".repeat(32)] {
+            let b = format!("[audit.forward.\"{n}\"]\ntype = \"file\"\npath = \"/x\"\n");
+            assert!(fwd_valid(&b).is_ok(), "{n}");
+        }
     }
 
     #[test]

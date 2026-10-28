@@ -153,7 +153,16 @@ struct World {
     ctx: Arc<Ctx>,
     m: Mock,
     tmp: tempfile::TempDir,
+    /// [`world_ask`]: this test's turn at running the hook.
+    _hook_turn: Option<std::sync::MutexGuard<'static, ()>>,
 }
+
+/// The tests that run the managed hook (`world_ask`) take turns: each hook
+/// call spawns `saiife check --managed` and its judging worker, and under
+/// the full parallel test load a hook could miss its fixed deadlines (the
+/// 2 s budget for the approval steps and the daemon's ack, the 3 s worker
+/// deadline) and fail closed without the "Needs approval" line.
+static HOOK_TURNS: Mutex<()> = Mutex::new(());
 
 fn config_text(tmp: &Path, port: u16, erp_extra: &str) -> String {
     format!(
@@ -262,7 +271,17 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
 
 /// [`world`] with `[guard] ask = [<ask>]` (command approvals, Task 4).
 fn world_ask(ask: &str) -> World {
-    world_full("", None, &format!("\n[guard]\nask = [{ask}]\n"))
+    let turn = HOOK_TURNS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut w = world_full("", None, &ask_tail(ask));
+    w._hook_turn = Some(turn);
+    w
+}
+
+/// The `[guard]` table of [`world_ask`]: `ask`, and a judging budget far
+/// above the 50 ms default, so a debug build on a loaded runner never
+/// fails open (and the managed hook closed) on a slow evaluation.
+fn ask_tail(ask: &str) -> String {
+    format!("\n[guard]\nask = [{ask}]\nbudget_ms = 10000\n")
 }
 
 /// The world; `tail` is appended to the config text.
@@ -390,7 +409,13 @@ fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
         });
     }
     rt.spawn(saiife_daemon::gateway::serve(gw, Arc::clone(&ctx)));
-    World { rt, ctx, m, tmp }
+    World {
+        rt,
+        ctx,
+        m,
+        tmp,
+        _hook_turn: None,
+    }
 }
 
 impl World {
@@ -500,9 +525,8 @@ impl World {
         files
             .iter()
             .flat_map(|f| {
-                fs::read_to_string(f)
-                    .unwrap()
-                    .lines()
+                let text = fs::read_to_string(f).unwrap();
+                common::complete_lines(&text)
                     .map(|l| serde_json::from_str(l).unwrap())
                     .collect::<Vec<Value>>()
             })
@@ -1537,8 +1561,9 @@ fn self_approval_of_command_refused() {
     let w = world_ask(ASK_FORCE_PUSH);
     let id = needs_approval_id(&w.hook(FORCE_PUSH));
     let text = format!(
-        "{}\n[guard]\nask = [{ASK_FORCE_PUSH}]\n",
-        config_text(w.path(), w.m.port, "")
+        "{}{}",
+        config_text(w.path(), w.m.port, ""),
+        ask_tail(ASK_FORCE_PUSH)
     )
     .replace(
         "approvers = [\"boss\"]",

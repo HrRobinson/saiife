@@ -12,6 +12,7 @@
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
 //! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
 //! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
+//! - `saiife policy check|test <file>` / `show` / `reload` -> check and test a policy file; show or reload the one in force
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
 #![forbid(unsafe_code)]
@@ -27,6 +28,7 @@ mod out;
 mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
+mod audit_locked;
 mod check;
 mod check_managed;
 mod connect_cmd;
@@ -38,6 +40,7 @@ mod init_cmd;
 mod lockdown_cmd;
 mod packs_cmd;
 mod paths;
+mod policy_cmd;
 mod project;
 mod report;
 mod report_html;
@@ -152,6 +155,15 @@ enum Cmd {
         /// Only blocked actions.
         #[arg(long)]
         blocked: bool,
+        /// Only records of this kind (locked mode).
+        #[arg(long, value_parser = ["connector", "approval", "guard"])]
+        kind: Option<String>,
+        /// Only records of this connector service (locked mode).
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
         /// Write a self-contained HTML report instead of the table (default name: saiife-report-YYYY-MM-DD.html here).
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
@@ -273,6 +285,15 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<lockdown_cmd::LockdownAction>,
     },
+    /// Check and test a policy kept in a file (`check`, `test`), or show
+    /// and reload the one in force (`show`, `reload`: locked mode).
+    Policy {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: policy_cmd::PolicyAction,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -283,7 +304,15 @@ enum Cmd {
 #[derive(Subcommand)]
 enum AuditAction {
     /// Check that the audit log has not been edited, reordered or cut.
-    Verify,
+    Verify {
+        /// A forwarded copy (one JSONL file, or a dir of month files): the
+        /// local log must hold every checkpoint it has and reach its end.
+        #[arg(long, value_name = "FILE|DIR")]
+        external: Option<std::path::PathBuf>,
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true)]
+        system_config: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -387,6 +416,13 @@ fn main() -> ExitCode {
     if let Cmd::Api(a) = cli.command {
         return api_cmd::run(a);
     }
+    if let Cmd::Policy {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return policy_cmd::run(system_config, action);
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -438,6 +474,7 @@ fn main() -> ExitCode {
         | Cmd::Api(_)
         | Cmd::Lockdown { .. }
         | Cmd::Approvals { .. }
+        | Cmd::Policy { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {
@@ -454,22 +491,34 @@ fn main() -> ExitCode {
         Cmd::Status { root } => status_cmd::run(&packs, root),
         Cmd::Packs { id } => packs_cmd::run(&packs, &cli.packs, &vars(), id.as_deref()),
         Cmd::Audit {
-            action: Some(AuditAction::Verify),
+            action:
+                Some(AuditAction::Verify {
+                    external,
+                    system_config,
+                }),
             ..
-        } => audit_cmd::verify(),
+        } => audit_cmd::verify(external.as_deref(), system_config.as_deref()),
         Cmd::Audit {
             action: None,
             since,
             project,
             agent,
             blocked,
+            kind,
+            service,
+            system_config,
             report,
         } => audit_cmd::run(
-            since.as_deref(),
-            project.as_deref(),
-            agent.as_deref(),
-            blocked,
-            report.as_deref(),
+            audit_cmd::RunArgs {
+                since: since.as_deref(),
+                project: project.as_deref(),
+                agent: agent.as_deref(),
+                blocked,
+                kind: kind.as_deref(),
+                service: service.as_deref(),
+                report: report.as_deref(),
+                system_config,
+            },
             &packs,
         ),
     }

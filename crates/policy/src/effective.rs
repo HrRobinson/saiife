@@ -156,12 +156,12 @@ mod tests {
 
     const CFG_A: &str = "version = 2\nlocked = true\n\
         [guard]\npacks = [\"db.postgres\"]\n\
-        [audit]\ncheckpoint_interval = \"15m\"\n[audit.forward.siem]\ntype = \"syslog\"\naddress = \"x\"\n\
+        [audit]\ncheckpoint_interval = \"15m\"\n[audit.forward.siem]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\n\
         [[scope]]\nname = \"s\"\nusers = [\"u\"]\nenv = \"prod\"\n\
         [services.shopify]\nconnector = \"shopify\"\nallow = [\"a:read\"]\n";
     const CFG_B: &str = "[services.shopify]\nallow = [\"a:read\"]\nconnector = \"shopify\"\n\
         [[scope]]\nenv = \"prod\"\nusers = [\"u\"]\nname = \"s\"\n\
-        [audit.forward.siem]\naddress = \"x\"\ntype = \"syslog\"\n\
+        [audit.forward.siem]\naddress = \"unix:/dev/log\"\ntype = \"syslog\"\n\
         [guard]\npacks = [\"db.postgres\"]\n\
         [audit]\ncheckpoint_interval = \"15m\"\n";
 

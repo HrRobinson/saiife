@@ -56,9 +56,14 @@ impl Sandbox {
         s
     }
 
-    fn cmd(&self) -> Command {
+    /// `saiife audit` in developer mode whatever the host has installed:
+    /// the system config named does not exist.
+    fn audit(&self) -> Command {
         let mut c = Command::cargo_bin("saiife").unwrap();
-        c.env(DIR_ENV, self.audit.path())
+        c.arg("audit")
+            .arg("--system-config")
+            .arg(self.work.path().join("absent.toml"))
+            .env(DIR_ENV, self.audit.path())
             .env("HOME", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .current_dir(self.work.path());
@@ -80,8 +85,8 @@ fn writes_default_named_report() {
     let today = OffsetDateTime::now_utc().date();
     let name = format!("saiife-report-{today}.html");
     let abs = std::fs::canonicalize(s.work.path()).unwrap().join(&name);
-    s.cmd()
-        .args(["audit", "--report"])
+    s.audit()
+        .args(["--report"])
         .assert()
         .success()
         .stdout(format!("Report written: {} (2 decisions)\n", abs.display()));
@@ -94,15 +99,8 @@ fn writes_default_named_report() {
 fn explicit_path_and_filters() {
     let s = Sandbox::new();
     std::fs::create_dir(s.path("out")).unwrap();
-    s.cmd()
-        .args([
-            "audit",
-            "--since",
-            "7d",
-            "--blocked",
-            "--report",
-            "out/r.html",
-        ])
+    s.audit()
+        .args(["--since", "7d", "--blocked", "--report", "out/r.html"])
         .assert()
         .success();
     let html = read(&s.path("out/r.html"));
@@ -127,8 +125,8 @@ fn blocked_report_does_not_hide_fail_open_gaps() {
         ),
     )
     .unwrap();
-    s.cmd()
-        .args(["audit", "--blocked", "--report", "b.html"])
+    s.audit()
+        .args(["--blocked", "--report", "b.html"])
         .assert()
         .success();
     let html = read(&s.path("b.html"));
@@ -147,8 +145,8 @@ fn refuses_non_html_path() {
     std::fs::create_dir(s.path(".claude")).unwrap();
     std::fs::write(s.path(".claude/settings.json"), "{\"keep\":1}").unwrap();
     for p in ["settings.json", ".claude/settings.json"] {
-        s.cmd()
-            .args(["audit", "--report", p])
+        s.audit()
+            .args(["--report", p])
             .assert()
             .code(2)
             .stderr(predicate::str::contains(
@@ -164,16 +162,16 @@ fn refuses_symlink_target() {
     let s = Sandbox::new();
     std::fs::write(s.path("target.json"), "precious").unwrap();
     std::os::unix::fs::symlink(s.path("target.json"), s.path("r.html")).unwrap();
-    s.cmd()
-        .args(["audit", "--report", "r.html"])
+    s.audit()
+        .args(["--report", "r.html"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("is not a regular file"));
     assert_eq!(read(&s.path("target.json")), "precious");
 
     std::fs::create_dir(s.path("d.html")).unwrap();
-    s.cmd()
-        .args(["audit", "--report", "d.html"])
+    s.audit()
+        .args(["--report", "d.html"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("is not a regular file"));
@@ -183,10 +181,7 @@ fn refuses_symlink_target() {
 fn overwrites_existing_regular_report() {
     let s = Sandbox::new();
     std::fs::write(s.path("r.html"), "old").unwrap();
-    s.cmd()
-        .args(["audit", "--report", "r.html"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "r.html"]).assert().success();
     assert!(read(&s.path("r.html")).contains("Blocked actions"));
     let leftovers: Vec<_> = std::fs::read_dir(s.work.path())
         .unwrap()
@@ -200,37 +195,27 @@ fn overwrites_existing_regular_report() {
 fn report_is_mode_0600_even_over_an_existing_0644_file() {
     use std::os::unix::fs::PermissionsExt;
     let s = Sandbox::new();
-    s.cmd()
-        .args(["audit", "--report", "a.html"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "a.html"]).assert().success();
     let mode = |n: &str| std::fs::metadata(s.path(n)).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode("a.html"), 0o600);
     std::fs::write(s.path("b.html"), "old").unwrap();
     std::fs::set_permissions(s.path("b.html"), std::fs::Permissions::from_mode(0o644)).unwrap();
-    s.cmd()
-        .args(["audit", "--report", "b.html"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "b.html"]).assert().success();
     assert_eq!(mode("b.html"), 0o600);
 }
 
 #[test]
 fn uppercase_extension_is_accepted() {
     let s = Sandbox::new();
-    s.cmd()
-        .args(["audit", "--report", "R.HTM"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "R.HTM"]).assert().success();
     assert!(s.path("R.HTM").exists());
 }
 
 #[test]
 fn project_and_agent_filter_labels() {
     let s = Sandbox::new();
-    s.cmd()
+    s.audit()
         .args([
-            "audit",
             "--project",
             "/home/u/app",
             "--agent",
@@ -247,8 +232,8 @@ fn project_and_agent_filter_labels() {
 fn damaged_log_is_reported_in_file_and_stdout() {
     let s = Sandbox::new();
     std::fs::write(s.audit.path().join("1999-01.jsonl"), "{\"v\":1,\"ts\":").unwrap();
-    s.cmd()
-        .args(["audit", "--report", "d.html"])
+    s.audit()
+        .args(["--report", "d.html"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -263,8 +248,8 @@ fn unreadable_log_files_are_counted_in_file_and_stdout() {
     let s = Sandbox::new();
     // A directory where a month file should be: listed, but not readable.
     std::fs::create_dir(s.audit.path().join("1999-02.jsonl")).unwrap();
-    s.cmd()
-        .args(["audit", "--report", "u.html"])
+    s.audit()
+        .args(["--report", "u.html"])
         .assert()
         .success()
         .stdout(predicate::str::contains("1 log files could not be read."));
@@ -274,8 +259,8 @@ fn unreadable_log_files_are_counted_in_file_and_stdout() {
 #[test]
 fn missing_parent_dir_is_an_error() {
     let s = Sandbox::new();
-    s.cmd()
-        .args(["audit", "--report", "nope/r.html"])
+    s.audit()
+        .args(["--report", "nope/r.html"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot write"));
@@ -286,8 +271,8 @@ fn missing_parent_dir_is_an_error() {
 #[test]
 fn bad_since_still_exit_2() {
     let s = Sandbox::new();
-    s.cmd()
-        .args(["audit", "--since", "7w", "--report"])
+    s.audit()
+        .args(["--since", "7w", "--report"])
         .assert()
         .code(2);
     let any_html = std::fs::read_dir(s.work.path()).unwrap().count();
@@ -307,10 +292,7 @@ fn large_log_renders() {
     // 19 998 + the 2 seeded records. A month file far from the seeded current month.
     std::fs::write(s.audit.path().join("2026-01.jsonl"), lines).unwrap();
     let start = std::time::Instant::now();
-    s.cmd()
-        .args(["audit", "--report", "big.html"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "big.html"]).assert().success();
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
     assert!(read(&s.path("big.html")).contains("Show all 20000 decisions"));
 }
@@ -330,10 +312,7 @@ fn html_report_has_chain_policy_mode_sections() {
     );
     r.policy = Some("<script>alert(1)</script>".into());
     saiife_audit::chain::append_chained(s.audit.path(), r).unwrap();
-    s.cmd()
-        .args(["audit", "--report", "c.html"])
-        .assert()
-        .success();
+    s.audit().args(["--report", "c.html"]).assert().success();
     let html = read(&s.path("c.html"));
     for h in ["Audit chain", "Policy in force", "Mode per host"] {
         assert!(html.contains(&format!("<h2>{h}</h2>")), "{h}");

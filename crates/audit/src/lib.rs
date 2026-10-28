@@ -15,4 +15,6 @@ pub mod verify;
 
 pub use chain::{ChainWriter, StartupCheck, WriterOptions};
 pub use record::{DecisionKind, NewRecord, Record};
-pub use verify::{verify, Break, BreakKind, VerifyReport};
+pub use verify::{
+    verify, verify_external, Break, BreakKind, ExternalReport, HeadMismatch, VerifyReport,
+};

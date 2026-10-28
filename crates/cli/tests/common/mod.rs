@@ -145,6 +145,37 @@ pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
     sandbox
 }
 
+/// A system config path that does not exist, under `dir`: `saiife audit`,
+/// `audit verify` and `--report` given it are in developer mode whatever
+/// the host has in /etc/saiife.
+pub fn absent_system_config(dir: &Path) -> PathBuf {
+    dir.join("absent-system-config.toml")
+}
+
+/// [`hermetic`] for `saiife audit <args>` (the table, `--report` and
+/// `verify`): the args, then `--system-config` naming a file that does not
+/// exist, so no test reads /etc/saiife.
+pub fn hermetic_audit<I, S>(cmd: &mut Command, audit: &Path, args: I) -> TempDir
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let sandbox = hermetic(cmd, audit);
+    cmd.arg("audit")
+        .args(args)
+        .arg("--system-config")
+        .arg(absent_system_config(sandbox.path()));
+    sandbox
+}
+
+/// The complete lines of an audit file being written: a last line
+/// without its `\n` is an append still in progress (a reader racing the
+/// daemon's writer), not a record yet, and is left out.
+pub fn complete_lines(text: &str) -> impl Iterator<Item = &str> {
+    let end = text.rfind('\n').map_or(0, |i| i + 1);
+    text[..end].lines()
+}
+
 /// The `cwd` the recorded fixtures use.
 pub const FIXTURE_CWD: &str = "/home/u/app";
 

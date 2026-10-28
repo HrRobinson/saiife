@@ -115,7 +115,23 @@ not running.
 
 Lock label: **unverified**. The [lock-check](../lock-check.md) for Gemini CLI has
 not been run with a logged-in account yet, so we do not know whether
-Gemini CLI can be locked.
+Gemini CLI can be locked. Until it has, treat Gemini CLI as running in the
+Developer setup even on a locked machine, and do not rely on the lock for it
+([threats](../threats.md)).
+
+Fail-closed matrix (Gemini CLI column, from the design; unverified live):
+
+| Failure | Result |
+|---|---|
+| saiife reports an error (exit 2 and a reason) | blocked |
+| guard engine crash | blocked (a worker isolates it; the parent denies) |
+| `check` parent killed or crashes | blocked if the exit code is not 0 or 1 (unverified for signals) |
+| hook timeout (10 s) | **runs** |
+| daemon down or not answering in 2 s | blocked |
+| binary missing | possibly blocked (exit 127, unverified) |
+
+saiife answers well inside the timeout (an internal deadline of 3 s).
+`saiife doctor` lists these gaps.
 
 In locked mode, MCP tools are denied unless `[guard.mcp] allow_servers`
 lists their server. Gemini CLI's `mcp_<server>_<tool>` names cannot be split
