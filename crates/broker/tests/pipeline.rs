@@ -1404,3 +1404,143 @@ async fn judge_and_pipeline_agree() {
         }
     );
 }
+
+/// A form connector on the loopback host: a built refund body (with an
+/// amount from the admin's currency) and a raw form body.
+fn form_manifest(source: &str) -> Manifest {
+    Manifest::parse(&format!(
+        r#"
+id = "test-form"
+version = 1
+title = "Test form"
+base_url = "https://{{shop}}.echo.test/api"
+hosts = ["*.echo.test"]
+auth = [{{ kind = "header", name = "X-Echo-Token", secret_field = "token" }}]
+
+[params.shop]
+type = "string"
+pattern = "^[a-z0-9-]+$"
+required = true
+
+[params.currency]
+type = "string"
+
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/refunds"
+body = "form"
+body_params = {{ charge = "string", amount = "int:1.." }}
+body_const = {{ "metadata.source" = "{source}" }}
+amount = {{ field = "amount", currency_param = "currency", unit = "minor" }}
+
+[[operation]]
+id = "charges.create"
+capability = "charges:write"
+kind = "write"
+method = "POST"
+path = "/charges"
+body = "form"
+"#
+    ))
+    .unwrap()
+}
+
+fn form_snap() -> PolicySnapshot {
+    snap_of(
+        r#"[services.pay]
+connector = "test-form"
+secret = "pay-tok"
+params = { shop = "acme", currency = "EUR" }
+ask = ["refunds:write", "charges:write"]
+"#,
+    )
+}
+
+fn form_catalog(source: &str) -> Catalog {
+    Catalog::new(&[], vec![form_manifest(source)])
+}
+
+#[tokio::test]
+async fn approved_form_and_built_bodies_are_sent() {
+    let (m, up) = mock().await;
+    let (snap, cat, lim, env) = (
+        form_snap(),
+        form_catalog("saiife"),
+        Limiter::new(),
+        env_for("pay"),
+    );
+    // A built body: nothing of the agent's is stored, the params rebuild it.
+    let c = named_call(
+        "pay",
+        "refunds.create",
+        &[("charge", "ch_1"), ("amount", "1250")],
+        None,
+    );
+    let (o, _) = run(&c, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[0].clone();
+    assert_eq!(p.stored.body_b64, None);
+    assert_eq!(p.amount, Some((1250, "EUR".to_string())));
+    assert_eq!(
+        p.body_display.as_deref(),
+        Some("amount=1250&charge=ch_1&metadata%5Bsource%5D=saiife")
+    );
+    let (_, o, tr) = send_approved(&p.stored, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert!(tr.sent);
+    assert_eq!(tr.body_sha256, p.body_sha256);
+    {
+        let seen = m.seen.lock().unwrap();
+        let (_, h, body) = seen.last().unwrap();
+        assert_eq!(
+            &body[..],
+            b"amount=1250&charge=ch_1&metadata%5Bsource%5D=saiife"
+        );
+        assert_eq!(
+            h.get("content-type").unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+    }
+    // A raw agent body on a form op: stored as canonical JSON, sent encoded.
+    let c = named_call(
+        "pay",
+        "charges.create",
+        &[],
+        Some(r#"{ "b": 2, "a": {"x": "y"} }"#),
+    );
+    let (o, _) = run(&c, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[1].clone();
+    assert!(p.stored.body_b64.is_some());
+    let (_, o, tr) = send_approved(&p.stored, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(tr.body_sha256, p.body_sha256);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(&seen.last().unwrap().2[..], b"a%5Bx%5D=y&b=2");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn manifest_change_between_ask_and_send_is_body_changed() {
+    let (m, up) = mock().await;
+    let (snap, lim, env) = (form_snap(), Limiter::new(), env_for("pay"));
+    let c = named_call(
+        "pay",
+        "refunds.create",
+        &[("charge", "ch_1"), ("amount", "1250")],
+        None,
+    );
+    let (o, _) = run(&c, &snap, &form_catalog("saiife"), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[0].clone();
+    // The admin changed a body constant before the approval was sent: the
+    // rebuilt bytes are not what the approver saw.
+    let changed = form_catalog("other");
+    let (_, o, tr) = send_approved(&p.stored, &snap, &changed, &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "body_changed");
+    assert!(!tr.sent);
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}

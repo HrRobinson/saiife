@@ -981,6 +981,136 @@ fn build_rs_lists_every_connector_file() {
     assert_eq!(ids, stems);
 }
 
+// ---------------------------------------------------------------- fix round 1
+
+#[test]
+fn form_keys_from_the_agent_cannot_nest() {
+    // `refund[amount]` would decode upstream as the nested amount the
+    // broker never checked.
+    let smuggle = json!({"refund": {"amount": 100}, "refund[amount]": 99999});
+    assert!(form_encode(&smuggle).is_err());
+    for bad in [
+        json!({"a": {"b.c": 1}}),
+        json!({"a]": 1}),
+        json!({"": 1}),
+        json!({"a": [{"x[y]": 1}]}),
+    ] {
+        assert!(form_encode(&bad).is_err(), "{bad}");
+    }
+    let m = body_manifest(
+        r#"
+[[operation]]
+id = "charges.create"
+capability = "charges:write"
+kind = "write"
+method = "POST"
+path = "/v1/charges"
+body = "form"
+"#,
+    );
+    let op = named(&m, "charges.create").unwrap();
+    for raw in [
+        &br#"{"refund":{"amount":100},"refund[amount]":99999}"#[..],
+        // A duplicated name.
+        &br#"{"refund":{"amount":100},"refund":{"amount":99999}}"#[..],
+    ] {
+        assert_eq!(
+            prepare_body(op, &BTreeMap::new(), Some(&Bytes::copy_from_slice(raw))).unwrap_err(),
+            "bad_body"
+        );
+    }
+    // An amount-capped form operation must build its body.
+    let text = "id = \"b\"\nversion = 1\ntitle = \"B\"\nbase_url = \"https://b.test\"\nhosts = [\"b.test\"]\n\
+                [params.currency]\ntype = \"string\"\n\
+                [[operation]]\nid = \"r\"\ncapability = \"r:write\"\nkind = \"write\"\nmethod = \"POST\"\n\
+                path = \"/r\"\nbody = \"form\"\n\
+                amount = { field = \"amount\", currency_param = \"currency\", unit = \"minor\" }\n";
+    let err = Manifest::parse(text).unwrap_err();
+    assert!(matches!(err, BrokerError::Manifest(_)), "{err:?}");
+}
+
+#[test]
+fn multiline_body_param_allowed() {
+    let m = body_manifest(
+        r#"
+[[operation]]
+id = "messages.create"
+capability = "messages:write"
+kind = "write"
+method = "POST"
+path = "/channels/{channel_id}/messages"
+path_params = { channel_id = "string:[0-9]{1,20}" }
+query = { q = "string" }
+body = "json"
+body_params = { content = "string" }
+"#,
+    );
+    let op = named(&m, "messages.create").unwrap();
+    let content = "Deploy done:\n\t- web\n\t- api";
+    let p = saiife_broker::params::validate(
+        op,
+        &map(&[("channel_id", "123"), ("content", content)]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let v = build_body(op, &p).unwrap().unwrap();
+    assert_eq!(v["content"], content);
+    // Other control characters stay refused, and so does a line break in a
+    // path or query param.
+    for (k, v) in [
+        ("content", "a\rb"),
+        ("content", "a\u{0}b"),
+        ("content", "a\u{7f}"),
+        ("q", "a\nb"),
+        ("channel_id", "1\n2"),
+    ] {
+        let err = saiife_broker::params::validate(
+            op,
+            &map(&[("channel_id", "123"), (k, v)]),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BrokerError::BadValue { .. }),
+            "{k}={v:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn host_param_refuses_ip_literals() {
+    for ip in ["169.254.169.254", "127.0.0.1", "10.0.0.1", "::1", "fe80::1"] {
+        assert!(!saiife_broker::request::bare_hostname(ip), "{ip}");
+    }
+    assert!(saiife_broker::request::bare_hostname("gitlab.acme.com"));
+    assert!(saiife_broker::request::bare_hostname(
+        "1password.example.com"
+    ));
+    // The manifest pattern would let the digits through; the check does not.
+    let cat = Catalog::new(&[], vec![pinned()]);
+    for ip in ["169.254.169.254", "127.0.0.1"] {
+        let err = catalog::validate(&cfg_with_host(ip), &cat).unwrap_err();
+        assert!(matches!(err, BrokerError::BadValue { .. }), "{ip}: {err:?}");
+    }
+}
+
+#[test]
+fn pagination_param_must_be_an_op_param() {
+    let manifest = |query: &str, pagination: &str| {
+        Manifest::parse(&format!(
+            "id = \"p\"\nversion = 1\ntitle = \"P\"\nbase_url = \"https://p.test\"\nhosts = [\"p.test\"]\n\
+             [[operation]]\nid = \"l\"\ncapability = \"l:read\"\nkind = \"read\"\nmethod = \"GET\"\n\
+             path = \"/l\"\nquery = {{ {query} }}\npagination = {pagination}\n"
+        ))
+    };
+    let cursor = "{ cursor = { param = \"after\", next = \"next\" } }";
+    let offset = "{ offset = { param = \"offset\", limit_field = \"limit\", more = \"more\" } }";
+    assert!(manifest("after = \"string\"", cursor).is_ok());
+    assert!(manifest("before = \"string\"", cursor).is_err());
+    assert!(manifest("offset = \"int:0..\"", offset).is_ok());
+    assert!(manifest("limit = \"int\"", offset).is_err());
+}
+
 #[test]
 fn transport_mail_refused_until_task_6() {
     let text = "id = \"m\"\nversion = 1\ntitle = \"M\"\nbase_url = \"https://m.test\"\nhosts = [\"m.test\"]\ntransport = \"mail\"\n";

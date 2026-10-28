@@ -403,7 +403,8 @@ impl Manifest {
             }
         }
         match &op.pagination {
-            Some(Pagination::Cursor { next, more, .. }) => {
+            Some(Pagination::Cursor { param, next, more }) => {
+                next_param_ok(op, param)?;
                 json_path_ok(next, true)?;
                 if let Some(m) = more {
                     json_path_ok(m, false)?;
@@ -414,6 +415,7 @@ impl Manifest {
                 limit_field,
                 more,
             }) => {
+                next_param_ok(op, param)?;
                 for p in [param, limit_field, more] {
                     json_path_ok(p, false)?;
                 }
@@ -440,6 +442,12 @@ impl Manifest {
             return Err(
                 "body_params, body_const and graphql need body = \"json\" or \"form\"".into(),
             );
+        }
+        // The amount is read from the JSON the broker encodes. A form body
+        // the agent shapes could still decode upstream differently from that
+        // JSON, so an amount-capped form operation must build its body.
+        if op.amount.is_some() && op.body.as_deref() == Some("form") && !op.builds_body() {
+            return Err("an amount on a form body needs a built body (body_params)".into());
         }
         if let Some(q) = &op.graphql {
             if op.body.as_deref() != Some("json") {
@@ -607,6 +615,18 @@ fn check_auth(a: &AuthSpec) -> Result<(), String> {
         (None, false) => {}
     }
     Ok(())
+}
+
+/// The next-page parameter must be one the operation takes: a query param,
+/// or a body param of a built (GraphQL) body, where a cursor is a variable.
+fn next_param_ok(op: &Operation, param: &str) -> Result<(), String> {
+    if op.query.contains_key(param) || op.body_params.contains_key(param) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pagination param {param} is not a query or body param of the operation"
+        ))
+    }
 }
 
 /// `x` when `h` is exactly `{x}` with a param-like name.

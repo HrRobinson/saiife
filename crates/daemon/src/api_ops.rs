@@ -87,6 +87,23 @@ fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     })
 }
 
+/// The values the masker hides for a secret before its auth entry is known
+/// (step 9 rebuilds the masker from the real credential). A token may be
+/// sent as `basic_token`, whose wire form is `base64(token:)`, so a token
+/// also yields `token:` (the masker covers its base64 forms).
+fn mask_values(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Vec<Zeroizing<String>> {
+    let kind = match kind {
+        Kind::Token => "basic_token",
+        k => kind_str(k),
+    };
+    AuthMaterial {
+        kind: kind.to_string(),
+        name: None,
+        fields: fields.clone(),
+    }
+    .values()
+}
+
 fn kind_str(k: Kind) -> &'static str {
     match k {
         Kind::Token => "token",
@@ -133,12 +150,7 @@ impl Env for DaemonEnv<'_> {
             return None;
         };
         let e = v.get(name)?;
-        let m = AuthMaterial {
-            kind: kind_str(e.kind).to_string(),
-            name: None,
-            fields: e.fields.clone(),
-        };
-        Some(m.values())
+        Some(mask_values(e.kind, &e.fields))
     }
 
     fn pool(&self, service: &str) -> Arc<Semaphore> {
@@ -762,5 +774,36 @@ mod tests {
         let one = [basic_token.clone()];
         assert_eq!(spec_for(Kind::Token, &one), Some(&basic_token));
         assert_eq!(spec_for(Kind::Basic, &one), None);
+    }
+
+    #[test]
+    fn token_mask_values_cover_the_basic_token_form() {
+        let key = concat!("wk", "_", "mask0042");
+        let fields: BTreeMap<String, Zeroizing<String>> =
+            [("token".to_string(), Zeroizing::new(key.to_string()))].into();
+        let vals: Vec<String> = mask_values(Kind::Token, &fields)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(vals.contains(&key.to_string()), "{vals:?}");
+        assert!(vals.contains(&format!("{key}:")), "{vals:?}");
+        // The masker built from them hides the wire form.
+        let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+        let masker = saiife_broker::mask::Masker::new(&refs);
+        let wire = base64::engine::general_purpose::STANDARD.encode(format!("{key}:"));
+        let masked = masker.mask_text(&format!("echo Basic {wire}"));
+        assert!(!masked.contains(&wire), "{masked}");
+        assert!(!masked.contains(key), "{masked}");
+        // Basic keeps its own pair.
+        let basic: BTreeMap<String, Zeroizing<String>> = [
+            ("username".to_string(), Zeroizing::new("ann".to_string())),
+            ("password".to_string(), Zeroizing::new("pw-1".to_string())),
+        ]
+        .into();
+        let vals: Vec<String> = mask_values(Kind::Basic, &basic)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(vals.contains(&"ann:pw-1".to_string()), "{vals:?}");
     }
 }

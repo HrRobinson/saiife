@@ -193,7 +193,15 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 /// bytes, not starting or ending in `-`, at least two labels, at most 253
 /// bytes, no trailing dot, no port, userinfo or path.
 pub fn bare_hostname(v: &str) -> bool {
+    // An IP literal is not a hostname: a dotted quad ends in an all-digit
+    // label, and IPv6 has `:` (refused by the label alphabet too).
+    let last_numeric = v
+        .rsplit('.')
+        .next()
+        .is_some_and(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
     v.len() <= 253
+        && !last_numeric
+        && !v.contains(':')
         && v.split('.').count() >= 2
         && v.split('.').all(|l| {
             !l.is_empty()
@@ -528,21 +536,37 @@ pub fn build_body(
 /// Stripe-style form encoding of a JSON object: `a[b]=v` for nested
 /// objects, `a[0]=v` for arrays, keys sorted at each level, every name and
 /// value percent-encoded. A `null` or a top level that is not an object is
-/// refused.
+/// refused. Every object key must be `[A-Za-z0-9_-]+`: a key holding `[`,
+/// `]` or `.` would let a flat JSON key decode upstream as a nested field
+/// the broker never saw (`{"refund[amount]": 99999}`), so nesting comes from
+/// this encoder only. An output name that repeats is refused too.
 pub fn form_encode(v: &Value) -> Result<String, BrokerError> {
-    fn walk(name: &str, v: &Value, out: &mut Vec<String>) -> Result<(), BrokerError> {
+    fn key_ok(k: &str) -> bool {
+        !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+    fn walk(
+        name: &str,
+        v: &Value,
+        out: &mut Vec<String>,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), BrokerError> {
         let scalar = match v {
             Value::Object(o) => {
                 let mut keys: Vec<&String> = o.keys().collect();
                 keys.sort();
                 for k in keys {
-                    walk(&format!("{name}[{k}]"), &o[k], out)?;
+                    if !key_ok(k) {
+                        return Err(bad_value("body", "a form key must be [A-Za-z0-9_-]+"));
+                    }
+                    walk(&format!("{name}[{k}]"), &o[k], out, seen)?;
                 }
                 return Ok(());
             }
             Value::Array(a) => {
                 for (i, x) in a.iter().enumerate() {
-                    walk(&format!("{name}[{i}]"), x, out)?;
+                    walk(&format!("{name}[{i}]"), x, out, seen)?;
                 }
                 return Ok(());
             }
@@ -551,6 +575,9 @@ pub fn form_encode(v: &Value) -> Result<String, BrokerError> {
             Value::Bool(b) => b.to_string(),
             Value::Null => return Err(bad_value("body", "null cannot be form-encoded")),
         };
+        if !seen.insert(name.to_string()) {
+            return Err(bad_value("body", "a form name repeats"));
+        }
         out.push(format!(
             "{}={}",
             utf8_percent_encode(name, COMPONENT),
@@ -564,8 +591,12 @@ pub fn form_encode(v: &Value) -> Result<String, BrokerError> {
     let mut keys: Vec<&String> = o.keys().collect();
     keys.sort();
     let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for k in keys {
-        walk(k, &o[k], &mut out)?;
+        if !key_ok(k) {
+            return Err(bad_value("body", "a form key must be [A-Za-z0-9_-]+"));
+        }
+        walk(k, &o[k], &mut out, &mut seen)?;
     }
     Ok(out.join("&"))
 }

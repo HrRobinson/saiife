@@ -89,8 +89,11 @@ pub struct StoredCall {
     /// The parameters as given (proxy captures included), validated at
     /// creation and validated again at send.
     pub params: BTreeMap<String, String>,
-    /// Base64 of the body as it would be sent: the canonical JSON when the
-    /// operation takes JSON.
+    /// Base64 of the agent's body as canonical JSON (the input to
+    /// [`prepare_body`], not the bytes sent: for `body = "form"` those are
+    /// its form encoding). `None` when the operation builds its body from
+    /// the params. At send it is prepared again, and the bytes must hash to
+    /// `body_sha256`.
     pub body_b64: Option<String>,
     /// SHA-256 (hex) of the exact body bytes the approver was shown the
     /// hash of. At send the bytes about to go upstream must hash to it,
