@@ -310,8 +310,16 @@ pub(crate) fn load_policy(
         }
         None => 0,
     };
-    check_ask(&l, catalog)?;
-    let cat = check_services_owned(&l, config, owner)?;
+    // Locked keeps main's order (services, then `[guard] ask`), so a
+    // config with both errors reports the same one as before plan 16.
+    let cat = if personal.is_none() {
+        let cat = check_services_owned(&l, config, owner)?;
+        check_ask(&l, catalog)?;
+        cat
+    } else {
+        check_ask(&l, catalog)?;
+        check_services_owned(&l, config, owner)?
+    };
     let state = PolicyState::from_loaded_in(&l, catalog, cat.clone(), mode);
     Ok((l, cat, state))
 }
@@ -1445,6 +1453,28 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// Locked mode checks the services before `[guard] ask` (as main did,
+    /// at start and reload): a config that fails both names the service.
+    #[test]
+    fn locked_load_reports_services_before_ask() {
+        let d = tempfile::tempdir().unwrap();
+        let config = d.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "version = 2\nlocked = true\n\n[daemon]\nuser = \"saiife\"\n\n\
+             [guard]\nask = [\"core.git/no-such-rule\"]\n\n\
+             [services.erp]\nconnector = \"no-such-connector\"\n",
+        )
+        .unwrap();
+        let dir = saiife_policy::FixedDirectory::from_text(
+            "saiife:x:990:990::/:/usr/sbin/nologin\n",
+            "saiife:x:990:\n",
+        );
+        let e = load_policy(Mode::Locked, &config, &dir, &[], None).unwrap_err();
+        assert!(e.contains("no-such-connector"), "{e}");
+        assert!(!e.contains("no-such-rule"), "{e}");
+    }
 
     #[test]
     fn state_lock_is_single_instance() {
