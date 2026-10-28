@@ -23,6 +23,7 @@ use saiife_policy::{
     scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceOverlay, SystemConfig, UserEntry,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -372,6 +373,14 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),
         Some(_) => return Err("collection must be a name of [a-z0-9_-], 1 to 64 bytes"),
     };
+    // `via` is attribution only (plan 17 decision 4): a client is `cli`
+    // or `mcp`. `approval` is the daemon's own and `http` the gateway's.
+    let via = match args.get("via") {
+        None | Some(Value::Null) => Via::Cli,
+        Some(Value::String(s)) if s == "cli" => Via::Cli,
+        Some(Value::String(s)) if s == "mcp" => Via::Mcp,
+        Some(_) => return Err("via must be cli or mcp"),
+    };
     // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
     // `api.result` from the client.
     let call = Call {
@@ -385,7 +394,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         body,
         headers,
         overlay,
-        via: Via::Cli,
+        via,
         collection,
     };
     Ok((service, op, call))
@@ -756,7 +765,11 @@ async fn has_scope(ctx: &Arc<Ctx>, uid: u32) -> bool {
     matches!(scope_for(&g.snap.config, &groups, &user), Ok(Some(_)))
 }
 
-/// `api.list`: [`services_for`] the caller.
+/// `api.list`: [`services_for`] the caller. With `schema: true` each
+/// operation also carries its MCP tool `title`, `input_schema` and
+/// `body_arg`. `tools_hash` is `sha256:<hex>` of the canonical JSON of the
+/// services with their schemas, whatever `schema` is: it moves when a
+/// reload changes what `saiife mcp` would list.
 async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let overlays = match parse_overlays(req.args.get("overlays")) {
@@ -767,13 +780,48 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(e) => e,
         Err(m) => return bad(id, m),
     };
-    let (services, warning) = services_in(ctx, peer.uid, &overlays, project_env.as_deref()).await;
+    let schema = match req.args.get("schema") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return bad(id, "schema must be a boolean"),
+    };
+    let (mut services, warning) =
+        services_in(ctx, peer.uid, &overlays, project_env.as_deref(), true).await;
+    let tools_hash = format!(
+        "sha256:{}",
+        hex(&Sha256::digest(
+            saiife_policy::canonical_json(&Value::Array(services.clone())).as_bytes()
+        ))
+    );
+    if !schema {
+        strip_schemas(&mut services);
+    }
     let mut m = Map::new();
     m.insert("services".into(), Value::Array(services));
+    m.insert("tools_hash".into(), tools_hash.into());
     if let Some(w) = warning {
         m.insert("warning".into(), w.into());
     }
     ok(id, m)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Drops what `schema: true` adds to each operation of `api.list`.
+fn strip_schemas(services: &mut [Value]) {
+    for s in services {
+        if let Some(Value::Array(ops)) = s.get_mut("operations") {
+            for op in ops {
+                if let Some(o) = op.as_object_mut() {
+                    for k in ["title", "input_schema", "body_arg"] {
+                        o.remove(k);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The services of `uid`'s scope and their operations, each with the
@@ -784,17 +832,19 @@ pub(crate) async fn services_for(
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
-    services_in(ctx, uid, overlays, None).await.0
+    services_in(ctx, uid, overlays, None, false).await.0
 }
 
 /// [`services_for`] under the environment `api.call` would choose for the
 /// same caller and project `env`, so the list matches what a call allows;
-/// with the warning that choice left.
+/// with the warning that choice left. `schema` as for
+/// [`pipeline::list_operations`].
 pub(crate) async fn services_in(
     ctx: &Arc<Ctx>,
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
     project_env: Option<&str>,
+    schema: bool,
 ) -> (Vec<Value>, Option<String>) {
     let mut services = Vec::new();
     let mut warning = None;
@@ -813,7 +863,7 @@ pub(crate) async fn services_in(
         if let (Some(snap), Some(scope)) = (snap, scope) {
             for name in &scope.services {
                 if let Some(ops) =
-                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name))
+                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name), schema)
                 {
                     services.push(json!({"name": name, "operations": ops}));
                 }

@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod redact;
 pub mod request;
 pub mod resolve;
+pub mod tool_schema;
 pub mod upstream;
 
 pub use catalog::Catalog;

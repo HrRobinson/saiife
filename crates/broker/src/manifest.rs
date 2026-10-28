@@ -16,7 +16,7 @@ pub const HTTP_CONNECTOR: &str = "http";
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 const AUTH_KINDS: &[&str] = &["header", "bearer", "basic", "basic_token", "oauth2"];
 /// The body formats of `Operation::body`. `text` is for `transport = "mail"`.
-const BODY_FORMATS: &[&str] = &["json", "form", "text"];
+pub(crate) const BODY_FORMATS: &[&str] = &["json", "form", "text"];
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
