@@ -614,13 +614,20 @@ mod imp {
         start: Option<&Path>,
     ) -> Result<(Vec<String>, String), String> {
         // The caller's scope environment adds its packs and is part of the
-        // hash. An environment that cannot be resolved denies the call.
-        let user = system_entry(rustix::process::getuid().as_raw()).map(|a| a.name);
-        let (cfg_env, env) = match (&user, cfg.scope.iter().any(|s| s.env.is_some())) {
-            (_, false) => (std::borrow::Cow::Borrowed(cfg), None),
-            (None, true) => return Err("cannot tell which user this is: no environment".into()),
-            (Some(u), true) => applied_for(cfg, &saiife_policy::Getent, u)
-                .map_err(|e| format!("environment: {e}"))?,
+        // hash. Nothing is read or spawned unless some scope binds one; an
+        // environment that cannot be resolved denies the call.
+        let (cfg_env, env) = if cfg.scope.iter().any(|s| s.env.is_some()) {
+            let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+            let nsswitch = std::fs::read_to_string("/etc/nsswitch.conf").ok();
+            hook_env(
+                cfg,
+                rustix::process::getuid().as_raw(),
+                (&read("/etc/passwd"), &read("/etc/group")),
+                nsswitch.as_deref(),
+                &saiife_policy::Getent,
+            )?
+        } else {
+            (std::borrow::Cow::Borrowed(cfg), None)
         };
         let cfg: &SystemConfig = &cfg_env;
         let merged = start.and_then(find_project_root).and_then(|root| {
@@ -661,6 +668,47 @@ mod imp {
             env.as_deref(),
         ));
         Ok((packs.into_iter().map(|p| p.id).collect(), hash))
+    }
+
+    /// Whether `nsswitch.conf` takes groups from local files only, so
+    /// `/etc/group` is the whole answer and no process needs to run.
+    fn groups_are_local(nsswitch: Option<&str>) -> bool {
+        let Some(text) = nsswitch else {
+            return false;
+        };
+        text.lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim())
+            .find_map(|l| l.strip_prefix("group:"))
+            .is_some_and(|sources| {
+                let mut any = false;
+                let local = sources.split_whitespace().all(|s| {
+                    any = true;
+                    matches!(s, "files" | "compat" | "systemd")
+                });
+                local && any
+            })
+    }
+
+    /// The scope environment of `uid`, as the daemon would find it. The
+    /// name comes from `/etc/passwd`, else from `nss` (the daemon asks NSS
+    /// too). Groups come from `/etc/group` when the user is local and
+    /// `nsswitch.conf` has no other group source; otherwise `nss` answers,
+    /// and a failed lookup denies.
+    fn hook_env<'a>(
+        cfg: &'a SystemConfig,
+        uid: u32,
+        (passwd, group): (&str, &str),
+        nsswitch: Option<&str>,
+        nss: &dyn saiife_policy::Directory,
+    ) -> Result<(std::borrow::Cow<'a, SystemConfig>, Option<String>), String> {
+        use saiife_policy::Directory;
+        let fixed = saiife_policy::FixedDirectory::from_text(passwd, group);
+        let Some(name) = fixed.name_of(uid).or_else(|| nss.name_of(uid)) else {
+            return Err("cannot tell which user this is: no environment".into());
+        };
+        let local = fixed.user(&name).is_some() && groups_are_local(nsswitch);
+        let dir: &dyn Directory = if local { &fixed } else { nss };
+        applied_for(cfg, dir, &name).map_err(|e| format!("environment: {e}"))
     }
 
     /// The worker child, running.
@@ -1113,6 +1161,79 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        use saiife_policy::{Directory, FixedDirectory};
+
+        const PASSWD: &str = "alice:x:1000:1000::/h:/bin/sh\n";
+        const GROUP: &str = "alice:x:1000:\ndevs:x:2000:alice\n";
+        const FILES: &str = "passwd: files\ngroup: files systemd\n";
+
+        fn envcfg(users: &str) -> SystemConfig {
+            toml::from_str(&format!(
+                "version = 2\n[[scope]]\nname = \"s\"\nusers = [{users}]\nenv = \"e\"\n\
+                 [environments.e]\nguard.packs = [\"db.postgres\"]\n"
+            ))
+            .unwrap()
+        }
+
+        /// A directory that fails every group lookup and knows no one.
+        struct Broken;
+        impl Directory for Broken {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn try_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+                Err("lookup failed".into())
+            }
+        }
+
+        #[test]
+        fn group_bound_env_is_applied_from_local_files() {
+            let cfg = envcfg("\"group:devs\"");
+            // Broken proves no process or NSS answer is needed.
+            let (_, env) = hook_env(&cfg, 1000, (PASSWD, GROUP), Some(FILES), &Broken).unwrap();
+            assert_eq!(env.as_deref(), Some("e"));
+        }
+
+        #[test]
+        fn group_lookup_failure_denies() {
+            let cfg = envcfg("\"group:devs\"");
+            // A non-local group source sends the lookup to NSS, which fails.
+            let nsswitch = "group: files sss\n";
+            let e = hook_env(&cfg, 1000, (PASSWD, GROUP), Some(nsswitch), &Broken).unwrap_err();
+            assert!(e.contains("group lookup failed"), "{e}");
+            // No nsswitch.conf at all: also NSS.
+            assert!(hook_env(&cfg, 1000, (PASSWD, GROUP), None, &Broken).is_err());
+        }
+
+        #[test]
+        fn user_missing_from_passwd_falls_back_to_nss() {
+            let cfg = envcfg("\"group:devs\"");
+            let nss = FixedDirectory::from_text(PASSWD, GROUP);
+            // Local files know nobody; NSS knows alice and her groups.
+            let (_, env) = hook_env(&cfg, 1000, ("", ""), Some(FILES), &nss).unwrap();
+            assert_eq!(env.as_deref(), Some("e"));
+            // Neither knows uid 7: denied.
+            assert!(hook_env(&cfg, 7, ("", ""), Some(FILES), &nss).is_err());
+        }
+
+        #[test]
+        fn local_groups_follow_nsswitch() {
+            assert!(groups_are_local(Some("group: files systemd # c\n")));
+            assert!(groups_are_local(Some("passwd: sss\ngroup: compat\n")));
+            assert!(!groups_are_local(Some("group: files sss\n")));
+            assert!(!groups_are_local(Some("passwd: files\n")));
+            assert!(!groups_are_local(None));
+        }
 
         fn len(v: &Value) -> usize {
             serde_json::to_vec(v).unwrap().len()

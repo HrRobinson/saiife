@@ -76,7 +76,6 @@ pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {
     };
     match r {
         Ok(Done::Code(code)) => ExitCode::from(code),
-        Ok(Done::Reload(config)) => crate::policy_cmd::reload(Some(config)),
         Err((code, m)) => {
             eprintln!("saiife: {}", sanitize(&m));
             ExitCode::from(code)
@@ -86,11 +85,9 @@ pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {
 
 type Failure = (u8, String);
 
-/// What a command came to: an exit code, or a file changed and the daemon
-/// to be told.
+/// What a command came to.
 enum Done {
     Code(u8),
-    Reload(PathBuf),
 }
 
 fn load(config: &Path) -> Result<SystemConfig, Failure> {
@@ -313,13 +310,89 @@ fn use_locked(config: &Path, name: &str, scope: &str) -> Result<Done, Failure> {
             }
         }
     }
-    write_atomic(&file, doc.to_string().as_bytes())
-        .map_err(|e| (2, format!("{}: {e}", file.display())))?;
+    // Never write through a link: the rename would replace the link, and
+    // the daemon would read something else than was validated.
+    let meta = fs::symlink_metadata(&file).map_err(|e| (2, format!("{}: {e}", file.display())))?;
+    if !meta.file_type().is_file() {
+        return Err((
+            2,
+            format!("{} is not a regular file (a link?)", file.display()),
+        ));
+    }
+    let text = doc.to_string();
+    validate_rewritten(config, &file, &text)?;
+    write_atomic(&file, text.as_bytes()).map_err(|e| (2, format!("{}: {e}", file.display())))?;
     println!(
         "scope {scope} is bound to environment {name} in {}",
         file.display()
     );
-    Ok(Done::Reload(config.to_path_buf()))
+    match reload_daemon(config) {
+        Ok(()) => {
+            println!("loaded");
+            Ok(Done::Code(0))
+        }
+        Err((code, m)) => Err((code, format!("file updated; reload failed: {m}"))),
+    }
+}
+
+/// `load_system` over a copy of the config tree with `file` replaced by
+/// `text`: what the daemon would load after the rename.
+fn validate_rewritten(config: &Path, file: &Path, text: &str) -> Result<(), Failure> {
+    let fail = |e: String| (2, format!("the rewritten policy would not load: {e}"));
+    let tmp = std::env::temp_dir().join(format!(
+        "saiife-env-use-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let result = (|| -> Result<(), String> {
+        let io = |e: std::io::Error| e.to_string();
+        fs::create_dir(&tmp).map_err(io)?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).map_err(io)?;
+        fs::create_dir(tmp.join("policy.d")).map_err(io)?;
+        let copy = |from: &Path, to: PathBuf| -> Result<(), String> {
+            let body = if from == file {
+                text.to_string()
+            } else {
+                fs::read_to_string(from).map_err(io)?
+            };
+            fs::write(to, body).map_err(io)
+        };
+        copy(config, tmp.join("config.toml"))?;
+        for f in scope_files(config).into_iter().skip(1) {
+            let n = f.file_name().unwrap_or_default();
+            copy(&f, tmp.join("policy.d").join(n))?;
+        }
+        load_system(&tmp.join("config.toml"))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result.map_err(fail)
+}
+
+/// Ask the daemon to load the policy again. `Err` is an exit code and why.
+#[cfg(target_os = "linux")]
+fn reload_daemon(config: &Path) -> Result<(), Failure> {
+    use crate::secret_cmd::linux::{call, Stop};
+    match call(config, "policy.reload", serde_json::Map::new()) {
+        Ok(a) if a.get("result").and_then(|r| r.as_str()) == Some("loaded") => Ok(()),
+        Ok(a) => {
+            let why = a
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("rejected");
+            Err((1, format!("rejected: {why}")))
+        }
+        Err(Stop::Refused(m) | Stop::Forbidden(m)) => Err((2, m)),
+        Err(Stop::Unavailable(m) | Stop::NotFound(m) | Stop::Unrecorded(m)) => Err((5, m)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reload_daemon(_config: &Path) -> Result<(), Failure> {
+    Err((5, "locked mode needs Linux in this version".into()))
 }
 
 fn use_project(system: Option<&Path>, name: &str) -> Result<Done, Failure> {
@@ -399,6 +472,26 @@ mod tests {
             assume_root(true, cfg!(debug_assertions)),
             cfg!(debug_assertions)
         );
+    }
+
+    #[test]
+    fn rewritten_policy_is_validated_before_the_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let config = d.path().join("config.toml");
+        fs::write(
+            &config,
+            "version = 2\n[[scope]]\nname = \"s\"\nusers = [\"a\"]\n[environments.e]\n",
+        )
+        .unwrap();
+        let ok = fs::read_to_string(&config)
+            .unwrap()
+            .replace("]\n[env", "]\nenv = \"e\"\n[env");
+        assert!(validate_rewritten(&config, &config, &ok).is_ok(), "{ok}");
+        let bad = ok.replace("env = \"e\"", "env = \"nope\"");
+        let e = validate_rewritten(&config, &config, &bad).unwrap_err().1;
+        assert!(e.contains("would not load"), "{e}");
+        // The real file was never touched, and no copy is left behind.
+        assert!(!fs::read_to_string(&config).unwrap().contains("nope"));
     }
 
     #[test]

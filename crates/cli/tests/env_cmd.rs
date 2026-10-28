@@ -189,9 +189,14 @@ fn use_locked_rewrites_scope_binding() {
     let (d, config) = locked_world();
     let file = d.path().join("etc/policy.d/shop.toml");
     let o = env_cmd(d.path(), &config, &["use", "prod", "--scope", "shop"], true);
-    // No daemon answers in this fixture: the reload is reported, the file
-    // is already rewritten.
+    // No daemon answers in this fixture: the failed reload is reported
+    // (non-zero), the file is already rewritten.
     assert_eq!(code(&o), 5, "{} / {}", out(&o), err(&o));
+    assert!(
+        err(&o).contains("file updated; reload failed"),
+        "{}",
+        err(&o)
+    );
     let text = fs::read_to_string(&file).unwrap();
     assert!(
         text.contains("env = \"prod\"") && !text.contains("staging"),
@@ -211,6 +216,24 @@ fn use_locked_rewrites_scope_binding() {
     let o = env_cmd(d.path(), &config, &["use", "prod"], true);
     assert_eq!(code(&o), 2);
     assert!(err(&o).contains("--scope"), "{}", err(&o));
+}
+
+#[test]
+fn use_locked_refuses_a_symlinked_target() {
+    let (d, config) = locked_world();
+    let file = d.path().join("etc/policy.d/shop.toml");
+    let real = d.path().join("elsewhere.toml");
+    fs::rename(&file, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &file).unwrap();
+    let before = fs::read_to_string(&real).unwrap();
+    let o = env_cmd(d.path(), &config, &["use", "prod", "--scope", "shop"], true);
+    assert_eq!(code(&o), 2, "{}", err(&o));
+    assert!(err(&o).contains("not a regular file"), "{}", err(&o));
+    assert_eq!(fs::read_to_string(&real).unwrap(), before);
+    assert!(fs::symlink_metadata(&file)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[test]
@@ -354,4 +377,50 @@ expect = "allow"
         .unwrap();
     assert_eq!(code(&o), 0, "{} / {}", out(&o), err(&o));
     assert!(out(&o).contains("2 passed, 0 failed"), "{}", out(&o));
+}
+
+#[test]
+fn hook_applies_a_group_bound_scope_env() {
+    let extra = format!(
+        "[[scope]]\nname = \"devs\"\nusers = [\"group:{}\"]\nenv = \"prod\"\n\n\
+         [environments.prod]\nguard.packs = [\"db.postgres\"]\n",
+        common::daemon::own_group()
+    );
+    let d = TestDaemon::start(Opts {
+        extra,
+        ..Opts::default()
+    });
+    let project = d.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    let o = managed(&d.config(), &project, "dropdb customers");
+    assert_eq!(code(&o), 2, "stderr: {}", err(&o));
+    let r = d.of_kind("guard").pop().unwrap();
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert_eq!(r["policy"], shown_hash(&d, "prod"));
+}
+
+#[test]
+fn hook_ignores_a_locked_project_env() {
+    let extra = format!(
+        "[[scope]]\nname = \"mine\"\nusers = [{:?}]\nenv = \"prod\"\n\n\
+         [environments.prod]\n\n[environments.other]\nguard.packs = [\"db.postgres\"]\n",
+        own_user()
+    );
+    let d = TestDaemon::start(Opts {
+        extra,
+        ..Opts::default()
+    });
+    let project = d.path().join("proj");
+    fs::create_dir_all(project.join(".saiife")).unwrap();
+    fs::write(
+        project.join(".saiife/config.toml"),
+        "version = 2\nenv = \"other\"\n",
+    )
+    .unwrap();
+    // The project's `other` would deny dropdb; the scope's `prod` does not.
+    let o = managed(&d.config(), &project, "dropdb customers");
+    assert_eq!(code(&o), 0, "stderr: {}", err(&o));
+    let r = d.of_kind("guard").pop().unwrap();
+    assert_eq!(r["decision"], "allow", "{r}");
+    // (The record hash also covers the project overlay, so it is not the bare prod hash.)
 }

@@ -164,7 +164,15 @@ pub fn applied_for<'a>(
     if !cfg.scope.iter().any(|s| s.env.is_some()) {
         return Ok((Cow::Borrowed(cfg), None));
     }
-    match env_for(cfg, dir, user)? {
+    // A failed group lookup is an error, never "no scope": a base policy
+    // would be looser than the environment the user is bound to.
+    let scope = crate::scope::try_scope_for(cfg, dir, user).map_err(|detail| {
+        PolicyError::Environment {
+            env: "-".to_string(),
+            detail: format!("group lookup failed: {detail}"),
+        }
+    })??;
+    match scope.and_then(|s| s.env.as_deref()) {
         None => Ok((Cow::Borrowed(cfg), None)),
         Some(name) => Ok((Cow::Owned(apply(cfg, name)?), Some(name.to_string()))),
     }
@@ -203,6 +211,45 @@ mod tests {
         for bad in ["", "Prod", "a b", "a/b", "a.b", "a\n"] {
             assert!(!valid_env_name(bad), "{bad:?}");
         }
+    }
+
+    /// A directory whose group lookup always fails.
+    struct Broken;
+    impl Directory for Broken {
+        fn user(&self, _: &str) -> Option<crate::users::UserEntry> {
+            None
+        }
+        fn name_of(&self, _: u32) -> Option<String> {
+            None
+        }
+        fn group(&self, _: &str) -> Option<crate::users::GroupEntry> {
+            None
+        }
+        fn groups_of(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn try_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+            Err("boom".into())
+        }
+    }
+
+    #[test]
+    fn applied_for_fails_closed_on_group_lookup_failure() {
+        let group_bound: SystemConfig = toml::from_str(
+            "version = 2\n[[scope]]\nname = \"s\"\nusers = [\"group:devs\"]\nenv = \"e\"\n\
+             [environments.e]\n",
+        )
+        .unwrap();
+        let e = applied_for(&group_bound, &Broken, "alice").unwrap_err();
+        assert!(e.to_string().contains("group lookup failed"), "{e}");
+        // A user-named scope needs no groups: it still resolves.
+        let by_name: SystemConfig = toml::from_str(
+            "version = 2\n[[scope]]\nname = \"s\"\nusers = [\"alice\"]\nenv = \"e\"\n\
+             [environments.e]\n",
+        )
+        .unwrap();
+        let (_, env) = applied_for(&by_name, &Broken, "alice").unwrap();
+        assert_eq!(env.as_deref(), Some("e"));
     }
 
     #[test]

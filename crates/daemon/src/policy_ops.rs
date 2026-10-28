@@ -67,9 +67,8 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let view = tokio::task::spawn_blocking(move || {
         dir.user(&name)?;
         let env = env_for(&cfg, dir.as_ref(), &name)
-            .ok()
-            .flatten()
-            .map(str::to_string);
+            .map(|e| e.map(str::to_string))
+            .map_err(|e| e.to_string());
         Some((user_view(&cfg, dir.as_ref(), &name), env))
     })
     .await
@@ -83,16 +82,41 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     m.insert("hash".into(), json!(state.hash));
     // The hash of each environment, so an admin can tell which one a
     // record's `policy` belongs to.
+    // Admins see every environment's hash; anyone else only their own.
+    let admin = ctx.is_admin(peer.uid).await;
+    let own_env = env.as_ref().ok().cloned().flatten();
     let hashes: Map<String, Value> = env_hashes(&system, &ctx.catalog)
         .into_iter()
         .filter_map(|(e, h)| e.map(|e| (e, json!(h))))
+        .filter(|(e, _)| admin || own_env.as_deref() == Some(e.as_str()))
         .collect();
     m.insert("env_hashes".into(), Value::Object(hashes));
     if effective {
         // The policy as this user runs under it: their scope's environment
         // applied.
+        // A user whose environment cannot be found or applied gets an
+        // error, never the base policy.
+        let env = match env {
+            Ok(e) => e,
+            Err(e) => {
+                return err(
+                    id,
+                    ErrorCode::Unavailable,
+                    &format!("the environment of {user} cannot be resolved: {e}"),
+                )
+            }
+        };
         let applied = match env.as_deref() {
-            Some(e) => environment::apply(&system, e).ok(),
+            Some(e) => match environment::apply(&system, e) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return err(
+                        id,
+                        ErrorCode::Unavailable,
+                        &format!("the environment of {user} does not apply: {e}"),
+                    )
+                }
+            },
             None => None,
         };
         let cfg = applied.as_ref().unwrap_or(&*system);
