@@ -18,9 +18,24 @@ zeroize = "=1.9.1"
 # Already in Cargo.lock; geteuid for the test dir's owner check.
 rustix = { version = "1", features = ["process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Secret Service over D-Bus in pure Rust (no libdbus): zbus 5.19.0 is from
+# 2026-08-09; 6.x is newer than the 14-day rule allows. tokio is already in
+# Cargo.lock. The backend owns a current-thread runtime per connection.
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"] }
+tokio = { version = "=1.53.2", features = ["rt", "net", "time"] }
+# Already in Cargo.lock (through zbus): `StreamExt::next` for the prompt's
+# `Completed` signal.
+futures-lite = { version = "=2.6.1", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Already in Cargo.lock (through the TLS platform verifier), so no new crate.
 security-framework = "=3.7.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# p2p: the tests serve a minimal Secret Service over a socket pair.
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "p2p"] }
+tokio = { version = "=1.53.2", features = ["rt", "net", "time", "macros"] }

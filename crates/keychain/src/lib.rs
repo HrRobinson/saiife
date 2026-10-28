@@ -3,8 +3,9 @@
 //! The broker keeps one item here, the 32-byte vault key ([`VAULT_KEY`]);
 //! the secrets themselves stay in `vault.bin`, sealed under that key.
 //!
-//! - [`platform`] is the real backend: Secret Service on Linux, the login
-//!   Keychain on macOS ([`MacKeychain`]).
+//! - [`platform`] is the real backend: Secret Service on Linux
+//!   ([`secret_service::SecretService`]), the login Keychain on macOS
+//!   ([`MacKeychain`]).
 //! - [`FakeKeychain`] is an in-memory backend for unit tests.
 //! - [`DirKeychain`] (debug builds only) keeps one 0600 file per item in a
 //!   0700 dir. [`from_env`] selects it when `SAIIFE_TEST_KEYCHAIN=<dir>` is
@@ -23,6 +24,8 @@ mod dir;
 mod fake;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 
 #[cfg(all(debug_assertions, unix))]
 pub use dir::DirKeychain;
@@ -92,8 +95,7 @@ pub fn platform() -> Result<Box<dyn Keychain>, KeychainError> {
     }
     #[cfg(target_os = "linux")]
     {
-        // The Secret Service backend (plan 16, Task 2) goes here.
-        Err(KeychainError::Unavailable("no keychain backend".into()))
+        Ok(Box::new(secret_service::SecretService::session()?))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -111,17 +113,4 @@ pub fn from_env() -> Result<Box<dyn Keychain>, KeychainError> {
         return Ok(Box::new(DirKeychain::new(dir)?));
     }
     platform()
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn platform_without_backend_is_unavailable() {
-        assert_eq!(
-            platform().err(),
-            Some(KeychainError::Unavailable("no keychain backend".into()))
-        );
-    }
 }
