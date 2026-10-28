@@ -453,8 +453,20 @@ mod imp {
             (Ok(()), Some(c)) => Some(PathBuf::from(c)),
             (Ok(()), None) => std::env::current_dir().ok(),
         };
-        let (packs, hash) = policy_for(cfg, start.as_deref())?;
-        *policy = Some(hash);
+        // A policy that cannot be resolved for this call (its scope
+        // environment's lookups failed) is judged `error_denied` with
+        // policy `unavailable`, recorded like any other failure: never a
+        // stderr-only block.
+        let (packs, unresolved) = match policy_for(cfg, start.as_deref()) {
+            Ok((packs, hash)) => {
+                *policy = Some(hash);
+                (packs, None)
+            }
+            Err(e) => (
+                Vec::new(),
+                Some(format!("the policy for this call is unavailable ({e})")),
+            ),
+        };
         if !cfg.guard.ask.is_empty() {
             // The project in a grant's key: its root as found for the
             // project config (else the cwd), and the cwd, both canonical
@@ -470,7 +482,8 @@ mod imp {
             });
         }
 
-        let failed = forced
+        let failed = unresolved
+            .or(forced)
             .or_else(|| input.as_ref().err().cloned())
             .or(cwd.err());
         let mcp_denied = match (&failed, &input, event) {

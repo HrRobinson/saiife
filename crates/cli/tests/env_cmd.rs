@@ -437,6 +437,36 @@ fn hook_applies_a_group_bound_scope_env() {
     assert_eq!(r["policy"], shown_hash(&d, "prod"));
 }
 
+/// The hook cannot resolve the caller's scope environment (here the user
+/// is in two scopes: by name, and by its primary group, which the load
+/// check does not see): the call is `error_denied`, recorded with policy
+/// `unavailable`, never a stderr-only block.
+#[test]
+fn hook_env_lookup_failure_is_recorded_error_denied() {
+    let extra = format!(
+        "[[scope]]\nname = \"mine\"\nusers = [{:?}]\nenv = \"prod\"\n\n\
+         [[scope]]\nname = \"grp\"\nusers = [\"group:{}\"]\n\n\
+         [environments.prod]\nguard.packs = [\"db.postgres\"]\n",
+        own_user(),
+        common::daemon::own_group()
+    );
+    let d = TestDaemon::start(Opts {
+        extra,
+        ..Opts::default()
+    });
+    let project = d.path().join("proj");
+    fs::create_dir_all(&project).unwrap();
+    let o = managed(&d.config(), &project, "ls");
+    assert_eq!(code(&o), 2, "stderr: {}", err(&o));
+    assert!(err(&o).contains("unavailable"), "{}", err(&o));
+    let r = d
+        .of_kind("guard")
+        .pop()
+        .unwrap_or_else(|| panic!("no record; stderr: {}", err(&o)));
+    assert_eq!(r["decision"], "error_denied", "{r}");
+    assert_eq!(r["policy"], "unavailable", "{r}");
+}
+
 #[test]
 fn hook_ignores_a_locked_project_env() {
     let extra = format!(
