@@ -10,6 +10,7 @@
 
 pub mod amount;
 pub mod catalog;
+pub mod cloud;
 pub mod judge;
 pub mod limits;
 pub mod mail;
