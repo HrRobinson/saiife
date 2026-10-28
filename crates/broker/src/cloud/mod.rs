@@ -1,7 +1,9 @@
 //! Cloud connectors (plan 15): AWS SigV4 signing, and later the GCP and
 //! Azure token mints and AWS STS.
 
+pub mod jwt;
 pub mod sigv4;
+pub mod token;
 
 use crate::BrokerError;
 
