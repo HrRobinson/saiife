@@ -236,21 +236,27 @@ pub fn string_to_sign(at: OffsetDateTime, scope: &str, creq: &str) -> String {
     )
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+/// HMAC-SHA256 into a buffer that is wiped on drop.
+///
+/// `ring::hmac::Key` (and the `Tag` it returns) cannot be zeroized: ring
+/// offers no way to wipe them, so the expanded key lives only for this call
+/// and the output is copied straight into a `Zeroizing` buffer.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(tag.as_ref());
     out
 }
 
 /// The derived key: `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region),
-/// service), "aws4_request")`.
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
-    let k0 = Zeroizing::new(format!("AWS4{secret}"));
-    let k = hmac_sha256(k0.as_bytes(), date.as_bytes());
-    let k = hmac_sha256(&k, region.as_bytes());
-    let k = hmac_sha256(&k, service.as_bytes());
-    hmac_sha256(&k, b"aws4_request")
+/// service), "aws4_request")`. Every intermediate key (kDate, kRegion,
+/// kService) and the result (kSigning) are wiped on drop.
+pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Zeroizing<[u8; 32]> {
+    let k_secret = Zeroizing::new(format!("AWS4{secret}"));
+    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date[..], region.as_bytes());
+    let k_service = hmac_sha256(&k_region[..], service.as_bytes());
+    hmac_sha256(&k_service[..], b"aws4_request")
 }
 
 fn bad(what: &str) -> CloudError {
@@ -284,6 +290,26 @@ fn wire_path(path: &str, o: &SignOpts) -> String {
 /// client sends), `x-amz-date`, `x-amz-security-token`,
 /// `x-amz-content-sha256` (when the service wants it) and `authorization`
 /// are set or replaced. Every other header present is signed as well.
+///
+/// # What callers must guarantee
+///
+/// - **No dot segments.** With `normalize_path` the signer removes `.` and
+///   `..`, and it decodes `%2E%2E` into `..` before re-encoding. It
+///   therefore relies on `resolve.rs` and `request.rs` refusing `..` and
+///   `%2E%2E` (and `.`) in paths before it runs: a dot segment that reached
+///   it could move the signed request to another resource.
+/// - **No action-changing headers from the agent.** Every header present is
+///   signed, so a header the agent may set is a header AWS acts on. Later
+///   manifests must never allowlist `x-amz-target`, `x-amz-copy-source`,
+///   `x-amz-acl`, `x-amz-grant-*`, `x-amz-server-side-encryption*`,
+///   `x-amz-website-redirect-location`, `x-amz-tagging`,
+///   `x-amz-object-lock-*`, `x-amz-bypass-governance-retention`,
+///   `x-amz-request-payer`, `x-amz-expected-bucket-owner`,
+///   `x-amz-metadata-directive`, `x-amz-tagging-directive`,
+///   `x-amz-mfa`, `x-amz-security-token`, `x-amz-date`,
+///   `x-amz-content-sha256`, `authorization` or `host`, nor any other header
+///   that changes what a call does (which action runs, what it copies from,
+///   who may read the result or who pays).
 pub fn sign(
     b: &mut Built,
     c: &AwsCreds,
@@ -360,13 +386,8 @@ pub fn sign(
     );
     let sc = format!("{date}/{}/{}/aws4_request", o.region, o.service);
     let sts = string_to_sign(at, &sc, &creq);
-    let key = Zeroizing::new(signing_key(
-        &c.secret_access_key,
-        &date,
-        &o.region,
-        &o.service,
-    ));
-    let sig = hex(&hmac_sha256(&key[..], sts.as_bytes()));
+    let key = signing_key(&c.secret_access_key, &date, &o.region, &o.service);
+    let sig = hex(&hmac_sha256(&key[..], sts.as_bytes())[..]);
     let auth = Zeroizing::new(format!(
         "{ALGORITHM} Credential={}/{sc}, SignedHeaders={signed}, Signature={sig}",
         c.access_key_id.as_str()

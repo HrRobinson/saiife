@@ -185,7 +185,7 @@ fn aws_suite_vectors() {
             &c.opts.service,
         );
         let sig = hex(ring::hmac::sign(
-            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key),
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key[..]),
             sts.as_bytes(),
         )
         .as_ref());
@@ -245,11 +245,11 @@ fn docs_secret() -> String {
 fn signing_key_matches_aws_docs_example() {
     let secret = concat!("wJalrXUtnFEMI/K7MDENG", "+bPxRfiCYEXAMPLEKEY");
     assert_eq!(
-        hex(&signing_key(secret, "20150830", "us-east-1", "iam")),
+        hex(&signing_key(secret, "20150830", "us-east-1", "iam")[..]),
         "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
     );
     assert_eq!(
-        hex(&signing_key(secret, "20120215", "us-east-1", "iam")),
+        hex(&signing_key(secret, "20120215", "us-east-1", "iam")[..]),
         "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
     );
 }
@@ -402,7 +402,7 @@ fn sent_uri_equals_canonical_for_awkward_keys() {
         let sc = scope(may_24_2013(), "us-east-1", "s3");
         let key = signing_key(&docs_secret(), "20130524", "us-east-1", "s3");
         let sig = hex(ring::hmac::sign(
-            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key),
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key[..]),
             string_to_sign(may_24_2013(), &sc, &creq).as_bytes(),
         )
         .as_ref());
