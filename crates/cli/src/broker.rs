@@ -92,7 +92,7 @@ fn installed(marker: &Path) -> Result<bool, String> {
 /// and name a daemon user that exists.
 pub(crate) fn locked(config: &Path) -> Result<Target, String> {
     let loaded = saiife_policy::load_system(config)
-        .map_err(|e| format!("cannot read the system config: {e}"))?;
+        .map_err(|e| format!("cannot read the system config {}: {e}", config.display()))?;
     if !loaded.config.locked {
         return Err(format!("{}: locked is not true", config.display()));
     }
@@ -350,7 +350,11 @@ mod tests {
             &w.env(),
         )
         .unwrap_err();
-        assert!(e.starts_with("cannot read the system config"), "{e}");
+        let want = format!(
+            "cannot read the system config {}:",
+            w.root.join("nope.toml").display()
+        );
+        assert!(e.starts_with(&want), "{e}");
     }
 
     #[test]
