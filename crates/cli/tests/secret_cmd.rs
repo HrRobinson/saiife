@@ -356,43 +356,144 @@ fn add_refuses_when_vault_undecryptable() {
 }
 
 #[test]
-fn aws_kind_still_refused_with_plan_15() {
+fn from_env_refused_for_multi_field() {
     let d = admin();
-    let o = saiife(
-        &d,
-        &[
-            "add",
-            "k1",
-            "--kind",
-            "aws",
-            "--service",
-            "s",
-            "--from-env",
-            "SV",
-        ],
-        &[("SV", "valuevalue")],
-    );
-    assert_eq!(o.status.code(), Some(2));
-    assert!(
-        err(&o).contains("kind aws comes with plan 15"),
-        "{}",
-        err(&o)
-    );
+    for kind in ["aws", "gcp_sa", "azure_sp"] {
+        let o = saiife(
+            &d,
+            &[
+                "add",
+                "k1",
+                "--kind",
+                kind,
+                "--service",
+                "s",
+                "--from-env",
+                "SV",
+            ],
+            &[("SV", "valuevalue-leaky")],
+        );
+        assert_eq!(o.status.code(), Some(2), "{kind}");
+        let e = err(&o);
+        assert!(
+            e.contains("several fields") && e.contains("--from-file"),
+            "{e}"
+        );
+        assert!(!e.contains("valuevalue-leaky"));
+    }
     assert_eq!(list_json(&d)["secrets"], json!([]));
-    // The daemon refuses it too.
+    // The daemon refuses a bad aws secret too, without quoting it.
     let mut c = d.client();
     let e = c
         .call(
             "secret.add",
             serde_json::from_value(json!({
                 "name": "k1", "kind": "aws",
-                "fields": {"token": "valuevalue"}, "allowed_services": ["s"]
+                "fields": {"token": "valuevalue-leaky"}, "allowed_services": ["s"]
             }))
             .unwrap(),
             common::daemon::dl(),
         )
         .unwrap_err();
-    assert!(e.to_string().contains("kind aws comes with plan 15"), "{e}");
+    assert!(e.to_string().contains("this kind takes the fields"), "{e}");
+    assert!(!e.to_string().contains("valuevalue-leaky"));
+}
+
+#[test]
+fn cloud_kinds_added_from_files_never_leak() {
+    let d = admin();
+    let akid = concat!("AKI", "A", "TESTTESTTEST0001");
+    let sk = concat!("test-secret-", "access-key-0001");
+    let pem = concat!(
+        "-----BEGIN ",
+        "PRIVATE KEY-----\nTESTBODYTESTBODY0001\n-----END ",
+        "PRIVATE KEY-----\n"
+    );
+    let cs = concat!("client-", "secret-0001");
+    let g = "0123abcd-4567-89ab-cdef-0123456789ab";
+    let files = [
+        (
+            "aws",
+            "ak",
+            json!({"access_key_id": akid, "secret_access_key": sk}),
+        ),
+        (
+            "gcp_sa",
+            "gk",
+            json!({"type": "service_account", "project_id": "my-proj-1",
+                "private_key_id": "abcd1234", "private_key": pem,
+                "client_email": "sa@my-proj-1.iam.gserviceaccount.com",
+                "token_uri": "https://token.example/t"}),
+        ),
+        (
+            "azure_sp",
+            "zk",
+            json!({"tenant_id": g, "client_id": g, "client_secret": cs}),
+        ),
+    ];
+    for (kind, name, body) in files {
+        let f = d.path().join(format!("{name}.json"));
+        fs::write(&f, body.to_string()).unwrap();
+        let o = saiife(
+            &d,
+            &[
+                "add",
+                name,
+                "--kind",
+                kind,
+                "--service",
+                "s",
+                "--from-file",
+                f.to_str().unwrap(),
+            ],
+            &[],
+        );
+        assert_eq!(o.status.code(), Some(0), "{kind}: {}", err(&o));
+        // The key file's token_uri is dropped with a note.
+        if kind == "gcp_sa" {
+            assert!(String::from_utf8_lossy(&o.stdout).contains("token_uri is ignored"));
+        }
+    }
+    let l = list_json(&d);
+    let kinds: Vec<&str> = l["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["aws", "gcp_sa", "azure_sp"]);
+    // A bad key id is refused by the daemon without echoing it.
+    let f = d.path().join("bad.json");
+    fs::write(
+        &f,
+        json!({"access_key_id": "nope-leaky", "secret_access_key": sk}).to_string(),
+    )
+    .unwrap();
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "bad",
+            "--kind",
+            "aws",
+            "--service",
+            "s",
+            "--from-file",
+            f.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("access_key_id is not in the expected form"));
+    // No value in any output, list output or record.
+    let mut seen = String::from_utf8_lossy(&o.stderr).into_owned();
+    seen.push_str(&l.to_string());
+    for r in secret_records(&d) {
+        seen.push_str(&r.to_string());
+    }
+    for v in [akid, sk, "TESTBODY", cs, "nope-leaky", "token.example"] {
+        assert!(!seen.contains(v), "{v} leaked");
+    }
 }
 
 #[test]

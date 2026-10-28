@@ -86,6 +86,8 @@ fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
         }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
         Kind::OAuth2 => a.kind == "oauth2",
+        // Signed or minted by the daemon itself (Task 9 wires the cloud auth).
+        Kind::Aws | Kind::GcpSa | Kind::AzureSp => false,
     })
 }
 
@@ -98,12 +100,28 @@ fn mask_values(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Vec<
         Kind::Token => "basic_token",
         k => kind_str(k),
     };
-    AuthMaterial {
+    let mut out = AuthMaterial {
         kind: kind.to_string(),
         name: None,
         fields: fields.clone(),
     }
-    .values()
+    .values();
+    if let Some(body) = fields.get("private_key").and_then(|k| pem_body(k)) {
+        // The key as a bare base64 run: what is left when an upstream
+        // echoes it without its framing or line breaks.
+        out.push(body);
+    }
+    out
+}
+
+/// The base64 of a PEM block without framing lines and line breaks.
+pub(crate) fn pem_body(pem: &str) -> Option<Zeroizing<String>> {
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .flat_map(|l| l.trim().chars())
+        .collect();
+    (body.len() >= 4).then(|| Zeroizing::new(body))
 }
 
 fn kind_str(k: Kind) -> &'static str {
@@ -112,6 +130,9 @@ fn kind_str(k: Kind) -> &'static str {
         Kind::Basic => "basic",
         Kind::Header => "header",
         Kind::OAuth2 => "oauth2",
+        Kind::Aws => "aws",
+        Kind::GcpSa => "gcp_sa",
+        Kind::AzureSp => "azure_sp",
     }
 }
 
@@ -958,6 +979,64 @@ mod tests {
         assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));
         assert_eq!(spec_for(Kind::Token, &o), None);
         assert_eq!(spec_for(Kind::OAuth2, &both), None);
+    }
+
+    #[test]
+    fn mask_values_cover_every_cloud_field() {
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nTESTBODYTESTBODY0001\nTESTBODYTESTBODY0002\n-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        let sets: [(Kind, Vec<(&str, &str)>); 3] = [
+            (
+                Kind::Aws,
+                vec![
+                    ("access_key_id", concat!("AKI", "A", "TESTTESTTEST0001")),
+                    ("secret_access_key", concat!("test-secret-", "key-0001")),
+                    ("session_token", concat!("test-session-", "token-0001")),
+                ],
+            ),
+            (
+                Kind::GcpSa,
+                vec![
+                    ("client_email", "sa@p.iam.gserviceaccount.com"),
+                    ("private_key", pem),
+                    ("private_key_id", "abcd1234"),
+                    ("project_id", "my-proj-1"),
+                ],
+            ),
+            (
+                Kind::AzureSp,
+                vec![
+                    ("tenant_id", "0123abcd-4567-89ab-cdef-0123456789ab"),
+                    ("client_id", "1123abcd-4567-89ab-cdef-0123456789ab"),
+                    ("client_secret", concat!("client-", "secret-0001")),
+                ],
+            ),
+        ];
+        for (kind, set) in sets {
+            let fields: BTreeMap<String, Zeroizing<String>> = set
+                .iter()
+                .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+                .collect();
+            let vals: Vec<String> = mask_values(kind, &fields)
+                .iter()
+                .map(|v| v.to_string())
+                .collect();
+            let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+            let masker = saiife_broker::mask::Masker::new(&refs);
+            for (k, v) in &set {
+                assert!(vals.contains(&v.to_string()), "{k} not in the mask set");
+                let masked = masker.mask_text(&format!("echo {v} end"));
+                assert!(!masked.contains(v), "{k}");
+            }
+            if kind == Kind::GcpSa {
+                // The key echoed as one base64 run, framing and breaks gone.
+                let run = "TESTBODYTESTBODY0001TESTBODYTESTBODY0002";
+                assert!(!masker.mask_text(&format!("k={run}")).contains(run));
+            }
+        }
     }
 
     #[test]

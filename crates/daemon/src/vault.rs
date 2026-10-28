@@ -27,6 +27,16 @@ pub enum Kind {
     /// `client_id`, `client_secret` and `refresh_token`; the access token
     /// lives in daemon memory only (`crate::oauth`).
     OAuth2,
+    /// `access_key_id`, `secret_access_key` and an optional `session_token`.
+    #[serde(rename = "aws")]
+    Aws,
+    /// A Google service account: `client_email`, `private_key`,
+    /// `private_key_id` and an optional `project_id`.
+    #[serde(rename = "gcp_sa")]
+    GcpSa,
+    /// An Azure service principal: `tenant_id`, `client_id`, `client_secret`.
+    #[serde(rename = "azure_sp")]
+    AzureSp,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -835,6 +845,68 @@ mod tests {
         assert!(!raw.windows(12).any(|w| w == b"s3cret-value"));
         assert_eq!(&raw[..8], MAGIC);
         assert_eq!(raw[8], VERSION);
+    }
+
+    #[test]
+    fn cloud_kinds_roundtrip_vault() {
+        let e = env();
+        let mut v = ready(&e);
+        let akid = concat!("AKI", "A", "TESTTESTTEST0001");
+        let sk = concat!("sk-", "aws-test-secret-0001");
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "TESTBODYTESTBODY0001\n",
+            "-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        for (name, kind, fields) in [
+            (
+                "a",
+                Kind::Aws,
+                vec![("access_key_id", akid), ("secret_access_key", sk)],
+            ),
+            (
+                "g",
+                Kind::GcpSa,
+                vec![
+                    ("client_email", "sa@p.iam.gserviceaccount.com"),
+                    ("private_key", pem),
+                    ("private_key_id", "abcd1234"),
+                ],
+            ),
+            (
+                "z",
+                Kind::AzureSp,
+                vec![
+                    ("tenant_id", "t.example.com"),
+                    ("client_id", "c"),
+                    ("client_secret", "cs-test-0001"),
+                ],
+            ),
+        ] {
+            let mut en = entry(name, "x");
+            en.kind = kind;
+            en.fields = fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+                .collect();
+            v.put(en).unwrap();
+        }
+        drop(v);
+        let v = ready(&e);
+        assert_eq!(v.get("a").unwrap().kind, Kind::Aws);
+        assert_eq!(v.get("g").unwrap().kind, Kind::GcpSa);
+        assert_eq!(v.get("g").unwrap().fields["private_key"].as_str(), pem);
+        assert_eq!(v.get("z").unwrap().kind, Kind::AzureSp);
+        assert_eq!(
+            serde_json::to_string(&[Kind::Aws, Kind::GcpSa, Kind::AzureSp]).unwrap(),
+            r#"["aws","gcp_sa","azure_sp"]"#
+        );
+        let raw = std::fs::read(&e.file).unwrap();
+        assert!(!raw.windows(8).any(|w| w == b"TESTBODY"));
+        // The values are not in Debug output.
+        assert!(!format!("{:?}", v.get("a").unwrap()).contains("aws-test-secret"));
     }
 
     #[test]

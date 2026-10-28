@@ -156,6 +156,18 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
             }
         }
     }
+    // A PEM key (a service account's) is also hidden as its bare base64
+    // run, which is what is left when the framing and line breaks go.
+    if value.contains("-----BEGIN ") {
+        let body: String = value
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .flat_map(|l| l.trim().chars())
+            .collect();
+        if body.len() >= 4 {
+            out.push(zeroize::Zeroizing::new(body));
+        }
+    }
     out
 }
 
@@ -412,6 +424,22 @@ mod tests {
             argv0_for(std::path::Path::new("/usr/bin/coreutils")),
             std::ffi::OsString::from("coreutils")
         );
+    }
+
+    #[test]
+    fn pem_key_is_masked_as_its_bare_base64_too() {
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nTESTBODYTESTBODY0001\nTESTBODYTESTBODY0002\n-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        let v: Vec<String> = mask_values("gcp_sa", pem)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(v.contains(&pem.to_string()));
+        assert!(v.contains(&"TESTBODYTESTBODY0001TESTBODYTESTBODY0002".to_string()));
+        assert_eq!(mask_values("token", "plain-value").len(), 1);
     }
 
     #[test]

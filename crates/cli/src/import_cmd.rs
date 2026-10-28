@@ -21,9 +21,11 @@
 //! configured one or a built-in connector): the guess, `--service
 //! <path>=<svc>` or `s(ervice)` at the prompt; without one it is skipped.
 //!
-//! Cloud and kube files are listed and never touched (plan 15).
+//! `~/.aws/credentials` profiles with both keys become `aws` secrets (their
+//! key lines are removed); other cloud and kube files are listed and never
+//! touched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, IsTerminal, Read, Write};
@@ -44,7 +46,7 @@ use crate::text::sanitize;
 
 /// The largest file imported: its backup travels base64 in one frame.
 pub const MAX_SOURCE_BYTES: u64 = 700 * 1024;
-pub const CLOUD: &str = "cloud credentials come with plan 15; remove or rotate by hand";
+pub const CLOUD: &str = "no importer for this cloud file; remove or rotate by hand";
 const MANUAL: &str = "no importer for this file in this version; remove or rotate by hand";
 const UNREADABLE: &str = "no credential the importer can read; remove or rotate by hand";
 
@@ -126,6 +128,7 @@ fn target(a: &ImportArgs, user: &str) -> Result<(u32, PathBuf), Stop> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     Cloud,
+    AwsCredentials,
     Symlink,
     Manual,
     Env,
@@ -140,13 +143,8 @@ fn classify(home: &Path, f: &Finding) -> Class {
         return Class::Symlink;
     }
     match f.path.strip_prefix(home).ok().and_then(Path::to_str) {
-        Some(
-            ".aws/credentials"
-            | ".config/gcloud"
-            | ".azure"
-            | ".kube/config"
-            | ".docker/config.json",
-        ) => Class::Cloud,
+        Some(".aws/credentials") => Class::AwsCredentials,
+        Some(".config/gcloud" | ".azure" | ".kube/config" | ".docker/config.json") => Class::Cloud,
         Some(".git-credentials") => Class::GitCredentials,
         Some(".config/gh/hosts.yml") => Class::GhHosts,
         Some(".npmrc") => Class::Npmrc,
@@ -170,8 +168,17 @@ struct Cand {
     /// The guessed connector (only a built-in id).
     service: Option<&'static str>,
     value: Zeroizing<String>,
-    /// The line it is on; `None` when the whole file is the secret.
+    /// The line it is on; `None` when the whole file is the secret (or
+    /// `cloud` holds its lines).
     line: Option<usize>,
+    /// A multi-field secret (kind `aws`) and the lines it came from.
+    cloud: Option<Cloud>,
+}
+
+struct Cloud {
+    kind: &'static str,
+    fields: BTreeMap<&'static str, Zeroizing<String>>,
+    lines: Vec<usize>,
 }
 
 pub fn run(config: &Path, a: ImportArgs) -> Result<(), Stop> {
@@ -367,8 +374,20 @@ impl Run<'_> {
             let (c, n, service) = pair;
             let mut args = Map::new();
             args.insert("name".into(), json!(n));
-            args.insert("kind".into(), json!("token"));
-            args.insert("fields".into(), json!({ "token": c.value.as_str() }));
+            match &c.cloud {
+                Some(cl) => {
+                    let mut fm = Map::new();
+                    for (k, v) in &cl.fields {
+                        fm.insert((*k).to_string(), json!(v.as_str()));
+                    }
+                    args.insert("kind".into(), json!(cl.kind));
+                    args.insert("fields".into(), Value::Object(fm));
+                }
+                None => {
+                    args.insert("kind".into(), json!("token"));
+                    args.insert("fields".into(), json!({ "token": c.value.as_str() }));
+                }
+            }
             args.insert("allowed_services".into(), json!([service]));
             // The backup goes with every add until one is acked.
             if !backed {
@@ -407,8 +426,15 @@ impl Run<'_> {
             }
         }
         if !stored.is_empty() {
-            let whole = stored.iter().any(|(c, _, _)| c.line.is_none());
-            let gone: BTreeSet<usize> = stored.iter().filter_map(|(c, _, _)| c.line).collect();
+            let whole = stored
+                .iter()
+                .any(|(c, _, _)| c.line.is_none() && c.cloud.is_none());
+            let mut gone: BTreeSet<usize> = stored.iter().filter_map(|(c, _, _)| c.line).collect();
+            for (c, _, _) in &stored {
+                if let Some(cl) = &c.cloud {
+                    gone.extend(cl.lines.iter().copied());
+                }
+            }
             let new = if whole {
                 Zeroizing::new(Vec::new())
             } else {
@@ -626,6 +652,7 @@ fn parse(class: Class, bytes: &[u8], user: &str) -> Vec<Cand> {
         Class::GhHosts => parse_gh(&lines, user),
         Class::Npmrc => parse_npmrc(&lines, user),
         Class::VaultToken => parse_vault(bytes, user),
+        Class::AwsCredentials => parse_aws(&lines),
         _ => Vec::new(),
     }
 }
@@ -701,6 +728,7 @@ fn parse_env(lines: &[&[u8]], user: &str) -> Vec<Cand> {
             service: guess(k),
             value,
             line: Some(i),
+            cloud: None,
         });
     }
     out
@@ -750,6 +778,7 @@ fn parse_git(lines: &[&[u8]], user: &str) -> Vec<Cand> {
             service: guess_host(&host),
             value,
             line: Some(i),
+            cloud: None,
         });
     }
     out
@@ -782,6 +811,7 @@ fn parse_gh(lines: &[&[u8]], user: &str) -> Vec<Cand> {
             service: guess_host(&host),
             value,
             line: Some(i),
+            cloud: None,
         });
     }
     out
@@ -816,6 +846,87 @@ fn parse_npmrc(lines: &[&[u8]], user: &str) -> Vec<Cand> {
             service: None,
             value,
             line: Some(i),
+            cloud: None,
+        });
+    }
+    out
+}
+
+/// The shared credentials file: each `[profile]` with both an access key id
+/// and a secret access key is an `aws` candidate named `aws-<profile>`,
+/// guessed for the `aws-s3` service. Only the key lines are removed; the
+/// header and other settings (region) stay.
+fn parse_aws(lines: &[&[u8]]) -> Vec<Cand> {
+    type Slot = Option<(usize, Zeroizing<String>)>;
+    #[derive(Default)]
+    struct Prof {
+        name: String,
+        id: Slot,
+        secret: Slot,
+        token: Slot,
+        // A key given twice is ambiguous: the profile is left alone.
+        dup: bool,
+    }
+    let mut profs: Vec<Prof> = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let Some(l) = text(raw) else { continue };
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') || l.starts_with(';') {
+            continue;
+        }
+        if let Some(h) = l.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            profs.push(Prof {
+                name: h.trim().to_string(),
+                ..Prof::default()
+            });
+            continue;
+        }
+        let (Some(p), Some((k, v))) = (profs.last_mut(), l.split_once('=')) else {
+            continue;
+        };
+        let slot = match k.trim().to_ascii_lowercase().as_str() {
+            "aws_access_key_id" => &mut p.id,
+            "aws_secret_access_key" => &mut p.secret,
+            "aws_session_token" => &mut p.token,
+            _ => continue,
+        };
+        let Some(v) = unquote(v, false).filter(|v| is_plain_value(v)) else {
+            continue;
+        };
+        if slot.is_some() {
+            p.dup = true;
+        }
+        *slot = Some((i, v));
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for p in profs {
+        // A profile named twice is ambiguous too.
+        if !seen.insert(p.name.clone()) {
+            continue;
+        }
+        let (Some((li, id)), Some((ls, secret)), false) = (p.id, p.secret, p.dup) else {
+            continue;
+        };
+        let mut fields: BTreeMap<&'static str, Zeroizing<String>> = BTreeMap::new();
+        let mut lines = vec![li, ls];
+        fields.insert("access_key_id", id);
+        fields.insert("secret_access_key", secret.clone());
+        if let Some((lt, tok)) = p.token {
+            fields.insert("session_token", tok);
+            lines.push(lt);
+        }
+        out.push(Cand {
+            what: format!("AWS keys in profile {}", sanitize(&p.name)),
+            name: suggest("aws", &p.name),
+            service: Some("aws-s3"),
+            value: secret,
+            line: None,
+            cloud: Some(Cloud {
+                kind: "aws",
+                fields,
+                lines,
+            }),
         });
     }
     out
@@ -835,6 +946,7 @@ fn parse_vault(bytes: &[u8], user: &str) -> Vec<Cand> {
         service: None,
         value: Zeroizing::new(t.to_string()),
         line: None,
+        cloud: None,
     }]
 }
 

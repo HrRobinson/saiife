@@ -304,8 +304,12 @@ fn parse_kind(v: Option<&Value>) -> Result<Kind, Refusal> {
         "basic" => Ok(Kind::Basic),
         "header" => Ok(Kind::Header),
         "oauth2" => Ok(Kind::OAuth2),
-        "aws" | "gcp_sa" | "azure_sp" => Err(bad(format!("kind {k} comes with plan 15"))),
-        _ => Err(bad("unknown kind (token, basic, header or oauth2)")),
+        "aws" => Ok(Kind::Aws),
+        "gcp_sa" => Ok(Kind::GcpSa),
+        "azure_sp" => Ok(Kind::AzureSp),
+        _ => Err(bad(
+            "unknown kind (token, basic, header, oauth2, aws, gcp_sa or azure_sp)",
+        )),
     }
 }
 
@@ -340,6 +344,85 @@ fn field_names(kind: Kind) -> &'static [&'static str] {
         Kind::Basic => &["username", "password"],
         Kind::Header => &["value"],
         Kind::OAuth2 => &saiife_broker::oauth2::FIELDS,
+        Kind::Aws => &["access_key_id", "secret_access_key"],
+        Kind::GcpSa => &["client_email", "private_key", "private_key_id"],
+        Kind::AzureSp => &["tenant_id", "client_id", "client_secret"],
+    }
+}
+
+/// The fields a kind may also carry.
+fn optional_names(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Aws => &["session_token"],
+        Kind::GcpSa => &["project_id"],
+        _ => &[],
+    }
+}
+
+fn all_of(s: &str, ok: impl Fn(char) -> bool) -> bool {
+    !s.is_empty() && s.chars().all(ok)
+}
+
+/// `8-4-4-4-12` hex digits.
+fn is_guid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&parts)
+            .all(|(n, p)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// A DNS name with at least one dot.
+fn is_domain(s: &str) -> bool {
+    s.len() <= 253
+        && s.contains('.')
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// The shape of one cloud field. A refusal names the field, never the value.
+fn check_cloud_field(kind: Kind, name: &str, v: &str) -> Result<(), Refusal> {
+    let ok = match name {
+        "access_key_id" => {
+            v.len() == 20
+                && (v.starts_with("AKIA") || v.starts_with("ASIA"))
+                && all_of(&v[4..], |c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        }
+        "secret_access_key" => v.len() >= 16 && all_of(v, |c| c.is_ascii_graphic()),
+        "session_token" => v.len() >= MIN_VALUE_BYTES && all_of(v, |c| c.is_ascii_graphic()),
+        "client_email" => {
+            v.matches('@').count() == 1
+                && v.ends_with(".iam.gserviceaccount.com")
+                && all_of(v, |c| c.is_ascii_graphic())
+        }
+        "private_key" => {
+            let t = v.trim();
+            t.starts_with("-----BEGIN ")
+                && t.ends_with("PRIVATE KEY-----")
+                && t.contains("PRIVATE KEY-----\n")
+                && t.contains("-----END ")
+        }
+        "private_key_id" => all_of(v, |c| c.is_ascii_alphanumeric()) && v.len() >= 4,
+        "project_id" => {
+            v.len() <= 128
+                && all_of(v, |c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | ':')
+                })
+        }
+        "tenant_id" => is_guid(v) || is_domain(v),
+        "client_id" if kind == Kind::AzureSp => is_guid(v),
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(bad(format!("{name} is not in the expected form")))
     }
 }
 
@@ -362,7 +445,11 @@ fn parse_fields_any(v: Option<&Value>) -> Result<BTreeMap<String, Zeroizing<Stri
         if s.len() > MAX_FIELD_BYTES {
             return Err(bad("secret value is too long"));
         }
-        if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        // A PEM key has line breaks; nothing else may.
+        let nl_ok = k == "private_key";
+        if s.bytes()
+            .any(|b| (b < 0x20 && !(nl_ok && b == b'\n')) || b == 0x7f)
+        {
             return Err(bad("secret value has control characters"));
         }
         out.insert(k.clone(), Zeroizing::new(s.to_string()));
@@ -373,17 +460,24 @@ fn parse_fields_any(v: Option<&Value>) -> Result<BTreeMap<String, Zeroizing<Stri
 /// Exactly the kind's fields, each long enough.
 fn check_fields(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Result<(), Refusal> {
     let want = field_names(kind);
-    if fields.len() != want.len() || !want.iter().all(|w| fields.contains_key(*w)) {
-        return Err(bad(format!(
-            "this kind takes the fields {}",
-            want.join(", ")
-        )));
+    let opt = optional_names(kind);
+    if !want.iter().all(|w| fields.contains_key(*w))
+        || !fields
+            .keys()
+            .all(|k| want.contains(&k.as_str()) || opt.contains(&k.as_str()))
+    {
+        let mut names = want.join(", ");
+        if !opt.is_empty() {
+            names = format!("{names} (optional: {})", opt.join(", "));
+        }
+        return Err(bad(format!("this kind takes the fields {names}")));
     }
     for (k, v) in fields {
         let min = if short_ok(k) { 1 } else { MIN_VALUE_BYTES };
         if v.len() < min {
             return Err(bad("secret value is too short"));
         }
+        check_cloud_field(kind, k, v)?;
     }
     Ok(())
 }
@@ -571,6 +665,9 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                     Kind::Basic => "basic",
                     Kind::Header => "header",
                     Kind::OAuth2 => "oauth2",
+                    Kind::Aws => "aws",
+                    Kind::GcpSa => "gcp_sa",
+                    Kind::AzureSp => "azure_sp",
                 }
                 .into(),
             );
@@ -753,6 +850,14 @@ async fn take_value(
                     "an oauth2 secret is for connectors only",
                 ))
             }
+            // The daemon signs or mints with these; the lease for them is
+            // `cloud.lease` (Task 10).
+            Kind::Aws | Kind::GcpSa | Kind::AzureSp => {
+                return Err(deny(
+                    "run_not_allowed",
+                    "a cloud secret is for connectors only",
+                ))
+            }
         };
         let kind = e.kind;
         vault.touch(&n, &now_ts());
@@ -798,11 +903,8 @@ mod tests {
         let none =
             json!({"name":"a1","kind":"token","fields":{"token":"abcdef"},"allowed_services":[]});
         assert!(msg(parse(&req(OP_SECRET_ADD, none))).contains("at least one"));
-        let aws = json!({"name":"a1","kind":"aws","fields":{},"allowed_services":["s"]});
-        assert_eq!(
-            msg(parse(&req(OP_SECRET_ADD, aws))),
-            "kind aws comes with plan 15"
-        );
+        let bogus = json!({"name":"a1","kind":"nope","fields":{},"allowed_services":["s"]});
+        assert!(msg(parse(&req(OP_SECRET_ADD, bogus))).starts_with("unknown kind"));
         let oauth = json!({"name":"a1","kind":"oauth2","fields":{
             "client_id":"c","client_secret":"cs-1234","refresh_token":"rt-1234"},"allowed_services":["s"]});
         assert_eq!(msg(parse(&req(OP_SECRET_ADD, oauth))), "ok");
@@ -824,6 +926,143 @@ mod tests {
             msg(parse(&req(OP_SECRET_ADD, nonstr))),
             "fields must be an object of strings"
         );
+    }
+
+    fn add(kind: &str, fields: Value) -> String {
+        let a = json!({"name":"c1","kind":kind,"fields":fields,"allowed_services":["s"]});
+        msg(parse(&req(OP_SECRET_ADD, a)))
+    }
+
+    const AKID: &str = concat!("AKI", "A", "TESTTESTTEST0001");
+    const ASKEY: &str = concat!("test-secret-", "access-key-0001");
+
+    #[test]
+    fn aws_fields_checked() {
+        let ok = json!({"access_key_id": AKID, "secret_access_key": ASKEY});
+        assert_eq!(add("aws", ok), "ok");
+        let sts = AKID.replace("AKIA", "ASIA");
+        let tok = concat!("session-", "token-value-0001");
+        let ok = json!({"access_key_id": sts, "secret_access_key": ASKEY, "session_token": tok});
+        assert_eq!(add("aws", ok), "ok");
+        // A key id of the wrong shape: lower case, short, another prefix.
+        for bad in [
+            AKID.to_lowercase(),
+            AKID[..19].to_string(),
+            AKID.replace("AKIA", "AIDA"),
+            format!("{AKID}X"),
+        ] {
+            let m = add(
+                "aws",
+                json!({"access_key_id": bad, "secret_access_key": ASKEY}),
+            );
+            assert_eq!(m, "access_key_id is not in the expected form");
+        }
+        // Missing, extra and empty fields.
+        let m = add("aws", json!({"access_key_id": AKID}));
+        assert!(m.contains("access_key_id, secret_access_key"), "{m}");
+        let m = add(
+            "aws",
+            json!({"access_key_id": AKID, "secret_access_key": ASKEY, "region": "eu-west-1"}),
+        );
+        assert!(m.starts_with("this kind takes the fields"), "{m}");
+        let m = add(
+            "aws",
+            json!({"access_key_id": AKID, "secret_access_key": ASKEY, "session_token": ""}),
+        );
+        assert_eq!(m, "secret value is too short");
+    }
+
+    #[test]
+    fn gcp_fields_checked() {
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nTESTBODYTESTBODY0001\n-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        let ok = json!({"client_email": "sa@p.iam.gserviceaccount.com", "private_key": pem,
+            "private_key_id": "abcd1234", "project_id": "my-proj-1"});
+        assert_eq!(add("gcp_sa", ok), "ok");
+        for (k, bad) in [
+            ("client_email", "sa@example.com"),
+            ("private_key", "not a pem at all"),
+            ("project_id", "Bad Project"),
+        ] {
+            let mut f = json!({"client_email": "sa@p.iam.gserviceaccount.com",
+                "private_key": pem, "private_key_id": "abcd1234"});
+            f[k] = json!(bad);
+            let m = add("gcp_sa", f);
+            assert_eq!(m, format!("{k} is not in the expected form"));
+            assert!(!m.contains(bad));
+        }
+        // Line breaks are allowed in the key and nowhere else.
+        let f = json!({"client_email": "sa@p.iam.gserviceaccount.com\n", "private_key": pem,
+            "private_key_id": "abcd1234"});
+        assert_eq!(add("gcp_sa", f), "secret value has control characters");
+    }
+
+    #[test]
+    fn azure_ids_checked() {
+        let g = "0123abcd-4567-89ab-cdef-0123456789ab";
+        let cs = concat!("client-", "secret-0001");
+        assert_eq!(
+            add(
+                "azure_sp",
+                json!({"tenant_id": g, "client_id": g, "client_secret": cs})
+            ),
+            "ok"
+        );
+        // The tenant may be a domain; the client id may not.
+        assert_eq!(
+            add(
+                "azure_sp",
+                json!({"tenant_id": "contoso.onmicrosoft.com", "client_id": g, "client_secret": cs})
+            ),
+            "ok"
+        );
+        for (k, bad) in [
+            ("tenant_id", "not-a-guid"),
+            ("tenant_id", "-bad.example.com"),
+            ("client_id", "contoso.onmicrosoft.com"),
+            ("client_id", "0123abcd-4567-89ab-cdef-0123456789a"),
+            ("client_id", "0123abcd-4567-89ab-cdef-0123456789zz"),
+        ] {
+            let mut f = json!({"tenant_id": g, "client_id": g, "client_secret": cs});
+            f[k] = json!(bad);
+            let m = add("azure_sp", f);
+            assert_eq!(m, format!("{k} is not in the expected form"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cloud_values_never_in_records_or_errors() {
+        // Every refusal names the field and never quotes a value.
+        let sk = concat!("leaky-", "secret-key-0001");
+        let tok = concat!("leaky-", "session-0001");
+        let cases = [
+            (
+                "aws",
+                json!({"access_key_id": "bad-id-leaky", "secret_access_key": sk, "session_token": tok}),
+            ),
+            (
+                "aws",
+                json!({"access_key_id": AKID, "secret_access_key": sk, "extra": tok}),
+            ),
+            (
+                "gcp_sa",
+                json!({"client_email": "x@leaky.example", "private_key": sk, "private_key_id": tok}),
+            ),
+            (
+                "azure_sp",
+                json!({"tenant_id": "leaky", "client_id": tok, "client_secret": sk}),
+            ),
+        ];
+        for (kind, f) in cases {
+            let m = add(kind, f);
+            assert_ne!(m, "ok");
+            for v in ["leaky", sk, tok] {
+                assert!(!m.contains(v), "{m}");
+            }
+        }
     }
 
     #[test]
