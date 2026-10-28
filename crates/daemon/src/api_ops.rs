@@ -10,9 +10,10 @@ use crate::tokens;
 use crate::vault::{Kind, VaultState};
 use base64::Engine as _;
 use bytes::Bytes;
-use saiife_broker::manifest::AuthSpec;
+use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::pipeline::{
-    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, Trace, Via,
+    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, TokenFuture,
+    Trace, Via,
 };
 use saiife_broker::request::AuthMaterial;
 use saiife_ipc::frame::MAX_ANSWER_FRAME;
@@ -75,7 +76,7 @@ pub(crate) struct DaemonEnv<'a> {
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
 /// bearer, a header or a `basic_token` reading `token`, `header` one reading
-/// `value`.
+/// `value`, `oauth2` the oauth2 one (its access token from daemon memory).
 fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     auth.iter().find(|a| match kind {
         Kind::Basic => a.kind == "basic",
@@ -84,6 +85,7 @@ fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
                 && a.secret_field == "token"
         }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
+        Kind::OAuth2 => a.kind == "oauth2",
     })
 }
 
@@ -109,6 +111,7 @@ fn kind_str(k: Kind) -> &'static str {
         Kind::Token => "token",
         Kind::Basic => "basic",
         Kind::Header => "header",
+        Kind::OAuth2 => "oauth2",
     }
 }
 
@@ -159,6 +162,28 @@ impl Env for DaemonEnv<'_> {
 
     fn create_approval<'b>(&'b self, p: &'b PendingCall) -> ApprovalFuture<'b> {
         Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
+    }
+
+    fn oauth_token<'b>(
+        &'b self,
+        secret: &'b str,
+        service: &'b str,
+        spec: &'b AuthSpec,
+        m: &'b Manifest,
+        svc_params: &'b BTreeMap<String, String>,
+        force: bool,
+    ) -> TokenFuture<'b> {
+        Box::pin(crate::oauth::access_token(
+            self.ctx,
+            crate::oauth::Want {
+                secret,
+                service,
+                spec,
+                manifest: m,
+                svc_params,
+                force,
+            },
+        ))
     }
 }
 
@@ -919,6 +944,18 @@ mod tests {
         let one = [basic_token.clone()];
         assert_eq!(spec_for(Kind::Token, &one), Some(&basic_token));
         assert_eq!(spec_for(Kind::Basic, &one), None);
+        // oauth2 serves oauth2 only, and no other kind serves it.
+        let oauth = AuthSpec {
+            kind: "oauth2".into(),
+            name: None,
+            secret_field: String::new(),
+            prefix: None,
+            token_path: Some("/services/oauth2/token".into()),
+        };
+        let o = [oauth.clone()];
+        assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));
+        assert_eq!(spec_for(Kind::Token, &o), None);
+        assert_eq!(spec_for(Kind::OAuth2, &both), None);
     }
 
     #[test]

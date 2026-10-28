@@ -14,13 +14,25 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-/// A request ready for [`crate::upstream::Upstream::send`].
-#[derive(Debug, Clone)]
+/// A request ready for [`crate::upstream::Upstream::send`]. `Debug` shows
+/// the body's length only (an OAuth2 token request carries secrets in it).
+#[derive(Clone)]
 pub struct Built {
     pub method: Method,
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: Option<Bytes>,
+}
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Built")
+            .field("method", &self.method)
+            .field("uri", &self.uri)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.as_ref().map(Bytes::len))
+            .finish()
+    }
 }
 
 /// The credential for one call: the manifest's auth kind and header name,
@@ -140,7 +152,10 @@ fn has_crlf_nul(v: &str) -> bool {
 /// Fills `{x}` in `base_url`. A value must be URL-unreserved characters
 /// only, so it cannot change the scheme, authority or query, and it must
 /// pass the manifest's parameter type.
-fn fill_base(m: &Manifest, svc_params: &BTreeMap<String, String>) -> Result<String, BrokerError> {
+pub(crate) fn fill_base(
+    m: &Manifest,
+    svc_params: &BTreeMap<String, String>,
+) -> Result<String, BrokerError> {
     let mut out = String::with_capacity(m.base_url.len());
     let mut rest = m.base_url.as_str();
     while let Some(i) = rest.find('{') {
@@ -215,7 +230,7 @@ pub fn bare_hostname(v: &str) -> bool {
 
 /// The `https` URI with an allowed host and no userinfo, or an error. A
 /// `{param}` entry of `hosts` allows exactly the admin's value of `param`.
-fn checked_uri(
+pub(crate) fn checked_uri(
     m: &Manifest,
     svc_params: &BTreeMap<String, String>,
     text: &str,

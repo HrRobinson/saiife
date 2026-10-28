@@ -323,7 +323,28 @@ pub trait Env: Sync {
     /// `approval`/`created` record); the id, or the deny rule
     /// (`approvals_unavailable`, `vault_unavailable`, ...). Nothing is sent.
     fn create_approval<'a>(&'a self, p: &'a PendingCall) -> ApprovalFuture<'a>;
+    /// Step 9 for an `oauth2` credential: the access token of secret
+    /// `secret` (from memory, refreshed when due, or always with `force`),
+    /// or the deny rule. The default has none (`secret_missing`).
+    #[allow(clippy::too_many_arguments)]
+    fn oauth_token<'a>(
+        &'a self,
+        secret: &'a str,
+        service: &'a str,
+        spec: &'a AuthSpec,
+        m: &'a Manifest,
+        svc_params: &'a BTreeMap<String, String>,
+        force: bool,
+    ) -> TokenFuture<'a> {
+        let _ = (secret, service, spec, m, svc_params, force);
+        Box::pin(async { Err("secret_missing") })
+    }
 }
+
+/// The future of [`Env::oauth_token`].
+pub type TokenFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Zeroizing<String>, &'static str>> + Send + 'a>,
+>;
 
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
 /// parsers that keep the first and the last value would see different
@@ -497,6 +518,14 @@ pub struct Trace {
     pub duration_ms: u64,
     /// The request went to the upstream (it counts against the limits).
     pub sent: bool,
+    /// An oauth2 call was sent again after a 401 and a forced refresh.
+    pub auth_retry: bool,
+}
+
+/// A masker of `values` (and the v1 patterns).
+fn masker_of(values: &[Zeroizing<String>]) -> Masker {
+    let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
+    Masker::new(&refs)
 }
 
 /// Steps 3–12; see [`run`] for the trace.
@@ -848,7 +877,7 @@ async fn steps(
         return denied("upstream_unavailable");
     };
     tr.secret = svc.secret.clone();
-    let auth = match &svc.secret {
+    let mut auth = match &svc.secret {
         Some(name) => match env.secret(name, &call.service, &m.auth) {
             Ok(a) => a,
             Err(rule) => return denied(rule),
@@ -856,12 +885,36 @@ async fn steps(
         None if m.auth.is_empty() => AuthMaterial::none(),
         None => return denied("secret_missing"),
     };
-    {
-        // Every value of the secret in use (each field and the basic pair).
-        let values = auth.values();
-        let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
-        *masker = Masker::new(&refs);
+    // ---- oauth2 (plan 14, Task 7) ----
+    // The access token comes from the daemon's memory (refreshed there when
+    // due), never from the vault.
+    let oauth: Option<(&str, &AuthSpec)> = match (&svc.secret, auth.kind == "oauth2") {
+        (Some(name), true) => match m.auth.iter().find(|a| a.kind == "oauth2") {
+            Some(spec) => Some((name.as_str(), spec)),
+            None => return denied("secret_missing"),
+        },
+        _ => None,
+    };
+    if let Some((name, spec)) = oauth {
+        match env
+            .oauth_token(name, &call.service, spec, &m, &svc.params, false)
+            .await
+        {
+            Ok(t) => {
+                auth.fields.insert("access_token".into(), t);
+            }
+            Err(rule) => return denied(rule),
+        }
     }
+    // Every value of the secret in use (each field and the basic pair; for
+    // oauth2 the access token, and the refresh token as the vault holds it
+    // now, rotated or not).
+    let mut mask_values = auth.values();
+    if let Some(v) = oauth.and_then(|(name, _)| env.secret_values(name)) {
+        mask_values.extend(v);
+    }
+    *masker = masker_of(&mask_values);
+    // ---- end oauth2 ----
     // ---- mail transport (plan 14, Task 6) ----
     // A mail call builds no HTTP request: its params are checked here,
     // before anything counts, and the credential is kept for `mail::run`.
@@ -952,7 +1005,7 @@ async fn steps(
         }
         // ---- end mail transport ----
     };
-    let resp = match sent {
+    let mut resp = match sent {
         Ok(r) => r,
         Err(BrokerError::RedirectRefused) => return denied("redirect_refused"),
         Err(e) => {
@@ -961,6 +1014,57 @@ async fn steps(
             }
         }
     };
+    // ---- oauth2 retry (plan 14, Task 7) ----
+    // A 401 with an oauth2 credential: the session expired or was revoked.
+    // One forced refresh and one resend; a second 401 is the answer, and so
+    // is the first when the refresh fails (its failure is recorded by the
+    // daemon). The resend counts with the first send.
+    if resp.status == 401 && !mail {
+        if let Some((name, spec)) = oauth {
+            if let Ok(t) = env
+                .oauth_token(name, &call.service, spec, &m, &svc.params, true)
+                .await
+            {
+                mask_values.push(t.clone());
+                // A refresh token rotated by this refresh, too.
+                mask_values.extend(env.secret_values(name).unwrap_or_default());
+                *masker = masker_of(&mask_values);
+                let a = AuthMaterial::from_spec(spec, [("access_token".to_string(), t)].into());
+                if let Ok(mut b) = build(
+                    &m,
+                    op,
+                    &svc.params,
+                    &params,
+                    &call.headers,
+                    body.clone(),
+                    &a,
+                ) {
+                    drop(a);
+                    b.headers
+                        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+                    if let Some(ct) = prepared.content_type {
+                        b.headers.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+                    }
+                    let permit =
+                        tokio::time::timeout(up.timeout(), env.pool(&call.service).acquire_owned())
+                            .await;
+                    if let Ok(Ok(_permit)) = permit {
+                        tr.auth_retry = true;
+                        resp = match up.send(b, read_limit).await {
+                            Ok(r) => r,
+                            Err(BrokerError::RedirectRefused) => return denied("redirect_refused"),
+                            Err(e) => {
+                                return Outcome::UpstreamFailed {
+                                    reason: e.to_string(),
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // ---- end oauth2 retry ----
     tr.status = Some(resp.status);
     if resp
         .headers
@@ -1239,6 +1343,9 @@ pub fn record(
     e.insert("secret".into(), json!(tr.secret));
     e.insert("limit".into(), json!(limit));
     e.insert("via".into(), call.via.as_str().into());
+    if tr.auth_retry {
+        e.insert("auth_retry".into(), true.into());
+    }
     if let Outcome::Pending { id } = outcome {
         e.insert("approval".into(), (*id).into());
     }

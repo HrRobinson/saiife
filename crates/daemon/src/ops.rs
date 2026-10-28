@@ -318,6 +318,8 @@ pub struct Ctx {
     pub upstream: Result<Upstream, String>,
     /// At most 4 upstream calls in flight per service.
     pub pools: Pools,
+    /// OAuth2 access tokens, in memory only (plan 14, Task 7).
+    pub oauth: crate::oauth::TokenCache,
     /// Where `secret.add` keeps the backups of imported files.
     pub backup_dir: PathBuf,
     /// Bearer tokens of the loopback TCP listener (`api.token`).
@@ -521,6 +523,7 @@ impl Ctx {
             limiter: i.limiter,
             upstream: i.upstream,
             pools: Pools::new(),
+            oauth: Default::default(),
             backup_dir: i.backup_dir,
             tokens: i.tokens,
             lockdown: i.lockdown,

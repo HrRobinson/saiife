@@ -24,6 +24,9 @@ pub enum Kind {
     Token,
     Basic,
     Header,
+    /// `client_id`, `client_secret` and `refresh_token`; the access token
+    /// lives in daemon memory only (`crate::oauth`).
+    OAuth2,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

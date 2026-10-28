@@ -39,6 +39,8 @@ pub mod notifier;
 #[cfg(target_os = "linux")]
 pub mod notify;
 #[cfg(target_os = "linux")]
+pub mod oauth;
+#[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
 pub mod personal;

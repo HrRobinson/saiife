@@ -142,6 +142,7 @@ impl Ctx {
             uid,
             host: hostname(),
             summary: clean(summary),
+            reason: None,
         });
     }
 

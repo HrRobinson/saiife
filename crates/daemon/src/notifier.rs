@@ -47,6 +47,9 @@ pub struct NotifyEvent {
     /// Masked, on one line and cut to [`SUMMARY_MAX`] characters before it
     /// leaves the daemon (the delivery task does it, so `send` stays cheap).
     pub summary: String,
+    /// `refresh_failed`: why (`http_<status>`, `network`, `bad_response`,
+    /// `instance_mismatch`, `persist`); a fixed word, never a body.
+    pub reason: Option<String>,
 }
 
 impl NotifyEvent {
@@ -64,6 +67,9 @@ impl NotifyEvent {
         }
         if let Some(v) = self.uid {
             m.insert("uid".into(), v.into());
+        }
+        if let Some(v) = &self.reason {
+            m.insert("reason".into(), v.clone().into());
         }
         m.insert("host".into(), self.host.clone().into());
         m.insert("summary".into(), self.summary.clone().into());
@@ -604,6 +610,7 @@ async fn smtp(env: &dyn Env, s: &SmtpCfg, ev: &NotifyEvent) -> Result<(), Fail> 
         ("service", ev.service.clone()),
         ("operation", ev.operation.clone()),
         ("uid", ev.uid.map(|u| u.to_string())),
+        ("reason", ev.reason.clone()),
         ("host", Some(ev.host.clone())),
         ("summary", Some(ev.summary.clone())),
     ] {

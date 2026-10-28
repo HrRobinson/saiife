@@ -179,7 +179,17 @@ fn execute(ctx: &Ctx, uid: u32, req: Request) -> Result<Map<String, Value>, Refu
             ),
         ));
     }
-    run(&mut w, uid, parsed, &ctx.backup_dir)
+    // A rotated or removed secret's access token goes with it (decision 8):
+    // dropped under the writer, after the change.
+    let forget = match &parsed {
+        Parsed::Rotate { name, .. } | Parsed::Remove { name } => Some(name.clone()),
+        _ => None,
+    };
+    let done = run(&mut w, uid, parsed, &ctx.backup_dir);
+    if let Some(name) = forget {
+        ctx.oauth.forget(&name);
+    }
+    done
 }
 
 /// `f` of the vault in memory (it is `Ready`: checked under the writer,
@@ -293,10 +303,9 @@ fn parse_kind(v: Option<&Value>) -> Result<Kind, Refusal> {
         "token" => Ok(Kind::Token),
         "basic" => Ok(Kind::Basic),
         "header" => Ok(Kind::Header),
-        "oauth2" | "aws" | "gcp_sa" | "azure_sp" => {
-            Err(bad(format!("kind {k} comes with plans 14–15")))
-        }
-        _ => Err(bad("unknown kind (token, basic or header)")),
+        "oauth2" => Ok(Kind::OAuth2),
+        "aws" | "gcp_sa" | "azure_sp" => Err(bad(format!("kind {k} comes with plan 15"))),
+        _ => Err(bad("unknown kind (token, basic, header or oauth2)")),
     }
 }
 
@@ -330,13 +339,14 @@ fn field_names(kind: Kind) -> &'static [&'static str] {
         Kind::Token => &["token"],
         Kind::Basic => &["username", "password"],
         Kind::Header => &["value"],
+        Kind::OAuth2 => &saiife_broker::oauth2::FIELDS,
     }
 }
 
-/// Fields whose value may be as short as one byte: a user name is not a
-/// secret.
+/// Fields whose value may be as short as one byte: a user name or a client
+/// id is not a secret.
 fn short_ok(name: &str) -> bool {
-    name == "username"
+    name == "username" || name == "client_id"
 }
 
 fn parse_fields_any(v: Option<&Value>) -> Result<BTreeMap<String, Zeroizing<String>>, Refusal> {
@@ -560,6 +570,7 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                     Kind::Token => "token",
                     Kind::Basic => "basic",
                     Kind::Header => "header",
+                    Kind::OAuth2 => "oauth2",
                 }
                 .into(),
             );
@@ -735,6 +746,13 @@ async fn take_value(
             Kind::Token => Zeroizing::new(field("token").to_string()),
             Kind::Basic => Zeroizing::new(format!("{}:{}", field("username"), field("password"))),
             Kind::Header => Zeroizing::new(field("value").to_string()),
+            // A refresh token is never handed out: only the daemon uses it.
+            Kind::OAuth2 => {
+                return Err(deny(
+                    "run_not_allowed",
+                    "an oauth2 secret is for connectors only",
+                ))
+            }
         };
         let kind = e.kind;
         vault.touch(&n, &now_ts());
@@ -780,10 +798,26 @@ mod tests {
         let none =
             json!({"name":"a1","kind":"token","fields":{"token":"abcdef"},"allowed_services":[]});
         assert!(msg(parse(&req(OP_SECRET_ADD, none))).contains("at least one"));
-        let oauth = json!({"name":"a1","kind":"oauth2","fields":{},"allowed_services":["s"]});
+        let aws = json!({"name":"a1","kind":"aws","fields":{},"allowed_services":["s"]});
+        assert_eq!(
+            msg(parse(&req(OP_SECRET_ADD, aws))),
+            "kind aws comes with plan 15"
+        );
+        let oauth = json!({"name":"a1","kind":"oauth2","fields":{
+            "client_id":"c","client_secret":"cs-1234","refresh_token":"rt-1234"},"allowed_services":["s"]});
+        assert_eq!(msg(parse(&req(OP_SECRET_ADD, oauth))), "ok");
+        let oauth = json!({"name":"a1","kind":"oauth2","fields":{
+            "client_id":"c","client_secret":"cs-1234"},"allowed_services":["s"]});
+        let m = msg(parse(&req(OP_SECRET_ADD, oauth)));
+        assert_eq!(
+            m,
+            "this kind takes the fields client_id, client_secret, refresh_token"
+        );
+        let oauth = json!({"name":"a1","kind":"oauth2","fields":{
+            "client_id":"c","client_secret":"cs1","refresh_token":"rt-1234"},"allowed_services":["s"]});
         assert_eq!(
             msg(parse(&req(OP_SECRET_ADD, oauth))),
-            "kind oauth2 comes with plans 14–15"
+            "secret value is too short"
         );
         let nonstr = json!({"name":"a1","kind":"token","fields":{"token":12345678},"allowed_services":["s"]});
         assert_eq!(

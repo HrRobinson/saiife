@@ -473,16 +473,19 @@ pub enum Event {
     ChainBreak,
     ForwardFailing,
     Lockdown,
+    /// An OAuth2 refresh failed (plan 14, decision 8).
+    RefreshFailed,
 }
 
 impl Event {
-    pub const ALL: [Event; 6] = [
+    pub const ALL: [Event; 7] = [
         Event::ApprovalCreated,
         Event::LimitReached,
         Event::ErrorDeniedBurst,
         Event::ChainBreak,
         Event::ForwardFailing,
         Event::Lockdown,
+        Event::RefreshFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -493,6 +496,7 @@ impl Event {
             Event::ChainBreak => "chain_break",
             Event::ForwardFailing => "forward_failing",
             Event::Lockdown => "lockdown",
+            Event::RefreshFailed => "refresh_failed",
         }
     }
 }
@@ -869,7 +873,9 @@ mod tests {
         assert!(t("[notify.targets.a]\ntype = \"command\"\npath = \"/x\"\nextra = 1\n").is_err());
         let c = t("[notify.targets.a]\ntype = \"webhook\"\nurl = \"https://h.test/x\"\n").unwrap();
         assert!(c.notify.validate().is_ok());
-        assert_eq!(c.notify.on.len(), 6);
+        assert_eq!(c.notify.on.len(), 7);
+        assert!(c.notify.on.contains(&Event::RefreshFailed));
+        assert!(t("[notify]\non = [\"refresh_failed\"]\n").is_ok());
     }
 
     #[test]

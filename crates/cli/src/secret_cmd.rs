@@ -16,13 +16,15 @@ pub enum SecretAction {
     Add {
         /// The secret's name: a-z, 0-9, `.`, `_`, `-`; up to 64 characters.
         name: String,
-        /// token, basic or header.
+        /// token, basic, header or oauth2.
         #[arg(long, value_name = "KIND")]
         kind: String,
         /// A service allowed to use it (repeatable, at least one).
         #[arg(long = "service", value_name = "SERVICE", required = true)]
         services: Vec<String>,
-        /// Read the value from this file (basic: `username:password`).
+        /// Read the value from this file (basic: `username:password`;
+        /// oauth2: a JSON object with client_id, client_secret and
+        /// refresh_token).
         #[arg(long, value_name = "PATH", conflicts_with = "from_env")]
         from_file: Option<PathBuf>,
         /// Read the value from this environment variable.
@@ -286,12 +288,12 @@ pub(crate) mod linux {
 
     fn check_kind(kind: &str) -> Result<(), Stop> {
         match kind {
-            "token" | "basic" | "header" => Ok(()),
-            "oauth2" | "aws" | "gcp_sa" | "azure_sp" => {
-                Err(Stop::Refused(format!("kind {kind} comes with plans 14–15")))
+            "token" | "basic" | "header" | "oauth2" => Ok(()),
+            "aws" | "gcp_sa" | "azure_sp" => {
+                Err(Stop::Refused(format!("kind {kind} comes with plan 15")))
             }
             _ => Err(Stop::Refused(
-                "unknown kind (token, basic or header)".into(),
+                "unknown kind (token, basic, header or oauth2)".into(),
             )),
         }
     }
@@ -398,6 +400,14 @@ pub(crate) mod linux {
                     "header" => {
                         f.insert("value", prompt("value: ")?);
                     }
+                    // Paste flow (decision 8): the client id is not a
+                    // secret; the client secret and refresh token are read
+                    // without echo.
+                    "oauth2" => {
+                        f.insert("client_id", prompt_echo("client_id: ")?);
+                        f.insert("client_secret", prompt("client_secret: ")?);
+                        f.insert("refresh_token", prompt("refresh_token: ")?);
+                    }
                     _ => {
                         f.insert("token", prompt("token: ")?);
                     }
@@ -426,7 +436,11 @@ pub(crate) mod linux {
             }
         }
         for (k, v) in &f {
-            let min = if *k == "username" { 1 } else { MIN_VALUE_BYTES };
+            let min = if matches!(*k, "username" | "client_id") {
+                1
+            } else {
+                MIN_VALUE_BYTES
+            };
             if v.len() < min {
                 return Err(Stop::Refused("secret value is too short".into()));
             }
@@ -449,9 +463,32 @@ pub(crate) mod linux {
             "header" => {
                 f.insert("value", v);
             }
+            "oauth2" => oauth2_fields(&v, f)?,
             _ => {
                 f.insert("token", v);
             }
+        }
+        Ok(())
+    }
+
+    /// An oauth2 secret from a file or a variable: one JSON object with
+    /// exactly `client_id`, `client_secret` and `refresh_token` (strings).
+    /// An error never quotes the input.
+    fn oauth2_fields(v: &str, f: &mut Fields) -> Result<(), Stop> {
+        const KEYS: [&str; 3] = ["client_id", "client_secret", "refresh_token"];
+        let shape = || {
+            Stop::Refused(
+                "an oauth2 secret takes a JSON object with client_id, client_secret and refresh_token"
+                    .into(),
+            )
+        };
+        let o: Map<String, Value> = serde_json::from_str(v).map_err(|_| shape())?;
+        if o.len() != KEYS.len() {
+            return Err(shape());
+        }
+        for k in KEYS {
+            let s = o.get(k).and_then(Value::as_str).ok_or_else(shape)?;
+            f.insert(k, Zeroizing::new(s.to_string()));
         }
         Ok(())
     }
@@ -523,6 +560,23 @@ pub(crate) mod linux {
             Ok(b) => utf8(&b),
             Err(e) => Err(e),
         }
+    }
+
+    /// One line from the terminal, echoed (a value that is not a secret).
+    fn prompt_echo(label: &str) -> Result<Zeroizing<String>, Stop> {
+        eprint!("{label}");
+        let mut line = Zeroizing::new(String::new());
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| Stop::Refused(format!("cannot read the terminal: {e}")))?;
+        let v = line.trim_end_matches(['\r', '\n']);
+        if v.is_empty() {
+            return Err(Stop::Refused("no value read".into()));
+        }
+        if v.len() > MAX_VALUE_BYTES {
+            return Err(Stop::Refused("secret value is too long".into()));
+        }
+        Ok(Zeroizing::new(v.to_string()))
     }
 
     fn read_line(fd: std::os::fd::BorrowedFd<'_>) -> Result<Zeroizing<Vec<u8>>, Stop> {

@@ -15,6 +15,7 @@ pub mod limits;
 pub mod mail;
 pub mod manifest;
 pub mod mask;
+pub mod oauth2;
 pub mod params;
 pub mod pipeline;
 pub mod redact;
