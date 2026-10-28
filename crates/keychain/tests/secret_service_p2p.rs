@@ -16,6 +16,8 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{connection, fdo, interface};
 
 const LOGIN: &str = "/org/freedesktop/secrets/collection/login";
+/// A second, non-default collection.
+const OTHER: &str = "/org/freedesktop/secrets/collection/other";
 const PROMPT: &str = "/org/freedesktop/secrets/prompt/p1";
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -39,6 +41,8 @@ struct State {
     /// `OpenSession` answers ServiceUnknown, as a bus without the service.
     unknown: bool,
     locked: bool,
+    /// A locked collection hides its items (KeePassXC, closed KWallet).
+    hide_locked: bool,
     prompt: PromptMode,
     items: Vec<StoredItem>,
     next: u32,
@@ -95,11 +99,18 @@ impl Service {
             .filter(|i| attributes.iter().all(|(k, v)| i.attrs.get(k) == Some(v)))
             .map(|i| op(&i.path))
             .collect();
-        Ok(if s.locked {
+        Ok(if s.locked && s.hide_locked {
+            (vec![], vec![])
+        } else if s.locked {
             (vec![], hits)
         } else {
             (hits, vec![])
         })
+    }
+
+    #[zbus(property)]
+    fn collections(&self) -> Vec<OwnedObjectPath> {
+        vec![op(LOGIN), op(OTHER)]
     }
 
     fn unlock(
@@ -129,6 +140,11 @@ type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 #[interface(name = "org.freedesktop.Secret.Collection")]
 impl Collection {
+    #[zbus(property)]
+    fn locked(&self) -> bool {
+        self.0.lock().unwrap().locked
+    }
+
     async fn create_item(
         &self,
         properties: HashMap<String, OwnedValue>,
@@ -284,11 +300,34 @@ fn serve(state: Shared, prompt_wait: Duration) -> SecretService<ZbusBus> {
                 .unwrap()
                 .serve_at(LOGIN, Collection(state.clone()))
                 .unwrap()
-                .serve_at(PROMPT, Prompt(state))
+                .serve_at(OTHER, Collection(state.clone()))
+                .unwrap()
+                .serve_at(PROMPT, Prompt(state.clone()))
                 .unwrap()
                 .build()
                 .await
                 .unwrap();
+            // Items seeded before the start get their objects too.
+            let seeded: Vec<String> = state
+                .lock()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.path.clone())
+                .collect();
+            for path in seeded {
+                _conn
+                    .object_server()
+                    .at(
+                        path.as_str(),
+                        Item {
+                            state: state.clone(),
+                            path: path.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
             std::future::pending::<()>().await;
         });
     });
@@ -354,6 +393,7 @@ fn p2p_attributes_and_label() {
     let s = state.lock().unwrap();
     let item = &s.items[0];
     let want: HashMap<String, String> = [
+        ("xdg:schema".to_string(), "dev.saiife.VaultKey".to_string()),
         ("application".to_string(), "saiife".to_string()),
         ("saiife-item".to_string(), "vault-key".to_string()),
     ]
@@ -496,4 +536,87 @@ fn p2p_call_inside_a_runtime_panics_clearly() {
     assert!(msg.contains("outside any tokio runtime"), "{msg}");
     // Outside a runtime the same backend still works.
     assert_eq!(k.get(&VAULT_KEY).unwrap(), None);
+}
+
+/// The vault key's attributes, as another client would have stored them.
+fn key_attrs() -> HashMap<String, String> {
+    [
+        ("xdg:schema", "dev.saiife.VaultKey"),
+        ("application", "saiife"),
+        ("saiife-item", "vault-key"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn seed(state: &Shared, collection: &str, n: u32, secret: &[u8]) {
+    state.lock().unwrap().items.push(StoredItem {
+        path: format!("{collection}/seed{n}"),
+        attrs: key_attrs(),
+        label: "seeded".into(),
+        secret: secret.to_vec(),
+        content_type: "application/octet-stream".into(),
+    });
+}
+
+#[test]
+fn p2p_item_in_non_default_collection_is_found() {
+    let state = shared();
+    seed(&state, OTHER, 1, b"elsewhere");
+    let k = serve(state, Duration::from_secs(10));
+    assert_eq!(k.get(&VAULT_KEY).unwrap().unwrap().as_slice(), b"elsewhere");
+}
+
+#[test]
+fn p2p_match_in_two_collections_is_other() {
+    let state = shared();
+    seed(&state, LOGIN, 1, b"in-login-QXJ");
+    seed(&state, OTHER, 2, b"in-other-ZWK");
+    let k = serve(state, Duration::from_secs(10));
+    let e = k.get(&VAULT_KEY).unwrap_err();
+    let KeychainError::Other(m) = &e else {
+        panic!("{e:?}")
+    };
+    assert!(m.starts_with("2 Secret Service items"), "{m}");
+    assert!(!m.contains("QXJ") && !m.contains("ZWK"), "{m}");
+}
+
+#[test]
+fn p2p_locked_collection_hides_item_until_unlocked() {
+    let state = shared();
+    seed(&state, LOGIN, 1, b"hidden");
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.hide_locked = true;
+    }
+    let k = serve(state.clone(), Duration::from_secs(10));
+    assert_eq!(k.get(&VAULT_KEY).unwrap().unwrap().as_slice(), b"hidden");
+    assert!(!state.lock().unwrap().locked);
+}
+
+#[test]
+fn p2p_still_locked_is_locked_not_none() {
+    let state = shared();
+    {
+        let mut s = state.lock().unwrap();
+        s.locked = true;
+        s.hide_locked = true;
+        s.prompt = PromptMode::Dismissed;
+    }
+    let k = serve(state.clone(), Duration::from_secs(10));
+    let e = k.get(&VAULT_KEY).unwrap_err();
+    assert!(matches!(e, KeychainError::Locked(_)), "{e:?}");
+}
+
+#[test]
+fn p2p_drop_inside_a_runtime_does_not_panic() {
+    let k = serve(shared(), Duration::from_secs(10));
+    assert_eq!(k.get(&VAULT_KEY).unwrap(), None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move { drop(k) });
 }

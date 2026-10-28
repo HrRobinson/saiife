@@ -6,6 +6,11 @@
 //! ask the service for the secret itself.
 //!
 //! The order matters for security:
+//! - a search that finds nothing is not yet "no item": KeePassXC and a
+//!   closed KWallet hide the items of a locked collection. So `get` and
+//!   `delete` then unlock the `default` collection (prompting if needed)
+//!   and search once more, and answer [`KeychainError::Locked`] rather than
+//!   "no item" while any collection is still locked;
 //! - `get` refuses more than one matching item rather than guess which one
 //!   holds the key;
 //! - `get` unlocks (prompting if needed) before it reads, and a dismissed
@@ -14,6 +19,11 @@
 //!   with the same attributes;
 //! - no session bus, or no Secret Service on it, is
 //!   [`KeychainError::Unavailable`], never a panic or a hang.
+//!
+//! Known limit: the secret is zeroized only once it is ours. zbus's own
+//! `Message` buffers (the `GetSecret` reply, the `CreateItem` call) hold
+//! the secret bytes and are freed without being zeroized. A same-user
+//! process could ask the Secret Service for the key anyway (§10).
 
 mod bus;
 mod zbus_bus;
@@ -85,16 +95,47 @@ impl<B: SsBus> SecretService<B> {
         }
     }
 
-    /// Every item with `id`'s attributes, unlocked or locked.
+    /// Every item with `id`'s attributes, unlocked or locked. When the
+    /// first search finds nothing, unlock the `default` collection and
+    /// search once more, since a locked collection may hide its items. Still
+    /// nothing while a collection is locked is `Locked`, not "no item".
     fn find(&self, id: &ItemId) -> Result<Found, KeychainError> {
-        self.bus.search_items(&attributes(id))
+        let attrs = attributes(id);
+        let found = self.bus.search_items(&attrs)?;
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        if let Some(collection) = self.bus.read_alias(DEFAULT_ALIAS)? {
+            self.unlock(std::slice::from_ref(&collection))?;
+        }
+        let found = self.bus.search_items(&attrs)?;
+        if !found.is_empty() {
+            return Ok(found);
+        }
+        let locked = self.bus.locked_collections()?;
+        if !locked.is_empty() {
+            return Err(KeychainError::Locked(format!(
+                "{} Secret Service collection(s) are still locked and may hold the item",
+                locked.len()
+            )));
+        }
+        Ok(found)
     }
 }
 
+/// The `xdg:schema` saiife's items carry (libsecret's schema attribute).
+/// The vault key is the only item the broker keeps.
+pub const SCHEMA: &str = "dev.saiife.VaultKey";
+
 /// The attributes an item is stored and found under:
-/// `application=<service>`, `saiife-item=<account>`.
-fn attributes(id: &ItemId) -> [(&'static str, &'static str); 2] {
-    [("application", id.service), ("saiife-item", id.account)]
+/// `xdg:schema=dev.saiife.VaultKey`, `application=<service>`,
+/// `saiife-item=<account>`.
+fn attributes(id: &ItemId) -> [(&'static str, &'static str); 3] {
+    [
+        ("xdg:schema", SCHEMA),
+        ("application", id.service),
+        ("saiife-item", id.account),
+    ]
 }
 
 impl<B: SsBus> Keychain for SecretService<B> {
@@ -141,7 +182,7 @@ impl<B: SsBus> Keychain for SecretService<B> {
 
     fn delete(&self, id: &ItemId) -> Result<bool, KeychainError> {
         let found = self.find(id)?;
-        if found.unlocked.is_empty() && found.locked.is_empty() {
+        if found.is_empty() {
             return Ok(false);
         }
         if !found.locked.is_empty() {
@@ -189,6 +230,8 @@ mod tests {
     struct State {
         alias: Option<String>,
         locked: bool,
+        /// A locked collection hides its items (KeePassXC, closed KWallet).
+        hide_locked: bool,
         prompt: PromptMode,
         items: Vec<Item>,
         next: u32,
@@ -210,7 +253,7 @@ mod tests {
             b.s().alias = Some(LOGIN.into());
             b
         }
-        fn add(&self, attrs: [(&str, &str); 2], secret: &[u8]) {
+        fn add(&self, attrs: [(&str, &str); 3], secret: &[u8]) {
             let mut s = self.s();
             s.next += 1;
             let path = format!("{LOGIN}/{}", s.next);
@@ -255,7 +298,9 @@ mod tests {
                 .filter(|i| matches(i, attrs))
                 .map(|i| i.path.clone())
                 .collect();
-            Ok(if s.locked {
+            Ok(if s.locked && s.hide_locked {
+                Found::default()
+            } else if s.locked {
                 Found {
                     unlocked: vec![],
                     locked: paths,
@@ -342,6 +387,11 @@ mod tests {
             });
             Ok(None)
         }
+        fn locked_collections(&self) -> Result<Vec<String>, KeychainError> {
+            let mut s = self.s();
+            s.calls.push("locked_collections");
+            Ok(if s.locked { vec![LOGIN.into()] } else { vec![] })
+        }
         fn delete(&self, item: &str) -> Result<Option<String>, KeychainError> {
             let mut s = self.s();
             s.calls.push("delete");
@@ -350,7 +400,11 @@ mod tests {
         }
     }
 
-    const KEY_ATTRS: [(&str, &str); 2] = [("application", "saiife"), ("saiife-item", "vault-key")];
+    const KEY_ATTRS: [(&str, &str); 3] = [
+        ("xdg:schema", "dev.saiife.VaultKey"),
+        ("application", "saiife"),
+        ("saiife-item", "vault-key"),
+    ];
 
     #[test]
     fn backend_name() {
@@ -364,7 +418,87 @@ mod tests {
     fn get_none_when_no_item() {
         let ss = SecretService::new(FakeBus::with_login());
         assert_eq!(ss.get(&VAULT_KEY).unwrap(), None);
-        assert_eq!(ss.bus.calls(), vec!["search_items"]);
+        // "No item" only after unlocking the default collection, searching
+        // again and finding no collection still locked.
+        assert_eq!(
+            ss.bus.calls(),
+            vec![
+                "search_items",
+                "read_alias",
+                "unlock",
+                "search_items",
+                "locked_collections"
+            ]
+        );
+    }
+
+    #[test]
+    fn locked_collection_hides_items_then_found() {
+        let bus = FakeBus::with_login();
+        bus.add(KEY_ATTRS, b"hidden key");
+        {
+            let mut s = bus.s();
+            s.locked = true;
+            s.hide_locked = true;
+        }
+        let ss = SecretService::new(bus);
+        assert_eq!(
+            ss.get(&VAULT_KEY).unwrap().unwrap().as_slice(),
+            b"hidden key"
+        );
+        assert_eq!(
+            ss.bus.calls(),
+            vec![
+                "search_items",
+                "read_alias",
+                "unlock",
+                "prompt",
+                "search_items",
+                "open_session",
+                "get_secret"
+            ]
+        );
+    }
+
+    #[test]
+    fn locked_collection_hides_items_dismissed_is_locked() {
+        let bus = FakeBus::with_login();
+        bus.add(KEY_ATTRS, b"hidden key");
+        {
+            let mut s = bus.s();
+            s.locked = true;
+            s.hide_locked = true;
+            s.prompt = PromptMode::Dismissed;
+        }
+        let ss = SecretService::new(bus);
+        assert_eq!(
+            ss.get(&VAULT_KEY),
+            Err(KeychainError::Locked(
+                "the Secret Service prompt was dismissed".into()
+            ))
+        );
+        // Not "no item" for delete either.
+        assert!(matches!(
+            ss.delete(&VAULT_KEY),
+            Err(KeychainError::Locked(_))
+        ));
+        assert_eq!(ss.bus.s().items.len(), 1);
+    }
+
+    #[test]
+    fn still_locked_collection_is_locked_not_none() {
+        // No default alias to unlock, and another collection stays locked.
+        let bus = FakeBus::default();
+        bus.s().locked = true;
+        bus.s().hide_locked = true;
+        let ss = SecretService::new(bus);
+        let e = ss.get(&VAULT_KEY).unwrap_err();
+        assert_eq!(
+            e,
+            KeychainError::Locked(
+                "1 Secret Service collection(s) are still locked and may hold the item".into()
+            )
+        );
     }
 
     #[test]
@@ -480,7 +614,17 @@ mod tests {
         assert!(!ss.delete(&VAULT_KEY).unwrap());
         assert_eq!(
             ss.bus.calls(),
-            vec!["search_items", "unlock", "prompt", "delete", "search_items"]
+            vec![
+                "search_items",
+                "unlock",
+                "prompt",
+                "delete",
+                "search_items",
+                "read_alias",
+                "unlock",
+                "search_items",
+                "locked_collections"
+            ]
         );
     }
 }

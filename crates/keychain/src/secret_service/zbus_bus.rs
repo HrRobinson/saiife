@@ -6,6 +6,10 @@
 //! connection, and every call is a `block_on` on it. A `block_on` inside
 //! another runtime would panic, so every call first asserts that there is
 //! no current runtime, with a message that says why.
+//!
+//! Dropping a [`ZbusBus`] is safe anywhere: inside a runtime its own
+//! runtime is shut down in the background instead of being dropped there
+//! (which would panic).
 
 use super::bus::{
     Found, Prompted, SsBus, CONTENT_TYPE, PROP_ATTRIBUTES, PROP_LABEL, SS_COLLECTION, SS_DEST,
@@ -32,9 +36,23 @@ const DISMISS_TIMEOUT: Duration = Duration::from_secs(2);
 /// current-thread runtime.
 #[derive(Debug)]
 pub struct ZbusBus {
-    // Declared first, so it is dropped before the runtime that drives it.
     conn: zbus::Connection,
-    rt: tokio::runtime::Runtime,
+    /// Always `Some` until `drop` takes it.
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for ZbusBus {
+    fn drop(&mut self) {
+        let Some(rt) = self.rt.take() else { return };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Dropping a runtime inside another one panics; this is tokio's
+            // non-blocking way to stop it from async context. It does not
+            // wait for the connection's tasks, which only read the socket.
+            rt.shutdown_background();
+        } else {
+            drop(rt);
+        }
+    }
 }
 
 /// Panic with a clear message when called inside a tokio runtime, where
@@ -154,7 +172,7 @@ impl ZbusBus {
                 Err(_) => Err(format!("no answer within {CONNECT_TIMEOUT:?}")),
             }
         })?;
-        Ok(ZbusBus { conn, rt })
+        Ok(ZbusBus { conn, rt: Some(rt) })
     }
 
     fn block<T, Fut>(&self, f: Fut) -> Result<T, KeychainError>
@@ -162,7 +180,8 @@ impl ZbusBus {
         Fut: Future<Output = zbus::Result<T>>,
     {
         assert_no_runtime();
-        self.rt.block_on(f).map_err(map_err)
+        let rt = self.rt.as_ref().expect("the runtime lives until drop");
+        rt.block_on(f).map_err(map_err)
     }
 }
 
@@ -213,6 +232,21 @@ impl SsBus for ZbusBus {
                 unlocked.iter().map(|p| p.as_str().to_string()).collect(),
                 some_path(prompt),
             ))
+        })
+    }
+
+    fn locked_collections(&self) -> Result<Vec<String>, KeychainError> {
+        self.block(async {
+            let service = proxy(&self.conn, SS_PATH, SS_SERVICE).await?;
+            let all: Vec<OwnedObjectPath> = service.get_property("Collections").await?;
+            let mut locked = vec![];
+            for c in all {
+                let p = proxy(&self.conn, c.as_str(), SS_COLLECTION).await?;
+                if p.get_property::<bool>("Locked").await? {
+                    locked.push(c.as_str().to_string());
+                }
+            }
+            Ok(locked)
         })
     }
 

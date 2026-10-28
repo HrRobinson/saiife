@@ -28,6 +28,13 @@ pub struct Found {
     pub locked: Vec<String>,
 }
 
+impl Found {
+    /// Nothing found, unlocked or locked.
+    pub fn is_empty(&self) -> bool {
+        self.unlocked.is_empty() && self.locked.is_empty()
+    }
+}
+
 /// How a prompt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prompted {
@@ -51,6 +58,9 @@ pub trait SsBus: Send + Sync {
     /// `Service.Unlock(objects)`: the objects unlocked now, and a prompt to
     /// run for the rest.
     fn unlock(&self, objects: &[String]) -> Result<(Vec<String>, Option<String>), KeychainError>;
+    /// The collections whose `Locked` property is true (from the service's
+    /// `Collections` property).
+    fn locked_collections(&self) -> Result<Vec<String>, KeychainError>;
     /// `Prompt.Prompt("")`, then wait up to `wait` for `Completed`.
     fn prompt(&self, prompt: &str, wait: Duration) -> Result<Prompted, KeychainError>;
     /// `Item.GetSecret(session)`: the secret's value.
