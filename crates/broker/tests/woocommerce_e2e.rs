@@ -208,6 +208,7 @@ fn call(op: &str, params: &[(&str, &str)], body: Option<&str>) -> Call {
         headers: vec![("Authorization".into(), "Bearer agent-guess".into())],
         overlay: None,
         via: Via::Cli,
+        collection: None,
     }
 }
 

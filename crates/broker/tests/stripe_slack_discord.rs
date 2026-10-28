@@ -789,6 +789,7 @@ fn call(service: &str, op_id: &str, params: &[(&str, &str)]) -> Call {
         headers: vec![],
         overlay: None,
         via: Via::Cli,
+        collection: None,
     }
 }
 

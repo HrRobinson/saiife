@@ -356,6 +356,7 @@ fn call(op: &str, params: &[(&str, &str)]) -> Call {
         headers: vec![],
         overlay: None,
         via: Via::Cli,
+        collection: None,
     }
 }
 
@@ -1004,6 +1005,7 @@ async fn connector_record_fields_exact() {
         "operation",
         "capability",
         "env",
+        "collection",
         "params",
         "body_sha256",
         "body_bytes",
@@ -1024,6 +1026,7 @@ async fn connector_record_fields_exact() {
     assert_eq!(v["decision"], "allow");
     assert_eq!(v["capability"], "orders:read");
     assert_eq!(v["env"], "prod");
+    assert_eq!(v["collection"], serde_json::Value::Null);
     assert_eq!(
         v["params"],
         serde_json::json!({"status":"open","limit":"50"})
@@ -1576,4 +1579,47 @@ async fn stored_call_keeps_env_and_old_blobs_read() {
     let old2: saiife_broker::pipeline::StoredCall = serde_json::from_value(again).unwrap();
     assert_eq!(old2.env, None);
     assert_eq!(old2.params, old.params);
+}
+
+/// A collection step is an ordinary call: the record names the collection
+/// (attribution only), and a pending one keeps it through the approval.
+#[tokio::test]
+async fn record_carries_collection() {
+    let (_m, up) = mock().await;
+    let snap = snapshot("");
+    let mut c = call("orders.list", &[("status", "open")]);
+    c.collection = Some("open-orders-report".into());
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(v["collection"], "open-orders-report");
+    assert_eq!(v["decision"], "allow");
+
+    // An ask: the stored call keeps the collection, so the record of the
+    // approved send carries it too.
+    let env = FakeEnv::ok();
+    let mut c = refund_call(&[("order_id", "7")]);
+    c.collection = Some("refunds".into());
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(v["collection"], "refunds");
+    let stored = env.approvals.lock().unwrap()[0].stored.clone();
+    assert_eq!(stored.collection.as_deref(), Some("refunds"));
+    let (back, ok) = stored.call();
+    assert!(ok);
+    assert_eq!(back.collection.as_deref(), Some("refunds"));
+    // A stored call without one (sealed before this field) still parses.
+    let mut j = serde_json::to_value(&stored).unwrap();
+    j.as_object_mut().unwrap().remove("collection");
+    let old: saiife_broker::pipeline::StoredCall = serde_json::from_value(j).unwrap();
+    assert_eq!(old.collection, None);
 }

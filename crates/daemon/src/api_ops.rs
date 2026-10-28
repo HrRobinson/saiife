@@ -182,6 +182,14 @@ pub(crate) fn valid_service(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
+/// A collection name (decision 11): `[a-z0-9_-]{1,64}`.
+pub(crate) fn valid_collection(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+}
+
 /// Parses `overlay` (`{allow, ask, deny}` lists of strings).
 fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
     let Some(v) = v.filter(|v| !v.is_null()) else {
@@ -332,6 +340,11 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         }
         Some(_) => return Err("project must be a path"),
     };
+    let collection = match args.get("collection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),
+        Some(_) => return Err("collection must be a name of [a-z0-9_-], 1 to 64 bytes"),
+    };
     // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
     // `api.result` from the client.
     let call = Call {
@@ -346,6 +359,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         headers,
         overlay,
         via: Via::Cli,
+        collection,
     };
     Ok((service, op, call))
 }
@@ -818,6 +832,37 @@ mod tests {
         assert_eq!(c.params["n"], "5");
         assert_eq!(c.body.as_deref(), Some(&b"hi"[..]));
         assert_eq!(c.overlay.unwrap().deny, vec!["*:write"]);
+        assert_eq!(c.collection, None);
+    }
+
+    #[test]
+    fn parse_call_collection_is_a_checked_name() {
+        let with = |v: Value| {
+            let a = json!({"service": "erp", "operation": "x", "collection": v});
+            parse_call(a.as_object().unwrap()).map(|(_, _, c)| c.collection)
+        };
+        assert_eq!(
+            with(json!("open-orders_2")).unwrap().as_deref(),
+            Some("open-orders_2")
+        );
+        assert_eq!(with(Value::Null).unwrap(), None);
+        assert_eq!(
+            with(json!("a".repeat(64))).unwrap().map(|s| s.len()),
+            Some(64)
+        );
+        for bad in [
+            json!(""),
+            json!("a".repeat(65)),
+            json!("Open"),
+            json!("a.b"),
+            json!("a b"),
+            json!("a/b"),
+            json!("x\n"),
+            json!(5),
+        ] {
+            let e = with(bad.clone()).unwrap_err();
+            assert!(e.contains("collection"), "{bad}: {e}");
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ mod audit_locked;
 #[cfg(target_os = "linux")]
 mod broker;
 mod check;
+// Used by `saiife api collection`, which is Linux only in this version.
 mod check_managed;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod collection;
 mod connect_cmd;
 mod doctor_cmd;
 mod eval;

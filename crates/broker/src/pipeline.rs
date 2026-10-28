@@ -113,6 +113,10 @@ pub struct StoredCall {
     /// stored before environments existed (read as `None`).
     #[serde(default)]
     pub env: Option<String>,
+    /// The collection the request was a step of (attribution only).
+    /// Absent in a call sealed before collections existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
 }
 
 impl std::fmt::Debug for StoredCall {
@@ -151,6 +155,7 @@ impl StoredCall {
             headers: self.headers.clone(),
             overlay: self.overlay.clone(),
             via: Via::Approval,
+            collection: self.collection.clone(),
         };
         (call, ok)
     }
@@ -221,6 +226,9 @@ pub struct Call {
     pub headers: Vec<(String, String)>,
     pub overlay: Option<ServiceOverlay>,
     pub via: Via,
+    /// The collection this call is a step of (`saiife api collection
+    /// run`), recorded as attribution only: it changes no decision.
+    pub collection: Option<String>,
 }
 
 /// Parameter values, header values and the body can hold anything the
@@ -242,6 +250,7 @@ impl std::fmt::Debug for Call {
             )
             .field("overlay", &self.overlay)
             .field("via", &self.via)
+            .field("collection", &self.collection)
             .finish()
     }
 }
@@ -798,6 +807,7 @@ async fn steps(
                 overlay: call.overlay.clone(),
                 via: call.via.as_str().to_string(),
                 env: snap.env.clone(),
+                collection: call.collection.clone(),
             },
             operation: masker.mask_text(&op.id),
             capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),
@@ -1158,6 +1168,15 @@ pub fn record(
     e.insert("operation".into(), json!(tr.operation));
     e.insert("capability".into(), json!(tr.capability));
     e.insert("env".into(), json!(tr.env));
+    // A collection name is `[a-z0-9_-]{1,64}`; masked like the project all
+    // the same (a name can look like a token).
+    e.insert(
+        "collection".into(),
+        json!(call
+            .collection
+            .as_deref()
+            .map(|c| Masker::new(&[]).mask_text(c))),
+    );
     e.insert("params".into(), json!(tr.params));
     e.insert("body_sha256".into(), json!(tr.body_sha256));
     e.insert("body_bytes".into(), json!(tr.body_bytes));
@@ -1306,6 +1325,7 @@ mod tests {
             headers: vec![("X-A".into(), "secret-header".into())],
             overlay: None,
             via: Via::Cli,
+            collection: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("secret-"), "{d}");
