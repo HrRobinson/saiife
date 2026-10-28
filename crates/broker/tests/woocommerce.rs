@@ -149,14 +149,9 @@ fn golden_requests_use_header_basic_auth_only() {
 
 #[test]
 fn golden_writes() {
-    let b = go(
-        "orders.update",
-        &[("order_id", "727")],
-        Some(r#"{"status":"completed"}"#),
-    );
+    let b = go("orders.update", &[("order_id", "727")], None);
     assert_eq!(b.method, "PUT");
     assert_eq!(b.uri.to_string(), format!("{BASE}/orders/727"));
-    assert_eq!(b.body.as_deref(), Some(&br#"{"status":"completed"}"#[..]));
     let b = go(
         "products.update",
         &[("product_id", "794")],
@@ -441,4 +436,108 @@ ask = ["orders:write", "products:write", "refunds:write"]"#,
 fn secret_values_stay_out_of_debug_output() {
     let dbg = format!("{:?}", material());
     assert!(!dbg.contains(&ck()) && !dbg.contains(&cs()), "{dbg}");
+}
+
+#[test]
+fn order_update_cannot_refund() {
+    let op = named(woo(), "orders.update").unwrap();
+    assert!(op.builds_body());
+    // status=refunded (any case) and other unlisted statuses are refused.
+    for bad in [
+        "refunded",
+        "Refunded",
+        "trash",
+        "any",
+        "completed,refunded",
+        "",
+    ] {
+        let r = validate(
+            op,
+            &map(&[("order_id", "727"), ("status", bad)]),
+            &BTreeMap::new(),
+        );
+        assert!(r.is_err(), "status={bad:?}");
+    }
+    // No other field can be sent as a param.
+    for extra in [
+        "line_items",
+        "fee_lines",
+        "total",
+        "set_paid",
+        "meta_data",
+        "refunds",
+        "billing",
+    ] {
+        let r = validate(
+            op,
+            &map(&[("order_id", "727"), (extra, "x")]),
+            &BTreeMap::new(),
+        );
+        assert!(r.is_err(), "{extra}");
+    }
+    // A raw body is refused, with or without params.
+    for raw in [
+        r#"{"status":"refunded"}"#,
+        r#"{"status":"completed"}"#,
+        r#"{"line_items":[]}"#,
+    ] {
+        let raw = Bytes::from(raw.to_string());
+        let p = map(&[("order_id", "727"), ("status", "completed")]);
+        assert_eq!(
+            saiife_broker::pipeline::prepare_body(op, &p, Some(&raw)).unwrap_err(),
+            "bad_param"
+        );
+    }
+    // The note is bounded.
+    let long = "x".repeat(1001);
+    assert!(validate(
+        op,
+        &map(&[("order_id", "727"), ("customer_note", &long)]),
+        &BTreeMap::new()
+    )
+    .is_err());
+}
+
+#[test]
+fn valid_order_update_is_built() {
+    let op = named(woo(), "orders.update").unwrap();
+    for status in [
+        "pending",
+        "processing",
+        "on-hold",
+        "completed",
+        "cancelled",
+        "failed",
+    ] {
+        let p = validate(
+            op,
+            &map(&[("order_id", "727"), ("status", status)]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let b = saiife_broker::pipeline::prepare_body(op, &p, None).unwrap();
+        let sent: Value = serde_json::from_slice(b.bytes.as_deref().unwrap()).unwrap();
+        assert_eq!(sent, json!({"status": status}));
+    }
+    let p = validate(
+        op,
+        &map(&[
+            ("order_id", "727"),
+            ("status", "completed"),
+            ("customer_note", "Shipped:\n- box 1\n- box 2"),
+        ]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let sent = saiife_broker::request::build_body(op, &p).unwrap().unwrap();
+    assert_eq!(
+        sent,
+        json!({"status": "completed", "customer_note": "Shipped:\n- box 1\n- box 2"})
+    );
+    let b = go(
+        "orders.update",
+        &[("order_id", "727"), ("status", "completed")],
+        None,
+    );
+    assert_eq!(b.uri.path(), "/wp-json/wc/v3/orders/727");
 }

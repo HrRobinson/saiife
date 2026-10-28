@@ -36,8 +36,14 @@ Parameters:
 - `*.list`: `page`, `per_page` (1 to 100) and filters such as `status`,
   `search`, `after`, `orderby`, `order`.
 - `*.get`: the id (an integer).
-- `orders.update`, `products.update`: the id and a JSON body such as
-  `{"status":"completed"}`. Send `Content-Type: application/json`.
+- `orders.update`: the order id and the params `status` (one of `pending`,
+  `processing`, `on-hold`, `completed`, `cancelled`, `failed`; not `refunded`)
+  and `customer_note` (up to 1000 characters, may span lines). saiife builds
+  the JSON body; there is no raw body, so an order update cannot refund an
+  order or change line items, fees or totals. Refunds go through
+  `refunds.create` and its amount cap.
+- `products.update`: the id and a JSON body such as
+  `{"regular_price":"24.00"}`. Send `Content-Type: application/json`.
 - `refunds.create`: the order id and the params `amount` (a decimal string,
   required) and `reason` (optional, may span lines). saiife builds the JSON
   body; there is no raw body, so the agent cannot send `line_items` or
@@ -55,12 +61,10 @@ string in major units) in the `currency` service param. Amount limits (`max`
 per call, daily caps) count it. A refund with no `amount` is denied
 (`bad_amount`).
 
-### The update body is not constrained
+### The product update body is not constrained
 
-saiife validates the ids and headers of `orders.update` and `products.update`,
-not the JSON body. An agent with `orders:write` can set any order field the key
-may write (status, addresses, line items); with `products:write` it can change
-prices and stock. Keep both under `ask`, and give the REST key the least
+saiife validates the ids and headers of `products.update`, not the JSON body.
+With `products:write` an agent can change prices and stock. Keep both under `ask`, and give the REST key the least
 permission (Read, or Read/Write only if you allow writes).
 
 ## Pagination

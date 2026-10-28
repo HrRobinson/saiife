@@ -51,6 +51,10 @@ method = "PUT"
 path = "/orders/{order_id}"
 path_params = { order_id = "int" }
 body = "json"
+# The body is built from this list only. `refunded` is not an allowed status
+# (WooCommerce would refund the order), and no money fields (line items, fees,
+# totals, set_paid, meta_data) can be sent: refunds go through refunds.create.
+body_params = { status = "enum:pending,processing,on-hold,completed,cancelled,failed", customer_note = "string:(?s).{0,1000}" }
 
 [[operation]]
 id = "products.list"
