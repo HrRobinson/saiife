@@ -134,6 +134,7 @@ path and query, passed to the matching operation).
 - [GitLab](gitlab.md): projects, issues, merge requests and pipelines.
 - [Sentry](sentry.md): projects, issues and events.
 - [PagerDuty](pagerduty.md): incidents, notes, services and on-calls.
+- [Email](email.md): send with SMTP, read with IMAP.
 - [Generic HTTP connector and outbound webhooks](http.md): any other API,
   configured by hand.
 
