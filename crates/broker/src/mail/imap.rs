@@ -32,8 +32,98 @@ use zeroize::Zeroizing;
 const SLACK: usize = 1024 * 1024;
 /// How long `LOGOUT` may take.
 const LOGOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-/// The most UIDs a `UID SEARCH` may answer with.
-const MAX_SEARCH: usize = 1_000_000;
+/// The deepest parenthesis nesting a response may have. imap-proto's
+/// parsers (BODYSTRUCTURE above all) recurse without a limit, so a deeper
+/// response is refused before it is parsed.
+const MAX_DEPTH: usize = 64;
+/// `mail.list` searches descending UID windows of this many UIDs. A
+/// window's `* SEARCH` line (at most 500 UIDs of 10 digits and a space)
+/// stays below the 8 KiB line limit.
+const WINDOW: u32 = 500;
+/// The most windows one `mail.list` searches (100,000 UIDs); past them it
+/// answers with what it found and a `next_before_uid` to go on from.
+const MAX_WINDOWS: usize = 200;
+/// The most untagged responses before the `+` of `AUTHENTICATE`.
+const MAX_BEFORE_CONTINUE: usize = 64;
+
+/// `{n}\r\n` (or `{n+}\r\n`) at the start of `s`: `(n, header length)`.
+fn literal_at(s: &[u8]) -> Option<(usize, usize)> {
+    let close = s.iter().take(16).position(|&b| b == b'}')?;
+    let digits = &s[1..close];
+    let digits = digits.strip_suffix(b"+").unwrap_or(digits);
+    if digits.is_empty() || digits.len() > 12 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if s.get(close + 1..close + 3) != Some(b"\r\n") {
+        return None;
+    }
+    let n: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    Some((n, close + 3))
+}
+
+/// Whether `buf` may be handed to imap-proto: its parenthesis depth stays
+/// within [`MAX_DEPTH`], counted outside quoted strings and literal bodies.
+/// A quoted string with an escape imap-proto would not take, or one not
+/// closed on its line, is refused too, so this scan and the parser agree
+/// on what is a string.
+fn depth_ok(buf: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if quoted {
+            match b {
+                b'\\' => match buf.get(i + 1) {
+                    Some(b'"' | b'\\') => i += 1,
+                    _ => return false,
+                },
+                b'"' => quoted = false,
+                b'\r' | b'\n' => return false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => quoted = true,
+            b'(' => {
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    return false;
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            b'{' => {
+                if let Some((n, head)) = literal_at(&buf[i..]) {
+                    i = i.saturating_add(head).saturating_add(n);
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    !quoted
+}
+
+/// The only way into imap-proto: the depth guard, then the parser. The
+/// error never holds the server's words.
+fn parse(raw: &[u8]) -> Result<Response<'_>, &'static str> {
+    if !depth_ok(raw) {
+        return Err("response refused: nested too deep or malformed");
+    }
+    imap_proto::parser::parse_response(raw)
+        .map(|(_, r)| r)
+        .map_err(|_| "malformed response")
+}
+
+/// What `EXAMINE` said about the folder.
+#[derive(Debug, Default)]
+struct Examined {
+    exists: Option<u32>,
+    uid_next: Option<u32>,
+}
 
 /// One IMAP session.
 struct Session {
@@ -194,8 +284,7 @@ impl Session {
     ) -> Result<(), String> {
         loop {
             let raw = self.read_response().await?;
-            let (_, resp) = imap_proto::parser::parse_response(&raw)
-                .map_err(|_| format!("{verb}: malformed response"))?;
+            let resp = parse(&raw).map_err(|e| format!("{verb}: {e}"))?;
             match resp {
                 Response::Done {
                     tag: t,
@@ -249,8 +338,7 @@ impl Session {
     /// to `caps`.
     async fn greeting(&mut self, caps: &mut BTreeSet<String>) -> Result<bool, String> {
         let raw = self.read_response().await?;
-        let (_, resp) = imap_proto::parser::parse_response(&raw)
-            .map_err(|_| "greeting: malformed response".to_string())?;
+        let resp = parse(&raw).map_err(|e| format!("greeting: {e}"))?;
         match resp {
             Response::Data { status, code, .. } => {
                 if let Some(ResponseCode::Capabilities(c)) = &code {
@@ -279,10 +367,25 @@ impl Session {
             let tag = self.next_tag();
             self.write_line(&format!("{tag} AUTHENTICATE PLAIN"))
                 .await?;
-            let raw = self.read_response().await?;
-            match imap_proto::parser::parse_response(&raw) {
-                Ok((_, Response::Continue { .. })) => {}
-                _ => return Err("AUTHENTICATE: refused".into()),
+            // Untagged responses may come before the `+`.
+            let mut seen = 0;
+            loop {
+                let raw = self.read_response().await?;
+                match parse(&raw) {
+                    Ok(Response::Continue { .. }) => break,
+                    Ok(Response::Data {
+                        status: Status::Bye,
+                        ..
+                    }) => return Err("AUTHENTICATE: the server closed the session".into()),
+                    Ok(Response::Done { .. }) => return Err("AUTHENTICATE: refused".into()),
+                    Err(e) => return Err(format!("AUTHENTICATE: {e}")),
+                    Ok(_) => {
+                        seen += 1;
+                        if seen > MAX_BEFORE_CONTINUE {
+                            return Err("AUTHENTICATE: no continuation".into());
+                        }
+                    }
+                }
             }
             self.write_line(&b64).await?;
             return self
@@ -301,9 +404,40 @@ impl Session {
     }
 
     /// `EXAMINE` (read-only); never `SELECT`.
-    async fn examine(&mut self, folder: &str) -> Result<(), String> {
+    async fn examine(&mut self, folder: &str) -> Result<Examined, String> {
         let f = quoted(folder)?;
-        self.run(&format!("EXAMINE {f}"), false, |_| Ok(())).await
+        let mut ex = Examined::default();
+        self.run(&format!("EXAMINE {f}"), false, |r| {
+            match r {
+                Response::Data {
+                    code: Some(ResponseCode::UidNext(n)),
+                    ..
+                } => ex.uid_next = Some(n),
+                Response::MailboxData(MailboxDatum::Exists(n)) => ex.exists = Some(n),
+                _ => {}
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(ex)
+    }
+
+    /// The UID of the last message (`FETCH * (UID)`), for a server whose
+    /// `EXAMINE` gave no `UIDNEXT`.
+    async fn last_uid(&mut self) -> Result<Option<u32>, String> {
+        let mut last = None;
+        self.run("FETCH * (UID)", false, |r| {
+            if let Response::Fetch(_, attrs) = r {
+                for a in attrs {
+                    if let AttributeValue::Uid(u) = a {
+                        last = Some(last.map_or(u, |l: u32| l.max(u)));
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(last)
     }
 
     async fn logout(&mut self) {
@@ -476,49 +610,79 @@ async fn list(
 ) -> Result<(u16, Value), String> {
     let q = list_query(params).map_err(|e| e.to_string())?;
     let folder = params.get("folder").map(String::as_str).unwrap_or("INBOX");
-    sess.examine(folder).await?;
-    let mut crit = Vec::new();
-    if let Some(b) = q.before_uid {
-        if b <= 1 {
-            return Ok((
-                200,
-                json!({ "folder": folder, "messages": [], "next_before_uid": null }),
-            ));
-        }
-        crit.push(format!("UID 1:{}", b - 1));
+    let empty = || {
+        Ok((
+            200,
+            json!({ "folder": folder, "messages": [], "next_before_uid": null }),
+        ))
+    };
+    let ex = sess.examine(folder).await?;
+    if ex.exists == Some(0) {
+        return empty();
     }
+    // The highest UID to look at: below UIDNEXT, and below `before_uid`.
+    let mut top = match ex.uid_next {
+        Some(n) => n.saturating_sub(1),
+        None => match sess.last_uid().await? {
+            Some(u) => u,
+            None => return empty(),
+        },
+    };
+    if let Some(b) = q.before_uid {
+        top = top.min(b.saturating_sub(1));
+    }
+    if top == 0 {
+        return empty();
+    }
+    let mut extra = Vec::new();
     if let Some(d) = &q.since {
-        crit.push(format!("SINCE {d}"));
+        extra.push(format!(" SINCE {d}"));
     }
     if q.unseen {
-        crit.push("UNSEEN".into());
+        extra.push(" UNSEEN".into());
     }
-    if crit.is_empty() {
-        crit.push("ALL".into());
-    }
+    let extra = extra.concat();
+    // Descending UID windows until `limit` hits, UID 1, or MAX_WINDOWS.
     let mut uids: Vec<u32> = Vec::new();
-    let mut too_many = false;
-    sess.run(&format!("UID SEARCH {}", crit.join(" ")), false, |r| {
-        if let Response::MailboxData(MailboxDatum::Search(v)) = r {
-            if uids.len() + v.len() > MAX_SEARCH {
-                too_many = true;
-            } else {
-                uids.extend(v);
+    let mut hi = top;
+    let mut lo;
+    let mut windows = 0;
+    loop {
+        lo = hi.saturating_sub(WINDOW - 1).max(1);
+        let mut hits: Vec<u32> = Vec::new();
+        let mut over = false;
+        sess.run(&format!("UID SEARCH UID {lo}:{hi}{extra}"), false, |r| {
+            if let Response::MailboxData(MailboxDatum::Search(v)) = r {
+                hits.extend(v.into_iter().filter(|u| (lo..=hi).contains(u)));
+                over |= hits.len() > WINDOW as usize;
             }
+            Ok(())
+        })
+        .await?;
+        if over {
+            return Err("UID SEARCH: more results than UIDs searched".into());
         }
-        Ok(())
-    })
-    .await?;
-    if too_many {
-        return Err("UID SEARCH: too many results".into());
-    }
-    if let Some(b) = q.before_uid {
-        uids.retain(|u| *u < b);
+        uids.extend(hits);
+        windows += 1;
+        if uids.len() >= q.limit || lo == 1 || windows >= MAX_WINDOWS {
+            break;
+        }
+        hi = lo - 1;
     }
     uids.sort_unstable_by(|a, b| b.cmp(a));
     uids.dedup();
-    let more = uids.len() > q.limit;
+    let found_n = uids.len();
     uids.truncate(q.limit);
+    // A full page goes on below its last UID while anything may be left
+    // below it; a short page stopped by MAX_WINDOWS goes on below the last
+    // window searched.
+    let next = if found_n > q.limit || (found_n == q.limit && lo > 1) {
+        uids.last().copied().filter(|u| *u > 1)
+    } else if found_n < q.limit && lo > 1 {
+        Some(lo)
+    } else {
+        None
+    };
     let mut found: BTreeMap<u32, Map<String, Value>> = BTreeMap::new();
     if !uids.is_empty() {
         let set: Vec<String> = uids.iter().map(u32::to_string).collect();
@@ -576,7 +740,6 @@ async fn list(
         .iter()
         .filter_map(|u| found.remove(u).map(Value::Object))
         .collect();
-    let next = if more { uids.last().copied() } else { None };
     Ok((
         200,
         json!({ "folder": folder, "messages": messages, "next_before_uid": next }),
@@ -617,7 +780,16 @@ async fn get(
     })
     .await?;
     Ok(match raw {
-        Some(r) => (200, message::get_json(uid, &r)),
+        // The answer fits in the service's `max_response_bytes` (the read
+        // limit less the pipeline's slack).
+        Some(r) => (
+            200,
+            message::get_json(
+                uid,
+                &r,
+                sess.read_limit.saturating_sub(crate::pipeline::READ_SLACK),
+            ),
+        ),
         None => (
             404,
             json!({ "error": "no message with this uid in the folder", "uid": uid }),
@@ -639,6 +811,26 @@ mod tests {
             literal_len(b"* 1 FETCH (BODY[] {99999999999999999999}\r\n"),
             Some(Err(_))
         ));
+    }
+
+    #[test]
+    fn depth_guard() {
+        let deep = format!("* 1 FETCH (BODYSTRUCTURE {}\r\n", "(".repeat(65));
+        assert!(!depth_ok(deep.as_bytes()));
+        assert!(parse(deep.as_bytes()).is_err());
+        let ok = format!("* 1 FETCH (X {}{}\r\n", "(".repeat(63), ")".repeat(64));
+        assert!(depth_ok(ok.as_bytes()));
+        // Parentheses in quoted strings and literals do not count.
+        let quoted = format!("* 1 FETCH (X \"{}\\\"\")\r\n", "(".repeat(100));
+        assert!(depth_ok(quoted.as_bytes()), "{quoted}");
+        let lit = format!("* 1 FETCH (BODY[] {{100}}\r\n{})\r\n", "(".repeat(100));
+        assert!(depth_ok(lit.as_bytes()));
+        // A literal's size does not hide what follows it.
+        let after = format!("* 1 FETCH (BODY[] {{2}}\r\nab {}\r\n", "(".repeat(100));
+        assert!(!depth_ok(after.as_bytes()));
+        // An escape imap-proto would refuse, or a string left open.
+        assert!(!depth_ok(b"* OK \"a\\x\"\r\n"));
+        assert!(!depth_ok(b"* OK \"open\r\n"));
     }
 
     #[test]

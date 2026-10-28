@@ -159,8 +159,40 @@ fn addresses(a: Option<&Address<'_>>) -> Value {
     )
 }
 
-/// The `mail.get` answer for message `uid`, from its raw bytes.
-pub fn get_json(uid: u32, raw: &[u8]) -> Value {
+/// The bytes `c` takes inside a JSON string as serde_json writes it.
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The longest prefix of `s` (on a char boundary) whose JSON escaping takes
+/// at most `budget` bytes; `true` when that is not all of `s`.
+fn cut_escaped(s: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += json_len(c);
+        if used > budget {
+            return (&s[..i], true);
+        }
+    }
+    (s, false)
+}
+
+/// The size of `v` as JSON.
+fn json_size(v: &Value) -> usize {
+    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
+}
+
+/// The `mail.get` answer for message `uid`, from its raw bytes. The JSON
+/// fits in `max` bytes: `text`, then `html`, are cut to the room the rest
+/// leaves (after escaping), with `"truncated": true` when anything was cut.
+/// A fifteenth of `max` is kept free, so masking in step 10 (which may
+/// lengthen a short value) does not push the answer past `max` and break
+/// the JSON there.
+pub fn get_json(uid: u32, raw: &[u8], max: usize) -> Value {
     let Some(msg) = MessageParser::default().parse(raw) else {
         return json!({
             "uid": uid, "from": [], "to": [], "cc": [], "subject": null,
@@ -170,13 +202,11 @@ pub fn get_json(uid: u32, raw: &[u8]) -> Value {
     let text = msg
         .text_bodies()
         .find(|p| !p.is_text_html())
-        .and_then(|p| p.text_contents())
-        .map(str::to_string);
+        .and_then(|p| p.text_contents());
     let html = msg
         .html_bodies()
         .find(|p| p.is_text_html())
-        .and_then(|p| p.text_contents())
-        .map(str::to_string);
+        .and_then(|p| p.text_contents());
     let attachments: Vec<Value> = msg
         .attachments()
         .map(|p| {
@@ -187,17 +217,45 @@ pub fn get_json(uid: u32, raw: &[u8]) -> Value {
             json!({ "name": p.attachment_name(), "type": ty, "size": p.len() })
         })
         .collect();
-    json!({
+    let mut v = json!({
         "uid": uid,
         "from": addresses(msg.from()),
         "to": addresses(msg.to()),
         "cc": addresses(msg.cc()),
         "subject": msg.subject(),
         "date": msg.date().map(|d| d.to_rfc3339()),
-        "text": text,
-        "html": html,
+        "text": null,
+        "html": null,
         "attachments": attachments,
-    })
+    });
+    // 64 bytes for `"truncated":true` and the quotes of the two bodies.
+    let room = max.saturating_sub(max / 16).saturating_sub(64);
+    let mut cut = false;
+    // Metadata too large on its own (a huge recipient list): dropped, in
+    // this order, until it fits.
+    for key in ["attachments", "cc", "to", "from"] {
+        if json_size(&v) <= room {
+            break;
+        }
+        v[key] = json!([]);
+        cut = true;
+    }
+    if json_size(&v) > room {
+        v["subject"] = Value::Null;
+        cut = true;
+    }
+    let mut left = room.saturating_sub(json_size(&v));
+    for (key, body) in [("text", text), ("html", html)] {
+        let Some(body) = body else { continue };
+        let (kept, was_cut) = cut_escaped(body, left);
+        left = left.saturating_sub(kept.chars().map(json_len).sum::<usize>());
+        cut |= was_cut;
+        v[key] = Value::String(kept.to_string());
+    }
+    if cut {
+        v["truncated"] = Value::Bool(true);
+    }
+    v
 }
 
 /// Decodes RFC 2047 encoded words in a header value from an IMAP envelope
@@ -307,6 +365,33 @@ mod tests {
         let parsed = MessageParser::default().parse(msg.as_bytes()).unwrap();
         let text = parsed.body_text(0).unwrap();
         assert_eq!(text.replace("\r\n", "\n").trim_end(), body);
+    }
+
+    #[test]
+    fn get_json_fits_max_and_says_truncated() {
+        let text = "a\"b\\c\u{1}\n".repeat(5000);
+        let html = format!("<p>{}</p>", "é<\"".repeat(5000));
+        let raw = format!(
+            "From: a@acme.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n\
+             --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--b--\r\n"
+        );
+        for max in [0, 100, 1000, 20_000, 60_000] {
+            let v = get_json(7, raw.as_bytes(), max);
+            let out = serde_json::to_string(&v).unwrap();
+            if max >= 1000 {
+                assert!(out.len() <= max, "{max}: {}", out.len());
+            }
+            assert_eq!(v["truncated"], true, "{max}");
+            // Valid JSON that reads back.
+            let back: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(back["uid"], 7);
+        }
+        // With room for all, nothing is cut and nothing says so.
+        let v = get_json(7, raw.as_bytes(), 10_000_000);
+        assert!(v.get("truncated").is_none());
+        assert_eq!(v["text"].as_str().unwrap().trim_end(), text.trim_end());
     }
 
     #[test]

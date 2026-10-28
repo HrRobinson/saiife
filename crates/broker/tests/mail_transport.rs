@@ -307,6 +307,22 @@ enum Imap {
     Silent,
     /// Refuses the login, and `EXAMINE`, with the password in the text.
     EchoPassword,
+    /// `mail.get` answers with a BODYSTRUCTURE nested 1000 deep.
+    DeepNest,
+    /// 5,000 messages (UIDs 1 to 5000, unseen 3, 7 and 4990), and an
+    /// `EXAMINE` without `UIDNEXT`.
+    Big,
+}
+
+const BIG_UNSEEN: [u32; 3] = [3, 7, 4990];
+
+/// The UIDs of the mailbox and its unseen ones.
+fn mailbox(mode: Imap) -> (Vec<u32>, Vec<u32>) {
+    if mode == Imap::Big {
+        ((1..=5000).collect(), BIG_UNSEEN.to_vec())
+    } else {
+        (UIDS.to_vec(), vec![])
+    }
 }
 
 /// The test mailbox: UIDs 101 to 105 in INBOX (sequence numbers 1 to 5).
@@ -447,7 +463,12 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             let given = match cmd.split(' ').nth(2) {
                 Some(b) => b.to_string(),
                 None => {
-                    put(&mut s, "+ \r\n").await;
+                    // Untagged chatter before the continuation.
+                    put(
+                        &mut s,
+                        "* OK [ALERT] hello\r\n* CAPABILITY IMAP4rev1\r\n+ \r\n",
+                    )
+                    .await;
                     let Some(b) = line(&mut s).await else { return };
                     log.push(&b);
                     b
@@ -468,11 +489,29 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             log.select_seen.store(true, Ordering::SeqCst);
             put(&mut s, &format!("{tag} BAD SELECT is not for saiife\r\n")).await;
         } else if upper.starts_with("EXAMINE") {
+            let (uids, _) = mailbox(mode);
+            let next = if mode == Imap::Big {
+                String::new()
+            } else {
+                format!("* OK [UIDNEXT {}] next\r\n", uids.last().unwrap() + 1)
+            };
             put(
                 &mut s,
                 &format!(
-                    "* 5 EXISTS\r\n* FLAGS (\\Seen \\Answered)\r\n* OK [UIDVALIDITY 7] ok\r\n\
-                     {tag} OK [READ-ONLY] EXAMINE done\r\n"
+                    "* {} EXISTS\r\n* FLAGS (\\Seen \\Answered)\r\n* OK [UIDVALIDITY 7] ok\r\n\
+                     {next}{tag} OK [READ-ONLY] EXAMINE done\r\n",
+                    uids.len()
+                ),
+            )
+            .await;
+        } else if upper == "FETCH * (UID)" {
+            let (uids, _) = mailbox(mode);
+            let last = uids.last().unwrap();
+            put(
+                &mut s,
+                &format!(
+                    "* {} FETCH (UID {last})\r\n{tag} OK FETCH done\r\n",
+                    uids.len()
                 ),
             )
             .await;
@@ -486,16 +525,19 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             )
             .await;
         } else if upper.starts_with("UID SEARCH") {
-            let below = upper
-                .split(' ')
-                .skip_while(|w| *w != "UID")
-                .nth(2)
-                .and_then(|r| r.strip_prefix("1:"))
-                .and_then(|n| n.parse::<u32>().ok())
-                .unwrap_or(u32::MAX);
-            let hits: Vec<String> = UIDS
+            let words: Vec<&str> = upper.split(' ').collect();
+            let (lo, hi) = words[1..]
+                .windows(2)
+                .find(|w| w[0] == "UID")
+                .and_then(|w| w[1].split_once(':'))
+                .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+                .unwrap_or((1, u32::MAX));
+            let unseen_only = words.contains(&"UNSEEN");
+            let (uids, unseen) = mailbox(mode);
+            let hits: Vec<String> = uids
                 .iter()
-                .filter(|u| **u <= below)
+                .filter(|u| (lo..=hi).contains(*u))
+                .filter(|u| !unseen_only || unseen.contains(u))
                 .map(u32::to_string)
                 .collect();
             put(
@@ -507,7 +549,7 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             let set = cmd.split(' ').nth(2).unwrap_or("");
             let mut out = String::new();
             for u in set.split(',').filter_map(|u| u.parse::<u32>().ok()) {
-                let seq = u - 100;
+                let seq = mailbox(mode).0.iter().position(|x| *x == u).unwrap() + 1;
                 out.push_str(&format!(
                     "* {seq} FETCH (UID {u} FLAGS (\\Seen) RFC822.SIZE {} ENVELOPE {})\r\n",
                     1000 + u,
@@ -516,6 +558,15 @@ async fn imap_session(tcp: TcpStream, acc: TlsAcceptor, mode: Imap, log: Arc<Log
             }
             put(&mut s, &format!("{out}{tag} OK FETCH done\r\n")).await;
         } else if upper.starts_with("UID FETCH") {
+            if mode == Imap::DeepNest {
+                put(
+                    &mut s,
+                    &format!("* 4 FETCH (BODYSTRUCTURE {}\r\n", "(".repeat(1000)),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                return;
+            }
             if mode == Imap::HugeLiteral {
                 put(&mut s, "* 4 FETCH (UID 104 BODY[] {2147483648}\r\n").await;
                 let _ = s.write_all(&[b'x'; 4096]).await;
@@ -1190,4 +1241,158 @@ fn host_params_must_be_bare_hostnames() {
     let svc = snap.config.services.get_mut("mail").unwrap();
     svc.params.insert("imap_host".into(), "127.0.0.1".into());
     assert!(saiife_broker::catalog::validate(&snap.config, &cat).is_err());
+}
+
+#[test]
+fn deep_bodystructure_refused_on_a_small_stack() {
+    // 2 MiB, the stack of a tokio worker thread in the daemon (and set
+    // explicitly, whatever RUST_MIN_STACK says). Without the depth guard
+    // imap-proto's recursion over 1000 parentheses overflows it and aborts
+    // the process (checked by hand); a smaller stack does not fit the
+    // unoptimized pipeline itself.
+    let h = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(Box::pin(async {
+                let p = pki();
+                let (ip, _log) = imap_server(&p, Imap::DeepNest).await;
+                let snap = snapshot((1, "implicit"), (ip, "implicit"));
+                let c = call("mail.get", &[("folder", "INBOX"), ("uid", "104")], None);
+                let (o, tr) = Box::pin(go(
+                    &c,
+                    &snap,
+                    &catalog_of(MANIFEST),
+                    &upstream(&p, Duration::from_secs(5)),
+                ))
+                .await;
+                let r = failed(&o).to_string();
+                assert!(r.contains("nested too deep"), "{r}");
+                assert!(!r.contains("BODYSTRUCTURE"), "no server text: {r}");
+                assert_no_secret(&c, &snap, &tr, &o);
+            }));
+        })
+        .unwrap();
+    h.join().expect("the call fails cleanly");
+}
+
+#[tokio::test]
+async fn mail_list_windows_over_5000_uids() {
+    let p = pki();
+    let (ip, log) = imap_server(&p, Imap::Big).await;
+    let snap = snapshot((1, "implicit"), (ip, "implicit"));
+    let up = upstream(&p, Duration::from_secs(10));
+    let cat = catalog_of(MANIFEST);
+    let page = |o: &Outcome| -> (Vec<u64>, Option<String>) {
+        let (status, v) = done(o);
+        assert_eq!(status, 200);
+        let uids = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["uid"].as_u64().unwrap())
+            .collect();
+        let next = match o {
+            Outcome::Done { next, .. } => next.as_ref().and_then(|n| n.get("before_uid").cloned()),
+            _ => None,
+        };
+        (uids, next)
+    };
+    let searches = |log: &Log| -> Vec<String> {
+        log.lines()
+            .into_iter()
+            .filter(|l| l.contains("UID SEARCH"))
+            .collect()
+    };
+    // The newest page: one window.
+    let (o, _) = go(
+        &call("mail.list", &[("limit", "3")], None),
+        &snap,
+        &cat,
+        &up,
+    )
+    .await;
+    assert_eq!(page(&o), (vec![5000, 4999, 4998], Some("4998".into())));
+    assert_eq!(searches(&log).len(), 1);
+    assert!(
+        searches(&log)[0].ends_with("UID SEARCH UID 4501:5000"),
+        "{:?}",
+        searches(&log)
+    );
+    // Unseen: windows down to UID 1 until two hits are found.
+    let (o, _) = go(
+        &call("mail.list", &[("unseen", "true"), ("limit", "2")], None),
+        &snap,
+        &cat,
+        &up,
+    )
+    .await;
+    assert_eq!(page(&o), (vec![4990, 7], Some("7".into())));
+    let s = searches(&log);
+    assert_eq!(s.len(), 1 + 10, "{s:?}");
+    assert!(
+        s.last().unwrap().ends_with("UID SEARCH UID 1:500 UNSEEN"),
+        "{s:?}"
+    );
+    for l in &s {
+        let range = l.split(' ').nth(4).unwrap();
+        let (a, b) = range.split_once(':').unwrap();
+        let (a, b): (u32, u32) = (a.parse().unwrap(), b.parse().unwrap());
+        assert!(b >= a && b - a < 500, "{l}");
+    }
+    // The page below 7: the last unseen one, and no next page.
+    let (o, _) = go(
+        &call(
+            "mail.list",
+            &[("unseen", "true"), ("limit", "2"), ("before_uid", "7")],
+            None,
+        ),
+        &snap,
+        &cat,
+        &up,
+    )
+    .await;
+    assert_eq!(page(&o), (vec![3], None));
+    // The UIDNEXT fallback was used, never a search of the whole folder.
+    assert!(log.any(|l| l.ends_with("FETCH * (UID)")));
+    assert!(!log.any(|l| l.ends_with("UID SEARCH ALL") || l.ends_with("UID SEARCH UNSEEN")));
+}
+
+#[tokio::test]
+async fn mail_get_is_cut_to_max_response_bytes() {
+    let p = pki();
+    let (ip, _log) = imap_server(&p, Imap::Implicit).await;
+    let mut snap = snapshot((1, "implicit"), (ip, "implicit"));
+    let max = 400;
+    snap.config
+        .services
+        .get_mut("mail")
+        .unwrap()
+        .limits
+        .max_response_bytes = Some(max);
+    let c = call("mail.get", &[("folder", "INBOX"), ("uid", "104")], None);
+    let (o, _) = go(
+        &c,
+        &snap,
+        &catalog_of(MANIFEST),
+        &upstream(&p, Duration::from_secs(5)),
+    )
+    .await;
+    match &o {
+        Outcome::Done { finished, .. } => {
+            assert!(
+                finished.body.len() <= max as usize,
+                "{}",
+                finished.body.len()
+            );
+            assert!(!finished.truncated, "cut by mail.get, not by step 10");
+            let v: serde_json::Value = serde_json::from_slice(&finished.body).unwrap();
+            assert_eq!(v["truncated"], true);
+            assert_eq!(v["uid"], 104);
+        }
+        other => panic!("{other:?}"),
+    }
 }
