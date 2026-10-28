@@ -50,26 +50,28 @@ fn env_cmd(cwd: &Path, config: &Path, args: &[&str], assume_root: bool) -> Outpu
     c.output().unwrap()
 }
 
-/// A developer-mode world: a system config (not locked) that defines
-/// environments, and a project whose config chooses `staging`.
-fn dev_world() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let d = common::tmp::short_tempdir();
-    let config = d.path().join("config.toml");
-    fs::write(&config, format!("version = 2\n{ENVS}")).unwrap();
-    let project = d.path().join("proj");
+/// A developer-mode world, found the way `saiife env` finds it without a
+/// flag (`broker::resolve_here`): no locked system config, a temp
+/// `XDG_RUNTIME_DIR`, and the personal broker's config defining the
+/// environments. The project (`<tmp>/p`, where [`TestBroker::run_cli`]
+/// runs) chooses `staging`. No broker needs to run.
+fn dev_world() -> (common::personal::TestBroker, std::path::PathBuf) {
+    let b = common::personal::TestBroker::prepare();
+    b.write_config(&format!("version = 2\n{ENVS}"));
+    let project = b.path().join("p");
     fs::create_dir_all(project.join(".saiife")).unwrap();
     fs::write(
         project.join(".saiife/config.toml"),
         "# my project\nversion = 2\nenv = \"staging\" # chosen\n\n[services.x]\nallow = []\n",
     )
     .unwrap();
-    (d, config, project)
+    (b, project)
 }
 
 #[test]
 fn list_marks_applying_env_developer() {
-    let (_d, config, project) = dev_world();
-    let o = env_cmd(&project, &config, &["list"], false);
+    let (b, _project) = dev_world();
+    let o = b.run_cli(&["env", "list"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let text = out(&o);
     let staging = text.lines().find(|l| l.contains("staging")).unwrap();
@@ -81,8 +83,8 @@ fn list_marks_applying_env_developer() {
 
 #[test]
 fn list_json_shape() {
-    let (_d, config, project) = dev_world();
-    let o = env_cmd(&project, &config, &["list", "--json"], false);
+    let (b, _project) = dev_world();
+    let o = b.run_cli(&["env", "list", "--json"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let v: Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(
@@ -96,8 +98,8 @@ fn list_json_shape() {
 
 #[test]
 fn use_developer_writes_project_key_keeps_comments() {
-    let (_d, config, project) = dev_world();
-    let o = env_cmd(&project, &config, &["use", "prod"], false);
+    let (b, project) = dev_world();
+    let o = b.run_cli(&["env", "use", "prod"]);
     assert_eq!(code(&o), 0, "{}", err(&o));
     let text = fs::read_to_string(project.join(".saiife/config.toml")).unwrap();
     assert!(text.contains("env = \"prod\""), "{text}");
@@ -106,16 +108,16 @@ fn use_developer_writes_project_key_keeps_comments() {
         "{text}"
     );
     assert!(!text.contains("staging"), "{text}");
-    let o = env_cmd(&project, &config, &["list", "--json"], false);
+    let o = b.run_cli(&["env", "list", "--json"]);
     let v: Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(v[0]["applies"], true, "{v}");
 }
 
 #[test]
 fn use_undefined_env_refused() {
-    let (_d, config, project) = dev_world();
+    let (b, project) = dev_world();
     let before = fs::read_to_string(project.join(".saiife/config.toml")).unwrap();
-    let o = env_cmd(&project, &config, &["use", "nope"], false);
+    let o = b.run_cli(&["env", "use", "nope"]);
     assert_eq!(code(&o), 2);
     assert!(err(&o).contains("not defined"), "{}", err(&o));
     assert_eq!(
@@ -139,7 +141,9 @@ fn use_undefined_env_refused() {
 /// packs apply in locked mode).
 #[test]
 fn developer_policy_show_says_project_env_not_reflected() {
-    let (d, config, project) = dev_world();
+    let (b, project) = dev_world();
+    let d = &b.tmp;
+    let config = d.path().join("dev-config.toml");
     // No daemon to ask: its user does not exist.
     fs::write(
         &config,
@@ -170,6 +174,30 @@ fn developer_policy_show_says_project_env_not_reflected() {
     // The project's `staging` packs are not shown.
     let guard = text.lines().find(|l| l.starts_with("guard:")).unwrap();
     assert!(!guard.contains("db.postgres"), "{text}");
+}
+
+/// `env --system-config` means locked mode, as plan 16's flag does
+/// everywhere: a file without `locked = true` is refused, and nothing is
+/// written.
+#[test]
+fn system_config_flag_refuses_a_non_locked_file() {
+    let (b, project) = dev_world();
+    let config = b.path().join("dev-config.toml");
+    fs::write(&config, format!("version = 2\n{ENVS}")).unwrap();
+    let before = fs::read_to_string(project.join(".saiife/config.toml")).unwrap();
+    for args in [&["list"][..], &["use", "prod"]] {
+        let o = env_cmd(&project, &config, args, false);
+        assert_eq!(code(&o), 2, "{args:?}: {}", out(&o));
+        assert!(
+            err(&o).contains(&format!("{}: locked is not true", config.display())),
+            "{}",
+            err(&o)
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(project.join(".saiife/config.toml")).unwrap(),
+        before
+    );
 }
 
 fn locked_world() -> (tempfile::TempDir, std::path::PathBuf) {

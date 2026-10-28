@@ -80,3 +80,8 @@ saiife env use <name> --scope <scope>    # locked mode, root only
 bound to it, and `*` for the one that applies to you. `env use --scope` edits
 the root-owned config and asks the daemon to reload, so it needs root:
 switching a scope to a looser environment is an admin act.
+
+Without a flag, `saiife env` finds its config as the other commands do: a
+locked host's system config, otherwise the personal broker's own config.
+`--system-config <file>` means locked mode, as everywhere else: a file that
+does not say `locked = true` is refused with "<file>: locked is not true".

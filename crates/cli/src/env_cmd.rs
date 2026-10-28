@@ -20,9 +20,8 @@ use saiife_policy::{load_system, parse_project, Directory, Getent, SystemConfig}
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
-use crate::audit_locked::locked_audit_dir;
 #[cfg(not(target_os = "linux"))]
-use crate::audit_locked::SYSTEM_CONFIG;
+use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
 use crate::text::sanitize;
 
 #[derive(Subcommand)]
@@ -60,22 +59,23 @@ enum Place {
 /// whose config is not locked, no usable `XDG_RUNTIME_DIR`) is an error,
 /// never a guess.
 ///
-/// `--system-config <file>` reads that file: locked mode when it says
-/// `locked = true`, otherwise the developer-mode definitions.
+/// `--system-config <file>` means locked mode, as plan 16's flag does
+/// everywhere: a file that does not say `locked = true` is refused.
 fn resolve(system_config: Option<PathBuf>) -> Result<Place, String> {
     match system_config {
-        Some(config) => from_file(config),
+        Some(config) => locked_flag(config),
         None => resolve_default(),
     }
 }
 
-fn from_file(config: PathBuf) -> Result<Place, String> {
-    match locked_audit_dir(&config)? {
-        Some(_) => Ok(Place::Locked(config)),
-        None => Ok(Place::Developer {
-            system: config.is_file().then_some(config),
-        }),
+/// The `--system-config` file, which must say `locked = true`.
+fn locked_flag(config: PathBuf) -> Result<Place, String> {
+    let loaded = load_system(&config)
+        .map_err(|e| format!("cannot read the system config {}: {e}", config.display()))?;
+    if !loaded.config.locked {
+        return Err(format!("{}: locked is not true", config.display()));
     }
+    Ok(Place::Locked(config))
 }
 
 #[cfg(target_os = "linux")]
@@ -89,10 +89,17 @@ fn resolve_default() -> Result<Place, String> {
     })
 }
 
-/// No personal broker off Linux in this version: the system config path.
+/// No personal broker off Linux in this version: the system config, as
+/// locked mode when it says so, else the developer-mode definitions.
 #[cfg(not(target_os = "linux"))]
 fn resolve_default() -> Result<Place, String> {
-    from_file(PathBuf::from(SYSTEM_CONFIG))
+    let config = PathBuf::from(SYSTEM_CONFIG);
+    match locked_audit_dir(&config)? {
+        Some(_) => Ok(Place::Locked(config)),
+        None => Ok(Place::Developer {
+            system: config.is_file().then_some(config),
+        }),
+    }
 }
 
 pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {
