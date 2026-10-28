@@ -21,6 +21,7 @@ use saiife_broker::cloud::sts::{
 use saiife_broker::cloud::CloudError;
 use saiife_broker::upstream::{Resolver, Upstream};
 use saiife_broker::Manifest;
+use saiife_policy::ServiceOverlay;
 use saiife_policy::{decide, Capability, Mode, Request as PolicyRequest, ServiceCfg, Verdict};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -474,7 +475,7 @@ async fn assume_role_signed_and_sent_to_loopback() {
         200,
         fixture(&new_ak(), &new_sk(), &new_token(), &stamp(exp)),
     );
-    let pol = session_policy::build(
+    let pol = build(
         &svc(r#"allow = ["s3:read:arn:aws:s3:::reports/**"]"#),
         &s3(),
     )
@@ -734,7 +735,22 @@ const KEYS: &[&str] = &[
 /// Every (operation, ARN) the saiife policy allows is allowed by IAM, and
 /// back again when `exact`; IAM never allows what saiife does not.
 fn compare(svc: &ServiceCfg, m: &Manifest, exact: bool) -> SessionPolicy {
-    let pol = session_policy::build(svc, m).unwrap();
+    compare_with(svc, None, Mode::Locked, m, exact)
+}
+
+fn build(svc: &ServiceCfg, m: &Manifest) -> Result<SessionPolicy, CloudError> {
+    session_policy::build(svc, m, None, Mode::Locked)
+}
+
+/// As [`compare`], with a project overlay in `mode`.
+fn compare_with(
+    svc: &ServiceCfg,
+    overlay: Option<&ServiceOverlay>,
+    mode: Mode,
+    m: &Manifest,
+    exact: bool,
+) -> SessionPolicy {
+    let pol = session_policy::build(svc, m, overlay, mode).unwrap();
     let st = statements(&pol);
     let mut allowed = 0;
     for op in &m.operation {
@@ -751,8 +767,8 @@ fn compare(svc: &ServiceCfg, m: &Manifest, exact: bool) -> SessionPolicy {
             let params = BTreeMap::new();
             let saiife = decide(
                 svc,
-                None,
-                Mode::Locked,
+                overlay,
+                mode,
                 &PolicyRequest {
                     capability: &cap,
                     params: &params,
@@ -838,7 +854,7 @@ fn session_policy_table() {
 }
 
 fn refused(body: &str, m: &Manifest) -> String {
-    match session_policy::build(&svc(body), m) {
+    match build(&svc(body), m) {
         Err(CloudError::Unrepresentable { pattern, .. }) => pattern,
         other => panic!("{body}: {other:?}"),
     }
@@ -874,7 +890,7 @@ fn session_policy_never_wider() {
     assert_eq!(refused(r#"allow = ["s3:*"]"#, &s3_with_unmapped()), "s3:*");
     // A deny on it is fine: there is no IAM action to deny, and nothing
     // allows it.
-    session_policy::build(
+    build(
         &svc("allow = [\"s3:read\"]\ndeny = [\"s3:export\"]"),
         &s3_with_unmapped(),
     )
@@ -889,7 +905,7 @@ fn session_policy_never_wider() {
     );
     // Nothing allowed.
     assert!(matches!(
-        session_policy::build(&svc(r#"deny = ["s3:read"]"#), &m),
+        build(&svc(r#"deny = ["s3:read"]"#), &m),
         Err(CloudError::Unrepresentable { .. })
     ));
     // STS mode is AWS only.
@@ -968,13 +984,10 @@ fn policy_too_large() {
         .map(|i| format!("\"s3:read:arn:aws:s3:::bucket-{i:03}/**\""))
         .collect();
     let body = format!("allow = [{}]", pats.join(", "));
-    assert!(matches!(
-        session_policy::build(&svc(&body), &m),
-        Err(CloudError::TooLarge)
-    ));
+    assert!(matches!(build(&svc(&body), &m), Err(CloudError::TooLarge)));
     // A handful fits.
     let body = format!("allow = [{}]", pats[..5].join(", "));
-    let pol = session_policy::build(&svc(&body), &m).unwrap();
+    let pol = build(&svc(&body), &m).unwrap();
     assert!(pol.json.len() <= MAX_POLICY);
 }
 
@@ -985,9 +998,9 @@ fn policy_deterministic() {
              deny = [\"s3:delete\", \"s3:read:arn:aws:s3:::b-one/x/*\"]";
     let b = "deny = [\"s3:read:arn:aws:s3:::b-one/x/*\", \"s3:delete\"]\n\
              allow = [\"s3:write\", \"s3:read:arn:aws:s3:::b-one/**\", \"s3:read:arn:aws:s3:::b-two/**\"]";
-    let p1 = session_policy::build(&svc(a), &m).unwrap();
-    let p2 = session_policy::build(&svc(a), &m).unwrap();
-    let p3 = session_policy::build(&svc(b), &m).unwrap();
+    let p1 = build(&svc(a), &m).unwrap();
+    let p2 = build(&svc(a), &m).unwrap();
+    let p3 = build(&svc(b), &m).unwrap();
     assert_eq!(p1, p2);
     assert_eq!(p1, p3);
     assert!(
@@ -1013,4 +1026,145 @@ fn policy_deterministic() {
         r.sort();
         assert_eq!(r, s.resources);
     }
+}
+
+/// S3 plus a `ListBucket` whose qualifier holds its `{prefix}` query param:
+/// the qualifier is `bucket/prefix`, but IAM sees only the bucket ARN.
+fn s3_with_prefix_list() -> Manifest {
+    Manifest::parse(&format!(
+        "{S3}\n[[operation]]\nid = \"s3.list_prefix\"\ncapability = \"s3:read\"\n\
+         qualifier = \"arn:aws:s3:::{{bucket}}/{{prefix}}\"\nkind = \"read\"\nmethod = \"GET\"\n\
+         path = \"/{{bucket}}\"\npath_params = {{ bucket = \"string:[a-z0-9.-]{{3,63}}\" }}\n\
+         query = {{ prefix = \"string\" }}\nfixed_query = {{ \"list-type\" = \"1\" }}\n\
+         iam_action = \"s3:ListBucket\"\n"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn qualifier_from_a_query_param_never_widens() {
+    let m = s3_with_prefix_list();
+    // Saiife allows `s3.list_prefix` on reports/<anything>, i.e. listing the
+    // whole `reports` bucket with a prefix; IAM's ListBucket on
+    // `reports/*` would match no bucket ARN, and on the bucket ARN it would
+    // allow listing the bucket under every prefix. Refused either way.
+    let p = "s3:read:arn:aws:s3:::reports/**";
+    assert_eq!(refused(&format!("allow = [{p:?}]"), &m), p);
+    let p = "s3:read:arn:aws:s3:::reports/public/**";
+    assert_eq!(refused(&format!("allow = [{p:?}]"), &m), p);
+    // Unqualified, the qualifier does not matter.
+    let pol = build(&svc(r#"allow = ["s3:read"]"#), &m).unwrap();
+    assert!(pol.json.contains("s3:ListBucket"), "{}", pol.json);
+    // A deny on it cannot be narrowed to the qualifier: ListBucket is
+    // denied everywhere, GetObject only on the widened resource.
+    let pol = build(
+        &svc("allow = [\"s3:read\"]\ndeny = [\"s3:read:arn:aws:s3:::reports/secret/**\"]"),
+        &m,
+    )
+    .unwrap();
+    let st = statements(&pol);
+    for arn in ["arn:aws:s3:::reports", "arn:aws:s3:::other"] {
+        assert!(!iam_allows(&st, "s3:ListBucket", arn), "{arn} {}", pol.json);
+    }
+    assert!(!iam_allows(
+        &st,
+        "s3:GetObject",
+        "arn:aws:s3:::reports/secret/k"
+    ));
+    assert!(iam_allows(
+        &st,
+        "s3:GetObject",
+        "arn:aws:s3:::reports/a.csv"
+    ));
+}
+
+#[test]
+fn shared_iam_action_refused() {
+    // `s3.download` is GetObject under another verb.
+    let m = Manifest::parse(&format!(
+        "{S3}\n[[operation]]\nid = \"s3.download\"\ncapability = \"s3:export\"\n\
+         qualifier = \"arn:aws:s3:::{{bucket}}/{{key}}\"\nkind = \"read\"\nmethod = \"GET\"\n\
+         path = \"/{{bucket}}/{{key}}\"\n\
+         path_params = {{ bucket = \"string:[a-z0-9.-]{{3,63}}\", key = \"objectkey\" }}\n\
+         fixed_query = {{ \"response-content-disposition\" = \"attachment\" }}\n\
+         iam_action = \"s3:GetObject\"\n"
+    ))
+    .unwrap();
+    for p in ["s3:read", "s3:read:arn:aws:s3:::reports/**", "s3:export"] {
+        assert_eq!(refused(&format!("allow = [{p:?}]"), &m), p);
+    }
+    // Allowing both verbs is fine.
+    build(&svc(r#"allow = ["s3:*"]"#), &m).unwrap();
+    build(&svc(r#"allow = ["*:*:arn:aws:s3:::reports/**"]"#), &m).unwrap();
+    // A qualified allow whose action an unqualified operation shares.
+    let m = Manifest::parse(&format!(
+        "{S3}\n[[operation]]\nid = \"s3.get_any\"\ncapability = \"s3:read\"\nkind = \"read\"\n\
+         method = \"GET\"\npath = \"/any/{{key}}\"\npath_params = {{ key = \"objectkey\" }}\n\
+         iam_action = \"s3:GetObject\"\n"
+    ))
+    .unwrap();
+    let p = "s3:read:arn:aws:s3:::reports/**";
+    assert_eq!(refused(&format!("allow = [{p:?}]"), &m), p);
+    build(&svc(r#"allow = ["s3:read"]"#), &m).unwrap();
+}
+
+fn overlay(allow: &[&str], ask: &[&str], deny: &[&str]) -> ServiceOverlay {
+    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect();
+    ServiceOverlay {
+        allow: v(allow),
+        ask: v(ask),
+        deny: v(deny),
+    }
+}
+
+#[test]
+fn overlay_mirrors_decide() {
+    let m = s3();
+    let base = svc(r#"allow = ["s3:read", "s3:write:arn:aws:s3:::reports/**"]"#);
+    let rows: &[(ServiceOverlay, bool)] = &[
+        (
+            overlay(&[], &[], &["s3:read:arn:aws:s3:::reports/secret/*"]),
+            false,
+        ),
+        (
+            overlay(&[], &["s3:write:arn:aws:s3:::reports/public/**"], &[]),
+            false,
+        ),
+        (
+            overlay(&["s3:delete:arn:aws:s3:::reports/tmp/**"], &[], &[]),
+            true,
+        ),
+        (overlay(&["s3:delete"], &[], &["s3:read"]), true),
+    ];
+    for (o, exact) in rows {
+        for mode in [Mode::Locked, Mode::Developer] {
+            compare_with(&base, Some(o), mode, &m, *exact);
+        }
+    }
+    // The overlay's allow counts in developer mode only; its deny always.
+    let o = overlay(
+        &["s3:delete"],
+        &[],
+        &["s3:read:arn:aws:s3:::reports/secret/*"],
+    );
+    let locked = statements(&session_policy::build(&base, &m, Some(&o), Mode::Locked).unwrap());
+    let dev = statements(&session_policy::build(&base, &m, Some(&o), Mode::Developer).unwrap());
+    let del = "arn:aws:s3:::reports/a.csv";
+    assert!(!iam_allows(&locked, "s3:DeleteObject", del));
+    assert!(iam_allows(&dev, "s3:DeleteObject", del));
+    for st in [&locked, &dev] {
+        assert!(!iam_allows(
+            st,
+            "s3:GetObject",
+            "arn:aws:s3:::reports/SECRET/k"
+        ));
+        assert!(iam_allows(st, "s3:GetObject", "arn:aws:s3:::reports/a.csv"));
+    }
+    // An unrepresentable overlay allow is refused only where it counts.
+    let o = overlay(&["s3:delete:arn:aws:s3:::reports/*"], &[], &[]);
+    session_policy::build(&base, &m, Some(&o), Mode::Locked).unwrap();
+    assert!(matches!(
+        session_policy::build(&base, &m, Some(&o), Mode::Developer),
+        Err(CloudError::Unrepresentable { .. })
+    ));
 }

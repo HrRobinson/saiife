@@ -314,6 +314,14 @@ fn extract(body: &[u8]) -> Result<Extract, CloudError> {
                         }
                         f.has_text = true;
                     }
+                    if f.want.is_some() && f.text.capacity() - f.text.len() < raw.len() {
+                        // Unescaping never lengthens text, so with room for
+                        // `raw` the buffer never reallocates; the old one is
+                        // wiped when its `Zeroizing` drops.
+                        let mut n = Zeroizing::new(String::with_capacity(f.text.len() + raw.len()));
+                        n.push_str(&f.text);
+                        f.text = n;
+                    }
                     let out: Option<&mut String> = f.want.is_some().then_some(&mut *f.text);
                     unescape(raw, out)?;
                 }

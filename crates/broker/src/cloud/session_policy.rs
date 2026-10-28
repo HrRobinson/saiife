@@ -14,20 +14,31 @@
 //!   bytes outside printable ASCII. An allow rule with `when`, an `allow`
 //!   matching an operation without `iam_action`, an `iam_action` holding
 //!   `*`, and a `fixed` parameter are refused too.
+//! - An operation's qualifier is taken as the IAM resource ARN only when
+//!   every `{placeholder}` in it is one of its path params (always
+//!   required). A qualifier built from a query param (`{prefix}` of a
+//!   `ListBucket`) or a service param names something IAM does not see, so
+//!   a qualified allow matching such an operation is refused and a deny on
+//!   it denies `*`.
+//! - An allow that grants an IAM action must allow every operation with
+//!   that action; an action shared with an operation it does not allow
+//!   (another verb, or unqualified under a qualified allow) is refused.
+//! - The project overlay counts as in `saiife_policy::decide`: its `ask`
+//!   and `deny` always, its `allow` only in developer mode.
 //! - `ask` and `deny` patterns and rules (their `when` ignored) give
 //!   `Deny <iam_action>`. Saiife matches them broadly (a `*` crosses `/`,
 //!   ASCII case is ignored, a qualified pattern matches an unqualified
 //!   request), so the IAM resource is made at least as wide: the ARN header
 //!   is lower-cased (AWS writes it in lower case), every letter after it,
-//!   and every `?`, `$`, `{`, `}` or non-ASCII character, becomes IAM's
-//!   single-character `?`, and everything after the first `*` becomes a
+//!   and every `?`, `$`, `{` or `}`, becomes IAM's single-character `?`,
+//!   and everything from the first `*` or non-ASCII character on becomes a
 //!   trailing `*`. A qualifier that is not such an ARN denies `*`. The
 //!   deny is therefore often wider than the saiife one, never narrower.
 //! - The output is deterministic JSON of at most [`MAX_POLICY`] bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use saiife_policy::{Action, Capability, ServiceCfg};
+use saiife_policy::{Action, Capability, Mode, ServiceCfg, ServiceOverlay};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -80,15 +91,50 @@ fn split(p: &str) -> Option<(&str, &str, Option<&str>)> {
     Some((it.next()?, it.next()?, it.next()))
 }
 
-/// The operations whose capability the pattern's resource and verb match,
-/// each with whether it has a qualifier.
-fn matching<'m>(m: &'m Manifest, res: &str, verb: &str) -> Vec<(&'m Operation, bool)> {
+/// An operation a pattern's resource and verb match.
+struct Matched<'m> {
+    op: &'m Operation,
+    /// The operation has a qualifier.
+    qualified: bool,
+    /// Its qualifier is the IAM resource ARN: every placeholder in it is a
+    /// path param of the operation.
+    arn: bool,
+}
+
+/// Every `{name}` in `t` is a path param of `op`.
+fn placeholders_are_path_params(t: &str, op: &Operation) -> bool {
+    let mut rest = t;
+    while let Some(k) = rest.find('{') {
+        if rest[..k].contains('}') {
+            return false;
+        }
+        let Some(e) = rest[k..].find('}') else {
+            return false;
+        };
+        if !op.path_params.contains_key(&rest[k + 1..k + e]) {
+            return false;
+        }
+        rest = &rest[k + e + 1..];
+    }
+    !rest.contains('}')
+}
+
+/// The operations whose capability the pattern's resource and verb match.
+fn matching<'m>(m: &'m Manifest, res: &str, verb: &str) -> Vec<Matched<'m>> {
     m.operation
         .iter()
         .filter_map(|op| {
             let cap = Capability::parse(&op.capability).ok()?;
             let ok = (res == "*" || res == cap.resource) && (verb == "*" || verb == cap.verb);
-            ok.then_some((op, op.qualifier.is_some() || cap.qualifier.is_some()))
+            if !ok {
+                return None;
+            }
+            let template = op.qualifier.as_deref().or(cap.qualifier.as_deref());
+            Some(Matched {
+                op,
+                qualified: template.is_some(),
+                arn: template.is_some_and(|t| placeholders_are_path_params(t, op)),
+            })
         })
         .collect()
 }
@@ -146,7 +192,10 @@ fn allow_resource(q: &str) -> Result<String, &'static str> {
 /// The IAM resource of a deny or ask qualifier: at least as wide as
 /// saiife's broad, case-insensitive match.
 fn deny_resource(q: &str) -> String {
-    let (prefix, star) = match q.find('*') {
+    // Cut at the first `*` (saiife's broad `*` crosses `:`, IAM's does not
+    // in mid-pattern) or non-ASCII character (its case folding and IAM
+    // reading are not worth guessing), and match any rest.
+    let (prefix, star) = match q.find(|c: char| c == '*' || !c.is_ascii()) {
         Some(k) => (&q[..k], true),
         None => (q, false),
     };
@@ -173,22 +222,48 @@ fn add_allow(p: &str, m: &Manifest, g: &mut Grants) -> Result<(), CloudError> {
         None => "*".to_string(),
         Some(q) => allow_resource(q).map_err(|why| unrep(p, why))?,
     };
-    for (op, qualified) in matching(m, res, verb) {
+    let mut allowed: Vec<&str> = Vec::new();
+    let mut actions: BTreeSet<&str> = BTreeSet::new();
+    for x in matching(m, res, verb) {
         // Saiife's allow stage: a qualified pattern does not match an
         // unqualified request.
-        if qual.is_some() && !qualified {
+        if qual.is_some() && !x.qualified {
             continue;
         }
-        let a = op
-            .iam_action
-            .as_deref()
-            .ok_or_else(|| unrep(p, "it allows an operation without an iam_action"))?;
+        if qual.is_some() && !x.arn {
+            return Err(unrep(
+                p,
+                "it allows an operation whose qualifier is not its IAM resource ARN (a placeholder is not a path param)",
+            ));
+        }
+        let a =
+            x.op.iam_action
+                .as_deref()
+                .ok_or_else(|| unrep(p, "it allows an operation without an iam_action"))?;
         if a.contains('*') {
             return Err(unrep(
                 p,
                 "it allows an operation whose iam_action holds `*`",
             ));
         }
+        allowed.push(&x.op.id);
+        actions.insert(a);
+    }
+    // A granted action must not also reach an operation this pattern does
+    // not allow (another verb, or unqualified under a qualified pattern).
+    for op in &m.operation {
+        let shared = op
+            .iam_action
+            .as_deref()
+            .is_some_and(|a| actions.contains(a));
+        if shared && !allowed.contains(&op.id.as_str()) {
+            return Err(unrep(
+                p,
+                "an IAM action it grants is shared with an operation it does not allow",
+            ));
+        }
+    }
+    for a in actions {
         g.entry(resource.clone()).or_default().insert(a.to_string());
     }
     Ok(())
@@ -196,13 +271,14 @@ fn add_allow(p: &str, m: &Manifest, g: &mut Grants) -> Result<(), CloudError> {
 
 fn add_deny(p: &str, m: &Manifest, g: &mut Grants) -> Result<(), CloudError> {
     let (res, verb, qual) = split(p).ok_or_else(|| unrep(p, "not a valid pattern"))?;
-    for (op, qualified) in matching(m, res, verb) {
-        let Some(a) = op.iam_action.as_deref() else {
+    for x in matching(m, res, verb) {
+        let Some(a) = x.op.iam_action.as_deref() else {
             continue;
         };
-        // Broad: a qualified deny matches an unqualified request.
+        // Broad: a qualified deny matches an unqualified request, and one
+        // whose qualifier is not the IAM ARN cannot be narrowed.
         let resource = match qual {
-            Some(q) if qualified => deny_resource(q),
+            Some(q) if x.qualified && x.arn => deny_resource(q),
             _ => "*".to_string(),
         };
         g.entry(resource).or_default().insert(a.to_string());
@@ -229,8 +305,14 @@ fn statements(effect: &'static str, g: Grants) -> Vec<Stmt> {
         .collect()
 }
 
-/// The session policy of `svc` on `m` (decision 10).
-pub fn build(svc: &ServiceCfg, m: &Manifest) -> Result<SessionPolicy, CloudError> {
+/// The session policy of `svc` on `m` (decision 10), with the project
+/// `overlay` counted as `saiife_policy::decide` counts it in `mode`.
+pub fn build(
+    svc: &ServiceCfg,
+    m: &Manifest,
+    overlay: Option<&ServiceOverlay>,
+    mode: Mode,
+) -> Result<SessionPolicy, CloudError> {
     if !m.signs_sigv4() {
         return Err(unrep(
             &m.id,
@@ -245,10 +327,18 @@ pub fn build(svc: &ServiceCfg, m: &Manifest) -> Result<SessionPolicy, CloudError
     }
     let mut allow = Grants::new();
     let mut deny = Grants::new();
-    for p in &svc.allow {
+    let o_allow: &[String] = match (overlay, mode) {
+        (Some(o), Mode::Developer) => &o.allow,
+        _ => &[],
+    };
+    let (o_ask, o_deny): (&[String], &[String]) = match overlay {
+        Some(o) => (&o.ask, &o.deny),
+        None => (&[], &[]),
+    };
+    for p in svc.allow.iter().chain(o_allow) {
         add_allow(p, m, &mut allow)?;
     }
-    for p in svc.ask.iter().chain(&svc.deny) {
+    for p in svc.ask.iter().chain(&svc.deny).chain(o_ask).chain(o_deny) {
         add_deny(p, m, &mut deny)?;
     }
     for r in &svc.rule {
@@ -305,6 +395,12 @@ mod tests {
 
     #[test]
     fn deny_widening() {
+        // Non-ASCII: cut there and match any rest.
+        assert_eq!(
+            deny_resource("arn:aws:s3:::b/r\u{e9}sum\u{e9}/x"),
+            "arn:aws:s3:::?/?*"
+        );
+        assert_eq!(deny_resource("arn:aws:s3:::\u{e9}"), "arn:aws:s3:::*");
         assert_eq!(
             deny_resource("arn:aws:s3:::b1/Se-cret/*"),
             "arn:aws:s3:::?1/??-????/*"
