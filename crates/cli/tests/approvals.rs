@@ -20,7 +20,7 @@ use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair}
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::approvals::{dir_in, State};
-use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
+use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, Mode, PolicyState};
 use saiife_daemon::sessions::RealProc;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
 use saiife_daemon::writer::{self, WriterConfig};
@@ -246,12 +246,17 @@ amount = {{ field = "refund.amount", currency_field = "refund.currency", unit = 
 /// The policy state of `text` (written to `etc/config.toml`), with the
 /// built-in connectors and `test-pay`.
 fn policy_of(tmp: &Path, port: u16, text: &str) -> PolicyState {
+    policy_in(tmp, port, text, Mode::Locked)
+}
+
+/// [`policy_of`] for a daemon of `mode`.
+fn policy_in(tmp: &Path, port: u16, text: &str, mode: Mode) -> PolicyState {
     let config = tmp.join("etc/config.toml");
     fs::write(&config, text).unwrap();
     let l = saiife_policy::load_system(&config).unwrap();
     let cat = saiife_broker::Catalog::new(saiife_broker::builtin(), vec![pay_manifest(port)]);
     saiife_broker::catalog::validate(&l.config, &cat).unwrap();
-    PolicyState::from_loaded(&l, &[], cat)
+    PolicyState::from_loaded_in(&l, &[], cat, mode)
 }
 
 fn world() -> World {
@@ -285,6 +290,11 @@ fn ask_tail(ask: &str) -> String {
 
 /// The world; `tail` is appended to the config text.
 fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
+    world_full_in(erp_extra, result_cap, tail, Mode::Locked)
+}
+
+/// [`world_full`] for a daemon of `mode`.
+fn world_full_in(erp_extra: &str, result_cap: Option<usize>, tail: &str, mode: Mode) -> World {
     let m = mock();
     let tmp = common::tmp::short_tempdir();
     let t = tmp.path();
@@ -295,7 +305,7 @@ fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
     }
     fs::write(t.join("etc/ca/test-ca.pem"), &m.ca_pem).unwrap();
     let text = format!("{}{tail}", config_text(t, m.port, erp_extra));
-    let policy = policy_of(t, m.port, &text);
+    let policy = policy_in(t, m.port, &text, mode);
 
     let cw = ChainWriter::open(
         &t.join("audit"),
@@ -384,6 +394,7 @@ fn world_full(erp_extra: &str, result_cap: Option<usize>, tail: &str) -> World {
                 })
                 .map_err(|e| e.to_string()),
             lockdown: saiife_daemon::lockdown::Store::memory(),
+            mode,
             ..CtxInit::minimal(handle, writer_cfg, directory, &state)
         }))
     });
@@ -808,6 +819,111 @@ fn policy_changed_to_deny_send_failed() {
     assert_eq!(http_status(&raw), 410, "{raw}");
     assert_eq!(http_body(&raw)["state"], "send_failed");
     assert_eq!(http_body(&raw)["rule"], "policy_changed");
+}
+
+/// Two environments of `erp`, both asking for `invoices:write`.
+const ENVS: &str = r#"
+[environments.staging]
+services.erp.ask = ["invoices:write"]
+
+[environments.prod]
+services.erp.ask = ["invoices:write"]
+"#;
+
+/// The config of [`world`] with [`ENVS`] (less the environments not in
+/// `keep`), the scope bound to `scope_env` (none when empty).
+fn env_config(w: &World, scope_env: &str, keep: &[&str]) -> String {
+    let scope = "services = [\"erp\", \"pay\"]\n";
+    let bound = if scope_env.is_empty() {
+        scope.to_string()
+    } else {
+        format!("{scope}env = {scope_env:?}\n")
+    };
+    let envs: String = ENVS
+        .split("\n[environments.")
+        .filter(|b| keep.iter().any(|k| b.starts_with(&format!("{k}]"))))
+        .map(|b| format!("\n[environments.{b}"))
+        .collect();
+    format!("{}{envs}", config_text(w.path(), w.m.port, "")).replacen(scope, &bound, 1)
+}
+
+/// An approved request is sent under the environment it was asked under:
+/// a scope rebound to another environment between the ask and the send is
+/// `send_failed` with `env_changed`, and nothing is sent. The approver saw
+/// the environment in `approval.show` and `approval.list`.
+#[test]
+fn env_rebound_between_ask_and_send_is_env_changed() {
+    let w = world();
+    let both = ["staging", "prod"];
+    *w.ctx.policy.lock().unwrap() =
+        policy_of(w.path(), w.m.port, &env_config(&w, "staging", &both));
+    let id = w.ask(BODY_A);
+    let shown = w.op(BOSS, "approval.show", json!({"request": id}));
+    assert_eq!(shown["item"]["env"], "staging", "{shown}");
+    let listed = w.op(BOSS, "approval.list", json!({}));
+    let item = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(item["env"], "staging", "{listed}");
+
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "prod", &both));
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::SendFailed);
+    assert!(w.m.hits().is_empty());
+    assert_eq!(w.wait_record(id, "send_failed")["rule"], "env_changed");
+    let o = w.api(&["result", &id.to_string()]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("env_changed"), "{}", stderr(&o));
+}
+
+/// A request stored with no environment (the base config, as every
+/// request sealed before environments existed reads) is not checked: it
+/// is sent under the scope's environment at send.
+#[test]
+fn request_without_env_still_sends_after_rebind() {
+    let w = world();
+    let both = ["staging", "prod"];
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "", &both));
+    let id = w.ask(BODY_A);
+    let shown = w.op(BOSS, "approval.show", json!({"request": id}));
+    assert!(shown["item"].get("env").is_none(), "{shown}");
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "prod", &both));
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::Sent);
+    assert_eq!(w.m.hits().len(), 1);
+}
+
+/// Developer mode (the personal broker): a request asked under a project
+/// environment that is no longer defined at send is `env_changed`, never
+/// sent under the base config instead.
+#[test]
+fn developer_env_gone_at_send_is_env_changed() {
+    use base64::Engine as _;
+    let w = world_full_in("", None, ENVS, Mode::Personal);
+    let a = w.op(
+        own_uid(),
+        "api.call",
+        json!({"service": "erp", "operation": "invoices.create", "env": "staging",
+               "body_b64": base64::engine::general_purpose::STANDARD.encode(BODY_A)}),
+    );
+    let id = a["pending"].as_u64().unwrap_or_else(|| panic!("{a}"));
+    let shown = w.op(own_uid(), "approval.show", json!({"request": id}));
+    assert_eq!(shown["item"]["env"], "staging", "{shown}");
+    *w.ctx.policy.lock().unwrap() = policy_in(
+        w.path(),
+        w.m.port,
+        &env_config(&w, "", &["prod"]),
+        Mode::Personal,
+    );
+    let d = w.decide(own_uid(), id, "approve");
+    assert_eq!(d["ok"], true, "{d}");
+    w.wait_state(id, State::SendFailed);
+    assert!(w.m.hits().is_empty());
+    assert_eq!(w.wait_record(id, "send_failed")["rule"], "env_changed");
 }
 
 /// Decision 1: creation checks the limits without counting; the send

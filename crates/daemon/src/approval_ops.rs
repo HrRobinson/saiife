@@ -38,6 +38,10 @@ use zeroize::Zeroizing;
 /// between the approval and the send. It is never sent again by itself
 /// (that could send a write twice).
 pub const INTERRUPTED: &str = "interrupted";
+/// The rule of an approved connector request whose environment changed
+/// between the ask and the send (rebound scope, or an environment no
+/// longer defined): nothing is sent.
+pub const ENV_CHANGED: &str = "env_changed";
 /// The note of a request its requester rejected (withdrew).
 pub const CANCELLED: &str = "cancelled by requester";
 /// At most this many pending requests per uid; more are denied
@@ -142,6 +146,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
                 .clone()
                 .map(|(minor, currency)| Amount { minor, currency }),
             headers: p.headers.clone(),
+            env: p.stored.env.clone(),
         },
     };
     store_new(ctx, new, Some(exact), ttl).await
@@ -1256,12 +1261,8 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     // scope's as it is now; developer mode the one the request was asked
     // under (stored with it).
     let groups = Groups(groups);
-    let Ok((env_name, _)) = g.select_env(
-        crate::api_ops::gateway_mode(&ctx),
-        &groups,
-        &stored.user,
-        stored.env.as_deref(),
-    ) else {
+    let mode = crate::api_ops::gateway_mode(&ctx);
+    let Ok((env_name, _)) = g.select_env(mode, &groups, &stored.user, stored.env.as_deref()) else {
         return fail(
             &ctx,
             &r,
@@ -1270,6 +1271,24 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
         )
         .await;
     };
+    // An approved request is sent under the environment it was asked
+    // under, or not at all: locked mode refuses a scope rebound to another
+    // environment since the ask, developer mode an environment no longer
+    // defined (never the base config instead). A request stored before
+    // environments existed (`None`) is not checked.
+    if let Some(asked) = stored.env.as_deref() {
+        if env_name != Some(asked) {
+            let message = match mode {
+                saiife_policy::Mode::Locked => {
+                    "the scope's environment changed since the request was asked"
+                }
+                saiife_policy::Mode::Developer => {
+                    "the environment the request was asked under is no longer defined"
+                }
+            };
+            return fail(&ctx, &r, ENV_CHANGED, message).await;
+        }
+    }
     let snap = g.snapshot_for(env_name);
     let env = DaemonEnv {
         ctx: &ctx,

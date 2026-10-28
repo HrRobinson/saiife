@@ -109,8 +109,10 @@ pub struct StoredCall {
     pub via: String,
     /// The environment of the snapshot the request was asked under
     /// ([`PolicySnapshot::env`]). Developer mode sends under it again;
-    /// locked mode chooses from the scope at send. Absent in requests
-    /// stored before environments existed (read as `None`).
+    /// locked mode chooses from the scope at send. Either way the daemon
+    /// refuses the send (`env_changed`) when that is not this environment.
+    /// Absent in requests stored before environments existed (read as
+    /// `None`, not checked).
     #[serde(default)]
     pub env: Option<String>,
     /// The collection the request was a step of (attribution only).

@@ -258,6 +258,8 @@ mod linux {
         let s = |k: &str| i[k].as_str().unwrap_or("");
         let w = if i["type"] == "command" {
             s("input").to_string()
+        } else if let Some(e) = i["env"].as_str() {
+            format!("{} {} (env {e})", s("service"), s("operation"))
         } else {
             format!("{} {}", s("service"), s("operation"))
         };
@@ -316,6 +318,11 @@ mod linux {
             outln!("  command    {}", s("input"));
         } else {
             outln!("  request    {} {}", s("service"), s("operation"));
+            if item["env"].is_string() {
+                // The environment the request was asked under: it is
+                // sent under that one or not at all.
+                outln!("  env        {}", s("env"));
+            }
             if !item["capability"].is_null() {
                 outln!("  capability {}", s("capability"));
             }

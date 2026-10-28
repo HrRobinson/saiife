@@ -48,7 +48,7 @@ or failed:
 | `expired` | nobody decided in time |
 | `sent` | a connector request was sent; for a command, the one-use grant was kept (the command may run once) |
 | `grant_used` | the approved command ran: its grant was used up |
-| `send_failed` | an approved request was not sent; `rule` says why: `policy_changed`, a `limit`, `lockdown`, `body_changed` (the body about to be sent no longer hashes to the one shown), `vault_unavailable`, `grants_unavailable`, or `interrupted` (the daemon stopped between the approval and the send; it is never sent by itself, and a command's grant is revoked) |
+| `send_failed` | an approved request was not sent; `rule` says why: `policy_changed`, a `limit`, `lockdown`, `body_changed` (the body about to be sent no longer hashes to the one shown), `env_changed` (the request was asked under an environment it would no longer be sent under: a locked scope rebound to another one, or a developer-mode environment no longer defined; a request with no environment is not checked), `vault_unavailable`, `grants_unavailable`, or `interrupted` (the daemon stopped between the approval and the send; it is never sent by itself, and a command's grant is revoked) |
 
 A result that could not be kept (it could not be sealed or written) is
 `result_unavailable`: `saiife api result` says so, and `GET
@@ -209,9 +209,10 @@ saiife reject  <id> [--note TEXT]
 ```
 
 - `approvals` lists pending requests by default; `--all` adds the decided ones.
-- `show` prints what would be sent, masked: the service, operation, amount,
-  headers and body (the first 2000 characters, plus the SHA-256 of the whole
-  body). `--full` prints the whole masked body. `--json` always has the whole
+- `show` prints what would be sent, masked: the service, operation, the
+  environment it was asked under (it is sent under that one or not at all),
+  amount, headers and body (the first 2000 characters, plus the SHA-256 of
+  the whole body). `--full` prints the whole masked body. `--json` always has the whole
   masked body (`--full` changes only the text output).
 - `approve` of a request whose body is over 1 MiB and was shown cut is refused
   unless you pass `--accept-truncated`: you decide on a body you have not seen

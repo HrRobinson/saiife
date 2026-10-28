@@ -823,6 +823,76 @@ fn show_prints_the_scope_of_a_command_request() {
     assert!(v.get("grant_key").is_none(), "{v}");
 }
 
+/// A connector request asked under an environment names it: `approvals
+/// show` on its own line, the list after the operation, `--json` as
+/// `env`. One with no environment shows none.
+#[test]
+fn show_and_list_print_the_env_of_a_connector_request() {
+    use saiife_daemon::approvals::{ApprovalType, NewRequest, SendDisplay};
+    let w = world();
+    let new = |env: Option<&str>| NewRequest {
+        uid: own_uid(),
+        user: own_user(),
+        session: None,
+        agent: "claude".into(),
+        project: "/srv/shop".into(),
+        kind: ApprovalType::Connector,
+        service: Some("erp".into()),
+        operation: Some("invoices.create".into()),
+        capability: Some("invoices:write".into()),
+        params: Default::default(),
+        input: None,
+        grant_key: None,
+        scope: None,
+        ask_rule: None,
+        send: SendDisplay {
+            env: env.map(str::to_string),
+            ..Default::default()
+        },
+    };
+    let store = w.ctx.approvals.as_ref().unwrap();
+    let create = |n| {
+        store
+            .create(
+                n,
+                |_| Ok(None),
+                Duration::from_secs(600),
+                std::time::SystemTime::now(),
+            )
+            .unwrap()
+    };
+    let with = create(new(Some("prod")));
+    let without = create(new(None));
+    assert_eq!(
+        saiife_daemon::approvals::offhost_summary(&with),
+        "erp invoices.create (env prod)"
+    );
+    assert_eq!(
+        saiife_daemon::approvals::offhost_summary(&without),
+        "erp invoices.create"
+    );
+
+    let out = stdout(&w.cli("approvals", &["show", &with.id.to_string()]));
+    assert!(out.contains("  env        prod\n"), "{out}");
+    let out = stdout(&w.cli("approvals", &["show", &without.id.to_string()]));
+    assert!(!out.contains("  env "), "{out}");
+    let v = json_out(&w.cli("approvals", &["show", &with.id.to_string(), "--json"]));
+    assert_eq!(v["env"], "prod", "{v}");
+
+    let out = stdout(&w.cli("approvals", &[]));
+    let line = |id: u64| {
+        out.lines()
+            .find(|l| l.split_whitespace().next() == Some(&id.to_string()))
+            .unwrap_or_else(|| panic!("{out}"))
+            .to_string()
+    };
+    assert!(
+        line(with.id).contains("erp invoices.create (env prod)"),
+        "{out}"
+    );
+    assert!(!line(without.id).contains("(env"), "{out}");
+}
+
 #[test]
 fn show_warns_when_the_full_body_was_cut() {
     let w = world();
