@@ -857,6 +857,14 @@ Built (plan 14):
   flow in this version.
 - The Sentry token mask shape is `sntry[su]_` (the real prefixes are
   `sntrys_` and `sntryu_`).
+- `saiife run --secret` refuses an oauth2 secret (`run_not_allowed`): it is
+  for connectors only, and its refresh token never leaves the daemon.
+- New mask shapes for the wave 2 and 3 services: Stripe `sk_`/`rk_` and
+  `whsec_`, Slack `xox*-`, `xoxe`, `xapp-` and webhook URLs, Discord bot
+  tokens and webhook URLs, Linear, Sentry, GitLab `gl*-`, Salesforce session
+  ids, Intercom, Airtable `pat…` and WooCommerce `ck_`/`cs_`. A webhook URL
+  keeps its host path and masks the rest; a token glued to other text is
+  masked too.
 - `policy check` accepts a concrete qualifier rule such as
   `messages:read:channel=C0123` for an operation whose qualifier is a
   template (`channel={channel}`): a `{placeholder}` counts as a wildcard when
@@ -1072,6 +1080,26 @@ Built (plan 14):
 - In developer and personal-broker mode an environment changes connector
   calls only; its guard packs apply in locked mode. A developer-mode `policy
   show` prints a line saying it does not reflect the project env.
+- A well-formed project `env` that no environment defines falls back to the
+  base config with a warning in developer and personal-broker mode; locked
+  mode ignores the project `env`.
+- `status` and `policy show` print each environment's policy hash beside the
+  base one (`policy show`: a non-admin sees only their own environment's).
+- The managed hook applies the scope environment. It looks up the caller's
+  groups only when some scope binds an `env`: `/etc/group` when the user is
+  local and `nsswitch.conf` takes groups from `files` alone, else NSS. A
+  failed lookup is a recorded `error_denied` with policy `unavailable`.
+  `env list` and the daemon's `policy.show` treat a failed group lookup as
+  an error, never as "no environment", and the daemon does not cache a
+  failed lookup.
+- An approved request is sent under the environment it was asked under or
+  not at all (`send_failed`, `env_changed`): in locked mode the scope's
+  environment at send must be the stored one, in developer mode the stored
+  one must still be defined. A request stored with no environment is not
+  checked. Approvers see the environment in `approvals show`, the list and
+  the notification summary.
+- `env --system-config <file>` means locked mode, as plan 16's flag does
+  everywhere: a file without `locked = true` is refused.
 - In personal-broker mode the HTTP gateway socket uses the base config, not
   the project env: only `saiife api` sends the project's `env`, so agents
   should use it. Binding an environment to an `api.token` is a later item.
