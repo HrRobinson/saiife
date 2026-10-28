@@ -1,38 +1,55 @@
-//! OAuth2 access tokens (plan 14, decision 8): refreshed by the daemon from
-//! the vault's refresh token and kept in memory only, never on disk, in a
-//! record, a log line or `Debug` output.
+//! The credentials the daemon holds for connector calls, in memory only,
+//! never on disk, in a record, a log line or `Debug` output: OAuth2 access
+//! tokens (plan 14, decision 8), and the cloud tokens and assumed-role
+//! session credentials of plan 15 (decision 7). One cache, keyed by
+//! `(secret, scope)`: the scope is `""` for oauth2, the manifest's `scope`
+//! for `gcp_sa` and `azure_sp`, and `sts:<role_arn>` for a role that sign
+//! mode assumes (decision 8). AWS keys used as they are come from the vault
+//! on every call and are not cached.
 //!
-//! - A token is refreshed on first use, when it is older than its
-//!   `expires_in` (15 min when absent) minus 60 s, and when the pipeline
-//!   asks with `force` after an upstream 401.
-//! - Refreshes are single-flight per secret: one `tokio` mutex per secret,
-//!   held across the refresh, so concurrent cold calls share one.
-//! - A rotated refresh token is written to the vault before the new access
-//!   token is used. When that write fails, both stay in memory, the call is
-//!   denied `vault_unavailable`, and the next call writes it again first.
-//! - A failed refresh starts a backoff: for [`BACKOFF_FIRST`], doubled with
-//!   each failure up to [`BACKOFF_MAX`], calls get the stored failure and no
-//!   token POST is made. A success or [`TokenCache::forget`] ends it.
-//! - A failure is a `secret`/`refresh_failed` record (name, service, reason;
-//!   never a body), one per backoff window, and a `refresh_failed`
+//! - A credential is fetched on first use, and again when it is older than
+//!   its lifetime (`expires_in`, 15 min when absent; the STS expiry) minus
+//!   60 s. An oauth2 token is also refreshed when the pipeline asks with
+//!   `force` after an upstream 401.
+//! - Fetches are single-flight per `(secret, scope)`: one `tokio` mutex per
+//!   key, held across the fetch, so concurrent cold calls share one.
+//! - oauth2: a rotated refresh token is written to the vault before the new
+//!   access token is used. When that write fails, both stay in memory, the
+//!   call is denied `vault_unavailable`, and the next call writes it again
+//!   first.
+//! - oauth2: a failed refresh starts a backoff: for [`BACKOFF_FIRST`],
+//!   doubled with each failure up to [`BACKOFF_MAX`], calls get the stored
+//!   failure and no token POST is made. A success or [`TokenCache::forget`]
+//!   ends it.
+//! - Cloud: a failed mint or assume is never cached: the next call tries
+//!   again. The call is denied `token_mint_failed`.
+//! - A failure is a `secret`/`refresh_failed` record (name, service,
+//!   reason; never a body or an error description), one per oauth2 backoff
+//!   window and one per failed cloud mint, and a `refresh_failed`
 //!   notification, at most once per secret per hour.
-//! - A refresh (POST, parse, persist) runs as its own task holding the
-//!   secret's lock, so a caller that goes away does not cut it short, and
-//!   shutdown waits for it ([`TokenCache::drain`]). A rotated refresh token
-//!   that still cannot be written is lost when the daemon stops; the
-//!   recovery is `saiife secret rotate` with a freshly issued token.
+//! - A fetch (POST, parse, persist) runs as its own task holding the key's
+//!   lock, so a caller that goes away does not cut it short, and shutdown
+//!   waits for it ([`TokenCache::drain`]). A rotated refresh token that
+//!   still cannot be written is lost when the daemon stops; the recovery is
+//!   `saiife secret rotate` with a freshly issued token.
 //!
-//! Plan 15 moves this behind a general credential hook; this module keeps
-//! to the one cache and the one entry point ([`access_token`]).
+//! The single entry point is [`credential`], behind the pipeline's
+//! `Env::credential`.
 
 use crate::ops::Ctx;
 use crate::vault::{Kind, VaultState};
+use saiife_broker::cloud::sigv4::AwsCreds;
+use saiife_broker::cloud::{jwt, sts, token, CloudError};
 use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::oauth2::{self, RefreshError};
+use saiife_broker::pipeline::Cred;
+use saiife_broker::upstream::Upstream;
+use saiife_policy::ServiceCfg;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 /// At most one `refresh_failed` notification per secret this often.
@@ -44,11 +61,18 @@ pub const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// How long shutdown waits for the refreshes in flight.
 pub const DRAIN: Duration = Duration::from_secs(5);
+/// The lifetime of a role sign mode assumes (decision 8).
+pub const SIGN_ROLE_SECONDS: u32 = 3600;
+/// The deny rule of a failed cloud mint or assume.
+pub const MINT_FAILED: &str = "token_mint_failed";
 
-/// The access tokens of the `oauth2` secrets in use, by secret name.
+/// One cache entry's key: the secret's name and the scope.
+type Key = (String, String);
+
+/// The credentials in use, by `(secret, scope)`.
 #[derive(Default)]
 pub struct TokenCache {
-    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Slot>>>>,
+    slots: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<Slot>>>>,
     notified: Mutex<HashMap<String, Instant>>,
     /// Refresh tasks running.
     in_flight: Arc<AtomicUsize>,
@@ -72,6 +96,7 @@ impl Drop for Flight {
 
 impl std::fmt::Debug for TokenCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Names and scopes only.
         f.debug_struct("TokenCache")
             .field("secrets", &lock(&self.slots).keys().collect::<Vec<_>>())
             .finish()
@@ -81,9 +106,10 @@ impl std::fmt::Debug for TokenCache {
 #[derive(Default)]
 struct Slot {
     cached: Option<Cached>,
-    /// A rotated refresh token the vault does not hold yet.
+    /// A rotated refresh token the vault does not hold yet (oauth2).
     pending_refresh: Option<Pending>,
-    /// The last refresh failed: when, why, and the backoff from then.
+    /// The last refresh failed: when, why, and the backoff from then
+    /// (oauth2; a failed cloud mint is never kept).
     failed: Option<(Instant, RefreshError, Duration)>,
 }
 
@@ -92,8 +118,10 @@ fn next_backoff(prev: Option<Duration>) -> Duration {
     prev.map_or(BACKOFF_FIRST, |d| d.saturating_mul(2).min(BACKOFF_MAX))
 }
 
+/// A credential and when it was obtained; due at `ttl` minus 60 s
+/// ([`oauth2::due`]).
 struct Cached {
-    access: Zeroizing<String>,
+    cred: Arc<Cred>,
     obtained: Instant,
     ttl: Duration,
 }
@@ -104,24 +132,29 @@ struct Pending {
     new: Zeroizing<String>,
 }
 
-/// What a call needs a token for.
+/// What a call needs a credential for. Everything here is the manifest's
+/// or the admin's: no agent input picks a scope, a role or an endpoint.
 pub struct Want<'a> {
     pub secret: &'a str,
     pub service: &'a str,
     pub spec: &'a AuthSpec,
     pub manifest: &'a Manifest,
-    pub svc_params: &'a BTreeMap<String, String>,
+    pub svc: &'a ServiceCfg,
     /// Refresh even when the cached token looks fresh (after a 401),
     /// unless another call refreshed it while this one waited.
     pub force: bool,
 }
 
-/// Why there is no token: the call's deny rule, and the `refresh_failed`
-/// reason when a refresh failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why there is no credential: the call's deny rule, and the
+/// `refresh_failed` reason when a refresh or a mint failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     pub rule: &'static str,
+    /// An oauth2 refresh failure.
     pub reason: Option<RefreshError>,
+    /// A cloud mint or assume failure (`endpoint:<code>`, `network`,
+    /// `bad_response`, `bad_key`).
+    pub mint: Option<String>,
     /// A failure of this call's own attempt, to be recorded; `false` for
     /// the stored failure returned during a backoff.
     pub fresh: bool,
@@ -135,6 +168,7 @@ fn plain(rule: &'static str) -> Failure {
     Failure {
         rule,
         reason: None,
+        mint: None,
         fresh: true,
     }
 }
@@ -147,7 +181,53 @@ fn refresh(e: RefreshError) -> Failure {
             "refresh_failed"
         },
         reason: Some(e),
+        mint: None,
         fresh: true,
+    }
+}
+
+/// The record reason of a failed mint or assume: the sanitized endpoint
+/// code only (decision 18), never a message.
+fn mint_reason(e: &CloudError) -> String {
+    match e {
+        CloudError::Endpoint { code } => format!("endpoint:{code}"),
+        CloudError::Transport(_) => "network".into(),
+        CloudError::Response(_) | CloudError::TooLarge => "bad_response".into(),
+        CloudError::Key(_) | CloudError::Unrepresentable { .. } => "bad_key".into(),
+    }
+}
+
+fn mint_failed(e: &CloudError) -> Failure {
+    Failure {
+        rule: MINT_FAILED,
+        reason: None,
+        mint: Some(mint_reason(e)),
+        fresh: true,
+    }
+}
+
+/// The vault kind that fills an auth entry the daemon holds or mints for.
+fn kind_for(auth_kind: &str) -> Option<Kind> {
+    match auth_kind {
+        "oauth2" => Some(Kind::OAuth2),
+        "aws_sigv4" => Some(Kind::Aws),
+        "gcp_sa" => Some(Kind::GcpSa),
+        "azure_sp" => Some(Kind::AzureSp),
+        _ => None,
+    }
+}
+
+/// The cache scope of `w` (decision 7), from the manifest and the service
+/// config only. `None`: AWS keys used as they are (not cached).
+fn scope_of(w: &Want<'_>) -> Result<Option<String>, Failure> {
+    match w.spec.kind.as_str() {
+        "oauth2" => Ok(Some(String::new())),
+        "gcp_sa" | "azure_sp" => match w.spec.scope.as_deref() {
+            Some(s) if !s.is_empty() => Ok(Some(s.to_string())),
+            _ => Err(plain("policy_invalid")),
+        },
+        "aws_sigv4" => Ok(w.svc.cloud.role_arn.as_ref().map(|a| format!("sts:{a}"))),
+        _ => Err(plain("secret_missing")),
     }
 }
 
@@ -156,17 +236,18 @@ struct Job {
     ctx: Arc<Ctx>,
     secret: String,
     service: String,
+    scope: String,
     spec: AuthSpec,
     manifest: Manifest,
-    svc_params: BTreeMap<String, String>,
+    svc: ServiceCfg,
     force: bool,
     asked: Instant,
 }
 
-/// The answer the slot gives without a refresh: the cached token while it
-/// is fresh, or the stored failure inside its backoff. `None` when a
-/// rotated refresh token waits to be written (that comes first).
-fn ready(s: &Slot, force: bool, asked: Instant) -> Option<Result<Zeroizing<String>, Failure>> {
+/// The answer the slot gives without a refresh: the cached credential
+/// while it is fresh, or the stored failure inside its backoff. `None`
+/// when a rotated refresh token waits to be written (that comes first).
+fn ready(s: &Slot, force: bool, asked: Instant) -> Option<Result<Arc<Cred>, Failure>> {
     if s.pending_refresh.is_some() {
         return None;
     }
@@ -175,7 +256,7 @@ fn ready(s: &Slot, force: bool, asked: Instant) -> Option<Result<Zeroizing<Strin
         // After a 401: a token another call got while this one waited is
         // new enough.
         if (!force && fresh) || (force && c.obtained > asked) {
-            return Some(Ok(c.access.clone()));
+            return Some(Ok(Arc::clone(&c.cred)));
         }
     }
     if let Some((at, e, window)) = s.failed {
@@ -196,16 +277,61 @@ fn warn_not_persisted(secret: &str) {
     );
 }
 
+/// The vault fields of `secret`: an entry of `kind` that serves `service`.
+fn vault_fields(
+    ctx: &Ctx,
+    secret: &str,
+    service: &str,
+    kind: Kind,
+) -> Result<BTreeMap<String, Zeroizing<String>>, Failure> {
+    let g = ctx.vault.lock();
+    let VaultState::Ready(v) = &*g else {
+        return Err(plain("vault_unavailable"));
+    };
+    let e = v.get(secret).ok_or(plain("secret_missing"))?;
+    if e.kind != kind {
+        return Err(plain("secret_missing"));
+    }
+    if !e.allowed_services.iter().any(|s| s == service) {
+        return Err(plain("secret_not_allowed_for_service"));
+    }
+    Ok(e.fields.clone())
+}
+
+/// The AWS keys of an `aws` secret's fields.
+fn aws_keys(fields: &BTreeMap<String, Zeroizing<String>>) -> Result<AwsCreds, Failure> {
+    let get = |n: &str| {
+        fields
+            .get(n)
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .ok_or(plain("secret_missing"))
+    };
+    Ok(AwsCreds {
+        access_key_id: get("access_key_id")?,
+        secret_access_key: get("secret_access_key")?,
+        session_token: fields
+            .get("session_token")
+            .filter(|v| !v.is_empty())
+            .cloned(),
+    })
+}
+
 impl TokenCache {
-    fn slot(&self, secret: &str) -> Arc<tokio::sync::Mutex<Slot>> {
-        Arc::clone(lock(&self.slots).entry(secret.to_string()).or_default())
+    fn slot(&self, secret: &str, scope: &str) -> Arc<tokio::sync::Mutex<Slot>> {
+        Arc::clone(
+            lock(&self.slots)
+                .entry((secret.to_string(), scope.to_string()))
+                .or_default(),
+        )
     }
 
-    /// Drops what is held for `secret` (`secret rotate`/`remove`), its
-    /// backoff included. A refresh in flight finishes on the dropped entry;
-    /// it never writes over the new vault value (see [`persist`]).
+    /// Drops what is held for `secret` (`secret rotate`/`remove`), in every
+    /// scope, its backoff included. A refresh in flight finishes on the
+    /// dropped entry; it never writes over the new vault value (see
+    /// [`persist`]).
     pub fn forget(&self, secret: &str) {
-        lock(&self.slots).remove(secret);
+        lock(&self.slots).retain(|(s, _), _| s != secret);
     }
 
     /// Refresh tasks running now.
@@ -238,12 +364,17 @@ impl TokenCache {
         }
     }
 
-    /// The access token for `w`: the cached one while it is fresh, the
-    /// stored failure during a backoff, else a refresh (one at a time per
-    /// secret, in its own task).
-    pub async fn token(&self, ctx: &Arc<Ctx>, w: &Want<'_>) -> Result<Zeroizing<String>, Failure> {
+    /// The credential for `w`: the cached one while it is fresh, the
+    /// stored failure during an oauth2 backoff, else a refresh or mint (one
+    /// at a time per `(secret, scope)`, in its own task). AWS keys used as
+    /// they are come from the vault.
+    pub async fn get(&self, ctx: &Arc<Ctx>, w: &Want<'_>) -> Result<Arc<Cred>, Failure> {
+        let Some(scope) = scope_of(w)? else {
+            let fields = vault_fields(ctx, w.secret, w.service, Kind::Aws)?;
+            return Ok(Arc::new(Cred::Aws(aws_keys(&fields)?)));
+        };
         let asked = Instant::now();
-        let s = self.slot(w.secret).lock_owned().await;
+        let s = self.slot(w.secret, &scope).lock_owned().await;
         if let Some(r) = ready(&s, w.force, asked) {
             return r;
         }
@@ -251,9 +382,10 @@ impl TokenCache {
             ctx: Arc::clone(ctx),
             secret: w.secret.to_string(),
             service: w.service.to_string(),
+            scope,
             spec: w.spec.clone(),
             manifest: w.manifest.clone(),
-            svc_params: w.svc_params.clone(),
+            svc: w.svc.clone(),
             force: w.force,
             asked,
         };
@@ -262,7 +394,11 @@ impl TokenCache {
         let flight = Flight::enter(&self.in_flight);
         tokio::spawn(async move {
             let _flight = flight;
-            job.run(s).await
+            if job.spec.kind == "oauth2" {
+                job.run(s).await
+            } else {
+                job.mint(s).await
+            }
         })
         .await
         .unwrap_or_else(|_| Err(plain("vault_unavailable")))
@@ -270,10 +406,8 @@ impl TokenCache {
 }
 
 impl Job {
-    async fn run(
-        self,
-        mut s: tokio::sync::OwnedMutexGuard<Slot>,
-    ) -> Result<Zeroizing<String>, Failure> {
+    /// An oauth2 refresh (plan 14).
+    async fn run(self, mut s: tokio::sync::OwnedMutexGuard<Slot>) -> Result<Arc<Cred>, Failure> {
         let ctx = &self.ctx;
         // A rotated refresh token the vault does not hold yet goes there
         // first: until it does, no token from that refresh is used.
@@ -295,12 +429,12 @@ impl Job {
         }
         s.cached = None;
 
-        let fields = self.read_fields()?;
+        let fields = vault_fields(ctx, &self.secret, &self.service, Kind::OAuth2)?;
         let used = fields
             .get("refresh_token")
             .cloned()
             .ok_or(plain("secret_missing"))?;
-        let built = oauth2::token_request(&self.spec, &self.manifest, &self.svc_params, &fields)
+        let built = oauth2::token_request(&self.spec, &self.manifest, &self.svc.params, &fields)
             .map_err(|_| plain("policy_invalid"))?;
         drop(fields);
         if self.ctx.upstream.is_err() {
@@ -317,8 +451,9 @@ impl Job {
                 return Err(refresh(e));
             }
         };
+        let cred = Arc::new(Cred::Bearer(tok.access));
         s.cached = Some(Cached {
-            access: tok.access.clone(),
+            cred: Arc::clone(&cred),
             obtained: Instant::now(),
             ttl: tok.ttl,
         });
@@ -342,7 +477,7 @@ impl Job {
                 }
             }
         }
-        Ok(tok.access)
+        Ok(cred)
     }
 
     /// Sends the token request and parses the answer.
@@ -369,21 +504,98 @@ impl Job {
         oauth2::parse_token(&resp.body, &host, oauth2::instance_required(&self.manifest))
     }
 
-    /// The vault fields of the call's secret: an `oauth2` secret that
-    /// serves the service.
-    fn read_fields(&self) -> Result<BTreeMap<String, Zeroizing<String>>, Failure> {
-        let g = self.ctx.vault.lock();
-        let VaultState::Ready(v) = &*g else {
-            return Err(plain("vault_unavailable"));
+    /// A cloud mint (GCP, Azure) or a sign-mode `AssumeRole` (AWS). A
+    /// failure is not kept: the next call tries again.
+    async fn mint(self, mut s: tokio::sync::OwnedMutexGuard<Slot>) -> Result<Arc<Cred>, Failure> {
+        if let Some(r) = ready(&s, false, self.asked) {
+            return r;
+        }
+        s.cached = None;
+        let kind = kind_for(&self.spec.kind).ok_or(plain("secret_missing"))?;
+        let fields = vault_fields(&self.ctx, &self.secret, &self.service, kind)?;
+        let up = self
+            .ctx
+            .upstream
+            .as_ref()
+            .map_err(|_| plain("upstream_unavailable"))?;
+        let now = OffsetDateTime::now_utc();
+        let got = match kind {
+            Kind::GcpSa => self.gcp(up, &fields, now).await,
+            Kind::AzureSp => self.azure(up, &fields).await,
+            Kind::Aws => self.assume(up, aws_keys(&fields)?, now).await?,
+            _ => return Err(plain("secret_missing")),
         };
-        let e = v.get(&self.secret).ok_or(plain("secret_missing"))?;
-        if e.kind != Kind::OAuth2 {
-            return Err(plain("secret_missing"));
-        }
-        if !e.allowed_services.contains(&self.service) {
-            return Err(plain("secret_not_allowed_for_service"));
-        }
-        Ok(e.fields.clone())
+        drop(fields);
+        let (cred, ttl) = got.map_err(|e| mint_failed(&e))?;
+        let cred = Arc::new(cred);
+        s.cached = Some(Cached {
+            cred: Arc::clone(&cred),
+            obtained: Instant::now(),
+            ttl,
+        });
+        Ok(cred)
+    }
+
+    async fn gcp(
+        &self,
+        up: &Upstream,
+        fields: &BTreeMap<String, Zeroizing<String>>,
+        now: OffsetDateTime,
+    ) -> Result<(Cred, Duration), CloudError> {
+        let key = jwt::parse_gcp_key(fields)?;
+        let req = token::gcp_request(&key, &self.scope, now)?;
+        drop(key);
+        let t = token::mint(up, req).await?;
+        Ok((Cred::Bearer(t.access), t.ttl))
+    }
+
+    async fn azure(
+        &self,
+        up: &Upstream,
+        fields: &BTreeMap<String, Zeroizing<String>>,
+    ) -> Result<(Cred, Duration), CloudError> {
+        let req = token::azure_request(
+            fields,
+            self.svc.cloud.authority_host.as_deref(),
+            &self.scope,
+        )?;
+        let t = token::mint(up, req).await?;
+        Ok((Cred::Bearer(t.access), t.ttl))
+    }
+
+    /// Sign mode with `role_arn` (decision 8): `AssumeRole` with the vault
+    /// keys, for [`SIGN_ROLE_SECONDS`], without a session policy, in the
+    /// service's region.
+    async fn assume(
+        &self,
+        up: &Upstream,
+        base: AwsCreds,
+        now: OffsetDateTime,
+    ) -> Result<Result<(Cred, Duration), CloudError>, Failure> {
+        let region = self
+            .svc
+            .params
+            .get("region")
+            .ok_or(plain("policy_invalid"))?;
+        let role_arn = self
+            .svc
+            .cloud
+            .role_arn
+            .as_deref()
+            .ok_or(plain("policy_invalid"))?;
+        let p = sts::AssumeRole {
+            role_arn,
+            session_name: sts::session_name(self.ctx.own_uid),
+            duration_s: SIGN_ROLE_SECONDS,
+            policy: None,
+            external_id: self.svc.cloud.external_id.as_deref(),
+        };
+        Ok(sts::assume(up, &base, region, &p, now)
+            .await
+            .map(|(creds, exp)| {
+                let ttl = Duration::try_from(exp - now).unwrap_or(Duration::ZERO);
+                (Cred::Aws(creds), ttl)
+            }))
     }
 }
 
@@ -429,28 +641,31 @@ async fn persist(
     .map_err(|_| ())?
 }
 
-/// [`TokenCache::token`] for a connector call, with the failure recorded
+/// [`TokenCache::get`] for a connector call, with the failure recorded
 /// (`secret`/`refresh_failed`) and notified (at most once per secret per
 /// hour). The deny rule on failure.
-pub async fn access_token(ctx: &Arc<Ctx>, w: Want<'_>) -> Result<Zeroizing<String>, &'static str> {
-    match ctx.oauth.token(ctx, &w).await {
-        Ok(t) => Ok(t),
+pub async fn credential(ctx: &Arc<Ctx>, w: Want<'_>) -> Result<Arc<Cred>, &'static str> {
+    match ctx.oauth.get(ctx, &w).await {
+        Ok(c) => Ok(c),
         Err(f) => {
             // One record per failed attempt; none for the stored failure
             // returned during its backoff.
-            if let (Some(e), true) = (f.reason, f.fresh) {
-                refresh_failed(ctx, &w, e).await;
+            if f.fresh {
+                if let Some(e) = f.reason {
+                    refresh_failed(ctx, &w, "oauth2 refresh failed", e.reason()).await;
+                } else if let Some(reason) = f.mint {
+                    refresh_failed(ctx, &w, "cloud credential mint failed", reason).await;
+                }
             }
             Err(f.rule)
         }
     }
 }
 
-async fn refresh_failed(ctx: &Arc<Ctx>, w: &Want<'_>, e: RefreshError) {
-    let reason = e.reason();
+async fn refresh_failed(ctx: &Arc<Ctx>, w: &Want<'_>, what: &str, reason: String) {
     let mut r = ctx.record("secret", &format!("refresh_failed {}", w.secret));
     r.decision = saiife_audit::DecisionKind::Deny;
-    r.reason = Some(format!("oauth2 refresh failed: {reason}"));
+    r.reason = Some(format!("{what}: {reason}"));
     r.extra.insert("event".into(), "refresh_failed".into());
     r.extra.insert("name".into(), w.secret.into());
     r.extra.insert("service".into(), w.service.into());
@@ -466,10 +681,7 @@ async fn refresh_failed(ctx: &Arc<Ctx>, w: &Want<'_>, e: RefreshError) {
             operation: None,
             uid: None,
             host: crate::signals::hostname(),
-            summary: crate::signals::clean(&format!(
-                "oauth2 refresh failed for secret {} ({reason})",
-                w.secret
-            )),
+            summary: crate::signals::clean(&format!("{what} for secret {} ({reason})", w.secret)),
             reason: Some(reason),
         });
     }
@@ -528,5 +740,39 @@ mod tests {
             Duration::from_secs(60),
         ));
         assert!(ready(&s, false, now).is_none());
+    }
+
+    #[test]
+    fn mint_reasons_hold_codes_only() {
+        let e = CloudError::Endpoint {
+            code: "invalid_grant".into(),
+        };
+        assert_eq!(mint_reason(&e), "endpoint:invalid_grant");
+        assert_eq!(
+            mint_reason(&CloudError::Response("a message".into())),
+            "bad_response"
+        );
+        assert_eq!(mint_reason(&CloudError::TooLarge), "bad_response");
+        assert_eq!(
+            mint_reason(&CloudError::Transport(
+                saiife_broker::BrokerError::RedirectRefused
+            )),
+            "network"
+        );
+        assert_eq!(mint_reason(&CloudError::Key("x".into())), "bad_key");
+        let f = mint_failed(&e);
+        assert_eq!(f.rule, MINT_FAILED);
+        assert!(f.reason.is_none() && f.fresh);
+    }
+
+    #[test]
+    fn forget_drops_every_scope_of_the_secret() {
+        let c = TokenCache::default();
+        let _ = c.slot("g", "https://a/.default");
+        let _ = c.slot("g", "https://b/.default");
+        let _ = c.slot("other", "");
+        c.forget("g");
+        let keys: Vec<Key> = lock(&c.slots).keys().cloned().collect();
+        assert_eq!(keys, vec![("other".to_string(), String::new())]);
     }
 }

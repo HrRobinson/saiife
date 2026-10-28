@@ -318,7 +318,8 @@ pub struct Ctx {
     pub upstream: Result<Upstream, String>,
     /// At most 4 upstream calls in flight per service.
     pub pools: Pools,
-    /// OAuth2 access tokens, in memory only (plan 14, Task 7).
+    /// OAuth2 access tokens and minted cloud credentials, by (secret,
+    /// scope), in memory only (plan 14 Task 7, plan 15 Task 9).
     pub oauth: crate::oauth::TokenCache,
     /// Where `secret.add` keeps the backups of imported files.
     pub backup_dir: PathBuf,

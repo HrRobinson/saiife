@@ -12,7 +12,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::pipeline::{
-    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, TokenFuture,
+    self, ApprovalFuture, Call, CredFuture, Env, OpRef, Outcome, PendingCall, PolicySnapshot,
     Trace, Via,
 };
 use saiife_broker::request::AuthMaterial;
@@ -20,7 +20,8 @@ use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request, OP_API_LIST, OP_API_RESULT};
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceOverlay, SystemConfig, UserEntry,
+    scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceCfg, ServiceOverlay, SystemConfig,
+    UserEntry,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -76,7 +77,9 @@ pub(crate) struct DaemonEnv<'a> {
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
 /// bearer, a header or a `basic_token` reading `token`, `header` one reading
-/// `value`, `oauth2` the oauth2 one (its access token from daemon memory).
+/// `value`, `oauth2` the oauth2 one (its access token from daemon memory),
+/// and each cloud kind its own entry (signed or minted by the daemon at
+/// step 9): `aws` `aws_sigv4`, `gcp_sa` `gcp_sa`, `azure_sp` `azure_sp`.
 fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     auth.iter().find(|a| match kind {
         Kind::Basic => a.kind == "basic",
@@ -86,8 +89,9 @@ fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
         }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
         Kind::OAuth2 => a.kind == "oauth2",
-        // Signed or minted by the daemon itself (Task 9 wires the cloud auth).
-        Kind::Aws | Kind::GcpSa | Kind::AzureSp => false,
+        Kind::Aws => a.kind == "aws_sigv4",
+        Kind::GcpSa => a.kind == "gcp_sa",
+        Kind::AzureSp => a.kind == "azure_sp",
     })
 }
 
@@ -195,23 +199,23 @@ impl Env for DaemonEnv<'_> {
         Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
     }
 
-    fn oauth_token<'b>(
+    fn credential<'b>(
         &'b self,
         secret: &'b str,
         service: &'b str,
         spec: &'b AuthSpec,
         m: &'b Manifest,
-        svc_params: &'b BTreeMap<String, String>,
+        svc: &'b ServiceCfg,
         force: bool,
-    ) -> TokenFuture<'b> {
-        Box::pin(crate::oauth::access_token(
+    ) -> CredFuture<'b> {
+        Box::pin(crate::oauth::credential(
             self.ctx,
             crate::oauth::Want {
                 secret,
                 service,
                 spec,
                 manifest: m,
-                svc_params,
+                svc,
                 force,
             },
         ))
@@ -995,6 +999,20 @@ mod tests {
         assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));
         assert_eq!(spec_for(Kind::Token, &o), None);
         assert_eq!(spec_for(Kind::OAuth2, &both), None);
+        // Each cloud kind serves its own auth entry only.
+        let cloud = |kind: &str| AuthSpec {
+            kind: kind.into(),
+            ..oauth.clone()
+        };
+        let (aws, gcp, az) = (cloud("aws_sigv4"), cloud("gcp_sa"), cloud("azure_sp"));
+        let all = [aws.clone(), gcp.clone(), az.clone(), oauth.clone()];
+        assert_eq!(spec_for(Kind::Aws, &all), Some(&aws));
+        assert_eq!(spec_for(Kind::GcpSa, &all), Some(&gcp));
+        assert_eq!(spec_for(Kind::AzureSp, &all), Some(&az));
+        assert_eq!(spec_for(Kind::Aws, &[gcp.clone(), az.clone()]), None);
+        assert_eq!(spec_for(Kind::GcpSa, &[aws.clone(), az.clone()]), None);
+        assert_eq!(spec_for(Kind::AzureSp, &[aws.clone(), gcp.clone()]), None);
+        assert_eq!(spec_for(Kind::Token, &all), None);
     }
 
     #[test]

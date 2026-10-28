@@ -20,8 +20,8 @@ use saiife_broker::manifest::{builtin, qualifier_for, AuthSpec, Manifest, OpKind
 use saiife_broker::oauth2;
 use saiife_broker::params::validate;
 use saiife_broker::pipeline::{
-    record, run, ApprovalFuture, Call, Env, Lockdown, OpRef, Outcome, PendingCall, PolicySnapshot,
-    Pools, TokenFuture, Via,
+    record, run, ApprovalFuture, Call, Cred, CredFuture, Env, Lockdown, OpRef, Outcome,
+    PendingCall, PolicySnapshot, Pools, Via,
 };
 use saiife_broker::request::{build, AuthMaterial, Built};
 use saiife_broker::resolve::{named, proxy};
@@ -843,20 +843,21 @@ impl Env for SfEnv<'_> {
     fn create_approval<'b>(&'b self, _p: &'b PendingCall) -> ApprovalFuture<'b> {
         Box::pin(async { Err("approvals_unavailable".to_string()) })
     }
-    fn oauth_token<'b>(
+    fn credential<'b>(
         &'b self,
         _secret: &'b str,
         _service: &'b str,
         spec: &'b AuthSpec,
         m: &'b Manifest,
-        svc_params: &'b BTreeMap<String, String>,
+        svc: &'b ServiceCfg,
         force: bool,
-    ) -> TokenFuture<'b> {
+    ) -> CredFuture<'b> {
+        let svc_params = &svc.params;
         Box::pin(async move {
             let mut cached = self.cache.lock().await;
             if !force {
                 if let Some(t) = cached.as_ref() {
-                    return Ok(t.clone());
+                    return Ok(Arc::new(Cred::Bearer(t.clone())));
                 }
             }
             *cached = None;
@@ -878,7 +879,7 @@ impl Env for SfEnv<'_> {
                 self.vault.lock().unwrap().insert("refresh_token".into(), r);
             }
             *cached = Some(tok.access.clone());
-            Ok(tok.access)
+            Ok(Arc::new(Cred::Bearer(tok.access)))
         })
     }
 }

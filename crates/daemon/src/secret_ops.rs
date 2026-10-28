@@ -179,8 +179,10 @@ fn execute(ctx: &Ctx, uid: u32, req: Request) -> Result<Map<String, Value>, Refu
             ),
         ));
     }
-    // A rotated or removed secret's access token goes with it (decision 8):
-    // dropped under the writer, after the change.
+    // A rotated or removed secret's access token goes with it (plan 14
+    // decision 8), and so does every token or session it minted, in every
+    // scope (plan 15 decision 7): dropped under the writer, after the
+    // change.
     let forget = match &parsed {
         Parsed::Rotate { name, .. } | Parsed::Remove { name } => Some(name.clone()),
         _ => None,
