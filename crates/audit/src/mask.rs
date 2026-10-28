@@ -33,21 +33,24 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // prefix and mask the secret remainder.
         (
             concat!(
-                r"(?i:(hooks\.slack\.com/(?:services|triggers|workflows)/|discord(?:app)?\.com/api/(?:v\d+/)?webhooks/[0-9]+/))[A-Za-z0-9_/-]+",
+                r"(?i:(hooks\.slack(?:-gov)?\.com/(?:services|triggers|workflows)/|discord(?:app)?\.com/api/(?:v\d+/)?webhooks/[0-9]+/))[A-Za-z0-9_/-]+",
                 r"|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
                 r"|whsec_[A-Za-z0-9]{24,}",
-                r"|xox[abposr]-[A-Za-z0-9-]{10,}",
+                r"|xox[abcdeposr]-[A-Za-z0-9-]{10,}",
                 r"|xoxe(?:\.xox[a-z])?-[A-Za-z0-9-]{10,}",
                 r"|xapp-[A-Za-z0-9-]{10,}",
                 r"|lin_(?:api|oauth)_[A-Za-z0-9]{32,}",
                 r"|sntry[su]_[A-Za-z0-9+/=_-]{20,}",
-                r"|gl(?:pat|dt|ptt|rt|oas)-[A-Za-z0-9_-]{20,}",
-                r"|\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,38}",
+                r"|gl(?:pat|dt|ptt|rt|oas|cbt|imt|agent|soat|ft)-[A-Za-z0-9_.-]{20,}",
+                r"|[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,38}",
                 r"|00D[A-Za-z0-9]{12,15}![A-Za-z0-9._]{80,}",
                 r"|dG9rO[A-Za-z0-9+/=_-]{20,}",
                 r"|pat[A-Za-z0-9]{14}\.[a-f0-9]{64}",
                 r"|c[ks]_[a-f0-9]{40}",
             ),
+            // `${1}` keeps the webhook URL prefix. In every other branch group 1
+            // did not participate, so it expands to the empty string and the
+            // whole match becomes `[MASKED]`.
             "${1}[MASKED]",
         ),
     ]
@@ -438,6 +441,31 @@ mod tests {
         // JWT-like strings must stay untouched (they start with eyJ).
         let jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
         assert_eq!(mask(&jwt), jwt);
+    }
+
+    #[test]
+    fn glued_and_extra_shapes() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        let disc = format!("M{}.{}.{}", al('a', 25), al('b', 6), al('c', 30));
+        assert_eq!(mask(&format!("Bot%20{disc}")), "Bot%20[MASKED]");
+        assert_eq!(mask(&format!("x_{disc}")), "x_[MASKED]");
+        assert_eq!(mask(&format!("a\n{disc}")), "a\n[MASKED]");
+        for pre in [concat!("xo", "xc"), concat!("xo", "xd")] {
+            assert_eq!(mask(&format!("{pre}-{}", al('1', 12))), "[MASKED]");
+        }
+        let gl = |p: &str| format!("{p}-{}.01.{}", al('a', 12), al('z', 12));
+        for p in [
+            concat!("gl", "pat"),
+            concat!("gl", "cbt"),
+            concat!("gl", "imt"),
+            concat!("gl", "agent"),
+            concat!("gl", "soat"),
+            concat!("gl", "ft"),
+        ] {
+            assert_eq!(mask(&format!("t {}", gl(p))), "t [MASKED]", "{p}");
+        }
+        let gov = format!("https://hooks.slack-gov.com/services/T1/B2/{}", al('z', 24));
+        assert_eq!(mask(&gov), "https://hooks.slack-gov.com/services/[MASKED]");
     }
 
     #[test]
