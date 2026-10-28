@@ -122,7 +122,13 @@ pub struct ToolAnnotations {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A token that is not a valid id (a float, say) is dropped: the call
+    /// goes on without progress notifications.
+    #[serde(
+        default,
+        deserialize_with = "lenient_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub progress_token: Option<ProgressToken>,
 }
 
@@ -147,7 +153,12 @@ pub struct CallToolResult {
     pub is_error: bool,
 }
 
-/// One content item of a result.
+/// One content item of a result that saiife emits. Closed on purpose:
+/// `saiife mcp` only ever writes text and embedded resources. Results from
+/// third-party gateway servers are not read into this type; they are
+/// handled as `serde_json::Value` (plan 17, Tasks 6 and 7): text and
+/// resource strings are masked, image and audio items are replaced with a
+/// text placeholder, and resource_link strings are masked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Content {
@@ -168,6 +179,23 @@ pub struct ResourceContents {
     pub blob: Option<String>,
 }
 
+impl ResourceContents {
+    /// An embedded resource carries exactly one of `text` and `blob`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (&self.text, &self.blob) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, None) => Err("a resource has text or a blob"),
+            (Some(_), Some(_)) => Err("a resource has text or a blob, not both"),
+        }
+    }
+}
+
+/// Reads an optional id, dropping a value that is not a valid one.
+fn lenient_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Id>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(v.as_ref().and_then(Id::from_value))
+}
+
 /// `notifications/progress` params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,7 +212,14 @@ pub struct ProgressParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CancelledParams {
-    pub request_id: Id,
+    /// Missing or not a valid id: the cancel names no request and is
+    /// ignored.
+    #[serde(
+        default,
+        deserialize_with = "lenient_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

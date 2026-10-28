@@ -57,11 +57,15 @@ impl DecodeError {
     }
 }
 
-/// Decodes one line (without its `\n`; a trailing `\r` is ignored).
+/// Decodes one line (without its `\n`). One trailing `\r` is stripped,
+/// and only one: a line still ending in `\r` after that is refused.
 pub fn decode_line(line: &[u8], max: usize) -> Result<Message, DecodeError> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.len() > max {
         return Err(DecodeError::too_long(max));
+    }
+    if line.ends_with(b"\r") {
+        return Err(DecodeError::parse());
     }
     let v = parse_strict(line).ok_or_else(DecodeError::parse)?;
     Message::from_value(v)
@@ -166,6 +170,8 @@ pub struct LineReader<R: BufRead> {
     inner: R,
     max: usize,
     buf: Vec<u8>,
+    /// The rest of an over-cap line, already reported, is still unread.
+    draining: bool,
 }
 
 impl<R: BufRead> LineReader<R> {
@@ -174,35 +180,66 @@ impl<R: BufRead> LineReader<R> {
             inner,
             max,
             buf: Vec::new(),
+            draining: false,
         }
     }
 
     /// The next message: `Ok(None)` at end of input, `Ok(Some(Err(_)))`
-    /// for a line that is not a message (an over-cap line is `-32600`
-    /// and is skipped whole), `Err` for an I/O error.
+    /// for a line that is not a message, `Err` for an I/O error. An
+    /// over-cap line is reported (`-32600`) as soon as it crosses the cap;
+    /// the rest of it is skipped by the next call, before anything else.
     pub fn next_message(&mut self) -> io::Result<Option<Result<Message, DecodeError>>> {
         loop {
             match self.next_line()? {
                 None => return Ok(None),
                 Some(Err(e)) => return Ok(Some(Err(e))),
                 Some(Ok(())) => {
-                    let line = self.buf.strip_suffix(b"\r").unwrap_or(&self.buf);
-                    if line.is_empty() {
+                    // Blank lines are skipped; `decode_line` strips the
+                    // one `\r` of a CRLF line itself.
+                    if self.buf.is_empty() || self.buf == b"\r" {
                         continue;
                     }
-                    return Ok(Some(decode_line(line, self.max)));
+                    return Ok(Some(decode_line(&self.buf, self.max)));
                 }
             }
         }
     }
 
-    /// Reads one line into `self.buf` (without the `\n`). An over-cap
-    /// line is drained to its end and reported.
+    /// Skips the rest of an over-cap line. `false` at end of input.
+    fn drain(&mut self) -> io::Result<bool> {
+        while self.draining {
+            let chunk = match self.inner.fill_buf() {
+                Ok(c) => c,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if chunk.is_empty() {
+                self.draining = false;
+                return Ok(false);
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.inner.consume(i + 1);
+                    self.draining = false;
+                }
+                None => {
+                    let n = chunk.len();
+                    self.inner.consume(n);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reads one line into `self.buf` (without the `\n`), or reports an
+    /// over-cap line the moment it crosses the cap.
     fn next_line(&mut self) -> io::Result<Option<Result<(), DecodeError>>> {
         self.buf.clear();
+        if !self.drain()? {
+            return Ok(None);
+        }
         // One spare byte for a trailing `\r`.
         let cap = self.max.saturating_add(1);
-        let mut over = false;
         let mut read_any = false;
         loop {
             let chunk = match self.inner.fill_buf() {
@@ -215,31 +252,25 @@ impl<R: BufRead> LineReader<R> {
                 if !read_any {
                     return Ok(None);
                 }
-                break;
+                return Ok(Some(Ok(())));
             }
             read_any = true;
             let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
                 Some(i) => (i, true),
                 None => (chunk.len(), false),
             };
-            if !over {
-                if self.buf.len() + take > cap {
-                    over = true;
-                    self.buf.clear();
-                } else {
-                    self.buf.extend_from_slice(&chunk[..take]);
-                }
+            if take > cap - self.buf.len() {
+                self.buf.clear();
+                self.inner.consume(if done { take + 1 } else { take });
+                self.draining = !done;
+                return Ok(Some(Err(DecodeError::too_long(self.max))));
             }
+            self.buf.extend_from_slice(&chunk[..take]);
             self.inner.consume(if done { take + 1 } else { take });
             if done {
-                break;
+                return Ok(Some(Ok(())));
             }
         }
-        if over {
-            self.buf.clear();
-            return Ok(Some(Err(DecodeError::too_long(self.max))));
-        }
-        Ok(Some(Ok(())))
     }
 
     /// The underlying reader.
