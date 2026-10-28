@@ -1143,3 +1143,140 @@ fn saiife_result_after_approve() {
     assert_eq!(recs[0]["decision"], "ask");
     assert_eq!(recs.last().unwrap()["via"], "approval", "{recs:?}");
 }
+
+// ------------------------------------------------------ fix round edges
+
+const BAD_OP_TAIL: &str = r#"
+[[services.erp.operation]]
+id = "bad__op"
+capability = "invoices:read"
+kind = "read"
+method = "GET"
+path = "/bad"
+"#;
+
+fn loaded(d: &TestDaemon) -> usize {
+    d.of_kind("policy")
+        .into_iter()
+        .filter(|r| r["result"] == "loaded")
+        .count()
+}
+
+/// An unknown name re-lists at most once every 5 s; a listing warning is
+/// logged once however often the list is built.
+#[test]
+fn unknown_tool_relists_at_most_every_5s_and_warns_once() {
+    let w = world_with(
+        |p| policy(p, "\"erp\"", "", "\"invoices:read\"", BAD_OP_TAIL),
+        &["erp"],
+    );
+    let mut c = w.mcp(&[]);
+    // Not listed yet: the miss re-lists (and does not find it).
+    let t0 = std::time::Instant::now();
+    let a = c.request(
+        "tools/call",
+        json!({"name": "erp_reports_get", "arguments": {}}),
+    );
+    assert_eq!(rpc_code(&a), -32602, "{a}");
+    // The policy now allows it.
+    let before = loaded(&w.d);
+    w.d.write_config(&Opts {
+        extra: policy(
+            w.m.port,
+            "\"erp\"",
+            "",
+            "\"invoices:read\", \"reports:read\"",
+            BAD_OP_TAIL,
+        ),
+        ..Opts::default()
+    });
+    w.d.signal("HUP");
+    assert!(wait_for(Duration::from_secs(10), || loaded(&w.d) > before));
+    // Within 5 s of the last re-list: still unknown, no re-list.
+    let a = c.request(
+        "tools/call",
+        json!({"name": "erp_reports_get", "arguments": {}}),
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(4500),
+        "too slow to check the window"
+    );
+    assert_eq!(rpc_code(&a), -32602, "{a}");
+    // After it: re-listed, found, called.
+    std::thread::sleep(Duration::from_millis(5200).saturating_sub(t0.elapsed()));
+    let r = c.call("erp_reports_get", json!({}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(w.m.hits(), vec!["GET /api/reports"]);
+    // Built three times (two re-lists and this listing), warned once.
+    c.tool_names();
+    let e = c.stderr_text();
+    assert_eq!(e.matches("erp bad__op is not listed").count(), 1, "{e}");
+}
+
+/// A client that reuses an id: the older request finishing does not drop
+/// the newer one's cancel flag.
+#[test]
+fn reused_id_stays_cancellable() {
+    let w = world();
+    let mut c = w.mcp(&["--wait", "1h"]);
+    let a = c.send_request_id(
+        5,
+        "tools/call",
+        json!({"name": "erp_invoices_block", "arguments": {}}),
+    );
+    assert!(wait_for(Duration::from_secs(20), || !w.m.hits().is_empty()));
+    c.send_request_id(
+        5,
+        "tools/call",
+        json!({
+            "name": "erp_invoices_create",
+            "arguments": {"body": {"amount": 5}},
+            "_meta": {"progressToken": "b"},
+        }),
+    );
+    let first = c.next_notification(Duration::from_secs(30)).unwrap();
+    assert_eq!(first["params"]["progressToken"], "b");
+    // The older request #5 finishes.
+    w.m.release();
+    let done = c.answer_within(&a, Duration::from_secs(30)).unwrap();
+    assert!(texts(&done["result"]).contains("blocked"), "{done}");
+    // Cancelling #5 still reaches the newer request: its poll stops.
+    c.notify("notifications/cancelled", json!({"requestId": 5}));
+    std::thread::sleep(Duration::from_millis(300));
+    while c.next_notification(Duration::from_millis(50)).is_some() {}
+    assert!(c.next_notification(Duration::from_secs(3)).is_none());
+    assert!(c.answer_within(&a, Duration::from_millis(500)).is_none());
+}
+
+/// A list the daemon refuses (not unavailable) has its own message.
+#[test]
+fn refused_list_is_not_unavailable() {
+    let w = world();
+    let cfg = w.d.path().join("project/.saiife/config.toml");
+    fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    let many: Vec<String> = (0..300).map(|i| format!("\"r{i}:read\"")).collect();
+    fs::write(
+        &cfg,
+        format!(
+            "version = 2\n[services.erp]\ndeny = [{}]\n",
+            many.join(", ")
+        ),
+    )
+    .unwrap();
+    let mut c = w.mcp(&[]);
+    let a = c.request("tools/list", json!({}));
+    assert_eq!(rpc_code(&a), -32603, "{a}");
+    let m = a["error"]["message"].as_str().unwrap();
+    assert!(m.starts_with("saiife refused the tool list: "), "{m}");
+    assert!(m.contains("overlay too large"), "{m}");
+    let r = c.call("erp_invoices_list", json!({}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(
+        texts(&r).starts_with("saiife refused the tool list: "),
+        "{r}"
+    );
+    // The same server lists again once the project is fixed.
+    fs::remove_file(&cfg).unwrap();
+    assert!(c.tool_names().iter().any(|n| n == "erp_invoices_list"));
+    assert!(w.m.hits().is_empty());
+}

@@ -71,7 +71,7 @@ mod linux {
     use saiife_mcp::jsonrpc::{Id, Message, RpcError};
     use saiife_mcp::types as t;
     use serde_json::{json, Map, Value};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::io::Write as _;
     use std::process::ExitCode;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +94,9 @@ mod linux {
     /// The in-flight drain at end of input when the config cannot be
     /// read: the default upstream timeout (30 s) twice, plus 15 s.
     const DEFAULT_DRAIN: Duration = Duration::from_secs(75);
+    /// A call to a name not in the last listing re-lists at most this
+    /// often; between, the name is unknown (-32602).
+    const RELIST_EVERY: Duration = Duration::from_secs(5);
 
     /// What every thread shares.
     struct Shared {
@@ -107,8 +110,13 @@ mod linux {
         hash: Mutex<Option<String>>,
         /// The cancel flag of each request a worker has not answered yet.
         cancels: Mutex<HashMap<Id, Arc<AtomicBool>>>,
-        /// End of input: a `--wait` poll stops at once.
+        /// End of input: a `--wait` poll stops at once, and work not
+        /// started yet is answered without calling the daemon.
         closing: AtomicBool,
+        /// When an unknown tool name last caused a re-list.
+        relisted: Mutex<Option<Instant>>,
+        /// The listing warnings already logged (each is logged once).
+        warned: Mutex<HashSet<String>>,
     }
 
     impl Shared {
@@ -119,6 +127,18 @@ mod linux {
             let mut out = self.out.lock().unwrap_or_else(|p| p.into_inner());
             let _ = out.write_all(line.as_bytes());
             let _ = out.flush();
+        }
+
+        /// `m` on stderr, the first time only.
+        fn warn_once(&self, m: String) {
+            if self
+                .warned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(m.clone())
+            {
+                log(&m);
+            }
         }
     }
 
@@ -177,6 +197,8 @@ mod linux {
             hash: Mutex::new(None),
             cancels: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
+            relisted: Mutex::new(None),
+            warned: Mutex::new(HashSet::new()),
         });
         let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE);
         let rx = Arc::new(Mutex::new(rx));
@@ -325,9 +347,15 @@ mod linux {
                 }
             };
             if !job.cancel.load(Ordering::SeqCst) {
-                let answer = match job.work {
-                    Work::List => list_tools(sh, &mut conn).map(|(v, _)| v),
-                    Work::Call(p) => call(sh, &mut conn, p, &job.cancel),
+                let answer = if sh.closing.load(Ordering::SeqCst) {
+                    // Read before the end of input, not started: answered
+                    // without calling the daemon.
+                    not_started(&job.work)
+                } else {
+                    match job.work {
+                        Work::List => list_tools(sh, &mut conn).map(|(v, _)| v),
+                        Work::Call(p) => call(sh, &mut conn, p, &job.cancel),
+                    }
                 };
                 // A cancelled request is not answered (MCP).
                 if !job.cancel.load(Ordering::SeqCst) {
@@ -337,10 +365,28 @@ mod linux {
                     });
                 }
             }
-            sh.cancels
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&job.id);
+            forget(&sh.cancels, &job.id, &job.cancel);
+        }
+    }
+
+    /// The answer to work taken after the end of input.
+    fn not_started(w: &Work) -> Result<Value, RpcError> {
+        const WHY: &str = "the input ended before this request started; it was not made";
+        match w {
+            Work::List => Err(RpcError::internal_error(format!(
+                "saiife unavailable: {WHY}"
+            ))),
+            Work::Call(_) => Ok(unavailable_result(WHY)),
+        }
+    }
+
+    /// Drops the cancel entry of `id`, but only when it is still this
+    /// job's own flag: a client may reuse an id, and the newer request's
+    /// flag must stay cancellable.
+    fn forget(cancels: &Mutex<HashMap<Id, Arc<AtomicBool>>>, id: &Id, flag: &Arc<AtomicBool>) {
+        let mut c = cancels.lock().unwrap_or_else(|p| p.into_inner());
+        if c.get(id).is_some_and(|f| Arc::ptr_eq(f, flag)) {
+            c.remove(id);
         }
     }
 
@@ -375,7 +421,9 @@ mod linux {
 
     /// `tools/list`: the answer, and the name map it was built from (also
     /// kept in `sh`, with the `tools_hash`). An unreachable daemon is
-    /// `-32603 saiife unavailable: <reason>`.
+    /// `-32603 saiife unavailable: <reason>`; a list the daemon refused
+    /// (a bad project overlay, say) is `-32603 saiife refused the tool
+    /// list: <reason>`, and the connection stays.
     fn list_tools(
         sh: &Shared,
         conn: &mut Option<Daemon>,
@@ -387,13 +435,19 @@ mod linux {
         };
         let ans = match ans {
             Ok(a) => a,
-            Err(Stop(_, m)) => {
+            Err(Stop(5, m)) => {
                 *conn = None;
                 return Err(unavailable(&m));
             }
+            Err(Stop(_, m)) => {
+                return Err(RpcError::internal_error(format!(
+                    "{REFUSED_LIST}{}",
+                    crate::text::sanitize(&m)
+                )))
+            }
         };
         api::env_warning(&ans);
-        let (tools, map) = build(&ans);
+        let (tools, map) = build(sh, &ans);
         *sh.tools.lock().unwrap_or_else(|p| p.into_inner()) = map.clone();
         if let Some(h) = ans.get("tools_hash").and_then(Value::as_str) {
             *sh.hash.lock().unwrap_or_else(|p| p.into_inner()) = Some(h.to_string());
@@ -409,7 +463,7 @@ mod linux {
     /// The tools of an `api.list` answer (decisions 5 and 6): the `allow`
     /// and `ask` operations, a name two operations share dropped for both,
     /// and `saiife_result` last.
-    fn build(ans: &Map<String, Value>) -> (Vec<t::Tool>, HashMap<String, ToolTarget>) {
+    fn build(sh: &Shared, ans: &Map<String, Value>) -> (Vec<t::Tool>, HashMap<String, ToolTarget>) {
         let mut seen: BTreeMap<String, Vec<(ToolTarget, t::Tool)>> = BTreeMap::new();
         let services = ans.get("services").and_then(Value::as_array);
         for s in services.into_iter().flatten() {
@@ -423,7 +477,7 @@ mod linux {
                 };
                 let id = s("id");
                 let Some(name) = tool_schema::tool_name(service, id) else {
-                    log(&format!(
+                    sh.warn_once(format!(
                         "{service} {id} is not listed: its tool name would be over {} chars, hold \"__\", a char outside [A-Za-z0-9_.-] or a reserved name",
                         tool_schema::MAX_TOOL_NAME
                     ));
@@ -434,7 +488,7 @@ mod linux {
                     Some("json") => Some(BodyArg::Json),
                     Some("text") => Some(BodyArg::Text),
                     Some(other) => {
-                        log(&format!(
+                        sh.warn_once(format!(
                             "{service} {id} is not listed: unknown body argument {other:?}"
                         ));
                         continue;
@@ -442,7 +496,7 @@ mod linux {
                 };
                 let schema = op["input_schema"].clone();
                 let Some(props) = schema.get("properties").and_then(Value::as_object) else {
-                    log(&format!("{service} {id} is not listed: no input schema"));
+                    sh.warn_once(format!("{service} {id} is not listed: no input schema"));
                     continue;
                 };
                 let args = props.keys().cloned().collect();
@@ -481,7 +535,7 @@ mod linux {
                     .iter()
                     .map(|(t, _)| format!("{} {}", t.service, t.operation))
                     .collect();
-                log(&format!(
+                sh.warn_once(format!(
                     "tool name {name} is shared by {}; none of them is listed",
                     ops.join(", ")
                 ));
@@ -515,25 +569,32 @@ mod linux {
     }
 
     /// The operation behind `name`: from the last listing, else from a
-    /// fresh one (a client may call without listing first). `Ok(None)`:
-    /// no listed tool has that name. `Err`: the daemon cannot be asked.
+    /// fresh one (a client may call without listing first), at most once
+    /// every 5 s. `Ok(None)`: no listed tool has that name. `Err`: the
+    /// error result when the list could not be had.
     fn lookup(
         sh: &Shared,
         conn: &mut Option<Daemon>,
         name: &str,
-    ) -> Result<Option<ToolTarget>, String> {
+    ) -> Result<Option<ToolTarget>, Value> {
         if let Some(t) = sh.tools.lock().unwrap_or_else(|p| p.into_inner()).get(name) {
             return Ok(Some(t.clone()));
         }
+        {
+            let mut last = sh.relisted.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|t| t.elapsed() < RELIST_EVERY) {
+                return Ok(None);
+            }
+            *last = Some(Instant::now());
+        }
         match list_tools(sh, conn) {
             Ok((_, map)) => Ok(map.get(name).cloned()),
-            Err(e) => Err(e
-                .message
-                .strip_prefix("saiife unavailable: ")
-                .unwrap_or(&e.message)
-                .to_string()),
+            Err(e) => Err(error_result(&e.message)),
         }
     }
+
+    /// The start of the message of a tool list the daemon refused.
+    const REFUSED_LIST: &str = "saiife refused the tool list: ";
 
     /// The `api.call` params and the body bytes of a tool call.
     type CallArgs = (Map<String, Value>, Option<Vec<u8>>);
@@ -594,7 +655,14 @@ mod linux {
         let args = p.arguments.unwrap_or_default();
         if p.name == tool_schema::RESULT_TOOL {
             let id = request_arg(&args)?;
-            return Ok(settle(sh, conn, id, progress.as_ref(), cancel));
+            return Ok(settle(
+                sh,
+                conn,
+                id,
+                progress.as_ref(),
+                cancel,
+                Next::Original,
+            ));
         }
         connector_call(sh, conn, &p.name, &args, progress.as_ref(), cancel)
     }
@@ -615,9 +683,17 @@ mod linux {
                     crate::text::sanitize(name)
                 )))
             }
-            Err(m) => return Ok(unavailable_result(&m)),
+            Err(r) => return Ok(r),
         };
         let (params, body) = map_args(&target, args)?;
+        // The args a next page is called with: the free body is not
+        // echoed (it can be large); the hint says to send it again.
+        let mut echo = args.clone();
+        let body_left_out = target.body.is_some() && echo.remove("body").is_some();
+        let next = Next::Args {
+            args: &echo,
+            body_left_out,
+        };
         let r = match daemon(sh, conn) {
             Ok(d) => api::call_one(
                 d,
@@ -631,15 +707,12 @@ mod linux {
             Err(m) => return Ok(unavailable_result(&m)),
         };
         Ok(match r {
-            Ok((3, ans)) => {
-                let id = ans.get("pending").and_then(Value::as_u64).unwrap_or(0);
-                if sh.wait.is_some() {
-                    settle(sh, conn, id, progress, cancel)
-                } else {
-                    pending_result(id)
-                }
-            }
-            Ok((_, ans)) => done_result(&ans, args),
+            Ok((3, ans)) => match pending_id(&ans) {
+                Err(r) => r,
+                Ok(id) if sh.wait.is_some() => settle(sh, conn, id, progress, cancel, next),
+                Ok(id) => pending_result(id),
+            },
+            Ok((_, ans)) => done_result(&ans, next),
             Err(s) => {
                 if s.0 == 5 {
                     *conn = None;
@@ -647,6 +720,27 @@ mod linux {
                 stop_result(s)
             }
         })
+    }
+
+    /// The id of a pending `api.call` answer: an integer >= 1, or the
+    /// error result for an answer without one.
+    fn pending_id(ans: &Map<String, Value>) -> Result<u64, Value> {
+        ans.get("pending")
+            .and_then(Value::as_u64)
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| unavailable_result("the daemon answered pending without an id"))
+    }
+
+    /// How a next page is described.
+    #[derive(Clone, Copy)]
+    enum Next<'a> {
+        /// The tool's own arguments are known.
+        Args {
+            args: &'a Map<String, Value>,
+            body_left_out: bool,
+        },
+        /// `saiife_result`: the original tool and arguments are not.
+        Original,
     }
 
     /// `saiife_result`'s `request`: an integer >= 1.
@@ -672,6 +766,7 @@ mod linux {
         id: u64,
         progress: Option<&Id>,
         cancel: &AtomicBool,
+        next: Next,
     ) -> Value {
         let deadline = Instant::now() + sh.wait.unwrap_or_default();
         let mut polls: u64 = 0;
@@ -726,9 +821,7 @@ mod linux {
                 }
                 "sent" | "send_failed" => {
                     return match ans.get("result").and_then(Value::as_object) {
-                        Some(r) if r.get("ok") == Some(&Value::Bool(true)) => {
-                            done_result(r, &Map::new())
-                        }
+                        Some(r) if r.get("ok") == Some(&Value::Bool(true)) => done_result(r, next),
                         Some(r) => stop_result(api::refusal(r)),
                         None if state == "sent" => error_result(&format!(
                             "request #{id} was sent; its result is kept 24 h and is gone"
@@ -790,7 +883,7 @@ mod linux {
     /// A done `api.call` answer (decision 7): the masked body as text (as
     /// an embedded resource when it is not UTF-8), then a note for a cut
     /// response and the next page. Status >= 400 is an error result.
-    fn done_result(ans: &Map<String, Value>, args: &Map<String, Value>) -> Value {
+    fn done_result(ans: &Map<String, Value>, next: Next) -> Value {
         let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
         let is_error = status >= 400;
         let mut content = Vec::new();
@@ -830,16 +923,34 @@ mod linux {
             content.push(text("the response was cut at max_response_bytes"));
         }
         if let Some(Value::Object(n)) = ans.get("next") {
-            let mut again = args.clone();
-            for (k, v) in n {
-                again.insert(k.clone(), v.clone());
-            }
-            content.push(text(format!(
-                "next page: call again with {}",
-                Value::Object(again)
-            )));
+            content.push(text(next_line(n, next)));
         }
         result(content, None, is_error)
+    }
+
+    /// The next-page hint of a done result.
+    fn next_line(n: &Map<String, Value>, next: Next) -> String {
+        match next {
+            Next::Args {
+                args,
+                body_left_out,
+            } => {
+                let mut again = args.clone();
+                for (k, v) in n {
+                    again.insert(k.clone(), v.clone());
+                }
+                let body = if body_left_out {
+                    " and the same body"
+                } else {
+                    ""
+                };
+                format!("next page: call again with {}{body}", Value::Object(again))
+            }
+            Next::Original => format!(
+                "next page: call the original tool again with its original arguments plus {}",
+                Value::Object(n.clone())
+            ),
+        }
     }
 
     /// How often the poller compares `tools_hash`: 30 s, or (debug builds
@@ -884,6 +995,86 @@ mod linux {
                     sh.send(&Message::notification(t::TOOLS_LIST_CHANGED, None));
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn obj(v: Value) -> Map<String, Value> {
+            match v {
+                Value::Object(m) => m,
+                _ => panic!("not an object"),
+            }
+        }
+
+        #[test]
+        fn pending_without_an_id_is_unavailable() {
+            for ans in [json!({"pending": 0}), json!({}), json!({"pending": "7"})] {
+                let r = pending_id(&obj(ans)).unwrap_err();
+                assert_eq!(r["isError"], true, "{r}");
+                assert_eq!(
+                    r["content"][0]["text"],
+                    "saiife unavailable: the daemon answered pending without an id"
+                );
+                assert!(r.get("structuredContent").is_none(), "{r}");
+            }
+            assert_eq!(pending_id(&obj(json!({"pending": 7}))).unwrap(), 7);
+        }
+
+        #[test]
+        fn a_reused_id_keeps_the_newer_cancel_flag() {
+            let cancels = Mutex::new(HashMap::new());
+            let id = Id::from(5i64);
+            let older = Arc::new(AtomicBool::new(false));
+            let newer = Arc::new(AtomicBool::new(false));
+            cancels
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Arc::clone(&older));
+            // The id is reused before the older request is done.
+            cancels
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Arc::clone(&newer));
+            forget(&cancels, &id, &older);
+            assert!(Arc::ptr_eq(
+                cancels.lock().unwrap().get(&id).unwrap(),
+                &newer
+            ));
+            forget(&cancels, &id, &newer);
+            assert!(cancels.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn next_page_hints() {
+            let n = obj(json!({"cursor": "c2"}));
+            let args = obj(json!({"status": "open"}));
+            assert_eq!(
+                next_line(
+                    &n,
+                    Next::Args {
+                        args: &args,
+                        body_left_out: false
+                    }
+                ),
+                r#"next page: call again with {"status":"open","cursor":"c2"}"#
+            );
+            assert_eq!(
+                next_line(
+                    &n,
+                    Next::Args {
+                        args: &args,
+                        body_left_out: true
+                    }
+                ),
+                r#"next page: call again with {"status":"open","cursor":"c2"} and the same body"#
+            );
+            assert_eq!(
+                next_line(&n, Next::Original),
+                r#"next page: call the original tool again with its original arguments plus {"cursor":"c2"}"#
+            );
         }
     }
 }

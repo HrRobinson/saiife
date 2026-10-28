@@ -149,6 +149,13 @@ impl McpClient {
         id
     }
 
+    /// Send a request under a chosen id (a client may reuse one).
+    pub fn send_request_id(&mut self, id: i64, method: &str, params: Value) -> Id {
+        let id = Id::from(id);
+        self.send(&Message::request(id.clone(), method, Some(params)));
+        id
+    }
+
     /// The answer to `id` (the whole message), waiting at most `limit`.
     pub fn answer_within(&mut self, id: &Id, limit: Duration) -> Option<Value> {
         let end = Instant::now() + limit;
