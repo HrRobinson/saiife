@@ -7,9 +7,11 @@ Approvals in this mode allow any approval from the same user. This is a
 workflow aid, not a control. If you need a boundary, use locked mode (see
 [Threat coverage](threats.md)).
 
-The wording rule applies here as everywhere: the agent never holds a
-credential for a brokered service; it holds its own model-provider login
-unless you run a local model.
+The wording rule (the agent never holds a credential for a brokered service;
+it holds its own model-provider login unless you run a local model) is a
+locked-mode claim. In this mode it is not guaranteed, because an agent
+running as the same user can reach the key; that is a workflow aid, not a
+control.
 
 Linux only in this version. On macOS `saiife daemon --user` refuses to start
 until the daemon is ported (v2.1). The macOS Keychain backend is built, but
@@ -72,7 +74,7 @@ and never fall back to the personal broker.
   same user.
 - `saiife audit --broker` reads the broker's audit, and
   `saiife audit verify --broker` checks it.
-- `saiife env use` (spec 6.11) arrives with the connector waves in plan 14.
+- `saiife env use` (spec 6.11) comes in a later release.
 - Your own user is the admin and the approver. A same-user approval needs no
   re-authentication.
 - Project overlays may `allow`, as in developer mode.
@@ -123,6 +125,7 @@ What it does not stop:
 - The agent writing under `$XDG_STATE_HOME` or `$XDG_DATA_HOME` when they
   point away from the default places. The guard rules are a mistake layer, not
   a wall: they do not protect against the same uid.
+- A same-uid agent rewriting or deleting the unsigned audit chain.
 - Anyone with root.
 
 ## When the keychain is unavailable

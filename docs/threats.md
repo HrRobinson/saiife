@@ -113,10 +113,10 @@ What the guard rules cannot do here: `core.self` and `core.secrets` catch
 mistakes, not a determined script of the same user. They do not see `busctl`
 calls such as `StopUnit`, killing a process by a pid read from a file,
 scripts that use the Secret Service from a library, or `security export`.
-The wording rule still holds only for a brokered service: the agent never
-holds a credential for a brokered service; it holds its own model-provider
-login unless you run a local model. In this setup the key sits where the
-agent's user can reach it, so use locked mode when that matters.
+The wording rule at the top of this page is for locked mode. In this setup it
+is not guaranteed, because an agent running as the same user can reach the
+key: in this mode that is a workflow aid, not a control. Use locked mode when
+that matters.
 
 ## Setup: Locked, on a person's account
 

@@ -7,12 +7,14 @@
 # Usage: SAIIFE_BIN=target/debug/saiife bash scripts/personal-broker/ss-smoke.sh
 set -euo pipefail
 
-if [ -z "${CI:-}" ]; then
-  echo "ss-smoke.sh runs in CI only (CI is not set)" >&2
+if [ -z "${CI:-}" ] || [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+  echo "ss-smoke.sh runs in GitHub Actions only (CI and GITHUB_ACTIONS=true)" >&2
   exit 2
 fi
 
 if [ -z "${SS_SMOKE_INNER:-}" ]; then
+  # Never reuse an inherited session bus: dbus-run-session makes a fresh one.
+  unset DBUS_SESSION_BUS_ADDRESS
   SAIIFE_BIN="$(realpath "${SAIIFE_BIN:-target/debug/saiife}")"
   export SAIIFE_BIN SS_SMOKE_INNER=1
   exec dbus-run-session -- bash "$0"
@@ -20,7 +22,11 @@ fi
 
 root="$(mktemp -d -p "${RUNNER_TEMP:-${TMPDIR:-/tmp}}" ss.XXXXXX)"
 broker_pid=""
+keyring_pid=""
 cleanup() {
+  if [ -n "$keyring_pid" ]; then
+    kill "$keyring_pid" 2>/dev/null || true
+  fi
   if [ -n "$broker_pid" ]; then
     kill "$broker_pid" 2>/dev/null || true
   fi
@@ -43,6 +49,8 @@ val="v-$(head -c 18 /dev/urandom | base64 | tr -d '/+=\n')"
 # Start a fresh keyring, unlocked by the random password (no prompt, no UI).
 eval "$(printf '%s' "$pw" | gnome-keyring-daemon --unlock --components=secrets)"
 export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK 2>/dev/null || true
+# The PID gnome-keyring-daemon reports is the one this script started.
+keyring_pid="${GNOME_KEYRING_PID:-}"
 
 start_broker() {
   "$SAIIFE_BIN" daemon --user >"$root/broker.log" 2>&1 &
@@ -79,8 +87,10 @@ if [ "$n" != 1 ]; then
   echo "expected 1 vault-key item, found $n" >&2
   exit 1
 fi
+# secret-tool prints the stored bytes as they are, with no added newline; a
+# trailing newline is tolerated anyway.
 len="$(secret-tool lookup application saiife saiife-item vault-key | wc -c)"
-if [ "$len" != 32 ]; then
+if [ "$len" != 32 ] && [ "$len" != 33 ]; then
   echo "expected a 32-byte key, got $len bytes" >&2
   exit 1
 fi
@@ -88,7 +98,8 @@ fi
 # The secret survives a restart, and no second key appears.
 stop_broker
 start_broker
-if ! "$SAIIFE_BIN" secret list | grep -q '^smoke'; then
+listing="$("$SAIIFE_BIN" secret list)"
+if ! grep -q '^smoke' <<<"$listing"; then
   echo "secret lost after restart" >&2
   exit 1
 fi
