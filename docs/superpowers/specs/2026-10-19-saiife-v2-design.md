@@ -1069,6 +1069,9 @@ Built (plan 14):
 - A malformed `env` value is a bad request in locked mode too; it never falls
   back to another environment.
 - `env use --scope` is root only (the spec's "admin rights").
+- In developer and personal-broker mode an environment changes connector
+  calls only; its guard packs apply in locked mode. A developer-mode `policy
+  show` prints a line saying it does not reflect the project env.
 
 ### 6.12 Collections (v1 §9.5 "agent-facing API client + collections"; after v2.0, plan 14)
 

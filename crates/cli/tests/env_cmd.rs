@@ -134,6 +134,44 @@ fn use_undefined_env_refused() {
     assert!(err(&o).contains("not defined"), "{}", err(&o));
 }
 
+/// Developer mode: `policy show` says it does not reflect the project's
+/// `env` (an environment changes connector calls only there; its guard
+/// packs apply in locked mode).
+#[test]
+fn developer_policy_show_says_project_env_not_reflected() {
+    let (d, config, project) = dev_world();
+    // No daemon to ask: its user does not exist.
+    fs::write(
+        &config,
+        format!("version = 2\n\n[daemon]\nuser = \"saiife-no-such-user\"\n{ENVS}"),
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["policy", "show", "--user", &own_user(), "--system-config"])
+        .arg(&config)
+        .current_dir(&project)
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", d.path().join("data"))
+        .env("SAIIFE_AUDIT_DIR", d.path().join("audit"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let text = out(&o);
+    assert_eq!(
+        text.lines().last(),
+        Some(
+            "note: developer mode: this does not reflect the project env; \
+             an environment changes connector calls only, its guard packs apply in locked mode"
+        ),
+        "{text}"
+    );
+    // The project's `staging` packs are not shown.
+    let guard = text.lines().find(|l| l.starts_with("guard:")).unwrap();
+    assert!(!guard.contains("db.postgres"), "{text}");
+}
+
 fn locked_world() -> (tempfile::TempDir, std::path::PathBuf) {
     let d = common::tmp::short_tempdir();
     let etc = d.path().join("etc");

@@ -57,6 +57,11 @@ well-formed `env` that no environment defines falls back to the base config
 with a warning in developer mode and the personal broker, and is ignored in
 locked mode.
 
+In developer and personal-broker mode an environment changes connector calls
+only; its guard packs apply in locked mode. The guard hook and `saiife policy
+show` do not read the project's `env` there, and `policy show` says so on its
+last line.
+
 ## Commands
 
 ```

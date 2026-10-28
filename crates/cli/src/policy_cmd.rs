@@ -592,8 +592,15 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
     let hash = policy_hash(&eff);
     let view = user_view(&cfg, &Getent, &user);
     print_show(&view, Some(&hash), &env_hashes, effective.then_some(&eff));
+    outln!("{DEVELOPER_ENV_NOTE}");
     ExitCode::SUCCESS
 }
+
+/// The last line of a developer-mode `policy show`: a project's `env`
+/// (`saiife env use`) changes connector calls only, so what is shown is
+/// not that environment's guard packs.
+const DEVELOPER_ENV_NOTE: &str = "note: developer mode: this does not reflect the project env; \
+an environment changes connector calls only, its guard packs apply in locked mode";
 
 #[cfg(not(target_os = "linux"))]
 fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) -> Option<ExitCode> {
