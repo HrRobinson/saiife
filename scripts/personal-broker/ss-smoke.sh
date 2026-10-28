@@ -80,7 +80,7 @@ count_items() {
 
 start_broker
 printf '%s\n' "$val" |
-  "$SAIIFE_BIN" secret add smoke --kind token --from-file /dev/stdin
+  "$SAIIFE_BIN" secret add smoke --kind token --service github --from-file /dev/stdin
 
 # Exactly one keychain item, and its value is the 32-byte key.
 n="$(count_items)"
