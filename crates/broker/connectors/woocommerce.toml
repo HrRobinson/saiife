@@ -1,0 +1,100 @@
+# WooCommerce REST API v3. Paths and Link pagination checked against the
+# vendor reference (shape per vendor docs):
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#orders
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#products
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#customers
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#order-refunds
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#pagination   (Link header, X-WP-TotalPages)
+#   https://woocommerce.github.io/woocommerce-rest-api-docs/#authentication-over-https   (consumer key and secret as Basic)
+# Query-string authentication (consumer_key=...) is not supported: it would put
+# the secrets in URLs.
+id = "woocommerce"
+version = 1
+title = "WooCommerce"
+base_url = "https://{host}/wp-json/wc/v3"
+hosts = ["{host}"]
+auth = [{ kind = "basic" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.host]                    # the shop's host, set by the admin
+type = "string"
+pattern = "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+required = true
+
+[params.currency]                # the shop currency, set by the admin; refund amounts are in it
+type = "string"
+pattern = "^[A-Za-z]{3}$"
+required = true
+
+[[operation]]
+id = "orders.list"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders"
+query = { page = "int:1..100000", per_page = "int:1..100", status = "enum:any,pending,processing,on-hold,completed,cancelled,refunded,failed,trash", after = "datetime", before = "datetime", customer = "int", orderby = "enum:date,id,include,title,slug", order = "enum:asc,desc" }
+pagination = "link-header"
+
+[[operation]]
+id = "orders.get"
+capability = "orders:read"
+kind = "read"
+method = "GET"
+path = "/orders/{order_id}"
+path_params = { order_id = "int" }
+
+[[operation]]
+id = "orders.update"
+capability = "orders:write"
+kind = "write"
+method = "PUT"
+path = "/orders/{order_id}"
+path_params = { order_id = "int" }
+body = "json"
+
+[[operation]]
+id = "products.list"
+capability = "products:read"
+kind = "read"
+method = "GET"
+path = "/products"
+query = { page = "int:1..100000", per_page = "int:1..100", status = "enum:any,draft,pending,private,publish", sku = "string:[A-Za-z0-9._-]{1,64}", search = "string:.{1,128}", orderby = "enum:date,id,include,title,slug,price,popularity,rating", order = "enum:asc,desc" }
+pagination = "link-header"
+
+[[operation]]
+id = "products.get"
+capability = "products:read"
+kind = "read"
+method = "GET"
+path = "/products/{product_id}"
+path_params = { product_id = "int" }
+
+[[operation]]
+id = "products.update"
+capability = "products:write"
+kind = "write"
+method = "PUT"
+path = "/products/{product_id}"
+path_params = { product_id = "int" }
+body = "json"
+
+[[operation]]
+id = "customers.list"
+capability = "customers:read"
+kind = "read"
+method = "GET"
+path = "/customers"
+query = { page = "int:1..100000", per_page = "int:1..100", search = "string:.{1,128}", email = "string:.{1,254}", role = "string:[a-z_]{1,32}", orderby = "enum:id,include,name,registered_date", order = "enum:asc,desc" }
+pagination = "link-header"
+
+# A refund moves money: `amount` (a decimal string in the shop currency, set by
+# the admin) is required, so a refund without one is denied bad_amount.
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/orders/{order_id}/refunds"
+path_params = { order_id = "int" }
+body = "json"
+amount = { field = "amount", currency_param = "currency", unit = "major" }

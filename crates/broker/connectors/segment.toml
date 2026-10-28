@@ -1,0 +1,49 @@
+# Segment Tracking API (HTTP API source). Write-only; the Public API is out of
+# scope. Paths and auth checked against the vendor reference:
+#   https://segment.com/docs/connections/sources/catalog/libraries/server/http-api/
+#   (Basic auth: the source write key as the user name, empty password;
+#    hosts api.segment.io and, for EU workspaces, events.eu1.segmentapis.com)
+id = "segment"
+version = 1
+title = "Segment Tracking API"
+base_url = "https://{host}/v1"
+hosts = ["api.segment.io", "events.eu1.segmentapis.com"]
+auth = [{ kind = "basic_token", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.host]                    # the region, set by the admin
+type = "enum:api.segment.io,events.eu1.segmentapis.com"
+required = true
+
+[[operation]]
+id = "track"
+capability = "events:write"
+kind = "write"
+method = "POST"
+path = "/track"
+body = "json"
+
+[[operation]]
+id = "identify"
+capability = "users:write"
+kind = "write"
+method = "POST"
+path = "/identify"
+body = "json"
+
+[[operation]]
+id = "group"
+capability = "groups:write"
+kind = "write"
+method = "POST"
+path = "/group"
+body = "json"
+
+# Up to 500 KB per request, 32 KB per message: many events in one call.
+[[operation]]
+id = "batch"
+capability = "events:write"
+kind = "bulk"
+method = "POST"
+path = "/batch"
+body = "json"

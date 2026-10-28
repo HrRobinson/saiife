@@ -1,0 +1,19 @@
+{
+  "_source": "Shape per vendor docs (last page); values synthetic.",
+  "tickets": [
+    {
+      "id": 35438,
+      "subject": "Last",
+      "status": "closed"
+    }
+  ],
+  "meta": {
+    "has_more": false,
+    "after_cursor": "eyJvIjoibmljZV9pZCIsInYiOiJhUUVBQUFBQUFBQUEifQ==",
+    "before_cursor": "abc"
+  },
+  "links": {
+    "prev": "x",
+    "next": "y"
+  }
+}

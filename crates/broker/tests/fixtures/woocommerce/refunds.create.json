@@ -1,0 +1,13 @@
+{
+  "_source": "https://woocommerce.github.io/woocommerce-rest-api-docs/#create-a-refund",
+  "_request": {
+    "amount": "10.00",
+    "reason": "Wrong size",
+    "api_refund": true
+  },
+  "id": 726,
+  "date_created": "2026-09-01T10:00:00",
+  "amount": "10.00",
+  "reason": "Wrong size",
+  "refunded_by": 1
+}

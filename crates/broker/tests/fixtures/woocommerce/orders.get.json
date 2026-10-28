@@ -1,0 +1,9 @@
+{
+  "_source": "https://woocommerce.github.io/woocommerce-rest-api-docs/#retrieve-an-order",
+  "id": 727,
+  "number": "727",
+  "status": "processing",
+  "currency": "EUR",
+  "total": "29.35",
+  "customer_id": 26
+}

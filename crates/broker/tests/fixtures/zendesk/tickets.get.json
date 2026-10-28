@@ -1,0 +1,16 @@
+{
+  "_source": "https://developer.zendesk.com/api-reference/ticketing/tickets/tickets/#show-ticket",
+  "ticket": {
+    "id": 35436,
+    "subject": "Help, my printer is on fire!",
+    "description": "The fire is very colorful.",
+    "status": "open",
+    "priority": "urgent",
+    "requester_id": 20978392,
+    "assignee_id": 235323,
+    "tags": [
+      "enterprise",
+      "other_tag"
+    ]
+  }
+}

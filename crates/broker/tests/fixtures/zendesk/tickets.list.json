@@ -1,0 +1,32 @@
+{
+  "_source": "Shape per vendor docs; values synthetic. https://developer.zendesk.com/api-reference/ticketing/tickets/tickets/#list-tickets and https://developer.zendesk.com/api-reference/introduction/pagination/",
+  "tickets": [
+    {
+      "id": 35436,
+      "subject": "Help, my printer is on fire!",
+      "status": "open",
+      "priority": "urgent",
+      "requester_id": 20978392,
+      "tags": [
+        "enterprise"
+      ]
+    },
+    {
+      "id": 35437,
+      "subject": "Second",
+      "status": "new",
+      "priority": "normal",
+      "requester_id": 20978393,
+      "tags": []
+    }
+  ],
+  "meta": {
+    "has_more": true,
+    "after_cursor": "eyJvIjoibmljZV9pZCIsInYiOiJhUUVBQUFBQUFBQUEifQ==",
+    "before_cursor": "eyJvIjoibmljZV9pZCIsInYiOiJhU0VBQUFBQUFBQUEifQ=="
+  },
+  "links": {
+    "prev": "https://acme.zendesk.com/api/v2/tickets.json?page%5Bsize%5D=2&page%5Bbefore%5D=x",
+    "next": "https://acme.zendesk.com/api/v2/tickets.json?page%5Bsize%5D=2&page%5Bafter%5D=y"
+  }
+}

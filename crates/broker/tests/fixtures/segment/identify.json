@@ -1,0 +1,11 @@
+{
+  "_source": "https://segment.com/docs/connections/sources/catalog/libraries/server/http-api/#identify",
+  "_request": {
+    "userId": "019mr8mf4r",
+    "traits": {
+      "email": "ada@example.test",
+      "name": "Ada Lovelace"
+    }
+  },
+  "success": true
+}

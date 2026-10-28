@@ -1,0 +1,20 @@
+{
+  "_source": "https://segment.com/docs/connections/sources/catalog/libraries/server/http-api/#batch",
+  "_request": {
+    "batch": [
+      {
+        "type": "identify",
+        "userId": "u1",
+        "traits": {
+          "name": "Ada"
+        }
+      },
+      {
+        "type": "track",
+        "userId": "u1",
+        "event": "Signed Up"
+      }
+    ]
+  },
+  "success": true
+}

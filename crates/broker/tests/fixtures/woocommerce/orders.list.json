@@ -1,0 +1,33 @@
+{
+  "_source": "https://woocommerce.github.io/woocommerce-rest-api-docs/#list-all-orders (values synthetic)",
+  "_link": "<https://shop.acme.test/wp-json/wc/v3/orders?page=1&per_page=2>; rel=\"prev\", <https://shop.acme.test/wp-json/wc/v3/orders?page=3&per_page=2>; rel=\"next\"",
+  "data": [
+    {
+      "id": 727,
+      "parent_id": 0,
+      "number": "727",
+      "status": "processing",
+      "currency": "EUR",
+      "total": "29.35",
+      "billing": {
+        "first_name": "Ada",
+        "email": "ada@example.test"
+      },
+      "line_items": [
+        {
+          "id": 315,
+          "name": "Woo Single #1",
+          "quantity": 2,
+          "total": "6.00"
+        }
+      ]
+    },
+    {
+      "id": 726,
+      "number": "726",
+      "status": "completed",
+      "currency": "EUR",
+      "total": "10.00"
+    }
+  ]
+}
