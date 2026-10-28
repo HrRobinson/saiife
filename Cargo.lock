@@ -1380,6 +1380,7 @@ dependencies = [
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
+ "saiife-mcp",
  "saiife-policy",
  "saiife-system",
  "serde",

@@ -45,6 +45,7 @@ mod eval;
 mod import_cmd;
 mod init_cmd;
 mod lockdown_cmd;
+mod mcp_cmd;
 mod packs_cmd;
 mod paths;
 mod policy_cmd;
@@ -258,6 +259,10 @@ enum Cmd {
     /// Locked mode (Linux): call a connector operation through the daemon,
     /// or list the ones you may call. The credential never reaches you.
     Api(api_cmd::ApiArgs),
+    /// Locked mode (Linux): an MCP server on stdio that offers the
+    /// connector operations you may call as tools, each call brokered by
+    /// the daemon like `saiife api`.
+    Mcp(mcp_cmd::McpArgs),
     /// Locked mode (Linux): list, show and decide ask-gated requests.
     /// `approvals [list] [--all|--pending] [--json]`, `approvals show <id>`.
     Approvals {
@@ -462,6 +467,9 @@ fn main() -> ExitCode {
     if let Cmd::Api(a) = cli.command {
         return api_cmd::run(a);
     }
+    if let Cmd::Mcp(a) = cli.command {
+        return mcp_cmd::run(a);
+    }
     if let Cmd::Policy {
         system_config,
         action,
@@ -525,6 +533,7 @@ fn main() -> ExitCode {
         | Cmd::Connect(..)
         | Cmd::Run { .. }
         | Cmd::Api(_)
+        | Cmd::Mcp(_)
         | Cmd::Lockdown { .. }
         | Cmd::Approvals { .. }
         | Cmd::Policy { .. }
