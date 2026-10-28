@@ -1,0 +1,76 @@
+# Slack Web API. Paths and fields checked against the vendor reference
+# (shape per vendor docs; no network in the build):
+#   https://api.slack.com/methods/conversations.list
+#   https://api.slack.com/methods/conversations.history
+#   https://api.slack.com/methods/conversations.replies
+#   https://api.slack.com/methods/users.list
+#   https://api.slack.com/methods/users.info
+#   https://api.slack.com/methods/chat.postMessage
+#   https://api.slack.com/apis/pagination   (response_metadata.next_cursor)
+# Slack answers an error as `200 {"ok": false, "error": "..."}`; the broker
+# passes the body on, so a caller must read `ok`.
+id = "slack"
+version = 1
+title = "Slack"
+base_url = "https://slack.com/api"
+hosts = ["slack.com"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Accept"]
+
+[[operation]]
+id = "conversations.list"
+capability = "channels:read"
+kind = "read"
+method = "GET"
+path = "/conversations.list"
+query = { limit = "int:1..1000", cursor = "string:[A-Za-z0-9_.=-]{1,256}", types = "string:[a-z_,]{1,64}", exclude_archived = "bool" }
+pagination = { cursor = { param = "cursor", next = "response_metadata.next_cursor" } }
+
+[[operation]]
+id = "conversations.history"
+capability = "messages:read"
+qualifier = "channel={channel}"
+kind = "read"
+method = "GET"
+path = "/conversations.history"
+query = { channel = "string:[CGD][A-Z0-9]{2,31}", limit = "int:1..999", cursor = "string:[A-Za-z0-9_.=-]{1,256}", oldest = "string:[0-9]{1,10}(\\.[0-9]{1,6})?", latest = "string:[0-9]{1,10}(\\.[0-9]{1,6})?", inclusive = "bool" }
+pagination = { cursor = { param = "cursor", next = "response_metadata.next_cursor" } }
+
+[[operation]]
+id = "conversations.replies"
+capability = "messages:read"
+qualifier = "channel={channel}"
+kind = "read"
+method = "GET"
+path = "/conversations.replies"
+query = { channel = "string:[CGD][A-Z0-9]{2,31}", ts = "string:[0-9]{10}\\.[0-9]{6}", limit = "int:1..999", cursor = "string:[A-Za-z0-9_.=-]{1,256}" }
+pagination = { cursor = { param = "cursor", next = "response_metadata.next_cursor" } }
+
+[[operation]]
+id = "users.list"
+capability = "users:read"
+kind = "read"
+method = "GET"
+path = "/users.list"
+query = { limit = "int:1..1000", cursor = "string:[A-Za-z0-9_.=-]{1,256}" }
+pagination = { cursor = { param = "cursor", next = "response_metadata.next_cursor" } }
+
+[[operation]]
+id = "users.info"
+capability = "users:read"
+kind = "read"
+method = "GET"
+path = "/users.info"
+query = { user = "string:[UW][A-Z0-9]{2,31}" }
+
+# The text may span lines. `channel` is a body param and the qualifier, so a
+# rule such as `messages:write:channel=C0123*` can name the channels.
+[[operation]]
+id = "chat.postMessage"
+capability = "messages:write"
+qualifier = "channel={channel}"
+kind = "write"
+method = "POST"
+path = "/chat.postMessage"
+body = "json"
+body_params = { channel = "string:[CGD][A-Z0-9]{2,31}", text = "string:(?s).{1,4000}", thread_ts = "string:[0-9]{10}\\.[0-9]{6}" }
