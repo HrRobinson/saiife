@@ -210,10 +210,15 @@ fn not_a_vault() -> VaultState {
 
 /// Open the vault. A missing `vault_file` with a good key is an empty vault.
 pub fn open(key_file: &Path, vault_file: &Path) -> VaultState {
-    let key = match read_key(key_file) {
-        Ok(k) => k,
-        Err(r) => return VaultState::Unavailable(r.into()),
-    };
+    match read_key(key_file) {
+        Ok(key) => open_with_key(key, vault_file),
+        Err(r) => VaultState::Unavailable(r.into()),
+    }
+}
+
+/// Open the vault under `key` (the personal broker's key comes from the
+/// keychain). A missing `vault_file` is an empty vault.
+pub fn open_with_key(key: Zeroizing<[u8; 32]>, vault_file: &Path) -> VaultState {
     let mut v = Vault {
         key,
         file: vault_file.to_path_buf(),
@@ -854,6 +859,26 @@ mod tests {
         assert_eq!(reason(&e), "vault file is not a saiife vault");
         std::fs::write(&e.file, b"short").unwrap();
         assert_eq!(reason(&e), "vault file is not a saiife vault");
+    }
+
+    #[test]
+    fn open_with_key_matches_open() {
+        let e = env();
+        ready(&e).put(entry("gh", "s3cret-value")).unwrap();
+        let v = match open_with_key(Zeroizing::new(KEY), &e.file) {
+            VaultState::Ready(v) => v,
+            VaultState::Unavailable(r) => panic!("unavailable: {r}"),
+        };
+        assert_eq!(
+            v.get("gh").unwrap().fields["token"].as_str(),
+            "s3cret-value"
+        );
+        let names = |v: &Vault| v.list().into_iter().map(|m| m.name).collect::<Vec<_>>();
+        assert_eq!(names(&v), names(&ready(&e)));
+        match open_with_key(Zeroizing::new([8u8; 32]), &e.file) {
+            VaultState::Ready(_) => panic!("wrong key opened the vault"),
+            VaultState::Unavailable(r) => assert_eq!(r, "vault cannot be decrypted"),
+        }
     }
 
     #[test]

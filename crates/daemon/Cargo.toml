@@ -29,6 +29,8 @@ toml = "0.8"
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros", "process"] }
 rustix = { version = "1", features = ["fs", "process", "net"] }
 saiife-system = { path = "../system" }
+# The personal broker's vault key (plan 16, Task 4).
+saiife-keychain = { path = "../keychain" }
 # Newest releases older than 14 days (2026-10-26): chacha20poly1305 0.11.0
 # is from 2026-06-28, zeroize 1.9.1 from 2026-10-06.
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
