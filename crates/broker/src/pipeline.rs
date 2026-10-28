@@ -115,6 +115,12 @@ pub struct StoredCall {
     /// `None`, not checked).
     #[serde(default)]
     pub env: Option<String>,
+    /// `env` was recorded at the ask: true for every request asked since,
+    /// so `env = None` then means the base config, and the send refuses an
+    /// environment chosen since (`env_changed`) for it too. `false` in a
+    /// request sealed before (read as the default): not checked.
+    #[serde(default)]
+    pub env_recorded: bool,
     /// The collection the request was a step of (attribution only).
     /// Absent in a call sealed before collections existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -840,6 +846,7 @@ async fn steps(
                 overlay: call.overlay.clone(),
                 via: call.via.as_str().to_string(),
                 env: snap.env.clone(),
+                env_recorded: true,
                 collection: call.collection.clone(),
             },
             operation: masker.mask_text(&op.id),

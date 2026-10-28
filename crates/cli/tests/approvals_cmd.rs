@@ -719,7 +719,9 @@ fn list_shows_pending_masked() {
     assert_eq!(cols[2], own_user());
     assert_eq!(cols[3], "connector");
     assert_eq!((cols[4], cols[5]), ("erp", "invoices.create"));
-    assert_eq!(cols[6], "pending");
+    // Asked under the base config, recorded as such.
+    assert_eq!((cols[6], cols[7]), ("(env", "base)"));
+    assert_eq!(cols[8], "pending");
     assert!(!out.contains(SECRET));
 
     // `list --json`: one array.
@@ -830,7 +832,7 @@ fn show_prints_the_scope_of_a_command_request() {
 fn show_and_list_print_the_env_of_a_connector_request() {
     use saiife_daemon::approvals::{ApprovalType, NewRequest, SendDisplay};
     let w = world();
-    let new = |env: Option<&str>| NewRequest {
+    let new = |env: Option<&str>, env_base: bool| NewRequest {
         uid: own_uid(),
         user: own_user(),
         session: None,
@@ -847,6 +849,7 @@ fn show_and_list_print_the_env_of_a_connector_request() {
         ask_rule: None,
         send: SendDisplay {
             env: env.map(str::to_string),
+            env_base,
             ..Default::default()
         },
     };
@@ -861,8 +864,15 @@ fn show_and_list_print_the_env_of_a_connector_request() {
             )
             .unwrap()
     };
-    let with = create(new(Some("prod")));
-    let without = create(new(None));
+    let with = create(new(Some("prod"), false));
+    let without = create(new(None, false));
+    let base = create(new(None, true));
+    assert_eq!(
+        saiife_daemon::approvals::offhost_summary(&base),
+        "erp invoices.create (env base)"
+    );
+    let out = stdout(&w.cli("approvals", &["show", &base.id.to_string()]));
+    assert!(out.contains("  env        base\n"), "{out}");
     assert_eq!(
         saiife_daemon::approvals::offhost_summary(&with),
         "erp invoices.create (env prod)"
@@ -891,6 +901,10 @@ fn show_and_list_print_the_env_of_a_connector_request() {
         "{out}"
     );
     assert!(!line(without.id).contains("(env"), "{out}");
+    assert!(
+        line(base.id).contains("erp invoices.create (env base)"),
+        "{out}"
+    );
 }
 
 #[test]

@@ -147,6 +147,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
                 .map(|(minor, currency)| Amount { minor, currency }),
             headers: p.headers.clone(),
             env: p.stored.env.clone(),
+            env_base: p.stored.env_recorded && p.stored.env.is_none(),
         },
     };
     store_new(ctx, new, Some(exact), ttl).await
@@ -1273,21 +1274,20 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     };
     // An approved request is sent under the environment it was asked
     // under, or not at all: locked mode refuses a scope rebound to another
-    // environment since the ask, developer mode an environment no longer
-    // defined (never the base config instead). A request stored before
-    // environments existed (`None`) is not checked.
-    if let Some(asked) = stored.env.as_deref() {
-        if env_name != Some(asked) {
-            let message = match mode {
-                saiife_policy::Mode::Locked => {
-                    "the scope's environment changed since the request was asked"
-                }
-                saiife_policy::Mode::Developer => {
-                    "the environment the request was asked under is no longer defined"
-                }
-            };
-            return fail(&ctx, &r, ENV_CHANGED, message).await;
-        }
+    // environment (or from the base config to one) since the ask,
+    // developer mode an environment no longer defined (never the base
+    // config instead). Only a request sealed before the environment was
+    // recorded (`env_recorded` false, no `env`) is not checked.
+    if (stored.env_recorded || stored.env.is_some()) && env_name != stored.env.as_deref() {
+        let message = match mode {
+            saiife_policy::Mode::Locked => {
+                "the scope's environment changed since the request was asked"
+            }
+            saiife_policy::Mode::Developer => {
+                "the environment the request was asked under is no longer defined"
+            }
+        };
+        return fail(&ctx, &r, ENV_CHANGED, message).await;
     }
     let snap = g.snapshot_for(env_name);
     let env = DaemonEnv {

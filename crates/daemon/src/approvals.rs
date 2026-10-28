@@ -144,6 +144,10 @@ pub struct Request {
     /// command request, or a request stored before environments existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
+    /// The connector request was asked under the base config (no
+    /// environment), as recorded at the ask: shown as `env base`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub env_base: bool,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -208,6 +212,8 @@ pub struct SendDisplay {
     pub headers: Vec<(String, String)>,
     /// [`Request::env`].
     pub env: Option<String>,
+    /// [`Request::env_base`].
+    pub env_base: bool,
 }
 
 /// Which requests [`Store::list`] returns: `None`/empty means any.
@@ -349,6 +355,7 @@ pub fn offhost_summary(r: &Request) -> String {
     match r.kind {
         ApprovalType::Connector => match &r.env {
             Some(e) => format!("{} (env {e})", summary(r)),
+            None if r.env_base => format!("{} (env base)", summary(r)),
             None => summary(r),
         },
         ApprovalType::Command => format!(
@@ -726,6 +733,7 @@ impl Store {
             amount: req.send.amount,
             headers: req.send.headers,
             env: req.send.env,
+            env_base: req.send.env_base,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,

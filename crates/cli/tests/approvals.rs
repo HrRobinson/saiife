@@ -880,17 +880,54 @@ fn env_rebound_between_ask_and_send_is_env_changed() {
     assert!(stderr(&o).contains("env_changed"), "{}", stderr(&o));
 }
 
-/// A request stored with no environment (the base config, as every
-/// request sealed before environments existed reads) is not checked: it
-/// is sent under the scope's environment at send.
+/// A request asked under the base config records that it was: a scope
+/// rebound to an environment before the send is `env_changed`, and
+/// nothing is sent. The approver saw `env base`.
 #[test]
-fn request_without_env_still_sends_after_rebind() {
+fn base_ask_rebound_to_env_is_env_changed() {
     let w = world();
     let both = ["staging", "prod"];
     *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "", &both));
     let id = w.ask(BODY_A);
     let shown = w.op(BOSS, "approval.show", json!({"request": id}));
     assert!(shown["item"].get("env").is_none(), "{shown}");
+    assert_eq!(shown["item"]["env_base"], true, "{shown}");
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "prod", &both));
+    assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+    w.wait_state(id, State::SendFailed);
+    assert!(w.m.hits().is_empty());
+    assert_eq!(w.wait_record(id, "send_failed")["rule"], "env_changed");
+}
+
+/// A request sealed before environments were recorded (no `env`, no
+/// `env_recorded`) is not checked: it is sent under the scope's
+/// environment at send.
+#[test]
+fn old_blob_without_env_still_sends_after_rebind() {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let w = world();
+    let both = ["staging", "prod"];
+    *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "", &both));
+    let id = w.ask(BODY_A);
+    // Rewrite the sealed request as an older daemon sealed it.
+    let file = dir_in(&w.path().join("state")).join(format!("{id}.json"));
+    let mut r: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let sealed = b64.decode(r["request_sealed"].as_str().unwrap()).unwrap();
+    let aad = saiife_daemon::approvals::aad(id);
+    let plain = w.ctx.vault.open_sealed(&aad, &sealed).unwrap();
+    let mut stored: Value = serde_json::from_slice(&plain).unwrap();
+    let o = stored.as_object_mut().unwrap();
+    assert_eq!(o.remove("env_recorded"), Some(json!(true)));
+    assert_eq!(o.remove("env"), Some(Value::Null));
+    let resealed = w
+        .ctx
+        .vault
+        .seal(&aad, &serde_json::to_vec(&stored).unwrap())
+        .unwrap();
+    r["request_sealed"] = json!(b64.encode(resealed));
+    fs::write(&file, serde_json::to_vec(&r).unwrap()).unwrap();
+
     *w.ctx.policy.lock().unwrap() = policy_of(w.path(), w.m.port, &env_config(&w, "prod", &both));
     assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
     w.wait_state(id, State::Sent);
