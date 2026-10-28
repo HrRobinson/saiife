@@ -461,7 +461,10 @@ mod tests {
         );
         assert_eq!(mask(&plain), "[MASKED]");
         assert_eq!(mask(&dotted), "[MASKED]");
-        // JWTs are masked by the cloud rule, not left to the Discord shape.
+        // A dotted string starting with eyJ but without a second eyJ part is
+        // not a JWT and stays untouched; a real JWT is masked by the cloud rule.
+        let not_jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
+        assert_eq!(mask(&not_jwt), not_jwt);
         let jwt = format!("eyJ{}.eyJ{}.{}", al('a', 30), al('b', 30), al('c', 30));
         assert_eq!(mask(&jwt), "[MASKED]");
     }
