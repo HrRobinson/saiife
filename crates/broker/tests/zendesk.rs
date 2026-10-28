@@ -219,6 +219,19 @@ fn subdomain_cannot_leave_the_zendesk_host() {
             }
         }
     }
+    // The policy refuses such a value before any call.
+    let cat = saiife_broker::Catalog::new(builtin(), Vec::new());
+    for bad in ["acme.evil.test/x", "acme@evil.test", "ACME"] {
+        let cfg: saiife_policy::SystemConfig = toml::from_str(&format!(
+            "version = 2\n[services.z]\nconnector = \"zendesk\"\nsecret = \"s\"\n\
+             [services.z.params]\nsubdomain = \"{bad}\"\n"
+        ))
+        .unwrap();
+        assert!(
+            saiife_broker::catalog::validate(&cfg, &cat).is_err(),
+            "{bad:?}"
+        );
+    }
     // The missing param is an error.
     assert!(try_go("tickets.get", &[], &[("ticket_id", "1")], &[], None).is_err());
 }

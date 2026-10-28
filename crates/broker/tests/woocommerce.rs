@@ -166,9 +166,32 @@ fn golden_writes() {
         (b.method.as_str(), b.uri.path()),
         ("PUT", "/wp-json/wc/v3/products/794")
     );
-    let body = fixture("refunds.create")["_request"].to_string();
-    let b = go("refunds.create", &[("order_id", "727")], Some(&body));
+    let b = go(
+        "refunds.create",
+        &[
+            ("order_id", "727"),
+            ("amount", "10.00"),
+            ("reason", "Wrong\nsize"),
+        ],
+        None,
+    );
     assert_eq!(b.method, "POST");
+    let op = named(woo(), "refunds.create").unwrap();
+    let p = validate(
+        op,
+        &map(&[
+            ("order_id", "727"),
+            ("amount", "10.00"),
+            ("reason", "Wrong\nsize"),
+        ]),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let sent = saiife_broker::request::build_body(op, &p).unwrap().unwrap();
+    assert_eq!(
+        sent,
+        json!({"amount": "10.00", "reason": "Wrong\nsize", "api_refund": false})
+    );
     assert_eq!(b.uri.to_string(), format!("{BASE}/orders/727/refunds"));
 }
 
@@ -314,6 +337,28 @@ fn refund_amount_is_read_in_the_admin_currency() {
     // Other operations carry no amount spec.
     for id in ["orders.update", "products.update"] {
         assert!(named(woo(), id).unwrap().amount.is_none(), "{id}");
+    }
+}
+
+#[test]
+fn refund_body_is_built_from_params_only() {
+    let op = named(woo(), "refunds.create").unwrap();
+    assert!(op.builds_body());
+    for extra in ["line_items", "meta_data", "api_refund", "refund_payment"] {
+        let r = validate(
+            op,
+            &map(&[("order_id", "1"), ("amount", "1.00"), (extra, "x")]),
+            &BTreeMap::new(),
+        );
+        assert!(r.is_err(), "{extra}");
+    }
+    for bad in ["1e3", "-1", "1,00", "10.", ".5", "1.0000001", ""] {
+        let r = validate(
+            op,
+            &map(&[("order_id", "1"), ("amount", bad)]),
+            &BTreeMap::new(),
+        );
+        assert!(r.is_err(), "{bad:?}");
     }
 }
 

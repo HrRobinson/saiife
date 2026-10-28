@@ -38,8 +38,12 @@ Parameters:
 - `*.get`: the id (an integer).
 - `orders.update`, `products.update`: the id and a JSON body such as
   `{"status":"completed"}`. Send `Content-Type: application/json`.
-- `refunds.create`: the order id and a JSON body such as
-  `{"amount":"10.00","reason":"wrong size"}`.
+- `refunds.create`: the order id and the params `amount` (a decimal string,
+  required) and `reason` (optional, may span lines). saiife builds the JSON
+  body; there is no raw body, so the agent cannot send `line_items` or
+  `meta_data`. `api_refund` is fixed to `false`: WooCommerce would otherwise
+  also refund through the payment gateway, so the refund only records it and
+  money moves through your payment provider.
 
 There is no delete, create or batch operation for orders, products or
 customers. A call that matches no operation is denied as `unknown_operation`.
@@ -49,7 +53,7 @@ customers. A call that matches no operation is denied as `unknown_operation`.
 `refunds.create` carries an `amount` spec: the body field `amount` (a decimal
 string in major units) in the `currency` service param. Amount limits (`max`
 per call, daily caps) count it. A refund with no `amount` is denied
-(`bad_amount`), so a refund that carries only line items is refused too.
+(`bad_amount`).
 
 ### The update body is not constrained
 
@@ -69,7 +73,7 @@ page. saiife returns the next page's `page` (and your other query params) as
 ```bash
 saiife api woo orders.list per_page=100 status=processing
 saiife api woo orders.list per_page=100 status=processing page=2
-saiife api woo refunds.create order_id=727 --body @refund.json
+saiife api woo refunds.create order_id=727 amount=10.00 reason='wrong size'
 ```
 
 ## Capabilities and policy

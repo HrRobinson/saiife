@@ -87,8 +87,12 @@ path = "/customers"
 query = { page = "int:1..100000", per_page = "int:1..100", search = "string:.{1,128}", email = "string:.{1,254}", role = "string:[a-z_]{1,32}", orderby = "enum:id,include,name,registered_date", order = "enum:asc,desc" }
 pagination = "link-header"
 
-# A refund moves money: `amount` (a decimal string in the shop currency, set by
-# the admin) is required, so a refund without one is denied bad_amount.
+# A refund moves money. The body is built: the agent can send only `amount` (a
+# decimal string in the shop currency, set by the admin), `reason` (optional); it cannot
+# send `line_items` or `meta_data`. `api_refund` is fixed to false: WooCommerce
+# defaults it to true, which would also refund through the payment gateway, so
+# the refund here only records it. Without an `amount` the call is denied
+# bad_amount.
 [[operation]]
 id = "refunds.create"
 capability = "refunds:write"
@@ -97,4 +101,6 @@ method = "POST"
 path = "/orders/{order_id}/refunds"
 path_params = { order_id = "int" }
 body = "json"
+body_params = { amount = "string:[0-9]{1,9}(\\.[0-9]{1,6})?", reason = "string:(?s).{0,512}" }
+body_const = { api_refund = false }
 amount = { field = "amount", currency_param = "currency", unit = "major" }
