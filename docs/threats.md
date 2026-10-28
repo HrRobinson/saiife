@@ -30,7 +30,7 @@ Legend: **covered**, **partly**, **not covered**.
 | Setup | Platform | Section |
 | --- | --- | --- |
 | Developer: hooks in your own account | any | [Developer](#setup-developer) |
-| Personal broker | after v2.0 | [Personal broker](#setup-personal-broker-after-v20) |
+| Personal broker | Linux (macOS: v2.1) | [Personal broker](#setup-personal-broker) |
 | Locked, on a person's account | supported Linux | [Locked, person's account](#setup-locked-on-a-persons-account) |
 | Locked, on a dedicated agent account (recommended for unattended work) | supported Linux | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
 
@@ -86,18 +86,20 @@ The agent runs commands without asking you, or runs while nobody watches.
 For agents that run unattended, the developer setup is not enough on its own.
 Use locked mode, ideally on a dedicated account.
 
-## Setup: Personal broker (after v2.0)
+## Setup: Personal broker
 
-A per-user daemon holds credentials in the OS keychain. It ships after v2.0
-and is listed here so you can compare.
+`saiife daemon --user` runs a broker as your own user, with the vault key in
+the OS keychain (Linux in this version). It is for trying connectors on your
+own machine; **not a security boundary**. Same-user approvals are a workflow
+aid, not a control. Setup and limits: [Personal broker](personal-broker.md).
 
 | Threat | Coverage | Why |
 | --- | --- | --- |
 | Mistake | **Covered** by packs; fails open | As Developer. |
-| Helpful bypass | **Partly covered** | |
-| Agent obtains a brokered credential | **Partly covered** | The key is in the keychain; a same-user script can read it (Linux). |
-| Agent uses an external service beyond rules | **Partly covered** | There is no boundary; workflow only. |
-| Agent erases or rewrites the audit | Not covered | As Developer. |
+| Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) also blocks the usual ways to stop the broker. It runs as your own user, so this is a mistake layer only. |
+| Agent obtains a brokered credential | **Partly covered** | The key is in the keychain; a same-user script can read it (Linux). The guard rules deny the obvious readers; a script that calls the Secret Service is not seen. |
+| Agent uses an external service beyond rules | **Partly covered** | There is no boundary; workflow only. The agent can stop the broker and bind its socket. |
+| Agent erases or rewrites the audit | Same as Developer | The chain is unsigned: there is no signing key in your own home. |
 | Agent's own script does local damage | Not covered | |
 | Agent reads your other files and logins | Not covered | |
 | Data exfiltration to arbitrary hosts | Not covered | |
@@ -106,6 +108,15 @@ and is listed here so you can compare.
 | MCP servers | Not covered | |
 | Attacker with root | Not covered | |
 | Tools without a hook | Not covered | |
+
+What the guard rules cannot do here: `core.self` and `core.secrets` catch
+mistakes, not a determined script of the same user. They do not see `busctl`
+calls such as `StopUnit`, killing a process by a pid read from a file,
+scripts that use the Secret Service from a library, or `security export`.
+The wording rule at the top of this page is for locked mode. In this setup it
+is not guaranteed, because an agent running as the same user can reach the
+key: in this mode that is a workflow aid, not a control. Use locked mode when
+that matters.
 
 ## Setup: Locked, on a person's account
 

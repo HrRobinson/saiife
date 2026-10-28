@@ -1045,3 +1045,57 @@ fn agent_settings_stay_readable() {
         );
     }
 }
+
+#[test]
+fn the_personal_brokers_vault_key_is_not_readable_through_the_keychain() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "secret-tool lookup application saiife",
+        "secret-tool lookup application saiife saiife-item vault-key",
+        "secret-tool search --all application saiife",
+        "sudo secret-tool lookup application saiife",
+        "security find-generic-password -s saiife -w",
+        "security find-generic-password -a vault-key -w",
+        "security dump-keychain",
+        "security dump-keychain -d login.keychain",
+        "busctl --user call org.freedesktop.secrets /org/freedesktop/secrets org.freedesktop.Secret.Service SearchItems a{ss} 1 application saiife",
+        "gdbus call --session --dest org.freedesktop.secrets --object-path /org/freedesktop/secrets --method org.freedesktop.Secret.Service.SearchItems '{}'",
+        "dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets/aliases/default org.freedesktop.Secret.Item.GetSecret",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    assert_allows(
+        &e,
+        &[
+            "secret-tool lookup application other",
+            "secret-tool store --label=x application other",
+            "security find-generic-password -s github",
+            "security list-keychains",
+            "busctl --user list",
+        ],
+    );
+}
+
+#[test]
+fn keychain_dump_gaps_round_one() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "secret-tool search --all",
+        "secret-tool search --all --unlock",
+        "security find-generic-password -w",
+        "security find-generic-password -ga",
+        "security dump-keychain -d",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+    }
+    assert_allows(
+        &e,
+        &[
+            "secret-tool search service github",
+            "secret-tool search --all service github",
+            "security find-generic-password -s github -w",
+        ],
+    );
+}

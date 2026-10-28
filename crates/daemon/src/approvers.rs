@@ -87,6 +87,17 @@ pub fn is_approver(cfg: &ApprovalCfg, dir: &dyn Directory, user: &str) -> bool {
         })
 }
 
+/// The personal broker's rule (spec §6.10.2): its own user approves its own
+/// requests, with no list and no re-authentication. This is a workflow
+/// aid, not a control. Any other uid is not an approver.
+pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
+    if crate::personal::admits(own_uid, peer_uid) {
+        Ok(())
+    } else {
+        Err(Refusal::NotApprover)
+    }
+}
+
 /// May the CLI connected as `peer` decide a request made by
 /// `requester_uid`? The approver's uid is `peer.uid`. Every error refuses
 /// (fail closed).
@@ -280,6 +291,13 @@ mod tests {
             gid: uid,
             pid: PID,
         }
+    }
+
+    #[test]
+    fn personal_may_decide_own_uid_only() {
+        assert_eq!(personal_may_decide(1000, 1000), Ok(()));
+        assert_eq!(personal_may_decide(1000, 1001), Err(Refusal::NotApprover));
+        assert_eq!(personal_may_decide(1000, 0), Err(Refusal::NotApprover));
     }
 
     #[test]

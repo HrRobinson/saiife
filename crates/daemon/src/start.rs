@@ -1,16 +1,19 @@
 //! Startup, the serve loop, reload and stop (spec §6.2).
 
-use crate::ops::{check_services, Ctx, CtxInit, PolicyState, MODE, VERSION};
+use crate::ops::{check_services_owned, Ctx, CtxInit, Mode, PolicyState, VERSION};
+use crate::personal::{self, PersonalCfg};
 use crate::tokens::{self, Tokens};
 use crate::vault::{self, VaultState};
 use crate::writer::{self, pending_key_path, WriterConfig};
-use crate::{gateway, notify, server, DaemonOptions};
+use crate::{gateway, notify, server, DaemonMode, DaemonOptions};
 use saiife_audit::sign::AuditKey;
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_broker::limits::Limiter;
 use saiife_broker::pipeline::limit_event;
 use saiife_broker::upstream::Upstream;
+use saiife_broker::Catalog;
 use saiife_ipc::msg::{GATEWAY_SOCKET_NAME, SOCKET_NAME};
+use saiife_policy::PackInfo;
 use saiife_policy::{load_and_check, parse_duration, AuditCfg, DaemonCfg, Fsync, LoadedPolicy};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -110,54 +113,325 @@ fn bootstrap(path: &Path) -> Bootstrap {
     b
 }
 
+/// What only the personal broker has at start.
+struct PersonalStart {
+    cfg: PersonalCfg,
+    /// The vault, read from the keychain before the runtime exists.
+    vault: VaultState,
+    /// The single-instance lock on the state dir, held until the end.
+    lock: std::fs::File,
+}
+
+/// The lock file in the personal state dir that keeps a second broker of
+/// the same user from starting (and from making a second vault key).
+const PERSONAL_LOCK: &str = "broker.lock";
+
+/// See [`crate::personal_preflight`].
+pub(crate) fn personal_preflight(
+    config: &Path,
+    socket_dir: &Path,
+    locked_marker: &Path,
+) -> Result<(), String> {
+    let euid = rustix::process::geteuid().as_raw();
+    if euid == 0 {
+        return Err("the personal broker runs as your own user, not root".into());
+    }
+    // Decision 10: a locked host wins.
+    if std::fs::symlink_metadata(locked_marker).is_ok() {
+        return Err(format!(
+            "this host is in locked mode ({} exists): connectors go through the system daemon, not daemon --user",
+            locked_marker.display()
+        ));
+    }
+    let runtime = socket_dir
+        .parent()
+        .ok_or_else(|| format!("{}: no XDG_RUNTIME_DIR above it", socket_dir.display()))?;
+    saiife_system::personal::check_runtime_dir(runtime, euid)?;
+    if bootstrap(config).locked == Some(true) {
+        return Err(format!(
+            "{}: locked = true is a locked-mode config; the personal broker does not serve it",
+            config.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A dir of the personal broker's own (state, audit): created 0700 when
+/// missing; an existing one must be a real dir of this user that group
+/// and others cannot use.
+fn private_dir(dir: &Path, euid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let md = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !md.file_type().is_dir() {
+        return Err(format!(
+            "{}: not a directory (symlinks are not followed)",
+            dir.display()
+        ));
+    }
+    if md.uid() != euid {
+        return Err(format!(
+            "{}: owned by uid {}, not this user (uid {euid})",
+            dir.display(),
+            md.uid()
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{}: mode {:04o}, must be 0700; fix: chmod 700 {}",
+            dir.display(),
+            md.mode() & 0o7777,
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Take the personal broker's single-instance lock (`flock` on
+/// `<state>/broker.lock`, never through a symlink). A lock another broker
+/// holds refuses the start.
+///
+/// The lock is per state dir, not per user: two brokers started with
+/// different `XDG_STATE_HOME` hold different locks but share the one
+/// keychain item (`saiife`/`vault-key`). If both start with no key at once,
+/// each may store its own and the last write wins; the other's vault is then
+/// left under a key the keychain no longer holds. One broker per user is the
+/// supported setup.
+fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = state_dir.join(PERSONAL_LOCK);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(f),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(format!(
+            "another personal broker of this user is running (it holds {})",
+            path.display()
+        )),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The personal broker's start up to the vault (decision 11 and the
+/// security order of Task 5): the refusals, the config, the state dir and
+/// its lock, then the key from the keychain. The keychain is dropped here,
+/// before any runtime exists.
+#[allow(clippy::too_many_arguments)]
+fn personal_start(
+    config: &Path,
+    state_dir: &Path,
+    directory: &dyn saiife_policy::Directory,
+    euid: u32,
+    socket_dir: PathBuf,
+    audit_dir: PathBuf,
+    keychain: Box<dyn saiife_keychain::Keychain>,
+    locked_marker: &Path,
+) -> Result<PersonalStart, Refuse> {
+    personal_preflight(config, &socket_dir, locked_marker)?;
+    let own_user = directory
+        .name_of(euid)
+        .ok_or_else(|| format!("uid {euid} has no user name"))?;
+    match personal::ensure_config(config) {
+        Ok(true) => eprintln!("saiife: created {}", config.display()),
+        Ok(false) => {}
+        Err(e) => {
+            let dir = config.parent().unwrap_or(Path::new("/"));
+            let fix = if e.to_string().contains("mode 0700") {
+                format!("; fix: chmod 700 {}", dir.display())
+            } else {
+                String::new()
+            };
+            return Err(format!("{}: {e}{fix}", config.display()).into());
+        }
+    }
+    private_dir(state_dir, euid)?;
+    // The lock before the keychain: two brokers starting at once must not
+    // both find no key and each store a new one.
+    let lock = lock_state_dir(state_dir)?;
+    let vault = personal::open_vault(
+        keychain.as_ref(),
+        &state_dir.join("vault").join("vault.bin"),
+    );
+    // The Secret Service backend owns a runtime of its own: dropped here,
+    // outside any runtime.
+    drop(keychain);
+    Ok(PersonalStart {
+        cfg: PersonalCfg {
+            own_user,
+            own_uid: euid,
+            socket_dir,
+            audit_dir,
+        },
+        vault,
+        lock,
+    })
+}
+
+/// The one load path for start and reload: load and check the files, fit
+/// them to personal mode (`personal`), check the `ask` rules and the
+/// services, then the state in force.
+pub(crate) fn load_policy(
+    mode: Mode,
+    config: &Path,
+    dir: &dyn saiife_policy::Directory,
+    catalog: &[PackInfo],
+    personal: Option<&PersonalCfg>,
+) -> Result<(LoadedPolicy, Catalog, PolicyState), String> {
+    let mut l = load_and_check(config, dir).map_err(|e| e.to_string())?;
+    let owner = match personal {
+        Some(p) => {
+            // A locked-mode config is never served by the personal broker:
+            // refused at start, and a reload to one is rejected (the old
+            // policy stays).
+            if l.config.locked {
+                return Err(format!(
+                    "{}: locked = true is a locked-mode config; the personal broker does not serve it",
+                    config.display()
+                ));
+            }
+            let raw = read_bounded(config)
+                .and_then(|s| s.parse::<toml::Table>().ok())
+                .unwrap_or_default();
+            for w in personal::apply(&mut l.config, &raw, p, dir) {
+                eprintln!("saiife: warning: {w}");
+            }
+            p.own_uid
+        }
+        None => 0,
+    };
+    // Locked keeps main's order (services, then `[guard] ask`), so a
+    // config with both errors reports the same one as before plan 16.
+    let cat = if personal.is_none() {
+        let cat = check_services_owned(&l, config, owner)?;
+        check_ask(&l, catalog)?;
+        cat
+    } else {
+        check_ask(&l, catalog)?;
+        check_services_owned(&l, config, owner)?
+    };
+    let state = PolicyState::from_loaded_in(&l, catalog, cat.clone(), mode);
+    Ok((l, cat, state))
+}
+
+/// The socket dir and socket modes: the locked daemon's dir is 0755 and
+/// its sockets 0666 (the peer check decides); the personal broker's are
+/// 0700 and 0600, owned by the user (root's is not accepted).
+#[derive(Debug, Clone, Copy)]
+struct SocketPerms {
+    dir: u32,
+    sock: u32,
+    root_dir_ok: bool,
+}
+
+const SYSTEM_SOCKETS: SocketPerms = SocketPerms {
+    dir: 0o755,
+    sock: 0o666,
+    root_dir_ok: true,
+};
+const PERSONAL_SOCKETS: SocketPerms = SocketPerms {
+    dir: 0o700,
+    sock: 0o600,
+    root_dir_ok: false,
+};
+
 fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
+    let DaemonOptions {
+        config,
+        state_dir,
+        catalog,
+        directory,
+        credentials_dir,
+        mode: daemon_mode,
+    } = opts;
     // 1. Who and what may run.
     let euid = rustix::process::geteuid().as_raw();
     if euid == 0 {
-        return Err("the daemon must run as the daemon user, not root".into());
-    }
-    let boot = bootstrap(&opts.config);
-    let name = boot.daemon.user.clone();
-    match opts.directory.user(&name) {
-        Some(u) if u.uid == euid => {}
-        Some(_) => {
-            return Err(format!("the daemon runs as {name} per [daemon] user, not uid {euid}").into())
+        return Err(match daemon_mode {
+            DaemonMode::System => "the daemon must run as the daemon user, not root",
+            DaemonMode::Personal { .. } => "the personal broker runs as your own user, not root",
         }
-        None => {
-            return Err(format!(
-                "the daemon runs as {name} per [daemon] user, and there is no such user (this is uid {euid})"
-            )
-            .into())
-        }
-    }
-    if boot.locked == Some(false) {
-        return Err(format!(
-            "{}: the daemon serves a locked config only; set locked = true",
-            opts.config.display()
-        )
         .into());
     }
-
-    // 2. No core dumps (the signing key is in memory).
+    let boot = bootstrap(&config);
+    let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(directory);
+    // 2. No core dumps (the signing key or the vault key is in memory).
     if let Err(e) =
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
     {
         eprintln!("saiife: warning: cannot turn off core dumps: {e}");
     }
+    let (mode, personal) = match daemon_mode {
+        DaemonMode::System => {
+            let name = &boot.daemon.user;
+            match directory.user(name) {
+                Some(u) if u.uid == euid => {}
+                Some(_) => {
+                    return Err(format!(
+                        "the daemon runs as {name} per [daemon] user, not uid {euid}"
+                    )
+                    .into())
+                }
+                None => {
+                    return Err(format!(
+                        "the daemon runs as {name} per [daemon] user, and there is no such user (this is uid {euid})"
+                    )
+                    .into())
+                }
+            }
+            if boot.locked == Some(false) {
+                return Err(format!(
+                    "{}: the daemon serves a locked config only; set locked = true",
+                    config.display()
+                )
+                .into());
+            }
+            (Mode::Locked, None)
+        }
+        DaemonMode::Personal {
+            socket_dir,
+            audit_dir,
+            keychain,
+            locked_marker,
+        } => (
+            Mode::Personal,
+            Some(personal_start(
+                &config,
+                &state_dir,
+                directory.as_ref(),
+                euid,
+                socket_dir,
+                audit_dir,
+                keychain,
+                &locked_marker,
+            )?),
+        ),
+    };
+    let pcfg = personal.as_ref().map(|p| p.cfg.clone());
+    let name = match &pcfg {
+        Some(p) => p.own_user.clone(),
+        None => boot.daemon.user.clone(),
+    };
 
     // 3. The policy; an invalid one still lets the daemon accept audit.
-    let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(opts.directory);
     // The services are checked against the connector catalog as part of
     // the policy: a broken one makes the whole policy invalid.
-    let loaded = load_and_check(&opts.config, directory.as_ref())
-        .map_err(|e| e.to_string())
-        .and_then(|l| check_services(&l, &opts.config).map(|cat| (l, cat)))
-        .and_then(|(l, cat)| check_ask(&l, &opts.catalog).map(|()| (l, cat)));
-    let (daemon_cfg, audit_cfg, policy, policy_err) = match &loaded {
-        Ok((l, cat)) => (
+    let loaded = load_policy(mode, &config, directory.as_ref(), &catalog, pcfg.as_ref());
+    let (mut daemon_cfg, mut audit_cfg, policy, policy_err) = match &loaded {
+        Ok((l, _, state)) => (
             l.config.daemon.clone(),
             l.config.audit.clone(),
-            PolicyState::from_loaded(l, &opts.catalog, cat.clone()),
+            state.clone(),
             None,
         ),
         Err(e) => {
@@ -165,46 +439,58 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
             (
                 boot.daemon.clone(),
                 boot.audit.clone(),
-                PolicyState {
-                    hash: None,
-                    ok: false,
-                    min_free_mb: boot.audit.min_free_mb,
-                    admin_groups: Vec::new(),
-                    system: None,
-                    gateway: None,
-                },
+                PolicyState::invalid(boot.audit.min_free_mb),
                 Some(e.clone()),
             )
         }
     };
+    // The personal broker's paths are fixed (decision 2), whatever the
+    // config says or whether it loaded.
+    if let Some(p) = &pcfg {
+        daemon_cfg.user = p.own_user.clone();
+        daemon_cfg.socket_dir = p.socket_dir.clone();
+        audit_cfg.dir = p.audit_dir.clone();
+    }
     let gateway_cfg = match &loaded {
-        Ok((l, _)) => l.config.gateway.clone(),
+        Ok((l, _, _)) => l.config.gateway.clone(),
         Err(_) => saiife_policy::GatewayCfg::default(),
     };
 
-    // 4. The signing key.
-    let key_path = opts.state_dir.join("keys").join("audit.ed25519");
-    let (key, _created) = AuditKey::load_or_create(&key_path).map_err(|e| e.to_string())?;
-    let pending = pending_key_path(&key_path);
-    if std::fs::symlink_metadata(&pending).is_ok() {
-        eprintln!(
-            "saiife: warning: {} is left from an interrupted key rotation; the key in {} stays in force",
-            pending.display(),
-            key_path.display()
-        );
-    }
+    // 4. The signing key: none for the personal broker (§6.4.4: a key in
+    // the user's own home proves nothing).
+    let key_path = state_dir.join("keys").join("audit.ed25519");
+    let key = match mode {
+        Mode::Personal => None,
+        Mode::Locked => {
+            let (key, _created) = AuditKey::load_or_create(&key_path).map_err(|e| e.to_string())?;
+            let pending = pending_key_path(&key_path);
+            if std::fs::symlink_metadata(&pending).is_ok() {
+                eprintln!(
+                    "saiife: warning: {} is left from an interrupted key rotation; the key in {} stays in force",
+                    pending.display(),
+                    key_path.display()
+                );
+            }
+            Some(key)
+        }
+    };
 
     // 5. The chain: one writer, checked at start.
+    if mode == Mode::Personal {
+        private_dir(&audit_cfg.dir, euid)?;
+    }
     let cw = ChainWriter::open(
         &audit_cfg.dir,
         WriterOptions {
-            mode: MODE.into(),
+            mode: mode.as_str().into(),
             saiife: VERSION.into(),
-            key: Some(key),
+            key,
         },
     )
     .map_err(|e| format!("{}: {e}", audit_cfg.dir.display()))?;
-    regroup_audit_dir(&audit_cfg.dir, directory.as_ref());
+    if mode == Mode::Locked {
+        regroup_audit_dir(&audit_cfg.dir, directory.as_ref());
+    }
     let check = cw.startup_check(STARTUP_CHECK_RECORDS);
     let writer_cfg = WriterConfig {
         checkpoint_every: audit_cfg.checkpoint_every,
@@ -216,10 +502,16 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
 
     // The vault: an unavailable one never stops the daemon (fail closed
     // for connectors, audit keeps working).
-    let vault_path = opts.state_dir.join("vault").join("vault.bin");
-    let vault = match &opts.credentials_dir {
-        Some(d) => vault::open(&d.join("vault-key"), &vault_path),
-        None => VaultState::Unavailable("no vault key".into()),
+    let vault_path = state_dir.join("vault").join("vault.bin");
+    let (vault, _personal_lock) = match personal {
+        Some(p) => (p.vault, Some(p.lock)),
+        None => (
+            match &credentials_dir {
+                Some(d) => vault::open(&d.join("vault-key"), &vault_path),
+                None => VaultState::Unavailable("no vault key".into()),
+            },
+            None,
+        ),
     };
 
     // Connector limits survive a restart: rebuilt from the last 24 h of
@@ -246,8 +538,8 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     // directory is a `ca_refused` record; the native roots stay. The tests
     // trust their loopback CA through that same directory (owner seam in
     // `trusted_owner`), so the daemon has no seam for roots or names.
-    let ca_dir = opts.config.parent().unwrap_or(Path::new("/")).join("ca");
-    let ca_refused = check_ca_dir(&ca_dir, trusted_owner()).err();
+    let ca_dir = config.parent().unwrap_or(Path::new("/")).join("ca");
+    let ca_refused = check_ca_dir(&ca_dir, crate::ops::trusted_owner_in(mode, euid)).err();
     if let Some(why) = &ca_refused {
         eprintln!("saiife: warning: extra CAs not used: {why}");
     }
@@ -257,13 +549,13 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         e.to_string()
     });
     // Import backups older than 7 days go at start (and daily in `serve`).
-    let backup_dir = crate::import_backup::dir_in(&opts.state_dir);
+    let backup_dir = crate::import_backup::dir_in(&state_dir);
     crate::import_backup::purge(&backup_dir, crate::import_backup::now());
     // The approval requests; pending ones past their expiry are expired at
     // start (and every 30 s in `serve`). A store that cannot be opened
     // keeps the daemon up and denies every `ask`.
-    let approvals = crate::approvals::Store::open(&crate::approvals::dir_in(&opts.state_dir))
-        .map_err(|e| {
+    let approvals =
+        crate::approvals::Store::open(&crate::approvals::dir_in(&state_dir)).map_err(|e| {
             eprintln!("saiife: warning: approvals unavailable: {e}");
             e.to_string()
         });
@@ -274,22 +566,21 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     };
     // The gateway's bearer tokens; an unreadable file is no tokens and a
     // `tokens_reset` record.
-    let (tokens, tokens_reset) =
-        Tokens::open(tokens::path_in(&opts.state_dir), tokens::system_clock());
+    let (tokens, tokens_reset) = Tokens::open(tokens::path_in(&state_dir), tokens::system_clock());
     if let Some(why) = &tokens_reset {
         eprintln!("saiife: warning: gateway tokens reset: {why}");
     }
     // The lockdown flag; an unreadable file is `all` (fail closed) and a
     // `lockdown_unreadable` record.
     let (lockdown, lockdown_unreadable) =
-        crate::lockdown::Store::open(crate::lockdown::path_in(&opts.state_dir));
+        crate::lockdown::Store::open(crate::lockdown::path_in(&state_dir));
     if let Some(why) = &lockdown_unreadable {
         eprintln!("saiife: warning: {why}: lockdown is on for all hooks and connectors");
     }
     // The command grants; an unusable file is no grants (each command
     // needs approval again) and a `grants_unreadable` record.
     let (grants, grants_unreadable) = crate::grants::Grants::open(
-        crate::grants::path_in(&opts.state_dir),
+        crate::grants::path_in(&state_dir),
         crate::import_backup::now(),
     );
     if let Some(why) = &grants_unreadable {
@@ -302,13 +593,14 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         writer: handle,
         writer_cfg,
         directory,
+        mode,
         own_uid: euid,
         own_user: name,
         audit_dir: audit_cfg.dir.clone(),
         socket_dir: daemon_cfg.socket_dir.clone(),
         key_path,
-        config_path: opts.config.clone(),
-        catalog: opts.catalog,
+        config_path: config.clone(),
+        catalog,
         policy,
         proc: Box::new(crate::sessions::RealProc::new("/proc")),
         vault,
@@ -329,7 +621,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         let host: std::sync::Weak<dyn crate::forwarder::Host> = weak.clone();
         ctx.forwarders.configure(crate::forwarder::Setup {
             audit_dir: audit_cfg.dir.clone(),
-            state_dir: opts.state_dir.clone(),
+            state_dir: state_dir.clone(),
             appended: ctx.writer.appends(),
             clock: Arc::new(crate::forwarder::SystemClock::default()),
             host,
@@ -342,7 +634,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
-    let loaded_files = loaded.as_ref().ok().map(|(l, _)| files_json(l));
+    let loaded_files = loaded.as_ref().ok().map(|(l, _, _)| files_json(l));
     let notes: Vec<_> = [
         ("ca_refused", ca_refused),
         ("tokens_reset", tokens_reset),
@@ -428,20 +720,6 @@ fn adopt_audit_group(dir: &Path, gid: u32) -> std::io::Result<u32> {
     Ok(changed)
 }
 
-/// Who must own `<config dir>/ca` and its files: root. A debug build (the
-/// test suite) honours `SAIIFE_TEST_CA_OWNER=<uid>`, so tests running as a
-/// normal user can use the directory; a release build has no such seam.
-fn trusted_owner() -> u32 {
-    #[cfg(debug_assertions)]
-    if let Some(uid) = std::env::var("SAIIFE_TEST_CA_OWNER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        return uid;
-    }
-    0
-}
-
 /// The checks `load_local_with` makes on local manifests, for the CA
 /// directory: owned by `owner`, not writable by group or others, no
 /// symlinks, and every `*.pem` a regular file with the same owner and mode
@@ -449,6 +727,8 @@ fn trusted_owner() -> u32 {
 fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let err = |p: &Path, why: &str| format!("{}: {why}", p.display());
+    let who = if owner == 0 { "root" } else { "this user" };
+    let owned = format!("must be owned by {who} and not writable by others");
     let meta = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -458,7 +738,7 @@ fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
         return Err(err(dir, "not a directory (symlinks are not followed)"));
     }
     if meta.uid() != owner || meta.mode() & 0o022 != 0 {
-        return Err(err(dir, "must be owned by root and not writable by others"));
+        return Err(err(dir, &owned));
     }
     for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
         let e = e.map_err(|e| err(dir, &e.to_string()))?;
@@ -471,7 +751,7 @@ fn check_ca_dir(dir: &Path, owner: u32) -> Result<(), String> {
             return Err(err(&p, "not a regular file (symlinks are not followed)"));
         }
         if m.uid() != owner || m.mode() & 0o022 != 0 {
-            return Err(err(&p, "must be owned by root and not writable by others"));
+            return Err(err(&p, &owned));
         }
     }
     Ok(())
@@ -590,9 +870,34 @@ fn policy_record(
 
 /// Refuse a socket dir others could write to or that is not this user's
 /// (or root's): the client trusts whatever socket is in it.
-fn check_socket_dir(st: &rustix::fs::Stat, dir: &Path, uid: u32) -> Result<(), String> {
+/// The personal broker's dir must be its own (not root's) and closed to
+/// group and others.
+fn check_socket_dir(
+    st: &rustix::fs::Stat,
+    dir: &Path,
+    uid: u32,
+    perms: SocketPerms,
+) -> Result<(), String> {
     if st.st_mode & 0o170000 != 0o040000 {
         return Err(format!("{}: not a directory", dir.display()));
+    }
+    if !perms.root_dir_ok {
+        if st.st_uid != uid {
+            return Err(format!(
+                "{}: owned by uid {}, expected this user (uid {uid})",
+                dir.display(),
+                st.st_uid
+            ));
+        }
+        if st.st_mode & 0o077 != 0 {
+            return Err(format!(
+                "{}: mode {:04o}, must be 0700; fix: chmod 700 {}",
+                dir.display(),
+                st.st_mode & 0o7777,
+                dir.display()
+            ));
+        }
+        return Ok(());
     }
     if st.st_uid != uid && st.st_uid != 0 {
         return Err(format!(
@@ -607,14 +912,19 @@ fn check_socket_dir(st: &rustix::fs::Stat, dir: &Path, uid: u32) -> Result<(), S
     Ok(())
 }
 
-/// The socket dir (created 0755 when missing; an existing one must be
-/// this user's or root's and not group/other-writable) and a fresh socket
-/// `name` in it (`saiife.sock`, `gateway.sock`), 0666. A stale socket is
+/// The socket dir (created `perms.dir` when missing: 0755, or 0700 for the
+/// personal broker; an existing one is checked by [`check_socket_dir`]) and a fresh socket
+/// `name` in it (`saiife.sock`, `gateway.sock`), `perms.sock` (0666 or 0600). A stale socket is
 /// removed only when it is a socket of this uid that nobody answers on;
 /// anything else there is left alone. The dir is held open (`O_NOFOLLOW`)
 /// and every later step works relative to it, without following a symlink
 /// at `name`.
-fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBuf), String> {
+fn bind(
+    socket_dir: &Path,
+    name: &str,
+    uid: u32,
+    perms: SocketPerms,
+) -> Result<(UnixListener, PathBuf), String> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     let at = |e: &dyn std::fmt::Display| format!("{}: {e}", socket_dir.display());
     match std::fs::symlink_metadata(socket_dir) {
@@ -625,7 +935,7 @@ fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBu
             }
             std::fs::create_dir(socket_dir)
                 .and_then(|()| {
-                    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o755))
+                    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(perms.dir))
                 })
                 .map_err(|e| at(&e))?;
         }
@@ -641,6 +951,7 @@ fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBu
         &rustix::fs::fstat(&dirfd).map_err(|e| at(&e))?,
         socket_dir,
         uid,
+        perms,
     )?;
 
     let path = socket_dir.join(name);
@@ -662,18 +973,23 @@ fn bind(socket_dir: &Path, name: &str, uid: u32) -> Result<(UnixListener, PathBu
         Err(e) => return Err(at_sock(&e)),
     }
     let l = UnixListener::bind(&path).map_err(|e| at_sock(&e))?;
-    chmod_socket(&dirfd, name, uid).map_err(|e| at_sock(&e))?;
+    chmod_socket(&dirfd, name, uid, perms.sock).map_err(|e| at_sock(&e))?;
     Ok((l, path))
 }
 
-/// `chmod 0666` on the socket just bound, never through a symlink: an
+/// `chmod` (`sock_mode`) on the socket just bound, never through a symlink: an
 /// `O_PATH | O_NOFOLLOW` handle is checked to be this uid's socket and
 /// changed through `/proc/self/fd`. Without `/proc`, `fchmodat` on the
 /// checked name in the held dir, which only this uid or root can change.
-fn chmod_socket(dirfd: &rustix::fd::OwnedFd, name: &str, uid: u32) -> std::io::Result<()> {
+fn chmod_socket(
+    dirfd: &rustix::fd::OwnedFd,
+    name: &str,
+    uid: u32,
+    sock_mode: u32,
+) -> std::io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     use std::os::fd::AsRawFd;
-    let mode = Mode::from_raw_mode(0o666);
+    let mode = Mode::from_raw_mode(sock_mode);
     let fd = rustix::fs::openat(
         dirfd,
         name,
@@ -753,6 +1069,10 @@ async fn serve(
     more: Vec<saiife_audit::Record>,
     tcp: Option<std::net::SocketAddr>,
 ) -> ExitCode {
+    let perms = match ctx.mode {
+        Mode::Locked => SYSTEM_SOCKETS,
+        Mode::Personal => PERSONAL_SOCKETS,
+    };
     let signals = (
         signal(SignalKind::hangup()),
         signal(SignalKind::terminate()),
@@ -805,7 +1125,7 @@ async fn serve(
     }
 
     // 7. The sockets: control and the HTTP gateway (§8.8), side by side.
-    let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid) {
+    let (listener, sock_path) = match bind(&socket_dir, SOCKET_NAME, ctx.own_uid, perms) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("saiife: {e}");
@@ -813,7 +1133,7 @@ async fn serve(
             return ExitCode::from(2);
         }
     };
-    let (gw_listener, gw_path) = match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid) {
+    let (gw_listener, gw_path) = match bind(&socket_dir, GATEWAY_SOCKET_NAME, ctx.own_uid, perms) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("saiife: {e}");
@@ -1039,19 +1359,29 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
     let _one_at_a_time = ctx.reloads.lock().await;
     let c = Arc::clone(ctx);
     let loaded = tokio::task::spawn_blocking(move || {
-        regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
-        load_and_check(&c.config_path, c.directory.as_ref())
-            .map_err(|e| e.to_string())
-            .and_then(|l| check_services(&l, &c.config_path).map(|cat| (l, cat)))
-            .and_then(|(l, cat)| check_ask(&l, &c.catalog).map(|()| (l, cat)))
+        let personal = (c.mode == Mode::Personal).then(|| PersonalCfg {
+            own_user: c.own_user.clone(),
+            own_uid: c.own_uid,
+            socket_dir: c.socket_dir.clone(),
+            audit_dir: c.audit_dir.clone(),
+        });
+        if c.mode == Mode::Locked {
+            regroup_audit_dir(&c.audit_dir, c.directory.as_ref());
+        }
+        load_policy(
+            c.mode,
+            &c.config_path,
+            c.directory.as_ref(),
+            &c.catalog,
+            personal.as_ref(),
+        )
     })
     .await
     .unwrap_or_else(|e| Err(format!("reload failed: {e}")));
     let mut recs = Vec::new();
     let mut result = Ok(());
     match loaded {
-        Ok((l, cat)) => {
-            let next = PolicyState::from_loaded(&l, &ctx.catalog, cat);
+        Ok((l, _, next)) => {
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             ctx.forwarders.apply(&l.config.audit.forward).await;
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
@@ -1086,7 +1416,9 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
 fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
     let c = &l.config;
     let mut out = Vec::new();
-    if !c.locked {
+    // (A personal reload with `locked = true` never gets here: `load_policy`
+    // rejects it.)
+    if ctx.mode == Mode::Locked && !c.locked {
         out.push("the reloaded config lacks locked = true".to_string());
     }
     if c.daemon.user != ctx.own_user {
@@ -1121,6 +1453,60 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// Locked mode checks the services before `[guard] ask` (as main did,
+    /// at start and reload): a config that fails both names the service.
+    #[test]
+    fn locked_load_reports_services_before_ask() {
+        let d = tempfile::tempdir().unwrap();
+        let config = d.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "version = 2\nlocked = true\n\n[daemon]\nuser = \"saiife\"\n\n\
+             [guard]\nask = [\"core.git/no-such-rule\"]\n\n\
+             [services.erp]\nconnector = \"no-such-connector\"\n",
+        )
+        .unwrap();
+        let dir = saiife_policy::FixedDirectory::from_text(
+            "saiife:x:990:990::/:/usr/sbin/nologin\n",
+            "saiife:x:990:\n",
+        );
+        let e = load_policy(Mode::Locked, &config, &dir, &[], None).unwrap_err();
+        assert!(e.contains("no-such-connector"), "{e}");
+        assert!(!e.contains("no-such-rule"), "{e}");
+    }
+
+    #[test]
+    fn state_lock_is_single_instance() {
+        let d = tempfile::tempdir().unwrap();
+        let first = lock_state_dir(d.path()).unwrap();
+        let e = lock_state_dir(d.path()).unwrap_err();
+        assert!(e.contains("another personal broker"), "{e}");
+        drop(first);
+        lock_state_dir(d.path()).unwrap();
+        // Never through a symlink.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::remove_file(d.path().join(PERSONAL_LOCK)).unwrap();
+        std::os::unix::fs::symlink(other.path().join("x"), d.path().join(PERSONAL_LOCK)).unwrap();
+        assert!(lock_state_dir(d.path()).is_err());
+        assert!(!other.path().join("x").exists());
+    }
+
+    #[test]
+    fn private_dir_is_0700_and_names_the_fix() {
+        let d = tempfile::tempdir().unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let p = d.path().join("a/b");
+        private_dir(&p, me).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let e = private_dir(&p, me).unwrap_err();
+        assert!(e.contains(&format!("chmod 700 {}", p.display())), "{e}");
+        assert!(private_dir(&p, me.wrapping_add(1)).is_err());
+    }
 
     /// The start and reload helper: no `saiife-audit` group, nothing to do;
     /// a group the dir is already in, nothing changed; a dir that cannot be

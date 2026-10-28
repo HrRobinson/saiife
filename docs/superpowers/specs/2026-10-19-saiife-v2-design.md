@@ -697,6 +697,10 @@ least once, to each target. Targets:
   (macOS Keychain with an access list that names the saiife binary; Linux
   Secret Service). The docs say plainly that any process of the same user can
   read these on Linux, and on macOS after one click the user may give.
+  Built (plan 16): one keychain item (`saiife`/`vault-key`) holds the 32-byte
+  vault key, and the secrets stay in `vault.bin` sealed under it, not one item
+  per secret. `saiife daemon --user` on macOS is refused until the plan 13
+  daemon port; the macOS Keychain backend is built and compile-checked.
 - `saiife secret add <name> --kind token [--service shopify]` reads the value
   from the terminal without echo, or from `--from-file <path>` /
   `--from-env <VAR>`. The value goes to the daemon over the socket (admin
@@ -1231,13 +1235,13 @@ v2.0: `saiife daemon --user`, the personal-broker side of `secret` and
 |---|---|---|
 | `saiife system install [--config <file>] [--agents claude,codex,gemini] [--approvers <list>] [--non-interactive]` | root | Create users and groups, install the binary to `/opt/saiife/bin`, write `/etc/saiife` (from `--config` or a commented default), the unit or plist, and the managed hooks for the chosen agents; start the daemon; write `installed.toml`; run `doctor`. Idempotent. |
 | `saiife system uninstall [--keep-audit]` | root | Remove exactly what `installed.toml` lists. The audit and vault are kept unless `--purge`. |
-| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. |
+| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. Built (plan 16): Linux only; macOS is refused until the plan 13 daemon port. |
 | `saiife doctor [--user <name>] [--json]` | anyone (more checks as root) | §6.16 (proposed; in v2.0). |
 | `saiife status` | anyone | v1 checks, plus mode, daemon health, chain head, pending approvals for this user, lockdown state, each agent's lock label (decision 9), and one warning per unbrokered MCP server allowed in policy (decision 10). |
 | `saiife check --managed …` | managed hooks | §6.1.2. |
 | `saiife init` | user | In locked mode: writes the project config, adds packs only, writes no hooks for agents that have managed hooks. |
 | `saiife init --off` | user / admin | In locked mode: removes leftover project hooks only. It cannot touch managed hooks (those need `system uninstall`). |
-| `saiife secret add\|list\|remove\|rotate\|import` | admin (locked) / user (personal broker) | §6.6. `list` shows names and metadata, never values. |
+| `saiife secret add\|list\|remove\|rotate\|import` | admin (locked) / user (personal broker) | §6.6. `list` shows names and metadata, never values. Built (plan 16): `import` is refused in personal broker mode (`personal broker: use secret add`). |
 | `saiife connect <service>` | admin / user | §6.8.3. |
 | `saiife api …` | agent user | §6.7.2. |
 | `saiife api token` | agent user | Bearer token for the optional TCP listener. |

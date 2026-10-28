@@ -94,15 +94,14 @@ pub use linux::{decide, run};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{ApprovalsAction, Decision, ListArgs};
+    use crate::broker::{self, Target};
     use crate::text::sanitize;
-    use saiife_ipc::client::{system_uid, Client, ClientError};
-    use saiife_policy::load_system;
+    use saiife_ipc::client::{Client, ClientError};
     use serde_json::{json, Map, Value};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::{Child, Command, ExitCode, Stdio};
     use std::time::{Duration, Instant};
 
-    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// A decision may wait for the approver to authenticate (the daemon
     /// gives polkit 120 s).
@@ -140,24 +139,9 @@ mod linux {
         }
     }
 
-    fn connect(config: &Path) -> Result<Client, Stop> {
-        let loaded = load_system(config)
-            .map_err(|e| unavailable(format!("cannot read the system config: {e}")))?;
-        if !loaded.config.locked {
-            return Err(unavailable(format!(
-                "{}: locked is not true",
-                config.display()
-            )));
-        }
-        let user = &loaded.config.daemon.user;
-        let uid = system_uid(user)
-            .ok_or_else(|| unavailable(format!("the daemon user {user} does not exist")))?;
-        Client::connect(
-            &loaded.config.daemon.socket_dir,
-            uid,
-            Instant::now() + CONNECT_TIMEOUT,
-        )
-        .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))
+    fn connect(t: &Target) -> Result<Client, Stop> {
+        broker::connect(t, Instant::now() + CONNECT_TIMEOUT)
+            .map_err(|e| unavailable(broker::unreachable(t, &e)))
     }
 
     /// One call; a refusal comes back as `Stop::Refused` (with the rule
@@ -189,8 +173,9 @@ mod linux {
         }
     }
 
-    fn config_of(config: Option<PathBuf>) -> PathBuf {
-        config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG))
+    /// The locked daemon (a flag or a locked host) or the personal broker.
+    fn target(config: Option<PathBuf>) -> Result<Target, Stop> {
+        broker::resolve_here(config.as_deref()).map_err(Stop::Unavailable)
     }
 
     fn args<const N: usize>(a: [(&str, Value); N]) -> Map<String, Value> {
@@ -202,15 +187,14 @@ mod linux {
         list: ListArgs,
         action: Option<ApprovalsAction>,
     ) -> ExitCode {
-        let config = config_of(config);
-        finish(match action {
-            None => list_cmd(&config, list),
-            Some(ApprovalsAction::List(l)) => list_cmd(&config, l),
-            Some(ApprovalsAction::Show { id, json, full }) => show_cmd(&config, id, json, full),
-        })
+        finish(target(config).and_then(|t| match action {
+            None => list_cmd(&t, list),
+            Some(ApprovalsAction::List(l)) => list_cmd(&t, l),
+            Some(ApprovalsAction::Show { id, json, full }) => show_cmd(&t, id, json, full),
+        }))
     }
 
-    fn list_cmd(config: &Path, l: ListArgs) -> Result<(), Stop> {
+    fn list_cmd(config: &Target, l: ListArgs) -> Result<(), Stop> {
         let mut c = connect(config)?;
         let mut a = Map::new();
         if !l.all {
@@ -306,7 +290,7 @@ mod linux {
         }
     }
 
-    fn show_cmd(config: &Path, id: u64, as_json: bool, full: bool) -> Result<(), Stop> {
+    fn show_cmd(config: &Target, id: u64, as_json: bool, full: bool) -> Result<(), Stop> {
         let mut c = connect(config)?;
         let ans = call(&mut c, "approval.show", args([("request", json!(id))]))?;
         let item = ans.get("item").cloned().unwrap_or(Value::Null);
@@ -396,11 +380,10 @@ mod linux {
     // ------------------------------------------------------- decisions
 
     pub fn decide(config: Option<PathBuf>, d: Decision) -> ExitCode {
-        let config = config_of(config);
-        finish(decide_inner(&config, d))
+        finish(target(config).and_then(|t| decide_inner(&t, d)))
     }
 
-    fn decide_inner(config: &Path, d: Decision) -> Result<(), Stop> {
+    fn decide_inner(config: &Target, d: Decision) -> Result<(), Stop> {
         let (id, action, note, ack) = match d {
             Decision::Approve {
                 id,
@@ -425,7 +408,9 @@ mod linux {
             let shown = call(&mut c, "approval.show", args([("request", json!(id))]))?;
             eprintln!("saiife: approving {}", request_summary(id, &shown["item"]));
             let uid = shown["item"]["uid"].as_u64();
-            if uid == Some(u64::from(rustix::process::getuid().as_raw())) {
+            // The personal broker needs no re-authentication for the
+            // user's own requests (spec 6.10.2): no prompt agent.
+            if config.is_locked() && uid == Some(u64::from(rustix::process::getuid().as_raw())) {
                 start_agent()
             } else {
                 None

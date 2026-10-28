@@ -18,9 +18,9 @@ use saiife_ipc::msg::{
     OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
+use saiife_policy::Mode as PolicyMode;
 use saiife_policy::{
-    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, Mode, PackInfo,
-    SystemConfig,
+    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo, SystemConfig,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -29,7 +29,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The locked daemon's record `mode`; a context's own is [`Ctx::mode`].
 pub const MODE: &str = "locked";
+
+/// Which daemon this is: the locked system daemon, or the personal broker
+/// (`saiife daemon --user`, plan 16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Locked,
+    Personal,
+}
+
+impl Mode {
+    /// The record and `hello` `mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Locked => "locked",
+            Mode::Personal => "personal",
+        }
+    }
+
+    /// How the policy decides: the personal broker lets project overlays
+    /// `allow`, as developer mode does (decision 7).
+    pub fn policy_mode(self) -> PolicyMode {
+        match self {
+            Mode::Locked => PolicyMode::Locked,
+            Mode::Personal => PolicyMode::Developer,
+        }
+    }
+}
 
 /// How long a user or group lookup is trusted.
 const LOOKUP_TTL: Duration = Duration::from_secs(60);
@@ -65,9 +93,32 @@ pub struct PolicyState {
 }
 
 impl PolicyState {
+    /// No valid policy was ever loaded: audit only, connectors denied.
+    pub fn invalid(min_free_mb: u64) -> PolicyState {
+        PolicyState {
+            hash: None,
+            ok: false,
+            min_free_mb,
+            admin_groups: Vec::new(),
+            system: None,
+            gateway: None,
+        }
+    }
+
     /// The state of a loaded policy whose services passed
-    /// [`check_services`].
+    /// [`check_services`], for the locked daemon.
     pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo], connectors: Catalog) -> PolicyState {
+        PolicyState::from_loaded_in(l, catalog, connectors, Mode::Locked)
+    }
+
+    /// [`PolicyState::from_loaded`] for a daemon of `mode`: the connector
+    /// snapshot decides with [`Mode::policy_mode`].
+    pub fn from_loaded_in(
+        l: &LoadedPolicy,
+        catalog: &[PackInfo],
+        connectors: Catalog,
+        mode: Mode,
+    ) -> PolicyState {
         let (packs, _) = active_packs(&l.config, catalog, None);
         let hash = policy_hash(&effective_policy(&l.config, &packs, None));
         PolicyState {
@@ -80,7 +131,7 @@ impl PolicyState {
                 snap: PolicySnapshot {
                     config: l.config.clone(),
                     hash,
-                    mode: Mode::Locked,
+                    mode: mode.policy_mode(),
                 },
                 catalog: connectors,
             })),
@@ -93,11 +144,22 @@ impl PolicyState {
 /// `[services.*]` checked against it. An error makes the policy invalid
 /// (at a reload: `rejected`, the old policy stays). Warnings go to stderr.
 pub fn check_services(l: &LoadedPolicy, config_path: &std::path::Path) -> Result<Catalog, String> {
+    check_services_owned(l, config_path, 0)
+}
+
+/// [`check_services`] with the uid that must own `<config dir>/connectors`:
+/// root for the locked daemon, the user for the personal broker.
+pub fn check_services_owned(
+    l: &LoadedPolicy,
+    config_path: &std::path::Path,
+    owner: u32,
+) -> Result<Catalog, String> {
     let dir = config_path
         .parent()
         .unwrap_or(std::path::Path::new("/"))
         .join("connectors");
-    let local = saiife_broker::manifest::load_local(&dir).map_err(|e| e.to_string())?;
+    let local = saiife_broker::manifest::load_local_with(&dir, saiife_broker::builtin(), owner)
+        .map_err(|e| e.to_string())?;
     let cat = Catalog::new(saiife_broker::builtin(), local);
     let warnings = saiife_broker::catalog::validate(&l.config, &cat).map_err(|e| e.to_string())?;
     for w in warnings {
@@ -117,6 +179,8 @@ pub struct Ctx {
     pub limits: Limits,
     pub conns: ConnLimits,
     pub directory: Arc<dyn Directory + Send + Sync>,
+    /// Locked daemon or personal broker.
+    pub mode: Mode,
     pub own_uid: u32,
     pub own_user: String,
     pub audit_dir: PathBuf,
@@ -181,6 +245,8 @@ pub struct CtxInit {
     pub writer: WriterHandle,
     pub writer_cfg: WriterConfig,
     pub directory: Arc<dyn Directory + Send + Sync>,
+    /// Locked daemon or personal broker.
+    pub mode: Mode,
     pub own_uid: u32,
     pub own_user: String,
     pub audit_dir: PathBuf,
@@ -201,6 +267,55 @@ pub struct CtxInit {
     pub lockdown: crate::lockdown::Store,
     /// One-use command grants (`<state>/state/grants.json`).
     pub grants: crate::grants::Grants,
+}
+
+impl CtxInit {
+    /// Every optional part at its default (decision 15): locked mode, this
+    /// process's uid, no user name, every path under `state_dir`, no vault,
+    /// no upstream, no approvals, an invalid policy, and tokens, lockdown
+    /// and grants opened under `state_dir`. Literals take the rest with
+    /// `..CtxInit::minimal(…)`.
+    pub fn minimal(
+        writer: WriterHandle,
+        writer_cfg: WriterConfig,
+        directory: Arc<dyn Directory + Send + Sync>,
+        state_dir: &std::path::Path,
+    ) -> CtxInit {
+        CtxInit {
+            writer,
+            writer_cfg,
+            directory,
+            mode: Mode::Locked,
+            own_uid: rustix::process::getuid().as_raw(),
+            own_user: String::new(),
+            audit_dir: state_dir.join("audit"),
+            socket_dir: state_dir.join("run"),
+            key_path: state_dir.join("keys").join("audit.ed25519"),
+            config_path: state_dir.join("config.toml"),
+            catalog: Vec::new(),
+            policy: PolicyState::invalid(0),
+            proc: Box::new(crate::sessions::RealProc::new(state_dir.join("proc"))),
+            vault: VaultState::Unavailable("not configured".into()),
+            vault_path: state_dir.join("vault").join("vault.bin"),
+            limiter: Limiter::default(),
+            upstream: Err("not configured".into()),
+            backup_dir: crate::import_backup::dir_in(state_dir),
+            tokens: Arc::new(
+                crate::tokens::Tokens::open(
+                    crate::tokens::path_in(state_dir),
+                    crate::tokens::system_clock(),
+                )
+                .0,
+            ),
+            approvals: Err("not configured".into()),
+            lockdown: crate::lockdown::Store::open(crate::lockdown::path_in(state_dir)).0,
+            grants: crate::grants::Grants::open(
+                crate::grants::path_in(state_dir),
+                std::time::SystemTime::now(),
+            )
+            .0,
+        }
+    }
 }
 
 /// A count of work in flight that a stop waits for.
@@ -275,6 +390,7 @@ impl Ctx {
             limits: Limits::new(),
             conns: ConnLimits::from_rlimit(),
             directory: i.directory,
+            mode: i.mode,
             own_uid: i.own_uid,
             own_user: i.own_user,
             audit_dir: i.audit_dir,
@@ -329,7 +445,7 @@ impl Ctx {
                 pack: None,
                 rule: None,
                 reason: None,
-                mode: MODE,
+                mode: self.mode.as_str(),
                 policy: hash.as_deref(),
                 permission_mode: None,
             },
@@ -408,9 +524,20 @@ impl Ctx {
         v
     }
 
-    /// uid 0, or a member of an `[admin] groups` group. Any lookup failure
-    /// denies.
+    /// Who must own `<config dir>/ca` and `connectors/`: root for the
+    /// locked daemon, the user for the personal broker. A debug build of
+    /// the locked daemon (the test suite) honours
+    /// `SAIIFE_TEST_CA_OWNER=<uid>`; a release build has no such seam.
+    pub fn trusted_owner(&self) -> u32 {
+        trusted_owner_in(self.mode, self.own_uid)
+    }
+
+    /// The locked daemon: uid 0, or a member of an `[admin] groups` group;
+    /// any lookup failure denies. The personal broker: its own uid only.
     pub async fn is_admin(&self, uid: u32) -> bool {
+        if self.mode == Mode::Personal {
+            return uid == self.own_uid;
+        }
         if uid == 0 {
             return true;
         }
@@ -544,11 +671,32 @@ pub fn now_ts() -> String {
         .unwrap_or_default()
 }
 
+/// [`Ctx::trusted_owner`] before there is a context.
+pub(crate) fn trusted_owner_in(mode: Mode, own_uid: u32) -> u32 {
+    if mode == Mode::Personal {
+        return own_uid;
+    }
+    #[cfg(debug_assertions)]
+    if let Some(uid) = std::env::var("SAIIFE_TEST_CA_OWNER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return uid;
+    }
+    0
+}
+
+/// The locked daemon's `hello` answer.
 pub fn hello(id: u64) -> Value {
+    hello_in(id, MODE)
+}
+
+/// The `hello` answer of a daemon whose record `mode` is `mode`.
+pub fn hello_in(id: u64, mode: &str) -> Value {
     let mut m = Map::new();
     m.insert("proto".into(), PROTO.into());
     m.insert("daemon".into(), VERSION.into());
-    m.insert("mode".into(), MODE.into());
+    m.insert("mode".into(), mode.into());
     ok(id, m)
 }
 
@@ -604,7 +752,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     match req.op.as_str() {
         OP_APPROVAL_LIST | OP_APPROVAL_SHOW | OP_APPROVAL_DECIDE | OP_APPROVAL_CREATE
         | OP_GRANT_CONSUME => crate::approval_ops::handle(ctx, conn, req).await,
-        OP_HELLO => hello(req.id),
+        OP_HELLO => hello_in(req.id, ctx.mode.as_str()),
         OP_AUDIT_APPEND => append(ctx, conn, req).await,
         OP_STATUS => status(ctx, req.id),
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
@@ -712,7 +860,7 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     }
     rec.v = saiife_audit::record::RECORD_VERSION;
     rec.kind = Some("guard".into());
-    rec.mode = Some(MODE.into());
+    rec.mode = Some(ctx.mode.as_str().into());
     rec.uid = Some(peer.uid);
     rec.user = ctx.name_of(peer.uid).await;
     rec.seq = None;
@@ -769,8 +917,17 @@ fn status(ctx: &Ctx, id: u64) -> Value {
     let snap = ctx.writer.snapshot();
     let p = ctx.policy();
     let mut m = Map::new();
-    m.insert("mode".into(), MODE.into());
+    m.insert("mode".into(), ctx.mode.as_str().into());
     m.insert("daemon".into(), VERSION.into());
+    // The personal broker's config path: `saiife connect` writes there, even
+    // when the CLI's XDG_CONFIG_HOME differs from the broker's (a systemd
+    // user unit started with another environment).
+    if ctx.mode == Mode::Personal {
+        m.insert(
+            "config".into(),
+            ctx.config_path.to_string_lossy().into_owned().into(),
+        );
+    }
     m.insert("chain".into(), json!(snap.chain));
     m.insert("head_seq".into(), json!(snap.head.as_ref().map(|h| h.0)));
     m.insert("head".into(), json!(snap.head.as_ref().map(|h| &h.1)));
@@ -792,6 +949,14 @@ fn status(ctx: &Ctx, id: u64) -> Value {
 }
 
 async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
+    if ctx.mode == Mode::Personal {
+        // §6.4.4: a key in the user's own home proves nothing.
+        return err(
+            id,
+            ErrorCode::BadRequest,
+            "personal broker: the audit chain has no signing key to rotate",
+        );
+    }
     if !ctx.is_admin(peer.uid).await {
         return err(
             id,
@@ -810,9 +975,104 @@ async fn rotate_key(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
     }
 }
 
+/// A context for unit tests: a real chain writer in `dir/audit`, every
+/// other part from [`CtxInit::minimal`], with `mode` and `own_uid`. The
+/// join handle ends when the context (its writer handle) is dropped.
+#[cfg(test)]
+pub(crate) fn test_ctx(
+    dir: &std::path::Path,
+    mode: Mode,
+    own_uid: u32,
+) -> (Arc<Ctx>, std::thread::JoinHandle<()>) {
+    let cw = saiife_audit::ChainWriter::open(
+        &dir.join("audit"),
+        saiife_audit::WriterOptions {
+            mode: mode.as_str().into(),
+            saiife: VERSION.into(),
+            key: None,
+        },
+    )
+    .unwrap();
+    let cfg = WriterConfig {
+        checkpoint_every: 1000,
+        checkpoint_interval: Duration::from_secs(900),
+        fsync: saiife_policy::Fsync::Always,
+    };
+    let (handle, join) = crate::writer::spawn(cw, cfg, None).unwrap();
+    let dirs: Arc<dyn Directory + Send + Sync> =
+        Arc::new(saiife_policy::FixedDirectory::from_text("", ""));
+    let ctx = Ctx::new(CtxInit {
+        mode,
+        own_uid,
+        ..CtxInit::minimal(handle, cfg, dirs, &dir.join("state"))
+    });
+    (Arc::new(ctx), join)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(op: &str) -> Request {
+        Request {
+            id: 3,
+            op: op.into(),
+            args: Map::new(),
+        }
+    }
+
+    fn peer(uid: u32) -> PeerCred {
+        PeerCred {
+            uid,
+            gid: uid,
+            pid: std::process::id(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ctx_init_minimal_builds() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = test_ctx(t.path(), Mode::Locked, 7);
+        assert_eq!(ctx.own_uid, 7);
+        assert_eq!(ctx.mode, Mode::Locked);
+        assert_eq!(ctx.trusted_owner(), trusted_owner_in(Mode::Locked, 7));
+        assert!(!ctx.policy().ok);
+        assert_eq!(ctx.key_path, t.path().join("state/keys/audit.ed25519"));
+        let a = dispatch(&ctx, &peer(7), req(OP_STATUS)).await;
+        assert_eq!(a["ok"], true, "{a}");
+        assert_eq!(a["mode"], "locked", "{a}");
+        assert_eq!(a["policy_ok"], false, "{a}");
+        let h = dispatch(&ctx, &peer(7), req(OP_HELLO)).await;
+        assert_eq!(h["mode"], "locked", "{h}");
+    }
+
+    #[tokio::test]
+    async fn personal_ctx_answers_personal_and_admits_own_uid_only() {
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = test_ctx(t.path(), Mode::Personal, 4242);
+        assert_eq!(ctx.trusted_owner(), 4242);
+        assert!(ctx.is_admin(4242).await);
+        assert!(!ctx.is_admin(0).await);
+        assert!(!ctx.is_admin(4243).await);
+        assert!(crate::approval_ops::is_approver(&ctx, 4242).await);
+        assert!(!crate::approval_ops::is_approver(&ctx, 0).await);
+        let a = dispatch(&ctx, &peer(4242), req(OP_STATUS)).await;
+        assert_eq!(a["mode"], "personal", "{a}");
+        assert_eq!(hello_in(1, ctx.mode.as_str())["mode"], "personal");
+        assert_eq!(ctx.record("daemon", "x").mode.as_deref(), Some("personal"));
+        // No signing key to rotate.
+        let r = dispatch(&ctx, &peer(4242), req(OP_AUDIT_ROTATE_KEY)).await;
+        assert_eq!(r["ok"], false, "{r}");
+    }
+
+    #[test]
+    fn mode_names_and_policy_modes() {
+        assert_eq!(Mode::Locked.as_str(), "locked");
+        assert_eq!(Mode::Personal.as_str(), "personal");
+        assert_eq!(Mode::Locked.policy_mode(), PolicyMode::Locked);
+        assert_eq!(Mode::Personal.policy_mode(), PolicyMode::Developer);
+        assert_eq!(hello(1)["mode"], MODE);
+    }
 
     #[tokio::test]
     async fn stop_waits_for_calls_in_flight() {

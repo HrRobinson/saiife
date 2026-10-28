@@ -54,6 +54,9 @@ fn event_of(op: &str) -> &'static str {
     }
 }
 
+/// Why `secret import` is refused by the personal broker (decision 6).
+pub const PERSONAL_IMPORT: &str = "personal broker: use secret add";
+
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let event = event_of(&req.op);
@@ -96,6 +99,18 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             ErrorCode::Forbidden,
             "secret ops are for root and [admin] groups",
         );
+    }
+    // Decision 6: an import moves plaintext out of the agent's reach, which
+    // the personal broker cannot do (the agent's uid reads the key), and its
+    // backup would be a second plaintext copy in the user's own home.
+    if ctx.mode == crate::ops::Mode::Personal && req.args.contains_key("backup") {
+        let mut r = record(ctx, peer, event, &name).await;
+        r.decision = DecisionKind::Deny;
+        r.reason = Some(PERSONAL_IMPORT.into());
+        if let Err(e) = ctx.writer.append(r).await {
+            eprintln!("saiifed: warning: cannot write {event} record: {e}");
+        }
+        return err(id, ErrorCode::BadRequest, PERSONAL_IMPORT);
     }
     let uid = peer.uid;
     let c = Arc::clone(ctx);

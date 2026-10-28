@@ -49,6 +49,7 @@ fn audit(d: &TestDaemon, group: &str, args: &[&str]) -> Output {
         .arg("--system-config")
         .arg(d.config())
         .env("HOME", d.path().join("home"))
+        .env("XDG_RUNTIME_DIR", d.path().join("no-runtime"))
         .env("PATH", "/usr/bin:/bin")
         .env("SAIIFE_DATA_DIR", d.path().join("data"))
         .env("SAIIFE_AUDIT_DIR", home_audit(d))

@@ -9,6 +9,7 @@
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
 //! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
+//! - `saiife daemon --user` -> the personal broker, as the logged-in user (Linux; not a security boundary)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
 //! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
 //! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
@@ -29,6 +30,8 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+#[cfg(target_os = "linux")]
+mod broker;
 mod check;
 mod check_managed;
 mod connect_cmd;
@@ -164,18 +167,31 @@ enum Cmd {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// The personal broker's log ($XDG_DATA_HOME/saiife/broker/audit;
+        /// not a security boundary).
+        #[arg(long, conflicts_with = "system_config")]
+        broker: bool,
         /// Write a self-contained HTML report instead of the table (default name: saiife-report-YYYY-MM-DD.html here).
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
     },
-    /// Run saiifed, the locked-mode daemon, as the `[daemon] user` (Linux).
+    /// Run saiifed: the locked-mode daemon (--system, as the `[daemon] user`) or the personal broker (--user) (Linux).
     Daemon {
-        /// System daemon mode (the only mode in this version).
-        #[arg(long)]
+        /// System daemon mode (locked mode).
+        #[arg(long, conflicts_with = "user")]
         system: bool,
-        /// Personal broker mode (after v2.0).
+        /// Personal broker mode, as your own user ($XDG_RUNTIME_DIR/saiife/;
+        /// not a security boundary).
         #[arg(long)]
         user: bool,
+        /// With --user: print the systemd user unit or the launchd plist
+        /// for this binary and exit (writes no file, runs no service manager).
+        #[arg(long = "print-unit", value_name = "KIND", requires = "user", value_parser = ["systemd", "launchd"])]
+        print_unit: Option<String>,
+        /// Test seam (debug builds): the locked-host marker to check.
+        #[cfg(debug_assertions)]
+        #[arg(long = "locked-marker", value_name = "PATH", hide = true)]
+        locked_marker: Option<std::path::PathBuf>,
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long, value_name = "FILE")]
         config: Option<std::path::PathBuf>,
@@ -312,6 +328,9 @@ enum AuditAction {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// Check the personal broker's log instead (not a security boundary).
+        #[arg(long, conflicts_with_all = ["system_config", "external"])]
+        broker: bool,
     },
 }
 
@@ -345,12 +364,26 @@ fn main() -> ExitCode {
     if let Cmd::Daemon {
         system,
         user,
+        print_unit,
+        #[cfg(debug_assertions)]
+        locked_marker,
         config,
         state_dir,
         credentials_dir,
     } = cli.command
     {
-        return cmd_daemon(system, user, config, state_dir, credentials_dir);
+        // Release builds have no `--locked-marker`: always the real one.
+        #[cfg(not(debug_assertions))]
+        let locked_marker: Option<std::path::PathBuf> = None;
+        return cmd_daemon(DaemonArgs {
+            system,
+            user,
+            print_unit,
+            locked_marker,
+            config,
+            state_dir,
+            credentials_dir,
+        });
     }
     if let Cmd::Secret {
         system_config,
@@ -495,9 +528,10 @@ fn main() -> ExitCode {
                 Some(AuditAction::Verify {
                     external,
                     system_config,
+                    broker,
                 }),
             ..
-        } => audit_cmd::verify(external.as_deref(), system_config.as_deref()),
+        } => audit_cmd::verify(external.as_deref(), system_config.as_deref(), broker),
         Cmd::Audit {
             action: None,
             since,
@@ -507,6 +541,7 @@ fn main() -> ExitCode {
             kind,
             service,
             system_config,
+            broker,
             report,
         } => audit_cmd::run(
             audit_cmd::RunArgs {
@@ -518,43 +553,43 @@ fn main() -> ExitCode {
                 service: service.as_deref(),
                 report: report.as_deref(),
                 system_config,
+                broker,
             },
             &packs,
         ),
     }
 }
 
-/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
-/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
-/// flag this binary does not know: warn and fail open, silently on stdout.
-/// Everything else (and `--help` / `--version`) keeps clap's behavior.
-/// `saiife daemon --system`: the system daemon, as the `[daemon] user`.
-fn cmd_daemon(
+/// The `saiife daemon` flags.
+struct DaemonArgs {
     system: bool,
     user: bool,
+    print_unit: Option<String>,
+    /// `--locked-marker` (debug builds); `None` is the real marker.
+    locked_marker: Option<std::path::PathBuf>,
     config: Option<std::path::PathBuf>,
     state_dir: Option<std::path::PathBuf>,
     credentials_dir: Option<std::path::PathBuf>,
-) -> ExitCode {
-    if !system || user {
+}
+
+/// `saiife daemon --system`: the system daemon, as the `[daemon] user`.
+/// `saiife daemon --user`: the personal broker, as the logged-in user.
+fn cmd_daemon(a: DaemonArgs) -> ExitCode {
+    if a.system == a.user {
         eprintln!(
-            "saiife: use `saiife daemon --system` (personal broker mode, --user, comes after v2.0)"
+            "saiife: use `saiife daemon --system` (locked mode) or `saiife daemon --user` (personal broker)"
         );
         return ExitCode::from(2);
     }
-    let (packs, warnings) = builtin_packs();
-    for w in &warnings {
-        warn(&format!("pack warning ({}): {}", w.source, w.message));
+    if a.user {
+        return cmd_daemon_user(a);
     }
-    let catalog = packs
-        .iter()
-        .map(|p| saiife_policy::PackInfo {
-            id: p.id.clone(),
-            version: p.version,
-            default_on: p.default_on,
-            rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
-        })
-        .collect();
+    let DaemonArgs {
+        config,
+        state_dir,
+        credentials_dir,
+        ..
+    } = a;
     // systemd's StateDirectory= may list several dirs, colon-separated.
     let state_dir = state_dir
         .or_else(|| {
@@ -569,11 +604,115 @@ fn cmd_daemon(
         credentials_dir: credentials_dir
             .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
             .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty()),
-        catalog,
+        catalog: daemon_catalog(),
         directory: Box::new(saiife_policy::Getent),
+        mode: saiife_daemon::DaemonMode::System,
     })
 }
 
+/// `saiife daemon --user` (plan 16): the personal paths, the refusals that
+/// need nothing opened, then the keychain. A keychain that cannot be
+/// opened still starts the broker, with the vault unavailable.
+fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
+    if let Some(kind) = &a.print_unit {
+        return print_unit(kind);
+    }
+    if !cfg!(target_os = "linux") {
+        eprintln!("{}", saiife_daemon::PERSONAL_NEEDS_LINUX);
+        return ExitCode::from(2);
+    }
+    if a.config.is_some() || a.state_dir.is_some() || a.credentials_dir.is_some() {
+        eprintln!(
+            "saiife: daemon --user takes no --config, --state-dir or --credentials-dir: its paths are fixed (XDG)"
+        );
+        return ExitCode::from(2);
+    }
+    let home = dirs::home_dir();
+    let paths =
+        match saiife_system::personal::personal_paths(&|k| std::env::var_os(k), home.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    let locked_marker = a
+        .locked_marker
+        .unwrap_or_else(|| saiife_system::layout::INSTALLED.into());
+    // A locked host, root or a bad runtime dir is refused before the
+    // keychain is touched.
+    if let Err(e) =
+        saiife_daemon::personal_preflight(&paths.config, &paths.socket_dir, &locked_marker)
+    {
+        eprintln!("saiife: {e}");
+        return ExitCode::from(2);
+    }
+    let keychain: Box<dyn saiife_keychain::Keychain> = match saiife_keychain::from_env() {
+        Ok(k) => k,
+        Err(e) => Box::new(saiife_daemon::UnavailableKeychain(e)),
+    };
+    saiife_daemon::run(saiife_daemon::DaemonOptions {
+        config: paths.config,
+        state_dir: paths.state_dir,
+        credentials_dir: None,
+        catalog: daemon_catalog(),
+        directory: Box::new(saiife_policy::Getent),
+        mode: saiife_daemon::DaemonMode::Personal {
+            socket_dir: paths.socket_dir,
+            audit_dir: paths.audit_dir,
+            keychain,
+            locked_marker,
+        },
+    })
+}
+
+/// `saiife daemon --user --print-unit systemd|launchd`: the text for this
+/// binary on stdout.
+fn print_unit(kind: &str) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("saiife: cannot find this binary: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let text = match kind {
+        "systemd" => saiife_system::user_unit::user_unit_text(&exe),
+        _ => saiife_system::user_unit::launchd_plist_text(&exe),
+    };
+    match text {
+        Ok(t) => {
+            print!("{t}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("saiife: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The built-in packs as the daemon's policy catalog.
+fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
+    let (packs, warnings) = builtin_packs();
+    for w in &warnings {
+        warn(&format!("pack warning ({}): {}", w.source, w.message));
+    }
+    packs
+        .iter()
+        .map(|p| saiife_policy::PackInfo {
+            id: p.id.clone(),
+            version: p.version,
+            default_on: p.default_on,
+            rules: p.deny_rules().iter().filter_map(|r| r.id.clone()).collect(),
+        })
+        .collect()
+}
+
+/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
+/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
+/// flag this binary does not know: warn and fail open, silently on stdout.
+/// Everything else (and `--help` / `--version`) keeps clap's behavior.
 fn arg_error(e: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     let hook_mode = std::env::args_os().nth(1).is_some_and(|a| a == "check");

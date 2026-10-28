@@ -67,6 +67,11 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
+    // The personal broker talks to its own uid only (decision 3): any
+    // other uid, root included, is closed before a byte is answered.
+    if ctx.mode == ops::Mode::Personal && !crate::personal::admits(ctx.own_uid, peer.uid) {
+        return;
+    }
     // Open-connection caps, before any frame is read: idle connections
     // must not use up the daemon's file descriptors.
     let _slot = match ctx.conns.try_open(peer.uid) {
@@ -126,7 +131,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
                 return;
             }
             greeted = true;
-            if !write(&mut s, &ops::hello(req.id)).await {
+            if !write(&mut s, &ops::hello_in(req.id, ctx.mode.as_str())).await {
                 return;
             }
             continue;
@@ -141,5 +146,56 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
         if !write(&mut s, &answer).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saiife_ipc::frame::encode_max;
+    use serde_json::json;
+
+    /// Serve one end of a socket pair as `ctx` and send a hello from the
+    /// other; what came back before EOF.
+    async fn hello_answer_bytes(ctx: Arc<Ctx>) -> Vec<u8> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(theirs, ctx));
+        let hello = json!({"id": 1, "op": OP_HELLO, "proto": PROTO});
+        let frame = encode_max(&hello, MAX_ANSWER_FRAME).unwrap();
+        // The far end may already be closed: a failed write is fine.
+        let _ = ours.write_all(&frame).await;
+        let _ = ours.shutdown().await;
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(5), ours.read_to_end(&mut got)).await;
+        assert!(read.is_ok(), "the connection was not closed");
+        let _ = task.await;
+        got
+    }
+
+    #[tokio::test]
+    async fn foreign_uid_closed_before_hello() {
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me.wrapping_add(1));
+        assert!(hello_answer_bytes(ctx).await.is_empty());
+        // The same pair as the own uid gets its hello answer.
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Personal, me);
+        let got = hello_answer_bytes(ctx).await;
+        assert!(got.len() > 4);
+        let body: Value = serde_json::from_slice(&got[4..]).unwrap();
+        assert_eq!(body["mode"], "personal", "{body}");
+    }
+
+    #[tokio::test]
+    async fn locked_ctx_still_answers_other_uids() {
+        // The locked daemon decides per op, not at the accept.
+        let t = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let (ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me.wrapping_add(1));
+        let got = hello_answer_bytes(ctx).await;
+        assert!(got.len() > 4);
+        let body: Value = serde_json::from_slice(&got[4..]).unwrap();
+        assert_eq!(body["mode"], "locked", "{body}");
     }
 }

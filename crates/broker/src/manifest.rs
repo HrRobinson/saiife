@@ -382,6 +382,9 @@ pub fn load_local_with(
 ) -> Result<Vec<Manifest>, BrokerError> {
     use std::os::unix::fs::MetadataExt;
     let err = |p: &Path, why: &str| BrokerError::Manifest(format!("{}: {why}", p.display()));
+    // Root for the locked daemon, the user for the personal broker.
+    let who = if owner_uid == 0 { "root" } else { "this user" };
+    let owned = format!("must be owned by {who} and not writable by others");
     let dmeta = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -391,7 +394,7 @@ pub fn load_local_with(
         return Err(err(dir, "not a directory"));
     }
     if dmeta.uid() != owner_uid || dmeta.mode() & 0o022 != 0 {
-        return Err(err(dir, "must be owned by root and not writable by others"));
+        return Err(err(dir, &owned));
     }
     let mut names = Vec::new();
     for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
@@ -410,10 +413,7 @@ pub fn load_local_with(
             return Err(err(&path, "not a regular file (symlinks are not followed)"));
         }
         if meta.uid() != owner_uid || meta.mode() & 0o022 != 0 {
-            return Err(err(
-                &path,
-                "must be owned by root and not writable by others",
-            ));
+            return Err(err(&path, &owned));
         }
         if meta.len() > MAX_MANIFEST_BYTES {
             return Err(err(&path, "larger than 1 MiB"));

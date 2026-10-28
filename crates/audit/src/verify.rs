@@ -91,6 +91,8 @@ pub struct VerifyReport {
     pub v1_files: Vec<String>,
     /// `chain` id of the latest genesis.
     pub chain: Option<String>,
+    /// `mode` of the latest genesis (`developer`, `locked`, `personal`).
+    pub mode: Option<String>,
     /// `seq` and line hash of the newest chained record.
     pub head: Option<(u64, String)>,
     pub checkpoints: u64,
@@ -619,6 +621,7 @@ impl State {
             self.seen_genesis = true;
             self.chain = obj.get("chain").and_then(Value::as_str).map(String::from);
             report.chain.clone_from(&self.chain);
+            report.mode = obj.get("mode").and_then(Value::as_str).map(String::from);
             let key = obj.get("key").and_then(Value::as_str).map(String::from);
             self.set_key(key, report);
             self.expected = Some(1);

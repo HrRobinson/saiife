@@ -19,12 +19,14 @@ pub mod fsops;
 pub mod host;
 pub mod install;
 pub mod layout;
+pub mod personal;
 pub mod polkit;
 pub mod supported;
 #[doc(hidden)]
 pub mod testing;
 pub mod uninstall;
 pub mod unit;
+pub mod user_unit;
 
 pub use host::{
     host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost, UserInfo,

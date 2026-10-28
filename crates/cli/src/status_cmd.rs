@@ -62,6 +62,21 @@ struct Problem {
     fix: String,
 }
 
+/// One line when the personal broker answers hello on its own socket
+/// (plan 16); nothing otherwise. Never on a locked host.
+#[cfg(target_os = "linux")]
+fn personal_broker_line() {
+    let up = crate::broker::personal(&|k| std::env::var_os(k)).is_ok_and(|t| {
+        crate::broker::connect(&t, std::time::Instant::now() + Duration::from_millis(500)).is_ok()
+    });
+    if up {
+        outln!("  personal broker: running (not a security boundary)");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn personal_broker_line() {}
+
 /// `system_root`: the hidden `--root` (tests); the real `/` otherwise.
 pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
     let Ok(cwd) = std::env::current_dir() else {
@@ -74,6 +89,9 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
         .map(Layout::under)
         .unwrap_or_else(Layout::system);
     let locked = locked_block(&layout, builtin);
+    if locked.is_none() {
+        personal_broker_line();
+    }
     let locked_failed = locked.as_ref().is_some_and(|l| l.failed);
     // Agents with a managed hook need no project hook (spec §7 `init`).
     let managed = locked.map(|l| l.managed).unwrap_or_default();
@@ -1073,7 +1091,8 @@ mod tests {
             .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
             .with_var("CLAUDE_CONFIG_DIR", "/home/u/.claude")
             .with_var("CODEX_HOME", "/home/u/.codex")
-            .with_var("SAIIFE_BIN", "/usr/bin/saiife");
+            .with_var("SAIIFE_BIN", "/usr/bin/saiife")
+            .with_var("XDG_CONFIG_HOME", "/home/u/.config");
         let text = inactive_lines(&active, &bound);
         assert!(
             text.starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),

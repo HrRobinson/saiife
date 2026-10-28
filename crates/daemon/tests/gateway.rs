@@ -17,7 +17,6 @@ use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair}
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::RootCertStore;
 use saiife_audit::{ChainWriter, WriterOptions};
-use saiife_broker::limits::Limiter;
 use saiife_broker::pipeline::PolicySnapshot;
 use saiife_broker::upstream::{Resolver, Upstream};
 use saiife_broker::{Catalog, Manifest};
@@ -353,35 +352,30 @@ allow = ["orders:read"]
     let clock = Arc::new(AtomicU64::new(1_800_000_000));
     let c2 = Arc::clone(&clock);
     let tokens = Tokens::memory_with_clock(Arc::new(move || c2.load(Ordering::SeqCst)));
+    let writer_cfg = WriterConfig {
+        checkpoint_every: 1000,
+        checkpoint_interval: Duration::from_secs(900),
+        fsync: Fsync::Always,
+    };
     let ctx = Arc::new(Ctx::new(CtxInit {
-        writer: handle,
-        writer_cfg: WriterConfig {
-            checkpoint_every: 1000,
-            checkpoint_interval: Duration::from_secs(900),
-            fsync: Fsync::Always,
-        },
-        directory: Arc::new(NoDirectory),
-        own_uid: rustix::process::getuid().as_raw(),
         // The peer is this process: its uid is the daemon's, named `agent`.
         own_user: "agent".into(),
         audit_dir: audit.clone(),
         socket_dir: tmp.path().join("run"),
-        key_path: state.join("keys/audit.ed25519"),
         config_path: tmp.path().join("config.toml"),
-        catalog: Vec::new(),
         policy,
         // No agent ancestors: no session.
         proc: Box::new(RealProc::new(tmp.path().join("proc"))),
         vault,
         vault_path,
         backup_dir: state.join("import-backup"),
-        limiter: Limiter::new(),
         upstream: Ok(up),
         tokens: Arc::new(tokens),
         approvals: saiife_daemon::approvals::Store::open(&state.join("approvals"))
             .map_err(|e| e.to_string()),
         lockdown: saiife_daemon::lockdown::Store::memory(),
         grants: saiife_daemon::grants::Grants::memory(),
+        ..CtxInit::minimal(handle, writer_cfg, Arc::new(NoDirectory), &state)
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.

@@ -644,9 +644,12 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
 
 #[cfg(target_os = "linux")]
 fn reload(config: Option<PathBuf>) -> ExitCode {
-    use crate::secret_cmd::linux::call;
-    let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
-    match call(&config, "policy.reload", serde_json::Map::new()) {
+    use crate::secret_cmd::linux::{call_to, target};
+    let t = match target(config.as_deref()) {
+        Ok(t) => t,
+        Err(s) => return stop(s),
+    };
+    match call_to(&t, "policy.reload", serde_json::Map::new()) {
         Ok(a) => match a.get("result").and_then(Value::as_str) {
             Some("loaded") => {
                 outln!("loaded");
