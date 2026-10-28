@@ -1304,6 +1304,7 @@ dependencies = [
 name = "saiife-keychain"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "security-framework",
  "tempfile",
  "zeroize",

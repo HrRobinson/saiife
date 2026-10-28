@@ -20,6 +20,7 @@ const ERR_SEC_AUTH_FAILED: i32 = -25293;
 const ERR_SEC_USER_CANCELED: i32 = -128;
 const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294;
 const ERR_SEC_NOT_AVAILABLE: i32 = -25291;
+const ERR_SEC_NO_DEFAULT_KEYCHAIN: i32 = -25307;
 
 /// The login Keychain through Security.framework.
 #[derive(Debug, Default)]
@@ -44,7 +45,9 @@ fn map(e: SecError) -> KeychainError {
         ERR_SEC_INTERACTION_NOT_ALLOWED | ERR_SEC_AUTH_FAILED | ERR_SEC_USER_CANCELED => {
             KeychainError::Locked(msg)
         }
-        ERR_SEC_NO_SUCH_KEYCHAIN | ERR_SEC_NOT_AVAILABLE => KeychainError::Unavailable(msg),
+        ERR_SEC_NO_SUCH_KEYCHAIN | ERR_SEC_NOT_AVAILABLE | ERR_SEC_NO_DEFAULT_KEYCHAIN => {
+            KeychainError::Unavailable(msg)
+        }
         _ => KeychainError::Other(msg),
     }
 }

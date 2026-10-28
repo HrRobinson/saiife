@@ -4,9 +4,9 @@
 //! [`crate::from_env`]). It is not compiled into release builds.
 
 use crate::{ItemId, Keychain, KeychainError};
-use std::fs::{self, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, OpenOptions, Permissions};
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -18,7 +18,10 @@ pub struct DirKeychain {
 }
 
 impl DirKeychain {
-    /// Open `dir`, creating it if missing, and set it to 0700.
+    /// Open `dir`. A missing dir is created with mode 0700. An existing dir
+    /// must be owned by the euid and be either already 0700 or empty (an
+    /// empty one of our own is tightened to 0700); anything else is refused,
+    /// so a dir that isn't ours is never chmodded.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, KeychainError> {
         let dir = dir.into();
         let unavailable = |what: &str| {
@@ -27,14 +30,41 @@ impl DirKeychain {
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.file_type().is_symlink() => return Err(unavailable("is a symlink")),
             Ok(m) if !m.is_dir() => return Err(unavailable("is not a directory")),
-            Ok(_) => {}
+            Ok(m) => {
+                let euid = rustix::process::geteuid().as_raw();
+                if m.uid() != euid {
+                    return Err(unavailable(&format!(
+                        "is owned by uid {}, not {euid}",
+                        m.uid()
+                    )));
+                }
+                let mode = m.permissions().mode() & 0o7777;
+                if mode != 0o700 {
+                    let empty = fs::read_dir(&dir)
+                        .map_err(|e| unavailable(&e.to_string()))?
+                        .next()
+                        .is_none();
+                    if !empty {
+                        return Err(unavailable(&format!(
+                            "has mode {mode:04o} and is not empty (want 0700)"
+                        )));
+                    }
+                    fs::set_permissions(&dir, Permissions::from_mode(0o700))
+                        .map_err(|e| unavailable(&e.to_string()))?;
+                }
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                fs::create_dir_all(&dir).map_err(|e| unavailable(&e.to_string()))?;
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)
+                    .map_err(|e| unavailable(&e.to_string()))?;
+                // We just made it, so pin the mode against the umask.
+                fs::set_permissions(&dir, Permissions::from_mode(0o700))
+                    .map_err(|e| unavailable(&e.to_string()))?;
             }
             Err(e) => return Err(unavailable(&e.to_string())),
         }
-        fs::set_permissions(&dir, Permissions::from_mode(0o700))
-            .map_err(|e| unavailable(&e.to_string()))?;
         Ok(Self { dir })
     }
 

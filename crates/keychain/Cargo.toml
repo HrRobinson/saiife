@@ -14,6 +14,10 @@ path = "src/lib.rs"
 # zeroize 1.9.1 is from 2026-10-06 (already in Cargo.lock).
 zeroize = "=1.9.1"
 
+[target.'cfg(unix)'.dependencies]
+# Already in Cargo.lock; geteuid for the test dir's owner check.
+rustix = { version = "1", features = ["process"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Already in Cargo.lock (through the TLS platform verifier), so no new crate.
 security-framework = "=3.7.0"

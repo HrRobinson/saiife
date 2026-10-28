@@ -7,6 +7,14 @@ const OTHER: ItemId = ItemId {
     account: "other",
 };
 
+/// Our euid, as the owner of a dir we just created.
+#[cfg(all(debug_assertions, unix))]
+fn own_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    let t = tempfile::tempdir().unwrap();
+    std::fs::metadata(t.path()).unwrap().uid()
+}
+
 #[test]
 fn fake_roundtrip_get_set_delete() {
     let k = FakeKeychain::new();
@@ -96,6 +104,24 @@ fn error_display_never_has_secret() {
         errs.push(d.set(&VAULT_KEY, VAULT_KEY_LABEL, secret).unwrap_err());
         let d_dbg = format!("{d:?}");
         assert!(!d_dbg.contains(needle), "{d_dbg}");
+
+        // A real failing write whose input is the secret: the dir is
+        // read-only, so creating the item fails with an io error.
+        use std::os::unix::fs::PermissionsExt;
+        let ro = t.path().join("ro");
+        let r = saiife_keychain::DirKeychain::new(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let res = r.set(&VAULT_KEY, VAULT_KEY_LABEL, secret);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root ignores the mode; only assert where the call really failed.
+        if let Err(e) = res {
+            let shown = format!("{e} {e:?}");
+            assert!(matches!(e, KeychainError::Other(_)), "{shown}");
+            assert!(!shown.contains(needle), "{shown}");
+            errs.push(e);
+        } else {
+            assert_eq!(own_uid(), 0, "the write should have failed");
+        }
     }
     assert!(errs.len() >= 8);
     for e in &errs {
@@ -149,12 +175,48 @@ mod dir {
         assert!(k.delete(&VAULT_KEY).unwrap());
         assert!(!item.exists());
 
-        // An existing loose dir is tightened to 0700.
+        // An existing empty loose dir of our own is tightened to 0700.
         let loose = t.path().join("loose");
         std::fs::create_dir(&loose).unwrap();
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
         DirKeychain::new(&loose).unwrap();
         assert_eq!(mode(&loose), 0o700);
+    }
+
+    #[test]
+    fn dir_keychain_refuses_existing_loose_nonempty_dir() {
+        let t = tempfile::tempdir().unwrap();
+        // A missing dir with missing parents is created 0700.
+        let nested = t.path().join("a").join("kc");
+        DirKeychain::new(&nested).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+
+        // An existing 0700 dir with items in it is fine and left alone.
+        let k = DirKeychain::new(&nested).unwrap();
+        k.set(&VAULT_KEY, VAULT_KEY_LABEL, b"k").unwrap();
+        DirKeychain::new(&nested).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+
+        // An existing non-empty dir that is not 0700 is refused and its mode
+        // is not touched.
+        let shared = t.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::write(shared.join("someone-elses"), b"x").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = DirKeychain::new(&shared).unwrap_err();
+        assert!(matches!(e, KeychainError::Unavailable(_)), "{e}");
+        assert!(e.to_string().contains("0755"), "{e}");
+        assert_eq!(mode(&shared), 0o755);
+
+        // A dir owned by another uid is refused before any chmod. Only
+        // testable where such a dir exists and we are not root.
+        let root = std::path::Path::new("/");
+        if own_uid() != 0 {
+            let before = mode(root);
+            let e = DirKeychain::new(root).unwrap_err();
+            assert!(e.to_string().contains("owned by uid 0"), "{e}");
+            assert_eq!(mode(root), before);
+        }
     }
 
     #[test]
