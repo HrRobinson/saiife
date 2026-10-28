@@ -11,6 +11,7 @@ pub mod capability;
 pub mod decide;
 pub mod duration;
 pub mod effective;
+pub mod environment;
 pub mod installed;
 pub mod load;
 pub mod project;
@@ -24,6 +25,7 @@ pub use capability::Capability;
 pub use decide::{decide, Request, Verdict};
 pub use duration::parse_duration;
 pub use effective::{active_packs, canonical_json, effective_policy, policy_hash, PackInfo};
+pub use environment::{env_for, EnvGuard, EnvironmentCfg, ServiceOverride};
 pub use load::{check_guard_ask, load_system, split_ask, LoadedPolicy, PolicyError};
 pub use project::{merge_project, parse_project, Merged, Mode, ProjectOverlay, ServiceOverlay};
 pub use scope::{check_scopes, load_and_check, scope_for};
@@ -35,5 +37,6 @@ pub use system::{
     facility_code, valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg,
     DoctorCfg, Event, Example, Expect, Fail, ForwardCfg, Fsync, GatewayCfg, GuardCfg, HttpsFormat,
     McpCfg, NotifyCfg, SameUser, Scope, SmtpCfg, SyslogFormat, SystemConfig, TargetCfg, WebhookCfg,
+    RESERVED_SERVICES,
 };
 pub use users::{Directory, FixedDirectory, Getent, GroupEntry, UserEntry};

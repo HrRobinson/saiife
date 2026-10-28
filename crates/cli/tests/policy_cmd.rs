@@ -54,6 +54,8 @@ users = [{user:?}]
 services = ["erp"]
 env = "prod"
 
+[environments.prod]
+
 [[scope]]
 name = "theirs"
 users = ["somebody-else"]

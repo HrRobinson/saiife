@@ -850,7 +850,7 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
             let (packs, _) = active_packs(&l.config, &catalog, None);
             outln!(
                 "  policy: {}",
-                policy_hash(&effective_policy(&l.config, &packs, None))
+                policy_hash(&effective_policy(&l.config, &packs, None, None))
             );
         }
         Err(e) => {

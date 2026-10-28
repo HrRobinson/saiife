@@ -180,6 +180,8 @@ users = [{user:?}]
 services = [{scope_services}]
 env = "prod"
 
+[environments.prod]
+
 [services.erp]
 connector = "http"
 base_url = "{base}"
@@ -793,6 +795,10 @@ fn unreadable_audit_month_denies_limits_unavailable() {
 fn reload_mid_request_uses_start_snapshot() {
     let mut w = world();
     let h1 = w.d.status()["policy"].clone();
+    // The scope's environment (prod) has its own hash: the one in records.
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let e1 = connector(&w.d).pop().unwrap()["policy"].clone();
     let child = api_cmd(&w, &["erp", "invoices.block"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -823,12 +829,14 @@ fn reload_mid_request_uses_start_snapshot() {
         .into_iter()
         .find(|r| r["operation"] == "invoices.block")
         .unwrap();
-    assert_eq!(r["policy"], h1);
+    assert_eq!(r["policy"], e1);
     assert_eq!(r["decision"], "allow");
     // A call that starts after the reload runs under the new policy.
     let o = api(&w, &["erp", "invoices.list"]);
     assert_eq!(denied_rule(&o), "default_deny");
-    assert_eq!(connector(&w.d).pop().unwrap()["policy"], h2);
+    let e2 = connector(&w.d).pop().unwrap()["policy"].clone();
+    assert_ne!(e2, e1);
+    assert_ne!(e2, h2, "the env hash, not the base one");
 }
 
 #[test]
@@ -884,7 +892,10 @@ fn connector_record_fields_exact() {
     assert_eq!(r["uid"], common::daemon::own_uid());
     assert_eq!(r["user"], own_user());
     assert_eq!(r["mode"], "locked");
-    assert_eq!(r["policy"], w.d.status()["policy"]);
+    // The scope's environment (prod) is applied: its own hash, not the
+    // base policy's that status reports.
+    assert!(r["policy"].as_str().unwrap().starts_with("sha256:"), "{r}");
+    assert_ne!(r["policy"], w.d.status()["policy"]);
     assert_eq!(r["project"], w.project.display().to_string());
     assert_eq!(r["tool"], "api");
     assert_eq!(r["input"], "erp invoices.list status=open");
@@ -1049,6 +1060,9 @@ fn list_shows_only_scoped_services() {
 fn policy_with_unknown_connector_rejected_on_reload() {
     let mut w = world();
     let h1 = w.d.status()["policy"].clone();
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let e1 = connector(&w.d).pop().unwrap()["policy"].clone();
     w.opts.extra = format!(
         "{}\n[services.bad]\nconnector = \"nope\"\n",
         policy(w.m.port, "\"erp\"", "")
@@ -1065,7 +1079,7 @@ fn policy_with_unknown_connector_rejected_on_reload() {
     assert_eq!(w.d.status()["policy"], h1);
     let o = api(&w, &["erp", "invoices.list"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(connector(&w.d).pop().unwrap()["policy"], h1);
+    assert_eq!(connector(&w.d).pop().unwrap()["policy"], e1);
 }
 
 #[test]

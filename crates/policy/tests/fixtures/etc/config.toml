@@ -68,3 +68,6 @@ expect = "allow"
 user = "agent-shop"
 request = "shopify customers.export"
 expect = "deny"
+
+[environments.prod]              # §6.11: bound to the scope above
+services.shopify.ask = ["products:write"]

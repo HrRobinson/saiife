@@ -225,6 +225,26 @@ fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>,
     Ok(m)
 }
 
+/// The mode connector calls choose their environment under (see
+/// [`GatewayPolicy::select_env`]). Locked until the personal broker
+/// (plan 16) gives the context its own mode.
+pub(crate) fn gateway_mode(_ctx: &Ctx) -> saiife_policy::Mode {
+    saiife_policy::Mode::Locked
+}
+
+/// The optional `env` argument of `api.call` and `api.list`: the project's
+/// environment, as the client read it from `.saiife/config.toml`. Only
+/// developer mode acts on it.
+pub(crate) fn parse_env(args: &Map<String, Value>) -> Result<Option<String>, &'static str> {
+    match args.get("env") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if saiife_policy::environment::valid_env_name(s) => {
+            Ok(Some(s.clone()))
+        }
+        Some(_) => Err("env must be an environment name ([a-z0-9_-]{1,64})"),
+    }
+}
+
 /// The arguments of `api.call`, checked. Errors never quote a value.
 pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Call), &'static str> {
     let service = args
@@ -341,6 +361,7 @@ fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySna
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
         mode: mode.policy_mode(),
+        env: None,
     }
 }
 
@@ -360,12 +381,24 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(x) => x,
         Err(m) => return bad(id, m),
     };
-    match execute(ctx, &Caller::Unix(*peer), call).await {
+    let project_env = match parse_env(&req.args) {
+        Ok(e) => e,
+        Err(m) => return bad(id, m),
+    };
+    match execute_in(ctx, &Caller::Unix(*peer), call, project_env.as_deref()).await {
         // 12. Return.
-        Ok(outcome) => answer(id, outcome),
+        Ok((outcome, warning)) => with_warning(answer(id, outcome), warning),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
         Err(Refused::Unrecorded(m)) => err(id, ErrorCode::Internal, &m),
     }
+}
+
+/// `answer` with a `warning` key when the environment choice left one.
+fn with_warning(mut v: Value, warning: Option<String>) -> Value {
+    if let (Some(w), Some(o)) = (warning, v.as_object_mut()) {
+        o.insert("warning".into(), w.into());
+    }
+    v
 }
 
 /// Who makes a connector call: a Unix-socket peer (uid and pid from the
@@ -413,8 +446,19 @@ impl Caller {
 pub(crate) async fn execute(
     ctx: &Arc<Ctx>,
     caller: &Caller,
-    mut call: Call,
+    call: Call,
 ) -> Result<Outcome, Refused> {
+    execute_in(ctx, caller, call, None).await.map(|(o, _)| o)
+}
+
+/// [`execute`] with the project's `env` (developer mode only), and the
+/// warning the environment choice left.
+pub(crate) async fn execute_in(
+    ctx: &Arc<Ctx>,
+    caller: &Caller,
+    mut call: Call,
+    project_env: Option<&str>,
+) -> Result<(Outcome, Option<String>), Refused> {
     // A stop waits for this call (and its record) before it ends the log.
     let _busy = ctx.calls.enter();
     let uid = caller.uid();
@@ -442,31 +486,42 @@ pub(crate) async fn execute(
     // The policy as it is now: a reload while this call runs does not
     // change what it runs under.
     let state = ctx.policy();
-    let (outcome, trace, snap): (Outcome, Trace, Arc<GatewayPolicy>) = match &state.gateway {
-        Some(g) => {
-            let env = DaemonEnv {
-                ctx,
-                config: &g.snap.config,
-                groups: Groups(groups),
-                agent: agent.clone(),
-            };
-            // Without an upstream client steps 3–8 still run; step 9
-            // denies with `upstream_unavailable`.
-            let up = ctx.upstream.as_ref().ok();
-            let (o, t) = pipeline::run(&call, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
-            (o, t, Arc::clone(g))
-        }
-        None => (
-            Outcome::Denied {
-                rule: "policy_invalid".into(),
-            },
-            Trace::default(),
-            Arc::new(GatewayPolicy {
-                snap: no_policy_snapshot(state.hash.clone(), ctx.mode),
-                catalog: Default::default(),
-            }),
-        ),
-    };
+    let mut warning = None;
+    let (outcome, trace, gw, env_name): (Outcome, Trace, Arc<GatewayPolicy>, Option<String>) =
+        match &state.gateway {
+            Some(g) => {
+                let groups = Groups(groups);
+                // The environment snapshot this call runs under (spec §6.11).
+                let (env_name, w) =
+                    g.select_env(gateway_mode(ctx), &groups, &call.user, project_env);
+                warning = w;
+                let snap = g.snapshot_for(env_name);
+                let env = DaemonEnv {
+                    ctx,
+                    config: &snap.config,
+                    groups,
+                    agent: agent.clone(),
+                };
+                // Without an upstream client steps 3–8 still run; step 9
+                // denies with `upstream_unavailable`.
+                let up = ctx.upstream.as_ref().ok();
+                let (o, t) = pipeline::run(&call, snap, &g.catalog, &ctx.limiter, &env, up).await;
+                (o, t, Arc::clone(g), env_name.map(str::to_string))
+            }
+            None => (
+                Outcome::Denied {
+                    rule: "policy_invalid".into(),
+                },
+                Trace::default(),
+                Arc::new(GatewayPolicy {
+                    snap: no_policy_snapshot(state.hash.clone(), ctx.mode),
+                    by_env: Default::default(),
+                    catalog: Default::default(),
+                }),
+                None,
+            ),
+        };
+    let snap = gw.snapshot_for(env_name.as_deref());
 
     if let Outcome::Limited { limit } = &outcome {
         ctx.notify_limit(
@@ -478,8 +533,8 @@ pub(crate) async fn execute(
     }
 
     // 11. Record (before the answer: an unrecorded result is withheld).
-    let mut rec = pipeline::record(&call, &snap.snap, &trace, &outcome, &agent, VERSION);
-    if snap.snap.hash.is_empty() {
+    let mut rec = pipeline::record(&call, snap, &trace, &outcome, &agent, VERSION);
+    if snap.hash.is_empty() {
         rec.policy = None;
     }
     rec.extra.insert("peer".into(), caller.record());
@@ -491,7 +546,7 @@ pub(crate) async fn execute(
             "the connector record could not be written: {e}"
         )));
     }
-    Ok(outcome)
+    Ok((outcome, warning))
 }
 
 pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
@@ -656,9 +711,16 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(o) => o,
         Err(m) => return bad(id, m),
     };
-    let services = services_for(ctx, peer.uid, &overlays).await;
+    let project_env = match parse_env(&req.args) {
+        Ok(e) => e,
+        Err(m) => return bad(id, m),
+    };
+    let (services, warning) = services_in(ctx, peer.uid, &overlays, project_env.as_deref()).await;
     let mut m = Map::new();
     m.insert("services".into(), Value::Array(services));
+    if let Some(w) = warning {
+        m.insert("warning".into(), w.into());
+    }
     ok(id, m)
 }
 
@@ -670,22 +732,38 @@ pub(crate) async fn services_for(
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
+    services_in(ctx, uid, overlays, None).await.0
+}
+
+/// [`services_for`] under the environment `api.call` would choose for the
+/// same caller and project `env`, so the list matches what a call allows;
+/// with the warning that choice left.
+pub(crate) async fn services_in(
+    ctx: &Arc<Ctx>,
+    uid: u32,
+    overlays: &BTreeMap<String, ServiceOverlay>,
+    project_env: Option<&str>,
+) -> (Vec<Value>, Option<String>) {
     let mut services = Vec::new();
+    let mut warning = None;
     let state = ctx.policy();
     let user = ctx.name_of(uid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
         let groups = Groups(ctx.groups_of(&user).await);
-        if let Ok(Some(scope)) = scope_for(&g.snap.config, &groups, &user) {
+        let (env_name, w) = g.select_env(gateway_mode(ctx), &groups, &user, project_env);
+        warning = w;
+        let snap = g.snapshot_for(env_name);
+        if let Ok(Some(scope)) = scope_for(&snap.config, &groups, &user) {
             for name in &scope.services {
                 if let Some(ops) =
-                    pipeline::list_operations(name, &g.snap, &g.catalog, overlays.get(name))
+                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name))
                 {
                     services.push(json!({"name": name, "operations": ops}));
                 }
             }
         }
     }
-    services
+    (services, warning)
 }
 
 #[cfg(test)]
@@ -715,6 +793,12 @@ mod tests {
                        "overlay": {"deny": ["*:write"]}, "project": "/p", "wait_ms": 10});
         let (_, op, c) = parse_call(a.as_object().unwrap()).unwrap();
         assert!(matches!(op, OpRef::Proxy { .. }));
+        assert_eq!(parse_env(a.as_object().unwrap()), Ok(None));
+        let e = |v: Value| parse_env(json!({ "env": v }).as_object().unwrap());
+        assert_eq!(e(json!("staging")), Ok(Some("staging".into())));
+        assert!(e(json!("Bad Name")).is_err());
+        assert!(e(json!(["prod"])).is_err());
+        assert!(e(json!("x".repeat(65))).is_err());
         assert_eq!(c.params["n"], "5");
         assert_eq!(c.body.as_deref(), Some(&b"hi"[..]));
         assert_eq!(c.overlay.unwrap().deny, vec!["*:write"]);

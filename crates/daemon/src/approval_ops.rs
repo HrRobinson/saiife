@@ -1252,15 +1252,25 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     } else {
         ctx.groups_of(&stored.user).await
     };
+    // The environment in force now, as for a new call. The project's `env`
+    // is not stored with the request (developer mode, plan 16).
+    let groups = Groups(groups);
+    let (env_name, _) = g.select_env(
+        crate::api_ops::gateway_mode(&ctx),
+        &groups,
+        &stored.user,
+        None,
+    );
+    let snap = g.snapshot_for(env_name);
     let env = DaemonEnv {
         ctx: &ctx,
-        config: &g.snap.config,
-        groups: Groups(groups),
+        config: &snap.config,
+        groups,
         agent: r.agent.clone(),
     };
     let up = ctx.upstream.as_ref().ok();
     let (call, outcome, trace) =
-        pipeline::send_approved(&stored, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
+        pipeline::send_approved(&stored, snap, &g.catalog, &ctx.limiter, &env, up).await;
     let asked_via = stored.via.clone();
     drop(stored);
     if let Outcome::Limited { limit } = &outcome {
@@ -1274,7 +1284,7 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
 
     // The connector record of the send: `via = approval`, linked by id,
     // with how the request first came in.
-    let mut rec = pipeline::record(&call, &g.snap, &trace, &outcome, &r.agent, VERSION);
+    let mut rec = pipeline::record(&call, snap, &trace, &outcome, &r.agent, VERSION);
     rec.extra.insert("approval".into(), rid.into());
     rec.extra.insert("approved_by".into(), by.into());
     rec.extra

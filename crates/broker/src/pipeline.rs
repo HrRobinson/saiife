@@ -247,6 +247,9 @@ pub struct PolicySnapshot {
     /// `sha256:<hex>` of the effective policy.
     pub hash: String,
     pub mode: Mode,
+    /// The environment applied to `config` (spec §6.11), `None` for the
+    /// base config. The record's `env`, so it always matches `hash`.
+    pub env: Option<String>,
 }
 
 /// What lockdown stops (spec §6.18).
@@ -645,7 +648,9 @@ async fn steps(
         Err(PolicyError::ScopeConflict { .. }) => return changed("scope_conflict"),
         Err(_) => return denied("policy_invalid"),
     };
-    tr.env = scope.env.clone();
+    // The environment the snapshot was chosen for (the scope's, in locked
+    // mode): the record names the policy the call ran under.
+    tr.env = snap.env.clone();
     if !scope.services.iter().any(|s| s == &call.service) {
         return changed("no_scope");
     }

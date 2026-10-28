@@ -641,7 +641,7 @@ mod imp {
         for w in &warnings {
             warn(w);
         }
-        let hash = policy_hash(&effective_policy(cfg, &packs, merged.as_ref()));
+        let hash = policy_hash(&effective_policy(cfg, &packs, merged.as_ref(), None));
         (packs.into_iter().map(|p| p.id).collect(), hash)
     }
 

@@ -77,7 +77,10 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     m.insert("hash".into(), json!(state.hash));
     if effective {
         let (packs, _) = active_packs(&system, &ctx.catalog, None);
-        m.insert("effective".into(), effective_policy(&system, &packs, None));
+        m.insert(
+            "effective".into(),
+            effective_policy(&system, &packs, None, None),
+        );
     }
     ok(id, m)
 }

@@ -44,6 +44,8 @@ use zeroize::Zeroizing;
 
 const TOKEN: &str = "echo-token-7f3a9c";
 const AGENT_TOKEN: &str = "agent-own-token-55d1";
+/// The `echo-tok-staging` secret, which only the staging environment uses.
+const STAGING_TOKEN: &str = "echo-staging-token-2b8e";
 /// The size of `/api/files/big`.
 const BIG: usize = 3 * 1024 * 1024;
 
@@ -223,6 +225,11 @@ struct Setup {
     /// Services `s0`.. like `shop` (same secret, same scope), each with
     /// its own 4 upstream slots.
     extra_services: usize,
+    /// The scope's `env`.
+    scope_env: &'static str,
+    /// `[environments.*]` TOML. When set, the gateway policy is built as
+    /// the daemon builds it (one snapshot per environment).
+    envs: &'static str,
 }
 
 impl Default for Setup {
@@ -234,6 +241,8 @@ impl Default for Setup {
             upstream_timeout: Duration::from_secs(5),
             policy: true,
             extra_services: 0,
+            scope_env: "prod",
+            envs: "",
         }
     }
 }
@@ -291,6 +300,21 @@ async fn world_with(s: Setup) -> World {
         rotate_after: None,
     })
     .unwrap();
+    v.put(Entry {
+        name: "echo-tok-staging".into(),
+        kind: Kind::Token,
+        fields: [(
+            "token".to_string(),
+            Zeroizing::new(STAGING_TOKEN.to_string()),
+        )]
+        .into(),
+        allowed_services: vec!["shop".to_string()],
+        created_by: 0,
+        created: "2026-10-26T00:00:00Z".into(),
+        last_used: None,
+        rotate_after: None,
+    })
+    .unwrap();
 
     let extra_names: String = (0..s.extra_services)
         .map(|i| format!(", \"s{i}\""))
@@ -311,7 +335,7 @@ locked = true
 name = "agents"
 users = [{users}]
 services = ["shop"{extra_names}]
-env = "prod"
+env = "{scope_env}"
 
 [services.shop]
 connector = "test-echo"
@@ -324,9 +348,12 @@ allow = ["orders:read", "files:read"]
 connector = "test-echo"
 params = {{ shop = "other" }}
 allow = ["orders:read"]
-{extra_tables}"#,
+{extra_tables}
+{envs}"#,
         users = s.users,
         extra = s.shop_extra,
+        scope_env = s.scope_env,
+        envs = s.envs,
     );
     let config: SystemConfig = toml::from_str(&text).unwrap();
     let manifest = Manifest::parse(include_str!("../../broker/connectors/test-echo.toml")).unwrap();
@@ -337,12 +364,25 @@ allow = ["orders:read"]
         admin_groups: Vec::new(),
         system: s.policy.then(|| Arc::new(config.clone())),
         gateway: s.policy.then(|| {
+            if !s.envs.is_empty() {
+                return Arc::new(
+                    GatewayPolicy::build(
+                        &config,
+                        &[],
+                        Catalog::new(&[], vec![manifest.clone()]),
+                        Mode::Locked,
+                    )
+                    .unwrap(),
+                );
+            }
             Arc::new(GatewayPolicy {
                 snap: PolicySnapshot {
                     config,
                     hash: "sha256:test".into(),
                     mode: Mode::Locked,
+                    env: None,
                 },
+                by_env: Default::default(),
                 catalog: Catalog::new(&[], vec![manifest]),
             })
         }),
@@ -1690,4 +1730,230 @@ async fn tcp_refuses_browser_origin_and_foreign_host() {
         .send("GET", "/v1/services", &[("origin", "https://x")], b"")
         .await;
     assert_eq!(st, StatusCode::OK);
+}
+
+// ---------------------------------------------------------- environments
+
+/// Staging uses its own secret and may refund; prod asks for refunds.
+const ENVS: &str = r#"
+[environments.staging]
+services.shop.secret = "echo-tok-staging"
+services.shop.allow = ["orders:read", "files:read", "refunds:write"]
+
+[environments.prod]
+services.shop.ask = ["refunds:write"]
+"#;
+
+async fn env_world(scope_env: &'static str) -> World {
+    world_with(Setup {
+        scope_env,
+        envs: ENVS,
+        ..Setup::default()
+    })
+    .await
+}
+
+fn me() -> PeerCred {
+    PeerCred {
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
+        pid: std::process::id(),
+    }
+}
+
+/// `api.call` over the control socket, as `saiife api` sends it.
+async fn ipc_call(w: &World, args: Value) -> Value {
+    let req = IpcRequest {
+        id: 3,
+        op: "api.call".into(),
+        args: args.as_object().unwrap().clone(),
+    };
+    saiife_daemon::ops::dispatch(&w.ctx, &me(), req).await
+}
+
+async fn ipc_list(w: &World, args: Value) -> Value {
+    let req = IpcRequest {
+        id: 4,
+        op: "api.list".into(),
+        args: args.as_object().unwrap().clone(),
+    };
+    saiife_daemon::ops::dispatch(&w.ctx, &me(), req).await
+}
+
+/// The `x-echo-token` the mock saw on its last request.
+fn last_token(w: &World) -> String {
+    let seen = w.m.seen.lock().unwrap();
+    let (_, h) = seen.last().expect("the mock saw a request");
+    h.get("x-echo-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn orders(env: Option<&str>) -> Value {
+    let mut a =
+        json!({"service": "shop", "operation": "orders.list", "params": {"status": "open"}});
+    if let Some(e) = env {
+        a["env"] = e.into();
+    }
+    a
+}
+
+#[tokio::test]
+async fn api_call_uses_scope_env_snapshot() {
+    let staging = env_world("staging").await;
+    let a = ipc_call(&staging, orders(None)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(last_token(&staging), STAGING_TOKEN);
+
+    let prod = env_world("prod").await;
+    let a = ipc_call(&prod, orders(None)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert_eq!(last_token(&prod), TOKEN);
+    // The HTTP gateway takes the same choice.
+    let (st, _, _) = staging
+        .api("shop/orders.list", json!({"params": {"status": "open"}}))
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(last_token(&staging), STAGING_TOKEN);
+    for w in [&staging, &prod] {
+        let text = w.audit_text();
+        assert!(!text.contains(TOKEN) && !text.contains(STAGING_TOKEN));
+    }
+}
+
+#[tokio::test]
+async fn record_carries_env_and_its_hash() {
+    let w = env_world("staging").await;
+    let a = ipc_call(&w, orders(None)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let g = w.ctx.policy().gateway.unwrap();
+    let base = g.snapshot_for(None).hash.clone();
+    let staging = g.snapshot_for(Some("staging")).hash.clone();
+    let prod = g.snapshot_for(Some("prod")).hash.clone();
+    assert_ne!(base, staging);
+    assert_ne!(staging, prod);
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["env"], "staging");
+    assert_eq!(recs[0]["policy"], staging.as_str());
+    assert_eq!(recs[0]["secret"], "echo-tok-staging");
+
+    // A scope bound to no environment runs under the base, env null.
+    let w = world_with(Setup {
+        scope_env: "prod",
+        ..Setup::default()
+    })
+    .await;
+    let a = ipc_call(&w, orders(None)).await;
+    assert_eq!(a["ok"], true, "{a}");
+    let recs = w.connector_records();
+    assert_eq!(recs[0]["env"], Value::Null);
+    assert_eq!(recs[0]["policy"], "sha256:test");
+}
+
+/// Locked mode: the project `env` the client sends is ignored and the
+/// scope's environment wins. (The developer-mode half, where that arg
+/// chooses the snapshot through `Ctx.mode`, lands with plan 16; the choice
+/// itself is `developer_mode_project_env_selects_snapshot`.)
+#[tokio::test]
+async fn locked_mode_project_env_arg_ignored() {
+    let w = env_world("prod").await;
+    let a = ipc_call(&w, orders(Some("staging"))).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("warning").is_none(), "{a}");
+    assert_eq!(last_token(&w), TOKEN);
+    let recs = w.connector_records();
+    assert_eq!(recs[0]["env"], "prod");
+    // A malformed env is a bad request, before anything is sent.
+    let a = ipc_call(&w, orders(Some("Bad Name"))).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(w.hits(), 1);
+}
+
+#[tokio::test]
+async fn developer_mode_project_env_selects_snapshot() {
+    let w = env_world("prod").await;
+    let g = w.ctx.policy().gateway.unwrap();
+    let dir = NoDirectory;
+    let pick = |mode, env| g.select_env(mode, &dir, "agent", env);
+    assert_eq!(
+        pick(Mode::Developer, Some("staging")),
+        (Some("staging"), None)
+    );
+    assert_eq!(pick(Mode::Developer, None), (None, None));
+    let (e, warn) = pick(Mode::Developer, Some("qa"));
+    assert_eq!(e, None);
+    assert!(warn.unwrap().contains("qa"));
+    // Locked: the scope's, whatever the project says.
+    assert_eq!(pick(Mode::Locked, Some("staging")), (Some("prod"), None));
+    assert_eq!(pick(Mode::Locked, None), (Some("prod"), None));
+    assert_eq!(
+        g.snapshot_for(Some("staging")).config.services["shop"]
+            .secret
+            .as_deref(),
+        Some("echo-tok-staging")
+    );
+    assert_eq!(g.snapshot_for(Some("qa")).hash, g.snap.hash);
+}
+
+#[tokio::test]
+async fn api_list_uses_env_snapshot() {
+    let action = |v: &Value| -> String {
+        let ops = v["services"][0]["operations"].as_array().unwrap();
+        ops.iter().find(|o| o["id"] == "refunds.create").unwrap()["action"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let staging = env_world("staging").await;
+    let v = ipc_list(&staging, json!({})).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(action(&v), "allow");
+    // The HTTP gateway's list is the same.
+    let (_, _, b) = staging.send("GET", "/v1/services", &[], b"").await;
+    assert_eq!(action(&serde_json::from_slice(&b).unwrap()), "allow");
+
+    let prod = env_world("prod").await;
+    let v = ipc_list(&prod, json!({})).await;
+    assert_eq!(action(&v), "ask");
+    // A project env does not change it in locked mode.
+    let v = ipc_list(&prod, json!({"env": "staging"})).await;
+    assert_eq!(action(&v), "ask");
+}
+
+#[test]
+fn env_snapshot_failing_to_apply_denies_connectors() {
+    // A config that bypassed load_system: the environment overrides a
+    // service the base lacks. No gateway rather than the base config.
+    let config: SystemConfig =
+        toml::from_str("version = 2\n[environments.x]\nservices.nope.secret = \"s\"\n").unwrap();
+    let l = saiife_policy::LoadedPolicy {
+        config,
+        files: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let st = PolicyState::from_loaded(&l, &[], Catalog::new(&[], vec![]));
+    assert!(st.gateway.is_none());
+}
+
+/// Each environment applied to the base passes the connector-catalog
+/// check the base passes, at load and at reload (`check_services`).
+#[test]
+fn env_override_checked_against_the_catalog() {
+    let manifest = Manifest::parse(include_str!("../../broker/connectors/test-echo.toml")).unwrap();
+    let cat = Catalog::new(&[], vec![manifest]);
+    let base = "version = 2\n[services.shop]\nconnector = \"test-echo\"\n\
+                params = { shop = \"acme\" }\nallow = [\"orders:read\"]\n";
+    let ok: SystemConfig = toml::from_str(&format!(
+        "{base}[environments.staging]\nservices.shop.params = {{ shop = \"acme-staging\" }}\n"
+    ))
+    .unwrap();
+    saiife_daemon::ops::check_catalog(&ok, &cat).unwrap();
+    let bad: SystemConfig = toml::from_str(&format!(
+        "{base}[environments.staging]\nservices.shop.params = {{ shop = \"evil.test/x\" }}\n"
+    ))
+    .unwrap();
+    let e = saiife_daemon::ops::check_catalog(&bad, &cat).unwrap_err();
+    assert!(e.contains("environment staging"), "{e}");
 }

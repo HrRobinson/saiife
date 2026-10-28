@@ -573,7 +573,7 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
         Some(m) => active_packs(&cfg, &pack_catalog(), Some(m)),
         None => (packs, Vec::new()),
     };
-    let eff = effective_policy(&cfg, &packs, project.as_ref());
+    let eff = effective_policy(&cfg, &packs, project.as_ref(), None);
     let hash = policy_hash(&eff);
     let view = user_view(&cfg, &Getent, &user);
     print_show(&view, Some(&hash), effective.then_some(&eff));
@@ -780,6 +780,8 @@ name = "shop"
 users = ["alice"]
 services = ["shopify"]
 env = "prod"
+
+[environments.prod]
 
 [services.shopify]
 connector = "shopify"

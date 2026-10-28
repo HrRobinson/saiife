@@ -331,6 +331,7 @@ ask = ["refunds:write"]
         config,
         hash: "sha256:test".into(),
         mode: Mode::Locked,
+        env: None,
     }
 }
 
@@ -964,7 +965,8 @@ async fn redact_non_json_withheld() {
 #[tokio::test]
 async fn connector_record_fields_exact() {
     let (_m, up) = mock().await;
-    let snap = snapshot("");
+    let mut snap = snapshot("");
+    snap.env = Some("prod".into());
     let c = call("orders.list", &[("status", "open"), ("limit", "50")]);
     let (o, tr) = run(
         &c,
@@ -1245,6 +1247,7 @@ fn snap_of(text: &str) -> PolicySnapshot {
         config: toml::from_str(&format!("version = 2\nlocked = true\n{text}")).unwrap(),
         hash: "sha256:test".into(),
         mode: Mode::Locked,
+        env: None,
     }
 }
 

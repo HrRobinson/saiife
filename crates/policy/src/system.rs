@@ -2,6 +2,7 @@
 //! (typos in a security config are errors) and every default is the §8.1
 //! value.
 
+use crate::environment::EnvironmentCfg;
 use crate::service::{SecretCfg, ServiceCfg};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,7 +43,16 @@ pub struct SystemConfig {
     pub scope: Vec<Scope>,
     #[serde(default)]
     pub example: Vec<Example>,
+    /// `[environments.<name>]` (spec §6.11): overlays bound to a scope by
+    /// `[[scope]] env`. Only `config.toml` may define them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, EnvironmentCfg>,
 }
+
+/// Service names a config may not use (plan 14 decision 11): they are
+/// `saiife api` subcommands (`collection`, `result`, `token`) or the tool
+/// itself.
+pub const RESERVED_SERVICES: &[&str] = &["collection", "result", "token", "saiife"];
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
