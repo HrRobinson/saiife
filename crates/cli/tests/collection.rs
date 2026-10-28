@@ -634,3 +634,75 @@ fn stops_at_first_non_done_with_its_exit_code() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(w.api_calls().is_empty());
 }
+
+/// Runs `cmd` to its exit, at most 10 s; a hang kills the test's own child
+/// and fails.
+#[cfg(target_os = "linux")]
+fn output_within(mut cmd: std::process::Command) -> (std::process::Output, std::time::Duration) {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the command hung on a FIFO");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (child.wait_with_output().unwrap(), started.elapsed())
+}
+
+/// A FIFO, or a symlink, planted in `.saiife/collections/` is refused
+/// before it is opened: `load`, `collection list` and `collection run`
+/// answer at once instead of blocking on the FIFO.
+#[cfg(target_os = "linux")]
+#[test]
+fn collection_files_must_be_regular_files() {
+    use rustix::fs::{mknodat, FileType, Mode, CWD};
+    use std::time::Duration;
+    let w = World::new(
+        &[],
+        "good",
+        SPEC_EXAMPLE.replace("open-orders-report", "good").as_str(),
+    );
+    let root = w.tmp.path().join("project");
+    let dir = root.join(".saiife/collections");
+    mknodat(
+        CWD,
+        dir.join("pipe.toml"),
+        FileType::Fifo,
+        Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(dir.join("good.toml"), dir.join("link.toml")).unwrap();
+
+    for name in ["pipe", "link"] {
+        let e = load(&root, name).unwrap_err();
+        assert!(
+            matches!(&e, CollectionError::Io(_, why) if why == "not a regular file"),
+            "{name}: {e:?}"
+        );
+    }
+    assert!(load(&root, "good").is_ok());
+
+    let (o, took) = output_within(w.cmd(&["collection", "list"]));
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert_eq!(out.trim(), "good  1  shopify", "{out}");
+    assert!(stderr(&o).contains("pipe"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("not a regular file"), "{}", stderr(&o));
+
+    let (o, took) = output_within(w.cmd(&["collection", "run", "pipe"]));
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(stderr(&o).contains("not a regular file"), "{}", stderr(&o));
+    assert!(w.api_calls().is_empty(), "{:?}", w.frames());
+}

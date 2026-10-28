@@ -194,10 +194,35 @@ pub fn load_path(path: &Path) -> Result<Collection, CollectionError> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let file = match std::fs::File::open(path) {
+    let not_regular = || CollectionError::Io(path.to_path_buf(), "not a regular file".into());
+    // An agent can write this directory: a FIFO (or a device) would block
+    // the open or the read, and a symlink could point anywhere. Only a
+    // regular file is opened at all.
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(not_regular()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CollectionError::NotFound(path.to_path_buf()))
+        }
+        Err(e) => return Err(CollectionError::Io(path.to_path_buf(), e.to_string())),
+    }
+    // Swapped after the check: O_NONBLOCK keeps the open of a FIFO from
+    // blocking, O_NOFOLLOW refuses a symlink, and the fstat below refuses
+    // anything that is not a regular file.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = match opts.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(CollectionError::NotFound(path.to_path_buf()))
+        }
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) => {
+            return Err(not_regular())
         }
         Err(e) => return Err(CollectionError::Io(path.to_path_buf(), e.to_string())),
     };
@@ -205,10 +230,7 @@ pub fn load_path(path: &Path) -> Result<Collection, CollectionError> {
         .metadata()
         .map_err(|e| CollectionError::Io(path.to_path_buf(), e.to_string()))?;
     if !meta.is_file() {
-        return Err(CollectionError::Io(
-            path.to_path_buf(),
-            "not a regular file".into(),
-        ));
+        return Err(not_regular());
     }
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1)
