@@ -51,7 +51,11 @@ there is still a bad request, not a fallback. The environment in force is
 part of the effective-policy hash, so every record shows which one applied.
 
 **Developer mode and the personal broker.** `saiife env use <name>` writes
-`env = "<name>"` into `.saiife/config.toml`.
+`env = "<name>"` into `.saiife/config.toml`. `saiife api` sends that `env` to
+the personal broker, whose own config defines the environments. A
+well-formed `env` that no environment defines falls back to the base config
+with a warning in developer mode and the personal broker, and is ignored in
+locked mode.
 
 ## Commands
 

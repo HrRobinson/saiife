@@ -134,8 +134,8 @@ path and query, passed to the matching operation).
 - [GitLab](gitlab.md): projects, issues, merge requests and pipelines.
 - [Sentry](sentry.md): projects, issues and events.
 - [PagerDuty](pagerduty.md): incidents, notes, services and on-calls.
-- [Stripe](stripe.md): customers, charges, payment intents, invoices and refunds (amount
-  caps).
+- [Stripe](stripe.md): customers, charges, payment intents, invoices and
+  refunds (amount caps).
 - [Slack](slack.md): conversations, messages and users.
 - [Discord](discord.md): guilds, channels and messages.
 - [Linear](linear.md): issues, projects and teams over fixed GraphQL
