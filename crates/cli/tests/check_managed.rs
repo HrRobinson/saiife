@@ -998,6 +998,83 @@ fn listed_mcp_server_allowed_not_judged() {
     );
 }
 
+/// A claude or codex payload calling `tool`.
+fn mcp_payload(agent: &str, tool: &str) -> String {
+    let rel = format!("{agent}/mcp-tool.json");
+    let mut v: Value = serde_json::from_str(&fixture(&rel)).unwrap();
+    v["tool_name"] = json!(tool);
+    v["cwd"] = json!("/");
+    v.to_string()
+}
+
+#[test]
+fn saiife_server_allowed_as_brokered() {
+    let d = TestDaemon::start(Opts::default());
+    for agent in ["claude", "codex"] {
+        let (o, _, _sb) = managed_as(
+            agent,
+            &d.config(),
+            &mcp_payload(agent, "mcp__saiife__shop_orders_list"),
+            &[],
+            &[],
+        );
+        assert_eq!(code(&o), 0, "{agent}: stderr: {}", stderr(&o));
+        let r = last_guard(&d);
+        assert_eq!(r["decision"], "allow", "{r}");
+        assert_eq!(r["pack"], "guard.mcp", "{r}");
+        assert_eq!(r["rule"], "mcp_brokered", "{r}");
+        assert_eq!(r["reason"], "brokered: judged by the saiife daemon", "{r}");
+        assert_eq!(r["tool"], "mcp__saiife__shop_orders_list", "{r}");
+        assert_eq!(r["agent"], agent, "{r}");
+    }
+}
+
+#[test]
+fn saiife_lookalike_names_denied() {
+    let d = TestDaemon::start(Opts::default());
+    for tool in ["mcp__saiife__x__y", "mcp__saiife___x", "mcp__saiife__"] {
+        let (o, _, _sb) = managed_as(
+            "claude",
+            &d.config(),
+            &mcp_payload("claude", tool),
+            &[],
+            &[],
+        );
+        assert_eq!(code(&o), 2, "{tool}: stderr: {}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with("BLOCKED by guard.mcp"),
+            "{}",
+            stderr(&o)
+        );
+        assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    }
+}
+
+#[test]
+fn gemini_saiife_needs_server_identity() {
+    let d = TestDaemon::start(Opts::default());
+    let call = |ctx: Option<Value>| {
+        let mut v = json!({
+            "session_id": "g-1",
+            "cwd": "/",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "mcp_saiife_shop_orders_list",
+            "tool_input": {}
+        });
+        if let Some(c) = ctx {
+            v["mcp_context"] = c;
+        }
+        managed_as("gemini", &d.config(), &v.to_string(), &[], &[]).0
+    };
+    let o = call(None);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let o = call(Some(json!({"server_name": "saiife_x"})));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let o = call(Some(json!({"server_name": "saiife"})));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["rule"], "mcp_brokered");
+}
+
 /// Controller ruling: on Gemini only an explicit server identity in the
 /// payload allows an MCP call; `mcp_docs_x` alone could be server `docs_x`.
 #[test]

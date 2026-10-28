@@ -239,6 +239,23 @@ mod imp {
             }
         }
 
+        /// An `allow` for the reserved server `saiife`: the daemon judges
+        /// its calls.
+        fn mcp_brokered() -> Judged {
+            let reason = "brokered: judged by the saiife daemon".to_string();
+            Judged {
+                decision: DecisionKind::Allow,
+                input: String::new(),
+                tool: None,
+                pack: Some("guard.mcp".into()),
+                rule: Some("mcp_brokered".into()),
+                rule_id: None,
+                askable: false,
+                outcome: Outcome::Allow,
+                reason: Some(reason),
+            }
+        }
+
         /// A `deny` by `guard.mcp` (spec §6.1.4).
         fn mcp_denied(reason: String) -> Judged {
             Judged {
@@ -486,11 +503,11 @@ mod imp {
             .or(forced)
             .or_else(|| input.as_ref().err().cloned())
             .or(cwd.err());
-        let mcp_denied = match (&failed, &input, event) {
-            (None, Ok(payload), None) => mcp_denial(agent, ctx, payload, cfg),
+        let mcp_judged = match (&failed, &input, event) {
+            (None, Ok(payload), None) => mcp_judgement(agent, ctx, payload, cfg),
             _ => None,
         };
-        let mut worker = match (&failed, &mcp_denied, input) {
+        let mut worker = match (&failed, &mcp_judged, input) {
             (None, None, Ok(payload)) => Some(Worker::spawn(EvalRequest {
                 payload,
                 // A settings change is judged without packs.
@@ -529,8 +546,8 @@ mod imp {
         if let Some(reason) = failed {
             return Ok(Judged::error(String::new(), reason));
         }
-        if let Some(reason) = mcp_denied {
-            return Ok(Judged::mcp_denied(reason));
+        if let Some(judged) = mcp_judged {
+            return Ok(judged);
         }
         let (payload, answer) = match worker {
             Some(Ok(w)) => w.finish(),
@@ -547,14 +564,15 @@ mod imp {
         })
     }
 
-    /// The `guard.mcp` deny reason for this call, if its tool is an MCP
-    /// tool whose server `[guard.mcp] allow_servers` does not list.
-    fn mcp_denial(
+    /// The `guard.mcp` judgement of this call without a worker, if its tool
+    /// is an MCP tool: a deny when `[guard.mcp] allow_servers` does not list
+    /// its server, an allow for the brokered server `saiife`.
+    fn mcp_judgement(
         agent: &str,
         ctx: &HookContext,
         payload: &str,
         cfg: &SystemConfig,
-    ) -> Option<String> {
+    ) -> Option<Judged> {
         let tool = ctx.tool.as_deref()?;
         // Claude Code and Codex names are judged alone; only the other
         // agents' payloads are scanned for `mcp_context`.
@@ -564,10 +582,11 @@ mod imp {
         };
         match eval::mcp_check(agent, tool, &identity, &cfg.guard.mcp.allow_servers) {
             McpCheck::NotMcp | McpCheck::Allowed => None,
-            McpCheck::Denied(s) => Some(format!(
+            McpCheck::Brokered => Some(Judged::mcp_brokered()),
+            McpCheck::Denied(s) => Some(Judged::mcp_denied(format!(
                 "MCP server {s} is not in [guard.mcp] allow_servers"
-            )),
-            McpCheck::Unknown => Some("MCP server unknown on Gemini".into()),
+            ))),
+            McpCheck::Unknown => Some(Judged::mcp_denied("MCP server unknown on Gemini".into())),
         }
     }
 

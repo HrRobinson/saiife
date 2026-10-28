@@ -57,6 +57,8 @@ pub const RUN_DIR: &str = "/run/saiife";
 pub const SOCKET: &str = "/run/saiife/saiife.sock";
 pub const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code/managed-settings.d";
 pub const CLAUDE_MANAGED: &str = "/etc/claude-code/managed-settings.d/50-saiife.json";
+/// The managed MCP allowlist drop-in, derived from `[guard.mcp]` policy.
+pub const CLAUDE_MCP: &str = "/etc/claude-code/managed-settings.d/60-saiife-mcp.json";
 pub const CODEX_DIR: &str = "/etc/codex";
 pub const CODEX_REQUIREMENTS: &str = "/etc/codex/requirements.toml";
 pub const GEMINI_DIR: &str = "/etc/gemini-cli";

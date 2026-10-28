@@ -55,6 +55,23 @@ pub fn managed_settings() -> &'static str {
     MANAGED_SETTINGS
 }
 
+/// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only the
+/// MCP servers it names. `saiife` (the broker's own server) comes first,
+/// then `allow_servers` in order, without repeats.
+pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
+    let mut names: Vec<&str> = vec!["saiife"];
+    for s in allow_servers {
+        if !names.contains(&s.as_str()) {
+            names.push(s);
+        }
+    }
+    let entries: Vec<Value> = names.iter().map(|n| json!({ "serverName": n })).collect();
+    let mut text =
+        serde_json::to_string_pretty(&json!({ "allowedMcpServers": entries })).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
 fn group() -> Value {
     json!({
         "matcher": MATCHER,
@@ -496,5 +513,27 @@ mod tests {
         assert!(errs[0].path.ends_with(".claude/settings.json"));
         assert!(errs[1].managed && errs[2].managed);
         assert!(found.iter().all(|b| b.setting.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+
+    #[test]
+    fn managed_mcp_settings_lists_saiife_first_without_repeats() {
+        let v: Value = serde_json::from_str(&managed_mcp_settings(&[
+            "github".into(),
+            "saiife".into(),
+            "jira".into(),
+            "github".into(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"allowedMcpServers": [
+                {"serverName": "saiife"}, {"serverName": "github"}, {"serverName": "jira"}
+            ]})
+        );
     }
 }

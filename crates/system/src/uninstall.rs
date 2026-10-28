@@ -101,6 +101,26 @@ pub fn uninstall(
         }
     }
 
+    // 3b. Whole files saiife wrote for an agent (the Claude MCP allowlist).
+    for f in rec
+        .files
+        .iter()
+        .rev()
+        .filter(|f| f.kind == FileKind::Managed)
+    {
+        let p = at(&f.path)?;
+        let Some(sha) = fsops::sha256_file(&p).map_err(step("managed"))? else {
+            continue;
+        };
+        fsops::remove_if_listed(&p).map_err(step("managed"))?;
+        let shown = f.path.display();
+        out.push(if f.sha256.as_deref() == Some(sha.as_str()) {
+            format!("removed {shown}")
+        } else {
+            format!("removed {shown} (changed since install)")
+        });
+    }
+
     // 4. The unit, daemon-reload, the binary.
     for kind in [FileKind::Unit, FileKind::Polkit, FileKind::Binary] {
         for f in rec.files.iter().rev().filter(|f| f.kind == kind) {
@@ -401,6 +421,19 @@ mod tests {
 
     fn un(e: &Env, purge: bool) -> Vec<String> {
         uninstall(&e.layout, &e.host, &UninstallOptions { purge }).unwrap()
+    }
+
+    #[test]
+    fn uninstall_removes_mcp_dropin() {
+        let e = env(255);
+        e.install();
+        assert!(e.at(CLAUDE_MCP).exists());
+        let out = un(&e, false);
+        assert!(!e.at(CLAUDE_MCP).exists());
+        assert!(
+            out.iter().any(|l| l == &format!("removed {CLAUDE_MCP}")),
+            "{out:?}"
+        );
     }
 
     #[test]
