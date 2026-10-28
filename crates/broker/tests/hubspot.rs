@@ -367,6 +367,19 @@ fn next_page_request_carries_the_cursor() {
 }
 
 #[test]
+fn hubspot_cursor_refuses_slash_and_plus() {
+    // next_cursor admits `/` and `+` for other connectors; hubspot's own
+    // `after` pattern must still refuse them.
+    let o = op("contacts.list");
+    for bad in ["a/b", "a+b"] {
+        assert!(
+            validate(o, &map(&[("after", bad)]), &BTreeMap::new()).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
 fn proxy_paths_resolve_to_operations() {
     let m = hubspot();
     let id = |method: &str, path: &str| proxy(m, method, path).map(|(o, _)| o.id.clone());

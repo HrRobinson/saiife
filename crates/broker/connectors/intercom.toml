@@ -28,7 +28,7 @@ capability = "contacts:read"
 kind = "read"
 method = "GET"
 path = "/contacts"
-query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=-]{1,256}" }
+query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=+-]{1,256}" }
 pagination = { cursor = { param = "starting_after", next = "pages.next.starting_after" } }
 
 [[operation]]
@@ -45,7 +45,7 @@ capability = "conversations:read"
 kind = "read"
 method = "GET"
 path = "/conversations"
-query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=-]{1,256}" }
+query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=+-]{1,256}" }
 pagination = { cursor = { param = "starting_after", next = "pages.next.starting_after" } }
 
 [[operation]]

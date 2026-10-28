@@ -553,6 +553,37 @@ fn intercom_proxy_and_policy() {
     assert_eq!(verdict(m, &ask, "conversations.reply", &[]), Verdict::Ask);
 }
 
+#[test]
+fn intercom_base64_cursor_plus_is_encoded() {
+    let p = op(intercom(), "contacts.list").pagination.clone().unwrap();
+    let body = json!({"pages": {"next": {"starting_after": "ab+cd=="}}});
+    assert_eq!(next_cursor(&p, &body).unwrap().1, "ab+cd==");
+    let tok = token("intercom");
+    let b = built(
+        intercom(),
+        "conversations.list",
+        &IC_SVC,
+        &[("starting_after", "ab+cd==")],
+        &[],
+        &tok,
+    )
+    .unwrap();
+    assert_eq!(
+        b.uri.to_string(),
+        "https://api.eu.intercom.io/conversations?starting_after=ab%2Bcd%3D%3D"
+    );
+    // No other connector's cursor pattern accepts `+`.
+    for m in builtin().iter().filter(|m| m.id != "intercom") {
+        for o in &m.operation {
+            if let Some(Pagination::Cursor { param, .. }) = &o.pagination {
+                let ty = o.query.get(param).or_else(|| o.body_params.get(param));
+                let ty = saiife_broker::params::ParamType::parse(ty.unwrap(), None).unwrap();
+                assert!(ty.check("a+b").is_err(), "{} {}", m.id, o.id);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- Airtable
 
 fn airtable() -> &'static Manifest {

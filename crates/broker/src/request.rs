@@ -653,12 +653,12 @@ pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, 
     };
     // The value is echoed into an HTTP header and a CLI line: refuse anything
     // long or outside a conservative alphabet (`/` is there for Airtable's
-    // `itr.../rec...` offsets; the next call's param pattern still applies).
+    // `itr.../rec...` offsets, `+` for base64 cursors; the next call's param pattern still applies).
     if v.is_empty()
         || v.len() > 256
-        || !v
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-' | b'/'))
+        || !v.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-' | b'/' | b'+')
+        })
     {
         return None;
     }
