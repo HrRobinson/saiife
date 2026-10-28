@@ -424,3 +424,43 @@ fn hook_ignores_a_locked_project_env() {
     assert_eq!(r["decision"], "allow", "{r}");
     // (The record hash also covers the project overlay, so it is not the bare prod hash.)
 }
+
+/// Without `--system-config`, `env` finds its config through plan 16's
+/// resolver: on a host with no locked config that is the personal broker's
+/// own (`$XDG_CONFIG_HOME/saiife/broker/config.toml`). No broker needs to
+/// run: listing and `env use` read and write files only.
+#[test]
+fn list_personal_config_via_broker_resolve() {
+    let b = common::personal::TestBroker::prepare();
+    b.write_config(&format!("version = 2\n{ENVS}"));
+    let project = b.path().join("p");
+    fs::create_dir_all(project.join(".saiife")).unwrap();
+    fs::write(
+        project.join(".saiife/config.toml"),
+        "version = 2\nenv = \"staging\"\n",
+    )
+    .unwrap();
+    let o = b.run_cli(&["env", "list", "--json"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let v: Value = serde_json::from_str(&out(&o)).unwrap();
+    let names: Vec<(&str, bool)> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e["applies"] == true))
+        .collect();
+    assert_eq!(names, [("prod", false), ("staging", true)], "{v}");
+    // `env use` checks the name against the broker's config too.
+    let o = b.run_cli(&["env", "use", "prod"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    let text = fs::read_to_string(project.join(".saiife/config.toml")).unwrap();
+    assert!(text.contains("env = \"prod\""), "{text}");
+    let o = b.run_cli(&["env", "use", "qa"]);
+    assert_eq!(code(&o), 2);
+    assert!(err(&o).contains("not defined"), "{}", err(&o));
+    // No broker config: no environments (never the host's /etc config).
+    fs::remove_file(b.config()).unwrap();
+    let o = b.run_cli(&["env", "list", "--json"]);
+    assert_eq!(code(&o), 0, "{}", err(&o));
+    assert_eq!(out(&o).trim(), "[]");
+}

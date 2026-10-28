@@ -19,7 +19,9 @@ use saiife_policy::{env_for, load_system, parse_project, Getent, SystemConfig};
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
-use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
+use crate::audit_locked::locked_audit_dir;
+#[cfg(not(target_os = "linux"))]
+use crate::audit_locked::SYSTEM_CONFIG;
 use crate::text::sanitize;
 
 #[derive(Subcommand)]
@@ -49,17 +51,47 @@ enum Place {
     Developer { system: Option<PathBuf> },
 }
 
-/// DEFERRED(plan 16): the one place that decides which config applies. It
-/// becomes a call of plan 16's `cli::broker::resolve` (locked, or the
-/// personal broker's config) at the rebase; nothing else here knows a path.
+/// The one place that decides which config applies; nothing else here
+/// knows a path. Without `--system-config`, plan 16's resolver
+/// (`cli::broker::resolve`) decides: a locked host is its system config,
+/// anything else the personal broker's config, which defines the
+/// environments in developer mode. A host it cannot place (a locked install
+/// whose config is not locked, no usable `XDG_RUNTIME_DIR`) is an error,
+/// never a guess.
+///
+/// `--system-config <file>` reads that file: locked mode when it says
+/// `locked = true`, otherwise the developer-mode definitions.
 fn resolve(system_config: Option<PathBuf>) -> Result<Place, String> {
-    let config = system_config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+    match system_config {
+        Some(config) => from_file(config),
+        None => resolve_default(),
+    }
+}
+
+fn from_file(config: PathBuf) -> Result<Place, String> {
     match locked_audit_dir(&config)? {
         Some(_) => Ok(Place::Locked(config)),
         None => Ok(Place::Developer {
             system: config.is_file().then_some(config),
         }),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_default() -> Result<Place, String> {
+    use crate::broker::{self, Target};
+    Ok(match broker::resolve_here(None)? {
+        Target::Locked { config, .. } => Place::Locked(config),
+        Target::Personal { config, .. } => Place::Developer {
+            system: config.is_file().then_some(config),
+        },
+    })
+}
+
+/// No personal broker off Linux in this version: the system config path.
+#[cfg(not(target_os = "linux"))]
+fn resolve_default() -> Result<Place, String> {
+    from_file(PathBuf::from(SYSTEM_CONFIG))
 }
 
 pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {
