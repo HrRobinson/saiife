@@ -21,7 +21,7 @@ saiife-system = { path = "../system" }
 saiife-broker = { path = "../broker" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
-serde ={ version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 # The hash of the exact command a grant is for (`raw_sha256`); also the

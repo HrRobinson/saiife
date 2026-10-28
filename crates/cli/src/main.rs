@@ -548,10 +548,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
-/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
-/// flag this binary does not know: warn and fail open, silently on stdout.
-/// Everything else (and `--help` / `--version`) keeps clap's behavior.
 /// The `saiife daemon` flags.
 struct DaemonArgs {
     system: bool,
@@ -701,6 +697,10 @@ fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
         .collect()
 }
 
+/// Bad arguments. In hook mode (`saiife check …`) clap's usual exit 2 would
+/// read as "block" to every agent, e.g. after a newer saiife wrote a hook
+/// flag this binary does not know: warn and fail open, silently on stdout.
+/// Everything else (and `--help` / `--version`) keeps clap's behavior.
 fn arg_error(e: clap::Error) -> ExitCode {
     use clap::error::ErrorKind;
     let hook_mode = std::env::args_os().nth(1).is_some_and(|a| a == "check");

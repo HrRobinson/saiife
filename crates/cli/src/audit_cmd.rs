@@ -256,9 +256,16 @@ pub fn render_verify(r: &saiife_audit::VerifyReport) -> String {
     if let Some(key) = &r.key {
         out.push_str(&format!("  signed with key {}\n", sanitize(key)));
     } else if r.breaks.is_empty() {
-        out.push_str(
-            "  developer mode: no signing key, so this catches accidental edits, not deliberate rewrites.\n",
-        );
+        // The label follows the chain's genesis: a personal broker's chain
+        // has no key either (§6.4.4), and is not developer mode.
+        let who = match r.mode.as_deref() {
+            Some("personal") => "personal broker",
+            Some("locked") => "locked mode",
+            _ => "developer mode",
+        };
+        out.push_str(&format!(
+            "  {who}: no signing key, so this catches accidental edits, not deliberate rewrites.\n",
+        ));
     }
     out.truncate(out.trim_end().len());
     out

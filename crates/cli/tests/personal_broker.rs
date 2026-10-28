@@ -492,13 +492,100 @@ fn audit_chain_has_no_key_and_verifies() {
     assert!(!b.state_dir().join("keys").exists());
     assert!(!b.events("stop").is_empty(), "{recs:?}");
     let o = b.verify();
+    let out = String::from_utf8_lossy(&o.stdout);
     assert_eq!(
         o.status.code(),
         Some(0),
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
+        "{out}{}",
         String::from_utf8_lossy(&o.stderr)
     );
+    // The label is the chain's own mode, not "developer mode".
+    assert!(
+        out.contains("personal broker: no signing key, so this catches accidental edits"),
+        "{out}"
+    );
+    assert!(!out.contains("developer mode"), "{out}");
+}
+
+#[test]
+fn personal_reload_with_locked_rejected() {
+    let b = TestBroker::start(None);
+    let before = b.call("status", json!({})).unwrap();
+    assert_eq!(before["policy_ok"], true);
+    b.write_config("version = 2\nlocked = true\n");
+    let a = b.call("policy.reload", json!({})).unwrap();
+    assert_eq!(a["result"], "rejected", "{a:?}");
+    assert!(
+        a["reason"].as_str().unwrap().contains("locked = true"),
+        "{a:?}"
+    );
+    // The old policy stays in force, and the record says `rejected`.
+    let after = b.call("status", json!({})).unwrap();
+    assert_eq!(after["policy_ok"], true);
+    assert_eq!(after["policy"], before["policy"]);
+    let policy: Vec<Value> = b
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "policy")
+        .collect();
+    let last = policy.last().unwrap();
+    assert_eq!(last["result"], "rejected", "{policy:?}");
+    assert!(
+        last["reason"].as_str().unwrap().contains("locked = true"),
+        "{last}"
+    );
+    assert!(b.events("reload_warning").is_empty());
+}
+
+#[test]
+fn gateway_tcp_ignored_in_personal() {
+    let b = TestBroker::prepare();
+    b.write_config("version = 2\n\n[gateway]\ntcp = \"127.0.0.1:0\"\n");
+    let mut b = b;
+    b.spawn_and_wait();
+    let s = b.call("status", json!({})).unwrap();
+    assert_eq!(s["policy_ok"], true, "{s:?}");
+    assert_eq!(s["gateway_tcp"], Value::Null, "{s:?}");
+    assert!(b.events("gateway_tcp").is_empty());
+    assert!(b.events("gateway_tcp_failed").is_empty());
+    assert!(
+        b.stderr_text().contains("[gateway] tcp is ignored"),
+        "{}",
+        b.stderr_text()
+    );
+}
+
+#[test]
+fn user_refuses_path_flags() {
+    let b = TestBroker::prepare();
+    for flag in ["--config", "--state-dir", "--credentials-dir"] {
+        let o = b
+            .command()
+            .arg(flag)
+            .arg(b.path().join("elsewhere"))
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{flag}: {err}");
+        assert!(err.contains(flag), "{flag}: {err}");
+        assert!(!b.socket_dir().exists());
+        assert!(!b.keychain_dir().exists());
+        assert!(!b.path().join("elsewhere").exists());
+    }
+}
+
+#[test]
+fn rotate_key_refused_without_record() {
+    let b = TestBroker::start(None);
+    let before = b.records().len();
+    let e = b.call("audit.rotate_key", json!({})).unwrap_err();
+    let (_, msg) = refused(&e);
+    assert!(msg.contains("no signing key"), "{msg}");
+    std::thread::sleep(Duration::from_millis(200));
+    let recs = b.records();
+    assert_eq!(recs.len(), before, "{:?}", &recs[before..]);
+    assert!(!recs.iter().any(|r| r["kind"] == "key_rotate"));
+    assert!(!b.state_dir().join("keys").exists());
 }
 
 #[test]

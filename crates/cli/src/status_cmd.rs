@@ -1073,7 +1073,8 @@ mod tests {
             .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
             .with_var("CLAUDE_CONFIG_DIR", "/home/u/.claude")
             .with_var("CODEX_HOME", "/home/u/.codex")
-            .with_var("SAIIFE_BIN", "/usr/bin/saiife");
+            .with_var("SAIIFE_BIN", "/usr/bin/saiife")
+            .with_var("XDG_CONFIG_HOME", "/home/u/.config");
         let text = inactive_lines(&active, &bound);
         assert!(
             text.starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),

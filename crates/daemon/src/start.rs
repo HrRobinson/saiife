@@ -194,6 +194,13 @@ fn private_dir(dir: &Path, euid: u32) -> Result<(), String> {
 /// Take the personal broker's single-instance lock (`flock` on
 /// `<state>/broker.lock`, never through a symlink). A lock another broker
 /// holds refuses the start.
+///
+/// The lock is per state dir, not per user: two brokers started with
+/// different `XDG_STATE_HOME` hold different locks but share the one
+/// keychain item (`saiife`/`vault-key`). If both start with no key at once,
+/// each may store its own and the last write wins; the other's vault is then
+/// left under a key the keychain no longer holds. One broker per user is the
+/// supported setup.
 fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = state_dir.join(PERSONAL_LOCK);
@@ -284,6 +291,15 @@ pub(crate) fn load_policy(
     let mut l = load_and_check(config, dir).map_err(|e| e.to_string())?;
     let owner = match personal {
         Some(p) => {
+            // A locked-mode config is never served by the personal broker:
+            // refused at start, and a reload to one is rejected (the old
+            // policy stays).
+            if l.config.locked {
+                return Err(format!(
+                    "{}: locked = true is a locked-mode config; the personal broker does not serve it",
+                    config.display()
+                ));
+            }
             let raw = read_bounded(config)
                 .and_then(|s| s.parse::<toml::Table>().ok())
                 .unwrap_or_default();
@@ -1392,15 +1408,10 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
 fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
     let c = &l.config;
     let mut out = Vec::new();
-    match ctx.mode {
-        Mode::Locked if !c.locked => {
-            out.push("the reloaded config lacks locked = true".to_string());
-        }
-        Mode::Personal if c.locked => out.push(
-            "the reloaded config has locked = true, which the personal broker does not serve"
-                .to_string(),
-        ),
-        _ => {}
+    // (A personal reload with `locked = true` never gets here: `load_policy`
+    // rejects it.)
+    if ctx.mode == Mode::Locked && !c.locked {
+        out.push("the reloaded config lacks locked = true".to_string());
     }
     if c.daemon.user != ctx.own_user {
         out.push(format!(

@@ -199,6 +199,15 @@ pub fn apply(
             p.audit_dir.display()
         ));
     }
+    // The loopback TCP listener knows its callers by bearer token only, not
+    // by uid: any local user could reach the broker through it.
+    if !cfg.gateway.tcp.is_empty() {
+        warnings.push(
+            "personal broker: [gateway] tcp is ignored; the TCP listener has no uid check, the broker serves its own sockets only"
+                .into(),
+        );
+        cfg.gateway.tcp = String::new();
+    }
     cfg.daemon = DaemonCfg {
         user: p.own_user.clone(),
         socket_dir: p.socket_dir.clone(),
@@ -533,6 +542,16 @@ secret = "mail"
         let (mut cfg, raw) = parse("version = 2\n[audit]\nretention_months = 3\n");
         assert!(apply(&mut cfg, &raw, &pcfg(), &dir()).is_empty());
         assert_eq!(cfg.audit.retention_months, 3);
+    }
+
+    #[test]
+    fn apply_drops_gateway_tcp_with_a_warning() {
+        let (mut cfg, raw) = parse("version = 2\n[gateway]\ntcp = \"127.0.0.1:0\"\n");
+        let w = apply(&mut cfg, &raw, &pcfg(), &dir());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("[gateway] tcp"), "{w:?}");
+        assert!(cfg.gateway.tcp.is_empty());
+        assert_eq!(cfg.gateway.tcp_addr().unwrap(), None);
     }
 
     #[test]
