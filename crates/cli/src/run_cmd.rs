@@ -162,15 +162,13 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{argv0_for, loader_vars, mask_values, parse_spec, pump, RunArgs};
-    use crate::secret_cmd::linux::{call, Stop};
+    use crate::secret_cmd::linux::{call_to, target, Stop};
     use saiife_broker::mask::Masker;
     use serde_json::{json, Map};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
     use zeroize::Zeroizing;
-
-    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
 
     pub fn run(args: RunArgs) -> ExitCode {
         match go(args) {
@@ -191,9 +189,7 @@ mod linux {
     }
 
     fn go(args: RunArgs) -> Result<ExitCode, Stop> {
-        let config = args
-            .system_config
-            .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+        let config = target(args.system_config.as_deref())?;
         let mut specs: Vec<(String, String)> = Vec::new();
         for s in &args.secrets {
             let spec = parse_spec(s).map_err(Stop::Refused)?;
@@ -220,7 +216,7 @@ mod linux {
             let mut a = Map::new();
             a.insert("name".into(), json!(name));
             a.insert("exe".into(), json!(exe_s));
-            let ans = call(&config, "secret.lease", a)?;
+            let ans = call_to(&config, "secret.lease", a)?;
             let value = ans
                 .get("value")
                 .and_then(|v| v.as_str())

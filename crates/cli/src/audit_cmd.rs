@@ -14,9 +14,63 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::{DecisionKind, Record};
 use time::{Duration, OffsetDateTime};
 
+/// What every `--broker` line says (plan 16).
+pub const BROKER_LABEL: &str = "personal broker, not a security boundary";
+
+/// The personal broker's audit dir, `$XDG_DATA_HOME/saiife/broker/audit`
+/// (its fallback: `~/.local/share`). Reading the log does not need the
+/// broker's runtime dir, so `XDG_RUNTIME_DIR` is not required here.
+fn broker_audit_dir() -> Result<PathBuf, String> {
+    let env = |k: &str| match k {
+        "XDG_RUNTIME_DIR" => Some(std::ffi::OsString::from("/")),
+        _ => std::env::var_os(k),
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    saiife_system::personal::personal_paths(&env, home.as_deref()).map(|p| p.audit_dir)
+}
+
+/// `text` with every `audit chain` line labelled [`BROKER_LABEL`].
+fn broker_labelled(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            if l.starts_with("audit chain") {
+                format!("{l} ({BROKER_LABEL})")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `saiife audit verify --broker`: the personal broker's log, with the
+/// developer reader, every summary line labelled.
+fn verify_broker() -> ExitCode {
+    let dir = match broker_audit_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            outln!(
+                "audit chain: could not read the log: {} ({BROKER_LABEL})",
+                sanitize(&e)
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let report = saiife_audit::verify(&dir);
+    outln!(
+        "{}\n  log: {} ({BROKER_LABEL})",
+        broker_labelled(render_verify(&report).trim_end()),
+        sanitize(&dir.display().to_string())
+    );
+    ExitCode::from(report.exit_code())
+}
+
 /// `saiife audit verify [--external <file|dir>]`: exit 0 intact, 1 broken,
 /// 2 unreadable. Prints counts and file names only, never record content.
-pub fn verify(external: Option<&Path>, system_config: Option<&Path>) -> ExitCode {
+pub fn verify(external: Option<&Path>, system_config: Option<&Path>, broker: bool) -> ExitCode {
+    if broker {
+        return verify_broker();
+    }
     let config = system_config.unwrap_or(Path::new(audit_locked::SYSTEM_CONFIG));
     let dir = match verify_dir(config) {
         Ok(dir) => dir,
@@ -439,6 +493,8 @@ pub struct RunArgs<'a> {
     /// The system config (default /etc/saiife/config.toml); locked mode
     /// when it exists with `locked = true`.
     pub system_config: Option<PathBuf>,
+    /// `--broker`: the personal broker's log (plan 16).
+    pub broker: bool,
 }
 
 /// Records read from one place, with what had to be skipped.
@@ -528,14 +584,24 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let source = match audit_locked::source(a.system_config.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("saiife: {}", sanitize(&e));
-            return ExitCode::from(2);
+    // `--broker` reads the personal broker's dir as developer mode does.
+    let (source, home_dir) = if a.broker {
+        match broker_audit_dir() {
+            Ok(d) => (Source::Developer, Some(d)),
+            Err(e) => {
+                eprintln!("saiife: {} ({BROKER_LABEL})", sanitize(&e));
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match audit_locked::source(a.system_config.as_deref()) {
+            Ok(s) => (s, store::default_dir()),
+            Err(e) => {
+                eprintln!("saiife: {}", sanitize(&e));
+                return ExitCode::from(2);
+            }
         }
     };
-    let home_dir = store::default_dir();
     let locked_dir = match &source {
         Source::Developer => None,
         Source::Direct { dir, .. } | Source::Daemon { dir, .. } => Some(dir.clone()),
@@ -547,10 +613,13 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
         since: since_time.map(|t| t.unix_timestamp()),
         ..Default::default()
     };
-    let main = match load_main(&source, home_dir.as_deref(), q) {
+    let mut main = match load_main(&source, home_dir.as_deref(), q) {
         Ok(m) => m,
         Err(code) => return code,
     };
+    if a.broker {
+        main.place = format!("{} ({BROKER_LABEL})", main.place);
+    }
     // Locked mode: the user's home log too, labelled (spec §6.4.5). A home
     // log that cannot be listed is left out.
     let home = match (&locked_dir, &home_dir) {
@@ -623,6 +692,9 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
             Some(dir) => report::chain_line(&saiife_audit::verify(dir)),
             None => "not checked: your records come through the saiife daemon (auditors run saiife audit verify)".to_string(),
         };
+        if a.broker {
+            model.chain = format!("{} ({BROKER_LABEL})", model.chain);
+        }
         model.last_checkpoint = report::last_checkpoint(&main.records);
         if main.skipped_lines > 0 {
             model.log_problems.push(format!(
@@ -667,6 +739,18 @@ pub fn run(a: RunArgs<'_>, packs: &[Pack]) -> ExitCode {
                 ExitCode::from(2)
             }
         };
+    }
+    if a.broker && !shown.is_empty() {
+        outln!(
+            "{BROKER_LABEL}: {}",
+            sanitize(
+                &home_dir
+                    .as_deref()
+                    .unwrap_or(Path::new(""))
+                    .display()
+                    .to_string()
+            )
+        );
     }
     if shown.is_empty() {
         outln!("No audit records found in {}.", main.place);

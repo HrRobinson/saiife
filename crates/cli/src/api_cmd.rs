@@ -50,20 +50,19 @@ pub fn run(a: ApiArgs) -> ExitCode {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::ApiArgs;
+    use crate::broker::{self, Target};
     use base64::Engine as _;
     use saiife_agents::config::{find_project_root, read_config_bytes};
-    use saiife_ipc::client::{system_uid, Client};
+    use saiife_ipc::client::Client;
     use saiife_policy::{
         load_system, merge_project, parse_duration, parse_project, Mode, SystemConfig,
     };
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::io::Read;
-    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
-    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// A request frame is at most 1 MiB; base64 grows by 4/3.
     const MAX_BODY: usize = 700 * 1024;
@@ -92,36 +91,37 @@ mod linux {
     struct Daemon {
         client: Client,
         cfg: SystemConfig,
+        target: Target,
     }
 
-    fn connect(config: &Path) -> Result<Daemon, Stop> {
-        let loaded = load_system(config)
-            .map_err(|e| unavailable(format!("cannot read the system config: {e}")))?;
-        if !loaded.config.locked {
-            return Err(unavailable(format!(
-                "{}: locked is not true",
-                config.display()
-            )));
-        }
-        let user = &loaded.config.daemon.user;
-        let uid = system_uid(user)
-            .ok_or_else(|| unavailable(format!("the daemon user {user} does not exist")))?;
-        let client = Client::connect(
-            &loaded.config.daemon.socket_dir,
-            uid,
-            Instant::now() + CONNECT_TIMEOUT,
-        )
-        .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+    /// The target's daemon and the config it serves (the system config,
+    /// or the personal broker's own, read after the broker answered).
+    fn connect(t: &Target) -> Result<Daemon, Stop> {
+        let client = broker::connect(t, Instant::now() + CONNECT_TIMEOUT)
+            .map_err(|e| unavailable(broker::unreachable(t, &e)))?;
+        let what = if t.is_locked() { "system" } else { "broker" };
+        let cfg = load_system(t.config())
+            .map_err(|e| unavailable(format!("cannot read the {what} config: {e}")))?
+            .config;
         Ok(Daemon {
             client,
-            cfg: loaded.config,
+            cfg,
+            target: t.clone(),
         })
     }
 
     /// The project root (or the cwd) and its service overlays, merged as
-    /// locked mode does (deny and ask only). An invalid project config is
-    /// ignored with a warning; it can only have tightened.
-    fn project(cfg: &SystemConfig) -> (String, BTreeMap<String, saiife_policy::ServiceOverlay>) {
+    /// the daemon decides: locked mode keeps deny and ask only (an invalid
+    /// project config is ignored with a warning; it can only have
+    /// tightened); the personal broker decides as developer mode, so a
+    /// project `allow` counts too (spec §6.9.1).
+    fn project(d: &Daemon) -> (String, BTreeMap<String, saiife_policy::ServiceOverlay>) {
+        let cfg = &d.cfg;
+        let mode = if d.target.is_locked() {
+            Mode::Locked
+        } else {
+            Mode::Developer
+        };
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(find_project_root);
         let shown = root
@@ -132,7 +132,7 @@ mod linux {
         let services = root
             .and_then(|r| match read_config_bytes(&r) {
                 Ok(Some(b)) => match parse_project(&b) {
-                    Ok(p) => Some(merge_project(&cfg.guard.packs, &p, Mode::Locked).services),
+                    Ok(p) => Some(merge_project(&cfg.guard.packs, &p, mode).services),
                     Err(e) => {
                         eprintln!("saiife: warning: project config ignored ({e})");
                         None
@@ -149,10 +149,7 @@ mod linux {
     }
 
     fn go(a: ApiArgs) -> Result<u8, Stop> {
-        let config = a
-            .system_config
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+        let config = broker::resolve_here(a.system_config.as_deref()).map_err(unavailable)?;
         if a.list {
             return list(&config, &a);
         }
@@ -197,7 +194,7 @@ mod linux {
         };
 
         let mut d = connect(&config)?;
-        let (project, overlays) = project(&d.cfg);
+        let (project, overlays) = project(&d);
         let mut args = Map::new();
         args.insert("service".into(), service.clone().into());
         args.insert("operation".into(), operation.clone().into());
@@ -223,7 +220,7 @@ mod linux {
         let ans = d
             .client
             .call_answer("api.call", args, Instant::now() + timeout)
-            .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+            .map_err(|e| unavailable(broker::unreachable(&d.target, &e)))?;
         let ms = started.elapsed().as_millis();
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
@@ -277,7 +274,7 @@ mod linux {
             let ans = d
                 .client
                 .call_answer("api.result", args, Instant::now() + Duration::from_secs(10))
-                .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+                .map_err(|e| unavailable(broker::unreachable(&d.target, &e)))?;
             if ans.get("ok") != Some(&Value::Bool(true)) {
                 return Err(refusal(&ans));
             }
@@ -421,7 +418,7 @@ mod linux {
     /// listener (`[gateway] tcp`), bound to this uid, valid 12 h. The token
     /// goes to stdout (with `--json`: `{"token", "expires"}`), the expiry
     /// to stderr.
-    fn token(config: &Path, as_json: bool) -> Result<u8, Stop> {
+    fn token(config: &Target, as_json: bool) -> Result<u8, Stop> {
         let mut d = connect(config)?;
         let ans = d
             .client
@@ -430,7 +427,7 @@ mod linux {
                 Map::new(),
                 Instant::now() + Duration::from_secs(10),
             )
-            .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+            .map_err(|e| unavailable(broker::unreachable(&d.target, &e)))?;
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
@@ -449,19 +446,19 @@ mod linux {
         Ok(0)
     }
 
-    fn list(config: &Path, a: &ApiArgs) -> Result<u8, Stop> {
+    fn list(config: &Target, a: &ApiArgs) -> Result<u8, Stop> {
         let filter = a.args.first();
         if a.args.len() > 1 {
             return Err(refused("usage: saiife api --list [<service>]"));
         }
         let mut d = connect(config)?;
-        let (_, overlays) = project(&d.cfg);
+        let (_, overlays) = project(&d);
         let mut args = Map::new();
         args.insert("overlays".into(), json!(overlays));
         let ans = d
             .client
             .call_answer("api.list", args, Instant::now() + Duration::from_secs(10))
-            .map_err(|e| unavailable(format!("cannot reach the saiife daemon: {e}")))?;
+            .map_err(|e| unavailable(broker::unreachable(&d.target, &e)))?;
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }

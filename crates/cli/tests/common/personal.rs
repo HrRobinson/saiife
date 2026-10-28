@@ -143,6 +143,39 @@ impl TestBroker {
         cmd
     }
 
+    /// A saiife CLI command (`args`) with the broker's environment, run in
+    /// `<tmp>/p`: no `--system-config`, so the resolver picks the personal
+    /// broker (this host has no locked `/etc/saiife/config.toml`).
+    pub fn cli(&self, args: &[&str]) -> Command {
+        let project = self.path().join("p");
+        fs::create_dir_all(&project).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+        cmd.args(args)
+            .current_dir(&project)
+            .env("HOME", self.home())
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env("XDG_CONFIG_HOME", self.path().join("c"))
+            .env("XDG_STATE_HOME", self.path().join("s"))
+            .env("XDG_DATA_HOME", self.path().join("d"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", self.path().join("no-bus").display()),
+            )
+            .env("SAIIFE_DATA_DIR", self.path().join("hookdata"))
+            .env("SAIIFE_AUDIT_DIR", self.path().join("hookaudit"))
+            .env("SAIIFE_TEST_PKTTYAGENT", self.path().join("no-pkttyagent"))
+            .env_remove("SAIIFE_TEST_KEYCHAIN")
+            .env_remove("SAIIFE_TEST_CA_OWNER")
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    /// [`Self::cli`], run to its end.
+    pub fn run_cli(&self, args: &[&str]) -> Output {
+        self.cli(args).output().unwrap()
+    }
+
     /// Run the broker to its exit (for refusals), killed after 10 s.
     pub fn run_to_exit(&self) -> Output {
         let mut child = self

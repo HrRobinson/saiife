@@ -94,10 +94,12 @@ pub(crate) mod linux {
     use std::time::{Duration, Instant};
     use zeroize::Zeroizing;
 
-    use saiife_ipc::client::{system_uid, Client, ClientError};
-    use saiife_policy::load_system;
+    use saiife_ipc::client::ClientError;
 
-    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+    use crate::broker::{self, Target};
+
+    /// `secret import` in personal broker mode (plan 16, decision 6).
+    const PERSONAL_IMPORT: &str = "personal broker: use secret add";
     /// The longest value read from a file, a variable or a terminal.
     const MAX_VALUE_BYTES: usize = 64 * 1024;
     const MIN_VALUE_BYTES: usize = 4;
@@ -133,8 +135,7 @@ pub(crate) mod linux {
     }
 
     pub fn run(config: Option<PathBuf>, action: SecretAction) -> ExitCode {
-        let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
-        match go(&config, action) {
+        match target(config.as_deref()).and_then(|t| go(&t, action)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(Stop::Refused(m) | Stop::Forbidden(m) | Stop::Unrecorded(m)) => {
                 eprintln!("saiife: {m}");
@@ -151,10 +152,17 @@ pub(crate) mod linux {
         }
     }
 
-    fn go(config: &Path, action: SecretAction) -> Result<(), Stop> {
+    /// The daemon this command talks to (the resolver, decision 10): a
+    /// flag or a locked `/etc/saiife/config.toml` is the locked daemon,
+    /// else the personal broker.
+    pub(crate) fn target(flag: Option<&Path>) -> Result<Target, Stop> {
+        broker::resolve_here(flag).map_err(Stop::Unavailable)
+    }
+
+    fn go(config: &Target, action: SecretAction) -> Result<(), Stop> {
         match action {
             SecretAction::List { json } => {
-                let a = call(config, "secret.list", Map::new())?;
+                let a = call_to(config, "secret.list", Map::new())?;
                 let secrets = a.get("secrets").cloned().unwrap_or(json!([]));
                 if json {
                     outln!("{}", json!({ "secrets": secrets }));
@@ -173,8 +181,14 @@ pub(crate) mod linux {
             } => {
                 #[cfg(not(debug_assertions))]
                 let home = None;
+                // Import moves plaintext out of the agent's reach; the
+                // personal broker cannot (the same uid reads the key).
+                if !config.is_locked() {
+                    let _ = (user, projects, yes_to, services, home);
+                    return Err(Stop::Refused(PERSONAL_IMPORT.into()));
+                }
                 crate::import_cmd::run(
-                    config,
+                    config.config(),
                     crate::import_cmd::ImportArgs {
                         user,
                         projects,
@@ -185,7 +199,7 @@ pub(crate) mod linux {
                 )
             }
             SecretAction::Remove { name } => {
-                call(config, "secret.remove", args([("name", json!(name))]))?;
+                call_to(config, "secret.remove", args([("name", json!(name))]))?;
                 outln!("removed {name}");
                 Ok(())
             }
@@ -206,12 +220,12 @@ pub(crate) mod linux {
                 from_env,
             } => {
                 // The stored kind says which fields to read.
-                let l = match call(config, "secret.list", Map::new()) {
+                let l = match call_to(config, "secret.list", Map::new()) {
                     Ok(l) => l,
                     // Not an admin: let the daemon refuse and record the
                     // rotate itself (no value is read or sent).
                     Err(Stop::Forbidden(_)) => {
-                        return call(config, "secret.rotate", args([("name", json!(name))]))
+                        return call_to(config, "secret.rotate", args([("name", json!(name))]))
                             .map(|_| ());
                     }
                     Err(e) => return Err(e),
@@ -223,7 +237,7 @@ pub(crate) mod linux {
                     .map(str::to_string)
                     .ok_or_else(|| Stop::Refused(format!("no secret named {name}")))?;
                 let fields = gather(&kind, source(from_file, from_env))?;
-                call(
+                call_to(
                     config,
                     "secret.rotate",
                     args([("name", json!(name)), ("fields", fields_json(&fields))]),
@@ -237,7 +251,7 @@ pub(crate) mod linux {
     /// The Task 5 add flow: check the kind, read the value (file, variable or
     /// terminal) and send `secret.add`. Shared with `saiife connect`.
     pub(crate) fn add_secret(
-        config: &Path,
+        config: &Target,
         name: &str,
         kind: &str,
         services: &[String],
@@ -245,7 +259,7 @@ pub(crate) mod linux {
     ) -> Result<(), Stop> {
         check_kind(kind)?;
         let fields = gather(kind, src)?;
-        call(
+        call_to(
             config,
             "secret.add",
             args([
@@ -282,31 +296,24 @@ pub(crate) mod linux {
         }
     }
 
-    /// One call on a fresh connection to the daemon.
+    /// One call on a fresh connection to the locked daemon of `config`
+    /// (a flag: `saiife lockdown`, `secret import`).
     pub(crate) fn call(
         config: &Path,
         op: &str,
         a: Map<String, Value>,
     ) -> Result<Map<String, Value>, Stop> {
-        let loaded = load_system(config)
-            .map_err(|e| Stop::Unavailable(format!("cannot read the system config: {e}")))?;
-        if !loaded.config.locked {
-            return Err(Stop::Unavailable(format!(
-                "{}: locked is not true",
-                config.display()
-            )));
-        }
-        let user = &loaded.config.daemon.user;
-        let uid = system_uid(user)
-            .ok_or_else(|| Stop::Unavailable(format!("the daemon user {user} does not exist")))?;
-        let down =
-            |e: &ClientError| Stop::Unavailable(format!("cannot reach the saiife daemon: {e}"));
-        let mut c = Client::connect(
-            &loaded.config.daemon.socket_dir,
-            uid,
-            Instant::now() + CONNECT_TIMEOUT,
-        )
-        .map_err(|e| down(&e))?;
+        call_to(&target(Some(config))?, op, a)
+    }
+
+    /// One call on a fresh connection to `t`.
+    pub(crate) fn call_to(
+        t: &Target,
+        op: &str,
+        a: Map<String, Value>,
+    ) -> Result<Map<String, Value>, Stop> {
+        let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
+        let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
         c.call(op, a, Instant::now() + CALL_TIMEOUT)
             .map_err(|e| match e {
                 ClientError::Refused { code, message } if code == "forbidden" => {

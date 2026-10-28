@@ -30,6 +30,8 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
+#[cfg(target_os = "linux")]
+mod broker;
 mod check;
 mod check_managed;
 mod connect_cmd;
@@ -165,6 +167,10 @@ enum Cmd {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// The personal broker's log ($XDG_DATA_HOME/saiife/broker/audit;
+        /// not a security boundary).
+        #[arg(long, conflicts_with = "system_config")]
+        broker: bool,
         /// Write a self-contained HTML report instead of the table (default name: saiife-report-YYYY-MM-DD.html here).
         #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
         report: Option<String>,
@@ -322,6 +328,9 @@ enum AuditAction {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
+        /// Check the personal broker's log instead (not a security boundary).
+        #[arg(long, conflicts_with_all = ["system_config", "external"])]
+        broker: bool,
     },
 }
 
@@ -519,9 +528,10 @@ fn main() -> ExitCode {
                 Some(AuditAction::Verify {
                     external,
                     system_config,
+                    broker,
                 }),
             ..
-        } => audit_cmd::verify(external.as_deref(), system_config.as_deref()),
+        } => audit_cmd::verify(external.as_deref(), system_config.as_deref(), broker),
         Cmd::Audit {
             action: None,
             since,
@@ -531,6 +541,7 @@ fn main() -> ExitCode {
             kind,
             service,
             system_config,
+            broker,
             report,
         } => audit_cmd::run(
             audit_cmd::RunArgs {
@@ -542,6 +553,7 @@ fn main() -> ExitCode {
                 service: service.as_deref(),
                 report: report.as_deref(),
                 system_config,
+                broker,
             },
             &packs,
         ),

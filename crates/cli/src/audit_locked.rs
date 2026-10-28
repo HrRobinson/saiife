@@ -6,7 +6,6 @@
 //! unchanged.
 
 use saiife_audit::Record;
-use saiife_policy::load_system;
 use std::path::{Path, PathBuf};
 
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
@@ -138,21 +137,12 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// how many answer entries were not records.
 #[cfg(target_os = "linux")]
 pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
-    use saiife_ipc::client::{system_uid, Client};
     use serde_json::{Map, Value};
     use std::time::{Duration, Instant};
 
-    let loaded = load_system(config)
-        .map_err(|e| format!("cannot read the system config {}: {e}", config.display()))?;
-    let cfg = &loaded.config;
-    let user = &cfg.daemon.user;
-    let uid = system_uid(user).ok_or_else(|| format!("the daemon user {user} does not exist"))?;
-    let mut c = Client::connect(
-        &cfg.daemon.socket_dir,
-        uid,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .map_err(|e| format!("cannot reach the saiife daemon: {e}"))?;
+    let t = crate::broker::locked(config)?;
+    let mut c = crate::broker::connect(&t, Instant::now() + Duration::from_secs(2))
+        .map_err(|e| crate::broker::unreachable(&t, &e))?;
     let mut base = Map::new();
     let mut put = |k: &str, v: Option<Value>| {
         if let Some(v) = v {
@@ -216,16 +206,7 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
         kind,
         service,
     } = q;
-    let _ = (
-        config,
-        load_system,
-        since,
-        project,
-        agent,
-        blocked,
-        kind,
-        service,
-    );
+    let _ = (config, since, project, agent, blocked, kind, service);
     Err("locked mode needs Linux in this version (macOS: v2.1)".into())
 }
 

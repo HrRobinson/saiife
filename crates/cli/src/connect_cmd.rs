@@ -66,21 +66,36 @@ mod linux {
     use std::collections::BTreeMap;
     use std::io::BufRead;
     use std::os::fd::AsFd;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::{Path, PathBuf};
 
-    use saiife_broker::manifest::{builtin, load_local, Manifest, OpKind, HTTP_CONNECTOR};
+    use saiife_broker::manifest::{builtin, load_local_with, Manifest, OpKind, HTTP_CONNECTOR};
 
     use super::ConnectArgs;
-    use crate::secret_cmd::linux::{add_secret, call, source, Stop};
-
-    const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+    use crate::broker::Target;
+    use crate::secret_cmd::linux::{add_secret, call_to, source, target, Stop};
 
     fn refuse<T>(m: impl Into<String>) -> Result<T, Stop> {
         Err(Stop::Refused(m.into()))
     }
 
     pub(super) fn go(a: ConnectArgs) -> Result<(), Stop> {
-        let config = a.config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+        let t = target(a.config.as_deref())?;
+        // The personal broker writes its config on its first start.
+        if let Target::Personal { config, .. } = &t {
+            if std::fs::symlink_metadata(config).is_err() {
+                return Err(Stop::Unavailable(format!(
+                    "{} does not exist; start the broker first: saiife daemon --user",
+                    config.display()
+                )));
+            }
+        }
+        // Root owns the locked config tree; the user owns the broker's.
+        let (owner, file_mode, dir_mode) = match &t {
+            Target::Locked { .. } => (0, 0o644, 0o755),
+            Target::Personal { owner_uid, .. } => (*owner_uid, 0o600, 0o700),
+        };
+        let config: PathBuf = t.config().to_path_buf();
         let service = a.service;
         if !valid_name(&service) {
             return refuse("service names use a-z, 0-9, `_` and `-` (up to 64 characters)");
@@ -93,7 +108,7 @@ mod linux {
         if connector == HTTP_CONNECTOR {
             return refuse("the http connector is configured by hand: see docs/connectors/http.md");
         }
-        let manifest = find_manifest(&connector, conf_dir)?;
+        let manifest = find_manifest(&connector, conf_dir, owner)?;
 
         // 2. The parameters.
         let params = collect_params(&manifest, &a.params)?;
@@ -109,7 +124,7 @@ mod linux {
 
         // 4. The secret, through the daemon (admin check included).
         // An existing secret of that name is reused, if it allows the service.
-        let listed = call(&config, "secret.list", serde_json::Map::new())?;
+        let listed = call_to(&t, "secret.list", serde_json::Map::new())?;
         let existing = listed
             .get("secrets")
             .and_then(|v| v.as_array())
@@ -130,7 +145,7 @@ mod linux {
                 }
             }
             None => add_secret(
-                &config,
+                &t,
                 &secret,
                 secret_kind(&manifest),
                 std::slice::from_ref(&service),
@@ -139,8 +154,13 @@ mod linux {
         }
 
         // 5. The policy file. If it fails, tell how to undo the secret.
-        let wrote = std::fs::create_dir_all(&dir)
-            .and_then(|()| saiife_system::fsops::write_new_file(&target, text.as_bytes(), 0o644));
+        let wrote = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(dir_mode)
+            .create(&dir)
+            .and_then(|()| {
+                saiife_system::fsops::write_new_file(&target, text.as_bytes(), file_mode)
+            });
         if let Err(e) = wrote {
             return refuse(format!(
                 "cannot write {}: {e}\n{}",
@@ -169,11 +189,11 @@ mod linux {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
     }
 
-    fn find_manifest(id: &str, conf_dir: &Path) -> Result<Manifest, Stop> {
+    fn find_manifest(id: &str, conf_dir: &Path, owner: u32) -> Result<Manifest, Stop> {
         if let Some(m) = builtin().iter().find(|m| m.id == id) {
             return Ok(m.clone());
         }
-        let local = load_local(&conf_dir.join("connectors"))
+        let local = load_local_with(&conf_dir.join("connectors"), builtin(), owner)
             .map_err(|e| Stop::Refused(format!("cannot load local connectors: {e}")))?;
         local
             .into_iter()

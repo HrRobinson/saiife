@@ -756,3 +756,307 @@ fn locked_records_still_locked() {
         assert_eq!(r["mode"], "locked", "{r}");
     }
 }
+
+// ------------------------------------------------- the CLI (Task 6)
+
+fn out(o: &std::process::Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn err(o: &std::process::Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// The secret value in a 0600 file under the test dir.
+fn value_file(b: &TestBroker, name: &str, value: &str) -> std::path::PathBuf {
+    let p = b.path().join(name);
+    fs::write(&p, value).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    p
+}
+
+fn assert_no_value(b: &TestBroker, outs: &[&std::process::Output], value: &str) {
+    for o in outs {
+        assert!(!out(o).contains(value), "stdout leaked the value");
+        assert!(!err(o).contains(value), "stderr leaked the value");
+    }
+    assert!(!contains(&all_bytes_under(&b.audit_dir()), value));
+}
+
+fn names(b: &TestBroker) -> Vec<String> {
+    let l = b.call("secret.list", json!({})).unwrap();
+    l["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn secret_add_list_rotate_remove_personal() {
+    let b = TestBroker::start(None);
+    let v1 = secret_value();
+    let v2 = concat!("personal", "-rotated-", "value-", "0815").to_string();
+    let f1 = value_file(&b, "v1", &v1);
+    let f2 = value_file(&b, "v2", &v2);
+    let add = b.run_cli(&[
+        "secret",
+        "add",
+        "gh",
+        "--kind",
+        "token",
+        "--service",
+        "github",
+        "--from-file",
+        f1.to_str().unwrap(),
+    ]);
+    assert_eq!(add.status.code(), Some(0), "{}", err(&add));
+    assert_eq!(out(&add), "added gh\n");
+    let list = b.run_cli(&["secret", "list", "--json"]);
+    assert_eq!(list.status.code(), Some(0), "{}", err(&list));
+    let v: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["secrets"][0]["name"], "gh");
+    assert_eq!(v["secrets"][0]["allowed_services"], json!(["github"]));
+    let rot = b.run_cli(&[
+        "secret",
+        "rotate",
+        "gh",
+        "--from-file",
+        f2.to_str().unwrap(),
+    ]);
+    assert_eq!(rot.status.code(), Some(0), "{}", err(&rot));
+    assert_eq!(out(&rot), "rotated gh\n");
+    let rm = b.run_cli(&["secret", "remove", "gh"]);
+    assert_eq!(rm.status.code(), Some(0), "{}", err(&rm));
+    assert_eq!(out(&rm), "removed gh\n");
+    let empty = b.run_cli(&["secret", "list"]);
+    assert_eq!(out(&empty), "no secrets\n");
+    assert_no_value(&b, &[&add, &list, &rot, &rm, &empty], &v1);
+    assert_no_value(&b, &[&add, &list, &rot, &rm, &empty], &v2);
+    // The records are the broker's, as the own uid.
+    let adds: Vec<Value> = b
+        .records()
+        .into_iter()
+        .filter(|r| r["event"] == "secret_add")
+        .collect();
+    assert_eq!(adds.len(), 1, "{adds:?}");
+    assert_eq!(adds[0]["uid"], json!(own_uid()));
+    assert_eq!(adds[0]["mode"], "personal");
+}
+
+#[test]
+fn connect_personal_writes_policy_0600_and_secret() {
+    let b = TestBroker::start(None);
+    let o = b
+        .cli(&[
+            "connect",
+            "shopify",
+            "--param",
+            "shop=acme",
+            "--from-env",
+            "PB_TOKEN",
+        ])
+        .env("PB_TOKEN", secret_value())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let file = b.config_dir().join("policy.d/shopify.toml");
+    assert!(out(&o).contains("added shopify"), "{}", out(&o));
+    assert!(out(&o).contains(&file.display().to_string()), "{}", out(&o));
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(&b.config_dir().join("policy.d")), 0o700);
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[services.shopify]"), "{text}");
+    assert_eq!(names(&b), ["shopify"]);
+    assert_no_value(&b, &[&o], &secret_value());
+    // The broker loads it.
+    let r = b.run_cli(&["policy", "reload"]);
+    assert_eq!(r.status.code(), Some(0), "{}{}", out(&r), err(&r));
+}
+
+#[test]
+fn connect_personal_without_config_says_start_broker() {
+    let b = TestBroker::prepare();
+    let o = b
+        .cli(&[
+            "connect",
+            "shopify",
+            "--param",
+            "shop=acme",
+            "--from-env",
+            "PB_TOKEN",
+        ])
+        .env("PB_TOKEN", secret_value())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(
+        err(&o).contains("start the broker first: saiife daemon --user"),
+        "{}",
+        err(&o)
+    );
+    assert!(!b.config_dir().exists());
+}
+
+#[test]
+fn api_call_through_broker_loopback_mock() {
+    let (b, m) = erp_world();
+    let o = b.run_cli(&["api", "erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(out(&o).contains(r#"{"ok":true}"#), "{}", out(&o));
+    assert_eq!(m.hits.lock().unwrap().as_slice(), ["GET /api/invoices"]);
+    // Developer-mode overlays: the project may allow (spec §6.9.1).
+    let project = b.path().join("p");
+    fs::create_dir_all(project.join(".saiife")).unwrap();
+    fs::write(
+        project.join(".saiife/config.toml"),
+        "version = 2\n[services.erp]\nallow = [\"reports:read\"]\n",
+    )
+    .unwrap();
+    let o = b.run_cli(&["api", "erp", "reports.get"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(
+        m.hits.lock().unwrap().as_slice(),
+        ["GET /api/invoices", "GET /api/reports"]
+    );
+    assert_no_value(&b, &[&o], &secret_value());
+}
+
+#[test]
+fn run_secret_through_broker() {
+    let Ok(bin) = fs::canonicalize("/usr/bin/printenv") else {
+        eprintln!("skipped: no printenv");
+        return;
+    };
+    if bin.file_name().unwrap() != "printenv"
+        || saiife_system::fsops::root_owned_chain(&bin).is_err()
+    {
+        eprintln!("skipped: printenv is not a root-owned file of its own here");
+        return;
+    }
+    let m = mock();
+    let mut b = TestBroker::prepare();
+    b.write_config(&format!(
+        "{}\n[secrets.erp-key]\nrun_allow = [{:?}]\n",
+        erp_config(m.port),
+        bin.display().to_string()
+    ));
+    b.spawn_and_wait();
+    add_secret(&b, "erp-key", &["erp"]);
+    let o = b
+        .cli(&[
+            "run",
+            "--secret",
+            "erp-key:TOKEN",
+            "--",
+            "printenv",
+            "TOKEN",
+        ])
+        .env("PATH", bin.parent().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "[MASKED]\n");
+    assert_no_value(&b, &[&o], &secret_value());
+}
+
+#[test]
+fn policy_reload_personal() {
+    let b = TestBroker::start(None);
+    let o = b.run_cli(&["policy", "reload"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert_eq!(out(&o), "loaded\n");
+    // A locked-mode config is rejected; the old policy stays.
+    b.write_config("version = 2\nlocked = true\n");
+    let o = b.run_cli(&["policy", "reload"]);
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(out(&o).starts_with("rejected: "), "{}", out(&o));
+}
+
+#[test]
+fn audit_broker_lists_and_verifies() {
+    let b = TestBroker::start(None);
+    add_secret(&b, "gh", &["github"]);
+    let label = "personal broker, not a security boundary";
+    let o = b.run_cli(&["audit", "--broker"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let text = out(&o);
+    assert!(text.lines().next().unwrap().contains(label), "{text}");
+    assert!(
+        text.contains(&b.audit_dir().display().to_string()),
+        "{text}"
+    );
+    let v = b.run_cli(&["audit", "verify", "--broker"]);
+    assert_eq!(v.status.code(), Some(0), "{}{}", out(&v), err(&v));
+    let vt = out(&v);
+    assert!(vt.starts_with("audit chain: intact"), "{vt}");
+    for line in vt
+        .lines()
+        .filter(|l| l.starts_with("audit chain") || l.contains("log:"))
+    {
+        assert!(line.contains(label), "{line}");
+    }
+    assert!(vt.contains(&b.audit_dir().display().to_string()), "{vt}");
+    // Without --broker the developer log is read, not the broker's.
+    let dev = b.run_cli(&["audit", "verify"]);
+    assert!(!out(&dev).contains(&b.audit_dir().display().to_string()));
+}
+
+#[test]
+fn status_shows_personal_broker() {
+    let mut b = TestBroker::start(None);
+    let sysroot = b.path().join("sysroot");
+    fs::create_dir_all(&sysroot).unwrap();
+    let line = "  personal broker: running (not a security boundary)";
+    let o = b.run_cli(&["status", "--root", sysroot.to_str().unwrap()]);
+    assert!(out(&o).lines().any(|l| l == line), "{}", out(&o));
+    b.stop();
+    let o = b.run_cli(&["status", "--root", sysroot.to_str().unwrap()]);
+    assert!(!out(&o).contains("personal broker"), "{}", out(&o));
+}
+
+#[test]
+fn secret_import_refused_personal_cli() {
+    let b = TestBroker::start(None);
+    let env = b.home().join(".env");
+    let text = format!("GITHUB_TOKEN={}\n", secret_value());
+    fs::write(&env, &text).unwrap();
+    let me = common::daemon::own_user();
+    let o = b.run_cli(&[
+        "secret",
+        "import",
+        "--user",
+        &me,
+        "--home",
+        b.home().to_str().unwrap(),
+        "--yes-to",
+        env.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert_eq!(err(&o), "saiife: personal broker: use secret add\n");
+    assert_eq!(fs::read_to_string(&env).unwrap(), text);
+    assert_eq!(names(&b), Vec::<String>::new());
+}
+
+#[test]
+fn broker_down_message() {
+    let b = TestBroker::prepare();
+    b.write_config("version = 2\n");
+    let o = b.run_cli(&["secret", "list"]);
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert_eq!(
+        err(&o),
+        format!(
+            "saiife: cannot reach the personal broker at {}: start it with saiife daemon --user (docs/personal-broker.md)\n",
+            b.socket_dir().display()
+        )
+    );
+    let o = b.run_cli(&["api", "erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert!(
+        err(&o).contains("start it with saiife daemon --user"),
+        "{}",
+        err(&o)
+    );
+}
