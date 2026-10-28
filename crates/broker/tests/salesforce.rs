@@ -347,6 +347,28 @@ fn sobject_qualifier_refuses_control_characters_and_paths() {
 }
 
 #[test]
+fn fields_cannot_traverse_relationships() {
+    // `fields` names the object's own fields only: a dotted relationship
+    // path would read another object under a per-sobject qualifier.
+    let op = named(salesforce(), "records.get").unwrap();
+    let ok = |f: &str| {
+        let p = map(&[ACC, REC, ("fields", f)]);
+        validate(op, &p, &BTreeMap::new()).is_ok()
+    };
+    assert!(ok("Name,Industry,My_Field__c"));
+    for bad in [
+        "Account.Name",
+        "Owner.Email",
+        "Name,Account.Owner.Email",
+        "Parent.Parent.Name",
+        "Name\n",
+        "",
+    ] {
+        assert!(!ok(bad), "{bad:?}");
+    }
+}
+
+#[test]
 fn query_more_locator_single_segment() {
     let m = salesforce();
     let op = named(m, "query.more").unwrap();

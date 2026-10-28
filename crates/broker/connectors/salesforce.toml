@@ -78,7 +78,7 @@ kind = "read"
 method = "GET"
 path = "/sobjects/{sobject}/{id}"
 path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}", id = "string:[A-Za-z0-9]{15}([A-Za-z0-9]{3})?" }
-query = { fields = "string:[A-Za-z0-9_.,]{1,2000}" }
+query = { fields = "string:[A-Za-z0-9_,]{1,2000}" }
 
 [[operation]]
 id = "records.create"

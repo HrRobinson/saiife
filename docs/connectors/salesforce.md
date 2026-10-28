@@ -83,7 +83,7 @@ refused. The general rules are in [OAuth2 secrets](README.md#oauth2-secrets).
 | `query.more` | `query:read` | read | `GET /query/{locator}` |
 | `sobjects.list` | `sobjects:read` | read | `GET /sobjects` |
 | `sobjects.describe` | `sobjects:read` | read | `GET /sobjects/{sobject}/describe` |
-| `records.get` | `records:read` | read | `GET /sobjects/{sobject}/{id}`; query `fields` (comma-separated field names) |
+| `records.get` | `records:read` | read | `GET /sobjects/{sobject}/{id}`; query `fields` (comma-separated names of the object's own fields) |
 | `records.create` | `records:write` | write | `POST /sobjects/{sobject}`, JSON body |
 | `records.update` | `records:write` | write | `PATCH /sobjects/{sobject}/{id}`, JSON body |
 | `records.delete` | `records:delete` | delete | `DELETE /sobjects/{sobject}/{id}` |
@@ -119,6 +119,16 @@ suggested policies therefore put `query:read` under `ask`, so a person sees
 each query before it runs. Allow it only when the profile already limits
 the user to data the agent may read.
 
+`FOR UPDATE` and `FOR VIEW` are permitted in a query. They have minor side
+effects: `FOR UPDATE` locks the returned records for the rest of the
+transaction, and `FOR VIEW` updates their `LastViewedDate`. The person who
+approves the query sees the clause.
+
+`records.get` with `fields` names only the object's own fields: `fields` is
+`[A-Za-z0-9_,]`, with no `.`, so a relationship such as
+`Account.Owner.Email` is refused. Relationship data needs `query`, which is
+under `ask`.
+
 **Pagination.** Salesforce returns no `next` parameter. A result with
 `"done": false` has a `nextRecordsUrl` such as
 `/services/data/v60.0/query/01gD0000002HU6KIAW-2000`. Pass its last segment
@@ -130,7 +140,9 @@ saiife api salesforce query.more locator=01gD0000002HU6KIAW-2000
 
 The locator is one path segment (`[A-Za-z0-9]{15,18}-[0-9]{1,9}`), never a
 path. It has the same capability as `query`, so under the suggested policies
-each page is asked for too.
+each page is asked for too. That is on purpose: a locator names a result set
+on the server, and asking for each page means an agent cannot walk a result
+set it was not shown.
 
 ## Suggested policy: read-only
 
