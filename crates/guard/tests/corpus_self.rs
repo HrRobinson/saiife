@@ -1007,3 +1007,38 @@ fn broker_stop_gaps_round_one() {
         assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
     }
 }
+
+#[test]
+fn broker_glob_units_exit_targets_and_drop_ins() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "systemctl --user stop 'sai*'",
+        "systemctl --user restart saiife-bro?er",
+        "systemctl --user kill 'sai[i]fe-broker'",
+        "systemctl --user mask 's*'",
+        "systemctl --user isolate 'x*'",
+        "systemctl --user start exit.target",
+        "systemctl --user isolate shutdown.target",
+        "systemctl start poweroff.target",
+        "systemctl --user start halt.target",
+        "loginctl terminate-user $USER",
+        "loginctl kill-user 1000",
+        "rm -rf ~/.config/systemd/user/saiife-broker.service.d",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), "core.self", "{cmd}");
+    }
+    for cmd in [
+        "systemctl --user stop pipewire",
+        "systemctl --user start default.target",
+        "systemctl --user status 'sai*'",
+        "loginctl list-sessions",
+        "loginctl show-user 1000",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+    let p = "~/.config/systemd/user/saiife-broker.service.d/override.conf";
+    assert!(e.evaluate_path(Access::Write, p).is_deny());
+    assert!(!e.evaluate_path(Access::Read, p).is_deny());
+}

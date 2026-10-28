@@ -20,11 +20,11 @@ id = "core.self"
 name = "Core: self-protection"
 description = "Guards saiife itself: turning it off, editing its config, agent hook settings, binary, audit log and integrity records."
 default_on = true
-version = 3
+version = 4
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl", "loginctl"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -92,6 +92,19 @@ reason = "changing PATH, HOME, XDG_DATA_HOME or an agent config dir (or running 
 # named like the broker is protected too); the unit name starts with `saiife`.
 pattern = '^systemctl\s+(?:\S+\s+)*(?:stop|disable|mask|kill|restart|try-restart|reload-or-restart|isolate|set-property|revert|edit)\s+(?:\S+\s+)*saiife\S*(?:\s|$)'
 reason = "an agent may not stop or change the saiife broker; do it in your own terminal"
+
+[[deny]]
+# A glob in the unit argument (`stop 'sai*'`) can hit the broker.
+pattern = '^systemctl\s+(?:\S+\s+)*(?:stop|kill|disable|mask|restart|isolate)\s+(?:\S+\s+)*\S*[*?\[]\S*'
+reason = "a glob in the unit name can stop the saiife broker; do it in your own terminal"
+
+[[deny]]
+pattern = '^systemctl\s+(?:\S+\s+)*(?:start|isolate)\s+(?:\S+\s+)*(?:exit|shutdown|halt|poweroff)\.target(?:\s|$)'
+reason = "ending the user session stops the saiife broker; do it in your own terminal"
+
+[[deny]]
+pattern = '^loginctl\s+(?:\S+\s+)*(?:terminate-user|kill-user)(?:\s|$)'
+reason = "ending the user session stops the saiife broker; do it in your own terminal"
 
 [[deny]]
 pattern = '^systemctl\s+(?:-\S+\s+)*exit(?:\s|$)'
@@ -194,8 +207,6 @@ access = "write"
 ancestors = true
 reason = "removing or moving the personal broker's folder, or a parent of it, removes its config, state or audit trail"
 
-
-
 [[deny_path]]
 glob = "~/.config/saiife/broker/**"
 access = "write"
@@ -235,9 +246,21 @@ access = "write"
 reason = "the personal broker's start-at-login unit may only be changed by you"
 
 [[deny_path]]
+glob = "~/.config/systemd/user/saiife-broker.service"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the personal broker's start-at-login unit removes it"
+
+[[deny_path]]
 glob = "$XDG_CONFIG_HOME/systemd/user/saiife-broker.service"
 access = "write"
 reason = "the personal broker's start-at-login unit may only be changed by you"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user/saiife-broker.service"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the personal broker's start-at-login unit removes it"
 
 [[deny_path]]
 glob = "~/.config/systemd/user/*.wants/saiife-broker.service"
@@ -253,3 +276,19 @@ reason = "the personal broker's start-at-login unit may only be changed by you"
 glob = "~/Library/LaunchAgents/com.saiife.broker.plist"
 access = "write"
 reason = "the personal broker's start-at-login unit may only be changed by you"
+
+[[deny_path]]
+glob = "~/Library/LaunchAgents/com.saiife.broker.plist"
+access = "write"
+ancestors = true
+reason = "removing or moving a parent of the personal broker's start-at-login unit removes it"
+
+[[deny_path]]
+glob = "~/.config/systemd/user/saiife-broker.service.d/**"
+access = "write"
+reason = "a drop-in can override the personal broker's unit; only you may change it"
+
+[[deny_path]]
+glob = "$XDG_CONFIG_HOME/systemd/user/saiife-broker.service.d/**"
+access = "write"
+reason = "a drop-in can override the personal broker's unit; only you may change it"

@@ -66,6 +66,10 @@ own user.
 
 ## Not covered
 
+- The personal broker runs as your own user, so this layer only catches
+  mistakes (spec §10). Left out on purpose: killing by regex or by pid without
+  the name `saiife`, and keychain queries by attribute that do not name
+  saiife.
 - The personal broker is protected against mistakes only. Not seen:
   `busctl` calls to `StopUnit`, killing a process by a pid read from a file,
   scripts that call the Secret Service (for example with `secretstorage`),
