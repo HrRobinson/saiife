@@ -41,11 +41,15 @@ mod connect_cmd;
 mod doctor_cmd;
 mod env_cmd;
 mod eval;
+#[cfg(debug_assertions)]
+mod fake_mcp;
 #[cfg(target_os = "linux")]
 mod import_cmd;
 mod init_cmd;
 mod lockdown_cmd;
 mod mcp_cmd;
+#[cfg(target_os = "linux")]
+mod mcp_spawn;
 mod packs_cmd;
 mod paths;
 mod policy_cmd;
@@ -223,6 +227,14 @@ enum Cmd {
     /// The locked-mode guard worker (`check --managed` spawns it).
     #[command(name = "__eval", hide = true)]
     Eval,
+    /// The MCP gateway's spawn helper (the daemon runs it): reads a spawn
+    /// spec on stdin, confines itself, execs the server.
+    #[command(name = "__mcp-spawn", hide = true)]
+    McpSpawn,
+    /// Test seam (debug builds): a scripted MCP stdio server.
+    #[cfg(debug_assertions)]
+    #[command(name = "__fake-mcp-server", hide = true)]
+    FakeMcpServer(fake_mcp::FakeArgs),
     /// Locked mode (Linux, admin): add, list, rotate or remove the
     /// secrets in the daemon's vault. Values never leave the daemon.
     Secret {
@@ -379,6 +391,19 @@ fn main() -> ExitCode {
     if let Cmd::Eval = cli.command {
         return eval::worker_main();
     }
+    if let Cmd::McpSpawn = cli.command {
+        #[cfg(target_os = "linux")]
+        return mcp_spawn::run();
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("saiife: __mcp-spawn: the MCP gateway needs Linux");
+            return ExitCode::from(126);
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Cmd::FakeMcpServer(args) = cli.command {
+        return fake_mcp::run(args);
+    }
     if let Cmd::Daemon {
         system,
         user,
@@ -525,8 +550,11 @@ fn main() -> ExitCode {
                 cmd_explain(&engine(), &active(), &vars(), &command.unwrap_or_default())
             }
         },
+        #[cfg(debug_assertions)]
+        Cmd::FakeMcpServer(_) => unreachable!("handled above"),
         Cmd::Check { .. }
         | Cmd::Eval
+        | Cmd::McpSpawn
         | Cmd::Daemon { .. }
         | Cmd::System { .. }
         | Cmd::Secret { .. }

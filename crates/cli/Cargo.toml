@@ -19,10 +19,11 @@ saiife-policy = { path = "../policy" }
 saiife-ipc = { path = "../ipc" }
 saiife-system = { path = "../system" }
 saiife-broker = { path = "../broker" }
+# JSON-RPC and the MCP subset (`__fake-mcp-server`, and later `saiife mcp`).
+saiife-mcp = { path = "../mcp" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
 # `saiife mcp`: the JSON-RPC/MCP codec and types (tokio-free).
-saiife-mcp = { path = "../mcp" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"

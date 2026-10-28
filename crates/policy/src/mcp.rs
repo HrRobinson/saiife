@@ -73,6 +73,13 @@ pub fn valid_server_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `v` may name a child's secret variable: `[A-Z_][A-Z0-9_]*` and
+/// not one saiife sets or that changes how a program loads code. The spawn
+/// helper checks it again before it execs.
+pub fn child_env_var_allowed(v: &str) -> bool {
+    valid_env_var(v) && !reserved_env_var(v)
+}
+
 fn valid_env_var(v: &str) -> bool {
     let mut b = v.bytes();
     matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_')
