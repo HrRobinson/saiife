@@ -395,6 +395,7 @@ mod tests {
     use crate::manifest::{AmountSpec, Unit};
     use saiife_policy::AmountCap;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
@@ -572,11 +573,15 @@ mod tests {
         use crate::amount::extract;
         let spec = AmountSpec {
             field: "refund.transactions[].amount".into(),
-            currency_field: "refund.currency".into(),
+            currency_field: Some("refund.currency".into()),
+            currency_param: None,
             unit: Unit::Major,
         };
         let body = json!({"refund":{"currency":"eur","transactions":[{"amount":"1.50"},{"amount":2},{"amount":0.25}]}});
-        assert_eq!(extract(&spec, &body).unwrap(), (375, "EUR".to_string()));
+        assert_eq!(
+            extract(&spec, &body, &BTreeMap::new()).unwrap(),
+            (375, "EUR".to_string())
+        );
         for bad in [
             json!({"refund":{"currency":"EUR","transactions":[{"amount":-1}]}}),
             json!({"refund":{"currency":"EUR","transactions":[{"amount":"1.234"}]}}),
@@ -585,16 +590,19 @@ mod tests {
             json!({"refund":{"currency":"EUR"}}),
             json!({"refund":{"transactions":[{"amount":1}]}}),
         ] {
-            assert!(extract(&spec, &bad).is_err(), "{bad}");
+            assert!(extract(&spec, &bad, &BTreeMap::new()).is_err(), "{bad}");
         }
         let minor = AmountSpec {
             unit: Unit::Minor,
             ..spec.clone()
         };
         let b = json!({"refund":{"currency":"JPY","transactions":[{"amount":300}]}});
-        assert_eq!(extract(&minor, &b).unwrap(), (300, "JPY".to_string()));
+        assert_eq!(
+            extract(&minor, &b, &BTreeMap::new()).unwrap(),
+            (300, "JPY".to_string())
+        );
         let b = json!({"refund":{"currency":"EUR","transactions":[{"amount":"3.5"}]}});
-        assert!(extract(&minor, &b).is_err());
+        assert!(extract(&minor, &b, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -677,7 +685,8 @@ mod tests {
         use crate::amount::extract;
         let spec = AmountSpec {
             field: "t[].amount".into(),
-            currency_field: "t[].cur".into(),
+            currency_field: Some("t[].cur".into()),
+            currency_param: None,
             unit: Unit::Minor,
         };
         for bad in [
@@ -685,10 +694,13 @@ mod tests {
             json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5}]}),
             json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5,"cur":"USD"}]}),
         ] {
-            assert!(extract(&spec, &bad).is_err(), "{bad}");
+            assert!(extract(&spec, &bad, &BTreeMap::new()).is_err(), "{bad}");
         }
         let ok = json!({"t":[{"amount":100,"cur":"EUR"},{"amount":5,"cur":"eur"}]});
-        assert_eq!(extract(&spec, &ok).unwrap(), (105, "EUR".to_string()));
+        assert_eq!(
+            extract(&spec, &ok, &BTreeMap::new()).unwrap(),
+            (105, "EUR".to_string())
+        );
     }
 
     #[test]

@@ -1,0 +1,20 @@
+EHLO saiife
+AUTH PLAIN [login]
+MAIL FROM:<bot@acme.com>
+RCPT TO:<a@acme.com>
+DATA
+From: <bot@acme.com>
+To: <a@acme.com>
+Subject: Weekly report
+Date: [date]
+Message-ID: [id]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Hello,
+..this line starts with a dot
+Gr=C3=BC=C3=9Fe =3D regards=20
+
+.
+QUIT

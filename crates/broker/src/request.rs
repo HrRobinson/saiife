@@ -3,22 +3,36 @@
 //! headers the manifest allows, and the credential in exactly one place.
 
 use crate::manifest::{template_segments, AuthSpec, Manifest, Operation, Pagination, Seg};
+use crate::params::ParamType;
 use crate::BrokerError;
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-/// A request ready for [`crate::upstream::Upstream::send`].
-#[derive(Debug, Clone)]
+/// A request ready for [`crate::upstream::Upstream::send`]. `Debug` shows
+/// the body's length only (an OAuth2 token request carries secrets in it).
+#[derive(Clone)]
 pub struct Built {
     pub method: Method,
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: Option<Bytes>,
+}
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Built")
+            .field("method", &self.method)
+            .field("uri", &self.uri)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.as_ref().map(Bytes::len))
+            .finish()
+    }
 }
 
 /// The credential for one call: the manifest's auth kind and header name,
@@ -60,7 +74,7 @@ impl AuthMaterial {
 
     /// Every non-empty field value, for the response masker (Task 8). For
     /// `basic` it also holds `username:password`, whose base64 is what goes
-    /// on the wire.
+    /// on the wire; for `basic_token` each `value:`.
     pub fn values(&self) -> Vec<Zeroizing<String>> {
         let mut out: Vec<Zeroizing<String>> = self
             .fields
@@ -72,6 +86,10 @@ impl AuthMaterial {
             if let (Some(u), Some(p)) = (self.fields.get("username"), self.fields.get("password")) {
                 out.push(basic_pair(u, p));
             }
+        }
+        if self.kind == "basic_token" {
+            let pairs: Vec<Zeroizing<String>> = out.iter().map(|v| basic_pair(v, "")).collect();
+            out.extend(pairs);
         }
         out
     }
@@ -96,7 +114,7 @@ pub const NO_AUTH: &str = "none";
 /// Agent headers that never reach the upstream, whatever the manifest says:
 /// credentials and the host, plus hop-by-hop and framing headers, which
 /// hyper sets itself (letting an agent set them invites request smuggling).
-const ALWAYS_DROPPED: &[&str] = &[
+pub(crate) const ALWAYS_DROPPED: &[&str] = &[
     "authorization",
     "proxy-authorization",
     "cookie",
@@ -134,7 +152,10 @@ fn has_crlf_nul(v: &str) -> bool {
 /// Fills `{x}` in `base_url`. A value must be URL-unreserved characters
 /// only, so it cannot change the scheme, authority or query, and it must
 /// pass the manifest's parameter type.
-fn fill_base(m: &Manifest, svc_params: &BTreeMap<String, String>) -> Result<String, BrokerError> {
+pub(crate) fn fill_base(
+    m: &Manifest,
+    svc_params: &BTreeMap<String, String>,
+) -> Result<String, BrokerError> {
     let mut out = String::with_capacity(m.base_url.len());
     let mut rest = m.base_url.as_str();
     while let Some(i) = rest.find('{') {
@@ -151,6 +172,9 @@ fn fill_base(m: &Manifest, svc_params: &BTreeMap<String, String>) -> Result<Stri
             spec.param_type()?
                 .check(value)
                 .map_err(|why| bad_value(name, &why))?;
+        }
+        if m.whole_host_param() == Some(name) && !bare_hostname(value) {
+            return Err(bad_value(name, "not a bare lower-case hostname"));
         }
         if value.is_empty()
             || !value
@@ -180,8 +204,37 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// The `https` URI with an allowed host and no userinfo, or an error.
-fn checked_uri(m: &Manifest, text: &str) -> Result<Uri, BrokerError> {
+/// A DNS hostname as an admin writes it: lower-case LDH labels of 1 to 63
+/// bytes, not starting or ending in `-`, at least two labels, at most 253
+/// bytes, no trailing dot, no port, userinfo or path.
+pub fn bare_hostname(v: &str) -> bool {
+    // An IP literal is not a hostname: a dotted quad ends in an all-digit
+    // label, and IPv6 has `:` (refused by the label alphabet too).
+    let last_numeric = v
+        .rsplit('.')
+        .next()
+        .is_some_and(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    v.len() <= 253
+        && !last_numeric
+        && !v.contains(':')
+        && v.split('.').count() >= 2
+        && v.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// The `https` URI with an allowed host and no userinfo, or an error. A
+/// `{param}` entry of `hosts` allows exactly the admin's value of `param`.
+pub(crate) fn checked_uri(
+    m: &Manifest,
+    svc_params: &BTreeMap<String, String>,
+    text: &str,
+) -> Result<Uri, BrokerError> {
     let uri: Uri = text.parse().map_err(|_| BrokerError::HostNotAllowed)?;
     if uri.scheme_str() != Some("https") {
         return Err(BrokerError::HostNotAllowed);
@@ -191,7 +244,16 @@ fn checked_uri(m: &Manifest, text: &str) -> Result<Uri, BrokerError> {
         return Err(BrokerError::HostNotAllowed);
     }
     let host = authority.host();
-    if !m.hosts.iter().any(|p| host_matches(p, host)) {
+    let allowed =
+        m.hosts.iter().any(
+            |p| match p.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                Some(param) => svc_params
+                    .get(param)
+                    .is_some_and(|v| bare_hostname(v) && v.eq_ignore_ascii_case(host)),
+                None => host_matches(p, host),
+            },
+        );
+    if !allowed {
         return Err(BrokerError::HostNotAllowed);
     }
     Ok(uri)
@@ -224,11 +286,30 @@ fn auth_header(
             let name = spec.name.as_deref().unwrap_or("");
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| refuse("auth header name is invalid"))?;
-            (name, auth.field(&spec.secret_field)?.to_string())
+            let prefix = spec.prefix.as_deref().unwrap_or("");
+            (name, format!("{prefix}{}", auth.field(&spec.secret_field)?))
         }
         "bearer" => (
             AUTHORIZATION,
             format!("Bearer {}", auth.field(&spec.secret_field)?),
+        ),
+        "basic_token" => {
+            // The Segment write key form: the token as the user name and an
+            // empty password.
+            let pair = basic_pair(auth.field(&spec.secret_field)?, "");
+            (
+                AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(&*pair)
+                ),
+            )
+        }
+        // The access token the daemon holds in memory (Task 7); never a
+        // vault field.
+        "oauth2" => (
+            AUTHORIZATION,
+            format!("Bearer {}", auth.field("access_token")?),
         ),
         "basic" => {
             // Ruling: basic uses the fields `username` and `password`;
@@ -303,7 +384,7 @@ pub fn build(
             url.extend(utf8_percent_encode(v, COMPONENT));
         }
     }
-    let uri = checked_uri(m, &url)?;
+    let uri = checked_uri(m, svc_params, &url)?;
 
     let auth = auth_header(m, auth)?;
     let mut headers = HeaderMap::new();
@@ -326,6 +407,18 @@ pub fn build(
             headers.insert(hname, hvalue);
         }
     }
+    // Fixed headers win over the agent's (decision 6).
+    for (name, tpl) in &m.headers {
+        let value = fill_template(tpl, svc_params)?;
+        if has_crlf_nul(&value) {
+            return Err(bad_value(name, "header value contains CR, LF or NUL"));
+        }
+        let hname = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| BrokerError::Manifest(format!("{}: bad header name", m.id)))?;
+        let hvalue = HeaderValue::from_str(&value)
+            .map_err(|_| bad_value(name, "not a valid header value"))?;
+        headers.insert(hname, hvalue);
+    }
     if let Some((name, value)) = auth {
         headers.insert(name, value);
     }
@@ -337,34 +430,316 @@ pub fn build(
     })
 }
 
-/// The next-page parameter of a cursor-paginated answer: `(param, value)`
-/// when `body` holds a string or number at the `next` JSON path, else `None`
-/// (last page, or `p` is not cursor pagination, or the value is longer than
-/// 256 bytes or has a byte outside `[A-Za-z0-9_.=-]`). Arrays are not traversed.
-pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, String)> {
-    let Pagination::Cursor { param, next } = p else {
-        return None;
-    };
-    let mut cur = body;
-    for key in next.split('.') {
-        cur = cur.get(key)?;
+/// `tpl` with every `{x}` replaced by the service param `x`.
+fn fill_template(tpl: &str, svc_params: &BTreeMap<String, String>) -> Result<String, BrokerError> {
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let end = rest[i..]
+            .find('}')
+            .ok_or_else(|| BrokerError::Manifest("unbalanced { in a header".into()))?
+            + i;
+        let name = &rest[i + 1..end];
+        out.push_str(
+            svc_params
+                .get(name)
+                .ok_or_else(|| BrokerError::MissingParam(name.to_string()))?,
+        );
+        rest = &rest[end + 1..];
     }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// One typed body value: `int` a JSON number, `bool` a JSON bool, any
+/// other type a string. `v` passed `params::validate` already.
+fn typed(name: &str, ty: &str, v: &str) -> Result<Value, BrokerError> {
+    Ok(match ParamType::parse(ty, None)? {
+        ParamType::Int { .. } => Value::from(
+            v.parse::<i64>()
+                .map_err(|_| bad_value(name, "not an integer"))?,
+        ),
+        ParamType::Bool => Value::Bool(match v {
+            "true" => true,
+            "false" => false,
+            _ => return Err(bad_value(name, "not true or false")),
+        }),
+        _ => Value::String(v.to_string()),
+    })
+}
+
+/// Places `v` at the dotted `path` of `obj`, creating objects on the way.
+fn put(obj: &mut Map<String, Value>, path: &str, v: Value) -> Result<(), BrokerError> {
+    let clash = || BrokerError::Manifest(format!("body key {path:?} overlaps another"));
+    let (parents, leaf) = match path.rsplit_once('.') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, path),
+    };
+    let mut cur = obj;
+    for part in parents.into_iter().flat_map(|p| p.split('.')) {
+        cur = match cur
+            .entry(part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+        {
+            Value::Object(o) => o,
+            _ => return Err(clash()),
+        };
+    }
+    if cur.insert(leaf.to_string(), v).is_some() {
+        return Err(clash());
+    }
+    Ok(())
+}
+
+fn toml_to_json(v: &toml::Value) -> Value {
+    match v {
+        toml::Value::String(s) => Value::String(s.clone()),
+        toml::Value::Integer(i) => Value::from(*i),
+        toml::Value::Float(f) => {
+            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
+        }
+        toml::Value::Boolean(b) => Value::Bool(*b),
+        toml::Value::Datetime(d) => Value::String(d.to_string()),
+        toml::Value::Array(a) => Value::Array(a.iter().map(toml_to_json).collect()),
+        toml::Value::Table(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// The body an operation builds (decision 2): its `body_params` found in
+/// `params` (typed, nested by dotted name) merged with `body_const`, inside
+/// `{"query": <graphql>, "variables": ...}` for a GraphQL operation. `None`
+/// when the operation takes the agent's body (or none).
+pub fn build_body(
+    op: &Operation,
+    params: &BTreeMap<String, String>,
+) -> Result<Option<Value>, BrokerError> {
+    if !op.builds_body() {
+        return Ok(None);
+    }
+    // Sorted by dotted key over both maps, so the built bytes do not depend
+    // on the JSON map's key order.
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for (k, ty) in &op.body_params {
+        if let Some(v) = params.get(k) {
+            entries.push((k, typed(k, ty, v)?));
+        }
+    }
+    for (k, v) in &op.body_const {
+        entries.push((k, toml_to_json(v)));
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut obj = Map::new();
+    for (k, v) in entries {
+        put(&mut obj, k, v)?;
+    }
+    Ok(Some(match &op.graphql {
+        Some(q) => {
+            let mut env = Map::new();
+            env.insert("query".into(), Value::String(q.clone()));
+            env.insert("variables".into(), Value::Object(obj));
+            Value::Object(env)
+        }
+        None => Value::Object(obj),
+    }))
+}
+
+/// Stripe-style form encoding of a JSON object: `a[b]=v` for nested
+/// objects, `a[0]=v` for arrays, keys sorted at each level, every name and
+/// value percent-encoded. A `null` or a top level that is not an object is
+/// refused. Every object key must be `[A-Za-z0-9_-]+`: a key holding `[`,
+/// `]` or `.` would let a flat JSON key decode upstream as a nested field
+/// the broker never saw (`{"refund[amount]": 99999}`), so nesting comes from
+/// this encoder only. An output name that repeats is refused too.
+pub fn form_encode(v: &Value) -> Result<String, BrokerError> {
+    fn key_ok(k: &str) -> bool {
+        !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+    fn walk(
+        name: &str,
+        v: &Value,
+        out: &mut Vec<String>,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), BrokerError> {
+        let scalar = match v {
+            Value::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                for k in keys {
+                    if !key_ok(k) {
+                        return Err(bad_value("body", "a form key must be [A-Za-z0-9_-]+"));
+                    }
+                    walk(&format!("{name}[{k}]"), &o[k], out, seen)?;
+                }
+                return Ok(());
+            }
+            Value::Array(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    walk(&format!("{name}[{i}]"), x, out, seen)?;
+                }
+                return Ok(());
+            }
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => return Err(bad_value("body", "null cannot be form-encoded")),
+        };
+        if !seen.insert(name.to_string()) {
+            return Err(bad_value("body", "a form name repeats"));
+        }
+        out.push(format!(
+            "{}={}",
+            utf8_percent_encode(name, COMPONENT),
+            utf8_percent_encode(&scalar, COMPONENT)
+        ));
+        Ok(())
+    }
+    let Value::Object(o) = v else {
+        return Err(bad_value("body", "a form body must be a JSON object"));
+    };
+    let mut keys: Vec<&String> = o.keys().collect();
+    keys.sort();
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for k in keys {
+        if !key_ok(k) {
+            return Err(bad_value("body", "a form key must be [A-Za-z0-9_-]+"));
+        }
+        walk(k, &o[k], &mut out, &mut seen)?;
+    }
+    Ok(out.join("&"))
+}
+
+/// The value at a dotted JSON path; a part ending in `[-1]` takes the last
+/// element of an array.
+fn json_at<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = body;
+    for part in path.split('.') {
+        cur = match part.strip_suffix("[-1]") {
+            Some(k) => cur.get(k)?.as_array()?.last()?,
+            None => cur.get(part)?,
+        };
+    }
+    Some(cur)
+}
+
+/// The next-page parameter of a cursor- or offset-paginated answer:
+/// `(param, value)`, else `None`. Cursor: the string or number at the `next`
+/// JSON path, unless `more` is given and is not `true`; an empty value, one
+/// longer than 256 bytes or with a byte outside `[A-Za-z0-9_.=-]` is the
+/// last page. Offset: `body[param] + body[limit_field]` while `body[more]`
+/// is `true`. Link-header pagination is [`next_from_link`].
+pub fn next_cursor(p: &Pagination, body: &serde_json::Value) -> Option<(String, String)> {
+    let (param, next, more) = match p {
+        Pagination::Cursor { param, next, more } => (param, next, more.as_deref()),
+        Pagination::Offset {
+            param,
+            limit_field,
+            more,
+        } => {
+            if !json_at(body, more)?.as_bool()? {
+                return None;
+            }
+            let offset = json_at(body, param)?.as_u64()?;
+            let limit = json_at(body, limit_field)?.as_u64()?;
+            if limit == 0 {
+                return None;
+            }
+            return Some((param.clone(), offset.checked_add(limit)?.to_string()));
+        }
+        Pagination::LinkHeader => return None,
+    };
+    if let Some(m) = more {
+        if !json_at(body, m)?.as_bool()? {
+            return None;
+        }
+    }
+    let cur = json_at(body, next)?;
     let v = match cur {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         _ => return None,
     };
     // The value is echoed into an HTTP header and a CLI line: refuse anything
-    // long or outside a conservative alphabet.
+    // long or outside a conservative alphabet (`/` is there for Airtable's
+    // `itr.../rec...` offsets, `+` for base64 cursors; the next call's param pattern still applies).
     if v.is_empty()
         || v.len() > 256
-        || !v
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-'))
+        || !v.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'=' | b'-' | b'/' | b'+')
+        })
     {
         return None;
     }
     Some((param.clone(), v))
+}
+
+/// The parameters of the next page from a `rel="next"` `Link` header: the
+/// call's path params plus the operation's own query params found in the
+/// link. A next link marked `results="false"` (Sentry) is the last page.
+pub fn next_from_link(
+    op: &Operation,
+    given: &BTreeMap<String, String>,
+    headers: &HeaderMap,
+) -> Option<BTreeMap<String, String>> {
+    let link = headers.get_all("link").iter().find_map(|v| {
+        v.to_str().ok()?.split(',').find_map(|part| {
+            let (url, attrs) = part.split_once(';')?;
+            let attrs: Vec<String> = attrs
+                .split(';')
+                .map(|a| a.trim().to_ascii_lowercase())
+                .collect();
+            let is_next = attrs.iter().any(|a| a == "rel=\"next\"" || a == "rel=next");
+            is_next.then(|| {
+                let empty = attrs
+                    .iter()
+                    .any(|a| a == "results=\"false\"" || a == "results=false");
+                (
+                    url.trim()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_string(),
+                    empty,
+                )
+            })
+        })
+    })?;
+    let (link, empty) = link;
+    if empty {
+        return None;
+    }
+    let query = link.split_once('?')?.1;
+    let mut out: BTreeMap<String, String> = given
+        .iter()
+        .filter(|(k, _)| op.path_params.contains_key(*k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let dec = |s: &str| {
+            percent_encoding::percent_decode_str(&s.replace('+', " "))
+                .decode_utf8()
+                .ok()
+                .map(|c| c.into_owned())
+        };
+        let (Some(k), Some(v)) = (dec(k), dec(v)) else {
+            continue;
+        };
+        // `next` reaches a header and a CLI line: printable ASCII without
+        // spaces, at most 256 bytes, like `next_cursor`.
+        let printable =
+            !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x21..0x7f).contains(&b));
+        if op.query.contains_key(&k) && printable {
+            out.insert(k, v);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]

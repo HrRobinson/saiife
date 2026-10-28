@@ -1,0 +1,82 @@
+# Zendesk Support API v2. Paths and cursor pagination checked against the
+# vendor reference (shape per vendor docs):
+#   https://developer.zendesk.com/api-reference/ticketing/tickets/tickets/
+#   https://developer.zendesk.com/api-reference/ticketing/tickets/ticket_comments/
+#   https://developer.zendesk.com/api-reference/ticketing/users/users/
+#   https://developer.zendesk.com/api-reference/ticketing/ticket-management/search/
+#   https://developer.zendesk.com/api-reference/introduction/pagination/   (cursor: meta.after_cursor, meta.has_more)
+#   https://developer.zendesk.com/api-reference/introduction/security-and-auth/   (API token: "<email>/token" as the Basic user name)
+id = "zendesk"
+version = 1
+title = "Zendesk Support"
+base_url = "https://{subdomain}.zendesk.com/api/v2"
+hosts = ["*.zendesk.com"]
+auth = [{ kind = "basic" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.subdomain]               # set by the admin in the service config, never by the agent
+type = "string"
+pattern = "^[a-z0-9][a-z0-9-]{0,62}$"
+required = true
+
+[[operation]]
+id = "tickets.list"
+capability = "tickets:read"
+kind = "read"
+method = "GET"
+path = "/tickets"
+query = { "page[size]" = "int:1..100", "page[after]" = "string:[A-Za-z0-9_.=-]{1,256}", sort = "enum:id,-id,updated_at,-updated_at" }
+pagination = { cursor = { param = "page[after]", next = "meta.after_cursor", more = "meta.has_more" } }
+
+[[operation]]
+id = "tickets.get"
+capability = "tickets:read"
+kind = "read"
+method = "GET"
+path = "/tickets/{ticket_id}"
+path_params = { ticket_id = "int" }
+
+[[operation]]
+id = "tickets.comments"
+capability = "tickets:read"
+kind = "read"
+method = "GET"
+path = "/tickets/{ticket_id}/comments"
+path_params = { ticket_id = "int" }
+query = { "page[size]" = "int:1..100", "page[after]" = "string:[A-Za-z0-9_.=-]{1,256}", sort = "enum:created_at,-created_at" }
+pagination = { cursor = { param = "page[after]", next = "meta.after_cursor", more = "meta.has_more" } }
+
+[[operation]]
+id = "tickets.create"
+capability = "tickets:write"
+kind = "write"
+method = "POST"
+path = "/tickets"
+body = "json"
+
+[[operation]]
+id = "tickets.update"
+capability = "tickets:write"
+kind = "write"
+method = "PUT"
+path = "/tickets/{ticket_id}"
+path_params = { ticket_id = "int" }
+body = "json"
+
+[[operation]]
+id = "users.get"
+capability = "users:read"
+kind = "read"
+method = "GET"
+path = "/users/{user_id}"
+path_params = { user_id = "int" }
+
+# Classic search is page-numbered (at most 1000 results); the answer's
+# `next_page` is a full URL, so the agent counts pages itself.
+[[operation]]
+id = "search"
+capability = "search:read"
+kind = "read"
+method = "GET"
+path = "/search.json"
+query = { query = "string:.{1,512}", sort_by = "enum:updated_at,created_at,priority,status,ticket_type", sort_order = "enum:asc,desc", page = "int:1..1000", per_page = "int:1..100" }

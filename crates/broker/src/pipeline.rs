@@ -13,7 +13,7 @@
 use crate::amount;
 use crate::catalog::Catalog;
 use crate::limits::{Event, Key, Limiter};
-use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination};
+use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination, Transport};
 use crate::mask::{finish, Finished, Masked, Masker};
 use crate::params;
 use crate::request::{build, AuthMaterial};
@@ -89,8 +89,11 @@ pub struct StoredCall {
     /// The parameters as given (proxy captures included), validated at
     /// creation and validated again at send.
     pub params: BTreeMap<String, String>,
-    /// Base64 of the body as it would be sent: the canonical JSON when the
-    /// operation takes JSON.
+    /// Base64 of the agent's body as canonical JSON (the input to
+    /// [`prepare_body`], not the bytes sent: for `body = "form"` those are
+    /// its form encoding). `None` when the operation builds its body from
+    /// the params. At send it is prepared again, and the bytes must hash to
+    /// `body_sha256`.
     pub body_b64: Option<String>,
     /// SHA-256 (hex) of the exact body bytes the approver was shown the
     /// hash of. At send the bytes about to go upstream must hash to it,
@@ -104,6 +107,24 @@ pub struct StoredCall {
     pub overlay: Option<ServiceOverlay>,
     /// How the request came in (`cli` or `http`).
     pub via: String,
+    /// The environment of the snapshot the request was asked under
+    /// ([`PolicySnapshot::env`]). Developer mode sends under it again;
+    /// locked mode chooses from the scope at send. Either way the daemon
+    /// refuses the send (`env_changed`) when that is not this environment.
+    /// Absent in requests stored before environments existed (read as
+    /// `None`, not checked).
+    #[serde(default)]
+    pub env: Option<String>,
+    /// `env` was recorded at the ask: true for every request asked since,
+    /// so `env = None` then means the base config, and the send refuses an
+    /// environment chosen since (`env_changed`) for it too. `false` in a
+    /// request sealed before (read as the default): not checked.
+    #[serde(default)]
+    pub env_recorded: bool,
+    /// The collection the request was a step of (attribution only).
+    /// Absent in a call sealed before collections existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
 }
 
 impl std::fmt::Debug for StoredCall {
@@ -142,6 +163,7 @@ impl StoredCall {
             headers: self.headers.clone(),
             overlay: self.overlay.clone(),
             via: Via::Approval,
+            collection: self.collection.clone(),
         };
         (call, ok)
     }
@@ -212,6 +234,9 @@ pub struct Call {
     pub headers: Vec<(String, String)>,
     pub overlay: Option<ServiceOverlay>,
     pub via: Via,
+    /// The collection this call is a step of (`saiife api collection
+    /// run`), recorded as attribution only: it changes no decision.
+    pub collection: Option<String>,
 }
 
 /// Parameter values, header values and the body can hold anything the
@@ -233,6 +258,7 @@ impl std::fmt::Debug for Call {
             )
             .field("overlay", &self.overlay)
             .field("via", &self.via)
+            .field("collection", &self.collection)
             .finish()
     }
 }
@@ -244,6 +270,9 @@ pub struct PolicySnapshot {
     /// `sha256:<hex>` of the effective policy.
     pub hash: String,
     pub mode: Mode,
+    /// The environment applied to `config` (spec §6.11), `None` for the
+    /// base config. The record's `env`, so it always matches `hash`.
+    pub env: Option<String>,
 }
 
 /// What lockdown stops (spec §6.18).
@@ -302,7 +331,28 @@ pub trait Env: Sync {
     /// `approval`/`created` record); the id, or the deny rule
     /// (`approvals_unavailable`, `vault_unavailable`, ...). Nothing is sent.
     fn create_approval<'a>(&'a self, p: &'a PendingCall) -> ApprovalFuture<'a>;
+    /// Step 9 for an `oauth2` credential: the access token of secret
+    /// `secret` (from memory, refreshed when due, or always with `force`),
+    /// or the deny rule. The default has none (`secret_missing`).
+    #[allow(clippy::too_many_arguments)]
+    fn oauth_token<'a>(
+        &'a self,
+        secret: &'a str,
+        service: &'a str,
+        spec: &'a AuthSpec,
+        m: &'a Manifest,
+        svc_params: &'a BTreeMap<String, String>,
+        force: bool,
+    ) -> TokenFuture<'a> {
+        let _ = (secret, service, spec, m, svc_params, force);
+        Box::pin(async { Err("secret_missing") })
+    }
 }
+
+/// The future of [`Env::oauth_token`].
+pub type TokenFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Zeroizing<String>, &'static str>> + Send + 'a>,
+>;
 
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
 /// parsers that keep the first and the last value would see different
@@ -476,6 +526,14 @@ pub struct Trace {
     pub duration_ms: u64,
     /// The request went to the upstream (it counts against the limits).
     pub sent: bool,
+    /// An oauth2 call was sent again after a 401 and a forced refresh.
+    pub auth_retry: bool,
+}
+
+/// A masker of `values` (and the v1 patterns).
+fn masker_of(values: &[Zeroizing<String>]) -> Masker {
+    let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
+    Masker::new(&refs)
 }
 
 /// Steps 3–12; see [`run`] for the trace.
@@ -642,7 +700,9 @@ async fn steps(
         Err(PolicyError::ScopeConflict { .. }) => return changed("scope_conflict"),
         Err(_) => return denied("policy_invalid"),
     };
-    tr.env = scope.env.clone();
+    // The environment the snapshot was chosen for (the scope's, in locked
+    // mode): the record names the policy the call ran under.
+    tr.env = snap.env.clone();
     if !scope.services.iter().any(|s| s == &call.service) {
         return changed("no_scope");
     }
@@ -680,37 +740,23 @@ async fn steps(
     };
     tr.operation = Some(op.id.clone());
     tr.op_kind = Some(op.kind);
-    let params = match params::validate(op, &given, &svc.fixed) {
+    let mut params = match params::validate(op, &given, &svc.fixed) {
         Ok(p) => p,
         Err(e) => return denied(rule_of(&e)),
     };
-    let mut body = call.body.clone().filter(|b| !b.is_empty());
-    if body.is_some() && op.body.is_none() {
-        return denied("bad_param");
+    // Mail: defaults and case are settled before the policy looks.
+    crate::mail::normalize(op, &mut params);
+    let prepared = match prepare_body(op, &params, call.body.as_ref()) {
+        Ok(p) => p,
+        Err(rule) => return denied(rule),
+    };
+    if let Some(b) = &prepared.bytes {
+        // The record describes what is sent.
+        tr.body_bytes = b.len();
+        tr.body_sha256 = prepared.sha256();
     }
-    // A JSON body is parsed once, strictly (a duplicate key is refused),
-    // and the re-serialized tree is what goes upstream: the amount checked
-    // is the amount sent, whatever parser the upstream uses.
-    let mut json_body: Option<Value> = None;
-    if op.body.as_deref() == Some("json") {
-        if let Some(b) = &body {
-            match strict_json(b) {
-                Some(v) => {
-                    match serde_json::to_vec(&v) {
-                        Ok(canon) => {
-                            // The record describes what is sent.
-                            tr.body_bytes = canon.len();
-                            tr.body_sha256 = Some(hex(&Sha256::digest(&canon)));
-                            body = Some(Bytes::from(canon));
-                        }
-                        Err(_) => return denied("bad_body"),
-                    }
-                    json_body = Some(v);
-                }
-                None => return denied("bad_body"),
-            }
-        }
-    }
+    let body = prepared.bytes.clone();
+    let json_body = prepared.json.as_ref();
 
     // An approved request sends only the bytes whose hash its approver saw.
     if let Stage::Approved { body_sha256 } = stage {
@@ -739,7 +785,7 @@ async fn steps(
 
     // 7. Limits. An operation that moves money must carry its amount.
     if let Some(spec) = &op.amount {
-        match json_body.as_ref().map(|v| amount::extract(spec, v)) {
+        match json_body.map(|v| amount::extract(spec, v, &svc.params)) {
             Some(Ok(a)) => tr.amount = Some(a),
             _ => return denied("bad_amount"),
         }
@@ -788,7 +834,10 @@ async fn steps(
                 service: call.service.clone(),
                 operation: op.id.clone(),
                 params: given.clone(),
-                body_b64: body.as_ref().map(|b| {
+                // The agent's body as canonical JSON (none for a built
+                // body): at send it is prepared again, and the bytes must
+                // hash to `body_sha256`.
+                body_b64: prepared.input.as_ref().map(|b| {
                     use base64::Engine as _;
                     base64::engine::general_purpose::STANDARD.encode(b)
                 }),
@@ -796,6 +845,9 @@ async fn steps(
                 headers: call.headers.clone(),
                 overlay: call.overlay.clone(),
                 via: call.via.as_str().to_string(),
+                env: snap.env.clone(),
+                env_recorded: true,
+                collection: call.collection.clone(),
             },
             operation: masker.mask_text(&op.id),
             capability: tr.capability.as_deref().map(|c| masker.mask_text(c)),
@@ -834,7 +886,7 @@ async fn steps(
         return denied("upstream_unavailable");
     };
     tr.secret = svc.secret.clone();
-    let auth = match &svc.secret {
+    let mut auth = match &svc.secret {
         Some(name) => match env.secret(name, &call.service, &m.auth) {
             Ok(a) => a,
             Err(rule) => return denied(rule),
@@ -842,34 +894,76 @@ async fn steps(
         None if m.auth.is_empty() => AuthMaterial::none(),
         None => return denied("secret_missing"),
     };
-    {
-        // Every value of the secret in use (each field and the basic pair).
-        let values = auth.values();
-        let refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
-        *masker = Masker::new(&refs);
-    }
-    let mut built = match build(
-        &m,
-        op,
-        &svc.params,
-        &params,
-        &call.headers,
-        body.clone(),
-        &auth,
-    ) {
-        Ok(b) => b,
-        Err(e) => return denied(rule_of(&e)),
+    // ---- oauth2 (plan 14, Task 7) ----
+    // The access token comes from the daemon's memory (refreshed there when
+    // due), never from the vault.
+    let oauth: Option<(&str, &AuthSpec)> = match (&svc.secret, auth.kind == "oauth2") {
+        (Some(name), true) => match m.auth.iter().find(|a| a.kind == "oauth2") {
+            Some(spec) => Some((name.as_str(), spec)),
+            None => return denied("secret_missing"),
+        },
+        _ => None,
     };
-    drop(auth);
-    // Compressed bytes never reach the masker: ask for none.
-    built
-        .headers
-        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if json_body.is_some() {
-        // The body is the canonical JSON: say so, whatever the agent sent.
+    if let Some((name, spec)) = oauth {
+        match env
+            .oauth_token(name, &call.service, spec, &m, &svc.params, false)
+            .await
+        {
+            Ok(t) => {
+                auth.fields.insert("access_token".into(), t);
+            }
+            Err(rule) => return denied(rule),
+        }
+    }
+    // Every value of the secret in use (each field and the basic pair; for
+    // oauth2 the access token, and the refresh token as the vault holds it
+    // now, rotated or not).
+    let mut mask_values = auth.values();
+    if let Some(v) = oauth.and_then(|(name, _)| env.secret_values(name)) {
+        mask_values.extend(v);
+    }
+    *masker = masker_of(&mask_values);
+    // ---- end oauth2 ----
+    // ---- mail transport (plan 14, Task 6) ----
+    // A mail call builds no HTTP request: its params are checked here,
+    // before anything counts, and the credential is kept for `mail::run`.
+    let mail = m.transport == Transport::Mail;
+    if mail {
+        if let Err(e) = crate::mail::check_call(op, &svc.params, &params, body.as_ref()) {
+            return denied(rule_of(&e));
+        }
+    }
+    let (mut built, mail_auth) = if mail {
+        (None, Some(auth))
+    } else {
+        let b = match build(
+            &m,
+            op,
+            &svc.params,
+            &params,
+            &call.headers,
+            body.clone(),
+            &auth,
+        ) {
+            Ok(b) => b,
+            Err(e) => return denied(rule_of(&e)),
+        };
+        drop(auth);
+        (Some(b), None)
+    };
+    // ---- end mail transport ----
+    if let Some(built) = built.as_mut() {
+        // Compressed bytes never reach the masker: ask for none.
         built
             .headers
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        if let Some(ct) = prepared.content_type {
+            // The body is the canonical JSON or its form encoding: say so,
+            // whatever the agent sent.
+            built
+                .headers
+                .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+        }
     }
     let max = svc
         .limits
@@ -898,9 +992,29 @@ async fn steps(
     let sent = {
         let _permit = permit;
         tr.sent = true;
-        up.send(built, read_limit).await
+        // ---- mail transport (plan 14, Task 6): SMTP or IMAP, not HTTPS ----
+        match (built, mail_auth) {
+            (Some(b), _) => up.send(b, read_limit).await,
+            (None, Some(a)) => {
+                let r = crate::mail::run(
+                    up,
+                    &m,
+                    op,
+                    &svc.params,
+                    &params,
+                    body.clone(),
+                    &a,
+                    read_limit,
+                )
+                .await;
+                drop(a);
+                r
+            }
+            (None, None) => Err(BrokerError::Upstream("no request was built".into())),
+        }
+        // ---- end mail transport ----
     };
-    let resp = match sent {
+    let mut resp = match sent {
         Ok(r) => r,
         Err(BrokerError::RedirectRefused) => return denied("redirect_refused"),
         Err(e) => {
@@ -909,6 +1023,57 @@ async fn steps(
             }
         }
     };
+    // ---- oauth2 retry (plan 14, Task 7) ----
+    // A 401 with an oauth2 credential: the session expired or was revoked.
+    // One forced refresh and one resend; a second 401 is the answer, and so
+    // is the first when the refresh fails (its failure is recorded by the
+    // daemon). The resend counts with the first send.
+    if resp.status == 401 && !mail {
+        if let Some((name, spec)) = oauth {
+            if let Ok(t) = env
+                .oauth_token(name, &call.service, spec, &m, &svc.params, true)
+                .await
+            {
+                mask_values.push(t.clone());
+                // A refresh token rotated by this refresh, too.
+                mask_values.extend(env.secret_values(name).unwrap_or_default());
+                *masker = masker_of(&mask_values);
+                let a = AuthMaterial::from_spec(spec, [("access_token".to_string(), t)].into());
+                if let Ok(mut b) = build(
+                    &m,
+                    op,
+                    &svc.params,
+                    &params,
+                    &call.headers,
+                    body.clone(),
+                    &a,
+                ) {
+                    drop(a);
+                    b.headers
+                        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+                    if let Some(ct) = prepared.content_type {
+                        b.headers.insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+                    }
+                    let permit =
+                        tokio::time::timeout(up.timeout(), env.pool(&call.service).acquire_owned())
+                            .await;
+                    if let Ok(Ok(_permit)) = permit {
+                        tr.auth_retry = true;
+                        resp = match up.send(b, read_limit).await {
+                            Ok(r) => r,
+                            Err(BrokerError::RedirectRefused) => return denied("redirect_refused"),
+                            Err(e) => {
+                                return Outcome::UpstreamFailed {
+                                    reason: e.to_string(),
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // ---- end oauth2 retry ----
     tr.status = Some(resp.status);
     if resp
         .headers
@@ -954,57 +1119,115 @@ fn next_page(
     f: &Finished,
 ) -> Option<BTreeMap<String, String>> {
     match op.pagination.as_ref()? {
-        p @ Pagination::Cursor { .. } => {
+        p @ (Pagination::Cursor { .. } | Pagination::Offset { .. }) => {
             let v: Value = serde_json::from_slice(&f.body).ok()?;
             let (param, value) = crate::request::next_cursor(p, &v)?;
             let mut out = given.clone();
             out.insert(param, value);
             Some(out)
         }
-        Pagination::LinkHeader => {
-            let link = f.headers.get_all("link").iter().find_map(|v| {
-                v.to_str().ok()?.split(',').find_map(|part| {
-                    let (url, attrs) = part.split_once(';')?;
-                    let is_next = attrs.split(';').any(|a| {
-                        let a = a.trim().to_ascii_lowercase();
-                        a == "rel=\"next\"" || a == "rel=next"
-                    });
-                    is_next.then(|| {
-                        url.trim()
-                            .trim_start_matches('<')
-                            .trim_end_matches('>')
-                            .to_string()
-                    })
-                })
-            })?;
-            let query = link.split_once('?')?.1;
-            let mut out: BTreeMap<String, String> = given
-                .iter()
-                .filter(|(k, _)| op.path_params.contains_key(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for pair in query.split('&') {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                let dec = |s: &str| {
-                    percent_encoding::percent_decode_str(&s.replace('+', " "))
-                        .decode_utf8()
-                        .ok()
-                        .map(|c| c.into_owned())
-                };
-                let (Some(k), Some(v)) = (dec(k), dec(v)) else {
-                    continue;
-                };
-                // `next` reaches a header and a CLI line: printable ASCII
-                // without spaces, at most 256 bytes, like `next_cursor`.
-                let printable =
-                    !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x21..0x7f).contains(&b));
-                if op.query.contains_key(&k) && printable {
-                    out.insert(k, v);
-                }
-            }
-            Some(out)
-        }
+        Pagination::LinkHeader => crate::request::next_from_link(op, given, &f.headers),
     }
+}
+
+/// The request body of one call, ready to send (step 5).
+#[derive(Clone, Default)]
+pub struct PreparedBody {
+    /// The bytes sent upstream.
+    pub bytes: Option<Bytes>,
+    /// The JSON the bytes encode, which the amount is read from.
+    pub json: Option<Value>,
+    /// The agent's body as canonical JSON, stored with an approval request
+    /// and prepared again at send. `None` for a built body.
+    pub input: Option<Bytes>,
+    /// The `Content-Type` the broker sets.
+    pub content_type: Option<&'static str>,
+}
+
+impl std::fmt::Debug for PreparedBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedBody")
+            .field("bytes_len", &self.bytes.as_ref().map(Bytes::len))
+            .field("content_type", &self.content_type)
+            .finish()
+    }
+}
+
+impl PreparedBody {
+    /// SHA-256 (hex) of the bytes sent.
+    pub fn sha256(&self) -> Option<String> {
+        self.bytes.as_ref().map(|b| hex(&Sha256::digest(b)))
+    }
+}
+
+/// Builds the body of `op` (decision 2). An operation with `body_params`,
+/// `body_const` or `graphql` builds its body from the validated `params`
+/// and refuses one from the agent (`bad_param`); otherwise the agent's body
+/// is parsed once, strictly (a duplicate key is `bad_body`), and its
+/// canonical JSON, or for `body = "form"` that JSON form-encoded, is what
+/// goes upstream: the amount checked is the amount sent, whatever parser
+/// the upstream uses.
+pub fn prepare_body(
+    op: &Operation,
+    params: &BTreeMap<String, String>,
+    raw: Option<&Bytes>,
+) -> Result<PreparedBody, &'static str> {
+    let raw = raw.filter(|b| !b.is_empty());
+    if raw.is_some() && (op.body.is_none() || op.builds_body()) {
+        return Err("bad_param");
+    }
+    // `text` (mail only): UTF-8, at most 256 KiB, sent as given.
+    if op.body.as_deref() == Some("text") {
+        let Some(b) = raw else {
+            return Ok(PreparedBody::default());
+        };
+        if b.len() > crate::mail::MAX_BODY || std::str::from_utf8(b).is_err() {
+            return Err("bad_body");
+        }
+        return Ok(PreparedBody {
+            bytes: Some(b.clone()),
+            json: None,
+            input: Some(b.clone()),
+            content_type: Some("text/plain; charset=utf-8"),
+        });
+    }
+    let (json, input) = if op.builds_body() {
+        (
+            crate::request::build_body(op, params).map_err(|e| rule_of(&e))?,
+            None,
+        )
+    } else {
+        match raw {
+            None => (None, None),
+            Some(b) => {
+                let v = strict_json(b).ok_or("bad_body")?;
+                let canon = serde_json::to_vec(&v).map_err(|_| "bad_body")?;
+                (Some(v), Some(Bytes::from(canon)))
+            }
+        }
+    };
+    let Some(v) = json else {
+        return Ok(PreparedBody::default());
+    };
+    let (bytes, content_type) = match op.body.as_deref() {
+        Some("json") => (
+            serde_json::to_vec(&v).map_err(|_| "bad_body")?,
+            "application/json",
+        ),
+        Some("form") => (
+            crate::request::form_encode(&v)
+                .map_err(|_| "bad_body")?
+                .into_bytes(),
+            "application/x-www-form-urlencoded",
+        ),
+        _ => return Err("bad_body"),
+    };
+    Ok(PreparedBody {
+        bytes: Some(Bytes::from(bytes)),
+        json: Some(v),
+        input,
+        content_type: Some(content_type),
+    })
 }
 
 fn hex(b: &[u8]) -> String {
@@ -1111,6 +1334,15 @@ pub fn record(
     e.insert("operation".into(), json!(tr.operation));
     e.insert("capability".into(), json!(tr.capability));
     e.insert("env".into(), json!(tr.env));
+    // A collection name is `[a-z0-9_-]{1,64}`; masked like the project all
+    // the same (a name can look like a token).
+    e.insert(
+        "collection".into(),
+        json!(call
+            .collection
+            .as_deref()
+            .map(|c| Masker::new(&[]).mask_text(c))),
+    );
     e.insert("params".into(), json!(tr.params));
     e.insert("body_sha256".into(), json!(tr.body_sha256));
     e.insert("body_bytes".into(), json!(tr.body_bytes));
@@ -1120,6 +1352,9 @@ pub fn record(
     e.insert("secret".into(), json!(tr.secret));
     e.insert("limit".into(), json!(limit));
     e.insert("via".into(), call.via.as_str().into());
+    if tr.auth_retry {
+        e.insert("auth_retry".into(), true.into());
+    }
     if let Outcome::Pending { id } = outcome {
         e.insert("approval".into(), (*id).into());
     }
@@ -1259,6 +1494,7 @@ mod tests {
             headers: vec![("X-A".into(), "secret-header".into())],
             overlay: None,
             via: Via::Cli,
+            collection: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("secret-"), "{d}");

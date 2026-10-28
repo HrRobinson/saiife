@@ -1,0 +1,102 @@
+# GitLab REST API v4 (self-managed or gitlab.com). Paths checked against the
+# vendor reference (shape per vendor docs; not fetched, no network in this build):
+#   https://docs.gitlab.com/api/projects/
+#   https://docs.gitlab.com/api/issues/
+#   https://docs.gitlab.com/api/notes/
+#   https://docs.gitlab.com/api/merge_requests/
+#   https://docs.gitlab.com/api/pipelines/
+#   https://docs.gitlab.com/api/rest/#pagination   (Link header)
+# `project_id` is the numeric id only: a URL-encoded path (`group%2Fproject`)
+# would need `%2F`, which path params refuse.
+id = "gitlab"
+version = 1
+title = "GitLab"
+base_url = "https://{host}/api/v4"
+hosts = ["{host}"]
+auth = [{ kind = "header", name = "PRIVATE-TOKEN", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.host]                    # set by the admin in the service config, never by the agent
+type = "string"
+pattern = "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+required = true
+
+[[operation]]
+id = "projects.get"
+capability = "projects:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}"
+path_params = { project_id = "int" }
+
+[[operation]]
+id = "issues.list"
+capability = "issues:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}/issues"
+path_params = { project_id = "int" }
+query = { state = "enum:opened,closed,all", labels = "string:[A-Za-z0-9 ._,:-]{1,256}", search = "string:.{1,256}", per_page = "int:1..100", page = "int:1..100000" }
+pagination = "link-header"
+
+[[operation]]
+id = "issues.get"
+capability = "issues:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}/issues/{issue_iid}"
+path_params = { project_id = "int", issue_iid = "int" }
+
+[[operation]]
+id = "issues.create"
+capability = "issues:write"
+qualifier = "project={project_id}"
+kind = "write"
+method = "POST"
+path = "/projects/{project_id}/issues"
+path_params = { project_id = "int" }
+body = "json"
+
+[[operation]]
+id = "issues.comment"
+capability = "issues:write"
+qualifier = "project={project_id}"
+kind = "write"
+method = "POST"
+path = "/projects/{project_id}/issues/{issue_iid}/notes"
+path_params = { project_id = "int", issue_iid = "int" }
+body = "json"
+
+[[operation]]
+id = "merge_requests.list"
+capability = "merge_requests:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}/merge_requests"
+path_params = { project_id = "int" }
+query = { state = "enum:opened,closed,locked,merged,all", per_page = "int:1..100", page = "int:1..100000" }
+pagination = "link-header"
+
+[[operation]]
+id = "merge_requests.get"
+capability = "merge_requests:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}/merge_requests/{mr_iid}"
+path_params = { project_id = "int", mr_iid = "int" }
+
+[[operation]]
+id = "pipelines.list"
+capability = "pipelines:read"
+qualifier = "project={project_id}"
+kind = "read"
+method = "GET"
+path = "/projects/{project_id}/pipelines"
+path_params = { project_id = "int" }
+query = { status = "enum:created,waiting_for_resource,preparing,pending,running,success,failed,canceled,skipped,manual,scheduled", ref = "string:[A-Za-z0-9._/-]{1,256}", per_page = "int:1..100", page = "int:1..100000" }
+pagination = "link-header"

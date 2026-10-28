@@ -1,0 +1,8 @@
+{
+  "_source": "https://docs.gitlab.com/api/issues/#list-project-issues (shape per vendor docs; not fetched)",
+  "_link": "<https://gitlab.acme.test/api/v4/projects/42/issues?state=opened&per_page=2&page=2>; rel=\"next\", <https://gitlab.acme.test/api/v4/projects/42/issues?state=opened&per_page=2&page=1>; rel=\"first\"",
+  "body": [
+    { "id": 76, "iid": 6, "project_id": 42, "title": "Consequatur vero maxime deserunt laboriosam est voluptas dolorem.", "state": "opened", "labels": ["bug"], "author": { "id": 1, "username": "root" } },
+    { "id": 77, "iid": 7, "project_id": 42, "title": "Ut commodi ullam eos dolores perferendis nihil sunt.", "state": "opened", "labels": [], "author": { "id": 2, "username": "ann" } }
+  ]
+}

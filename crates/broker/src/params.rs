@@ -232,22 +232,56 @@ fn path_value_problem(v: &str) -> Option<&'static str> {
     Some("too deeply percent-encoded")
 }
 
-fn type_of(op: &Operation, name: &str) -> Result<Option<(ParamType, bool)>, BrokerError> {
+/// Where a parameter goes, which decides the characters it may hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Path,
+    Query,
+    /// A JSON or form body field: escaped by the encoder, so a line break
+    /// or a tab (a multi-line message) is safe.
+    Body,
+}
+
+fn type_of(op: &Operation, name: &str) -> Result<Option<(ParamType, Place)>, BrokerError> {
     if let Some(t) = op.path_params.get(name) {
-        return Ok(Some((ParamType::parse(t, None)?, true)));
+        return Ok(Some((ParamType::parse(t, None)?, Place::Path)));
     }
     if let Some(t) = op.query.get(name) {
-        return Ok(Some((ParamType::parse(t, None)?, false)));
+        return Ok(Some((ParamType::parse(t, None)?, Place::Query)));
+    }
+    // Body params are checked like query params (decision 2), except that
+    // `\n` and `\t` are allowed.
+    // A param that fills the capability qualifier never takes a line break
+    // or a tab: a multi-line qualifier would be read differently by the
+    // policy matcher and by whatever shows or records it.
+    if let Some(t) = op.body_params.get(name) {
+        let in_qualifier = op
+            .qualifier
+            .as_deref()
+            .is_some_and(|q| q.contains(&format!("{{{name}}}")));
+        let place = if in_qualifier {
+            Place::Query
+        } else {
+            Place::Body
+        };
+        return Ok(Some((ParamType::parse(t, None)?, place)));
     }
     Ok(None)
 }
 
-fn check_one(name: &str, v: &str, ty: Option<&(ParamType, bool)>) -> Result<(), BrokerError> {
-    if has_control(v) {
+fn check_one(name: &str, v: &str, ty: Option<&(ParamType, Place)>) -> Result<(), BrokerError> {
+    let body = matches!(ty, Some((_, Place::Body)));
+    let control = if body {
+        v.chars()
+            .any(|c| c != '\n' && c != '\t' && ((c as u32) < 0x20 || c == '\u{7f}'))
+    } else {
+        has_control(v)
+    };
+    if control {
         return Err(bad_value(name, "contains a control character"));
     }
-    if let Some((t, is_path)) = ty {
-        if *is_path {
+    if let Some((t, place)) = ty {
+        if *place == Place::Path {
             if let Some(why) = path_value_problem(v) {
                 return Err(bad_value(name, why));
             }

@@ -28,6 +28,31 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         // saiife's own gateway bearer tokens (`saiife api token`).
         (r"saiife_gw_[A-Za-z0-9_-]{20,}", MASK),
         (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", MASK),
+        // Wave 2 and 3 connector services, one alternation (one extra pass
+        // on the hook path). The webhook forms keep their visible host path
+        // prefix and mask the secret remainder.
+        (
+            concat!(
+                r"(?i:(hooks\.slack(?:-gov)?\.com/(?:services|triggers|workflows)/|discord(?:app)?\.com/api/(?:v\d+/)?webhooks/[0-9]+/))[A-Za-z0-9_/-]+",
+                r"|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
+                r"|whsec_[A-Za-z0-9]{24,}",
+                r"|xox[abcdeposr]-[A-Za-z0-9-]{10,}",
+                r"|xoxe(?:\.xox[a-z])?-[A-Za-z0-9-]{10,}",
+                r"|xapp-[A-Za-z0-9-]{10,}",
+                r"|lin_(?:api|oauth)_[A-Za-z0-9]{32,}",
+                r"|sntry[su]_[A-Za-z0-9+/=_-]{20,}",
+                r"|gl(?:pat|dt|ptt|rt|oas|cbt|imt|agent|soat|ft)-[A-Za-z0-9_.-]{20,}",
+                r"|[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,38}",
+                r"|00D[A-Za-z0-9]{12,15}![A-Za-z0-9._]{80,}",
+                r"|dG9rO[A-Za-z0-9+/=_-]{20,}",
+                r"|pat[A-Za-z0-9]{14}\.[a-f0-9]{64}",
+                r"|c[ks]_[a-f0-9]{40}",
+            ),
+            // `${1}` keeps the webhook URL prefix. In every other branch group 1
+            // did not participate, so it expands to the empty string and the
+            // whole match becomes `[MASKED]`.
+            "${1}[MASKED]",
+        ),
     ]
     .into_iter()
     .map(|(p, r)| (Regex::new(p).expect("mask pattern compiles"), r))
@@ -315,5 +340,137 @@ mod tests {
         assert_eq!(mask(input), "echo '[MASKED]' > k");
         let unterminated = "cat <<EOF\n-----BEGIN RSA PRIVATE KEY-----\nAAAA";
         assert_eq!(mask(unterminated), "cat <<EOF\n[MASKED]");
+    }
+
+    #[test]
+    fn wave2_wave3_shapes_masked() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        let cases = [
+            format!("{}_{}_{}", "sk", "live", al('a', 24)),
+            format!("{}_{}_{}", "rk", "test", al('B', 20)),
+            format!("{}_{}", "whsec", al('c', 32)),
+            format!("{}-{}", "xoxb", "1234567890-abcdefghij"),
+            format!("{}-{}", "xapp", "1-A0123456789-abcdef"),
+            format!("{}_{}_{}", "lin", "api", al('d', 40)),
+            format!("{}_{}", concat!("sntr", "ys"), al('e', 40)),
+            format!("{}-{}", "glpat", al('f', 20)),
+            format!("{}-{}", "gldt", al('g', 24)),
+            format!("M{}.{}.{}", al('a', 24), al('b', 6), al('c', 30)),
+            format!("00D{}!{}", al('A', 12), al('b', 90)),
+            format!("{}{}", "dG9rO", al('h', 30)),
+            format!("{}{}.{}", "pat", al('A', 14), al('a', 64)),
+            format!("{}_{}", "ck", al('a', 40)),
+            format!("{}_{}", "cs", al('0', 40)),
+        ];
+        for tok in cases {
+            assert_eq!(mask(&format!("echo {tok} x")), "echo [MASKED] x", "{tok}");
+        }
+        let slack = format!("https://hooks.slack.com/services/T01/B02/{}", al('z', 24));
+        assert_eq!(
+            mask(&format!("curl {slack}")),
+            "curl https://hooks.slack.com/services/[MASKED]"
+        );
+        let discord = format!("https://discord.com/api/webhooks/123456/{}", al('Q', 40));
+        assert_eq!(
+            mask(&format!("curl {discord}")),
+            "curl https://discord.com/api/webhooks/123456/[MASKED]"
+        );
+        let app = format!("https://discordapp.com/api/webhooks/9/{}", al('Q', 40));
+        assert_eq!(mask(&app), "https://discordapp.com/api/webhooks/9/[MASKED]");
+    }
+
+    #[test]
+    fn near_misses_untouched() {
+        let short_lin = format!("{}_{}_{}", "lin", "api", "a".repeat(10));
+        for s in [
+            "sk_live_short",
+            "xoxb-",
+            short_lin.as_str(),
+            "pat",
+            "a pat on the back",
+            "https://hooks.slack.com/services/",
+        ] {
+            assert_eq!(mask(s), s);
+        }
+    }
+
+    #[test]
+    fn sentry_prefixes() {
+        let body = "e".repeat(40);
+        for pre in [concat!("sntr", "ys"), concat!("sntr", "yu")] {
+            assert_eq!(mask(&format!("x {pre}_{body}")), "x [MASKED]");
+        }
+        let bad = format!("{}_{}", concat!("sntr", "y"), body);
+        assert_eq!(mask(&bad), bad);
+    }
+
+    #[test]
+    fn slack_discord_bypasses_closed() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        // Case-insensitive host, extra Slack paths, versioned Discord API.
+        for u in [
+            format!("HTTPS://Hooks.Slack.COM/Services/T1/B2/{}", al('z', 24)),
+            format!("https://hooks.slack.com/triggers/T1/B2/{}", al('z', 24)),
+            format!("https://hooks.slack.com/workflows/T1/B2/{}", al('z', 24)),
+            format!("https://DISCORD.com/api/v10/webhooks/42/{}", al('Q', 40)),
+        ] {
+            let m = mask(&u);
+            assert!(m.ends_with("/[MASKED]"), "{m}");
+            assert!(!m.contains("zzzz") && !m.contains("QQQQ"), "{m}");
+        }
+        // Discord bot token starting with O, 7-char middle, 27-char first.
+        for tok in [
+            format!("O{}.{}.{}", al('a', 25), al('b', 6), al('c', 30)),
+            format!("M{}.{}.{}", al('a', 26), al('b', 7), al('c', 38)),
+        ] {
+            assert_eq!(mask(&format!("t={tok} x")), "t=[MASKED] x");
+        }
+        // A token ending in `-` leaks nothing.
+        let dash = format!("M{}.{}.{}-", al('a', 25), al('b', 6), al('c', 29));
+        assert_eq!(mask(&format!("t={dash} x")), "t=[MASKED] x");
+        // Slack refresh tokens.
+        let plain = format!("{}-{}", concat!("xo", "xe"), "1-abcdefghijkl");
+        let dotted = format!(
+            "{}.{}-{}",
+            concat!("xo", "xe"),
+            concat!("xo", "xp"),
+            "1-abcdefghijkl"
+        );
+        assert_eq!(mask(&plain), "[MASKED]");
+        assert_eq!(mask(&dotted), "[MASKED]");
+        // JWT-like strings must stay untouched (they start with eyJ).
+        let jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
+        assert_eq!(mask(&jwt), jwt);
+    }
+
+    #[test]
+    fn glued_and_extra_shapes() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        let disc = format!("M{}.{}.{}", al('a', 25), al('b', 6), al('c', 30));
+        assert_eq!(mask(&format!("Bot%20{disc}")), "Bot%20[MASKED]");
+        assert_eq!(mask(&format!("x_{disc}")), "x_[MASKED]");
+        assert_eq!(mask(&format!("a\n{disc}")), "a\n[MASKED]");
+        for pre in [concat!("xo", "xc"), concat!("xo", "xd")] {
+            assert_eq!(mask(&format!("{pre}-{}", al('1', 12))), "[MASKED]");
+        }
+        let gl = |p: &str| format!("{p}-{}.01.{}", al('a', 12), al('z', 12));
+        for p in [
+            concat!("gl", "pat"),
+            concat!("gl", "cbt"),
+            concat!("gl", "imt"),
+            concat!("gl", "agent"),
+            concat!("gl", "soat"),
+            concat!("gl", "ft"),
+        ] {
+            assert_eq!(mask(&format!("t {}", gl(p))), "t [MASKED]", "{p}");
+        }
+        let gov = format!("https://hooks.slack-gov.com/services/T1/B2/{}", al('z', 24));
+        assert_eq!(mask(&gov), "https://hooks.slack-gov.com/services/[MASKED]");
+    }
+
+    #[test]
+    fn one_extra_pass_only() {
+        // Twelve rules before wave 2/3, plus exactly one alternation.
+        assert_eq!(RULES.len(), 13);
     }
 }

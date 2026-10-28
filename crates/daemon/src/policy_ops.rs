@@ -3,7 +3,9 @@
 use crate::ops::Ctx;
 use saiife_ipc::msg::{err, ok, ErrorCode, Request, OP_POLICY_RELOAD, OP_POLICY_SHOW};
 use saiife_ipc::peer::PeerCred;
-use saiife_policy::{active_packs, effective_policy, view::user_view};
+use saiife_policy::{
+    active_packs, effective_policy, env_hashes, environment, scope::try_scope_for, view::user_view,
+};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
@@ -64,20 +66,79 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let cfg = Arc::clone(&system);
     let view = tokio::task::spawn_blocking(move || {
         dir.user(&name)?;
-        Some(user_view(&cfg, dir.as_ref(), &name))
+        // A failed group lookup is an error (`Err` outside), never "no
+        // scope, no environment"; a scope conflict is the view's own
+        // `scope_error` (`Err` inside).
+        let env = try_scope_for(&cfg, dir.as_ref(), &name).map(|s| {
+            s.map(|s| s.and_then(|s| s.env.clone()))
+                .map_err(|e| e.to_string())
+        });
+        Some((user_view(&cfg, dir.as_ref(), &name), env))
     })
     .await
     .ok()
     .flatten();
-    let Some(view) = view else {
+    let Some((view, env)) = view else {
         return err(id, ErrorCode::BadRequest, &format!("no user {user:?}"));
+    };
+    let env = match env {
+        Ok(e) => e,
+        Err(e) => {
+            return err(
+                id,
+                ErrorCode::Unavailable,
+                &format!("the scope of {user} cannot be resolved: group lookup failed: {e}"),
+            )
+        }
     };
     let mut m = Map::new();
     m.insert("view".into(), view);
     m.insert("hash".into(), json!(state.hash));
+    // The hash of each environment, so an admin can tell which one a
+    // record's `policy` belongs to.
+    // Admins see every environment's hash; anyone else only their own.
+    let admin = ctx.is_admin(peer.uid).await;
+    let own_env = env.as_ref().ok().cloned().flatten();
+    let hashes: Map<String, Value> = env_hashes(&system, &ctx.catalog)
+        .into_iter()
+        .filter_map(|(e, h)| e.map(|e| (e, json!(h))))
+        .filter(|(e, _)| admin || own_env.as_deref() == Some(e.as_str()))
+        .collect();
+    m.insert("env_hashes".into(), Value::Object(hashes));
     if effective {
-        let (packs, _) = active_packs(&system, &ctx.catalog, None);
-        m.insert("effective".into(), effective_policy(&system, &packs, None));
+        // The policy as this user runs under it: their scope's environment
+        // applied.
+        // A user whose environment cannot be found or applied gets an
+        // error, never the base policy.
+        let env = match env {
+            Ok(e) => e,
+            Err(e) => {
+                return err(
+                    id,
+                    ErrorCode::Unavailable,
+                    &format!("the environment of {user} cannot be resolved: {e}"),
+                )
+            }
+        };
+        let applied = match env.as_deref() {
+            Some(e) => match environment::apply(&system, e) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return err(
+                        id,
+                        ErrorCode::Unavailable,
+                        &format!("the environment of {user} does not apply: {e}"),
+                    )
+                }
+            },
+            None => None,
+        };
+        let cfg = applied.as_ref().unwrap_or(&*system);
+        let (packs, _) = active_packs(cfg, &ctx.catalog, None);
+        m.insert(
+            "effective".into(),
+            effective_policy(cfg, &packs, None, env.as_deref()),
+        );
     }
     ok(id, m)
 }

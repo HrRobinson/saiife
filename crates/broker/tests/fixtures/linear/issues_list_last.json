@@ -1,0 +1,11 @@
+{
+  "_source": "Shape per vendor docs (https://linear.app/developers/pagination); values are synthetic.",
+  "data": {
+    "issues": {
+      "nodes": [
+        {"id": "0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d", "identifier": "ENG-103", "title": "Typo in docs", "url": "https://linear.app/acme/issue/ENG-103", "state": {"name": "Done"}}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": "0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d"}
+    }
+  }
+}

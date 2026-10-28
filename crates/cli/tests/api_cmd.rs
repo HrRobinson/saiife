@@ -180,6 +180,8 @@ users = [{user:?}]
 services = [{scope_services}]
 env = "prod"
 
+[environments.prod]
+
 [services.erp]
 connector = "http"
 base_url = "{base}"
@@ -793,6 +795,10 @@ fn unreadable_audit_month_denies_limits_unavailable() {
 fn reload_mid_request_uses_start_snapshot() {
     let mut w = world();
     let h1 = w.d.status()["policy"].clone();
+    // The scope's environment (prod) has its own hash: the one in records.
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let e1 = connector(&w.d).pop().unwrap()["policy"].clone();
     let child = api_cmd(&w, &["erp", "invoices.block"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -823,12 +829,14 @@ fn reload_mid_request_uses_start_snapshot() {
         .into_iter()
         .find(|r| r["operation"] == "invoices.block")
         .unwrap();
-    assert_eq!(r["policy"], h1);
+    assert_eq!(r["policy"], e1);
     assert_eq!(r["decision"], "allow");
     // A call that starts after the reload runs under the new policy.
     let o = api(&w, &["erp", "invoices.list"]);
     assert_eq!(denied_rule(&o), "default_deny");
-    assert_eq!(connector(&w.d).pop().unwrap()["policy"], h2);
+    let e2 = connector(&w.d).pop().unwrap()["policy"].clone();
+    assert_ne!(e2, e1);
+    assert_ne!(e2, h2, "the env hash, not the base one");
 }
 
 #[test]
@@ -865,6 +873,7 @@ fn connector_record_fields_exact() {
         "operation",
         "capability",
         "env",
+        "collection",
         "params",
         "body_sha256",
         "body_bytes",
@@ -884,7 +893,22 @@ fn connector_record_fields_exact() {
     assert_eq!(r["uid"], common::daemon::own_uid());
     assert_eq!(r["user"], own_user());
     assert_eq!(r["mode"], "locked");
-    assert_eq!(r["policy"], w.d.status()["policy"]);
+    // The scope's environment (prod) is applied: its own hash, not the
+    // base policy's that status reports.
+    assert!(r["policy"].as_str().unwrap().starts_with("sha256:"), "{r}");
+    assert_ne!(r["policy"], w.d.status()["policy"]);
+    // ... and it is exactly the hash `policy show` prints for prod.
+    let shown = base_cmd(&w.d)
+        .args(["policy", "show", "--system-config"])
+        .arg(w.d.config())
+        .output()
+        .unwrap();
+    let shown = stdout(&shown);
+    let prod = shown
+        .lines()
+        .find_map(|l| l.strip_prefix("policy (env prod): "))
+        .unwrap_or_else(|| panic!("no per-env hash in:\n{shown}"));
+    assert_eq!(r["policy"], prod, "record hash is the shown per-env hash");
     assert_eq!(r["project"], w.project.display().to_string());
     assert_eq!(r["tool"], "api");
     assert_eq!(r["input"], "erp invoices.list status=open");
@@ -893,6 +917,7 @@ fn connector_record_fields_exact() {
     assert_eq!(r["operation"], "invoices.list");
     assert_eq!(r["capability"], "invoices:read");
     assert_eq!(r["env"], "prod");
+    assert_eq!(r["collection"], Value::Null);
     assert_eq!(r["params"], json!({"status": "open"}));
     assert_eq!(r["body_sha256"], Value::Null);
     assert_eq!(r["body_bytes"], 0);
@@ -1049,6 +1074,9 @@ fn list_shows_only_scoped_services() {
 fn policy_with_unknown_connector_rejected_on_reload() {
     let mut w = world();
     let h1 = w.d.status()["policy"].clone();
+    let o = api(&w, &["erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let e1 = connector(&w.d).pop().unwrap()["policy"].clone();
     w.opts.extra = format!(
         "{}\n[services.bad]\nconnector = \"nope\"\n",
         policy(w.m.port, "\"erp\"", "")
@@ -1065,7 +1093,7 @@ fn policy_with_unknown_connector_rejected_on_reload() {
     assert_eq!(w.d.status()["policy"], h1);
     let o = api(&w, &["erp", "invoices.list"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(connector(&w.d).pop().unwrap()["policy"], h1);
+    assert_eq!(connector(&w.d).pop().unwrap()["policy"], e1);
 }
 
 #[test]
@@ -1323,4 +1351,80 @@ fn corrupt_token_file_resets() {
     // Tokens work again from scratch.
     let o = api(&w, &["token"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+}
+
+/// A collection (plan 14 Task 5) against the real daemon: each step is one
+/// ordinary `api.call` through the whole pipeline. An allowed step reaches
+/// the upstream; a step the policy denies is denied and recorded as any
+/// call would be, and stops the run; an ask step waits for approval like a
+/// single call. Every record names the collection.
+#[test]
+fn collection_steps_run_the_full_pipeline() {
+    let w = world();
+    let dir = w.project.join(".saiife/collections");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("month-end.toml"),
+        r#"name = "month-end"
+[[step]]
+service = "erp"
+operation = "invoices.list"
+params = { status = "{{status}}" }
+[[step]]
+service = "erp"
+operation = "reports.get"
+[[step]]
+service = "erp"
+operation = "invoices.list"
+"#,
+    )
+    .unwrap();
+    let o = api(&w, &["collection", "run", "month-end", "status=open"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("default_deny"), "{}", stderr(&o));
+    // Only step 1 went upstream, with the filled value.
+    assert_eq!(w.m.hits(), vec!["GET /api/echo?status=open"]);
+    let out: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(out.as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out[0]["status"], 200);
+    // The response masking applies to a step as to any call.
+    assert_eq!(out[0]["data"]["echo"], "[MASKED]");
+    let c = connector(&w.d);
+    assert_eq!(c.len(), 2, "{c:?}");
+    assert_eq!(c[0]["decision"], "allow");
+    assert_eq!(c[0]["input"], "erp invoices.list status=open");
+    assert_eq!(c[1]["decision"], "deny");
+    assert_eq!(c[1]["rule"], "default_deny");
+    for r in &c {
+        assert_eq!(r["collection"], "month-end");
+        assert_eq!(r["via"], "cli");
+    }
+
+    // An ask step: pending, exit 3, nothing sent for it or after it.
+    fs::write(
+        dir.join("bill.toml"),
+        "name = \"bill\"\n[[step]]\nservice = \"erp\"\noperation = \"invoices.create\"\n\
+         body = { amount = 5 }\n[[step]]\nservice = \"erp\"\noperation = \"invoices.list\"\n",
+    )
+    .unwrap();
+    let o = api(&w, &["collection", "run", "bill"]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).contains("pending approval #"), "{}", stderr(&o));
+    assert_eq!(w.m.hits().len(), 1);
+    let c = connector(&w.d);
+    assert_eq!(c.len(), 3, "{c:?}");
+    assert_eq!(c[2]["decision"], "ask");
+    assert_eq!(c[2]["collection"], "bill");
+    // The approval keeps the collection for the record of its send.
+    let id = c[2]["approval"].as_u64().unwrap();
+    let file = w.d.state_dir().join(format!("approvals/{id}.json"));
+    assert!(file.is_file());
+    // The secret never shows in the output or the audit files.
+    assert!(!stdout(&o).contains(SECRET) && !stderr(&o).contains(SECRET));
+    for e in fs::read_dir(w.d.audit_dir()).unwrap().flatten() {
+        if e.path().is_file() {
+            let text = String::from_utf8_lossy(&fs::read(e.path()).unwrap()).into_owned();
+            assert!(!text.contains(SECRET), "{}", e.path().display());
+        }
+    }
 }

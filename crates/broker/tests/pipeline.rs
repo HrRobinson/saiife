@@ -331,6 +331,7 @@ ask = ["refunds:write"]
         config,
         hash: "sha256:test".into(),
         mode: Mode::Locked,
+        env: None,
     }
 }
 
@@ -355,6 +356,7 @@ fn call(op: &str, params: &[(&str, &str)]) -> Call {
         headers: vec![],
         overlay: None,
         via: Via::Cli,
+        collection: None,
     }
 }
 
@@ -513,6 +515,7 @@ async fn ask_creates_pending_no_upstream_call() {
     assert_eq!(stored.stored.operation, "refunds.create");
     assert_eq!(stored.stored.uid, 1001);
     assert_eq!(stored.stored.via, "cli");
+    assert_eq!(stored.stored.env, None);
     assert_eq!(stored.capability.as_deref(), Some("refunds:write"));
     assert_eq!(stored.params.get()["order_id"], "7");
     use base64::Engine as _;
@@ -964,7 +967,8 @@ async fn redact_non_json_withheld() {
 #[tokio::test]
 async fn connector_record_fields_exact() {
     let (_m, up) = mock().await;
-    let snap = snapshot("");
+    let mut snap = snapshot("");
+    snap.env = Some("prod".into());
     let c = call("orders.list", &[("status", "open"), ("limit", "50")]);
     let (o, tr) = run(
         &c,
@@ -1001,6 +1005,7 @@ async fn connector_record_fields_exact() {
         "operation",
         "capability",
         "env",
+        "collection",
         "params",
         "body_sha256",
         "body_bytes",
@@ -1021,6 +1026,7 @@ async fn connector_record_fields_exact() {
     assert_eq!(v["decision"], "allow");
     assert_eq!(v["capability"], "orders:read");
     assert_eq!(v["env"], "prod");
+    assert_eq!(v["collection"], serde_json::Value::Null);
     assert_eq!(
         v["params"],
         serde_json::json!({"status":"open","limit":"50"})
@@ -1245,6 +1251,7 @@ fn snap_of(text: &str) -> PolicySnapshot {
         config: toml::from_str(&format!("version = 2\nlocked = true\n{text}")).unwrap(),
         hash: "sha256:test".into(),
         mode: Mode::Locked,
+        env: None,
     }
 }
 
@@ -1403,4 +1410,216 @@ async fn judge_and_pipeline_agree() {
             rule: "no_scope".into()
         }
     );
+}
+
+/// A form connector on the loopback host: a built refund body (with an
+/// amount from the admin's currency) and a raw form body.
+fn form_manifest(source: &str) -> Manifest {
+    Manifest::parse(&format!(
+        r#"
+id = "test-form"
+version = 1
+title = "Test form"
+base_url = "https://{{shop}}.echo.test/api"
+hosts = ["*.echo.test"]
+auth = [{{ kind = "header", name = "X-Echo-Token", secret_field = "token" }}]
+
+[params.shop]
+type = "string"
+pattern = "^[a-z0-9-]+$"
+required = true
+
+[params.currency]
+type = "string"
+
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/refunds"
+body = "form"
+body_params = {{ charge = "string", amount = "int:1.." }}
+body_const = {{ "metadata.source" = "{source}" }}
+amount = {{ field = "amount", currency_param = "currency", unit = "minor" }}
+
+[[operation]]
+id = "charges.create"
+capability = "charges:write"
+kind = "write"
+method = "POST"
+path = "/charges"
+body = "form"
+"#
+    ))
+    .unwrap()
+}
+
+fn form_snap() -> PolicySnapshot {
+    snap_of(
+        r#"[services.pay]
+connector = "test-form"
+secret = "pay-tok"
+params = { shop = "acme", currency = "EUR" }
+ask = ["refunds:write", "charges:write"]
+"#,
+    )
+}
+
+fn form_catalog(source: &str) -> Catalog {
+    Catalog::new(&[], vec![form_manifest(source)])
+}
+
+#[tokio::test]
+async fn approved_form_and_built_bodies_are_sent() {
+    let (m, up) = mock().await;
+    let (snap, cat, lim, env) = (
+        form_snap(),
+        form_catalog("saiife"),
+        Limiter::new(),
+        env_for("pay"),
+    );
+    // A built body: nothing of the agent's is stored, the params rebuild it.
+    let c = named_call(
+        "pay",
+        "refunds.create",
+        &[("charge", "ch_1"), ("amount", "1250")],
+        None,
+    );
+    let (o, _) = run(&c, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[0].clone();
+    assert_eq!(p.stored.body_b64, None);
+    assert_eq!(p.amount, Some((1250, "EUR".to_string())));
+    assert_eq!(
+        p.body_display.as_deref(),
+        Some("amount=1250&charge=ch_1&metadata%5Bsource%5D=saiife")
+    );
+    let (_, o, tr) = send_approved(&p.stored, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert!(tr.sent);
+    assert_eq!(tr.body_sha256, p.body_sha256);
+    {
+        let seen = m.seen.lock().unwrap();
+        let (_, h, body) = seen.last().unwrap();
+        assert_eq!(
+            &body[..],
+            b"amount=1250&charge=ch_1&metadata%5Bsource%5D=saiife"
+        );
+        assert_eq!(
+            h.get("content-type").unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+    }
+    // A raw agent body on a form op: stored as canonical JSON, sent encoded.
+    let c = named_call(
+        "pay",
+        "charges.create",
+        &[],
+        Some(r#"{ "b": 2, "a": {"x": "y"} }"#),
+    );
+    let (o, _) = run(&c, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[1].clone();
+    assert!(p.stored.body_b64.is_some());
+    let (_, o, tr) = send_approved(&p.stored, &snap, &cat, &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(tr.body_sha256, p.body_sha256);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(&seen.last().unwrap().2[..], b"a%5Bx%5D=y&b=2");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn manifest_change_between_ask_and_send_is_body_changed() {
+    let (m, up) = mock().await;
+    let (snap, lim, env) = (form_snap(), Limiter::new(), env_for("pay"));
+    let c = named_call(
+        "pay",
+        "refunds.create",
+        &[("charge", "ch_1"), ("amount", "1250")],
+        None,
+    );
+    let (o, _) = run(&c, &snap, &form_catalog("saiife"), &lim, &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let p = env.approvals.lock().unwrap()[0].clone();
+    // The admin changed a body constant before the approval was sent: the
+    // rebuilt bytes are not what the approver saw.
+    let changed = form_catalog("other");
+    let (_, o, tr) = send_approved(&p.stored, &snap, &changed, &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "body_changed");
+    assert!(!tr.sent);
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// The pending request keeps the environment of the snapshot it was asked
+/// under; a blob stored before the field existed still reads (env None).
+#[tokio::test]
+async fn stored_call_keeps_env_and_old_blobs_read() {
+    let (_m, up) = mock().await;
+    let env = FakeEnv::ok();
+    let mut snap = snapshot("");
+    snap.env = Some("staging".into());
+    let c = refund_call(&[("order_id", "7")]);
+    let (o, _) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let stored = env.approvals.lock().unwrap().pop().unwrap().stored;
+    assert_eq!(stored.env.as_deref(), Some("staging"));
+
+    let mut v = serde_json::to_value(&stored).unwrap();
+    assert_eq!(v["env"], "staging");
+    let back: saiife_broker::pipeline::StoredCall = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back.env.as_deref(), Some("staging"));
+    // An old blob: no `env` key.
+    v.as_object_mut().unwrap().remove("env");
+    let old: saiife_broker::pipeline::StoredCall = serde_json::from_value(v).unwrap();
+    assert_eq!(old.env, None);
+    assert_eq!(old.operation, "refunds.create");
+    let again = serde_json::to_value(&old).unwrap();
+    let old2: saiife_broker::pipeline::StoredCall = serde_json::from_value(again).unwrap();
+    assert_eq!(old2.env, None);
+    assert_eq!(old2.params, old.params);
+}
+
+/// A collection step is an ordinary call: the record names the collection
+/// (attribution only), and a pending one keeps it through the approval.
+#[tokio::test]
+async fn record_carries_collection() {
+    let (_m, up) = mock().await;
+    let snap = snapshot("");
+    let mut c = call("orders.list", &[("status", "open")]);
+    c.collection = Some("open-orders-report".into());
+    let (o, tr) = run(
+        &c,
+        &snap,
+        &catalog(),
+        &Limiter::new(),
+        &FakeEnv::ok(),
+        Some(&up),
+    )
+    .await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(v["collection"], "open-orders-report");
+    assert_eq!(v["decision"], "allow");
+
+    // An ask: the stored call keeps the collection, so the record of the
+    // approved send carries it too.
+    let env = FakeEnv::ok();
+    let mut c = refund_call(&[("order_id", "7")]);
+    c.collection = Some("refunds".into());
+    let (o, tr) = run(&c, &snap, &catalog(), &Limiter::new(), &env, Some(&up)).await;
+    assert!(matches!(o, Outcome::Pending { .. }), "{o:?}");
+    let v = serde_json::to_value(record(&c, &snap, &tr, &o, "", "0.2.0")).unwrap();
+    assert_eq!(v["collection"], "refunds");
+    let stored = env.approvals.lock().unwrap()[0].stored.clone();
+    assert_eq!(stored.collection.as_deref(), Some("refunds"));
+    let (back, ok) = stored.call();
+    assert!(ok);
+    assert_eq!(back.collection.as_deref(), Some("refunds"));
+    // A stored call without one (sealed before this field) still parses.
+    let mut j = serde_json::to_value(&stored).unwrap();
+    j.as_object_mut().unwrap().remove("collection");
+    let old: saiife_broker::pipeline::StoredCall = serde_json::from_value(j).unwrap();
+    assert_eq!(old.collection, None);
 }

@@ -1,0 +1,12 @@
+{
+  "_source": "https://segment.com/docs/connections/sources/catalog/libraries/server/http-api/#group",
+  "_request": {
+    "userId": "019mr8mf4r",
+    "groupId": "56",
+    "traits": {
+      "name": "Acme",
+      "plan": "Enterprise"
+    }
+  },
+  "success": true
+}

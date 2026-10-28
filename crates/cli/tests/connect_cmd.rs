@@ -309,3 +309,231 @@ fn existing_secret_for_another_service_is_refused() {
     );
     assert!(!policy_file(&d, "shopify.toml").exists());
 }
+
+#[test]
+fn salesforce_connect_stores_an_oauth2_secret() {
+    let d = admin();
+    // Built at runtime: no token-shaped literal in the source.
+    let refresh = format!("5Aep{}", "x7".repeat(20));
+    let secret = format!("cs-{}", "q4".repeat(16));
+    let value = serde_json::json!({
+        "client_id": "3MVG9connect.test",
+        "client_secret": secret,
+        "refresh_token": refresh,
+    })
+    .to_string();
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args([
+            "connect",
+            "salesforce",
+            "--param",
+            "instance_host=acme.my.salesforce.com",
+            "--param",
+            "api_version=v60.0",
+            "--from-env",
+            "CONNECT_TEST_OAUTH",
+            "--config",
+        ])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", d.path().join("data"))
+        .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+        .env("CONNECT_TEST_OAUTH", &value)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let printed = format!("{}{}", err(&o), String::from_utf8_lossy(&o.stdout));
+    for needle in [&refresh, &secret] {
+        assert!(!printed.contains(needle.as_str()));
+    }
+
+    let l = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .args(["secret", "list", "--json", "--system-config"])
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(l.status.success(), "{}", err(&l));
+    let v: Value = serde_json::from_slice(&l.stdout).unwrap();
+    let s = &v["secrets"][0];
+    assert_eq!(s["name"], "salesforce");
+    assert_eq!(s["kind"], "oauth2");
+
+    let text = fs::read_to_string(policy_file(&d, "salesforce.toml")).unwrap();
+    assert!(!text.contains(&refresh) && !text.contains(&secret));
+    let loaded = load_system(&d.config()).expect("loads");
+    validate(&loaded.config, &Catalog::new(builtin(), vec![])).expect("validates");
+}
+
+/// A value that passes the manifest's own check for each required param.
+fn test_params(m: &saiife_broker::manifest::Manifest) -> Vec<String> {
+    const TRIES: [&str; 9] = [
+        "acme.example.com",
+        "acme",
+        "api.intercom.io",
+        "api.segment.io",
+        "2.10",
+        "v60.0",
+        "USD",
+        "ops@example.com",
+        "acme.my.salesforce.com",
+    ];
+    let mut out = Vec::new();
+    for (name, spec) in &m.params {
+        if !spec.required {
+            continue;
+        }
+        let ty = spec.param_type().unwrap();
+        let v = TRIES
+            .iter()
+            .find(|v| ty.check(v).is_ok())
+            .unwrap_or_else(|| panic!("{}.{name}: no test value fits", m.id));
+        out.push("--param".to_string());
+        out.push(format!("{name}={v}"));
+    }
+    out
+}
+
+#[test]
+fn connect_every_builtin_generates_deny_all() {
+    let d = admin();
+    // Built at runtime: no token-shaped literal in the source.
+    let oauth = serde_json::json!({
+        "client_id": "cid-connect-test",
+        "client_secret": format!("cs-{}", "q4".repeat(16)),
+        "refresh_token": format!("rt-{}", "x7".repeat(20)),
+    })
+    .to_string();
+    let basic = format!("user:{}", "pw".repeat(8));
+    for m in builtin() {
+        let value = match m.auth.first().map(|a| a.kind.as_str()) {
+            Some("basic") => basic.clone(),
+            Some("oauth2") => oauth.clone(),
+            _ => TOKEN.to_string(),
+        };
+        let mut args = vec![m.id.as_str()];
+        let given = test_params(m);
+        args.extend(given.iter().map(String::as_str));
+        args.extend(["--from-env", "CONNECT_TEST_VALUE"]);
+        let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+            .arg("connect")
+            .args(&args)
+            .arg("--config")
+            .arg(d.config())
+            .env("HOME", d.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("SAIIFE_DATA_DIR", d.path().join("data"))
+            .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+            .env("CONNECT_TEST_VALUE", &value)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}: {}", m.id, err(&o));
+
+        let loaded = load_system(&d.config()).unwrap_or_else(|e| panic!("{}: {e:?}", m.id));
+        validate(&loaded.config, &Catalog::new(builtin(), vec![]))
+            .unwrap_or_else(|e| panic!("{}: {e}", m.id));
+        let svc = &loaded.config.services[m.id.as_str()];
+        assert!(!m.operation.is_empty());
+        for o in &m.operation {
+            let cap = Capability::parse(&o.capability).unwrap();
+            let params = BTreeMap::new();
+            let v = decide(
+                svc,
+                None,
+                Mode::Locked,
+                &Request {
+                    capability: &cap,
+                    params: &params,
+                },
+            );
+            assert_eq!(
+                v,
+                Verdict::Deny {
+                    rule: "default_deny".into()
+                },
+                "{}.{}",
+                m.id,
+                o.id
+            );
+        }
+    }
+    let listed = secrets(&d);
+    for m in builtin() {
+        assert!(listed.contains(&m.id), "{} has no secret", m.id);
+    }
+}
+
+#[test]
+fn connect_refuses_a_host_param_that_is_not_a_hostname() {
+    let d = admin();
+    // The pattern allows `localhost`; the host rule of `policy check` does not.
+    let o = connect(
+        &d,
+        &[
+            "email",
+            "--param",
+            "smtp_host=localhost",
+            "--param",
+            "imap_host=imap.example.com",
+            "--param",
+            "from=ops@example.com",
+            "--from-env",
+            "CONNECT_TEST_TOKEN",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        err(&o).contains("--param smtp_host: not a bare lower-case hostname"),
+        "{}",
+        err(&o)
+    );
+    assert!(secrets(&d).is_empty());
+    assert!(!policy_file(&d, "email.toml").exists());
+}
+
+#[test]
+fn connect_salesforce_prompts_oauth2_fields() {
+    let d = admin();
+    let base = [
+        "salesforce",
+        "--param",
+        "instance_host=acme.my.salesforce.com",
+        "--param",
+        "api_version=v60.0",
+    ];
+    // No source and no terminal: the paste flow needs a terminal.
+    let o = connect(&d, &base);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("needs a terminal"), "{}", err(&o));
+    // A JSON object that lacks a field is refused by name, without quoting it.
+    let partial = r#"{"client_id":"cid-connect-test","client_secret":"aaaaaaaaaaaaaaaa"}"#;
+    let mut args = base.to_vec();
+    args.extend(["--from-env", "CONNECT_TEST_PARTIAL"]);
+    let o = Command::new(env!("CARGO_BIN_EXE_saiife"))
+        .arg("connect")
+        .args(&args)
+        .arg("--config")
+        .arg(d.config())
+        .env("HOME", d.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAIIFE_DATA_DIR", d.path().join("data"))
+        .env("SAIIFE_AUDIT_DIR", d.audit_dir())
+        .env("CONNECT_TEST_PARTIAL", partial)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        err(&o).contains("client_id, client_secret and refresh_token"),
+        "{}",
+        err(&o)
+    );
+    assert!(!err(&o).contains("aaaaaaaaaaaaaaaa"));
+    assert!(secrets(&d).is_empty());
+    assert!(!policy_file(&d, "salesforce.toml").exists());
+}

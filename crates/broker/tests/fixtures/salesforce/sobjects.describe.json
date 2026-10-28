@@ -1,0 +1,9 @@
+{
+  "name": "Account",
+  "label": "Account",
+  "keyPrefix": "001",
+  "fields": [
+    { "name": "Id", "type": "id", "label": "Account ID", "nillable": false },
+    { "name": "Name", "type": "string", "label": "Account Name", "length": 255 }
+  ]
+}

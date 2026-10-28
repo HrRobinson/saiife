@@ -1,0 +1,452 @@
+//! Messages in and out (plan 14, Task 6).
+//!
+//! - [`compose`] writes the `mail.send` DATA section: RFC 5322 headers, a
+//!   UTF-8 `text/plain` body in quoted-printable, dot-stuffed, ended with
+//!   `.\r\n`. A CR, LF or other control character in a header value is
+//!   refused, never folded into a new header.
+//! - [`get_json`] turns a fetched message into the `mail.get` answer with
+//!   mail-parser: `{uid, from, to, cc, subject, date, text, html,
+//!   attachments: [{name, type, size}]}`. Attachment content never leaves.
+
+use crate::mask::Masker;
+use base64::Engine as _;
+use mail_parser::{Address, MessageParser, MimeHeaders};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+
+/// The longest line of quoted-printable output, the `=` of a soft break
+/// included (RFC 2045 §6.7).
+const QP_LINE: usize = 76;
+/// The longest UTF-8 run in one encoded word: its base64 is 56 characters,
+/// so `=?UTF-8?B?...?=` is 68, within 75 (RFC 2047 §2), and the first line,
+/// `Subject: ` included, within 78 (RFC 5322 §2.1.1).
+const WORD_BYTES: usize = 42;
+
+/// One outgoing message.
+pub struct Outgoing<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub date: OffsetDateTime,
+}
+
+/// The DATA section of `o`, or why it cannot be sent (no value in the
+/// reason).
+pub fn compose(o: &Outgoing<'_>) -> Result<String, String> {
+    for (name, v) in [("from", o.from), ("to", o.to)] {
+        if !super::address_ok(v) {
+            return Err(format!("{name} is not one plain address"));
+        }
+    }
+    if o.subject.chars().any(char::is_control) {
+        return Err("the subject has a control character".into());
+    }
+    let date = o
+        .date
+        .format(&time::format_description::well_known::Rfc2822)
+        .map_err(|_| "the date cannot be formatted".to_string())?;
+    let domain = o.from.rsplit('@').next().unwrap_or("saiife.invalid");
+    let mut out = String::new();
+    out.push_str(&format!("From: <{}>\r\n", o.from));
+    out.push_str(&format!("To: <{}>\r\n", o.to));
+    out.push_str(&format!("Subject: {}\r\n", subject(o.subject)));
+    out.push_str(&format!("Date: {date}\r\n"));
+    out.push_str(&format!(
+        "Message-ID: <{}.saiife@{domain}>\r\n",
+        message_id(o)
+    ));
+    out.push_str("MIME-Version: 1.0\r\n");
+    out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    out.push_str("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+    for line in quoted_printable(o.body).split_inclusive("\r\n") {
+        // Dot-stuffing (RFC 5321 §4.5.2).
+        if line.starts_with('.') {
+            out.push('.');
+        }
+        out.push_str(line);
+    }
+    out.push_str(".\r\n");
+    Ok(out)
+}
+
+/// A unique-enough id from the time and the message.
+fn message_id(o: &Outgoing<'_>) -> String {
+    let mut h = Sha256::new();
+    h.update(o.date.unix_timestamp_nanos().to_be_bytes());
+    for part in [o.from, o.to, o.subject, o.body] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    h.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The `Subject` value: as is when it is short printable ASCII, else
+/// UTF-8 encoded words folded one per line.
+fn subject(s: &str) -> String {
+    if s.len() <= 66 && s.bytes().all(|b| (0x20..0x7f).contains(&b)) && !s.contains("=?") {
+        return s.to_string();
+    }
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        if cur.len() + c.len_utf8() > WORD_BYTES {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() || words.is_empty() {
+        words.push(cur);
+    }
+    words
+        .iter()
+        .map(|w| {
+            format!(
+                "=?UTF-8?B?{}?=",
+                base64::engine::general_purpose::STANDARD.encode(w.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n ")
+}
+
+/// `body` as quoted-printable UTF-8 with CRLF line ends: a line break of
+/// the text (LF or CRLF) is a hard break, a lone CR is `=0D`, and lines are
+/// cut with soft breaks at [`QP_LINE`].
+pub fn quoted_printable(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + body.len() / 8);
+    let text = body.replace("\r\n", "\n");
+    for line in text.split('\n') {
+        let bytes = line.as_bytes();
+        let mut col = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            let last = i + 1 == bytes.len();
+            let lit = match b {
+                b' ' | b'\t' => !last,
+                b'=' => false,
+                33..=126 => true,
+                _ => false,
+            };
+            let enc = if lit {
+                (b as char).to_string()
+            } else {
+                format!("={b:02X}")
+            };
+            if col + enc.len() > QP_LINE - 1 {
+                out.push_str("=\r\n");
+                col = 0;
+            }
+            out.push_str(&enc);
+            col += enc.len();
+        }
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// `[{name, address}]` of a header's addresses (groups flattened).
+fn addresses(a: Option<&Address<'_>>) -> Value {
+    let Some(a) = a else {
+        return json!([]);
+    };
+    Value::Array(
+        a.iter()
+            .map(|x| json!({ "name": x.name(), "address": x.address() }))
+            .collect(),
+    )
+}
+
+/// The bytes `c` takes inside a JSON string as serde_json writes it.
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The longest prefix of `s` (on a char boundary) whose JSON escaping takes
+/// at most `budget` bytes; `true` when that is not all of `s`.
+fn cut_escaped(s: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += json_len(c);
+        if used > budget {
+            return (&s[..i], true);
+        }
+    }
+    (s, false)
+}
+
+/// The size of `v` as JSON.
+fn json_size(v: &Value) -> usize {
+    serde_json::to_string(v).map_or(usize::MAX, |s| s.len())
+}
+
+/// The `mail.get` answer for message `uid`, from its raw bytes. The JSON
+/// fits in `max` bytes: `text`, then `html`, are cut to the room the rest
+/// leaves (after escaping), with `"truncated": true` when anything was cut.
+/// A fifteenth of `max` is kept free, so masking in step 10 (which may
+/// lengthen a short value) does not push the answer past `max` and break
+/// the JSON there.
+///
+/// `text`, `html` and the subject are masked with `masker` (the
+/// credential's values and the v1 patterns) **before** they are measured
+/// and cut: a cut inside a secret would leave a prefix step 10 can no
+/// longer recognize. Step 10 masks the whole answer again.
+pub fn get_json(uid: u32, raw: &[u8], max: usize, masker: &Masker) -> Value {
+    let Some(msg) = MessageParser::default().parse(raw) else {
+        return json!({
+            "uid": uid, "from": [], "to": [], "cc": [], "subject": null,
+            "date": null, "text": null, "html": null, "attachments": [],
+        });
+    };
+    let text = msg
+        .text_bodies()
+        .find(|p| !p.is_text_html())
+        .and_then(|p| p.text_contents());
+    let html = msg
+        .html_bodies()
+        .find(|p| p.is_text_html())
+        .and_then(|p| p.text_contents());
+    let attachments: Vec<Value> = msg
+        .attachments()
+        .map(|p| {
+            let ty = p.content_type().map(|c| match &c.c_subtype {
+                Some(sub) => format!("{}/{sub}", c.c_type),
+                None => c.c_type.to_string(),
+            });
+            json!({ "name": p.attachment_name(), "type": ty, "size": p.len() })
+        })
+        .collect();
+    let mut v = json!({
+        "uid": uid,
+        "from": addresses(msg.from()),
+        "to": addresses(msg.to()),
+        "cc": addresses(msg.cc()),
+        "subject": msg.subject().map(|s| masker.mask_text(s)),
+        "date": msg.date().map(|d| d.to_rfc3339()),
+        "text": null,
+        "html": null,
+        "attachments": attachments,
+    });
+    // 64 bytes for `"truncated":true` and the quotes of the two bodies.
+    let room = max.saturating_sub(max / 16).saturating_sub(64);
+    let mut cut = false;
+    // Metadata too large on its own (a huge recipient list): dropped, in
+    // this order, until it fits.
+    for key in ["attachments", "cc", "to", "from"] {
+        if json_size(&v) <= room {
+            break;
+        }
+        v[key] = json!([]);
+        cut = true;
+    }
+    if json_size(&v) > room {
+        v["subject"] = Value::Null;
+        cut = true;
+    }
+    let mut left = room.saturating_sub(json_size(&v));
+    for (key, body) in [("text", text), ("html", html)] {
+        let Some(body) = body else { continue };
+        // Masked first, then cut.
+        let body = masker.mask_text(body);
+        let (kept, was_cut) = cut_escaped(&body, left);
+        left = left.saturating_sub(kept.chars().map(json_len).sum::<usize>());
+        cut |= was_cut;
+        v[key] = Value::String(kept.to_string());
+    }
+    if cut {
+        v["truncated"] = Value::Bool(true);
+    }
+    v
+}
+
+/// Decodes RFC 2047 encoded words in a header value from an IMAP envelope
+/// (a subject or a display name), lossily.
+pub fn header_text(raw: &[u8]) -> String {
+    let mut doc = b"Subject: ".to_vec();
+    doc.extend(
+        raw.iter()
+            .map(|&b| if b == b'\r' || b == b'\n' { b' ' } else { b }),
+    );
+    doc.extend_from_slice(b"\r\n\r\n");
+    MessageParser::default()
+        .parse(&doc)
+        .and_then(|m| m.subject().map(str::to_string))
+        .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
+}
+
+/// An envelope date as RFC 3339, or `None` when it does not parse.
+pub fn header_date(raw: &[u8]) -> Option<String> {
+    let mut doc = b"Date: ".to_vec();
+    doc.extend(
+        raw.iter()
+            .map(|&b| if b == b'\r' || b == b'\n' { b' ' } else { b }),
+    );
+    doc.extend_from_slice(b"\r\n\r\n");
+    let m = MessageParser::default().parse(&doc)?;
+    m.date().map(|d| d.to_rfc3339())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn out(subject: &str, body: &str) -> Result<String, String> {
+        compose(&Outgoing {
+            from: "bot@acme.com",
+            to: "a@acme.com",
+            subject,
+            body,
+            date: OffsetDateTime::UNIX_EPOCH,
+        })
+    }
+
+    #[test]
+    fn crlf_in_a_header_is_refused() {
+        assert!(out("hi\r\nBcc: evil@x", "b").is_err());
+        assert!(out("hi\nBcc: evil@x", "b").is_err());
+        assert!(compose(&Outgoing {
+            from: "bot@acme.com",
+            to: "a@acme.com\r\nBcc: b@evil.test",
+            subject: "s",
+            body: "b",
+            date: OffsetDateTime::UNIX_EPOCH,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn body_is_quoted_printable_and_dot_stuffed() {
+        let d = out("hi", "one\n.two\r\nth\u{e9} = x \n").unwrap();
+        assert!(
+            d.contains("\r\n\r\none\r\n..two\r\nth=C3=A9 =3D x=20\r\n\r\n.\r\n"),
+            "{d}"
+        );
+        assert!(d.contains("Content-Transfer-Encoding: quoted-printable\r\n"));
+        assert!(
+            d.contains("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn long_lines_get_soft_breaks() {
+        let qp = quoted_printable(&"\u{e9}".repeat(100));
+        for l in qp.split("\r\n") {
+            assert!(l.len() <= QP_LINE, "{l}");
+        }
+        assert!(qp.contains("=\r\n"));
+    }
+
+    #[test]
+    fn utf8_subject_is_encoded_words() {
+        let d = out("Grüße aus Århus", "b").unwrap();
+        assert!(d.contains("Subject: =?UTF-8?B?"), "{d}");
+        let parsed = MessageParser::default().parse(d.as_bytes()).unwrap();
+        assert_eq!(parsed.subject(), Some("Grüße aus Århus"));
+        let long = "ä".repeat(300);
+        let d = out(&long, "b").unwrap();
+        let parsed = MessageParser::default().parse(d.as_bytes()).unwrap();
+        assert_eq!(parsed.subject(), Some(long.as_str()));
+        for l in d.split("\r\n") {
+            assert!(l.len() <= 78, "{l}");
+        }
+    }
+
+    #[test]
+    fn composed_body_round_trips() {
+        let body = "line one\n.leading dot\ntrailing space \nünïcödé = yes";
+        let d = out("s", body).unwrap();
+        // Undo the dot-stuffing and the terminator, as a server does.
+        let msg: String = d
+            .strip_suffix(".\r\n")
+            .unwrap()
+            .split_inclusive("\r\n")
+            .map(|l| l.strip_prefix('.').unwrap_or(l))
+            .collect();
+        let parsed = MessageParser::default().parse(msg.as_bytes()).unwrap();
+        let text = parsed.body_text(0).unwrap();
+        assert_eq!(text.replace("\r\n", "\n").trim_end(), body);
+    }
+
+    #[test]
+    fn get_json_fits_max_and_says_truncated() {
+        let text = "a\"b\\c\u{1}\n".repeat(5000);
+        let html = format!("<p>{}</p>", "é<\"".repeat(5000));
+        let raw = format!(
+            "From: a@acme.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n\
+             --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--b--\r\n"
+        );
+        for max in [0, 100, 1000, 20_000, 60_000] {
+            let v = get_json(7, raw.as_bytes(), max, &Masker::new(&[]));
+            let out = serde_json::to_string(&v).unwrap();
+            if max >= 1000 {
+                assert!(out.len() <= max, "{max}: {}", out.len());
+            }
+            assert_eq!(v["truncated"], true, "{max}");
+            // Valid JSON that reads back.
+            let back: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(back["uid"], 7);
+        }
+        // With room for all, nothing is cut and nothing says so.
+        let v = get_json(7, raw.as_bytes(), 10_000_000, &Masker::new(&[]));
+        assert!(v.get("truncated").is_none());
+        assert_eq!(v["text"].as_str().unwrap().trim_end(), text.trim_end());
+    }
+
+    /// Every prefix of `secret` of 4 or more characters.
+    fn prefixes(secret: &str) -> Vec<&str> {
+        (4..=secret.len()).map(|n| &secret[..n]).collect()
+    }
+
+    #[test]
+    fn secret_at_the_cut_never_leaks_a_prefix() {
+        let secret = concat!("mail", "-pw-", "Zq8", "vault-value").to_string();
+        let masker = Masker::new(&[secret.as_str()]);
+        let text = format!("{}{secret}{}", "a".repeat(300), "b".repeat(300));
+        let html = format!("<p>{}{secret}{}</p>", "c".repeat(200), "d".repeat(200));
+        let raw = format!(
+            "From: a@acme.com\r\nSubject: about {secret}\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n\
+             --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n--b--\r\n"
+        );
+        // Every max from "nothing fits" to "all fits", so the cut lands at
+        // every offset of the secret in text and in html.
+        let mut cut_lengths = std::collections::BTreeSet::new();
+        for max in 300..2000 {
+            let v = get_json(7, raw.as_bytes(), max, &masker);
+            let out = serde_json::to_string(&v).unwrap();
+            for p in prefixes(&secret) {
+                assert!(!out.contains(p), "max {max} leaks {p:?}: {out}");
+            }
+            if v["truncated"] == true {
+                cut_lengths.insert(v["text"].as_str().map_or(0, str::len));
+            }
+        }
+        // The sweep did cut the text at many lengths.
+        assert!(cut_lengths.len() > 300, "{}", cut_lengths.len());
+        // Unmasked, the same sweep would leak: the test can see a leak.
+        let mut leaked = false;
+        for max in 300..2000 {
+            let v = get_json(7, raw.as_bytes(), max, &Masker::new(&[]));
+            let t = v["text"].as_str().unwrap_or("");
+            leaked |= prefixes(&secret).iter().any(|p| t.ends_with(p)) && !t.contains(&secret);
+        }
+        assert!(leaked);
+    }
+
+    #[test]
+    fn header_text_decodes_encoded_words() {
+        assert_eq!(header_text(b"=?UTF-8?B?R3LDvMOfZQ==?="), "Grüße");
+        assert_eq!(header_text(b"plain"), "plain");
+    }
+}

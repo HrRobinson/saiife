@@ -1,0 +1,65 @@
+# Email: SMTP send, read-only IMAP (transport "mail", plan 14 Task 6).
+# Protocols: RFC 5321 (SMTP), RFC 3501 (IMAP4rev1, EXAMINE and BODY.PEEK only),
+# RFC 4616 (AUTHENTICATE PLAIN). No vendor API, so nothing to fetch.
+# The shape of a mail manifest is enforced by `mail::check_manifest`.
+id = "email"
+version = 1
+title = "Email (SMTP send, IMAP read)"
+hosts = ["{smtp_host}", "{imap_host}"]
+transport = "mail"
+auth = [{ kind = "basic" }]
+
+[params.smtp_host]
+type = "string"
+pattern = '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
+required = true
+
+[params.smtp_port]
+type = "int:1..65535"
+
+[params.smtp_tls]
+type = "enum:implicit,starttls"
+
+[params.imap_host]
+type = "string"
+pattern = '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'
+required = true
+
+[params.imap_port]
+type = "int:1..65535"
+
+[params.imap_tls]
+type = "enum:implicit,starttls"
+
+[params.from]                    # the sender address; set by the admin, never by the agent
+type = "string"
+pattern = '^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}$'
+required = true
+
+[[operation]]
+id = "mail.send"
+capability = "mail:write"
+qualifier = "to={to}"
+kind = "write"
+body = "text"
+query = { to = 'string:[^@\s,;<>%!]{1,64}@[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*', subject = "string:.{1,998}" }
+
+[[operation]]
+id = "folders.list"
+capability = "folders:read"
+kind = "read"
+
+[[operation]]
+id = "mail.list"
+capability = "mail:read"
+qualifier = "folder={folder}"
+kind = "read"
+query = { folder = "string", since = "datetime", unseen = "bool", limit = "int:1..100", before_uid = "int" }
+pagination = { cursor = { param = "before_uid", next = "next_before_uid" } }
+
+[[operation]]
+id = "mail.get"
+capability = "mail:read"
+qualifier = "folder={folder}"
+kind = "read"
+query = { folder = "string", uid = "int" }

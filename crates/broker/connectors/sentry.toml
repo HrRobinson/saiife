@@ -1,0 +1,77 @@
+# Sentry Web API (sentry.io or self-hosted). Paths checked against the vendor
+# reference (shape per vendor docs; not fetched, no network in this build):
+#   https://docs.sentry.io/api/projects/list-your-projects/
+#   https://docs.sentry.io/api/events/list-a-projects-issues/
+#   https://docs.sentry.io/api/events/retrieve-an-issue/
+#   https://docs.sentry.io/api/events/list-an-issues-events/
+#   https://docs.sentry.io/api/events/retrieve-the-latest-event-for-an-issue/
+#   https://docs.sentry.io/api/events/update-an-issue/
+#   https://docs.sentry.io/api/pagination/   (Link header, results="false" ends)
+id = "sentry"
+version = 1
+title = "Sentry"
+base_url = "https://{host}/api/0"
+hosts = ["{host}"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.host]                    # set by the admin in the service config, never by the agent
+type = "string"
+pattern = "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+required = true
+
+[[operation]]
+id = "projects.list"
+capability = "projects:read"
+kind = "read"
+method = "GET"
+path = "/organizations/{org}/projects/"
+path_params = { org = "string:[a-z0-9_-]{1,50}" }
+query = { cursor = "string:[A-Za-z0-9:_-]{1,256}" }
+pagination = "link-header"
+
+[[operation]]
+id = "issues.list"
+capability = "issues:read"
+qualifier = "project={project}"
+kind = "read"
+method = "GET"
+path = "/projects/{org}/{project}/issues/"
+path_params = { org = "string:[a-z0-9_-]{1,50}", project = "string:[a-z0-9_-]{1,50}" }
+query = { query = "string:.{1,256}", statsPeriod = "enum:24h,14d", cursor = "string:[A-Za-z0-9:_-]{1,256}" }
+pagination = "link-header"
+
+[[operation]]
+id = "issues.get"
+capability = "issues:read"
+kind = "read"
+method = "GET"
+path = "/organizations/{org}/issues/{issue_id}/"
+path_params = { org = "string:[a-z0-9_-]{1,50}", issue_id = "int" }
+
+[[operation]]
+id = "issues.events"
+capability = "events:read"
+kind = "read"
+method = "GET"
+path = "/organizations/{org}/issues/{issue_id}/events/"
+path_params = { org = "string:[a-z0-9_-]{1,50}", issue_id = "int" }
+query = { cursor = "string:[A-Za-z0-9:_-]{1,256}", full = "bool" }
+pagination = "link-header"
+
+[[operation]]
+id = "events.latest"
+capability = "events:read"
+kind = "read"
+method = "GET"
+path = "/organizations/{org}/issues/{issue_id}/events/latest/"
+path_params = { org = "string:[a-z0-9_-]{1,50}", issue_id = "int" }
+
+[[operation]]
+id = "issues.update"
+capability = "issues:write"
+kind = "write"
+method = "PUT"
+path = "/organizations/{org}/issues/{issue_id}/"
+path_params = { org = "string:[a-z0-9_-]{1,50}", issue_id = "int" }
+body = "json"

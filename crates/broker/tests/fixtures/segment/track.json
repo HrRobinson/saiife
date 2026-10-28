@@ -1,0 +1,13 @@
+{
+  "_source": "https://segment.com/docs/connections/sources/catalog/libraries/server/http-api/#track (values synthetic)",
+  "_request": {
+    "userId": "019mr8mf4r",
+    "event": "Order Completed",
+    "properties": {
+      "revenue": 39.95,
+      "shippingMethod": "Premium"
+    },
+    "timestamp": "2026-09-01T10:00:00Z"
+  },
+  "success": true
+}

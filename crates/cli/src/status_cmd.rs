@@ -15,7 +15,7 @@ use saiife_agents::{lock, Agent};
 use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
 use saiife_policy::installed::{read_installed, FileKind, Installed};
-use saiife_policy::{active_packs, effective_policy, load_system, policy_hash, PackInfo};
+use saiife_policy::{load_system, PackInfo};
 use saiife_system::layout::{CONFIG, INSTALLED};
 use saiife_system::{host_for, Host, Layout};
 use saiifeguard::canon::PathVars;
@@ -847,11 +847,12 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
                     rules: Vec::new(),
                 })
                 .collect();
-            let (packs, _) = active_packs(&l.config, &catalog, None);
-            outln!(
-                "  policy: {}",
-                policy_hash(&effective_policy(&l.config, &packs, None))
-            );
+            for (env, hash) in saiife_policy::env_hashes(&l.config, &catalog) {
+                match env {
+                    None => outln!("  policy: {hash}"),
+                    Some(e) => outln!("  policy (env {}): {hash}", sanitize(&e)),
+                }
+            }
         }
         Err(e) => {
             st.failed = true;

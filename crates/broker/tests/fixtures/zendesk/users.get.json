@@ -1,0 +1,10 @@
+{
+  "_source": "https://developer.zendesk.com/api-reference/ticketing/users/users/#show-user",
+  "user": {
+    "id": 20978392,
+    "name": "Ada Lovelace",
+    "email": "ada@example.test",
+    "role": "end-user",
+    "active": true
+  }
+}

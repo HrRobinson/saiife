@@ -1,0 +1,14 @@
+{
+  "_source": "https://woocommerce.github.io/woocommerce-rest-api-docs/#list-all-customers",
+  "_link": "<https://shop.acme.test/wp-json/wc/v3/customers?page=2>; rel=\"next\"",
+  "data": [
+    {
+      "id": 25,
+      "email": "john.doe@example.test",
+      "first_name": "John",
+      "last_name": "Doe",
+      "role": "customer",
+      "username": "john.doe"
+    }
+  ]
+}

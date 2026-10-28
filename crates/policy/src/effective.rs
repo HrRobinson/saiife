@@ -59,9 +59,17 @@ pub fn active_packs(
     (packs, warnings)
 }
 
-/// `{"saiife_policy":1,"system":…,"packs":[{"id","version"}],"project":…|null}`.
+/// `{"saiife_policy":1,"system":…,"packs":[{"id","version"}],"project":…|null,"env":…|null}`.
 /// Durations in `system` are whole seconds; `project` leaves out the notes.
-pub fn effective_policy(cfg: &SystemConfig, packs: &[PackInfo], project: Option<&Merged>) -> Value {
+/// With an environment, `cfg` is the config it was applied to
+/// ([`crate::environment::apply`]) and `env` names it, so each environment
+/// has its own hash.
+pub fn effective_policy(
+    cfg: &SystemConfig,
+    packs: &[PackInfo],
+    project: Option<&Merged>,
+    env: Option<&str>,
+) -> Value {
     // Plain data with string keys: serialization cannot fail.
     let system = serde_json::to_value(cfg).unwrap_or(Value::Null);
     let project = project
@@ -76,6 +84,7 @@ pub fn effective_policy(cfg: &SystemConfig, packs: &[PackInfo], project: Option<
         "system": system,
         "packs": packs,
         "project": project,
+        "env": env,
     })
 }
 
@@ -171,7 +180,7 @@ mod tests {
 
     fn hash_of(c: &SystemConfig, cat: &[PackInfo], m: Option<&Merged>) -> String {
         let (packs, _) = active_packs(c, cat, m);
-        policy_hash(&effective_policy(c, &packs, m))
+        policy_hash(&effective_policy(c, &packs, m, None))
     }
 
     #[test]
@@ -208,7 +217,7 @@ mod tests {
         let c = cfg("version = 2\n");
         let (packs, w) = active_packs(&c, &catalog(), None);
         assert!(w.is_empty());
-        let v = effective_policy(&c, &packs, None);
+        let v = effective_policy(&c, &packs, None, None);
         assert_eq!(v["saiife_policy"], 1);
         assert_eq!(v["project"], Value::Null);
         assert_eq!(v["system"]["audit"]["checkpoint_interval"], 900);

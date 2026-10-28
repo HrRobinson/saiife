@@ -356,7 +356,7 @@ fn add_refuses_when_vault_undecryptable() {
 }
 
 #[test]
-fn unsupported_kind_refused() {
+fn aws_kind_still_refused_with_plan_15() {
     let d = admin();
     let o = saiife(
         &d,
@@ -364,7 +364,7 @@ fn unsupported_kind_refused() {
             "add",
             "k1",
             "--kind",
-            "oauth2",
+            "aws",
             "--service",
             "s",
             "--from-env",
@@ -374,7 +374,7 @@ fn unsupported_kind_refused() {
     );
     assert_eq!(o.status.code(), Some(2));
     assert!(
-        err(&o).contains("kind oauth2 comes with plans 14–15"),
+        err(&o).contains("kind aws comes with plan 15"),
         "{}",
         err(&o)
     );
@@ -385,17 +385,102 @@ fn unsupported_kind_refused() {
         .call(
             "secret.add",
             serde_json::from_value(json!({
-                "name": "k1", "kind": "oauth2",
+                "name": "k1", "kind": "aws",
                 "fields": {"token": "valuevalue"}, "allowed_services": ["s"]
             }))
             .unwrap(),
             common::daemon::dl(),
         )
         .unwrap_err();
-    assert!(
-        e.to_string().contains("kind oauth2 comes with plans 14–15"),
-        "{e}"
+    assert!(e.to_string().contains("kind aws comes with plan 15"), "{e}");
+}
+
+#[test]
+fn secret_add_oauth2_fields() {
+    let d = admin();
+    let secret = format!("cs-{}", "7a".repeat(10));
+    let refresh = format!("rt-{}", "b4".repeat(10));
+    let v =
+        json!({"client_id": "cid", "client_secret": secret, "refresh_token": refresh}).to_string();
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "sf",
+            "--kind",
+            "oauth2",
+            "--service",
+            "sf",
+            "--from-env",
+            "SV",
+        ],
+        &[("SV", &v)],
     );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let l = list_json(&d);
+    assert_eq!(l["secrets"][0]["name"], "sf");
+    assert_eq!(l["secrets"][0]["kind"], "oauth2");
+    // Not the three fields: refused by the CLI, without quoting the input.
+    let bad = json!({"client_id": "cid", "refresh_token": refresh}).to_string();
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "sf2",
+            "--kind",
+            "oauth2",
+            "--service",
+            "sf",
+            "--from-env",
+            "SV",
+        ],
+        &[("SV", &bad)],
+    );
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("client_id, client_secret and refresh_token"));
+    // A key twice: refused, though the object has three distinct keys.
+    let dup = format!(
+        r#"{{"client_id":"cid","client_secret":"{secret}","refresh_token":"{refresh}","refresh_token":"rt-dup-{}"}}"#,
+        "d0".repeat(8)
+    );
+    let o = saiife(
+        &d,
+        &[
+            "add",
+            "sf3",
+            "--kind",
+            "oauth2",
+            "--service",
+            "sf",
+            "--from-env",
+            "SV",
+        ],
+        &[("SV", &dup)],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("client_id, client_secret and refresh_token"));
+    assert!(!err(&o).contains(&refresh) && !err(&o).contains("rt-dup-"));
+    // Rotate reads the same shape (the stored kind says so).
+    let f = d.path().join("oauth.json");
+    let refresh2 = format!("rt-{}", "c5".repeat(10));
+    fs::write(
+        &f,
+        json!({"client_id": "cid", "client_secret": secret, "refresh_token": refresh2}).to_string(),
+    )
+    .unwrap();
+    let o = saiife(
+        &d,
+        &["rotate", "sf", "--from-file", f.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let mut hay = String::from_utf8_lossy(&o.stderr).into_owned();
+    for e in fs::read_dir(d.audit_dir()).unwrap() {
+        hay.push_str(&fs::read_to_string(e.unwrap().path()).unwrap_or_default());
+    }
+    for n in [&secret, &refresh, &refresh2] {
+        assert!(!hay.contains(n.as_str()), "{n} leaked");
+    }
 }
 
 #[test]

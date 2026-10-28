@@ -1,0 +1,58 @@
+# Discord API v10. Paths and fields checked against the vendor reference
+# (shape per vendor docs; no network in the build):
+#   https://discord.com/developers/docs/resources/guild#get-guild-channels
+#   https://discord.com/developers/docs/resources/channel#get-channel
+#   https://discord.com/developers/docs/resources/message#get-channel-messages
+#   https://discord.com/developers/docs/resources/message#create-message
+# The messages list has no `next` field: pass the id of the last message as
+# `before=<id>` for the next page.
+id = "discord"
+version = 1
+title = "Discord"
+base_url = "https://discord.com/api/v10"
+hosts = ["discord.com"]
+auth = [{ kind = "header", name = "Authorization", prefix = "Bot ", secret_field = "token" }]
+request_headers = ["Accept"]
+headers = { User-Agent = "DiscordBot (https://saiife.com, 1)" }
+
+[[operation]]
+id = "guilds.channels"
+capability = "channels:read"
+qualifier = "guild={guild_id}"
+kind = "read"
+method = "GET"
+path = "/guilds/{guild_id}/channels"
+path_params = { guild_id = "string:[0-9]{1,20}" }
+
+[[operation]]
+id = "channels.get"
+capability = "channels:read"
+qualifier = "channel={channel_id}"
+kind = "read"
+method = "GET"
+path = "/channels/{channel_id}"
+path_params = { channel_id = "string:[0-9]{1,20}" }
+
+[[operation]]
+id = "messages.list"
+capability = "messages:read"
+qualifier = "channel={channel_id}"
+kind = "read"
+method = "GET"
+path = "/channels/{channel_id}/messages"
+path_params = { channel_id = "string:[0-9]{1,20}" }
+query = { limit = "string:[0-9]{1,20}", before = "string:[0-9]{1,20}", after = "string:[0-9]{1,20}" }
+
+# `allowed_mentions.parse = []` makes the message ping nobody: an agent cannot
+# send an @everyone, @here, role or user mention that notifies.
+[[operation]]
+id = "messages.create"
+capability = "messages:write"
+qualifier = "channel={channel_id}"
+kind = "write"
+method = "POST"
+path = "/channels/{channel_id}/messages"
+path_params = { channel_id = "string:[0-9]{1,20}" }
+body = "json"
+body_params = { content = "string:(?s).{1,2000}" }
+body_const = { "allowed_mentions.parse" = [] }

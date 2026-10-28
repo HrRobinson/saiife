@@ -139,6 +139,15 @@ pub struct Request {
     pub amount: Option<Amount>,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    /// The environment a connector request was asked under (its
+    /// snapshot's), shown to approvers; absent for the base config, a
+    /// command request, or a request stored before environments existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// The connector request was asked under the base config (no
+    /// environment), as recorded at the ask: shown as `env base`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub env_base: bool,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -201,6 +210,10 @@ pub struct SendDisplay {
     pub body_truncated: bool,
     pub amount: Option<Amount>,
     pub headers: Vec<(String, String)>,
+    /// [`Request::env`].
+    pub env: Option<String>,
+    /// [`Request::env_base`].
+    pub env_base: bool,
 }
 
 /// Which requests [`Store::list`] returns: `None`/empty means any.
@@ -336,11 +349,15 @@ pub fn summary(r: &Request) -> String {
 }
 
 /// What may leave the host about `r` (a notification): the service and
-/// operation of a connector request; for a command only
+/// operation of a connector request, and its environment when it has one; for a command only
 /// `command request (<pack>/<rule_id>)`, never the command text.
 pub fn offhost_summary(r: &Request) -> String {
     match r.kind {
-        ApprovalType::Connector => summary(r),
+        ApprovalType::Connector => match &r.env {
+            Some(e) => format!("{} (env {e})", summary(r)),
+            None if r.env_base => format!("{} (env base)", summary(r)),
+            None => summary(r),
+        },
         ApprovalType::Command => format!(
             "command request ({})",
             r.ask_rule.as_deref().unwrap_or("unknown rule")
@@ -715,6 +732,8 @@ impl Store {
             body_truncated: req.send.body_truncated,
             amount: req.send.amount,
             headers: req.send.headers,
+            env: req.send.env,
+            env_base: req.send.env_base,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,

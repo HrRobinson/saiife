@@ -288,7 +288,8 @@ fn pagination_is_a_cursor_on_after() {
             op(id).pagination,
             Some(Pagination::Cursor {
                 param: "after".into(),
-                next: "paging.next.after".into()
+                next: "paging.next.after".into(),
+                more: None,
             }),
             "{id}"
         );
@@ -337,7 +338,7 @@ fn next_cursor_refuses_unsafe_values() {
     assert_eq!(next_cursor(&p, &with(Value::String(long))), None);
     let ok = "a".repeat(256);
     assert!(next_cursor(&p, &with(Value::String(ok))).is_some());
-    for bad in ["52\r\nX-Evil: 1", "a b", "a&b=c", "a/b", "é"] {
+    for bad in ["52\r\nX-Evil: 1", "a b", "a&b=c", "a\\b", "é"] {
         assert_eq!(
             next_cursor(&p, &with(Value::String(bad.into()))),
             None,
@@ -363,6 +364,19 @@ fn next_page_request_carries_the_cursor() {
         b.uri.to_string(),
         "https://api.hubapi.com/crm/v3/objects/contacts?after=52"
     );
+}
+
+#[test]
+fn hubspot_cursor_refuses_slash_and_plus() {
+    // next_cursor admits `/` and `+` for other connectors; hubspot's own
+    // `after` pattern must still refuse them.
+    let o = op("contacts.list");
+    for bad in ["a/b", "a+b"] {
+        assert!(
+            validate(o, &map(&[("after", bad)]), &BTreeMap::new()).is_err(),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]

@@ -5,6 +5,11 @@
 //! `--wait` polls `api.result` every 2 s (at most 1 h, decision 3);
 //! `saiife api result <id>` fetches a result later.
 //!
+//! `saiife api collection list|run` (spec §6.12, plan 14 decision 11) runs
+//! a saved collection: each step is one ordinary `api.call` (`call_one`,
+//! the same as a single call), carrying `collection = "<name>"` as
+//! attribution only. The run stops at the first step that is not done.
+//!
 //! The project's `.saiife/config.toml` may tighten a service (`deny`,
 //! `ask`); it is read here and sent as `overlay` (decision 4). In locked
 //! mode the daemon ignores its `allow`.
@@ -30,8 +35,9 @@ pub struct ApiArgs {
     /// The system config (default /etc/saiife/config.toml).
     #[arg(long = "system-config", hide = true)]
     pub system_config: Option<PathBuf>,
-    /// `<service> <operation> [k=v ...]`, `[<service>]` with --list, or
-    /// `token` (a 12 h bearer token for the gateway's TCP listener).
+    /// `<service> <operation> [k=v ...]`, `[<service>]` with --list,
+    /// `token` (a 12 h bearer token for the gateway's TCP listener), or
+    /// `collection list` / `collection run <name> [k=v ...]`.
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
 }
@@ -51,6 +57,7 @@ pub fn run(a: ApiArgs) -> ExitCode {
 mod linux {
     use super::ApiArgs;
     use crate::broker::{self, Target};
+    use crate::collection;
     use base64::Engine as _;
     use saiife_agents::config::{find_project_root, read_config_bytes};
     use saiife_ipc::client::Client;
@@ -60,6 +67,7 @@ mod linux {
     use serde_json::{json, Map, Value};
     use std::collections::BTreeMap;
     use std::io::Read;
+    use std::path::Path;
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
@@ -115,7 +123,17 @@ mod linux {
     /// project config is ignored with a warning; it can only have
     /// tightened); the personal broker decides as developer mode, so a
     /// project `allow` counts too (spec §6.9.1).
-    fn project(d: &Daemon) -> (String, BTreeMap<String, saiife_policy::ServiceOverlay>) {
+    ///
+    /// The third value is the project `env` the call asks for: only the
+    /// personal broker acts on it (the locked daemon takes the scope's), so
+    /// it is sent to the broker only.
+    fn project(
+        d: &Daemon,
+    ) -> (
+        String,
+        BTreeMap<String, saiife_policy::ServiceOverlay>,
+        Option<String>,
+    ) {
         let cfg = &d.cfg;
         let mode = if d.target.is_locked() {
             Mode::Locked
@@ -129,23 +147,36 @@ mod linux {
             .or(cwd.as_ref())
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let services = root
-            .and_then(|r| match read_config_bytes(&r) {
-                Ok(Some(b)) => match parse_project(&b) {
-                    Ok(p) => Some(merge_project(&cfg.guard.packs, &p, mode).services),
-                    Err(e) => {
-                        eprintln!("saiife: warning: project config ignored ({e})");
-                        None
-                    }
-                },
-                Ok(None) => None,
+        let parsed = root.and_then(|r| match read_config_bytes(&r) {
+            Ok(Some(b)) => match parse_project(&b) {
+                Ok(p) => Some(p),
                 Err(e) => {
                     eprintln!("saiife: warning: project config ignored ({e})");
                     None
                 }
-            })
+            },
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("saiife: warning: project config ignored ({e})");
+                None
+            }
+        });
+        let env = parsed
+            .as_ref()
+            .filter(|_| !d.target.is_locked())
+            .and_then(|p| p.env.clone());
+        let services = parsed
+            .map(|p| merge_project(&cfg.guard.packs, &p, mode).services)
             .unwrap_or_default();
-        (shown, services)
+        (shown, services, env)
+    }
+
+    /// The broker's `warning` (an undefined project `env`: the base config
+    /// was used), on stderr.
+    fn env_warning(ans: &Map<String, Value>) {
+        if let Some(w) = ans.get("warning").and_then(Value::as_str) {
+            eprintln!("saiife: warning: {}", crate::text::sanitize(w));
+        }
     }
 
     fn go(a: ApiArgs) -> Result<u8, Stop> {
@@ -155,6 +186,9 @@ mod linux {
         }
         if a.args.len() == 1 && a.args[0] == "token" {
             return token(&config, a.json);
+        }
+        if a.args.first().map(String::as_str) == Some("collection") {
+            return collection_cmd(&config, &a);
         }
         if a.args.first().map(String::as_str) == Some("result") {
             let id = match a.args.as_slice() {
@@ -194,13 +228,39 @@ mod linux {
         };
 
         let mut d = connect(&config)?;
-        let (project, overlays) = project(&d);
+        let (code, ans) = call_one(&mut d, service, operation, params, body, None)?;
+        if code == 3 {
+            let id = ans.get("pending").and_then(Value::as_u64).unwrap_or(0);
+            return match wait {
+                Some(w) => settle(&mut d, &a, id, Some(w)),
+                None => Err(pending(id)),
+            };
+        }
+        let ms = ans.get("ms").and_then(Value::as_u64).map(u128::from);
+        done(&a, &format!("{service} {operation}"), &ans, ms)
+    }
+
+    /// One `api.call`: the whole pipeline in the daemon (scope, decide,
+    /// limits, approvals, audit), for a single call and for each collection
+    /// step alike. `Ok((0 | 1, answer))` once done (1: upstream status >=
+    /// 400; the answer gains `ms`), `Ok((3, answer))` while it waits for
+    /// approval (the answer holds `pending`), `Err` for a refusal with its
+    /// exit code. Prints nothing.
+    fn call_one(
+        d: &mut Daemon,
+        service: &str,
+        operation: &str,
+        params: Map<String, Value>,
+        body: Option<Vec<u8>>,
+        collection: Option<&str>,
+    ) -> Result<(u8, Map<String, Value>), Stop> {
+        let (project, overlays, env) = project(d);
         let mut args = Map::new();
-        args.insert("service".into(), service.clone().into());
-        args.insert("operation".into(), operation.clone().into());
+        args.insert("service".into(), service.into());
+        args.insert("operation".into(), operation.into());
         args.insert("params".into(), Value::Object(params));
         args.insert("project".into(), project.into());
-        if let Some(o) = overlays.get(service.as_str()) {
+        if let Some(o) = overlays.get(service) {
             args.insert("overlay".into(), json!(o));
         }
         if let Some(b) = &body {
@@ -209,29 +269,187 @@ mod linux {
                 base64::engine::general_purpose::STANDARD.encode(b).into(),
             );
         }
-        if let Some(w) = wait {
-            let ms = w.as_millis().min(u128::from(u64::MAX)) as u64;
-            args.insert("wait_ms".into(), ms.into());
+        if let Some(c) = collection {
+            args.insert("collection".into(), c.into());
+        }
+        if let Some(e) = env {
+            args.insert("env".into(), e.into());
         }
         // The daemon waits at most one upstream timeout for a pool slot and
         // one for the upstream; past both, plus slack, it is gone.
         let timeout = d.cfg.gateway.upstream_timeout * 2 + Duration::from_secs(15);
         let started = Instant::now();
-        let ans = d
+        let mut ans = d
             .client
             .call_answer("api.call", args, Instant::now() + timeout)
             .map_err(|e| unavailable(broker::unreachable(&d.target, &e)))?;
-        let ms = started.elapsed().as_millis();
+        let ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
-        if let Some(id) = ans.get("pending").and_then(Value::as_u64) {
-            return match wait {
-                Some(w) => settle(&mut d, &a, id, Some(w)),
-                None => Err(pending(id)),
-            };
+        env_warning(&ans);
+        if ans.get("pending").and_then(Value::as_u64).is_some() {
+            return Ok((3, ans));
         }
-        done(&a, &format!("{service} {operation}"), &ans, Some(ms))
+        ans.insert("ms".into(), ms.into());
+        let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
+        Ok((if status >= 400 { 1 } else { 0 }, ans))
+    }
+
+    /// `saiife api collection list | run <name> [k=v ...]`. The project
+    /// root is the nearest saiife project at or above the cwd.
+    fn collection_cmd(config: &Target, a: &ApiArgs) -> Result<u8, Stop> {
+        const USAGE: &str =
+            "usage: saiife api collection list | saiife api collection run <name> [k=v ...]";
+        if a.wait.is_some() || a.body.is_some() {
+            return Err(refused(
+                "--wait and --body do not apply to a collection (a pending step stops the run)",
+            ));
+        }
+        let cwd = std::env::current_dir()
+            .map_err(|e| refused(format!("cannot read the current directory: {e}")))?;
+        let root = crate::project::project_root(&cwd);
+        match a.args.get(1).map(String::as_str) {
+            Some("list") if a.args.len() == 2 => collection_list(&root, a.json),
+            Some("run") if a.args.len() >= 3 => collection_run(config, &root, a),
+            _ => Err(refused(USAGE)),
+        }
+    }
+
+    /// `name  steps  services`, one line per collection (`--json`: an
+    /// array). A file that does not load is a warning.
+    fn collection_list(root: &Path, as_json: bool) -> Result<u8, Stop> {
+        let mut rows = Vec::new();
+        for (stem, c) in collection::list_all(root) {
+            match c {
+                Ok(c) => {
+                    let mut services: Vec<String> = Vec::new();
+                    for s in &c.step {
+                        if !services.contains(&s.service) {
+                            services.push(s.service.clone());
+                        }
+                    }
+                    rows.push((c.name, c.step.len(), services));
+                }
+                Err(e) => eprintln!(
+                    "saiife: warning: collection {}: {}",
+                    crate::text::sanitize(&stem),
+                    crate::text::sanitize(&e.to_string())
+                ),
+            }
+        }
+        if as_json {
+            let v: Vec<Value> = rows
+                .iter()
+                .map(|(n, k, s)| json!({"name": n, "steps": k, "services": s}))
+                .collect();
+            outln!("{}", Value::Array(v));
+            return Ok(0);
+        }
+        if rows.is_empty() {
+            outln!("no collections in {}", collection::dir(root).display());
+        }
+        for (name, steps, services) in &rows {
+            outln!(
+                "{name}  {steps}  {}",
+                crate::text::sanitize(&services.join(","))
+            );
+        }
+        Ok(0)
+    }
+
+    /// Fill the collection (every variable is checked before any step),
+    /// then run its steps in order, each as one `call_one`. stdout: a JSON
+    /// array of `{step, service, operation, status, data}` for the steps
+    /// that were answered; stderr: one summary line per step. The run
+    /// stops at the first step that is not done, with that step's exit
+    /// code; a pending step prints its id. There is no resume.
+    fn collection_run(config: &Target, root: &Path, a: &ApiArgs) -> Result<u8, Stop> {
+        let c = collection::load(root, &a.args[2]).map_err(|e| refused(e.to_string()))?;
+        let vars = collection::parse_vars(&a.args[3..]).map_err(|e| refused(e.to_string()))?;
+        let steps = collection::fill(&c, &vars).map_err(|e| refused(e.to_string()))?;
+        let mut bodies = Vec::with_capacity(steps.len());
+        for (i, s) in steps.iter().enumerate() {
+            let b = match &s.body {
+                Some(v) => {
+                    let b = serde_json::to_vec(v)
+                        .map_err(|e| refused(format!("step {}: body: {e}", i + 1)))?;
+                    if b.len() > MAX_BODY {
+                        return Err(refused(format!(
+                            "step {}: the body is larger than {} KiB",
+                            i + 1,
+                            MAX_BODY / 1024
+                        )));
+                    }
+                    Some(b)
+                }
+                None => None,
+            };
+            bodies.push(b);
+        }
+
+        let mut d = connect(config)?;
+        let n = steps.len();
+        let mut out: Vec<Value> = Vec::new();
+        let print = |out: &[Value]| outln!("{}", Value::Array(out.to_vec()));
+        for (i, (s, body)) in steps.into_iter().zip(bodies).enumerate() {
+            let label =
+                crate::text::sanitize(&format!("step {}/{n} {} {}", i + 1, s.service, s.operation));
+            let params: Map<String, Value> = s
+                .params
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            let r = call_one(
+                &mut d,
+                &s.service,
+                &s.operation,
+                params,
+                body,
+                Some(&c.name),
+            );
+            let (code, ans) = match r {
+                Ok(x) => x,
+                Err(Stop(code, m)) => {
+                    print(&out);
+                    return Err(Stop(code, format!("{label}: {m}")));
+                }
+            };
+            if code == 3 {
+                print(&out);
+                let id = ans.get("pending").and_then(Value::as_u64).unwrap_or(0);
+                return Err(Stop(
+                    3,
+                    format!(
+                        "{label}: pending approval #{id} (saiife api result {id}); \
+                         the steps after it were not run"
+                    ),
+                ));
+            }
+            let ms = ans.get("ms").and_then(Value::as_u64).map(u128::from);
+            let body = summary(&label, &ans, ms);
+            let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
+            out.push(json!({
+                "step": i + 1,
+                "service": s.service,
+                "operation": s.operation,
+                "status": status,
+                "data": parsed(&body),
+            }));
+            if code != 0 {
+                print(&out);
+                eprintln!("saiife: {label}: stopped at upstream status {status}");
+                return Ok(code);
+            }
+        }
+        print(&out);
+        Ok(0)
+    }
+
+    /// A response body as JSON, or as a string when it is not JSON.
+    fn parsed(body: &[u8]) -> Value {
+        serde_json::from_slice::<Value>(body)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()))
     }
 
     /// The longest `--wait` (decision 3).
@@ -320,23 +538,16 @@ mod linux {
         ms: Option<u128>,
     ) -> Result<u8, Stop> {
         let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
-        let body = ans
-            .get("body_b64")
-            .and_then(Value::as_str)
-            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-            .unwrap_or_default();
-        let truncated = ans.get("truncated") == Some(&Value::Bool(true));
+        let body = body_of(ans);
         if a.json {
-            let parsed = serde_json::from_slice::<Value>(&body)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
             outln!(
                 "{}",
                 json!({
                     "status": status,
                     "headers": ans.get("headers").cloned().unwrap_or(json!([])),
-                    "truncated": truncated,
+                    "truncated": ans.get("truncated") == Some(&Value::Bool(true)),
                     "next": ans.get("next").cloned().unwrap_or(Value::Null),
-                    "body": parsed,
+                    "body": parsed(&body),
                 })
             );
         } else {
@@ -347,11 +558,28 @@ mod linux {
                 let _ = out.write_all(b"\n");
             }
         }
+        summary(label, ans, ms);
+        Ok(if status >= 400 { 1 } else { 0 })
+    }
+
+    /// The decoded body of a done answer.
+    fn body_of(ans: &Map<String, Value>) -> Vec<u8> {
+        ans.get("body_b64")
+            .and_then(Value::as_str)
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .unwrap_or_default()
+    }
+
+    /// The stderr summary of a done answer (status, size, time, a cut
+    /// response, the next page); returns the body.
+    fn summary(label: &str, ans: &Map<String, Value>, ms: Option<u128>) -> Vec<u8> {
+        let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let body = body_of(ans);
         match ms {
             Some(ms) => eprintln!("saiife: {label} → {status} ({} bytes, {ms} ms)", body.len()),
             None => eprintln!("saiife: {label} → {status} ({} bytes)", body.len()),
         }
-        if truncated {
+        if ans.get("truncated") == Some(&Value::Bool(true)) {
             eprintln!("saiife: the response was cut at max_response_bytes");
         }
         if let Some(Value::Object(n)) = ans.get("next") {
@@ -361,7 +589,7 @@ mod linux {
                 .collect();
             eprintln!("next: {}", kv.join(" "));
         }
-        Ok(if status >= 400 { 1 } else { 0 })
+        body
     }
 
     fn read_capped(r: impl Read, what: &str) -> Result<Vec<u8>, Stop> {
@@ -452,9 +680,12 @@ mod linux {
             return Err(refused("usage: saiife api --list [<service>]"));
         }
         let mut d = connect(config)?;
-        let (_, overlays) = project(&d);
+        let (_, overlays, env) = project(&d);
         let mut args = Map::new();
         args.insert("overlays".into(), json!(overlays));
+        if let Some(e) = env {
+            args.insert("env".into(), e.into());
+        }
         let ans = d
             .client
             .call_answer("api.list", args, Instant::now() + Duration::from_secs(10))
@@ -462,6 +693,7 @@ mod linux {
         if ans.get("ok") != Some(&Value::Bool(true)) {
             return Err(refusal(&ans));
         }
+        env_warning(&ans);
         let services: Vec<Value> = ans
             .get("services")
             .and_then(Value::as_array)

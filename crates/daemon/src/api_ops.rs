@@ -10,9 +10,10 @@ use crate::tokens;
 use crate::vault::{Kind, VaultState};
 use base64::Engine as _;
 use bytes::Bytes;
-use saiife_broker::manifest::AuthSpec;
+use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::pipeline::{
-    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, Trace, Via,
+    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, TokenFuture,
+    Trace, Via,
 };
 use saiife_broker::request::AuthMaterial;
 use saiife_ipc::frame::MAX_ANSWER_FRAME;
@@ -74,13 +75,35 @@ pub(crate) struct DaemonEnv<'a> {
 }
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
-/// bearer or a header reading `token`, `header` one reading `value`.
+/// bearer, a header or a `basic_token` reading `token`, `header` one reading
+/// `value`, `oauth2` the oauth2 one (its access token from daemon memory).
 fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     auth.iter().find(|a| match kind {
         Kind::Basic => a.kind == "basic",
-        Kind::Token => matches!(a.kind.as_str(), "bearer" | "header") && a.secret_field == "token",
+        Kind::Token => {
+            matches!(a.kind.as_str(), "bearer" | "header" | "basic_token")
+                && a.secret_field == "token"
+        }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
+        Kind::OAuth2 => a.kind == "oauth2",
     })
+}
+
+/// The values the masker hides for a secret before its auth entry is known
+/// (step 9 rebuilds the masker from the real credential). A token may be
+/// sent as `basic_token`, whose wire form is `base64(token:)`, so a token
+/// also yields `token:` (the masker covers its base64 forms).
+fn mask_values(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Vec<Zeroizing<String>> {
+    let kind = match kind {
+        Kind::Token => "basic_token",
+        k => kind_str(k),
+    };
+    AuthMaterial {
+        kind: kind.to_string(),
+        name: None,
+        fields: fields.clone(),
+    }
+    .values()
 }
 
 fn kind_str(k: Kind) -> &'static str {
@@ -88,6 +111,7 @@ fn kind_str(k: Kind) -> &'static str {
         Kind::Token => "token",
         Kind::Basic => "basic",
         Kind::Header => "header",
+        Kind::OAuth2 => "oauth2",
     }
 }
 
@@ -129,12 +153,7 @@ impl Env for DaemonEnv<'_> {
             return None;
         };
         let e = v.get(name)?;
-        let m = AuthMaterial {
-            kind: kind_str(e.kind).to_string(),
-            name: None,
-            fields: e.fields.clone(),
-        };
-        Some(m.values())
+        Some(mask_values(e.kind, &e.fields))
     }
 
     fn pool(&self, service: &str) -> Arc<Semaphore> {
@@ -143,6 +162,28 @@ impl Env for DaemonEnv<'_> {
 
     fn create_approval<'b>(&'b self, p: &'b PendingCall) -> ApprovalFuture<'b> {
         Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
+    }
+
+    fn oauth_token<'b>(
+        &'b self,
+        secret: &'b str,
+        service: &'b str,
+        spec: &'b AuthSpec,
+        m: &'b Manifest,
+        svc_params: &'b BTreeMap<String, String>,
+        force: bool,
+    ) -> TokenFuture<'b> {
+        Box::pin(crate::oauth::access_token(
+            self.ctx,
+            crate::oauth::Want {
+                secret,
+                service,
+                spec,
+                manifest: m,
+                svc_params,
+                force,
+            },
+        ))
     }
 }
 
@@ -164,6 +205,14 @@ pub(crate) fn valid_service(s: &str) -> bool {
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
+/// A collection name (decision 11): `[a-z0-9_-]{1,64}`.
+pub(crate) fn valid_collection(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
 }
 
 /// Parses `overlay` (`{allow, ask, deny}` lists of strings).
@@ -207,6 +256,30 @@ fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>,
         check_overlay(o)?;
     }
     Ok(m)
+}
+
+/// The mode connector calls choose their environment under (see
+/// [`GatewayPolicy::select_env`]): the daemon's own, as the policy
+/// decides it. The locked daemon takes the scope's environment; the
+/// personal broker decides as developer mode, so the project `env` the
+/// client sends picks the snapshot.
+pub(crate) fn gateway_mode(ctx: &Ctx) -> saiife_policy::Mode {
+    ctx.mode.policy_mode()
+}
+
+/// The optional `env` argument of `api.call` and `api.list`: the project's
+/// environment, as the client read it from `.saiife/config.toml`. Only
+/// developer mode acts on it, but a malformed one is a bad request in every
+/// mode, locked included: the shape is checked before the mode decides
+/// whether the value counts.
+pub(crate) fn parse_env(args: &Map<String, Value>) -> Result<Option<String>, &'static str> {
+    match args.get("env") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if saiife_policy::environment::valid_env_name(s) => {
+            Ok(Some(s.clone()))
+        }
+        Some(_) => Err("env must be an environment name ([a-z0-9_-]{1,64})"),
+    }
 }
 
 /// The arguments of `api.call`, checked. Errors never quote a value.
@@ -294,6 +367,11 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         }
         Some(_) => return Err("project must be a path"),
     };
+    let collection = match args.get("collection") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),
+        Some(_) => return Err("collection must be a name of [a-z0-9_-], 1 to 64 bytes"),
+    };
     // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
     // `api.result` from the client.
     let call = Call {
@@ -308,6 +386,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         headers,
         overlay,
         via: Via::Cli,
+        collection,
     };
     Ok((service, op, call))
 }
@@ -325,6 +404,7 @@ fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySna
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
         mode: mode.policy_mode(),
+        env: None,
     }
 }
 
@@ -344,12 +424,24 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(x) => x,
         Err(m) => return bad(id, m),
     };
-    match execute(ctx, &Caller::Unix(*peer), call).await {
+    let project_env = match parse_env(&req.args) {
+        Ok(e) => e,
+        Err(m) => return bad(id, m),
+    };
+    match execute_in(ctx, &Caller::Unix(*peer), call, project_env.as_deref()).await {
         // 12. Return.
-        Ok(outcome) => answer(id, outcome),
+        Ok((outcome, warning)) => with_warning(answer(id, outcome), warning),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
         Err(Refused::Unrecorded(m)) => err(id, ErrorCode::Internal, &m),
     }
+}
+
+/// `answer` with a `warning` key when the environment choice left one.
+fn with_warning(mut v: Value, warning: Option<String>) -> Value {
+    if let (Some(w), Some(o)) = (warning, v.as_object_mut()) {
+        o.insert("warning".into(), w.into());
+    }
+    v
 }
 
 /// Who makes a connector call: a Unix-socket peer (uid and pid from the
@@ -397,8 +489,19 @@ impl Caller {
 pub(crate) async fn execute(
     ctx: &Arc<Ctx>,
     caller: &Caller,
-    mut call: Call,
+    call: Call,
 ) -> Result<Outcome, Refused> {
+    execute_in(ctx, caller, call, None).await.map(|(o, _)| o)
+}
+
+/// [`execute`] with the project's `env` (developer mode only), and the
+/// warning the environment choice left.
+pub(crate) async fn execute_in(
+    ctx: &Arc<Ctx>,
+    caller: &Caller,
+    mut call: Call,
+    project_env: Option<&str>,
+) -> Result<(Outcome, Option<String>), Refused> {
     // A stop waits for this call (and its record) before it ends the log.
     let _busy = ctx.calls.enter();
     let uid = caller.uid();
@@ -426,31 +529,51 @@ pub(crate) async fn execute(
     // The policy as it is now: a reload while this call runs does not
     // change what it runs under.
     let state = ctx.policy();
-    let (outcome, trace, snap): (Outcome, Trace, Arc<GatewayPolicy>) = match &state.gateway {
-        Some(g) => {
-            let env = DaemonEnv {
-                ctx,
-                config: &g.snap.config,
-                groups: Groups(groups),
-                agent: agent.clone(),
-            };
-            // Without an upstream client steps 3–8 still run; step 9
-            // denies with `upstream_unavailable`.
-            let up = ctx.upstream.as_ref().ok();
-            let (o, t) = pipeline::run(&call, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
-            (o, t, Arc::clone(g))
-        }
-        None => (
-            Outcome::Denied {
-                rule: "policy_invalid".into(),
-            },
-            Trace::default(),
-            Arc::new(GatewayPolicy {
-                snap: no_policy_snapshot(state.hash.clone(), ctx.mode),
-                catalog: Default::default(),
-            }),
-        ),
-    };
+    let mut warning = None;
+    let (outcome, trace, gw, env_name): (Outcome, Trace, Arc<GatewayPolicy>, Option<String>) =
+        match &state.gateway {
+            Some(g) => {
+                let groups = Groups(groups);
+                // The environment snapshot this call runs under (spec §6.11).
+                match g.select_env(gateway_mode(ctx), &groups, &call.user, project_env) {
+                    Ok((env_name, w)) => {
+                        warning = w;
+                        let snap = g.snapshot_for(env_name);
+                        let env = DaemonEnv {
+                            ctx,
+                            config: &snap.config,
+                            groups,
+                            agent: agent.clone(),
+                        };
+                        // Without an upstream client steps 3–8 still run;
+                        // step 9 denies with `upstream_unavailable`.
+                        let up = ctx.upstream.as_ref().ok();
+                        let (o, t) =
+                            pipeline::run(&call, snap, &g.catalog, &ctx.limiter, &env, up).await;
+                        (o, t, Arc::clone(g), env_name.map(str::to_string))
+                    }
+                    Err(rule) => (
+                        Outcome::Denied { rule: rule.into() },
+                        Trace::default(),
+                        Arc::clone(g),
+                        None,
+                    ),
+                }
+            }
+            None => (
+                Outcome::Denied {
+                    rule: "policy_invalid".into(),
+                },
+                Trace::default(),
+                Arc::new(GatewayPolicy {
+                    snap: no_policy_snapshot(state.hash.clone(), ctx.mode),
+                    by_env: Default::default(),
+                    catalog: Default::default(),
+                }),
+                None,
+            ),
+        };
+    let snap = gw.snapshot_for(env_name.as_deref());
 
     if let Outcome::Limited { limit } = &outcome {
         ctx.notify_limit(
@@ -462,8 +585,8 @@ pub(crate) async fn execute(
     }
 
     // 11. Record (before the answer: an unrecorded result is withheld).
-    let mut rec = pipeline::record(&call, &snap.snap, &trace, &outcome, &agent, VERSION);
-    if snap.snap.hash.is_empty() {
+    let mut rec = pipeline::record(&call, snap, &trace, &outcome, &agent, VERSION);
+    if snap.hash.is_empty() {
         rec.policy = None;
     }
     rec.extra.insert("peer".into(), caller.record());
@@ -475,7 +598,7 @@ pub(crate) async fn execute(
             "the connector record could not be written: {e}"
         )));
     }
-    Ok(outcome)
+    Ok((outcome, warning))
 }
 
 pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
@@ -640,9 +763,16 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(o) => o,
         Err(m) => return bad(id, m),
     };
-    let services = services_for(ctx, peer.uid, &overlays).await;
+    let project_env = match parse_env(&req.args) {
+        Ok(e) => e,
+        Err(m) => return bad(id, m),
+    };
+    let (services, warning) = services_in(ctx, peer.uid, &overlays, project_env.as_deref()).await;
     let mut m = Map::new();
     m.insert("services".into(), Value::Array(services));
+    if let Some(w) = warning {
+        m.insert("warning".into(), w.into());
+    }
     ok(id, m)
 }
 
@@ -654,22 +784,43 @@ pub(crate) async fn services_for(
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
+    services_in(ctx, uid, overlays, None).await.0
+}
+
+/// [`services_for`] under the environment `api.call` would choose for the
+/// same caller and project `env`, so the list matches what a call allows;
+/// with the warning that choice left.
+pub(crate) async fn services_in(
+    ctx: &Arc<Ctx>,
+    uid: u32,
+    overlays: &BTreeMap<String, ServiceOverlay>,
+    project_env: Option<&str>,
+) -> (Vec<Value>, Option<String>) {
     let mut services = Vec::new();
+    let mut warning = None;
     let state = ctx.policy();
     let user = ctx.name_of(uid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
         let groups = Groups(ctx.groups_of(&user).await);
-        if let Ok(Some(scope)) = scope_for(&g.snap.config, &groups, &user) {
+        // A locked scope env with no snapshot lists nothing (a call is
+        // denied `policy_invalid`).
+        let chosen = g.select_env(gateway_mode(ctx), &groups, &user, project_env);
+        let snap = chosen.as_ref().ok().map(|(e, _)| g.snapshot_for(*e));
+        if let Ok((_, w)) = chosen {
+            warning = w;
+        }
+        let scope = snap.and_then(|s| scope_for(&s.config, &groups, &user).ok().flatten());
+        if let (Some(snap), Some(scope)) = (snap, scope) {
             for name in &scope.services {
                 if let Some(ops) =
-                    pipeline::list_operations(name, &g.snap, &g.catalog, overlays.get(name))
+                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name))
                 {
                     services.push(json!({"name": name, "operations": ops}));
                 }
             }
         }
     }
-    services
+    (services, warning)
 }
 
 #[cfg(test)]
@@ -699,9 +850,46 @@ mod tests {
                        "overlay": {"deny": ["*:write"]}, "project": "/p", "wait_ms": 10});
         let (_, op, c) = parse_call(a.as_object().unwrap()).unwrap();
         assert!(matches!(op, OpRef::Proxy { .. }));
+        assert_eq!(parse_env(a.as_object().unwrap()), Ok(None));
+        let e = |v: Value| parse_env(json!({ "env": v }).as_object().unwrap());
+        assert_eq!(e(json!("staging")), Ok(Some("staging".into())));
+        assert!(e(json!("Bad Name")).is_err());
+        assert!(e(json!(["prod"])).is_err());
+        assert!(e(json!("x".repeat(65))).is_err());
         assert_eq!(c.params["n"], "5");
         assert_eq!(c.body.as_deref(), Some(&b"hi"[..]));
         assert_eq!(c.overlay.unwrap().deny, vec!["*:write"]);
+        assert_eq!(c.collection, None);
+    }
+
+    #[test]
+    fn parse_call_collection_is_a_checked_name() {
+        let with = |v: Value| {
+            let a = json!({"service": "erp", "operation": "x", "collection": v});
+            parse_call(a.as_object().unwrap()).map(|(_, _, c)| c.collection)
+        };
+        assert_eq!(
+            with(json!("open-orders_2")).unwrap().as_deref(),
+            Some("open-orders_2")
+        );
+        assert_eq!(with(Value::Null).unwrap(), None);
+        assert_eq!(
+            with(json!("a".repeat(64))).unwrap().map(|s| s.len()),
+            Some(64)
+        );
+        for bad in [
+            json!(""),
+            json!("a".repeat(65)),
+            json!("Open"),
+            json!("a.b"),
+            json!("a b"),
+            json!("a/b"),
+            json!("x\n"),
+            json!(5),
+        ] {
+            let e = with(bad.clone()).unwrap_err();
+            assert!(e.contains("collection"), "{bad}: {e}");
+        }
     }
 
     #[test]
@@ -736,15 +924,70 @@ mod tests {
             kind: "header".into(),
             name: Some("X-Api-Key".into()),
             secret_field: "value".into(),
+            prefix: None,
+            token_path: None,
         };
         let bearer = AuthSpec {
             kind: "bearer".into(),
             name: None,
             secret_field: "token".into(),
+            prefix: None,
+            token_path: None,
         };
         let both = [header.clone(), bearer.clone()];
         assert_eq!(spec_for(Kind::Header, &both), Some(&header));
         assert_eq!(spec_for(Kind::Token, &both), Some(&bearer));
         assert_eq!(spec_for(Kind::Basic, &both), None);
+        // A Segment-style write key is a vault token.
+        let basic_token = AuthSpec {
+            kind: "basic_token".into(),
+            ..bearer.clone()
+        };
+        let one = [basic_token.clone()];
+        assert_eq!(spec_for(Kind::Token, &one), Some(&basic_token));
+        assert_eq!(spec_for(Kind::Basic, &one), None);
+        // oauth2 serves oauth2 only, and no other kind serves it.
+        let oauth = AuthSpec {
+            kind: "oauth2".into(),
+            name: None,
+            secret_field: String::new(),
+            prefix: None,
+            token_path: Some("/services/oauth2/token".into()),
+        };
+        let o = [oauth.clone()];
+        assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));
+        assert_eq!(spec_for(Kind::Token, &o), None);
+        assert_eq!(spec_for(Kind::OAuth2, &both), None);
+    }
+
+    #[test]
+    fn token_mask_values_cover_the_basic_token_form() {
+        let key = concat!("wk", "_", "mask0042");
+        let fields: BTreeMap<String, Zeroizing<String>> =
+            [("token".to_string(), Zeroizing::new(key.to_string()))].into();
+        let vals: Vec<String> = mask_values(Kind::Token, &fields)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(vals.contains(&key.to_string()), "{vals:?}");
+        assert!(vals.contains(&format!("{key}:")), "{vals:?}");
+        // The masker built from them hides the wire form.
+        let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+        let masker = saiife_broker::mask::Masker::new(&refs);
+        let wire = base64::engine::general_purpose::STANDARD.encode(format!("{key}:"));
+        let masked = masker.mask_text(&format!("echo Basic {wire}"));
+        assert!(!masked.contains(&wire), "{masked}");
+        assert!(!masked.contains(key), "{masked}");
+        // Basic keeps its own pair.
+        let basic: BTreeMap<String, Zeroizing<String>> = [
+            ("username".to_string(), Zeroizing::new("ann".to_string())),
+            ("password".to_string(), Zeroizing::new("pw-1".to_string())),
+        ]
+        .into();
+        let vals: Vec<String> = mask_values(Kind::Basic, &basic)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert!(vals.contains(&"ann:pw-1".to_string()), "{vals:?}");
     }
 }

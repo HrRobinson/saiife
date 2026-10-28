@@ -3,6 +3,7 @@
 use crate::manifest::{AmountSpec, Unit};
 use crate::BrokerError;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Minor-unit exponent of an active ISO 4217 currency (list as of the
 /// current amendment; funds codes included, metals and test codes excluded).
@@ -104,19 +105,31 @@ fn parse_minor(text: &str, unit: Unit, exp: u32) -> Result<u64, BrokerError> {
     Ok(acc)
 }
 
-/// Extract `(minor units, upper-case currency)` from a request body.
-pub fn extract(spec: &AmountSpec, body: &Value) -> Result<(u64, String), BrokerError> {
+/// Extract `(minor units, upper-case currency)` from a request body. The
+/// currency is the body's `currency_field`, or the admin's service param
+/// `currency_param` from `svc_params`.
+pub fn extract(
+    spec: &AmountSpec,
+    body: &Value,
+    svc_params: &BTreeMap<String, String>,
+) -> Result<(u64, String), BrokerError> {
     let mut currency: Option<String> = None;
-    for c in collect(body, &spec.currency_field)? {
-        let s = c
-            .as_str()
-            .ok_or_else(|| bad("currency is not a string"))?
-            .to_ascii_uppercase();
-        match &currency {
-            None => currency = Some(s),
-            Some(p) if *p == s => {}
-            Some(_) => return Err(bad("mixed currencies")),
+    match (&spec.currency_field, &spec.currency_param) {
+        (Some(field), None) => {
+            for c in collect(body, field)? {
+                let s = c
+                    .as_str()
+                    .ok_or_else(|| bad("currency is not a string"))?
+                    .to_ascii_uppercase();
+                match &currency {
+                    None => currency = Some(s),
+                    Some(p) if *p == s => {}
+                    Some(_) => return Err(bad("mixed currencies")),
+                }
+            }
         }
+        (None, Some(param)) => currency = svc_params.get(param).map(|c| c.to_ascii_uppercase()),
+        _ => return Err(bad("the amount spec needs exactly one currency source")),
     }
     let currency = currency.ok_or_else(|| bad("currency missing"))?;
     if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {

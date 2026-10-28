@@ -1,0 +1,110 @@
+# Salesforce REST API (one org, OAuth2 refresh-token flow). Paths and response
+# shapes per the vendor reference (shape per vendor docs; not fetched, no
+# network in this build):
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_query.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_query.htm   (nextRecordsUrl)
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_describeGlobal.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_describe.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_sobject_retrieve.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_sobject_create.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_update_fields.htm
+#   https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/dome_delete_record.htm
+#   https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_refresh_token_flow.htm
+# The access token is obtained by the daemon from `token_path` on the admin's
+# instance host and lives only in daemon memory; the vault holds client_id,
+# client_secret and refresh_token (kind oauth2).
+#
+# SOQL: `query` sends the agent's SOQL text as the `q` query parameter. It is
+# not narrowed by the `sobject` qualifier, so what it can read is bounded only
+# by the integration user's profile; the docs keep `query:read` under `ask`.
+# `q` is printable ASCII (no control characters), at most 4000 bytes.
+id = "salesforce"
+version = 1
+title = "Salesforce"
+base_url = "https://{instance_host}/services/data/{api_version}"
+hosts = ["{instance_host}"]
+auth = [{ kind = "oauth2", token_path = "/services/oauth2/token" }]
+request_headers = ["Content-Type", "Accept"]
+
+[params.instance_host]           # the org's My Domain host, set by the admin
+type = "string"
+pattern = "^[a-z0-9-]+(\\.sandbox)?\\.my\\.salesforce\\.com$"
+required = true
+
+[params.api_version]             # for example v60.0, set by the admin
+type = "string"
+pattern = "^v[0-9]{2,3}\\.0$"
+required = true
+
+[[operation]]
+id = "query"
+capability = "query:read"
+kind = "read"
+method = "GET"
+path = "/query"
+query = { q = "string:[ -~]{1,4000}" }
+
+# The follow-up page of a query: the last segment of `nextRecordsUrl`
+# (`01gD0000002HU6KIAW-2000`). One path segment, never a path.
+[[operation]]
+id = "query.more"
+capability = "query:read"
+kind = "read"
+method = "GET"
+path = "/query/{locator}"
+path_params = { locator = "string:[A-Za-z0-9]{15,18}-[0-9]{1,9}" }
+
+[[operation]]
+id = "sobjects.list"
+capability = "sobjects:read"
+kind = "read"
+method = "GET"
+path = "/sobjects"
+
+[[operation]]
+id = "sobjects.describe"
+capability = "sobjects:read"
+qualifier = "sobject={sobject}"
+kind = "read"
+method = "GET"
+path = "/sobjects/{sobject}/describe"
+path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}" }
+
+[[operation]]
+id = "records.get"
+capability = "records:read"
+qualifier = "sobject={sobject}"
+kind = "read"
+method = "GET"
+path = "/sobjects/{sobject}/{id}"
+path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}", id = "string:[A-Za-z0-9]{15}([A-Za-z0-9]{3})?" }
+query = { fields = "string:[A-Za-z0-9_,]{1,2000}" }
+
+[[operation]]
+id = "records.create"
+capability = "records:write"
+qualifier = "sobject={sobject}"
+kind = "write"
+method = "POST"
+path = "/sobjects/{sobject}"
+path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}" }
+body = "json"
+
+[[operation]]
+id = "records.update"
+capability = "records:write"
+qualifier = "sobject={sobject}"
+kind = "write"
+method = "PATCH"
+path = "/sobjects/{sobject}/{id}"
+path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}", id = "string:[A-Za-z0-9]{15}([A-Za-z0-9]{3})?" }
+body = "json"
+
+[[operation]]
+id = "records.delete"
+capability = "records:delete"
+qualifier = "sobject={sobject}"
+kind = "delete"
+method = "DELETE"
+path = "/sobjects/{sobject}/{id}"
+path_params = { sobject = "string:[A-Za-z][A-Za-z0-9_]{0,79}", id = "string:[A-Za-z0-9]{15}([A-Za-z0-9]{3})?" }

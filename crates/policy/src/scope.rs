@@ -49,7 +49,33 @@ pub fn scope_for<'a>(
     dir: &dyn Directory,
     user: &str,
 ) -> Result<Option<&'a Scope>, PolicyError> {
-    let groups = dir.groups_of(user);
+    scope_in(cfg, user, &dir.groups_of(user))
+}
+
+/// [`scope_for`] that fails when the group lookup does, but only when a
+/// `group:` entry is there to need it (`Err` is the lookup's message).
+pub fn try_scope_for<'a>(
+    cfg: &'a SystemConfig,
+    dir: &dyn Directory,
+    user: &str,
+) -> Result<Result<Option<&'a Scope>, PolicyError>, String> {
+    let needs = cfg
+        .scope
+        .iter()
+        .any(|s| s.users.iter().any(|e| e.starts_with(GROUP_PREFIX)));
+    let groups = if needs {
+        dir.try_groups_of(user)?
+    } else {
+        Vec::new()
+    };
+    Ok(scope_in(cfg, user, &groups))
+}
+
+fn scope_in<'a>(
+    cfg: &'a SystemConfig,
+    user: &str,
+    groups: &[String],
+) -> Result<Option<&'a Scope>, PolicyError> {
     let matches: Vec<&Scope> = cfg
         .scope
         .iter()

@@ -1,0 +1,70 @@
+# Intercom REST API. Reference: https://developers.intercom.com/docs/references/rest-api/api.intercom.io/
+#   contacts:      https://developers.intercom.com/docs/references/rest-api/api.intercom.io/contacts
+#   conversations: https://developers.intercom.com/docs/references/rest-api/api.intercom.io/conversations
+#   pagination:    https://developers.intercom.com/docs/build-an-integration/learn-more/rest-apis/pagination
+# The regional host and the API version are admin service params. Intercom
+# versions look like `2.11`; the broker sends them as `Intercom-Version`.
+id = "intercom"
+version = 1
+title = "Intercom"
+base_url = "https://{host}"
+hosts = ["api.intercom.io", "api.eu.intercom.io", "api.au.intercom.io"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Content-Type", "Accept"]
+headers = { "Intercom-Version" = "{api_version}" }
+
+[params.host]
+type = "enum:api.intercom.io,api.eu.intercom.io,api.au.intercom.io"
+required = true
+
+[params.api_version]
+type = "string"
+pattern = '^[0-9]+\.[0-9]+$'
+required = true
+
+[[operation]]
+id = "contacts.list"
+capability = "contacts:read"
+kind = "read"
+method = "GET"
+path = "/contacts"
+query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=+-]{1,256}" }
+pagination = { cursor = { param = "starting_after", next = "pages.next.starting_after" } }
+
+[[operation]]
+id = "contacts.get"
+capability = "contacts:read"
+kind = "read"
+method = "GET"
+path = "/contacts/{contact_id}"
+path_params = { contact_id = "string:[A-Za-z0-9]{1,64}" }
+
+[[operation]]
+id = "conversations.list"
+capability = "conversations:read"
+kind = "read"
+method = "GET"
+path = "/conversations"
+query = { per_page = "int:1..150", starting_after = "string:[A-Za-z0-9_.=+-]{1,256}" }
+pagination = { cursor = { param = "starting_after", next = "pages.next.starting_after" } }
+
+[[operation]]
+id = "conversations.get"
+capability = "conversations:read"
+kind = "read"
+method = "GET"
+path = "/conversations/{conversation_id}"
+path_params = { conversation_id = "string:[A-Za-z0-9]{1,64}" }
+
+# An admin reply. The body is built: the agent chooses the text, the kind
+# (`comment` reaches the customer, `note` is internal) and the admin.
+[[operation]]
+id = "conversations.reply"
+capability = "conversations:write"
+kind = "write"
+method = "POST"
+path = "/conversations/{conversation_id}/reply"
+path_params = { conversation_id = "string:[A-Za-z0-9]{1,64}" }
+body = "json"
+body_const = { type = "admin" }
+body_params = { message_type = "enum:comment,note", admin_id = "string:[A-Za-z0-9]{1,64}", body = "string" }

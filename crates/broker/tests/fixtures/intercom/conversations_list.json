@@ -1,0 +1,15 @@
+{
+  "_source": "Shape per vendor docs (https://developers.intercom.com/docs/references/rest-api/api.intercom.io/conversations); values are synthetic.",
+  "type": "conversation.list",
+  "conversations": [
+    {"type": "conversation", "id": "215467000000001", "state": "open", "read": true, "title": "Where is my order?"}
+  ],
+  "total_count": 1,
+  "pages": {
+    "type": "pages",
+    "page": 1,
+    "per_page": 20,
+    "total_pages": 5,
+    "next": {"page": 2, "starting_after": "WzE3MDAwMDAwMDAwMDAsMjE1NDY3MDAwMDAwMDAxLDJd"}
+  }
+}

@@ -19,6 +19,11 @@ pub trait Directory {
     fn group(&self, name: &str) -> Option<GroupEntry>;
     /// The user's current groups, primary group included.
     fn groups_of(&self, user: &str) -> Vec<String>;
+    /// [`groups_of`](Directory::groups_of), but a failed lookup is an error
+    /// instead of an empty list. Callers that must fail closed use this.
+    fn try_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
+        Ok(self.groups_of(user))
+    }
 }
 
 /// NSS lookups through `getent passwd|group` and `id -Gn`.
@@ -49,12 +54,16 @@ impl Directory for Getent {
     }
 
     fn groups_of(&self, user: &str) -> Vec<String> {
+        self.try_groups_of(user).unwrap_or_default()
+    }
+
+    fn try_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
         if !valid_name(user) {
-            return Vec::new();
+            return Err(format!("{user:?} is not a user name"));
         }
         run("id", &["-Gn", user])
             .map(|out| out.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_default()
+            .ok_or_else(|| format!("cannot look up the groups of {user}"))
     }
 }
 

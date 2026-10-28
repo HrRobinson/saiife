@@ -11,8 +11,8 @@ In `/etc/saiife/config.toml`:
 
 ```toml
 [notify]
-# Which events are sent. All six when this line is absent.
-on = ["approval_created", "limit_reached", "error_denied_burst", "chain_break", "lockdown"]
+# Which events are sent. All seven when this line is absent.
+on = ["approval_created", "limit_reached", "error_denied_burst", "chain_break", "lockdown", "refresh_failed"]
 
 # A webhook: the URL is https, and may hold a token, so it can live in the vault.
 [notify.targets.chat]
@@ -56,7 +56,7 @@ The webhook body (and the command's standard input):
 ```
 
 Fields that do not apply (`id` for a lockdown, `service` for a chain break) are
-left out.
+left out. `refresh_failed` also has `reason`.
 
 ## Events
 
@@ -68,6 +68,24 @@ left out.
 | `chain_break` | the daemon's check of the audit chain at start fails |
 | `forward_failing` | defined for audit-log forwarding; nothing sends it yet |
 | `lockdown` | lockdown is turned on or off |
+| `refresh_failed` | the daemon could not refresh an `oauth2` secret's access token; at most once per secret per hour. It carries `reason`: `http_<status>`, `network`, `bad_response`, `instance_mismatch` or `persist` |
+
+After a failed refresh the daemon backs off. It makes no token request for
+5 seconds, and the wait doubles with each failure in a row, up to 5 minutes.
+Calls in that time are denied `refresh_failed` with the same reason, and the
+audit log gets one `refresh_failed` record per wait, not one per call. A
+successful refresh, `secret rotate` or `secret remove` ends the backoff.
+
+`reason = "persist"` needs action. The token endpoint rotated the refresh
+token, and the daemon could not write the new one to the vault. Only the
+daemon's memory holds it now, and stderr says
+`<secret>: rotated refresh token not persisted; do not restart the daemon`.
+Fix the vault (disk space, permissions); the next call writes the token
+first. If the daemon stopped before that, the vault's refresh token may no
+longer be valid. Get a new refresh token from the service and run
+`saiife secret rotate <secret>` with it. At shutdown the daemon waits up to
+5 seconds for a refresh in flight, so a stop in the middle of a refresh does
+not cause this.
 
 `limit_reached` is sent once per window for each user, service and limit. The
 window is the limit's own: 60 seconds for `requests_per_minute`,

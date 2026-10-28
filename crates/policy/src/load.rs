@@ -3,7 +3,9 @@
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
 use crate::service::{is_interpreter, SecretCfg, ServiceCfg, AUTH_KINDS};
-use crate::system::{Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING};
+use crate::system::{
+    Example, Fail, McpCfg, Scope, SystemConfig, NO_APPROVERS_WARNING, RESERVED_SERVICES,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -43,6 +45,8 @@ pub enum PolicyError {
     RunAllowInterpreter { secret: String, entry: PathBuf },
     #[error("user {user} matches more than one scope: {}", scopes.join(", "))]
     ScopeConflict { user: String, scopes: Vec<String> },
+    #[error("environment {env}: {detail}")]
+    Environment { env: String, detail: String },
 }
 
 /// Largest config file or drop-in read (1 MiB).
@@ -50,7 +54,16 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Keys only `config.toml` may set; a drop-in setting one is `Invalid`.
 const CONFIG_ONLY: &[&str] = &[
-    "version", "locked", "daemon", "admin", "audit", "approval", "notify", "gateway", "doctor",
+    "version",
+    "locked",
+    "daemon",
+    "admin",
+    "audit",
+    "approval",
+    "notify",
+    "gateway",
+    "doctor",
+    "environments",
 ];
 const CONFIG_ONLY_GUARD: &[&str] = &["budget_ms", "fail"];
 
@@ -166,6 +179,7 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     }
 
     validate_services(config_file, &cfg, &service_origin)?;
+    validate_environments(config_file, &cfg, &service_origin)?;
     cfg.gateway
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
@@ -273,6 +287,15 @@ fn validate_services(
             .get(name)
             .map(PathBuf::from)
             .unwrap_or_else(|| config_file.to_path_buf());
+        if RESERVED_SERVICES.contains(&name.as_str()) {
+            return Err(invalid(
+                &file,
+                format!(
+                    "service name {name:?} is reserved ({})",
+                    RESERVED_SERVICES.join(", ")
+                ),
+            ));
+        }
         let patterns = svc
             .allow
             .iter()
@@ -299,6 +322,52 @@ fn validate_services(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// `[environments.*]` (plan 14 decision 10): valid names, every
+/// `[[scope]] env` defined, and each environment applied to the base config
+/// passing the same service checks as the base. The connector-catalog
+/// check of each applied config is the daemon's (`catalog::validate`).
+fn validate_environments(
+    config_file: &Path,
+    cfg: &SystemConfig,
+    origin: &BTreeMap<String, String>,
+) -> Result<(), PolicyError> {
+    if let Some(name) = cfg
+        .environments
+        .keys()
+        .find(|n| !crate::environment::valid_env_name(n))
+    {
+        return Err(invalid(
+            config_file,
+            format!("environment name {name:?} is not [a-z0-9_-]{{1,64}}"),
+        ));
+    }
+    for s in &cfg.scope {
+        if let Some(env) = &s.env {
+            if !cfg.environments.contains_key(env) {
+                return Err(invalid(
+                    config_file,
+                    format!(
+                        "scope {:?}: env {env:?} is not defined in [environments]",
+                        s.name
+                    ),
+                ));
+            }
+        }
+    }
+    for env in cfg.environments.keys() {
+        let applied =
+            crate::environment::apply(cfg, env).map_err(|e| invalid(config_file, e.to_string()))?;
+        validate_services(config_file, &applied, origin).map_err(|e| match e {
+            PolicyError::Invalid { path, detail } => PolicyError::Invalid {
+                path,
+                detail: format!("environment {env}: {detail}"),
+            },
+            other => other,
+        })?;
     }
     Ok(())
 }

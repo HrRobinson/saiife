@@ -39,6 +39,8 @@ pub mod notifier;
 #[cfg(target_os = "linux")]
 pub mod notify;
 #[cfg(target_os = "linux")]
+pub mod oauth;
+#[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
 pub mod personal;
@@ -54,8 +56,10 @@ pub mod server;
 pub mod sessions;
 #[cfg(target_os = "linux")]
 pub mod signals;
+/// The SMTP client lives in the broker's mail transport (plan 14, Task 6);
+/// the notifier sends through it.
 #[cfg(target_os = "linux")]
-pub mod smtp;
+pub use saiife_broker::mail::smtp;
 #[cfg(target_os = "linux")]
 mod start;
 #[cfg(target_os = "linux")]

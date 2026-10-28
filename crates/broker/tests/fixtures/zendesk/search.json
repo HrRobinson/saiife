@@ -1,0 +1,15 @@
+{
+  "_source": "https://developer.zendesk.com/api-reference/ticketing/ticket-management/search/#list-search-results",
+  "results": [
+    {
+      "id": 35436,
+      "result_type": "ticket",
+      "subject": "Help, my printer is on fire!",
+      "status": "open"
+    }
+  ],
+  "count": 1,
+  "next_page": null,
+  "previous_page": null,
+  "facets": null
+}

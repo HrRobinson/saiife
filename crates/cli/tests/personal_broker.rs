@@ -197,9 +197,14 @@ path = "/reports"
 /// A broker serving [`erp_config`] on a fresh mock, its CA in the user's
 /// `<config dir>/ca/`, and the `erp-key` secret added.
 fn erp_world() -> (TestBroker, Mock) {
+    erp_world_with("")
+}
+
+/// [`erp_world`] with `extra` appended to the config.
+fn erp_world_with(extra: &str) -> (TestBroker, Mock) {
     let m = mock();
     let mut b = TestBroker::prepare();
-    b.write_config(&erp_config(m.port));
+    b.write_config(&format!("{}{extra}", erp_config(m.port)));
     let ca = b.config_dir().join("ca");
     fs::create_dir(&ca).unwrap();
     fs::set_permissions(&ca, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1190,4 +1195,58 @@ fn locked_daemon_at_personal_socket_is_not_a_broker() {
         .filter(|r| r["event"] == "secret_add")
         .collect();
     assert!(adds.is_empty(), "{adds:?}");
+}
+
+/// Plan 14 environments through the personal broker: `saiife api` sends the
+/// project's `env`, and the broker (developer-mode decisions) runs the call
+/// under that environment's snapshot. An undefined `env` is the base config
+/// with a warning.
+#[test]
+fn project_env_picks_snapshot_via_cli() {
+    let (b, m) = erp_world_with(
+        "\n[environments.staging]\nservices.erp.allow = [\"invoices:read\", \"reports:read\"]\n",
+    );
+    let project = b.path().join("p");
+    fs::create_dir_all(project.join(".saiife")).unwrap();
+    // No project env: the base config, where `reports:read` is in no list.
+    let o = b.run_cli(&["api", "erp", "reports.get"]);
+    assert_eq!(o.status.code(), Some(2), "{} / {}", out(&o), err(&o));
+    fs::write(
+        project.join(".saiife/config.toml"),
+        "version = 2\nenv = \"staging\"\n",
+    )
+    .unwrap();
+    let o = b.run_cli(&["api", "erp", "reports.get"]);
+    assert_eq!(o.status.code(), Some(0), "{} / {}", out(&o), err(&o));
+    assert_eq!(m.hits.lock().unwrap().as_slice(), ["GET /api/reports"]);
+    let conn: Vec<Value> = b
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "connector")
+        .collect();
+    let last = conn.last().unwrap();
+    assert_eq!(last["env"], "staging", "{last}");
+    assert_eq!(last["decision"], "allow", "{last}");
+    // `api --list` takes the same snapshot.
+    let o = b.run_cli(&["api", "--list", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    let action = v["services"][0]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["id"] == "reports.get")
+        .map(|op| op["action"].clone());
+    assert_eq!(action, Some(json!("allow")), "{v}");
+    // An env the broker config does not define: the base, with a warning.
+    fs::write(
+        project.join(".saiife/config.toml"),
+        "version = 2\nenv = \"qa\"\n",
+    )
+    .unwrap();
+    let o = b.run_cli(&["api", "erp", "invoices.list"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("\"qa\" is not defined"), "{}", err(&o));
+    let o = b.run_cli(&["api", "erp", "reports.get"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
 }

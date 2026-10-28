@@ -38,6 +38,10 @@ use zeroize::Zeroizing;
 /// between the approval and the send. It is never sent again by itself
 /// (that could send a write twice).
 pub const INTERRUPTED: &str = "interrupted";
+/// The rule of an approved connector request whose environment changed
+/// between the ask and the send (rebound scope, or an environment no
+/// longer defined): nothing is sent.
+pub const ENV_CHANGED: &str = "env_changed";
 /// The note of a request its requester rejected (withdrew).
 pub const CANCELLED: &str = "cancelled by requester";
 /// At most this many pending requests per uid; more are denied
@@ -142,6 +146,8 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
                 .clone()
                 .map(|(minor, currency)| Amount { minor, currency }),
             headers: p.headers.clone(),
+            env: p.stored.env.clone(),
+            env_base: p.stored.env_recorded && p.stored.env.is_none(),
         },
     };
     store_new(ctx, new, Some(exact), ttl).await
@@ -1252,15 +1258,47 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     } else {
         ctx.groups_of(&stored.user).await
     };
+    // The environment, chosen as for a new call: locked mode takes the
+    // scope's as it is now; developer mode the one the request was asked
+    // under (stored with it).
+    let groups = Groups(groups);
+    let mode = crate::api_ops::gateway_mode(&ctx);
+    let Ok((env_name, _)) = g.select_env(mode, &groups, &stored.user, stored.env.as_deref()) else {
+        return fail(
+            &ctx,
+            &r,
+            crate::ops::UNKNOWN_ENV_RULE,
+            "the scope's environment has no policy snapshot",
+        )
+        .await;
+    };
+    // An approved request is sent under the environment it was asked
+    // under, or not at all: locked mode refuses a scope rebound to another
+    // environment (or from the base config to one) since the ask,
+    // developer mode an environment no longer defined (never the base
+    // config instead). Only a request sealed before the environment was
+    // recorded (`env_recorded` false, no `env`) is not checked.
+    if (stored.env_recorded || stored.env.is_some()) && env_name != stored.env.as_deref() {
+        let message = match mode {
+            saiife_policy::Mode::Locked => {
+                "the scope's environment changed since the request was asked"
+            }
+            saiife_policy::Mode::Developer => {
+                "the environment the request was asked under is no longer defined"
+            }
+        };
+        return fail(&ctx, &r, ENV_CHANGED, message).await;
+    }
+    let snap = g.snapshot_for(env_name);
     let env = DaemonEnv {
         ctx: &ctx,
-        config: &g.snap.config,
-        groups: Groups(groups),
+        config: &snap.config,
+        groups,
         agent: r.agent.clone(),
     };
     let up = ctx.upstream.as_ref().ok();
     let (call, outcome, trace) =
-        pipeline::send_approved(&stored, &g.snap, &g.catalog, &ctx.limiter, &env, up).await;
+        pipeline::send_approved(&stored, snap, &g.catalog, &ctx.limiter, &env, up).await;
     let asked_via = stored.via.clone();
     drop(stored);
     if let Outcome::Limited { limit } = &outcome {
@@ -1274,7 +1312,7 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
 
     // The connector record of the send: `via = approval`, linked by id,
     // with how the request first came in.
-    let mut rec = pipeline::record(&call, &g.snap, &trace, &outcome, &r.agent, VERSION);
+    let mut rec = pipeline::record(&call, snap, &trace, &outcome, &r.agent, VERSION);
     rec.extra.insert("approval".into(), rid.into());
     rec.extra.insert("approved_by".into(), by.into());
     rec.extra

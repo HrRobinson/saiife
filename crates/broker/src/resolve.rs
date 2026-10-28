@@ -76,6 +76,12 @@ pub fn proxy<'m>(
     method: &str,
     raw_path_and_query: &str,
 ) -> Result<(&'m Operation, BTreeMap<String, String>), BrokerError> {
+    // A mail operation is named-only: there is no path to send.
+    if m.transport == crate::manifest::Transport::Mail {
+        return Err(BrokerError::UnknownOperation(
+            "a proxy path (mail operations are named only)".into(),
+        ));
+    }
     check_raw(raw_path_and_query)?;
     let (path, query) = match raw_path_and_query.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -92,7 +98,13 @@ pub fn proxy<'m>(
     // with prefix/suffix, 0 bare placeholder. Compared from the left; two
     // equally specific matches are ambiguous.
     let mut cands: Vec<(Vec<u8>, &Operation, BTreeMap<String, String>)> = Vec::new();
-    for op in m.operation.iter().filter(|o| o.method == method) {
+    // A GraphQL operation is named-only: its fixed document is the body,
+    // so a proxied request can never reach it.
+    for op in m
+        .operation
+        .iter()
+        .filter(|o| o.method == method && o.graphql.is_none())
+    {
         let Ok(tpl) = template_segments(&op.path) else {
             continue;
         };

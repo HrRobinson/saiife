@@ -33,9 +33,13 @@ mod audit_locked;
 #[cfg(target_os = "linux")]
 mod broker;
 mod check;
+// Used by `saiife api collection`, which is Linux only in this version.
 mod check_managed;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod collection;
 mod connect_cmd;
 mod doctor_cmd;
+mod env_cmd;
 mod eval;
 #[cfg(target_os = "linux")]
 mod import_cmd;
@@ -310,6 +314,15 @@ enum Cmd {
         #[command(subcommand)]
         action: policy_cmd::PolicyAction,
     },
+    /// Environments (`[environments.<name>]`): list them, or choose the
+    /// one that applies (locked mode: root rebinds a scope).
+    Env {
+        /// The system config (default /etc/saiife/config.toml).
+        #[arg(long = "system-config", hide = true, global = true)]
+        system_config: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: env_cmd::EnvAction,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     System {
         #[command(subcommand)]
@@ -456,6 +469,13 @@ fn main() -> ExitCode {
     {
         return policy_cmd::run(system_config, action);
     }
+    if let Cmd::Env {
+        system_config,
+        action,
+    } = cli.command
+    {
+        return env_cmd::run(system_config, action);
+    }
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
@@ -508,6 +528,7 @@ fn main() -> ExitCode {
         | Cmd::Lockdown { .. }
         | Cmd::Approvals { .. }
         | Cmd::Policy { .. }
+        | Cmd::Env { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
         | Cmd::Doctor { .. } => {

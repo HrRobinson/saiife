@@ -1,0 +1,110 @@
+# Stripe API (v1). Paths and fields checked against the vendor reference
+# (shape per vendor docs; no network in the build):
+#   https://docs.stripe.com/api/customers
+#   https://docs.stripe.com/api/charges
+#   https://docs.stripe.com/api/payment_intents
+#   https://docs.stripe.com/api/invoices
+#   https://docs.stripe.com/api/refunds
+#   https://docs.stripe.com/api/pagination   (starting_after, has_more)
+id = "stripe"
+version = 1
+title = "Stripe"
+base_url = "https://api.stripe.com/v1"
+hosts = ["api.stripe.com"]
+auth = [{ kind = "bearer", secret_field = "token" }]
+request_headers = ["Idempotency-Key", "Accept"]
+
+[params.currency]                # the account's currency, used for amount caps; admin-only
+type = "string"
+pattern = "^[A-Z]{3}$"
+required = true
+
+[[operation]]
+id = "customers.list"
+capability = "customers:read"
+kind = "read"
+method = "GET"
+path = "/customers"
+query = { limit = "int:1..100", starting_after = "string:cus_[A-Za-z0-9]{1,64}", email = "string:[A-Za-z0-9._%+@-]{1,254}" }
+pagination = { cursor = { param = "starting_after", next = "data[-1].id", more = "has_more" } }
+
+[[operation]]
+id = "customers.get"
+capability = "customers:read"
+kind = "read"
+method = "GET"
+path = "/customers/{customer_id}"
+path_params = { customer_id = "string:cus_[A-Za-z0-9]{1,64}" }
+
+[[operation]]
+id = "charges.list"
+capability = "charges:read"
+kind = "read"
+method = "GET"
+path = "/charges"
+query = { limit = "int:1..100", starting_after = "string:(ch|py)_[A-Za-z0-9]{1,64}", customer = "string:cus_[A-Za-z0-9]{1,64}", payment_intent = "string:pi_[A-Za-z0-9]{1,64}" }
+pagination = { cursor = { param = "starting_after", next = "data[-1].id", more = "has_more" } }
+
+[[operation]]
+id = "charges.get"
+capability = "charges:read"
+kind = "read"
+method = "GET"
+path = "/charges/{charge_id}"
+path_params = { charge_id = "string:(ch|py)_[A-Za-z0-9]{1,64}" }
+
+[[operation]]
+id = "payment_intents.list"
+capability = "payment_intents:read"
+kind = "read"
+method = "GET"
+path = "/payment_intents"
+query = { limit = "int:1..100", starting_after = "string:pi_[A-Za-z0-9]{1,64}", customer = "string:cus_[A-Za-z0-9]{1,64}" }
+pagination = { cursor = { param = "starting_after", next = "data[-1].id", more = "has_more" } }
+
+[[operation]]
+id = "payment_intents.get"
+capability = "payment_intents:read"
+kind = "read"
+method = "GET"
+path = "/payment_intents/{payment_intent_id}"
+path_params = { payment_intent_id = "string:pi_[A-Za-z0-9]{1,64}" }
+
+[[operation]]
+id = "invoices.list"
+capability = "invoices:read"
+kind = "read"
+method = "GET"
+path = "/invoices"
+query = { limit = "int:1..100", starting_after = "string:in_[A-Za-z0-9]{1,64}", customer = "string:cus_[A-Za-z0-9]{1,64}", status = "enum:draft,open,paid,uncollectible,void" }
+pagination = { cursor = { param = "starting_after", next = "data[-1].id", more = "has_more" } }
+
+[[operation]]
+id = "invoices.get"
+capability = "invoices:read"
+kind = "read"
+method = "GET"
+path = "/invoices/{invoice_id}"
+path_params = { invoice_id = "string:in_[A-Za-z0-9]{1,64}" }
+
+[[operation]]
+id = "refunds.list"
+capability = "refunds:read"
+kind = "read"
+method = "GET"
+path = "/refunds"
+query = { limit = "int:1..100", starting_after = "string:re_[A-Za-z0-9]{1,64}", charge = "string:(ch|py)_[A-Za-z0-9]{1,64}", payment_intent = "string:pi_[A-Za-z0-9]{1,64}" }
+pagination = { cursor = { param = "starting_after", next = "data[-1].id", more = "has_more" } }
+
+# The body is built and form-encoded; the amount is read from the same JSON,
+# in minor units, in the admin's `currency`. A refund without an `amount`
+# (a full refund) is denied `bad_amount`.
+[[operation]]
+id = "refunds.create"
+capability = "refunds:write"
+kind = "write"
+method = "POST"
+path = "/refunds"
+body = "form"
+body_params = { payment_intent = "string:pi_[A-Za-z0-9]{1,64}", charge = "string:(ch|py)_[A-Za-z0-9]{1,64}", amount = "int:1..99999999", reason = "enum:duplicate,fraudulent,requested_by_customer" }
+amount = { field = "amount", currency_param = "currency", unit = "minor" }

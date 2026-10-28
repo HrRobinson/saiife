@@ -240,6 +240,7 @@ mod linux {
     fn secret_kind(m: &Manifest) -> &'static str {
         match m.auth.first() {
             Some(a) if a.kind == "basic" => "basic",
+            Some(a) if a.kind == "oauth2" => "oauth2",
             Some(a) if a.secret_field == "value" => "header",
             _ => "token",
         }
@@ -283,6 +284,14 @@ mod linux {
                 .map_err(|e| Stop::Refused(format!("connector {}: {e}", m.id)))?;
             ty.check(v)
                 .map_err(|why| Stop::Refused(format!("--param {name}: {why}")))?;
+            // The same host rule as `policy check`, so a file that would not
+            // load is never written.
+            if (m.whole_host_param() == Some(name.as_str())
+                || m.host_params().contains(&name.as_str()))
+                && !saiife_broker::request::bare_hostname(v)
+            {
+                return refuse(format!("--param {name}: not a bare lower-case hostname"));
+            }
         }
         Ok(out)
     }

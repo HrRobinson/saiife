@@ -2,8 +2,9 @@
 //! check of `[services.*]` against them.
 
 use crate::manifest::{from_http_service, Manifest, HTTP_CONNECTOR};
+use crate::request::bare_hostname;
 use crate::BrokerError;
-use saiife_policy::capability::{matches_with, Capability};
+use saiife_policy::capability::{glob_with, matches_with, Capability};
 use saiife_policy::{ServiceCfg, SystemConfig};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -65,6 +66,16 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
                     name: format!("{name}.{p}"),
                     reason,
                 })?;
+            // A param that is the whole upstream host: no userinfo, port,
+            // path, upper case or trailing dot can ride along (decision 1).
+            if (m.whole_host_param() == Some(p.as_str()) || m.host_params().contains(&p.as_str()))
+                && !bare_hostname(v)
+            {
+                return Err(BrokerError::BadValue {
+                    name: format!("{name}.{p}"),
+                    reason: "not a bare lower-case hostname".into(),
+                });
+            }
         }
         let caps: Vec<Capability> = m
             .operation
@@ -84,7 +95,10 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
             ("deny", &svc.deny),
         ] {
             for pat in pats {
-                if !caps.iter().any(|c| matches_with(pat, c, true)) {
+                if !caps
+                    .iter()
+                    .any(|c| matches_with(pat, c, true) || template_matches(pat, c))
+                {
                     warnings.push(format!(
                         "service {name}: {list} pattern {pat:?} matches no operation of {}",
                         m.id
@@ -94,4 +108,60 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
         }
     }
     Ok(warnings)
+}
+
+/// A concrete qualifier pattern (`messages:read:channel=C0123`) against an
+/// operation whose qualifier is a template (`channel={channel}`): each
+/// `{placeholder}` stands for any value, so the pattern can match at call time.
+fn template_matches(pat: &str, cap: &Capability) -> bool {
+    let Some(tpl) = cap.qualifier.as_deref().filter(|q| q.contains('{')) else {
+        return false;
+    };
+    let mut it = pat.splitn(3, ':');
+    let (Some(res), Some(verb), Some(qual)) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    if (res != "*" && res != cap.resource) || (verb != "*" && verb != cap.verb) {
+        return false;
+    }
+    let mut starred = String::new();
+    let mut open = false;
+    for c in tpl.chars() {
+        match c {
+            '{' => {
+                open = true;
+                starred.push('*');
+            }
+            '}' => open = false,
+            _ if !open => starred.push(c),
+            _ => {}
+        }
+    }
+    glob_with(&starred, qual, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn warnings(allow: &str) -> Vec<String> {
+        let cfg: SystemConfig = toml::from_str(&format!(
+            "version = 2\n[services.chat]\nconnector = \"slack\"\nsecret = \"s\"\nallow = [{allow}]\n"
+        ))
+        .unwrap();
+        validate(&cfg, &Catalog::new(crate::manifest::builtin(), vec![])).unwrap()
+    }
+
+    #[test]
+    fn concrete_qualifier_matches_a_template() {
+        assert!(warnings(r#""messages:read:channel=C0123""#).is_empty());
+        assert!(warnings(r#""messages:write:channel=C0123""#).is_empty());
+    }
+
+    #[test]
+    fn wrong_key_or_verb_still_warns() {
+        assert_eq!(warnings(r#""messages:read:team=C0123""#).len(), 1);
+        assert_eq!(warnings(r#""messages:nuke:channel=C0123""#).len(), 1);
+        assert_eq!(warnings(r#""nothing:read:channel=C0123""#).len(), 1);
+    }
 }

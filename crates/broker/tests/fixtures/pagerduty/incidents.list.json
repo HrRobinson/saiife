@@ -1,0 +1,10 @@
+{
+  "_source": "https://developer.pagerduty.com/api-reference/9d0b4b12e36f9-list-incidents and https://developer.pagerduty.com/docs/rest-api-v2/pagination/ (shape per vendor docs; not fetched)",
+  "incidents": [
+    { "id": "PT4KHLK", "incident_number": 1234, "title": "The server is on fire.", "status": "triggered", "urgency": "high", "service": { "id": "PIJ90N7", "type": "service_reference" } }
+  ],
+  "limit": 25,
+  "offset": 25,
+  "more": true,
+  "total": null
+}

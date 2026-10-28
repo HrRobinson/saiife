@@ -68,19 +68,19 @@ Capabilities are `<object>:<verb>`. Policy order is deny, then ask, then allow;
 nothing matching means deny. Both policies below go in
 `/etc/saiife/policy.d/hubspot.toml`.
 
-### Suggested read-only policy
+## Suggested policy: read-only
 
 ```toml
 [services.hubspot]
 connector = "hubspot"
 secret = "hubspot-prod"
 allow = ["contacts:read", "companies:read", "deals:read"]
-deny  = ["*:delete"]
 ```
 
-`contacts.update` and `deals.update` are denied (`default_deny`).
+`contacts.update` and `deals.update` are denied (`default_deny`). The
+manifest has no delete operation, so there is nothing to deny by name.
 
-### Every write under `ask`
+## Suggested policy: every write under `ask`
 
 ```toml
 [services.hubspot]
@@ -88,7 +88,6 @@ connector = "hubspot"
 secret = "hubspot-prod"
 allow = ["contacts:read", "companies:read", "deals:read"]
 ask   = ["contacts:write", "deals:write"]
-deny  = ["*:delete"]
 ```
 
 Until plan 11 lands, `ask` answers deny with `rule = "approval_not_available"`.

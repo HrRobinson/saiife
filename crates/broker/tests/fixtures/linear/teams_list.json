@@ -1,0 +1,12 @@
+{
+  "_source": "Shape per vendor docs (https://linear.app/developers/pagination); values are synthetic.",
+  "data": {
+    "teams": {
+      "nodes": [
+        {"id": "9cfb482a-81e3-4154-b5b9-2c805e70a02d", "key": "ENG", "name": "Engineering"},
+        {"id": "5b8c2d6e-0a1f-4f2f-8f0c-3d7a1b2c4e5f", "key": "OPS", "name": "Operations"}
+      ],
+      "pageInfo": {"hasNextPage": false, "endCursor": "5b8c2d6e-0a1f-4f2f-8f0c-3d7a1b2c4e5f"}
+    }
+  }
+}

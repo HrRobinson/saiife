@@ -1,0 +1,86 @@
+# PagerDuty REST API v2. Paths checked against the vendor reference (shape per
+# vendor docs; not fetched, no network in this build):
+#   https://developer.pagerduty.com/api-reference/   (Incidents, Notes, Services, On-Calls)
+#   https://developer.pagerduty.com/docs/rest-api-v2/pagination/   (offset, limit, more)
+id = "pagerduty"
+version = 1
+title = "PagerDuty"
+base_url = "https://api.pagerduty.com"
+hosts = ["api.pagerduty.com"]
+auth = [{ kind = "header", name = "Authorization", prefix = "Token token=", secret_field = "token" }]
+request_headers = ["Content-Type"]
+headers = { Accept = "application/vnd.pagerduty+json;version=2", From = "{from}" }
+
+[params.from]                    # the acting user's email; set by the admin, never by the agent
+type = "string"
+pattern = "^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}$"
+required = true
+
+[[operation]]
+id = "incidents.list"
+capability = "incidents:read"
+kind = "read"
+method = "GET"
+path = "/incidents"
+query = { limit = "int:1..100", offset = "int:0..", since = "datetime", until = "datetime", urgencies = "enum:high,low" }
+pagination = { offset = { param = "offset", limit_field = "limit", more = "more" } }
+
+[[operation]]
+id = "incidents.get"
+capability = "incidents:read"
+kind = "read"
+method = "GET"
+path = "/incidents/{incident_id}"
+path_params = { incident_id = "string:[A-Z0-9]{1,32}" }
+
+[[operation]]
+id = "incidents.notes"
+capability = "incidents:read"
+kind = "read"
+method = "GET"
+path = "/incidents/{incident_id}/notes"
+path_params = { incident_id = "string:[A-Z0-9]{1,32}" }
+
+[[operation]]
+id = "incidents.create"
+capability = "incidents:write"
+kind = "write"
+method = "POST"
+path = "/incidents"
+body = "json"
+
+[[operation]]
+id = "incidents.update"
+capability = "incidents:write"
+kind = "write"
+method = "PUT"
+path = "/incidents/{incident_id}"
+path_params = { incident_id = "string:[A-Z0-9]{1,32}" }
+body = "json"
+
+[[operation]]
+id = "notes.create"
+capability = "incidents:write"
+kind = "write"
+method = "POST"
+path = "/incidents/{incident_id}/notes"
+path_params = { incident_id = "string:[A-Z0-9]{1,32}" }
+body = "json"
+
+[[operation]]
+id = "services.list"
+capability = "services:read"
+kind = "read"
+method = "GET"
+path = "/services"
+query = { limit = "int:1..100", offset = "int:0..", query = "string:.{1,256}" }
+pagination = { offset = { param = "offset", limit_field = "limit", more = "more" } }
+
+[[operation]]
+id = "oncalls.list"
+capability = "oncalls:read"
+kind = "read"
+method = "GET"
+path = "/oncalls"
+query = { limit = "int:1..100", offset = "int:0..", since = "datetime", until = "datetime" }
+pagination = { offset = { param = "offset", limit_field = "limit", more = "more" } }

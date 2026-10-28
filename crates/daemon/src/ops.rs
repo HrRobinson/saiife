@@ -20,10 +20,11 @@ use saiife_ipc::msg::{
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::Mode as PolicyMode;
 use saiife_policy::{
-    active_packs, effective_policy, policy_hash, Directory, LoadedPolicy, PackInfo, SystemConfig,
+    active_packs, effective_policy, env_for, environment, policy_hash, Directory, LoadedPolicy,
+    PackInfo, SystemConfig,
 };
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -69,12 +70,99 @@ pub use saiife_ipc::msg::MAX_RECORD_BYTES;
 const NOTICE_EVERY: Duration = Duration::from_secs(60);
 
 /// The connector side of a valid policy: the snapshot every call takes when
-/// it starts, and the connector catalog checked against it.
+/// it starts (the base config, and one per `[environments.<name>]` with
+/// that environment applied and its own hash), and the connector catalog
+/// checked against them.
 #[derive(Debug)]
 pub struct GatewayPolicy {
     pub snap: PolicySnapshot,
+    pub by_env: BTreeMap<String, PolicySnapshot>,
     pub catalog: Catalog,
 }
+
+impl GatewayPolicy {
+    /// The base snapshot and one per environment of `config`. `Err` when an
+    /// environment does not apply (a config that passed `load_system`
+    /// always does).
+    pub fn build(
+        config: &SystemConfig,
+        packs: &[PackInfo],
+        catalog: Catalog,
+        mode: PolicyMode,
+    ) -> Result<GatewayPolicy, String> {
+        let snap_of = |cfg: SystemConfig, env: Option<&str>| {
+            let (active, _) = active_packs(&cfg, packs, None);
+            let hash = policy_hash(&effective_policy(&cfg, &active, None, env));
+            PolicySnapshot {
+                config: cfg,
+                hash,
+                mode,
+                env: env.map(str::to_string),
+            }
+        };
+        let mut by_env = BTreeMap::new();
+        for name in config.environments.keys() {
+            let applied = environment::apply(config, name).map_err(|e| e.to_string())?;
+            by_env.insert(name.clone(), snap_of(applied, Some(name)));
+        }
+        Ok(GatewayPolicy {
+            snap: snap_of(config.clone(), None),
+            by_env,
+            catalog,
+        })
+    }
+
+    /// The snapshot of environment `env`; the base one for `None` or a
+    /// name with no snapshot. Callers take the name from [`select_env`],
+    /// which never hands a locked caller a name without a snapshot.
+    ///
+    /// [`select_env`]: GatewayPolicy::select_env
+    pub fn snapshot_for(&self, env: Option<&str>) -> &PolicySnapshot {
+        env.and_then(|e| self.by_env.get(e)).unwrap_or(&self.snap)
+    }
+
+    /// Which environment a call by `user` runs under, and a warning for
+    /// the answer. `Locked`: the environment of the user's scope; a
+    /// project `env` is ignored (the project path never chooses it).
+    /// `Developer` (the personal broker, spec §6.11): the project `env`
+    /// the client sends; an undefined one falls back to the base config
+    /// with a warning (the only path that falls back to the base).
+    ///
+    /// `Err(rule)`: a locked scope bound to an environment with no
+    /// snapshot (impossible after `load_system`); the call is denied
+    /// rather than run under the looser base config.
+    pub fn select_env<'a>(
+        &'a self,
+        mode: PolicyMode,
+        dir: &dyn Directory,
+        user: &str,
+        project_env: Option<&'a str>,
+    ) -> Result<(Option<&'a str>, Option<String>), &'static str> {
+        match mode {
+            PolicyMode::Locked => match env_for(&self.snap.config, dir, user) {
+                Ok(Some(e)) => match self.by_env.get_key_value(e) {
+                    Some((k, _)) => Ok((Some(k.as_str()), None)),
+                    None => Err(UNKNOWN_ENV_RULE),
+                },
+                // A scope conflict leaves the base: step 3 denies the call.
+                Ok(None) | Err(_) => Ok((None, None)),
+            },
+            PolicyMode::Developer => Ok(match project_env {
+                None => (None, None),
+                Some(e) if self.by_env.contains_key(e) => (Some(e), None),
+                Some(e) => (
+                    None,
+                    Some(format!(
+                        "environment {e:?} is not defined; the base config is used"
+                    )),
+                ),
+            }),
+        }
+    }
+}
+
+/// The deny rule of a locked call whose scope environment has no snapshot.
+pub const UNKNOWN_ENV_RULE: &str = "policy_invalid";
 
 /// The policy in force.
 #[derive(Debug, Clone)]
@@ -107,6 +195,11 @@ impl PolicyState {
 
     /// The state of a loaded policy whose services passed
     /// [`check_services`], for the locked daemon.
+    ///
+    /// Each environment gets its own snapshot. One that does not apply
+    /// (impossible after `load_system`) leaves connectors denied rather
+    /// than running its callers under the base config, and the policy not
+    /// `ok` (status reports it).
     pub fn from_loaded(l: &LoadedPolicy, catalog: &[PackInfo], connectors: Catalog) -> PolicyState {
         PolicyState::from_loaded_in(l, catalog, connectors, Mode::Locked)
     }
@@ -120,29 +213,31 @@ impl PolicyState {
         mode: Mode,
     ) -> PolicyState {
         let (packs, _) = active_packs(&l.config, catalog, None);
-        let hash = policy_hash(&effective_policy(&l.config, &packs, None));
+        let hash = policy_hash(&effective_policy(&l.config, &packs, None, None));
+        let built = GatewayPolicy::build(&l.config, catalog, connectors, mode.policy_mode());
+        let gateway = match built {
+            Ok(g) => Some(Arc::new(g)),
+            Err(e) => {
+                eprintln!("saiife: warning: connectors denied: {e}");
+                None
+            }
+        };
         PolicyState {
-            hash: Some(hash.clone()),
-            ok: true,
+            hash: Some(hash),
+            ok: gateway.is_some(),
             min_free_mb: l.config.audit.min_free_mb,
             admin_groups: l.config.admin.groups.clone(),
             system: Some(Arc::new(l.config.clone())),
-            gateway: Some(Arc::new(GatewayPolicy {
-                snap: PolicySnapshot {
-                    config: l.config.clone(),
-                    hash,
-                    mode: mode.policy_mode(),
-                },
-                catalog: connectors,
-            })),
+            gateway,
         }
     }
 }
 
 /// The connector catalog for a loaded policy: the built-in manifests plus
 /// the admin's in `<config dir>/connectors` (root-owned), with every
-/// `[services.*]` checked against it. An error makes the policy invalid
-/// (at a reload: `rejected`, the old policy stays). Warnings go to stderr.
+/// `[services.*]` checked against it, for the base config and for each
+/// environment applied to it. An error makes the policy invalid (at a
+/// reload: `rejected`, the old policy stays). Warnings go to stderr.
 pub fn check_services(l: &LoadedPolicy, config_path: &std::path::Path) -> Result<Catalog, String> {
     check_services_owned(l, config_path, 0)
 }
@@ -161,11 +256,30 @@ pub fn check_services_owned(
     let local = saiife_broker::manifest::load_local_with(&dir, saiife_broker::builtin(), owner)
         .map_err(|e| e.to_string())?;
     let cat = Catalog::new(saiife_broker::builtin(), local);
-    let warnings = saiife_broker::catalog::validate(&l.config, &cat).map_err(|e| e.to_string())?;
-    for w in warnings {
+    for w in check_catalog(&l.config, &cat)? {
         eprintln!("saiife: warning: {w}");
     }
     Ok(cat)
+}
+
+/// `catalog::validate` for `cfg` and for every environment applied to it
+/// (plan 14 decision 10): an environment's secret, params or rule lists
+/// get the checks the base ones get. The warnings, each environment's
+/// prefixed with its name.
+pub fn check_catalog(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, String> {
+    let mut warnings = saiife_broker::catalog::validate(cfg, cat).map_err(|e| e.to_string())?;
+    for name in cfg.environments.keys() {
+        let applied = environment::apply(cfg, name).map_err(|e| e.to_string())?;
+        let w = saiife_broker::catalog::validate(&applied, cat)
+            .map_err(|e| format!("environment {name}: {e}"))?;
+        warnings.extend(
+            w.into_iter()
+                .filter(|w| !warnings.contains(w))
+                .map(|w| format!("environment {name}: {w}"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(warnings)
 }
 
 type Cache<K, V> = Mutex<HashMap<K, (Instant, V)>>;
@@ -204,6 +318,8 @@ pub struct Ctx {
     pub upstream: Result<Upstream, String>,
     /// At most 4 upstream calls in flight per service.
     pub pools: Pools,
+    /// OAuth2 access tokens, in memory only (plan 14, Task 7).
+    pub oauth: crate::oauth::TokenCache,
     /// Where `secret.add` keeps the backups of imported files.
     pub backup_dir: PathBuf,
     /// Bearer tokens of the loopback TCP listener (`api.token`).
@@ -407,6 +523,7 @@ impl Ctx {
             limiter: i.limiter,
             upstream: i.upstream,
             pools: Pools::new(),
+            oauth: Default::default(),
             backup_dir: i.backup_dir,
             tokens: i.tokens,
             lockdown: i.lockdown,
@@ -508,20 +625,27 @@ impl Ctx {
     }
 
     /// The user's groups, cached for at most 60 s. A failed lookup is an
-    /// empty list (so: not an admin).
+    /// empty list (so: not an admin), and is not cached.
     pub(crate) async fn groups_of(&self, user: &str) -> Vec<String> {
+        self.try_groups_of(user).await.unwrap_or_default()
+    }
+
+    /// [`Ctx::groups_of`], a failed lookup an error. Only an answer is
+    /// cached: a lookup that failed is tried again on the next call, never
+    /// remembered as "no groups" for the TTL.
+    pub async fn try_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
         if let Some((at, v)) = lock(&self.groups).get(user) {
             if at.elapsed() < LOOKUP_TTL {
-                return v.clone();
+                return Ok(v.clone());
             }
         }
         let dir = Arc::clone(&self.directory);
         let name = user.to_string();
-        let v = tokio::task::spawn_blocking(move || dir.groups_of(&name))
+        let v = tokio::task::spawn_blocking(move || dir.try_groups_of(&name))
             .await
-            .unwrap_or_default();
+            .map_err(|e| format!("group lookup did not finish: {e}"))??;
         lock(&self.groups).insert(user.to_string(), (Instant::now(), v.clone()));
-        v
+        Ok(v)
     }
 
     /// Who must own `<config dir>/ca` and `connectors/`: root for the
