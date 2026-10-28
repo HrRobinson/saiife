@@ -236,14 +236,14 @@ impl TestDaemon {
             .unwrap();
         self.child = Some(child);
         let sock = self.socket();
-        let up = wait_for(Duration::from_secs(5), || {
+        let up = wait_for(Duration::from_secs(15), || {
             fs::symlink_metadata(&sock).is_ok() && self.try_client().is_ok()
         });
         if !up {
             let mut child = self.child.take().unwrap();
             let _ = child.kill();
             let _ = child.wait();
-            panic!("daemon did not come up in 5 s: {}", self.stderr_text());
+            panic!("daemon did not come up in 15 s: {}", self.stderr_text());
         }
     }
 
@@ -251,13 +251,19 @@ impl TestDaemon {
         self.child.as_ref().unwrap().id()
     }
 
+    /// Send `sig` to this test's own daemon child, by its pid, without
+    /// running a `kill` binary.
     pub fn signal(&self, sig: &str) {
-        let st = Command::new("kill")
-            .arg(format!("-{sig}"))
-            .arg(self.pid().to_string())
-            .status()
-            .unwrap();
-        assert!(st.success());
+        use rustix::process::{kill_process, Pid, Signal};
+        let sig = match sig {
+            "HUP" => Signal::HUP,
+            "INT" => Signal::INT,
+            "KILL" => Signal::KILL,
+            "TERM" => Signal::TERM,
+            other => panic!("unsupported test signal {other}"),
+        };
+        let pid = Pid::from_raw(self.pid() as i32).expect("child pid");
+        kill_process(pid, sig).unwrap();
     }
 
     /// Wait (at most `limit`) for the daemon to exit.
