@@ -151,6 +151,45 @@ pub fn env_for<'a>(
     Ok(scope_for(cfg, dir, user)?.and_then(|s| s.env.as_deref()))
 }
 
+/// `cfg` as `user` runs under it: the environment of the user's scope
+/// applied, and its name. No environment (no scope, or a scope without
+/// `env`) borrows `cfg`. The directory is only asked when some scope binds
+/// an environment, so a config without environments costs no lookup.
+pub fn applied_for<'a>(
+    cfg: &'a SystemConfig,
+    dir: &dyn Directory,
+    user: &str,
+) -> Result<(std::borrow::Cow<'a, SystemConfig>, Option<String>), PolicyError> {
+    use std::borrow::Cow;
+    if !cfg.scope.iter().any(|s| s.env.is_some()) {
+        return Ok((Cow::Borrowed(cfg), None));
+    }
+    match env_for(cfg, dir, user)? {
+        None => Ok((Cow::Borrowed(cfg), None)),
+        Some(name) => Ok((Cow::Owned(apply(cfg, name)?), Some(name.to_string()))),
+    }
+}
+
+/// The effective-policy hash of the base config and of each environment
+/// (`(None, hash)` first), for `status` and `policy show`.
+pub fn env_hashes(
+    cfg: &SystemConfig,
+    catalog: &[crate::effective::PackInfo],
+) -> Vec<(Option<String>, String)> {
+    use crate::effective::{active_packs, effective_policy, policy_hash};
+    let hash_of = |c: &SystemConfig, env: Option<&str>| {
+        let (packs, _) = active_packs(c, catalog, None);
+        policy_hash(&effective_policy(c, &packs, None, env))
+    };
+    let mut out = vec![(None, hash_of(cfg, None))];
+    for name in cfg.environments.keys() {
+        if let Ok(applied) = apply(cfg, name) {
+            out.push((Some(name.clone()), hash_of(&applied, Some(name))));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

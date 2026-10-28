@@ -897,6 +897,18 @@ fn connector_record_fields_exact() {
     // base policy's that status reports.
     assert!(r["policy"].as_str().unwrap().starts_with("sha256:"), "{r}");
     assert_ne!(r["policy"], w.d.status()["policy"]);
+    // ... and it is exactly the hash `policy show` prints for prod.
+    let shown = base_cmd(&w.d)
+        .args(["policy", "show", "--system-config"])
+        .arg(w.d.config())
+        .output()
+        .unwrap();
+    let shown = stdout(&shown);
+    let prod = shown
+        .lines()
+        .find_map(|l| l.strip_prefix("policy (env prod): "))
+        .unwrap_or_else(|| panic!("no per-env hash in:\n{shown}"));
+    assert_eq!(r["policy"], prod, "record hash is the shown per-env hash");
     assert_eq!(r["project"], w.project.display().to_string());
     assert_eq!(r["tool"], "api");
     assert_eq!(r["input"], "erp invoices.list status=open");

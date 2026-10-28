@@ -123,8 +123,8 @@ mod imp {
         ErrorCode, MAX_RECORD_BYTES, OP_APPROVAL_CREATE, OP_AUDIT_APPEND, OP_GRANT_CONSUME,
     };
     use saiife_policy::{
-        active_packs, effective_policy, load_system, merge_project, parse_project, policy_hash,
-        Mode, PackInfo, SystemConfig,
+        active_packs, applied_for, effective_policy, load_system, merge_project, parse_project,
+        policy_hash, Mode, PackInfo, SystemConfig,
     };
     use saiifeguard::builtins::Catalog;
     use saiifeguard::payload::{context_from_hook_json_bounded, HookContext};
@@ -453,7 +453,7 @@ mod imp {
             (Ok(()), Some(c)) => Some(PathBuf::from(c)),
             (Ok(()), None) => std::env::current_dir().ok(),
         };
-        let (packs, hash) = policy_for(cfg, start.as_deref());
+        let (packs, hash) = policy_for(cfg, start.as_deref())?;
         *policy = Some(hash);
         if !cfg.guard.ask.is_empty() {
             // The project in a grant's key: its root as found for the
@@ -609,7 +609,20 @@ mod imp {
     /// project config adds packs and service rules only (add-only merge);
     /// an invalid one is ignored with a warning: the system policy alone
     /// applies.
-    fn policy_for(cfg: &SystemConfig, start: Option<&Path>) -> (Vec<String>, String) {
+    fn policy_for(
+        cfg: &SystemConfig,
+        start: Option<&Path>,
+    ) -> Result<(Vec<String>, String), String> {
+        // The caller's scope environment adds its packs and is part of the
+        // hash. An environment that cannot be resolved denies the call.
+        let user = system_entry(rustix::process::getuid().as_raw()).map(|a| a.name);
+        let (cfg_env, env) = match (&user, cfg.scope.iter().any(|s| s.env.is_some())) {
+            (_, false) => (std::borrow::Cow::Borrowed(cfg), None),
+            (None, true) => return Err("cannot tell which user this is: no environment".into()),
+            (Some(u), true) => applied_for(cfg, &saiife_policy::Getent, u)
+                .map_err(|e| format!("environment: {e}"))?,
+        };
+        let cfg: &SystemConfig = &cfg_env;
         let merged = start.and_then(find_project_root).and_then(|root| {
             let ignored = |why: &str| {
                 warn(&format!(
@@ -641,8 +654,13 @@ mod imp {
         for w in &warnings {
             warn(w);
         }
-        let hash = policy_hash(&effective_policy(cfg, &packs, merged.as_ref(), None));
-        (packs.into_iter().map(|p| p.id).collect(), hash)
+        let hash = policy_hash(&effective_policy(
+            cfg,
+            &packs,
+            merged.as_ref(),
+            env.as_deref(),
+        ));
+        Ok((packs.into_iter().map(|p| p.id).collect(), hash))
     }
 
     /// The worker child, running.

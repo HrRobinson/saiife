@@ -22,9 +22,9 @@ use clap::{Args, Subcommand};
 use saiife_broker::judge::{judge, Unjudgeable};
 use saiife_broker::{manifest, Catalog};
 use saiife_policy::{
-    active_packs, check_guard_ask, check_scopes, effective_policy, load_system, merge_project,
-    parse_project, policy_hash, scope_for, view::user_view, Directory, Example, FixedDirectory,
-    Getent, LoadedPolicy, Mode, PackInfo, PolicyError, SystemConfig, Verdict,
+    active_packs, applied_for, check_guard_ask, check_scopes, effective_policy, load_system,
+    merge_project, parse_project, policy_hash, scope_for, view::user_view, Directory, Example,
+    FixedDirectory, Getent, LoadedPolicy, Mode, PackInfo, PolicyError, SystemConfig, Verdict,
 };
 use serde_json::Value;
 
@@ -437,6 +437,9 @@ fn run_case(
     user: &str,
     case: &Case,
 ) -> Result<Actual, String> {
+    // The example user's scope environment applies to both kinds of case.
+    let (applied, _env) = applied_for(cfg, dir, user).map_err(|e| e.to_string())?;
+    let cfg: &SystemConfig = &applied;
     match case {
         Case::Request {
             service,
@@ -558,6 +561,18 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
         eprintln!("saiife: cannot tell which user you are; use --user");
         return ExitCode::from(2);
     };
+    let (applied, env) = match applied_for(&cfg, &Getent, &user) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("saiife: {}", crate::text::sanitize(&e.to_string()));
+            return ExitCode::from(2);
+        }
+    };
+    let env_hashes: Vec<(String, String)> = saiife_policy::env_hashes(&cfg, &pack_catalog())
+        .into_iter()
+        .filter_map(|(e, h)| e.map(|e| (e, h)))
+        .collect();
+    let cfg: SystemConfig = applied.into_owned();
     let (packs, _) = active_packs(&cfg, &pack_catalog(), None);
     let project = std::env::current_dir()
         .ok()
@@ -573,10 +588,10 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
         Some(m) => active_packs(&cfg, &pack_catalog(), Some(m)),
         None => (packs, Vec::new()),
     };
-    let eff = effective_policy(&cfg, &packs, project.as_ref(), None);
+    let eff = effective_policy(&cfg, &packs, project.as_ref(), env.as_deref());
     let hash = policy_hash(&eff);
     let view = user_view(&cfg, &Getent, &user);
-    print_show(&view, Some(&hash), effective.then_some(&eff));
+    print_show(&view, Some(&hash), &env_hashes, effective.then_some(&eff));
     ExitCode::SUCCESS
 }
 
@@ -586,7 +601,7 @@ fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) ->
 }
 
 #[cfg(not(target_os = "linux"))]
-fn reload(_config: Option<PathBuf>) -> ExitCode {
+pub(crate) fn reload(_config: Option<PathBuf>) -> ExitCode {
     eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
     ExitCode::from(5)
 }
@@ -624,9 +639,19 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
     ) {
         Ok(a) => {
             let view = a.get("view").cloned().unwrap_or(Value::Null);
+            let env_hashes: Vec<(String, String)> = a
+                .get("env_hashes")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
             print_show(
                 &view,
                 a.get("hash").and_then(Value::as_str),
+                &env_hashes,
                 a.get("effective"),
             );
             Some(ExitCode::SUCCESS)
@@ -643,7 +668,7 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
 }
 
 #[cfg(target_os = "linux")]
-fn reload(config: Option<PathBuf>) -> ExitCode {
+pub(crate) fn reload(config: Option<PathBuf>) -> ExitCode {
     use crate::secret_cmd::linux::{call_to, target};
     let t = match target(config.as_deref()) {
         Ok(t) => t,
@@ -703,9 +728,17 @@ fn list(v: &Value) -> String {
     }
 }
 
-fn print_show(view: &Value, hash: Option<&str>, effective: Option<&Value>) {
+fn print_show(
+    view: &Value,
+    hash: Option<&str>,
+    env_hashes: &[(String, String)],
+    effective: Option<&Value>,
+) {
     use crate::text::sanitize;
     outln!("policy: {}", hash.unwrap_or("(none loaded)"));
+    for (env, h) in env_hashes {
+        outln!("policy (env {}): {}", sanitize(env), sanitize(h));
+    }
     outln!("user: {}", sanitize(view["user"].as_str().unwrap_or("")));
     match view.get("scope") {
         Some(Value::Object(s)) => {
