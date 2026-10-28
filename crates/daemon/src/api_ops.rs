@@ -957,6 +957,8 @@ mod tests {
             secret_field: "value".into(),
             prefix: None,
             token_path: None,
+            service: None,
+            scope: None,
         };
         let bearer = AuthSpec {
             kind: "bearer".into(),
@@ -964,6 +966,8 @@ mod tests {
             secret_field: "token".into(),
             prefix: None,
             token_path: None,
+            service: None,
+            scope: None,
         };
         let both = [header.clone(), bearer.clone()];
         assert_eq!(spec_for(Kind::Header, &both), Some(&header));
@@ -984,6 +988,8 @@ mod tests {
             secret_field: String::new(),
             prefix: None,
             token_path: Some("/services/oauth2/token".into()),
+            service: None,
+            scope: None,
         };
         let o = [oauth.clone()];
         assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));

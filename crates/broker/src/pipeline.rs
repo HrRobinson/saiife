@@ -91,7 +91,8 @@ pub struct StoredCall {
     pub params: BTreeMap<String, String>,
     /// Base64 of the agent's body as canonical JSON (the input to
     /// [`prepare_body`], not the bytes sent: for `body = "form"` those are
-    /// its form encoding). `None` when the operation builds its body from
+    /// its form encoding; for `text` and `raw` the bytes as given). `None`
+    /// when the operation builds its body from
     /// the params. At send it is prepared again, and the bytes must hash to
     /// `body_sha256`.
     pub body_b64: Option<String>,
@@ -1189,6 +1190,20 @@ pub fn prepare_body(
             json: None,
             input: Some(b.clone()),
             content_type: Some("text/plain; charset=utf-8"),
+        });
+    }
+    // `raw` (plan 15): the agent's bytes as they are, never parsed, so the
+    // manifest refuses an amount on such an operation. The Content-Type is
+    // the agent's, if the manifest lists it.
+    if op.body.as_deref() == Some("raw") {
+        let Some(b) = raw else {
+            return Ok(PreparedBody::default());
+        };
+        return Ok(PreparedBody {
+            bytes: Some(b.clone()),
+            json: None,
+            input: Some(b.clone()),
+            content_type: None,
         });
     }
     let (json, input) = if op.builds_body() {

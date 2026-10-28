@@ -2,8 +2,11 @@
 //! manifest and the service parameters, the operation's path and query, the
 //! headers the manifest allows, and the credential in exactly one place.
 
-use crate::manifest::{template_segments, AuthSpec, Manifest, Operation, Pagination, Seg};
-use crate::params::ParamType;
+use crate::manifest::{
+    dns_label, label_placeholder, template_segments, AuthSpec, Manifest, Operation, Pagination,
+    Seg, CLOUD_AUTH_KINDS,
+};
+use crate::params::{object_value_problem, ParamType};
 use crate::BrokerError;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -176,6 +179,10 @@ pub(crate) fn fill_base(
         if m.whole_host_param() == Some(name) && !bare_hostname(value) {
             return Err(bad_value(name, "not a bare lower-case hostname"));
         }
+        // A placeholder inside a host label: one DNS label, never a dot.
+        if m.label_host_params().contains(&name) && !dns_label(value) {
+            return Err(bad_value(name, "not a single lower-case DNS label"));
+        }
         if value.is_empty()
             || !value
                 .bytes()
@@ -229,7 +236,9 @@ pub fn bare_hostname(v: &str) -> bool {
 }
 
 /// The `https` URI with an allowed host and no userinfo, or an error. A
-/// `{param}` entry of `hosts` allows exactly the admin's value of `param`.
+/// `{param}` entry of `hosts` allows exactly the admin's value of `param`;
+/// an in-label entry (`s3.{region}.amazonaws.com`) exactly that host with
+/// the admin's value, one DNS label, in the label.
 pub(crate) fn checked_uri(
     m: &Manifest,
     svc_params: &BTreeMap<String, String>,
@@ -250,7 +259,14 @@ pub(crate) fn checked_uri(
                 Some(param) => svc_params
                     .get(param)
                     .is_some_and(|v| bare_hostname(v) && v.eq_ignore_ascii_case(host)),
-                None => host_matches(p, host),
+                None => match label_placeholder(p) {
+                    Ok(Some(l)) => svc_params.get(l.name).is_some_and(|v| {
+                        let want = l.fill(v);
+                        dns_label(v) && bare_hostname(&want) && want.eq_ignore_ascii_case(host)
+                    }),
+                    Ok(None) => host_matches(p, host),
+                    Err(_) => false,
+                },
             },
         );
     if !allowed {
@@ -281,6 +297,11 @@ fn auth_header(
                         == auth.name.as_deref().map(str::to_ascii_lowercase))
         })
         .ok_or_else(|| refuse("the credential does not match the connector's auth"))?;
+    // The cloud kinds are signed or minted by the daemon (plan 15, Task 9),
+    // not placed here.
+    if CLOUD_AUTH_KINDS.contains(&spec.kind.as_str()) {
+        return Ok(None);
+    }
     let (name, value) = match spec.kind.as_str() {
         "header" => {
             let name = spec.name.as_deref().unwrap_or("");
@@ -365,24 +386,55 @@ pub fn build(
                 let v = params
                     .get(name)
                     .ok_or_else(|| BrokerError::MissingParam(name.to_string()))?;
-                if v.is_empty() || v == "." || v == ".." || v.contains(['/', '\\']) {
-                    return Err(bad_value(name, "not a single path segment"));
-                }
+                let ty = match op.path_params.get(name) {
+                    Some(t) => Some(ParamType::parse(t, None)?),
+                    None => None,
+                };
                 url.push_str(prefix);
-                url.extend(utf8_percent_encode(v, COMPONENT));
+                match ty {
+                    // Decision 5, checked again here: `/` stays a separator
+                    // and each segment is encoded.
+                    Some(ParamType::ObjectKey) => {
+                        if let Some(why) = object_value_problem(v) {
+                            return Err(bad_value(name, why));
+                        }
+                        for (i, part) in v.split('/').enumerate() {
+                            if i > 0 {
+                                url.push('/');
+                            }
+                            url.extend(utf8_percent_encode(part, COMPONENT));
+                        }
+                    }
+                    // The whole name as one segment: `/` becomes `%2F`.
+                    Some(ParamType::ObjectName) => {
+                        if let Some(why) = object_value_problem(v) {
+                            return Err(bad_value(name, why));
+                        }
+                        url.extend(utf8_percent_encode(v, COMPONENT));
+                    }
+                    _ => {
+                        if v.is_empty() || v == "." || v == ".." || v.contains(['/', '\\']) {
+                            return Err(bad_value(name, "not a single path segment"));
+                        }
+                        url.extend(utf8_percent_encode(v, COMPONENT));
+                    }
+                }
                 url.push_str(suffix);
             }
         }
     }
     let mut sep = '?';
-    for name in op.query.keys() {
-        if let Some(v) = params.get(name) {
-            url.push(sep);
-            sep = '&';
-            url.extend(utf8_percent_encode(name, COMPONENT));
-            url.push('=');
-            url.extend(utf8_percent_encode(v, COMPONENT));
-        }
+    let given = op
+        .query
+        .keys()
+        .filter_map(|name| params.get(name).map(|v| (name, v)));
+    // The fixed query comes after the agent's (plan 15).
+    for (name, v) in given.chain(&op.fixed_query) {
+        url.push(sep);
+        sep = '&';
+        url.extend(utf8_percent_encode(name, COMPONENT));
+        url.push('=');
+        url.extend(utf8_percent_encode(v, COMPONENT));
     }
     let uri = checked_uri(m, svc_params, &url)?;
 
@@ -407,8 +459,9 @@ pub fn build(
             headers.insert(hname, hvalue);
         }
     }
-    // Fixed headers win over the agent's (decision 6).
-    for (name, tpl) in &m.headers {
+    // Fixed headers win over the agent's (decision 6), and an operation's
+    // over the manifest's (plan 15).
+    for (name, tpl) in m.headers.iter().chain(&op.headers) {
         let value = fill_template(tpl, svc_params)?;
         if has_crlf_nul(&value) {
             return Err(bad_value(name, "header value contains CR, LF or NUL"));
@@ -1142,8 +1195,9 @@ body = "json"
             call(&m, "evil.com#").unwrap_err(),
             BrokerError::BadValue { .. }
         ));
-        // Without the pattern, the host check still refuses what escapes
-        // the one-label glob.
+        // Without the pattern, the one-label check of an in-label host
+        // param (plan 15) and the host check still refuse what escapes the
+        // one-label glob.
         let mut loose = m.clone();
         loose.params.get_mut("shop").unwrap().pattern = None;
         for shop in ["a.b", "evil.com#", "evil.com/x?", "x@evil.com", ""] {
@@ -1156,9 +1210,10 @@ body = "json"
                 "{shop:?}: {err:?}"
             );
         }
+        // A dot never reaches the URL: the value is not one DNS label.
         assert!(matches!(
             call(&loose, "a.b").unwrap_err(),
-            BrokerError::HostNotAllowed
+            BrokerError::BadValue { .. }
         ));
         assert!(call(&loose, "acme").is_ok());
         // A base URL outside the hosts list.

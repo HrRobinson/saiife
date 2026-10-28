@@ -1,7 +1,7 @@
 //! Operation resolution (spec §6.7.1 step 4): named operations, and proxy
 //! paths matched segment-wise on the raw (still percent-encoded) path.
 
-use crate::manifest::{template_segments, Manifest, Operation, Seg};
+use crate::manifest::{template_segments, Manifest, Operation, Seg, OBJECT_KEY};
 use crate::BrokerError;
 use percent_encoding::percent_decode_str;
 use std::collections::BTreeMap;
@@ -99,22 +99,47 @@ pub fn proxy<'m>(
     // equally specific matches are ambiguous.
     let mut cands: Vec<(Vec<u8>, &Operation, BTreeMap<String, String>)> = Vec::new();
     // A GraphQL operation is named-only: its fixed document is the body,
-    // so a proxied request can never reach it.
+    // so a proxied request can never reach it. So is one with an
+    // `objectname`, whose `/` is `%2F`, which no raw path may hold.
     for op in m
         .operation
         .iter()
-        .filter(|o| o.method == method && o.graphql.is_none())
+        .filter(|o| o.method == method && o.proxy_reachable())
     {
         let Ok(tpl) = template_segments(&op.path) else {
             continue;
         };
-        if tpl.len() != segs.len() {
+        // An `objectkey` last segment takes the rest of the path (one or
+        // more segments; `check_path` refused `//`, `..` and encoded
+        // separators already).
+        let tail = match tpl.last() {
+            Some(Seg::Var {
+                prefix: "",
+                name,
+                suffix: "",
+            }) if op.path_params.get(*name).map(String::as_str) == Some(OBJECT_KEY) => Some(*name),
+            _ => None,
+        };
+        let fixed = if tail.is_some() {
+            tpl.len() - 1
+        } else {
+            tpl.len()
+        };
+        if segs.len() < tpl.len() || (tail.is_none() && segs.len() != tpl.len()) {
             continue;
         }
         let mut caps = BTreeMap::new();
         let mut spec = Vec::with_capacity(tpl.len());
         let mut hit = true;
-        for (t, s) in tpl.iter().zip(&segs) {
+        if let Some(name) = tail {
+            let rest = &segs[fixed..];
+            if rest.iter().any(|s| s.is_empty()) {
+                continue;
+            }
+            let v = decode(&rest.join("/")).map_err(|()| bad_path("path is not valid UTF-8"))?;
+            caps.insert(name.to_string(), v);
+        }
+        for (t, s) in tpl[..fixed].iter().zip(&segs) {
             match t {
                 Seg::Lit(l) if l == s => spec.push(2),
                 Seg::Lit(_) => {
@@ -143,6 +168,10 @@ pub fn proxy<'m>(
             }
         }
         if hit {
+            // The tail counts as a bare placeholder.
+            if tail.is_some() {
+                spec.push(0);
+            }
             cands.push((spec, op, caps));
         }
     }
@@ -161,6 +190,17 @@ pub fn proxy<'m>(
         let v = decode(&v.replace('+', " ")).map_err(|()| bad_value(&k, "not UTF-8"))?;
         if params.insert(k.clone(), v).is_some() {
             return Err(bad_value(&k, "given twice"));
+        }
+    }
+    // A fixed query value may be repeated exactly, never changed; the
+    // request builder appends it.
+    for (k, fixed) in &op.fixed_query {
+        if let Some(v) = params.remove(k) {
+            if &v != fixed {
+                return Err(BrokerError::BadPath(format!(
+                    "query parameter {k} is fixed by the connector"
+                )));
+            }
         }
     }
     Ok((op, params))

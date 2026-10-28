@@ -1,7 +1,7 @@
 //! The connector catalog: built-in plus admin-local manifests, and the
 //! check of `[services.*]` against them.
 
-use crate::manifest::{from_http_service, Manifest, HTTP_CONNECTOR};
+use crate::manifest::{dns_label, from_http_service, Manifest, HTTP_CONNECTOR};
 use crate::request::bare_hostname;
 use crate::BrokerError;
 use saiife_policy::capability::{glob_with, matches_with, Capability};
@@ -74,6 +74,14 @@ pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, Broker
                 return Err(BrokerError::BadValue {
                     name: format!("{name}.{p}"),
                     reason: "not a bare lower-case hostname".into(),
+                });
+            }
+            // A param inside one host label (`s3.{region}.amazonaws.com`):
+            // one DNS label, so it can never add a label or a port.
+            if m.label_host_params().contains(&p.as_str()) && !dns_label(v) {
+                return Err(BrokerError::BadValue {
+                    name: format!("{name}.{p}"),
+                    reason: "not a single lower-case DNS label".into(),
                 });
             }
         }
