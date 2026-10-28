@@ -1018,6 +1018,12 @@ fn broker_glob_units_exit_targets_and_drop_ins() {
         "systemctl --user kill 'sai[i]fe-broker'",
         "systemctl --user mask 's*'",
         "systemctl --user isolate 'x*'",
+        // The glob rule takes the same verbs as the name rule.
+        "systemctl --user try-restart 'sai*'",
+        "systemctl --user reload-or-restart 'sai*'",
+        "systemctl --user set-property 'sai*' CPUQuota=1%",
+        "systemctl --user revert 'sai*'",
+        "systemctl --user edit 'sai*'",
         "systemctl --user start exit.target",
         "systemctl --user isolate shutdown.target",
         "systemctl start poweroff.target",

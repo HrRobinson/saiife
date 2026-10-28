@@ -95,7 +95,7 @@ reason = "an agent may not stop or change the saiife broker; do it in your own t
 
 [[deny]]
 # A glob in the unit argument (`stop 'sai*'`) can hit the broker.
-pattern = '^systemctl\s+(?:\S+\s+)*(?:stop|kill|disable|mask|restart|isolate)\s+(?:\S+\s+)*\S*[*?\[]\S*'
+pattern = '^systemctl\s+(?:\S+\s+)*(?:stop|disable|mask|kill|restart|try-restart|reload-or-restart|isolate|set-property|revert|edit)\s+(?:\S+\s+)*\S*[*?\[]\S*'
 reason = "a glob in the unit name can stop the saiife broker; do it in your own terminal"
 
 [[deny]]
