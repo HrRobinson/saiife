@@ -60,13 +60,26 @@ fn allow_servers_overlap_refused_with_message() {
     );
 }
 
+/// Controller ruling (plan 17, T9 follow-up): Codex and Gemini CLI do not
+/// pin the `saiife` server's command, so their hook allows it only when it
+/// is listed. Exactly `saiife` may be listed; a case variant may not.
 #[test]
-fn saiife_in_allow_servers_refused() {
+fn saiife_in_allow_servers_accepted_exactly() {
     let (_d, cfg) = etc(
         LOCKED,
         &[("x.toml", "[guard.mcp]\nallow_servers = [\"saiife\"]\n")],
     );
-    assert!(load_system(&cfg).is_err());
+    let p = load_system(&cfg).unwrap();
+    assert_eq!(p.config.guard.mcp.allow_servers, vec!["saiife".to_string()]);
+    let (_d, cfg) = etc(
+        LOCKED,
+        &[("x.toml", "[guard.mcp]\nallow_servers = [\"Saiife\"]\n")],
+    );
+    let e = load_system(&cfg).unwrap_err().to_string();
+    assert!(
+        e.contains("[guard.mcp] allow_servers may not contain \"Saiife\"; write \"saiife\""),
+        "{e}"
+    );
 }
 
 #[test]

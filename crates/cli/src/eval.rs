@@ -561,8 +561,10 @@ pub enum McpCheck {
     NotMcp,
     /// Its server is in `[guard.mcp] allow_servers`.
     Allowed,
-    /// The reserved server `saiife`: its tools run in the daemon, which
-    /// judges every call, so the hook has nothing to add.
+    /// The reserved server `saiife` on Claude Code, whose managed drop-in
+    /// pins its command: its tools run in the daemon, which judges every
+    /// call, so the hook has nothing to add. Other agents pin nothing, so
+    /// there `saiife` is `Allowed` (listed) or `Denied` like any server.
     Brokered,
     /// Its server (or, when the name cannot be split safely, the whole
     /// tool name) is not listed.
@@ -600,9 +602,17 @@ pub enum McpIdentity {
 /// Gemini MCP call (a name starting `mcp_` or holding `__`, or any payload
 /// with `mcp_context`) is allowed only when the payload's `identity` names
 /// a listed server. Other agents: the double form, else the Gemini rule.
+///
+/// The server `saiife` is `Brokered` for `claude` only (its command is
+/// pinned there); for every other agent it needs `allow` like any server.
 // Used by the locked hook, which is Linux-only in this version.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[String]) -> McpCheck {
+    // `saiife` is brokered only where the agent cannot run another server
+    // under that name: Claude Code, whose managed drop-in pins its command.
+    // Elsewhere a project or user config could register its own `saiife`
+    // server, so it is judged like any other: denied unless listed.
+    let brokered_ok = agent == "claude";
     let listed = |s: &str| allow.iter().any(|a| a == s);
     let double = |tool: &str| {
         let rest = tool.strip_prefix("mcp__")?;
@@ -611,7 +621,7 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
         let best = allow
             .iter()
             .map(String::as_str)
-            .chain(std::iter::once(BROKERED_SERVER))
+            .chain(brokered_ok.then_some(BROKERED_SERVER))
             .filter(|s| !s.is_empty())
             .filter(|s| rest.strip_prefix(s).is_some_and(|r| r.starts_with("__")))
             .max_by_key(|s| s.len());
@@ -622,7 +632,7 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
                 // (Claude Code turns `linear.` into `linear_`).
                 if name.is_empty() || name.contains("__") || name.starts_with('_') {
                     McpCheck::Denied(tool.to_string())
-                } else if s == BROKERED_SERVER {
+                } else if brokered_ok && s == BROKERED_SERVER {
                     McpCheck::Brokered
                 } else {
                     McpCheck::Allowed
@@ -638,7 +648,7 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
         let mcp =
             tool.starts_with("mcp_") || tool.contains("__") || *identity != McpIdentity::Absent;
         mcp.then(|| match identity {
-            McpIdentity::Server(s) if s == BROKERED_SERVER => McpCheck::Brokered,
+            McpIdentity::Server(s) if brokered_ok && s == BROKERED_SERVER => McpCheck::Brokered,
             McpIdentity::Server(s) if listed(s) => McpCheck::Allowed,
             McpIdentity::Server(s) => McpCheck::Denied(s.clone()),
             McpIdentity::Absent | McpIdentity::NoServer => McpCheck::Unknown,
@@ -1213,30 +1223,99 @@ mod tests {
         McpIdentity::Server(s.to_string())
     }
 
+    /// Claude Code pins the `saiife` server's command in its managed
+    /// drop-in, so only there is `saiife` brokered.
     #[test]
-    fn mcp_check_saiife_is_brokered() {
-        let allow = list(&["linear", "saiife__x"]);
-        for agent in ["claude", "codex"] {
+    fn mcp_check_saiife_is_brokered_on_claude() {
+        for allow in [
+            list(&["linear", "saiife__x"]),
+            list(&["saiife", "saiife__x"]),
+        ] {
             assert_eq!(
-                mcp_check(agent, "mcp__saiife__shop_orders_list", &NONE, &allow),
+                mcp_check("claude", "mcp__saiife__shop_orders_list", &NONE, &allow),
+                McpCheck::Brokered
+            );
+            assert_eq!(
+                mcp_check("claude", "mcp__saiife__api_call", &NONE, &allow),
                 McpCheck::Brokered
             );
             // A longer listed server wins; the rest stays ambiguous.
             assert_eq!(
-                mcp_check(agent, "mcp__saiife__x__y", &NONE, &allow),
+                mcp_check("claude", "mcp__saiife__x__y", &NONE, &allow),
                 McpCheck::Allowed
             );
             for t in ["mcp__saiife__a__b", "mcp__saiife___x", "mcp__saiife__"] {
                 assert_eq!(
-                    mcp_check(agent, t, &NONE, &allow),
+                    mcp_check("claude", t, &NONE, &allow),
                     McpCheck::Denied(t.into()),
                     "{t}"
                 );
             }
         }
+    }
+
+    /// Controller ruling (T9 follow-up): nothing pins the `saiife` server's
+    /// command on Codex, Gemini CLI or other agents, so a project or user
+    /// config could register its own `saiife`. It is never brokered there:
+    /// denied unless `allow_servers` lists it, then the normal guarded path.
+    #[test]
+    fn mcp_check_saiife_not_brokered_elsewhere() {
+        for agent in ["codex", "unknown"] {
+            for allow in [list(&[]), list(&["linear", "saiife__x"])] {
+                assert_eq!(
+                    mcp_check(agent, "mcp__saiife__api_call", &NONE, &allow),
+                    McpCheck::Denied("saiife".into()),
+                    "{agent}"
+                );
+            }
+            let allow = list(&["saiife"]);
+            assert_eq!(
+                mcp_check(agent, "mcp__saiife__api_call", &NONE, &allow),
+                McpCheck::Allowed,
+                "{agent}"
+            );
+            // Longest match and ambiguity as for any listed server.
+            let allow = list(&["saiife", "saiife__x"]);
+            assert_eq!(
+                mcp_check(agent, "mcp__saiife__x__y", &NONE, &allow),
+                McpCheck::Allowed,
+                "{agent}"
+            );
+            for t in ["mcp__saiife__a__b", "mcp__saiife___x", "mcp__saiife__"] {
+                assert_eq!(
+                    mcp_check(agent, t, &NONE, &allow),
+                    McpCheck::Denied(t.into()),
+                    "{agent} {t}"
+                );
+            }
+            // A Gemini-style identity on another agent: the same rule.
+            if agent == "unknown" {
+                assert_eq!(
+                    mcp_check(agent, "mcp_saiife_x", &server("saiife"), &[]),
+                    McpCheck::Denied("saiife".into())
+                );
+                assert_eq!(
+                    mcp_check(agent, "mcp_saiife_x", &server("saiife"), &list(&["saiife"])),
+                    McpCheck::Allowed
+                );
+            }
+        }
         assert_eq!(
             mcp_check("gemini", "mcp_saiife_x", &server("saiife"), &[]),
-            McpCheck::Brokered
+            McpCheck::Denied("saiife".into())
+        );
+        assert_eq!(
+            mcp_check(
+                "gemini",
+                "mcp_saiife_x",
+                &server("saiife"),
+                &list(&["saiife"])
+            ),
+            McpCheck::Allowed
+        );
+        assert_eq!(
+            mcp_check("gemini", "mcp_saiife_x", &NONE, &list(&["saiife"])),
+            McpCheck::Unknown
         );
         assert_eq!(
             mcp_check("gemini", "mcp_saiife_x", &NONE, &[]),

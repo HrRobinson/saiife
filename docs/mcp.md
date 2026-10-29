@@ -40,7 +40,23 @@ Gemini CLI, in its `settings.json`:
 `saiife` is a reserved server name. On Claude Code with saiife's managed
 settings, the server is allowed by its command, so a project `.mcp.json`
 cannot define its own server called `saiife` (see
-[Claude Code](agents/claude-code.md#locked-mode-v2)).
+[Claude Code](agents/claude-code.md#locked-mode-v2)). There the hook
+brokers it: it lets each call through and the daemon judges it.
+
+On Codex and Gemini CLI nothing pins that command, so a project or user
+config could register its own `saiife` server, running any program as the
+agent user. There the hook does not broker `saiife`: it denies the
+server's tools unless `[guard.mcp] allow_servers` lists `"saiife"`, and a
+listed `saiife` goes through the normal guard like any listed server. To
+use `saiife mcp` on those agents:
+
+```toml
+[guard.mcp]
+allow_servers = ["saiife"]
+```
+
+Only `saiife` spelled exactly so may be listed. Claude Code's managed
+settings never allow it by name.
 
 ### Tool names
 
@@ -301,8 +317,8 @@ The limits, as built:
 | `mcp.landlock` | info: `Landlock ABI <n>`, shown when a gateway server exists |
 | `mcp.sandbox` | warn for ABI 1 to 5: `MCP server sandbox is weaker than full`, with the missing part |
 | `mcp.claude.allowlist` | pass: `Claude Code MCP allowlist matches policy`. Warn: `the Claude Code MCP allowlist differs from policy; run saiife system install again` |
-| `mcp.codex.restriction`, `mcp.gemini.restriction` | info: `MCP servers for Codex are restricted by the hook only` (and the same for Gemini CLI) |
-| `mcp.<server>` | warn, for each server in `allow_servers`: `MCP server <server> bypasses saiife: its requests are not brokered or limited` |
+| `mcp.codex.restriction`, `mcp.gemini.restriction` | info: `MCP servers for Codex are restricted by the hook only` (and the same for Gemini CLI). The detail says the `saiife` server is not brokered there, and whether `allow_servers` lists it |
+| `mcp.<server>` | warn, for each server in `allow_servers` other than `saiife`: `MCP server <server> bypasses saiife: its requests are not brokered or limited` |
 
 `saiife status` prints one line for each gateway server:
 
@@ -310,7 +326,8 @@ The limits, as built:
 MCP server linear: brokered, running (12 tools)
 ```
 
-and, for each unbrokered server in `[guard.mcp] allow_servers`, the warning
+and, for each unbrokered server in `[guard.mcp] allow_servers` (not
+`saiife`), the warning
 
 ```
 MCP server linear bypasses saiife: its requests are not brokered or limited
@@ -330,8 +347,9 @@ with `; move it behind the MCP gateway: docs/mcp.md`. That is this page.
   `doctor` says "restricted by the hook only", and the hook judges each call
   (`[guard.mcp] allow_servers`, as in the agent pages). Nothing stops either
   agent from configuring more servers, and nothing pins the command of a
-  server called `saiife` there. The managed keys of both agents are not
-  verified live, so none is written.
+  server called `saiife` there, so the hook does not broker it: list
+  `"saiife"` in `allow_servers` to use it (see above). The managed keys of
+  both agents are not verified live, so none is written.
 
 ## Moving a server out of `allow_servers`
 

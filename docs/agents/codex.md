@@ -94,10 +94,20 @@ command = "/opt/saiife/bin/saiife"
 args = ["mcp"]
 ```
 
-The hook allows the server named `saiife` as brokered (the daemon judges
-each call). saiife does not restrict Codex's other MCP servers yet:
-`doctor` says "MCP servers for Codex are restricted by the hook only", and
-nothing pins the command of a server called `saiife`. See [MCP](../mcp.md).
+On Codex the hook does not broker `saiife`. Nothing pins the command of a
+server called `saiife` here, so a project or user config could register its
+own server under that name, running any program as the agent user. The
+hook therefore denies a `saiife` server's tools unless you list it:
+
+```toml
+[guard.mcp]
+allow_servers = ["saiife"]
+```
+
+Its calls then go through the normal guard, like any listed server's, and
+the daemon still decides each brokered call. saiife does not restrict
+Codex's other MCP servers yet: `doctor` says "MCP servers for Codex are
+restricted by the hook only". See [MCP](../mcp.md).
 
 ## Not covered
 

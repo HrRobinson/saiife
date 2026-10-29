@@ -566,7 +566,8 @@ mod imp {
 
     /// The `guard.mcp` judgement of this call without a worker, if its tool
     /// is an MCP tool: a deny when `[guard.mcp] allow_servers` does not list
-    /// its server, an allow for the brokered server `saiife`.
+    /// its server, an allow for the brokered server `saiife` on Claude Code
+    /// (only there is its command pinned; elsewhere it needs listing).
     fn mcp_judgement(
         agent: &str,
         ctx: &HookContext,

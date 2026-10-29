@@ -896,7 +896,15 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         }
     }
     if let Ok(l) = &config {
-        for s in &l.config.guard.mcp.allow_servers {
+        // A listed `saiife` is the broker's own server: it bypasses nothing.
+        for s in l
+            .config
+            .guard
+            .mcp
+            .allow_servers
+            .iter()
+            .filter(|s| *s != "saiife")
+        {
             outln!(
                 "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
                 sanitize(s)

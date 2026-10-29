@@ -56,7 +56,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
     }
     if let Ok(p) = &ctx.config {
-        out.extend(p.config.guard.mcp.allow_servers.iter().map(|s| {
+        // A listed `saiife` is the broker's own server, judged by the guard
+        // on agents that do not pin its command: it bypasses nothing.
+        let listed = p.config.guard.mcp.allow_servers.iter();
+        out.extend(listed.filter(|s| *s != "saiife").map(|s| {
             Check::new(
                 format!("mcp.{s}"),
                 Status::Warn,
@@ -948,6 +951,19 @@ fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
         }
     }
     if let Some(i) = &ctx.installed {
+        let saiife_listed = ctx.config.as_ref().is_ok_and(|p| {
+            p.config
+                .guard
+                .mcp
+                .allow_servers
+                .iter()
+                .any(|s| s == "saiife")
+        });
+        let saiife = if saiife_listed {
+            "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so the guard judges its calls"
+        } else {
+            "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
+        };
         for a in &i.agents {
             if matches!(a.agent.as_str(), "codex" | "gemini") {
                 if let Some(ag) = Agent::from_name(&a.agent) {
@@ -958,7 +974,7 @@ fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
                             "MCP servers for {} are restricted by the hook only",
                             ag.label()
                         ),
-                        "",
+                        saiife,
                     ));
                 }
             }
@@ -1992,7 +2008,25 @@ mod tests {
                     && c.title.ends_with(" are restricted by the hook only"),
                 "{c:?}"
             );
+            assert_eq!(
+                c.detail,
+                "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
+            );
         }
+        // Listed, the saiife server takes the guarded path; it bypasses
+        // nothing, so there is no `mcp.saiife` warning.
+        t.append_config("\n[guard.mcp]\nallow_servers = [\"saiife\"]\n");
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        for id in ["codex", "gemini"] {
+            let c = pick(&cs, &format!("mcp.{id}.restriction"));
+            assert_eq!(
+                c.detail,
+                "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so the guard judges its calls"
+            );
+        }
+        let r = t.doctor();
+        assert_status(&r, "config.valid", Status::Pass);
+        assert!(r.checks.iter().all(|c| c.id != "mcp.saiife"));
     }
 
     #[test]

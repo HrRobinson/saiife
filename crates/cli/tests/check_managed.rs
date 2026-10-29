@@ -1010,23 +1010,54 @@ fn mcp_payload(agent: &str, tool: &str) -> String {
 #[test]
 fn saiife_server_allowed_as_brokered() {
     let d = TestDaemon::start(Opts::default());
-    for agent in ["claude", "codex"] {
-        let (o, _, _sb) = managed_as(
-            agent,
-            &d.config(),
-            &mcp_payload(agent, "mcp__saiife__shop_orders_list"),
-            &[],
-            &[],
-        );
-        assert_eq!(code(&o), 0, "{agent}: stderr: {}", stderr(&o));
-        let r = last_guard(&d);
-        assert_eq!(r["decision"], "allow", "{r}");
-        assert_eq!(r["pack"], "guard.mcp", "{r}");
-        assert_eq!(r["rule"], "mcp_brokered", "{r}");
-        assert_eq!(r["reason"], "brokered: judged by the saiife daemon", "{r}");
-        assert_eq!(r["tool"], "mcp__saiife__shop_orders_list", "{r}");
-        assert_eq!(r["agent"], agent, "{r}");
-    }
+    let agent = "claude";
+    let (o, _, _sb) = managed_as(
+        agent,
+        &d.config(),
+        &mcp_payload(agent, "mcp__saiife__shop_orders_list"),
+        &[],
+        &[],
+    );
+    assert_eq!(code(&o), 0, "{agent}: stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_eq!(r["pack"], "guard.mcp", "{r}");
+    assert_eq!(r["rule"], "mcp_brokered", "{r}");
+    assert_eq!(r["reason"], "brokered: judged by the saiife daemon", "{r}");
+    assert_eq!(r["tool"], "mcp__saiife__shop_orders_list", "{r}");
+    assert_eq!(r["agent"], agent, "{r}");
+}
+
+/// Controller ruling (T9 follow-up): Codex pins no MCP server command, so
+/// a `saiife` server there may be the agent's own. Denied unless listed;
+/// listed, it takes the normal path, judged by the worker.
+#[test]
+fn codex_saiife_server_needs_listing() {
+    let d = TestDaemon::start(Opts::default());
+    let payload = mcp_payload("codex", "mcp__saiife__api_call");
+    let (o, _, sb) = managed_as("codex", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers"
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert_eq!(r["rule"], "mcp_server_not_allowed", "{r}");
+    assert_eq!(r["agent"], "codex", "{r}");
+    assert!(sb.is_untouched());
+
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"saiife\"]\n".into(),
+        ..Opts::default()
+    });
+    let (o, _, _sb) = managed_as("codex", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_ne!(r["rule"], "mcp_brokered", "{r}");
+    assert_eq!(r["reason"], "tool not judged", "{r}");
+    assert_eq!(r["tool"], "mcp__saiife__api_call", "{r}");
 }
 
 #[test]
@@ -1050,10 +1081,11 @@ fn saiife_lookalike_names_denied() {
     }
 }
 
+/// Gemini CLI pins no MCP server command, so `saiife` is never brokered
+/// there: it needs both the server identity and a listing.
 #[test]
 fn gemini_saiife_needs_server_identity() {
-    let d = TestDaemon::start(Opts::default());
-    let call = |ctx: Option<Value>| {
+    let call = |d: &TestDaemon, ctx: Option<Value>| {
         let mut v = json!({
             "session_id": "g-1",
             "cwd": "/",
@@ -1066,13 +1098,28 @@ fn gemini_saiife_needs_server_identity() {
         }
         managed_as("gemini", &d.config(), &v.to_string(), &[], &[]).0
     };
-    let o = call(None);
+    let d = TestDaemon::start(Opts::default());
+    let o = call(&d, Some(json!({"server_name": "saiife"})));
     assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
-    let o = call(Some(json!({"server_name": "saiife_x"})));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers"
+    );
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"saiife\"]\n".into(),
+        ..Opts::default()
+    });
+    let o = call(&d, None);
     assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
-    let o = call(Some(json!({"server_name": "saiife"})));
+    let o = call(&d, Some(json!({"server_name": "saiife_x"})));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let o = call(&d, Some(json!({"server_name": "saiife"})));
     assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
-    assert_eq!(last_guard(&d)["rule"], "mcp_brokered");
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_ne!(r["rule"], "mcp_brokered", "{r}");
 }
 
 /// Controller ruling: on Gemini only an explicit server identity in the

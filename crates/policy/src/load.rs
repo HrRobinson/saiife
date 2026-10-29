@@ -348,6 +348,7 @@ fn validate_services(
 
 /// `[mcp.*]` (plan 17 decisions 12 to 14): locked mode only, valid servers,
 /// and no server both brokered and listed in `[guard.mcp] allow_servers`.
+/// `saiife` itself may be listed, spelled exactly so.
 fn validate_mcp(
     config_file: &Path,
     cfg: &SystemConfig,
@@ -367,10 +368,14 @@ fn validate_mcp(
         srv.validate(name).map_err(|why| invalid(&file, why))?;
     }
     for s in &cfg.guard.mcp.allow_servers {
-        if s.eq_ignore_ascii_case("saiife") {
+        // Exactly `saiife` may be listed: on Codex and Gemini CLI, which do
+        // not pin its command, the hook then judges its calls like any
+        // listed server's. A case variant would reach Claude Code's drop-in
+        // by name, next to the pinned command.
+        if s != "saiife" && s.eq_ignore_ascii_case("saiife") {
             return Err(invalid(
                 config_file,
-                "[guard.mcp] allow_servers may not contain \"saiife\" (it is the brokered server)",
+                format!("[guard.mcp] allow_servers may not contain {s:?}; write \"saiife\""),
             ));
         }
         if let Some(s) = cfg.mcp.keys().find(|k| k.eq_ignore_ascii_case(s)) {
