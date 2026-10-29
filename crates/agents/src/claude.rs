@@ -75,6 +75,25 @@ pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
     text
 }
 
+/// Whether `text` is a drop-in [`managed_mcp_settings`] would write: the
+/// pinned `saiife` command first, then `serverName` entries only, none of
+/// them `saiife`, nothing else. Anything more (another `serverCommand`, a
+/// `serverUrl`, a `saiife` by name, another key) could let a server that
+/// is not saiife's own run under the name `saiife`.
+pub fn managed_mcp_pinned(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(entries) = v.get("allowedMcpServers").and_then(Value::as_array) else {
+        return false;
+    };
+    let names: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.get("serverName")?.as_str().map(str::to_string))
+        .collect();
+    serde_json::from_str::<Value>(&managed_mcp_settings(&names)).is_ok_and(|want| want == v)
+}
+
 /// The installed binary (the same path the hook command uses).
 const SAIIFE_BINARY: &str = "/opt/saiife/bin/saiife";
 
@@ -525,6 +544,26 @@ mod tests {
 #[cfg(test)]
 mod mcp_tests {
     use super::*;
+
+    #[test]
+    fn managed_mcp_pinned_only_for_saiifes_own_text() {
+        let good = managed_mcp_settings(&["linear".to_string(), "docs".to_string()]);
+        assert!(managed_mcp_pinned(&good));
+        assert!(managed_mcp_pinned(&managed_mcp_settings(&[])));
+        for bad in [
+            "",
+            "{}",
+            "not json",
+            r#"{"allowedMcpServers": []}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp", "--wait", "5m"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/tmp/saiife", "mcp"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}, {"serverName": "saiife"}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}, {"serverCommand": ["/usr/bin/x"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}], "x": 1}"#,
+        ] {
+            assert!(!managed_mcp_pinned(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn managed_mcp_settings_pins_saiife_by_command() {

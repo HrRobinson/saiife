@@ -409,6 +409,14 @@ impl Gateway {
         if bytes > cap {
             return Err(ChildError::TooLarge);
         }
+        if bytes > child::BLOCKING_LINE {
+            // A large result is masked off the daemon's one runtime thread.
+            let m = Arc::clone(&srv.masker);
+            return tokio::task::spawn_blocking(move || child::mask_result(v, &m))
+                .await
+                .map_err(|_| ChildError::Exited)?
+                .map_err(masked);
+        }
         child::mask_result(v, &srv.masker).map_err(masked)
     }
 
@@ -913,10 +921,20 @@ async fn run(
     }
 }
 
-/// Relist on each (coalesced) `notifications/tools/list_changed`.
+/// Relists of one child start at least this far apart.
+pub const RELIST_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Relist on each (coalesced) `notifications/tools/list_changed`, at most
+/// once per [`RELIST_MIN_INTERVAL`]: a notification inside the interval is
+/// kept (one stored permit) and served when it ends.
 async fn relist_loop(srv: Arc<Server>, conn: Arc<Conn>, log: Log) {
+    let mut last: Option<tokio::time::Instant> = None;
     loop {
         conn.list_changed.notified().await;
+        if let Some(at) = last {
+            tokio::time::sleep_until(at + RELIST_MIN_INTERVAL).await;
+        }
+        last = Some(tokio::time::Instant::now());
         relist(&srv, &conn, &log).await;
     }
 }

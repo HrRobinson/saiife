@@ -320,14 +320,23 @@ fn parse_overlays(v: Option<&Value>) -> Result<BTreeMap<String, ServiceOverlay>,
 }
 
 /// Step 6: the arguments object, or `None` (`bad_param`): over
-/// [`MAX_ARGUMENTS`], not JSON, a duplicate key anywhere, too deep, or not
-/// an object.
+/// [`MAX_ARGUMENTS`], not JSON, a duplicate key anywhere, too deep, not
+/// an object, or a NUL (U+0000) in any string or key, at any depth (plan 17
+/// appendix 6: a NUL cuts a C string short in the server).
 pub fn parse_arguments(b: &[u8]) -> Option<Map<String, Value>> {
+    fn has_nul(v: &Value) -> bool {
+        match v {
+            Value::String(s) => s.contains('\0'),
+            Value::Array(a) => a.iter().any(has_nul),
+            Value::Object(o) => o.iter().any(|(k, x)| k.contains('\0') || has_nul(x)),
+            _ => false,
+        }
+    }
     if b.len() > MAX_ARGUMENTS {
         return None;
     }
     match saiife_mcp::codec::parse_strict(b)? {
-        Value::Object(o) => Some(o),
+        Value::Object(o) if !o.iter().any(|(k, x)| k.contains('\0') || has_nul(x)) => Some(o),
         _ => None,
     }
 }
@@ -441,36 +450,50 @@ pub fn numbers_exact(b: &[u8]) -> bool {
 }
 
 /// Whether the decimal `t` (`-?digits.digits`) survives the f64 round trip
-/// with the same value: its digits, ignoring a leading zero run and trailing
-/// fraction zeros, equal those of the shortest f64 text. `123456789012345.678`
-/// does not (f64 prints `123456789012345.69`).
+/// with the same value: its value, as significant digits and a decimal
+/// exponent, equals that of the shortest f64 text, whichever form that
+/// text takes (`0.000001` prints `1e-6`, `10000000000000000.0` prints
+/// `1e16`). `123456789012345.678` does not (f64 prints
+/// `123456789012345.69`), nor does `10000000000000000.5` (`1e16`).
 fn decimal_exact(t: &str) -> bool {
-    fn norm(s: &str) -> Option<(bool, String, String)> {
-        let (neg, s) = match s.strip_prefix('-') {
-            Some(r) => (true, r),
-            None => (false, s),
-        };
-        let (i, f) = s.split_once('.')?;
-        let i = i.trim_start_matches('0');
-        let f = f.trim_end_matches('0');
-        Some((neg, i.to_string(), f.to_string()))
-    }
     let Ok(x) = t.parse::<f64>() else {
         return false;
     };
     let Some(n) = serde_json::Number::from_f64(x) else {
         return false;
     };
-    let shown = n.to_string();
-    let Some(a) = norm(t) else {
-        return false;
-    };
-    match norm(&shown) {
-        // `-0.0` is zero whichever way it is signed.
-        Some(b) => a == b || (a.1.is_empty() && a.2.is_empty() && b.1.is_empty() && b.2.is_empty()),
-        // The shortest text has no point (`1e21`, `5`): compare as integer.
-        None => a.2.is_empty() && a.1 == shown.trim_start_matches('-').trim_start_matches('0'),
+    match (decimal_norm(t), decimal_norm(&n.to_string())) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
+}
+
+/// A JSON number's value as `(negative, significant digits, exponent)`:
+/// the value is `0.<digits> * 10^exponent`, the digits without leading or
+/// trailing zeros. Zero is `(false, "", 0)`, however it is signed.
+fn decimal_norm(s: &str) -> Option<(bool, String, i64)> {
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(p) => (&s[..p], s[p + 1..].parse::<i64>().ok()?),
+        None => (s, 0),
+    };
+    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+    if int.is_empty() || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let all = format!("{int}{frac}");
+    let lead = all.len() - all.trim_start_matches('0').len();
+    let digits = all.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    let pos = (int.len() as i64)
+        .checked_add(exp)?
+        .checked_sub(lead as i64)?;
+    Some((neg, digits.to_string(), pos))
 }
 
 fn json_len(v: &Value) -> usize {

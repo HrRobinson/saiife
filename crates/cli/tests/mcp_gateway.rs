@@ -747,7 +747,8 @@ fn in_process_tools_cached_and_names_sent_exactly() {
         return;
     }
     let tools = json!([
-        {"name": "Weird.Name-1 x", "inputSchema": {"type": "object"}},
+        {"name": "Weird.Name-1_x", "inputSchema": {"type": "object"}},
+        {"name": "Weird Name", "inputSchema": {"type": "object"}},
         {"name": "echo", "description": "Echo.", "inputSchema": {"type": "object"}},
     ])
     .to_string();
@@ -755,14 +756,19 @@ fn in_process_tools_cached_and_names_sent_exactly() {
     w.wait_event("mcp_server_started", "fake", 1);
     let t = w.gw().tools("fake").expect("running");
     let names: Vec<&str> = t.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, ["Weird.Name-1 x", "echo"]);
+    assert_eq!(names, ["Weird.Name-1_x", "echo"]);
+    assert!(
+        w.wait_log("1 tool(s) dropped: the name is not"),
+        "{}",
+        w.log_text()
+    );
     // Through the trait, as Task 7 calls it; the odd name goes as listed.
     let caller: &dyn ToolCaller = w.gw();
     assert_eq!(caller.tools("fake").unwrap().len(), 2);
     let r = w
         .call(
             "fake",
-            "Weird.Name-1 x",
+            "Weird.Name-1_x",
             json!({"a": 1}),
             Duration::from_secs(10),
         )
@@ -1115,6 +1121,64 @@ fn list_changed_flood_is_coalesced() {
     std::thread::sleep(Duration::from_secs(2));
     let n = lists(&w);
     assert!((2..=3).contains(&n), "{n} tools/list in all");
+}
+
+/// A child that floods notifications past its unsolicited budget is
+/// stopped like an over-cap line: the waiting call fails, a masked
+/// `mcp_server_exited` record (and journal line) names the reason, and the
+/// child restarts.
+#[test]
+fn unsolicited_flood_stops_child() {
+    if !env_runnable() {
+        return;
+    }
+    let w = World::new(&server("fake", &[], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    let r = w.call(
+        "fake",
+        "flood",
+        json!({"n": 20_000}),
+        Duration::from_secs(20),
+    );
+    assert!(r.is_err(), "{r:?}");
+    let exited = w.wait_event("mcp_server_exited", "fake", 1);
+    let reason = exited[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("unsolicited"), "{reason}");
+    assert!(
+        w.wait_log("mcp_server_exited: stopped: the server sent over"),
+        "{}",
+        w.log_text()
+    );
+    w.wait_event("mcp_server_started", "fake", 2);
+}
+
+/// A storm of single list_changed notifications: at most one relist per
+/// 5 s (plus the first list at start).
+#[test]
+fn relist_storm_is_rate_limited() {
+    if !env_runnable() {
+        return;
+    }
+    let w = World::new(&server("fake", &[], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    let lists = |w: &World| w.log_text().matches("fake-mcp: got tools/list").count();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(6) {
+        w.call(
+            "fake",
+            "spam_list_changed",
+            json!({"n": 1}),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let n = lists(&w);
+    // The start's list, one relist at once, one per 5 s after it.
+    let most = 2 + (secs / 5.0).floor() as usize;
+    assert!(n >= 2, "no relist: {n}");
+    assert!(n <= most, "{n} tools/list in {secs:.1} s");
 }
 
 /// A stop while the child is still initializing: the pid leaves the set

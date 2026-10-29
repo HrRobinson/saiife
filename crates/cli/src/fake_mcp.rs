@@ -18,6 +18,7 @@
 //! - `--block-tool T`: on a call to `T`, stops reading stdin (sleeps 10
 //!   minutes);
 //! - `spam_list_changed {n}`: sends `n` `notifications/tools/list_changed`;
+//! - `flood {n}`: sends `n` `notifications/message` (log) lines;
 //! - `--fail-method M`: answers `M` (`initialize`, `tools/list`) with an
 //!   error whose message holds the `--echo-env` variable's value and a
 //!   control char;
@@ -316,6 +317,16 @@ impl Fake {
                     let n = args.get("n").and_then(Value::as_u64).unwrap_or(1);
                     for _ in 0..n {
                         send(&Message::notification(t::TOOLS_LIST_CHANGED, None));
+                    }
+                    text(format!("sent {n}"), false)
+                }
+                "flood" => {
+                    let n = args.get("n").and_then(Value::as_u64).unwrap_or(1);
+                    for i in 0..n {
+                        send(&Message::notification(
+                            "notifications/message",
+                            Some(json!({"level": "info", "data": format!("noise {i}")})),
+                        ));
                     }
                     text(format!("sent {n}"), false)
                 }

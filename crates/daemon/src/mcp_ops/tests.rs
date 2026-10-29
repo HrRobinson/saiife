@@ -1051,11 +1051,44 @@ async fn numbers_that_change_on_the_round_trip_are_refused() {
         r#"{"n":1.50}"#,
         r#"{"n":-0.0}"#,
         r#"{"n":100.25}"#,
+        // The shortest f64 text is in exponent form; the value is the same.
+        r#"{"n":0.000001}"#,
+        r#"{"n":-0.0000001234}"#,
+        r#"{"n":10000000000000000.0}"#,
+        r#"{"n":100000000000000000000000.0}"#,
     ] {
         assert!(numbers_exact(ok.as_bytes()), "{ok}");
     }
+    for bad in [
+        // f64 has no .5 at 1e16: it would become 1e16.
+        r#"{"n":10000000000000000.5}"#,
+        r#"{"n":0.1000000000000000000001}"#,
+        r#"{"n":0.0000010000000000000000001}"#,
+    ] {
+        assert!(!numbers_exact(bad.as_bytes()), "{bad}");
+    }
     assert!(numbers_exact(br#"{"s":"\\","n":3}"#));
     assert!(!numbers_exact(br#"{"s":"\\","n":3e1}"#));
+}
+
+/// A NUL (U+0000) in any argument string or key, at any depth, is
+/// `bad_param`, and nothing is sent.
+#[tokio::test]
+async fn nul_in_arguments_is_refused() {
+    let w = world("[\"mcp:linear\"]", "");
+    for args in [
+        r#"{"q":"a\u0000b"}"#,
+        r#"{"k\u0000":"v"}"#,
+        r#"{"a":[{"deep":["x","\u0000"]}]}"#,
+        r#"{"o":{"in\u0000ner":1}}"#,
+    ] {
+        let a = w.call("list_issues", args).await;
+        assert_eq!(denied_rule(&a), "bad_param", "{args}");
+    }
+    assert!(w.fake.calls().is_empty());
+    // An escaped backslash-zero is not a NUL.
+    let a = w.call("list_issues", r#"{"q":"a\\u0000b"}"#).await;
+    assert_eq!(a["ok"], true, "{a}");
 }
 
 #[tokio::test]

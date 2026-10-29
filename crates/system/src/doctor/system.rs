@@ -991,7 +991,13 @@ fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
                 format!("Landlock ABI {abi}"),
                 "",
             ));
-            if let Some(gap) = landlock_gap(abi) {
+            // Only a server that runs under Landlock has a sandbox to weaken.
+            let uses_landlock = p
+                .config
+                .mcp
+                .values()
+                .any(|c| c.sandbox != saiife_policy::mcp::Sandbox::Off);
+            if let Some(gap) = landlock_gap(abi).filter(|_| uses_landlock) {
                 out.push(Check::new(
                     "mcp.sandbox",
                     Status::Warn,
@@ -1988,6 +1994,16 @@ mod tests {
             crate::sandbox::Strength::from_abi(3).gap().unwrap()
         );
         assert_eq!(pick(&cs, "mcp.gateway.fs").status, Status::Pass);
+    }
+
+    /// No server under Landlock: no `mcp.sandbox` warning, whatever the ABI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weaker_sandbox_not_warned_when_every_server_is_off() {
+        let t = T::installed();
+        with_server(&t, "sandbox = \"off\"");
+        let cs = mcp_ctx_checks(&t, running(1), 3);
+        assert!(cs.iter().all(|c| c.id != "mcp.sandbox"), "{cs:?}");
     }
 
     #[test]

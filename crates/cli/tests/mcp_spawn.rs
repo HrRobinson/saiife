@@ -223,7 +223,7 @@ fn spawn_clears_env_keeps_secret_vars() {
     let env = out.introspect(2)["env"].as_object().unwrap().clone();
     let mut names: Vec<&str> = env.keys().map(String::as_str).collect();
     names.sort_unstable();
-    assert_eq!(names, ["API_TOKEN", "HOME", "LANG", "PATH"]);
+    assert_eq!(names, ["API_TOKEN", "HOME", "LANG", "PATH", "TMPDIR"]);
     assert_eq!(env["API_TOKEN"], token);
     assert_eq!(env["PATH"], CHILD_PATH);
     assert_eq!(env["LANG"], "C.UTF-8");
@@ -238,6 +238,8 @@ fn spawn_sets_home_and_cwd() {
     let home = t.home().display().to_string();
     assert_eq!(i["cwd"], home);
     assert_eq!(i["env"]["HOME"], home);
+    // /tmp is not writable under the sandbox: temp files go to the home.
+    assert_eq!(i["env"]["TMPDIR"], home);
 }
 
 #[test]

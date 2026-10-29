@@ -40,6 +40,12 @@ pub const LINE_SLACK: usize = 64 * 1024;
 pub const STDERR_PER_MINUTE: usize = 64 * 1024;
 /// One stderr line is cut at this many bytes.
 const STDERR_LINE: usize = 4 * 1024;
+/// The window of the unsolicited-message budget ([`Budget`]).
+pub const UNSOLICITED_WINDOW: Duration = Duration::from_secs(10);
+/// Unsolicited lines a child may send per window.
+pub const UNSOLICITED_LINES: usize = 5000;
+/// Unsolicited bytes a child may send per window.
+pub const UNSOLICITED_BYTES: usize = 8 * 1024 * 1024;
 /// `tools/list` pages at most.
 const MAX_PAGES: usize = 64;
 /// The text an image or audio item is replaced with.
@@ -463,12 +469,60 @@ async fn read_capped<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// What one child may send without being asked, per
+/// [`UNSOLICITED_WINDOW`]: notifications, server requests, unreadable lines
+/// and answers to no call of ours. Past it the child is stopped, like an
+/// over-cap line: each such line costs the daemon's one runtime thread a
+/// parse.
+pub(crate) struct Budget {
+    start: tokio::time::Instant,
+    lines: usize,
+    bytes: usize,
+}
+
+impl Budget {
+    pub fn new() -> Budget {
+        Budget {
+            start: tokio::time::Instant::now(),
+            lines: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Charge one unsolicited line of `n` bytes; `Err` with the reason once
+    /// the window's budget is spent.
+    pub fn charge(&mut self, n: usize) -> Result<(), String> {
+        if self.start.elapsed() >= UNSOLICITED_WINDOW {
+            *self = Budget::new();
+        }
+        self.lines += 1;
+        self.bytes += n;
+        if self.lines > UNSOLICITED_LINES {
+            return Err(format!(
+                "the server sent over {UNSOLICITED_LINES} unsolicited messages in {} s",
+                UNSOLICITED_WINDOW.as_secs()
+            ));
+        }
+        if self.bytes > UNSOLICITED_BYTES {
+            return Err(format!(
+                "the server sent over {UNSOLICITED_BYTES} bytes of unsolicited messages in {} s",
+                UNSOLICITED_WINDOW.as_secs()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A line is parsed off the runtime thread when longer than this.
+pub const BLOCKING_LINE: usize = 256 * 1024;
+
 async fn read_stdout(
     mut r: BufReader<ChildStdout>,
     conn: Arc<Conn>,
     fatal: mpsc::UnboundedSender<String>,
     cap: usize,
 ) {
+    let mut budget = Budget::new();
     loop {
         let line = match read_capped(&mut r, cap, false).await {
             Ok(Line::Full(l)) => l,
@@ -487,22 +541,43 @@ async fn read_stdout(
             continue;
         }
         let bytes = line.len();
-        let msg = match decode_line(&line, cap) {
-            Ok(m) => m,
-            // An unreadable line names no call of ours; it is skipped.
-            Err(_) => continue,
+        let decoded = if bytes > BLOCKING_LINE {
+            match tokio::task::spawn_blocking(move || decode_line(&line, cap)).await {
+                Ok(d) => d,
+                Err(_) => {
+                    conn.fail_all(ChildError::Exited);
+                    return;
+                }
+            }
+        } else {
+            decode_line(&line, cap)
         };
+        // An answer to a call still waiting is the only solicited line.
+        let waiter = match &decoded {
+            Ok(Message::Response { id, .. }) | Ok(Message::Error { id: Some(id), .. }) => {
+                our_id(id).and_then(|n| conn.take(n))
+            }
+            _ => None,
+        };
+        if waiter.is_none() {
+            if let Err(why) = budget.charge(bytes) {
+                conn.fail_all(ChildError::Exited);
+                let _ = fatal.send(why);
+                return;
+            }
+        }
+        // An unreadable line names no call of ours; it is skipped.
+        let Ok(msg) = decoded else { continue };
         match msg {
-            Message::Response { id, result } => {
-                if let Some(tx) = our_id(&id).and_then(|n| conn.take(n)) {
+            Message::Response { result, .. } => {
+                if let Some(tx) = waiter {
                     let _ = tx.send(Ok((result, bytes)));
                 }
             }
             Message::Error {
-                id: Some(id),
-                error,
+                id: Some(_), error, ..
             } => {
-                if let Some(tx) = our_id(&id).and_then(|n| conn.take(n)) {
+                if let Some(tx) = waiter {
                     let text = format!("server error {}: {}", error.code, error.message);
                     let _ = tx.send(Err(ChildError::Protocol(sanitize(&conn.masker, &text))));
                 }
@@ -671,11 +746,11 @@ fn clean_value(v: &mut Value, masker: &Masker) {
 }
 
 /// The tools saiife keeps from a server's list, built page by page:
-/// - names are kept byte-for-byte; a tool whose name is empty, over 128
-///   bytes, holds a control char, or would change under masking (it holds
-///   a secret form or matches a v1 pattern) is dropped, with a masked
-///   note; so are all tools sharing a name, including a name seen again
-///   past the cap;
+/// - names are kept byte-for-byte; a tool whose name is not
+///   `[A-Za-z0-9_.-]{1,128}`, or would change under masking (it holds a
+///   secret form or matches a v1 pattern) is dropped, with a note that
+///   counts them and never shows the name; so are all tools sharing a
+///   name, including a name seen again past the cap;
 /// - at most [`MAX_TOOLS`] tools and [`MAX_LIST_BYTES`] kept;
 /// - title and description without control chars, masked, cut at 256 B
 ///   and 2 KiB;
@@ -691,7 +766,18 @@ pub(crate) struct Collector {
     overflow: BTreeSet<String>,
     dup: BTreeSet<String>,
     masked_names: usize,
+    /// Names outside `[A-Za-z0-9_.-]{1,128}`.
+    bad_names: usize,
     full: bool,
+}
+
+/// A tool name saiife passes on: `[A-Za-z0-9_.-]{1,128}`.
+fn tool_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 impl Collector {
@@ -704,7 +790,8 @@ impl Collector {
         let Some(name) = o.get("name").and_then(Value::as_str) else {
             return;
         };
-        if name.is_empty() || name.len() > MAX_TOOL_NAME || name.chars().any(char::is_control) {
+        if !tool_name_ok(name) {
+            self.bad_names += 1;
             return;
         }
         if masker.mask_text(name) != name {
@@ -767,6 +854,13 @@ impl Collector {
             notes.push(format!(
                 "saiife: mcp: {} tool(s) dropped: the name holds a secret or a secret-like value ([MASKED])",
                 self.masked_names
+            ));
+        }
+        if self.bad_names > 0 {
+            // The names themselves are never shown: they are the server's.
+            notes.push(format!(
+                "saiife: mcp: {} tool(s) dropped: the name is not 1 to 128 of A-Z a-z 0-9 _ . -",
+                self.bad_names
             ));
         }
         let dup = &self.dup;
@@ -879,27 +973,33 @@ mod tests {
     fn tools_are_bounded_and_cleaned_names_kept_exactly() {
         let long = "d".repeat(5000);
         let raw = vec![
-            json!({"name": "Tool.With Spaces", "description": format!("a\u{7}b{long}"),
+            json!({"name": "Tool.With_dots-1", "description": format!("a\u{7}b{long}"),
                    "inputSchema": {"type": "object", "description": "x\u{1b}y"},
                    "annotations": {"readOnlyHint": true}}),
             json!({"name": "dup", "inputSchema": {}}),
             json!({"name": "dup", "inputSchema": {}}),
             json!({"name": "bad\nname", "inputSchema": {}}),
             json!({"name": "", "inputSchema": {}}),
+            json!({"name": "has space", "inputSchema": {}}),
+            json!({"name": "slash/x", "inputSchema": {}}),
+            json!({"name": "\u{e9}t\u{e9}", "inputSchema": {}}),
+            json!({"name": "n".repeat(129), "inputSchema": {}}),
+            json!({"name": "n".repeat(128), "inputSchema": {}}),
             json!({"name": "big", "inputSchema": {"x": "y".repeat(70 * 1024)}}),
             json!({"name": "noschema"}),
             json!("not a tool"),
         ];
         let tools = clean_tools(raw, &none());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["Tool.With Spaces", "big", "noschema"]);
+        let n128 = "n".repeat(128);
+        assert_eq!(names, ["Tool.With_dots-1", &n128, "big", "noschema"]);
         let d = tools[0].description.as_deref().unwrap();
         assert!(d.starts_with("ab"), "{d:.10}");
         assert_eq!(d.len(), MAX_DESCRIPTION);
         assert_eq!(tools[0].input_schema["description"], "xy");
         assert!(tools[0].annotations.is_none());
-        assert_eq!(tools[1].input_schema, json!({"type": "object"}));
         assert_eq!(tools[2].input_schema, json!({"type": "object"}));
+        assert_eq!(tools[3].input_schema, json!({"type": "object"}));
     }
 
     /// The exit watch sees an exit without reaping: the leader is still a
@@ -914,8 +1014,11 @@ mod tests {
             } else {
                 ExitWatch::new(pid)
             };
-            if !fallback {
-                assert!(matches!(w, ExitWatch::Pidfd(..)), "no pidfd here");
+            if !fallback && !matches!(w, ExitWatch::Pidfd(..)) {
+                // No pidfd on this kernel or sandbox: only the fallback runs.
+                eprintln!("skipped: no pidfd here");
+                let _ = c.wait().await;
+                continue;
             }
             tokio::time::timeout(Duration::from_secs(10), w.exited())
                 .await
@@ -958,6 +1061,27 @@ mod tests {
             "{notes:?}"
         );
         assert!(!notes.concat().contains(secret));
+    }
+
+    /// Names outside `[A-Za-z0-9_.-]{1,128}` are dropped with a counting
+    /// note that never shows them.
+    #[test]
+    fn odd_tool_names_dropped_with_a_note() {
+        let raw = vec![
+            json!({"name": "ok_1", "inputSchema": {}}),
+            json!({"name": "spaced name", "inputSchema": {}}),
+            json!({"name": "ctl\u{1b}x", "inputSchema": {}}),
+        ];
+        let mut c = Collector::default();
+        for v in &raw {
+            c.add(v, &none());
+        }
+        let (tools, notes) = c.finish();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ok_1");
+        let all = notes.concat();
+        assert!(all.contains("2 tool(s) dropped: the name is not"), "{all}");
+        assert!(!all.contains("spaced") && !all.contains("ctl"), "{all}");
     }
 
     #[test]

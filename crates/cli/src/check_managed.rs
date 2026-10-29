@@ -422,6 +422,21 @@ mod imp {
                 }
             }
         }
+        // An approval step that broke the connection (a timeout) must not
+        // also cost the record: one fresh connection, with its own
+        // deadlines, for the append. Its error, if any, is what is shown.
+        let mut deadline = deadline;
+        if client.is_poisoned() {
+            match connect_locked(&cfg, daemon_uid) {
+                Ok(c) => {
+                    client = c;
+                    deadline = Instant::now() + ACK_TIMEOUT;
+                }
+                Err(e) => {
+                    return blocked(&format!("the audit daemon did not record this call ({e})"))
+                }
+            }
+        }
         if let Err(e) = append(&mut client, rec, deadline) {
             // Lockdown `all`: the daemon wrote the record as a deny.
             if let ClientError::Refused { code, message } = &e {
@@ -520,27 +535,15 @@ mod imp {
             _ => None,
         };
 
-        let connected = Client::connect(
-            &cfg.daemon.socket_dir,
-            daemon_uid,
-            Instant::now() + CONNECT_TIMEOUT,
-        );
-        let c = match connected {
+        let c = match connect_locked(cfg, daemon_uid) {
             Ok(c) => c,
             Err(e) => {
                 if let Some(Ok(w)) = &mut worker {
                     w.kill();
                 }
-                return Err(format!("cannot reach the audit daemon ({})", describe(&e)));
+                return Err(e);
             }
         };
-        // Only a daemon in locked mode may take the record.
-        if c.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
-            if let Some(Ok(w)) = &mut worker {
-                w.kill();
-            }
-            return Err("the audit daemon is not in locked mode".into());
-        }
         *client = Some(c);
 
         if let Some(reason) = failed {
@@ -581,7 +584,13 @@ mod imp {
             "claude" | "codex" => McpIdentity::Absent,
             _ => eval::mcp_identity(payload),
         };
-        match eval::mcp_check(agent, tool, &identity, &cfg.guard.mcp.allow_servers) {
+        match eval::mcp_check_pinned(
+            agent,
+            tool,
+            &identity,
+            &cfg.guard.mcp.allow_servers,
+            &claude_pin_ok,
+        ) {
             McpCheck::NotMcp | McpCheck::Allowed => None,
             McpCheck::Brokered => Some(Judged::mcp_brokered(recorded_input(payload))),
             McpCheck::Denied(s) => Some(Judged::mcp_denied(format!(
@@ -589,6 +598,21 @@ mod imp {
             ))),
             McpCheck::Unknown => Some(Judged::mcp_denied("MCP server unknown on Gemini".into())),
         }
+    }
+
+    /// Debug builds only: the Claude Code MCP drop-in to read instead of
+    /// the real one, owned by the test's own uid (tests never read /etc).
+    #[cfg(debug_assertions)]
+    pub const CLAUDE_MCP_SEAM: &str = "SAIIFE_TEST_CLAUDE_MCP_DROPIN";
+
+    /// Whether Claude Code's managed MCP drop-in pins the `saiife` command
+    /// (final review I3): read only for a `saiife` tool call on Claude.
+    fn claude_pin_ok() -> bool {
+        #[cfg(debug_assertions)]
+        if let Some(p) = std::env::var_os(CLAUDE_MCP_SEAM) {
+            return eval::claude_pin_ok(Path::new(&p), rustix::process::getuid().as_raw());
+        }
+        eval::claude_pin_ok(Path::new(saiife_system::layout::CLAUDE_MCP), 0)
     }
 
     /// What the record names when the worker gave no answer: the command
@@ -1170,6 +1194,21 @@ mod imp {
             .iter()
             .map(|x| format!("{x:02x}"))
             .collect()
+    }
+
+    /// A connection to the daemon, which must be in locked mode (only it
+    /// may take the record). `Err` is the reason, for stderr.
+    fn connect_locked(cfg: &SystemConfig, daemon_uid: u32) -> Result<Client, String> {
+        let c = Client::connect(
+            &cfg.daemon.socket_dir,
+            daemon_uid,
+            Instant::now() + CONNECT_TIMEOUT,
+        )
+        .map_err(|e| format!("cannot reach the audit daemon ({})", describe(&e)))?;
+        if c.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
+            return Err("the audit daemon is not in locked mode".into());
+        }
+        Ok(c)
     }
 
     /// `audit.append`, acknowledged with a `seq` by `deadline` (at most

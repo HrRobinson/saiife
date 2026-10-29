@@ -178,13 +178,16 @@ impl SpawnSpec {
         Ok(())
     }
 
-    /// The child's whole environment: `PATH`, `HOME`, `LANG`, then the
-    /// secrets. Borrowed: the values are copied only into the exec.
+    /// The child's whole environment: `PATH`, `HOME`, `LANG`, `TMPDIR`
+    /// (the home: /tmp is not writable under the sandbox or the unit),
+    /// then the secrets. Borrowed: the values are copied only into the
+    /// exec.
     pub fn child_env(&self) -> Vec<(&str, &OsStr)> {
         let mut out = vec![
             ("PATH", OsStr::new(CHILD_PATH)),
             ("HOME", self.home.as_os_str()),
             ("LANG", OsStr::new(CHILD_LANG)),
+            ("TMPDIR", self.home.as_os_str()),
         ];
         for (k, v) in &self.env {
             out.push((k.as_str(), OsStr::new(v.as_str())));
@@ -604,12 +607,13 @@ mod tests {
     }
 
     #[test]
-    fn child_env_is_path_home_lang_and_secrets() {
+    fn child_env_is_path_home_lang_tmpdir_and_secrets() {
         let s = spec();
         let env = s.child_env();
         let names: Vec<_> = env.iter().map(|(k, _)| *k).collect();
-        assert_eq!(names, ["PATH", "HOME", "LANG", "API_TOKEN"]);
+        assert_eq!(names, ["PATH", "HOME", "LANG", "TMPDIR", "API_TOKEN"]);
         assert_eq!(env[0].1, CHILD_PATH);
+        assert_eq!(env[3].1, s.home.as_os_str());
     }
 
     #[test]

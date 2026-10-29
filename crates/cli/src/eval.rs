@@ -575,6 +575,57 @@ pub enum McpCheck {
     Unknown,
 }
 
+/// [`mcp_check`], with `Brokered` only while `pin_ok()` says Claude Code's
+/// managed MCP drop-in still pins the `saiife` command
+/// ([`claude_pin_ok`]); otherwise `saiife` is judged like any server:
+/// denied unless listed. `pin_ok` runs only for a call that would be
+/// `Brokered`.
+// Used by the locked hook, which is Linux-only in this version.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn mcp_check_pinned(
+    agent: &str,
+    tool: &str,
+    identity: &McpIdentity,
+    allow: &[String],
+    pin_ok: &dyn Fn() -> bool,
+) -> McpCheck {
+    match mcp_check_as(agent, tool, identity, allow, agent == "claude") {
+        McpCheck::Brokered if !pin_ok() => mcp_check_as(agent, tool, identity, allow, false),
+        other => other,
+    }
+}
+
+/// Whether the drop-in at `path` (Claude Code's
+/// `managed-settings.d/60-saiife-mcp.json`) pins the `saiife` command: a
+/// regular file (opened without following a symlink) owned by `owner`
+/// (root in production), not group- or world-writable, at most 1 MiB,
+/// that parses and is exactly what `managed_mcp_settings` writes
+/// (`saiife_agents::claude::managed_mcp_pinned`). Any doubt is `false`.
+// Used by the locked hook, which is Linux-only in this version.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const MAX: u64 = 1 << 20;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(m) = f.metadata() else {
+        return false;
+    };
+    if !m.file_type().is_file() || m.uid() != owner || m.mode() & 0o022 != 0 || m.len() > MAX {
+        return false;
+    }
+    let mut text = String::new();
+    if f.take(MAX + 1).read_to_string(&mut text).is_err() || text.len() as u64 > MAX {
+        return false;
+    }
+    saiife_agents::claude::managed_mcp_pinned(&text)
+}
+
 /// The MCP server identity a payload states (Gemini CLI's `mcp_context`).
 // Used by the locked hook, which is Linux-only in this version.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -605,14 +656,27 @@ pub enum McpIdentity {
 ///
 /// The server `saiife` is `Brokered` for `claude` only (its command is
 /// pinned there); for every other agent it needs `allow` like any server.
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+///
+/// This assumes the drop-in pin holds (tests); the hook uses
+/// [`mcp_check_pinned`], which checks it.
+#[cfg(test)]
 pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[String]) -> McpCheck {
     // `saiife` is brokered only where the agent cannot run another server
     // under that name: Claude Code, whose managed drop-in pins its command.
     // Elsewhere a project or user config could register its own `saiife`
     // server, so it is judged like any other: denied unless listed.
-    let brokered_ok = agent == "claude";
+    mcp_check_as(agent, tool, identity, allow, agent == "claude")
+}
+
+/// [`mcp_check`] with whether `saiife` may be `Brokered` given.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mcp_check_as(
+    agent: &str,
+    tool: &str,
+    identity: &McpIdentity,
+    allow: &[String],
+    brokered_ok: bool,
+) -> McpCheck {
     let listed = |s: &str| allow.iter().any(|a| a == s);
     let double = |tool: &str| {
         let rest = tool.strip_prefix("mcp__")?;
@@ -1252,6 +1316,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Final review I3: on Claude Code `saiife` is brokered only while the
+    /// managed MCP drop-in pins its command; a missing or wrong drop-in
+    /// makes it a server like any other (denied unless listed).
+    #[test]
+    fn mcp_check_pinned_needs_the_drop_in() {
+        let t = "mcp__saiife__api_call";
+        let yes = || true;
+        let no = || false;
+        assert_eq!(
+            mcp_check_pinned("claude", t, &NONE, &[], &yes),
+            McpCheck::Brokered
+        );
+        assert_eq!(
+            mcp_check_pinned("claude", t, &NONE, &[], &no),
+            McpCheck::Denied("saiife".into())
+        );
+        assert_eq!(
+            mcp_check_pinned("claude", t, &NONE, &list(&["saiife"]), &no),
+            McpCheck::Allowed
+        );
+        // The pin is read only for a saiife call that would be brokered.
+        let never = || panic!("pin read");
+        let allow = list(&["linear"]);
+        assert_eq!(
+            mcp_check_pinned("claude", "mcp__linear__x", &NONE, &allow, &never),
+            McpCheck::Allowed
+        );
+        assert_eq!(
+            mcp_check_pinned("codex", t, &NONE, &[], &never),
+            McpCheck::Denied("saiife".into())
+        );
+        assert_eq!(
+            mcp_check_pinned("claude", "Bash", &NONE, &[], &never),
+            McpCheck::NotMcp
+        );
+    }
+
+    /// The drop-in file: missing, a wrong pin, a symlink, writable by the
+    /// group, another owner: not pinned. saiife's own text: pinned.
+    #[test]
+    fn claude_pin_ok_reads_the_drop_in_strictly() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let p = d.path().join("60-saiife-mcp.json");
+        assert!(!claude_pin_ok(&p, me), "missing");
+        std::fs::write(&p, r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp", "--wait", "5m"]}]}"#).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!claude_pin_ok(&p, me), "wrong pin");
+        std::fs::write(&p, "{").unwrap();
+        assert!(!claude_pin_ok(&p, me), "no parse");
+        std::fs::write(
+            &p,
+            saiife_agents::claude::managed_mcp_settings(&["linear".into()]),
+        )
+        .unwrap();
+        assert!(claude_pin_ok(&p, me), "good");
+        assert!(!claude_pin_ok(&p, me.wrapping_add(1)), "other owner");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(!claude_pin_ok(&p, me), "group-writable");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = d.path().join("link.json");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        assert!(!claude_pin_ok(&link, me), "symlink");
+        assert!(!claude_pin_ok(d.path(), me), "a dir");
     }
 
     /// Controller ruling (T9 follow-up): nothing pins the `saiife` server's

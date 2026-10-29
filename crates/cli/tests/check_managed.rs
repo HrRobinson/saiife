@@ -77,6 +77,11 @@ fn managed_as(
         .env("SAIIFE_DATA_DIR", sb.data())
         .env("SAIIFE_AUDIT_DIR", sb.audit())
         .env_remove("SAIIFE_EVAL_FAULT")
+        // Never the real /etc drop-in: none, unless a test writes one.
+        .env(
+            "SAIIFE_TEST_CLAUDE_MCP_DROPIN",
+            sb.dir.path().join("no-dropin"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1011,11 +1016,18 @@ fn mcp_payload(agent: &str, tool: &str) -> String {
 fn saiife_server_allowed_as_brokered() {
     let d = TestDaemon::start(Opts::default());
     let agent = "claude";
+    let drop_in = d.path().join("60-saiife-mcp.json");
+    std::fs::write(
+        &drop_in,
+        saiife_agents::claude::managed_mcp_settings(&["linear".into()]),
+    )
+    .unwrap();
+    let seam = drop_in.display().to_string();
     let (o, _, _sb) = managed_as(
         agent,
         &d.config(),
         &mcp_payload(agent, "mcp__saiife__shop_orders_list"),
-        &[],
+        &[("SAIIFE_TEST_CLAUDE_MCP_DROPIN", &seam)],
         &[],
     );
     assert_eq!(code(&o), 0, "{agent}: stderr: {}", stderr(&o));
@@ -1026,6 +1038,38 @@ fn saiife_server_allowed_as_brokered() {
     assert_eq!(r["reason"], "brokered: judged by the saiife daemon", "{r}");
     assert_eq!(r["tool"], "mcp__saiife__shop_orders_list", "{r}");
     assert_eq!(r["agent"], agent, "{r}");
+}
+
+/// Final review I3: on Claude Code `saiife` is brokered only while the
+/// managed MCP drop-in pins its command. Missing, or with a wrong pin: a
+/// server like any other, denied unless listed.
+#[test]
+fn claude_saiife_needs_the_pinned_drop_in() {
+    let d = TestDaemon::start(Opts::default());
+    let payload = mcp_payload("claude", "mcp__saiife__api_call");
+    let blocked = "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers";
+    // Missing (managed_as points the seam at a file that is not there).
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(stderr(&o).trim_end(), blocked);
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    // A wrong pin: extra arguments on the command.
+    let drop_in = d.path().join("60-saiife-mcp.json");
+    std::fs::write(
+        &drop_in,
+        r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp", "--wait", "5m"]}]}"#,
+    )
+    .unwrap();
+    let seam = drop_in.display().to_string();
+    let env = [("SAIIFE_TEST_CLAUDE_MCP_DROPIN", seam.as_str())];
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &env, &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(stderr(&o).trim_end(), blocked);
+    // The good drop-in: brokered.
+    std::fs::write(&drop_in, saiife_agents::claude::managed_mcp_settings(&[])).unwrap();
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &env, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["rule"], "mcp_brokered");
 }
 
 /// Controller ruling (T9 follow-up): Codex pins no MCP server command, so

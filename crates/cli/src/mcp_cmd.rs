@@ -42,7 +42,7 @@ use std::process::ExitCode;
 pub struct McpArgs {
     /// Wait this long (at most 1h) for an approval before a tool call that
     /// needs one answers; without it, the call answers at once with the
-    /// request id.
+    /// request id. Falls back to `SAIIFE_MCP_WAIT` (the flag wins).
     #[arg(long, value_name = "DURATION")]
     pub wait: Option<String>,
     /// The system config (default /etc/saiife/config.toml).
@@ -175,12 +175,35 @@ mod linux {
         cancel: Arc<AtomicBool>,
     }
 
+    /// The env fallback for `--wait`: an MCP client config can set it
+    /// without changing the server's command line (Claude Code's
+    /// `serverCommand` pin matches the arguments exactly).
+    const WAIT_ENV: &str = "SAIIFE_MCP_WAIT";
+
+    /// `--wait`, else `SAIIFE_MCP_WAIT` (unset or empty: no wait), with the
+    /// same parse rules.
+    fn wait_setting(
+        flag: Option<&str>,
+        env: Option<std::ffi::OsString>,
+    ) -> Result<Option<Duration>, Stop> {
+        if flag.is_some() {
+            return api::wait_limit(flag);
+        }
+        let Some(v) = env.filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(v) = v.to_str() else {
+            return Err(Stop(2, format!("{WAIT_ENV} is not UTF-8")));
+        };
+        api::wait_limit(Some(v)).map_err(|Stop(c, m)| Stop(c, format!("{WAIT_ENV}: {m}")))
+    }
+
     fn log(m: &str) {
         eprintln!("saiife mcp: {}", crate::text::sanitize(m));
     }
 
     pub fn run(a: McpArgs) -> ExitCode {
-        let wait = match api::wait_limit(a.wait.as_deref()) {
+        let wait = match wait_setting(a.wait.as_deref(), std::env::var_os(WAIT_ENV)) {
             Ok(w) => w,
             Err(Stop(code, m)) => {
                 eprintln!("saiife: {m}");
@@ -770,8 +793,21 @@ mod linux {
     /// The `api.call` params and body for a tool's arguments: scalars
     /// become strings, the free `body` is sent as `body_b64`; anything else
     /// is `-32602`, answered without calling the daemon.
-    fn map_args(t: &ToolTarget, args: &Map<String, Value>) -> Result<CallArgs, RpcError> {
+    ///
+    /// Numbers are never changed on the way: a number argument is sent as
+    /// the text the client wrote, and a JSON body as the client's own
+    /// bytes (`raw`, the exact text of `arguments`), not re-encoded
+    /// through f64. Without that text only an integer is taken; any other
+    /// number is `-32602`.
+    fn map_args(
+        t: &ToolTarget,
+        args: &Map<String, Value>,
+        raw: Option<&str>,
+    ) -> Result<CallArgs, RpcError> {
         let bad = |m: String| RpcError::invalid_params(crate::text::sanitize(&m));
+        let raw: Option<HashMap<String, &serde_json::value::RawValue>> =
+            raw.and_then(|r| serde_json::from_str(r).ok());
+        let raw_of = |k: &str| raw.as_ref().and_then(|m| m.get(k)).map(|r| r.get());
         let mut params = Map::new();
         let mut body = None;
         for (k, v) in args {
@@ -780,12 +816,24 @@ mod linux {
             }
             if k == "body" {
                 if let Some(b) = t.body {
-                    let bytes = b.encode(v).ok_or_else(|| {
+                    let mut bytes = b.encode(v).ok_or_else(|| {
                         bad(match b {
                             BodyArg::Json => "body must be a JSON object".to_string(),
                             BodyArg::Text => "body must be a string".to_string(),
                         })
                     })?;
+                    if b == BodyArg::Json {
+                        // The client's own text: its numbers stay as written.
+                        match raw_of(k) {
+                            Some(r) => bytes = r.as_bytes().to_vec(),
+                            None if has_inexact_number(v) => {
+                                return Err(bad(
+                                    "a number in the body cannot be kept exact".to_string()
+                                ))
+                            }
+                            None => {}
+                        }
+                    }
                     if bytes.len() > api::MAX_BODY {
                         return Err(bad(format!(
                             "the body is larger than {} KiB",
@@ -798,7 +846,15 @@ mod linux {
             }
             let s = match v {
                 Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
+                Value::Number(n) => match raw_of(k) {
+                    Some(r) => r.to_string(),
+                    None if n.is_i64() || n.is_u64() => n.to_string(),
+                    None => {
+                        return Err(bad(format!(
+                            "argument {k:?}: the number cannot be kept exact; send it as a string"
+                        )))
+                    }
+                },
                 Value::Bool(b) => b.to_string(),
                 _ => {
                     return Err(bad(format!(
@@ -809,6 +865,17 @@ mod linux {
             params.insert(k.clone(), Value::String(s));
         }
         Ok((params, body))
+    }
+
+    /// Whether `v` holds a number that is not an integer (one f64 may have
+    /// rounded).
+    fn has_inexact_number(v: &Value) -> bool {
+        match v {
+            Value::Number(n) => !(n.is_i64() || n.is_u64()),
+            Value::Array(a) => a.iter().any(has_inexact_number),
+            Value::Object(o) => o.values().any(has_inexact_number),
+            _ => false,
+        }
     }
 
     /// `tools/call`. Policy outcomes are results; only an unknown tool or
@@ -858,7 +925,7 @@ mod linux {
         if target.gateway {
             return Ok(gateway_call(sh, conn, &target, args, raw, progress, cancel));
         }
-        let (params, body) = map_args(&target, args)?;
+        let (params, body) = map_args(&target, args, raw.as_deref())?;
         // The args a next page is called with: the free body is not
         // echoed (it can be large); the hint says to send it again.
         let mut echo = args.clone();
@@ -1255,6 +1322,83 @@ mod linux {
             match v {
                 Value::Object(m) => m,
                 _ => panic!("not an object"),
+            }
+        }
+
+        fn target(body: Option<BodyArg>) -> ToolTarget {
+            ToolTarget {
+                service: "erp".into(),
+                operation: "op".into(),
+                body,
+                args: ["n", "s", "body"].iter().map(|s| s.to_string()).collect(),
+                gateway: false,
+            }
+        }
+
+        /// Number arguments go as the client wrote them; without the raw
+        /// text a non-integer is refused, never rounded.
+        #[test]
+        fn number_arguments_keep_the_clients_text() {
+            let raw = r#"{"n": 12345678901234567890.000000001, "s": "x", "body": {"a": 0.10000000000000000001, "b": 1E2}}"#;
+            let args: Map<String, Value> = serde_json::from_str(raw).unwrap();
+            let (p, body) = map_args(&target(Some(BodyArg::Json)), &args, Some(raw)).unwrap();
+            assert_eq!(p["n"], "12345678901234567890.000000001");
+            assert_eq!(p["s"], "x");
+            assert_eq!(
+                body.unwrap(),
+                br#"{"a": 0.10000000000000000001, "b": 1E2}"#.to_vec()
+            );
+            // An integer needs no raw text.
+            let args = obj(json!({"n": 42}));
+            let (p, _) = map_args(&target(None), &args, None).unwrap();
+            assert_eq!(p["n"], "42");
+            // A non-integer without it is -32602.
+            let args = obj(json!({"n": 0.5}));
+            let e = map_args(&target(None), &args, None).unwrap_err();
+            assert_eq!(e.code, -32602);
+            let args = obj(json!({"body": {"a": 0.5}}));
+            let e = map_args(&target(Some(BodyArg::Json)), &args, None).unwrap_err();
+            assert_eq!(e.code, -32602);
+        }
+
+        /// `SAIIFE_MCP_WAIT` is the fallback for `--wait`, with the same
+        /// parse rules; the flag wins; unset or empty is no wait.
+        #[test]
+        fn wait_env_falls_back_and_the_flag_wins() {
+            let env = |s: &str| Some(std::ffi::OsString::from(s));
+            let ok = |r: Result<Option<Duration>, Stop>| match r {
+                Ok(v) => v,
+                Err(Stop(_, m)) => panic!("{m}"),
+            };
+            let err = |r: Result<Option<Duration>, Stop>| match r {
+                Ok(v) => panic!("{v:?}"),
+                Err(Stop(c, m)) => (c, m),
+            };
+            assert_eq!(ok(wait_setting(None, None)), None);
+            assert_eq!(ok(wait_setting(None, env(""))), None);
+            assert_eq!(
+                ok(wait_setting(None, env("5m"))),
+                Some(Duration::from_secs(300))
+            );
+            assert_eq!(
+                ok(wait_setting(Some("2s"), env("5m"))),
+                Some(Duration::from_secs(2))
+            );
+            // The same 1 h cap as the flag.
+            assert_eq!(
+                ok(wait_setting(None, env("5h"))),
+                ok(wait_setting(Some("5h"), None))
+            );
+            let (code, m) = err(wait_setting(None, env("soon")));
+            let (flag_code, _) = err(wait_setting(Some("soon"), None));
+            assert_eq!(code, flag_code);
+            assert!(m.starts_with("SAIIFE_MCP_WAIT: "), "{m}");
+            // A bad env value is not read when the flag is given.
+            assert!(ok(wait_setting(Some("1s"), env("soon"))).is_some());
+            {
+                use std::os::unix::ffi::OsStringExt;
+                let bad = Some(std::ffi::OsString::from_vec(vec![0xff]));
+                err(wait_setting(None, bad));
             }
         }
 

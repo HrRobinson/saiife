@@ -132,6 +132,17 @@ When the time is up, the answer is the pending text above. Set it below the
 client's own tool-call timeout. Which timeout each client uses has not been
 checked yet.
 
+The environment variable `SAIIFE_MCP_WAIT` sets the same thing, with the
+same rules (`SAIIFE_MCP_WAIT=5m`; unset or empty means no wait). `--wait`
+wins when both are set. On Claude Code use the variable, not the flag:
+saiife's managed settings pin the server's command as exactly
+`/opt/saiife/bin/saiife mcp`, so an extra argument such as `--wait 5m`
+makes the server unavailable there:
+
+```bash
+claude mcp add -e SAIIFE_MCP_WAIT=5m saiife -- /opt/saiife/bin/saiife mcp
+```
+
 saiife never uses MCP elicitation or sampling to ask. An answer given inside
 the agent's own UI would come from the requester's session, which is
 self-approval. An approver decides outside the agent, with `saiife approve`.
@@ -201,6 +212,17 @@ job and not a control.
   `roots/list`) are answered `-32601`.
 - A server's stderr is masked with its secrets and written to the daemon's
   stderr as `saiife: mcp <name>: ...`, at most 64 KiB a minute.
+- A server's output is bounded. A line over `max_response_bytes` plus
+  64 KiB stops the child. So do more than 5000 lines, or more than 8 MiB,
+  in 10 seconds that answer no call of the daemon's (notifications, server
+  requests, unreadable lines, answers to a call already given up). Either
+  way the child is restarted with the backoff, and the
+  `mcp_server_exited` record says why. A `notifications/tools/list_changed`
+  makes the daemon list the tools again, at most once every 5 seconds;
+  notifications that arrive in between are folded into the next list.
+- Tool names are kept as the server lists them. A tool whose name is not 1
+  to 128 of `A-Z a-z 0-9 _ . -`, or holds a secret, is dropped; the
+  daemon's stderr says how many, never the names.
 - A secret added, rotated or removed restarts (or starts, or fails) the
   servers that name it, at once. A policy reload restarts servers whose
   settings changed.
@@ -265,7 +287,8 @@ canonical arguments.
 The daemon starts each server through `saiife __mcp-spawn`, which sets
 `no_new_privs`, starts a new session, closes inherited descriptors above 2,
 clears the environment (only `PATH=/usr/local/bin:/usr/bin:/bin`, `HOME`,
-`LANG=C.UTF-8` and the listed secrets stay) and applies a Landlock ruleset:
+`LANG=C.UTF-8`, `TMPDIR` set to the server's home, and the listed secrets
+stay) and applies a Landlock ruleset:
 
 - read and execute: `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/opt`, the
   server's `read_paths`, and a few files under `/etc` (TLS roots, resolver,
@@ -308,6 +331,22 @@ The limits, as built:
 - **No exec from under the server's home.** The writable home is not
   executable, so a server cannot write a program and run it. Install
   programs and runtimes root-owned, under `/opt` or `/usr`.
+- **`/tmp` is not writable.** `TMPDIR` points at the server's home; a
+  server that ignores `TMPDIR` and writes to `/tmp` fails.
+- **No JIT under the unit.** The daemon's systemd unit sets
+  `MemoryDenyWriteExecute=yes`, which its children inherit. Node.js
+  servers need `--jitless` (for example `args = ["--jitless",
+  "/opt/mcp/x/index.js"]`); other runtimes with a JIT need the same.
+- **`/proc` is limited to the server itself.** The ruleset allows reading
+  only the server's own `/proc/<pid>` (the process saiife started). The rest
+  of `/proc` (`/proc/cpuinfo`, `/proc/meminfo`, other processes, and the
+  `/proc/self` of a process the server starts) is denied, so a runtime that
+  reads it at start may need a flag to skip that.
+- **A process that leaves the group is not killed with it.** When a server
+  stops, the daemon kills its whole process group. A grandchild that calls
+  `setsid` itself leaves that group and keeps running. It is still under
+  the same Landlock ruleset and `no_new_privs`, and the daemon refuses it at
+  its sockets like any gateway child.
 - A server runs as the **daemon user**, not as a separate account. A
   separate uid is a follow-up.
 - `doctor` warns on `npx` and `uvx`, which download code at run time, and on
@@ -319,7 +358,7 @@ The limits, as built:
 |---|---|
 | `mcp.gateway.<name>` | pass: `MCP server <name> is brokered (<n> tools)`. Fail: `MCP server <name> is not running: <reason>` (or the daemon is unreachable), or `sandbox unavailable`. Warn: `sandbox is off`, an argument that is not root-owned, `npx`/`uvx` |
 | `mcp.landlock` | info: `Landlock ABI <n>`, shown when a gateway server exists |
-| `mcp.sandbox` | warn for ABI 1 to 5: `MCP server sandbox is weaker than full`, with the missing part |
+| `mcp.sandbox` | warn for ABI 1 to 5, when a server runs with `sandbox = "landlock"`: `MCP server sandbox is weaker than full`, with the missing part |
 | `mcp.claude.allowlist` | pass: `Claude Code MCP allowlist matches policy`. Warn: `the Claude Code MCP allowlist differs from policy; run saiife system install again` |
 | `mcp.codex.restriction`, `mcp.gemini.restriction` | info: `MCP servers for Codex are restricted by the hook only` (and the same for Gemini CLI). The detail says the `saiife` server is not brokered there, and whether `allow_servers` lists it |
 | `mcp.saiife` | warn, when `allow_servers` lists `saiife` and Codex or Gemini CLI is installed: `MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command` |

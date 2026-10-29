@@ -632,6 +632,23 @@ fn wait_flag_polls_and_sends_progress() {
     assert!(w.m.hits().is_empty());
 }
 
+/// `SAIIFE_MCP_WAIT` does what `--wait` does, without an argument (Claude
+/// Code's pin matches the command line exactly).
+#[test]
+fn wait_env_polls_like_the_flag() {
+    let w = world();
+    let mut c = McpClient::spawn_env(&w.d, &[], &[("SAIIFE_MCP_WAIT", "3s")]);
+    c.initialize();
+    let started = std::time::Instant::now();
+    let r = c.result(
+        "tools/call",
+        json!({"name": "erp_invoices_create", "arguments": {"body": {"amount": 5}}}),
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2), "did not wait");
+    let id = r["structuredContent"]["pending"].as_u64().unwrap();
+    assert_eq!(texts(&r), pending_text(id));
+}
+
 #[test]
 fn cancelled_stops_a_wait_poll() {
     let w = world();
