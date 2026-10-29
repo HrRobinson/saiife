@@ -934,10 +934,10 @@ mod inproc {
         pub tmp: tempfile::TempDir,
     }
 
-    fn config_text(tmp: &Path, port: u16) -> String {
+    fn config_text(tmp: &Path, port: u16, scope: &str, tail: &str) -> String {
         format!(
             "version = 2\nlocked = true\n\n[daemon]\nuser = {user:?}\nsocket_dir = {run:?}\n\n[audit]\ndir = {audit:?}\n\n[approval]\napprovers = [\"boss\"]\n\n{}",
-            policy(port, "\"erp\"", "", "\"invoices:read\"", ""),
+            policy(port, scope, "", "\"invoices:read\"", tail),
             user = own_user(),
             run = tmp.join("run").display().to_string(),
             audit = tmp.join("audit").display().to_string(),
@@ -945,6 +945,20 @@ mod inproc {
     }
 
     pub fn world() -> Inproc {
+        build("\"erp\"", "", false)
+    }
+
+    /// A world with the real MCP gateway and one `[mcp.fake]` server whose
+    /// `echo` needs approval.
+    pub fn world_gw() -> Inproc {
+        build(
+            "\"erp\", \"mcp:fake\"",
+            &fake_server(&[], "ask = [\"echo\"]\n"),
+            true,
+        )
+    }
+
+    fn build(scope: &str, tail: &str, gw: bool) -> Inproc {
         let m = mock();
         let tmp = common::tmp::short_tempdir();
         let t = tmp.path();
@@ -955,7 +969,7 @@ mod inproc {
         }
         fs::write(t.join("etc/ca/test-ca.pem"), &m.ca_pem).unwrap();
         let config = t.join("etc/config.toml");
-        fs::write(&config, config_text(t, m.port)).unwrap();
+        fs::write(&config, config_text(t, m.port, scope, tail)).unwrap();
         let l = saiife_policy::load_system(&config).unwrap();
         let cat = saiife_broker::Catalog::new(saiife_broker::builtin(), vec![]);
         saiife_broker::catalog::validate(&l.config, &cat).unwrap();
@@ -1007,10 +1021,24 @@ mod inproc {
             .enable_all()
             .build()
             .unwrap();
+        let gateway = gw.then(|| {
+            Arc::new(saiife_daemon::mcp_gateway::Gateway::new(
+                saiife_daemon::mcp_gateway::GatewaySetup {
+                    helper: PathBuf::from(env!("CARGO_BIN_EXE_saiife")),
+                    state_dir: t.join("state"),
+                    protected: ["state", "audit", "run", "etc"]
+                        .iter()
+                        .map(|d| t.join(d))
+                        .collect(),
+                    enabled: true,
+                    log: saiife_daemon::mcp_gateway::Log::new(|_| {}),
+                },
+            ))
+        });
         let ctx = rt.block_on(async {
             let directory = Arc::new(FixedDirectory::from_text(&passwd, &group));
             let state = t.join("state");
-            Arc::new(Ctx::new(CtxInit {
+            let mut init = CtxInit {
                 own_uid: uid,
                 own_user: me,
                 audit_dir: t.join("audit"),
@@ -1030,7 +1058,17 @@ mod inproc {
                 lockdown: saiife_daemon::lockdown::Store::memory(),
                 mode: Mode::Locked,
                 ..CtxInit::minimal(handle, writer_cfg(), directory, &state)
-            }))
+            };
+            if let Some(g) = &gateway {
+                init.mcp = Arc::clone(g);
+            }
+            let ctx = Arc::new(Ctx::new(init));
+            if gw {
+                ctx.mcp.attach(Arc::downgrade(&ctx));
+                let v = ctx.vault.lock();
+                ctx.mcp.reconcile(&l.config, &v);
+            }
+            ctx
         });
         let control = rt
             .block_on(async { tokio::net::UnixListener::bind(t.join("run/saiife.sock")).unwrap() });
@@ -1043,6 +1081,13 @@ mod inproc {
             });
         }
         Inproc { rt, ctx, m, tmp }
+    }
+
+    impl Drop for Inproc {
+        fn drop(&mut self) {
+            let ctx = Arc::clone(&self.ctx);
+            self.rt.block_on(async move { ctx.mcp.stop().await });
+        }
     }
 
     impl Inproc {
@@ -1279,4 +1324,296 @@ fn refused_list_is_not_unavailable() {
     fs::remove_file(&cfg).unwrap();
     assert!(c.tool_names().iter().any(|n| n == "erp_invoices_list"));
     assert!(w.m.hits().is_empty());
+}
+
+// ------------------------------------------------------ gateway (Task 8)
+
+const ENV_BIN: &str = "/usr/bin/env";
+
+/// A test token, built at run time (no token-shaped literal in the tree).
+fn fake_token() -> String {
+    concat!("fk", "-tok-", "9z8y7x6w5v").to_string()
+}
+
+fn sandbox_line() -> &'static str {
+    if saiife_system::sandbox::landlock_abi() == 0 {
+        eprintln!("note: no Landlock on this kernel; the gateway tests run with sandbox = \"off\"");
+        "sandbox = \"off\"\n"
+    } else {
+        ""
+    }
+}
+
+/// `[mcp.fake]` running `saiife __fake-mcp-server <fake_args>` under
+/// `/usr/bin/env` (a root-owned command), with `extra` lines appended.
+fn fake_server(fake_args: &[&str], extra: &str) -> String {
+    let bin = env!("CARGO_BIN_EXE_saiife");
+    let mut args = vec![bin.to_string(), "__fake-mcp-server".to_string()];
+    args.extend(fake_args.iter().map(|s| s.to_string()));
+    let bin_dir = std::path::Path::new(bin)
+        .parent()
+        .unwrap()
+        .display()
+        .to_string();
+    format!(
+        "\n[mcp.fake]\ncommand = {ENV_BIN:?}\nargs = {args:?}\nread_paths = [{bin_dir:?}]\n{}{extra}\n",
+        sandbox_line()
+    )
+}
+
+fn gw_policy(port: u16, servers: &str) -> String {
+    policy(
+        port,
+        "\"erp\", \"mcp:fake\"",
+        "",
+        "\"invoices:read\", \"invoices:delete\"",
+        servers,
+    )
+}
+
+fn gw_world(servers: &str) -> World {
+    world_with(|p| gw_policy(p, servers), &["erp"])
+}
+
+/// Waits until `tools/list` holds `name` (the server may still be starting).
+fn wait_tool(c: &mut McpClient, name: &str) {
+    let ok = wait_for(Duration::from_secs(30), || {
+        c.tool_names().iter().any(|n| n == name)
+    });
+    assert!(ok, "{name} never listed: {}", c.stderr_text());
+}
+
+/// Rewrites the policy and reloads the daemon.
+fn reload_gw(w: &World, servers: &str) {
+    w.d.write_config(&Opts {
+        extra: gw_policy(w.m.port, servers),
+        ..Opts::default()
+    });
+    w.d.signal("HUP");
+}
+
+// ------------------------------------------------- gateway tools (Task 8)
+
+#[test]
+fn gateway_tools_listed_with_prefix() {
+    let w = gw_world(&fake_server(
+        &[],
+        "allow = [\"echo\"]\nask = [\"introspect\"]\n",
+    ));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__echo");
+    let list = c.result("tools/list", json!({}));
+    let echo = tool(&list, "fake__echo").expect("fake__echo");
+    // The third-party schema is passed through as it is; no annotations
+    // (a third party's hints are untrusted); the policy line ends the text.
+    assert_eq!(echo["inputSchema"], json!({"type": "object"}), "{echo}");
+    assert!(echo.get("annotations").is_none(), "{echo}");
+    assert!(
+        echo["description"]
+            .as_str()
+            .unwrap()
+            .ends_with("Policy: allowed."),
+        "{echo}"
+    );
+    let ask = tool(&list, "fake__introspect").expect("fake__introspect");
+    assert!(
+        ask["description"]
+            .as_str()
+            .unwrap()
+            .ends_with("Policy: needs approval; the result says how to get it."),
+        "{ask}"
+    );
+    // Connector tools and the built-in are still there.
+    assert!(tool(&list, "erp_invoices_list").is_some(), "{list}");
+    assert!(tool(&list, "saiife_result").is_some(), "{list}");
+}
+
+#[test]
+fn gateway_allow_call_roundtrip() {
+    let w = gw_world(&fake_server(
+        &[],
+        "allow = [\"echo\"]\nread_tools = [\"echo\"]\n",
+    ));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__echo");
+    let r = c.call("fake__echo", json!({"b": 1, "a": [2]}));
+    // Forwarded as the server answered (the fake echoes the arguments it
+    // got, which the daemon sent canonically); isError is the server's.
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(texts(&r), r#"{"a":[2],"b":1}"#, "{r}");
+    let recs: Vec<Value> = w
+        .connector()
+        .into_iter()
+        .filter(|r| r["service"] == "mcp:fake")
+        .collect();
+    assert_eq!(recs.len(), 1, "{recs:#?}");
+    assert_eq!(recs[0]["tool"], "mcp");
+    assert_eq!(recs[0]["via"], "mcp");
+    assert_eq!(recs[0]["operation"], "echo");
+    assert_eq!(recs[0]["decision"], "allow");
+}
+
+#[test]
+fn gateway_ask_then_saiife_result() {
+    use saiife_daemon::approvals::State;
+    let w = inproc::world_gw();
+    let mut c = w.mcp();
+    wait_tool(&mut c, "fake__echo");
+    let r = c.call("fake__echo", json!({"x": 1}));
+    assert_eq!(r["isError"], false, "{r}");
+    let id = r["structuredContent"]["pending"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(texts(&r), pending_text(id), "{r}");
+    // Nothing is sent before an approver decides.
+    let r2 = c.call("saiife_result", json!({"request": id}));
+    assert_eq!(texts(&r2), pending_text(id), "{r2}");
+    let d = w.decide(inproc::BOSS, id, "approve");
+    assert_eq!(d["ok"], true, "{d}");
+    assert!(
+        wait_for(Duration::from_secs(20), || w.state(id) == Some(State::Sent)),
+        "request #{id} is {:?}",
+        w.state(id)
+    );
+    let r3 = c.call("saiife_result", json!({"request": id}));
+    assert_eq!(r3["isError"], false, "{r3}");
+    assert_eq!(texts(&r3), r#"{"x":1}"#, "{r3}");
+    let recs: Vec<Value> = w
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "connector")
+        .collect();
+    assert_eq!(recs[0]["via"], "mcp", "{recs:?}");
+    assert_eq!(recs[0]["decision"], "ask");
+    assert_eq!(recs.last().unwrap()["via"], "approval", "{recs:?}");
+}
+
+#[test]
+fn gateway_deny_is_error_result() {
+    let w = gw_world(&fake_server(&[], "allow = [\"echo\"]\n"));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__echo");
+    // The policy now denies the tool the agent's client still lists.
+    reload_gw(&w, &fake_server(&[], "deny = [\"echo\"]\n"));
+    let ok = wait_for(Duration::from_secs(20), || {
+        let r = c.call("fake__echo", json!({}));
+        r["isError"] == true
+    });
+    assert!(ok, "the denied call never became an error result");
+    let r = c.call("fake__echo", json!({}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(texts(&r).starts_with("denied ("), "{r}");
+    let recs = w.connector();
+    let last = recs.last().unwrap();
+    assert_eq!(last["service"], "mcp:fake", "{last}");
+    assert_eq!(last["decision"], "deny", "{last}");
+}
+
+#[test]
+fn token_never_reaches_agent() {
+    let tok = fake_token();
+    let servers = fake_server(
+        &["--echo-env", "FAKE_TOKEN"],
+        "env = { FAKE_TOKEN = \"fake-tok\" }\nallow = [\"echo\", \"echo_env\"]\n",
+    );
+    let w = gw_world(&servers);
+    let o = base_cmd(&w.d)
+        .arg("secret")
+        .arg("--system-config")
+        .arg(w.d.config())
+        .args([
+            "add",
+            "fake-tok",
+            "--kind",
+            "token",
+            "--from-env",
+            "SV",
+            "--service",
+            "mcp:fake",
+        ])
+        .env("SV", &tok)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__echo_env");
+    let r = c.call("fake__echo_env", json!({}));
+    assert_eq!(texts(&r), "[MASKED]", "{r}");
+    assert!(!r.to_string().contains(&tok), "{r}");
+    // Not in the listing, not in the log either.
+    let list = c.result("tools/list", json!({}));
+    assert!(!list.to_string().contains(&tok));
+    for f in fs::read_dir(w.d.audit_dir()).unwrap() {
+        let text = fs::read_to_string(f.unwrap().path()).unwrap_or_default();
+        assert!(!text.contains(&tok), "a secret value in the audit log");
+    }
+}
+
+#[test]
+fn reload_revokes_listed_tool() {
+    let w = gw_world(&fake_server(&[], "allow = [\"echo\", \"introspect\"]\n"));
+    // Fast hash polling is set at spawn.
+    let mut c = McpClient::spawn_env(&w.d, &[], &[("SAIIFE_TEST_MCP_HASH_MS", "200")]);
+    c.initialize();
+    wait_tool(&mut c, "fake__introspect");
+    assert!(c.next_notification(Duration::from_millis(800)).is_none());
+    reload_gw(&w, &fake_server(&[], "allow = [\"echo\"]\n"));
+    let n = c
+        .next_notification(Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("no list_changed: {}", c.stderr_text()));
+    assert_eq!(n["method"], "notifications/tools/list_changed");
+    let names = c.tool_names();
+    assert!(names.iter().any(|n| n == "fake__echo"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "fake__introspect"), "{names:?}");
+    // And the tool is no longer callable by name.
+    let r = c.request(
+        "tools/call",
+        json!({"name": "fake__introspect", "arguments": {}}),
+    );
+    assert_eq!(rpc_code(&r), -32602, "{r}");
+}
+
+#[test]
+fn connector_and_gateway_names_never_collide() {
+    let tools = json!([
+        {"name": "a.b", "inputSchema": {"type": "object"}},
+        {"name": "a_b", "inputSchema": {"type": "object"}},
+        {"name": "ok", "inputSchema": {"type": "object"}},
+        {"name": "x".repeat(60), "inputSchema": {"type": "object"}},
+    ])
+    .to_string();
+    let w = gw_world(&fake_server(&["--tools", &tools], "allow = [\"*\"]\n"));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__ok");
+    let names = c.tool_names();
+    // Two tools that mangle alike are both dropped; so is a name over 51.
+    assert!(!names.iter().any(|n| n == "fake__a_b"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("fake__xxxx")),
+        "{names:?}"
+    );
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        names.len(),
+        "a name is listed twice: {names:?}"
+    );
+    assert!(names.iter().all(|n| n.len() <= 51), "{names:?}");
+    // The two namespaces: a gateway name holds `__`, a connector name never.
+    for n in &names {
+        let gateway = n.starts_with("fake__");
+        assert_eq!(n.contains("__"), gateway, "{n}");
+    }
+    assert!(names.iter().any(|n| n == "erp_invoices_list"), "{names:?}");
+    // A dropped name is not routed by guesswork.
+    let r = c.request("tools/call", json!({"name": "fake__a_b", "arguments": {}}));
+    assert_eq!(rpc_code(&r), -32602, "{r}");
+    assert!(
+        c.stderr_text().contains("fake__a_b is shared by"),
+        "{}",
+        c.stderr_text()
+    );
 }

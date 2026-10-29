@@ -13,6 +13,10 @@
 //!   (`api.list {schema: true}`), named `<service>_<op>` (decision 5), plus
 //!   the built-in `saiife_result`. A name that two operations map to is
 //!   dropped for both, with a warning: a name is never routed by guesswork.
+//! - It also lists the third-party MCP tools the daemon brokers
+//!   (`mcp.list`), named `<server>__<tool>`; a call to one is an `mcp.call`
+//!   (`via = "mcp"`) and its masked `CallToolResult` is forwarded as it is.
+//!   The poller compares the connector and the gateway `tools_hash` both.
 //! - A result is the daemon's masked body; a refusal, a limit, an upstream
 //!   failure, an upstream status >= 400 and `saiife unavailable` are
 //!   `isError` results, never JSON-RPC errors (decision 7). JSON-RPC errors
@@ -153,6 +157,9 @@ mod linux {
         body: Option<BodyArg>,
         /// The argument names the schema lists.
         args: BTreeSet<String>,
+        /// A brokered third-party MCP tool: `service` is `mcp:<server>` and
+        /// `operation` the tool's exact name as the server listed it.
+        gateway: bool,
     }
 
     enum Work {
@@ -399,15 +406,21 @@ mod linux {
         Ok(conn.as_mut().expect("just connected"))
     }
 
+    /// The project's overlays and `env`, read once per listing.
+    type Project = (
+        BTreeMap<String, saiife_policy::ServiceOverlay>,
+        Option<String>,
+    );
+
     /// `api.list {schema: true}` with the project's overlays (and env, for
     /// the personal broker), as `saiife api --list` sends them.
-    fn api_list(d: &mut Daemon) -> Result<Map<String, Value>, Stop> {
-        let (_, overlays, env) = api::project(d);
+    fn api_list(d: &mut Daemon, p: &Project) -> Result<Map<String, Value>, Stop> {
+        let (overlays, env) = p;
         let mut args = Map::new();
         args.insert("overlays".into(), json!(overlays));
         args.insert("schema".into(), true.into());
         if let Some(e) = env {
-            args.insert("env".into(), e.into());
+            args.insert("env".into(), e.clone().into());
         }
         let ans = d
             .client
@@ -417,6 +430,56 @@ mod linux {
             return Err(api::refusal(&ans));
         }
         Ok(ans)
+    }
+
+    /// `mcp.list` with the project's `mcp:<name>` overlays (Task 7).
+    fn mcp_list(d: &mut Daemon, p: &Project) -> Result<Map<String, Value>, Stop> {
+        let overlays: BTreeMap<&String, &saiife_policy::ServiceOverlay> =
+            p.0.iter().filter(|(k, _)| k.starts_with("mcp:")).collect();
+        let mut args = Map::new();
+        args.insert("overlays".into(), json!(overlays));
+        let ans = d
+            .client
+            .call_answer("mcp.list", args, Instant::now() + CONTROL)
+            .map_err(|e| api::unavailable(broker::unreachable(&d.target, &e)))?;
+        if ans.get("ok") != Some(&Value::Bool(true)) {
+            return Err(api::refusal(&ans));
+        }
+        Ok(ans)
+    }
+
+    /// The `api.list` answer and the `mcp.list` answer (when there is one).
+    type Lists = (Map<String, Value>, Option<Map<String, Value>>);
+
+    /// Both listings. A connector listing that fails is the error; a
+    /// gateway listing the daemon refuses leaves the connector tools alone
+    /// (`None`), but an unreachable daemon (`Stop(5, _)`) is the error.
+    fn both_lists(d: &mut Daemon) -> Result<Lists, Stop> {
+        let (_, overlays, env) = api::project(d);
+        let p = (overlays, env);
+        let a = api_list(d, &p)?;
+        match mcp_list(d, &p) {
+            Ok(g) => Ok((a, Some(g))),
+            Err(Stop(5, m)) => Err(Stop(5, m)),
+            Err(Stop(_, m)) => {
+                log(&format!(
+                    "the gateway tool list was refused: {}",
+                    crate::text::sanitize(&m)
+                ));
+                Ok((a, None))
+            }
+        }
+    }
+
+    /// What `tools_hash` is compared as: the connector hash and the
+    /// gateway hash (empty when there is no gateway listing).
+    fn combined_hash(a: &Map<String, Value>, g: Option<&Map<String, Value>>) -> Option<String> {
+        let c = a.get("tools_hash").and_then(Value::as_str)?;
+        let g = g
+            .and_then(|g| g.get("tools_hash"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Some(format!("{c}|{g}"))
     }
 
     /// `tools/list`: the answer, and the name map it was built from (also
@@ -430,10 +493,10 @@ mod linux {
     ) -> Result<(Value, HashMap<String, ToolTarget>), RpcError> {
         let unavailable = |m: &str| RpcError::internal_error(format!("saiife unavailable: {m}"));
         let ans = match daemon(sh, conn) {
-            Ok(d) => api_list(d),
+            Ok(d) => both_lists(d),
             Err(m) => return Err(unavailable(&m)),
         };
-        let ans = match ans {
+        let (ans, gw) = match ans {
             Ok(a) => a,
             Err(Stop(5, m)) => {
                 *conn = None;
@@ -447,10 +510,10 @@ mod linux {
             }
         };
         api::env_warning(&ans);
-        let (tools, map) = build(sh, &ans);
+        let (tools, map) = build(sh, &ans, gw.as_ref());
         *sh.tools.lock().unwrap_or_else(|p| p.into_inner()) = map.clone();
-        if let Some(h) = ans.get("tools_hash").and_then(Value::as_str) {
-            *sh.hash.lock().unwrap_or_else(|p| p.into_inner()) = Some(h.to_string());
+        if let Some(h) = combined_hash(&ans, gw.as_ref()) {
+            *sh.hash.lock().unwrap_or_else(|p| p.into_inner()) = Some(h);
         }
         let r = t::ListToolsResult {
             tools,
@@ -463,7 +526,11 @@ mod linux {
     /// The tools of an `api.list` answer (decisions 5 and 6): the `allow`
     /// and `ask` operations, a name two operations share dropped for both,
     /// and `saiife_result` last.
-    fn build(sh: &Shared, ans: &Map<String, Value>) -> (Vec<t::Tool>, HashMap<String, ToolTarget>) {
+    fn build(
+        sh: &Shared,
+        ans: &Map<String, Value>,
+        gw: Option<&Map<String, Value>>,
+    ) -> (Vec<t::Tool>, HashMap<String, ToolTarget>) {
         let mut seen: BTreeMap<String, Vec<(ToolTarget, t::Tool)>> = BTreeMap::new();
         let services = ans.get("services").and_then(Value::as_array);
         for s in services.into_iter().flatten() {
@@ -523,10 +590,12 @@ mod linux {
                     operation: id.to_string(),
                     body,
                     args,
+                    gateway: false,
                 };
                 seen.entry(name).or_default().push((target, tool));
             }
         }
+        gateway_tools(sh, gw, &mut seen);
         let mut tools = Vec::new();
         let mut map = HashMap::new();
         for (name, mut v) in seen {
@@ -566,6 +635,86 @@ mod linux {
             }),
         });
         (tools, map)
+    }
+
+    /// The gateway tool name (decision 5): `<server>__<tool>`, every char of
+    /// the tool outside `[a-z0-9_-]` turned into `_`, at most
+    /// `MAX_TOOL_NAME` chars. `None` when it does not fit or the tool part
+    /// is empty. The name is only for the agent; the call carries the
+    /// exact tool name.
+    fn gateway_name(server: &str, tool: &str) -> Option<String> {
+        let part: String = tool
+            .chars()
+            .map(|c| {
+                if matches!(c, 'a'..='z' | '0'..='9' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = format!("{server}__{part}");
+        (!part.is_empty() && name.len() <= tool_schema::MAX_TOOL_NAME).then_some(name)
+    }
+
+    /// The tools of an `mcp.list` answer, added to `seen` with the
+    /// connector tools so that one name for two targets (two tools that
+    /// mangle alike, or a gateway and a connector tool) drops both.
+    fn gateway_tools(
+        sh: &Shared,
+        gw: Option<&Map<String, Value>>,
+        seen: &mut BTreeMap<String, Vec<(ToolTarget, t::Tool)>>,
+    ) {
+        let servers = gw.and_then(|g| g.get("servers")).and_then(Value::as_array);
+        for s in servers.into_iter().flatten() {
+            let server = s["name"].as_str().unwrap_or_default();
+            for tl in s["tools"].as_array().into_iter().flatten() {
+                let tool = tl["name"].as_str().unwrap_or_default();
+                let policy = match tl["action"].as_str().unwrap_or_default() {
+                    "allow" => "Policy: allowed.",
+                    "ask" => "Policy: needs approval; the result says how to get it.",
+                    _ => continue,
+                };
+                let Some(name) = gateway_name(server, tool) else {
+                    sh.warn_once(format!(
+                        "mcp:{server} {tool:?} is not listed: its tool name would be over {} chars or empty",
+                        tool_schema::MAX_TOOL_NAME
+                    ));
+                    continue;
+                };
+                let schema = tl["inputSchema"].clone();
+                if !schema.is_object() {
+                    sh.warn_once(format!(
+                        "mcp:{server} {tool:?} is not listed: no input schema"
+                    ));
+                    continue;
+                }
+                let desc = tl["description"].as_str().unwrap_or_default().trim();
+                let description = if desc.is_empty() {
+                    policy.to_string()
+                } else {
+                    format!("{desc} {policy}")
+                };
+                let title = tl["title"].as_str().filter(|s| !s.is_empty());
+                let target = ToolTarget {
+                    service: format!("mcp:{server}"),
+                    operation: tool.to_string(),
+                    body: None,
+                    args: BTreeSet::new(),
+                    gateway: true,
+                };
+                // No annotations: a third party's hints are untrusted.
+                let def = t::Tool {
+                    name: name.clone(),
+                    title: title.map(str::to_string),
+                    description: Some(description),
+                    input_schema: schema,
+                    output_schema: None,
+                    annotations: None,
+                };
+                seen.entry(name).or_default().push((target, def));
+            }
+        }
     }
 
     /// The operation behind `name`: from the last listing, else from a
@@ -685,6 +834,9 @@ mod linux {
             }
             Err(r) => return Ok(r),
         };
+        if target.gateway {
+            return Ok(gateway_call(sh, conn, &target, args, progress, cancel));
+        }
         let (params, body) = map_args(&target, args)?;
         // The args a next page is called with: the free body is not
         // echoed (it can be large); the hint says to send it again.
@@ -720,6 +872,68 @@ mod linux {
                 stop_result(s)
             }
         })
+    }
+
+    /// `tools/call` on a brokered third-party tool: one `mcp.call`. The
+    /// arguments go as the JSON text of the object the agent sent (the
+    /// daemon takes text, to refuse duplicate keys on the raw form;
+    /// saiife-mcp's strict parser has already refused them on the way in)
+    /// and the tool name goes byte for byte as the server listed it. The
+    /// masked `CallToolResult` comes back as it is (see `done_result`).
+    fn gateway_call(
+        sh: &Shared,
+        conn: &mut Option<Daemon>,
+        target: &ToolTarget,
+        args: &Map<String, Value>,
+        progress: Option<&Id>,
+        cancel: &AtomicBool,
+    ) -> Value {
+        let text = match serde_json::to_string(args) {
+            Ok(t) => t,
+            Err(e) => return error_result(&format!("cannot encode the arguments: {e}")),
+        };
+        let d = match daemon(sh, conn) {
+            Ok(d) => d,
+            Err(m) => return unavailable_result(&m),
+        };
+        let (project, overlays, _) = api::project(d);
+        let mut a = Map::new();
+        a.insert(
+            "server".into(),
+            target.service.trim_start_matches("mcp:").into(),
+        );
+        a.insert("tool".into(), target.operation.clone().into());
+        a.insert("arguments".into(), text.into());
+        a.insert("project".into(), project.into());
+        if let Some(o) = overlays.get(&target.service) {
+            a.insert("overlay".into(), json!(o));
+        }
+        a.insert("via".into(), "mcp".into());
+        let timeout = d.cfg.gateway.upstream_timeout * 2 + Duration::from_secs(15);
+        let ans = match d
+            .client
+            .call_answer("mcp.call", a, Instant::now() + timeout)
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let m = broker::unreachable(&d.target, &e);
+                *conn = None;
+                return unavailable_result(&m);
+            }
+        };
+        if ans.get("ok") != Some(&Value::Bool(true)) {
+            return stop_result(api::refusal(&ans));
+        }
+        if ans.get("pending").and_then(Value::as_u64).is_some() {
+            return match pending_id(&ans) {
+                Err(r) => r,
+                Ok(id) if sh.wait.is_some() => {
+                    settle(sh, conn, id, progress, cancel, Next::Original)
+                }
+                Ok(id) => pending_result(id),
+            };
+        }
+        done_result(&ans, Next::Original)
     }
 
     /// The id of a pending `api.call` answer: an integer >= 1, or the
@@ -884,6 +1098,13 @@ mod linux {
     /// an embedded resource when it is not UTF-8), then a note for a cut
     /// response and the next page. Status >= 400 is an error result.
     fn done_result(ans: &Map<String, Value>, next: Next) -> Value {
+        // A brokered tool's answer (`status: null`, `result`): the daemon
+        // masked it, and `isError` is the server's own. Nothing is added.
+        if ans.get("status") == Some(&Value::Null) {
+            if let Some(r) = ans.get("result").filter(|r| r.is_object()) {
+                return r.clone();
+            }
+        }
         let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
         let is_error = status >= 400;
         let mut content = Vec::new();
@@ -974,23 +1195,19 @@ mod linux {
         loop {
             std::thread::sleep(every);
             let got = match daemon(sh, &mut conn) {
-                Ok(d) => api_list(d).ok(),
+                Ok(d) => both_lists(d).ok(),
                 Err(_) => None,
             };
-            let Some(h) = got
-                .as_ref()
-                .and_then(|a| a.get("tools_hash"))
-                .and_then(Value::as_str)
-            else {
+            let Some(h) = got.as_ref().and_then(|(a, g)| combined_hash(a, g.as_ref())) else {
                 conn = None;
                 continue;
             };
             let mut known = sh.hash.lock().unwrap_or_else(|p| p.into_inner());
             match known.as_deref() {
-                None => *known = Some(h.to_string()),
+                None => *known = Some(h),
                 Some(k) if k == h => {}
                 Some(_) => {
-                    *known = Some(h.to_string());
+                    *known = Some(h);
                     drop(known);
                     sh.send(&Message::notification(t::TOOLS_LIST_CHANGED, None));
                 }
