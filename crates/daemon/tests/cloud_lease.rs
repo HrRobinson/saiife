@@ -55,6 +55,18 @@ fn exe() -> &'static str {
     })
 }
 
+/// A lease is only granted for an exe with a root-owned chain. In a user
+/// namespace (the offline CI job) `/` is owned by the overflow uid, so the
+/// tests that need a granted lease skip there, as the run_cmd tests do.
+macro_rules! need_root_chain {
+    () => {
+        if saiife_system::fsops::root_owned_chain(std::path::Path::new(exe())).is_err() {
+            eprintln!("skipped: {} has no root-owned chain here", exe());
+            return;
+        }
+    };
+}
+
 // Built at runtime: no token-shaped literal in the source.
 const VAULT_AK: &str = concat!("AK", "IA", "TESTVAULT0000002");
 const VAULT_SK: &str = concat!("vaultSecret", "Key/1234567890", "lEaSeKEY+abc");
@@ -637,6 +649,7 @@ async fn lease_during_lockdown_denied() {
 
 #[tokio::test]
 async fn lease_sends_session_policy_and_900s() {
+    need_root_chain!();
     let w = world(200).await;
     let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
@@ -684,6 +697,7 @@ async fn lease_sends_session_policy_and_900s() {
 
 #[tokio::test]
 async fn lease_record_has_no_values() {
+    need_root_chain!();
     let w = world(200).await;
     let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
@@ -704,6 +718,7 @@ async fn lease_record_has_no_values() {
 
 #[tokio::test]
 async fn lease_sts_error_code_recorded_message_not() {
+    need_root_chain!();
     let w = world(403).await;
     let a = w.lease("s3sts", exe()).await;
     assert_eq!(rule(&a), "token_mint_failed", "{a}");
@@ -730,6 +745,7 @@ async fn lease_sts_error_code_recorded_message_not() {
 
 #[tokio::test]
 async fn lease_counts_requests_per_minute() {
+    need_root_chain!();
     let w = world(200).await;
     for _ in 0..2 {
         let a = w.lease("s3rpm", exe()).await;
@@ -773,6 +789,7 @@ fn statements(json: &str, effect: &str) -> Vec<Value> {
 
 #[tokio::test]
 async fn project_deny_narrows_the_lease() {
+    need_root_chain!();
     let w = world(200).await;
     let base = w.lease("s3sts", exe()).await;
     assert_eq!(base["ok"], true, "{base}");
@@ -820,6 +837,7 @@ async fn project_deny_narrows_the_lease() {
 
 #[tokio::test]
 async fn project_allow_never_widens_the_lease() {
+    need_root_chain!();
     let w = world(200).await;
     let a = w
         .lease_with(json!({"service": "s3sts", "exe": exe(),
@@ -846,6 +864,7 @@ async fn project_allow_never_widens_the_lease() {
 
 #[tokio::test]
 async fn lease_unrepresentable_policy_refused_without_sts_or_rpm() {
+    need_root_chain!();
     let w = world(200).await;
     // `requests_per_minute = 1`: were the first refusal counted, the
     // second would be `limited`.
@@ -865,6 +884,7 @@ async fn lease_unrepresentable_policy_refused_without_sts_or_rpm() {
 
 #[tokio::test]
 async fn lease_too_large_policy_refused_without_sts_or_rpm() {
+    need_root_chain!();
     let w = world(200).await;
     let deny: Vec<String> = (0..80)
         .map(|i| format!("s3:read:arn:aws:s3:::project-bucket-{i:03}/some/long/prefix/**"))
@@ -908,6 +928,7 @@ fn rebuilt(audit: &Path) -> (Limiter, usize) {
 
 #[tokio::test]
 async fn leases_count_after_a_restart() {
+    need_root_chain!();
     let w = world(200).await;
     for _ in 0..2 {
         let a = w.lease("s3rpm", exe()).await;
@@ -959,6 +980,7 @@ fn signers(w: &World) -> Vec<String> {
 
 #[tokio::test]
 async fn personal_lease_follows_the_project_env() {
+    need_root_chain!();
     let w = personal().await;
     let g = w.ctx.policy().gateway.unwrap();
     // No env: the base config (its secret, its allow).
@@ -1007,6 +1029,7 @@ async fn personal_lease_follows_the_project_env() {
 
 #[tokio::test]
 async fn personal_lease_undefined_env_warns() {
+    need_root_chain!();
     let w = personal().await;
     let a = w
         .lease_with(json!({"service": "s3sts", "exe": exe(), "env": "qa"}))
@@ -1034,6 +1057,7 @@ async fn personal_lease_undefined_env_warns() {
 
 #[tokio::test]
 async fn locked_lease_ignores_a_client_env() {
+    need_root_chain!();
     let w = world_setup(
         scratch(),
         200,
@@ -1066,6 +1090,7 @@ async fn locked_lease_ignores_a_client_env() {
 
 #[tokio::test]
 async fn locked_lease_without_scope_env_runs_base() {
+    need_root_chain!();
     // No scope env: a client `env` still does not pick one.
     let w = world(200).await;
     let a = w
