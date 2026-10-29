@@ -66,9 +66,10 @@ saiife connect blob --connector azure-blob --secret azure-storage --param accoun
 ```
 
 The daemon gets a token for `https://storage.azure.com/.default` with the
-client-credentials flow and keeps it in memory only. For a sovereign cloud
-set `[services.blob.cloud] authority_host`. The storage account name is
-`params.account`; a sovereign cloud's storage domain is not supported.
+client-credentials flow and keeps it in memory only. The storage
+account name is `params.account`. The host is `blob.core.windows.net` and the
+scope is public-cloud only: `authority_host` is accepted, but sovereign
+clouds do not work.
 
 ## Minimum permissions in Azure
 

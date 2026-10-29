@@ -10,8 +10,9 @@ sees the client secret or the token. The manifest is
 - Auth: `azure_sp`, scope `https://management.azure.com/.default`. The vault
   entry is an `azure_sp` secret (`tenant_id`, `client_id`,
   `client_secret`). Tokens come from
-  `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`; set
-  `[services.<name>.cloud] authority_host` for a sovereign cloud.
+  `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`. ARM is the
+  public-cloud endpoint only: `authority_host` is accepted, but the ARM host
+  and scope do not change, so sovereign clouds do not work.
 - `api-version` is fixed per operation: `2021-04-01` for the
   `Microsoft.Resources` operations and `2025-04-01` for
   `Microsoft.Compute`. A call that sets it is refused.
@@ -61,9 +62,9 @@ saiife connect azure --connector azure-arm --secret azure-reader
 ```
 
 The daemon gets a token with the client-credentials flow and keeps it in
-memory only. The default authority is `login.microsoftonline.com`; set
-`[services.azure.cloud] authority_host` to `login.microsoftonline.us` or
-`login.chinacloudapi.cn` for a sovereign cloud.
+memory only. ARM is the public-cloud endpoint only (`management.azure.com`).
+`authority_host` is accepted, but the ARM host and scope do not change, so
+sovereign clouds do not work.
 
 ## Minimum permissions in Azure
 

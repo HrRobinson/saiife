@@ -72,7 +72,7 @@ and an optional `session_token`. Add it with the paste flow, or let
 
 ```sh
 saiife secret add aws-prod --kind aws --service s3
-saiife connect s3 --connector aws-s3 --param region=eu-west-1
+saiife connect s3 --connector aws-s3 --secret aws-prod --param region=eu-west-1
 ```
 
 `saiife connect` writes a deny-all policy file with a commented
@@ -201,6 +201,9 @@ The session policy is built only from the admin config and the manifest.
 
 - An `allow` pattern gives `Allow <IAM action>` on its qualifier. A missing
   qualifier means `*`, and a trailing `**` means `*`.
+- An allow qualifier must start with an ARN header in lower case
+  (`arn:partition:service:region:account:`), or the service is
+  unrepresentable and the lease is refused. Only printable ASCII is allowed.
 - A single `*`, `?`, `$`, `{` or `}` inside an allow qualifier makes the
   service unrepresentable, and the lease is refused: IAM's `*` crosses `/`,
   and `?` and `${...}` are IAM syntax. An `allow` rule with `when` is
@@ -228,7 +231,9 @@ service in STS mode: `saiife policy check` warns.
 `AWS_SESSION_TOKEN`, `AWS_REGION` and `AWS_DEFAULT_REGION`. It sets
 `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` to `/dev/null`. It
 removes `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_ROLE_ARN`,
-`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_*`. It also removes
+`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_*`. It removes the loader variables too (`LD_PRELOAD`,
+`LD_LIBRARY_PATH` and the other `LD_*` names, and a few more such as
+`GCONV_PATH` and `LOCPATH`). It also removes
 `AWS_ENDPOINT_URL`, every `AWS_ENDPOINT_URL_*` and `AWS_CA_BUNDLE`, so an
 inherited environment cannot send the credentials to another endpoint. A
 local endpoint override (localstack) therefore does not work under
@@ -243,11 +248,14 @@ saiife: AWS credentials for s3 (STS mode) expire at 2026-10-29T12:15:00Z; this c
 The exit codes are those of `run --secret`: 2 refused, 5 unavailable,
 otherwise the command's own code. `--cloud` cannot be combined with
 `--secret`. A lease is refused with one of these rules: `lockdown`,
-`no_scope`, `scope_conflict`, `sts_not_enabled`, `exe_not_allowed`,
-`secret_missing`, `secret_not_allowed_for_service`, `vault_unavailable`,
-`session_policy_unrepresentable`, `session_policy_too_large`,
-`token_mint_failed` or `limited` (`requests_per_minute`). A failed mint
-records the AWS error code only, never its message.
+`policy_invalid` (no valid policy is loaded), `no_scope`, `scope_conflict`,
+`sts_not_enabled`, `exe_not_allowed`, `secret_missing`,
+`secret_not_allowed_for_service`, `vault_unavailable`, `limits_unavailable`,
+`requests_per_minute` (error code `limited`), `session_policy_unrepresentable`,
+`session_policy_too_large`, `policy_invalid` (the manifest or `params.region`
+is missing), `upstream_unavailable` or `token_mint_failed`. They are listed in
+the order the daemon checks them. A failed mint records the AWS error code
+only, never its message.
 
 ## Suggested policy: read-only
 

@@ -94,7 +94,10 @@ masked in every answer.
 | `storage:write` | `storage.objects.insert` | `storage.objects.create` | `roles/storage.objectCreator` |
 | `storage:delete` | `storage.objects.delete` | `storage.objects.delete` | `roles/storage.objectUser` |
 
-Grant the roles on the bucket, not the project. A read-only policy needs
+Overwriting an existing object also needs `storage.objects.delete`, so
+`roles/storage.objectCreator` covers new objects only; use
+`roles/storage.objectUser` or higher for overwrites. Grant the roles on the
+bucket, not the project. A read-only policy needs
 only `roles/storage.objectViewer`.
 
 ## Known limits
