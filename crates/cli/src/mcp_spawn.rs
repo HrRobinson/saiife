@@ -119,11 +119,22 @@ mod tests {
             args,
             [
                 "-c",
-                "exec \"$0\" \"$@\" 3<&- 7<&-",
+                "exec /usr/bin/env -u PWD -u OLDPWD -u SHLVL \"$0\" \"$@\" 3<&- 7<&-",
                 "/usr/bin/server",
                 "--x",
                 "a b"
             ]
+        );
+    }
+
+    #[test]
+    fn bash_closes_a_descriptor_above_nine() {
+        let c = command(&spec(), &[5, 12]);
+        assert_eq!(c.get_program(), BASH);
+        let args: Vec<_> = c.get_args().collect();
+        assert_eq!(
+            args[1],
+            "exec /usr/bin/env -u PWD -u OLDPWD -u SHLVL \"$0\" \"$@\" 5<&- 12<&-"
         );
     }
 }
