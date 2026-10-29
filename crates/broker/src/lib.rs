@@ -10,6 +10,7 @@
 
 pub mod amount;
 pub mod catalog;
+pub mod cloud;
 pub mod judge;
 pub mod limits;
 pub mod mail;
@@ -45,6 +46,9 @@ pub enum BrokerError {
     UnknownOperation(String),
     #[error("manifest: {0}")]
     Manifest(String),
+    /// A `[services.*]` setting that does not fit its connector.
+    #[error("service config: {0}")]
+    Config(String),
     #[error("unknown connector {0:?}")]
     UnknownConnector(String),
     #[error("{0}")]

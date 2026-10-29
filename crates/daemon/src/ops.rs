@@ -13,8 +13,8 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_MCP_CALL, OP_MCP_LIST,
-    OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
+    OP_AUDIT_ROTATE_KEY, OP_CLOUD_LEASE, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_MCP_CALL,
+    OP_MCP_LIST, OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
     OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
@@ -318,7 +318,8 @@ pub struct Ctx {
     pub upstream: Result<Upstream, String>,
     /// At most 4 upstream calls in flight per service.
     pub pools: Pools,
-    /// OAuth2 access tokens, in memory only (plan 14, Task 7).
+    /// OAuth2 access tokens and minted cloud credentials, by (secret,
+    /// scope), in memory only (plan 14 Task 7, plan 15 Task 9).
     pub oauth: crate::oauth::TokenCache,
     /// Where `secret.add` keeps the backups of imported files.
     pub backup_dir: PathBuf,
@@ -920,6 +921,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         OP_AUDIT_ROTATE_KEY => rotate_key(ctx, peer, req.id).await,
         saiife_ipc::msg::OP_AUDIT_QUERY => crate::audit_query::handle(ctx, peer, req).await,
         OP_SECRET_LEASE => crate::secret_ops::lease(ctx, peer, req).await,
+        OP_CLOUD_LEASE => crate::cloud_ops::lease(ctx, peer, req).await,
         OP_SECRET_ADD | OP_SECRET_ROTATE | OP_SECRET_REMOVE | OP_SECRET_LIST => {
             crate::secret_ops::handle(ctx, peer, req).await
         }

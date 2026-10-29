@@ -1151,6 +1151,11 @@ Two modes per cloud service:
 GCP and Azure STS equivalents (short-lived access tokens for an
 impersonated service account; Azure workload identity) follow the same rule.
 
+> Note (plan 15): STS mode is AWS only for now. GCP and Azure cannot scope a
+> token down in general, so `mode = "sts"` on those connectors is a config
+> error; they stay in sign mode until they have a way to scope tokens. Owner
+> to confirm.
+
 ### 6.14 `saiife run --secret`
 
 `saiife run --secret <name>[:ENV_VAR] -- <cmd>` puts a secret into one
@@ -1558,7 +1563,15 @@ amount = { field = "refund.transactions[].amount", currency_field = "refund.curr
 
 The schema is versioned (`version`). Unknown keys are build errors (a test
 loads every manifest). Path parameters are percent-encoded and may not hold
-`/`.
+`/`, with one exception.
+
+> Note (plan 15): object keys may contain `/`, through two parameter types.
+> `objectkey` (S3, Azure Blob) keeps `/` and percent-encodes each segment; it
+> may only be the last path segment and is reachable by proxy as the path's
+> tail. `objectname` (Cloud Storage) encodes the whole value, so `/` becomes
+> `%2F`, and is named-only. Both refuse an empty value, more than 1024 bytes,
+> a control character, `\`, an empty segment, and a `.` or `..` segment.
+> Every other path parameter still may not hold `/`. Owner to confirm.
 
 ### 8.5 Audit record v2
 

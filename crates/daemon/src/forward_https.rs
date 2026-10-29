@@ -201,7 +201,7 @@ impl HttpsTransport {
                     .ok_or_else(|| SendError::Retry(format!("secret {name} holds no value")))?;
                 (Zeroizing::new(v.to_string()), Zeroizing::new(v.to_string()))
             }
-            Kind::Basic | Kind::OAuth2 => {
+            Kind::Basic | Kind::OAuth2 | Kind::Aws | Kind::GcpSa | Kind::AzureSp => {
                 return Err(SendError::Retry(format!(
                     "secret {name} must be of kind token or header"
                 )))

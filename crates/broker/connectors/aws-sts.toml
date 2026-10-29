@@ -1,0 +1,30 @@
+# AWS Security Token Service, regional endpoint, Query API.
+#   GetCallerIdentity: https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+#   Query requests:    https://docs.aws.amazon.com/STS/latest/APIReference/CommonParameters.html
+#   Endpoints:         https://docs.aws.amazon.com/general/latest/gr/sts.html
+#   IAM actions:       https://docs.aws.amazon.com/service-authorization/latest/reference/list_awssecuritytokenservice.html
+# The action and the API version (2011-06-15) are fixed query parameters, so
+# the agent can never pick another STS action, and no header is listed (an
+# x-amz-target header would select a JSON-protocol action). Signed with SigV4
+# for the service `sts` in `params.region`. The answer is XML, passed through
+# as text.
+id = "aws-sts"
+version = 1
+title = "AWS STS"
+base_url = "https://sts.{region}.amazonaws.com"
+hosts = ["sts.{region}.amazonaws.com"]
+auth = [{ kind = "aws_sigv4", service = "sts" }]
+
+[params.region]                  # set by the admin, never by the agent
+type = "string"
+pattern = "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$"
+required = true
+
+[[operation]]
+id = "sts.get_caller_identity"
+capability = "sts:read"
+kind = "read"
+method = "GET"
+path = "/"
+fixed_query = { Action = "GetCallerIdentity", Version = "2011-06-15" }
+iam_action = "sts:GetCallerIdentity"

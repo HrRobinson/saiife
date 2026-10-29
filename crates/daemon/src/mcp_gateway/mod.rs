@@ -572,7 +572,22 @@ fn env_value(
             f("password")
         ))),
         Kind::Header => Some(Zeroizing::new(f("value").to_string())),
-        Kind::OAuth2 => None,
+        // Connector-only kinds: the daemon refreshes, signs or mints from
+        // them; no single env value exists (fail closed).
+        Kind::OAuth2 | Kind::Aws | Kind::GcpSa | Kind::AzureSp => None,
+    }
+}
+
+/// "an oauth2", "an aws", "a gcp_sa", "an azure_sp": the refusal wording.
+fn kind_article(kind: Kind) -> &'static str {
+    match kind {
+        Kind::OAuth2 => "an oauth2",
+        Kind::Aws => "an aws",
+        Kind::GcpSa => "a gcp_sa",
+        Kind::AzureSp => "an azure_sp",
+        Kind::Token => "a token",
+        Kind::Basic => "a basic",
+        Kind::Header => "a header",
     }
 }
 
@@ -598,7 +613,8 @@ fn plan_for(name: &str, s: &McpServerCfg, sys: &SystemConfig, vault: &VaultState
         }
         let Some(value) = env_value(e.kind, &e.fields) else {
             return Plan::Refused(format!(
-                "secret_kind_unsupported: secret {secret} (env {var}) is an oauth2 secret, for connectors only"
+                "secret_kind_unsupported: secret {secret} (env {var}) is {} secret, for connectors only",
+                kind_article(e.kind)
             ));
         };
         values.extend(e.fields.values().filter(|v| !v.is_empty()).cloned());

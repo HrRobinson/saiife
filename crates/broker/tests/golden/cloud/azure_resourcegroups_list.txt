@@ -1,0 +1,2 @@
+GET https://management.azure.com/subscriptions/00000000-1111-2222-3333-444444444444/resourcegroups?%24top=10&api-version=2021-04-01
+authorization: Bearer fake-minted-access-token

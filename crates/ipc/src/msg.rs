@@ -21,6 +21,9 @@ pub const OP_SECRET_ROTATE: &str = "secret.rotate";
 pub const OP_SECRET_REMOVE: &str = "secret.remove";
 pub const OP_SECRET_LIST: &str = "secret.list";
 pub const OP_SECRET_LEASE: &str = "secret.lease";
+/// STS mode (plan 15): short AWS session credentials for one listed
+/// command. `{service, exe}` -> `{env, expires, session}`.
+pub const OP_CLOUD_LEASE: &str = "cloud.lease";
 pub const OP_API_CALL: &str = "api.call";
 pub const OP_API_LIST: &str = "api.list";
 pub const OP_API_RESULT: &str = "api.result";

@@ -29,6 +29,11 @@ text a masking pattern matches) is never stored for approval: the approver
 could not see what would be sent. It is a plain deny with the rule
 `masked_content`: "cannot be approved: the request contains masked content".
 
+A binary request body (one that is not UTF-8 text, such as an image uploaded
+with a `raw` body) cannot be shown either. It is a plain deny with the rule
+`body_not_displayable`: "cannot be approved: the request body is binary and
+cannot be shown for approval". Put such uploads under `allow`, with limits.
+
 A request that nobody decides expires after `[approval] timeout` (default
 `30m`). Results are kept 24 hours. A request can never be sent after it
 expired, was rejected or was sent.

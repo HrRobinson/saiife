@@ -34,8 +34,9 @@ pub use mcp::{decide_tool, tool_kind, valid_server_name, McpServerCfg, Sandbox};
 pub use project::{merge_project, parse_project, Merged, Mode, ProjectOverlay, ServiceOverlay};
 pub use scope::{check_scopes, load_and_check, scope_for};
 pub use service::{
-    is_interpreter, Action, AmountCap, AuthCfg, HttpOperationCfg, LimitsCfg, RedactCfg, RuleCfg,
-    SecretCfg, ServiceCfg,
+    is_interpreter, valid_external_id, valid_role_arn, Action, AmountCap, AuthCfg, CloudCfg,
+    CloudMode, HttpOperationCfg, LimitsCfg, RedactCfg, RuleCfg, SecretCfg, ServiceCfg,
+    AZURE_AUTHORITIES,
 };
 pub use system::{
     facility_code, valid_address, AdminCfg, ApprovalCfg, AuditCfg, CommandCfg, DaemonCfg,

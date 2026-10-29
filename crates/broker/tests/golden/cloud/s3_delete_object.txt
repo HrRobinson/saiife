@@ -1,0 +1,6 @@
+DELETE https://s3.eu-west-1.amazonaws.com/acme-logs/2026/10/report.json
+authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261028/eu-west-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=375a2f94e9dfa4ad115ca01b4a18835de98898d88ff7dec9166fde9854aa0685
+host: s3.eu-west-1.amazonaws.com
+range: bytes=0-99
+x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+x-amz-date: 20261028T123456Z

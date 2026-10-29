@@ -134,8 +134,20 @@ pub(crate) mod linux {
         BTreeMap<String, saiife_policy::ServiceOverlay>,
         Option<String>,
     ) {
-        let cfg = &d.cfg;
-        let mode = if d.target.is_locked() {
+        project_for(&d.cfg, &d.target)
+    }
+
+    /// [`project`] for the config `cfg` that `target` serves (also used by
+    /// `saiife run --cloud`, whose lease takes the same overlay).
+    pub(crate) fn project_for(
+        cfg: &SystemConfig,
+        target: &Target,
+    ) -> (
+        String,
+        BTreeMap<String, saiife_policy::ServiceOverlay>,
+        Option<String>,
+    ) {
+        let mode = if target.is_locked() {
             Mode::Locked
         } else {
             Mode::Developer
@@ -163,7 +175,7 @@ pub(crate) mod linux {
         });
         let env = parsed
             .as_ref()
-            .filter(|_| !d.target.is_locked())
+            .filter(|_| !target.is_locked())
             .and_then(|p| p.env.clone());
         let services = parsed
             .map(|p| merge_project(&cfg.guard.packs, &p, mode).services)

@@ -75,6 +75,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         }));
     }
     out.extend(mcp_checks(ctx));
+    if let Ok(p) = &ctx.config {
+        out.extend(cloud_sts(&p.config));
+    }
     if let Some(i) = &ctx.installed {
         out.push(Check::new(
             "vault.key",
@@ -94,6 +97,37 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         "audit forwarding",
         forwarding_detail(&ctx.config),
     ));
+    out
+}
+
+/// One `warn` per service in STS mode (plan 15): `run --cloud` hands a
+/// short-lived AWS credential to agent-controlled code, which can copy it.
+/// With any, one `info` notes how far `run_allow` is checked.
+fn cloud_sts(config: &saiife_policy::SystemConfig) -> Vec<Check> {
+    use saiife_policy::CloudMode;
+    let mut out: Vec<Check> = config
+        .services
+        .iter()
+        .filter(|(_, s)| s.mode == CloudMode::Sts)
+        .map(|(name, _)| {
+            Check::new(
+                format!("cloud_sts.{name}"),
+                Status::Warn,
+                format!(
+                    "service {name} is in STS mode: run --cloud hands a 15-minute AWS credential to agent-controlled code, which can copy it"
+                ),
+                "",
+            )
+        })
+        .collect();
+    if !out.is_empty() {
+        out.push(Check::new(
+            "cloud_sts.run_allow",
+            Status::Info,
+            "STS run_allow entries are checked by basename only",
+            "a symlink to an interpreter is not caught at config time; run --cloud checks the resolved path at runtime",
+        ));
+    }
     out
 }
 
@@ -2066,6 +2100,36 @@ mod tests {
             .checks
             .iter()
             .all(|c| !c.title.contains("MCP server saiife")));
+    }
+
+    const STS_SVC: &str = "\n[services.aws]\nconnector = \"aws-s3\"\nmode = \"sts\"\n\
+        [services.aws.cloud]\nrole_arn = \"arn:aws:iam::123456789012:role/saiife\"\n\
+        run_allow = [\"/usr/bin/aws-sync\"]\n";
+
+    #[test]
+    fn doctor_lists_every_sts_service() {
+        let t = T::installed();
+        t.append_config(STS_SVC);
+        t.append_config(&STS_SVC.replace("services.aws", "services.aws2"));
+        let r = t.doctor();
+        assert_status(&r, "config.valid", Status::Pass);
+        for s in ["aws", "aws2"] {
+            let c = get(&r, &format!("cloud_sts.{s}"));
+            assert_eq!(c.status, Status::Warn);
+            assert_eq!(
+                c.title,
+                format!("service {s} is in STS mode: run --cloud hands a 15-minute AWS credential to agent-controlled code, which can copy it")
+            );
+        }
+        assert!(get(&r, "cloud_sts.run_allow").detail.contains("symlink"));
+    }
+
+    #[test]
+    fn doctor_silent_without_sts() {
+        let t = T::installed();
+        t.append_config("\n[services.aws]\nconnector = \"aws-s3\"\n");
+        let r = t.doctor();
+        assert!(!r.checks.iter().any(|c| c.id.starts_with("cloud_sts")));
     }
 
     #[test]

@@ -13,10 +13,31 @@ use std::sync::OnceLock;
 pub const SCHEMA_VERSION: u32 = 1;
 /// The connector name of the generic HTTP connector; no manifest may use it.
 pub const HTTP_CONNECTOR: &str = "http";
-const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
-const AUTH_KINDS: &[&str] = &["header", "bearer", "basic", "basic_token", "oauth2"];
-/// The body formats of `Operation::body`. `text` is for `transport = "mail"`.
-pub(crate) const BODY_FORMATS: &[&str] = &["json", "form", "text"];
+const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+const AUTH_KINDS: &[&str] = &[
+    "header",
+    "bearer",
+    "basic",
+    "basic_token",
+    "oauth2",
+    "aws_sigv4",
+    "gcp_sa",
+    "azure_sp",
+];
+/// The cloud auth kinds (plan 15): the daemon signs or mints the credential
+/// from the whole vault entry, so none takes a `secret_field`.
+pub const CLOUD_AUTH_KINDS: &[&str] = &["aws_sigv4", "gcp_sa", "azure_sp"];
+/// Headers the SigV4 signer sets: never a manifest's or an operation's.
+pub const SIGV4_HEADERS: &[&str] = &["x-amz-date", "x-amz-security-token", "x-amz-content-sha256"];
+/// The body formats of `Operation::body`. `text` is for `transport = "mail"`;
+/// `raw` is the agent's bytes as they are, never parsed.
+pub(crate) const BODY_FORMATS: &[&str] = &["json", "form", "text", "raw"];
+/// The operation param type of an object key that keeps its `/` (S3,
+/// Azure blobs): the last whole path segment, encoded segment by segment.
+pub const OBJECT_KEY: &str = "objectkey";
+/// The operation param type of an object name encoded whole, `/` as `%2F`
+/// (GCS). Such an operation is named-only.
+pub const OBJECT_NAME: &str = "objectname";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -29,7 +50,8 @@ pub struct Manifest {
     #[serde(default)]
     pub base_url: String,
     /// Literal hosts and `*.suffix` globs, or whole-host placeholders
-    /// `{param}` (decision 1).
+    /// `{param}` (decision 1), or hosts with a placeholder inside one label
+    /// (`s3.{region}.amazonaws.com`, plan 15).
     pub hosts: Vec<String>,
     #[serde(default)]
     pub auth: Vec<AuthSpec>,
@@ -93,6 +115,13 @@ pub struct AuthSpec {
     /// `oauth2` only: the token endpoint's path on the base URL's host.
     #[serde(default)]
     pub token_path: Option<String>,
+    /// `aws_sigv4` only (required): the SigV4 service name (`s3`, `sts`).
+    #[serde(default)]
+    pub service: Option<String>,
+    /// `gcp_sa` and `azure_sp` only (required): the OAuth scope, an
+    /// `https://` URL.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -132,12 +161,41 @@ pub struct Operation {
     pub pagination: Option<Pagination>,
     #[serde(default)]
     pub amount: Option<AmountSpec>,
+    /// Headers of this operation, with the syntax and banned names of
+    /// [`Manifest::headers`]; they win over the manifest's and the agent's.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Query parameters with a fixed value, appended after the agent's. A
+    /// named call may not set one; a proxied query may only repeat the
+    /// exact value.
+    #[serde(default)]
+    pub fixed_query: BTreeMap<String, String>,
+    /// The cloud IAM action of the operation (`s3:GetObject`), for the STS
+    /// session policy.
+    #[serde(default)]
+    pub iam_action: Option<String>,
 }
 
 impl Operation {
     /// The body is built from `body_params`, `body_const` and `graphql`.
     pub fn builds_body(&self) -> bool {
         !self.body_params.is_empty() || !self.body_const.is_empty() || self.graphql.is_some()
+    }
+
+    /// Some path, query or body param of the operation has type `ty`.
+    pub fn has_param_type(&self, ty: &str) -> bool {
+        self.path_params
+            .values()
+            .chain(self.query.values())
+            .chain(self.body_params.values())
+            .any(|t| t == ty)
+    }
+
+    /// A proxied path can reach the operation: not a GraphQL one (its fixed
+    /// document is the body) and none with an `objectname` (its `/` is
+    /// encoded, which no raw path segment may carry).
+    pub fn proxy_reachable(&self) -> bool {
+        self.graphql.is_none() && !self.has_param_type(OBJECT_NAME)
     }
 }
 
@@ -195,6 +253,15 @@ pub enum Unit {
 
 fn bad(m: &str, why: impl std::fmt::Display) -> BrokerError {
     BrokerError::Manifest(format!("{m}: {why}"))
+}
+
+/// An `x-amz-*` header name (any case). A SigV4 manifest may neither list
+/// one in `request_headers` nor set one as a fixed header: the signer sets
+/// its own ([`SIGV4_HEADERS`]), and every other one can change what a signed
+/// call does (`x-amz-copy-source` turns a PUT into a copy, `x-amz-target`
+/// picks a JSON-protocol action, ...).
+fn is_amz_header(name: &str) -> bool {
+    name.len() >= 6 && name.as_bytes()[..6].eq_ignore_ascii_case(b"x-amz-")
 }
 
 /// One segment of a path template: a literal, or `prefix{name}suffix` with
@@ -293,6 +360,12 @@ impl Manifest {
         for (name, spec) in &self.params {
             spec.param_type()
                 .map_err(|e| bad(id, format!("param {name}: {e}")))?;
+            if spec.ty == OBJECT_KEY || spec.ty == OBJECT_NAME {
+                return Err(bad(
+                    id,
+                    format!("param {name}: {} is for operation params only", spec.ty),
+                ));
+            }
         }
         let mail = self.transport == Transport::Mail;
         if mail {
@@ -312,22 +385,43 @@ impl Manifest {
         for a in &self.auth {
             check_auth(a).map_err(|e| bad(id, e))?;
         }
-        self.check_headers().map_err(|e| bad(id, e))?;
+        self.check_headers(&self.headers).map_err(|e| bad(id, e))?;
+        // A SigV4 connector lists no `x-amz-*` request header: the signer
+        // owns its own, and the others change what a signed call does
+        // (`x-amz-copy-source`, `x-amz-acl`, `x-amz-target`, ...), which
+        // policy never sees. No exception: no built-in needs one.
+        if self.signs_sigv4() {
+            if let Some(h) = self.request_headers.iter().find(|h| is_amz_header(h)) {
+                return Err(bad(
+                    id,
+                    format!(
+                        "request_headers: {h}: no x-amz-* header may be listed for a SigV4 connector"
+                    ),
+                ));
+            }
+        }
         let mut seen = BTreeSet::new();
         let mut shapes = BTreeSet::new();
         for op in &self.operation {
-            // A GraphQL operation is named-only (never matched by path), so
-            // several may share one endpoint.
+            // A GraphQL or `objectname` operation is named-only (never
+            // matched by path), so several may share one endpoint.
             // A mail operation has no path at all.
-            let segs = match op.graphql {
-                None if !mail => template_segments(&op.path).ok(),
-                _ => None,
+            let segs = if !mail && op.proxy_reachable() {
+                template_segments(&op.path).ok()
+            } else {
+                None
             };
             if let Some(segs) = segs {
-                if !shapes.insert((op.method.clone(), shape(&segs))) {
+                // The fixed query tells sub-resources apart (S3's
+                // `GET /{key}?acl` next to GetObject); the proxy picks the
+                // operation whose fixed names the query carries.
+                if !shapes.insert((op.method.clone(), shape(&segs), op.fixed_query.clone())) {
                     return Err(bad(
                         id,
-                        format!("operation {}: same method and path shape as another", op.id),
+                        format!(
+                            "operation {}: same method, path shape and fixed query as another",
+                            op.id
+                        ),
                     ));
                 }
             }
@@ -403,6 +497,40 @@ impl Manifest {
         {
             ParamType::parse(t, None).map_err(|e| e.to_string())?;
         }
+        if !mail {
+            check_object_params(op)?;
+        }
+        self.check_headers(&op.headers)?;
+        for (k, v) in &op.fixed_query {
+            if k.is_empty()
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
+            {
+                return Err(format!(
+                    "fixed_query {k:?}: a name must be [A-Za-z0-9._~-]+"
+                ));
+            }
+            if !v.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                return Err(format!(
+                    "fixed_query {k}: the value must be printable ASCII"
+                ));
+            }
+            if declared.contains(k.as_str())
+                || op.query.contains_key(k)
+                || op.body_params.contains_key(k)
+            {
+                return Err(format!("fixed_query {k} is also a param of the operation"));
+            }
+        }
+        if let Some(a) = &op.iam_action {
+            let ok = (1..=128).contains(&a.len())
+                && a.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".:/*-".contains(&b));
+            if !ok {
+                return Err("iam_action must match [A-Za-z0-9.:/*-]{1,128}".into());
+            }
+        }
         self.check_body(op)?;
         if let Some(a) = &op.amount {
             match (&a.currency_field, &a.currency_param) {
@@ -452,6 +580,14 @@ impl Manifest {
             }
             if b == "text" && self.transport != Transport::Mail {
                 return Err("body = \"text\" is for transport = \"mail\" only".into());
+            }
+            if b == "raw" && self.transport == Transport::Mail {
+                return Err("body = \"raw\" is not for transport = \"mail\"".into());
+            }
+            // A raw body is never parsed, so no amount can be read from it:
+            // a cap on it would bind nothing.
+            if b == "raw" && op.amount.is_some() {
+                return Err("an amount needs a body the broker parses, not body = \"raw\"".into());
             }
         }
         if op.builds_body() && !matches!(op.body.as_deref(), Some("json" | "form")) {
@@ -525,40 +661,57 @@ impl Manifest {
             .collect()
     }
 
+    /// Every service param that fills a placeholder inside one label of a
+    /// host: of a `hosts` entry (`s3.{region}.amazonaws.com`) or of the base
+    /// URL host (`{shop}.myshopify.com`). Each value must be one DNS label.
+    pub fn label_host_params(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .hosts
+            .iter()
+            .map(String::as_str)
+            .chain(self.base_host_template())
+            .filter(|h| whole_placeholder(h).is_none())
+            .filter_map(|h| label_placeholder(h).ok().flatten().map(|l| l.name))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Decision 1: either fixed hosts and globs, or whole-host `{param}`
     /// entries, each a required param with an anchored pattern, one of which
-    /// is exactly the base URL host.
+    /// is exactly the base URL host. Plan 15 adds in-label placeholders
+    /// (`s3.{region}.amazonaws.com`), next to fixed hosts and globs: the
+    /// same param rules, and the value is one DNS label.
     fn check_hosts(&self) -> Result<(), String> {
         let placeholders: Vec<&str> = self
             .hosts
             .iter()
             .filter_map(|h| whole_placeholder(h))
             .collect();
-        if placeholders.is_empty() {
-            if let Some(h) = self.hosts.iter().find(|h| h.contains(['{', '}'])) {
-                return Err(format!("host {h:?}: a placeholder must be the whole host"));
+        let mut in_label = Vec::new();
+        for h in self.hosts.iter().filter(|h| whole_placeholder(h).is_none()) {
+            if let Some(l) = label_placeholder(h).map_err(|e| format!("host {h:?}: {e}"))? {
+                in_label.push(l.name);
             }
+        }
+        // The base URL host, when it is not a whole placeholder.
+        if let Some(h) = self
+            .base_host_template()
+            .filter(|h| whole_placeholder(h).is_none())
+        {
+            if let Some(l) = label_placeholder(h).map_err(|e| format!("base_url host: {e}"))? {
+                in_label.push(l.name);
+            }
+        }
+        for p in placeholders.iter().chain(&in_label) {
+            self.host_param_ok(p)?;
+        }
+        if placeholders.is_empty() {
             return Ok(());
         }
         if placeholders.len() != self.hosts.len() {
             return Err("hosts may not mix {param} entries with fixed hosts".into());
-        }
-        for p in &placeholders {
-            let spec = self
-                .params
-                .get(*p)
-                .ok_or_else(|| format!("host placeholder {{{p}}} is not a declared param"))?;
-            if !spec.required {
-                return Err(format!("host param {p} must be required"));
-            }
-            match spec.pattern.as_deref() {
-                Some(pat) if pat.starts_with('^') && pat.ends_with('$') => {}
-                _ => {
-                    return Err(format!(
-                        "host param {p} needs an anchored hostname pattern (^...$)"
-                    ))
-                }
-            }
         }
         // A mail manifest has no base_url; its hosts are the SMTP and IMAP
         // host params (checked in `mail`).
@@ -571,9 +724,33 @@ impl Manifest {
         }
     }
 
-    /// Fixed headers: valid names the broker does not own, printable ASCII
-    /// values, and placeholders that are required params.
-    fn check_headers(&self) -> Result<(), String> {
+    /// The manifest authenticates with `aws_sigv4`.
+    pub fn signs_sigv4(&self) -> bool {
+        self.auth.iter().any(|a| a.kind == "aws_sigv4")
+    }
+
+    /// A host placeholder's param: declared, required, with an anchored
+    /// pattern.
+    fn host_param_ok(&self, p: &str) -> Result<(), String> {
+        let spec = self
+            .params
+            .get(p)
+            .ok_or_else(|| format!("host placeholder {{{p}}} is not a declared param"))?;
+        if !spec.required {
+            return Err(format!("host param {p} must be required"));
+        }
+        match spec.pattern.as_deref() {
+            Some(pat) if pat.starts_with('^') && pat.ends_with('$') => Ok(()),
+            _ => Err(format!(
+                "host param {p} needs an anchored hostname pattern (^...$)"
+            )),
+        }
+    }
+
+    /// Fixed headers (the manifest's or an operation's): valid names the
+    /// broker does not own, printable ASCII values, and placeholders that
+    /// are required params.
+    fn check_headers(&self, headers: &BTreeMap<String, String>) -> Result<(), String> {
         let auth_names: Vec<String> = self
             .auth
             .iter()
@@ -582,15 +759,24 @@ impl Manifest {
                 _ => "authorization".to_string(),
             })
             .collect();
-        for (name, value) in &self.headers {
+        let sigv4 = self.signs_sigv4();
+        for (name, value) in headers {
             let h = http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| format!("header {name:?}: not a valid header name"))?;
             let lower = h.as_str();
             if crate::request::ALWAYS_DROPPED.contains(&lower)
                 || auth_names.iter().any(|a| a == lower)
+                || (sigv4 && SIGV4_HEADERS.contains(&lower))
             {
                 return Err(format!(
                     "header {name}: set by the broker, not the manifest"
+                ));
+            }
+            // As for `request_headers`: a fixed `x-amz-*` header would be
+            // signed into every call and can change what it does.
+            if sigv4 && is_amz_header(lower) {
+                return Err(format!(
+                    "header {name}: no x-amz-* header may be set by a SigV4 connector"
                 ));
             }
             if !value.bytes().all(|b| (0x20..0x7f).contains(&b)) {
@@ -616,8 +802,43 @@ fn check_auth(a: &AuthSpec) -> Result<(), String> {
     if !AUTH_KINDS.contains(&a.kind.as_str()) {
         return Err(format!("auth kind {:?} is not supported", a.kind));
     }
-    if !matches!(a.kind.as_str(), "basic" | "oauth2") && a.secret_field.is_empty() {
+    let cloud = CLOUD_AUTH_KINDS.contains(&a.kind.as_str());
+    if cloud && !a.secret_field.is_empty() {
+        return Err(format!("auth kind {} takes no secret_field", a.kind));
+    }
+    if !cloud && !matches!(a.kind.as_str(), "basic" | "oauth2") && a.secret_field.is_empty() {
         return Err("auth needs a secret_field".into());
+    }
+    match (&a.service, a.kind == "aws_sigv4") {
+        (Some(_), false) => return Err("auth service is only for kind aws_sigv4".into()),
+        (None, true) => return Err("auth kind aws_sigv4 needs a service".into()),
+        (Some(s), true) => {
+            let ok = (1..=64).contains(&s.len())
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !ok {
+                return Err("auth service must match [a-z0-9-]{1,64}".into());
+            }
+        }
+        (None, false) => {}
+    }
+    let scoped = matches!(a.kind.as_str(), "gcp_sa" | "azure_sp");
+    match (&a.scope, scoped) {
+        (Some(_), false) => return Err("auth scope is only for kinds gcp_sa and azure_sp".into()),
+        (None, true) => return Err(format!("auth kind {} needs a scope", a.kind)),
+        (Some(s), true) => {
+            let ok = s.len() <= 512
+                && s.strip_prefix("https://").is_some_and(|r| {
+                    !r.is_empty()
+                        && !r.starts_with('/')
+                        && r.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-._~:/".contains(&b))
+                });
+            if !ok {
+                return Err("auth scope must be a plain https:// URL".into());
+            }
+        }
+        (None, false) => {}
     }
     if a.kind == "header" && a.name.as_deref().unwrap_or("").is_empty() {
         return Err("auth kind header needs a name".into());
@@ -663,8 +884,145 @@ fn next_param_ok(op: &Operation, param: &str) -> Result<(), String> {
 /// `x` when `h` is exactly `{x}` with a param-like name.
 fn whole_placeholder(h: &str) -> Option<&str> {
     let name = h.strip_prefix('{')?.strip_suffix('}')?;
-    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-        .then_some(name)
+    param_name(name).then_some(name)
+}
+
+fn param_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// A lower-case LDH run: letters, digits and `-` (possibly empty).
+fn ldh(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// One DNS label as a host param fills it: 1 to 63 lower-case letters,
+/// digits and `-`, not starting or ending in `-`. No dot, so the value can
+/// never add a label, and no `:`, `@`, `/` or `%`.
+pub fn dns_label(v: &str) -> bool {
+    (1..=63).contains(&v.len()) && ldh(v) && !v.starts_with('-') && !v.ends_with('-')
+}
+
+/// A host template with a placeholder inside one label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LabelHost<'a> {
+    /// The labels before the placeholder label, with their trailing dot,
+    /// and the placeholder label's fixed prefix.
+    pub before: &'a str,
+    pub name: &'a str,
+    /// The placeholder label's fixed suffix and the labels after it.
+    pub after: &'a str,
+}
+
+impl LabelHost<'_> {
+    /// The host with `value` (one DNS label) in place of the placeholder.
+    pub fn fill(&self, value: &str) -> String {
+        format!("{}{value}{}", self.before, self.after)
+    }
+}
+
+/// `None` for a host without braces; otherwise the in-label placeholder of
+/// `h`, or why `h` is not one: exactly one `{name}` in one label (with an
+/// optional lower-case LDH prefix and suffix in that label), every other
+/// label lower-case LDH, and at least two fixed labels after it. That
+/// keeps the value off a plain `example.com` domain, but it is a heuristic:
+/// a multi-label public suffix (`co.uk`) is not detected. Manifests are
+/// admin-controlled, so this guards against mistakes, not a hostile author.
+pub(crate) fn label_placeholder(h: &str) -> Result<Option<LabelHost<'_>>, String> {
+    if !h.contains(['{', '}']) {
+        return Ok(None);
+    }
+    let open = h.find('{').ok_or("unbalanced }")?;
+    let close = h[open..].find('}').ok_or("unbalanced {")? + open;
+    let (before, name, after) = (&h[..open], &h[open + 1..close], &h[close + 1..]);
+    if !param_name(name) {
+        return Err(format!("{{{name}}} is not a param name"));
+    }
+    if before.contains(['{', '}']) || after.contains(['{', '}']) {
+        return Err("a host holds at most one placeholder".into());
+    }
+    let (pre_labels, prefix): (Vec<&str>, &str) = match before.rsplit_once('.') {
+        Some((ls, p)) => (ls.split('.').collect(), p),
+        None => (Vec::new(), before),
+    };
+    let (suffix, post_labels): (&str, Vec<&str>) = match after.split_once('.') {
+        Some((s, ls)) => (s, ls.split('.').collect()),
+        None => (after, Vec::new()),
+    };
+    if !ldh(prefix) || !ldh(suffix) || pre_labels.iter().chain(&post_labels).any(|l| !dns_label(l))
+    {
+        return Err("the other labels must be lower-case letters, digits and -".into());
+    }
+    if post_labels.len() < 2 {
+        return Err("the placeholder needs at least two fixed labels after it".into());
+    }
+    Ok(Some(LabelHost {
+        before,
+        name,
+        after,
+    }))
+}
+
+/// Decision 5: an `objectkey` is only the last whole path segment; an
+/// `objectname` is a whole path segment or a query param. Neither goes in
+/// a body.
+fn check_object_params(op: &Operation) -> Result<(), String> {
+    let segs = template_segments(&op.path)?;
+    let last = segs.len().saturating_sub(1);
+    for (i, s) in segs.iter().enumerate() {
+        let Seg::Var {
+            prefix,
+            name,
+            suffix,
+        } = s
+        else {
+            continue;
+        };
+        let ty = op.path_params.get(*name).map(String::as_str);
+        let whole = prefix.is_empty() && suffix.is_empty();
+        if ty == Some(OBJECT_KEY) && !(whole && i == last) {
+            return Err(format!(
+                "path param {name}: an objectkey must be the last whole path segment"
+            ));
+        }
+        if ty == Some(OBJECT_NAME) && !whole {
+            return Err(format!(
+                "path param {name}: an objectname must be a whole path segment"
+            ));
+        }
+    }
+    if op.query.values().any(|t| t == OBJECT_KEY) {
+        return Err("an objectkey is a path param only".into());
+    }
+    if op
+        .body_params
+        .values()
+        .any(|t| t == OBJECT_KEY || t == OBJECT_NAME)
+    {
+        return Err("objectkey and objectname are not body params".into());
+    }
+    // An object value holds `/`, so in the qualifier it could pose as the
+    // placeholders after it (`{key}` = `x/other-bucket`): it must be the
+    // last one.
+    if let Some(q) = op.qualifier.as_deref() {
+        let vars = braces(q)?;
+        let is_object = |v: &str| {
+            op.path_params
+                .get(v)
+                .or_else(|| op.query.get(v))
+                .is_some_and(|t| t == OBJECT_KEY || t == OBJECT_NAME)
+        };
+        if let Some(i) = vars.iter().position(|v| is_object(v)) {
+            if i + 1 != vars.len() {
+                return Err(format!(
+                    "qualifier: object param {} must be the last placeholder",
+                    vars[i]
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A dotted JSON path of object keys; with `last_ok`, a part may end in
@@ -844,6 +1202,8 @@ pub fn from_http_service(name: &str, svc: &ServiceCfg) -> Result<Manifest, Broke
             .to_string(),
             prefix: None,
             token_path: None,
+            service: None,
+            scope: None,
         }],
     };
     let mut operation = Vec::new();
@@ -882,6 +1242,9 @@ pub fn from_http_service(name: &str, svc: &ServiceCfg) -> Result<Manifest, Broke
             graphql: None,
             pagination: None,
             amount: None,
+            headers: BTreeMap::new(),
+            fixed_query: BTreeMap::new(),
+            iam_action: None,
         });
     }
     let m = Manifest {

@@ -16,7 +16,7 @@ pub enum SecretAction {
     Add {
         /// The secret's name: a-z, 0-9, `.`, `_`, `-`; up to 64 characters.
         name: String,
-        /// token, basic, header or oauth2.
+        /// token, basic, header, oauth2, aws, gcp_sa or azure_sp.
         #[arg(long, value_name = "KIND")]
         kind: String,
         /// A service allowed to use it (repeatable, at least one).
@@ -24,10 +24,12 @@ pub enum SecretAction {
         services: Vec<String>,
         /// Read the value from this file (basic: `username:password`;
         /// oauth2: a JSON object with client_id, client_secret and
-        /// refresh_token).
+        /// refresh_token; aws, azure_sp: a JSON object with the kind's
+        /// fields; gcp_sa: Google's service account key file).
         #[arg(long, value_name = "PATH", conflicts_with = "from_env")]
         from_file: Option<PathBuf>,
-        /// Read the value from this environment variable.
+        /// Read the value from this environment variable (kinds with one
+        /// value only).
         #[arg(long, value_name = "VAR")]
         from_env: Option<String>,
     },
@@ -288,12 +290,9 @@ pub(crate) mod linux {
 
     fn check_kind(kind: &str) -> Result<(), Stop> {
         match kind {
-            "token" | "basic" | "header" | "oauth2" => Ok(()),
-            "aws" | "gcp_sa" | "azure_sp" => {
-                Err(Stop::Refused(format!("kind {kind} comes with plan 15")))
-            }
+            "token" | "basic" | "header" | "oauth2" | "aws" | "gcp_sa" | "azure_sp" => Ok(()),
             _ => Err(Stop::Refused(
-                "unknown kind (token, basic, header or oauth2)".into(),
+                "unknown kind (token, basic, header, oauth2, aws, gcp_sa or azure_sp)".into(),
             )),
         }
     }
@@ -314,9 +313,20 @@ pub(crate) mod linux {
         op: &str,
         a: Map<String, Value>,
     ) -> Result<Map<String, Value>, Stop> {
+        call_within(t, op, a, CALL_TIMEOUT)
+    }
+
+    /// [`call_to`] that waits up to `timeout` for the answer (a
+    /// `cloud.lease` waits for STS).
+    pub(crate) fn call_within(
+        t: &Target,
+        op: &str,
+        a: Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Map<String, Value>, Stop> {
         let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
         let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
-        c.call(op, a, Instant::now() + CALL_TIMEOUT)
+        c.call(op, a, Instant::now() + timeout)
             .map_err(|e| match e {
                 ClientError::Refused { code, message } if code == "forbidden" => {
                     Stop::Forbidden(message)
@@ -408,6 +418,28 @@ pub(crate) mod linux {
                         f.insert("client_secret", prompt("client_secret: ")?);
                         f.insert("refresh_token", prompt("refresh_token: ")?);
                     }
+                    "aws" => {
+                        f.insert("access_key_id", prompt_echo("access_key_id: ")?);
+                        f.insert("secret_access_key", prompt("secret_access_key: ")?);
+                        if let Some(t) = prompt_optional("session_token (empty for none): ")? {
+                            f.insert("session_token", t);
+                        }
+                    }
+                    "gcp_sa" => {
+                        f.insert("client_email", prompt_echo("client_email: ")?);
+                        f.insert("private_key_id", prompt("private_key_id: ")?);
+                        // One line: a pasted key has its line breaks as `\n`.
+                        let k = prompt("private_key (one line, line breaks as \\n): ")?;
+                        f.insert("private_key", Zeroizing::new(k.replace("\\n", "\n")));
+                        if let Some(p) = prompt_optional("project_id (empty for none): ")? {
+                            f.insert("project_id", p);
+                        }
+                    }
+                    "azure_sp" => {
+                        f.insert("tenant_id", prompt_echo("tenant_id: ")?);
+                        f.insert("client_id", prompt_echo("client_id: ")?);
+                        f.insert("client_secret", prompt("client_secret: ")?);
+                    }
                     _ => {
                         f.insert("token", prompt("token: ")?);
                     }
@@ -419,6 +451,11 @@ pub(crate) mod linux {
                 single(kind, utf8(&raw)?, &mut f)?;
             }
             Source::Env(var) => {
+                if matches!(kind, "aws" | "gcp_sa" | "azure_sp") {
+                    return Err(Stop::Refused(format!(
+                        "a {kind} secret has several fields; use --from-file or the terminal, not --from-env"
+                    )));
+                }
                 let mut v = std::env::var_os(&var)
                     .ok_or_else(|| Stop::Refused(format!("environment variable {var} is not set")))?
                     .into_string()
@@ -464,6 +501,21 @@ pub(crate) mod linux {
                 f.insert("value", v);
             }
             "oauth2" => oauth2_fields(&v, f)?,
+            "aws" => json_fields(
+                &v,
+                f,
+                &["access_key_id", "secret_access_key"],
+                &["session_token"],
+                &[],
+            )?,
+            "azure_sp" => json_fields(
+                &v,
+                f,
+                &["tenant_id", "client_id", "client_secret"],
+                &[],
+                &[],
+            )?,
+            "gcp_sa" => gcp_fields(&v, f)?,
             _ => {
                 f.insert("token", v);
             }
@@ -496,6 +548,82 @@ pub(crate) mod linux {
             f.insert(k, Zeroizing::new(s.to_string()));
         }
         Ok(())
+    }
+
+    /// A cloud secret from a JSON object: every `required` key, any of the
+    /// `optional` ones, nothing else except the `ignored` names. An error
+    /// never quotes the input.
+    fn json_fields(
+        v: &str,
+        f: &mut Fields,
+        required: &[&'static str],
+        optional: &[&'static str],
+        ignored: &[&str],
+    ) -> Result<(), Stop> {
+        let shape = || {
+            Stop::Refused(format!(
+                "this secret takes a JSON object with the fields {}{}",
+                required.join(", "),
+                if optional.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (optional: {})", optional.join(", "))
+                }
+            ))
+        };
+        let o = match saiife_broker::pipeline::strict_json(v.as_bytes()) {
+            Some(Value::Object(o)) => o,
+            _ => return Err(shape()),
+        };
+        let known =
+            |k: &str| required.contains(&k) || optional.contains(&k) || ignored.contains(&k);
+        if !o.keys().all(|k| known(k)) {
+            return Err(shape());
+        }
+        for k in required.iter().chain(optional) {
+            match o.get(*k) {
+                Some(Value::String(s)) if !s.is_empty() => {
+                    f.insert(k, Zeroizing::new(s.clone()));
+                }
+                Some(_) => return Err(shape()),
+                None if required.contains(k) => return Err(shape()),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A GCP service account: the fields by name, or Google's key file
+    /// (`"type": "service_account"`). A key file's `token_uri` is ignored:
+    /// the token endpoint is fixed in the daemon.
+    fn gcp_fields(v: &str, f: &mut Fields) -> Result<(), Stop> {
+        const FILE_ONLY: [&str; 7] = [
+            "type",
+            "client_id",
+            "auth_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+            "universe_domain",
+            "token_uri",
+        ];
+        let required = ["client_email", "private_key", "private_key_id"];
+        let optional = ["project_id"];
+        let mut ignored: &[&str] = &[];
+        if let Some(Value::Object(o)) = saiife_broker::pipeline::strict_json(v.as_bytes()) {
+            if let Some(t) = o.get("type") {
+                if t.as_str() != Some("service_account") {
+                    return Err(Stop::Refused(
+                        "this key file is not a service account key (type must be service_account)"
+                            .into(),
+                    ));
+                }
+                if o.contains_key("token_uri") {
+                    outln!("note: token_uri is ignored; the token endpoint is fixed");
+                }
+                ignored = &FILE_ONLY;
+            }
+        }
+        json_fields(v, f, &required, &optional, ignored)
     }
 
     /// Exactly one trailing `\n` or `\r\n` goes; nothing else.
@@ -567,6 +695,15 @@ pub(crate) mod linux {
         }
     }
 
+    /// A prompt that may be left empty.
+    fn prompt_optional(label: &str) -> Result<Option<Zeroizing<String>>, Stop> {
+        match prompt(label) {
+            Ok(v) => Ok(Some(v)),
+            Err(Stop::Refused(m)) if m == "no value read" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// One line from the terminal, echoed (a value that is not a secret).
     fn prompt_echo(label: &str) -> Result<Zeroizing<String>, Stop> {
         eprint!("{label}");
@@ -629,7 +766,85 @@ pub(crate) mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::strip_eol;
+        use super::{gcp_fields, json_fields, strip_eol, Fields, Stop};
+
+        fn key_file(extra: &str) -> String {
+            let pem = concat!(
+                "-----BEGIN ",
+                "PRIVATE KEY-----\\nTESTBODYTESTBODY0001\\n-----END ",
+                "PRIVATE KEY-----\\n"
+            );
+            format!(
+                r#"{{"type":"service_account","project_id":"my-proj-1","private_key_id":"abcd1234","private_key":"{pem}","client_email":"sa@my-proj-1.iam.gserviceaccount.com","client_id":"1234","auth_uri":"https://accounts.example/auth","token_uri":"https://evil.example/token","universe_domain":"googleapis.com"{extra}}}"#
+            )
+        }
+
+        fn msg(r: Result<(), Stop>) -> String {
+            match r {
+                Ok(()) => "ok".into(),
+                Err(Stop::Refused(m)) => m,
+                Err(_) => "other".into(),
+            }
+        }
+
+        #[test]
+        fn gcp_key_file_parsed_token_uri_ignored() {
+            let mut f = Fields::new();
+            assert_eq!(msg(gcp_fields(&key_file(""), &mut f)), "ok");
+            let names: Vec<&str> = f.keys().copied().collect();
+            assert_eq!(
+                names,
+                [
+                    "client_email",
+                    "private_key",
+                    "private_key_id",
+                    "project_id"
+                ]
+            );
+            assert!(f["private_key"].contains("PRIVATE KEY-----\nTESTBODY"));
+            // token_uri is not a field of the secret, and its value is nowhere.
+            assert!(f.values().all(|v| !v.contains("evil.example")));
+            // The plain field form works too, and an unknown key does not.
+            let mut g = Fields::new();
+            let plain = r#"{"client_email":"sa@p.iam.gserviceaccount.com","private_key":"k","private_key_id":"i"}"#;
+            assert_eq!(msg(gcp_fields(plain, &mut g)), "ok");
+            let mut h = Fields::new();
+            let extra = plain.replace('}', r#","token_uri":"x"}"#);
+            let m = msg(gcp_fields(&extra, &mut h));
+            assert!(m.starts_with("this secret takes a JSON object"), "{m}");
+        }
+
+        #[test]
+        fn gcp_wrong_type_refused() {
+            for kind in ["authorized_user", "external_account", ""] {
+                let text = key_file("").replace("service_account", kind);
+                let mut f = Fields::new();
+                let m = msg(gcp_fields(&text, &mut f));
+                assert!(m.contains("not a service account key"), "{kind}: {m}");
+                assert!(!m.contains("TESTBODY") && f.is_empty());
+            }
+            // A type that is not a string is refused too.
+            let text = key_file("").replace(r#""type":"service_account""#, r#""type":1"#);
+            let mut f = Fields::new();
+            assert!(msg(gcp_fields(&text, &mut f)).contains("not a service account key"));
+        }
+
+        #[test]
+        fn json_fields_refuse_without_quoting() {
+            let secret = concat!("leaky-", "value-0001");
+            let mut f = Fields::new();
+            let text =
+                format!(r#"{{"tenant_id":"t.example.com","client_id":"c","oops":"{secret}"}}"#);
+            let m = msg(json_fields(
+                &text,
+                &mut f,
+                &["tenant_id", "client_id", "client_secret"],
+                &[],
+                &[],
+            ));
+            assert!(m.contains("tenant_id, client_id, client_secret"), "{m}");
+            assert!(!m.contains(secret));
+        }
 
         #[test]
         fn strips_exactly_one_line_ending() {

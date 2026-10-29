@@ -19,6 +19,11 @@ pub enum ParamType {
     /// RFC 3339.
     Datetime,
     Bool,
+    /// An object key that keeps its `/` (S3, Azure blobs), encoded segment
+    /// by segment ([`object_value_problem`]).
+    ObjectKey,
+    /// An object name encoded whole, `/` as `%2F` (GCS).
+    ObjectName,
 }
 
 impl ParamType {
@@ -51,6 +56,8 @@ impl ParamType {
             }),
             "datetime" => Ok(ParamType::Datetime),
             "bool" => Ok(ParamType::Bool),
+            "objectkey" => Ok(ParamType::ObjectKey),
+            "objectname" => Ok(ParamType::ObjectName),
             _ => {
                 if let Some(range) = spec.strip_prefix("int:") {
                     let (lo, hi) = range
@@ -122,8 +129,64 @@ impl ParamType {
                     Err("not true or false".into())
                 }
             }
+            ParamType::ObjectKey | ParamType::ObjectName => match object_value_problem(v) {
+                Some(why) => Err(why.into()),
+                None => Ok(()),
+            },
         }
     }
+
+    /// An object key or name: `/` is allowed, with the checks of
+    /// [`object_value_problem`] instead of the single-segment ones.
+    pub fn is_object(&self) -> bool {
+        matches!(self, ParamType::ObjectKey | ParamType::ObjectName)
+    }
+}
+
+/// The longest object key or name, in bytes (S3's and GCS's limit).
+pub const MAX_OBJECT_KEY: usize = 1024;
+
+/// Decision 5: an object key or name may hold `/` but never escape the
+/// path structure: it is not empty, at most 1024 bytes, and has no control
+/// character, no `\`, no empty segment and no `.` or `..` segment, as
+/// given and after each of up to four rounds of percent-decoding (an
+/// upstream that decodes once more never sees a traversal either). A round
+/// that does not decode to UTF-8 is refused.
+pub fn object_value_problem(v: &str) -> Option<&'static str> {
+    if v.is_empty() {
+        return Some("empty");
+    }
+    if v.len() > MAX_OBJECT_KEY {
+        return Some("longer than 1024 bytes");
+    }
+    let mut cur = v.to_string();
+    for _ in 0..5 {
+        if has_control(&cur) {
+            return Some("contains a control character");
+        }
+        if cur.contains('\\') {
+            return Some("contains a backslash");
+        }
+        for seg in cur.split('/') {
+            if seg.is_empty() {
+                return Some("has an empty segment");
+            }
+            if seg == "." || seg == ".." {
+                return Some("has a . or .. segment");
+            }
+        }
+        // Strict: a decoding that is not UTF-8 (an overlong `%c0%ae` for
+        // `.`) is refused, never replaced, so no upstream decoder can read
+        // the bytes differently from what was checked.
+        let Ok(next) = percent_decode_str(&cur).decode_utf8() else {
+            return Some("percent-decodes to invalid UTF-8");
+        };
+        if next == cur.as_str() {
+            return None;
+        }
+        cur = next.into_owned();
+    }
+    Some("too deeply percent-encoded")
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.frac](Z|+HH:MM|-HH:MM)`.
@@ -281,7 +344,8 @@ fn check_one(name: &str, v: &str, ty: Option<&(ParamType, Place)>) -> Result<(),
         return Err(bad_value(name, "contains a control character"));
     }
     if let Some((t, place)) = ty {
-        if *place == Place::Path {
+        // An object key or name has its own segment checks (in `t.check`).
+        if *place == Place::Path && !t.is_object() {
             if let Some(why) = path_value_problem(v) {
                 return Err(bad_value(name, why));
             }

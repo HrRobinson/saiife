@@ -1454,6 +1454,7 @@ dependencies = [
  "percent-encoding",
  "rcgen",
  "regex",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
