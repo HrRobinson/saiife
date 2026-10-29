@@ -194,7 +194,7 @@ const AWS_SCRUB_PREFIXES: &[&str] = &["AWS_CONTAINER_", "AWS_ENDPOINT_URL_"];
 
 /// Prepares `cmd`'s environment: the loader variables of `inherited` and
 /// `remove` taken out, `values` put in.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare_env(
     cmd: &mut std::process::Command,
     inherited: Vec<String>,
