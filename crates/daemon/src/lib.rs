@@ -37,6 +37,8 @@ pub mod lockdown;
 #[cfg(target_os = "linux")]
 pub mod mcp_gateway;
 #[cfg(target_os = "linux")]
+pub mod mcp_ops;
+#[cfg(target_os = "linux")]
 pub mod notifier;
 #[cfg(target_os = "linux")]
 pub mod notify;

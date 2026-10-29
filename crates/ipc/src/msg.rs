@@ -53,6 +53,23 @@ pub const OP_GRANT_CONSUME: &str = "grant.consume";
 /// call. `{rec}` (with `pack` and `rule_id` naming the `[guard] ask`
 /// rule) -> `{request}`.
 pub const OP_APPROVAL_CREATE: &str = "approval.create";
+/// The MCP gateway's tools for the caller (plan 17, Task 7):
+/// `{overlays?: {"mcp:<name>": {allow, ask, deny}}}` ->
+/// `{servers: [{name, tools: [{name, title?, description, inputSchema,
+/// action}]}], tools_hash}`. Only the servers of the caller's scope that
+/// are running, and only their tools whose action is `allow` or `ask`.
+/// `tools_hash` is `sha256:<hex>` of the canonical JSON of `servers`.
+pub const OP_MCP_LIST: &str = "mcp.list";
+/// One `tools/call` of a gateway server, through the whole pipeline:
+/// `{server, tool, arguments, project?, overlay?, via?}`. `arguments` is the
+/// JSON text of the arguments object (a string: the daemon parses it,
+/// refusing duplicate keys, so what the policy and the approver see is
+/// what is sent); `overlay` is the project's `{allow, ask, deny}` for
+/// `mcp:<server>`; `via` is `cli` or `mcp` (attribution only). Answers as
+/// `api.call` does: `{status: null, result, truncated}` (`result` is the
+/// masked `CallToolResult`), `{pending}`, or an error with code `denied`
+/// (`rule`), `limited` (`limit`) or `upstream_failed` (`reason`).
+pub const OP_MCP_CALL: &str = "mcp.call";
 
 /// Largest `rec` that `audit.append` takes, as compact JSON
 /// (`serde_json::to_vec`). The daemon refuses a larger one with

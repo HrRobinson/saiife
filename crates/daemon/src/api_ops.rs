@@ -37,7 +37,7 @@ const MAX_HEADERS: usize = 64;
 const MAX_PATTERNS: usize = 256;
 const MAX_PATTERN_BYTES: usize = 256;
 const MAX_OVERLAY_SERVICES: usize = 64;
-const MAX_PROJECT: usize = 4096;
+pub(crate) const MAX_PROJECT: usize = 4096;
 
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match req.op.as_str() {
@@ -217,7 +217,7 @@ pub(crate) fn valid_collection(s: &str) -> bool {
 }
 
 /// Parses `overlay` (`{allow, ask, deny}` lists of strings).
-fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
+pub(crate) fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
@@ -229,7 +229,7 @@ fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static s
 
 /// Each list at most [`MAX_PATTERNS`] entries of at most
 /// [`MAX_PATTERN_BYTES`] bytes.
-fn check_overlay(o: &ServiceOverlay) -> Result<(), &'static str> {
+pub(crate) fn check_overlay(o: &ServiceOverlay) -> Result<(), &'static str> {
     if [&o.allow, &o.ask, &o.deny]
         .iter()
         .any(|l| l.len() > MAX_PATTERNS || l.iter().any(|p| p.len() > MAX_PATTERN_BYTES))
@@ -402,13 +402,13 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
 
 /// The audit-volume gate (as for `audit.append`): a call that cannot be
 /// recorded is not made.
-fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
+pub(crate) fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
     let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
     crate::disk::disk_gate(free, ctx.policy().min_free_mb, uid, ctx.own_uid)
 }
 
 /// A snapshot for the record of a call made without a valid policy.
-fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
+pub(crate) fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
     PolicySnapshot {
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
@@ -473,7 +473,7 @@ impl Caller {
         }
     }
 
-    fn pid(&self) -> Option<u32> {
+    pub(crate) fn pid(&self) -> Option<u32> {
         match self {
             Caller::Unix(p) => Some(p.pid),
             Caller::Token { .. } => None,
@@ -481,12 +481,48 @@ impl Caller {
     }
 
     /// The record's `peer`.
-    fn record(&self) -> Value {
+    pub(crate) fn record(&self) -> Value {
         match self {
             Caller::Unix(p) => json!({"pid": p.pid, "comm": comm(p.pid)}),
             Caller::Token { addr, .. } => json!({"tcp": addr.to_string(), "auth": "token"}),
         }
     }
+}
+
+/// Who makes a call (pipeline step 1), as the daemon finds it: never what
+/// the request says.
+#[derive(Debug, Default)]
+pub(crate) struct Identity {
+    /// From the caller's identity (peer credentials or token).
+    pub(crate) uid: u32,
+    /// The daemon's name for `uid`; empty when it has none.
+    pub(crate) user: String,
+    /// The session of the caller's agent ancestor, by attribution.
+    pub(crate) session: Option<String>,
+    /// The `comm` of that agent process, for an approval request.
+    pub(crate) agent: String,
+    /// `user`'s current groups (cached lookups, off the runtime thread).
+    pub(crate) groups: Vec<String>,
+}
+
+/// Step 1 for every entry point (`api.call`, the HTTP gateway, `mcp.call`):
+/// fills `id` from `caller`.
+pub(crate) async fn identify(ctx: &Ctx, caller: &Caller, id: &mut Identity) {
+    id.uid = caller.uid();
+    id.user = ctx.name_of(id.uid).await.unwrap_or_default();
+    let ancestor = caller
+        .pid()
+        .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
+    id.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
+    id.agent = ancestor
+        .and_then(|(pid, _)| ctx.proc.stat(pid))
+        .map(|s| s.comm)
+        .unwrap_or_default();
+    id.groups = if id.user.is_empty() {
+        Vec::new()
+    } else {
+        ctx.groups_of(&id.user).await
+    };
 }
 
 /// Every entry point (`api.call`, the HTTP gateway) once it has parsed its
@@ -519,21 +555,18 @@ pub(crate) async fn execute_in(
         return Err(Refused::LowDisk(code));
     }
     // 1. Identify: the caller's uid, the session by attribution.
+    let mut who = Identity::default();
+    identify(ctx, caller, &mut who).await;
+    let Identity {
+        uid,
+        user,
+        session,
+        agent,
+        groups,
+    } = who;
     call.uid = uid;
-    call.user = ctx.name_of(uid).await.unwrap_or_default();
-    let ancestor = caller
-        .pid()
-        .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
-    call.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
-    let agent = ancestor
-        .and_then(|(pid, _)| ctx.proc.stat(pid))
-        .map(|s| s.comm)
-        .unwrap_or_default();
-    let groups = if call.user.is_empty() {
-        Vec::new()
-    } else {
-        ctx.groups_of(&call.user).await
-    };
+    call.user = user;
+    call.session = session;
 
     // The policy as it is now: a reload while this call runs does not
     // change what it runs under.
@@ -805,7 +838,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     ok(id, m)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

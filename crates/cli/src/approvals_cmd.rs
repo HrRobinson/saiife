@@ -316,8 +316,22 @@ mod linux {
             outln!("  scope      {}", s("scope"));
         }
         outln!("  type       {}", s("type"));
+        let mcp = item["type"] == "mcp";
         if item["type"] == "command" {
             outln!("  command    {}", s("input"));
+        } else if mcp {
+            // A gateway tool call: `service` is `mcp:<server>`.
+            let service = s("service");
+            outln!(
+                "  server     {}",
+                service.strip_prefix("mcp:").unwrap_or(&service)
+            );
+            outln!("  tool       {}", s("operation"));
+            if item["env"].is_string() {
+                outln!("  env        {}", s("env"));
+            } else if item["env_base"] == true {
+                outln!("  env        base");
+            }
         } else {
             outln!("  request    {} {}", s("service"), s("operation"));
             if item["env"].is_string() {
@@ -367,20 +381,25 @@ mod linux {
             outln!("  note       {}", s("note"));
         }
         if let Some(body) = item["body_display"].as_str() {
-            outln!("  body sha256 {}", s("body_sha256"));
+            let what = if mcp { "arguments" } else { "body" };
+            outln!("  {what} sha256 {}", s("body_sha256"));
             let (shown, was_cut): (String, bool) = if full || body.chars().count() <= BODY_CHARS {
                 (body.to_string(), false)
             } else {
                 (body.chars().take(BODY_CHARS).collect(), true)
             };
-            outln!("  body (masked)");
+            outln!("  {what} (masked)");
             for line in shown.split('\n') {
                 outln!("    {}", sanitize(line));
             }
             if was_cut {
                 outln!("  … (cut; use --full)");
             }
-            if item["body_truncated"] == true {
+            if item["body_truncated"] == true && mcp {
+                outln!(
+                    "  WARNING: the arguments are over 4 KiB, so they are shown cut. Approve them only knowingly, with --accept-truncated."
+                );
+            } else if item["body_truncated"] == true {
                 outln!(
                     "  WARNING: the body is over 1 MiB, so even the full masked body above is cut. Approve it only knowingly, with --accept-truncated."
                 );

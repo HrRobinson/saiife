@@ -907,6 +907,78 @@ fn show_and_list_print_the_env_of_a_connector_request() {
     );
 }
 
+/// An MCP gateway request (plan 17): `show` prints the server, the tool
+/// and the masked arguments; the list names it `mcp:<server> <tool>`.
+#[test]
+fn show_prints_server_tool_and_masked_arguments_of_an_mcp_request() {
+    use saiife_daemon::approvals::{ApprovalType, NewRequest, SendDisplay};
+    let w = world();
+    let store = w.ctx.approvals.as_ref().unwrap();
+    let new = |truncated: bool| NewRequest {
+        uid: own_uid(),
+        user: own_user(),
+        session: None,
+        agent: "claude".into(),
+        project: "/srv/shop".into(),
+        kind: ApprovalType::Mcp,
+        service: Some("mcp:linear".into()),
+        operation: Some("create_issue".into()),
+        capability: None,
+        params: Default::default(),
+        input: None,
+        grant_key: None,
+        scope: None,
+        ask_rule: None,
+        send: SendDisplay {
+            body_display: Some("{\"team\":\"ENG\",\"title\":\"Bug\"}".into()),
+            body_sha256: Some("ab".repeat(32)),
+            body_truncated: truncated,
+            env_base: true,
+            ..Default::default()
+        },
+    };
+    let create = |n| {
+        store
+            .create(
+                n,
+                |_| Ok(None),
+                Duration::from_secs(600),
+                std::time::SystemTime::now(),
+            )
+            .unwrap()
+    };
+    let r = create(new(false));
+    let o = w.cli("approvals", &["show", &r.id.to_string()]);
+    ok(&o);
+    let out = stdout(&o);
+    assert!(out.contains("  type       mcp\n"), "{out}");
+    assert!(out.contains("  server     linear\n"), "{out}");
+    assert!(out.contains("  tool       create_issue\n"), "{out}");
+    assert!(out.contains("  env        base\n"), "{out}");
+    assert!(out.contains("  arguments (masked)\n"), "{out}");
+    assert!(
+        out.contains("{\"team\":\"ENG\",\"title\":\"Bug\"}"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("  arguments sha256 {}", "ab".repeat(32))),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING"), "{out}");
+    let v = json_out(&w.cli("approvals", &["show", &r.id.to_string(), "--json"]));
+    assert_eq!(v["type"], "mcp", "{v}");
+    let out = stdout(&w.cli("approvals", &[]));
+    assert!(out.contains("mcp:linear create_issue"), "{out}");
+    // Shown cut: approving needs --accept-truncated.
+    let cut = create(new(true));
+    let out = stdout(&w.cli("approvals", &["show", &cut.id.to_string()]));
+    assert!(
+        out.contains("WARNING: the arguments are over 4 KiB"),
+        "{out}"
+    );
+    assert!(out.contains("--accept-truncated"), "{out}");
+}
+
 #[test]
 fn show_warns_when_the_full_body_was_cut() {
     let w = world();

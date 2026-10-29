@@ -1409,10 +1409,15 @@ fn unrecorded_ask_is_expired_at_once() {
 #[test]
 fn at_most_20_pending_per_uid() {
     let w = world();
-    for _ in 0..20 {
-        assert!(ops_ask(&w, BODY_A)["pending"].is_u64());
+    // Twenty different requests (an identical one would get the id of
+    // the one already waiting, plan 17 decision 8).
+    let body = |i: u32| format!(r#"{{"amount": {}, "to": "acme"}}"#, i + 1);
+    for i in 0..20 {
+        assert!(ops_ask(&w, &body(i))["pending"].is_u64());
     }
-    let a = ops_ask(&w, BODY_A);
+    // An identical retry is not a new request: the same id, under the cap.
+    assert_eq!(ops_ask(&w, &body(0))["pending"], 1);
+    let a = ops_ask(&w, &body(20));
     assert_eq!(a["rule"], "approvals_full", "{a}");
     let conn: Vec<Value> = w
         .records()
@@ -1422,7 +1427,7 @@ fn at_most_20_pending_per_uid() {
     assert_eq!(conn.last().unwrap()["rule"], "approvals_full");
     // One decided frees a place.
     assert_eq!(w.decide(BOSS, 1, "reject")["ok"], true);
-    assert!(ops_ask(&w, BODY_A)["pending"].is_u64());
+    assert!(ops_ask(&w, &body(21))["pending"].is_u64());
 }
 
 /// An approved `/v1/proxy` request is sent with the method, path and

@@ -13,9 +13,9 @@ use saiife_broker::Catalog;
 use saiife_ipc::msg::{
     err, ok, ErrorCode, Request, OP_API_CALL, OP_API_LIST, OP_API_RESULT, OP_API_TOKEN,
     OP_APPROVAL_CREATE, OP_APPROVAL_DECIDE, OP_APPROVAL_LIST, OP_APPROVAL_SHOW, OP_AUDIT_APPEND,
-    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_POLICY_RELOAD,
-    OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST, OP_SECRET_REMOVE,
-    OP_SECRET_ROTATE, OP_STATUS, PROTO,
+    OP_AUDIT_ROTATE_KEY, OP_GRANT_CONSUME, OP_HELLO, OP_LOCKDOWN_SET, OP_MCP_CALL, OP_MCP_LIST,
+    OP_POLICY_RELOAD, OP_POLICY_SHOW, OP_SECRET_ADD, OP_SECRET_LEASE, OP_SECRET_LIST,
+    OP_SECRET_REMOVE, OP_SECRET_ROTATE, OP_STATUS, PROTO,
 };
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::Mode as PolicyMode;
@@ -354,6 +354,10 @@ pub struct Ctx {
     pub reloads: tokio::sync::Mutex<()>,
     /// The MCP gateway's children (plan 17, Task 6).
     pub mcp: Arc<crate::mcp_gateway::Gateway>,
+    /// What `mcp.list` and `mcp.call` (and the send of an approved mcp
+    /// request) reach the servers through: [`Ctx::mcp`]; tests replace it
+    /// before the context is shared.
+    pub tool_caller: Arc<dyn crate::mcp_gateway::ToolCaller>,
     /// Locked mode: every socket peer of the daemon's own uid is closed
     /// before it is read (no client runs as the daemon user; gateway
     /// children do). Set by the daemon's start; off in test contexts.
@@ -515,6 +519,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Ctx {
     pub fn new(i: CtxInit) -> Ctx {
+        let tool_caller: Arc<dyn crate::mcp_gateway::ToolCaller> = i.mcp.clone();
         Ctx {
             writer: i.writer,
             writer_cfg: i.writer_cfg,
@@ -553,6 +558,7 @@ impl Ctx {
             signals: Default::default(),
             reloads: tokio::sync::Mutex::new(()),
             mcp: i.mcp,
+            tool_caller,
             refuse_own_uid_peers: i.refuse_own_uid_peers,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
@@ -919,6 +925,7 @@ pub async fn dispatch_conn(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
         OP_API_CALL | OP_API_LIST | OP_API_RESULT => crate::api_ops::handle(ctx, peer, req).await,
         OP_API_TOKEN => crate::api_ops::token(ctx, peer.uid, req.id).await,
+        OP_MCP_LIST | OP_MCP_CALL => crate::mcp_ops::handle(ctx, peer, req).await,
         OP_LOCKDOWN_SET => crate::lockdown::set(ctx, conn, req).await,
         OP_POLICY_SHOW | OP_POLICY_RELOAD => crate::policy_ops::handle(ctx, peer, req).await,
         other => err(

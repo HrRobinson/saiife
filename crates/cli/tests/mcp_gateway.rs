@@ -1100,3 +1100,109 @@ fn crash_clears_children_and_kills_the_group() {
         "the background process of the crashed child is still {state:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Task 7: `mcp.list` and `mcp.call` over the control socket.
+
+fn mcp_op(d: &TestDaemon, op: &str, args: Value) -> Value {
+    let mut c = d.client();
+    match c.call(op, args.as_object().unwrap().clone(), common::daemon::dl()) {
+        Ok(m) => Value::Object(m),
+        Err(e) => json!({"refused": format!("{e:?}")}),
+    }
+}
+
+#[test]
+fn mcp_call_through_the_daemon_masks_and_records() {
+    let tok = token();
+    let policy = format!(
+        "{}[[scope]]\nname = \"dev\"\nusers = [{:?}]\nservices = [\"mcp:fake\"]\n\n{}",
+        admin(),
+        own_user(),
+        server(
+            "fake",
+            &["--echo-env", "FAKE_TOKEN"],
+            "env = { FAKE_TOKEN = \"fake-tok\" }\nallow = [\"echo\", \"echo_env\"]\nread_tools = [\"echo\"]\n"
+        )
+    );
+    let d = daemon(&policy);
+    wait_event(&d, "mcp_server_failed", "fake", 1);
+    let o = add_secret(&d, "fake-tok", &tok, &["mcp:fake"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    wait_event(&d, "mcp_server_started", "fake", 1);
+
+    // Listed: the scoped server's allowed tools, names as the server gave.
+    let l = mcp_op(&d, "mcp.list", json!({}));
+    let servers = l["servers"].as_array().unwrap_or_else(|| panic!("{l}"));
+    assert_eq!(servers.len(), 1, "{l}");
+    assert_eq!(servers[0]["name"], "fake");
+    let names: Vec<&str> = servers[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"echo") && names.contains(&"echo_env"),
+        "{l}"
+    );
+    assert!(l["tools_hash"].as_str().unwrap().starts_with("sha256:"));
+
+    // The real child echoes its token: masked in the answer.
+    let a = mcp_op(
+        &d,
+        "mcp.call",
+        json!({"server": "fake", "tool": "echo_env", "arguments": "{}"}),
+    );
+    assert_eq!(a["status"], Value::Null, "{a}");
+    assert_eq!(a["result"]["content"][0]["text"], "[MASKED]", "{a}");
+    // The canonical arguments reach the server.
+    let a = mcp_op(
+        &d,
+        "mcp.call",
+        json!({"server": "fake", "tool": "echo", "arguments": "{\"b\":1,\"a\":[2]}"}),
+    );
+    assert_eq!(
+        a["result"]["content"][0]["text"], "{\"a\":[2],\"b\":1}",
+        "{a}"
+    );
+    // Refused before anything is sent: a duplicate key, an unlisted tool.
+    let a = mcp_op(
+        &d,
+        "mcp.call",
+        json!({"server": "fake", "tool": "echo", "arguments": "{\"a\":1,\"a\":2}"}),
+    );
+    assert!(a["refused"].as_str().unwrap().contains("bad_param"), "{a}");
+    let a = mcp_op(
+        &d,
+        "mcp.call",
+        json!({"server": "fake", "tool": "introspect", "arguments": "{}"}),
+    );
+    assert!(
+        a["refused"].as_str().unwrap().contains("unknown_operation")
+            || a["refused"].as_str().unwrap().contains("default_deny"),
+        "{a}"
+    );
+
+    // One connector record per call, tool `mcp`, and no secret anywhere.
+    let recs: Vec<Value> = d
+        .records()
+        .into_iter()
+        .filter(|r| r["kind"] == "connector")
+        .collect();
+    assert_eq!(recs.len(), 4, "{recs:#?}");
+    assert!(recs.iter().all(|r| r["tool"] == "mcp" && r["via"] == "mcp"));
+    assert!(recs.iter().all(|r| r["service"] == "mcp:fake"));
+    assert_eq!(recs[0]["operation"], "echo_env");
+    assert_eq!(recs[0]["op_kind"], "write");
+    assert_eq!(recs[1]["op_kind"], "read");
+    assert_eq!(recs[0]["secret"], "fake-tok");
+    assert_eq!(recs[2]["rule"], "bad_param");
+    for f in fs::read_dir(d.audit_dir()).unwrap() {
+        let text = fs::read_to_string(f.unwrap().path()).unwrap_or_default();
+        assert!(!text.contains(&tok), "a secret value in the audit log");
+    }
+    assert!(!d.stderr_text().contains(&tok));
+    let v = d.verify();
+    assert_eq!(v.status.code(), Some(0), "{v:?}");
+}
