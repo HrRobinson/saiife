@@ -137,6 +137,7 @@ agent cannot write. The agent runs as you.
 | Nested or patched agent without hooks | Not covered | It has no keys and writes no audit. |
 | Model-provider login used or copied by the agent | **Not covered, by design** | The agent holds its own model login. |
 | MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
+| MCP servers behind the gateway | **Covered** (brokered, limited, audited) | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
 | Attacker with root | **Detected** with forwarding | |
 | Tools without a hook (Codex hosted web search) | Not covered | Not visible to any hook. |
 
@@ -159,6 +160,7 @@ the recommended setup for unattended agents.
 | Nested or patched agent without hooks | Not covered | No keys, no audit. |
 | Model-provider login used or copied by the agent | **Not covered, by design**, unless the agent uses a local model (Ollama, vLLM): then there is no key | |
 | MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
+| MCP servers behind the gateway | **Covered** (brokered, limited, audited) | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
 | Attacker with root | **Detected** with forwarding | |
 | Tools without a hook | Not covered | |
 

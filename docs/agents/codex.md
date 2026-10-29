@@ -83,6 +83,22 @@ with code 1.
 call" line shows it: if it says "no call yet" after you used Codex, the hook
 is not running.
 
+## The `saiife` MCP server
+
+`saiife mcp` gives Codex the brokered connectors (and gateway servers) as
+typed tools. Register it in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.saiife]
+command = "/opt/saiife/bin/saiife"
+args = ["mcp"]
+```
+
+The hook allows the server named `saiife` as brokered (the daemon judges
+each call). saiife does not restrict Codex's other MCP servers yet:
+`doctor` says "MCP servers for Codex are restricted by the hook only", and
+nothing pins the command of a server called `saiife`. See [MCP](../mcp.md).
+
 ## Not covered
 
 - Other Codex tools are not sent to saiife: for example MCP tools. Hosted

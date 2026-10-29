@@ -138,6 +138,12 @@ With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
   `.mcp.json` cannot define its own server named `saiife`, plus the
   `[guard.mcp] allow_servers` by name. A Claude Code that ignores
   `serverCommand` makes saiife's MCP unavailable (it fails closed).
+  `doctor` warns (`mcp.claude.allowlist`) when the file differs from policy.
+- Register the brokered server with
+  `claude mcp add saiife -- /opt/saiife/bin/saiife mcp`. Its tools are
+  connector operations (`shopify_orders_list`) and the tools of gateway
+  servers (`linear__create_issue`). Third-party servers can run behind the
+  gateway instead of in `allow_servers`. See [MCP](../mcp.md).
 
 ### Fail-closed matrix (Claude Code)
 

@@ -95,6 +95,21 @@ The name of that setting is not known yet (see below). Watch the "last hook
 call" line: if it says "no call yet" after you used Gemini CLI, the hook is
 not running.
 
+## The `saiife` MCP server
+
+`saiife mcp` gives Gemini CLI the brokered connectors (and gateway servers)
+as typed tools. Register it as `mcpServers.saiife` in `settings.json`:
+
+```json
+{ "mcpServers": { "saiife": { "command": "/opt/saiife/bin/saiife", "args": ["mcp"] } } }
+```
+
+The hook allows a call as brokered when `mcp_context.server_name` is
+`saiife`. saiife does not restrict Gemini CLI's other MCP servers yet:
+`doctor` says "MCP servers for Gemini CLI are restricted by the hook only",
+and nothing pins the command of a server called `saiife`. See
+[MCP](../mcp.md).
+
 ## Not covered
 
 - Other Gemini CLI tools are not sent to saiife: for example `web_fetch`,

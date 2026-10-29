@@ -548,6 +548,14 @@ requirements). `system install --mcp-allow <list>` writes them where the
 live check in plan 7 confirms the keys, so the list in `[guard.mcp]` and the
 agents' own lists agree.
 
+**Note (plan 17).** `system install` writes the Claude Code managed MCP
+allowlist drop-in `/etc/claude-code/managed-settings.d/60-saiife-mcp.json`
+from policy (the `saiife` server by command, plus each
+`[guard.mcp] allow_servers` by name). This replaces the `--mcp-allow <list>`
+flag (plan 17 decision 14): the list is derived from policy, so the two
+cannot disagree. Codex and Gemini get no managed MCP keys yet; `doctor` says
+their MCP servers are restricted by the hook only.
+
 ### 6.2 Daemon (`saiifed`)
 
 - **Start:** loads policy (an invalid policy at start means "deny all
@@ -1184,6 +1192,15 @@ daemon user, and `saiife mcp` also lists their tools, prefixed by server
 Why: MCP servers configured by users keep their tokens in the user's config
 files, which is exactly the credential leak v2 closes elsewhere.
 
+**Note (plan 17).** The gateway runs in locked mode only (decision 12): in
+personal broker mode its servers would run as the user, so `[mcp.*]` there
+is a load error. Children are confined with Landlock (files and exec) and
+`no_new_privs`; **their network is not sandboxed**, so a hostile server can
+still send out what it was given. The daemon refuses socket peers that are
+gateway children and, in locked mode, any peer with the daemon's own uid.
+`via` in a record is declared by the client and is attribution only. See
+`docs/mcp.md`.
+
 ### 6.16 `saiife doctor` (proposed addition; in v2.0, owner decision 1)
 
 Checks the host preconditions of §5.6, the files and fingerprints in
@@ -1684,6 +1701,13 @@ The exact request to send after approval (`request_sealed`) is encrypted
 with the vault key because it may hold unmasked customer data. The display
 copy is masked. Command grants use `"type":"command"` and the grant key
 instead of a request.
+
+**Note (plan 17).** A third type, `"type":"mcp"`, is a gateway tool call:
+`service` is `mcp:<name>`, `operation` is the tool, and the display holds the
+masked canonical arguments (cut at 4 KiB; a cut display needs
+`--accept-truncated`). Identical pending requests share one id when nothing
+in them was masked. On approval the current policy and the server's tool list
+are checked again.
 
 ## 9. Security model
 
