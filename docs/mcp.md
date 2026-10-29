@@ -387,6 +387,12 @@ with `; move it behind the MCP gateway: docs/mcp.md`. That is this page.
   `saiife` server by command, and each `[guard.mcp] allow_servers` by name.
   It replaces a hand-kept `--mcp-allow` list, so the two cannot disagree.
   `doctor` warns when it drifts after a reload. `uninstall` removes it.
+  The hook brokers `saiife` only while that file is root-owned, not group-
+  or world-writable, and holds exactly saiife's pin. Test builds
+  (`ci-locked`, debug assertions on) compile in the seam
+  `SAIIFE_TEST_CLAUDE_MCP_DROPIN`, which can point the hook at another file
+  and so grant `Brokered`. That is one reason those builds are CI-only and
+  install only with `--allow-test-build`.
 - **Codex and Gemini CLI.** saiife does not restrict their MCP servers yet:
   `doctor` says "restricted by the hook only", and the hook judges each call
   (`[guard.mcp] allow_servers`, as in the agent pages). Nothing stops either

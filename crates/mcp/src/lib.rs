@@ -10,5 +10,6 @@
 
 pub mod codec;
 pub mod jsonrpc;
+pub mod numbers;
 pub mod types;
 pub mod version;

@@ -823,15 +823,22 @@ mod linux {
                         })
                     })?;
                     if b == BodyArg::Json {
-                        // The client's own text: its numbers stay as written.
-                        match raw_of(k) {
-                            Some(r) => bytes = r.as_bytes().to_vec(),
-                            None if has_inexact_number(v) => {
-                                return Err(bad(
-                                    "a number in the body cannot be kept exact".to_string()
-                                ))
+                        // The broker parses a JSON body (f64) and encodes it
+                        // again: a number that would change on that round
+                        // trip is refused, never rounded. Checked on the
+                        // client's own text; without it only integers pass.
+                        let exact = match raw_of(k) {
+                            Some(r) => {
+                                bytes = r.as_bytes().to_vec();
+                                saiife_mcp::numbers::numbers_exact(r.as_bytes())
                             }
-                            None => {}
+                            None => !has_inexact_number(v),
+                        };
+                        if !exact {
+                            return Err(bad(
+                                "a number in the body would change on the way; send it as a string"
+                                    .to_string(),
+                            ));
                         }
                     }
                     if bytes.len() > api::MAX_BODY {
@@ -1339,15 +1346,25 @@ mod linux {
         /// text a non-integer is refused, never rounded.
         #[test]
         fn number_arguments_keep_the_clients_text() {
-            let raw = r#"{"n": 12345678901234567890.000000001, "s": "x", "body": {"a": 0.10000000000000000001, "b": 1E2}}"#;
+            let raw = r#"{"n": 12345678901234567890.000000001, "s": "x", "body": {"a": 0.25, "b": [1, -0.5], "c": 18446744073709551615}}"#;
             let args: Map<String, Value> = serde_json::from_str(raw).unwrap();
             let (p, body) = map_args(&target(Some(BodyArg::Json)), &args, Some(raw)).unwrap();
             assert_eq!(p["n"], "12345678901234567890.000000001");
             assert_eq!(p["s"], "x");
             assert_eq!(
                 body.unwrap(),
-                br#"{"a": 0.10000000000000000001, "b": 1E2}"#.to_vec()
+                br#"{"a": 0.25, "b": [1, -0.5], "c": 18446744073709551615}"#.to_vec()
             );
+            // A body number the broker's f64 round trip would change: -32602.
+            for raw in [
+                r#"{"body": {"amount": 0.10000000000000000001}}"#,
+                r#"{"body": {"amount": 18446744073709551616}}"#,
+                r#"{"body": {"deep": [{"x": 1E2}]}}"#,
+            ] {
+                let args: Map<String, Value> = serde_json::from_str(raw).unwrap();
+                let e = map_args(&target(Some(BodyArg::Json)), &args, Some(raw)).unwrap_err();
+                assert_eq!(e.code, -32602, "{raw}");
+            }
             // An integer needs no raw text.
             let args = obj(json!({"n": 42}));
             let (p, _) = map_args(&target(None), &args, None).unwrap();
