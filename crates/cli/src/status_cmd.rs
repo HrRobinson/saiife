@@ -16,6 +16,7 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
 use saiife_policy::installed::{read_installed, FileKind, Installed};
 use saiife_policy::{load_system, PackInfo};
+use saiife_system::doctor::system::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use saiife_system::layout::{CONFIG, INSTALLED};
 use saiife_system::{host_for, Host, Layout};
 use saiifeguard::canon::PathVars;
@@ -896,19 +897,21 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         }
     }
     if let Ok(l) = &config {
-        // A listed `saiife` is the broker's own server: it bypasses nothing.
-        for s in l
-            .config
-            .guard
-            .mcp
-            .allow_servers
-            .iter()
-            .filter(|s| *s != "saiife")
-        {
-            outln!(
-                "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
-                sanitize(s)
-            );
+        // A listed `saiife` changes nothing on Claude Code (pinned by
+        // command there). On Codex and Gemini CLI it allows any server a
+        // project or user config registers under that name.
+        let unpinned = installed
+            .as_ref()
+            .is_some_and(|i| i.agents.iter().any(|a| unpinned_saiife(&a.agent)));
+        for s in &l.config.guard.mcp.allow_servers {
+            if s != "saiife" {
+                outln!(
+                    "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
+                    sanitize(s)
+                );
+            } else if unpinned {
+                outln!("  warning: {SAIIFE_LISTED_UNPINNED}");
+            }
         }
     }
     Some(st)

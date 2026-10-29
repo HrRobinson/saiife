@@ -115,9 +115,10 @@ agent user. The hook therefore denies a call whose
 allow_servers = ["saiife"]
 ```
 
-Its calls then go through the normal guard, like any listed server's, and
-the daemon still decides each brokered call. saiife does not restrict
-Gemini CLI's other MCP servers yet: `doctor` says "MCP servers for Gemini
+Listing `"saiife"` accepts the same risk as any listed server: a project
+or user `settings.json` can register its own `saiife` server, and its calls
+are allowed by name and not brokered. `doctor` and `status` warn about it.
+saiife does not restrict Gemini CLI's other MCP servers yet: `doctor` says "MCP servers for Gemini
 CLI are restricted by the hook only". See [MCP](../mcp.md).
 
 ## Not covered

@@ -1030,7 +1030,7 @@ fn saiife_server_allowed_as_brokered() {
 
 /// Controller ruling (T9 follow-up): Codex pins no MCP server command, so
 /// a `saiife` server there may be the agent's own. Denied unless listed;
-/// listed, it takes the normal path, judged by the worker.
+/// listed, it is allowed by name ("tool not judged"), unpinned.
 #[test]
 fn codex_saiife_server_needs_listing() {
     let d = TestDaemon::start(Opts::default());

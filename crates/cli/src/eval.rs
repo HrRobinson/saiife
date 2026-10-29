@@ -1257,7 +1257,7 @@ mod tests {
     /// Controller ruling (T9 follow-up): nothing pins the `saiife` server's
     /// command on Codex, Gemini CLI or other agents, so a project or user
     /// config could register its own `saiife`. It is never brokered there:
-    /// denied unless `allow_servers` lists it, then the normal guarded path.
+    /// denied unless `allow_servers` lists it, then allowed by name.
     #[test]
     fn mcp_check_saiife_not_brokered_elsewhere() {
         for agent in ["codex", "unknown"] {

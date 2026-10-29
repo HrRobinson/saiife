@@ -46,17 +46,21 @@ brokers it: it lets each call through and the daemon judges it.
 On Codex and Gemini CLI nothing pins that command, so a project or user
 config could register its own `saiife` server, running any program as the
 agent user. There the hook does not broker `saiife`: it denies the
-server's tools unless `[guard.mcp] allow_servers` lists `"saiife"`, and a
-listed `saiife` goes through the normal guard like any listed server. To
-use `saiife mcp` on those agents:
+server's tools unless `[guard.mcp] allow_servers` lists `"saiife"`. To use
+`saiife mcp` on those agents:
 
 ```toml
 [guard.mcp]
 allow_servers = ["saiife"]
 ```
 
-Only `saiife` spelled exactly so may be listed. Claude Code's managed
-settings never allow it by name.
+Listing `"saiife"` accepts the same risk as any listed server: a project
+or user config can register its own `saiife` server, and its calls are
+allowed by name and not brokered. While Codex or Gemini CLI is installed,
+`doctor` and `status` warn: `MCP server saiife is listed: on Codex and
+Gemini CLI any server named saiife is allowed, and nothing pins its
+command`. Only `saiife` spelled exactly so may be listed. Claude Code's
+managed settings never allow it by name.
 
 ### Tool names
 
@@ -318,6 +322,7 @@ The limits, as built:
 | `mcp.sandbox` | warn for ABI 1 to 5: `MCP server sandbox is weaker than full`, with the missing part |
 | `mcp.claude.allowlist` | pass: `Claude Code MCP allowlist matches policy`. Warn: `the Claude Code MCP allowlist differs from policy; run saiife system install again` |
 | `mcp.codex.restriction`, `mcp.gemini.restriction` | info: `MCP servers for Codex are restricted by the hook only` (and the same for Gemini CLI). The detail says the `saiife` server is not brokered there, and whether `allow_servers` lists it |
+| `mcp.saiife` | warn, when `allow_servers` lists `saiife` and Codex or Gemini CLI is installed: `MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command` |
 | `mcp.<server>` | warn, for each server in `allow_servers` other than `saiife`: `MCP server <server> bypasses saiife: its requests are not brokered or limited` |
 
 `saiife status` prints one line for each gateway server:

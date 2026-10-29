@@ -56,16 +56,22 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
     }
     if let Ok(p) = &ctx.config {
-        // A listed `saiife` is the broker's own server, judged by the guard
-        // on agents that do not pin its command: it bypasses nothing.
-        let listed = p.config.guard.mcp.allow_servers.iter();
-        out.extend(listed.filter(|s| *s != "saiife").map(|s| {
-            Check::new(
-                format!("mcp.{s}"),
-                Status::Warn,
-                format!("MCP server {s} bypasses saiife: its requests are not brokered or limited"),
-                "",
-            )
+        // A listed `saiife` changes nothing on Claude Code (pinned by
+        // command there). On Codex and Gemini CLI it allows any server a
+        // project or user config registers under that name.
+        let unpinned = ctx
+            .installed
+            .as_ref()
+            .is_some_and(|i| i.agents.iter().any(|a| unpinned_saiife(&a.agent)));
+        out.extend(p.config.guard.mcp.allow_servers.iter().filter_map(|s| {
+            let title = if s != "saiife" {
+                format!("MCP server {s} bypasses saiife: its requests are not brokered or limited")
+            } else if unpinned {
+                SAIIFE_LISTED_UNPINNED.to_string()
+            } else {
+                return None;
+            };
+            Some(Check::new(format!("mcp.{s}"), Status::Warn, title, ""))
         }));
     }
     out.extend(mcp_checks(ctx));
@@ -915,6 +921,17 @@ fn daemon_mcp_status(_ctx: &Ctx) -> McpStatus {
     Err(crate::supported::NOT_LINUX.to_string())
 }
 
+/// The warning for `saiife` in `[guard.mcp] allow_servers` while an agent
+/// that does not pin its command (Codex, Gemini CLI) is installed: there
+/// the listing allows any server registered under that name.
+pub const SAIIFE_LISTED_UNPINNED: &str = "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command";
+
+/// Whether `agent` may run any MCP server named `saiife` (nothing pins its
+/// command): every agent but Claude Code, whose managed drop-in pins it.
+pub fn unpinned_saiife(agent: &str) -> bool {
+    agent != "claude"
+}
+
 fn mcp_checks(ctx: &Ctx) -> Vec<Check> {
     let has_gateway = ctx.config.as_ref().is_ok_and(|p| !p.config.mcp.is_empty());
     let (status, abi) = if has_gateway {
@@ -960,7 +977,7 @@ fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
                 .any(|s| s == "saiife")
         });
         let saiife = if saiife_listed {
-            "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so the guard judges its calls"
+            "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so its calls are allowed by name; nothing checks which program serves them"
         } else {
             "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
         };
@@ -2013,20 +2030,42 @@ mod tests {
                 "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
             );
         }
-        // Listed, the saiife server takes the guarded path; it bypasses
-        // nothing, so there is no `mcp.saiife` warning.
+        // Listed, any server named saiife is allowed by name on these
+        // agents: `mcp.saiife` warns.
         t.append_config("\n[guard.mcp]\nallow_servers = [\"saiife\"]\n");
         let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
         for id in ["codex", "gemini"] {
             let c = pick(&cs, &format!("mcp.{id}.restriction"));
             assert_eq!(
                 c.detail,
-                "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so the guard judges its calls"
+                "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so its calls are allowed by name; nothing checks which program serves them"
             );
         }
         let r = t.doctor();
         assert_status(&r, "config.valid", Status::Pass);
+        let c = get(&r, "mcp.saiife");
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.title, super::SAIIFE_LISTED_UNPINNED);
+        assert_eq!(
+            c.title,
+            "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command"
+        );
+    }
+
+    /// On Claude Code alone a listed `saiife` changes nothing (the drop-in
+    /// pins it by command and leaves the name out): no warning.
+    #[test]
+    fn listed_saiife_quiet_with_claude_only() {
+        let t = T::installed();
+        t.edit_installed(|i| i.agents.retain(|a| a.agent == "claude"));
+        t.append_config("\n[guard.mcp]\nallow_servers = [\"saiife\"]\n");
+        let r = t.doctor();
+        assert_status(&r, "config.valid", Status::Pass);
         assert!(r.checks.iter().all(|c| c.id != "mcp.saiife"));
+        assert!(r
+            .checks
+            .iter()
+            .all(|c| !c.title.contains("MCP server saiife")));
     }
 
     #[test]

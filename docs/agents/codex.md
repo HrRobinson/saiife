@@ -104,9 +104,10 @@ hook therefore denies a `saiife` server's tools unless you list it:
 allow_servers = ["saiife"]
 ```
 
-Its calls then go through the normal guard, like any listed server's, and
-the daemon still decides each brokered call. saiife does not restrict
-Codex's other MCP servers yet: `doctor` says "MCP servers for Codex are
+Listing `"saiife"` accepts the same risk as any listed server: a project
+or user config can register its own `saiife` server, and its calls are
+allowed by name and not brokered. `doctor` and `status` warn about it.
+saiife does not restrict Codex's other MCP servers yet: `doctor` says "MCP servers for Codex are
 restricted by the hook only". See [MCP](../mcp.md).
 
 ## Not covered
