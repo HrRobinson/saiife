@@ -319,21 +319,28 @@ fn fds_above_2_closed() {
         assert_eq!(out.introspect(2)["fds"], json!([0, 1, 2]), "{sandbox:?}");
     }
     // A descriptor above 9 cannot be closed by a POSIX shell (dash reads
-    // `12<&-` as the word 12): the helper refuses instead of leaking it.
+    // `12<&-` as the word 12): the helper closes it with bash, and refuses
+    // only where bash is missing. Never leaked to the server either way.
     for fds in [&[12][..], &[5, 12]] {
         let out = run_raw(
             &t,
             &session(&t.spec(Sandbox::Off), &[("introspect", json!({}))]),
             fds,
         );
-        assert_eq!(out.code, Some(126), "{fds:?}: {}", out.stderr);
-        assert!(
-            out.stderr.contains("an inherited descriptor above 9"),
-            "{}",
-            out.stderr
-        );
-        assert!(out.stdout.is_empty(), "the server ran: {}", out.stdout);
+        if !std::path::Path::new("/bin/bash").is_file() {
+            assert_eq!(out.code, Some(126), "{fds:?}: {}", out.stderr);
+            assert!(out.stderr.contains("no /bin/bash"), "{}", out.stderr);
+            assert!(out.stdout.is_empty(), "the server ran: {}", out.stdout);
+            continue;
+        }
+        assert_eq!(out.introspect(2)["fds"], json!([0, 1, 2]), "{fds:?}");
     }
+}
+
+/// The exec was refused: by the helper itself, or, when the helper closed a
+/// leaked descriptor with a shell (a CI runner leaks one), by that shell.
+fn exec_refused(stderr: &str) -> bool {
+    stderr.contains("cannot exec the server") || stderr.contains("Permission denied")
 }
 
 #[test]
@@ -351,11 +358,7 @@ fn home_is_not_executable() {
         return assert_fallback_refused(&out);
     }
     assert_eq!(out.code, Some(126), "{}", out.stderr);
-    assert!(
-        out.stderr.contains("cannot exec the server"),
-        "{}",
-        out.stderr
-    );
+    assert!(exec_refused(&out.stderr), "{}", out.stderr);
     assert!(!out.stdout.contains("ran-from-home"));
     // Unconfined, the same program runs: the denial is the sandbox's.
     spec.sandbox = Sandbox::Off;
@@ -451,12 +454,19 @@ fn exec_outside_allow_list_refused() {
         return assert_fallback_refused(&out);
     }
     assert_eq!(out.code, Some(126), "{}", out.stderr);
-    assert!(
-        out.stderr.contains("cannot exec the server"),
-        "{}",
-        out.stderr
-    );
-    assert!(!out.stderr.contains(BIN), "{}", out.stderr);
+    assert!(exec_refused(&out.stderr), "{}", out.stderr);
+    // The helper's own reason names no path. When a leaked descriptor made
+    // it exec through a shell, that shell's error names the server's
+    // command, which is admin config, not a secret.
+    if !leaked_fd_here() {
+        assert!(!out.stderr.contains(BIN), "{}", out.stderr);
+    }
+}
+
+/// This test process holds a descriptor above 2 that an exec would keep
+/// (a CI runner leaks one), so the helper execs through a shell.
+fn leaked_fd_here() -> bool {
+    saiife_system::sandbox::inherited_fds().is_ok_and(|v| !v.is_empty())
 }
 
 /// A refused spawn: exit 126, this reason, and the server never ran.

@@ -37,9 +37,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-/// The highest inherited descriptor the helper can close: it closes them
-/// with a POSIX shell redirection (`N<&-`), and POSIX shells such as dash
-/// take only one digit there. A higher one makes the helper refuse.
+/// The highest inherited descriptor a POSIX shell can close with `N<&-`
+/// (dash takes only one digit there). The helper closes a higher one with
+/// bash, and refuses when bash is missing.
 pub const MAX_CLOSABLE_FD: i32 = 9;
 
 /// The largest spec frame the helper reads.
@@ -260,8 +260,7 @@ fn spawn_helper_from(seam: Option<OsString>) -> PathBuf {
 
 /// The open descriptors above 2 that an exec would keep (no
 /// `FD_CLOEXEC`), from `/proc/self/fdinfo`. The helper closes them before
-/// it execs the server, or refuses to start it when one is above
-/// [`MAX_CLOSABLE_FD`].
+/// it execs the server (with bash when one is above [`MAX_CLOSABLE_FD`]).
 ///
 /// [`MAX_CLOSABLE_FD`]: crate::sandbox::MAX_CLOSABLE_FD
 pub fn inherited_fds() -> io::Result<Vec<i32>> {
