@@ -247,7 +247,9 @@ enum Cmd {
     ///
     /// `--cloud <service>` (STS mode) instead puts AWS session credentials
     /// for that service in the command's environment: at most 15 minutes,
-    /// scoped by a session policy built from the saiife policy.
+    /// scoped by a session policy built from the saiife policy. As with
+    /// `--secret`, any process of your uid can obtain these credentials
+    /// from the daemon; the executable check binds only this client.
     #[command(group(
         clap::ArgGroup::new("lease")
             .required(true)
@@ -261,6 +263,8 @@ enum Cmd {
         #[arg(long = "secret", value_name = "NAME[:ENV_VAR]")]
         secrets: Vec<String>,
         /// STS mode: short AWS credentials for this service (`mode = "sts"`).
+        /// Any process of your uid can obtain them from the daemon; the
+        /// executable check binds only this client.
         #[arg(long = "cloud", value_name = "SERVICE")]
         cloud: Option<String>,
         /// The command and its arguments, after `--`.

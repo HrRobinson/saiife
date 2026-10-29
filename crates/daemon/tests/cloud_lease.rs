@@ -246,7 +246,19 @@ locked = true
 [[scope]]
 name = "agents"
 users = ["agent"]
-services = ["s3sts", "s3sign", "s3link", "s3rpm"]
+services = ["s3sts", "s3sign", "s3link", "s3rpm", "s3unrep"]
+
+[services.s3unrep]
+connector = "aws-s3"
+secret = "aws-keys"
+params = {{ region = "eu-west-1" }}
+mode = "sts"
+# A single `*` stays within one `/` level in saiife, not in IAM.
+allow = ["s3:read:arn:aws:s3:::rep*"]
+limits = {{ requests_per_minute = 1 }}
+[services.s3unrep.cloud]
+role_arn = "{ROLE}"
+run_allow = ["{EXE}"]
 
 [services.s3sts]
 connector = "aws-s3"
@@ -305,14 +317,21 @@ run_allow = ["{link}"]
 }
 
 async fn world(status: u16) -> World {
-    let tmp = scratch();
+    world_in(scratch(), status, Limiter::new()).await
+}
+
+/// A daemon on `tmp` (fresh, or the dirs of a stopped one: a restart),
+/// with `limiter`.
+async fn world_in(tmp: tempfile::TempDir, status: u16, limiter: Limiter) -> World {
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&audit).unwrap();
     std::fs::create_dir_all(tmp.path().join("proc")).unwrap();
     std::fs::create_dir_all(tmp.path().join("run")).unwrap();
     let link = tmp.path().join("s3tool");
-    std::os::unix::fs::symlink("/usr/bin/bash", &link).unwrap();
+    if !link.exists() {
+        std::os::unix::fs::symlink("/usr/bin/bash", &link).unwrap();
+    }
     let cw = ChainWriter::open(
         &audit,
         WriterOptions {
@@ -344,7 +363,7 @@ async fn world(status: u16) -> World {
             .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
             .collect(),
         // Every service may use it; `s3out` is out of the caller's scope.
-        allowed_services: ["s3sts", "s3sign", "s3out", "s3link", "s3rpm"]
+        allowed_services: ["s3sts", "s3sign", "s3out", "s3link", "s3rpm", "s3unrep"]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -390,7 +409,7 @@ async fn world(status: u16) -> World {
         vault,
         vault_path: vault_file,
         backup_dir: state.join("import-backup"),
-        limiter: Limiter::new(),
+        limiter,
         upstream: Ok(up),
         tokens: Arc::new(Tokens::memory_with_clock(Arc::new(|| 1_800_000_000))),
         approvals: saiife_daemon::approvals::Store::open(&state.join("approvals"))
@@ -422,15 +441,28 @@ fn peer() -> PeerCred {
 
 impl World {
     async fn lease(&self, service: &str, exe: &str) -> Value {
+        self.lease_with(json!({"service": service, "exe": exe}))
+            .await
+    }
+
+    async fn lease_with(&self, args: Value) -> Value {
         let req = IpcRequest {
             id: 1,
             op: "cloud.lease".into(),
-            args: json!({"service": service, "exe": exe})
-                .as_object()
-                .unwrap()
-                .clone(),
+            args: args.as_object().unwrap().clone(),
         };
         saiife_daemon::ops::dispatch(&self.ctx, &peer(), req).await
+    }
+
+    /// The `Policy` of each STS call, in order.
+    fn policies_sent(&self) -> Vec<String> {
+        self.st
+            .lock()
+            .unwrap()
+            .sts
+            .iter()
+            .map(|(f, _)| f.get("Policy").cloned().unwrap_or_default())
+            .collect()
     }
 
     fn audit_text(&self) -> String {
@@ -493,7 +525,12 @@ async fn lease_requires_sts_mode() {
 #[tokio::test]
 async fn lease_exe_not_listed_refused() {
     let w = world(200).await;
-    refused(&w, "s3sts", "/usr/bin/false", "exe_not_allowed").await;
+    let a = refused(&w, "s3sts", "/usr/bin/false", "exe_not_allowed").await;
+    let m = a["message"].as_str().unwrap_or_default();
+    assert!(
+        m.contains("cloud.run_allow") && !m.contains("secret"),
+        "{m}"
+    );
 }
 
 #[tokio::test]
@@ -597,7 +634,9 @@ async fn lease_record_has_no_values() {
     assert_eq!(r["decision"], "allow");
     assert_eq!(r["service"], "s3sts");
     assert_eq!(r["role_arn"], ROLE);
-    assert_eq!(r["session"], a["session"]);
+    assert_eq!(r["sts_session"], a["session"]);
+    // `session` is the agent session (none here), never the STS name.
+    assert!(r["session"].is_null(), "{r}");
     assert_eq!(r["expires"], a["expires"]);
     assert_eq!(r["exe"], EXE);
     assert_eq!(r["policy_sha256"].as_str().unwrap().len(), 64);
@@ -648,4 +687,185 @@ async fn lease_counts_requests_per_minute() {
     // Leases of another service count apart.
     let a = w.lease("s3sts", EXE).await;
     assert_eq!(a["ok"], true, "{a}");
+}
+
+// ------------------------------------------------- fix round 1
+
+/// The overlay as `saiife run --cloud` sends it for a service.
+fn overlay_of(deny: &[&str]) -> saiife_policy::ServiceOverlay {
+    saiife_policy::ServiceOverlay {
+        allow: vec![],
+        ask: vec![],
+        deny: deny.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// The statements of `json` with `effect`.
+fn statements(json: &str, effect: &str) -> Vec<Value> {
+    let d: Value = serde_json::from_str(json).unwrap();
+    d["Statement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["Effect"] == effect)
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn project_deny_narrows_the_lease() {
+    let w = world(200).await;
+    let base = w.lease("s3sts", EXE).await;
+    assert_eq!(base["ok"], true, "{base}");
+    // The admin allows `s3:read`; the project denies one prefix of it.
+    let deny = "s3:read:arn:aws:s3:::reports/secret/**";
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "overlay": {"deny": [deny]}}))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let svc = &w.config.services["s3sts"];
+    let plain = session_policy::build(svc, &s3_manifest(), None, Mode::Locked).unwrap();
+    let narrowed = session_policy::build(
+        svc,
+        &s3_manifest(),
+        Some(&overlay_of(&[deny])),
+        Mode::Locked,
+    )
+    .unwrap();
+    let sent = w.policies_sent();
+    assert_eq!(sent, [plain.json.clone(), narrowed.json.clone()]);
+    // The extra statement is a Deny on the project's prefix (made at least
+    // as wide: each letter becomes IAM's `?`, decision 10).
+    let denies = statements(&sent[1], "Deny");
+    assert_eq!(
+        denies.len(),
+        statements(&sent[0], "Deny").len() + 1,
+        "{}",
+        sent[1]
+    );
+    assert!(
+        denies.iter().any(
+            |s| s["Resource"] == json!(["arn:aws:s3:::???????/??????/*"])
+                && s["Action"].to_string().contains("s3:GetObject")
+        ),
+        "{}",
+        sent[1]
+    );
+    // The allows are the admin's, unchanged.
+    assert_eq!(statements(&sent[0], "Allow"), statements(&sent[1], "Allow"));
+    let recs = w.leases();
+    assert_eq!(recs[0]["policy_sha256"], plain.sha256);
+    assert_eq!(recs[1]["policy_sha256"], narrowed.sha256);
+    assert_ne!(plain.sha256, narrowed.sha256);
+}
+
+#[tokio::test]
+async fn project_allow_never_widens_the_lease() {
+    let w = world(200).await;
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE,
+                           "overlay": {"allow": ["s3:write", "s3:*"]}}))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let svc = &w.config.services["s3sts"];
+    let plain = session_policy::build(svc, &s3_manifest(), None, Mode::Locked).unwrap();
+    let sent = w.policies_sent();
+    assert_eq!(
+        sent,
+        std::slice::from_ref(&plain.json),
+        "an overlay allow changed the policy"
+    );
+    assert!(!sent[0].contains("s3:PutObject"), "{}", sent[0]);
+    // A malformed overlay is a bad request: no lease, no STS call.
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "overlay": {"deny": "x"}}))
+        .await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(w.sts_calls(), 1);
+}
+
+#[tokio::test]
+async fn lease_unrepresentable_policy_refused_without_sts_or_rpm() {
+    let w = world(200).await;
+    // `requests_per_minute = 1`: were the first refusal counted, the
+    // second would be `limited`.
+    for _ in 0..2 {
+        let a = w.lease("s3unrep", EXE).await;
+        assert_eq!(rule(&a), "session_policy_unrepresentable", "{a}");
+        assert_eq!(a["error"], "denied", "{a}");
+    }
+    assert_eq!(w.sts_calls(), 0);
+    let recs = w.leases();
+    assert_eq!(recs.len(), 2);
+    assert!(recs
+        .iter()
+        .all(|r| r["rule"] == "session_policy_unrepresentable"));
+    w.assert_records_clean();
+}
+
+#[tokio::test]
+async fn lease_too_large_policy_refused_without_sts_or_rpm() {
+    let w = world(200).await;
+    let deny: Vec<String> = (0..80)
+        .map(|i| format!("s3:read:arn:aws:s3:::project-bucket-{i:03}/some/long/prefix/**"))
+        .collect();
+    // `s3rpm` allows 2 a minute: two refusals, then two leases.
+    for _ in 0..2 {
+        let a = w
+            .lease_with(json!({"service": "s3rpm", "exe": EXE, "overlay": {"deny": deny}}))
+            .await;
+        assert_eq!(rule(&a), "session_policy_too_large", "{a}");
+    }
+    assert_eq!(w.sts_calls(), 0);
+    for _ in 0..2 {
+        let a = w.lease("s3rpm", EXE).await;
+        assert_eq!(a["ok"], true, "{a}");
+    }
+    assert_eq!(w.lease("s3rpm", EXE).await["limit"], "requests_per_minute");
+    assert_eq!(w.sts_calls(), 2);
+}
+
+/// The limiter as the daemon rebuilds it at start (`start.rs`): every
+/// record of the window through `pipeline::limit_event`.
+fn rebuilt(audit: &Path) -> (Limiter, usize) {
+    let read = saiife_audit::store::read_recent(audit, 2, |_| true);
+    assert_eq!(read.skipped_lines, 0, "a record does not read back");
+    assert_eq!(read.unreadable_files, 0);
+    let events: Vec<_> = read
+        .records
+        .iter()
+        .filter_map(saiife_broker::pipeline::limit_event)
+        .collect();
+    let n = events.len();
+    (
+        Limiter::rebuild(events.into_iter(), time::OffsetDateTime::now_utc()),
+        n,
+    )
+}
+
+#[tokio::test]
+async fn leases_count_after_a_restart() {
+    let w = world(200).await;
+    for _ in 0..2 {
+        let a = w.lease("s3rpm", EXE).await;
+        assert_eq!(a["ok"], true, "{a}");
+    }
+    // A refusal before the send never counts.
+    assert_eq!(w.lease("s3rpm", "/usr/bin/false").await["ok"], false);
+    // Each lease record has one `session` key (the agent session).
+    for l in w.audit_text().lines().filter(|l| l.contains("cloud_lease")) {
+        assert_eq!(l.matches("\"session\":").count(), 1, "{l}");
+    }
+    // Stop the daemon; start a new one on the same dirs.
+    let World { ctx, tmp, .. } = w;
+    drop(ctx);
+    let (limiter, n) = rebuilt(&tmp.path().join("audit"));
+    assert_eq!(n, 2, "only the two sent leases count");
+    let w = world_in(tmp, 200, limiter).await;
+    let a = w.lease("s3rpm", EXE).await;
+    assert_eq!(a["ok"], false, "{a}");
+    assert_eq!(a["error"], "limited", "{a}");
+    assert_eq!(a["limit"], "requests_per_minute", "{a}");
+    assert_eq!(w.sts_calls(), 0, "the new daemon called STS");
 }

@@ -1502,7 +1502,29 @@ pub fn record(
 /// The limiter event of a `connector` record of a request that was sent,
 /// for the rebuild at start (Task 3). Sent means: allowed (done or failed
 /// upstream) or denied after sending ([`POST_SEND_RULES`]).
+///
+/// A `secret`/`cloud_lease` record is one `requests_per_minute` slot of its
+/// service (plan 15 decision 17) when its `AssumeRole` was sent: granted, or
+/// denied `token_mint_failed`.
 pub fn limit_event(r: &Record) -> Option<Event> {
+    if r.kind() == "secret" && r.extra.get("event").and_then(|e| e.as_str()) == Some("cloud_lease")
+    {
+        let sent =
+            r.decision == DecisionKind::Allow || r.rule.as_deref() == Some("token_mint_failed");
+        if !sent {
+            return None;
+        }
+        return Some(Event {
+            at: r.timestamp()?,
+            key: Key {
+                uid: r.uid?,
+                service: r.extra.get("service")?.as_str()?.to_string(),
+                session: r.session.clone(),
+            },
+            kind: OpKind::Read,
+            amount_minor: None,
+        });
+    }
     if r.kind() != "connector" {
         return None;
     }

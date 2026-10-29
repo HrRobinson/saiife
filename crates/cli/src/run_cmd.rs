@@ -171,7 +171,10 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
 /// The inherited AWS variables `run --cloud` removes (decision 16): a
 /// profile, a role or web identity, the container credential endpoint
 /// (`AWS_CONTAINER_*`) and the three credential variables. None of them may
-/// point the SDK at credentials other than the lease's.
+/// point the SDK at credentials other than the lease's. Beyond decision 16
+/// (fix round 1): `AWS_ENDPOINT_URL`, every `AWS_ENDPOINT_URL_*` and
+/// `AWS_CA_BUNDLE`, so an inherited environment cannot send the leased
+/// credentials to another endpoint.
 #[cfg(any(target_os = "linux", test))]
 const AWS_SCRUB: &[&str] = &[
     "AWS_PROFILE",
@@ -181,7 +184,33 @@ const AWS_SCRUB: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
+    "AWS_ENDPOINT_URL",
+    "AWS_CA_BUNDLE",
 ];
+
+/// Prefixes of the inherited variables `run --cloud` removes.
+#[cfg(any(target_os = "linux", test))]
+const AWS_SCRUB_PREFIXES: &[&str] = &["AWS_CONTAINER_", "AWS_ENDPOINT_URL_"];
+
+/// Prepares `cmd`'s environment: the loader variables of `inherited` and
+/// `remove` taken out, `values` put in.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn prepare_env(
+    cmd: &mut std::process::Command,
+    inherited: Vec<String>,
+    remove: &[String],
+    values: &[(String, zeroize::Zeroizing<String>)],
+) {
+    for var in loader_vars(inherited) {
+        cmd.env_remove(var);
+    }
+    for var in remove {
+        cmd.env_remove(var);
+    }
+    for (env, v) in values {
+        cmd.env(env, v.as_str());
+    }
+}
 
 /// The lease variables whose values are credentials (masked).
 #[cfg(any(target_os = "linux", test))]
@@ -196,7 +225,9 @@ const AWS_CREDENTIALS: [&str; 3] = [
 pub(crate) fn aws_scrub<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     names
         .into_iter()
-        .filter(|n| AWS_SCRUB.contains(&n.as_str()) || n.starts_with("AWS_CONTAINER_"))
+        .filter(|n| {
+            AWS_SCRUB.contains(&n.as_str()) || AWS_SCRUB_PREFIXES.iter().any(|p| n.starts_with(p))
+        })
         .collect()
 }
 
@@ -254,7 +285,7 @@ pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        argv0_for, aws_scrub, cloud_env, cloud_notice, loader_vars, mask_values, parse_spec, pump,
+        argv0_for, aws_scrub, cloud_env, cloud_notice, mask_values, parse_spec, prepare_env, pump,
         RunArgs,
     };
     use crate::broker::Target;
@@ -348,6 +379,22 @@ mod linux {
         let mut a = Map::new();
         a.insert("service".into(), json!(service));
         a.insert("exe".into(), json!(exe_s));
+        // The project's overlay for the service, read as `saiife api` reads
+        // it. Only its ask and deny are sent: a lease can only be narrowed.
+        let what = if config.is_locked() {
+            "system"
+        } else {
+            "broker"
+        };
+        let cfg = saiife_policy::load_system(config.config())
+            .map_err(|e| Stop::Unavailable(format!("cannot read the {what} config: {e}")))?
+            .config;
+        let (_, overlays, _) = crate::api_cmd::linux::project_for(&cfg, config);
+        if let Some(o) = overlays.get(service) {
+            if !o.ask.is_empty() || !o.deny.is_empty() {
+                a.insert("overlay".into(), json!({"ask": o.ask, "deny": o.deny}));
+            }
+        }
         let ans = call_within(config, "cloud.lease", a, LEASE_TIMEOUT)?;
         let lease =
             cloud_env(ans.get("env").and_then(|e| e.as_object())).map_err(Stop::Unavailable)?;
@@ -384,15 +431,14 @@ mod linux {
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for var in loader_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
-            cmd.env_remove(var);
-        }
-        for var in remove {
-            cmd.env_remove(var);
-        }
-        for (env, v) in values {
-            cmd.env(env, v.as_str());
-        }
+        prepare_env(
+            &mut cmd,
+            std::env::vars_os()
+                .filter_map(|(k, _)| k.into_string().ok())
+                .collect(),
+            remove,
+            values,
+        );
         let mut child = cmd
             .spawn()
             .map_err(|e| Stop::Refused(format!("cannot start {}: {e}", exe.display())))?;
@@ -654,14 +700,19 @@ mod tests {
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_ENDPOINT_URL_STS",
+            "AWS_CA_BUNDLE",
             "AWS_REGION",
             "HOME",
             "PATH",
             "MY_AWS_PROFILE",
+            "AWS_ENDPOINT_URLX",
         ];
         let mut removed = aws_scrub(inherited.iter().map(|s| s.to_string()));
         removed.sort();
-        let mut want: Vec<String> = inherited[..9].iter().map(|s| s.to_string()).collect();
+        let mut want: Vec<String> = inherited[..13].iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(removed, want);
 
@@ -735,6 +786,78 @@ mod tests {
             "saiife: AWS credentials for aws (STS mode) expire at 2026-10-29T12:15:00Z; \
              this command and anything it starts can read them"
         );
+    }
+
+    /// A real child (`/usr/bin/env`) started as `run --cloud` starts it:
+    /// the inherited AWS variables are gone, the lease's are set. Its
+    /// output is masked before anything looks at it, so no assertion
+    /// message can print a credential.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cloud_spawned_env_scrubbed_and_set() {
+        let a = lease_answer();
+        let lease = cloud_env(Some(&a)).unwrap();
+        let inherited_vals = [
+            ("AWS_PROFILE", "inherited-profile"),
+            ("AWS_ACCESS_KEY_ID", "inherited-key-id-0000"),
+            ("AWS_SECRET_ACCESS_KEY", "inherited-secret-0000"),
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "http://127.0.0.1:1/creds",
+            ),
+            ("AWS_ENDPOINT_URL", "https://evil.example"),
+            ("AWS_ENDPOINT_URL_STS", "https://evil-sts.example"),
+            ("AWS_CA_BUNDLE", "/tmp/evil-ca.pem"),
+            ("AWS_REGION", "us-east-1"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("KEEP_ME", "kept"),
+        ];
+        let mut cmd = std::process::Command::new("/usr/bin/env");
+        // The child's inherited environment is this one only.
+        cmd.env_clear();
+        for (k, v) in inherited_vals {
+            cmd.env(k, v);
+        }
+        let names: Vec<String> = inherited_vals.iter().map(|(k, _)| k.to_string()).collect();
+        let remove = aws_scrub(names.clone());
+        prepare_env(&mut cmd, names, &remove, &lease.sets);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        let values: Vec<&str> = lease.masked.iter().map(|v| v.as_str()).collect();
+        let mut masked = Vec::new();
+        pump(&out.stdout[..], &mut masked, &Masker::new(&values));
+        let text = String::from_utf8(masked).unwrap();
+        let vars: std::collections::BTreeMap<&str, &str> =
+            text.lines().filter_map(|l| l.split_once('=')).collect();
+        for gone in [
+            "AWS_PROFILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_STS",
+            "AWS_CA_BUNDLE",
+            "LD_PRELOAD",
+        ] {
+            assert!(!vars.contains_key(gone), "{gone} reached the child");
+        }
+        assert_eq!(vars["KEEP_ME"], "kept");
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            assert_eq!(vars[k], "[MASKED]", "{k}");
+        }
+        assert_eq!(vars["AWS_REGION"], "eu-west-1");
+        assert_eq!(vars["AWS_DEFAULT_REGION"], "eu-west-1");
+        assert_eq!(vars["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
+        assert_eq!(vars["AWS_CONFIG_FILE"], "/dev/null");
+        assert!(
+            !text.contains("inherited-"),
+            "an inherited credential reached the child"
+        );
+        for v in &values {
+            assert!(!text.contains(v));
+        }
     }
 
     #[test]

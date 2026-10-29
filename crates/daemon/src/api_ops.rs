@@ -251,7 +251,7 @@ pub(crate) fn valid_collection(s: &str) -> bool {
 }
 
 /// Parses `overlay` (`{allow, ask, deny}` lists of strings).
-fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
+pub(crate) fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(None);
     };

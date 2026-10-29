@@ -9,10 +9,16 @@
 //! connector could. A lease is never cached: the signing cache
 //! (`Ctx.oauth`) holds sign-mode credentials only.
 //!
-//! The client sends only `service` and `exe`. The role, the scope of the
-//! session and its policy come from the config in force (the caller's
-//! environment snapshot, as for `api.call`) and the connector manifest;
-//! no project overlay or agent input reaches the policy.
+//! The client sends `service`, `exe` and, optionally, the project's
+//! `overlay` (as for `api.call`). The role, the scope of the session and
+//! its policy come from the config in force (the caller's environment
+//! snapshot, as for `api.call`) and the connector manifest; of the overlay
+//! only `ask` and `deny` count, so it can only add `Deny` statements and
+//! never widens the session.
+//!
+//! The record's `sts_session` is the STS session name; its `session` is
+//! the agent session, as in every record (the limiter rebuilds the lease's
+//! `requests_per_minute` slot from it, `pipeline::limit_event`).
 //!
 //! The checks, in order (the first that fails is the answer's `rule`):
 //! lockdown (`lockdown`), the caller's scope (`no_scope`), the service's
@@ -23,7 +29,7 @@
 //! and `AssumeRole` (`token_mint_failed`).
 //!
 //! Every answer writes one `secret` record, `event = "cloud_lease"`, with
-//! `service`, `exe` and what is known of `role_arn`, `session`, `expires`
+//! `service`, `exe` and what is known of `role_arn`, `sts_session`, `expires`
 //! and `policy_sha256`. It never holds a credential, and a failed
 //! `AssumeRole` keeps only the sanitized STS error code (decision 18).
 //!
@@ -31,7 +37,7 @@
 //! can ask, and the `exe` check binds only the honest client. The
 //! credentials are bounded by the session policy and 15 minutes.
 
-use crate::api_ops::{gateway_mode, valid_service, Groups};
+use crate::api_ops::{gateway_mode, parse_overlay, valid_service, Groups};
 use crate::ops::{Ctx, Notice};
 use crate::secret_ops::{check_exe, MAX_EXE_BYTES};
 use crate::sessions::agent_ancestor;
@@ -42,7 +48,7 @@ use saiife_broker::limits::Key;
 use saiife_broker::manifest::OpKind;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request};
 use saiife_ipc::peer::{comm, PeerCred};
-use saiife_policy::{is_interpreter, scope_for, CloudMode, LimitsCfg, PolicyError};
+use saiife_policy::{is_interpreter, scope_for, CloudMode, LimitsCfg, PolicyError, ServiceOverlay};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,6 +76,16 @@ struct Facts {
     session: Option<String>,
     expires: Option<String>,
     policy_sha256: Option<String>,
+    agent_session: Option<String>,
+}
+
+/// An overlay as a lease counts it: its `allow` dropped, so it can only
+/// add `Deny` statements (in every mode).
+fn narrowing(o: ServiceOverlay) -> ServiceOverlay {
+    ServiceOverlay {
+        allow: Vec::new(),
+        ..o
+    }
 }
 
 /// A granted lease: the variables to set and the expiry.
@@ -104,6 +120,12 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Some(e) if !e.is_empty() && e.len() <= MAX_EXE_BYTES && !e.contains('\0') => e.to_string(),
         _ => return err(id, ErrorCode::BadRequest, "cloud.lease takes an exe path"),
     };
+    // The project's overlay (as `api.call` takes it): only its ask and deny
+    // count, so it can only narrow the session.
+    let overlay = match parse_overlay(req.args.get("overlay")) {
+        Ok(o) => o,
+        Err(m) => return err(id, ErrorCode::BadRequest, m),
+    };
     let mut facts = Facts::default();
     // Lockdown first: under either scope no credential is handed out.
     let verdict = match ctx.lockdown.get() {
@@ -119,7 +141,7 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 ctx.notice(peer.uid, Notice::LowDisk);
                 return err(id, code, "the audit volume is below [audit] min_free_mb");
             }
-            decide(ctx, peer, &service, &exe, &mut facts).await
+            decide(ctx, peer, &service, &exe, overlay, &mut facts).await
         }
     };
     let mut r = ctx.record("secret", &format!("cloud_lease {service} {exe}"));
@@ -128,9 +150,12 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     r.extra.insert("event".into(), "cloud_lease".into());
     r.extra.insert("service".into(), service.clone().into());
     r.extra.insert("exe".into(), exe.clone().into());
+    // The agent session (the limiter bucket); the STS session name is
+    // `sts_session` (a record's `session` is the agent session).
+    r.session.clone_from(&facts.agent_session);
     for (k, v) in [
         ("role_arn", &facts.role_arn),
-        ("session", &facts.session),
+        ("sts_session", &facts.session),
         ("expires", &facts.expires),
         ("policy_sha256", &facts.policy_sha256),
     ] {
@@ -183,6 +208,7 @@ async fn decide(
     peer: &PeerCred,
     service: &str,
     exe: &str,
+    overlay: Option<ServiceOverlay>,
     facts: &mut Facts,
 ) -> Result<Granted, Deny> {
     let state = ctx.policy();
@@ -264,6 +290,8 @@ async fn decide(
     }
     let session_of =
         agent_ancestor(ctx.proc.as_ref(), peer.pid).and_then(|a| ctx.sessions.lookup(a));
+    // The record carries it, so a restart rebuilds the same bucket.
+    facts.agent_session.clone_from(&session_of);
     let key = Key {
         uid: peer.uid,
         service: service.to_string(),
@@ -286,13 +314,15 @@ async fn decide(
         .catalog
         .manifest_for(service, svc)
         .map_err(|_| deny("policy_invalid", "the connector manifest is not available"))?;
-    let policy = session_policy::build(svc, &m, None, snap.mode).map_err(|e| match e {
-        CloudError::TooLarge => deny(
-            "session_policy_too_large",
-            "the session policy is over 2048 bytes",
-        ),
-        other => deny("session_policy_unrepresentable", other.to_string()),
-    })?;
+    let overlay = overlay.map(narrowing);
+    let policy =
+        session_policy::build(svc, &m, overlay.as_ref(), snap.mode).map_err(|e| match e {
+            CloudError::TooLarge => deny(
+                "session_policy_too_large",
+                "the session policy is over 2048 bytes",
+            ),
+            other => deny("session_policy_unrepresentable", other.to_string()),
+        })?;
     facts.policy_sha256 = Some(policy.sha256.clone());
     let Some(region) = svc.params.get("region") else {
         return Err(deny("policy_invalid", "the service has no params.region"));
@@ -333,15 +363,12 @@ async fn decide(
         "AWS_SECRET_ACCESS_KEY".into(),
         creds.secret_access_key.as_str().into(),
     );
-    env.insert(
-        "AWS_SESSION_TOKEN".into(),
-        creds
-            .session_token
-            .as_deref()
-            .map(String::as_str)
-            .unwrap_or_default()
-            .into(),
-    );
+    // `parse_assume_role` always sets one; a lease without it is unusable.
+    let Some(token) = creds.session_token.as_deref() else {
+        facts.expires = None;
+        return Err(deny(crate::oauth::MINT_FAILED, "bad_response"));
+    };
+    env.insert("AWS_SESSION_TOKEN".into(), token.as_str().into());
     env.insert("AWS_REGION".into(), region.as_str().into());
     env.insert("AWS_DEFAULT_REGION".into(), region.as_str().into());
     Ok(Granted {
@@ -367,7 +394,15 @@ fn check_cloud_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
             "the executable is (or links to) an interpreter or shell",
         ));
     }
-    check_exe(exe, allow).map_err(|d| deny("exe_not_allowed", d.detail))
+    check_exe(exe, allow).map_err(|d| {
+        // `check_exe` words it for `[secrets.*] run_allow`.
+        let detail = if d.detail.ends_with("in run_allow for this secret") {
+            "the executable is not in this service's cloud.run_allow".to_string()
+        } else {
+            d.detail
+        };
+        deny("exe_not_allowed", detail)
+    })
 }
 
 #[cfg(test)]
@@ -379,6 +414,19 @@ mod tests {
         let t = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
             + time::Duration::milliseconds(250);
         assert_eq!(timestamp(t), "2027-01-15T08:00:00Z");
+    }
+
+    #[test]
+    fn overlay_allow_dropped_in_every_mode() {
+        let o = ServiceOverlay {
+            allow: vec!["s3:*".into()],
+            ask: vec!["s3:write".into()],
+            deny: vec!["s3:delete".into()],
+        };
+        let n = narrowing(o);
+        assert!(n.allow.is_empty());
+        assert_eq!(n.ask, ["s3:write"]);
+        assert_eq!(n.deny, ["s3:delete"]);
     }
 
     #[test]
