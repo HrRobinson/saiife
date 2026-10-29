@@ -322,7 +322,12 @@ fn parse_services(v: Option<&Value>) -> Result<Vec<String>, Refusal> {
     let mut out: Vec<String> = Vec::new();
     for s in a {
         match s.as_str() {
-            Some(s) if valid_name(s) => {
+            // `mcp:<server>`: a gateway server's environment (plan 17).
+            Some(s)
+                if valid_name(s)
+                    || s.strip_prefix("mcp:")
+                        .is_some_and(saiife_policy::valid_server_name) =>
+            {
                 if !out.iter().any(|o| o == s) {
                     out.push(s.to_string());
                 }
@@ -795,6 +800,16 @@ mod tests {
         let wrong = json!({"name":"a1","kind":"token","fields":{"value":"abcdef"},"allowed_services":["s"]});
         let m = msg(parse(&req(OP_SECRET_ADD, wrong)));
         assert!(m.contains("token") && !m.contains("abcdef"), "{m}");
+        // A gateway server's `mcp:<name>`; not a bad server name.
+        let mcp = json!({"name":"a1","kind":"token","fields":{"token":"abcd"},"allowed_services":["mcp:linear"]});
+        assert_eq!(msg(parse(&req(OP_SECRET_ADD, mcp))), "ok");
+        for bad in ["mcp:a_b", "mcp:", "mcp:saiife", "other:x"] {
+            let v = json!({"name":"a1","kind":"token","fields":{"token":"abcd"},"allowed_services":[bad]});
+            assert!(
+                msg(parse(&req(OP_SECRET_ADD, v))).contains("invalid service name"),
+                "{bad}"
+            );
+        }
         let none =
             json!({"name":"a1","kind":"token","fields":{"token":"abcdef"},"allowed_services":[]});
         assert!(msg(parse(&req(OP_SECRET_ADD, none))).contains("at least one"));

@@ -352,6 +352,12 @@ pub struct Ctx {
     /// so two reloads never interleave: each loads, applies and records
     /// in turn, in the order they asked (the lock is fair).
     pub reloads: tokio::sync::Mutex<()>,
+    /// The MCP gateway's children (plan 17, Task 6).
+    pub mcp: Arc<crate::mcp_gateway::Gateway>,
+    /// Locked mode: every socket peer of the daemon's own uid is closed
+    /// before it is read (no client runs as the daemon user; gateway
+    /// children do). Set by the daemon's start; off in test contexts.
+    pub refuse_own_uid_peers: bool,
     names: Cache<u32, Option<String>>,
     groups: Cache<String, Vec<String>>,
     notices: Mutex<HashMap<(u32, Notice), Instant>>,
@@ -383,6 +389,11 @@ pub struct CtxInit {
     pub lockdown: crate::lockdown::Store,
     /// One-use command grants (`<state>/state/grants.json`).
     pub grants: crate::grants::Grants,
+    /// The MCP gateway (plan 17, Task 6); attached to the context by
+    /// [`Ctx::new`]'s caller once the context is shared.
+    pub mcp: Arc<crate::mcp_gateway::Gateway>,
+    /// See [`Ctx::refuse_own_uid_peers`]. `minimal` leaves it off.
+    pub refuse_own_uid_peers: bool,
 }
 
 impl CtxInit {
@@ -430,6 +441,10 @@ impl CtxInit {
                 std::time::SystemTime::now(),
             )
             .0,
+            mcp: Arc::new(crate::mcp_gateway::Gateway::new(
+                crate::mcp_gateway::GatewaySetup::in_state(state_dir),
+            )),
+            refuse_own_uid_peers: false,
         }
     }
 }
@@ -537,6 +552,8 @@ impl Ctx {
             grants: i.grants,
             signals: Default::default(),
             reloads: tokio::sync::Mutex::new(()),
+            mcp: i.mcp,
+            refuse_own_uid_peers: i.refuse_own_uid_peers,
             names: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             notices: Mutex::new(HashMap::new()),
@@ -708,6 +725,9 @@ pub enum Notice {
     /// The HTTP gateway refused a request before the pipeline (no
     /// `connector` record is written for it).
     Gateway(GatewayRefusal),
+    /// A peer that is a gateway MCP child (or, in locked mode, any process
+    /// of the daemon's own uid) was closed at the accept.
+    McpChildPeer(crate::mcp_gateway::PeerSocket),
 }
 
 /// Why the HTTP gateway refused a request before the pipeline.
@@ -735,6 +755,7 @@ impl Notice {
             Notice::Requests | Notice::Connections => "rate_limited",
             Notice::LowDisk => "low_disk",
             Notice::Gateway(_) => "gateway_refused",
+            Notice::McpChildPeer(_) => "mcp_child_peer",
         }
     }
 
@@ -762,6 +783,17 @@ impl Notice {
                     GatewayRefusal::Method => "a method the route does not take (405)",
                 };
                 format!("the HTTP gateway refused {what} from {who}; at most one record a minute")
+            }
+            Notice::McpChildPeer(on) => {
+                let who = if uid == UNKNOWN_UID {
+                    "an unidentified TCP peer".to_string()
+                } else {
+                    format!("uid {uid}")
+                };
+                format!(
+                    "the {} closed a connection from {who}: a gateway MCP server, a process it started, or (locked mode) another process of the daemon's own uid; at most one record a minute",
+                    on.as_str()
+                )
             }
         }
     }
@@ -1069,6 +1101,8 @@ fn status(ctx: &Ctx, id: u64) -> Value {
         "lockdown".into(),
         crate::lockdown::status_json(ctx.lockdown.get().as_ref()),
     );
+    // The MCP gateway's servers: `[{name, state, tools, since, last_error}]`.
+    m.insert("mcp".into(), ctx.mcp.status());
     ok(id, m)
 }
 

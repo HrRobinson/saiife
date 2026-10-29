@@ -67,6 +67,15 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
+    // A gateway MCP child (decision 12), or in locked mode any process of
+    // the daemon's own uid: closed before a byte is read or answered.
+    if crate::mcp_gateway::unix_peer_refused(&ctx, &peer) {
+        ctx.notice(
+            peer.uid,
+            Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Control),
+        );
+        return;
+    }
     // The personal broker talks to its own uid only (decision 3): any
     // other uid, root included, is closed before a byte is answered.
     if ctx.mode == ops::Mode::Personal && !crate::personal::admits(ctx.own_uid, peer.uid) {
@@ -197,5 +206,35 @@ mod tests {
         assert!(got.len() > 4);
         let body: Value = serde_json::from_slice(&got[4..]).unwrap();
         assert_eq!(body["mode"], "locked", "{body}");
+    }
+
+    /// A gateway MCP child (here: this test process, counted as one) is
+    /// closed before its hello, in both modes; the pid check is all the
+    /// personal broker has, since its clients share its uid.
+    #[tokio::test]
+    async fn mcp_child_peer_closed_before_hello() {
+        let me = rustix::process::getuid().as_raw();
+        for mode in [ops::Mode::Personal, ops::Mode::Locked] {
+            let t = tempfile::tempdir().unwrap();
+            let (ctx, _join) = ops::test_ctx(t.path(), mode, me);
+            ctx.mcp.add_test_pid(std::process::id());
+            assert!(hello_answer_bytes(ctx).await.is_empty(), "{mode:?}");
+        }
+    }
+
+    /// Locked mode, refusing its own uid (as the daemon's start sets it):
+    /// a peer of the daemon's uid is closed before hello; another uid is
+    /// answered.
+    #[tokio::test]
+    async fn locked_own_uid_peer_closed_before_hello() {
+        let me = rustix::process::getuid().as_raw();
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me);
+        Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
+        assert!(hello_answer_bytes(ctx).await.is_empty());
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = ops::test_ctx(t.path(), ops::Mode::Locked, me.wrapping_add(1));
+        Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
+        assert!(hello_answer_bytes(ctx).await.len() > 4);
     }
 }

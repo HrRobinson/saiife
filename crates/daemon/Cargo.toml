@@ -34,6 +34,8 @@ zeroize = { version = "=1.9.1", features = ["serde"] }
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros", "process"] }
 rustix = { version = "1", features = ["fs", "process", "net"] }
 saiife-system = { path = "../system" }
+# The MCP gateway's JSON-RPC client side (plan 17, Task 6).
+saiife-mcp = { path = "../mcp" }
 # Newest release older than 14 days (2026-10-26): chacha20poly1305 0.11.0
 # is from 2026-06-28.
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }

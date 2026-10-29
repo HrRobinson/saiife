@@ -18,6 +18,10 @@
 //!
 //! Every message received is logged to stderr as `fake-mcp: got <method>`
 //! (`notifications/cancelled` with its request id).
+//!
+//! `--connect-control PATH` / `--connect-gateway PATH`: at start, connect
+//! to that saiife socket as a client would (a `hello` frame, or an HTTP
+//! request) and log `fake-mcp: connect-control: answered|closed|...`.
 
 use saiife_mcp::codec::{encode, LineReader};
 use saiife_mcp::jsonrpc::{Id, Message, RpcError};
@@ -52,6 +56,12 @@ pub struct FakeArgs {
     /// Add the `read_file` tool.
     #[arg(long = "read-file-tool")]
     read_file_tool: bool,
+    /// At start, send a `hello` to this control socket and log the outcome.
+    #[arg(long = "connect-control", value_name = "PATH")]
+    connect_control: Option<String>,
+    /// At start, send an HTTP request to this gateway socket and log it.
+    #[arg(long = "connect-gateway", value_name = "PATH")]
+    connect_gateway: Option<String>,
 }
 
 const DEFAULT_HUGE: usize = 8 * 1024 * 1024;
@@ -101,6 +111,18 @@ pub fn run(args: FakeArgs) -> ExitCode {
         let val = std::env::var(var).unwrap_or_default();
         eprintln!("fake-mcp: {var}={val}");
     }
+    if let Some(path) = &args.connect_control {
+        let hello = json!({"id": 1, "op": "hello", "proto": saiife_ipc::msg::PROTO});
+        let frame = saiife_ipc::frame::encode_max(&hello, 4096).unwrap_or_default();
+        probe("connect-control", path, &frame);
+    }
+    if let Some(path) = &args.connect_gateway {
+        probe(
+            "connect-gateway",
+            path,
+            b"GET /v1/services HTTP/1.1\r\nHost: saiife\r\nConnection: close\r\n\r\n",
+        );
+    }
     let mut fake = Fake {
         args,
         tools,
@@ -121,6 +143,28 @@ pub fn run(args: FakeArgs) -> ExitCode {
             return code;
         }
     }
+}
+
+/// Connect to a unix socket, send `payload`, and log whether anything came
+/// back within 3 s.
+fn probe(label: &str, path: &str, payload: &[u8]) {
+    use std::io::Read;
+    let outcome = match std::os::unix::net::UnixStream::connect(path) {
+        Err(e) => format!("connect failed: {:?}", e.kind()),
+        Ok(mut s) => {
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let _ = s.write_all(payload);
+            let mut buf = [0u8; 64];
+            match s.read(&mut buf) {
+                // Closed with our bytes unread: a reset.
+                Ok(0) => "closed".to_string(),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => "closed".to_string(),
+                Ok(_) => "answered".to_string(),
+                Err(e) => format!("no answer: {:?}", e.kind()),
+            }
+        }
+    };
+    eprintln!("fake-mcp: {label}: {outcome}");
 }
 
 fn send(m: &Message) {
