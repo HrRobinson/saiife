@@ -1344,6 +1344,21 @@ fn sandbox_line() -> &'static str {
     }
 }
 
+/// The gateway runs a server's command only when it is root-owned
+/// (`command_not_root_owned`). In `scripts/test-offline.sh`'s nested user
+/// namespace, which maps only the current user, root's files show as the
+/// overflow uid, so no command passes and the gateway tests cannot run
+/// there: they are skipped with a note. Everywhere else they run.
+fn gateway_runnable() -> bool {
+    match saiife_system::fsops::root_owned_chain(std::path::Path::new(ENV_BIN)) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("note: {ENV_BIN} is not root-owned here ({e}); the gateway test is skipped");
+            false
+        }
+    }
+}
+
 /// `[mcp.fake]` running `saiife __fake-mcp-server <fake_args>` under
 /// `/usr/bin/env` (a root-owned command), with `extra` lines appended.
 fn fake_server(fake_args: &[&str], extra: &str) -> String {
@@ -1396,6 +1411,9 @@ fn reload_gw(w: &World, servers: &str) {
 
 #[test]
 fn gateway_tools_listed_with_prefix() {
+    if !gateway_runnable() {
+        return;
+    }
     let w = gw_world(&fake_server(
         &[],
         "allow = [\"echo\"]\nask = [\"introspect\"]\n",
@@ -1430,6 +1448,9 @@ fn gateway_tools_listed_with_prefix() {
 
 #[test]
 fn gateway_allow_call_roundtrip() {
+    if !gateway_runnable() {
+        return;
+    }
     let w = gw_world(&fake_server(
         &[],
         "allow = [\"echo\"]\nread_tools = [\"echo\"]\n",
@@ -1455,6 +1476,9 @@ fn gateway_allow_call_roundtrip() {
 
 #[test]
 fn gateway_ask_then_saiife_result() {
+    if !gateway_runnable() {
+        return;
+    }
     use saiife_daemon::approvals::State;
     let w = inproc::world_gw();
     let mut c = w.mcp();
@@ -1490,6 +1514,9 @@ fn gateway_ask_then_saiife_result() {
 
 #[test]
 fn gateway_deny_is_error_result() {
+    if !gateway_runnable() {
+        return;
+    }
     let w = gw_world(&fake_server(&[], "allow = [\"echo\"]\n"));
     let mut c = w.mcp(&[]);
     wait_tool(&mut c, "fake__echo");
@@ -1511,6 +1538,9 @@ fn gateway_deny_is_error_result() {
 
 #[test]
 fn token_never_reaches_agent() {
+    if !gateway_runnable() {
+        return;
+    }
     let tok = fake_token();
     let servers = fake_server(
         &["--echo-env", "FAKE_TOKEN"],
@@ -1552,6 +1582,9 @@ fn token_never_reaches_agent() {
 
 #[test]
 fn reload_revokes_listed_tool() {
+    if !gateway_runnable() {
+        return;
+    }
     let w = gw_world(&fake_server(&[], "allow = [\"echo\", \"introspect\"]\n"));
     // Fast hash polling is set at spawn.
     let mut c = McpClient::spawn_env(&w.d, &[], &[("SAIIFE_TEST_MCP_HASH_MS", "200")]);
@@ -1576,6 +1609,9 @@ fn reload_revokes_listed_tool() {
 
 #[test]
 fn connector_and_gateway_names_never_collide() {
+    if !gateway_runnable() {
+        return;
+    }
     let tools = json!([
         {"name": "a.b", "inputSchema": {"type": "object"}},
         {"name": "a_b", "inputSchema": {"type": "object"}},
@@ -1620,6 +1656,9 @@ fn connector_and_gateway_names_never_collide() {
 
 #[test]
 fn gateway_arguments_text_is_not_rounded() {
+    if !gateway_runnable() {
+        return;
+    }
     let w = gw_world(&fake_server(&[], "allow = [\"echo\"]\n"));
     let mut c = w.mcp(&[]);
     wait_tool(&mut c, "fake__echo");

@@ -58,6 +58,18 @@ fn root_owned(p: &str) -> bool {
     saiife_system::fsops::root_owned_chain(Path::new(p)).is_ok()
 }
 
+/// The fake's command `/usr/bin/env` passes the gateway's root-owned
+/// check. Not in `scripts/test-offline.sh`'s nested user namespace, which
+/// maps only the current user (root's files show as the overflow uid):
+/// there every test that starts a server is skipped with a note.
+fn env_runnable() -> bool {
+    let ok = root_owned(ENV);
+    if !ok {
+        eprintln!("skipped: {ENV} is not root-owned here");
+    }
+    ok
+}
+
 /// `[mcp.<name>]` running the fake with `fake_args`.
 fn server(name: &str, fake_args: &[&str], extra: &str) -> String {
     let mut args = vec![BIN.to_string(), "__fake-mcp-server".to_string()];
@@ -171,6 +183,9 @@ fn reload(d: &TestDaemon, extra: &str) {
 
 #[test]
 fn starts_initializes_and_caches_tools() {
+    if !env_runnable() {
+        return;
+    }
     let d = daemon(&server("fake", &[], ""));
     let started = wait_event(&d, "mcp_server_started", "fake", 1);
     assert_eq!(started[0]["tools"], 2, "{started:?}");
@@ -189,6 +204,9 @@ fn starts_initializes_and_caches_tools() {
 
 #[test]
 fn unsupported_version_fails_with_record() {
+    if !env_runnable() {
+        return;
+    }
     let d = daemon(&server("old", &["--version", "2024-11-05"], ""));
     let failed = wait_event(&d, "mcp_server_failed", "old", 1);
     let reason = failed[0]["reason"].as_str().unwrap();
@@ -209,6 +227,9 @@ fn unsupported_version_fails_with_record() {
 
 #[test]
 fn secret_reaches_child_env_only_when_allowed_for_mcp_service() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let policy = |extra: &str| {
         format!(
@@ -274,6 +295,9 @@ fn secret_reaches_child_env_only_when_allowed_for_mcp_service() {
 
 #[test]
 fn child_stderr_is_masked() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let d = daemon(&format!(
         "{}{}",
@@ -317,6 +341,9 @@ fn child_stderr_is_masked() {
 
 #[test]
 fn reload_removes_and_adds_servers() {
+    if !env_runnable() {
+        return;
+    }
     let a = server("a", &[], "");
     let b = server("b", &[], "");
     let c = server("c", &[], "");
@@ -428,6 +455,9 @@ fn child_peer_refused_on(flag: &str, sock: &str, label: &str, socket_name: &str)
 
 #[test]
 fn child_peer_refused_on_control_socket() {
+    if !env_runnable() {
+        return;
+    }
     child_peer_refused_on(
         "--connect-control",
         "saiife.sock",
@@ -438,6 +468,9 @@ fn child_peer_refused_on_control_socket() {
 
 #[test]
 fn child_peer_refused_on_gateway_socket() {
+    if !env_runnable() {
+        return;
+    }
     child_peer_refused_on(
         "--connect-gateway",
         "gateway.sock",
@@ -524,6 +557,9 @@ fn command_not_root_owned_fails() {
 
 #[test]
 fn status_lists_servers() {
+    if !env_runnable() {
+        return;
+    }
     let d = daemon(&format!(
         "{}{}",
         server("zeta", &[], ""),
@@ -707,6 +743,9 @@ fn text_of(r: &Value) -> String {
 
 #[test]
 fn in_process_tools_cached_and_names_sent_exactly() {
+    if !env_runnable() {
+        return;
+    }
     let tools = json!([
         {"name": "Weird.Name-1 x", "inputSchema": {"type": "object"}},
         {"name": "echo", "description": "Echo.", "inputSchema": {"type": "object"}},
@@ -738,6 +777,9 @@ fn in_process_tools_cached_and_names_sent_exactly() {
 
 #[test]
 fn hung_server_times_out_and_is_cancelled() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &["--hang-tool", "slow"], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     let t0 = Instant::now();
@@ -758,6 +800,9 @@ fn hung_server_times_out_and_is_cancelled() {
 
 #[test]
 fn oversized_line_stops_child() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(
         &server(
             "fake",
@@ -793,6 +838,9 @@ fn oversized_line_stops_child() {
 
 #[test]
 fn crash_restarts_with_backoff() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &["--crash-after", "1"], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     let r = w
@@ -843,6 +891,9 @@ fn crash_restarts_with_backoff() {
 
 #[test]
 fn server_request_answered_method_not_found() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &["--server-request"], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     assert!(
@@ -854,6 +905,9 @@ fn server_request_answered_method_not_found() {
 
 #[test]
 fn list_changed_triggers_relist() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &[], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     assert_eq!(w.gw().tools("fake").unwrap().len(), 2);
@@ -871,6 +925,9 @@ fn list_changed_triggers_relist() {
 
 #[test]
 fn results_and_stderr_masked_with_the_child_secrets() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let w = World::new(
         &server(
@@ -915,6 +972,9 @@ fn no_token_anywhere(w: &World, tok: &str) {
 /// control-stripped and short.
 #[test]
 fn initialize_error_text_is_masked_everywhere() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let d = daemon(&format!(
         "{}{}",
@@ -949,6 +1009,9 @@ fn initialize_error_text_is_masked_everywhere() {
 
 #[test]
 fn tools_list_error_text_is_masked() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let w = World::new(
         &server(
@@ -970,6 +1033,9 @@ fn tools_list_error_text_is_masked() {
 /// rewritten), with a masked note.
 #[test]
 fn tool_named_with_the_secret_is_dropped() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let tools = json!([
         {"name": format!("leak_{tok}"), "inputSchema": {"type": "object"}},
@@ -1002,6 +1068,9 @@ fn tool_named_with_the_secret_is_dropped() {
 /// slot) past the call's timeout, however full its pipe gets.
 #[test]
 fn call_times_out_when_child_stops_reading() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &["--block-tool", "block"], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     let r = w.call("fake", "block", json!({}), Duration::from_millis(300));
@@ -1028,6 +1097,9 @@ fn call_times_out_when_child_stops_reading() {
 /// 1000 list_changed notifications: at most two relists.
 #[test]
 fn list_changed_flood_is_coalesced() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &[], ""), &[]);
     w.wait_event("mcp_server_started", "fake", 1);
     let lists = |w: &World| w.log_text().matches("fake-mcp: got tools/list").count();
@@ -1049,6 +1121,9 @@ fn list_changed_flood_is_coalesced() {
 /// (the cancelled start's reaper).
 #[test]
 fn stop_during_initialize_clears_children() {
+    if !env_runnable() {
+        return;
+    }
     let w = World::new(&server("fake", &["--init-delay-ms", "20000"], ""), &[]);
     assert!(w.wait_log("fake-mcp: got initialize"), "{}", w.log_text());
     assert!(w.gw().has_children());
@@ -1114,6 +1189,9 @@ fn mcp_op(d: &TestDaemon, op: &str, args: Value) -> Value {
 
 #[test]
 fn mcp_call_through_the_daemon_masks_and_records() {
+    if !env_runnable() {
+        return;
+    }
     let tok = token();
     let policy = format!(
         "{}[[scope]]\nname = \"dev\"\nusers = [{:?}]\nservices = [\"mcp:fake\"]\n\n{}",
