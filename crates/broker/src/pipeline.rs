@@ -516,26 +516,38 @@ pub enum Outcome {
     },
 }
 
-/// Step 8: the body would be shown masked, so it cannot be approved.
-/// The body as the approver will see it, when that is exactly what will be
-/// sent: `None` if the masker would change it, or it is not UTF-8. The
-/// vault forms are compared on the raw bytes (a lossy UTF-8 view would
-/// hide a change inside invalid bytes), then the v1 patterns on the text.
-fn faithful_display(masker: &Masker, b: &[u8]) -> Option<String> {
+/// Step 8: the body as the approver will see it, when that is exactly what
+/// will be sent. `Err(rule)`: [`MASKED_CONTENT_RULE`] if the masker would
+/// change it, [`BODY_NOT_DISPLAYABLE_RULE`] if it is not UTF-8 (a binary
+/// `body = "raw"` upload). The vault forms are compared on the raw bytes
+/// first (a lossy UTF-8 view would hide a change inside invalid bytes), so
+/// a binary body that holds a vault value is still `masked_content`; then
+/// the v1 patterns on the text.
+fn faithful_display(masker: &Masker, b: &[u8]) -> Result<String, &'static str> {
     if masker.mask_bytes(b) != b {
-        return None;
+        return Err(MASKED_CONTENT_RULE);
     }
-    // Unreachable for body = "json" today (canonical JSON by now); defence in depth.
-    let text = std::str::from_utf8(b).ok()?;
-    (masker.mask_text(text) == text).then(|| text.to_string())
+    // Unreachable for body = "json" (canonical JSON by now); a binary raw
+    // body cannot be shown at all.
+    let text = std::str::from_utf8(b).map_err(|_| BODY_NOT_DISPLAYABLE_RULE)?;
+    if masker.mask_text(text) != text {
+        return Err(MASKED_CONTENT_RULE);
+    }
+    Ok(text.to_string())
 }
 
 pub const MASKED_CONTENT_RULE: &str = "masked_content";
+/// An `ask` call whose body is binary (not UTF-8): it cannot be shown to
+/// the approver, so it cannot be approved.
+pub const BODY_NOT_DISPLAYABLE_RULE: &str = "body_not_displayable";
 
 /// The fixed explanation a deny rule carries, if any.
 pub fn deny_reason(rule: &str) -> Option<&'static str> {
     match rule {
         MASKED_CONTENT_RULE => Some("cannot be approved: the request contains masked content"),
+        BODY_NOT_DISPLAYABLE_RULE => {
+            Some("cannot be approved: the request body is binary and cannot be shown for approval")
+        }
         _ => None,
     }
 }
@@ -905,8 +917,8 @@ async fn steps(
         let mut display = None;
         if let Some(b) = body.as_ref() {
             match faithful_display(masker, b) {
-                Some(text) => display = Some(cut_display(&text, BODY_DISPLAY_MAX)),
-                None => return denied(MASKED_CONTENT_RULE),
+                Ok(text) => display = Some(cut_display(&text, BODY_DISPLAY_MAX)),
+                Err(rule) => return denied(rule),
             }
         }
         let pending = PendingCall {
@@ -1611,16 +1623,24 @@ mod tests {
         let m = Masker::new(&["s3cr3t-vault-value"]);
         assert_eq!(
             faithful_display(&m, b"{\"a\":1}").as_deref(),
-            Some("{\"a\":1}")
+            Ok("{\"a\":1}")
         );
-        // Not UTF-8: refused even though nothing is masked.
-        assert_eq!(faithful_display(&m, b"{\"a\":\"\xff\xfe\"}"), None);
+        // Not UTF-8: refused even though nothing is masked, as binary.
+        assert_eq!(
+            faithful_display(&m, b"{\"a\":\"\xff\xfe\"}"),
+            Err(BODY_NOT_DISPLAYABLE_RULE)
+        );
         // A vault value, also beside invalid bytes (a lossy view would
-        // have replaced the bytes and hidden the difference).
-        assert_eq!(faithful_display(&m, b"x s3cr3t-vault-value y"), None);
-        assert_eq!(faithful_display(&m, b"\xff s3cr3t-vault-value"), None);
+        // have replaced the bytes and hidden the difference): masked
+        // content, binary or not.
+        for b in [&b"x s3cr3t-vault-value y"[..], b"\xff s3cr3t-vault-value"] {
+            assert_eq!(faithful_display(&m, b), Err(MASKED_CONTENT_RULE));
+        }
         // A v1 pattern.
-        assert_eq!(faithful_display(&m, b"API_TOKEN=x"), None);
+        assert_eq!(
+            faithful_display(&m, b"API_TOKEN=x"),
+            Err(MASKED_CONTENT_RULE)
+        );
     }
 
     #[test]

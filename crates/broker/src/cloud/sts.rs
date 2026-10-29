@@ -17,10 +17,10 @@ use http::{HeaderMap, HeaderValue, Method, Uri};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use ring::rand::{SecureRandom, SystemRandom};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::sigv4::{for_service, sign, AwsCreds};
-use super::CloudError;
+use super::{token, wipe, CloudError};
 use crate::request::Built;
 use crate::upstream::Upstream;
 
@@ -544,16 +544,12 @@ pub fn parse_assume_role(
     ))
 }
 
-/// Wipes a body that held credentials, when nothing else shares it.
-fn wipe(b: Bytes) {
-    if let Ok(mut m) = b.try_into_mut() {
-        m.as_mut().zeroize();
-    }
-}
-
 /// Calls `AssumeRole` with `base`, signed for `sts` in `region`. The
 /// expiry is the earlier of the answer's `Expiration` and
-/// `now + duration_s`; an answer already expired is refused.
+/// `now + duration_s`; an answer already expired is refused. Like every
+/// mint ([`token::mint`]), the exchange takes at most
+/// [`token::MINT_TIMEOUT`] (or the client's timeout, if shorter), for a
+/// lease and a sign-mode `role_arn` alike.
 pub async fn assume(
     up: &Upstream,
     base: &AwsCreds,
@@ -563,6 +559,7 @@ pub async fn assume(
 ) -> Result<(AwsCreds, OffsetDateTime), CloudError> {
     let mut b = assume_role_request(region, p)?;
     sign(&mut b, base, &for_service(region, "sts"), now)?;
+    let up = up.with_timeout(up.timeout().min(token::MINT_TIMEOUT));
     let r = up.send(b, MAX_RESPONSE).await?;
     if r.truncated {
         wipe(r.body);

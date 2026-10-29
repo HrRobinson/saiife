@@ -123,6 +123,12 @@ ask   = ["blobs:write", "blobs:delete"]
 account = "acmedata"
 ```
 
+A binary upload (`blobs.put` with a body that is not UTF-8 text, such as an
+image or an archive) cannot go through `ask`: the approver could not see it,
+so it is denied with the rule `body_not_displayable`. Put such uploads under
+`allow`, narrowed to a container or prefix and bounded with
+`writes_per_hour`, or upload text.
+
 ## Locked mode
 
 In locked mode (Linux) the agent user reaches Blob Storage only through

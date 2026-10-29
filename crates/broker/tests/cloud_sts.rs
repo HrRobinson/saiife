@@ -1168,3 +1168,33 @@ fn overlay_mirrors_decide() {
         Err(CloudError::Unrepresentable { .. })
     ));
 }
+
+/// `AssumeRole` is capped at `token::MINT_TIMEOUT` whatever the client's
+/// timeout (a sign-mode `role_arn` and a lease alike): an STS endpoint
+/// that accepts and never answers fails after 15 s, not after the
+/// client's hour. The clock is paused, so the test takes no 15 s.
+#[tokio::test(start_paused = true)]
+async fn assume_capped_at_mint_timeout() {
+    let pki = pki();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Accepts, holds the connection open, says nothing.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((tcp, _)) = listener.accept().await {
+            held.push(tcp);
+        }
+    });
+    let hour = Duration::from_secs(3600);
+    let up = Upstream::with_roots(pki.roots, Arc::new(Loopback(port)), hour);
+    let started = tokio::time::Instant::now();
+    let e = assume(&up, &base(), "us-east-1", &lease(None), now())
+        .await
+        .unwrap_err();
+    let took = started.elapsed();
+    assert!(
+        took >= saiife_broker::cloud::token::MINT_TIMEOUT && took < hour,
+        "took {took:?}: {e:?}"
+    );
+    assert!(took <= saiife_broker::cloud::token::MINT_TIMEOUT + Duration::from_secs(1));
+}

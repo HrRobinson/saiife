@@ -674,7 +674,7 @@ locked = true
 [[scope]]
 name = "agents"
 users = ["agent"]
-services = ["s3", "s3role", "s3role_x", "gcs", "gcs2", "gcs_ask", "arm", "arm_us", "arm_cn",
+services = ["s3", "s3_ask", "s3role", "s3role_x", "gcs", "gcs2", "gcs_ask", "arm", "arm_us", "arm_cn",
             "sf", "gcs_wrong"]
 
 [services.s3]
@@ -682,6 +682,12 @@ connector = "aws-s3"
 secret = "aws-keys"
 params = { region = "eu-west-1" }
 allow = ["s3:read"]
+
+[services.s3_ask]
+connector = "aws-s3"
+secret = "aws-keys"
+params = { region = "eu-west-1" }
+ask = ["s3:write"]
 
 [services.s3role]
 connector = "aws-s3"
@@ -782,7 +788,7 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
             "aws-keys",
             Kind::Aws,
             fields(&[("access_key_id", VAULT_AK), ("secret_access_key", VAULT_SK)]),
-            &["s3", "s3role", "s3role_x", "gcs_wrong"],
+            &["s3", "s3_ask", "s3role", "s3role_x", "gcs_wrong"],
         ),
         entry(
             "gcp-sa",
@@ -1522,6 +1528,43 @@ async fn ask_verdict_mints_nothing() {
     assert!(a["pending"].is_u64(), "the request waits for approval: {a}");
     assert_eq!(w.gcp_mints(), 0, "nothing minted for a request that waits");
     assert!(w.st.lock().unwrap().api.is_empty());
+}
+
+/// A binary `body = "raw"` upload under `ask` cannot be shown to the
+/// approver: it is refused as `body_not_displayable` (not as masked
+/// content), and nothing is stored or sent. A text upload still waits.
+#[tokio::test]
+async fn binary_raw_body_under_ask_not_displayable() {
+    let w = world(|_| {}).await;
+    let put = |b: &[u8]| {
+        json!({"service": "s3_ask", "operation": "s3.put_object",
+               "params": {"bucket": "reports", "key": "logo.png"},
+               "body_b64": STANDARD.encode(b)})
+    };
+    let a = w
+        .op("api.call", put(b"\x89PNG\r\n\x1a\n\x00\xff\xfe"))
+        .await;
+    assert_eq!(rule(&a), "body_not_displayable", "{a}");
+    let msg = a.to_string();
+    assert!(msg.contains("binary"), "{a}");
+    assert!(!msg.contains("masked content"), "{a}");
+    let rec = w.records("connector");
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0]["decision"], "deny");
+    assert_eq!(rec[0]["rule"], "body_not_displayable");
+    assert_eq!(
+        rec[0]["reason"],
+        "cannot be approved: the request body is binary and cannot be shown for approval"
+    );
+    assert!(
+        w.st.lock().unwrap().s3.is_empty(),
+        "a refused call was sent"
+    );
+    // A text body waits for approval as before.
+    let a = w.op("api.call", put(b"plain text upload\n")).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a["pending"].is_u64(), "{a}");
+    assert!(w.st.lock().unwrap().s3.is_empty());
 }
 
 /// Set in the child run of [`cloud_values_never_in_stderr`].

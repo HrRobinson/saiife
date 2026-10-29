@@ -185,7 +185,7 @@ pub(crate) mod linux {
 
     /// The broker's `warning` (an undefined project `env`: the base config
     /// was used), on stderr.
-    fn env_warning(ans: &Map<String, Value>) {
+    pub(crate) fn env_warning(ans: &Map<String, Value>) {
         if let Some(w) = ans.get("warning").and_then(Value::as_str) {
             eprintln!("saiife: warning: {}", crate::text::sanitize(w));
         }

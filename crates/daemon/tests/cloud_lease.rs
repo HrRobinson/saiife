@@ -17,10 +17,10 @@ use rustls::RootCertStore;
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_broker::cloud::session_policy;
 use saiife_broker::limits::Limiter;
-use saiife_broker::pipeline::{LockScope, Lockdown, PolicySnapshot};
+use saiife_broker::pipeline::{LockScope, Lockdown};
 use saiife_broker::upstream::{Resolver, Upstream};
 use saiife_broker::{Catalog, Manifest};
-use saiife_daemon::ops::{Ctx, CtxInit, GatewayPolicy, PolicyState};
+use saiife_daemon::ops::{Ctx, CtxInit, GatewayPolicy, Mode as DaemonMode, PolicyState};
 use saiife_daemon::sessions::RealProc;
 use saiife_daemon::tokens::Tokens;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
@@ -47,15 +47,33 @@ const EXE: &str = "/usr/bin/true";
 // Built at runtime: no token-shaped literal in the source.
 const VAULT_AK: &str = concat!("AK", "IA", "TESTVAULT0000002");
 const VAULT_SK: &str = concat!("vaultSecret", "Key/1234567890", "lEaSeKEY+abc");
+const STAGING_AK: &str = concat!("AK", "IA", "TESTSTAGE0000003");
+const STAGING_SK: &str = concat!("stagingSecret", "Key/1234567890", "sTaGeKEY+abc");
+const PROD_AK: &str = concat!("AK", "IA", "TESTPROD00000004");
+const PROD_SK: &str = concat!("prodSecret", "Key/1234567890", "pRoDkEy+abcdef");
 const SESSION_AK: &str = concat!("AS", "IA", "TESTLEASE000001");
 const SESSION_SK: &str = concat!("leaseSecret", "Key/0987654321", "QwErTyUi");
 const SESSION_TOKEN: &str = concat!("leaseSession", "EXAMPLEsession", "TokenValue7777==");
 /// What the STS error message says; it must never be recorded or answered.
 const STS_MESSAGE: &str = "User is not authorized to perform sts:AssumeRole on the lease role";
 
-fn secret_values() -> [&'static str; 5] {
-    [VAULT_AK, VAULT_SK, SESSION_AK, SESSION_SK, SESSION_TOKEN]
+fn secret_values() -> [&'static str; 9] {
+    [
+        VAULT_AK,
+        VAULT_SK,
+        STAGING_AK,
+        STAGING_SK,
+        PROD_AK,
+        PROD_SK,
+        SESSION_AK,
+        SESSION_SK,
+        SESSION_TOKEN,
+    ]
 }
+
+/// The `allow` of `s3sts` in the `staging` environment: narrower than the
+/// base `s3:read`.
+const STAGING_ALLOW: &str = "s3:read:arn:aws:s3:::reports/**";
 
 // ---------------------------------------------------------------- mock
 
@@ -237,8 +255,14 @@ fn s3_manifest() -> Manifest {
     Manifest::parse(&text).unwrap()
 }
 
-/// `link` is a `run_allow` entry that is a symlink to an interpreter.
-fn config(link: &Path) -> String {
+/// `link` is a `run_allow` entry that is a symlink to an interpreter;
+/// `scope_env` binds the caller's scope to an environment. Two
+/// environments override `s3sts`: `staging` (its own secret, a narrower
+/// allow) and `prod` (its own secret).
+fn config(link: &Path, scope_env: Option<&str>) -> String {
+    let scope_env = scope_env
+        .map(|e| format!("env = \"{e}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"version = 2
 locked = true
@@ -247,6 +271,13 @@ locked = true
 name = "agents"
 users = ["agent"]
 services = ["s3sts", "s3sign", "s3link", "s3rpm", "s3unrep"]
+{scope_env}
+[environments.staging.services.s3sts]
+secret = "aws-staging"
+allow = ["{STAGING_ALLOW}"]
+
+[environments.prod.services.s3sts]
+secret = "aws-prod"
 
 [services.s3unrep]
 connector = "aws-s3"
@@ -323,6 +354,18 @@ async fn world(status: u16) -> World {
 /// A daemon on `tmp` (fresh, or the dirs of a stopped one: a restart),
 /// with `limiter`.
 async fn world_in(tmp: tempfile::TempDir, status: u16, limiter: Limiter) -> World {
+    world_setup(tmp, status, limiter, DaemonMode::Locked, None).await
+}
+
+/// A daemon of `mode` (locked, or the personal broker), its scope bound to
+/// `scope_env`.
+async fn world_setup(
+    tmp: tempfile::TempDir,
+    status: u16,
+    limiter: Limiter,
+    mode: DaemonMode,
+    scope_env: Option<&str>,
+) -> World {
     let audit = tmp.path().join("audit");
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&audit).unwrap();
@@ -355,42 +398,45 @@ async fn world_in(tmp: tempfile::TempDir, status: u16, limiter: Limiter) -> Worl
     let VaultState::Ready(v) = &mut vault else {
         panic!("vault not ready");
     };
-    v.put(Entry {
-        name: "aws-keys".into(),
-        kind: Kind::Aws,
-        fields: [("access_key_id", VAULT_AK), ("secret_access_key", VAULT_SK)]
-            .iter()
-            .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
-            .collect(),
-        // Every service may use it; `s3out` is out of the caller's scope.
-        allowed_services: ["s3sts", "s3sign", "s3out", "s3link", "s3rpm", "s3unrep"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        created_by: 0,
-        created: "2026-10-28T00:00:00Z".into(),
-        last_used: None,
-        rotate_after: None,
-    })
-    .unwrap();
+    // Every service may use `aws-keys`; `s3out` is out of the caller's
+    // scope. The environments' secrets are for `s3sts`.
+    let all: &[&str] = &["s3sts", "s3sign", "s3out", "s3link", "s3rpm", "s3unrep"];
+    for (name, ak, sk, services) in [
+        ("aws-keys", VAULT_AK, VAULT_SK, all),
+        ("aws-staging", STAGING_AK, STAGING_SK, &["s3sts"][..]),
+        ("aws-prod", PROD_AK, PROD_SK, &["s3sts"][..]),
+    ] {
+        v.put(Entry {
+            name: name.into(),
+            kind: Kind::Aws,
+            fields: [("access_key_id", ak), ("secret_access_key", sk)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+                .collect(),
+            allowed_services: services.iter().map(|s| s.to_string()).collect(),
+            created_by: 0,
+            created: "2026-10-28T00:00:00Z".into(),
+            last_used: None,
+            rotate_after: None,
+        })
+        .unwrap();
+    }
 
-    let config: SystemConfig = toml::from_str(&config(&link)).unwrap();
+    let config: SystemConfig = toml::from_str(&config(&link, scope_env)).unwrap();
+    let gateway = GatewayPolicy::build(
+        &config,
+        &[],
+        Catalog::new(&[], vec![s3_manifest()]),
+        mode.policy_mode(),
+    )
+    .unwrap();
     let policy = PolicyState {
         hash: Some("sha256:test".into()),
         ok: true,
         min_free_mb: 0,
         admin_groups: vec![],
         system: Some(Arc::new(config.clone())),
-        gateway: Some(Arc::new(GatewayPolicy {
-            snap: PolicySnapshot {
-                config: config.clone(),
-                hash: "sha256:test".into(),
-                mode: Mode::Locked,
-                env: None,
-            },
-            by_env: Default::default(),
-            catalog: Catalog::new(&[], vec![s3_manifest()]),
-        })),
+        gateway: Some(Arc::new(gateway)),
     };
     let st: Shared = Arc::new(Mutex::new(State {
         status,
@@ -398,6 +444,7 @@ async fn world_in(tmp: tempfile::TempDir, status: u16, limiter: Limiter) -> Worl
     }));
     let up = mock(st.clone()).await;
     let ctx = Arc::new(Ctx::new(CtxInit {
+        mode,
         own_user: "agent".into(),
         audit_dir: audit.clone(),
         socket_dir: tmp.path().join("run"),
@@ -868,4 +915,149 @@ async fn leases_count_after_a_restart() {
     assert_eq!(a["error"], "limited", "{a}");
     assert_eq!(a["limit"], "requests_per_minute", "{a}");
     assert_eq!(w.sts_calls(), 0, "the new daemon called STS");
+}
+
+// ------------------------------------------------- the project env
+
+/// The personal broker (developer mode) on a fresh dir, its scope bound
+/// to `prod` (which a personal broker does not act on).
+async fn personal() -> World {
+    world_setup(
+        scratch(),
+        200,
+        Limiter::new(),
+        DaemonMode::Personal,
+        Some("prod"),
+    )
+    .await
+}
+
+/// The access key id that signed each STS call, in order.
+fn signers(w: &World) -> Vec<String> {
+    w.st.lock()
+        .unwrap()
+        .sts
+        .iter()
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn personal_lease_follows_the_project_env() {
+    let w = personal().await;
+    let g = w.ctx.policy().gateway.unwrap();
+    // No env: the base config (its secret, its allow).
+    let a = w.lease("s3sts", EXE).await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("warning").is_none(), "{a}");
+    // `env = "staging"`: that environment's secret signs the AssumeRole,
+    // and the session policy follows its narrower allow.
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "staging",
+                           "project": "/home/agent/proj"}))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("warning").is_none(), "{a}");
+    assert_eq!(signers(&w), [VAULT_AK, STAGING_AK]);
+    let base_svc = &g.snapshot_for(None).config.services["s3sts"];
+    let staging_svc = &g.snapshot_for(Some("staging")).config.services["s3sts"];
+    assert_eq!(staging_svc.allow, [STAGING_ALLOW]);
+    let base = session_policy::build(base_svc, &s3_manifest(), None, Mode::Developer).unwrap();
+    let staging =
+        session_policy::build(staging_svc, &s3_manifest(), None, Mode::Developer).unwrap();
+    assert_ne!(base.json, staging.json);
+    assert_eq!(w.policies_sent(), [base.json.clone(), staging.json.clone()]);
+    assert!(
+        staging.json.contains("arn:aws:s3:::reports/*"),
+        "{}",
+        staging.json
+    );
+    // The records name the environment and the project.
+    let recs = w.leases();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0]["env"], Value::Null);
+    assert_eq!(recs[0]["project"], "");
+    assert_eq!(recs[1]["env"], "staging");
+    assert_eq!(recs[1]["project"], "/home/agent/proj");
+    assert_eq!(recs[1]["policy_sha256"], staging.sha256);
+    // The record's `policy` is that environment's hash, as for `api.call`.
+    assert_eq!(recs[0]["policy"], g.snapshot_for(None).hash.as_str());
+    assert_eq!(
+        recs[1]["policy"],
+        g.snapshot_for(Some("staging")).hash.as_str()
+    );
+    assert_ne!(recs[0]["policy"], recs[1]["policy"]);
+    w.assert_records_clean();
+}
+
+#[tokio::test]
+async fn personal_lease_undefined_env_warns() {
+    let w = personal().await;
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "qa"}))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    let warn = a["warning"].as_str().unwrap_or_default();
+    assert!(
+        warn.contains("\"qa\"") && warn.contains("not defined"),
+        "{a}"
+    );
+    // The base config: its secret, env null in the record.
+    assert_eq!(signers(&w), [VAULT_AK]);
+    let recs = w.leases();
+    assert_eq!(recs[0]["env"], Value::Null);
+    // A refused lease keeps the warning too.
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": "/usr/bin/false", "env": "qa"}))
+        .await;
+    assert_eq!(rule(&a), "exe_not_allowed", "{a}");
+    assert!(
+        a["warning"].as_str().unwrap_or_default().contains("qa"),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn locked_lease_ignores_a_client_env() {
+    let w = world_setup(
+        scratch(),
+        200,
+        Limiter::new(),
+        DaemonMode::Locked,
+        Some("prod"),
+    )
+    .await;
+    // The scope's `prod`, whatever the client sends; no warning, even for
+    // an undefined name.
+    for env in [json!("staging"), json!("qa"), Value::Null] {
+        let a = w
+            .lease_with(json!({"service": "s3sts", "exe": EXE, "env": env}))
+            .await;
+        assert_eq!(a["ok"], true, "{a}");
+        assert!(a.get("warning").is_none(), "{a}");
+    }
+    assert_eq!(signers(&w), [PROD_AK, PROD_AK, PROD_AK]);
+    let recs = w.leases();
+    assert!(recs.iter().all(|r| r["env"] == "prod"), "{recs:?}");
+    // A malformed env is a bad request in every mode: no lease, no record.
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "Bad Name"}))
+        .await;
+    assert_eq!(a["error"], "bad_request", "{a}");
+    assert_eq!(w.sts_calls(), 3);
+    assert_eq!(w.leases().len(), 3);
+    w.assert_records_clean();
+}
+
+#[tokio::test]
+async fn locked_lease_without_scope_env_runs_base() {
+    // No scope env: a client `env` still does not pick one.
+    let w = world(200).await;
+    let a = w
+        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "staging"}))
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a.get("warning").is_none(), "{a}");
+    assert_eq!(signers(&w), [VAULT_AK]);
+    assert_eq!(w.leases()[0]["env"], Value::Null);
 }

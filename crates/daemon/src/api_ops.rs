@@ -317,6 +317,18 @@ pub(crate) fn parse_env(args: &Map<String, Value>) -> Result<Option<String>, &'s
     }
 }
 
+/// The optional `project` argument of `api.call` and `cloud.lease`: the
+/// project path the client reports, for the record only (empty if absent).
+pub(crate) fn parse_project(args: &Map<String, Value>) -> Result<String, &'static str> {
+    match args.get("project") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) if s.len() <= MAX_PROJECT && !s.contains(['\n', '\r', '\0']) => {
+            Ok(s.clone())
+        }
+        Some(_) => Err("project must be a path"),
+    }
+}
+
 /// The arguments of `api.call`, checked. Errors never quote a value.
 pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Call), &'static str> {
     let service = args
@@ -395,13 +407,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         Some(_) => return Err("headers must be an array"),
     }
     let overlay = parse_overlay(args.get("overlay"))?;
-    let project = match args.get("project") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) if s.len() <= MAX_PROJECT && !s.contains(['\n', '\r', '\0']) => {
-            s.clone()
-        }
-        Some(_) => return Err("project must be a path"),
-    };
+    let project = parse_project(args)?;
     let collection = match args.get("collection") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),

@@ -2047,6 +2047,54 @@ fn agent_sigv4_headers_dropped_and_unlistable() {
     assert!(Manifest::check(&m).is_ok());
 }
 
+/// A SigV4 manifest may list or fix no `x-amz-*` header at all: each is
+/// signed into the call and can change what it does (a PUT with
+/// `x-amz-copy-source` is a copy), and policy never sees headers.
+#[test]
+fn sigv4_manifest_refuses_every_amz_header() {
+    for h in [
+        "x-amz-copy-source",
+        "X-Amz-Acl",
+        "x-amz-grant-read",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-website-redirect-location",
+        "x-amz-tagging",
+        "x-amz-metadata-directive",
+        "X-Amz-Target",
+        "x-amz-meta-anything",
+    ] {
+        // Listed for the agent.
+        let err = s3_with(
+            r#"request_headers = ["Content-Type", "X-Agent", "X-Both"]"#,
+            &format!(r#"request_headers = ["Content-Type", "{h}"]"#),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BrokerError::Manifest(m) if m.contains("x-amz-")),
+            "{h}: {err:?}"
+        );
+        // Fixed manifest-wide.
+        let err = s3_with(
+            r#"headers = { "X-Both" = "manifest", "X-Fixed" = "manifest" }"#,
+            &format!(r#"headers = {{ "X-Both" = "manifest", "{h}" = "v" }}"#),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerError::Manifest(_)), "{h}: {err:?}");
+        // Fixed on one operation.
+        let err = s3_with(
+            r#"headers = { "x-both" = "op", "X-Agent" = "op-{region}" }"#,
+            &format!(r#"headers = {{ "x-both" = "op", "{h}" = "v" }}"#),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BrokerError::Manifest(_)), "{h}: {err:?}");
+    }
+    // Without SigV4 auth the same names are ordinary headers.
+    let mut m = auth_manifest(r#"{ kind = "bearer", secret_field = "token" }"#, "").unwrap();
+    m.request_headers.push("x-amz-copy-source".into());
+    assert!(Manifest::check(&m).is_ok());
+}
+
 #[test]
 fn object_param_last_in_qualifier() {
     let from = "qualifier = \"arn:aws:s3:::{bucket}/{key}\"";

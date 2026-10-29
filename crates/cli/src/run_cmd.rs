@@ -389,13 +389,21 @@ mod linux {
         let cfg = saiife_policy::load_system(config.config())
             .map_err(|e| Stop::Unavailable(format!("cannot read the {what} config: {e}")))?
             .config;
-        let (_, overlays, _) = crate::api_cmd::linux::project_for(&cfg, config);
+        // The project `env` too, by the same rule: only to the personal
+        // broker (`project_for` leaves it out for a locked target, whose
+        // daemon takes the scope's).
+        let (project, overlays, env) = crate::api_cmd::linux::project_for(&cfg, config);
+        a.insert("project".into(), json!(project));
         if let Some(o) = overlays.get(service) {
             if !o.ask.is_empty() || !o.deny.is_empty() {
                 a.insert("overlay".into(), json!({"ask": o.ask, "deny": o.deny}));
             }
         }
+        if let Some(e) = env {
+            a.insert("env".into(), e.into());
+        }
         let ans = call_within(config, "cloud.lease", a, LEASE_TIMEOUT)?;
+        crate::api_cmd::linux::env_warning(&ans);
         let lease =
             cloud_env(ans.get("env").and_then(|e| e.as_object())).map_err(Stop::Unavailable)?;
         let expires = ans

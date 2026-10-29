@@ -139,6 +139,12 @@ allow = ["storage:read:projects/_/buckets/acme-data", "storage:read:projects/_/b
 ask   = ["storage:write", "storage:delete"]
 ```
 
+A binary upload (`storage.objects.insert` with a body that is not UTF-8
+text, such as an image or an archive) cannot go through `ask`: the approver
+could not see it, so it is denied with the rule `body_not_displayable`. Put
+such uploads under `allow`, narrowed to a bucket or prefix and bounded with
+`writes_per_hour`, or upload text.
+
 ## Locked mode
 
 In locked mode (Linux) the agent user reaches Cloud Storage only through

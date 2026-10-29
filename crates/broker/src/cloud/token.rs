@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use super::jwt::{assertion, GcpKey};
-use super::CloudError;
+use super::{wipe, CloudError};
 use crate::oauth2::Token;
 use crate::request::Built;
 use crate::upstream::Upstream;
@@ -301,12 +301,18 @@ pub async fn mint(up: &Upstream, req: Built) -> Result<Token, CloudError> {
     let up = up.with_timeout(up.timeout().min(MINT_TIMEOUT));
     let r = up.send(req, MAX_RESPONSE).await?;
     if (300..400).contains(&r.status) {
+        wipe(r.body);
         return Err(BrokerError::RedirectRefused.into());
     }
     if r.truncated {
+        wipe(r.body);
         return Err(CloudError::TooLarge);
     }
-    parse_token_response(r.status, &r.body)
+    // The answer held the token: wiped once it is parsed, as in
+    // `sts::assume`.
+    let parsed = parse_token_response(r.status, &r.body);
+    wipe(r.body);
+    parsed
 }
 
 #[cfg(test)]

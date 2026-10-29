@@ -33,3 +33,35 @@ pub enum CloudError {
     #[error("cloud answer or session policy too large")]
     TooLarge,
 }
+
+/// Wipes an endpoint answer that held credentials or a token (`sts`,
+/// `token`), when nothing else shares its buffer.
+pub(crate) fn wipe(b: bytes::Bytes) {
+    drop(zeroed(b));
+}
+
+/// `b`'s buffer, zeroed; `None` when another handle shares it (it is then
+/// left to the last owner).
+fn zeroed(b: bytes::Bytes) -> Option<bytes::BytesMut> {
+    use zeroize::Zeroize;
+    let mut m = b.try_into_mut().ok()?;
+    m.as_mut().zeroize();
+    Some(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_unique_answer_is_zeroed() {
+        let b = bytes::Bytes::from(b"{\"access_token\":\"value\"}".to_vec());
+        let m = zeroed(b).expect("a unique buffer is wiped");
+        assert!(!m.is_empty() && m.iter().all(|&x| x == 0));
+        // A shared one is left to its last owner.
+        let b = bytes::Bytes::from(b"shared".to_vec());
+        let other = b.clone();
+        assert!(zeroed(b).is_none());
+        assert_eq!(&other[..], b"shared");
+    }
+}

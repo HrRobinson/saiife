@@ -22,7 +22,10 @@ manifest is `crates/broker/connectors/aws-s3.toml`, embedded at build time.
   present is signed and the policy does not see headers, so no header that
   changes what a call does is accepted: `x-amz-copy-source`, `x-amz-acl`,
   `x-amz-grant-*`, the encryption, tagging, object-lock, MFA and
-  request-payer headers are all dropped.
+  request-payer headers are all dropped. A custom manifest that signs with
+  SigV4 cannot add one back: a manifest that lists any `x-amz-*` header in
+  `request_headers`, or sets one as a fixed header, is refused when it
+  loads.
 - Vendor reference:
   <https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html>,
   <https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html>,
@@ -188,16 +191,22 @@ Read this before you turn STS mode on.
   at most 900 s and stay within the session policy, but they work from
   anywhere until then.
 - Each lease is a `secret` record with `event = "cloud_lease"`. It holds
-  `service`, `exe`, `role_arn`, `expires`, `policy_sha256` and the STS
-  session name in `sts_session` (the record's `session` is the agent
-  session). No credential value is written to it. The `cloud.lease` answer
-  names the STS session `session`.
-- Under the personal broker a lease runs under the broker's base config,
-  with no project `env`.
+  `service`, `exe`, `project`, `env`, `role_arn`, `expires`, `policy_sha256`
+  and the STS session name in `sts_session` (the record's `session` is the
+  agent session). No credential value is written to it. The `cloud.lease`
+  answer names the STS session `session`.
+- A lease picks its environment as `saiife api` does. Under the personal
+  broker, the project's `env` (from `.saiife/config.toml`) chooses the
+  environment, so its `secret` signs the `AssumeRole` and its `allow`,
+  `ask` and `deny` build the session policy. An `env` that is not defined
+  falls back to the base config, and `saiife run --cloud` prints a warning.
+  Under the locked daemon the environment is the one bound to your scope,
+  and a project `env` is ignored.
 
 ### The session policy
 
-The session policy is built only from the admin config and the manifest.
+The session policy is built only from the admin config (in the lease's
+environment) and the manifest.
 
 - An `allow` pattern gives `Allow <IAM action>` on its qualifier. A missing
   qualifier means `*`, and a trailing `**` means `*`.
@@ -283,6 +292,12 @@ ask   = ["s3:write", "s3:delete"]
 [services.s3.params]
 region = "eu-west-1"
 ```
+
+A binary upload (`s3.put_object` with a body that is not UTF-8 text, such as
+an image or an archive) cannot go through `ask`: the approver could not see
+it, so it is denied with the rule `body_not_displayable`. Put such uploads
+under `allow`, narrowed to a prefix and bounded with `writes_per_hour`, or
+upload text.
 
 ## Known limits
 

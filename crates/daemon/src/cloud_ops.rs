@@ -10,11 +10,14 @@
 //! (`Ctx.oauth`) holds sign-mode credentials only.
 //!
 //! The client sends `service`, `exe` and, optionally, the project's
-//! `overlay` (as for `api.call`). The role, the scope of the session and
-//! its policy come from the config in force (the caller's environment
-//! snapshot, as for `api.call`) and the connector manifest; of the overlay
-//! only `ask` and `deny` count, so it can only add `Deny` statements and
-//! never widens the session.
+//! `overlay`, `env` and `project` path (as for `api.call`). The role, the
+//! scope of the session and its policy come from the config in force (the
+//! caller's environment snapshot, as for `api.call`: the scope's in locked
+//! mode, where a client `env` is ignored; the project `env` for the
+//! personal broker, an undefined one falling back to the base config with
+//! a `warning`) and the connector manifest; of the overlay only `ask` and
+//! `deny` count, so it can only add `Deny` statements and never widens the
+//! session.
 //!
 //! The record's `sts_session` is the STS session name; its `session` is
 //! the agent session, as in every record (the limiter rebuilds the lease's
@@ -29,21 +32,24 @@
 //! and `AssumeRole` (`token_mint_failed`).
 //!
 //! Every answer writes one `secret` record, `event = "cloud_lease"`, with
-//! `service`, `exe` and what is known of `role_arn`, `sts_session`, `expires`
-//! and `policy_sha256`. It never holds a credential, and a failed
+//! `service`, `exe`, `project`, `env` (the snapshot's environment, null for
+//! the base config) and what is known of `role_arn`, `sts_session`,
+//! `expires` and `policy_sha256`. It never holds a credential, and a failed
 //! `AssumeRole` keeps only the sanitized STS error code (decision 18).
 //!
 //! Trust boundary: as for `secret.lease`, any process of the caller's uid
 //! can ask, and the `exe` check binds only the honest client. The
 //! credentials are bounded by the session policy and 15 minutes.
 
-use crate::api_ops::{gateway_mode, parse_overlay, valid_service, Groups};
+use crate::api_ops::{
+    gateway_mode, parse_env, parse_overlay, parse_project, valid_service, Groups,
+};
 use crate::ops::{Ctx, Notice};
 use crate::secret_ops::{check_exe, MAX_EXE_BYTES};
 use crate::sessions::agent_ancestor;
 use crate::vault::Kind;
 use saiife_audit::DecisionKind;
-use saiife_broker::cloud::{session_policy, sts, token, CloudError};
+use saiife_broker::cloud::{session_policy, sts, CloudError};
 use saiife_broker::limits::Key;
 use saiife_broker::manifest::OpKind;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request};
@@ -77,6 +83,13 @@ struct Facts {
     expires: Option<String>,
     policy_sha256: Option<String>,
     agent_session: Option<String>,
+    /// The environment snapshot the lease was decided under (`None`: base).
+    env: Option<String>,
+    /// That snapshot's policy hash (the record's `policy`, as for a
+    /// `connector` record).
+    policy_hash: Option<String>,
+    /// The `warning` the environment choice left (an undefined project env).
+    warning: Option<String>,
 }
 
 /// An overlay as a lease counts it: its `allow` dropped, so it can only
@@ -126,6 +139,17 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(o) => o,
         Err(m) => return err(id, ErrorCode::BadRequest, m),
     };
+    // The project's `env` and path, as `api.call` takes them: a malformed
+    // env is a bad request in every mode; only the personal broker acts on
+    // it (`select_env`).
+    let project_env = match parse_env(&req.args) {
+        Ok(e) => e,
+        Err(m) => return err(id, ErrorCode::BadRequest, m),
+    };
+    let project = match parse_project(&req.args) {
+        Ok(p) => p,
+        Err(m) => return err(id, ErrorCode::BadRequest, m),
+    };
     let mut facts = Facts::default();
     // Lockdown first: under either scope no credential is handed out.
     let verdict = match ctx.lockdown.get() {
@@ -141,7 +165,16 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 ctx.notice(peer.uid, Notice::LowDisk);
                 return err(id, code, "the audit volume is below [audit] min_free_mb");
             }
-            decide(ctx, peer, &service, &exe, overlay, &mut facts).await
+            decide(
+                ctx,
+                peer,
+                &service,
+                &exe,
+                overlay,
+                project_env.as_deref(),
+                &mut facts,
+            )
+            .await
         }
     };
     let mut r = ctx.record("secret", &format!("cloud_lease {service} {exe}"));
@@ -150,6 +183,13 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     r.extra.insert("event".into(), "cloud_lease".into());
     r.extra.insert("service".into(), service.clone().into());
     r.extra.insert("exe".into(), exe.clone().into());
+    // As in a `connector` record: the reported project, masked (agent
+    // input), and the environment the lease was decided under.
+    r.project = saiife_broker::mask::Masker::new(&[]).mask_text(&project);
+    r.extra.insert("env".into(), json!(facts.env));
+    if let Some(h) = facts.policy_hash.take().filter(|h| !h.is_empty()) {
+        r.policy = Some(h);
+    }
     // The agent session (the limiter bucket); the STS session name is
     // `sts_session` (a record's `session` is the agent session).
     r.session.clone_from(&facts.agent_session);
@@ -181,6 +221,9 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             m.insert("env".into(), Value::Object(g.env));
             m.insert("expires".into(), g.expires.into());
             m.insert("session".into(), g.session.into());
+            if let Some(w) = facts.warning {
+                m.insert("warning".into(), w.into());
+            }
             ok(id, m)
         }
         Err(Deny { rule, detail, code }) => {
@@ -192,6 +235,9 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             }
             let mut extra = Map::new();
             extra.insert("rule".into(), rule.into());
+            if let Some(w) = facts.warning {
+                extra.insert("warning".into(), w.into());
+            }
             if code == ErrorCode::Limited {
                 ctx.notify_limit(peer.uid, &service, "cloud.lease", rule);
                 extra.insert("limit".into(), rule.into());
@@ -209,23 +255,28 @@ async fn decide(
     service: &str,
     exe: &str,
     overlay: Option<ServiceOverlay>,
+    project_env: Option<&str>,
     facts: &mut Facts,
 ) -> Result<Granted, Deny> {
     let state = ctx.policy();
     let Some(g) = &state.gateway else {
         return Err(deny("policy_invalid", "no valid policy is loaded"));
     };
-    // Scope: the caller's, in the environment snapshot it runs under (the
-    // scope's in locked mode; the base config for the personal broker, as
-    // the lease names no project environment).
+    // Scope: the caller's, in the environment snapshot it runs under, as
+    // for `api.call`: the scope's in locked mode (a client `env` ignored);
+    // the project `env` for the personal broker, an undefined one the base
+    // config with a warning.
     let Some(user) = ctx.name_of(peer.uid).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
     let groups = Groups(ctx.groups_of(&user).await);
-    let (env_name, _) = g
-        .select_env(gateway_mode(ctx), &groups, &user, None)
+    let (env_name, warning) = g
+        .select_env(gateway_mode(ctx), &groups, &user, project_env)
         .map_err(|rule| deny(rule, "the caller's environment has no policy"))?;
+    facts.warning = warning;
     let snap = g.snapshot_for(env_name);
+    facts.env.clone_from(&snap.env);
+    facts.policy_hash = Some(snap.hash.clone());
     match scope_for(&snap.config, &groups, &user) {
         Ok(Some(s)) if s.services.iter().any(|x| x == service) => {}
         Ok(_) => return Err(deny("no_scope", "the service is not in the caller's scope")),
@@ -342,15 +393,13 @@ async fn decide(
         policy: Some(&policy.json),
         external_id: svc.cloud.external_id.as_deref(),
     };
-    let up = up.with_timeout(up.timeout().min(token::MINT_TIMEOUT));
-    // What was sent counts, whatever came back.
+    // What was sent counts, whatever came back. `sts::assume` caps the
+    // exchange at `token::MINT_TIMEOUT`.
     reservation.commit();
-    let (creds, exp) = sts::assume(&up, &base, region, &p, now)
-        .await
-        .map_err(|e| {
-            let reason = crate::oauth::mint_reason(&e);
-            deny(crate::oauth::MINT_FAILED, reason)
-        })?;
+    let (creds, exp) = sts::assume(up, &base, region, &p, now).await.map_err(|e| {
+        let reason = crate::oauth::mint_reason(&e);
+        deny(crate::oauth::MINT_FAILED, reason)
+    })?;
     drop(base);
     let expires = timestamp(exp);
     facts.expires = Some(expires.clone());

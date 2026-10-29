@@ -255,6 +255,15 @@ fn bad(m: &str, why: impl std::fmt::Display) -> BrokerError {
     BrokerError::Manifest(format!("{m}: {why}"))
 }
 
+/// An `x-amz-*` header name (any case). A SigV4 manifest may neither list
+/// one in `request_headers` nor set one as a fixed header: the signer sets
+/// its own ([`SIGV4_HEADERS`]), and every other one can change what a signed
+/// call does (`x-amz-copy-source` turns a PUT into a copy, `x-amz-target`
+/// picks a JSON-protocol action, ...).
+fn is_amz_header(name: &str) -> bool {
+    name.len() >= 6 && name.as_bytes()[..6].eq_ignore_ascii_case(b"x-amz-")
+}
+
 /// One segment of a path template: a literal, or `prefix{name}suffix` with
 /// exactly one placeholder (so `{order_id}.json` works).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,17 +386,17 @@ impl Manifest {
             check_auth(a).map_err(|e| bad(id, e))?;
         }
         self.check_headers(&self.headers).map_err(|e| bad(id, e))?;
-        // The SigV4 signer owns its headers: the agent may not be allowed
-        // to send one.
+        // A SigV4 connector lists no `x-amz-*` request header: the signer
+        // owns its own, and the others change what a signed call does
+        // (`x-amz-copy-source`, `x-amz-acl`, `x-amz-target`, ...), which
+        // policy never sees. No exception: no built-in needs one.
         if self.signs_sigv4() {
-            if let Some(h) = self
-                .request_headers
-                .iter()
-                .find(|h| SIGV4_HEADERS.contains(&h.to_ascii_lowercase().as_str()))
-            {
+            if let Some(h) = self.request_headers.iter().find(|h| is_amz_header(h)) {
                 return Err(bad(
                     id,
-                    format!("request_headers: {h} is set by the SigV4 signer"),
+                    format!(
+                        "request_headers: {h}: no x-amz-* header may be listed for a SigV4 connector"
+                    ),
                 ));
             }
         }
@@ -761,6 +770,13 @@ impl Manifest {
             {
                 return Err(format!(
                     "header {name}: set by the broker, not the manifest"
+                ));
+            }
+            // As for `request_headers`: a fixed `x-amz-*` header would be
+            // signed into every call and can change what it does.
+            if sigv4 && is_amz_header(lower) {
+                return Err(format!(
+                    "header {name}: no x-amz-* header may be set by a SigV4 connector"
                 ));
             }
             if !value.bytes().all(|b| (0x20..0x7f).contains(&b)) {
