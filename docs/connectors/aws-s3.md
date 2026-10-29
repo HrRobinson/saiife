@@ -190,7 +190,7 @@ Read this before you turn STS mode on.
 - Each lease is a `secret` record with `event = "cloud_lease"`. It holds
   `service`, `exe`, `role_arn`, `expires`, `policy_sha256` and the STS
   session name in `sts_session` (the record's `session` is the agent
-  session). It never holds a credential value. The `cloud.lease` answer
+  session). No credential value is written to it. The `cloud.lease` answer
   names the STS session `session`.
 - Under the personal broker a lease runs under the broker's base config,
   with no project `env`.
