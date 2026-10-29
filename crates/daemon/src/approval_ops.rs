@@ -107,6 +107,21 @@ pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
 
 // ------------------------------------------------------------ create
 
+/// The display is the request itself only when masking changed none of it
+/// (step 8 already refused a body it would change, and a binary raw body
+/// as `body_not_displayable`): only then may an identical pending request
+/// be given back (decision 8). A body without a display (plan 15's binary
+/// raw upload, should one ever reach here) is never faithful: its hash
+/// alone is not what the approver reads.
+fn display_is_faithful(p: &PendingCall) -> bool {
+    p.operation == p.stored.operation
+        && p.project == p.stored.project
+        && *p.params.get() == p.stored.params
+        && p.headers == p.stored.headers
+        && p.body_sha256 == p.stored.body_sha256
+        && (p.body_sha256.is_none() || p.body_display.is_some())
+}
+
 /// Step 8 for the daemon: seal `p`'s exact request (bound to its id), store
 /// it with the masked display copy, and write its `approval`/`created`
 /// record. Errs with the deny rule; nothing is left pending on an error.
@@ -122,14 +137,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     let exact = Zeroizing::new(
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
-    // The display is the request itself only when masking changed none of
-    // it (step 8 already refused a body it would change): only then may an
-    // identical pending request be given back (decision 8).
-    let faithful = p.operation == p.stored.operation
-        && p.project == p.stored.project
-        && *p.params.get() == p.stored.params
-        && p.headers == p.stored.headers
-        && p.body_sha256 == p.stored.body_sha256;
+    let faithful = display_is_faithful(p);
     let new = NewRequest {
         uid: p.stored.uid,
         user: p.stored.user.clone(),
@@ -1684,4 +1692,44 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
         }
     }
     ok(id, m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saiife_broker::mask::Masker;
+    use serde_json::json;
+
+    fn pending(body_display: Option<&str>, body_sha256: Option<&str>) -> PendingCall {
+        let stored: StoredCall = serde_json::from_value(json!({
+            "uid": 1000, "user": "u", "session": null, "project": "/p",
+            "service": "s3_ask", "operation": "s3.put_object",
+            "params": {"bucket": "reports", "key": "logo.png"},
+            "body_b64": null, "body_sha256": body_sha256, "headers": [],
+            "overlay": null, "via": "cli",
+        }))
+        .unwrap();
+        PendingCall {
+            operation: stored.operation.clone(),
+            capability: None,
+            params: Masker::new(&[]).mask_params(&stored.params),
+            project: stored.project.clone(),
+            body_display: body_display.map(str::to_string),
+            body_truncated: false,
+            body_sha256: body_sha256.map(str::to_string),
+            amount: None,
+            headers: vec![],
+            stored,
+        }
+    }
+
+    /// Plan 15's binary raw body meets plan 17's dedupe: a body the
+    /// approver is not shown is never faithful, so it is never deduped.
+    #[test]
+    fn body_without_display_is_never_faithful() {
+        let h = "ab".repeat(32);
+        assert!(display_is_faithful(&pending(Some("text upload"), Some(&h))));
+        assert!(display_is_faithful(&pending(None, None)));
+        assert!(!display_is_faithful(&pending(None, Some(&h))));
+    }
 }
