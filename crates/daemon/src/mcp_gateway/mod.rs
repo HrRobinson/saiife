@@ -19,7 +19,7 @@ pub mod child;
 
 use crate::ops::{now_ts, Ctx};
 use crate::vault::{Kind, VaultState};
-use child::{Conn, Event, Running, StartError};
+use child::{Conn, Running, StartError};
 use saiife_broker::mask::Masker;
 use saiife_mcp::types::Tool;
 use saiife_policy::{McpServerCfg, Sandbox, SystemConfig};
@@ -243,7 +243,8 @@ struct Inner {
     setup: GatewaySetup,
     host: OnceLock<Weak<Ctx>>,
     /// Pids of the children (the helper's pid is the server's: it execs).
-    pids: Mutex<BTreeSet<u32>>,
+    /// Shared with each child's [`child::Reaper`], which removes its pid.
+    pids: Arc<Mutex<BTreeSet<u32>>>,
 }
 
 /// The gateway: the servers of the policy in force and their children.
@@ -263,7 +264,7 @@ impl Gateway {
             inner: Arc::new(Inner {
                 setup,
                 host: OnceLock::new(),
-                pids: Mutex::new(BTreeSet::new()),
+                pids: Arc::new(Mutex::new(BTreeSet::new())),
             }),
             servers: Mutex::new(BTreeMap::new()),
             stopping: AtomicBool::new(false),
@@ -282,11 +283,18 @@ impl Gateway {
     /// secret is missing or not allowed for `mcp:<name>` is `failed`, with
     /// a `mcp_server_failed` record). Synchronous: the starts and stops run
     /// in tasks of the current runtime, so the caller may hold the vault
-    /// lock.
+    /// lock. Without a runtime it logs and does nothing.
     pub fn reconcile(&self, cfg: &SystemConfig, vault: &VaultState) {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.inner
+                .setup
+                .log
+                .line("saiife: warning: mcp reconcile outside a runtime; servers left as they are");
+            return;
+        };
         let wanted: BTreeMap<String, Plan> = if self.inner.setup.enabled {
             cfg.mcp
                 .iter()
@@ -335,7 +343,7 @@ impl Gateway {
                 task: Mutex::new(None),
             });
             let prev = previous.remove(&name).flatten();
-            let task = tokio::spawn(supervise(Arc::clone(&self.inner), Arc::clone(&srv), prev));
+            let task = rt.spawn(supervise(Arc::clone(&self.inner), Arc::clone(&srv), prev));
             *lock(&srv.task) = Some(task);
             servers.insert(name, srv);
         }
@@ -391,7 +399,7 @@ impl Gateway {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let params = json!({"name": tool, "arguments": arguments});
         let masked = |e: ChildError| match e {
-            ChildError::Protocol(m) => ChildError::Protocol(srv.masker.mask_text(&m)),
+            ChildError::Protocol(m) => ChildError::Protocol(child::sanitize(&srv.masker, &m)),
             other => other,
         };
         let (v, bytes) = conn
@@ -422,6 +430,12 @@ impl Gateway {
     /// leader: the helper calls `setsid`) is a child. A pid whose `/proc`
     /// entry cannot be read while children run counts as one (fail
     /// closed).
+    ///
+    /// The pid is `SO_PEERCRED`'s, taken at `connect()`: a peer that has
+    /// since exited is refused (no `/proc` entry). If its pid was reused
+    /// in between by an unrelated process, that process is judged instead;
+    /// in locked mode the own-uid rule still refuses a child's socket
+    /// whatever its pid shows.
     pub fn is_child_or_descendant(&self, pid: u32) -> bool {
         let pids = lock(&self.inner.pids).clone();
         descends(&pids, pid, &|p| proc_stat(Path::new("/proc"), p))
@@ -448,8 +462,13 @@ impl Gateway {
             if !pids.contains(&pid) && !descends_strict(&pids, pid, &stat) {
                 continue;
             }
-            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-                continue;
+            let fds = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                Ok(fds) => fds,
+                // Gone since the listing: nothing it holds.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // A child's fds we cannot read: count it as holding the
+                // socket (fail closed).
+                Err(_) => return true,
             };
             for fd in fds.flatten() {
                 if std::fs::read_link(fd.path()).is_ok_and(|l| l.as_os_str() == want.as_str()) {
@@ -659,6 +678,8 @@ impl Inner {
             sandbox: d.cfg.sandbox,
             protected: self.setup.protected.clone(),
         };
+        // The pid enters the set inside `spawn` and leaves it when the
+        // child's reaper drops, also when this future is dropped by a stop.
         let mut running = child::spawn(
             &self.setup.helper,
             &srv.name,
@@ -666,10 +687,10 @@ impl Inner {
             Arc::clone(&srv.masker),
             d.line_cap,
             self.setup.log.clone(),
+            Arc::clone(&self.pids),
         )
         .await?;
         drop(spec);
-        lock(&self.pids).insert(running.pid);
         let init = async {
             child::initialize(&running.conn, INIT_TIMEOUT).await?;
             child::list_tools(&running.conn, INIT_TIMEOUT)
@@ -679,27 +700,11 @@ impl Inner {
         match init.await {
             Ok(tools) => Ok((running, tools)),
             Err(e) => {
-                kill(&mut running.process, running.pid).await;
-                lock(&self.pids).remove(&running.pid);
+                running.kill().await;
                 Err(e)
             }
         }
     }
-}
-
-/// Kill the child and its process group (it is the leader: the helper
-/// calls `setsid`), through the handle we hold; reap it, bounded.
-async fn kill(p: &mut tokio::process::Child, pid: u32) {
-    if let Some(raw) = rustix::process::Pid::from_raw(pid as i32) {
-        // Only while unreaped, and only when it leads its own group.
-        if p.try_wait().ok().flatten().is_none()
-            && rustix::process::getpgid(Some(raw)).is_ok_and(|g| g == raw)
-        {
-            let _ = rustix::process::kill_process_group(raw, rustix::process::Signal::KILL);
-        }
-    }
-    let _ = p.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), p.wait()).await;
 }
 
 fn exit_text(st: std::io::Result<std::process::ExitStatus>) -> String {
@@ -789,8 +794,11 @@ async fn supervise(inner: Arc<Inner>, srv: Arc<Server>, prev: Option<JoinHandle<
             .await;
         let up = tokio::time::Instant::now();
         let end = run(&srv, &mut running, &mut stop, &inner.setup.log).await;
-        lock(&inner.pids).remove(&running.pid);
-        running.conn.fail_all(ChildError::Exited);
+        // The reaper drops here: the pid leaves the set and what is left of
+        // the child's group is killed, whatever the end was.
+        let conn = Arc::clone(&running.conn);
+        drop(running);
+        conn.fail_all(ChildError::Exited);
         {
             let mut st = lock(&srv.state);
             st.conn = None;
@@ -835,6 +843,15 @@ async fn sleep_or_stop(stop: &mut watch::Receiver<bool>, d: Duration) -> bool {
     }
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Serve one running child until it exits, breaks the protocol, or a stop.
 async fn run(
     srv: &Arc<Server>,
@@ -842,32 +859,36 @@ async fn run(
     stop: &mut watch::Receiver<bool>,
     log: &Log,
 ) -> End {
-    let mut events_open = true;
+    // One relist at a time, for as long as this child runs: list_changed
+    // notifications coalesce into one stored permit (see `Conn`).
+    let _relister = AbortOnDrop(tokio::spawn(relist_loop(
+        Arc::clone(srv),
+        Arc::clone(&r.conn),
+        log.clone(),
+    )));
+    let mut fatal_open = true;
     loop {
         tokio::select! {
             st = r.process.wait() => {
+                if st.is_ok() {
+                    r.mark_reaped();
+                }
                 let why = format!("mcp server exited: {}", exit_text(st));
                 return End::Exited(why);
             }
-            ev = r.events.recv(), if events_open => match ev {
-                Some(Event::ListChanged) => {
-                    let srv = Arc::clone(srv);
-                    let conn = Arc::clone(&r.conn);
-                    let log = log.clone();
-                    tokio::spawn(async move { relist(srv, conn, log).await });
-                }
-                Some(Event::Fatal(why)) => {
-                    kill(&mut r.process, r.pid).await;
+            why = r.fatal.recv(), if fatal_open => match why {
+                Some(why) => {
+                    r.kill().await;
                     return End::Exited(format!("stopped: {why}"));
                 }
-                None => events_open = false,
+                None => fatal_open = false,
             },
             _ = stopped(stop) => {
                 r.conn.close_stdin();
-                let how = match tokio::time::timeout(STOP_GRACE, r.process.wait()).await {
+                let how = match tokio::time::timeout(STOP_GRACE, r.wait()).await {
                     Ok(st) => exit_text(st),
                     Err(_) => {
-                        kill(&mut r.process, r.pid).await;
+                        r.kill().await;
                         "killed after 2 s without exiting on EOF".to_string()
                     }
                 };
@@ -877,16 +898,24 @@ async fn run(
     }
 }
 
-/// `notifications/tools/list_changed`: list again; a failed list keeps the
-/// old one.
-async fn relist(srv: Arc<Server>, conn: Arc<Conn>, log: Log) {
-    match child::list_tools(&conn, INIT_TIMEOUT).await {
+/// Relist on each (coalesced) `notifications/tools/list_changed`.
+async fn relist_loop(srv: Arc<Server>, conn: Arc<Conn>, log: Log) {
+    loop {
+        conn.list_changed.notified().await;
+        relist(&srv, &conn, &log).await;
+    }
+}
+
+/// List again; a failed list keeps the old one.
+async fn relist(srv: &Server, conn: &Arc<Conn>, log: &Log) {
+    match child::list_tools(conn, INIT_TIMEOUT).await {
         Ok(tools) => {
             let mut st = lock(&srv.state);
-            if st.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
+            if st.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
                 st.tools = Arc::new(tools);
             }
         }
+        // `ChildError` texts from the child are sanitized where built.
         Err(e) => log.line(&format!(
             "saiife: mcp {}: tools/list after list_changed failed: {e}",
             srv.name

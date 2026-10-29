@@ -14,7 +14,14 @@
 //!   `added_tool` to the list;
 //! - `--hang-tool T`: never answers `T`;
 //! - `--huge-tool T`: answers `T` with `bytes` (default 8 MiB) of text on
-//!   one line.
+//!   one line;
+//! - `--block-tool T`: on a call to `T`, stops reading stdin (sleeps 10
+//!   minutes);
+//! - `spam_list_changed {n}`: sends `n` `notifications/tools/list_changed`;
+//! - `--fail-method M`: answers `M` (`initialize`, `tools/list`) with an
+//!   error whose message holds the `--echo-env` variable's value and a
+//!   control char;
+//! - `--init-delay-ms N`: waits before answering `initialize`.
 //!
 //! Every message received is logged to stderr as `fake-mcp: got <method>`
 //! (`notifications/cancelled` with its request id).
@@ -56,6 +63,15 @@ pub struct FakeArgs {
     /// Add the `read_file` tool.
     #[arg(long = "read-file-tool")]
     read_file_tool: bool,
+    /// On a call to this tool, stop reading stdin.
+    #[arg(long = "block-tool", value_name = "T")]
+    block_tool: Option<String>,
+    /// Answer this method with an error that echoes the `--echo-env` value.
+    #[arg(long = "fail-method", value_name = "M")]
+    fail_method: Option<String>,
+    /// Wait this long before answering `initialize`.
+    #[arg(long = "init-delay-ms", value_name = "N")]
+    init_delay_ms: Option<u64>,
     /// At start, send a `hello` to this control socket and log the outcome.
     #[arg(long = "connect-control", value_name = "PATH")]
     connect_control: Option<String>,
@@ -219,6 +235,20 @@ impl Fake {
     }
 
     fn request(&mut self, id: Id, method: &str, params: Option<Value>) -> Option<ExitCode> {
+        if self.args.fail_method.as_deref() == Some(method) {
+            let var = self.args.echo_env.clone().unwrap_or_default();
+            let val = std::env::var(&var).unwrap_or_default();
+            send(&Message::error(
+                Some(id),
+                RpcError::new(-32000, format!("cannot start: {var}={val}\u{1b}[31m")),
+            ));
+            return None;
+        }
+        if method == t::INITIALIZE {
+            if let Some(ms) = self.args.init_delay_ms {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+        }
         let result = match method {
             t::INITIALIZE => {
                 let asked = params
@@ -263,6 +293,10 @@ impl Fake {
         if self.args.hang_tool.as_deref() == Some(name) {
             return None;
         }
+        if self.args.block_tool.as_deref() == Some(name) {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            return None;
+        }
         let result = if self.args.huge_tool.as_deref() == Some(name) {
             let n = args
                 .get("bytes")
@@ -277,6 +311,13 @@ impl Fake {
                 "echo_env" => {
                     let var = self.args.echo_env.clone().unwrap_or_default();
                     text(std::env::var(var).unwrap_or_default(), false)
+                }
+                "spam_list_changed" => {
+                    let n = args.get("n").and_then(Value::as_u64).unwrap_or(1);
+                    for _ in 0..n {
+                        send(&Message::notification(t::TOOLS_LIST_CHANGED, None));
+                    }
+                    text(format!("sent {n}"), false)
                 }
                 "change_tools" => {
                     send(&Message::notification(t::TOOLS_LIST_CHANGED, None));

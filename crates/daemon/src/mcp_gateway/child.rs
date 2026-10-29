@@ -46,16 +46,24 @@ const MAX_PAGES: usize = 64;
 pub const OMITTED: &str = "[image content omitted by saiife]";
 /// Tool names longer than this (bytes) are dropped.
 const MAX_TOOL_NAME: usize = 128;
+/// A tool title is cut at this many bytes.
+pub const MAX_TITLE: usize = 256;
+/// The cleaned tools of one list are at most this many bytes in all.
+pub const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
+/// Names of tools past [`MAX_TOOLS`] remembered for the duplicate check.
+const MAX_OVERFLOW_NAMES: usize = 10_000;
+/// Any text built from what a child said (an error message, a reason) is
+/// cut at this many bytes, after control chars are stripped and it is
+/// masked ([`sanitize`]).
+pub const MAX_REASON: usize = 512;
 
 type Reply = Result<(Value, usize), ChildError>;
 
-/// What the reader tells the supervisor.
-#[derive(Debug)]
-pub(crate) enum Event {
-    /// `notifications/tools/list_changed`.
-    ListChanged,
-    /// The child broke the protocol in a way that stops it.
-    Fatal(String),
+/// Child-provided text made safe for a record, `status`, the journal or an
+/// answer: control chars stripped, masked with the child's secret forms
+/// and the v1 patterns, cut at [`MAX_REASON`] bytes.
+pub(crate) fn sanitize(masker: &Masker, s: &str) -> String {
+    cut(masker.mask_text(&strip_control(s)), MAX_REASON)
 }
 
 /// The JSON-RPC side of a running child, shared by callers.
@@ -66,6 +74,10 @@ pub(crate) struct Conn {
     next_id: AtomicU64,
     pub pool: Semaphore,
     pub masker: Arc<Masker>,
+    /// `notifications/tools/list_changed`: one stored permit however many
+    /// arrive, so they coalesce into at most one more relist.
+    pub list_changed: tokio::sync::Notify,
+    pub log: Log,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -73,13 +85,15 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Conn {
-    fn new(out: mpsc::Sender<String>, masker: Arc<Masker>) -> Conn {
+    fn new(out: mpsc::Sender<String>, masker: Arc<Masker>, log: Log) -> Conn {
         Conn {
             out: Mutex::new(Some(out)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             pool: Semaphore::new(POOL_SIZE),
             masker,
+            list_changed: tokio::sync::Notify::new(),
+            log,
         }
     }
 
@@ -105,8 +119,10 @@ impl Conn {
         lock(&self.pending).remove(&id)
     }
 
-    /// Send `method` and wait at most `limit` for its answer. On timeout
-    /// the request is cancelled (`notifications/cancelled`).
+    /// Send `method` and wait for its answer, both within `limit`: a child
+    /// that stops reading its stdin cannot hold the caller (or its pool
+    /// slot) past it. On timeout the request is cancelled
+    /// (`notifications/cancelled`, best effort: never waited for).
     pub async fn request(
         &self,
         method: &str,
@@ -116,23 +132,29 @@ impl Conn {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).insert(id, tx);
-        if let Err(e) = self
-            .send_line(&Message::request(id, method, Some(params)))
-            .await
-        {
-            self.take(id);
-            return Err(e);
-        }
-        match tokio::time::timeout(limit, rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err(ChildError::Exited),
+        let line = Message::request(id, method, Some(params));
+        let exchange = async {
+            self.send_line(&line).await?;
+            match rx.await {
+                Ok(r) => r,
+                Err(_) => Err(ChildError::Exited),
+            }
+        };
+        match tokio::time::timeout(limit, exchange).await {
+            Ok(r) => {
+                self.take(id);
+                r
+            }
             Err(_) => {
                 self.take(id);
                 let cancel = Message::notification(
                     t::CANCELLED,
                     Some(json!({"requestId": id, "reason": "timeout"})),
                 );
-                let _ = tokio::time::timeout(Duration::from_secs(1), self.send_line(&cancel)).await;
+                let tx = lock(&self.out).clone();
+                if let Some(tx) = tx {
+                    let _ = tx.try_send(encode(&cancel));
+                }
                 Err(ChildError::Timeout)
             }
         }
@@ -143,12 +165,132 @@ impl Conn {
     }
 }
 
-/// A started child: the process, its connection and the reader's events.
+/// The pid set entry and the process group of one child, for as long as
+/// it exists: dropping it (a stop that cancels a start, a crash, any end)
+/// removes the pid from the gateway's set and kills what is left of the
+/// child's group (the helper's `setsid` makes the child its leader).
+pub(crate) struct Reaper {
+    pid: u32,
+    pids: Arc<Mutex<BTreeSet<u32>>>,
+    /// The leader was waited for: its pid is no longer ours to check.
+    reaped: bool,
+}
+
+impl Reaper {
+    fn new(pid: u32, pids: Arc<Mutex<BTreeSet<u32>>>) -> Reaper {
+        lock(&pids).insert(pid);
+        Reaper {
+            pid,
+            pids,
+            reaped: false,
+        }
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        lock(&self.pids).remove(&self.pid);
+        kill_group(self.pid, self.reaped);
+    }
+}
+
+/// SIGKILL the process group `pid` leads, only when it is ours:
+/// - leader not yet reaped: its pid cannot have been reused, and it must
+///   lead its own group (`getpgid(pid) == pid`);
+/// - leader reaped: the group id stays allocated while members exist, so
+///   a member is looked for (`/proc`: group and session both `pid`, and
+///   `getpgid(member) == pid`); none, no signal.
+///
+/// A syscall on a group we created, never a shell `kill`.
+pub(crate) fn kill_group(pid: u32, reaped: bool) {
+    use rustix::process::{getpgid, kill_process_group, Pid, Signal};
+    let Some(raw) = Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let ours = if reaped {
+        group_member_of(pid).is_some()
+    } else {
+        getpgid(Some(raw)).is_ok_and(|g| g == raw)
+    };
+    if ours {
+        let _ = kill_process_group(raw, Signal::KILL);
+    }
+}
+
+/// A live process of group and session `pid`, other than `pid`.
+fn group_member_of(pid: u32) -> Option<u32> {
+    use rustix::process::{getpgid, Pid};
+    let rd = std::fs::read_dir("/proc").ok()?;
+    for e in rd.flatten() {
+        let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if p == pid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
+            continue;
+        };
+        let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_ascii_whitespace().take(4).collect();
+        let (Some(pgrp), Some(sid)) = (
+            f.get(2).and_then(|v| v.parse::<u32>().ok()),
+            f.get(3).and_then(|v| v.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        if pgrp == pid && sid == pid {
+            let confirmed = Pid::from_raw(p as i32)
+                .and_then(|m| getpgid(Some(m)).ok())
+                .is_some_and(|g| g.as_raw_nonzero().get() as u32 == pid);
+            if confirmed {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// A started child: the process, its connection and the reader's fatal
+/// reason. `reaper` is the first field, so it drops (and kills the group)
+/// while the leader is still unreaped, before `process` drops.
 pub(crate) struct Running {
+    reaper: Reaper,
     pub process: tokio::process::Child,
     pub pid: u32,
     pub conn: Arc<Conn>,
-    pub events: mpsc::UnboundedReceiver<Event>,
+    /// The reader's one fatal protocol break, already sanitized.
+    pub fatal: mpsc::UnboundedReceiver<String>,
+}
+
+impl Running {
+    /// The leader was waited for (by `process.wait()`).
+    pub fn mark_reaped(&mut self) {
+        self.reaper.reaped = true;
+    }
+
+    /// Wait for the leader to exit; marks it reaped.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let st = self.process.wait().await;
+        if st.is_ok() {
+            self.reaper.reaped = true;
+        }
+        st
+    }
+
+    /// Kill the child's group and the leader, through our handle; reap it,
+    /// bounded.
+    pub async fn kill(&mut self) {
+        if !self.reaper.reaped {
+            kill_group(self.pid, false);
+        }
+        let _ = self.process.start_kill();
+        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), self.process.wait()).await {
+            self.reaper.reaped = true;
+        }
+    }
 }
 
 /// Why a start failed; `permanent` ones are not retried.
@@ -182,6 +324,7 @@ pub(crate) async fn spawn(
     masker: Arc<Masker>,
     line_cap: usize,
     log: Log,
+    pids: Arc<Mutex<BTreeSet<u32>>>,
 ) -> Result<Running, StartError> {
     let frame = encode_spec(spec).map_err(|e| StartError::permanent(e.to_string()))?;
     let mut cmd = tokio::process::Command::new(helper);
@@ -198,6 +341,8 @@ pub(crate) async fn spawn(
     let pid = process
         .id()
         .ok_or_else(|| StartError::retry("the spawn helper exited at once"))?;
+    // From here on every way out kills the group and clears the pid.
+    let reaper = Reaper::new(pid, pids);
     let mut stdin = process
         .stdin
         .take()
@@ -214,7 +359,7 @@ pub(crate) async fn spawn(
         name.to_string(),
         stderr,
         Arc::clone(&masker),
-        log,
+        log.clone(),
     ));
     // A helper that refuses exits before it reads the frame: the error
     // shows on its stderr and in its exit.
@@ -229,19 +374,20 @@ pub(crate) async fn spawn(
         }
         // Dropping stdin here is the EOF.
     });
-    let conn = Arc::new(Conn::new(tx, masker));
-    let (ev_tx, events) = mpsc::unbounded_channel();
+    let conn = Arc::new(Conn::new(tx, masker, log));
+    let (fatal_tx, fatal) = mpsc::unbounded_channel();
     tokio::spawn(read_stdout(
         BufReader::new(stdout),
         Arc::clone(&conn),
-        ev_tx,
+        fatal_tx,
         line_cap,
     ));
     Ok(Running {
+        reaper,
         process,
         pid,
         conn,
-        events,
+        fatal,
     })
 }
 
@@ -295,7 +441,7 @@ async fn read_capped<R: AsyncBufRead + Unpin>(
 async fn read_stdout(
     mut r: BufReader<ChildStdout>,
     conn: Arc<Conn>,
-    events: mpsc::UnboundedSender<Event>,
+    fatal: mpsc::UnboundedSender<String>,
     cap: usize,
 ) {
     loop {
@@ -303,9 +449,8 @@ async fn read_stdout(
             Ok(Line::Full(l)) => l,
             Ok(Line::TooLong) => {
                 conn.fail_all(ChildError::TooLarge);
-                let _ = events.send(Event::Fatal(format!(
-                    "the server sent a message over {cap} bytes"
-                )));
+                // The only message on this channel, sent once.
+                let _ = fatal.send(format!("the server sent a message over {cap} bytes"));
                 return;
             }
             Ok(Line::Eof) | Err(_) => {
@@ -333,10 +478,8 @@ async fn read_stdout(
                 error,
             } => {
                 if let Some(tx) = our_id(&id).and_then(|n| conn.take(n)) {
-                    let _ = tx.send(Err(ChildError::Protocol(format!(
-                        "server error {}: {}",
-                        error.code, error.message
-                    ))));
+                    let text = format!("server error {}: {}", error.code, error.message);
+                    let _ = tx.send(Err(ChildError::Protocol(sanitize(&conn.masker, &text))));
                 }
             }
             Message::Error { id: None, .. } => {}
@@ -352,7 +495,7 @@ async fn read_stdout(
             }
             Message::Notification { method, .. } => {
                 if method == t::TOOLS_LIST_CHANGED {
-                    let _ = events.send(Event::ListChanged);
+                    conn.list_changed.notify_one();
                 }
             }
         }
@@ -433,9 +576,11 @@ pub(crate) async fn initialize(conn: &Conn, limit: Duration) -> Result<(), Start
     Ok(())
 }
 
-/// Every page of `tools/list`, cleaned ([`clean_tools`]).
+/// Every page of `tools/list`, each page cleaned as it arrives
+/// ([`Collector`]): at most [`MAX_TOOLS`] tools and [`MAX_LIST_BYTES`]
+/// kept, at most 64 pages.
 pub(crate) async fn list_tools(conn: &Conn, limit: Duration) -> Result<Vec<Tool>, ChildError> {
-    let mut raw: Vec<Value> = Vec::new();
+    let mut c = Collector::default();
     let mut cursor: Option<String> = None;
     let mut seen = BTreeSet::new();
     for _ in 0..MAX_PAGES {
@@ -447,16 +592,27 @@ pub(crate) async fn list_tools(conn: &Conn, limit: Duration) -> Result<Vec<Tool>
         let Some(tools) = v.get("tools").and_then(Value::as_array) else {
             return Err(ChildError::Protocol("tools/list has no tools array".into()));
         };
-        raw.extend(tools.iter().cloned());
-        if raw.len() > MAX_TOOLS {
+        for t in tools {
+            c.add(t, &conn.masker);
+        }
+        let cursor_next = v
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        drop(v);
+        if c.full() {
             break;
         }
-        match v.get("nextCursor").and_then(Value::as_str) {
-            Some(c) if !c.is_empty() && seen.insert(c.to_string()) => cursor = Some(c.to_string()),
+        match cursor_next {
+            Some(n) if !n.is_empty() && seen.insert(n.clone()) => cursor = Some(n),
             _ => break,
         }
     }
-    Ok(clean_tools(raw, &conn.masker))
+    let (tools, notes) = c.finish();
+    for n in notes {
+        conn.log.line(&n);
+    }
+    Ok(tools)
 }
 
 fn strip_control(s: &str) -> String {
@@ -490,58 +646,126 @@ fn clean_value(v: &mut Value, masker: &Masker) {
     }
 }
 
-/// The tools saiife keeps from a server's list:
+/// The tools saiife keeps from a server's list, built page by page:
 /// - names are kept byte-for-byte; a tool whose name is empty, over 128
-///   bytes or holds a control char is dropped, and so are both of two
-///   tools with the same name;
-/// - at most [`MAX_TOOLS`];
-/// - title and description without control chars, masked, the
-///   description cut at 2 KiB;
+///   bytes, holds a control char, or would change under masking (it holds
+///   a secret form or matches a v1 pattern) is dropped, with a masked
+///   note; so are all tools sharing a name, including a name seen again
+///   past the cap;
+/// - at most [`MAX_TOOLS`] tools and [`MAX_LIST_BYTES`] kept;
+/// - title and description without control chars, masked, cut at 256 B
+///   and 2 KiB;
 /// - the schema's strings cleaned the same way; a schema over 64 KiB, or
 ///   one that is not an object, becomes `{"type": "object"}`;
 /// - annotations and output schemas are not kept (third-party hints are
 ///   untrusted).
-pub(crate) fn clean_tools(raw: Vec<Value>, masker: &Masker) -> Vec<Tool> {
-    let mut out: Vec<Tool> = Vec::new();
-    let mut dup: BTreeSet<String> = BTreeSet::new();
-    for v in raw {
-        let Some(o) = v.as_object() else { continue };
+#[derive(Default)]
+pub(crate) struct Collector {
+    out: Vec<Tool>,
+    bytes: usize,
+    /// Names seen after the list was full.
+    overflow: BTreeSet<String>,
+    dup: BTreeSet<String>,
+    masked_names: usize,
+    full: bool,
+}
+
+impl Collector {
+    pub fn full(&self) -> bool {
+        self.full && self.overflow.len() >= MAX_OVERFLOW_NAMES
+    }
+
+    pub fn add(&mut self, v: &Value, masker: &Masker) {
+        let Some(o) = v.as_object() else { return };
         let Some(name) = o.get("name").and_then(Value::as_str) else {
-            continue;
+            return;
         };
         if name.is_empty() || name.len() > MAX_TOOL_NAME || name.chars().any(char::is_control) {
-            continue;
+            return;
         }
-        if out.iter().any(|t| t.name == name) {
-            dup.insert(name.to_string());
-            continue;
+        if masker.mask_text(name) != name {
+            self.masked_names += 1;
+            return;
         }
-        let text = |k: &str| {
+        if self.out.iter().any(|t| t.name == name) {
+            self.dup.insert(name.to_string());
+            return;
+        }
+        if self.full {
+            if self.overflow.len() < MAX_OVERFLOW_NAMES {
+                self.overflow.insert(name.to_string());
+            }
+            return;
+        }
+        let text = |k: &str, max: usize| {
             o.get(k)
                 .and_then(Value::as_str)
-                .map(|s| masker.mask_text(&strip_control(s)))
+                .map(|s| cut(masker.mask_text(&strip_control(s)), max))
         };
         let mut schema = o.get("inputSchema").cloned().unwrap_or(Value::Null);
         let size = serde_json::to_vec(&schema).map_or(usize::MAX, |b| b.len());
-        if !schema.is_object() || size > MAX_SCHEMA {
+        let size = if !schema.is_object() || size > MAX_SCHEMA {
             schema = json!({"type": "object"});
+            16
         } else {
             clean_value(&mut schema, masker);
-        }
-        out.push(Tool {
+            size
+        };
+        let tool = Tool {
             name: name.to_string(),
-            title: text("title"),
-            description: text("description").map(|d| cut(d, MAX_DESCRIPTION)),
+            title: text("title", MAX_TITLE),
+            description: text("description", MAX_DESCRIPTION),
             input_schema: schema,
             output_schema: None,
             annotations: None,
-        });
-        if out.len() >= MAX_TOOLS {
-            break;
+        };
+        let cost = name.len()
+            + size
+            + tool.title.as_ref().map_or(0, String::len)
+            + tool.description.as_ref().map_or(0, String::len);
+        if self.bytes + cost > MAX_LIST_BYTES {
+            self.full = true;
+            self.overflow.insert(name.to_string());
+            return;
+        }
+        self.bytes += cost;
+        self.out.push(tool);
+        if self.out.len() >= MAX_TOOLS {
+            self.full = true;
         }
     }
-    out.retain(|t| !dup.contains(&t.name));
-    out
+
+    /// The kept tools and the journal notes about what was dropped.
+    pub fn finish(mut self) -> (Vec<Tool>, Vec<String>) {
+        let mut notes = Vec::new();
+        if self.masked_names > 0 {
+            notes.push(format!(
+                "saiife: mcp: {} tool(s) dropped: the name holds a secret or a secret-like value ([MASKED])",
+                self.masked_names
+            ));
+        }
+        let dup = &self.dup;
+        let overflow = &self.overflow;
+        self.out
+            .retain(|t| !dup.contains(&t.name) && !overflow.contains(&t.name));
+        if self.full {
+            notes.push(format!(
+                "saiife: mcp: the tool list was cut at {} tool(s)",
+                self.out.len()
+            ));
+        }
+        (self.out, notes)
+    }
+}
+
+/// [`Collector`] over one list (unit tests).
+#[cfg(test)]
+pub(crate) fn clean_tools(raw: Vec<Value>, masker: &Masker) -> Vec<Tool> {
+    let mut c = Collector::default();
+    for v in &raw {
+        c.add(v, masker);
+    }
+    c.finish().0
 }
 
 /// A `tools/call` result as the agent may see it: an object with a
@@ -651,6 +875,39 @@ mod tests {
         assert!(tools[0].annotations.is_none());
         assert_eq!(tools[1].input_schema, json!({"type": "object"}));
         assert_eq!(tools[2].input_schema, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn sanitize_strips_masks_and_cuts() {
+        let secret = concat!("sk", "-test-", "0123456789");
+        let m = Masker::new(&[secret]);
+        let s = sanitize(&m, &format!("bad\u{1b}[31m {secret} {}", "x".repeat(2000)));
+        assert!(s.starts_with("bad[31m [MASKED] x"), "{s:.40}");
+        assert_eq!(s.len(), MAX_REASON);
+    }
+
+    #[test]
+    fn masked_names_dropped_and_duplicates_past_the_cap_seen() {
+        let secret = concat!("sk", "-test-", "0123456789");
+        let m = Masker::new(&[secret]);
+        let mut raw = vec![json!({"name": format!("t_{secret}"), "inputSchema": {}})];
+        raw.extend((0..MAX_TOOLS).map(|i| json!({"name": format!("t{i}"), "inputSchema": {}})));
+        // Past the cap: a second `t5`.
+        raw.push(json!({"name": "t5", "inputSchema": {}}));
+        let mut c = Collector::default();
+        for v in &raw {
+            c.add(v, &m);
+        }
+        let (tools, notes) = c.finish();
+        assert_eq!(tools.len(), MAX_TOOLS - 1);
+        assert!(!tools
+            .iter()
+            .any(|t| t.name == "t5" || t.name.contains(secret)));
+        assert!(
+            notes.iter().any(|n| n.contains("1 tool(s) dropped")),
+            "{notes:?}"
+        );
+        assert!(!notes.concat().contains(secret));
     }
 
     #[test]

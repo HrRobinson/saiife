@@ -898,3 +898,205 @@ fn results_and_stderr_masked_with_the_child_secrets() {
         assert!(!r.to_string().contains(&tok), "{r}");
     }
 }
+
+// ---------------------------------------------------------------------
+// Fix round 1.
+
+fn no_token_anywhere(w: &World, tok: &str) {
+    assert!(!w.log_text().contains(tok), "log: {}", w.log_text());
+    assert!(!w.gw().status().to_string().contains(tok));
+    for r in w.records() {
+        assert!(!r.to_string().contains(tok), "{r}");
+    }
+}
+
+/// A server whose `initialize` error echoes its token: the reason in the
+/// record, `status` and the journal (the daemon's stderr) is masked,
+/// control-stripped and short.
+#[test]
+fn initialize_error_text_is_masked_everywhere() {
+    let tok = token();
+    let d = daemon(&format!(
+        "{}{}",
+        admin(),
+        server(
+            "fake",
+            &["--echo-env", "FAKE_TOKEN", "--fail-method", "initialize"],
+            "env = { FAKE_TOKEN = \"fake-tok\" }\n"
+        )
+    ));
+    wait_event(&d, "mcp_server_failed", "fake", 1);
+    // The secret add itself makes the gateway reconcile: no reload.
+    let o = add_secret(&d, "fake-tok", &tok, &["mcp:fake"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let failed = wait_event(&d, "mcp_server_failed", "fake", 2);
+    let reason = failed[1]["reason"].as_str().unwrap();
+    assert!(reason.contains("initialize failed"), "{reason}");
+    assert!(reason.contains("FAKE_TOKEN=[MASKED]"), "{reason}");
+    assert!(!reason.chars().any(char::is_control), "{reason:?}");
+    assert!(reason.len() <= 600, "{}", reason.len());
+    let s = status_of(&d, "fake");
+    assert!(
+        s["last_error"].as_str().unwrap().contains("[MASKED]"),
+        "{s}"
+    );
+    assert!(!Value::Object(d.status()).to_string().contains(&tok));
+    assert!(!d.stderr_text().contains(&tok), "{}", d.stderr_text());
+    for r in d.records() {
+        assert!(!r.to_string().contains(&tok), "{r}");
+    }
+}
+
+#[test]
+fn tools_list_error_text_is_masked() {
+    let tok = token();
+    let w = World::new(
+        &server(
+            "fake",
+            &["--echo-env", "FAKE_TOKEN", "--fail-method", "tools/list"],
+            "env = { FAKE_TOKEN = \"fake-tok\" }\n",
+        ),
+        &[("fake-tok", &tok, &["mcp:fake"])],
+    );
+    let failed = w.wait_event("mcp_server_failed", "fake", 1);
+    let reason = failed[0]["reason"].as_str().unwrap();
+    assert!(reason.starts_with("tools/list failed"), "{reason}");
+    assert!(reason.contains("[MASKED]"), "{reason}");
+    assert!(!reason.chars().any(char::is_control), "{reason:?}");
+    no_token_anywhere(&w, &tok);
+}
+
+/// A tool whose name holds the secret is dropped (names are never
+/// rewritten), with a masked note.
+#[test]
+fn tool_named_with_the_secret_is_dropped() {
+    let tok = token();
+    let tools = json!([
+        {"name": format!("leak_{tok}"), "inputSchema": {"type": "object"}},
+        {"name": "ok_tool", "inputSchema": {"type": "object"}},
+    ])
+    .to_string();
+    let w = World::new(
+        &server(
+            "fake",
+            &["--tools", &tools],
+            "env = { FAKE_TOKEN = \"fake-tok\" }\n",
+        ),
+        &[("fake-tok", &tok, &["mcp:fake"])],
+    );
+    let started = w.wait_event("mcp_server_started", "fake", 1);
+    assert_eq!(started[0]["tools"], 1);
+    let names: Vec<String> = w
+        .gw()
+        .tools("fake")
+        .unwrap()
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(names, ["ok_tool"]);
+    assert!(w.wait_log("1 tool(s) dropped"), "{}", w.log_text());
+    no_token_anywhere(&w, &tok);
+}
+
+/// A server that stops reading its stdin cannot hold a call (or a pool
+/// slot) past the call's timeout, however full its pipe gets.
+#[test]
+fn call_times_out_when_child_stops_reading() {
+    let w = World::new(&server("fake", &["--block-tool", "block"], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    let r = w.call("fake", "block", json!({}), Duration::from_millis(300));
+    assert_eq!(r, Err(ChildError::Timeout));
+    // Fill the pipe and the queue behind it: every call still ends in time.
+    let pad = "p".repeat(100 * 1024);
+    for i in 0..80 {
+        let t0 = Instant::now();
+        let r = w.call(
+            "fake",
+            "echo",
+            json!({"pad": pad}),
+            Duration::from_millis(200),
+        );
+        assert_eq!(r, Err(ChildError::Timeout), "call {i}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "call {i}: {:?}",
+            t0.elapsed()
+        );
+    }
+}
+
+/// 1000 list_changed notifications: at most two relists.
+#[test]
+fn list_changed_flood_is_coalesced() {
+    let w = World::new(&server("fake", &[], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    let lists = |w: &World| w.log_text().matches("fake-mcp: got tools/list").count();
+    assert_eq!(lists(&w), 1);
+    w.call(
+        "fake",
+        "spam_list_changed",
+        json!({"n": 1000}),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(wait_for(Duration::from_secs(10), || lists(&w) >= 2));
+    std::thread::sleep(Duration::from_secs(2));
+    let n = lists(&w);
+    assert!((2..=3).contains(&n), "{n} tools/list in all");
+}
+
+/// A stop while the child is still initializing: the pid leaves the set
+/// (the cancelled start's reaper).
+#[test]
+fn stop_during_initialize_clears_children() {
+    let w = World::new(&server("fake", &["--init-delay-ms", "20000"], ""), &[]);
+    assert!(w.wait_log("fake-mcp: got initialize"), "{}", w.log_text());
+    assert!(w.gw().has_children());
+    let t0 = Instant::now();
+    let ctx = Arc::clone(&w.ctx);
+    w.rt.block_on(async move { ctx.mcp.stop().await });
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert!(!w.gw().has_children());
+}
+
+/// A crash: the pid leaves the set before the exit record, and what the
+/// child started in its group is killed with it.
+#[test]
+fn crash_clears_children_and_kills_the_group() {
+    if !root_owned(BASH) {
+        eprintln!("skipped: {BASH} is not root-owned here");
+        return;
+    }
+    let extra = format!(
+        "[mcp.grp]\ncommand = {BASH:?}\nargs = [\"-c\", \"/usr/bin/sleep 300 </dev/null >/dev/null 2>&1 & echo bg=$! >&2; exec \\\"$0\\\" __fake-mcp-server --crash-after 1\", {BIN:?}]\nread_paths = [{:?}]\n{}",
+        bin_dir(),
+        sandbox_line()
+    );
+    let w = World::new(&extra, &[]);
+    w.wait_event("mcp_server_started", "grp", 1);
+    assert!(w.wait_log("bg="), "{}", w.log_text());
+    let bg: u32 = w
+        .log_text()
+        .split("bg=")
+        .nth(1)
+        .unwrap()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(w.gw().has_children());
+    w.call("grp", "echo", json!({}), Duration::from_secs(10))
+        .unwrap();
+    w.wait_event("mcp_server_exited", "grp", 1);
+    // The backoff before the restart is 1 s: no child now.
+    assert!(!w.gw().has_children());
+    std::thread::sleep(Duration::from_millis(300));
+    let state = fs::read_to_string(format!("/proc/{bg}/stat"))
+        .ok()
+        .and_then(|s| s.rsplit_once(") ").map(|(_, r)| r.chars().next().unwrap()));
+    assert!(
+        matches!(state, None | Some('Z') | Some('X')),
+        "the background process of the crashed child is still {state:?}"
+    );
+}

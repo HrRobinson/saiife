@@ -119,6 +119,13 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match done {
         Ok(Ok(fields)) => {
             if event != "secret_list" {
+                // A gateway child holds secret values in its environment:
+                // an added, rotated or removed secret restarts (or starts,
+                // or fails) the servers that name it, now.
+                if let Some(sys) = ctx.policy().system {
+                    let vault = ctx.vault.lock();
+                    ctx.mcp.reconcile(&sys, &vault);
+                }
                 let mut r = record(ctx, peer, event, &name).await;
                 if let Some(src) = &source {
                     r.extra.insert("imported_from".into(), src.clone().into());
