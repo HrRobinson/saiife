@@ -51,13 +51,17 @@ const GCP_TOKEN_HOST: &str = "oauth2.googleapis.com";
 const GCS_HOST: &str = "storage.googleapis.com";
 const AZ_LOGIN_HOST: &str = "login.microsoftonline.com";
 const ARM_HOST: &str = "management.azure.com";
+const AZ_US_HOST: &str = "login.microsoftonline.us";
 const SF_HOST: &str = "acme.sf.test";
-const HOSTS: [&str; 7] = [
+/// What the resolver knows. `login.chinacloudapi.cn` is not here: a
+/// service on that authority fails its mint with `network`.
+const HOSTS: [&str; 8] = [
     S3_HOST,
     STS_HOST,
     GCP_TOKEN_HOST,
     GCS_HOST,
     AZ_LOGIN_HOST,
+    AZ_US_HOST,
     ARM_HOST,
     SF_HOST,
 ];
@@ -148,6 +152,8 @@ fn key_pem() -> String {
 /// answer, `Debug` output, a notification or stderr.
 fn secret_values() -> Vec<String> {
     let mut v = vec![
+        VAULT_AK.to_string(),
+        SESSION_AK.to_string(),
         VAULT_SK.to_string(),
         SESSION_SK.to_string(),
         SESSION_TOKEN.to_string(),
@@ -186,14 +192,17 @@ struct State {
     /// STS calls: the access key id that signed each, and whether the
     /// signature checked out.
     sts: Vec<(String, bool)>,
+    /// The `ExternalId` each STS call sent.
+    sts_external: Vec<Option<String>>,
     sts_status: u16,
     /// S3 requests: what the mock saw.
     s3: Vec<S3Seen>,
     /// GCP token POSTs: the JWT claims of each.
     gcp_mints: Vec<Value>,
     gcp_status: u16,
-    /// Azure token POSTs: the form of each.
+    /// Azure token POSTs: the form of each, and the login host.
     az_mints: Vec<BTreeMap<String, String>>,
+    az_hosts: Vec<String>,
     az_status: u16,
     /// API requests to GCS and ARM: (host, bearer).
     api: Vec<(String, String)>,
@@ -389,8 +398,10 @@ async fn answer(req: Request<Incoming>, st: Shared) -> Result<Response<Full<Byte
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_string();
-    let is_token = matches!(host.as_str(), GCP_TOKEN_HOST | AZ_LOGIN_HOST | STS_HOST)
-        || parts.uri.path() == "/services/oauth2/token";
+    let is_token = matches!(
+        host.as_str(),
+        GCP_TOKEN_HOST | AZ_LOGIN_HOST | AZ_US_HOST | STS_HOST
+    ) || parts.uri.path() == "/services/oauth2/token";
     if is_token {
         let delay = st.lock().unwrap().delay_ms;
         if delay > 0 {
@@ -402,6 +413,7 @@ async fn answer(req: Request<Incoming>, st: Shared) -> Result<Response<Full<Byte
         STS_HOST => {
             let (akid, ok) = verify_sigv4(&s.keys, &parts, &host, &body, "sts");
             s.sts.push((akid, ok));
+            s.sts_external.push(form(&body).get("ExternalId").cloned());
             if s.sts_status != 200 {
                 return Ok(reply(
                     s.sts_status,
@@ -480,10 +492,11 @@ async fn answer(req: Request<Incoming>, st: Shared) -> Result<Response<Full<Byte
                 json!({"access_token": t, "expires_in": 3599, "token_type": "Bearer"}).to_string(),
             ))
         }
-        AZ_LOGIN_HOST => {
+        AZ_LOGIN_HOST | AZ_US_HOST => {
             let f = form(&body);
             let ok_path = parts.uri.path() == format!("/{TENANT}/oauth2/v2.0/token");
             s.az_mints.push(f.clone());
+            s.az_hosts.push(host.clone());
             if s.az_status != 200 || !ok_path {
                 let d = f.get("client_secret").cloned().unwrap_or_default();
                 return Ok(json(
@@ -574,7 +587,10 @@ async fn mock(st: Shared) -> Upstream {
     });
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
-    Upstream::with_roots(roots, Arc::new(Loopback(port)), Duration::from_secs(5))
+    // Generous: a loaded machine (many test binaries at once) must not turn
+    // a slow loopback handshake into a `network` mint failure. Mints are
+    // capped at 15 s by `token::MINT_TIMEOUT`.
+    Upstream::with_roots(roots, Arc::new(Loopback(port)), Duration::from_secs(30))
 }
 
 // ---------------------------------------------------------------- daemon
@@ -658,7 +674,8 @@ locked = true
 [[scope]]
 name = "agents"
 users = ["agent"]
-services = ["s3", "s3role", "gcs", "gcs2", "arm", "sf", "gcs_wrong"]
+services = ["s3", "s3role", "s3role_x", "gcs", "gcs2", "gcs_ask", "arm", "arm_us", "arm_cn",
+            "sf", "gcs_wrong"]
 
 [services.s3]
 connector = "aws-s3"
@@ -673,6 +690,20 @@ params = { region = "eu-west-1" }
 allow = ["s3:read"]
 [services.s3role.cloud]
 role_arn = "arn:aws:iam::123456789012:role/saiife-reader"
+
+[services.s3role_x]
+connector = "aws-s3"
+secret = "aws-keys"
+params = { region = "eu-west-1" }
+allow = ["s3:read"]
+[services.s3role_x.cloud]
+role_arn = "arn:aws:iam::123456789012:role/saiife-reader"
+external_id = "ext-id-1234"
+
+[services.gcs_ask]
+connector = "gcp-storage"
+secret = "gcp-sa"
+ask = ["storage:read"]
 
 [services.gcs]
 connector = "gcp-storage"
@@ -694,6 +725,20 @@ allow = ["storage:read"]
 connector = "azure-arm"
 secret = "az-sp"
 allow = ["resourcegroups:read"]
+
+[services.arm_us]
+connector = "azure-arm"
+secret = "az-sp"
+allow = ["resourcegroups:read"]
+[services.arm_us.cloud]
+authority_host = "login.microsoftonline.us"
+
+[services.arm_cn]
+connector = "azure-arm"
+secret = "az-sp"
+allow = ["resourcegroups:read"]
+[services.arm_cn.cloud]
+authority_host = "login.chinacloudapi.cn"
 
 [services.sf]
 connector = "sfx"
@@ -737,9 +782,14 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
             "aws-keys",
             Kind::Aws,
             fields(&[("access_key_id", VAULT_AK), ("secret_access_key", VAULT_SK)]),
-            &["s3", "s3role", "gcs_wrong"],
+            &["s3", "s3role", "s3role_x", "gcs_wrong"],
         ),
-        entry("gcp-sa", Kind::GcpSa, gcp_fields(), &["gcs", "gcs2"]),
+        entry(
+            "gcp-sa",
+            Kind::GcpSa,
+            gcp_fields(),
+            &["gcs", "gcs2", "gcs_ask"],
+        ),
         entry(
             "az-sp",
             Kind::AzureSp,
@@ -748,7 +798,7 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
                 ("client_id", CLIENT_ID),
                 ("client_secret", AZ_SECRET),
             ]),
-            &["arm"],
+            &["arm", "arm_us", "arm_cn"],
         ),
         entry(
             "sf-oauth",
@@ -1361,6 +1411,117 @@ async fn agent_authorization_and_x_amz_headers_dropped() {
         w.st.lock().unwrap().api,
         vec![(GCS_HOST.to_string(), gcp_token(1))]
     );
+}
+
+#[tokio::test]
+async fn one_mint_per_outage() {
+    let w = Arc::new(
+        world(|s| {
+            s.gcp_status = 503;
+            s.delay_ms = 200;
+        })
+        .await,
+    );
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let w = Arc::clone(&w);
+        tasks.push(tokio::spawn(async move { w.gcs().await }));
+    }
+    for t in tasks {
+        assert_eq!(rule(&t.await.unwrap()), "token_mint_failed");
+    }
+    assert_eq!(
+        w.gcp_mints(),
+        1,
+        "the waiters share the failed mint: {:?}",
+        w.refresh_failed()
+    );
+    assert_eq!(w.refresh_failed().len(), 1, "one record for the outage");
+    assert_eq!(w.notifications().len(), 1);
+    // A call that arrives after the failure tries again (no backoff).
+    assert_eq!(rule(&w.gcs().await), "token_mint_failed");
+    assert_eq!(w.gcp_mints(), 2);
+    assert_eq!(w.refresh_failed().len(), 2);
+    w.st.lock().unwrap().gcp_status = 200;
+    assert_eq!(status(&w.gcs().await), 200);
+    assert_eq!(w.gcp_mints(), 3);
+    w.assert_no_values(&[]);
+}
+
+#[tokio::test]
+async fn cache_key_covers_authority_and_external_id() {
+    let w = world(|_| {}).await;
+    // One secret, one scope, two authorities: two tokens.
+    assert_eq!(status(&w.arm().await), 200);
+    let a = w
+        .call(
+            "arm_us",
+            "resourcegroups.list",
+            json!({"subscription_id": SUB}),
+        )
+        .await;
+    assert_eq!(status(&a), 200, "{}", body(&a));
+    assert_eq!(status(&w.arm().await), 200);
+    {
+        let st = w.st.lock().unwrap();
+        assert_eq!(st.az_hosts, vec![AZ_LOGIN_HOST, AZ_US_HOST]);
+        assert_eq!(
+            st.api,
+            vec![
+                (ARM_HOST.to_string(), az_token(1)),
+                (ARM_HOST.to_string(), az_token(2)),
+                (ARM_HOST.to_string(), az_token(1)),
+            ],
+            "each service keeps its own token"
+        );
+    }
+    // One secret, one role, two external ids: two sessions.
+    assert_eq!(status(&w.s3("s3role").await), 200);
+    assert_eq!(status(&w.s3("s3role_x").await), 200);
+    assert_eq!(status(&w.s3("s3role_x").await), 200);
+    assert_eq!(status(&w.s3("s3role").await), 200);
+    let st = w.st.lock().unwrap();
+    assert_eq!(st.sts_external, vec![None, Some("ext-id-1234".to_string())]);
+}
+
+#[tokio::test]
+async fn mint_network_failure_recorded() {
+    // The resolver does not know login.chinacloudapi.cn.
+    let w = world(|_| {}).await;
+    let a = w
+        .call(
+            "arm_cn",
+            "resourcegroups.list",
+            json!({"subscription_id": SUB}),
+        )
+        .await;
+    assert_eq!(rule(&a), "token_mint_failed");
+    let f = w.refresh_failed();
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0]["reason"], "network");
+    assert_eq!(f[0]["name"], "az-sp");
+    assert_eq!(f[0]["service"], "arm_cn");
+    assert_eq!(w.notifications()[0].reason.as_deref(), Some("network"));
+    let st = w.st.lock().unwrap();
+    assert!(st.az_mints.is_empty() && st.api.is_empty());
+    drop(st);
+    w.assert_no_values(&[a]);
+}
+
+#[tokio::test]
+async fn ask_verdict_mints_nothing() {
+    let w = world(|_| {}).await;
+    let a = w
+        .call(
+            "gcs_ask",
+            "storage.objects.list",
+            json!({"bucket": "my-bucket"}),
+        )
+        .await;
+    assert_eq!(a["ok"], true, "{a}");
+    assert!(a["pending"].is_u64(), "the request waits for approval: {a}");
+    assert_eq!(w.gcp_mints(), 0, "nothing minted for a request that waits");
+    assert!(w.st.lock().unwrap().api.is_empty());
 }
 
 /// Set in the child run of [`cloud_values_never_in_stderr`].

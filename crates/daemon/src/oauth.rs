@@ -2,10 +2,12 @@
 //! never on disk, in a record, a log line or `Debug` output: OAuth2 access
 //! tokens (plan 14, decision 8), and the cloud tokens and assumed-role
 //! session credentials of plan 15 (decision 7). One cache, keyed by
-//! `(secret, scope)`: the scope is `""` for oauth2, the manifest's `scope`
-//! for `gcp_sa` and `azure_sp`, and `sts:<role_arn>` for a role that sign
-//! mode assumes (decision 8). AWS keys used as they are come from the vault
-//! on every call and are not cached.
+//! `(secret, scope, variant)`: the scope is `""` for oauth2, the manifest's
+//! `scope` for `gcp_sa` and `azure_sp`, and `sts:<role_arn>` for a role
+//! that sign mode assumes (decision 8); the variant is the rest of the
+//! service config that changes the credential (the Azure authority, the
+//! AWS external id), `""` otherwise. AWS keys used as they are come from
+//! the vault on every call and are not cached.
 //!
 //! - A credential is fetched on first use, and again when it is older than
 //!   its lifetime (`expires_in`, 15 min when absent; the STS expiry) minus
@@ -21,8 +23,11 @@
 //!   doubled with each failure up to [`BACKOFF_MAX`], calls get the stored
 //!   failure and no token POST is made. A success or [`TokenCache::forget`]
 //!   ends it.
-//! - Cloud: a failed mint or assume is never cached: the next call tries
-//!   again. The call is denied `token_mint_failed`.
+//! - Cloud: a failed mint or assume is never cached as a credential and
+//!   has no backoff: a call that arrives after it tries again. Only the
+//!   calls that were already waiting for that key's lock when it failed
+//!   share the failure (one token POST per outage, not one per waiter).
+//!   The call is denied `token_mint_failed`.
 //! - A failure is a `secret`/`refresh_failed` record (name, service,
 //!   reason; never a body or an error description), one per oauth2 backoff
 //!   window and one per failed cloud mint, and a `refresh_failed`
@@ -66,10 +71,10 @@ pub const SIGN_ROLE_SECONDS: u32 = 3600;
 /// The deny rule of a failed cloud mint or assume.
 pub const MINT_FAILED: &str = "token_mint_failed";
 
-/// One cache entry's key: the secret's name and the scope.
-type Key = (String, String);
+/// One cache entry's key: the secret's name, the scope and the variant.
+type Key = (String, String, String);
 
-/// The credentials in use, by `(secret, scope)`.
+/// The credentials in use, by `(secret, scope, variant)`.
 #[derive(Default)]
 pub struct TokenCache {
     slots: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<Slot>>>>,
@@ -109,8 +114,12 @@ struct Slot {
     /// A rotated refresh token the vault does not hold yet (oauth2).
     pending_refresh: Option<Pending>,
     /// The last refresh failed: when, why, and the backoff from then
-    /// (oauth2; a failed cloud mint is never kept).
+    /// (oauth2).
     failed: Option<(Instant, RefreshError, Duration)>,
+    /// The last cloud mint failed: when, and its record reason. Only a call
+    /// that asked before then gets it (it waited on this mint); a later
+    /// call mints again.
+    mint_failed: Option<(Instant, String)>,
 }
 
 /// The backoff after `prev` (none: the first failure).
@@ -217,16 +226,30 @@ fn kind_for(auth_kind: &str) -> Option<Kind> {
     }
 }
 
-/// The cache scope of `w` (decision 7), from the manifest and the service
-/// config only. `None`: AWS keys used as they are (not cached).
-fn scope_of(w: &Want<'_>) -> Result<Option<String>, Failure> {
+/// The cache scope and variant of `w` (decision 7), from the manifest and
+/// the service config only. The variant holds what else changes the
+/// credential: the Azure authority (empty for the default one) and the AWS
+/// external id. `None`: AWS keys used as they are (not cached).
+fn scope_of(w: &Want<'_>) -> Result<Option<(String, String)>, Failure> {
+    let manifest_scope = || match w.spec.scope.as_deref() {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(plain("policy_invalid")),
+    };
     match w.spec.kind.as_str() {
-        "oauth2" => Ok(Some(String::new())),
-        "gcp_sa" | "azure_sp" => match w.spec.scope.as_deref() {
-            Some(s) if !s.is_empty() => Ok(Some(s.to_string())),
-            _ => Err(plain("policy_invalid")),
-        },
-        "aws_sigv4" => Ok(w.svc.cloud.role_arn.as_ref().map(|a| format!("sts:{a}"))),
+        "oauth2" => Ok(Some((String::new(), String::new()))),
+        "gcp_sa" => Ok(Some((manifest_scope()?, String::new()))),
+        "azure_sp" => {
+            let authority = match w.svc.cloud.authority_host.as_deref() {
+                None => "",
+                Some(a) if a == token::AZURE_AUTHORITIES[0] => "",
+                Some(a) => a,
+            };
+            Ok(Some((manifest_scope()?, format!("authority={authority}"))))
+        }
+        "aws_sigv4" => Ok(w.svc.cloud.role_arn.as_ref().map(|a| {
+            let ext = w.svc.cloud.external_id.as_deref().unwrap_or_default();
+            (format!("sts:{a}"), format!("external_id={ext}"))
+        })),
         _ => Err(plain("secret_missing")),
     }
 }
@@ -264,6 +287,18 @@ fn ready(s: &Slot, force: bool, asked: Instant) -> Option<Result<Arc<Cred>, Fail
             let mut f = refresh(e);
             f.fresh = false;
             return Some(Err(f));
+        }
+    }
+    // A cloud mint that failed while this call waited for the lock: the
+    // same answer, not recorded again. A call that asked later tries again.
+    if let Some((at, reason)) = &s.mint_failed {
+        if *at > asked {
+            return Some(Err(Failure {
+                rule: MINT_FAILED,
+                reason: None,
+                mint: Some(reason.clone()),
+                fresh: false,
+            }));
         }
     }
     None
@@ -318,10 +353,10 @@ fn aws_keys(fields: &BTreeMap<String, Zeroizing<String>>) -> Result<AwsCreds, Fa
 }
 
 impl TokenCache {
-    fn slot(&self, secret: &str, scope: &str) -> Arc<tokio::sync::Mutex<Slot>> {
+    fn slot(&self, secret: &str, scope: &str, variant: &str) -> Arc<tokio::sync::Mutex<Slot>> {
         Arc::clone(
             lock(&self.slots)
-                .entry((secret.to_string(), scope.to_string()))
+                .entry((secret.to_string(), scope.to_string(), variant.to_string()))
                 .or_default(),
         )
     }
@@ -331,7 +366,7 @@ impl TokenCache {
     /// dropped entry; it never writes over the new vault value (see
     /// [`persist`]).
     pub fn forget(&self, secret: &str) {
-        lock(&self.slots).retain(|(s, _), _| s != secret);
+        lock(&self.slots).retain(|(s, _, _), _| s != secret);
     }
 
     /// Refresh tasks running now.
@@ -369,12 +404,12 @@ impl TokenCache {
     /// at a time per `(secret, scope)`, in its own task). AWS keys used as
     /// they are come from the vault.
     pub async fn get(&self, ctx: &Arc<Ctx>, w: &Want<'_>) -> Result<Arc<Cred>, Failure> {
-        let Some(scope) = scope_of(w)? else {
+        let Some((scope, variant)) = scope_of(w)? else {
             let fields = vault_fields(ctx, w.secret, w.service, Kind::Aws)?;
             return Ok(Arc::new(Cred::Aws(aws_keys(&fields)?)));
         };
         let asked = Instant::now();
-        let s = self.slot(w.secret, &scope).lock_owned().await;
+        let s = self.slot(w.secret, &scope, &variant).lock_owned().await;
         if let Some(r) = ready(&s, w.force, asked) {
             return r;
         }
@@ -505,7 +540,8 @@ impl Job {
     }
 
     /// A cloud mint (GCP, Azure) or a sign-mode `AssumeRole` (AWS). A
-    /// failure is not kept: the next call tries again.
+    /// failure is kept only for the calls already waiting (see [`ready`]):
+    /// the next call tries again.
     async fn mint(self, mut s: tokio::sync::OwnedMutexGuard<Slot>) -> Result<Arc<Cred>, Failure> {
         if let Some(r) = ready(&s, false, self.asked) {
             return r;
@@ -526,7 +562,15 @@ impl Job {
             _ => return Err(plain("secret_missing")),
         };
         drop(fields);
-        let (cred, ttl) = got.map_err(|e| mint_failed(&e))?;
+        let (cred, ttl) = match got {
+            Ok(v) => v,
+            Err(e) => {
+                let f = mint_failed(&e);
+                s.mint_failed = Some((Instant::now(), f.mint.clone().unwrap_or_default()));
+                return Err(f);
+            }
+        };
+        s.mint_failed = None;
         let cred = Arc::new(cred);
         s.cached = Some(Cached {
             cred: Arc::clone(&cred),
@@ -768,11 +812,34 @@ mod tests {
     #[test]
     fn forget_drops_every_scope_of_the_secret() {
         let c = TokenCache::default();
-        let _ = c.slot("g", "https://a/.default");
-        let _ = c.slot("g", "https://b/.default");
-        let _ = c.slot("other", "");
+        let _ = c.slot("g", "https://a/.default", "");
+        let _ = c.slot("g", "https://b/.default", "");
+        let _ = c.slot(
+            "g",
+            "https://b/.default",
+            "authority=login.microsoftonline.us",
+        );
+        let _ = c.slot("other", "", "");
         c.forget("g");
         let keys: Vec<Key> = lock(&c.slots).keys().cloned().collect();
-        assert_eq!(keys, vec![("other".to_string(), String::new())]);
+        assert_eq!(
+            keys,
+            vec![("other".to_string(), String::new(), String::new())]
+        );
+    }
+
+    #[test]
+    fn mint_failure_answers_only_the_calls_that_waited() {
+        let asked = Instant::now();
+        let s = Slot {
+            mint_failed: Some((asked + Duration::from_millis(5), "network".into())),
+            ..Slot::default()
+        };
+        let f = ready(&s, false, asked).unwrap().unwrap_err();
+        assert_eq!(f.rule, MINT_FAILED);
+        assert_eq!(f.mint.as_deref(), Some("network"));
+        assert!(!f.fresh, "not recorded again");
+        // A call that asked after the failure mints again.
+        assert!(ready(&s, false, asked + Duration::from_millis(10)).is_none());
     }
 }

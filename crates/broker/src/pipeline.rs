@@ -395,9 +395,12 @@ pub type CredFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Arc<Cred>, &'static str>> + Send + 'a>,
 >;
 
-/// The auth kinds whose credential comes from [`Env::credential`] rather
-/// than from the vault entry as it is.
-pub const CREDENTIAL_KINDS: &[&str] = &["oauth2", "aws_sigv4", "gcp_sa", "azure_sp"];
+/// An auth kind whose credential comes from [`Env::credential`] rather than
+/// from the vault entry as it is: `oauth2` and the cloud kinds
+/// ([`crate::manifest::CLOUD_AUTH_KINDS`]).
+pub fn is_credential_kind(kind: &str) -> bool {
+    kind == "oauth2" || crate::manifest::CLOUD_AUTH_KINDS.contains(&kind)
+}
 
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
 /// parsers that keep the first and the last value would see different
@@ -982,7 +985,7 @@ async fn steps(
     // Nothing is minted before this point: a call denied in steps 2–8
     // costs no token request.
     let minted: Option<(&str, &AuthSpec)> = match &svc.secret {
-        Some(name) if CREDENTIAL_KINDS.contains(&auth.kind.as_str()) => {
+        Some(name) if is_credential_kind(&auth.kind) => {
             match m.auth.iter().find(|a| a.kind == auth.kind) {
                 Some(spec) => Some((name.as_str(), spec)),
                 None => return denied("secret_missing"),
