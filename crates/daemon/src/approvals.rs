@@ -152,6 +152,12 @@ pub struct Request {
     /// environment), as recorded at the ask: shown as `env base`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub env_base: bool,
+    /// Masking changed nothing the approver is shown of this request (its
+    /// operation, params, headers, body and project): the display is the
+    /// request itself. Only such requests are ever deduped (decision 8).
+    /// Absent (false) in a request stored before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub display_faithful: bool,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -218,6 +224,9 @@ pub struct SendDisplay {
     pub env: Option<String>,
     /// [`Request::env_base`].
     pub env_base: bool,
+    /// [`Request::display_faithful`]: set by the caller only when every
+    /// masked display field equals its raw value.
+    pub faithful: bool,
 }
 
 /// Which requests [`Store::list`] returns: `None`/empty means any.
@@ -429,11 +438,13 @@ pub fn record_for(
 
 /// Whether pending request `r` is the one `new` would create (decision 8):
 /// a command by its `grant_key`; a connector or MCP request by everything
-/// its approver is shown (service, operation, capability, masked params,
-/// body display and SHA-256, amount, headers, environment, project and
-/// session). The sealed exact requests behind two equal displays may still
-/// differ in a masked value; the retry then gets the first one's id, and
-/// only the first is ever sent.
+/// its approver is shown (service, operation, capability, params, body
+/// display and SHA-256, amount, headers, environment, project and
+/// session), and only when both displays are faithful (masking changed
+/// none of them): two equal displays are then two equal requests. A
+/// display that masking changed may hide a difference (two different
+/// vault values both shown as `[MASKED]`), so such a request is never
+/// deduped.
 fn same_request(r: &Request, new: &NewRequest) -> bool {
     if r.kind != new.kind || r.uid != new.uid {
         return false;
@@ -441,7 +452,9 @@ fn same_request(r: &Request, new: &NewRequest) -> bool {
     match new.kind {
         ApprovalType::Command => new.grant_key.is_some() && r.grant_key == new.grant_key,
         ApprovalType::Connector | ApprovalType::Mcp => {
-            r.service == new.service
+            r.display_faithful
+                && new.send.faithful
+                && r.service == new.service
                 && r.operation == new.operation
                 && r.capability == new.capability
                 && &r.params == new.params.get()
@@ -785,6 +798,7 @@ impl Store {
             headers: req.send.headers,
             env: req.send.env,
             env_base: req.send.env_base,
+            display_faithful: req.send.faithful,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
@@ -1086,7 +1100,10 @@ mod tests {
     fn identical_pending_connector_request_is_deduped() {
         let e = env();
         let s = &e.store;
-        let d = |r: NewRequest| s.create_dedup(r, no_seal, HOUR, t0(), Some(20)).unwrap();
+        let d = |mut r: NewRequest| {
+            r.send.faithful = true;
+            s.create_dedup(r, no_seal, HOUR, t0(), Some(20)).unwrap()
+        };
         let (a, made) = d(new_req(1));
         assert!(made);
         let (b, made) = d(new_req(1));
@@ -1104,15 +1121,27 @@ mod tests {
         let mut mcp = new_req(1);
         mcp.kind = ApprovalType::Mcp;
         assert_ne!(d(mcp).0.id, a.id);
+        // A display masking changed is never deduped, either way round.
+        let unfaithful = |r: NewRequest| s.create_dedup(r, no_seal, HOUR, t0(), Some(20)).unwrap();
+        let (u, made) = unfaithful(new_req(1));
+        assert!(made);
+        assert_ne!(u.id, a.id);
+        let (v, made) = unfaithful(new_req(1));
+        assert!(made);
+        assert_ne!(v.id, u.id);
         // Decided: no longer pending, so a new request.
         decide(s, a.id, State::Pending, State::Rejected).unwrap();
         assert_ne!(d(new_req(1)).0.id, a.id);
         // Expired but not swept: a new one too.
+        let faithful = |mut r: NewRequest| {
+            r.send.faithful = true;
+            r
+        };
         let (x, _) = s
-            .create_dedup(new_req(9), no_seal, MIN, t0(), None)
+            .create_dedup(faithful(new_req(9)), no_seal, MIN, t0(), None)
             .unwrap();
         let (y, made) = s
-            .create_dedup(new_req(9), no_seal, MIN, t0() + HOUR, None)
+            .create_dedup(faithful(new_req(9)), no_seal, MIN, t0() + HOUR, None)
             .unwrap();
         assert!(made);
         assert_ne!(x.id, y.id);

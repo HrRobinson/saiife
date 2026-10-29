@@ -122,6 +122,14 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     let exact = Zeroizing::new(
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
+    // The display is the request itself only when masking changed none of
+    // it (step 8 already refused a body it would change): only then may an
+    // identical pending request be given back (decision 8).
+    let faithful = p.operation == p.stored.operation
+        && p.project == p.stored.project
+        && *p.params.get() == p.stored.params
+        && p.headers == p.stored.headers
+        && p.body_sha256 == p.stored.body_sha256;
     let new = NewRequest {
         uid: p.stored.uid,
         user: p.stored.user.clone(),
@@ -148,6 +156,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
             headers: p.headers.clone(),
             env: p.stored.env.clone(),
             env_base: p.stored.env_recorded && p.stored.env.is_none(),
+            faithful,
         },
     };
     store_new(ctx, new, Some(exact), ttl).await
@@ -198,6 +207,10 @@ pub(crate) async fn create_mcp(
             headers: Vec::new(),
             env: p.stored.env.clone(),
             env_base: p.stored.env_recorded && p.stored.env.is_none(),
+            // Step 9 refused a tool name or arguments masking would change
+            // (`masked_content`); the project must be unchanged too.
+            // A cut display is still compared whole by its SHA-256.
+            faithful: p.tool == p.stored.tool && p.project == p.stored.project,
         },
     };
     store_new(ctx, new, Some(exact), ttl).await

@@ -32,6 +32,8 @@ struct Fake {
     tools: Mutex<Option<Vec<Tool>>>,
     calls: Mutex<Vec<Sent>>,
     answer: Mutex<Answer>,
+    /// The server's secret values (the token by default).
+    secrets: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -45,6 +47,7 @@ impl Fake {
                           "isError": false}),
                 )
             })),
+            secrets: Mutex::new(vec![token()]),
         }
     }
 
@@ -100,7 +103,12 @@ impl ToolCaller for Fake {
 
     fn secret_values(&self, server: &str) -> Vec<Zeroizing<String>> {
         if server == "linear" {
-            vec![Zeroizing::new(token())]
+            self.secrets
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|v| Zeroizing::new(v.clone()))
+                .collect()
         } else {
             Vec::new()
         }
@@ -985,4 +993,107 @@ async fn limiter_rebuild_counts_mcp_records() {
         lim.would_allow(&events[0].key, OpKind::Read, None, false, &limits, now),
         Err("requests_per_minute")
     );
+}
+
+// ------------------------------------------------------------ fix round 1
+
+#[tokio::test]
+async fn masked_tool_name_or_escaped_secret_cannot_be_approved() {
+    let w = world("[\"mcp:linear\"]", "");
+    // A listed tool (ask) whose name holds the secret.
+    let named = format!("create_{}", token());
+    *w.fake.tools.lock().unwrap() = Some(vec![tool(&named), tool("create_issue")]);
+    let a = w.call(&named, "{}").await;
+    assert_eq!(denied_rule(&a), "masked_content");
+    // A secret holding a `"`: escaped in the canonical text, found in the
+    // parsed string.
+    let quoted = concat!("q\"uo", "te-sec", "ret-7Hk2").to_string();
+    w.fake.secrets.lock().unwrap().push(quoted.clone());
+    let args = serde_json::to_string(&json!({ "k": quoted })).unwrap();
+    assert!(!args.contains(&quoted));
+    let a = w.call("create_issue", &args).await;
+    assert_eq!(denied_rule(&a), "masked_content");
+    // In a key too.
+    let args = serde_json::to_string(&json!({ quoted.clone(): 1 })).unwrap();
+    let a = w.call("create_issue", &args).await;
+    assert_eq!(denied_rule(&a), "masked_content");
+    assert!(w.approvals().is_empty());
+    assert!(w.fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn numbers_that_change_on_the_round_trip_are_refused() {
+    let w = world("[\"mcp:linear\"]", "");
+    for args in [
+        r#"{"n":1e2}"#,
+        r#"{"n":1E2}"#,
+        r#"{"n":1.5e3}"#,
+        r#"{"n":18446744073709551616}"#,
+        r#"{"n":-9223372036854775809}"#,
+        r#"{"a":[{"n":2e0}]}"#,
+    ] {
+        let a = w.call("list_issues", args).await;
+        assert_eq!(denied_rule(&a), "bad_param", "{args}");
+    }
+    assert!(w.fake.calls().is_empty());
+    for args in [
+        r#"{"n":18446744073709551615}"#,
+        r#"{"n":-9223372036854775808}"#,
+        r#"{"n":1.5,"m":-0.25,"s":"1e2 and 18446744073709551616","e":"\"9e9\""}"#,
+    ] {
+        let a = w.call("list_issues", args).await;
+        assert_eq!(a["ok"], true, "{args}: {a}");
+    }
+    assert_eq!(w.fake.calls()[0].2["n"], json!(u64::MAX));
+    assert!(numbers_exact(br#"{"s":"\\","n":3}"#));
+    assert!(!numbers_exact(br#"{"s":"\\","n":3e1}"#));
+}
+
+#[tokio::test]
+async fn tool_removed_before_approval_is_refused() {
+    let w = world("[\"mcp:linear\"]", "");
+    let id = w.call("create_issue", "{}").await["pending"]
+        .as_u64()
+        .unwrap();
+    // The server no longer lists it (a relist after the ask).
+    *w.fake.tools.lock().unwrap() = Some(vec![tool("list_issues")]);
+    w.approve(id).await;
+    let r = w.result(id).await;
+    assert_eq!(r["state"], "send_failed", "{r}");
+    assert_eq!(r["result"]["rule"], "unknown_operation", "{r}");
+    assert!(w.fake.calls().is_empty());
+    // Not running at all: nothing is sent either.
+    let w = world("[\"mcp:linear\"]", "");
+    let id = w.call("create_issue", "{}").await["pending"]
+        .as_u64()
+        .unwrap();
+    *w.fake.tools.lock().unwrap() = None;
+    w.approve(id).await;
+    assert_eq!(w.result(id).await["result"]["rule"], "upstream_unavailable");
+    assert!(w.fake.calls().is_empty());
+}
+
+#[test]
+fn cut_result_keeps_the_note_and_never_exceeds_max() {
+    let big = json!({"content": [{"type": "text", "text": "x".repeat(10_000)}], "isError": true});
+    // A result that is not an object gets the note too.
+    let (v, cut) = cut_result(Value::String("y".repeat(5000)), 1000);
+    assert!(cut);
+    assert!(json_len(&v) <= 1000, "{v}");
+    assert!(v["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("cut at max_response_bytes"));
+    // Below the note's reserve: the note never makes it larger than max.
+    for max in [300, 120, 60, 40, 14, 5, 0] {
+        let (v, cut) = cut_result(big.clone(), max);
+        assert!(cut);
+        let n = json_len(&v);
+        assert!(n <= max.max(14), "{max}: {n} {v}");
+        assert!(v["content"].is_array(), "{v}");
+    }
+    let (v, _) = cut_result(big.clone(), 60);
+    assert_eq!(v["content"][0]["text"], "[saiife: cut]", "{v}");
+    let (v, _) = cut_result(big, 10);
+    assert_eq!(v, json!({"content": []}));
 }

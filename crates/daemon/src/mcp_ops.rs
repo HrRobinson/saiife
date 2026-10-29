@@ -365,13 +365,77 @@ fn record_params(args: &Map<String, Value>, masker: &Masker) -> BTreeMap<String,
 
 /// The text the approver is shown, when it is exactly what will be sent:
 /// `None` when the masker would change it (a secret value, or a v1
-/// pattern), as for a connector body.
-fn faithful(masker: &Masker, b: &[u8]) -> Option<String> {
+/// pattern), as for a connector body. The canonical text is checked, and so
+/// is every string of `args` (keys too) as parsed: a secret holding `"`,
+/// `\` or a control char is escaped in the text, where its raw form is not
+/// found.
+fn faithful(masker: &Masker, b: &[u8], args: &Map<String, Value>) -> Option<String> {
     if masker.mask_bytes(b) != b {
         return None;
     }
     let text = std::str::from_utf8(b).ok()?;
-    (masker.mask_text(text) == text).then(|| text.to_string())
+    if masker.mask_text(text) != text {
+        return None;
+    }
+    fn unchanged(m: &Masker, v: &Value) -> bool {
+        match v {
+            Value::String(s) => m.mask_text(s) == *s,
+            Value::Array(a) => a.iter().all(|x| unchanged(m, x)),
+            Value::Object(o) => o
+                .iter()
+                .all(|(k, x)| m.mask_text(k) == *k && unchanged(m, x)),
+            _ => true,
+        }
+    }
+    args.iter()
+        .all(|(k, v)| masker.mask_text(k) == *k && unchanged(masker, v))
+        .then(|| text.to_string())
+}
+
+/// Whether every number in the JSON text `b` (already parsed, so valid)
+/// keeps its meaning through the parser and canonical JSON: no exponent
+/// form (`1e2` would become `100.0`) and no integer outside the i64/u64
+/// range (it would become a float and lose digits). Decimals like `1.5`
+/// are kept.
+pub fn numbers_exact(b: &[u8]) -> bool {
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            match c {
+                b'\\' => i += 1,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if c == b'-' || c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b"0123456789+-.eE".contains(&b[i]) {
+                i += 1;
+            }
+            let tok = &b[start..i];
+            if tok.iter().any(|&x| x == b'e' || x == b'E') {
+                return false;
+            }
+            if !tok.contains(&b'.') {
+                let t = std::str::from_utf8(tok).unwrap_or("");
+                if t.parse::<i64>().is_err() && t.parse::<u64>().is_err() {
+                    return false;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn json_len(v: &Value) -> usize {
@@ -404,8 +468,13 @@ pub fn cut_result(v: Value, max: usize) -> (Value, bool) {
     if size <= max {
         return (v, false);
     }
+    let note = |max: usize, size: usize| {
+        json!({"type": "text", "text": format!(
+            "[saiife: the result was cut at max_response_bytes ({max} bytes); it was {size} bytes]"
+        )})
+    };
     let Value::Object(mut o) = v else {
-        return (json!({"content": []}), true);
+        return (fit(json!({"content": [note(max, size)]}), max), true);
     };
     let budget = max.saturating_sub(CUT_RESERVE);
     let items = match o.remove("content") {
@@ -445,11 +514,23 @@ pub fn cut_result(v: Value, max: usize) -> (Value, bool) {
             out.insert("structuredContent".into(), sc);
         }
     }
-    kept.push(json!({"type": "text", "text": format!(
-        "[saiife: the result was cut at max_response_bytes ({max} bytes); it was {size} bytes]"
-    )}));
+    kept.push(note(max, size));
     out.insert("content".into(), Value::Array(kept));
-    (Value::Object(out), true)
+    (fit(Value::Object(out), max), true)
+}
+
+/// A cut result never exceeds `max`: when even the note does not fit (a
+/// `max_response_bytes` below [`CUT_RESERVE`]), the shorter `[saiife:
+/// cut]`; below that, an empty `content` (14 bytes, the smallest result).
+fn fit(v: Value, max: usize) -> Value {
+    if json_len(&v) <= max {
+        return v;
+    }
+    let short = json!({"content": [{"type": "text", "text": "[saiife: cut]"}]});
+    if json_len(&short) <= max {
+        return short;
+    }
+    json!({"content": []})
 }
 
 // ------------------------------------------------------------ pipeline
@@ -558,6 +639,12 @@ async fn steps(
     let Some(args) = parse_arguments(&call.arguments) else {
         return denied("bad_param");
     };
+    // A number the round trip would change is refused, not rewritten. The
+    // stored canonical text of an approved call was checked at its ask
+    // (canonical JSON may write a decimal in exponent form).
+    if stage == Stage::New && !numbers_exact(&call.arguments) {
+        return denied("bad_param");
+    }
     let canonical = saiife_policy::canonical_json(&Value::Object(args.clone())).into_bytes();
     let sha = hex(&Sha256::digest(&canonical));
     tr.body_bytes = canonical.len();
@@ -592,7 +679,12 @@ async fn steps(
         if let Err(limit) = lim.would_allow(&key, kind, None, false, &cfg.limits, now) {
             return McpOutcome::Limited { limit };
         }
-        let Some(text) = faithful(masker, &canonical) else {
+        // The approver must see what will be sent: the tool name and the
+        // arguments, unmasked.
+        if masker.mask_text(&tool.name) != tool.name {
+            return denied(MASKED_CONTENT_RULE);
+        }
+        let Some(text) = faithful(masker, &canonical, &args) else {
             return denied(MASKED_CONTENT_RULE);
         };
         let (display, truncated) = cut_display(&text, DISPLAY_MAX);

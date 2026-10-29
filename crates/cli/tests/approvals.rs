@@ -1430,6 +1430,46 @@ fn at_most_20_pending_per_uid() {
     assert!(ops_ask(&w, &body(21))["pending"].is_u64());
 }
 
+/// Decision 8 dedupes only faithful displays: two asks that differ only
+/// inside a masked value (both shown as `[MASKED]`) are two requests, and
+/// each approval sends its own call. Two identical faithful asks still
+/// share one id.
+#[test]
+fn asks_differing_only_in_a_masked_param_are_not_deduped() {
+    use base64::Engine as _;
+    let w = world();
+    let ask = |r: &str| {
+        w.op(
+            own_uid(),
+            "api.call",
+            json!({"service": "erp", "operation": "invoices.create",
+                   "params": {"ref": r},
+                   "body_b64": base64::engine::general_purpose::STANDARD.encode(BODY_A)}),
+        )
+    };
+    let hexed: String = SECRET.bytes().map(|b| format!("{b:02x}")).collect();
+    let a = ask(SECRET)["pending"].as_u64().unwrap();
+    let b = ask(&hexed)["pending"].as_u64().unwrap();
+    assert_ne!(a, b, "a masked difference was deduped");
+    // The approver is shown the same masked display for both.
+    let show =
+        |id: u64| w.op(BOSS, "approval.show", json!({ "request": id }))["item"]["params"].clone();
+    assert_eq!(show(a), show(b));
+    assert_eq!(show(a)["ref"], "[MASKED]");
+    // A faithful request asked twice is one request.
+    let c = ask("plain-ref")["pending"].as_u64().unwrap();
+    assert_eq!(ask("plain-ref")["pending"], c);
+    // Each approval sends its own call.
+    for id in [a, b] {
+        assert_eq!(w.decide(BOSS, id, "approve")["ok"], true);
+        w.wait_state(id, State::Sent);
+    }
+    let hits = w.m.hits();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits[0].0.contains(&format!("ref={SECRET}")), "{hits:?}");
+    assert!(hits[1].0.contains(&format!("ref={hexed}")), "{hits:?}");
+}
+
 /// An approved `/v1/proxy` request is sent with the method, path and
 /// query of the original.
 #[test]
