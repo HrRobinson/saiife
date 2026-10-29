@@ -144,14 +144,6 @@ mod linux {
             return refuse("the http connector is configured by hand: see docs/connectors/http.md");
         }
         let manifest = find_manifest(&connector, conf_dir, owner)?;
-        // A service account key has many fields and a private key: it comes
-        // from the file Google issued, never a variable or a prompt.
-        if secret_kind(&manifest) == "gcp_sa" && a.from_file.is_none() {
-            return refuse(format!(
-                "{connector} needs --from-file with the service account key (JSON) file"
-            ));
-        }
-
         // 2. The parameters.
         let params = collect_params(&manifest, &a.params)?;
 
@@ -186,13 +178,23 @@ mod linux {
                     ));
                 }
             }
-            None => add_secret(
-                &t,
-                &secret,
-                secret_kind(&manifest),
-                std::slice::from_ref(&service),
-                source(a.from_file, a.from_env),
-            )?,
+            None => {
+                // A service account key has many fields and a private key:
+                // it comes from the file Google issued, never a variable or
+                // a prompt. Only a new secret needs it.
+                if secret_kind(&manifest) == "gcp_sa" && a.from_file.is_none() {
+                    return refuse(format!(
+                        "{connector} needs --from-file with the service account key (JSON) file"
+                    ));
+                }
+                add_secret(
+                    &t,
+                    &secret,
+                    secret_kind(&manifest),
+                    std::slice::from_ref(&service),
+                    source(a.from_file, a.from_env),
+                )?
+            }
         }
 
         // 5. The policy file. If it fails, tell how to undo the secret.

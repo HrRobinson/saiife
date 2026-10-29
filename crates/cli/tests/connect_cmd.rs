@@ -487,6 +487,19 @@ fn connect_gcp_needs_from_file() {
     assert_eq!(secret_kinds(&d)["gcp-storage"], "gcp_sa");
 }
 
+#[test]
+fn connect_gcp_reuse_needs_no_file() {
+    let d = admin();
+    let file = d.path().join("sa.json");
+    fs::write(&file, cloud_secret_json("gcp_sa")).unwrap();
+    let o = connect(&d, &["gcp-storage", "--from-file", file.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", err(&o));
+    fs::remove_file(policy_file(&d, "gcp-storage.toml")).unwrap();
+    let o = connect(&d, &["gcp-storage"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(err(&o).is_empty() || !err(&o).contains("--from-file"));
+}
+
 /// A value that passes the manifest's own check for each required param.
 fn test_params(m: &saiife_broker::manifest::Manifest) -> Vec<String> {
     const TRIES: [&str; 10] = [

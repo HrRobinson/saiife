@@ -156,7 +156,12 @@ fn check_cloud(
         if let Err(e) = crate::cloud::session_policy::build(svc, m, None, Mode::Locked) {
             return bad(format!("mode = \"sts\" cannot be used: {e}"));
         }
-        if svc.limits != saiife_policy::LimitsCfg::default() {
+        // A lease counts as one request, so requests_per_minute binds.
+        let unbound = saiife_policy::LimitsCfg {
+            requests_per_minute: None,
+            ..svc.limits.clone()
+        };
+        if unbound != saiife_policy::LimitsCfg::default() {
             warnings.push(format!(
                 "service {name}: limits apply to saiife api calls, not to run --cloud credentials"
             ));
@@ -314,6 +319,18 @@ mod tests {
                     .contains("limits apply to saiife api calls, not to run --cloud credentials")),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn sts_requests_per_minute_alone_not_warned() {
+        let w = check(&sts("limits = { requests_per_minute = 5 }", DOCS_ALLOW)).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        let w = check(&sts(
+            "limits = { requests_per_minute = 5, writes_per_hour = 5 }",
+            DOCS_ALLOW,
+        ))
+        .unwrap();
+        assert!(w.iter().any(|x| x.contains("limits apply")), "{w:?}");
     }
 
     #[test]
