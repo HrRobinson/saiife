@@ -166,14 +166,14 @@ impl Conn {
 }
 
 /// The pid set entry and the process group of one child, for as long as
-/// it exists: dropping it (a stop that cancels a start, a crash, any end)
-/// removes the pid from the gateway's set and kills what is left of the
-/// child's group (the helper's `setsid` makes the child its leader).
+/// it exists. While armed (the leader not yet waited for, so its pid and
+/// group id cannot have been reused), dropping it kills the child's group
+/// first, then removes the pid from the gateway's set. Once the leader was
+/// waited for (any outcome) it is disarmed and never signals again.
 pub(crate) struct Reaper {
     pid: u32,
     pids: Arc<Mutex<BTreeSet<u32>>>,
-    /// The leader was waited for: its pid is no longer ours to check.
-    reaped: bool,
+    armed: bool,
 }
 
 impl Reaper {
@@ -182,75 +182,102 @@ impl Reaper {
         Reaper {
             pid,
             pids,
-            reaped: false,
+            armed: true,
         }
+    }
+
+    /// Kill the group, only while armed.
+    fn kill_group(&self) {
+        if self.armed {
+            kill_group(self.pid);
+        }
+    }
+
+    /// The leader was waited for: no signal from here on.
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for Reaper {
     fn drop(&mut self) {
+        self.kill_group();
         lock(&self.pids).remove(&self.pid);
-        kill_group(self.pid, self.reaped);
     }
 }
 
-/// SIGKILL the process group `pid` leads, only when it is ours:
-/// - leader not yet reaped: its pid cannot have been reused, and it must
-///   lead its own group (`getpgid(pid) == pid`);
-/// - leader reaped: the group id stays allocated while members exist, so
-///   a member is looked for (`/proc`: group and session both `pid`, and
-///   `getpgid(member) == pid`); none, no signal.
-///
-/// A syscall on a group we created, never a shell `kill`.
-pub(crate) fn kill_group(pid: u32, reaped: bool) {
+/// SIGKILL the process group `pid` leads. Called only while the leader is
+/// unreaped (running or a zombie), so `pid` is still our child and the
+/// group id cannot have been reused; and only when the child leads its
+/// own group (`getpgid(pid) == pid`: the helper calls `setsid`). A syscall
+/// on a group we created, never a shell `kill`.
+fn kill_group(pid: u32) {
     use rustix::process::{getpgid, kill_process_group, Pid, Signal};
     let Some(raw) = Pid::from_raw(pid as i32) else {
         return;
     };
-    let ours = if reaped {
-        group_member_of(pid).is_some()
-    } else {
-        getpgid(Some(raw)).is_ok_and(|g| g == raw)
-    };
-    if ours {
+    if getpgid(Some(raw)).is_ok_and(|g| g == raw) {
         let _ = kill_process_group(raw, Signal::KILL);
     }
 }
 
-/// A live process of group and session `pid`, other than `pid`.
-fn group_member_of(pid: u32) -> Option<u32> {
-    use rustix::process::{getpgid, Pid};
-    let rd = std::fs::read_dir("/proc").ok()?;
-    for e in rd.flatten() {
-        let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if p == pid {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
-            continue;
-        };
-        let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
-            continue;
-        };
-        let f: Vec<&str> = rest.split_ascii_whitespace().take(4).collect();
-        let (Some(pgrp), Some(sid)) = (
-            f.get(2).and_then(|v| v.parse::<u32>().ok()),
-            f.get(3).and_then(|v| v.parse::<u32>().ok()),
-        ) else {
-            continue;
-        };
-        if pgrp == pid && sid == pid {
-            let confirmed = Pid::from_raw(p as i32)
-                .and_then(|m| getpgid(Some(m)).ok())
-                .is_some_and(|g| g.as_raw_nonzero().get() as u32 == pid);
-            if confirmed {
-                return Some(p);
-            }
+/// Watches for the leader's exit without reaping it: a pidfd (readable once
+/// the process has exited, while it is still a zombie), or, where pidfds
+/// are unavailable, `waitid(P_PID, WEXITED | WNOWAIT)` on a blocking
+/// thread.
+pub(crate) enum ExitWatch {
+    Pidfd(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, u32),
+    Waitid(u32),
+}
+
+impl ExitWatch {
+    fn new(pid: u32) -> ExitWatch {
+        use rustix::process::{pidfd_open, Pid, PidfdFlags};
+        let fd = Pid::from_raw(pid as i32)
+            .and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok())
+            .and_then(|fd| {
+                tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()
+            });
+        match fd {
+            Some(fd) => ExitWatch::Pidfd(fd, pid),
+            None => ExitWatch::Waitid(pid),
         }
     }
-    None
+
+    /// Returns once the leader has exited; it stays unreaped.
+    pub async fn exited(&self) {
+        let pid = match self {
+            ExitWatch::Pidfd(fd, pid) => {
+                // Readiness is never cleared: once exited, always exited.
+                if fd.readable().await.is_ok() {
+                    return;
+                }
+                // The reactor refused the fd: wait the blocking way.
+                *pid
+            }
+            ExitWatch::Waitid(pid) => *pid,
+        };
+        wait_nowait(pid).await
+    }
+}
+
+/// `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a blocking thread. Any error
+/// other than EINTR (ECHILD: already reaped) counts as exited.
+async fn wait_nowait(pid: u32) {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let Some(raw) = Pid::from_raw(pid as i32) else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || loop {
+        match waitid(
+            WaitId::Pid(raw),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            _ => return,
+        }
+    })
+    .await;
 }
 
 /// A started child: the process, its connection and the reader's fatal
@@ -263,32 +290,29 @@ pub(crate) struct Running {
     pub conn: Arc<Conn>,
     /// The reader's one fatal protocol break, already sanitized.
     pub fatal: mpsc::UnboundedReceiver<String>,
+    pub exit: ExitWatch,
 }
 
 impl Running {
-    /// The leader was waited for (by `process.wait()`).
-    pub fn mark_reaped(&mut self) {
-        self.reaper.reaped = true;
-    }
-
-    /// Wait for the leader to exit; marks it reaped.
-    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    /// After [`ExitWatch::exited`]: kill what is left of the group while
+    /// the leader is a zombie, then reap it.
+    pub async fn reap_exited(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.reaper.kill_group();
         let st = self.process.wait().await;
-        if st.is_ok() {
-            self.reaper.reaped = true;
-        }
+        self.reaper.disarm();
         st
     }
 
-    /// Kill the child's group and the leader, through our handle; reap it,
-    /// bounded.
+    /// Kill the child's group and the leader (before any reap), through
+    /// our handle; then reap it, bounded.
     pub async fn kill(&mut self) {
-        if !self.reaper.reaped {
-            kill_group(self.pid, false);
-        }
+        self.reaper.kill_group();
         let _ = self.process.start_kill();
-        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), self.process.wait()).await {
-            self.reaper.reaped = true;
+        if tokio::time::timeout(Duration::from_secs(1), self.process.wait())
+            .await
+            .is_ok()
+        {
+            self.reaper.disarm();
         }
     }
 }
@@ -388,6 +412,7 @@ pub(crate) async fn spawn(
         pid,
         conn,
         fatal,
+        exit: ExitWatch::new(pid),
     })
 }
 
@@ -491,7 +516,9 @@ async fn read_stdout(
                 } else {
                     Message::error(Some(id), RpcError::method_not_found(&method))
                 };
-                let _ = conn.send_line(&answer).await;
+                // Bounded: a ping flood with an unread stdin must not
+                // stall the reader.
+                let _ = tokio::time::timeout(Duration::from_secs(1), conn.send_line(&answer)).await;
             }
             Message::Notification { method, .. } => {
                 if method == t::TOOLS_LIST_CHANGED {
@@ -559,14 +586,11 @@ pub(crate) async fn initialize(conn: &Conn, limit: Duration) -> Result<(), Start
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !saiife_mcp::version::is_supported(version) {
-        let shown: String = version
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(32)
-            .collect();
+        // Masked whole, then cut (never a cut-then-masked fragment).
+        let shown = cut(sanitize(&conn.masker, version), 64);
         return Err(StartError::permanent(format!(
             "mcp_version_unsupported: the server answered protocol version {:?}; saiife speaks {}",
-            conn.masker.mask_text(&shown),
+            shown,
             saiife_mcp::version::SUPPORTED.join(", ")
         )));
     }
@@ -709,7 +733,8 @@ impl Collector {
             16
         } else {
             clean_value(&mut schema, masker);
-            size
+            // Counted after cleaning: masking can make a string longer.
+            serde_json::to_vec(&schema).map_or(usize::MAX, |b| b.len())
         };
         let tool = Tool {
             name: name.to_string(),
@@ -875,6 +900,31 @@ mod tests {
         assert!(tools[0].annotations.is_none());
         assert_eq!(tools[1].input_schema, json!({"type": "object"}));
         assert_eq!(tools[2].input_schema, json!({"type": "object"}));
+    }
+
+    /// The exit watch sees an exit without reaping: the leader is still a
+    /// zombie (so its group can be killed safely) until `wait`. Both ways.
+    #[tokio::test]
+    async fn exit_watch_does_not_reap() {
+        for fallback in [false, true] {
+            let mut c = tokio::process::Command::new("true").spawn().unwrap();
+            let pid = c.id().unwrap();
+            let w = if fallback {
+                ExitWatch::Waitid(pid)
+            } else {
+                ExitWatch::new(pid)
+            };
+            if !fallback {
+                assert!(matches!(w, ExitWatch::Pidfd(..)), "no pidfd here");
+            }
+            tokio::time::timeout(Duration::from_secs(10), w.exited())
+                .await
+                .expect("exit seen");
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let state = stat.rsplit_once(") ").unwrap().1.chars().next().unwrap();
+            assert_eq!(state, 'Z', "fallback {fallback}: reaped too early");
+            assert!(c.wait().await.unwrap().success());
+        }
     }
 
     #[test]

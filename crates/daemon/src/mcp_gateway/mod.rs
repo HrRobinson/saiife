@@ -869,10 +869,9 @@ async fn run(
     let mut fatal_open = true;
     loop {
         tokio::select! {
-            st = r.process.wait() => {
-                if st.is_ok() {
-                    r.mark_reaped();
-                }
+            _ = r.exit.exited() => {
+                // Exited, not yet reaped: the group goes first.
+                let st = r.reap_exited().await;
                 let why = format!("mcp server exited: {}", exit_text(st));
                 return End::Exited(why);
             }
@@ -885,8 +884,8 @@ async fn run(
             },
             _ = stopped(stop) => {
                 r.conn.close_stdin();
-                let how = match tokio::time::timeout(STOP_GRACE, r.wait()).await {
-                    Ok(st) => exit_text(st),
+                let how = match tokio::time::timeout(STOP_GRACE, r.exit.exited()).await {
+                    Ok(()) => exit_text(r.reap_exited().await),
                     Err(_) => {
                         r.kill().await;
                         "killed after 2 s without exiting on EOF".to_string()

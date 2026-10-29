@@ -122,9 +122,14 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
                 // A gateway child holds secret values in its environment:
                 // an added, rotated or removed secret restarts (or starts,
                 // or fails) the servers that name it, now.
-                if let Some(sys) = ctx.policy().system {
+                // The vault lock first, then the policy under it: a reload
+                // reconciles under the same lock, so a stale snapshot taken
+                // here can never undo it.
+                {
                     let vault = ctx.vault.lock();
-                    ctx.mcp.reconcile(&sys, &vault);
+                    if let Some(sys) = ctx.policy().system {
+                        ctx.mcp.reconcile(&sys, &vault);
+                    }
                 }
                 let mut r = record(ctx, peer, event, &name).await;
                 if let Some(src) = &source {
