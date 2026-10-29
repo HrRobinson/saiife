@@ -44,8 +44,9 @@ pub fn tool_name(service: &str, op_id: &str) -> Option<String> {
 pub enum BodyArg {
     /// `body = "json"`: a JSON object, sent as its compact JSON.
     Json,
-    /// `body = "text"` (and plan 15's `"raw"`): a string, sent as its
-    /// UTF-8 bytes.
+    /// `body = "text"` and `body = "raw"`: a string, sent as its UTF-8
+    /// bytes. A raw body reaches the upstream as those bytes, never parsed;
+    /// a binary upload cannot be sent as an MCP string.
     Text,
 }
 
@@ -68,12 +69,26 @@ impl BodyArg {
     }
 }
 
-// Plan 15 adds `body = "raw"` to `BODY_FORMATS`. This stops the build until
-// `body_arg` below maps it (to `BodyArg::Text`): plan 17 owns the mapping.
+// A new entry in `BODY_FORMATS` stops the build until `body_arg` below
+// maps it (`json`, `form`, `text`, `raw` are mapped).
 const _: () = assert!(
-    crate::manifest::BODY_FORMATS.len() == 3,
-    "a new body format: map it in tool_schema::body_arg (plan 15's raw is BodyArg::Text)"
+    crate::manifest::BODY_FORMATS.len() == 4,
+    "a new body format: map it in tool_schema::body_arg"
 );
+
+/// The description of an `objectkey` property (decision 5 of plan 15, as
+/// `params::object_value_problem` checks it).
+pub const OBJECT_KEY_DESCRIPTION: &str = "An object key: 1 to 1024 bytes; `/` separates \
+    path segments and is kept; no empty, `.` or `..` segment, no backslash, no control \
+    character, at any depth of percent-decoding.";
+/// The description of an `objectname` property: the same rules, the whole
+/// name sent as one segment (`/` as `%2F`).
+pub const OBJECT_NAME_DESCRIPTION: &str = "An object name: 1 to 1024 bytes, sent whole \
+    (`/` is encoded as %2F); no empty, `.` or `..` segment between `/`, no backslash, no \
+    control character, at any depth of percent-decoding.";
+/// The description of the `body` property of a `body = "raw"` operation.
+pub const RAW_BODY_DESCRIPTION: &str =
+    "The request body, sent as its UTF-8 bytes exactly as given (never parsed).";
 
 /// The free `body` argument of `op`. None with a built body
 /// (`body_params`, `body_const`, `graphql`: the agent sends params only),
@@ -86,7 +101,9 @@ pub fn body_arg(op: &Operation) -> Option<BodyArg> {
     }
     match op.body.as_deref() {
         Some("json") => Some(BodyArg::Json),
-        Some("text") => Some(BodyArg::Text),
+        // `raw` (plan 15): the agent's bytes as they are; over MCP, a
+        // string's UTF-8 bytes (`prepare_body` takes them unparsed).
+        Some("text") | Some("raw") => Some(BodyArg::Text),
         // `form` without body_params, none, or a format the manifest check
         // refuses: no body argument (fail closed).
         _ => None,
@@ -94,8 +111,7 @@ pub fn body_arg(op: &Operation) -> Option<BodyArg> {
 }
 
 /// The JSON Schema of one param type. The match is exhaustive on purpose:
-/// plan 15's `ObjectKey` and `ObjectName` stop the build here until they
-/// are mapped, to `{"type":"string","maxLength":1024}` (plan 17 owns it).
+/// a new param type stops the build here until it is mapped.
 pub fn param_schema(t: &ParamType) -> Value {
     match t {
         ParamType::String { pattern: None } => json!({"type": "string"}),
@@ -117,8 +133,20 @@ pub fn param_schema(t: &ParamType) -> Value {
         ParamType::Enum(vals) => json!({"type": "string", "enum": vals}),
         ParamType::Datetime => json!({"type": "string", "format": "date-time"}),
         ParamType::Bool => json!({"type": "boolean"}),
-        // PLAN 15: ParamType::ObjectKey | ParamType::ObjectName =>
-        //     json!({"type": "string", "maxLength": 1024}),
+        // `maxLength` counts chars, the broker bytes: the broker still
+        // refuses a longer key.
+        ParamType::ObjectKey => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": crate::params::MAX_OBJECT_KEY,
+            "description": OBJECT_KEY_DESCRIPTION,
+        }),
+        ParamType::ObjectName => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": crate::params::MAX_OBJECT_KEY,
+            "description": OBJECT_NAME_DESCRIPTION,
+        }),
     }
 }
 
@@ -127,10 +155,8 @@ pub fn param_schema(t: &ParamType) -> Value {
 /// params the policy fixes and service params left out, the free `body`
 /// per [`body_arg`], and `additionalProperties: false`.
 pub fn input_schema(_m: &Manifest, op: &Operation, svc: &ServiceCfg) -> Value {
-    // Destructured without `..`: a new operation field (plan 15's
-    // `fixed_query` and per-op `headers`) stops the build here until it is
-    // decided whether the schema shows it. Plan 15's fixed values are set
-    // by the manifest, never by the agent: leave them out.
+    // Destructured without `..`: a new operation field stops the build
+    // here until it is decided whether the schema shows it.
     let Operation {
         id: _,
         capability: _,
@@ -149,11 +175,17 @@ pub fn input_schema(_m: &Manifest, op: &Operation, svc: &ServiceCfg) -> Value {
         graphql: _,
         pagination: _,
         amount: _,
+        // Plan 15: set by the manifest (headers fill `{param}` from service
+        // params only), never by the agent: not arguments.
+        headers: _,
+        fixed_query,
+        iam_action: _,
     } = op;
     let hidden = |name: &str| {
         svc.fixed.contains_key(name)
             || svc.params.contains_key(name)
             || body_const.contains_key(name)
+            || fixed_query.contains_key(name)
     };
     let mut props = Map::new();
     let mut required = Vec::new();
@@ -179,6 +211,12 @@ pub fn input_schema(_m: &Manifest, op: &Operation, svc: &ServiceCfg) -> Value {
     match body_arg(op) {
         Some(BodyArg::Json) => {
             props.insert("body".into(), json!({"type": "object"}));
+        }
+        Some(BodyArg::Text) if op.body.as_deref() == Some("raw") => {
+            props.insert(
+                "body".into(),
+                json!({"type": "string", "description": RAW_BODY_DESCRIPTION}),
+            );
         }
         Some(BodyArg::Text) => {
             props.insert("body".into(), json!({"type": "string"}));

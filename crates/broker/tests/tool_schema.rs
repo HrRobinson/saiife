@@ -6,6 +6,7 @@ use saiife_broker::manifest::{builtin, Manifest, Operation};
 use saiife_broker::params::ParamType;
 use saiife_broker::tool_schema::{
     body_arg, input_schema, param_schema, tool_name, BodyArg, MAX_TOOL_NAME,
+    OBJECT_KEY_DESCRIPTION, OBJECT_NAME_DESCRIPTION, RAW_BODY_DESCRIPTION,
 };
 use saiife_policy::ServiceCfg;
 use serde_json::{json, Value};
@@ -341,6 +342,10 @@ fn every_builtin_op_has_a_schema() {
             }
             match free {
                 Some(BodyArg::Json) => assert_eq!(p["body"], json!({"type": "object"})),
+                Some(BodyArg::Text) if o.body.as_deref() == Some("raw") => assert_eq!(
+                    p["body"],
+                    json!({"type": "string", "description": RAW_BODY_DESCRIPTION})
+                ),
                 Some(BodyArg::Text) => assert_eq!(p["body"], json!({"type": "string"})),
                 None => assert!(
                     !p.contains_key("body")
@@ -356,4 +361,78 @@ fn every_builtin_op_has_a_schema() {
         }
     }
     assert!(n > 100, "only {n} operations");
+}
+
+/// Plan 15's `objectkey` path param and `raw` body: the key is a string
+/// with the key rules; the body is a string, sent as its UTF-8 bytes
+/// (`prepare_body` takes a raw body unparsed).
+#[test]
+fn s3_put_object_schema() {
+    let o = op(manifest("aws-s3"), "s3.put_object");
+    assert_eq!(body_arg(o), Some(BodyArg::Text));
+    let s = schema_of("aws-s3", "s3.put_object");
+    assert_eq!(
+        s,
+        json!({
+            "type": "object",
+            "properties": {
+                "bucket": {
+                    "type": "string",
+                    "pattern": anchored("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"),
+                },
+                "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "description": OBJECT_KEY_DESCRIPTION,
+                },
+                "body": {"type": "string", "description": RAW_BODY_DESCRIPTION},
+            },
+            "required": ["bucket", "key"],
+            "additionalProperties": false,
+        })
+    );
+    assert!(OBJECT_KEY_DESCRIPTION.contains("1024 bytes"));
+    // A raw body is the string's bytes, as given.
+    assert_eq!(
+        BodyArg::Text.encode(&json!("a,b\n1,2\n")).unwrap(),
+        b"a,b\n1,2\n"
+    );
+    assert_eq!(BodyArg::Text.encode(&json!({"a": 1})), None);
+}
+
+/// Plan 15's `objectname` (GCS): a string with the same key rules, sent
+/// whole.
+#[test]
+fn objectname_param_schema() {
+    assert_eq!(
+        param_schema(&ParamType::ObjectName),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": OBJECT_NAME_DESCRIPTION,
+        })
+    );
+    assert!(OBJECT_NAME_DESCRIPTION.contains("%2F"));
+    let gcs = manifest("gcp-storage");
+    let with_name: Vec<&Operation> = gcs
+        .operation
+        .iter()
+        .filter(|o| o.path_params.values().any(|t| t == "objectname"))
+        .collect();
+    assert!(!with_name.is_empty());
+    for o in with_name {
+        let s = input_schema(gcs, o, &plain("gcp-storage"));
+        let (name, _) = o
+            .path_params
+            .iter()
+            .find(|(_, t)| *t == "objectname")
+            .unwrap();
+        assert_eq!(
+            s["properties"][name]["description"], OBJECT_NAME_DESCRIPTION,
+            "{}",
+            o.id
+        );
+    }
 }
