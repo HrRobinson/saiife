@@ -55,6 +55,40 @@ saiife api blob blobs.list container=logs prefix=2026/
 saiife api blob blobs.get container=logs blob=2026/10/report.json
 ```
 
+## The secret
+
+The vault kind is `azure_sp`, with the fields `tenant_id`, `client_id` and
+`client_secret` of an app registration (service principal).
+
+```sh
+saiife secret add azure-storage --kind azure_sp --service blob
+saiife connect blob --connector azure-blob --secret azure-storage --param account=acmedata
+```
+
+The daemon gets a token for `https://storage.azure.com/.default` with the
+client-credentials flow and keeps it in memory only. For a sovereign cloud
+set `[services.blob.cloud] authority_host`. The storage account name is
+`params.account`; a sovereign cloud's storage domain is not supported.
+
+## Minimum permissions in Azure
+
+Assign a Storage Blob Data role to the service principal, scoped to the
+storage account or, better, to one container.
+
+| Capability | Operations | Data action | Smallest built-in role |
+|---|---|---|---|
+| `blobs:read` | `blobs.list`, `blobs.get` | `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read` | Storage Blob Data Reader |
+| `blobs:write` | `blobs.put` | `.../containers/blobs/write` | Storage Blob Data Contributor |
+| `blobs:delete` | `blobs.delete` | `.../containers/blobs/delete` | Storage Blob Data Contributor |
+
+## Known limits
+
+- There is no STS mode for Azure: `mode = "sts"` on this connector is a
+  config error.
+- Folder-marker blobs (a name that ends in `/`) are refused: an empty
+  segment is not accepted.
+- Blob versions, snapshots and SAS tokens are not operations.
+
 ## Capabilities and policy
 
 Policy order is deny, then ask, then allow; nothing matching means deny. In

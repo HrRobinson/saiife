@@ -50,6 +50,42 @@ saiife api azure resourcegroups.list subscription_id=00000000-1111-2222-3333-444
 saiife api azure vms.restart subscription_id=00000000-1111-2222-3333-444444444444 resource_group=web vm_name=vm1
 ```
 
+## The secret
+
+The vault kind is `azure_sp`, with the fields `tenant_id`, `client_id` and
+`client_secret` of an app registration (service principal).
+
+```sh
+saiife secret add azure-reader --kind azure_sp --service azure
+saiife connect azure --connector azure-arm --secret azure-reader
+```
+
+The daemon gets a token with the client-credentials flow and keeps it in
+memory only. The default authority is `login.microsoftonline.com`; set
+`[services.azure.cloud] authority_host` to `login.microsoftonline.us` or
+`login.chinacloudapi.cn` for a sovereign cloud.
+
+## Minimum permissions in Azure
+
+Assign roles to the service principal at the narrowest scope that works.
+
+| Capability | Operations | Azure action | Smallest built-in role |
+|---|---|---|---|
+| `resourcegroups:read` | `resourcegroups.list` | `Microsoft.Resources/subscriptions/resourceGroups/read` | Reader |
+| `resources:read` | `resources.list` | `Microsoft.Resources/subscriptions/resources/read` | Reader |
+| `vms:read` | `vms.list` | `Microsoft.Compute/virtualMachines/read` | Reader |
+| `vms:write` | `vms.restart` | `Microsoft.Compute/virtualMachines/restart/action` | Virtual Machine Contributor, on one resource group |
+
+## Known limits
+
+- **Paging.** An answer that is cut off carries `nextLink`, a full URL.
+  saiife does not follow it and has no `next` parameter for ARM. Narrow the
+  list with `$filter` and `$top` instead.
+- There is no STS mode for Azure: `mode = "sts"` on this connector is a
+  config error.
+- The `api-version` values are pinned in the manifest; an Azure change needs
+  a new saiife version.
+
 ## Capabilities and policy
 
 Policy order is deny, then ask, then allow; nothing matching means deny. Both

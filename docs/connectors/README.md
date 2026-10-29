@@ -149,7 +149,8 @@ path and query, passed to the matching operation).
 - [Email](email.md): send with SMTP, read with IMAP.
 - [Salesforce](salesforce.md): SOQL queries, object metadata and records
   (OAuth2).
-- [Amazon S3](aws-s3.md): list, get, head, put and delete objects (SigV4).
+- [Amazon S3](aws-s3.md): list, get, head, put and delete objects (SigV4;
+  opt-in STS mode with `saiife run --cloud`).
 - [AWS STS](aws-sts.md): `GetCallerIdentity` (SigV4).
 - [Google Cloud Storage](gcp-storage.md): list, get, download, upload and
   delete objects (service account).

@@ -30,6 +30,27 @@ The answer is XML, passed through as text and masked.
 saiife api sts sts.get_caller_identity
 ```
 
+## The secret
+
+The vault kind is `aws`, with `access_key_id`, `secret_access_key` and an
+optional `session_token`:
+
+```sh
+saiife secret add aws-prod --kind aws --service sts
+saiife connect sts --connector aws-sts --secret aws-prod --param region=us-east-1
+```
+
+## Minimum permissions in AWS
+
+`sts:GetCallerIdentity` needs no IAM permission: any valid credential can
+call it. Give the key only what its other services need.
+
+## Not the STS mode
+
+This connector is the sign-mode call `GetCallerIdentity`. It is not
+`mode = "sts"`, which hands short-lived credentials to a command; that is a
+setting of a service such as [Amazon S3](aws-s3.md#sts-mode).
+
 ## Capabilities and policy
 
 There is no write operation. The policy goes in

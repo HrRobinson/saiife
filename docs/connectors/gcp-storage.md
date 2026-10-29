@@ -65,6 +65,50 @@ saiife api gcs storage.objects.download bucket=acme-data object=2026/10/report.j
 saiife api gcs storage.objects.insert bucket=acme-data name=out/summary.txt --body @summary.txt
 ```
 
+## The secret
+
+The vault kind is `gcp_sa`. It holds Google's service-account key file (the
+JSON with `client_email` and `private_key`). Only a new secret needs the
+file:
+
+```sh
+saiife secret add gcp-reader --kind gcp_sa --service gcs --from-file key.json
+saiife connect gcs --connector gcp-storage --secret gcp-reader
+```
+
+`saiife connect gcs --connector gcp-storage --from-file key.json` stores the
+key in one step. `--from-file` is required when `connect` has to store a new
+secret; with `--secret <name>` for an existing one it is not.
+
+The daemon signs an RS256 assertion with the key and exchanges it at
+`https://oauth2.googleapis.com/token` for an access token. The token lives in
+memory only, for the scope the manifest names. The key and the token are
+masked in every answer.
+
+## Minimum permissions in Google Cloud
+
+| Capability | Operations | IAM permission | Smallest role |
+|---|---|---|---|
+| `storage:read` | `storage.objects.list` | `storage.objects.list` | `roles/storage.objectViewer` |
+| `storage:read` | `storage.objects.get`, `storage.objects.download` | `storage.objects.get` | `roles/storage.objectViewer` |
+| `storage:write` | `storage.objects.insert` | `storage.objects.create` | `roles/storage.objectCreator` |
+| `storage:delete` | `storage.objects.delete` | `storage.objects.delete` | `roles/storage.objectUser` |
+
+Grant the roles on the bucket, not the project. A read-only policy needs
+only `roles/storage.objectViewer`.
+
+## Known limits
+
+- There is no STS mode for GCP: `mode = "sts"` on this connector is a config
+  error. Short-lived impersonated tokens may follow; until then the token
+  stays in the daemon.
+- A 401 with a minted token is returned as it is; the daemon does not mint
+  again within the call. The next call uses a fresh token when the cached one
+  has expired.
+- Folder-marker objects (a name that ends in `/`) are refused: an empty
+  segment is not accepted.
+- `userProject` (requester-pays buckets) is not supported.
+
 ## Capabilities and policy
 
 Policy order is deny, then ask, then allow; nothing matching means deny. In

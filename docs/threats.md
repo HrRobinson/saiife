@@ -129,6 +129,7 @@ agent cannot write. The agent runs as you.
 | Mistake | **Covered**; fails closed | The gaps are in the [fail-closed matrix](#fail-closed-matrix). |
 | Helpful bypass | **Covered** | Managed settings outrank user and project ones and are root-owned. |
 | Agent obtains a brokered credential | **Covered** once imported | A credential that was never imported is still readable (`saiife secret import` moves them into the vault). |
+| Agent copies a cloud STS credential (`mode = "sts"`) | **Not covered**, by design | `saiife run --cloud` hands a credential that lasts at most 15 minutes, within a session policy, to one command and anything it starts. Any process of your user can ask the daemon for a lease; the `run_allow` check binds only the honest client. Each lease is a `secret` record and `doctor` warns for every service in STS mode. Sign mode has no such gap. See [Amazon S3](connectors/aws-s3.md#sts-mode). |
 | Agent uses an external service beyond rules | **Covered** for brokered services | The daemon checks every call against your policy. |
 | Agent erases or rewrites the audit | **Covered** against the agent; **detected** against root with [forwarding](forwarding.md) | |
 | Agent's own script does local damage (`rm -rf` inside a script) | **Not covered** | Damage reaches your whole home. |
@@ -151,6 +152,7 @@ the recommended setup for unattended agents.
 | Mistake | **Covered**; fails closed | |
 | Helpful bypass | **Covered** | |
 | Agent obtains a brokered credential | **Covered** | The account holds no other credentials. |
+| Agent copies a cloud STS credential (`mode = "sts"`) | **Not covered**, by design | `saiife run --cloud` hands a credential that lasts at most 15 minutes, within a session policy, to one command and anything it starts. Any process of your user can ask the daemon for a lease; the `run_allow` check binds only the honest client. Each lease is a `secret` record and `doctor` warns for every service in STS mode. Sign mode has no such gap. See [Amazon S3](connectors/aws-s3.md#sts-mode). |
 | Agent uses an external service beyond rules | **Covered** | |
 | Agent erases or rewrites the audit | **Covered** against the agent; **detected** against root with forwarding | |
 | Agent's own script does local damage | **Not covered** | Damage is limited to what the agent account can write. |
