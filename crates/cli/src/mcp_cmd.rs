@@ -164,7 +164,9 @@ mod linux {
 
     enum Work {
         List,
-        Call(t::CallToolParams),
+        /// The params, and the exact text of their `arguments` as the agent
+        /// wrote it.
+        Call(t::CallToolParams, Option<Box<str>>),
     }
 
     struct Job {
@@ -233,6 +235,7 @@ mod linux {
                 }
                 Ok(Some(Ok(m))) => m,
             };
+            let raw = reader.take_raw_arguments();
             match m {
                 Message::Request { id, method, params } => match method.as_str() {
                     t::PING => sh.send(&Message::response(id, json!({}))),
@@ -254,7 +257,7 @@ mod linux {
                     )),
                     t::TOOLS_LIST => enqueue(&sh, &tx, id, Work::List),
                     t::TOOLS_CALL => match call_params(params) {
-                        Ok(p) => enqueue(&sh, &tx, id, Work::Call(p)),
+                        Ok(p) => enqueue(&sh, &tx, id, Work::Call(p, raw)),
                         Err(e) => sh.send(&Message::error(Some(id), e)),
                     },
                     other => sh.send(&Message::error(Some(id), RpcError::method_not_found(other))),
@@ -361,7 +364,7 @@ mod linux {
                 } else {
                     match job.work {
                         Work::List => list_tools(sh, &mut conn).map(|(v, _)| v),
-                        Work::Call(p) => call(sh, &mut conn, p, &job.cancel),
+                        Work::Call(p, raw) => call(sh, &mut conn, p, raw, &job.cancel),
                     }
                 };
                 // A cancelled request is not answered (MCP).
@@ -383,7 +386,7 @@ mod linux {
             Work::List => Err(RpcError::internal_error(format!(
                 "saiife unavailable: {WHY}"
             ))),
-            Work::Call(_) => Ok(unavailable_result(WHY)),
+            Work::Call(..) => Ok(unavailable_result(WHY)),
         }
     }
 
@@ -473,12 +476,25 @@ mod linux {
 
     /// What `tools_hash` is compared as: the connector hash and the
     /// gateway hash (empty when there is no gateway listing).
-    fn combined_hash(a: &Map<String, Value>, g: Option<&Map<String, Value>>) -> Option<String> {
+    /// When the gateway listing was refused, the gateway half of `prev`
+    /// (the hash last listed or announced) is kept, so a transient refusal
+    /// moves nothing.
+    fn combined_hash(
+        a: &Map<String, Value>,
+        g: Option<&Map<String, Value>>,
+        prev: Option<&str>,
+    ) -> Option<String> {
         let c = a.get("tools_hash").and_then(Value::as_str)?;
-        let g = g
-            .and_then(|g| g.get("tools_hash"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let g = match g {
+            Some(g) => g
+                .get("tools_hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None => prev
+                .and_then(|p| p.split_once('|'))
+                .map(|(_, g)| g)
+                .unwrap_or_default(),
+        };
         Some(format!("{c}|{g}"))
     }
 
@@ -512,8 +528,11 @@ mod linux {
         api::env_warning(&ans);
         let (tools, map) = build(sh, &ans, gw.as_ref());
         *sh.tools.lock().unwrap_or_else(|p| p.into_inner()) = map.clone();
-        if let Some(h) = combined_hash(&ans, gw.as_ref()) {
-            *sh.hash.lock().unwrap_or_else(|p| p.into_inner()) = Some(h);
+        {
+            let mut known = sh.hash.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(h) = combined_hash(&ans, gw.as_ref(), known.as_deref()) {
+                *known = Some(h);
+            }
         }
         let r = t::ListToolsResult {
             tools,
@@ -798,6 +817,7 @@ mod linux {
         sh: &Shared,
         conn: &mut Option<Daemon>,
         p: t::CallToolParams,
+        raw: Option<Box<str>>,
         cancel: &AtomicBool,
     ) -> Result<Value, RpcError> {
         let progress = p.meta.and_then(|m| m.progress_token);
@@ -813,7 +833,7 @@ mod linux {
                 Next::Original,
             ));
         }
-        connector_call(sh, conn, &p.name, &args, progress.as_ref(), cancel)
+        connector_call(sh, conn, &p.name, &args, raw, progress.as_ref(), cancel)
     }
 
     fn connector_call(
@@ -821,6 +841,7 @@ mod linux {
         conn: &mut Option<Daemon>,
         name: &str,
         args: &Map<String, Value>,
+        raw: Option<Box<str>>,
         progress: Option<&Id>,
         cancel: &AtomicBool,
     ) -> Result<Value, RpcError> {
@@ -835,7 +856,7 @@ mod linux {
             Err(r) => return Ok(r),
         };
         if target.gateway {
-            return Ok(gateway_call(sh, conn, &target, args, progress, cancel));
+            return Ok(gateway_call(sh, conn, &target, args, raw, progress, cancel));
         }
         let (params, body) = map_args(&target, args)?;
         // The args a next page is called with: the free body is not
@@ -885,12 +906,19 @@ mod linux {
         conn: &mut Option<Daemon>,
         target: &ToolTarget,
         args: &Map<String, Value>,
+        raw: Option<Box<str>>,
         progress: Option<&Id>,
         cancel: &AtomicBool,
     ) -> Value {
-        let text = match serde_json::to_string(args) {
-            Ok(t) => t,
-            Err(e) => return error_result(&format!("cannot encode the arguments: {e}")),
+        // The agent's own text, so the daemon's checks see what the agent
+        // sent (a decimal is not rounded through f64). Without it (absent
+        // or null `arguments`) the parsed map is empty.
+        let text = match raw {
+            Some(r) => r.into_string(),
+            None => match serde_json::to_string(args) {
+                Ok(t) => t,
+                Err(e) => return error_result(&format!("cannot encode the arguments: {e}")),
+            },
         };
         let d = match daemon(sh, conn) {
             Ok(d) => d,
@@ -1101,9 +1129,10 @@ mod linux {
         // A brokered tool's answer (`status: null`, `result`): the daemon
         // masked it, and `isError` is the server's own. Nothing is added.
         if ans.get("status") == Some(&Value::Null) {
-            if let Some(r) = ans.get("result").filter(|r| r.is_object()) {
-                return r.clone();
-            }
+            return match ans.get("result").filter(|r| r.is_object()) {
+                Some(r) => r.clone(),
+                None => unavailable_result("the daemon answered a tool call without a result"),
+            };
         }
         let status = ans.get("status").and_then(Value::as_u64).unwrap_or(0);
         let is_error = status >= 400;
@@ -1198,11 +1227,14 @@ mod linux {
                 Ok(d) => both_lists(d).ok(),
                 Err(_) => None,
             };
-            let Some(h) = got.as_ref().and_then(|(a, g)| combined_hash(a, g.as_ref())) else {
+            let Some((a, g)) = got.as_ref() else {
                 conn = None;
                 continue;
             };
             let mut known = sh.hash.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(h) = combined_hash(a, g.as_ref(), known.as_deref()) else {
+                continue;
+            };
             match known.as_deref() {
                 None => *known = Some(h),
                 Some(k) if k == h => {}

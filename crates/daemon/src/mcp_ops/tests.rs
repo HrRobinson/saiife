@@ -1031,6 +1031,7 @@ async fn numbers_that_change_on_the_round_trip_are_refused() {
         r#"{"n":18446744073709551616}"#,
         r#"{"n":-9223372036854775809}"#,
         r#"{"a":[{"n":2e0}]}"#,
+        r#"{"n":123456789012345.678}"#,
     ] {
         let a = w.call("list_issues", args).await;
         assert_eq!(denied_rule(&a), "bad_param", "{args}");
@@ -1045,6 +1046,14 @@ async fn numbers_that_change_on_the_round_trip_are_refused() {
         assert_eq!(a["ok"], true, "{args}: {a}");
     }
     assert_eq!(w.fake.calls()[0].2["n"], json!(u64::MAX));
+    for ok in [
+        r#"{"n":0.1}"#,
+        r#"{"n":1.50}"#,
+        r#"{"n":-0.0}"#,
+        r#"{"n":100.25}"#,
+    ] {
+        assert!(numbers_exact(ok.as_bytes()), "{ok}");
+    }
     assert!(numbers_exact(br#"{"s":"\\","n":3}"#));
     assert!(!numbers_exact(br#"{"s":"\\","n":3e1}"#));
 }

@@ -172,6 +172,26 @@ pub struct LineReader<R: BufRead> {
     buf: Vec<u8>,
     /// The rest of an over-cap line, already reported, is still unread.
     draining: bool,
+    /// The exact text of `params.arguments` of the last `tools/call`.
+    raw_arguments: Option<Box<str>>,
+}
+
+/// The exact text of `params.arguments` in a line that already passed
+/// [`parse_strict`] (so keys are unique and depth is bounded). `None` when
+/// absent or `null`.
+pub fn raw_call_arguments(line: &[u8]) -> Option<Box<str>> {
+    #[derive(serde::Deserialize)]
+    struct P<'a> {
+        #[serde(borrow)]
+        arguments: Option<&'a serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct M<'a> {
+        #[serde(borrow)]
+        params: Option<P<'a>>,
+    }
+    let m: M = serde_json::from_slice(line).ok()?;
+    Some(m.params?.arguments?.get().into())
 }
 
 impl<R: BufRead> LineReader<R> {
@@ -181,7 +201,15 @@ impl<R: BufRead> LineReader<R> {
             max,
             buf: Vec::new(),
             draining: false,
+            raw_arguments: None,
         }
+    }
+
+    /// The exact text of `params.arguments` of the `tools/call` request
+    /// `next_message` returned last (once; `None` for any other message).
+    /// Numbers and escapes in it are as the client wrote them.
+    pub fn take_raw_arguments(&mut self) -> Option<Box<str>> {
+        self.raw_arguments.take()
     }
 
     /// The next message: `Ok(None)` at end of input, `Ok(Some(Err(_)))`
@@ -199,7 +227,13 @@ impl<R: BufRead> LineReader<R> {
                     if self.buf.is_empty() || self.buf == b"\r" {
                         continue;
                     }
-                    return Ok(Some(decode_line(&self.buf, self.max)));
+                    self.raw_arguments = None;
+                    let m = decode_line(&self.buf, self.max);
+                    if matches!(&m, Ok(Message::Request { method, .. }) if method == crate::types::TOOLS_CALL)
+                    {
+                        self.raw_arguments = raw_call_arguments(&self.buf);
+                    }
+                    return Ok(Some(m));
                 }
             }
         }

@@ -1617,3 +1617,46 @@ fn connector_and_gateway_names_never_collide() {
         c.stderr_text()
     );
 }
+
+#[test]
+fn gateway_arguments_text_is_not_rounded() {
+    let w = gw_world(&fake_server(&[], "allow = [\"echo\"]\n"));
+    let mut c = w.mcp(&[]);
+    wait_tool(&mut c, "fake__echo");
+    // An ordinary call, with a key and a unicode escape.
+    c.send_line(
+        r#"{"jsonrpc":"2.0","id":901,"method":"tools/call","params":{"name":"fake__echo","arguments":{"kéy":"üA","n":7}}}"#,
+    );
+    let r = c
+        .answer_within(
+            &saiife_mcp::jsonrpc::Id::from(901i64),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(
+        texts(&r["result"]),
+        "{\"k\u{e9}y\":\"\u{fc}A\",\"n\":7}",
+        "{r}"
+    );
+    // A decimal that f64 would round: the daemon sees the agent's text,
+    // so it is sent exactly or refused, never rounded.
+    c.send_line(
+        r#"{"jsonrpc":"2.0","id":902,"method":"tools/call","params":{"name":"fake__echo","arguments":{"amount":123456789012345.678}}}"#,
+    );
+    let r = c
+        .answer_within(
+            &saiife_mcp::jsonrpc::Id::from(902i64),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    let t = texts(&r["result"]);
+    assert!(
+        !t.contains("123456789012345.67\"") && !t.contains("123456789012345.67}"),
+        "rounded: {r}"
+    );
+    assert!(
+        t.contains("123456789012345.678") || r["result"]["isError"] == true,
+        "{r}"
+    );
+}

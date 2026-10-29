@@ -425,17 +425,52 @@ pub fn numbers_exact(b: &[u8]) -> bool {
             if tok.iter().any(|&x| x == b'e' || x == b'E') {
                 return false;
             }
+            let t = std::str::from_utf8(tok).unwrap_or("");
             if !tok.contains(&b'.') {
-                let t = std::str::from_utf8(tok).unwrap_or("");
                 if t.parse::<i64>().is_err() && t.parse::<u64>().is_err() {
                     return false;
                 }
+            } else if !decimal_exact(t) {
+                return false;
             }
             continue;
         }
         i += 1;
     }
     true
+}
+
+/// Whether the decimal `t` (`-?digits.digits`) survives the f64 round trip
+/// with the same value: its digits, ignoring a leading zero run and trailing
+/// fraction zeros, equal those of the shortest f64 text. `123456789012345.678`
+/// does not (f64 prints `123456789012345.69`).
+fn decimal_exact(t: &str) -> bool {
+    fn norm(s: &str) -> Option<(bool, String, String)> {
+        let (neg, s) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s),
+        };
+        let (i, f) = s.split_once('.')?;
+        let i = i.trim_start_matches('0');
+        let f = f.trim_end_matches('0');
+        Some((neg, i.to_string(), f.to_string()))
+    }
+    let Ok(x) = t.parse::<f64>() else {
+        return false;
+    };
+    let Some(n) = serde_json::Number::from_f64(x) else {
+        return false;
+    };
+    let shown = n.to_string();
+    let Some(a) = norm(t) else {
+        return false;
+    };
+    match norm(&shown) {
+        // `-0.0` is zero whichever way it is signed.
+        Some(b) => a == b || (a.1.is_empty() && a.2.is_empty() && b.1.is_empty() && b.2.is_empty()),
+        // The shortest text has no point (`1e21`, `5`): compare as integer.
+        None => a.2.is_empty() && a.1 == shown.trim_start_matches('-').trim_start_matches('0'),
+    }
 }
 
 fn json_len(v: &Value) -> usize {

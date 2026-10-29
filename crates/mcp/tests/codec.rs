@@ -611,3 +611,26 @@ fn fuzz_table_never_panics() {
         }
     }
 }
+
+#[test]
+fn raw_arguments_keep_the_clients_exact_text() {
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments": {"k\u00e9y" : 123456789012345.678, "n":1E2}}}"#;
+    let other = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+    let none = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"t"}}"#;
+    let dup = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"t","arguments":{"a":1,"a":2}}}"#;
+    let text = format!("{call}\n{other}\n{none}\n{dup}\n");
+    let mut r = LineReader::new(Cursor::new(text.into_bytes()), MAX);
+    assert!(matches!(r.next_message().unwrap(), Some(Ok(_))));
+    assert_eq!(
+        r.take_raw_arguments().as_deref(),
+        Some(r#"{"k\u00e9y" : 123456789012345.678, "n":1E2}"#)
+    );
+    assert_eq!(r.take_raw_arguments(), None);
+    assert!(matches!(r.next_message().unwrap(), Some(Ok(_))));
+    assert_eq!(r.take_raw_arguments(), None);
+    assert!(matches!(r.next_message().unwrap(), Some(Ok(_))));
+    assert_eq!(r.take_raw_arguments(), None);
+    // A duplicate key is refused before any text is kept.
+    assert!(matches!(r.next_message().unwrap(), Some(Err(_))));
+    assert_eq!(r.take_raw_arguments(), None);
+}
