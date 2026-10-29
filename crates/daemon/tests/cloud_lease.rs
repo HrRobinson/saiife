@@ -42,7 +42,18 @@ use zeroize::Zeroizing;
 const STS_HOST: &str = "sts.eu-west-1.amazonaws.com";
 const ROLE: &str = "arn:aws:iam::123456789012:role/saiife-lease";
 const EXTERNAL: &str = "ext-lease-42";
-const EXE: &str = "/usr/bin/true";
+/// A root-owned, non-interpreter program, by its canonical path: on some
+/// hosts `/usr/bin/true` is a symlink (a multicall coreutils), and a lease
+/// refuses an exe path that is not canonical.
+fn exe() -> &'static str {
+    static EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::fs::canonicalize("/usr/bin/true")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
 
 // Built at runtime: no token-shaped literal in the source.
 const VAULT_AK: &str = concat!("AK", "IA", "TESTVAULT0000002");
@@ -260,6 +271,7 @@ fn s3_manifest() -> Manifest {
 /// environments override `s3sts`: `staging` (its own secret, a narrower
 /// allow) and `prod` (its own secret).
 fn config(link: &Path, scope_env: Option<&str>) -> String {
+    let exe = exe();
     let scope_env = scope_env
         .map(|e| format!("env = \"{e}\"\n"))
         .unwrap_or_default();
@@ -289,7 +301,7 @@ allow = ["s3:read:arn:aws:s3:::rep*"]
 limits = {{ requests_per_minute = 1 }}
 [services.s3unrep.cloud]
 role_arn = "{ROLE}"
-run_allow = ["{EXE}"]
+run_allow = ["{exe}"]
 
 [services.s3sts]
 connector = "aws-s3"
@@ -301,7 +313,7 @@ deny = ["s3:delete"]
 [services.s3sts.cloud]
 role_arn = "{ROLE}"
 external_id = "{EXTERNAL}"
-run_allow = ["{EXE}"]
+run_allow = ["{exe}"]
 
 [services.s3rpm]
 connector = "aws-s3"
@@ -312,7 +324,7 @@ allow = ["s3:read"]
 limits = {{ requests_per_minute = 2, writes_per_hour = 1 }}
 [services.s3rpm.cloud]
 role_arn = "{ROLE}"
-run_allow = ["{EXE}"]
+run_allow = ["{exe}"]
 
 [services.s3sign]
 connector = "aws-s3"
@@ -321,7 +333,7 @@ params = {{ region = "eu-west-1" }}
 allow = ["s3:read"]
 [services.s3sign.cloud]
 role_arn = "{ROLE}"
-run_allow = ["{EXE}"]
+run_allow = ["{exe}"]
 
 [services.s3out]
 connector = "aws-s3"
@@ -331,7 +343,7 @@ mode = "sts"
 allow = ["s3:read"]
 [services.s3out.cloud]
 role_arn = "{ROLE}"
-run_allow = ["{EXE}"]
+run_allow = ["{exe}"]
 
 [services.s3link]
 connector = "aws-s3"
@@ -566,7 +578,7 @@ async fn refused(w: &World, service: &str, exe: &str, want: &str) -> Value {
 #[tokio::test]
 async fn lease_requires_sts_mode() {
     let w = world(200).await;
-    refused(&w, "s3sign", EXE, "sts_not_enabled").await;
+    refused(&w, "s3sign", exe(), "sts_not_enabled").await;
 }
 
 #[tokio::test]
@@ -602,9 +614,9 @@ async fn lease_run_allow_symlink_to_interpreter_refused() {
 #[tokio::test]
 async fn lease_outside_scope_no_scope() {
     let w = world(200).await;
-    refused(&w, "s3out", EXE, "no_scope").await;
+    refused(&w, "s3out", exe(), "no_scope").await;
     // A service that is not defined at all: the same.
-    let a = w.lease("nosuch", EXE).await;
+    let a = w.lease("nosuch", exe()).await;
     assert_eq!(rule(&a), "no_scope", "{a}");
 }
 
@@ -620,13 +632,13 @@ async fn lease_during_lockdown_denied() {
             since: "2026-10-29T00:00:00Z".into(),
         }))
         .unwrap();
-    refused(&w, "s3sts", EXE, "lockdown").await;
+    refused(&w, "s3sts", exe(), "lockdown").await;
 }
 
 #[tokio::test]
 async fn lease_sends_session_policy_and_900s() {
     let w = world(200).await;
-    let a = w.lease("s3sts", EXE).await;
+    let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
     let calls = w.st.lock().unwrap().sts.clone();
     assert_eq!(calls.len(), 1);
@@ -673,7 +685,7 @@ async fn lease_sends_session_policy_and_900s() {
 #[tokio::test]
 async fn lease_record_has_no_values() {
     let w = world(200).await;
-    let a = w.lease("s3sts", EXE).await;
+    let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
     let recs = w.leases();
     assert_eq!(recs.len(), 1, "one record per lease");
@@ -685,7 +697,7 @@ async fn lease_record_has_no_values() {
     // `session` is the agent session (none here), never the STS name.
     assert!(r["session"].is_null(), "{r}");
     assert_eq!(r["expires"], a["expires"]);
-    assert_eq!(r["exe"], EXE);
+    assert_eq!(r["exe"], exe());
     assert_eq!(r["policy_sha256"].as_str().unwrap().len(), 64);
     w.assert_records_clean();
 }
@@ -693,7 +705,7 @@ async fn lease_record_has_no_values() {
 #[tokio::test]
 async fn lease_sts_error_code_recorded_message_not() {
     let w = world(403).await;
-    let a = w.lease("s3sts", EXE).await;
+    let a = w.lease("s3sts", exe()).await;
     assert_eq!(rule(&a), "token_mint_failed", "{a}");
     let text = a.to_string();
     assert!(text.contains("AccessDenied"), "{a}");
@@ -720,10 +732,10 @@ async fn lease_sts_error_code_recorded_message_not() {
 async fn lease_counts_requests_per_minute() {
     let w = world(200).await;
     for _ in 0..2 {
-        let a = w.lease("s3rpm", EXE).await;
+        let a = w.lease("s3rpm", exe()).await;
         assert_eq!(a["ok"], true, "{a}");
     }
-    let a = w.lease("s3rpm", EXE).await;
+    let a = w.lease("s3rpm", exe()).await;
     assert_eq!(a["ok"], false, "{a}");
     assert_eq!(a["limit"], "requests_per_minute", "{a}");
     assert_eq!(w.sts_calls(), 2, "a limited lease called STS");
@@ -732,7 +744,7 @@ async fn lease_counts_requests_per_minute() {
     assert_eq!(recs[2]["decision"], "deny");
     assert_eq!(recs[2]["rule"], "requests_per_minute");
     // Leases of another service count apart.
-    let a = w.lease("s3sts", EXE).await;
+    let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
 }
 
@@ -762,12 +774,12 @@ fn statements(json: &str, effect: &str) -> Vec<Value> {
 #[tokio::test]
 async fn project_deny_narrows_the_lease() {
     let w = world(200).await;
-    let base = w.lease("s3sts", EXE).await;
+    let base = w.lease("s3sts", exe()).await;
     assert_eq!(base["ok"], true, "{base}");
     // The admin allows `s3:read`; the project denies one prefix of it.
     let deny = "s3:read:arn:aws:s3:::reports/secret/**";
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "overlay": {"deny": [deny]}}))
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "overlay": {"deny": [deny]}}))
         .await;
     assert_eq!(a["ok"], true, "{a}");
     let svc = &w.config.services["s3sts"];
@@ -810,7 +822,7 @@ async fn project_deny_narrows_the_lease() {
 async fn project_allow_never_widens_the_lease() {
     let w = world(200).await;
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE,
+        .lease_with(json!({"service": "s3sts", "exe": exe(),
                            "overlay": {"allow": ["s3:write", "s3:*"]}}))
         .await;
     assert_eq!(a["ok"], true, "{a}");
@@ -825,7 +837,7 @@ async fn project_allow_never_widens_the_lease() {
     assert!(!sent[0].contains("s3:PutObject"), "{}", sent[0]);
     // A malformed overlay is a bad request: no lease, no STS call.
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "overlay": {"deny": "x"}}))
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "overlay": {"deny": "x"}}))
         .await;
     assert_eq!(a["ok"], false, "{a}");
     assert_eq!(a["error"], "bad_request", "{a}");
@@ -838,7 +850,7 @@ async fn lease_unrepresentable_policy_refused_without_sts_or_rpm() {
     // `requests_per_minute = 1`: were the first refusal counted, the
     // second would be `limited`.
     for _ in 0..2 {
-        let a = w.lease("s3unrep", EXE).await;
+        let a = w.lease("s3unrep", exe()).await;
         assert_eq!(rule(&a), "session_policy_unrepresentable", "{a}");
         assert_eq!(a["error"], "denied", "{a}");
     }
@@ -860,16 +872,19 @@ async fn lease_too_large_policy_refused_without_sts_or_rpm() {
     // `s3rpm` allows 2 a minute: two refusals, then two leases.
     for _ in 0..2 {
         let a = w
-            .lease_with(json!({"service": "s3rpm", "exe": EXE, "overlay": {"deny": deny}}))
+            .lease_with(json!({"service": "s3rpm", "exe": exe(), "overlay": {"deny": deny}}))
             .await;
         assert_eq!(rule(&a), "session_policy_too_large", "{a}");
     }
     assert_eq!(w.sts_calls(), 0);
     for _ in 0..2 {
-        let a = w.lease("s3rpm", EXE).await;
+        let a = w.lease("s3rpm", exe()).await;
         assert_eq!(a["ok"], true, "{a}");
     }
-    assert_eq!(w.lease("s3rpm", EXE).await["limit"], "requests_per_minute");
+    assert_eq!(
+        w.lease("s3rpm", exe()).await["limit"],
+        "requests_per_minute"
+    );
     assert_eq!(w.sts_calls(), 2);
 }
 
@@ -895,7 +910,7 @@ fn rebuilt(audit: &Path) -> (Limiter, usize) {
 async fn leases_count_after_a_restart() {
     let w = world(200).await;
     for _ in 0..2 {
-        let a = w.lease("s3rpm", EXE).await;
+        let a = w.lease("s3rpm", exe()).await;
         assert_eq!(a["ok"], true, "{a}");
     }
     // A refusal before the send never counts.
@@ -910,7 +925,7 @@ async fn leases_count_after_a_restart() {
     let (limiter, n) = rebuilt(&tmp.path().join("audit"));
     assert_eq!(n, 2, "only the two sent leases count");
     let w = world_in(tmp, 200, limiter).await;
-    let a = w.lease("s3rpm", EXE).await;
+    let a = w.lease("s3rpm", exe()).await;
     assert_eq!(a["ok"], false, "{a}");
     assert_eq!(a["error"], "limited", "{a}");
     assert_eq!(a["limit"], "requests_per_minute", "{a}");
@@ -947,13 +962,13 @@ async fn personal_lease_follows_the_project_env() {
     let w = personal().await;
     let g = w.ctx.policy().gateway.unwrap();
     // No env: the base config (its secret, its allow).
-    let a = w.lease("s3sts", EXE).await;
+    let a = w.lease("s3sts", exe()).await;
     assert_eq!(a["ok"], true, "{a}");
     assert!(a.get("warning").is_none(), "{a}");
     // `env = "staging"`: that environment's secret signs the AssumeRole,
     // and the session policy follows its narrower allow.
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "staging",
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "env": "staging",
                            "project": "/home/agent/proj"}))
         .await;
     assert_eq!(a["ok"], true, "{a}");
@@ -994,7 +1009,7 @@ async fn personal_lease_follows_the_project_env() {
 async fn personal_lease_undefined_env_warns() {
     let w = personal().await;
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "qa"}))
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "env": "qa"}))
         .await;
     assert_eq!(a["ok"], true, "{a}");
     let warn = a["warning"].as_str().unwrap_or_default();
@@ -1031,7 +1046,7 @@ async fn locked_lease_ignores_a_client_env() {
     // an undefined name.
     for env in [json!("staging"), json!("qa"), Value::Null] {
         let a = w
-            .lease_with(json!({"service": "s3sts", "exe": EXE, "env": env}))
+            .lease_with(json!({"service": "s3sts", "exe": exe(), "env": env}))
             .await;
         assert_eq!(a["ok"], true, "{a}");
         assert!(a.get("warning").is_none(), "{a}");
@@ -1041,7 +1056,7 @@ async fn locked_lease_ignores_a_client_env() {
     assert!(recs.iter().all(|r| r["env"] == "prod"), "{recs:?}");
     // A malformed env is a bad request in every mode: no lease, no record.
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "Bad Name"}))
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "env": "Bad Name"}))
         .await;
     assert_eq!(a["error"], "bad_request", "{a}");
     assert_eq!(w.sts_calls(), 3);
@@ -1054,7 +1069,7 @@ async fn locked_lease_without_scope_env_runs_base() {
     // No scope env: a client `env` still does not pick one.
     let w = world(200).await;
     let a = w
-        .lease_with(json!({"service": "s3sts", "exe": EXE, "env": "staging"}))
+        .lease_with(json!({"service": "s3sts", "exe": exe(), "env": "staging"}))
         .await;
     assert_eq!(a["ok"], true, "{a}");
     assert!(a.get("warning").is_none(), "{a}");
