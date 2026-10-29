@@ -593,12 +593,12 @@ fn run(
 // ---- secret.lease (spec §6.14) ----
 
 /// Longest `exe` a lease takes.
-const MAX_EXE_BYTES: usize = 4096;
+pub(crate) const MAX_EXE_BYTES: usize = 4096;
 
 /// A refused lease: the rule and why.
-struct Deny {
-    rule: &'static str,
-    detail: String,
+pub(crate) struct Deny {
+    pub(crate) rule: &'static str,
+    pub(crate) detail: String,
 }
 
 fn deny(rule: &'static str, detail: impl Into<String>) -> Deny {
@@ -772,7 +772,7 @@ async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<
 /// anywhere in it, and (so) the same basename. A multi-call binary reached
 /// through a link (`printenv` -> `coreutils`) therefore needs the real file
 /// listed.
-fn entry_is_canonical(entry: &Path, canonical: &Path) -> Result<(), &'static str> {
+pub(crate) fn entry_is_canonical(entry: &Path, canonical: &Path) -> Result<(), &'static str> {
     if entry == canonical {
         return Ok(());
     }
@@ -785,7 +785,7 @@ fn entry_is_canonical(entry: &Path, canonical: &Path) -> Result<(), &'static str
 /// The executable: absolute and canonical, listed as itself, no
 /// interpreter by its resolved name, a regular file, and root-owned along
 /// its whole path.
-fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
+pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     let no = |d: &str| deny("run_not_allowed", d);
     if !exe.is_absolute() {
         return Err(no("the executable path is not absolute"));

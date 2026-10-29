@@ -197,7 +197,7 @@ fn refresh(e: RefreshError) -> Failure {
 
 /// The record reason of a failed mint or assume: the sanitized endpoint
 /// code only (decision 18), never a message.
-fn mint_reason(e: &CloudError) -> String {
+pub(crate) fn mint_reason(e: &CloudError) -> String {
     match e {
         CloudError::Endpoint { code } => format!("endpoint:{code}"),
         CloudError::Transport(_) => "network".into(),
@@ -313,7 +313,7 @@ fn warn_not_persisted(secret: &str) {
 }
 
 /// The vault fields of `secret`: an entry of `kind` that serves `service`.
-fn vault_fields(
+pub(crate) fn vault_fields(
     ctx: &Ctx,
     secret: &str,
     service: &str,
@@ -334,7 +334,7 @@ fn vault_fields(
 }
 
 /// The AWS keys of an `aws` secret's fields.
-fn aws_keys(fields: &BTreeMap<String, Zeroizing<String>>) -> Result<AwsCreds, Failure> {
+pub(crate) fn aws_keys(fields: &BTreeMap<String, Zeroizing<String>>) -> Result<AwsCreds, Failure> {
     let get = |n: &str| {
         fields
             .get(n)

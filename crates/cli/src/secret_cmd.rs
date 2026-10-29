@@ -313,9 +313,20 @@ pub(crate) mod linux {
         op: &str,
         a: Map<String, Value>,
     ) -> Result<Map<String, Value>, Stop> {
+        call_within(t, op, a, CALL_TIMEOUT)
+    }
+
+    /// [`call_to`] that waits up to `timeout` for the answer (a
+    /// `cloud.lease` waits for STS).
+    pub(crate) fn call_within(
+        t: &Target,
+        op: &str,
+        a: Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Map<String, Value>, Stop> {
         let down = |e: &ClientError| Stop::Unavailable(broker::unreachable(t, e));
         let mut c = broker::connect(t, Instant::now() + CONNECT_TIMEOUT).map_err(|e| down(&e))?;
-        c.call(op, a, Instant::now() + CALL_TIMEOUT)
+        c.call(op, a, Instant::now() + timeout)
             .map_err(|e| match e {
                 ClientError::Refused { code, message } if code == "forbidden" => {
                     Stop::Forbidden(message)

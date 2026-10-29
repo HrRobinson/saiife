@@ -244,13 +244,25 @@ enum Cmd {
     /// you and holds the value while it runs. Prefer a connector wherever
     /// one exists, and list only purpose-built, argument-constrained
     /// programs in run_allow.
+    ///
+    /// `--cloud <service>` (STS mode) instead puts AWS session credentials
+    /// for that service in the command's environment: at most 15 minutes,
+    /// scoped by a session policy built from the saiife policy.
+    #[command(group(
+        clap::ArgGroup::new("lease")
+            .required(true)
+            .args(["secrets", "cloud"])
+    ))]
     Run {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
         system_config: Option<std::path::PathBuf>,
         /// The secret and the variable to set: NAME or NAME:ENV_VAR.
-        #[arg(long = "secret", value_name = "NAME[:ENV_VAR]", required = true)]
+        #[arg(long = "secret", value_name = "NAME[:ENV_VAR]")]
         secrets: Vec<String>,
+        /// STS mode: short AWS credentials for this service (`mode = "sts"`).
+        #[arg(long = "cloud", value_name = "SERVICE")]
+        cloud: Option<String>,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
@@ -411,12 +423,14 @@ fn main() -> ExitCode {
     if let Cmd::Run {
         system_config,
         secrets,
+        cloud,
         command,
     } = cli.command
     {
         return run_cmd::run(run_cmd::RunArgs {
             system_config,
             secrets,
+            cloud,
             command,
         });
     }
