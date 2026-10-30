@@ -1313,7 +1313,7 @@ v2.0: `saiife daemon --user`, the personal-broker side of `secret` and
 
 | Command | Who | Behavior |
 |---|---|---|
-| `saiife system install [--config <file>] [--agents claude,codex,gemini] [--approvers <list>] [--non-interactive]` | root | Create users and groups, install the binary to `/opt/saiife/bin`, write `/etc/saiife` (from `--config` or a commented default), the unit or plist, and the managed hooks for the chosen agents; start the daemon; write `installed.toml`; run `doctor`. Idempotent. |
+| `saiife system install [--config <file>] [--agents claude,codex,gemini] [--approvers <list>] [--non-interactive]` | root | Create users and groups, install the binary to `/opt/saiife/bin`, write `/etc/saiife` (from `--config` or a commented default), the unit or plist, and the managed hooks for the chosen agents; start the daemon; write `installed.toml`; run `doctor`. Idempotent. `--fleet` reads `/etc/saiife/fleet/config.toml` and `install.toml` (plan 18). |
 | `saiife system uninstall [--keep-audit]` | root | Remove exactly what `installed.toml` lists. The audit and vault are kept unless `--purge`. |
 | `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. Built (plan 16): Linux only; macOS is refused until the plan 13 daemon port. |
 | `saiife doctor [--user <name>] [--json]` | anyone (more checks as root) | §6.16 (proposed; in v2.0). |
@@ -1882,7 +1882,8 @@ Developer mode keeps every other v1 behavior unchanged.
 5. **Fleets:** in v2.0, run `system install --non-interactive --config
    <file>` from the configuration tool (for example Ansible). Packages and
    MDM recipes (proposed, after v2.0, §15 plan 18) make this a standard
-   install.
+   install. Packages (`.deb`, `.rpm`; macOS `.pkg` after plan 13) run
+   `system install --fleet`; see docs/fleet.md.
 
 ## 13. Testing
 
@@ -2026,7 +2027,7 @@ costs about the same, so the total stays close to the first draft.
 | 15 | Cloud connectors | v2.x | AWS SigV4 signing and STS mode, GCP and Azure tokens, cloud docs pages | 2 |
 | 16 | Personal broker mode | v2.x | `saiife daemon --user`, keychain vault (macOS Keychain, Secret Service), developer-mode `connect`/`secret` (decision 7) | 1 |
 | 17 | MCP (proposed) | v2.x | `saiife mcp` server, MCP gateway for third-party servers, managed MCP restrictions moved behind the broker | 1.5 |
-| 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible) | 1 |
+| 18 | Fleet packaging (proposed) | v2.x | `.deb`, `.rpm`, and a signed, notarized macOS `.pkg` (after plan 13); MDM recipes (Jamf, Intune, Ansible). Built (plan 18): Linux packages, Ansible, Intune Linux; `.pkg`, Jamf and Intune macOS after plan 13 | 1 |
 
 **Full v2 series (plans 7–18): about 20.5 weeks of evenings.** Plans 14–18
 can be reordered by customer demand. Plan 13 comes first after v2.0 because
