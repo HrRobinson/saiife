@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use saiife_agents::detect::which;
 use saiife_agents::integrity;
 use saiife_audit::store;
+use saiife_system::layout::Platform;
 use saiifeguard::canon::PathVars;
 
 /// An agent config dir: `value` when set and absolute, else `default` under
@@ -27,17 +28,36 @@ fn config_dir(
     }
 }
 
-/// Locked mode's system paths (spec §5.2), at their defaults. Always bound:
-/// only `core.lock` uses them, and it is on only in locked mode (or when a
-/// project turns it on).
-const SYSTEM_PATHS: [(&str, &str); 6] = [
-    ("SAIIFE_ETC", "/etc/saiife"),
-    ("SAIIFE_STATE", "/var/lib/saiife"),
-    ("SAIIFE_LOG", "/var/log/saiife"),
-    ("SAIIFE_RUN", "/run/saiife"),
-    ("SAIIFE_OPT", "/opt/saiife"),
-    ("SAIIFE_UNIT", "/etc/systemd/system/saiifed.service"),
-];
+/// Locked mode's system paths (spec §5.2), at their defaults; on macOS the
+/// §5.3 ones. Always bound: only `core.lock` uses them, and it is on only
+/// in locked mode (or when a project turns it on).
+const SYSTEM_PATHS: [(&str, &str); 6] = system_paths(if cfg!(target_os = "macos") {
+    Platform::Macos
+} else {
+    Platform::Linux
+});
+
+/// The rule variables of [`SYSTEM_PATHS`] on `p`. The macOS values are
+/// `layout::macos_path` of the Linux ones (checked by a test).
+const fn system_paths(p: Platform) -> [(&'static str, &'static str); 6] {
+    use saiife_system::layout::{ETC_DIR, LOG_DIR, OPT_DIR, RUN_DIR, STATE_DIR, UNIT};
+    let (state, run, unit) = match p {
+        Platform::Linux => (STATE_DIR, RUN_DIR, UNIT),
+        Platform::Macos => (
+            "/var/db/saiife",
+            "/var/db/saiife-run",
+            "/Library/LaunchDaemons/com.saiife.saiifed.plist",
+        ),
+    };
+    [
+        ("SAIIFE_ETC", ETC_DIR),
+        ("SAIIFE_STATE", state),
+        ("SAIIFE_LOG", LOG_DIR),
+        ("SAIIFE_RUN", run),
+        ("SAIIFE_OPT", OPT_DIR),
+        ("SAIIFE_UNIT", unit),
+    ]
+}
 
 /// Where a locked host's system config puts saiife's paths, when they are
 /// not the §5.2 defaults: bound as extra values of the rule variables.
@@ -173,6 +193,37 @@ mod tests {
     }
 
     #[test]
+    fn system_paths_macos_values() {
+        use saiife_system::layout::{self, macos_path};
+        let mac = system_paths(Platform::Macos);
+        assert_eq!(
+            mac,
+            [
+                ("SAIIFE_ETC", "/etc/saiife"),
+                ("SAIIFE_STATE", "/var/db/saiife"),
+                ("SAIIFE_LOG", "/var/log/saiife"),
+                ("SAIIFE_RUN", "/var/db/saiife-run"),
+                ("SAIIFE_OPT", "/opt/saiife"),
+                (
+                    "SAIIFE_UNIT",
+                    "/Library/LaunchDaemons/com.saiife.saiifed.plist"
+                ),
+            ]
+        );
+        // Each value is the layout's macOS path of the Linux one.
+        for ((name, linux), (_, m)) in system_paths(Platform::Linux).into_iter().zip(mac) {
+            assert_eq!(macos_path(linux).unwrap_or(linux), m, "{name}");
+        }
+        let l = layout::Layout::under_for("/", Platform::Macos);
+        assert_eq!(mac[3].1, l.logical(layout::RUN_DIR));
+        #[cfg(target_os = "macos")]
+        assert_eq!(SYSTEM_PATHS, mac);
+        #[cfg(target_os = "linux")]
+        assert_eq!(SYSTEM_PATHS, system_paths(Platform::Linux));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn system_paths_are_always_bound_to_their_defaults() {
         let v = path_vars(None, None);
         for (name, want) in [

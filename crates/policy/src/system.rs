@@ -66,10 +66,19 @@ pub struct DaemonCfg {
 }
 
 impl Default for DaemonCfg {
+    /// The §5.2 values; on macOS the §5.3 ones (`_saiife`, and the socket
+    /// dir `/var/db/saiife-run`, plan 13 decision 2). Kept in step with
+    /// `saiife_system::layout` (`MACOS_DAEMON_USER`, `RUN_DIR`), which this
+    /// crate cannot depend on.
     fn default() -> Self {
+        let (user, socket_dir) = if cfg!(target_os = "macos") {
+            ("_saiife", "/var/db/saiife-run")
+        } else {
+            ("saiife", "/run/saiife")
+        };
         DaemonCfg {
-            user: "saiife".to_string(),
-            socket_dir: PathBuf::from("/run/saiife"),
+            user: user.to_string(),
+            socket_dir: PathBuf::from(socket_dir),
         }
     }
 }
@@ -661,6 +670,22 @@ pub enum SameUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn daemon_cfg_default_macos() {
+        let d = DaemonCfg::default();
+        assert_eq!(d.user, "_saiife");
+        assert_eq!(d.socket_dir, PathBuf::from("/var/db/saiife-run"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn daemon_cfg_default_linux() {
+        let d = DaemonCfg::default();
+        assert_eq!(d.user, "saiife");
+        assert_eq!(d.socket_dir, PathBuf::from("/run/saiife"));
+    }
 
     #[test]
     fn enums_are_lowercase() {

@@ -2,7 +2,7 @@
 //! none and no `--config` (spec §8.1): `locked = true`, and every other key
 //! as a comment holding its default.
 
-use crate::layout::{Layout, AUDIT_DIR, RUN_DIR};
+use crate::layout::{Layout, Platform, AUDIT_DIR, RUN_DIR};
 
 /// One section: its header and `(key, default as TOML)` pairs.
 type Section = (&'static str, &'static [(&'static str, &'static str)]);
@@ -96,11 +96,25 @@ pub fn default_config(layout: &Layout, approvers: &[String], reauth: bool) -> St
         for (key, default) in *keys {
             match set.iter().find(|(s, k, _)| s == section && k == key) {
                 Some((_, _, v)) => out.push_str(&format!("{key} = {v}\n")),
-                None => out.push_str(&format!("# {key} = {default}\n")),
+                None => out.push_str(&format!(
+                    "# {key} = {}\n",
+                    platform_default(layout, section, key, default)
+                )),
             }
         }
     }
     out
+}
+
+/// The default shown for `section.key`: the daemon user and socket dir are
+/// the layout's platform values (`_saiife`, `/var/db/saiife-run` on macOS),
+/// every other key the one in [`SECTIONS`].
+fn platform_default(layout: &Layout, section: &str, key: &str, default: &str) -> String {
+    match (section, key, layout.platform()) {
+        ("daemon", "user", Platform::Macos) => toml_str(layout.daemon_user()),
+        ("daemon", "socket_dir", Platform::Macos) => toml_str(layout.logical(RUN_DIR)),
+        _ => default.to_string(),
+    }
 }
 
 /// This process's user name from `/etc/passwd` (else `$USER`).
@@ -205,6 +219,33 @@ mod tests {
     }
 
     #[test]
+    fn macos_defaults_are_the_macos_daemon_values() {
+        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], false);
+        assert!(
+            t.contains(
+                "\n# [daemon]\n# user = \"_saiife\"\n# socket_dir = \"/var/db/saiife-run\"\n"
+            ),
+            "{t}"
+        );
+        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], false);
+        assert!(
+            t.contains("\n# [daemon]\n# user = \"saiife\"\n# socket_dir = \"/run/saiife\"\n"),
+            "{t}"
+        );
+        // Under a test root the socket dir is the macOS one, below the root.
+        let d = tempfile::tempdir().unwrap();
+        let l = Layout::under_for(d.path(), Platform::Macos);
+        let c = load(&default_config(&l, &[], false));
+        assert_eq!(c.daemon.socket_dir, l.root().join("var/db/saiife-run"));
+        // The policy crate's own defaults are this platform's layout values.
+        let sys = Layout::system();
+        let d = saiife_policy::system::DaemonCfg::default();
+        assert_eq!(d.user, sys.daemon_user());
+        assert_eq!(d.socket_dir, Path::new(sys.logical(RUN_DIR)));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn test_root_points_below_the_root() {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::under(d.path());
