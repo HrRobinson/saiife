@@ -710,7 +710,13 @@ phase_attacks() {
     expect_hook 0 "" "A4: hook with DYLD_INSERT_LIBRARIES" claude "$allow" \
         DYLD_INSERT_LIBRARIES="$WORK/inject.dylib" SAIIFE_INJECT_MARKER="$marker"
     if as_root test -e "$marker"; then
-        fail "A4: the injected library ran inside the managed hook"
+        # Which process ran it (the hook itself, or a child it started),
+        # the hook's signature as the kernel sees it, and SIP.
+        as_root cat "$marker" || true
+        as_root /usr/bin/codesign -dv --verbose=4 "$OPT_BIN" 2>&1 || true
+        /usr/bin/csrutil status 2>&1 || true
+        cat "$WORK/hook.err" || true
+        fail "A4: the injected library ran inside the managed hook (or a child of it): $(as_root cat "$marker" | tr '\n' ' ')"
     fi
     ok "A4: no marker; the hardened runtime kept the library out of the hook"
 }

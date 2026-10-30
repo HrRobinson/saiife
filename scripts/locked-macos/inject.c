@@ -16,6 +16,7 @@
  *       such as /usr/bin/env is no control: SIP strips DYLD_* there too.)
  */
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -32,9 +33,17 @@ __attribute__((constructor)) static void saiife_ci_inject(void) {
     if (path == NULL || path[0] != '/') {
         return;
     }
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    /* O_APPEND without O_EXCL: every process that loads the library adds
+     * a line naming itself, so a failure shows whether the hook or one of
+     * its children ran it. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0644);
     if (fd >= 0) {
-        (void)write(fd, "injected\n", 9);
+        char line[256];
+        int n = snprintf(line, sizeof line, "injected pid=%d ppid=%d prog=%s\n",
+                         (int)getpid(), (int)getppid(), getprogname());
+        if (n > 0) {
+            (void)write(fd, line, (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1));
+        }
         (void)close(fd);
     }
 }
