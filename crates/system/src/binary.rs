@@ -272,6 +272,8 @@ fn linking(bytes: &[u8]) -> Result<Linking, String> {
 pub enum Signature {
     Unsigned,
     AdHoc,
+    /// Not flagged ad-hoc, but no CMS blob either.
+    NoCms,
     /// A CMS signature and no ad-hoc flag (a Developer ID build).
     Signed,
 }
@@ -311,10 +313,12 @@ impl MachInfo {
 
     /// Things worth saying that do not refuse.
     pub fn warnings(&self) -> Vec<String> {
-        if self.signature == Signature::AdHoc {
-            vec!["ad-hoc signature: not a Developer ID build (spec 5.3)".to_string()]
-        } else {
-            Vec::new()
+        match self.signature {
+            Signature::AdHoc => {
+                vec!["ad-hoc signature: not a Developer ID build (spec 5.3)".to_string()]
+            }
+            Signature::NoCms => vec!["no CMS signature present".to_string()],
+            Signature::Unsigned | Signature::Signed => Vec::new(),
         }
     }
 }
@@ -331,7 +335,9 @@ const CS_ADHOC: u32 = 0x2;
 const CS_RUNTIME: u32 = 0x10000;
 const MACH_HEADER_64: usize = 32;
 
-fn rd(b: &[u8], at: usize, big: bool) -> Result<u32, String> {
+/// The u32 at `at + add`, with every offset step checked.
+fn rd(b: &[u8], at: usize, add: usize, big: bool) -> Result<u32, String> {
+    let at = at.checked_add(add).ok_or("offset out of range")?;
     let end = at.checked_add(4).ok_or("offset out of range")?;
     let x: [u8; 4] = b
         .get(at..end)
@@ -346,8 +352,12 @@ fn rd(b: &[u8], at: usize, big: bool) -> Result<u32, String> {
 
 /// The signature and hardened-runtime flag of a thin 64-bit Mach-O, read
 /// from its bytes (no `codesign`). A universal binary is refused.
+///
+/// This reads the flags the file claims; it does not verify the signature
+/// (hashes, certificate chain). Every offset is bounds- and overflow-checked,
+/// so hostile input gives an `Err`, never a panic.
 pub fn inspect_macho(bytes: &[u8]) -> Result<MachInfo, String> {
-    let magic = rd(bytes, 0, false).map_err(|_| "not a Mach-O file".to_string())?;
+    let magic = rd(bytes, 0, 0, false).map_err(|_| "not a Mach-O file".to_string())?;
     // Fat headers are big-endian on disk, so a little-endian read swaps them.
     if magic == FAT_MAGIC.swap_bytes() || magic == FAT_MAGIC_64.swap_bytes() {
         return Err(
@@ -358,19 +368,19 @@ pub fn inspect_macho(bytes: &[u8]) -> Result<MachInfo, String> {
         return Err("not a 64-bit Mach-O file".to_string());
     }
     let profile = profile(bytes);
-    let ncmds = rd(bytes, 16, false)?;
+    let ncmds = rd(bytes, 16, 0, false)?;
     let mut at = MACH_HEADER_64;
     let mut sig = None;
     for _ in 0..ncmds {
-        let cmd = rd(bytes, at, false)?;
-        let size = rd(bytes, at + 4, false)? as usize;
+        let cmd = rd(bytes, at, 0, false)?;
+        let size = rd(bytes, at, 4, false)? as usize;
         if size < 8 {
             return Err("malformed load command".to_string());
         }
         if cmd == LC_CODE_SIGNATURE {
             sig = Some((
-                rd(bytes, at + 8, false)? as usize,
-                rd(bytes, at + 12, false)? as usize,
+                rd(bytes, at, 8, false)? as usize,
+                rd(bytes, at, 12, false)? as usize,
             ));
             break;
         }
@@ -385,28 +395,29 @@ pub fn inspect_macho(bytes: &[u8]) -> Result<MachInfo, String> {
     };
     let end = off.checked_add(len).ok_or("offset out of range")?;
     let blob = bytes.get(off..end).ok_or("truncated Mach-O file")?;
-    if rd(blob, 0, true)? != CSMAGIC_EMBEDDED_SIGNATURE {
+    if rd(blob, 0, 0, true)? != CSMAGIC_EMBEDDED_SIGNATURE {
         return Err("code signature is not an embedded SuperBlob".to_string());
     }
-    let count = rd(blob, 8, true)? as usize;
+    let count = rd(blob, 8, 0, true)? as usize;
     let (mut flags, mut cms) = (None, false);
     for i in 0..count.min(64) {
-        let ent = 12 + i * 8;
-        let (slot, so) = (rd(blob, ent, true)?, rd(blob, ent + 4, true)? as usize);
+        let ent = 12usize.saturating_add(i.saturating_mul(8));
+        let (slot, so) = (rd(blob, ent, 0, true)?, rd(blob, ent, 4, true)? as usize);
         if slot == CSSLOT_CODEDIRECTORY {
-            if rd(blob, so, true)? != CSMAGIC_CODEDIRECTORY {
+            if rd(blob, so, 0, true)? != CSMAGIC_CODEDIRECTORY {
                 return Err("code signature has no CodeDirectory".to_string());
             }
-            flags = Some(rd(blob, so + 12, true)?);
+            flags = Some(rd(blob, so, 12, true)?);
         } else if slot == CSSLOT_SIGNATURESLOT {
             // A CMS blob is magic + length + data; empty means length 8.
-            cms = rd(blob, so + 4, true)? > 8;
+            cms = rd(blob, so, 4, true)? > 8;
         }
     }
     let flags = flags.ok_or("code signature has no CodeDirectory")?;
-    let signature = if flags & CS_ADHOC != 0 || !cms {
-        // Neither CMS-signed nor anything else but ad-hoc: not Developer ID.
+    let signature = if flags & CS_ADHOC != 0 {
         Signature::AdHoc
+    } else if !cms {
+        Signature::NoCms
     } else {
         Signature::Signed
     };
@@ -630,6 +641,55 @@ mod tests {
         let i = inspect_macho(&b).unwrap();
         assert_eq!(i.profile, Profile::DebugAssertions);
         assert!(i.problems()[0].contains("test build"));
+    }
+
+    #[test]
+    fn no_cms_without_adhoc_has_its_own_warning() {
+        let i = inspect_macho(&macho_fixture(CS_RUNTIME, false)).unwrap();
+        assert_eq!(i.signature, Signature::NoCms);
+        assert_eq!(i.warnings(), vec!["no CMS signature present".to_string()]);
+    }
+
+    #[test]
+    fn every_prefix_is_err_or_valid() {
+        let b = macho_fixture(CS_RUNTIME, true);
+        for n in 0..=b.len() {
+            let _ = inspect_macho(&b[..n]);
+        }
+        assert!(inspect_macho(&b).is_ok());
+    }
+
+    fn put(b: &mut [u8], at: usize, v: u32, big: bool) {
+        let x = if big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        };
+        b[at..at + 4].copy_from_slice(&x);
+    }
+
+    #[test]
+    fn hostile_mutations_do_not_panic() {
+        let good = macho_fixture(CS_RUNTIME, true);
+        let sb = u32::from_le_bytes(good[40..44].try_into().unwrap()) as usize;
+        // (offset, value, big-endian)
+        let cases: [(usize, u32, bool); 8] = [
+            (36, 0, false),                // cmdsize 0
+            (16, u32::MAX, false),         // huge ncmds
+            (40, u32::MAX - 2, false),     // dataoff near u32::MAX
+            (44, u32::MAX, false),         // datasize near u32::MAX
+            (sb + 8, u32::MAX, true),      // huge SuperBlob count
+            (sb + 16, u32::MAX, true),     // bad slot offset
+            (sb + 28, 0xdead_beef, true),  // wrong CodeDirectory magic
+            (sb + 24, u32::MAX - 3, true), // bad CMS slot offset
+        ];
+        for (at, v, big) in cases {
+            let mut b = good.clone();
+            put(&mut b, at, v, big);
+            let r = inspect_macho(&b);
+            // A huge ncmds is harmless: the signature command comes first.
+            assert!(r.is_err() || at == 16, "case at {at}");
+        }
     }
 
     #[cfg(target_os = "macos")]
