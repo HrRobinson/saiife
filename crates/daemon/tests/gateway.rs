@@ -471,7 +471,11 @@ impl World {
         files.sort();
         let mut out = Vec::new();
         for f in files {
-            for l in std::fs::read_to_string(f).unwrap().lines() {
+            let text = std::fs::read_to_string(f).unwrap();
+            // A record the writer is still appending has no newline yet:
+            // only whole lines are read.
+            let whole = text.rfind('\n').map_or("", |i| &text[..=i]);
+            for l in whole.lines() {
                 let v: Value = serde_json::from_str(l).unwrap();
                 if v["kind"] == "connector" {
                     out.push(v);
