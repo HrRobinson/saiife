@@ -15,7 +15,7 @@
 //! (4343, not an approver); the daemon looks `boss` up by uid itself.
 //! The upstream is a loopback HTTPS mock; nothing leaves 127.0.0.1.
 // Debug builds only: the CLI honours SAIIFE_TEST_PKTTYAGENT only there, so a release test could start the real pkttyagent.
-#![cfg(all(target_os = "linux", debug_assertions))]
+#![cfg(all(unix, debug_assertions))]
 #![allow(dead_code)]
 
 mod common;
@@ -328,8 +328,14 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
         None,
     )
     .unwrap();
-    let key_file = t.join("vault-key");
+    let key_file = t.join(saiife_daemon::VAULT_KEY_FILE);
     fs::write(&key_file, [7u8; 32]).unwrap();
+    // macOS: the vault refuses a key open to group or others.
+    fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let vault_path = t.join("state/vault/vault.bin");
     let mut vault = vault::open(&key_file, &vault_path);
     let VaultState::Ready(v) = &mut vault else {
@@ -1065,8 +1071,10 @@ fn refusal_prints_rule_and_exit_2() {
         "{}",
         stderr(&o)
     );
-    assert!(
+    // pkttyagent is polkit's: never started on macOS.
+    assert_eq!(
         stderr(&o).contains("no-pkttyagent is missing"),
+        cfg!(target_os = "linux"),
         "{}",
         stderr(&o)
     );
@@ -1133,6 +1141,8 @@ fn daemon_unavailable_is_exit_5() {
     }
 }
 
+/// Linux: macOS has no polkit, so no pkttyagent.
+#[cfg(target_os = "linux")]
 #[test]
 fn pkttyagent_started_and_stopped_for_same_uid_reauth() {
     let w = world();
@@ -1196,8 +1206,11 @@ fn lockdown_off_by_an_approver_needs_reauth() {
         *w.reauth.details.lock().unwrap(),
         vec!["lockdown off".to_string()]
     );
-    // The CLI started its agent first.
-    assert!(w.path().join("agent.pid").exists());
+    // The CLI started its agent first (Linux: macOS has no pkttyagent).
+    assert_eq!(
+        w.path().join("agent.pid").exists(),
+        cfg!(target_os = "linux")
+    );
 
     ok(&lockdown(&["on", "--scope", "connectors"]));
     w.own_reauth(false);
@@ -1293,7 +1306,8 @@ fn pkttyagent_not_started_for_other_users_requests_or_a_desktop() {
         .env("DISPLAY", ":0")
         .env("SSH_TTY", "/dev/pts/9");
     ok(&cmd.output().unwrap());
-    assert!(started(), "no agent over ssh");
+    // Linux only: macOS has no pkttyagent.
+    assert_eq!(started(), cfg!(target_os = "linux"), "no agent over ssh");
 
     // A rejection never prompts.
     let _ = fs::remove_file(w.path().join("agent.pid"));

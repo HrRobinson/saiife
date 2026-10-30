@@ -5,7 +5,7 @@
 //! narrowing or replacing an active lockdown, by an approver who is not an
 //! admin needs polkit re-authentication (`same_user = "reauth"`), so the
 //! CLI says what it changes and starts `pkttyagent` first (as `approve`
-//! does). Linux only. Exit codes: 0 ok,
+//! does). Linux and macOS. Exit codes: 0 ok,
 //! 2 refused, 5 the daemon cannot be reached.
 
 use std::path::PathBuf;
@@ -36,13 +36,13 @@ pub enum LockdownAction {
     Off,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(_config: Option<PathBuf>, _action: Option<LockdownAction>) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode {
     use crate::secret_cmd::linux::call;
     use serde_json::{json, Map, Value};
@@ -107,7 +107,9 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             let mut args = Map::new();
             args.insert("on".into(), json!(false));
             // Root never re-authenticates; anyone else may be asked for a
-            // password, so say first what it is for.
+            // password, so say first what it is for. macOS: no `auth` is
+            // sent yet (`approvals_cmd::mac::external_form`, Task 8), so a
+            // same-user off there is refused by the daemon (fail closed).
             let _agent = if rustix::process::geteuid().is_root() {
                 None
             } else {
@@ -127,7 +129,7 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 /// The exit code and message for a stop. `Unrecorded` (the change is made
 /// but not on record) is exit 5 like an unreachable daemon, as in
 /// `approvals_cmd`: the caller must check.
@@ -139,7 +141,7 @@ fn exit_of(stop: crate::secret_cmd::linux::Stop) -> (u8, String) {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod exit_tests {
     use super::*;
     use crate::secret_cmd::linux::Stop;

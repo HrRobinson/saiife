@@ -114,7 +114,10 @@ impl TestDaemon {
         fs::create_dir_all(d.path().join("home")).unwrap();
         fs::create_dir_all(d.path().join("data")).unwrap();
         fs::create_dir_all(d.creds_dir()).unwrap();
-        fs::write(d.creds_dir().join("vault-key"), [42u8; 32]).unwrap();
+        let key = d.creds_dir().join(saiife_daemon::VAULT_KEY_FILE);
+        fs::write(&key, [42u8; 32]).unwrap();
+        // macOS: the vault refuses a key open to group or others.
+        fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         d.write_config(opts);
         d
     }

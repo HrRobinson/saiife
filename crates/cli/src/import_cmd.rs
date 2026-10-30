@@ -100,7 +100,8 @@ fn parse_services(
     Ok(out)
 }
 
-/// The agent user's uid and home: `/etc/passwd`, else NSS for the uid.
+/// The agent user's uid and home: the host's account (`/etc/passwd`, or
+/// Directory Services on macOS), else NSS for the uid.
 /// Test seams, debug builds only: `--home` and `SAIIFE_IMPORT_TARGET_UID`.
 fn target(a: &ImportArgs, user: &str) -> Result<(u32, PathBuf), Stop> {
     use saiife_policy::Directory as _;
@@ -120,7 +121,7 @@ fn target(a: &ImportArgs, user: &str) -> Result<(u32, PathBuf), Stop> {
         (Some(_), Some(_)) => Err(Stop::Refused(format!(
             "the home of {user} is not an absolute path"
         ))),
-        _ => Err(Stop::Refused(format!("no user {user} in /etc/passwd"))),
+        _ => Err(Stop::Refused(format!("no user {user} on this host"))),
     }
 }
 
@@ -1091,7 +1092,9 @@ impl Source {
             ino: st.st_ino as u64,
             uid: st.st_uid,
             gid: st.st_gid,
-            mode: st.st_mode & 0o7777,
+            // st_mode is u16 on macOS.
+            #[allow(clippy::unnecessary_cast)]
+            mode: st.st_mode as u32 & 0o7777,
             bytes,
         })
     }

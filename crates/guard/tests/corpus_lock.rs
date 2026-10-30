@@ -881,3 +881,50 @@ fn hostile_patterns_do_not_exhaust_the_budget() {
     let d = e.evaluate(&cmd);
     assert!(d.is_deny(), "{d:?}");
 }
+
+/// macOS (plan 13): rewriting an authorization right (`com.saiife.approve`
+/// or any other) and editing saiife's `_saiife*` accounts are denied, by
+/// their own rule ids; reading the keychain, the rights and other accounts
+/// stays allowed.
+#[test]
+fn macos_rights_and_saiife_accounts_are_denied() {
+    let f = Fixture::new();
+    let e = f.engine();
+    let rule = |cmd: &str| match e.evaluate(cmd) {
+        Decision::Deny { pack, pattern, .. } => {
+            assert_eq!(pack, "core.lock", "{cmd}");
+            e.rule_id(&pack, &pattern).map(str::to_string)
+        }
+        other => panic!("expected DENY for {cmd:?}, got {other:?}"),
+    };
+    for cmd in [
+        "security authorizationdb write com.saiife.approve allow",
+        "security authorizationdb remove com.saiife.approve",
+        "security  authorizationdb merge /tmp/rights.plist",
+        "SECURITY AuthorizationDB Write com.saiife.approve allow",
+        "timeout 5 security authorizationdb write com.saiife.approve allow",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("authorizationdb"), "{cmd}");
+    }
+    for cmd in [
+        "dseditgroup -o edit -a agent -t user _saiifeaudit",
+        "dseditgroup -o delete _saiife",
+        "dscl . -create /Users/_saiife UserShell /bin/zsh",
+        "dscl . -delete /Groups/_saiifeaudit",
+        "dscl . -append /Groups/_saiifeaudit GroupMembership agent",
+        "DSCL . -passwd /Users/_saiife x",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("saiife-accounts"), "{cmd}");
+    }
+    for cmd in [
+        "security find-generic-password -s x",
+        "security authorizationdb read com.saiife.approve",
+        "security authorizationdb writer",
+        "dscl . -read /Users/agent",
+        "dseditgroup -o checkmember -m agent staff",
+        "echo security authorizationdb write x allow",
+    ] {
+        let d = e.evaluate(cmd);
+        assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
+    }
+}

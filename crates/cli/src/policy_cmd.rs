@@ -602,21 +602,21 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
 const DEVELOPER_ENV_NOTE: &str = "note: developer mode: this does not reflect the project env; \
 an environment changes connector calls only, its guard packs apply in locked mode";
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) -> Option<ExitCode> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn reload(_config: Option<PathBuf>) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
 /// `Some` when a daemon answered (or refused); `None` when there is none
 /// to ask. The socket directory and user come from the config when it
 /// loads, else the defaults.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Option<ExitCode> {
     use saiife_ipc::client::{system_uid, Client, ClientError};
     use std::time::Instant;
@@ -674,7 +674,7 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn reload(config: Option<PathBuf>) -> ExitCode {
     use crate::secret_cmd::linux::{call_to, target};
     let t = match target(config.as_deref()) {
@@ -704,7 +704,7 @@ fn reload(config: Option<PathBuf>) -> ExitCode {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn stop(s: crate::secret_cmd::linux::Stop) -> ExitCode {
     let (code, m) = exit_of(s);
     eprintln!("saiife: {m}");
@@ -714,7 +714,7 @@ fn stop(s: crate::secret_cmd::linux::Stop) -> ExitCode {
 /// The exit code and message for a stop. `Unrecorded` (the reload took
 /// effect but is not on record) is exit 5 like an unreachable daemon, as
 /// in `lockdown_cmd` and `approvals_cmd`: the caller must check.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn exit_of(s: crate::secret_cmd::linux::Stop) -> (u8, String) {
     use crate::secret_cmd::linux::Stop;
     match s {
@@ -1042,7 +1042,7 @@ expect = "deny"
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod stop_tests {
     use super::*;
     use crate::secret_cmd::linux::Stop;

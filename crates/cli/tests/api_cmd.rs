@@ -5,7 +5,7 @@
 //! the service's base URL is the IP literal `127.0.0.1`: no test seam in
 //! the daemon. Nothing leaves loopback; signals go to the test's own child
 //! through a syscall.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

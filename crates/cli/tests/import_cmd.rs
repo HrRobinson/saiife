@@ -2,7 +2,7 @@
 //! Task 17). The daemon runs as the test user and admin ops authorize
 //! through `[admin] groups = [<primary group>]`. The agent user's home is a
 //! fake one in a temp dir (never the real home, never /tmp).
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

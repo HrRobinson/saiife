@@ -1,5 +1,5 @@
 //! `saiife approvals`, `saiife approve`, `saiife reject` (spec §6.10.1):
-//! the approver's side of ask-gated requests. Linux only.
+//! the approver's side of ask-gated requests. Linux and macOS.
 //!
 //! Exit codes: 0 done, 2 refused (the rule is printed), 5 the daemon
 //! cannot be reached (or could not record the decision: `unrecorded`).
@@ -10,7 +10,7 @@
 //! then SIGKILL after 1 s). `approvals show --json` prints the whole
 //! masked request: `--full` only changes the text output.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, Subcommand};
@@ -58,17 +58,17 @@ pub enum Decision {
     },
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(
     _config: Option<PathBuf>,
     _list: ListArgs,
     _action: Option<ApprovalsAction>,
 ) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn decide(_config: Option<PathBuf>, d: Decision) -> ExitCode {
     match d {
         Decision::Approve {
@@ -82,16 +82,16 @@ pub fn decide(_config: Option<PathBuf>, d: Decision) -> ExitCode {
             let _ = (id, note);
         }
     }
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) use linux::start_agent;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use linux::{decide, run};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod linux {
     use super::{ApprovalsAction, Decision, ListArgs};
     use crate::broker::{self, Target};
@@ -518,9 +518,10 @@ mod linux {
 
     /// Start `pkttyagent` for this process when the session is
     /// terminal-only; `None` when it is not needed or cannot run (then a
-    /// hint says how a prompt could appear).
+    /// hint says how a prompt could appear). Never off Linux: macOS has no
+    /// polkit, and its prompt comes from Authorization Services.
     pub(crate) fn start_agent() -> Option<Agent> {
-        if !wants_agent(|k| std::env::var_os(k)) {
+        if !cfg!(target_os = "linux") || !wants_agent(|k| std::env::var_os(k)) {
             return None;
         }
         let path = agent_path();

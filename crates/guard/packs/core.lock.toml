@@ -29,7 +29,7 @@ version = 1
 # `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
 # substitution argument must not block every `kill` or `systemctl`.
 substitution_failsafe = false
-triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
 
 # --- read-only carve-outs (whole segment: no wrapper in front) ----------------
 [[allow]]
@@ -59,6 +59,21 @@ reason = "an agent may not change privileges in locked mode; root could switch s
 [[deny]]
 pattern = '(?i)^osascript\s.*with\s+administrator\s+privileges'
 reason = "an agent may not ask for administrator privileges in locked mode; root could switch saiife off"
+
+# --- macOS: the approval right and saiife's accounts (plan 13) -----------------
+[[deny]]
+# Rewriting a right (`com.saiife.approve`, or one it is built on) changes
+# who may approve; `authorizationdb read` stays allowed.
+id = "authorizationdb"
+pattern = '(?i)^security\s+authorizationdb\s+(?:write|remove|merge)\b'
+reason = "an agent may not change the authorization rights in locked mode; saiife's approvals depend on them"
+
+[[deny]]
+# `_saiife` runs saiifed and `_saiifeaudit` reads the audit log: adding a
+# member or changing either account changes who holds them.
+id = "saiife-accounts"
+pattern = '(?i)^(?:dseditgroup|dscl)\s.*\b_saiife'
+reason = "an agent may not change saiife's accounts or groups in locked mode"
 
 # --- saiife's service ---------------------------------------------------------
 # An operand naming saiife: containing `saiif` (`saiifed`, `saiife*`,

@@ -42,18 +42,18 @@ pub struct ApiArgs {
     pub args: Vec<String>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(_a: ApiArgs) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(a: ApiArgs) -> ExitCode {
     linux::run(a)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) mod linux {
     use super::ApiArgs;
     use crate::broker::{self, Target};

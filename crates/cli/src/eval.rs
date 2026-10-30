@@ -553,8 +553,8 @@ pub fn judge_config_change(payload: &str) -> EvalAnswer {
 const BROKERED_SERVER: &str = "saiife";
 
 /// Whether an MCP tool may be used in locked mode (spec §6.1.4).
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by the locked hook (Linux and macOS).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpCheck {
     /// Not an MCP tool.
@@ -580,8 +580,8 @@ pub enum McpCheck {
 /// ([`claude_pin_ok`]); otherwise `saiife` is judged like any server:
 /// denied unless listed. `pin_ok` runs only for a call that would be
 /// `Brokered`.
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by the locked hook (Linux and macOS).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn mcp_check_pinned(
     agent: &str,
     tool: &str,
@@ -601,8 +601,8 @@ pub fn mcp_check_pinned(
 /// (root in production), not group- or world-writable, at most 1 MiB,
 /// that parses and is exactly what `managed_mcp_settings` writes
 /// (`saiife_agents::claude::managed_mcp_pinned`). Any doubt is `false`.
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by the locked hook (Linux and macOS).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     const MAX: u64 = 1 << 20;
@@ -627,8 +627,8 @@ pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
 }
 
 /// The MCP server identity a payload states (Gemini CLI's `mcp_context`).
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by the locked hook (Linux and macOS).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpIdentity {
     /// No `mcp_context` key.
@@ -669,7 +669,7 @@ pub fn mcp_check(agent: &str, tool: &str, identity: &McpIdentity, allow: &[Strin
 }
 
 /// [`mcp_check`] with whether `saiife` may be `Brokered` given.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn mcp_check_as(
     agent: &str,
     tool: &str,
@@ -730,8 +730,8 @@ fn mcp_check_as(
 /// (a duplicate key, an escaped key spelling, not JSON at all) is an MCP
 /// call whose server is unknown: denied for Gemini CLI and other agents,
 /// never guessed from its raw text.
-// Used by the locked hook, which is Linux-only in this version.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by the locked hook (Linux and macOS).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn mcp_identity(payload: &str) -> McpIdentity {
     /// `Some` whenever the key is present, `null` included.
     fn present<'de, D: serde::Deserializer<'de>>(

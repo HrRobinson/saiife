@@ -2,7 +2,7 @@
 //! Task 16). There is no root in tests, so the positive path runs a binary
 //! that is root-owned on every Linux box (`printenv`, else `echo`), found
 //! at test time; with none, the test prints why and skips.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

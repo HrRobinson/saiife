@@ -2,7 +2,7 @@
 //! service (spec §6.8.3, §8.1). It stores the secret through the daemon
 //! (the `secret add` flow) and writes `<config dir>/policy.d/<service>.toml`
 //! with every operation listed but commented out, so the service starts
-//! deny-all. Linux only. Exit codes as `saiife secret`.
+//! deny-all. Linux and macOS. Exit codes as `saiife secret`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,13 +35,13 @@ pub struct ConnectArgs {
     pub config: Option<PathBuf>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(_args: ConnectArgs) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(args: ConnectArgs) -> ExitCode {
     use crate::secret_cmd::linux::Stop;
     match linux::go(args) {
@@ -61,7 +61,7 @@ pub fn run(args: ConnectArgs) -> ExitCode {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod linux {
     use std::collections::BTreeMap;
     use std::io::BufRead;

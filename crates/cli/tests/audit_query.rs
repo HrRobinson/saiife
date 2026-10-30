@@ -4,7 +4,7 @@
 //! runs as the current user on temp dirs (see common/daemon.rs). Who counts
 //! as an auditor is set with the debug-build seam `SAIIFE_TEST_AUDIT_GROUP`,
 //! so the host's groups never matter.
-#![cfg(all(target_os = "linux", debug_assertions))]
+#![cfg(all(unix, debug_assertions))]
 
 mod common;
 

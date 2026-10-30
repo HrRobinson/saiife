@@ -4,11 +4,11 @@
 //! under test. Nothing touches the real user's directories.
 #![allow(dead_code)]
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod daemon;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod mcp;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod personal;
 pub mod tmp;
 
