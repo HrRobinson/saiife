@@ -306,17 +306,28 @@ fn with_real_copy(agents: &[&str]) -> Env {
     std::fs::remove_file(&exe).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_saiife"), &exe).unwrap();
     // Run init through the copy so the record names it.
-    let out = Command::new(&exe)
-        .arg("init")
-        .current_dir(env.root())
-        .env("PATH", env.bin.path())
-        .env("HOME", env.home.path())
-        .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
-        .env("SAIIFE_DATA_DIR", env.data.path())
-        .env("SAIIFE_AUDIT_DIR", env.audit.path())
-        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
-        .output()
-        .unwrap();
+    // ETXTBSY: a test thread that forks while the copy's write fd is open
+    // keeps the file open for writing until its exec; try again.
+    let mut tries = 0;
+    let out = loop {
+        let r = Command::new(&exe)
+            .arg("init")
+            .current_dir(env.root())
+            .env("PATH", env.bin.path())
+            .env("HOME", env.home.path())
+            .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
+            .env("SAIIFE_DATA_DIR", env.data.path())
+            .env("SAIIFE_AUDIT_DIR", env.audit.path())
+            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+            .output();
+        match r {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => break r.unwrap(),
+        }
+    };
     assert_eq!(code(&out), 0, "{}", stdout(&out));
     env
 }
@@ -567,17 +578,28 @@ fn unhashable_binary_at_init_is_a_failed_check() {
         eprintln!("skipped: running as root, the binary stays readable");
         return;
     }
-    let out = Command::new(&exe)
-        .arg("init")
-        .current_dir(env.root())
-        .env("PATH", env.bin.path())
-        .env("HOME", env.home.path())
-        .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
-        .env("SAIIFE_DATA_DIR", env.data.path())
-        .env("SAIIFE_AUDIT_DIR", env.audit.path())
-        .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
-        .output()
-        .unwrap();
+    // ETXTBSY: a test thread that forks while the copy's write fd is open
+    // keeps the file open for writing until its exec; try again.
+    let mut tries = 0;
+    let out = loop {
+        let r = Command::new(&exe)
+            .arg("init")
+            .current_dir(env.root())
+            .env("PATH", env.bin.path())
+            .env("HOME", env.home.path())
+            .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
+            .env("SAIIFE_DATA_DIR", env.data.path())
+            .env("SAIIFE_AUDIT_DIR", env.audit.path())
+            .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
+            .output();
+        match r {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            r => break r.unwrap(),
+        }
+    };
     assert!(
         stdout(&out).contains("WARNING: could not compute the SHA-256"),
         "{}",
