@@ -46,9 +46,10 @@ ca = "/etc/saiife/ca/siem.pem"   # optional extra CA for tls://
   `saiife audit verify --external` use `rfc5424-json` (or `file` or
   `https`): the copy must hold the exact lines.
 - The TIMESTAMP is the record's own `ts`.
-- `unix:/dev/log`: one datagram per record. A message over 8 KiB is
-  truncated at a character boundary and ends with `…[truncated]` (a
-  truncated line cannot be verified). If `/dev/log` is a stream socket,
+- `unix:/dev/log` (`unix:/var/run/syslog` on macOS): one datagram per
+  record. A message over 8 KiB (2 KiB on macOS, whose local datagram
+  sockets take no more) is truncated at a character boundary and ends with
+  `…[truncated]` (a truncated line cannot be verified). If `/dev/log` is a stream socket,
   every message goes over it with octet-counting framing instead, uncut.
   Note that syslog-ng's `unix-stream()` source expects newline framing by
   default; point a `unix:` target at a datagram socket (`unix-dgram()`), or

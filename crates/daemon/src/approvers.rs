@@ -1,11 +1,13 @@
 //! Who may approve or reject a request (spec §6.10.2). The approver must be
 //! listed in `[approval] approvers` (by user name, or `group:<name>` through
 //! the approver's current groups). The requester's own uid is refused under
-//! `same_user = "deny"`, and under `"reauth"` must pass polkit
-//! re-authentication; when that is unavailable it behaves as `"deny"`, with
-//! its own reason.
+//! `same_user = "deny"`, and under `"reauth"` must pass re-authentication
+//! (polkit on Linux, `security authorize` on macOS); when that is
+//! unavailable it behaves as `"deny"`, with its own reason.
 
-use crate::reauth::{start_time_of, Cooldowns, InFlight, Reauth, ReauthResult, REAUTH_TIMEOUT};
+use crate::reauth::{
+    start_time_of, Cooldowns, InFlight, Reauth, ReauthResult, Subject, REAUTH_TIMEOUT, TOOL,
+};
 use crate::sessions::Proc;
 use saiife_ipc::peer::PeerCred;
 use saiife_policy::{ApprovalCfg, Directory, SameUser};
@@ -25,9 +27,9 @@ pub const REAUTH_UNAVAILABLE: &str =
 pub enum Refusal {
     NotApprover,
     SameUserDenied,
-    /// pkcheck's first stderr line, if any.
+    /// The re-authentication tool's answer, if any.
     ReauthUnavailable(String),
-    /// pkcheck's first stderr line, if any.
+    /// The re-authentication tool's answer, if any.
     ReauthFailed(String),
     ReauthError(String),
     /// Another re-authentication for the same uid is still running.
@@ -59,9 +61,9 @@ impl fmt::Display for Refusal {
                 f.write_str("the requester cannot approve its own request (same_user = \"deny\")")
             }
             Refusal::ReauthUnavailable(d) if d.is_empty() => f.write_str(REAUTH_UNAVAILABLE),
-            Refusal::ReauthUnavailable(d) => write!(f, "{REAUTH_UNAVAILABLE} (pkcheck: {d})"),
+            Refusal::ReauthUnavailable(d) => write!(f, "{REAUTH_UNAVAILABLE} ({TOOL}: {d})"),
             Refusal::ReauthFailed(d) if d.is_empty() => f.write_str("re-authentication failed"),
-            Refusal::ReauthFailed(d) => write!(f, "re-authentication failed (pkcheck: {d})"),
+            Refusal::ReauthFailed(d) => write!(f, "re-authentication failed ({TOOL}: {d})"),
             Refusal::ReauthError(e) => write!(f, "re-authentication error: {e}"),
             Refusal::ReauthBusy => {
                 f.write_str("another re-authentication for this user is still running")
@@ -119,6 +121,9 @@ pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
 ///   in a cooldown (`cooldowns`, 30 s doubling to 10 min, reset by a
 ///   success): `ReauthCooldown`, without asking polkit.
 /// - `detail` names what is decided (polkit's `--detail request`).
+/// - `auth` is the external form the CLI sent (macOS); `security authorize`
+///   decides on it, never on `peer.pid`. Without it a macOS check is
+///   unavailable. The start-time re-check after it only ever refuses.
 #[allow(clippy::too_many_arguments)]
 pub fn may_decide(
     cfg: &ApprovalCfg,
@@ -131,6 +136,7 @@ pub fn may_decide(
     proc: &dyn Proc,
     cooldowns: &Mutex<Cooldowns>,
     detail: &str,
+    auth: Option<[u8; 32]>,
 ) -> Result<(), Refusal> {
     let approver_uid = peer.uid;
     if dir.user(approver_user).map(|u| u.uid) != Some(approver_uid) {
@@ -155,7 +161,13 @@ pub fn may_decide(
             if let Some(left) = cool().remaining(approver_uid, Instant::now()) {
                 return Err(Refusal::ReauthCooldown(left.as_secs().max(1)));
             }
-            let result = reauth.check(peer.pid, start_time, approver_uid, detail, REAUTH_TIMEOUT);
+            let who = Subject {
+                pid: peer.pid,
+                start: start_time,
+                uid: approver_uid,
+                auth,
+            };
+            let result = reauth.check(&who, detail, REAUTH_TIMEOUT);
             match &result {
                 ReauthResult::Authorized => cool().succeeded(approver_uid),
                 // No prompt was shown: nothing to cool down from.
@@ -204,8 +216,8 @@ mod tests {
     const PID: u32 = 5555;
     const START: u64 = 424242;
 
-    /// `(pid, start, uid, detail, timeout)` of one check.
-    type Call = (u32, u64, u32, String, Duration);
+    /// `(subject, detail, timeout)` of one check.
+    type Call = (Subject, String, Duration);
 
     struct FakeReauth {
         available: bool,
@@ -227,18 +239,11 @@ mod tests {
         fn available(&self) -> bool {
             self.available
         }
-        fn check(
-            &self,
-            pid: u32,
-            start: u64,
-            uid: u32,
-            detail: &str,
-            timeout: Duration,
-        ) -> ReauthResult {
+        fn check(&self, who: &Subject, detail: &str, timeout: Duration) -> ReauthResult {
             self.calls
                 .lock()
                 .unwrap()
-                .push((pid, start, uid, detail.to_string(), timeout));
+                .push((*who, detail.to_string(), timeout));
             self.result.clone()
         }
     }
@@ -369,13 +374,23 @@ mod tests {
                 &p,
                 &Mutex::default(),
                 "#9 x",
+                None,
             );
             assert_eq!(got, want, "row {i}");
             let calls = fake.calls.lock().unwrap();
             if runs {
                 assert_eq!(
                     *calls,
-                    vec![(PID, START, uid, "#9 x".to_string(), REAUTH_TIMEOUT)],
+                    vec![(
+                        Subject {
+                            pid: PID,
+                            start: START,
+                            uid,
+                            auth: None
+                        },
+                        "#9 x".to_string(),
+                        REAUTH_TIMEOUT
+                    )],
                     "row {i}"
                 );
             } else {
@@ -402,6 +417,7 @@ mod tests {
                 p,
                 &cd,
                 "",
+                None,
             )
         };
 
@@ -437,6 +453,7 @@ mod tests {
                 &p,
                 &Mutex::default(),
                 "",
+                None,
             ),
             Err(Refusal::ReauthFailed(String::new()))
         );
@@ -453,7 +470,7 @@ mod tests {
         fn available(&self) -> bool {
             true
         }
-        fn check(&self, _pid: u32, _s: u64, _uid: u32, _d: &str, _t: Duration) -> ReauthResult {
+        fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
             self.entered.wait();
             self.release.wait();
             ReauthResult::Authorized
@@ -474,7 +491,7 @@ mod tests {
         let cd = Mutex::default();
         let decide = |user: &str, uid: u32, r: &dyn Reauth| {
             let p = FakeProc::steady();
-            may_decide(&c, &dir, user, uid, r, &peer(uid), START, &p, &cd, "")
+            may_decide(&c, &dir, user, uid, r, &peer(uid), START, &p, &cd, "", None)
         };
         std::thread::scope(|s| {
             let first = s.spawn(|| decide("busy", 990100, &blocking));
@@ -503,7 +520,19 @@ mod tests {
         let cd = Mutex::default();
         let run = |r: &FakeReauth| {
             let p = FakeProc::steady();
-            may_decide(&c, &dir, "alice", 1000, r, &peer(1000), START, &p, &cd, "")
+            may_decide(
+                &c,
+                &dir,
+                "alice",
+                1000,
+                r,
+                &peer(1000),
+                START,
+                &p,
+                &cd,
+                "",
+                None,
+            )
         };
         // Unavailable (no prompt shown) never cools down.
         let unavailable = FakeReauth::new(true, R::Unavailable(String::new()));
@@ -571,5 +600,186 @@ mod tests {
         assert!(Refusal::ReauthFailed("Not authorized".into())
             .to_string()
             .contains("Not authorized"));
+    }
+
+    /// The macOS check with a fake `security`, made available (the real
+    /// test needs a root-owned binary).
+    struct AvailableMac(crate::reauth::MacAuthorize);
+
+    impl Reauth for AvailableMac {
+        fn available(&self) -> bool {
+            true
+        }
+        fn check(&self, who: &Subject, d: &str, t: Duration) -> ReauthResult {
+            self.0.check(who, d, t)
+        }
+    }
+
+    fn mac(dir: &std::path::Path, answer: &str, code: i32) -> AvailableMac {
+        AvailableMac(crate::reauth::MacAuthorize::with_path(
+            crate::reauth::fakes::security(dir, answer, false, code, 0),
+        ))
+    }
+
+    #[test]
+    fn missing_auth_is_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice"], SameUser::Reauth);
+        let cd = Mutex::default();
+        let sec = mac(d.path(), "YES (0)", 0);
+        let p = FakeProc::steady();
+        let got = may_decide(
+            &c,
+            &dir,
+            "alice",
+            1000,
+            &sec,
+            &peer(1000),
+            START,
+            &p,
+            &cd,
+            "",
+            None,
+        );
+        assert_eq!(
+            got,
+            Err(Refusal::ReauthUnavailable(crate::reauth::NO_AUTH.into()))
+        );
+        assert_eq!(
+            got.unwrap_err().to_string(),
+            format!("{REAUTH_UNAVAILABLE} ({TOOL}: the approving CLI sent no authorization)")
+        );
+        // No cooldown: with the authorization it goes through at once.
+        let ext = Some(crate::reauth::tests::EXT);
+        assert_eq!(
+            may_decide(
+                &c,
+                &dir,
+                "alice",
+                1000,
+                &sec,
+                &peer(1000),
+                START,
+                &p,
+                &cd,
+                "",
+                ext
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unavailable_starts_no_cooldown() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice"], SameUser::Reauth);
+        let cd = Mutex::default();
+        let ext = Some(crate::reauth::tests::EXT);
+        let p = FakeProc::steady();
+        let run = |r: &dyn Reauth| {
+            may_decide(
+                &c,
+                &dir,
+                "alice",
+                1000,
+                r,
+                &peer(1000),
+                START,
+                &p,
+                &cd,
+                "",
+                ext,
+            )
+        };
+        // SSH or a locked screen: interaction not allowed.
+        assert_eq!(
+            run(&mac(d.path(), "NO (-60007)", 1)),
+            Err(Refusal::ReauthUnavailable("NO (-60007)".into()))
+        );
+        assert_eq!(cd.lock().unwrap().remaining(1000, Instant::now()), None);
+        assert_eq!(run(&mac(d.path(), "YES (0)", 0)), Ok(()));
+        // A cancel does cool down.
+        assert_eq!(
+            run(&mac(d.path(), "NO (-60006)", 1)),
+            Err(Refusal::ReauthFailed("NO (-60006)".into()))
+        );
+        assert!(matches!(
+            run(&mac(d.path(), "YES (0)", 0)),
+            Err(Refusal::ReauthCooldown(_))
+        ));
+    }
+
+    /// The approver is the peer uid; `auth` reaches the check unchanged.
+    #[test]
+    fn auth_reaches_the_check() {
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice"], SameUser::Reauth);
+        let ok = FakeReauth::new(true, ReauthResult::Authorized);
+        let p = FakeProc::steady();
+        let ext = Some([9u8; 32]);
+        let got = may_decide(
+            &c,
+            &dir,
+            "alice",
+            1000,
+            &ok,
+            &peer(1000),
+            START,
+            &p,
+            &Mutex::default(),
+            "",
+            ext,
+        );
+        assert_eq!(got, Ok(()));
+        let calls = ok.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0.auth, ext);
+        assert_eq!(calls[0].0.uid, 1000);
+    }
+
+    /// macOS (security fix): same-user `reauth` acts as `deny`, with the
+    /// unavailable reason; a second account still approves.
+    #[test]
+    fn same_user_reauth_is_denied_on_macos() {
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice", "bob"], SameUser::Reauth);
+        let off = crate::reauth::PromptWithoutDetail;
+        let p = FakeProc::steady();
+        let ext = Some([1u8; 32]);
+        let cd = Mutex::default();
+        let own = may_decide(
+            &c,
+            &dir,
+            "alice",
+            1000,
+            &off,
+            &peer(1000),
+            START,
+            &p,
+            &cd,
+            "",
+            ext,
+        );
+        assert_eq!(own, Err(Refusal::ReauthUnavailable(String::new())));
+        assert_eq!(own.unwrap_err().to_string(), REAUTH_UNAVAILABLE);
+        assert_eq!(cd.lock().unwrap().remaining(1000, Instant::now()), None);
+        assert_eq!(
+            may_decide(
+                &c,
+                &dir,
+                "bob",
+                1000,
+                &off,
+                &peer(1001),
+                START,
+                &p,
+                &cd,
+                "",
+                ext
+            ),
+            Ok(())
+        );
     }
 }

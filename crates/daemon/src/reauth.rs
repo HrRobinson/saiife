@@ -12,6 +12,17 @@
 //! unavailable; 126 and any other code, a spawn failure or a timeout are an
 //! error (see [`exit_result`]). Every non-`Authorized` result refuses the
 //! approval.
+//!
+//! On macOS same-user re-authentication is off in this version
+//! ([`PromptWithoutDetail`]): the prompt cannot show which request is
+//! approved. [`MacAuthorize`] is built and tested for when it can be: per
+//! plan 13 decisions 3 to 5 the approving CLI
+//! sends the external form of an empty authorization reference, and the
+//! daemon runs `/usr/bin/security authorize -u -i -d com.saiife.approve`
+//! with that form on stdin, the same way: its own child, `PATH` only,
+//! killed at the timeout. The check rests on the reference and never on the
+//! peer pid (`LOCAL_PEERPID` is the socket's last pid); the approver is
+//! `LOCAL_PEERCRED`'s uid.
 
 use crate::sessions::Proc;
 use std::collections::{HashMap, HashSet};
@@ -63,6 +74,12 @@ fn exit_result(code: Option<i32>, stderr: &str) -> ReauthResult {
         Some(c) => ReauthResult::Error(with(format!("pkcheck: unexpected exit {c}"))),
     }
 }
+
+/// The tool whose answer a refusal quotes.
+#[cfg(target_os = "macos")]
+pub const TOOL: &str = "security";
+#[cfg(not(target_os = "macos"))]
+pub const TOOL: &str = "pkcheck";
 
 /// The longest stderr line kept, in characters.
 pub const MAX_STDERR_CHARS: usize = 200;
@@ -223,21 +240,42 @@ pub enum ReauthResult {
     Error(String),
 }
 
-/// The re-authentication seam: production is [`PkCheck`], tests use fakes.
+/// Who re-authenticates: the approving CLI as the daemon saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subject {
+    /// The peer pid (polkit's subject on Linux; never used on macOS).
+    pub pid: u32,
+    /// The peer's start time, read when the connection was accepted.
+    pub start: u64,
+    /// The approver's uid (the peer credential).
+    pub uid: u32,
+    /// macOS: the external form of the CLI's authorization reference.
+    pub auth: Option<[u8; 32]>,
+}
+
+/// The re-authentication seam: production is [`PkCheck`] (Linux) or
+/// [`PromptWithoutDetail`] (macOS: same-user re-authentication is off;
+/// [`MacAuthorize`] is not wired in), tests use fakes.
 pub trait Reauth: Send + Sync {
     /// Whether re-authentication can run at all on this host.
     fn available(&self) -> bool;
-    /// Asks whether the process `pid` (started at `start`, running as `uid`)
-    /// proved a human is present, within `timeout`. `detail` names what is
-    /// approved; polkit shows it in the prompt.
-    fn check(
-        &self,
-        pid: u32,
-        start: u64,
-        uid: u32,
-        detail: &str,
-        timeout: Duration,
-    ) -> ReauthResult;
+    /// Asks whether `who` proved a human is present, within `timeout`.
+    /// `detail` names what is approved; polkit shows it in the prompt.
+    fn check(&self, who: &Subject, detail: &str, timeout: Duration) -> ReauthResult;
+}
+
+/// The host's re-authentication: polkit on Linux; on macOS, none in this
+/// version ([`PromptWithoutDetail`]: `same_user = "reauth"` acts as
+/// `"deny"`).
+pub fn host_reauth() -> std::sync::Arc<dyn Reauth> {
+    #[cfg(target_os = "macos")]
+    {
+        std::sync::Arc::new(PromptWithoutDetail)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::sync::Arc::new(PkCheck::new())
+    }
 }
 
 /// `pkcheck` from polkit.
@@ -295,71 +333,328 @@ impl Reauth for PkCheck {
     /// root-owned and not group/other-writable, and a polkit daemon binary
     /// is installed.
     fn available(&self) -> bool {
-        root_owned_file(&self.pkcheck)
+        // polkit's subject is the pid; outside Linux (macOS: the socket's
+        // last pid, not strictly its connector) no approval may rest on a
+        // pid, so polkit is never used there (plan 13, Task 7).
+        cfg!(target_os = "linux")
+            && root_owned_file(&self.pkcheck)
             && root_owned_file(&self.action_file)
             && polkitd_present(&self.polkitd)
     }
 
-    fn check(
-        &self,
-        pid: u32,
-        start: u64,
-        uid: u32,
-        detail: &str,
-        timeout: Duration,
-    ) -> ReauthResult {
+    fn check(&self, who: &Subject, detail: &str, timeout: Duration) -> ReauthResult {
         let mut cmd = Command::new(&self.pkcheck);
-        cmd.args(PkCheck::argv(pid, start, uid, detail))
+        cmd.args(PkCheck::argv(who.pid, who.start, who.uid, detail))
             .env_clear()
             .env("PATH", PKCHECK_PATH_ENV)
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = match spawn(&mut cmd) {
-            Ok(c) => c,
+        match run_bounded(&mut cmd, &self.pkcheck, "pkcheck", None, timeout) {
+            Ok(ran) => exit_result(ran.code, &first_line(&ran.stderr)),
+            Err(e) => ReauthResult::Error(e),
+        }
+    }
+}
+
+/// What a bounded child run gave.
+struct Ran {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Reads a child pipe on the side (bounded), so a chatty child never blocks
+/// on a full pipe; the rest is drained and dropped.
+fn side_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut b = Vec::new();
+            let _ = (&mut p).take(MAX_STDERR_BYTES).read_to_end(&mut b);
+            let _ = std::io::copy(&mut p, &mut std::io::sink());
+            b
+        })
+    })
+}
+
+/// Runs `cmd` (spawned from `path`, called `name` in errors) as our own
+/// child: `input` is written to its stdin, which is then closed; at
+/// `timeout` it is killed and reaped through its handle. An `Err` is a
+/// spawn failure, a wait failure or the timeout.
+fn run_bounded(
+    cmd: &mut Command,
+    path: &Path,
+    name: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Ran, String> {
+    let mut child = spawn(cmd).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        use std::io::Write;
+        // 32 bytes always fit the pipe; a child that already exited only
+        // makes this fail (EPIPE), and its answer still decides.
+        let _ = stdin.write_all(bytes);
+    }
+    let stdout = side_reader(child.stdout.take());
+    let stderr = side_reader(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child has exited and does not fork: its pipes are at
+                // EOF, so the joins return.
+                let join = |t: Option<std::thread::JoinHandle<Vec<u8>>>| {
+                    t.and_then(|t| t.join().ok()).unwrap_or_default()
+                };
+                return Ok(Ran {
+                    code: status.code(),
+                    stdout: join(stdout),
+                    stderr: join(stderr),
+                });
+            }
+            Ok(None) => {}
             Err(e) => {
-                return ReauthResult::Error(format!("{}: {e}", self.pkcheck.display()));
-            }
-        };
-        // Read stderr on the side (bounded), so a chatty pkcheck never
-        // blocks on a full pipe; the rest is drained and dropped.
-        let stderr = child.stderr.take().map(|mut e| {
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut b = Vec::new();
-                let _ = (&mut e).take(MAX_STDERR_BYTES).read_to_end(&mut b);
-                let _ = std::io::copy(&mut e, &mut std::io::sink());
-                b
-            })
-        });
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // pkcheck has exited and does not fork: its stderr is
-                    // at EOF, so the join returns.
-                    let raw = stderr.and_then(|t| t.join().ok()).unwrap_or_default();
-                    return exit_result(status.code(), &first_line(&raw));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return ReauthResult::Error(format!("waiting for pkcheck: {e}"));
-                }
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                // Our own child: kill and reap it.
                 let _ = child.kill();
                 let _ = child.wait();
-                return ReauthResult::Error(format!(
-                    "pkcheck timed out after {} ms",
-                    timeout.as_millis()
-                ));
+                return Err(format!("waiting for {name}: {e}"));
             }
-            std::thread::sleep(POLL.min(deadline - now));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            // Our own child: kill and reap it.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{name} timed out after {} ms", timeout.as_millis()));
+        }
+        std::thread::sleep(POLL.min(deadline - now));
+    }
+}
+
+/// The production `security` (macOS).
+pub const SECURITY: &str = "/usr/bin/security";
+/// The authorization right `system install` registers on macOS.
+pub use saiife_system::authright::RIGHT;
+/// How long `security authorizationdb read` may take in `available()`.
+pub const RIGHT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// The refusal detail when a same-user approval came without `auth`.
+pub const NO_AUTH: &str = "the approving CLI sent no authorization";
+/// `security authorize` status codes (Authorization Services).
+const ERR_DENIED: i32 = -60005;
+const ERR_CANCELED: i32 = -60006;
+const ERR_INTERACTION_NOT_ALLOWED: i32 = -60007;
+
+/// Maps `security authorize`'s answer to a result (decision 5). `out` is
+/// its stdout, then its stderr; the first line matching
+/// `^(YES|NO) \((-?\d+)\)` is the answer. `YES (0)` with exit 0 is
+/// authorized; `NO (-60005)` (denied) and `NO (-60006)` (canceled) are
+/// denied; `NO (-60007)` (interaction not allowed: SSH, no GUI) is
+/// unavailable; any other code, no answer or a signal is an error.
+pub fn parse_answer(code: Option<i32>, out: &str) -> ReauthResult {
+    let Some(code) = code else {
+        return ReauthResult::Error("security: killed by a signal".into());
+    };
+    let answer = out.lines().find_map(|l| answer_of(l).map(|a| (l, a)));
+    let Some((line, (yes, status))) = answer else {
+        let first = first_line(out.as_bytes());
+        return ReauthResult::Error(if first.is_empty() {
+            format!("security: no answer (exit {code})")
+        } else {
+            format!("security: no answer (exit {code}): {first}")
+        });
+    };
+    let line = first_line(line.as_bytes());
+    match (yes, status) {
+        (true, 0) if code == 0 => ReauthResult::Authorized,
+        (true, _) => ReauthResult::Error(format!("security: {line} (exit {code})")),
+        (false, ERR_DENIED | ERR_CANCELED) => ReauthResult::Denied(line),
+        (false, ERR_INTERACTION_NOT_ALLOWED) => ReauthResult::Unavailable(line),
+        (false, _) => ReauthResult::Error(format!("security: {line}")),
+    }
+}
+
+/// `(yes, status)` of a line `YES (<n>)` or `NO (<n>)`.
+fn answer_of(line: &str) -> Option<(bool, i32)> {
+    let (yes, rest) = if let Some(r) = line.strip_prefix("YES (") {
+        (true, r)
+    } else {
+        (false, line.strip_prefix("NO (")?)
+    };
+    let (num, _) = rest.split_once(')')?;
+    let digits = num.strip_prefix('-').unwrap_or(num);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((yes, num.parse().ok()?))
+}
+
+/// The `auth` argument: exactly 64 lowercase hex characters, the 32-byte
+/// external form of an authorization reference.
+pub fn parse_auth_hex(s: &str) -> Result<[u8; 32], String> {
+    const BAD: &str = "auth is 64 lowercase hex characters";
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return Err(BAD.into());
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (nib(b[2 * i]).ok_or(BAD)? << 4) | nib(b[2 * i + 1]).ok_or(BAD)?;
+    }
+    Ok(out)
+}
+
+/// The refusal detail of a same-user approval on macOS.
+pub const MAC_NO_DETAIL: &str =
+    "the macOS password prompt cannot show which request is approved, so same-user approval is off on macOS";
+
+/// macOS in this version: same-user re-authentication is off, so
+/// `same_user = "reauth"` acts as `"deny"` (a second account approves).
+///
+/// Why (security review of plan 13, Task 8): `security authorize` shows
+/// only the right's fixed `default-prompt`, never which request is
+/// approved, so a same-user agent could start an approval of its own
+/// request while the human believes they confirm another one. A prompt
+/// text the CLI supplies (`kAuthorizationEnvironmentPrompt`) would be
+/// chosen by a process the agent can imitate, so it binds nothing either.
+/// polkit on Linux shows the daemon's `--detail`. Until a macOS prompt can
+/// carry a detail the daemon chooses, [`MacAuthorize`] stays unused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptWithoutDetail;
+
+impl Reauth for PromptWithoutDetail {
+    fn available(&self) -> bool {
+        false
+    }
+    fn check(&self, _who: &Subject, _detail: &str, _timeout: Duration) -> ReauthResult {
+        ReauthResult::Unavailable(MAC_NO_DETAIL.into())
+    }
+}
+
+/// How many used external forms [`MacAuthorize`] remembers.
+const USED_FORMS: usize = 1024;
+
+/// `security authorize` on the CLI's authorization reference (macOS). It
+/// builds on every unix, so the Linux tests run it with fake scripts.
+/// Not wired in yet: see [`PromptWithoutDetail`]. Each external form is
+/// single-use: it arrives with the request it decides, and a second check
+/// with the same form is an error, never another prompt.
+#[derive(Debug, Clone)]
+pub struct MacAuthorize {
+    security: PathBuf,
+    used: std::sync::Arc<Mutex<std::collections::VecDeque<[u8; 32]>>>,
+}
+
+impl Default for MacAuthorize {
+    fn default() -> Self {
+        MacAuthorize::new()
+    }
+}
+
+impl MacAuthorize {
+    /// `/usr/bin/security`.
+    pub fn new() -> MacAuthorize {
+        MacAuthorize::with_path(SECURITY)
+    }
+
+    /// Another `security`, for tests (a fake script in a tempdir).
+    pub fn with_path(security: impl Into<PathBuf>) -> MacAuthorize {
+        MacAuthorize {
+            security: security.into(),
+            used: std::sync::Arc::default(),
+        }
+    }
+
+    /// The argv after the program name: user interaction allowed (`-u`),
+    /// the reference read from stdin (`-i`), the acquired right destroyed
+    /// afterwards (`-d`). No pid: the reference names the session.
+    pub fn argv() -> Vec<String> {
+        ["authorize", "-u", "-i", "-d", RIGHT]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn command(&self, args: &[String], stdin: bool) -> Command {
+        let mut cmd = Command::new(&self.security);
+        cmd.args(args)
+            .env_clear()
+            .env("PATH", PKCHECK_PATH_ENV)
+            .current_dir("/")
+            .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
+    /// `security authorizationdb read com.saiife.approve` exits 0 within
+    /// [`RIGHT_READ_TIMEOUT`] and prints a right that passes `read_ok`.
+    fn right_registered(&self) -> bool {
+        let args: Vec<String> = saiife_system::authright::read_args()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut cmd = self.command(&args, false);
+        match run_bounded(
+            &mut cmd,
+            &self.security,
+            "security",
+            None,
+            RIGHT_READ_TIMEOUT,
+        ) {
+            Ok(ran) => {
+                ran.code == Some(0)
+                    && saiife_system::authright::read_ok(&String::from_utf8_lossy(&ran.stdout))
+                        .is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl Reauth for MacAuthorize {
+    /// `security` is a root-owned regular file (its whole path), and the
+    /// right is registered as decision 4 writes it. A missing right makes
+    /// `same_user = "reauth"` act as `"deny"`.
+    fn available(&self) -> bool {
+        root_owned_file(&self.security) && self.right_registered()
+    }
+
+    /// Decides by the reference alone: `who.pid` and `who.start` are never
+    /// used (macOS `LOCAL_PEERPID` is the socket's last pid). `detail` is
+    /// not passed either: the prompt is the right's `default-prompt`.
+    fn check(&self, who: &Subject, _detail: &str, timeout: Duration) -> ReauthResult {
+        let Some(auth) = who.auth else {
+            return ReauthResult::Unavailable(NO_AUTH.into());
+        };
+        {
+            let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
+            if used.contains(&auth) {
+                return ReauthResult::Error("this authorization was already used".into());
+            }
+            if used.len() >= USED_FORMS {
+                used.pop_front();
+            }
+            used.push_back(auth);
+        }
+        let mut cmd = self.command(&MacAuthorize::argv(), true);
+        match run_bounded(&mut cmd, &self.security, "security", Some(&auth), timeout) {
+            Ok(ran) => {
+                let out = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&ran.stdout),
+                    String::from_utf8_lossy(&ran.stderr)
+                );
+                parse_answer(ran.code, &out)
+            }
+            Err(e) => ReauthResult::Error(e),
         }
     }
 }
@@ -404,14 +699,16 @@ pub fn start_time_of(proc: &dyn Proc, pid: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
     /// A fake `pkcheck`: records its argv and its initial environment (from
     /// `/proc/$$/environ`, so nothing the shell adds), then exits `code`, or
     /// sleeps `sleep` seconds when that is not 0.
+    #[cfg(target_os = "linux")]
     fn fake(dir: &Path, code: i32, sleep: u32) -> PathBuf {
         let script = dir.join("pkcheck");
         let out = dir.display();
@@ -439,14 +736,25 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// A subject without an authorization (the polkit shape).
+    #[cfg(target_os = "linux")]
+    fn subj(pid: u32, start: u64, uid: u32) -> Subject {
+        Subject {
+            pid,
+            start,
+            uid,
+            auth: None,
+        }
+    }
+
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_argv_exact() {
         let d = tmp();
         let pk = PkCheck::with_paths(fake(d.path(), 0, 0), d.path().join("action"));
         let r = pk.check(
-            4242,
-            987654,
-            1000,
+            &subj(4242, 987654, 1000),
             "#7 erp invoices.create\n",
             Duration::from_secs(10),
         );
@@ -460,6 +768,8 @@ mod tests {
         assert_eq!(env, "PATH=/usr/bin:/bin\n");
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_exit_codes() {
         use ReauthResult as R;
@@ -474,14 +784,14 @@ mod tests {
         ] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
             assert_eq!(
-                pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+                pk.check(&subj(1, 2, 3), "x", Duration::from_secs(10)),
                 want,
                 "{code}"
             );
         }
         for code in [4, 5, 125, 255] {
             let pk = PkCheck::with_paths(fake(d.path(), code, 0), d.path().join("action"));
-            match pk.check(1, 2, 3, "x", Duration::from_secs(10)) {
+            match pk.check(&subj(1, 2, 3), "x", Duration::from_secs(10)) {
                 R::Error(e) => assert!(e.contains(&format!("exit {code}")), "{code}: {e}"),
                 other => panic!("{code}: expected Error, got {other:?}"),
             }
@@ -492,6 +802,7 @@ mod tests {
     }
 
     /// A fake `pkcheck` that writes `stderr` there, then exits `code`.
+    #[cfg(target_os = "linux")]
     fn fake_stderr(dir: &Path, code: i32, stderr: &str) -> PathBuf {
         let script = dir.join("pkcheck-err");
         fs::write(
@@ -503,6 +814,8 @@ mod tests {
         script
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_stderr_first_line_is_the_reason() {
         use ReauthResult as R;
@@ -512,7 +825,7 @@ mod tests {
             fake_stderr(d.path(), 127, &format!("\n{trusted}\nsecond line\n")),
             d.path().join("action"),
         );
-        match pk.check(1, 2, 3, "x", Duration::from_secs(10)) {
+        match pk.check(&subj(1, 2, 3), "x", Duration::from_secs(10)) {
             R::Unavailable(e) => {
                 assert!(e.contains("trusted callers"), "{e}");
                 assert!(!e.contains("second line"), "{e}");
@@ -525,12 +838,12 @@ mod tests {
             d.path().join("action"),
         );
         assert_eq!(
-            pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+            pk.check(&subj(1, 2, 3), "x", Duration::from_secs(10)),
             R::Denied("Not authorized.[2J".into())
         );
         let pk = PkCheck::with_paths(fake_stderr(d.path(), 126, "bad"), d.path().join("action"));
         assert_eq!(
-            pk.check(1, 2, 3, "x", Duration::from_secs(10)),
+            pk.check(&subj(1, 2, 3), "x", Duration::from_secs(10)),
             R::Error("pkcheck: bad options: bad".into())
         );
     }
@@ -587,12 +900,14 @@ mod tests {
         drop((b, again));
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_timeout_is_error() {
         let d = tmp();
         let pk = PkCheck::with_paths(fake(d.path(), 0, 30), d.path().join("action"));
         let t0 = Instant::now();
-        let r = pk.check(1, 2, 3, "x", Duration::from_millis(200));
+        let r = pk.check(&subj(1, 2, 3), "x", Duration::from_millis(200));
         assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
         match r {
             ReauthResult::Error(e) => assert!(e.contains("timed out"), "{e}"),
@@ -615,16 +930,20 @@ mod tests {
         assert!(InFlight::begin(1000).is_some());
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn missing_pkcheck_is_error() {
         let d = tmp();
         let pk = PkCheck::with_paths(d.path().join("nope"), d.path().join("action"));
         assert!(matches!(
-            pk.check(1, 2, 3, "x", Duration::from_secs(1)),
+            pk.check(&subj(1, 2, 3), "x", Duration::from_secs(1)),
             ReauthResult::Error(_)
         ));
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn available_needs_root_owned_binary_and_action_file() {
         let d = tmp();
@@ -668,6 +987,18 @@ mod tests {
             .available());
     }
 
+    /// Outside Linux polkit is never used: its subject is a pid, and no
+    /// approval may rest on a pid there (macOS `LOCAL_PEERPID`).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pkcheck_never_available_off_linux() {
+        let root_file = PathBuf::from("/etc/passwd");
+        assert!(!PkCheck::with_paths(&root_file, &root_file)
+            .with_polkitd(vec![root_file.clone()])
+            .available());
+        assert!(!PkCheck::new().available());
+    }
+
     #[test]
     fn polkitd_present_needs_a_regular_file() {
         let d = tmp();
@@ -692,5 +1023,383 @@ mod tests {
         let rp = RealProc::new(d.path());
         assert_eq!(start_time_of(&rp, 77), Some(31337));
         assert_eq!(start_time_of(&rp, 78), None);
+    }
+
+    // ------------------------------------------------ macOS (`security`)
+
+    /// 32 bytes standing in for an external form.
+    pub(crate) const EXT: [u8; 32] = {
+        let mut b = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            b[i] = (i as u8).wrapping_mul(37).wrapping_add(1);
+            i += 1;
+        }
+        b
+    };
+
+    fn mac_subject(pid: u32, auth: Option<[u8; 32]>) -> Subject {
+        Subject {
+            pid,
+            start: 7,
+            uid: 501,
+            auth,
+        }
+    }
+
+    #[test]
+    fn mac_argv_exact() {
+        assert_eq!(
+            MacAuthorize::argv(),
+            ["authorize", "-u", "-i", "-d", "com.saiife.approve"]
+        );
+        assert_eq!(RIGHT, "com.saiife.approve");
+        assert_eq!(
+            MacAuthorize::new().security,
+            PathBuf::from("/usr/bin/security")
+        );
+    }
+
+    #[test]
+    fn yes_is_authorized() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        let r = sec.check(&mac_subject(4242, Some(EXT)), "#7", Duration::from_secs(10));
+        assert_eq!(r, ReauthResult::Authorized);
+        let argv = fs::read_to_string(d.path().join("argv")).unwrap();
+        assert_eq!(argv, "authorize\n-u\n-i\n-d\ncom.saiife.approve\n");
+    }
+
+    #[test]
+    fn canceled_is_denied() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "NO (-60006)", false, 1, 0));
+        assert_eq!(
+            sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10)),
+            ReauthResult::Denied("NO (-60006)".into())
+        );
+    }
+
+    #[test]
+    fn denied_is_denied() {
+        let d = tmp();
+        // On stderr: either stream carries the answer.
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "NO (-60005)", true, 1, 0));
+        assert_eq!(
+            sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10)),
+            ReauthResult::Denied("NO (-60005)".into())
+        );
+    }
+
+    #[test]
+    fn interaction_not_allowed_is_unavailable() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "NO (-60007)", true, 1, 0));
+        assert_eq!(
+            sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10)),
+            ReauthResult::Unavailable("NO (-60007)".into())
+        );
+    }
+
+    #[test]
+    fn other_code_is_error() {
+        use ReauthResult as R;
+        let d = tmp();
+        for (answer, code) in [
+            ("NO (-60008)", 1),
+            ("NO (-2)", 1),
+            ("YES (0)", 1),
+            ("YES (-60005)", 0),
+            ("garbage", 0),
+            ("", 0),
+            ("NO (x)", 1),
+        ] {
+            let sec = MacAuthorize::with_path(fakes::security(d.path(), answer, false, code, 0));
+            match sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10)) {
+                R::Error(e) => assert!(e.starts_with("security: "), "{answer}: {e}"),
+                other => panic!("{answer}: expected Error, got {other:?}"),
+            }
+        }
+        // Killed by a signal; the answer line need not be first.
+        assert!(matches!(parse_answer(None, "YES (0)"), R::Error(_)));
+        assert_eq!(parse_answer(Some(0), "noise\nYES (0)\n"), R::Authorized);
+        assert_eq!(
+            parse_answer(Some(1), "\nNO (-60006)\nYES (0)"),
+            R::Denied("NO (-60006)".into())
+        );
+        // Anchored at the line start.
+        assert!(matches!(parse_answer(Some(0), " x YES (0)"), R::Error(_)));
+    }
+
+    #[test]
+    fn external_form_written_on_stdin_exactly() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10));
+        assert_eq!(fs::read(d.path().join("stdin")).unwrap(), EXT.to_vec());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn env_is_path_only() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_secs(10));
+        let env = fs::read_to_string(d.path().join("env")).unwrap();
+        assert_eq!(env, "PATH=/usr/bin:/bin\n");
+    }
+
+    #[test]
+    fn hung_security_is_killed_at_timeout() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "", false, 0, 30));
+        let t0 = Instant::now();
+        let r = sec.check(&mac_subject(1, Some(EXT)), "x", Duration::from_millis(200));
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        match r {
+            ReauthResult::Error(e) => assert!(e.contains("timed out"), "{e}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Reaped: our child's pid has no /proc entry, not even a zombie.
+        #[cfg(target_os = "linux")]
+        {
+            let pid = fs::read_to_string(d.path().join("pid")).unwrap();
+            let pid = pid.trim();
+            assert!(!pid.is_empty());
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "{pid} not reaped"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_auth_is_unavailable_without_running_security() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        assert_eq!(
+            sec.check(&mac_subject(1, None), "x", Duration::from_secs(10)),
+            ReauthResult::Unavailable(NO_AUTH.into())
+        );
+        assert!(!d.path().join("argv").exists());
+    }
+
+    /// macOS `LOCAL_PEERPID` is the socket's last pid: the check must not
+    /// depend on it. Any pid (none, ours, a foreign one) gives the same
+    /// answer and the same argv and stdin.
+    #[test]
+    fn foreign_pid_does_not_change_the_outcome() {
+        for answer in ["YES (0)", "NO (-60006)"] {
+            let mut seen = Vec::new();
+            for pid in [0, 1, std::process::id(), 99_999, u32::MAX] {
+                let d = tmp();
+                let code = if answer.starts_with("YES") { 0 } else { 1 };
+                let sec =
+                    MacAuthorize::with_path(fakes::security(d.path(), answer, false, code, 0));
+                let mut who = mac_subject(pid, Some(EXT));
+                who.start = u64::from(pid) * 3;
+                let r = sec.check(&who, "x", Duration::from_secs(10));
+                let argv = fs::read_to_string(d.path().join("argv")).unwrap();
+                let stdin = fs::read(d.path().join("stdin")).unwrap();
+                seen.push((r, argv, stdin));
+            }
+            assert!(seen.windows(2).all(|w| w[0] == w[1]), "{answer}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn auth_hex_is_exactly_64_lowercase() {
+        let hex: String = EXT.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(parse_auth_hex(&hex), Ok(EXT));
+        assert_eq!(parse_auth_hex(&"0".repeat(64)), Ok([0; 32]));
+        for bad in [
+            String::new(),
+            "0".repeat(63),
+            "0".repeat(65),
+            hex.to_uppercase(),
+            format!("{}g", &hex[..63]),
+            format!(" {}", &hex[1..]),
+            format!("{}é", &hex[..62]),
+        ] {
+            assert!(parse_auth_hex(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn right_read_needs_the_full_dictionary() {
+        let d = tmp();
+        // What `authorizationdb read` prints for the right install writes.
+        let full = saiife_system::authright::RIGHT_PLIST;
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), full, false, 0, 0));
+        assert!(sec.right_registered());
+        assert_eq!(
+            fs::read_to_string(d.path().join("argv")).unwrap(),
+            "authorizationdb\nread\ncom.saiife.approve\n"
+        );
+        // A right that is shared, or lets root in, or remembered, or
+        // weakened by a rule, or missing a key, or not a dict, or missing.
+        for (out, code) in [
+            (
+                full.replace(
+                    "<key>shared</key>\n\t<false/>",
+                    "<key>shared</key>\n\t<true/>",
+                ),
+                0,
+            ),
+            (
+                full.replace(
+                    "<key>allow-root</key>\n\t<false/>",
+                    "<key>allow-root</key>\n\t<true/>",
+                ),
+                0,
+            ),
+            (
+                full.replace("<integer>0</integer>", "<integer>300</integer>"),
+                0,
+            ),
+            (
+                full.replace(
+                    "<key>version</key>",
+                    "<key>rule</key><string>allow</string><key>version</key>",
+                ),
+                0,
+            ),
+            (full.replace("session-owner", "x"), 0),
+            (full.replace("authenticate-user", "x"), 0),
+            (
+                "<key>class</key><string>user</string><key>authenticate-user</key><true/>\
+                 <key>allow-root</key><false/><key>session-owner</key><true/>\
+                 <key>shared</key><false/><key>timeout</key><integer>0</integer>"
+                    .to_string(),
+                0,
+            ),
+            (full.to_string(), 1),
+            (String::new(), 0),
+        ] {
+            let sec = MacAuthorize::with_path(fakes::security(d.path(), &out, false, code, 0));
+            assert!(!sec.right_registered(), "{code} {out}");
+        }
+    }
+
+    #[test]
+    fn mac_available_needs_root_owned_security() {
+        let d = tmp();
+        let full = saiife_system::authright::RIGHT_PLIST;
+        // Registered, but the binary is the test user's.
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), full, false, 0, 0));
+        assert!(sec.right_registered());
+        assert!(!sec.available());
+        assert!(!MacAuthorize::with_path(d.path().join("nope")).available());
+        assert!(!MacAuthorize::with_path("security").available());
+    }
+
+    /// The security fix: on macOS the prompt cannot show the request, so
+    /// same-user re-authentication is off and never prompts.
+    #[test]
+    fn macos_same_user_reauth_is_off() {
+        let off = PromptWithoutDetail;
+        assert!(!off.available());
+        assert_eq!(
+            off.check(&mac_subject(1, Some(EXT)), "#7 x", Duration::from_secs(1)),
+            ReauthResult::Unavailable(MAC_NO_DETAIL.into())
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!host_reauth().available());
+    }
+
+    /// An external form decides one check: the same form again is an
+    /// error, and `security` is not run for it.
+    #[test]
+    fn reused_external_form_is_refused() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        let who = mac_subject(1, Some(EXT));
+        assert_eq!(
+            sec.check(&who, "x", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
+        fs::remove_file(d.path().join("argv")).unwrap();
+        // A clone (another connection's view) shares the record.
+        match sec.clone().check(&who, "x", Duration::from_secs(10)) {
+            ReauthResult::Error(e) => assert!(e.contains("already used"), "{e}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(!d.path().join("argv").exists());
+        // Another form is fine.
+        let mut other = who;
+        other.auth = Some([0xee; 32]);
+        assert_eq!(
+            sec.check(&other, "x", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
+    }
+
+    /// polkit ignores `auth`: the same argv with or without it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pkcheck_unchanged_with_subject() {
+        let d = tmp();
+        let pk = PkCheck::with_paths(fake(d.path(), 0, 0), d.path().join("action"));
+        let mut who = subj(4242, 987654, 1000);
+        assert_eq!(
+            pk.check(&who, "#7", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
+        let without = fs::read_to_string(d.path().join("argv")).unwrap();
+        who.auth = Some(EXT);
+        assert_eq!(
+            pk.check(&who, "#7", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
+        assert_eq!(fs::read_to_string(d.path().join("argv")).unwrap(), without);
+        assert!(without.contains("4242,987654,1000"));
+    }
+}
+
+/// Fake re-authentication tools for tests (shell scripts in a tempdir).
+#[cfg(test)]
+pub(crate) mod fakes {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A fake `security` in `dir`: records its argv, its pid, its stdin and
+    /// (Linux) its initial environment there, then prints `answer` (to
+    /// stderr when `to_stderr`) and exits `code`, or sleeps `sleep` seconds
+    /// when that is not 0. Each call writes a new script.
+    pub(crate) fn security(
+        dir: &Path,
+        answer: &str,
+        to_stderr: bool,
+        code: i32,
+        sleep: u32,
+    ) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let script = dir.join(format!("security-{}", N.fetch_add(1, Ordering::SeqCst)));
+        let out = dir.display();
+        let answer_file = PathBuf::from(format!("{}.answer", script.display()));
+        fs::write(&answer_file, answer).unwrap();
+        let redirect = if to_stderr { " >&2" } else { "" };
+        // `exec` so the timeout kill reaches the sleeper itself.
+        let tail = if sleep > 0 {
+            format!("exec sleep {sleep}")
+        } else {
+            format!("cat '{}'{redirect}\nexit {code}", answer_file.display())
+        };
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{out}/argv'\n\
+                 echo $$ > '{out}/pid'\n\
+                 if [ -r /proc/$$/environ ]; then tr '\\000' '\\n' < /proc/$$/environ > '{out}/env'; fi\n\
+                 cat > '{out}/stdin'\n\
+                 {tail}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
     }
 }

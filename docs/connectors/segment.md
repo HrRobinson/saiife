@@ -91,11 +91,9 @@ Both policies are exercised by `crates/broker/tests/segment.rs`.
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches Segment only through `saiifed`:
+In locked mode (Linux and macOS) the agent user reaches Segment only through `saiifed`:
 `saiife api segment ...`, or `gateway.sock` at `/v1/api` and `/v1/proxy`.
 The write key lives in the daemon's vault (`saiife secret add segment-prod`,
 or `saiife connect segment`) and never reaches the agent's environment, files
 or audit records. A project overlay can only add `deny` and `ask`; in locked
-mode its `allow` is ignored. Every call is one `connector` audit record. On
-macOS the commands print `saiife: locked mode needs Linux in this version
-(macOS: v2.1)` and exit 5.
+mode its `allow` is ignored. Every call is one `connector` audit record.

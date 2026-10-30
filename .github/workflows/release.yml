@@ -9,6 +9,7 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - 'install.sh'
+      - 'scripts/release/**'
       - 'packaging/**'
       - 'scripts/package-linux/**'
   workflow_dispatch:
@@ -123,6 +124,24 @@ jobs:
             echo "::error::expected exactly '$LIPO_ARCH', got '$archs'"
             exit 1
           fi
+      # Hardened runtime always; Developer ID + notarization only when all six
+      # secrets exist (none: ad-hoc with a warning; some: fail). The secrets
+      # reach this step only, never the job. Fork PRs have none, so they stay
+      # green in ad-hoc mode.
+      - name: sign (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        # Secrets exist only on v* tag pushes: PRs and branch runs (same-repo
+        # included) get empty strings, see "none" and take the ad-hoc path.
+        # All six use the same gate, so it can never yield a partial set.
+        env:
+          MACOS_SIGN_P12_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_BASE64 || '' }}
+          MACOS_SIGN_P12_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_PASSWORD || '' }}
+          MACOS_SIGN_IDENTITY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_IDENTITY || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_NOTARY_APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_APPLE_ID || '' }}
+          APPLE_NOTARY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_PASSWORD || '' }}
+        run: bash scripts/release/macos-sign.sh "target/$TARGET/release/saiife" "$TARGET"
       - name: saiife --version
         if: matrix.run
         shell: bash
@@ -146,7 +165,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
-          path: dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+          path: |
+            dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/SIGNING-*.txt
           if-no-files-found: error
 
   linux-packages:
@@ -332,6 +353,24 @@ jobs:
             echo "::error::CHANGELOG.md still has the YYYY-MM-DD placeholder; set the release date before tagging"
             exit 1
           fi
+          # One SIGNING-<target>.txt per macOS build: a missing one must
+          # not drop the ad-hoc note silently.
+          shopt -s nullglob
+          signing=(dist/SIGNING-*.txt)
+          shopt -u nullglob
+          if [ "${#signing[@]}" -ne 2 ]; then
+            echo "::error::expected 2 SIGNING-*.txt files (one per macOS target), found ${#signing[@]}: ${signing[*]}"
+            exit 1
+          fi
+          for f in "${signing[@]}"; do
+            case "$(cat "$f")" in
+              ad-hoc | developer-id) ;;
+              *) echo "::error::$f holds '$(cat "$f")', want ad-hoc or developer-id"; exit 1 ;;
+            esac
+          done
+          if grep -qx 'ad-hoc' "${signing[@]}"; then
+            printf '\nmacOS binaries in this release are ad-hoc signed and not notarized.\n' >> notes.md
+          fi
           cat notes.md
       # Draft first: nothing is public (or "latest") until install-test passes.
       - name: create draft release
@@ -373,6 +412,10 @@ jobs:
           set -euo pipefail
           ls -l rel
           SAIIFE_DOWNLOAD_BASE="file://$PWD/rel/" SAIIFE_VERSION="$VERSION" sh rel/install.sh
+      - name: codesign --verify (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: codesign --verify --strict --verbose=2 "$HOME/.local/bin/saiife"
       - name: saiife --version
         shell: bash
         run: |

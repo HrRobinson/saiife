@@ -3,13 +3,18 @@
 //! groups are kept unless `--purge`. Listed paths that are gone are
 //! skipped; unlisted paths are never touched.
 
+use crate::authright;
 use crate::fsops;
-use crate::host::Host;
-use crate::install::{check_trusted_owner_mode, read_previous, step, InstallError, PREVIOUS};
+use crate::host::{Host, SECURITY};
+use crate::install::{
+    beneath_links, check_trusted_owner_mode, read_previous, root_group, step, InstallError,
+    MACOS_TOOL_TIMEOUT, PREVIOUS,
+};
+use crate::launchd;
 use crate::layout::*;
 use saiife_agents::{codex, gemini, AgentError, Change};
 use saiife_policy::installed::{read_installed, FileKind};
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -54,9 +59,15 @@ pub fn uninstall(
         })
     };
 
+    let mac = layout.platform() == Platform::Macos;
     // 2. Stop the daemon. A failure is a warning, except before --purge
-    // deletes the daemon's state while it may still run.
-    if !systemctl_warn(host, &["disable", "--now", UNIT_NAME], &mut out) && opts.purge {
+    // deletes the daemon's state while it may still run. On macOS a job
+    // launchd still has loaded after a failed bootout stops the uninstall.
+    if mac {
+        if !launchctl_warn(host, &["bootout", launchd::SERVICE], &mut out) {
+            unloaded_or_refuse(host, &out)?;
+        }
+    } else if !systemctl_warn(host, &["disable", "--now", UNIT_NAME], &mut out) && opts.purge {
         stopped_or_refuse(host, &out)?;
     }
 
@@ -104,7 +115,10 @@ pub fn uninstall(
     // 3b. Whole files saiife wrote for an agent (the Claude MCP allowlist).
     // Only paths install knows how to write: a doctored installed.toml
     // cannot make this delete anything else.
-    let known = [Path::new(CLAUDE_MCP), Path::new(CLAUDE_MANAGED)];
+    let known = [
+        Path::new(layout.logical(CLAUDE_MCP)),
+        Path::new(layout.logical(CLAUDE_MANAGED)),
+    ];
     for f in rec
         .files
         .iter()
@@ -131,8 +145,28 @@ pub fn uninstall(
                 out.push(format!("removed {}", f.path.display()));
             }
         }
-        if kind == FileKind::Unit {
+        if kind == FileKind::Unit && !mac {
             let _ = systemctl_warn(host, &["daemon-reload"], &mut out);
+        }
+    }
+    // 4b. Authorization rights install registered (macOS). Only the one
+    // install knows: a doctored installed.toml cannot remove another.
+    for r in rec.auth_rights.iter().rev() {
+        if r != authright::RIGHT {
+            out.push(format!(
+                "warning: unknown authorization right {r:?} in installed.toml; left as is"
+            ));
+            continue;
+        }
+        let line = format!("{SECURITY} {}", authright::remove_args().join(" "));
+        match host.run(SECURITY, &authright::remove_args(), MACOS_TOOL_TIMEOUT) {
+            Ok(o) if o.status == 0 => out.push(format!("removed auth right {r}")),
+            Ok(o) => out.push(format!(
+                "warning: {line} exited {}: {}",
+                o.status,
+                o.stderr.trim()
+            )),
+            Err(e) => out.push(format!("warning: {line}: {e}")),
         }
     }
     // Listed dirs outside /etc/saiife, if empty, innermost first.
@@ -148,39 +182,72 @@ pub fn uninstall(
         if fsops::remove_if_listed(&installed_path).map_err(step("installed.toml"))? {
             out.push(format!("removed {INSTALLED}"));
         }
-        out.push(format!(
-            "kept {ETC_DIR} (config, policy.d, vault key), {STATE_DIR}, {AUDIT_DIR} \
-             and the {DAEMON_USER} user and groups (remove them with --purge)"
-        ));
+        out.push(if mac {
+            format!(
+                "kept {ETC_DIR} (config, policy.d), {} (vault key), {} \
+                 and the {} user and groups (remove them with --purge)",
+                layout.logical(STATE_DIR),
+                layout.logical(AUDIT_DIR),
+                layout.daemon_user()
+            )
+        } else {
+            format!(
+                "kept {ETC_DIR} (config, policy.d, vault key), {STATE_DIR}, {AUDIT_DIR} \
+                 and the {DAEMON_USER} user and groups (remove them with --purge)"
+            )
+        });
         return Ok(out);
     }
 
     // --purge: the config and vault key (only when install created them),
-    // state, audit, users and groups.
-    for f in rec
-        .files
-        .iter()
-        .rev()
-        .filter(|f| f.created && matches!(f.kind, FileKind::Config | FileKind::VaultKey))
-    {
+    // state, audit, users and groups. On macOS the vault key lies in the
+    // daemon user's state dir: it goes with that tree, fd-relative, never
+    // by a path the daemon user could redirect.
+    for f in rec.files.iter().rev().filter(|f| {
+        f.created
+            && match f.kind {
+                FileKind::Config => true,
+                FileKind::VaultKey => !mac,
+                _ => false,
+            }
+    }) {
         if fsops::remove_if_listed(&at(&f.path)?).map_err(step("files"))? {
             out.push(format!("removed {}", f.path.display()));
         }
     }
-    // systemd made these for the daemon (StateDirectory, LogsDirectory).
+    // systemd made these for the daemon (StateDirectory, LogsDirectory);
+    // on macOS install did, with the socket dir.
     // Removed fd-relative from the root (checked again here).
-    for abs in [STATE_DIR, AUDIT_DIR] {
+    for abs in purge_trees(layout) {
+        let shown = layout.logical(abs);
         if let Some(t) = purge_target(layout, host, abs)? {
-            fsops::remove_tree_at(&t.parent, t.name, &t.stat)
-                .map_err(|e| step("purge")(io_at(abs, e)))?;
-            out.push(format!("removed {abs}"));
+            fsops::remove_tree_at(&t.parent, &t.name, &t.stat)
+                .map_err(|e| step("purge")(io_at(shown, e)))?;
+            out.push(format!("removed {shown}"));
         }
     }
-    let (log_parent, log_name) = split(LOG_DIR);
-    if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(log_parent))
-        .map_err(|e| step("purge")(io_at(log_parent, e)))?
+    let log_dir = beneath_links(layout, host, Path::new(layout.logical(LOG_DIR)));
+    // macOS: the daemon's stderr, in the log dir install made (its parent
+    // was checked with the audit tree's). Unlinked fd-relative: a symlink
+    // there is removed, never followed.
+    if mac {
+        if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(&log_dir))
+            .map_err(|e| step("purge")(io_at(LOG_DIR, e)))?
+        {
+            let name = Path::new(DAEMON_LOG).file_name().unwrap_or_default();
+            let st = fsops::stat_at(&fd, name).map_err(|e| step("purge")(io_at(DAEMON_LOG, e)))?;
+            if st.is_some_and(|st| !fsops::stat_owner_mode(&st).2) {
+                rustix::fs::unlinkat(&fd, name, rustix::fs::AtFlags::empty())
+                    .map_err(|e| step("purge")(io_at(DAEMON_LOG, e.into())))?;
+                out.push(format!("removed {DAEMON_LOG}"));
+            }
+        }
+    }
+    let (log_parent, log_name) = split(&log_dir);
+    if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(&log_parent))
+        .map_err(|e| step("purge")(io_at(&log_parent.to_string_lossy(), e)))?
     {
-        if fsops::remove_empty_dir_at(&fd, log_name)
+        if fsops::remove_empty_dir_at(&fd, &log_name)
             .map_err(|e| step("purge")(io_at(LOG_DIR, e)))?
         {
             out.push(format!("removed {LOG_DIR}"));
@@ -232,29 +299,37 @@ pub fn uninstall(
 /// Before `--purge` deletes the state and audit trees: each is checked as
 /// [`purge_target`] checks it, before anything is removed.
 fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
-    for abs in [STATE_DIR, AUDIT_DIR] {
+    for abs in purge_trees(layout) {
         purge_target(layout, host, abs)?;
     }
     Ok(())
 }
 
+/// The daemon's trees `--purge` removes: the state and audit dirs, and on
+/// macOS the socket dir install made.
+fn purge_trees(layout: &Layout) -> Vec<&'static str> {
+    match layout.platform() {
+        Platform::Linux => vec![STATE_DIR, AUDIT_DIR],
+        Platform::Macos => vec![STATE_DIR, AUDIT_DIR, RUN_DIR],
+    }
+}
+
 /// A tree `--purge` removes: its parent, open, and its `stat`.
 struct PurgeTarget {
     parent: OwnedFd,
-    name: &'static OsStr,
+    name: OsString,
     stat: fsops::Stat,
 }
 
-/// `(parent, name)` of a path constant.
-fn split(abs: &'static str) -> (&'static str, &'static OsStr) {
-    let p = Path::new(abs);
-    let parent = p.parent().and_then(Path::to_str).unwrap_or("/");
-    (parent, p.file_name().unwrap_or_default())
+/// `(parent, name)` of an absolute path.
+fn split(p: &Path) -> (PathBuf, OsString) {
+    let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
+    (parent, p.file_name().unwrap_or_default().to_os_string())
 }
 
-/// A path constant relative to the root.
-fn rel(abs: &str) -> &Path {
-    Path::new(abs).strip_prefix("/").unwrap_or(Path::new(abs))
+/// An absolute path relative to the root.
+fn rel(p: &Path) -> &Path {
+    p.strip_prefix("/").unwrap_or(p)
 }
 
 fn io_at(abs: &str, e: std::io::Error) -> std::io::Error {
@@ -280,14 +355,23 @@ fn purge_target(
             step: "owners".into(),
             detail: "user root not found".into(),
         })?;
-    let daemon_uid = host.user(DAEMON_USER).map(|u| u.uid);
-    let (parent_abs, name) = split(abs);
-    let shown_parent = layout.at(parent_abs);
+    let daemon_user = layout.daemon_user();
+    let daemon_uid = host.user(daemon_user).map(|u| u.uid);
+    // On macOS `/var` is a link to `private/var`: the fd-relative walk
+    // starts below the trusted link instead.
+    let real = beneath_links(layout, host, Path::new(layout.logical(abs)));
+    let (parent_abs, name) = split(&real);
+    let shown_parent = layout
+        .try_at(&parent_abs)
+        .map_err(|e| InstallError::Refused {
+            path: parent_abs.clone(),
+            detail: e.to_string(),
+        })?;
     let refuse_parent = |detail: String| InstallError::Refused {
         path: shown_parent.clone(),
         detail,
     };
-    let Some(parent) = fsops::open_dir_beneath(layout.root(), rel(parent_abs))
+    let Some(parent) = fsops::open_dir_beneath(layout.root(), rel(&parent_abs))
         .map_err(|e| refuse_parent(e.to_string()))?
     else {
         return Ok(None);
@@ -300,7 +384,7 @@ fn purge_target(
         path: p.clone(),
         detail,
     };
-    let Some(stat) = fsops::stat_at(&parent, name).map_err(|e| refuse(e.to_string()))? else {
+    let Some(stat) = fsops::stat_at(&parent, &name).map_err(|e| refuse(e.to_string()))? else {
         return Ok(None);
     };
     let (uid, _, is_dir) = fsops::stat_owner_mode(&stat);
@@ -309,7 +393,7 @@ fn purge_target(
     }
     if uid != root_uid && Some(uid) != daemon_uid {
         return Err(refuse(format!(
-            "is owned by uid {uid}, not root or {DAEMON_USER}; --purge does not remove it"
+            "is owned by uid {uid}, not root or {daemon_user}; --purge does not remove it"
         )));
     }
     Ok(Some(PurgeTarget { parent, name, stat }))
@@ -340,6 +424,49 @@ fn stopped_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError
     })
 }
 
+/// `launchctl bootout` failed: go on only when launchd no longer has the
+/// job (`launchctl print` fails). Otherwise stop: the daemon may still run.
+fn unloaded_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError> {
+    let loaded = host
+        .launchctl(&["print", launchd::SERVICE])
+        .is_ok_and(|o| o.status == 0);
+    if !loaded {
+        return Ok(());
+    }
+    let why = out
+        .last()
+        .and_then(|l| l.strip_prefix("warning: "))
+        .unwrap_or("launchctl bootout failed");
+    Err(InstallError::Step {
+        step: "stop".into(),
+        detail: format!(
+            "{why}; the daemon may still run ({} is loaded), so uninstall removed nothing",
+            launchd::SERVICE
+        ),
+    })
+}
+
+/// Runs `launchctl args`; a failure is a `warning:` line. True when it
+/// succeeded.
+fn launchctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool {
+    let line = args.join(" ");
+    match host.launchctl(args) {
+        Ok(o) if o.status == 0 => true,
+        Ok(o) => {
+            out.push(format!(
+                "warning: launchctl {line} exited {}: {}",
+                o.status,
+                o.stderr.trim()
+            ));
+            false
+        }
+        Err(e) => {
+            out.push(format!("warning: launchctl {line}: {e}"));
+            false
+        }
+    }
+}
+
 /// A plain uninstall keeps installed.toml as `/etc/saiife/installed.previous.toml`
 /// (root:root 0600), so a later install or `--purge` knows what install
 /// created.
@@ -355,7 +482,7 @@ fn keep_copy(
     let copy = layout.at(PREVIOUS);
     fsops::write_file_atomic(&copy, &bytes, 0o600).map_err(step("installed.toml"))?;
     let root = host.user("root").map(|u| u.uid);
-    let gid = host.group_id("root");
+    let gid = host.group_id(root_group(layout));
     if let (Some(u), Some(g)) = (root, gid) {
         host.chown(&copy, u, g).map_err(step("installed.toml"))?;
     }
@@ -840,5 +967,207 @@ mod tests {
         assert!(!e.at(CONFIG).exists());
         assert!(!e.at(STATE_DIR).exists());
         assert!(e.host.state().users.is_empty());
+    }
+}
+
+/// The macOS uninstall, driven from any Unix (see `install::macos_tests`).
+#[cfg(all(test, unix))]
+mod macos_tests {
+    use super::*;
+    use crate::install::macos_tests::{exit, mac_env, ok, MacEnv, MAC_SETUP, PRINT};
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    const REMOVE: &str = "/usr/bin/security authorizationdb remove com.saiife.approve";
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn un(e: &MacEnv, purge: bool) -> Vec<String> {
+        uninstall(&e.layout, &e.host, &UninstallOptions { purge }).unwrap()
+    }
+
+    fn removable(e: &MacEnv) {
+        e.host.set(|s| {
+            s.run.insert(REMOVE.into(), ok(""));
+            s.calls.clear();
+        });
+    }
+
+    #[test]
+    fn macos_uninstall_removes_exactly_what_install_listed() {
+        let e = mac_env();
+        e.install();
+        removable(&e);
+        let out = un(&e, false);
+        let mut want = set(MAC_SETUP);
+        want.extend(set(&[
+            // /etc/saiife is kept (config, policy.d, the copy).
+            "private/etc/saiife",
+            "private/etc/saiife/config.toml",
+            "private/etc/saiife/policy.d",
+            "private/etc/saiife/installed.previous.toml",
+            // The daemon's state, key and logs are kept.
+            "private/var/db/saiife",
+            "private/var/db/saiife/keys",
+            "private/var/db/saiife/keys/vault.key",
+            "private/var/db/saiife-run",
+            "private/var/log/saiife",
+            "private/var/log/saiife/audit",
+            "private/var/log/saiife/daemon.log",
+        ]));
+        assert_eq!(e.tree(), want);
+        let calls = e.calls();
+        assert_eq!(calls[0], "launchctl bootout system/com.saiife.saiifed");
+        assert!(calls.contains(&REMOVE.to_string()), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("systemctl")),
+            "{calls:?}"
+        );
+        for line in [
+            "removed /Library/LaunchDaemons/com.saiife.saiifed.plist",
+            "removed /opt/saiife/bin/saiife",
+            "removed /opt",
+            "removed auth right com.saiife.approve",
+            "removed /Library/Application Support/ClaudeCode/managed-settings.d/50-saiife.json",
+        ] {
+            assert!(out.iter().any(|l| l == line), "{line}: {out:?}");
+        }
+        assert!(
+            out.last().unwrap().starts_with(
+                "kept /etc/saiife (config, policy.d), /var/db/saiife (vault key), \
+                 /var/log/saiife/audit and the _saiife user"
+            ),
+            "{out:?}"
+        );
+        // Users and groups are kept.
+        assert!(e.host.user("_saiife").is_some());
+        assert!(e.host.group_id("_saiifeaudit").is_some());
+        // A second run has nothing to do.
+        assert!(un(&e, false).is_empty());
+    }
+
+    #[test]
+    fn macos_auth_right_remove_failure_is_a_warning() {
+        let e = mac_env();
+        e.install();
+        e.host
+            .set(|s| drop(s.run.insert(REMOVE.into(), exit(1, "NO (-60005)"))));
+        let out = un(&e, false);
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with(&format!("warning: {REMOVE} exited 1"))),
+            "{out:?}"
+        );
+        assert!(!e.at("/opt/saiife/bin/saiife").exists());
+    }
+
+    #[test]
+    fn macos_bootout_failure_while_loaded_refuses() {
+        let e = mac_env();
+        e.install();
+        e.host.set(|s| {
+            s.run.remove(PRINT);
+            s.run.insert(
+                "launchctl bootout system/com.saiife.saiifed".into(),
+                exit(1, "Boot-out failed: 1: Operation not permitted"),
+            );
+        });
+        match uninstall(&e.layout, &e.host, &UninstallOptions { purge: false }) {
+            Err(InstallError::Step { step, detail }) => {
+                assert_eq!(step, "stop");
+                assert!(detail.contains("Operation not permitted"), "{detail}");
+                assert!(detail.contains("is loaded"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.at("/opt/saiife/bin/saiife").exists());
+        // Not loaded any more (the job was gone already): goes on.
+        e.host.set(|s| {
+            drop(
+                s.run
+                    .insert(PRINT.into(), exit(113, "Could not find service")),
+            )
+        });
+        let out = un(&e, false);
+        assert!(out[0].starts_with("warning: launchctl bootout"), "{out:?}");
+        assert!(!e.at("/opt/saiife/bin/saiife").exists());
+    }
+
+    #[test]
+    fn macos_purge_deletes_created_users_with_dscl() {
+        let e = mac_env();
+        e.install();
+        // What the daemon would have made.
+        fs::write(e.at("/var/db/saiife/keys/audit.ed25519"), "k").unwrap();
+        fs::write(e.at("/var/log/saiife/audit/2026-10.jsonl"), "{}\n").unwrap();
+        fs::write(e.at("/var/db/saiife-run/saiife.sock"), "").unwrap();
+        removable(&e);
+        let out = un(&e, true);
+        assert_eq!(e.tree(), set(MAC_SETUP), "{out:?}");
+        let calls = e.calls();
+        let pos = |line: &str| {
+            calls
+                .iter()
+                .position(|c| c == line)
+                .unwrap_or_else(|| panic!("{line}: {calls:?}"))
+        };
+        let u = pos("/usr/bin/dscl . -delete /Users/_saiife");
+        let a = pos("/usr/bin/dscl . -delete /Groups/_saiifeaudit");
+        let g = pos("/usr/bin/dscl . -delete /Groups/_saiife");
+        assert!(u < a && a < g, "{calls:?}");
+        pos(REMOVE);
+        for line in [
+            "removed /var/db/saiife",
+            "removed /var/db/saiife-run",
+            "removed /var/log/saiife/audit",
+            "removed /var/log/saiife/daemon.log",
+            "removed /var/log/saiife",
+            "deleted user _saiife",
+            "deleted group _saiife",
+        ] {
+            assert!(out.iter().any(|l| l == line), "{line}: {out:?}");
+        }
+        let s = e.host.state();
+        assert!(s.users.is_empty() && s.groups.is_empty(), "{s:?}");
+    }
+
+    /// The daemon user swaps `keys/` for a link to a dir of its choosing:
+    /// `--purge` removes the link, never what it points at.
+    #[test]
+    fn macos_purge_never_follows_a_swapped_key_dir() {
+        let e = mac_env();
+        e.install();
+        let outside = e._src.path().join("victim");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("vault.key"), [5u8; 32]).unwrap();
+        let keys = e.at("/var/db/saiife/keys");
+        fs::remove_dir_all(&keys).unwrap();
+        std::os::unix::fs::symlink(&outside, &keys).unwrap();
+        // daemon.log as a link too.
+        let log_target = e._src.path().join("log-victim");
+        fs::write(&log_target, "keep").unwrap();
+        let log = e.at(DAEMON_LOG);
+        fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&log_target, &log).unwrap();
+        removable(&e);
+        let out = un(&e, true);
+        assert!(outside.join("vault.key").exists(), "{out:?}");
+        assert_eq!(fs::read(outside.join("vault.key")).unwrap(), [5u8; 32]);
+        assert_eq!(fs::read_to_string(&log_target).unwrap(), "keep");
+        assert_eq!(e.tree(), set(MAC_SETUP), "{out:?}");
+    }
+
+    #[test]
+    fn macos_purge_after_plain_uninstall_uses_the_copy() {
+        let e = mac_env();
+        e.install();
+        removable(&e);
+        un(&e, false);
+        assert!(e.at("/var/db/saiife/keys/vault.key").exists());
+        let out = un(&e, true);
+        assert!(out.iter().any(|l| l == "deleted user _saiife"), "{out:?}");
+        assert_eq!(e.tree(), set(MAC_SETUP), "{out:?}");
     }
 }

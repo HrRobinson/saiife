@@ -480,10 +480,14 @@ mod tests {
 
     #[test]
     fn interpreter_by_resolved_name_refused() {
-        let r = check_cloud_exe(
-            Path::new("/usr/bin/bash"),
-            &[PathBuf::from("/usr/bin/bash")],
-        );
+        // `/usr/bin/bash` on Linux, `/bin/bash` on macOS (no
+        // `/usr/bin/bash` there).
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .expect("no bash");
+        let r = check_cloud_exe(bash, &[bash.to_path_buf()]);
         let Err(d) = r else { panic!("not refused") };
         assert_eq!(d.rule, "exe_not_allowed");
         assert!(d.detail.contains("interpreter"), "{}", d.detail);

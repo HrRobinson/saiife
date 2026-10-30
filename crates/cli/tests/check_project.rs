@@ -303,6 +303,7 @@ impl Etc {
             memberships: vec![],
             dirs: vec![],
             files: vec![],
+            auth_rights: vec![],
             agents: agents
                 .iter()
                 .map(|(a, sha)| ManagedAgent {
@@ -364,6 +365,10 @@ fn guard_records(audit: &Path) -> Vec<saiife_audit::Record> {
         .collect()
 }
 
+/// Claude Code's lock holds on Linux only: on macOS its label is
+/// `unverified` until a macOS recording exists, so the project hook judges
+/// there (`project_hook_judges_when_managed_hook_does_not_hold`).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn project_hook_quiet_when_agent_managed() {
     let etc = Etc::new();
@@ -400,13 +405,18 @@ fn project_hook_quiet_when_agent_managed() {
 #[test]
 fn project_hook_judges_when_managed_hook_does_not_hold() {
     let home = common::FixtureHome::new();
-    for (installed, agent, payload) in [
+    let mut cases = vec![
         // The managed file write failed part-way: no fingerprint.
         (vec![("claude", "")], "claude", "claude/bash-deny.json"),
         // Codex and Gemini CLI are unverified.
         (vec![("codex", "cc")], "codex", "codex/bash-deny.json"),
         (vec![("gemini", "cc")], "gemini", "gemini/shell-deny.json"),
-    ] {
+    ];
+    // On macOS every lock label is unverified (no macOS recording yet).
+    if cfg!(target_os = "macos") {
+        cases.push((vec![("claude", "cc")], "claude", "claude/bash-deny.json"));
+    }
+    for (installed, agent, payload) in cases {
         let etc = Etc::new();
         etc.install_with(&installed);
         let audit = tempfile::tempdir().unwrap();

@@ -24,3 +24,6 @@ tempfile = "3"
 # Safe syscalls for the project config read: openat2 with RESOLVE_BENEATH
 # on Linux, open flags and fd paths elsewhere. No unsafe in this crate.
 rustix = { version = "1", features = ["fs"] }
+
+[lints]
+workspace = true

@@ -20,7 +20,7 @@ use saiife_policy::{load_system, parse_project, Directory, Getent, SystemConfig}
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
 use crate::text::sanitize;
 
@@ -78,7 +78,7 @@ fn locked_flag(config: PathBuf) -> Result<Place, String> {
     Ok(Place::Locked(config))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn resolve_default() -> Result<Place, String> {
     use crate::broker::{self, Target};
     Ok(match broker::resolve_here(None)? {
@@ -91,7 +91,7 @@ fn resolve_default() -> Result<Place, String> {
 
 /// No personal broker off Linux in this version: the system config, as
 /// locked mode when it says so, else the developer-mode definitions.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn resolve_default() -> Result<Place, String> {
     let config = PathBuf::from(SYSTEM_CONFIG);
     match locked_audit_dir(&config)? {
@@ -424,7 +424,7 @@ fn validate_rewritten(config: &Path, file: &Path, text: &str) -> Result<(), Fail
 }
 
 /// Ask the daemon to load the policy again. `Err` is an exit code and why.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn reload_daemon(config: &Path) -> Result<(), Failure> {
     use crate::secret_cmd::linux::{call, Stop};
     match call(config, "policy.reload", serde_json::Map::new()) {
@@ -441,9 +441,9 @@ fn reload_daemon(config: &Path) -> Result<(), Failure> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn reload_daemon(_config: &Path) -> Result<(), Failure> {
-    Err((5, "locked mode needs Linux in this version".into()))
+    Err((5, saiife_system::NOT_SUPPORTED_OS.into()))
 }
 
 fn use_project(system: Option<&Path>, name: &str) -> Result<Done, Failure> {

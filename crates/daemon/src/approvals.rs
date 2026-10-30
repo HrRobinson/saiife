@@ -1053,6 +1053,12 @@ mod tests {
     fn vault(t: &tempfile::TempDir) -> Shared {
         let key = t.path().join("vault-key");
         std::fs::write(&key, [7u8; 32]).unwrap();
+        // The key is the daemon's own and private (macOS checks it).
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
         let s = crate::vault::open(&key, &t.path().join("vault").join("vault.bin"));
         assert!(matches!(s, VaultState::Ready(_)));
         Shared::new(s)

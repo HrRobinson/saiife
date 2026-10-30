@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authright;
 pub mod binary;
 pub mod default_config;
 pub mod doctor;
@@ -19,11 +20,13 @@ pub mod fleet;
 pub mod fsops;
 pub mod host;
 pub mod install;
+pub mod launchd;
 pub mod layout;
 pub mod personal;
 pub mod polkit;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+pub mod sip;
 pub mod supported;
 #[doc(hidden)]
 pub mod testing;
@@ -36,5 +39,5 @@ pub use host::{
     ReloadAnswer, UserInfo, CONTAINER_UNKNOWN,
 };
 pub use layout::Layout;
-pub use supported::{check_supported, refusal_line, Support, NOT_LINUX};
+pub use supported::{check_supported, refusal_line, Support, NOT_SUPPORTED_OS};
 pub use unit::{unit_text, vault_key_mode};

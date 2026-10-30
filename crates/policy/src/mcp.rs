@@ -17,6 +17,23 @@ use std::time::Duration;
 /// Longest a tool call may take (`timeout`).
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The load error for `[mcp.*]` where the gateway cannot run (plan 13,
+/// decision 7: no Landlock on macOS in v2.1).
+pub const MCP_NEEDS_LINUX: &str = "the MCP gateway needs Linux (Landlock) in this version";
+
+/// `[mcp.*]` on this platform: any server where the gateway is not
+/// supported (`gateway_supported`, which the loader sets to
+/// `cfg!(target_os = "linux")`) is [`MCP_NEEDS_LINUX`].
+pub fn validate_mcp(
+    cfg: &BTreeMap<String, McpServerCfg>,
+    gateway_supported: bool,
+) -> Result<(), &'static str> {
+    if !cfg.is_empty() && !gateway_supported {
+        return Err(MCP_NEEDS_LINUX);
+    }
+    Ok(())
+}
+
 /// How the child is confined (decision 12).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -331,6 +348,18 @@ mod tests {
             let c = cfg(&format!("read_paths = [\"{p}\"]"));
             assert!(c.validate("linear").is_ok(), "{p}");
         }
+    }
+
+    #[test]
+    fn mcp_refused_when_gateway_unsupported() {
+        let mut servers = BTreeMap::new();
+        assert_eq!(validate_mcp(&servers, false), Ok(()));
+        servers.insert("linear".to_string(), cfg(""));
+        assert_eq!(validate_mcp(&servers, true), Ok(()));
+        assert_eq!(
+            validate_mcp(&servers, false),
+            Err("the MCP gateway needs Linux (Landlock) in this version")
+        );
     }
 
     fn deny(rule: &str) -> Verdict {

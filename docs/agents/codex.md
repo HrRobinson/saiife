@@ -126,9 +126,12 @@ restricted by the hook only". See [MCP](../mcp.md).
 
 ## Locked mode (v2)
 
-Lock label: **unverified**. The [lock-check](../lock-check.md) for Codex has
-not been run with a logged-in account yet, so we do not know whether
-Codex can be locked. Until it has, treat Codex as running in the Developer
+Lock label: **unverified**, on Linux and on macOS. The
+[lock-check](../lock-check.md) for Codex has not been run with a logged-in
+account yet, so we do not know whether Codex can be locked. The managed
+file is `/etc/codex/requirements.toml` on both (on macOS `/etc` is
+`/private/etc`). The macOS results will go to
+`crates/agents/tests/fixtures/lock-check/macos/codex.tsv`. Until it has, treat Codex as running in the Developer
 setup even on a locked machine, and do not rely on the lock for it
 ([threats](../threats.md)).
 

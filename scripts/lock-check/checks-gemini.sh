@@ -10,7 +10,10 @@
 # keys behave.
 #
 # What it touches (inside the container; under $LC_ROOT in the offline
-# tests): the system settings /etc/gemini-cli/settings.json (root 0644),
+# tests; in the macOS VM the system settings are /Library/Application
+# Support/GeminiCli/settings.json, spec 5.3, and /work is
+# /opt/lockcheck/work): the system settings /etc/gemini-cli/settings.json
+# (root 0644),
 # /work/empty-settings.json, and as `agent` ~/.gemini/settings.json,
 # ~/.gemini/trustedFolders.json, /work/project/.gemini/settings.json and
 # ~/alt (all restored or removed by lib.sh's reset). The login files
@@ -28,6 +31,11 @@
 
 GEMINI_KEY=""
 GEMINI_TOGGLES=()
+if [[ "$LC_PLATFORM" == macos ]]; then
+  GEMINI_SYSTEM_DIR="$LC_ROOT/Library/Application Support/GeminiCli"
+else
+  GEMINI_SYSTEM_DIR="$LC_ROOT/etc/gemini-cli"
+fi
 GEMINI_TOGGLE_SRC=""
 GEMINI_TOGGLES_LOADED=""
 
@@ -224,7 +232,7 @@ gemini_update_as_agent() {
 
 # Rewrite the system settings file (as root) through the command "$@".
 gemini_update_managed() {
-  local f="$LC_ROOT/etc/gemini-cli/settings.json" new
+  local f="$GEMINI_SYSTEM_DIR/settings.json" new
   new="$(gemini_read_json "$f" | "$@")"
   printf '%s\n' "$new" >"$f"
   chmod 0644 "$f"
@@ -235,7 +243,7 @@ gemini_update_managed() {
 # call; BeforeTool only, never a prompt-bearing event), plus (pin) every
 # toggle key switched on.
 gemini_write_managed() {
-  local pin="$1" dir="$LC_ROOT/etc/gemini-cli" new
+  local pin="$1" dir="$GEMINI_SYSTEM_DIR" new
   local -a keys=()
   gemini_load_toggles
   if [[ "$pin" == pin ]]; then
@@ -297,7 +305,7 @@ gemini_home() {
 }
 
 gemini_system_path_env() {
-  local f="$LC_ROOT/work/empty-settings.json"
+  local f="$LC_WORK/empty-settings.json"
   lc_require_path "$f" || return 1
   mkdir -p "$(dirname "$f")"
   printf '{}\n' >"$f"

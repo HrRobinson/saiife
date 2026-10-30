@@ -3,8 +3,7 @@
 //! reads: it changes nothing on the host. Programs run through [`Host`]
 //! from absolute paths only.
 
-/// Per-user host checks: locked mode is Linux-only (macOS in v2.1).
-#[cfg(target_os = "linux")]
+/// Per-user host checks.
 pub mod host;
 pub mod report;
 pub mod secrets;
@@ -67,9 +66,7 @@ pub fn run(layout: &Layout, host: &dyn Host, dir: &dyn Directory, opts: &DoctorO
         as_root: host.euid() == 0,
         opts,
     };
-    #[allow(unused_mut)]
     let mut checks = system::checks(&ctx);
-    #[cfg(target_os = "linux")]
     checks.extend(host::checks(&ctx));
     Report { checks }
 }

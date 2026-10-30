@@ -1,5 +1,5 @@
 //! The per-user host checks of `saiife doctor` (spec §5.6, §6.16): for
-//! each agent user, local passwd entry, no password-less way to root, agent
+//! each agent user, local account, no password-less way to root, agent
 //! binaries out of the user's reach, agent versions, plaintext credentials,
 //! model login and leftover project hooks; once per host, `hidepid`.
 //! Read-only. Agent binaries never run as root.
@@ -8,6 +8,7 @@ use super::report::{Check, Status};
 use super::secrets::{self, read_at, read_under};
 use super::Ctx;
 use crate::host::{valid_name, SUDO};
+use crate::layout::Platform;
 use saiife_agents::integrity::Integrity;
 use saiife_audit::text::sanitize;
 use saiife_ipc::client::{entry_by_name, entry_by_uid, uid_by_name};
@@ -41,6 +42,9 @@ const AGENT_BINARIES: [&str; 3] = ["claude", "codex", "gemini"];
 const USER_BIN_DIRS: [&str; 4] = [".local/bin", ".claude/local", ".npm-global/bin", ".bun/bin"];
 /// Where `saiife init` keeps its integrity records, below the home.
 const RECORDS: &str = ".local/share/saiife/projects";
+/// What macOS offers instead of the Linux per-uid egress recipe.
+const MAC_EGRESS_HINT: &str =
+    "macOS has no per-uid firewall in pf; the egress recipe is Linux only";
 const PASSWD: &str = "/etc/passwd";
 const MOUNTS: &str = "/proc/mounts";
 const GROUP_PREFIX: &str = "group:";
@@ -84,17 +88,39 @@ fn caller(ctx: &Ctx, passwd: &str) -> Option<String> {
 }
 
 /// The members of `group:<g>`: its listed members plus the local users
-/// whose primary group it is.
-fn group_users(ctx: &Ctx, g: &str) -> Vec<String> {
+/// whose primary group it is. An `Err` when the primary-group list could
+/// not be read: [`checks`] then fails the run (see [`unreadable_groups`]).
+fn group_users(ctx: &Ctx, g: &str) -> std::io::Result<Vec<String>> {
     let Some(entry) = ctx.dir.group(g) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut out = entry.members;
-    out.extend(ctx.host.users_with_primary_gid(entry.gid));
+    out.extend(ctx.host.users_with_primary_gid(entry.gid)?);
+    Ok(out)
+}
+
+/// The `group:<g>` scope entries whose members could not be listed, as
+/// `(group, why)`. While any is there, the users doctor scans and the
+/// scopes they belong to may be partial, so the run fails.
+fn unreadable_groups(ctx: &Ctx) -> Vec<(String, String)> {
+    let Ok(p) = &ctx.config else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in p.config.scope.iter().flat_map(|s| &s.users) {
+        if let Some(g) = entry.strip_prefix(GROUP_PREFIX) {
+            if let Err(e) = group_users(ctx, g) {
+                if !out.iter().any(|(x, _)| x == g) {
+                    out.push((g.to_string(), e.to_string()));
+                }
+            }
+        }
+    }
     out
 }
 
-/// Every user named by a `[[scope]]`, groups expanded.
+/// Every user named by a `[[scope]]`, groups expanded. A group whose list
+/// cannot be read adds no one here; [`checks`] fails the run for it.
 fn scoped_names(ctx: &Ctx) -> BTreeSet<String> {
     let Ok(p) = &ctx.config else {
         return BTreeSet::new();
@@ -103,7 +129,7 @@ fn scoped_names(ctx: &Ctx) -> BTreeSet<String> {
     for scope in &p.config.scope {
         for entry in &scope.users {
             match entry.strip_prefix(GROUP_PREFIX) {
-                Some(g) => out.extend(group_users(ctx, g)),
+                Some(g) => out.extend(group_users(ctx, g).unwrap_or_default()),
                 None => {
                     out.insert(entry.clone());
                 }
@@ -118,6 +144,10 @@ fn rooted(ctx: &Ctx, p: &Path) -> Option<PathBuf> {
     ctx.layout.try_at(p).ok()
 }
 
+fn mac(ctx: &Ctx) -> bool {
+    ctx.layout.platform() == Platform::Macos
+}
+
 fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<AgentUser> {
     let entry = entry_by_name(passwd, name);
     let dir_uid = ctx.dir.user(name).map(|u| u.uid);
@@ -125,6 +155,13 @@ fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<Agen
         return None;
     }
     let info = ctx.host.user(name);
+    // macOS keeps its accounts in Directory Services (local or network
+    // nodes), not `/etc/passwd`.
+    let local = if mac(ctx) {
+        info.is_some()
+    } else {
+        entry.is_some()
+    };
     let uid = dir_uid
         .or_else(|| uid_by_name(passwd, name))
         .or_else(|| info.as_ref().map(|i| i.uid))
@@ -141,7 +178,7 @@ fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<Agen
         name: name.to_string(),
         uid,
         home: home.unwrap_or_default(),
-        in_passwd: entry.is_some(),
+        in_passwd: local,
     })
 }
 
@@ -186,12 +223,21 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     let mut egress: Option<Egress> = None;
     let mut any_finding = false;
     let mut incomplete: Vec<String> = Vec::new();
+    for (g, why) in unreadable_groups(ctx) {
+        out.push(Check::new(
+            format!("scope.group.{g}"),
+            Status::Fail,
+            format!("members of group {g}"),
+            format!("could not list members of group {g}: {why}"),
+        ));
+        incomplete.push(format!("members of group {g} unknown"));
+    }
     if users.is_empty() {
         incomplete.push("no agent user to scan".to_string());
     }
     for u in &users {
         let id = |what: &str| format!("user.{}.{what}", u.name);
-        out.push(passwd_check(u, id("passwd")));
+        out.push(passwd_check(ctx, u, id("passwd")));
         out.push(root_check(ctx, u, id("root")));
         let bins = binaries(ctx, u);
         out.push(binaries_check(u, &bins, id("agent-binaries")));
@@ -218,13 +264,22 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             }));
         }
         out.push(model_login(u, id("model-login")));
-        if dedicated(ctx, &passwd, u) {
+        if mac(ctx) {
+            out.push(Check::new(
+                id("egress"),
+                Status::Info,
+                format!("egress rules for {}", u.name),
+                MAC_EGRESS_HINT,
+            ));
+        } else if dedicated(ctx, &passwd, u) {
             let table = *egress.get_or_insert_with(|| egress_table(ctx));
             out.push(egress_check(u, table, id("egress")));
         }
         out.push(leftover_hooks(ctx, u, id("leftover-hooks")));
     }
-    out.push(hidepid(ctx));
+    if !mac(ctx) {
+        out.push(hidepid(ctx));
+    }
     if !incomplete.is_empty() {
         out.push(Check::new(
             "secrets.incomplete",
@@ -245,10 +300,29 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
 
 // ------------------------------------------------------------ checks
 
-fn passwd_check(u: &AgentUser, id: String) -> Check {
-    let title = format!("user {} in /etc/passwd", u.name);
+/// Linux: the user must be in `/etc/passwd` (an NSS-only account is denied
+/// by the locked hooks). macOS: the user must be known to Directory
+/// Services, on the local node or a network one (`getpwnam`).
+fn passwd_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
+    let mac = mac(ctx);
+    let place = if mac {
+        "Directory Services"
+    } else {
+        "/etc/passwd"
+    };
+    let title = format!("user {} in {place}", u.name);
     if u.in_passwd {
         Check::new(id, Status::Pass, title, "")
+    } else if mac {
+        Check::new(
+            id,
+            Status::Fail,
+            title,
+            format!(
+                "{} is not known to Directory Services (no local or network record): saiife cannot check this user",
+                u.name
+            ),
+        )
     } else {
         Check::new(
             id,
@@ -270,10 +344,13 @@ fn in_group(ctx: &Ctx, u: &AgentUser, g: &str) -> bool {
         .host
         .group_members(g)
         .is_some_and(|m| m.iter().any(|x| x == &u.name));
-    let primary = ctx
-        .host
-        .group_id(g)
-        .is_some_and(|gid| ctx.host.users_with_primary_gid(gid).contains(&u.name));
+    // A primary-group list that cannot be read counts as in the group:
+    // this check looks for root-equivalent groups, so it fails closed.
+    let primary = ctx.host.group_id(g).is_some_and(|gid| {
+        ctx.host
+            .users_with_primary_gid(gid)
+            .map_or(true, |us| us.contains(&u.name))
+    });
     listed
         || primary
         || (ctx.layout.is_system() && ctx.dir.groups_of(&u.name).iter().any(|x| x == g))
@@ -286,9 +363,20 @@ fn root_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
     let mut bad = Vec::new();
     let mut warn = Vec::new();
     let mut notes = Vec::new();
-    for g in ROOT_EQUIVALENT_GROUPS {
-        if in_group(ctx, u, g) {
-            bad.push(format!("{} is in group {g} (root-equivalent)", u.name));
+    if mac(ctx) {
+        // macOS has no docker or disk groups; `admin` may use sudo, with
+        // its own password.
+        if in_group(ctx, u, "admin") {
+            warn.push(format!(
+                "agent user {} is an admin: sudo needs its password",
+                u.name
+            ));
+        }
+    } else {
+        for g in ROOT_EQUIVALENT_GROUPS {
+            if in_group(ctx, u, g) {
+                bad.push(format!("{} is in group {g} (root-equivalent)", u.name));
+            }
         }
     }
     if !ctx.layout.at(SUDO).exists() {
@@ -346,6 +434,12 @@ struct Bins {
     symlinks: Vec<PathBuf>,
     /// User install dirs that are, or lie below, a symlink.
     symlinked_dirs: Vec<PathBuf>,
+}
+
+/// `st_mode` as a `u32` (it is a `u16` on macOS).
+#[allow(clippy::useless_conversion)]
+fn wide(mode: rustix::fs::RawMode) -> u32 {
+    u32::from(mode)
 }
 
 /// Owned by `uid`, or writable by group or others.
@@ -418,8 +512,8 @@ fn binaries(ctx: &Ctx, u: &AgentUser) -> Bins {
             }
             _ => continue,
         };
-        let dir_w =
-            rustix::fs::fstat(&fd).is_ok_and(|st| writable_mode(st.st_uid, st.st_mode, u.uid));
+        let dir_w = rustix::fs::fstat(&fd)
+            .is_ok_and(|st| writable_mode(st.st_uid, wide(st.st_mode), u.uid));
         for name in AGENT_BINARIES {
             let Ok(st) = rustix::fs::statat(&fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
             else {
@@ -429,7 +523,7 @@ fn binaries(ctx: &Ctx, u: &AgentUser) -> Bins {
             if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink {
                 b.symlinks.push(p);
             } else {
-                let w = dir_w || writable_mode(st.st_uid, st.st_mode, u.uid);
+                let w = dir_w || writable_mode(st.st_uid, wide(st.st_mode), u.uid);
                 add(&mut b, name, p, w);
             }
         }
@@ -565,7 +659,8 @@ fn project_roots(ctx: &Ctx, u: &AgentUser) -> Vec<PathBuf> {
             .users
             .iter()
             .any(|e| match e.strip_prefix(GROUP_PREFIX) {
-                Some(g) => group_users(ctx, g).contains(&u.name),
+                // Unreadable: no membership here, and `checks` fails the run.
+                Some(g) => group_users(ctx, g).is_ok_and(|us| us.contains(&u.name)),
                 None => e == &u.name,
             });
         if !member {
@@ -819,7 +914,8 @@ fn hidepid(ctx: &Ctx) -> Check {
     }
 }
 
-#[cfg(test)]
+// The fixtures are a Linux machine's (`/etc/passwd`, `/proc`, nft).
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::super::{run, Ctx, DoctorOptions, Report, Status};
     use super::*;
@@ -1215,6 +1311,32 @@ mod tests {
         t.user("alice", 5001, 5001, true);
         t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"alice\"]\n");
         assert_eq!(t.users(), ["me"]);
+    }
+
+    #[test]
+    fn unreadable_scope_group_fails_the_scan() {
+        let mut t = T::new(true);
+        t.user("alice", 5001, 5001, true);
+        t.user("bob", 5002, 3000, true);
+        t.group_line("devs:x:3000:alice");
+        t.append_config("\n[[scope]]\nname = \"d\"\nusers = [\"group:devs\"]\n");
+        let r = t.doctor();
+        assert!(!r.checks.iter().any(|c| c.id == "scope.group.devs"));
+        // The directory cannot list devs' primary members (dscl failing).
+        t.host.set(|s| s.fail_primary_gid = vec![3000]);
+        let r = t.doctor();
+        let c = get(&r, "scope.group.devs");
+        assert_eq!(c.status, Status::Fail, "{}", r.to_text());
+        assert!(
+            c.detail
+                .starts_with("could not list members of group devs: "),
+            "{c:?}"
+        );
+        // The partial list is never taken as complete.
+        assert!(!r.checks.iter().any(|c| c.id == "secrets.none"));
+        assert!(get(&r, "secrets.incomplete")
+            .detail
+            .contains("members of group devs unknown"));
     }
 
     fn nologin_user(t: &mut T, name: &str, uid: u32) {

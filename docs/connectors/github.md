@@ -118,8 +118,7 @@ the gateway socket; the daemon checks the policy from `/etc/saiife`, adds the
 `Authorization: Bearer ...` header and sends the request to `api.github.com`
 only. A project `.saiife/config.toml` can add `deny` and `ask` entries for this
 service, never `allow`. Redirects are followed to the same host only, and the
-token is masked in everything that comes back. Locked mode needs Linux in this
-version.
+token is masked in everything that comes back. Locked mode runs on Linux and macOS.
 
 ## Tests
 

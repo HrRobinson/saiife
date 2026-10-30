@@ -26,11 +26,14 @@ pub trait Directory {
     }
 }
 
-/// NSS lookups through `getent passwd|group` and `id -Gn`.
+/// NSS lookups through `getent passwd|group` and `id -Gn`. macOS has no
+/// `getent`: there users and groups come from Directory Services through
+/// `getpwnam_r`, `getpwuid_r` and `getgrnam_r`, and `id -Gn` stays.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Getent;
 
 impl Directory for Getent {
+    #[cfg(not(target_os = "macos"))]
     fn user(&self, name: &str) -> Option<UserEntry> {
         if !valid_name(name) {
             return None;
@@ -39,18 +42,50 @@ impl Directory for Getent {
         parse_passwd_line(line.lines().next()?).map(|(_, e)| e)
     }
 
+    #[cfg(target_os = "macos")]
+    fn user(&self, name: &str) -> Option<UserEntry> {
+        if !valid_name(name) {
+            return None;
+        }
+        let u = nix::unistd::User::from_name(name).ok()??;
+        Some(UserEntry {
+            uid: u.uid.as_raw(),
+            gid: u.gid.as_raw(),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn name_of(&self, uid: u32) -> Option<String> {
         let line = run("getent", &["passwd", &uid.to_string()])?;
         let (name, e) = parse_passwd_line(line.lines().next()?)?;
         (e.uid == uid).then_some(name)
     }
 
+    #[cfg(target_os = "macos")]
+    fn name_of(&self, uid: u32) -> Option<String> {
+        let u = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok()??;
+        (u.uid.as_raw() == uid && !u.name.is_empty()).then_some(u.name)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn group(&self, name: &str) -> Option<GroupEntry> {
         if !valid_name(name) {
             return None;
         }
         let line = run("getent", &["group", name])?;
         parse_group_line(line.lines().next()?).map(|(_, g)| g)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn group(&self, name: &str) -> Option<GroupEntry> {
+        if !valid_name(name) {
+            return None;
+        }
+        let g = nix::unistd::Group::from_name(name).ok()??;
+        Some(GroupEntry {
+            gid: g.gid.as_raw(),
+            members: g.mem.into_iter().filter(|m| !m.is_empty()).collect(),
+        })
     }
 
     fn groups_of(&self, user: &str) -> Vec<String> {
@@ -240,5 +275,15 @@ mod tests {
         assert_eq!(g.user("-x"), None);
         assert_eq!(g.user(""), None);
         assert!(g.groups_of("--help").is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn getent_finds_root_and_wheel() {
+        let g = Getent;
+        assert_eq!(g.group("wheel").unwrap().gid, 0);
+        assert_eq!(g.user("root").unwrap().uid, 0);
+        assert_eq!(g.name_of(0).as_deref(), Some("root"));
+        assert_eq!(g.group("-wheel"), None);
     }
 }

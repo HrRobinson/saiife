@@ -115,7 +115,7 @@ ask   = ["vms:write"]
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches Azure only through `saiifed`.
+In locked mode (Linux and macOS) the agent user reaches Azure only through `saiifed`.
 The client secret lives in the daemon's vault (`saiife secret add
 azure-reader --kind azure_sp --service azure`); the secret and every minted
 token are masked in answers and never reach the agent's environment, files or

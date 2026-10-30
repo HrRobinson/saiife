@@ -11,7 +11,7 @@ mod common;
 
 use collection::{fill, load, Collection, CollectionError, FilledStep};
 use serde_json::json;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -142,7 +142,7 @@ fn missing_var_error_before_any_call() {
         CollectionError::Missing(vec!["also".into(), "late".into()])
     );
     // End to end: the run stops before it sends anything, step 1 included.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let w = World::new(&[], "x", &collection_text_missing());
         let o = w.run(&["x"]);
@@ -156,7 +156,7 @@ fn missing_var_error_before_any_call() {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn collection_text_missing() -> String {
     "name = \"x\"\n[[step]]\nservice = \"erp\"\noperation = \"a\"\n\
      [[step]]\nservice = \"erp\"\noperation = \"b\"\nparams = { q = \"{{late}}\" }\n"
@@ -320,7 +320,7 @@ fn reserved_name_collection_not_a_service() {
     }
     // `saiife api collection ...` is the subcommand: it never becomes a call
     // to a service named `collection`.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let w = World::new(&[], "x", &collection_text_missing());
         let o = w.cmd(&["collection", "list"]).output().unwrap();
@@ -334,15 +334,15 @@ fn reserved_name_collection_not_a_service() {
 
 // ------------------------------------------------- fake daemon, end to end
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn stderr(o: &std::process::Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use fake::World;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod fake {
     use super::common;
     use base64::Engine as _;
@@ -490,10 +490,10 @@ mod fake {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use fake::Answer;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const THREE_STEPS: &str = r#"name = "report"
 [[step]]
 service = "erp"
@@ -508,7 +508,7 @@ service = "other"
 operation = "things.list"
 "#;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn each_step_is_one_api_call() {
     let w = World::new(
@@ -570,7 +570,7 @@ fn each_step_is_one_api_call() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn stops_at_first_non_done_with_its_exit_code() {
     let args = ["report", "status=open", "who=ann"];
@@ -637,7 +637,7 @@ fn stops_at_first_non_done_with_its_exit_code() {
 
 /// Runs `cmd` to its exit, at most 10 s; a hang kills the test's own child
 /// and fails.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn output_within(mut cmd: std::process::Command) -> (std::process::Output, std::time::Duration) {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -661,10 +661,9 @@ fn output_within(mut cmd: std::process::Command) -> (std::process::Output, std::
 /// A FIFO, or a symlink, planted in `.saiife/collections/` is refused
 /// before it is opened: `load`, `collection list` and `collection run`
 /// answer at once instead of blocking on the FIFO.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn collection_files_must_be_regular_files() {
-    use rustix::fs::{mknodat, FileType, Mode, CWD};
     use std::time::Duration;
     let w = World::new(
         &[],
@@ -673,14 +672,25 @@ fn collection_files_must_be_regular_files() {
     );
     let root = w.tmp.path().join("project");
     let dir = root.join(".saiife/collections");
-    mknodat(
-        CWD,
-        dir.join("pipe.toml"),
-        FileType::Fifo,
-        Mode::from_raw_mode(0o600),
-        0,
-    )
-    .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{mknodat, FileType, Mode, CWD};
+        mknodat(
+            CWD,
+            dir.join("pipe.toml"),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+    }
+    // rustix has no mknodat on Apple targets.
+    #[cfg(not(target_os = "linux"))]
+    assert!(std::process::Command::new("mkfifo")
+        .arg(dir.join("pipe.toml"))
+        .status()
+        .unwrap()
+        .success());
     std::os::unix::fs::symlink(dir.join("good.toml"), dir.join("link.toml")).unwrap();
 
     for name in ["pipe", "link"] {

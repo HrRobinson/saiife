@@ -30,11 +30,25 @@ jobs:
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
-      # The hook path (guard, audit, policy, ipc), saiife-system and saiife-mcp must not link tokio: only
-      # the daemon crate does (spec §4.2).
-      - name: no tokio in hook crates
+      - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp | grep -c tokio)" = 0
+        run: bash scripts/release/test-macos-sign.sh
+      # The macOS managed hook against a live `daemon --system` (plan 13):
+      # p95 of 50 calls per payload within 40 ms. The script needs bash 5
+      # (EPOCHREALTIME); the runner's /bin/bash is 3.2, so Homebrew's.
+      - name: managed hook bench (macOS, p95 budget)
+        if: runner.os == 'macOS'
+        run: |
+          bash5="$(brew --prefix)/bin/bash"
+          [ -x "$bash5" ] || brew install bash
+          BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp and saiife-darwin must not
+      # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
+      - name: no tokio in hook crates
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin | grep -c tokio)" = 0
+      # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
+      - name: unsafe only in saiife-darwin
+        run: bash scripts/check-unsafe.sh
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
@@ -80,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/personal-broker/*.sh packaging/linux/build.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/locked-macos/*.sh scripts/personal-broker/*.sh scripts/release/*.sh packaging/linux/build.sh
       - run: shellcheck -s sh packaging/linux/scripts/* deploy/intune/linux/discovery.sh
       - run: shellcheck -x scripts/package-linux/run.sh scripts/package-linux/deb.sh
       - run: shellcheck -s sh scripts/package-linux/rpm-container.sh
@@ -137,6 +151,49 @@ jobs:
         with:
           name: locked-linux-logs-${{ matrix.os }}
           path: target/locked-linux-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Locked mode on real Macs (plan 13): `system install` as root, the §5.3
+  # owners and modes, managed hooks as an unprivileged agent account, the
+  # fail-closed matrix (launchd bootout, SIGKILL and KeepAlive), attacks on
+  # the install including DYLD_INSERT_LIBRARIES against the hardened
+  # runtime (A4), doctor, approvals from a second account, lockdown,
+  # reinstall, uninstall and purge. Apple silicon (macos-15) and Intel
+  # (macos-15-intel). run.sh refuses outside GitHub Actions on macOS and
+  # calls sudo itself (the runner has passwordless sudo).
+  locked-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Debug assertions on (the SAIIFE_EVAL_FAULT seam), like locked-linux.
+      - run: cargo build --locked --profile ci-locked --bin saiife
+      # Ad hoc, with the hardened runtime: dyld then ignores DYLD_* for the
+      # hook. run.sh installs it with --allow-test-build (never production).
+      - name: sign ad hoc with the hardened runtime
+        run: codesign --force --options runtime --sign - target/ci-locked/saiife
+      - name: install, fail-closed matrix, attacks, uninstall (sudo inside, this job only)
+        env:
+          SAIIFE_LOCKED_CI: "1"
+          SAIIFE_LOCKED_LOGS: ${{ github.workspace }}/target/locked-macos-logs
+        run: bash scripts/locked-macos/run.sh "$PWD/target/ci-locked/saiife"
+      # daemon.log, /etc/saiife, the audit, the plist and `launchctl print`
+      # (run.sh copies them on a failure; never the keys in /var/db/saiife).
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: locked-macos-logs-${{ matrix.os }}
+          path: target/locked-macos-logs
           if-no-files-found: ignore
           retention-days: 7
 

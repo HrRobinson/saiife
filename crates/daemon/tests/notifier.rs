@@ -2,7 +2,7 @@
 //! SMTP server speaking just enough protocol (implicit TLS, STARTTLS, and a
 //! plain one that must be refused) and local command targets. Certificates
 //! come from `rcgen`; nothing leaves 127.0.0.1.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -874,7 +874,8 @@ fn runs(sh: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-#[cfg(debug_assertions)]
+// Reads /proc to see the grandchild gone (Linux).
+#[cfg(all(debug_assertions, target_os = "linux"))]
 #[tokio::test]
 async fn command_timeout_kills_its_group_and_is_not_retried() {
     use std::os::unix::fs::PermissionsExt;

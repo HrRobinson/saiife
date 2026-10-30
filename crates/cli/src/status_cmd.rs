@@ -65,7 +65,7 @@ struct Problem {
 
 /// One line when the personal broker answers hello on its own socket
 /// (plan 16); nothing otherwise. Never on a locked host.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn personal_broker_line() {
     let up = crate::broker::personal(&|k| std::env::var_os(k)).is_ok_and(|t| {
         crate::broker::connect(&t, std::time::Instant::now() + Duration::from_millis(500)).is_ok()
@@ -75,7 +75,7 @@ fn personal_broker_line() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn personal_broker_line() {}
 
 /// `system_root`: the hidden `--root` (tests); the real `/` otherwise.
@@ -979,7 +979,7 @@ type DaemonStatus = (
 
 /// `status`, its lockdown flag and the caller's pending requests, or why
 /// it did not answer.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn daemon_status(
     layout: &Layout,
     host: &dyn Host,
@@ -987,13 +987,13 @@ fn daemon_status(
 ) -> Result<DaemonStatus, String> {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
-    use saiife_system::layout::{DAEMON_USER, RUN_DIR};
+    use saiife_system::layout::RUN_DIR;
     use serde_json::{Map, Value};
     use std::time::Instant;
-    // The §5.2 default lies under the layout's root; any other value is
-    // taken as written (as `doctor` does).
+    // The §5.2 (§5.3 on macOS) default lies under the layout's root;
+    // any other value is taken as written (as `doctor` does).
     let configured = |value: &Path, default: &str| {
-        if value == Path::new(default) {
+        if value == Path::new(layout.logical(default)) {
             layout.at(default)
         } else {
             value.to_path_buf()
@@ -1004,7 +1004,7 @@ fn daemon_status(
             c.daemon.user.clone(),
             configured(&c.daemon.socket_dir, RUN_DIR),
         ),
-        None => (DAEMON_USER.to_string(), layout.at(RUN_DIR)),
+        None => (layout.daemon_user().to_string(), layout.at(RUN_DIR)),
     };
     let Some(uid) = host.user(&user).map(|u| u.uid) else {
         return Err(format!("the daemon user {user} does not exist"));
@@ -1046,13 +1046,13 @@ fn daemon_status(
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn daemon_status(
     _layout: &Layout,
     _host: &dyn Host,
     _cfg: Option<&saiife_policy::SystemConfig>,
 ) -> Result<DaemonStatus, String> {
-    Err(saiife_system::NOT_LINUX.to_string())
+    Err(saiife_system::NOT_SUPPORTED_OS.to_string())
 }
 
 /// Installed files whose fingerprint differs from `installed.toml`: the

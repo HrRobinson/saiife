@@ -147,7 +147,7 @@ such uploads under `allow`, narrowed to a bucket or prefix and bounded with
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches Cloud Storage only through
+In locked mode (Linux and macOS) the agent user reaches Cloud Storage only through
 `saiifed`. The key lives in the daemon's vault (`saiife secret add gcp-reader
 --kind gcp_sa --service gcs --from-file key.json`); the key and every minted
 token are masked in answers and never reach the agent's environment, files or

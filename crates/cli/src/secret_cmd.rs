@@ -1,5 +1,5 @@
 //! `saiife secret add|list|rotate|remove`: the admin's way into the vault
-//! (spec §8.7), through the daemon. Linux only. Exit codes: 0 ok, 2
+//! (spec §8.7), through the daemon. Linux and macOS. Exit codes: 0 ok, 2
 //! refused, 5 the daemon cannot be reached. A value comes from a file, an
 //! environment variable or a terminal prompt without echo; it is never
 //! printed and never part of an error message.
@@ -75,18 +75,18 @@ pub enum SecretAction {
     },
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(_config: Option<PathBuf>, _action: SecretAction) -> ExitCode {
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(config: Option<PathBuf>, action: SecretAction) -> ExitCode {
     linux::run(config, action)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) mod linux {
     use super::SecretAction;
     use serde_json::{json, Map, Value};

@@ -384,24 +384,69 @@ pub fn root_owned_problems(m: &std::fs::Metadata, root_uid: u32) -> Vec<String> 
     out
 }
 
+/// The system links macOS ships: `/etc`, `/var` and `/tmp`, each pointing
+/// at `private/<same name>`. The only symlinks a root-owned path may pass
+/// through (and only when root owns the link).
+const TRUSTED_SYSTEM_LINKS: [&str; 3] = ["etc", "var", "tmp"];
+
+/// True only when `link` is `/etc`, `/var` or `/tmp` and `target` (the
+/// link's text) is `private/<same name>`. Every other link is untrusted.
+pub fn trusted_link_target(link: &Path, target: &Path) -> bool {
+    let mut parts = link.components();
+    if parts.next() != Some(Component::RootDir) {
+        return false;
+    }
+    let (Some(Component::Normal(name)), None) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    TRUSTED_SYSTEM_LINKS.contains(&name) && target == Path::new("private").join(name)
+}
+
+/// When `p` is a trusted system link ([`trusted_link_target`]) owned by
+/// uid 0, the directory it points at (`/private/<name>`).
+fn trusted_link_dir(p: &Path, m: &std::fs::Metadata) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if !m.file_type().is_symlink() || m.uid() != 0 {
+        return None;
+    }
+    let target = std::fs::read_link(p).ok()?;
+    trusted_link_target(p, &target).then(|| Path::new("/").join(target))
+}
+
 /// `path` (absolute) and every parent down from `/`: no symlink, owned by
 /// uid 0, not writable by group or others. `Err` names the first fault.
+/// The one exception is a root-owned trusted system link (`/etc`, `/var`,
+/// `/tmp` on macOS): the walk goes on through its target instead.
 pub fn root_owned_chain(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(format!("{}: not an absolute path", path.display()));
     }
-    let mut chain: Vec<&Path> = path.ancestors().collect();
-    chain.reverse();
-    for p in chain {
-        let m = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        if m.file_type().is_symlink() {
-            return Err(format!("{}: is a symlink", p.display()));
+    let mut path = path.to_path_buf();
+    // Each trusted link is a top-level name, so a walk restarts at most
+    // once per name; the bound keeps a looping tree from spinning.
+    'walk: for _ in 0..=TRUSTED_SYSTEM_LINKS.len() {
+        let mut chain: Vec<&Path> = path.ancestors().collect();
+        chain.reverse();
+        for p in chain {
+            let m = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if let Some(dir) = trusted_link_dir(p, &m) {
+                let rest = path.strip_prefix(p).unwrap_or(Path::new(""));
+                path = dir.join(rest);
+                continue 'walk;
+            }
+            if m.file_type().is_symlink() {
+                return Err(format!("{}: is a symlink", p.display()));
+            }
+            if let Some(prob) = root_owned_problems(&m, 0).into_iter().next() {
+                return Err(format!("{}: {prob}", p.display()));
+            }
         }
-        if let Some(prob) = root_owned_problems(&m, 0).into_iter().next() {
-            return Err(format!("{}: {prob}", p.display()));
-        }
+        return Ok(());
     }
-    Ok(())
+    Err(format!("{}: too many system links", path.display()))
 }
 
 #[cfg(test)]
@@ -458,6 +503,39 @@ mod tests {
         assert_eq!(mode(&p), 0o640);
         assert!(write_new_file(&p, &[2; 32], 0o640).is_err());
         assert_eq!(fs::read(&p).unwrap(), vec![1; 32]);
+    }
+
+    #[test]
+    fn trusted_system_links_only_the_three() {
+        let t = |l: &str, to: &str| trusted_link_target(Path::new(l), Path::new(to));
+        assert!(t("/etc", "private/etc"));
+        assert!(t("/var", "private/var"));
+        assert!(t("/tmp", "private/tmp"));
+        assert!(!t("/etc", "/tmp/x"));
+        assert!(!t("/opt", "private/opt"));
+        assert!(!t("/var", "private/etc"));
+        assert!(!t("/etc", "/private/etc"));
+        assert!(!t("/etc", "private/etc/.."));
+        assert!(!t("/x/etc", "private/etc"));
+        assert!(!t("etc", "private/etc"));
+    }
+
+    #[test]
+    fn root_owned_chain_refuses_a_tempdir_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let link = d.path().join("l");
+        std::os::unix::fs::symlink("/usr", &link).unwrap();
+        assert!(root_owned_chain(&link.join("bin")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_owned_chain_accepts_private_etc() {
+        assert_eq!(root_owned_chain(Path::new("/etc/hosts")), Ok(()));
+        let d = tempfile::tempdir().unwrap();
+        let link = d.path().join("l");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        assert!(root_owned_chain(&link.join("hosts")).is_err());
     }
 
     #[test]

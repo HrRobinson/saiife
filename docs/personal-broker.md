@@ -13,9 +13,8 @@ locked-mode claim. In this mode it is not guaranteed, because an agent
 running as the same user can reach the key; that is a workflow aid, not a
 control.
 
-Linux only in this version. On macOS `saiife daemon --user` refuses to start
-until the daemon is ported (v2.1). The macOS Keychain backend is built, but
-nothing runs it yet.
+It runs on Linux and macOS (v2.1). On Linux the key is in the Secret
+Service; on macOS it is in your login Keychain ([macOS](#macos)).
 
 ## Set up
 
@@ -26,7 +25,8 @@ saiife daemon --user
 This creates a minimal config at `$XDG_CONFIG_HOME/saiife/broker/config.toml`
 when there is none (mode 0600). `$XDG_RUNTIME_DIR` must be set, absolute, a
 real directory (not a symlink), owned by you and mode 0700; otherwise the
-start is refused.
+start is refused. On macOS, where nothing sets `XDG_RUNTIME_DIR`, the
+broker uses `~/Library/Caches/saiife` instead (see [macOS](#macos)).
 
 To start it at login, print the unit and install it yourself. saiife writes
 no unit file and runs no service manager:
@@ -62,8 +62,10 @@ and `saiife api` go through the socket, so they are not affected.
 `saiife audit --broker` reads the audit dir itself, so it needs the same
 `XDG_DATA_HOME` as the broker.
 
-`saiife daemon --user --print-unit launchd` prints a launchd plist. It is for
-after the v2.1 daemon port; it does not work on a Mac today.
+On macOS, `saiife daemon --user --print-unit launchd` prints a launchd
+agent plist (label `com.saiife.broker`). Save it as
+`~/Library/LaunchAgents/com.saiife.broker.plist` and load it yourself, for
+example with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.saiife.broker.plist`.
 
 `--user` refuses `--config`, `--state-dir` and `--credentials-dir`: the
 paths below are fixed. A host with `/etc/saiife/installed.toml` is a locked
@@ -73,7 +75,7 @@ host, and `--user` refuses there.
 
 | What | Path |
 | --- | --- |
-| Sockets (`saiife.sock`, `gateway.sock`, 0600) | `$XDG_RUNTIME_DIR/saiife/` (0700) |
+| Sockets (`saiife.sock`, `gateway.sock`, 0600) | `$XDG_RUNTIME_DIR/saiife/` (0700); on macOS without `XDG_RUNTIME_DIR`, `~/Library/Caches/saiife/run/` |
 | Config, plus `policy.d/`, `connectors/` and `ca/` | `$XDG_CONFIG_HOME/saiife/broker/config.toml` (default `~/.config`) |
 | State: vault, approvals, grants, tokens, lockdown | `$XDG_STATE_HOME/saiife/broker/` (default `~/.local/state`, 0700) |
 | Audit | `$XDG_DATA_HOME/saiife/broker/audit/` (default `~/.local/share`) |
@@ -118,12 +120,33 @@ What differs from locked mode:
   Records carry `mode: personal`.
 - Peers with another uid, root included, are closed before any answer.
 
+## macOS
+
+- **Runtime dir.** When `XDG_RUNTIME_DIR` is unset, the sockets are in
+  `~/Library/Caches/saiife/run/`, and the broker creates
+  `~/Library/Caches/saiife` (0700) when it is missing. A set, absolute
+  `XDG_RUNTIME_DIR` wins, as on Linux, with the same owner and mode checks.
+- **Cache purges.** macOS or a cleaning tool may empty `~/Library/Caches`.
+  The broker's sockets go with it, and clients can no longer reach the
+  broker. Restart the broker to get them back.
+- **Socket path length.** macOS binds a socket path of at most 103 bytes.
+  When `gateway.sock`'s path is longer (a long home path), the start is
+  refused with `the personal broker's socket path is too long for macOS (<n>
+  bytes); set XDG_RUNTIME_DIR to a shorter dir`.
+- **Keychain.** The key is a generic password in your login Keychain
+  (service `saiife`, account `vault-key`). saiife creates the item, so its
+  access list names the saiife binary; another program of yours that reads
+  it gets a prompt you may click through.
+- The config, state and audit paths are the XDG ones in the table above
+  (`~/.config`, `~/.local/state`, `~/.local/share` by default), on macOS too.
+
 ## What protects the key, and what does not
 
 One keychain item (service `saiife`, account `vault-key`, label "saiife
 personal broker: vault key") holds a 32-byte key. The secrets stay in
 `<state>/vault/vault.bin`, sealed under that key. On Linux the item is in the
-Secret Service (GNOME Keyring or KWallet).
+Secret Service (GNOME Keyring or KWallet); on macOS it is in the login
+Keychain.
 
 Any process of the same user can read these on Linux, and on macOS after one
 click the user may give. For example, a script running as you can run

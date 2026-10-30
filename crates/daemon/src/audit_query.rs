@@ -27,7 +27,11 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// The group that may read the whole audit log (spec §5.2).
+#[cfg(not(target_os = "macos"))]
 pub use saiife_system::layout::AUDIT_GROUP;
+/// The group that may read the whole audit log (spec §5.3: `_saiifeaudit`).
+#[cfg(target_os = "macos")]
+pub use saiife_system::layout::MACOS_AUDIT_GROUP as AUDIT_GROUP;
 /// Queries reading the log at once, daemon-wide: each reads month files
 /// from disk, so a burst of them must not multiply the memory and I/O.
 pub const MAX_CONCURRENT: usize = 2;
@@ -545,7 +549,7 @@ mod tests {
     fn all_requires_auditor_group() {
         let dir = FixedDirectory::from_text(
             "me:x:1000:1000::/h:/bin/sh\naud:x:1002:1002::/h:/bin/sh\nprim:x:1003:3000::/h:/bin/sh\n",
-            "me:x:1000:\naud:x:1002:\nwheel:x:10:me\nsaiife-audit:x:3000:aud\n",
+            &format!("me:x:1000:\naud:x:1002:\nwheel:x:10:me\n{AUDIT_GROUP}:x:3000:aud\n"),
         );
         assert!(!may_read_all(&dir, 1000));
         assert!(may_read_all(&dir, 1002));
@@ -558,7 +562,7 @@ mod tests {
         let refused = scope_for(true, 1000, || may_read_all(&dir, 1000)).unwrap_err();
         assert_eq!(
             refused,
-            "audit.query with all is for root and the saiife-audit group"
+            format!("audit.query with all is for root and the {AUDIT_GROUP} group")
         );
         assert_eq!(
             scope_for(true, 1002, || may_read_all(&dir, 1002)),

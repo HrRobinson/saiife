@@ -60,6 +60,58 @@ impl Proc for RealProc {
     }
 }
 
+/// macOS: `sysctl(KERN_PROC_PID)` through `saiife-darwin`. `start_time` is
+/// the process start in microseconds since the epoch. The command line
+/// (`KERN_PROCARGS2`) is readable only for one's own uid, so `cmdline` is
+/// always `None` and a `node` ancestor never matches an agent (decision 6):
+/// such a request gets no session, the stricter shared bucket. Attribution
+/// only; nothing is allowed because of it.
+#[cfg(target_os = "macos")]
+pub struct MacProc;
+
+#[cfg(target_os = "macos")]
+impl Proc for MacProc {
+    fn stat(&self, pid: u32) -> Option<ProcStat> {
+        let i = saiife_darwin::proc_info(pid)?;
+        Some(ProcStat {
+            ppid: i.ppid,
+            comm: i.comm,
+            start_time: i.start_us,
+        })
+    }
+
+    fn cmdline(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// The host's process table: `/proc` on Linux, `KERN_PROC_PID` on macOS.
+#[cfg(target_os = "linux")]
+pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
+    Box::new(RealProc::new("/proc"))
+}
+
+/// The host's process table: `/proc` on Linux, `KERN_PROC_PID` on macOS.
+#[cfg(target_os = "macos")]
+pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
+    Box::new(MacProc)
+}
+
+/// Other unix: no process table, so no session is ever attributed.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
+    struct NoProc;
+    impl Proc for NoProc {
+        fn stat(&self, _: u32) -> Option<ProcStat> {
+            None
+        }
+        fn cmdline(&self, _: u32) -> Option<Vec<String>> {
+            None
+        }
+    }
+    Box::new(NoProc)
+}
+
 /// `pid (comm) state ppid ... starttime(22)`. The comm may hold spaces and
 /// parentheses, so it spans the first `(` to the last `)`.
 fn parse_stat(s: &str) -> Option<ProcStat> {
@@ -318,6 +370,98 @@ mod tests {
         put(t.path(), 500, "saiife", 1, 5, &[]);
         assert_eq!(agent_ancestor(&p, 500), None);
         assert_eq!(agent_ancestor(&p, 999), None); // vanished
+    }
+
+    /// A process table as macOS gives it: names and parents, never a
+    /// command line.
+    struct NoArgv(HashMap<u32, (u32, &'static str, u64)>);
+    impl Proc for NoArgv {
+        fn stat(&self, pid: u32) -> Option<ProcStat> {
+            let (ppid, comm, start_time) = *self.0.get(&pid)?;
+            Some(ProcStat {
+                ppid,
+                comm: comm.into(),
+                start_time,
+            })
+        }
+        fn cmdline(&self, _: u32) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn node_ancestor_has_no_session() {
+        let p = NoArgv(HashMap::from([
+            (1, (0, "launchd", 1)),
+            (100, (1, "node", 500)),
+            (200, (100, "zsh", 600)),
+            (300, (200, "saiife", 700)),
+        ]));
+        let s = Sessions::new();
+        s.record((100, 500), "gemini-session");
+        let a = agent_ancestor(&p, 300);
+        assert_eq!(a, None);
+        assert_eq!(a.and_then(|a| s.lookup(a)), None);
+        // A named agent still matches without a command line.
+        let p = NoArgv(HashMap::from([
+            (1, (0, "launchd", 1)),
+            (100, (1, "claude", 500)),
+            (300, (100, "saiife", 700)),
+        ]));
+        assert_eq!(agent_ancestor(&p, 300), Some((100, 500)));
+    }
+
+    #[test]
+    fn gone_pid_has_no_session() {
+        let p = NoArgv(HashMap::from([
+            (1, (0, "launchd", 1)),
+            (100, (1, "claude", 500)),
+        ]));
+        let s = Sessions::new();
+        s.record((100, 500), "s");
+        // The requester (pid 300) has exited: no session, no crash.
+        assert_eq!(agent_ancestor(&p, 300).and_then(|a| s.lookup(a)), None);
+        // Its parent has exited mid-chain: likewise.
+        let p = NoArgv(HashMap::from([(300, (250, "saiife", 700))]));
+        assert_eq!(agent_ancestor(&p, 300), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_proc_walks_to_parent() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let st = MacProc.stat(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let st = st.expect("the child is in the process table");
+        assert_eq!(st.ppid, std::process::id());
+        assert_eq!(st.comm, "sleep");
+        assert!(MacProc.cmdline(std::process::id()).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_proc_start_time_detects_reuse() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let real = crate::reauth::start_time_of(&MacProc, pid);
+        let again = crate::reauth::start_time_of(&MacProc, pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let real = real.expect("the child has a start time");
+        assert_eq!(again, Some(real));
+        // A start time stored for an earlier process of this pid differs.
+        let stored = real - 1;
+        assert_ne!(crate::reauth::start_time_of(&MacProc, pid), Some(stored));
+        // The reaped pid is gone (or reused by a later process, which then
+        // has another start time).
+        assert_ne!(crate::reauth::start_time_of(&MacProc, pid), Some(real));
     }
 
     #[test]

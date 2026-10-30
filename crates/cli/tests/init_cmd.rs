@@ -646,7 +646,10 @@ fn locked_root() -> tempfile::TempDir {
     root
 }
 
-#[cfg(unix)]
+/// Not on macOS: there Claude Code's lock label is `unverified` until a
+/// macOS recording exists, so it keeps its project hook
+/// (`locked_init_hooks_agents_whose_managed_hook_does_not_hold`).
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn locked_init_writes_no_hook_for_managed_agent() {
     let root = locked_root();

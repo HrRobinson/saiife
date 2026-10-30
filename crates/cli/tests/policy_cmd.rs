@@ -1,7 +1,7 @@
 //! `saiife policy show|reload` against a real daemon on temp dirs, and the
 //! `check`/`test` commands as a CI would run them (users from files, so no
 //! host account is needed). Nothing leaves the temp dirs.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

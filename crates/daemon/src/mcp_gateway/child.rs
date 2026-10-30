@@ -8,10 +8,15 @@
 //! kept as JSON values and masked, and stderr is masked and rate-capped
 //! before it reaches the daemon's journal.
 
+// Only the spawn path is Linux-only (plan 13, decision 7); the pipe and
+// session code it drives stays compiled elsewhere, unreached.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use saiife_broker::mask::Masker;
 use saiife_mcp::codec::{decode_line, encode};
 use saiife_mcp::jsonrpc::{Id, Message, RpcError};
 use saiife_mcp::types::{self as t, Tool};
+#[cfg(target_os = "linux")]
 use saiife_system::sandbox::{encode_spec, SpawnSpec};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -232,11 +237,18 @@ fn kill_group(pid: u32) {
 /// are unavailable, `waitid(P_PID, WEXITED | WNOWAIT)` on a blocking
 /// thread.
 pub(crate) enum ExitWatch {
+    #[cfg(target_os = "linux")]
     Pidfd(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, u32),
     Waitid(u32),
 }
 
 impl ExitWatch {
+    #[cfg(not(target_os = "linux"))]
+    fn new(pid: u32) -> ExitWatch {
+        ExitWatch::Waitid(pid)
+    }
+
+    #[cfg(target_os = "linux")]
     fn new(pid: u32) -> ExitWatch {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
         let fd = Pid::from_raw(pid as i32)
@@ -253,6 +265,7 @@ impl ExitWatch {
     /// Returns once the leader has exited; it stays unreaped.
     pub async fn exited(&self) {
         let pid = match self {
+            #[cfg(target_os = "linux")]
             ExitWatch::Pidfd(fd, pid) => {
                 // Readiness is never cleared: once exited, always exited.
                 if fd.readable().await.is_ok() {
@@ -297,6 +310,8 @@ pub(crate) struct Running {
     /// The reader's one fatal protocol break, already sanitized.
     pub fatal: mpsc::UnboundedReceiver<String>,
     pub exit: ExitWatch,
+    /// The stdout reader: done at EOF.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Running {
@@ -307,6 +322,17 @@ impl Running {
         let st = self.process.wait().await;
         self.reaper.disarm();
         st
+    }
+
+    /// After [`Running::reap_exited`]: let the reader take what the child
+    /// wrote before it exited (an answer sent just before a crash), up to
+    /// EOF, bounded by `within` (a process outside the group may still
+    /// hold the pipe). The exit watch can fire before that last line is
+    /// read; without this the call it answers would fail as `Exited`.
+    pub async fn drain_stdout(&mut self, within: Duration) {
+        if let Some(h) = self.reader.take() {
+            let _ = tokio::time::timeout(within, h).await;
+        }
     }
 
     /// Kill the child's group and the leader (before any reap), through
@@ -347,6 +373,8 @@ impl StartError {
 
 /// Spawn the helper with `spec`, then start the pipe tasks. The spec frame
 /// goes first on stdin; the JSON-RPC session follows on the same pipe.
+/// Linux only (plan 13, decision 7).
+#[cfg(target_os = "linux")]
 pub(crate) async fn spawn(
     helper: &Path,
     name: &str,
@@ -406,7 +434,7 @@ pub(crate) async fn spawn(
     });
     let conn = Arc::new(Conn::new(tx, masker, log));
     let (fatal_tx, fatal) = mpsc::unbounded_channel();
-    tokio::spawn(read_stdout(
+    let reader = tokio::spawn(read_stdout(
         BufReader::new(stdout),
         Arc::clone(&conn),
         fatal_tx,
@@ -419,6 +447,7 @@ pub(crate) async fn spawn(
         conn,
         fatal,
         exit: ExitWatch::new(pid),
+        reader: Some(reader),
     })
 }
 
@@ -1004,6 +1033,7 @@ mod tests {
 
     /// The exit watch sees an exit without reaping: the leader is still a
     /// zombie (so its group can be killed safely) until `wait`. Both ways.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn exit_watch_does_not_reap() {
         for fallback in [false, true] {

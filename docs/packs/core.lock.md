@@ -166,6 +166,49 @@ It also blocks too much in a few cases. This is the safe direction:
 The limits that apply to every pack are in
 [Limits of the guard as a whole](../threats.md#limits-of-the-guard-as-a-whole).
 
+## macOS rules
+
+A locked Mac has two more things an agent must not change: the
+authorization right `com.saiife.approve`, and saiife's accounts `_saiife`
+(runs saiifed) and `_saiifeaudit` (reads the audit log). The pack has three
+more trigger words for them, `security`, `dscl` and `dseditgroup`, and
+eight rules. The rules are in the pack on every platform, so a Linux
+project with `core.lock` on gets them too.
+
+| Rule id | Blocks |
+| --- | --- |
+| `authorizationdb` | `security authorizationdb write`, `remove` or `merge`, also after global options (`security -q -v authorizationdb write …`) or a `--` (`authorizationdb -- write`). `authorizationdb read` stays allowed. |
+| `security-interactive` | `security -i`, and `-p PROMPT`, which implies it, in any option word (`-ix`, `-qip`, `-pPROMPT`): it reads its commands from stdin. |
+| `security-no-command` | `security` with only options and no command (`cat cmds \| security`, `security -q < f`): it reads its commands from stdin too. |
+| `security-unknown-command` | A command word, or a verb after `authorizationdb`, known only when it runs: `security $S write`, `security authorizationdb "$A"`, `security $(cat f) …`, a glob such as `security auth* write`. |
+| `xargs-security-accounts` | `xargs` in front of `security`, `dscl` or `dseditgroup`: their arguments come from stdin, out of the guard's sight. |
+| `saiife-accounts` | `dscl` or `dseditgroup` with an operand naming `_saiife` or `_saiifeaudit`, or a shorter prefix with a glob (`_saii*`, `_sai?ifeaudit`). |
+| `saiife-accounts-pattern` | `dscl` or `dseditgroup` with an operand that may match one of them: a glob, a variable (`/Groups/$G`) or a substitution (`$(cat g)`, backticks), under every record path dscl takes (`/Users/…`, `/Groups/…`, `/Local/Default/…`). |
+| `dscl-interactive` | `dscl <datasource>` with no command after it (`printf … \| dscl .`): it reads its commands from stdin. |
+
+It blocks too much in a few cases, on Linux as well as on macOS. This is
+the safe direction:
+
+- `xargs` with `security`, `dscl` or `dseditgroup` anywhere after it, even
+  as an argument of another command: `xargs grep security` is blocked.
+- `security -h` and other option-only calls: `security-no-command` cannot
+  tell them from an interactive session. Use `security help`.
+- A read with a variable in the record path, such as
+  `dscl . -read /Users/$USER`: what the variable expands to is not known.
+  Write the name instead.
+
+Not covered on macOS, as for the rest of the pack:
+
+- Code run through an interpreter (`python3 -c`, `perl -e`, a script the
+  agent writes).
+- A command word found at run time (`$(which security) authorizationdb
+  write …`), a copy of the binary under another name (`cp
+  /usr/bin/security /tmp/s`), and an alias defined on the same line
+  (`alias s=security; s authorizationdb write …`).
+
+The right and the accounts are also guarded by permissions: writing the
+authorization database and changing an account need root.
+
 ## Examples
 
 ```saiife-examples
@@ -218,4 +261,16 @@ allow systemctl list-units '*'
 allow kill 1234
 allow atop
 allow cat /etc/codex/requirements.toml
+deny security authorizationdb write com.saiife.approve allow
+deny security authorizationdb -- write com.saiife.approve allow
+deny echo 'authorizationdb write x allow' | security -i
+deny security $S write com.saiife.approve allow
+deny dseditgroup -o edit -a agent -t user _saiifeaudit
+deny dscl . -create /Users/_saiife UserShell /bin/sh
+deny dscl . -read /Users/$USER
+deny xargs grep security
+deny printf 'x' | dscl .
+allow security authorizationdb read com.saiife.approve
+allow security find-generic-password -s x
+allow dscl . -read /Users/agent
 ```

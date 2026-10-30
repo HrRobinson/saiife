@@ -21,6 +21,10 @@ pub enum VaultKeyMode {
     Credential,
     /// systemd < 250: a plain key file, root:saiife 0640 (`LoadCredential=`).
     File,
+    /// macOS: a plain key file the daemon user owns and reads itself,
+    /// `_saiife` 0400 (`/var/db/saiife/keys/vault.key`).
+    #[serde(rename = "daemon_file")]
+    DaemonFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +99,10 @@ pub struct Installed {
     pub dirs: Vec<PathBuf>,
     pub files: Vec<InstalledFile>,
     pub agents: Vec<ManagedAgent>,
+    /// Authorization rights install registered (macOS:
+    /// `com.saiife.approve`), removed again by uninstall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auth_rights: Vec<String>,
 }
 
 impl Installed {
@@ -258,7 +266,31 @@ mod tests {
                     created_file: false,
                 },
             ],
+            auth_rights: vec![],
         }
+    }
+
+    #[test]
+    fn installed_toml_daemon_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("installed.toml");
+        let mut i = sample();
+        i.systemd = 0;
+        i.vault_key = VaultKeyMode::DaemonFile;
+        i.auth_rights = vec!["com.saiife.approve".into()];
+        write_installed(&p, &i).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("vault_key = \"daemon_file\""), "{text}");
+        assert!(
+            text.contains("auth_rights = [\"com.saiife.approve\"]"),
+            "{text}"
+        );
+        assert_eq!(read_installed(&p).unwrap(), Some(i));
+        // Without rights the key is not written, so the Linux file is as before.
+        write_installed(&p, &sample()).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("auth_rights"), "{text}");
+        assert_eq!(read_installed(&p).unwrap().unwrap().auth_rights.len(), 0);
     }
 
     #[test]

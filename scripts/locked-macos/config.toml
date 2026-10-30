@@ -1,0 +1,18 @@
+# The system config the locked-macos CI job installs (scripts/locked-macos/
+# run.sh). Locked, with the CI's unprivileged agent user in one scope and
+# the second account as the approver (same-user approval is off on macOS).
+# lib.sh swaps the min_free_mb line to test the disk floor: keep it exactly
+# as written.
+version = 2
+locked = true
+
+[audit]
+min_free_mb = 512
+
+[approval]
+approvers = ["approver"]
+same_user = "deny"
+
+[[scope]]
+name = "ci"
+users = ["agent"]

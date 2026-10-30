@@ -1,7 +1,9 @@
 //! Lock labels: can a managed saiife hook lock this agent? The label comes
 //! from the live lock checks (docs/lock-check.md), recorded as fixtures in
-//! `tests/fixtures/lock-check/<agent>.tsv`. An agent without a recording is
-//! `Unverified` (plan 7 gate rule, spec §0 decision 9).
+//! `tests/fixtures/lock-check/<agent>.tsv` (Linux) and
+//! `tests/fixtures/lock-check/macos/<agent>.tsv` (macOS). Labels are per
+//! platform (plan 13 decision 12): an agent without a recording for the
+//! platform is `Unverified` (plan 7 gate rule, spec §0 decision 9).
 
 use crate::Agent;
 
@@ -60,9 +62,19 @@ impl LockLabel {
     }
 }
 
-/// The recorded label of each agent. `tests/lock_check_fixtures.rs` fails
-/// when this and the recordings disagree.
+/// The recorded label of each agent on this platform.
 pub fn label(agent: Agent) -> LockLabel {
+    label_for(agent, cfg!(target_os = "macos"))
+}
+
+/// The recorded label of each agent on Linux (`macos` false) or macOS.
+/// `tests/lock_check_fixtures.rs` fails when this and the recordings
+/// disagree.
+pub fn label_for(agent: Agent, macos: bool) -> LockLabel {
+    if macos {
+        // No macOS recording yet (tests/fixtures/lock-check/macos/).
+        return LockLabel::Unverified;
+    }
     match agent {
         // Plan 7 recording, claude.tsv.
         Agent::Claude => LockLabel::Lockable,
@@ -85,7 +97,12 @@ mod tests {
 
     #[test]
     fn only_a_written_holding_managed_hook_replaces_the_project_hook() {
-        assert!(replaces_project_hook("claude", "ab"));
+        // Claude Code holds on Linux; on macOS it is unverified for now.
+        assert!(label_for(Agent::Claude, false).holds());
+        assert_eq!(
+            replaces_project_hook("claude", "ab"),
+            label(Agent::Claude).holds()
+        );
         assert!(!replaces_project_hook("claude", ""));
         assert!(!replaces_project_hook("codex", "ab"));
         assert!(!replaces_project_hook("gemini", "ab"));
@@ -109,6 +126,25 @@ mod tests {
         for l in LockLabel::ALL {
             let row = format!("| `{}` | {} |", l.id(), l.wording());
             assert!(doc.contains(&row), "docs/lock-check.md has no row {row}");
+        }
+    }
+
+    /// Every macOS label is `unverified` until the owner records
+    /// `tests/fixtures/lock-check/macos/<agent>.tsv` in a macOS VM.
+    #[test]
+    fn macos_labels_unverified_without_recordings() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lock-check/macos");
+        assert!(dir.is_dir(), "{} is missing", dir.display());
+        for a in Agent::ALL {
+            if !dir.join(format!("{}.tsv", a.name())).exists() {
+                assert_eq!(label_for(a, true), LockLabel::Unverified, "{}", a.name());
+            }
+        }
+        if cfg!(target_os = "macos") {
+            for a in Agent::ALL {
+                assert_eq!(label(a), label_for(a, true), "{}", a.name());
+            }
         }
     }
 

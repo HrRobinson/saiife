@@ -5,7 +5,7 @@
 //! where the request target must reach the daemon byte for byte. Nothing
 //! leaves 127.0.0.1. The loopback TCP listener (`gateway::serve_tcp`) runs
 //! beside it on `127.0.0.1:0`, with its bearer tokens on an injected clock.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -285,6 +285,12 @@ async fn world_with(s: Setup) -> World {
     // The vault: the service's token, as `saiife secret add` would store it.
     let key_file = tmp.path().join("vault-key");
     std::fs::write(&key_file, [7u8; 32]).unwrap();
+    // The key is the daemon's own and private (macOS checks it).
+    std::fs::set_permissions(
+        &key_file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let vault_path = state.join("vault").join("vault.bin");
     let mut vault = vault::open(&key_file, &vault_path);
     let VaultState::Ready(v) = &mut vault else {
@@ -427,8 +433,13 @@ allow = ["orders:read"]
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.
+    // macOS has no /proc: the plain path (its temp dirs fit in 104 bytes).
     let dir_fd = std::fs::File::open(tmp.path().join("run")).unwrap();
-    let sock = PathBuf::from(format!("/proc/self/fd/{}/gateway.sock", dir_fd.as_raw_fd()));
+    let sock = if cfg!(target_os = "linux") {
+        PathBuf::from(format!("/proc/self/fd/{}/gateway.sock", dir_fd.as_raw_fd()))
+    } else {
+        tmp.path().join("run").join("gateway.sock")
+    };
     let listener = UnixListener::bind(&sock).unwrap();
     tokio::spawn(gateway::serve_with(listener, Arc::clone(&ctx), s.opts));
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -460,7 +471,11 @@ impl World {
         files.sort();
         let mut out = Vec::new();
         for f in files {
-            for l in std::fs::read_to_string(f).unwrap().lines() {
+            let text = std::fs::read_to_string(f).unwrap();
+            // A record the writer is still appending has no newline yet:
+            // only whole lines are read.
+            let whole = text.rfind('\n').map_or("", |i| &text[..=i]);
+            for l in whole.lines() {
                 let v: Value = serde_json::from_str(l).unwrap();
                 if v["kind"] == "connector" {
                     out.push(v);
@@ -571,9 +586,20 @@ impl World {
 
     /// Bytes written as given, the whole answer read back (the request
     /// asks for `Connection: close`).
+    /// A refusal may close the socket before the whole request is written
+    /// (a 64 KiB head does not fit a macOS socket buffer, 8 KiB): the write
+    /// then fails with `EPIPE`, and the answer is still there to read.
     async fn raw(&self, req: &[u8]) -> String {
         let mut s = UnixStream::connect(&self.sock).await.unwrap();
-        s.write_all(req).await.unwrap();
+        if let Err(e) = s.write_all(req).await {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "{e}"
+            );
+        }
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut out)).await;
         String::from_utf8_lossy(&out).into_owned()

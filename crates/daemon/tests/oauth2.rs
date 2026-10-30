@@ -3,7 +3,7 @@
 //! and one loopback TLS mock serving both the token endpoint and the API.
 //! Calls go through `api.call` as a client would send them. Nothing leaves
 //! 127.0.0.1.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -311,6 +311,12 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
 
     let key_file = tmp.path().join("vault-key");
     std::fs::write(&key_file, [7u8; 32]).unwrap();
+    // The key is the daemon's own and private (macOS checks it).
+    std::fs::set_permissions(
+        &key_file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let vault_dir = state.join("vault");
     let vault_file = vault_dir.join("vault.bin");
     let mut vault = vault::open(&key_file, &vault_file);

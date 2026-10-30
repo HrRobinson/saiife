@@ -1,6 +1,6 @@
 # Approvals
 
-Locked mode (Linux). An `ask` rule does not allow or deny a call. It parks the
+Locked mode (Linux and macOS). An `ask` rule does not allow or deny a call. It parks the
 call until a person you named decides. Two kinds of call can wait:
 
 - a connector request, when its capability is in a service's `ask` list;
@@ -86,15 +86,16 @@ grant_ttl = "15m"
   made under their own uid. The refusal is recorded as `refused` with rule
   `same_user`. Use a second account for approving.
 - `same_user = "reauth"`: an approver may decide their own request after
-  re-authenticating through polkit (below). Use this on a machine with one
-  person and no second account.
+  re-authenticating through polkit (below). Use this on a Linux machine with
+  one person and no second account. On macOS it acts as `"deny"`
+  ([macOS](#macos)).
 - The requester may always withdraw its own request with `saiife reject`: no
   approver list, no re-authentication. It is recorded as `rejected` with the
   note `cancelled by requester`.
 
 ## Re-authentication and the fallback
 
-With `same_user = "reauth"` the daemon runs `pkcheck --action-id
+On Linux, with `same_user = "reauth"`, the daemon runs `pkcheck --action-id
 com.saiife.approve` for the approving CLI process, with `--detail request
 "#<id> <service> <operation>"` (or `#<id> <pack>/<rule>` for a command, or
 `lockdown off`), which the prompt shows. The polkit action is installed by
@@ -136,6 +137,29 @@ calls to `/etc/polkit-1`, `/run/polkit-1`, `/usr/local/share/polkit-1` and
 `/usr/share/polkit-1`. Reading them is allowed: the files are public. `saiife
 doctor` warns when a rule in one of their `rules.d` folders mentions
 `com.saiife.approve`.
+
+## macOS
+
+**Same-user approval is off on macOS.** The macOS password or Touch ID
+prompt shows the authorization right's fixed text, not the request it
+approves. An agent running as you could start an approval of its own
+request while you believe you confirm another one, and polkit's detail line
+has no macOS counterpart the daemon can set. So on macOS:
+
+- `same_user = "reauth"` acts as `"deny"`. A same-user decision is refused
+  with `reauth_unavailable` and the reason
+  `re-authentication unavailable: approvals need a second account`. No
+  prompt is shown and no cooldown starts.
+- Approve from a second account in `approvers`: log in as yourself at the
+  Mac, or over SSH (`ssh you@mac`), and run `saiife approve <id>` there. SSH
+  means a second account here, never the agent's own one.
+- The approver route for lifting `saiife lockdown` needs re-authentication,
+  so on macOS only root and `[admin]` users can lift or narrow it.
+- `system install` still registers the authorization right
+  `com.saiife.approve` (Touch ID or the password each time, `timeout = 0`),
+  and `doctor` checks it, so a later version can turn same-user approval
+  on once the prompt can carry the request. `doctor` reports
+  `same-user approval is off on macOS: approvals need a second account`.
 
 ## Command grants
 

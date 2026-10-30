@@ -1,7 +1,7 @@
 //! `saiife secret add|list|rotate|remove` against a real daemon on temp
 //! dirs (plan 10, Task 5). The daemon runs as the test user; admin ops
 //! authorize through `[admin] groups = [<primary group>]`.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

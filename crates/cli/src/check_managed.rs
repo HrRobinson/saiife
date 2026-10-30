@@ -83,7 +83,7 @@ pub(crate) fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> 
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 mod imp {
     use super::*;
 
@@ -99,12 +99,12 @@ mod imp {
     ) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-        crate::warn("locked mode needs Linux in this version (macOS: v2.1)");
+        crate::warn(saiife_system::NOT_SUPPORTED_OS);
         ExitCode::from(2)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod imp {
     use super::*;
 
@@ -674,8 +674,17 @@ mod imp {
         // hash. Nothing is read or spawned unless some scope binds one; an
         // environment that cannot be resolved denies the call.
         let (cfg_env, env) = if cfg.scope.iter().any(|s| s.env.is_some()) {
-            let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
-            let nsswitch = std::fs::read_to_string("/etc/nsswitch.conf").ok();
+            // macOS keeps its accounts in Directory Services, not in
+            // /etc/passwd and /etc/group: `nss` answers there.
+            let linux = cfg!(target_os = "linux");
+            let read = |p: &str| {
+                linux
+                    .then(|| std::fs::read_to_string(p).ok())
+                    .flatten()
+                    .unwrap_or_default()
+            };
+            let nsswitch = read("/etc/nsswitch.conf");
+            let nsswitch = (!nsswitch.is_empty()).then_some(nsswitch);
             hook_env(
                 cfg,
                 rustix::process::getuid().as_raw(),

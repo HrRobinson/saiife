@@ -1,5 +1,5 @@
 //! `saiife mcp`: an MCP server on stdio that offers the connector
-//! operations you may call as tools (plan 17, Task 4). Linux only.
+//! operations you may call as tools (plan 17, Task 4). Linux and macOS.
 //!
 //! The protocol is UTF-8 JSON-RPC, one message per line; logs go to
 //! stderr (decision 2). `saiife mcp` decides nothing, caches no verdict and
@@ -50,22 +50,22 @@ pub struct McpArgs {
     pub system_config: Option<PathBuf>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(a: McpArgs) -> ExitCode {
     let McpArgs {
         wait: _,
         system_config: _,
     } = a;
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(a: McpArgs) -> ExitCode {
     linux::run(a)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod linux {
     use super::McpArgs;
     use crate::api_cmd::linux::{self as api, Daemon, Stop};

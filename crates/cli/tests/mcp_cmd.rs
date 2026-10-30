@@ -5,7 +5,7 @@
 //! an in-process daemon context (as in `tests/approvals.rs`), because an
 //! approval needs a second uid. Nothing leaves loopback; signals go to the
 //! test's own daemon child through a syscall.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 
@@ -967,6 +967,7 @@ mod inproc {
 
     /// A world with the real MCP gateway and one `[mcp.fake]` server whose
     /// `echo` needs approval.
+    #[cfg(target_os = "linux")]
     pub fn world_gw() -> Inproc {
         build(
             "\"erp\", \"mcp:fake\"",
@@ -1006,8 +1007,14 @@ mod inproc {
         )
         .unwrap();
         let (handle, _join) = writer::spawn(cw, writer_cfg(), None).unwrap();
-        let key_file = t.join("vault-key");
+        let key_file = t.join(saiife_daemon::VAULT_KEY_FILE);
         fs::write(&key_file, [7u8; 32]).unwrap();
+        // macOS: the vault refuses a key open to group or others.
+        fs::set_permissions(
+            &key_file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         let vault_path = t.join("state/vault/vault.bin");
         let mut vault = vault::open(&key_file, &vault_path);
         let VaultState::Ready(v) = &mut vault else {
@@ -1344,14 +1351,19 @@ fn refused_list_is_not_unavailable() {
 }
 
 // ------------------------------------------------------ gateway (Task 8)
+// The MCP gateway needs Linux (Landlock) in this version (plan 13
+// decision 7): `[mcp.*]` is a load error on macOS.
 
+#[cfg(target_os = "linux")]
 const ENV_BIN: &str = "/usr/bin/env";
 
 /// A test token, built at run time (no token-shaped literal in the tree).
+#[cfg(target_os = "linux")]
 fn fake_token() -> String {
     concat!("fk", "-tok-", "9z8y7x6w5v").to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn sandbox_line() -> &'static str {
     if saiife_system::sandbox::landlock_abi() == 0 {
         eprintln!("note: no Landlock on this kernel; the gateway tests run with sandbox = \"off\"");
@@ -1366,6 +1378,7 @@ fn sandbox_line() -> &'static str {
 /// namespace, which maps only the current user, root's files show as the
 /// overflow uid, so no command passes and the gateway tests cannot run
 /// there: they are skipped with a note. Everywhere else they run.
+#[cfg(target_os = "linux")]
 fn gateway_runnable() -> bool {
     match saiife_system::fsops::root_owned_chain(std::path::Path::new(ENV_BIN)) {
         Ok(()) => true,
@@ -1378,6 +1391,7 @@ fn gateway_runnable() -> bool {
 
 /// `[mcp.fake]` running `saiife __fake-mcp-server <fake_args>` under
 /// `/usr/bin/env` (a root-owned command), with `extra` lines appended.
+#[cfg(target_os = "linux")]
 fn fake_server(fake_args: &[&str], extra: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_saiife");
     let mut args = vec![bin.to_string(), "__fake-mcp-server".to_string()];
@@ -1393,6 +1407,7 @@ fn fake_server(fake_args: &[&str], extra: &str) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn gw_policy(port: u16, servers: &str) -> String {
     policy(
         port,
@@ -1403,11 +1418,13 @@ fn gw_policy(port: u16, servers: &str) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn gw_world(servers: &str) -> World {
     world_with(|p| gw_policy(p, servers), &["erp"])
 }
 
 /// Waits until `tools/list` holds `name` (the server may still be starting).
+#[cfg(target_os = "linux")]
 fn wait_tool(c: &mut McpClient, name: &str) {
     let ok = wait_for(Duration::from_secs(30), || {
         c.tool_names().iter().any(|n| n == name)
@@ -1416,6 +1433,7 @@ fn wait_tool(c: &mut McpClient, name: &str) {
 }
 
 /// Rewrites the policy and reloads the daemon.
+#[cfg(target_os = "linux")]
 fn reload_gw(w: &World, servers: &str) {
     w.d.write_config(&Opts {
         extra: gw_policy(w.m.port, servers),
@@ -1426,6 +1444,7 @@ fn reload_gw(w: &World, servers: &str) {
 
 // ------------------------------------------------- gateway tools (Task 8)
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_tools_listed_with_prefix() {
     if !gateway_runnable() {
@@ -1463,6 +1482,7 @@ fn gateway_tools_listed_with_prefix() {
     assert!(tool(&list, "saiife_result").is_some(), "{list}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_allow_call_roundtrip() {
     if !gateway_runnable() {
@@ -1491,6 +1511,7 @@ fn gateway_allow_call_roundtrip() {
     assert_eq!(recs[0]["decision"], "allow");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_ask_then_saiife_result() {
     if !gateway_runnable() {
@@ -1529,6 +1550,7 @@ fn gateway_ask_then_saiife_result() {
     assert_eq!(recs.last().unwrap()["via"], "approval", "{recs:?}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_deny_is_error_result() {
     if !gateway_runnable() {
@@ -1553,6 +1575,7 @@ fn gateway_deny_is_error_result() {
     assert_eq!(last["decision"], "deny", "{last}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn token_never_reaches_agent() {
     if !gateway_runnable() {
@@ -1597,6 +1620,7 @@ fn token_never_reaches_agent() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn reload_revokes_listed_tool() {
     if !gateway_runnable() {
@@ -1624,6 +1648,7 @@ fn reload_revokes_listed_tool() {
     assert_eq!(rpc_code(&r), -32602, "{r}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn connector_and_gateway_names_never_collide() {
     if !gateway_runnable() {
@@ -1671,6 +1696,7 @@ fn connector_and_gateway_names_never_collide() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_arguments_text_is_not_rounded() {
     if !gateway_runnable() {

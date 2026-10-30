@@ -117,14 +117,12 @@ on a service with `redact` is withheld.
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches HubSpot only through `saiifed`:
+In locked mode (Linux and macOS) the agent user reaches HubSpot only through `saiifed`:
 `saiife api hubspot ...`, or `gateway.sock` at `/v1/api` and `/v1/proxy`.
 The token lives in the daemon's vault (`saiife secret add hubspot-prod`, or
 `saiife connect hubspot`) and never reaches the agent's environment, files or
 audit records. A project overlay can only add `deny` and `ask`; in locked mode
-its `allow` is ignored. Every call is one `connector` audit record. On macOS
-the commands print `saiife: locked mode needs Linux in this version (macOS: v2.1)`
-and exit 5.
+its `allow` is ignored. Every call is one `connector` audit record.
 
 Create a private app in HubSpot with only the scopes the policy needs
 (`crm.objects.contacts.read`, `crm.objects.companies.read`,

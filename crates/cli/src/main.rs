@@ -8,11 +8,11 @@
 //! - `saiife status` -> tamper checks; exit 1 if any fails
 //! - `saiife packs [ID]` -> list packs and which are on here, or one pack's rules
 //! - `saiife audit` -> the audit log as a table
-//! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux, as the daemon user)
+//! - `saiife daemon --system` -> saiifed, the locked-mode daemon (Linux or macOS, as the daemon user)
 //! - `saiife daemon --user` -> the personal broker, as the logged-in user (Linux; not a security boundary)
 //! - `saiife system install|uninstall` -> set up or remove locked mode (Linux, root)
-//! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux, admin)
-//! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux)
+//! - `saiife secret add|list|rotate|remove|import` -> the vault, through the daemon (Linux or macOS, admin)
+//! - `saiife api <service> <operation> [k=v ...]` / `--list` -> connector calls through the daemon (Linux or macOS)
 //! - `saiife policy check|test <file>` / `show` / `reload` -> check and test a policy file; show or reload the one in force
 //! - `saiife doctor [--json]` -> locked-mode host checks; exit 0 pass / 1 warning / 2 failure
 
@@ -30,12 +30,12 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod broker;
 mod check;
-// Used by `saiife api collection`, which is Linux only in this version.
 mod check_managed;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// Used by `saiife api collection`, which needs Linux or macOS.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod collection;
 mod connect_cmd;
 mod doctor_cmd;
@@ -43,7 +43,7 @@ mod env_cmd;
 mod eval;
 #[cfg(debug_assertions)]
 mod fake_mcp;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod import_cmd;
 mod init_cmd;
 mod lockdown_cmd;
@@ -109,7 +109,7 @@ enum Cmd {
         /// Which agent is calling (claude, codex, gemini); recorded in the audit log.
         #[arg(long = "agent", default_value = "unknown")]
         agent: String,
-        /// Locked mode (Linux): judge in a worker process, record through
+        /// Locked mode (Linux, macOS): judge in a worker process, record through
         /// the saiife daemon, fail closed on every error. Implies --hook-exit.
         #[arg(long)]
         managed: bool,
@@ -207,7 +207,8 @@ enum Cmd {
         /// Where the signing key lives (default $STATE_DIRECTORY, else /var/lib/saiife).
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
-        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY).
+        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY; macOS:
+        /// `vault.key` in /var/db/saiife/keys).
         #[arg(long = "credentials-dir", value_name = "DIR", hide = true)]
         credentials_dir: Option<std::path::PathBuf>,
     },
@@ -235,7 +236,7 @@ enum Cmd {
     #[cfg(debug_assertions)]
     #[command(name = "__fake-mcp-server", hide = true)]
     FakeMcpServer(fake_mcp::FakeArgs),
-    /// Locked mode (Linux, admin): add, list, rotate or remove the
+    /// Locked mode (Linux, macOS, admin): add, list, rotate or remove the
     /// secrets in the daemon's vault. Values never leave the daemon.
     Secret {
         /// The system config (default /etc/saiife/config.toml).
@@ -244,11 +245,11 @@ enum Cmd {
         #[command(subcommand)]
         action: secret_cmd::SecretAction,
     },
-    /// Locked mode (Linux, admin): set up a connector service. Stores its
+    /// Locked mode (Linux, macOS, admin): set up a connector service. Stores its
     /// secret and writes policy.d/<service>.toml with every operation
     /// commented out (deny-all until you edit it).
     Connect(connect_cmd::ConnectArgs),
-    /// Locked mode (Linux): run one allowed, root-owned command with a
+    /// Locked mode (Linux, macOS): run one allowed, root-owned command with a
     /// secret in its environment; its output is masked.
     ///
     /// Trust boundary: any process of the agent's uid can lease a listed
@@ -284,14 +285,14 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Locked mode (Linux): call a connector operation through the daemon,
+    /// Locked mode (Linux, macOS): call a connector operation through the daemon,
     /// or list the ones you may call. The credential never reaches you.
     Api(api_cmd::ApiArgs),
-    /// Locked mode (Linux): an MCP server on stdio that offers the
+    /// Locked mode (Linux, macOS): an MCP server on stdio that offers the
     /// connector operations you may call as tools, each call brokered by
     /// the daemon like `saiife api`.
     Mcp(mcp_cmd::McpArgs),
-    /// Locked mode (Linux): list, show and decide ask-gated requests.
+    /// Locked mode (Linux, macOS): list, show and decide ask-gated requests.
     /// `approvals [list] [--all|--pending] [--json]`, `approvals show <id>`.
     Approvals {
         /// The system config (default /etc/saiife/config.toml).
@@ -302,7 +303,7 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<approvals_cmd::ApprovalsAction>,
     },
-    /// Locked mode (Linux, approver): approve request <id>. For your own
+    /// Locked mode (Linux, macOS, approver): approve request <id>. For your own
     /// request (`same_user = "reauth"`) you are asked to authenticate.
     Approve {
         /// The system config (default /etc/saiife/config.toml).
@@ -317,7 +318,7 @@ enum Cmd {
         #[arg(long)]
         accept_truncated: bool,
     },
-    /// Locked mode (Linux, approver): reject request <id>.
+    /// Locked mode (Linux, macOS, approver): reject request <id>.
     Reject {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true)]
@@ -328,7 +329,7 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Locked mode (Linux, admin or approver): `on` denies every connector
+    /// Locked mode (Linux, macOS, admin or approver): `on` denies every connector
     /// request (`--scope connectors`) or also every hook call (`--scope
     /// all`); `off` lifts it; no subcommand shows the state.
     Lockdown {
@@ -666,6 +667,8 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
         credentials_dir,
         ..
     } = a;
+    let platform = saiife_system::layout::Platform::current()
+        .unwrap_or(saiife_system::layout::Platform::Linux);
     // systemd's StateDirectory= may list several dirs, colon-separated.
     let state_dir = state_dir
         .or_else(|| {
@@ -673,17 +676,42 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
                 .and_then(|v| v.to_str().and_then(|s| s.split(':').next()).map(Into::into))
                 .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
         })
-        .unwrap_or_else(|| "/var/lib/saiife".into());
+        .unwrap_or_else(|| daemon_default_dirs(platform).0.into());
     saiife_daemon::run(saiife_daemon::DaemonOptions {
-        config: config.unwrap_or_else(|| "/etc/saiife/config.toml".into()),
+        config: config.unwrap_or_else(|| daemon_default_config(platform).into()),
         state_dir,
         credentials_dir: credentials_dir
             .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
-            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty()),
+            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
+            .or_else(|| daemon_default_dirs(platform).1.map(Into::into)),
         catalog: daemon_catalog(),
         directory: Box::new(saiife_policy::Getent),
         mode: saiife_daemon::DaemonMode::System,
     })
+}
+
+/// `saiife daemon --system`'s config when `--config` does not name one:
+/// the platform's `layout::CONFIG`.
+fn daemon_default_config(p: saiife_system::layout::Platform) -> &'static str {
+    use saiife_system::layout::{macos_path, Platform, CONFIG};
+    match p {
+        Platform::Linux => CONFIG,
+        Platform::Macos => macos_path(CONFIG).unwrap_or(CONFIG),
+    }
+}
+
+/// `saiife daemon --system`'s state and credentials dirs when neither a
+/// flag nor systemd (`$STATE_DIRECTORY`, `$CREDENTIALS_DIRECTORY`) names
+/// them. launchd sets neither, so macOS has both (spec 5.3).
+fn daemon_default_dirs(p: saiife_system::layout::Platform) -> (&'static str, Option<&'static str>) {
+    use saiife_system::layout::{macos_path, Platform, KEYS_DIR, STATE_DIR};
+    match p {
+        Platform::Linux => (STATE_DIR, None),
+        Platform::Macos => (
+            macos_path(STATE_DIR).unwrap_or(STATE_DIR),
+            macos_path(KEYS_DIR),
+        ),
+    }
 }
 
 /// `saiife daemon --user` (plan 16): the personal paths, the refusals that
@@ -693,8 +721,8 @@ fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
     if let Some(kind) = &a.print_unit {
         return print_unit(kind);
     }
-    if !cfg!(target_os = "linux") {
-        eprintln!("{}", saiife_daemon::PERSONAL_NEEDS_LINUX);
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        eprintln!("{}", saiife_daemon::PERSONAL_UNSUPPORTED);
         return ExitCode::from(2);
     }
     if a.config.is_some() || a.state_dir.is_some() || a.credentials_dir.is_some() {
@@ -922,4 +950,30 @@ fn trace(decision: Decision) -> String {
 
 pub(crate) fn warn(msg: &str) {
     let _ = writeln!(std::io::stderr(), "saiife: {msg}");
+}
+
+#[cfg(test)]
+mod daemon_default_tests {
+    use super::{daemon_default_config, daemon_default_dirs};
+    use saiife_system::layout::Platform;
+
+    #[test]
+    fn daemon_defaults_per_platform() {
+        assert_eq!(
+            daemon_default_dirs(Platform::Linux),
+            ("/var/lib/saiife", None)
+        );
+        assert_eq!(
+            daemon_default_dirs(Platform::Macos),
+            ("/var/db/saiife", Some("/var/db/saiife/keys"))
+        );
+        assert_eq!(
+            daemon_default_config(Platform::Linux),
+            "/etc/saiife/config.toml"
+        );
+        assert_eq!(
+            daemon_default_config(Platform::Macos),
+            "/etc/saiife/config.toml"
+        );
+    }
 }

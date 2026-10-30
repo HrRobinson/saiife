@@ -15,7 +15,7 @@
 //! (4343, not an approver); the daemon looks `boss` up by uid itself.
 //! The upstream is a loopback HTTPS mock; nothing leaves 127.0.0.1.
 // Debug builds only: the CLI honours SAIIFE_TEST_PKTTYAGENT only there, so a release test could start the real pkttyagent.
-#![cfg(all(target_os = "linux", debug_assertions))]
+#![cfg(all(unix, debug_assertions))]
 #![allow(dead_code)]
 
 mod common;
@@ -26,7 +26,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::approvals::{dir_in, State};
 use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
-use saiife_daemon::sessions::RealProc;
+use saiife_daemon::sessions::host_proc;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::msg::Request;
@@ -166,9 +166,7 @@ impl saiife_daemon::reauth::Reauth for FakeReauth {
     }
     fn check(
         &self,
-        _pid: u32,
-        _start: u64,
-        _uid: u32,
+        _who: &saiife_daemon::reauth::Subject,
         detail: &str,
         _t: Duration,
     ) -> saiife_daemon::reauth::ReauthResult {
@@ -328,8 +326,14 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
         None,
     )
     .unwrap();
-    let key_file = t.join("vault-key");
+    let key_file = t.join(saiife_daemon::VAULT_KEY_FILE);
     fs::write(&key_file, [7u8; 32]).unwrap();
+    // macOS: the vault refuses a key open to group or others.
+    fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let vault_path = t.join("state/vault/vault.bin");
     let mut vault = vault::open(&key_file, &vault_path);
     let VaultState::Ready(v) = &mut vault else {
@@ -385,7 +389,7 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
             socket_dir: t.join("run"),
             config_path: t.join("etc/config.toml"),
             policy,
-            proc: Box::new(RealProc::new("/proc")),
+            proc: host_proc(),
             vault,
             vault_path,
             upstream,
@@ -1065,8 +1069,10 @@ fn refusal_prints_rule_and_exit_2() {
         "{}",
         stderr(&o)
     );
-    assert!(
+    // pkttyagent is polkit's: never started on macOS.
+    assert_eq!(
         stderr(&o).contains("no-pkttyagent is missing"),
+        cfg!(target_os = "linux"),
         "{}",
         stderr(&o)
     );
@@ -1133,6 +1139,8 @@ fn daemon_unavailable_is_exit_5() {
     }
 }
 
+/// Linux: macOS has no polkit, so no pkttyagent.
+#[cfg(target_os = "linux")]
 #[test]
 fn pkttyagent_started_and_stopped_for_same_uid_reauth() {
     let w = world();
@@ -1196,8 +1204,11 @@ fn lockdown_off_by_an_approver_needs_reauth() {
         *w.reauth.details.lock().unwrap(),
         vec!["lockdown off".to_string()]
     );
-    // The CLI started its agent first.
-    assert!(w.path().join("agent.pid").exists());
+    // The CLI started its agent first (Linux: macOS has no pkttyagent).
+    assert_eq!(
+        w.path().join("agent.pid").exists(),
+        cfg!(target_os = "linux")
+    );
 
     ok(&lockdown(&["on", "--scope", "connectors"]));
     w.own_reauth(false);
@@ -1293,7 +1304,8 @@ fn pkttyagent_not_started_for_other_users_requests_or_a_desktop() {
         .env("DISPLAY", ":0")
         .env("SSH_TTY", "/dev/pts/9");
     ok(&cmd.output().unwrap());
-    assert!(started(), "no agent over ssh");
+    // Linux only: macOS has no pkttyagent.
+    assert_eq!(started(), cfg!(target_os = "linux"), "no agent over ssh");
 
     // A rejection never prompts.
     let _ = fs::remove_file(w.path().join("agent.pid"));

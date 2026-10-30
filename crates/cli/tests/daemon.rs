@@ -1,6 +1,6 @@
 //! `saiife daemon --system` end to end, as the current user with every path
 //! in a temp dir (plan 9a, Task 6).
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 
@@ -384,7 +384,7 @@ fn missing_or_short_vault_key_is_recorded_and_audit_keeps_serving() {
         (Some(vec![1u8; 16]), "vault key is not 32 bytes"),
     ] {
         let mut d = TestDaemon::prepare(&Opts::default());
-        let key_file = d.creds_dir().join("vault-key");
+        let key_file = d.creds_dir().join(saiife_daemon::VAULT_KEY_FILE);
         match key {
             None => std::fs::remove_file(&key_file).unwrap(),
             Some(k) => std::fs::write(&key_file, k).unwrap(),

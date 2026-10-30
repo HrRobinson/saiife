@@ -50,10 +50,18 @@ pub fn host_id() -> Option<String> {
         .clone()
 }
 
+/// `ioreg` by its absolute path: it lives in `/usr/sbin`, which a minimal
+/// `PATH` (`/usr/bin:/bin`) leaves out, and a `PATH` lookup would let the
+/// environment pick the program that names the host.
+#[cfg(target_os = "macos")]
+const IOREG: &str = "/usr/sbin/ioreg";
+
 #[cfg(target_os = "macos")]
 fn raw_machine_id() -> Option<String> {
-    let out = std::process::Command::new("ioreg")
+    let out = std::process::Command::new(IOREG)
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);

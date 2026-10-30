@@ -3,7 +3,7 @@
 //! leaves loopback (no connector call reaches a network: lockdown denies
 //! at step 2); signals go to the test's own child through a syscall.
 // Debug builds only: the CLI honours SAIIFE_TEST_PKTTYAGENT only there, so a release test could start the real pkttyagent.
-#![cfg(all(target_os = "linux", debug_assertions))]
+#![cfg(all(unix, debug_assertions))]
 
 mod common;
 

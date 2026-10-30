@@ -371,6 +371,13 @@ enum RunAllowBad {
     Relative,
     NoName,
     Interpreter,
+    /// macOS: the entry starts with `/etc`, `/var` or `/tmp`, root-owned
+    /// symlinks into `/private` there (plan 13 decision 10). The daemon
+    /// matches the command's canonical path, so such an entry never
+    /// matches, and a link never grants its target.
+    ThroughSystemLink {
+        link: &'static str,
+    },
 }
 
 impl RunAllowBad {
@@ -380,14 +387,50 @@ impl RunAllowBad {
             Self::Relative => format!("run_allow entry {e} must be an absolute path"),
             Self::NoName => format!("run_allow entry {e} names no program (no file name)"),
             Self::Interpreter => format!("run_allow entry {e} is an interpreter or shell"),
+            Self::ThroughSystemLink { link } => {
+                // `/private/<link>` and whatever followed the link.
+                let mut hint = Path::new("/private").join(&link[1..]);
+                let rest: PathBuf = entry.components().skip(2).collect();
+                if !rest.as_os_str().is_empty() {
+                    hint.push(rest);
+                }
+                format!(
+                    "run_allow entry {e} goes through the {link} symlink on macOS; write {} instead",
+                    hint.display()
+                )
+            }
         }
+    }
+}
+
+/// The macOS system symlink (`/etc`, `/var`, `/tmp`) that `p`'s first
+/// component is, if any. Any case: the usual macOS file system ignores it
+/// (`/VAR` is the link too).
+fn system_link_of(p: &Path) -> Option<&'static str> {
+    use std::path::Component;
+    let mut parts = p.components();
+    if parts.next() != Some(Component::RootDir) {
+        return None;
+    }
+    match parts.next()? {
+        Component::Normal(n) => ["/etc", "/var", "/tmp"].into_iter().find(|l| {
+            n.as_encoded_bytes()
+                .eq_ignore_ascii_case(&l.as_bytes()[1..])
+        }),
+        _ => None,
     }
 }
 
 /// The first bad `run_allow` entry, shared by `[secrets]` and
 /// `[services.*.cloud]`: not absolute, no file name (`/`, `/usr/bin/..`),
-/// or an interpreter.
+/// or an interpreter; on macOS also one through a system symlink.
 fn run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
+    run_allow_problem_for(list, cfg!(target_os = "macos"))
+}
+
+/// [`run_allow_problem`] for macOS (`macos`) or Linux. The policy crate
+/// cannot see `saiife_system::layout::Platform`, so callers pass a bool.
+fn run_allow_problem_for(list: &[PathBuf], macos: bool) -> Option<(RunAllowBad, &PathBuf)> {
     list.iter().find_map(|p| {
         if !p.is_absolute() {
             Some((RunAllowBad::Relative, p))
@@ -395,6 +438,8 @@ fn run_allow_problem(list: &[PathBuf]) -> Option<(RunAllowBad, &PathBuf)> {
             Some((RunAllowBad::NoName, p))
         } else if is_interpreter(p) {
             Some((RunAllowBad::Interpreter, p))
+        } else if let Some(link) = system_link_of(p).filter(|_| macos) {
+            Some((RunAllowBad::ThroughSystemLink { link }, p))
         } else {
             None
         }
@@ -444,6 +489,8 @@ fn validate_mcp(
     cfg: &SystemConfig,
     origin: &BTreeMap<String, String>,
 ) -> Result<(), PolicyError> {
+    crate::mcp::validate_mcp(&cfg.mcp, cfg!(target_os = "linux"))
+        .map_err(|why| invalid(config_file, why))?;
     if !cfg.mcp.is_empty() && !cfg.locked {
         return Err(invalid(
             config_file,
@@ -726,4 +773,53 @@ fn read_regular(path: &Path) -> Result<Vec<u8>, PolicyError> {
         return Err(too_big());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn problem(list: &[&str], macos: bool) -> Option<String> {
+        let list: Vec<PathBuf> = list.iter().map(PathBuf::from).collect();
+        run_allow_problem_for(&list, macos).map(|(bad, e)| bad.describe(e))
+    }
+
+    /// Plan 13 decision 10: `/etc`, `/var` and `/tmp` are symlinks on
+    /// macOS, and a link in `run_allow` never grants its target.
+    #[test]
+    fn run_allow_through_var_symlink_refused_with_hint() {
+        assert_eq!(
+            problem(&["/usr/bin/curl", "/var/x"], true).as_deref(),
+            Some(
+                "run_allow entry /var/x goes through the /var symlink on macOS; \
+                 write /private/var/x instead"
+            )
+        );
+        for (entry, link, hint) in [
+            ("/etc/saiife/tool", "/etc", "/private/etc/saiife/tool"),
+            ("/tmp/bin/t", "/tmp", "/private/tmp/bin/t"),
+            ("//var/db/x", "/var", "/private/var/db/x"),
+            ("/VAR/db/x", "/var", "/private/var/db/x"),
+            ("/etc", "/etc", "/private/etc"),
+        ] {
+            let got = problem(&[entry], true).unwrap();
+            assert!(got.contains(&format!("the {link} symlink")), "{got}");
+            assert!(got.ends_with(&format!("write {hint} instead")), "{got}");
+        }
+        for ok in [
+            "/usr/bin/curl",
+            "/private/var/x",
+            "/opt/homebrew/bin/aws",
+            "/variable/x",
+            "/usr/var/x",
+        ] {
+            assert_eq!(problem(&[ok], true), None, "{ok}");
+        }
+        // Linux has no such links: /var/x is a plain path there.
+        assert_eq!(problem(&["/var/x", "/etc/x", "/tmp/x"], false), None);
+        // The other checks still come first, on either platform.
+        assert!(problem(&["var/x"], true)
+            .unwrap()
+            .contains("must be an absolute path"));
+    }
 }

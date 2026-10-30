@@ -11,7 +11,7 @@
 //! a fixed passwd/group text naming the test user, `boss` and `carol`
 //! (4343, not an approver); the daemon looks `boss` up by uid itself.
 //! The upstream is a loopback HTTPS mock; nothing leaves 127.0.0.1.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 
@@ -326,8 +326,14 @@ fn world_full_in(erp_extra: &str, result_cap: Option<usize>, tail: &str, mode: M
         None,
     )
     .unwrap();
-    let key_file = t.join("vault-key");
+    let key_file = t.join(saiife_daemon::VAULT_KEY_FILE);
     fs::write(&key_file, [7u8; 32]).unwrap();
+    // macOS: the vault refuses a key open to group or others.
+    fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let vault_path = t.join("state/vault/vault.bin");
     let mut vault = vault::open(&key_file, &vault_path);
     let VaultState::Ready(v) = &mut vault else {

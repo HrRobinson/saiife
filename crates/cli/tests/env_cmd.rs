@@ -1,7 +1,7 @@
 //! `saiife env list|use`, and environments in the guard hook and the policy
 //! tools. Every file lives in a temp dir; the root-only path runs through the
 //! debug-build seam `SAIIFE_TEST_ASSUME_ROOT`.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 

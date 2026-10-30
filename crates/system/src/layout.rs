@@ -25,6 +25,9 @@ pub const POLKIT_ACTION_ID: &str = "com.saiife.approve";
 /// The warning when re-authentication is unavailable (install and doctor).
 pub const REAUTH_UNAVAILABLE: &str =
     "re-authentication unavailable: approvals need a second account";
+/// macOS refuses every same-user approval (install and doctor).
+pub const MAC_SAME_USER_OFF: &str =
+    "same-user approval is off on macOS: approvals need a second account";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
 /// The warning when an install lists no agents (install and doctor).
 pub const NO_AGENTS: &str = "no agents listed: no agent is guarded";
@@ -81,12 +84,80 @@ pub const DAEMON_GROUP: &str = "saiife";
 pub const AUDIT_GROUP: &str = "saiife-audit";
 pub const UNIT_NAME: &str = "saiifed.service";
 
+// ------------------------------------------------ macOS (spec §5.3)
+
+/// The daemon's stderr on macOS, which has no journal for it.
+pub const DAEMON_LOG: &str = "/var/log/saiife/daemon.log";
+/// An MDM profile that may also deliver Claude Code managed settings.
+pub const CLAUDE_MDM_PROFILE: &str = "/Library/Managed Preferences/com.anthropic.claudecode.plist";
+pub const MACOS_DAEMON_USER: &str = "_saiife";
+pub const MACOS_DAEMON_GROUP: &str = "_saiife";
+pub const MACOS_AUDIT_GROUP: &str = "_saiifeaudit";
+pub const LAUNCHD_LABEL: &str = "com.saiife.saiifed";
+
+/// The platform a layout is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Linux,
+    Macos,
+}
+
+impl Platform {
+    /// The platform this binary runs on; `None` on any other OS.
+    pub fn current() -> Option<Platform> {
+        if cfg!(target_os = "linux") {
+            Some(Platform::Linux)
+        } else if cfg!(target_os = "macos") {
+            Some(Platform::Macos)
+        } else {
+            None
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Platform::Linux => "linux",
+            Platform::Macos => "macos",
+        }
+    }
+}
+
+/// The macOS path (spec §5.3) for a Linux path constant, when it differs.
+/// Every other constant is the same on both platforms.
+pub fn macos_path(linux: &str) -> Option<&'static str> {
+    Some(match linux {
+        STATE_DIR => "/var/db/saiife",
+        KEYS_DIR => "/var/db/saiife/keys",
+        AUDIT_KEY => "/var/db/saiife/keys/audit.ed25519",
+        VAULT_KEY => "/var/db/saiife/keys/vault.key",
+        RUN_DIR => "/var/db/saiife-run",
+        SOCKET => "/var/db/saiife-run/saiife.sock",
+        UNIT => "/Library/LaunchDaemons/com.saiife.saiifed.plist",
+        CLAUDE_MANAGED_DIR => "/Library/Application Support/ClaudeCode/managed-settings.d",
+        CLAUDE_MANAGED => {
+            "/Library/Application Support/ClaudeCode/managed-settings.d/50-saiife.json"
+        }
+        CLAUDE_MCP => {
+            "/Library/Application Support/ClaudeCode/managed-settings.d/60-saiife-mcp.json"
+        }
+        GEMINI_DIR => "/Library/Application Support/GeminiCli",
+        GEMINI_SETTINGS => "/Library/Application Support/GeminiCli/settings.json",
+        _ => return None,
+    })
+}
+
 /// Where the locked-mode tree lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// Canonical (symlinks and `..` resolved) when `resolved`.
     root: PathBuf,
     resolved: bool,
+    platform: Platform,
+}
+
+/// The platform `Layout::system()` and `Layout::under` use.
+fn host_platform() -> Platform {
+    Platform::current().unwrap_or(Platform::Linux)
 }
 
 impl Layout {
@@ -95,6 +166,7 @@ impl Layout {
         Layout {
             root: PathBuf::from("/"),
             resolved: true,
+            platform: host_platform(),
         }
     }
 
@@ -105,16 +177,66 @@ impl Layout {
     /// When it cannot be resolved (`..` below a missing directory),
     /// [`Layout::is_resolved`] is false and `host_for` refuses it.
     pub fn under(root: impl Into<PathBuf>) -> Layout {
+        Layout::under_for(root, host_platform())
+    }
+
+    /// [`Layout::under`] with `platform`'s paths, so Linux tests can drive
+    /// the macOS tree.
+    pub fn under_for(root: impl Into<PathBuf>, platform: Platform) -> Layout {
         let raw = root.into();
         match resolve_root(&raw) {
             Some(root) => Layout {
                 root,
                 resolved: true,
+                platform,
             },
             None => Layout {
                 root: raw,
                 resolved: false,
+                platform,
             },
+        }
+    }
+
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// The path constant `abs` (spelled as on Linux) as this platform
+    /// names it, without the root.
+    pub fn logical<'a>(&self, abs: &'a str) -> &'a str {
+        match self.platform {
+            Platform::Linux => abs,
+            Platform::Macos => macos_path(abs).unwrap_or(abs),
+        }
+    }
+
+    pub fn daemon_user(&self) -> &'static str {
+        match self.platform {
+            Platform::Linux => DAEMON_USER,
+            Platform::Macos => MACOS_DAEMON_USER,
+        }
+    }
+
+    pub fn daemon_group(&self) -> &'static str {
+        match self.platform {
+            Platform::Linux => DAEMON_GROUP,
+            Platform::Macos => MACOS_DAEMON_GROUP,
+        }
+    }
+
+    pub fn audit_group(&self) -> &'static str {
+        match self.platform {
+            Platform::Linux => AUDIT_GROUP,
+            Platform::Macos => MACOS_AUDIT_GROUP,
+        }
+    }
+
+    /// The systemd unit, or the launchd label on macOS.
+    pub fn unit_name(&self) -> &'static str {
+        match self.platform {
+            Platform::Linux => UNIT_NAME,
+            Platform::Macos => LAUNCHD_LABEL,
         }
     }
 
@@ -132,16 +254,19 @@ impl Layout {
         self.resolved && self.root == Path::new("/")
     }
 
-    /// `abs` (one of the path constants) below the root. Panics on a path
-    /// that could leave the root; use [`Layout::try_at`] for any path that
-    /// is not a constant of this module.
+    /// `abs` (one of the path constants) below the root, as this platform
+    /// names it ([`macos_path`]). Panics on a path that could leave the
+    /// root; use [`Layout::try_at`] for any path that is not a constant of
+    /// this module (it is joined as given, never mapped).
     pub fn at(&self, abs: &str) -> PathBuf {
-        self.try_at(Path::new(abs))
+        self.try_at(Path::new(self.logical(abs)))
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// `abs` below the root. `abs` must be absolute with plain components
     /// only (no `..`, no `.`), so the result never leaves the root.
+    /// Never pass a layout constant: it is joined as given, never mapped,
+    /// so map it with [`Layout::logical`] first (or use [`Layout::at`]).
     pub fn try_at(&self, abs: &Path) -> io::Result<PathBuf> {
         let mut parts = abs.components();
         let rooted = parts.next() == Some(Component::RootDir);
@@ -199,6 +324,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn under_joins_every_path() {
         let l = Layout::under("/x");
         assert_eq!(l.root(), Path::new("/x"));
@@ -215,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn system_layout_is_the_real_paths() {
         let l = Layout::system();
         assert!(l.is_system());
@@ -326,5 +453,171 @@ mod tests {
         assert_eq!(FLEET_INSTALL, "/etc/saiife/fleet/install.toml");
         #[cfg(target_os = "linux")]
         assert_eq!(PACKAGE_BINARY, "/usr/libexec/saiife/saiife");
+    }
+
+    /// The Linux constants that differ on macOS, with their §5.3 value.
+    const MACOS_TABLE: [(&str, &str); 12] = [
+        (STATE_DIR, "/var/db/saiife"),
+        (KEYS_DIR, "/var/db/saiife/keys"),
+        (AUDIT_KEY, "/var/db/saiife/keys/audit.ed25519"),
+        (VAULT_KEY, "/var/db/saiife/keys/vault.key"),
+        (RUN_DIR, "/var/db/saiife-run"),
+        (SOCKET, "/var/db/saiife-run/saiife.sock"),
+        (UNIT, "/Library/LaunchDaemons/com.saiife.saiifed.plist"),
+        (
+            CLAUDE_MANAGED_DIR,
+            "/Library/Application Support/ClaudeCode/managed-settings.d",
+        ),
+        (
+            CLAUDE_MANAGED,
+            "/Library/Application Support/ClaudeCode/managed-settings.d/50-saiife.json",
+        ),
+        (
+            CLAUDE_MCP,
+            "/Library/Application Support/ClaudeCode/managed-settings.d/60-saiife-mcp.json",
+        ),
+        (GEMINI_DIR, "/Library/Application Support/GeminiCli"),
+        (
+            GEMINI_SETTINGS,
+            "/Library/Application Support/GeminiCli/settings.json",
+        ),
+    ];
+
+    /// Every path constant of this module.
+    const ALL_PATHS: [&str; 27] = [
+        OPT_DIR,
+        BIN_DIR,
+        BINARY,
+        ETC_DIR,
+        CONFIG,
+        POLICY_D,
+        CREDSTORE,
+        VAULT_KEY,
+        INSTALLED,
+        POLKIT_DIR,
+        POLKIT_ACTION,
+        PKCHECK,
+        UNIT,
+        STATE_DIR,
+        KEYS_DIR,
+        AUDIT_KEY,
+        LOG_DIR,
+        AUDIT_DIR,
+        RUN_DIR,
+        SOCKET,
+        CLAUDE_MANAGED_DIR,
+        CLAUDE_MANAGED,
+        CLAUDE_MCP,
+        CODEX_DIR,
+        CODEX_REQUIREMENTS,
+        GEMINI_DIR,
+        GEMINI_SETTINGS,
+    ];
+
+    fn differs(p: &str) -> bool {
+        MACOS_TABLE.iter().any(|(l, _)| *l == p)
+    }
+
+    #[test]
+    fn macos_paths_are_spec_values() {
+        for (linux, mac) in MACOS_TABLE {
+            assert_eq!(macos_path(linux), Some(mac), "{linux}");
+        }
+        for p in ALL_PATHS.into_iter().filter(|p| !differs(p)) {
+            assert_eq!(macos_path(p), None, "{p} is the same on macOS");
+        }
+        assert_eq!(macos_path("/etc/saiife/other"), None);
+        assert_eq!(DAEMON_LOG, "/var/log/saiife/daemon.log");
+        assert_eq!(
+            CLAUDE_MDM_PROFILE,
+            "/Library/Managed Preferences/com.anthropic.claudecode.plist"
+        );
+        assert_eq!(MACOS_DAEMON_USER, "_saiife");
+        assert_eq!(MACOS_DAEMON_GROUP, "_saiife");
+        assert_eq!(MACOS_AUDIT_GROUP, "_saiifeaudit");
+        assert_eq!(LAUNCHD_LABEL, "com.saiife.saiifed");
+    }
+
+    #[test]
+    fn under_for_macos_maps_every_differing_constant() {
+        let l = Layout::under_for("/x", Platform::Macos);
+        assert_eq!(l.platform(), Platform::Macos);
+        assert!(!l.is_system());
+        for (linux, mac) in MACOS_TABLE {
+            assert_eq!(l.at(linux), Path::new("/x").join(&mac[1..]), "{linux}");
+        }
+        for p in ALL_PATHS.into_iter().filter(|p| !differs(p)) {
+            assert_eq!(l.at(p), Path::new("/x").join(&p[1..]), "{p}");
+        }
+        assert_eq!(
+            l.managed_file(Agent::Claude),
+            Path::new(
+                "/x/Library/Application Support/ClaudeCode/managed-settings.d/50-saiife.json"
+            )
+        );
+        assert_eq!(
+            l.managed_file(Agent::Gemini),
+            Path::new("/x/Library/Application Support/GeminiCli/settings.json")
+        );
+        assert_eq!(
+            l.managed_file(Agent::Codex),
+            Path::new("/x/etc/codex/requirements.toml")
+        );
+        // `try_at` joins as given: it is for paths that are not constants.
+        assert_eq!(
+            l.try_at(Path::new(STATE_DIR)).unwrap(),
+            Path::new("/x/var/lib/saiife")
+        );
+        let sys = Layout::under_for("/", Platform::Macos);
+        assert!(sys.is_system());
+        assert_eq!(sys.at(SOCKET), Path::new("/var/db/saiife-run/saiife.sock"));
+    }
+
+    #[test]
+    fn linux_layout_unchanged() {
+        let l = Layout::under_for("/x", Platform::Linux);
+        assert_eq!(l.platform(), Platform::Linux);
+        for p in ALL_PATHS {
+            assert_eq!(l.at(p), Path::new("/x").join(&p[1..]), "{p}");
+            assert_eq!(l.logical(p), p);
+        }
+        let sys = Layout::under_for("/", Platform::Linux);
+        assert!(sys.is_system());
+        assert_eq!(sys.at(AUDIT_KEY), Path::new(AUDIT_KEY));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(Layout::system().platform(), Platform::Linux);
+            assert_eq!(Layout::under("/x"), l);
+        }
+    }
+
+    #[test]
+    fn names_per_platform() {
+        assert_eq!(Platform::Linux.name(), "linux");
+        assert_eq!(Platform::Macos.name(), "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(Platform::current(), Some(Platform::Linux));
+        #[cfg(target_os = "macos")]
+        assert_eq!(Platform::current(), Some(Platform::Macos));
+        let l = Layout::under_for("/x", Platform::Linux);
+        assert_eq!(
+            (
+                l.daemon_user(),
+                l.daemon_group(),
+                l.audit_group(),
+                l.unit_name()
+            ),
+            ("saiife", "saiife", "saiife-audit", "saiifed.service")
+        );
+        let m = Layout::under_for("/x", Platform::Macos);
+        assert_eq!(
+            (
+                m.daemon_user(),
+                m.daemon_group(),
+                m.audit_group(),
+                m.unit_name()
+            ),
+            ("_saiife", "_saiife", "_saiifeaudit", "com.saiife.saiifed")
+        );
     }
 }

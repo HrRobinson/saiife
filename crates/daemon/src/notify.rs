@@ -1,10 +1,10 @@
-//! systemd readiness: one `READY=1` datagram to `NOTIFY_SOCKET`.
+//! systemd readiness: one `READY=1` datagram to `NOTIFY_SOCKET`. launchd
+//! sets no `NOTIFY_SOCKET`, so on macOS this does nothing unless it is set.
 
 use std::ffi::OsStr;
 use std::io;
-use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::{SocketAddr, UnixDatagram};
+use std::os::unix::net::UnixDatagram;
 
 /// Send `READY=1` when `NOTIFY_SOCKET` is set; otherwise do nothing.
 pub fn ready() {
@@ -21,15 +21,30 @@ pub fn ready_to(socket: Option<&OsStr>) -> io::Result<()> {
     };
     let tx = UnixDatagram::unbound()?;
     match socket.as_bytes().strip_prefix(b"@") {
-        Some(name) => {
-            let addr = SocketAddr::from_abstract_name(name)?;
-            tx.send_to_addr(b"READY=1", &addr)?;
-        }
+        Some(name) => send_abstract(&tx, name)?,
         None => {
             tx.send_to(b"READY=1", socket)?;
         }
     }
     Ok(())
+}
+
+/// `READY=1` to an abstract socket (Linux only).
+#[cfg(target_os = "linux")]
+fn send_abstract(tx: &UnixDatagram, name: &[u8]) -> io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+    tx.send_to_addr(b"READY=1", &addr).map(|_| ())
+}
+
+/// Abstract sockets exist only on Linux.
+#[cfg(not(target_os = "linux"))]
+fn send_abstract(tx: &UnixDatagram, name: &[u8]) -> io::Result<()> {
+    let _ = (tx, name);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "abstract sockets need Linux",
+    ))
 }
 
 #[cfg(test)]
@@ -50,6 +65,7 @@ mod tests {
         assert_eq!(&buf[..n], b"READY=1");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn ready_sends_to_abstract_socket() {
         use std::os::linux::net::SocketAddrExt;

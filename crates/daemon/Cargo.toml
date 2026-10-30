@@ -27,12 +27,12 @@ saiife-keychain = { path = "../keychain" }
 # zeroize 1.9.1 is from 2026-10-06.
 zeroize = { version = "=1.9.1", features = ["serde"] }
 
-# The daemon is Linux-only in this version (decision 2); on other platforms
-# the crate builds a stub `run` and links no runtime.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The daemon runs on Linux and macOS (plan 13); on other platforms the crate
+# builds a stub `run` and links no runtime.
+[target.'cfg(unix)'.dependencies]
 # 1.53.3 and later are younger than 14 days (2026-10-22).
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros", "process"] }
-rustix = { version = "1", features = ["fs", "process", "net"] }
+rustix = { version = "1", features = ["fs", "process", "net", "system"] }
 saiife-system = { path = "../system" }
 # The MCP gateway's JSON-RPC client side (plan 17, Task 6).
 saiife-mcp = { path = "../mcp" }
@@ -56,10 +56,15 @@ sha2 = "0.10"
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 
+# macOS session attribution reads `sysctl(KERN_PROC_PID)` through the one
+# unsafe crate (plan 13, decision 1).
+[target.'cfg(target_os = "macos")'.dependencies]
+saiife-darwin = { path = "../darwin" }
+
 [dev-dependencies]
 tempfile = "3"
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 # The gateway tests: a hyper client over the socket and a loopback TLS
 # upstream; versions as in saiife-broker.
 tokio = { version = "=1.53.2", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
@@ -67,3 +72,6 @@ hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
+[lints]
+workspace = true

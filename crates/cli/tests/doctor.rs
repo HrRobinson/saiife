@@ -4,6 +4,7 @@
 mod common;
 
 use assert_cmd::Command;
+#[cfg(target_os = "linux")]
 use serde_json::Value;
 use std::path::Path;
 
@@ -21,6 +22,7 @@ fn doctor(root: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+#[cfg(target_os = "linux")]
 fn check<'v>(report: &'v Value, id: &str) -> &'v Value {
     report["checks"]
         .as_array()
@@ -30,6 +32,11 @@ fn check<'v>(report: &'v Value, id: &str) -> &'v Value {
         .unwrap_or_else(|| panic!("no check {id} in {report:#}"))
 }
 
+/// `fake_install` makes the Linux tree, and `--root` takes the build
+/// host's layout: on macOS the paths differ, so Linux only. The macOS
+/// doctor runs against a macOS tree in saiife-system (`macos_tests`) and on
+/// a real Mac in the locked-macos job.
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_json_exit_matches_report() {
     let tmp = tempfile::tempdir().unwrap();
@@ -109,6 +116,11 @@ fn doctor_user_other_than_self_needs_root() {
     assert!(out.stdout.is_empty());
 }
 
+/// `fake_install` makes the Linux tree, and `--root` takes the build
+/// host's layout: on macOS the paths differ, so Linux only. The macOS
+/// doctor runs against a macOS tree in saiife-system (`macos_tests`) and on
+/// a real Mac in the locked-macos job.
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_output_escapes_hostile_names() {
     use std::os::unix::fs::PermissionsExt;
@@ -147,7 +159,8 @@ fn doctor_user_name_is_escaped() {
 }
 
 /// The secret is never printed. The per-user host checks (the `.secrets`
-/// finding) run on Linux only.
+/// finding) run on Linux only. Linux only for the reason above.
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_as_user_checks_self() {
     let tmp = tempfile::tempdir().unwrap();

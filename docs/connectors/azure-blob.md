@@ -131,7 +131,7 @@ so it is denied with the rule `body_not_displayable`. Put such uploads under
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches Blob Storage only through
+In locked mode (Linux and macOS) the agent user reaches Blob Storage only through
 `saiifed`. The client secret lives in the daemon's vault (`saiife secret add
 azure-storage --kind azure_sp --service blob`); the secret and every minted
 token are masked in answers and never reach the agent's environment, files or

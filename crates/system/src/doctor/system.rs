@@ -5,9 +5,12 @@
 
 use super::report::{Check, Status};
 use super::Ctx;
+use crate::host::SECURITY;
+use crate::install::MACOS_TOOL_TIMEOUT;
+use crate::launchd;
 use crate::layout::*;
 use crate::supported::{check_supported, Support};
-use saiife_agents::lock::{label, LockLabel};
+use saiife_agents::lock::{label_for, LockLabel};
 use saiife_agents::Agent;
 use saiife_audit::sign::{judge, Kind};
 use saiife_policy::installed::{FileKind, Installed, VaultKeyMode};
@@ -39,6 +42,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         ));
         return out;
     }
+    if mac(ctx) {
+        out.push(sip_check(ctx.host.sip_enabled(), crate::sip::seam_set()));
+    }
     out.push(install_record(ctx));
     out.push(config_valid(ctx));
     out.push(paths_owner(ctx));
@@ -60,7 +66,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         if i.agents.is_empty() {
             out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
         }
-        out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
+        out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
     }
     if let Ok(p) = &ctx.config {
         // A listed `saiife` changes nothing on Claude Code (pinned by
@@ -86,17 +92,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.extend(cloud_sts(&p.config));
     }
     if let Some(i) = &ctx.installed {
-        out.push(Check::new(
-            "vault.key",
-            Status::Info,
-            "vault key",
-            match i.vault_key {
-                VaultKeyMode::Credential => "encrypted systemd credential",
-                VaultKeyMode::File => "plain key file (systemd < 250)",
-            },
-        ));
+        out.push(vault_key(ctx, i));
+        out.extend(claude_mdm(ctx, i));
     }
-    out.push(peer_pidfd());
+    out.push(peer_pidfd(ctx));
     out.push(reauth(ctx));
     out.push(Check::new(
         "forwarding",
@@ -105,6 +104,90 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         forwarding_detail(&ctx.config),
     ));
     out
+}
+
+/// The vault key's mode on record, which must be the platform's.
+fn vault_key(ctx: &Ctx, i: &Installed) -> Check {
+    const TITLE: &str = "vault key";
+    let text = match i.vault_key {
+        VaultKeyMode::Credential => "encrypted systemd credential",
+        VaultKeyMode::File => "plain key file (systemd < 250)",
+        VaultKeyMode::DaemonFile => {
+            return if mac(ctx) {
+                Check::new(
+                    "vault.key",
+                    Status::Info,
+                    TITLE,
+                    format!("daemon key file, 0400 {}", ctx.layout.daemon_user()),
+                )
+            } else {
+                Check::new(
+                    "vault.key",
+                    Status::Fail,
+                    TITLE,
+                    "the install record holds a macOS vault key mode on Linux",
+                )
+            };
+        }
+    };
+    if mac(ctx) {
+        Check::new(
+            "vault.key",
+            Status::Fail,
+            TITLE,
+            format!("the install record holds a Linux vault key mode ({text}) on macOS"),
+        )
+    } else {
+        Check::new("vault.key", Status::Info, TITLE, text)
+    }
+}
+
+/// An MDM profile may also deliver Claude Code managed settings, and then
+/// Claude Code may ignore the drop-in directory saiife writes.
+fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
+    if !mac(ctx) || !i.agents.iter().any(|a| a.agent == "claude") {
+        return None;
+    }
+    let at = ctx.layout.at(CLAUDE_MDM_PROFILE);
+    fs::symlink_metadata(at).ok()?;
+    Some(Check::new(
+        "agents.claude.mdm",
+        Status::Warn,
+        "Claude Code managed settings",
+        format!(
+            "an MDM profile sets Claude Code managed settings ({CLAUDE_MDM_PROFILE}); \
+             Claude Code may ignore saiife's managed-settings.d drop-in"
+        ),
+    ))
+}
+
+/// Whether this layout is macOS's.
+/// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
+/// otherwise ([`crate::sip::SIP_REQUIRED`]); a test build with the seam
+/// reports Warn instead.
+fn sip_check(enabled: bool, seam: bool) -> Check {
+    use crate::sip::{verdict, SipVerdict, SIP_BYPASSED, SIP_REQUIRED};
+    const ID: &str = "system.sip";
+    const TITLE: &str = "System Integrity Protection";
+    match verdict(enabled, seam) {
+        SipVerdict::Enabled => Check::new(ID, Status::Pass, TITLE, "enabled"),
+        SipVerdict::Bypassed => Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!("not enabled {SIP_BYPASSED}: {SIP_REQUIRED}"),
+        ),
+        SipVerdict::Required => Check::new(ID, Status::Fail, TITLE, SIP_REQUIRED),
+    }
+}
+
+fn mac(ctx: &Ctx) -> bool {
+    ctx.layout.platform() == Platform::Macos
+}
+
+/// A path constant as this platform names it.
+fn shown<'a>(ctx: &Ctx, c: &'a str) -> &'a str {
+    ctx.layout.logical(c)
 }
 
 /// One `warn` per service in STS mode (plan 15): `run --cloud` hands a
@@ -231,7 +314,7 @@ fn lstat(ctx: &Ctx, shown: &str, path: &Path, t: &mut Tally) -> Stat {
 /// other value is taken as written (a test or `--root` config names its
 /// own absolute paths).
 fn configured(ctx: &Ctx, value: &Path, default: &str) -> PathBuf {
-    if value == Path::new(default) {
+    if value == Path::new(default) || value == Path::new(ctx.layout.logical(default)) {
         ctx.layout.at(default)
     } else {
         value.to_path_buf()
@@ -244,7 +327,7 @@ fn socket_dir(ctx: &Ctx) -> (String, PathBuf) {
             let v = &p.config.daemon.socket_dir;
             (v.display().to_string(), configured(ctx, v, RUN_DIR))
         }
-        Err(_) => (RUN_DIR.to_string(), ctx.layout.at(RUN_DIR)),
+        Err(_) => (shown(ctx, RUN_DIR).to_string(), ctx.layout.at(RUN_DIR)),
     }
 }
 
@@ -254,7 +337,7 @@ fn audit_dir(ctx: &Ctx) -> (String, PathBuf) {
             let v = &p.config.audit.dir;
             (v.display().to_string(), configured(ctx, v, AUDIT_DIR))
         }
-        Err(_) => (AUDIT_DIR.to_string(), ctx.layout.at(AUDIT_DIR)),
+        Err(_) => (shown(ctx, AUDIT_DIR).to_string(), ctx.layout.at(AUDIT_DIR)),
     }
 }
 
@@ -282,7 +365,11 @@ fn supported(ctx: &Ctx) -> Check {
             "system.supported",
             Status::Pass,
             TITLE,
-            format!("{distro}, systemd {systemd}"),
+            if mac(ctx) {
+                format!("{distro}, launchd")
+            } else {
+                format!("{distro}, systemd {systemd}")
+            },
         ),
         // Without locked mode installed, an unsupported machine is only a
         // fact: developer mode does not need it.
@@ -490,6 +577,9 @@ fn files_binary(ctx: &Ctx) -> Check {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return fail(format!("{BINARY}: missing")),
         Err(e) => return fail(format!("{BINARY}: cannot read: {e}")),
     };
+    if mac(ctx) {
+        return macho_binary(&bytes);
+    }
     let info = match inspect(&bytes) {
         Ok(i) => i,
         Err(e) => return fail(format!("{BINARY}: not a static ELF executable ({e})")),
@@ -517,6 +607,55 @@ fn files_binary(ctx: &Ctx) -> Check {
             TITLE,
             format!("{BINARY}: no saiife build marker; its build is unknown"),
         ),
+    }
+}
+
+/// The macOS binary (spec 5.3): code-signed with the hardened runtime, so
+/// `DYLD_INSERT_LIBRARIES` is ignored. Without the runtime, or unsigned, it
+/// fails. An ad-hoc signature (or none the certificate chain backs) warns:
+/// the file's claimed flags are read, the signature is not verified.
+fn macho_binary(bytes: &[u8]) -> Check {
+    use crate::binary::{inspect_macho, Profile, Signature};
+    const ID: &str = "files.binary";
+    const TITLE: &str = "installed binary";
+    let fail = |d: String| Check::new(ID, Status::Fail, TITLE, d);
+    let info = match inspect_macho(bytes) {
+        Ok(i) => i,
+        Err(e) => return fail(format!("{BINARY}: not a thin Mach-O executable ({e})")),
+    };
+    if info.signature == Signature::Unsigned {
+        return fail(format!("{BINARY}: it is not code-signed"));
+    }
+    if !info.hardened_runtime {
+        return fail(format!(
+            "{BINARY}: signed without the hardened runtime: an agent could inject code into \
+             the managed hook through DYLD_INSERT_LIBRARIES; sign with the hardened runtime"
+        ));
+    }
+    let mut notes = info.warnings();
+    match info.profile {
+        Profile::Release => {}
+        Profile::DebugAssertions => notes.push(
+            "test build installed: debug assertions are on (the SAIIFE_EVAL_FAULT test seam \
+             can hang the guard); install the release build"
+                .to_string(),
+        ),
+        Profile::Unknown => notes.push("no saiife build marker; its build is unknown".to_string()),
+    }
+    if notes.is_empty() {
+        Check::new(
+            ID,
+            Status::Pass,
+            TITLE,
+            "release build, hardened runtime, code-signed",
+        )
+    } else {
+        Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!("{BINARY}: {}", notes.join("; ")),
+        )
     }
 }
 
@@ -571,6 +710,9 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
 fn reauth(ctx: &Ctx) -> Check {
     const ID: &str = "reauth";
     const TITLE: &str = "re-authentication";
+    if mac(ctx) {
+        return auth_right(ctx);
+    }
     let (rules, unreadable) = crate::polkit::scan_rules(ctx.layout);
     let problems = crate::polkit::action_problems(ctx.layout, ctx.host);
     let sound = crate::polkit::polkit_present(ctx.layout, ctx.host) && problems.is_empty();
@@ -594,6 +736,42 @@ fn reauth(ctx: &Ctx) -> Check {
     } else {
         Check::new(ID, Status::Warn, TITLE, notes.join("; "))
     }
+}
+
+/// macOS: the authorization right `com.saiife.approve` is registered as
+/// installed (asks the session owner every time). Read through the host
+/// (`security authorizationdb read`); doctor never writes it.
+/// Same-user approval is off on macOS on purpose ([`MAC_SAME_USER_OFF`]):
+/// the prompt cannot show what is being approved, so `same_user = "reauth"`
+/// acts as `deny`.
+fn auth_right(ctx: &Ctx) -> Check {
+    use crate::authright::{read_args, read_ok, RIGHT};
+    const ID: &str = "reauth";
+    const TITLE: &str = "re-authentication";
+    let why = match ctx.host.run(SECURITY, &read_args(), MACOS_TOOL_TIMEOUT) {
+        Ok(o) if o.status == 0 => match read_ok(&o.stdout) {
+            Ok(()) => {
+                return Check::new(
+                    ID,
+                    Status::Info,
+                    TITLE,
+                    format!("{MAC_SAME_USER_OFF}; authorization right {RIGHT} is registered"),
+                )
+            }
+            Err(e) => format!("weakened: {e}"),
+        },
+        Ok(o) => format!(
+            "the right {RIGHT} is missing (authorizationdb read exited {})",
+            o.status
+        ),
+        Err(e) => format!("the right {RIGHT} could not be read: {e}"),
+    };
+    Check::new(
+        ID,
+        Status::Warn,
+        TITLE,
+        format!("{MAC_SAME_USER_OFF}; {REAUTH_UNAVAILABLE}; {why}"),
+    )
 }
 
 fn files_installed(ctx: &Ctx, i: &Installed) -> Check {
@@ -654,6 +832,8 @@ struct Want {
     /// Made by the running daemon (systemd's `RuntimeDirectory=`): absent
     /// while it is stopped, which `daemon.health` reports.
     while_running: bool,
+    /// The group is not compared (another check reports it).
+    loose_group: bool,
 }
 
 fn want(
@@ -672,6 +852,7 @@ fn want(
         mode,
         ty,
         while_running,
+        loose_group: false,
     }
 }
 
@@ -684,37 +865,42 @@ fn files_modes(ctx: &Ctx) -> Check {
     let (sock_shown, sock_at) = socket_dir(ctx);
     let socket_shown = format!("{}/saiife.sock", sock_shown.trim_end_matches('/'));
     let socket_at = sock_at.join("saiife.sock");
-    let daemon = (DAEMON_USER, DAEMON_GROUP);
-    let root = ("root", "root");
+    let (du, dg, ag) = (
+        ctx.layout.daemon_user(),
+        ctx.layout.daemon_group(),
+        ctx.layout.audit_group(),
+    );
+    let daemon = (du, dg);
+    let root = ("root", if mac(ctx) { "wheel" } else { "root" });
+    let sh = |c: &'static str| shown(ctx, c);
+    let mut audit = want(&audit_shown, audit_at, (du, ag), 0o2750, Ty::Dir, false);
+    // On macOS a missing or wrong audit group is a warning of its own
+    // (`daemon.audit_group`): the month files would end up in `wheel`.
+    audit.loose_group = mac(ctx);
     let mut wants = vec![
-        want(STATE_DIR, l(STATE_DIR), daemon, 0o700, Ty::Dir, false),
-        want(KEYS_DIR, l(KEYS_DIR), daemon, 0o700, Ty::Dir, false),
-        want(AUDIT_KEY, l(AUDIT_KEY), daemon, 0o600, Ty::File, false),
-        want(
-            &audit_shown,
-            audit_at,
-            (DAEMON_USER, AUDIT_GROUP),
-            0o2750,
-            Ty::Dir,
-            false,
-        ),
+        want(sh(STATE_DIR), l(STATE_DIR), daemon, 0o700, Ty::Dir, false),
+        want(sh(KEYS_DIR), l(KEYS_DIR), daemon, 0o700, Ty::Dir, false),
+        want(sh(AUDIT_KEY), l(AUDIT_KEY), daemon, 0o600, Ty::File, false),
+        audit,
         want(&sock_shown, sock_at, daemon, 0o755, Ty::Dir, true),
         want(&socket_shown, socket_at, daemon, 0o666, Ty::Socket, true),
     ];
     if let Some(i) = &ctx.installed {
+        let vault = sh(VAULT_KEY);
         wants.push(match i.vault_key {
-            VaultKeyMode::Credential => want(VAULT_KEY, l(VAULT_KEY), root, 0o600, Ty::File, false),
+            VaultKeyMode::Credential => want(vault, l(VAULT_KEY), root, 0o600, Ty::File, false),
             VaultKeyMode::File => want(
-                VAULT_KEY,
+                vault,
                 l(VAULT_KEY),
                 ("root", DAEMON_GROUP),
                 0o640,
                 Ty::File,
                 false,
             ),
+            VaultKeyMode::DaemonFile => want(vault, l(VAULT_KEY), daemon, 0o400, Ty::File, false),
         });
     }
-    wants.push(want(UNIT, l(UNIT), root, 0o644, Ty::File, false));
+    wants.push(want(sh(UNIT), l(UNIT), root, 0o644, Ty::File, false));
 
     for w in &wants {
         let m = match lstat(ctx, &w.shown, &w.at, &mut t) {
@@ -727,7 +913,11 @@ fn files_modes(ctx: &Ctx) -> Check {
             Stat::Skipped => continue,
         };
         let uid = ctx.host.user(w.user).map(|u| u.uid);
-        let gid = ctx.host.group_id(w.group);
+        let gid = if w.loose_group {
+            Some(m.gid())
+        } else {
+            ctx.host.group_id(w.group)
+        };
         let (Some(uid), Some(gid)) = (uid, gid) else {
             if uid.is_none() {
                 t.bad(format!("user {} does not exist", w.user));
@@ -766,12 +956,14 @@ fn keys(ctx: &Ctx) -> Check {
     const ID: &str = "keys";
     const TITLE: &str = "audit signing key";
     let mut t = Tally::default();
-    let Some(owner) = ctx.host.user(DAEMON_USER).map(|u| u.uid) else {
-        t.bad(format!("user {DAEMON_USER} does not exist"));
+    let du = ctx.layout.daemon_user();
+    let (keys_dir, audit_key) = (shown(ctx, KEYS_DIR), shown(ctx, AUDIT_KEY));
+    let Some(owner) = ctx.host.user(du).map(|u| u.uid) else {
+        t.bad(format!("user {du} does not exist"));
         return t.check(ID, TITLE);
     };
     let keys_at = ctx.layout.at(KEYS_DIR);
-    match lstat(ctx, KEYS_DIR, &keys_at, &mut t) {
+    match lstat(ctx, keys_dir, &keys_at, &mut t) {
         Stat::Found(m) => {
             if let Err(e) = judge(&keys_at, Kind::KeyDir, m.uid(), m.mode(), owner) {
                 t.bad(e.to_string());
@@ -779,51 +971,76 @@ fn keys(ctx: &Ctx) -> Check {
             }
         }
         Stat::Missing => {
-            t.bad(format!("{KEYS_DIR}: missing"));
+            t.bad(format!("{keys_dir}: missing"));
             return t.check(ID, TITLE);
         }
         Stat::Skipped => return t.check(ID, TITLE),
     }
     let key_at = ctx.layout.at(AUDIT_KEY);
-    match lstat(ctx, AUDIT_KEY, &key_at, &mut t) {
+    match lstat(ctx, audit_key, &key_at, &mut t) {
         Stat::Found(m) => {
             if let Err(e) = judge(&key_at, Kind::KeyFile, m.uid(), m.mode(), owner) {
                 t.bad(e.to_string());
             } else if m.len() != KEY_LEN {
                 t.bad(format!(
-                    "{AUDIT_KEY}: is {} bytes, must be {KEY_LEN} bytes",
+                    "{audit_key}: is {} bytes, must be {KEY_LEN} bytes",
                     m.len()
                 ));
             }
         }
-        Stat::Missing => t.bad(format!("{AUDIT_KEY}: missing")),
+        Stat::Missing => t.bad(format!("{audit_key}: missing")),
         Stat::Skipped => {}
     }
     t.check(ID, TITLE)
 }
 
-/// The daemon gives the audit dir to `saiife-audit` at start, which needs
-/// the daemon user in that group.
+/// The daemon gives the audit dir to the audit group at start, which needs
+/// the daemon user in that group. On macOS a missing group, or an audit
+/// dir in another group, is a warning: the month files then end up in
+/// `wheel`, which the audit readers cannot use.
 fn audit_group(ctx: &Ctx) -> Check {
     const ID: &str = "daemon.audit_group";
-    const TITLE: &str = "daemon user in saiife-audit";
-    let fail = |d: String| Check::new(ID, Status::Fail, TITLE, d);
-    let Some(user) = ctx.host.user(DAEMON_USER) else {
-        return fail(format!("user {DAEMON_USER} does not exist"));
+    let (du, ag) = (ctx.layout.daemon_user(), ctx.layout.audit_group());
+    let title = format!("daemon user in {ag}");
+    let fail = |d: String| Check::new(ID, Status::Fail, title.clone(), d);
+    let Some(user) = ctx.host.user(du) else {
+        return fail(format!("user {du} does not exist"));
     };
-    let (Some(gid), Some(members)) = (
-        ctx.host.group_id(AUDIT_GROUP),
-        ctx.host.group_members(AUDIT_GROUP),
-    ) else {
-        return fail(format!("group {AUDIT_GROUP} does not exist"));
+    let (Some(gid), Some(members)) = (ctx.host.group_id(ag), ctx.host.group_members(ag)) else {
+        let why = format!("group {ag} does not exist");
+        return if mac(ctx) {
+            Check::new(
+                ID,
+                Status::Warn,
+                title,
+                format!("{why}: the audit month files end up in group wheel"),
+            )
+        } else {
+            fail(why)
+        };
     };
-    if user.gid == gid || members.iter().any(|m| m == DAEMON_USER) {
-        Check::new(ID, Status::Pass, TITLE, "")
-    } else {
-        fail(format!(
-            "{DAEMON_USER} is not a member of {AUDIT_GROUP}: the daemon cannot give the audit log to {AUDIT_GROUP}"
-        ))
+    if !(user.gid == gid || members.iter().any(|m| m == du)) {
+        return fail(format!(
+            "{du} is not a member of {ag}: the daemon cannot give the audit log to {ag}"
+        ));
     }
+    if mac(ctx) {
+        let (dir_shown, dir_at) = audit_dir(ctx);
+        if let Ok(m) = fs::symlink_metadata(&dir_at) {
+            if m.gid() != gid {
+                return Check::new(
+                    ID,
+                    Status::Warn,
+                    title,
+                    format!(
+                        "{dir_shown} is in group {}, not {ag}: the audit month files end up in group wheel",
+                        m.gid()
+                    ),
+                );
+            }
+        }
+    }
+    Check::new(ID, Status::Pass, title, "")
 }
 
 /// No user but the daemon's is in the `saiife` group, listed in
@@ -832,21 +1049,33 @@ fn audit_group(ctx: &Ctx) -> Check {
 fn daemon_group(ctx: &Ctx) -> Check {
     const ID: &str = "daemon.group";
     const TITLE: &str = "saiife group holds only the daemon user";
-    let Some(gid) = ctx.host.group_id(DAEMON_GROUP) else {
+    let (du, dg) = (ctx.layout.daemon_user(), ctx.layout.daemon_group());
+    let Some(gid) = ctx.host.group_id(dg) else {
         return Check::new(
             ID,
             Status::Fail,
             TITLE,
-            format!("group {DAEMON_GROUP} does not exist"),
+            format!("group {dg} does not exist"),
         );
+    };
+    let primary = match ctx.host.users_with_primary_gid(gid) {
+        Ok(p) => p,
+        Err(e) => {
+            return Check::new(
+                ID,
+                Status::Fail,
+                TITLE,
+                format!("the members of group {dg} could not be read: {e}"),
+            )
+        }
     };
     let mut others: Vec<String> = ctx
         .host
-        .group_members(DAEMON_GROUP)
+        .group_members(dg)
         .unwrap_or_default()
         .into_iter()
-        .chain(ctx.host.users_with_primary_gid(gid))
-        .filter(|u| u != DAEMON_USER)
+        .chain(primary)
+        .filter(|u| u != du)
         .collect();
     others.sort();
     others.dedup();
@@ -858,7 +1087,7 @@ fn daemon_group(ctx: &Ctx) -> Check {
             Status::Fail,
             TITLE,
             format!(
-                "{} in group {DAEMON_GROUP}: they can read what the daemon's group can, including a plain vault key",
+                "{} in group {dg}: they can read what the daemon's group can, including a plain vault key",
                 others.join(", ")
             ),
         )
@@ -867,6 +1096,9 @@ fn daemon_group(ctx: &Ctx) -> Check {
 
 fn daemon_unit(ctx: &Ctx) -> Check {
     const TITLE: &str = "saiifed.service active";
+    if mac(ctx) {
+        return launchd_unit(ctx);
+    }
     match ctx.host.systemctl(&["is-active", UNIT_NAME]) {
         Ok(out) if out.stdout.trim() == "active" => {
             Check::new("daemon.unit", Status::Pass, TITLE, "")
@@ -887,7 +1119,39 @@ fn daemon_unit(ctx: &Ctx) -> Check {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// macOS: the plist is the one install recorded, and launchd has the job
+/// loaded (`launchctl print system/com.saiife.saiifed` exits 0).
+fn launchd_unit(ctx: &Ctx) -> Check {
+    const ID: &str = "daemon.unit";
+    const TITLE: &str = "saiifed loaded in launchd";
+    let fail = |d: String| Check::new(ID, Status::Fail, TITLE, d);
+    let plist = shown(ctx, UNIT);
+    let recorded = ctx
+        .installed
+        .as_ref()
+        .and_then(|i| i.files.iter().find(|f| f.kind == FileKind::Unit))
+        .and_then(|f| f.sha256.as_deref());
+    match (recorded, sha256_file(&ctx.layout.at(UNIT), MAX_FINGERPRINT)) {
+        (Some(want), Ok(got)) if want != got => {
+            return fail(format!("{plist}: differs from its install record"))
+        }
+        (None, _) => return fail(format!("{plist}: no fingerprint in the install record")),
+        (_, Err(e)) if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root => {}
+        (_, Err(e)) => return fail(format!("{plist}: cannot read: {e}")),
+        _ => {}
+    }
+    match ctx.host.launchctl(&["print", launchd::SERVICE]) {
+        Ok(o) if o.status == 0 => Check::new(ID, Status::Pass, TITLE, ""),
+        Ok(o) => fail(format!(
+            "launchctl print {}: exited {}: the daemon is not loaded",
+            launchd::SERVICE,
+            o.status
+        )),
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+#[cfg(unix)]
 fn daemon_health(ctx: &Ctx) -> Check {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
@@ -897,7 +1161,7 @@ fn daemon_health(ctx: &Ctx) -> Check {
     let fail = |d: String| Check::new("daemon.health", Status::Fail, TITLE, d);
     let user = match &ctx.config {
         Ok(p) => p.config.daemon.user.clone(),
-        Err(_) => DAEMON_USER.to_string(),
+        Err(_) => ctx.layout.daemon_user().to_string(),
     };
     let Some(uid) = ctx.host.user(&user).map(|u| u.uid) else {
         return fail(format!("daemon user {user} is not in /etc/passwd"));
@@ -928,16 +1192,6 @@ fn daemon_health(ctx: &Ctx) -> Check {
             show("head_seq"),
             show("last_checkpoint_seq")
         ),
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn daemon_health(_ctx: &Ctx) -> Check {
-    Check::new(
-        "daemon.health",
-        Status::Fail,
-        "daemon health",
-        crate::supported::NOT_LINUX,
     )
 }
 
@@ -976,7 +1230,7 @@ type McpStatus = Result<Vec<serde_json::Value>, String>;
 
 /// The daemon's `mcp` status list (`[{name, state, tools, since,
 /// last_error}]`), or why the daemon did not answer.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
@@ -984,7 +1238,7 @@ fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
     use std::time::{Duration, Instant};
     let user = match &ctx.config {
         Ok(p) => p.config.daemon.user.clone(),
-        Err(_) => DAEMON_USER.to_string(),
+        Err(_) => ctx.layout.daemon_user().to_string(),
     };
     let Some(uid) = ctx.host.user(&user).map(|u| u.uid) else {
         return Err(format!("daemon user {user} is not in /etc/passwd"));
@@ -1000,11 +1254,6 @@ fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn daemon_mcp_status(_ctx: &Ctx) -> McpStatus {
-    Err(crate::supported::NOT_LINUX.to_string())
-}
-
 /// The warning for `saiife` in `[guard.mcp] allow_servers` while an agent
 /// that does not pin its command (Codex, Gemini CLI) is installed: there
 /// the listing allows any server registered under that name.
@@ -1017,6 +1266,25 @@ pub fn unpinned_saiife(agent: &str) -> bool {
 }
 
 fn mcp_checks(ctx: &Ctx) -> Vec<Check> {
+    if mac(ctx) {
+        let mut out = vec![Check::new(
+            "mcp.landlock",
+            Status::Info,
+            "MCP gateway: Linux only in this version",
+            "",
+        )];
+        // The gateway checks do not apply; the agent checks do.
+        out.extend(
+            mcp_checks_with(ctx, &Ok(Vec::new()), 0)
+                .into_iter()
+                .filter(|c| {
+                    !(c.id == "mcp.landlock"
+                        || c.id == "mcp.sandbox"
+                        || c.id.starts_with("mcp.gateway."))
+                }),
+        );
+        return out;
+    }
     let has_gateway = ctx.config.as_ref().is_ok_and(|p| !p.config.mcp.is_empty());
     let (status, abi) = if has_gateway {
         (daemon_mcp_status(ctx), landlock_abi())
@@ -1204,26 +1472,25 @@ fn claude_allowlist(ctx: &Ctx, i: &Installed) -> Check {
     };
     let want = saiife_agents::claude::managed_mcp_settings(&p.config.guard.mcp.allow_servers);
     let warn = |d: String| Check::new(ID, Status::Warn, DRIFT, d);
+    let mcp = shown(ctx, CLAUDE_MCP);
     let at = ctx.layout.at(CLAUDE_MCP);
     let read = match fs::symlink_metadata(&at) {
         Ok(m) if m.is_file() && m.len() <= 1 << 20 => fs::read(&at),
-        Ok(_) => return warn(format!("{CLAUDE_MCP}: not a regular file of sane size")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return warn(format!("{CLAUDE_MCP}: missing"))
-        }
-        Err(e) => return warn(format!("{CLAUDE_MCP}: {e}")),
+        Ok(_) => return warn(format!("{mcp}: not a regular file of sane size")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return warn(format!("{mcp}: missing")),
+        Err(e) => return warn(format!("{mcp}: {e}")),
     };
     let got = match read {
         Ok(g) => g,
-        Err(e) => return warn(format!("{CLAUDE_MCP}: {e}")),
+        Err(e) => return warn(format!("{mcp}: {e}")),
     };
     if got != want.as_bytes() {
-        return warn(format!("{CLAUDE_MCP}: content differs from policy"));
+        return warn(format!("{mcp}: content differs from policy"));
     }
-    let recorded = i.files.iter().find(|f| f.path == Path::new(CLAUDE_MCP));
+    let recorded = i.files.iter().find(|f| f.path == Path::new(mcp));
     if let Some(want_sha) = recorded.and_then(|f| f.sha256.as_deref()) {
         if want_sha != crate::fsops::sha256_hex(&got) {
-            return warn(format!("{CLAUDE_MCP}: differs from its install record"));
+            return warn(format!("{mcp}: differs from its install record"));
         }
     }
     Check::new(
@@ -1234,11 +1501,13 @@ fn claude_allowlist(ctx: &Ctx, i: &Installed) -> Check {
     )
 }
 
-fn agent_label(name: &str) -> Check {
+/// The label recorded for the layout's platform (the host's, outside
+/// tests), so a macOS tree checked from Linux reads as a Mac reads it.
+fn agent_label(ctx: &Ctx, name: &str) -> Check {
     let id = format!("agents.{name}.label");
     match Agent::from_name(name) {
         Some(a) => {
-            let l = label(a);
+            let l = label_for(a, mac(ctx));
             let title = format!("{} lock label", a.label());
             let status = if l == LockLabel::Lockable {
                 Status::Pass
@@ -1266,7 +1535,15 @@ pub(crate) fn pidfd_release(release: &str) -> bool {
     }
 }
 
-fn peer_pidfd() -> Check {
+fn peer_pidfd(ctx: &Ctx) -> Check {
+    if mac(ctx) {
+        return Check::new(
+            "peer.pidfd",
+            Status::Info,
+            "peer identity",
+            "LOCAL_PEERCRED and LOCAL_PEERPID (the pid is used for attribution only)",
+        );
+    }
     let uname = rustix::system::uname();
     let release = uname.release().to_string_lossy();
     let linux = cfg!(target_os = "linux");
@@ -1332,7 +1609,8 @@ mod tests {
         }
 
         fn open(dir: TempDir) -> T {
-            let layout = Layout::under(dir.path());
+            // The Linux tree `fake_install` makes, whatever the build host.
+            let layout = Layout::under_for(dir.path(), Platform::Linux);
             let host = FakeHost::open(dir.path()).unwrap();
             T {
                 _dir: dir,
@@ -2025,18 +2303,22 @@ mod tests {
             .unwrap_or_else(|| panic!("no check {id}"))
     }
 
+    #[cfg(target_os = "linux")]
     fn with_server(t: &T, extra: &str) {
         t.append_config(&format!(
             "\n[mcp.fs]\ncommand = \"/usr/bin/true\"\n{extra}\n"
         ));
     }
 
+    #[cfg(target_os = "linux")]
     fn running(tools: u64) -> Result<Vec<serde_json::Value>, String> {
         Ok(vec![
             serde_json::json!({"name":"fs","state":"running","tools":tools,"since":"t","last_error":null}),
         ])
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_server_pass_with_tool_count() {
         let t = T::installed();
@@ -2053,6 +2335,8 @@ mod tests {
         assert!(cs.iter().all(|c| c.id != "mcp.fs"));
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_server_not_running_fails() {
         let t = T::installed();
@@ -2074,6 +2358,8 @@ mod tests {
         assert!(c.title.contains("daemon is unreachable"), "{c:?}");
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_landlock_fails_unless_off() {
         let t = T::installed();
@@ -2116,6 +2402,8 @@ mod tests {
         assert!(cs.iter().all(|c| c.id != "mcp.sandbox"), "{cs:?}");
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn npx_and_unowned_args_warn() {
         let t = T::installed();
@@ -2341,5 +2629,521 @@ mod tests {
         assert!(!super::pidfd_release("6.4.16"));
         assert!(!super::pidfd_release("5.15.0-91-generic"));
         assert!(!super::pidfd_release("junk"));
+    }
+}
+
+/// The macOS checks, on a tree `system install` made through the fake host
+/// (`Layout::under_for(.., Platform::Macos)`). Nothing here runs a macOS
+/// tool: the host answers from canned output.
+#[cfg(all(test, unix))]
+mod macos_tests {
+    use super::super::{run, DoctorOptions, Report, Status};
+    use crate::authright::{RIGHT, RIGHT_PLIST};
+    use crate::binary::fake_macho;
+    use crate::host::{CmdOutput, UserInfo, SECURITY};
+    use crate::install::macos_tests::{exit, mac_env, ok, MacEnv, PRINT};
+    use crate::layout::*;
+    use saiife_policy::installed::VaultKeyMode;
+    use saiife_policy::FixedDirectory;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn read_line() -> String {
+        format!("{SECURITY} authorizationdb read {RIGHT}")
+    }
+
+    /// A finished macOS install: the fake records chowns without applying
+    /// them, so the accounts take the ids the test user's files have.
+    fn installed() -> MacEnv {
+        let e = mac_env();
+        e.install();
+        e.settle();
+        // The first daemon start makes the audit key.
+        let key = e.layout.at(AUDIT_KEY);
+        fs::write(&key, [7u8; 32]).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let gid = rustix::process::getgid().as_raw();
+        e.host.set(|s| {
+            for g in [MACOS_DAEMON_GROUP, MACOS_AUDIT_GROUP] {
+                s.groups.insert(g.to_string(), gid);
+            }
+            s.users.get_mut(MACOS_DAEMON_USER).unwrap().gid = gid;
+            // launchd does not have the job yet.
+            s.run
+                .insert(PRINT.into(), exit(113, "Could not find service"));
+        });
+        e
+    }
+
+    fn doctor_with(e: &MacEnv, dir: &FixedDirectory, opts: &DoctorOptions) -> Report {
+        run(&e.layout, &e.host, dir, opts)
+    }
+
+    fn doctor(e: &MacEnv) -> Report {
+        doctor_with(
+            e,
+            &FixedDirectory::from_text("", ""),
+            &DoctorOptions::default(),
+        )
+    }
+
+    fn get<'r>(r: &'r Report, id: &str) -> &'r super::Check {
+        r.checks
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("no check {id} in\n{}", r.to_text()))
+    }
+
+    fn assert_status(r: &Report, id: &str, s: Status) {
+        let c = get(r, id);
+        assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
+    }
+
+    fn put_binary(e: &MacEnv, bytes: &[u8]) {
+        let p = e.layout.at(BINARY);
+        fs::write(&p, bytes).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn macos_doctor_after_fake_install_fails_only_daemon_checks() {
+        let e = installed();
+        let r = doctor(&e);
+        for id in [
+            "system.supported",
+            "install.record",
+            "config.valid",
+            "paths.owner",
+            "files.installed",
+            "files.binary",
+            "files.modes",
+            "keys",
+            "daemon.audit_group",
+            "daemon.group",
+        ] {
+            assert_status(&r, id, Status::Pass);
+        }
+        // No macOS lock-check recording yet: unverified on a macOS tree,
+        // whichever host checks it.
+        assert_status(&r, "agents.claude.label", Status::Warn);
+        assert_eq!(get(&r, "agents.claude.label").detail, "unverified");
+        assert_status(&r, "reauth", Status::Info);
+        let fails: Vec<&str> = r
+            .checks
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(fails, ["daemon.unit", "daemon.health"], "{}", r.to_text());
+        // macOS names and launchd, not systemd.
+        assert_eq!(get(&r, "system.supported").detail, "macOS 15.0, launchd");
+        assert_eq!(get(&r, "daemon.unit").title, "saiifed loaded in launchd");
+        assert!(get(&r, "daemon.unit").detail.contains(
+            "launchctl print system/com.saiife.saiifed: exited 113: the daemon is not loaded"
+        ));
+        assert_eq!(
+            get(&r, "daemon.audit_group").title,
+            "daemon user in _saiifeaudit"
+        );
+        assert_status(&r, "vault.key", Status::Info);
+        assert_eq!(get(&r, "vault.key").detail, "daemon key file, 0400 _saiife");
+        assert_eq!(
+            get(&r, "reauth").detail,
+            "same-user approval is off on macOS: approvals need a second account; \
+             authorization right com.saiife.approve is registered"
+        );
+        assert_status(&r, "mcp.landlock", Status::Info);
+        assert_eq!(
+            get(&r, "mcp.landlock").title,
+            "MCP gateway: Linux only in this version"
+        );
+        assert!(!r.to_text().contains("systemd"), "{}", r.to_text());
+        // A loaded job passes.
+        e.host.set(|s| {
+            s.run.remove(PRINT);
+        });
+        assert_status(&doctor(&e), "daemon.unit", Status::Pass);
+        // Doctor read through the host and changed nothing.
+        let st = e.host.state();
+        let print = format!("launchctl print {}", crate::launchd::SERVICE);
+        assert!(
+            st.calls.iter().all(|c| c == &print || c == &read_line()),
+            "{:?}",
+            st.calls
+        );
+        let chowns = st.chowns.len();
+        doctor(&e);
+        assert_eq!(e.host.state().chowns.len(), chowns);
+    }
+
+    #[test]
+    fn plist_changed_since_install_fails_the_unit() {
+        let e = installed();
+        e.host.set(|s| {
+            s.run.remove(PRINT);
+        });
+        let p = e.layout.at(UNIT);
+        let mut text = fs::read_to_string(&p).unwrap();
+        text.push_str("<!-- edited -->\n");
+        fs::write(&p, text).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "daemon.unit", Status::Fail);
+        assert!(get(&r, "daemon.unit")
+            .detail
+            .contains("differs from its install record"));
+        assert_status(&r, "files.installed", Status::Fail);
+    }
+
+    #[test]
+    fn adhoc_binary_warns() {
+        let e = installed();
+        put_binary(&e, &fake_macho(Some((true, true, false))));
+        let r = doctor(&e);
+        assert_status(&r, "files.binary", Status::Warn);
+        assert!(get(&r, "files.binary").detail.contains("ad-hoc signature"));
+        // Signed without the ad-hoc flag but with no CMS blob.
+        put_binary(&e, &fake_macho(Some((false, true, false))));
+        let r = doctor(&e);
+        assert_status(&r, "files.binary", Status::Warn);
+        assert!(get(&r, "files.binary")
+            .detail
+            .contains("no CMS signature present"));
+    }
+
+    #[test]
+    fn no_runtime_binary_fails() {
+        let e = installed();
+        put_binary(&e, &fake_macho(Some((false, false, true))));
+        let r = doctor(&e);
+        assert_status(&r, "files.binary", Status::Fail);
+        assert!(get(&r, "files.binary")
+            .detail
+            .contains("without the hardened runtime"));
+        // Ad-hoc without the runtime is a failure too.
+        put_binary(&e, &fake_macho(Some((true, false, false))));
+        assert_status(&doctor(&e), "files.binary", Status::Fail);
+        put_binary(&e, &fake_macho(None));
+        let r = doctor(&e);
+        assert_status(&r, "files.binary", Status::Fail);
+        assert!(get(&r, "files.binary").detail.contains("not code-signed"));
+        // An ELF file is no macOS binary.
+        put_binary(&e, &crate::binary::fake_elf(None, 0, Some(false)));
+        assert_status(&doctor(&e), "files.binary", Status::Fail);
+    }
+
+    #[test]
+    fn auth_right_missing_warns_reauth_unavailable() {
+        let e = installed();
+        e.host.set(|s| {
+            s.run.remove(&read_line());
+        });
+        let r = doctor(&e);
+        assert_status(&r, "reauth", Status::Warn);
+        let d = &get(&r, "reauth").detail;
+        assert!(
+            d.contains(REAUTH_UNAVAILABLE) && d.contains(super::MAC_SAME_USER_OFF),
+            "{d}"
+        );
+        assert!(d.contains("is missing"), "{d}");
+        e.host.set(|s| {
+            s.run.insert(read_line(), exit(1, "no such right"));
+        });
+        assert_status(&doctor(&e), "reauth", Status::Warn);
+    }
+
+    #[test]
+    fn auth_right_with_timeout_nonzero_warns() {
+        let e = installed();
+        let weak = RIGHT_PLIST.replace(
+            "<key>timeout</key>\n\t<integer>0</integer>",
+            "<key>timeout</key>\n\t<integer>300</integer>",
+        );
+        assert_ne!(weak, RIGHT_PLIST);
+        e.host.set(|s| {
+            s.run.insert(read_line(), ok(&weak));
+        });
+        let r = doctor(&e);
+        assert_status(&r, "reauth", Status::Warn);
+        let d = &get(&r, "reauth").detail;
+        assert!(
+            d.contains(REAUTH_UNAVAILABLE) && d.contains("weakened"),
+            "{d}"
+        );
+        // Shared across sessions, or not the session owner's.
+        for (from, to) in [
+            (
+                "<key>shared</key>\n\t<false/>",
+                "<key>shared</key>\n\t<true/>",
+            ),
+            (
+                "<key>session-owner</key>\n\t<true/>",
+                "<key>session-owner</key>\n\t<false/>",
+            ),
+        ] {
+            let weak = RIGHT_PLIST.replace(from, to);
+            assert_ne!(weak, RIGHT_PLIST, "{from}");
+            e.host.set(|s| {
+                s.run.insert(read_line(), ok(&weak));
+            });
+            assert_status(&doctor(&e), "reauth", Status::Warn);
+        }
+        // Doctor only ever reads the right.
+        let writes: Vec<String> = e
+            .host
+            .state()
+            .calls
+            .into_iter()
+            .filter(|c| c.contains("write") || c.contains("remove"))
+            .collect();
+        assert!(writes.is_empty(), "{writes:?}");
+    }
+
+    #[test]
+    fn claude_mdm_profile_warns() {
+        let e = installed();
+        assert!(doctor(&e)
+            .checks
+            .iter()
+            .all(|c| c.id != "agents.claude.mdm"));
+        let p = e.layout.at(CLAUDE_MDM_PROFILE);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "<plist/>").unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "agents.claude.mdm", Status::Warn);
+        assert_eq!(
+            get(&r, "agents.claude.mdm").detail,
+            "an MDM profile sets Claude Code managed settings \
+             (/Library/Managed Preferences/com.anthropic.claudecode.plist); \
+             Claude Code may ignore saiife's managed-settings.d drop-in"
+        );
+    }
+
+    /// An agent user `agent` in the fake host and the directory, checked as
+    /// root (`--user agent`).
+    fn with_agent(e: &MacEnv) -> (FixedDirectory, DoctorOptions) {
+        let home = std::path::PathBuf::from("/Users/agent");
+        fs::create_dir_all(e.layout.try_at(&home).unwrap()).unwrap();
+        e.host.set(|s| {
+            s.euid = 0;
+            s.users.insert(
+                "agent".into(),
+                UserInfo {
+                    uid: 501,
+                    gid: 20,
+                    home: home.clone(),
+                    shell: "/bin/zsh".into(),
+                },
+            );
+            // `admin` as on a Mac (gid 80, no members). Unnamed, the fake
+            // gives it the caller's gid, which is 20 (staff) on a Mac
+            // runner: the agent's primary group, so "an admin".
+            s.groups.insert("admin".into(), 80);
+        });
+        (
+            FixedDirectory::from_text("agent:x:501:20::/Users/agent:/bin/zsh\n", ""),
+            DoctorOptions {
+                user: Some("agent".into()),
+                home: None,
+            },
+        )
+    }
+
+    #[test]
+    fn admin_agent_user_warns() {
+        let e = installed();
+        let (dir, opts) = with_agent(&e);
+        let r = doctor_with(&e, &dir, &opts);
+        assert_status(&r, "user.agent.root", Status::Pass);
+        assert_status(&r, "user.agent.passwd", Status::Pass);
+        assert_eq!(
+            get(&r, "user.agent.passwd").title,
+            "user agent in Directory Services"
+        );
+        e.host.set(|s| {
+            s.groups.insert("admin".into(), 80);
+            s.members.insert("admin".into(), vec!["agent".into()]);
+        });
+        let r = doctor_with(&e, &dir, &opts);
+        assert_status(&r, "user.agent.root", Status::Warn);
+        assert_eq!(
+            get(&r, "user.agent.root").detail,
+            "agent user agent is an admin: sudo needs its password"
+        );
+        // NOPASSWD stays a failure.
+        fs::create_dir_all(e.layout.at("/usr/bin")).unwrap();
+        fs::write(e.layout.at(crate::host::SUDO), "").unwrap();
+        e.host.set(|s| {
+            s.run.insert(
+                "/usr/bin/sudo -n -l -U agent".into(),
+                CmdOutput {
+                    status: 0,
+                    stdout: "(ALL) NOPASSWD: ALL".into(),
+                    stderr: String::new(),
+                },
+            );
+        });
+        let r = doctor_with(&e, &dir, &opts);
+        assert_status(&r, "user.agent.root", Status::Fail);
+        assert!(get(&r, "user.agent.root").detail.contains("NOPASSWD"));
+        assert!(get(&r, "user.agent.root").detail.contains("is an admin"));
+    }
+
+    #[test]
+    fn macos_agent_user_checks_have_no_linux_leftovers() {
+        let e = installed();
+        let (dir, opts) = with_agent(&e);
+        let r = doctor_with(&e, &dir, &opts);
+        assert_status(&r, "user.agent.egress", Status::Info);
+        assert_eq!(
+            get(&r, "user.agent.egress").detail,
+            "macOS has no per-uid firewall in pf; the egress recipe is Linux only"
+        );
+        assert!(r.checks.iter().all(|c| c.id != "proc.hidepid"));
+        assert!(
+            r.checks.iter().all(|c| !c.detail.contains("/proc")),
+            "{}",
+            r.to_text()
+        );
+    }
+
+    #[test]
+    fn macos_sip_check() {
+        let e = installed();
+        assert_status(&doctor(&e), "system.sip", Status::Pass);
+        assert_eq!(get(&doctor(&e), "system.sip").detail, "enabled");
+        e.host.set(|s| {
+            s.csrutil = Some(CmdOutput {
+                status: 0,
+                stdout: "System Integrity Protection status: disabled.\n".into(),
+                stderr: String::new(),
+            })
+        });
+        let r = doctor(&e);
+        assert_status(&r, "system.sip", Status::Fail);
+        assert_eq!(get(&r, "system.sip").detail, crate::sip::SIP_REQUIRED);
+        e.host.set(|s| s.csrutil = None);
+        assert_status(&doctor(&e), "system.sip", Status::Fail);
+        // The seam (debug builds only): Warn, still reported.
+        let c = super::sip_check(false, true);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.detail.contains("(test build: SIP check bypassed)"),
+            "{}",
+            c.detail
+        );
+        assert_eq!(super::sip_check(true, true).status, Status::Pass);
+    }
+
+    #[test]
+    fn macos_peer_identity_info() {
+        let e = installed();
+        let r = doctor(&e);
+        assert_status(&r, "peer.pidfd", Status::Info);
+        assert_eq!(
+            get(&r, "peer.pidfd").detail,
+            "LOCAL_PEERCRED and LOCAL_PEERPID (the pid is used for attribution only)"
+        );
+    }
+
+    #[test]
+    fn missing_audit_group_warns_that_month_files_get_wheel() {
+        let e = installed();
+        e.host.set(|s| {
+            s.groups.remove(MACOS_AUDIT_GROUP);
+        });
+        let r = doctor(&e);
+        assert_status(&r, "daemon.audit_group", Status::Warn);
+        assert_eq!(
+            get(&r, "daemon.audit_group").detail,
+            "group _saiifeaudit does not exist: the audit month files end up in group wheel"
+        );
+        // The audit dir is not reported as a failure of its own.
+        assert_status(&r, "files.modes", Status::Pass);
+    }
+
+    #[test]
+    fn audit_dir_in_another_group_warns() {
+        let e = installed();
+        let gid = rustix::process::getgid().as_raw();
+        e.host.set(|s| {
+            s.groups.insert(MACOS_AUDIT_GROUP.into(), gid + 1);
+            s.members
+                .insert(MACOS_AUDIT_GROUP.into(), vec![MACOS_DAEMON_USER.into()]);
+        });
+        let r = doctor(&e);
+        assert_status(&r, "daemon.audit_group", Status::Warn);
+        assert!(get(&r, "daemon.audit_group")
+            .detail
+            .contains("not _saiifeaudit: the audit month files end up in group wheel"));
+        // The daemon user outside the group is still a failure.
+        e.host.set(|s| {
+            s.members.clear();
+            s.users.get_mut(MACOS_DAEMON_USER).unwrap().gid = gid;
+        });
+        assert_status(&doctor(&e), "daemon.audit_group", Status::Fail);
+    }
+
+    #[test]
+    fn vault_key_is_the_daemon_file() {
+        let e = installed();
+        let key = e.layout.at(VAULT_KEY);
+        assert_eq!(
+            fs::metadata(&key).unwrap().permissions().mode() & 0o7777,
+            0o400
+        );
+        // Wrong mode is named with the macOS path.
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.modes", Status::Fail);
+        assert!(
+            get(&r, "files.modes")
+                .detail
+                .contains("/var/db/saiife/keys/vault.key: want _saiife:_saiife 0400"),
+            "{}",
+            get(&r, "files.modes").detail
+        );
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_status(&doctor(&e), "files.modes", Status::Pass);
+        // A Linux key mode on a Mac is wrong.
+        let p = e.layout.at(INSTALLED);
+        let mut i = saiife_policy::installed::read_installed(&p)
+            .unwrap()
+            .unwrap();
+        i.vault_key = VaultKeyMode::Credential;
+        saiife_policy::installed::write_installed(&p, &i).unwrap();
+        assert_status(&doctor(&e), "vault.key", Status::Fail);
+    }
+
+    #[test]
+    fn macos_doctor_json_exit_codes() {
+        let e = installed();
+        // Daemon checks fail: exit 2.
+        let r = doctor(&e);
+        assert_eq!(r.exit_code(), 2);
+        let j = r.to_json();
+        assert_eq!(j["exit"], 2);
+        assert!(j["checks"].as_array().unwrap().len() > 10);
+        // Only a warning left: exit 1.
+        let p = e.layout.at(CLAUDE_MDM_PROFILE);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "<plist/>").unwrap();
+        let mut warned = Report {
+            checks: r
+                .checks
+                .iter()
+                .filter(|c| c.status != Status::Fail)
+                .cloned()
+                .collect(),
+        };
+        warned
+            .checks
+            .push(get(&doctor(&e), "agents.claude.mdm").clone());
+        assert_eq!(warned.exit_code(), 1);
+        assert_eq!(warned.to_json()["exit"], 1);
+        // Nothing installed: developer mode, exit 0.
+        let r = doctor(&mac_env());
+        assert_eq!(r.exit_code(), 0, "{}", r.to_text());
+        assert_eq!(r.to_json()["exit"], 0);
+        assert_status(&r, "install.record", Status::Info);
     }
 }

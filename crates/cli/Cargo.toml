@@ -47,6 +47,12 @@ zeroize = "=1.9.1"
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same-user approvals: an empty authorization reference whose external form
+# the daemon's `security authorize` uses (plan 13, decision 3). Safe API
+# only; the version saiife-keychain uses.
+security-framework = "=3.7.0"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
@@ -55,7 +61,10 @@ tempfile = "3"
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 # The approvals tests serve an in-process daemon context to the CLI (an
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+
+[lints]
+workspace = true

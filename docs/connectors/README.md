@@ -1,6 +1,6 @@
 # Connectors
 
-In locked mode (Linux), the agent never holds a credential for a brokered
+In locked mode (Linux and macOS), the agent never holds a credential for a brokered
 service; it holds its own model-provider login unless you run a local model.
 For a brokered service it asks the
 saiife daemon to make the call. The daemon checks the call against the

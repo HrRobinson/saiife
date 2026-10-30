@@ -64,7 +64,8 @@ pub fn fake_config(layout: &Layout) -> String {
 #[doc(hidden)]
 pub fn fake_install(root: &Path) -> Installed {
     let host = FakeHost::open(root).unwrap_or_else(|e| panic!("fake host: {e}"));
-    let layout = Layout::under(root);
+    // The Linux tree, whatever the build host (`Layout::under` follows it).
+    let layout = Layout::under_for(root, Platform::Linux);
     let l = |p: &str| layout.at(p);
 
     for g in [DAEMON_GROUP, AUDIT_GROUP] {
@@ -105,7 +106,12 @@ pub fn fake_install(root: &Path) -> Installed {
     ));
     file(&l("/etc/passwd"), passwd.as_bytes(), 0o644);
 
-    for d in [OPT_DIR, BIN_DIR, ETC_DIR, POLICY_D, "/etc/systemd/system"] {
+    // The unit's dir as the layout's platform names it.
+    let unit_dir = Path::new(layout.logical(UNIT))
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or("/");
+    for d in [OPT_DIR, BIN_DIR, ETC_DIR, POLICY_D, unit_dir] {
         dir(&l(d), 0o755);
     }
     dir(&l(CREDSTORE), 0o700);
@@ -178,6 +184,7 @@ pub fn fake_install(root: &Path) -> Installed {
             whole_file: true,
             created_file: true,
         }],
+        auth_rights: Vec::new(),
     };
     write_installed(&l(INSTALLED), &installed).unwrap();
     installed

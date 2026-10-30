@@ -2,7 +2,7 @@
 //! guard runs in a worker child, the record goes to the daemon, and every
 //! error ends in exit 2 (fail closed). Runs as the current user with every
 //! path in a temp dir.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 
@@ -718,17 +718,14 @@ fn oversized_session_is_still_recorded() {
     assert!(session.len() < 8192);
 }
 
-/// The account's home from /etc/passwd, not from HOME.
+/// The account's home from the system's entry (/etc/passwd; Directory
+/// Services on macOS), as the hook's worker gets it, not from HOME.
 fn passwd_home() -> String {
-    let uid = common::daemon::own_uid().to_string();
-    fs::read_to_string("/etc/passwd")
-        .unwrap()
-        .lines()
-        .find_map(|l| {
-            let f: Vec<&str> = l.split(':').collect();
-            (f.len() >= 7 && f[2] == uid).then(|| f[5].to_string())
-        })
+    saiife_ipc::client::system_entry(common::daemon::own_uid())
         .expect("own passwd entry")
+        .home
+        .display()
+        .to_string()
 }
 
 fn file_call(tool: &str, path: &str) -> String {

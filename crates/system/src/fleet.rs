@@ -134,13 +134,15 @@ fn recorded_agents(layout: &Layout, host: &dyn Host) -> Result<Option<Vec<Agent>
 /// Walks every dir down to [`FLEET_DIR`]: each must be a directory (not a
 /// symlink) of root's, not writable by group or others; a sticky bit does
 /// not excuse a writable one. False when one is missing (no fleet files).
+/// On macOS the walk goes through the root-owned system link `/etc` to
+/// `/private/etc` ([`fleet_path`]); any other link is refused.
 fn fleet_dir_present(
     layout: &Layout,
     host: &dyn Host,
     root_uid: u32,
 ) -> Result<bool, InstallError> {
     let mut logical = PathBuf::from("/");
-    for comp in Path::new(FLEET_DIR).components().skip(1) {
+    for comp in fleet_path(layout, host, FLEET_DIR).components().skip(1) {
         logical.push(comp);
         let p = layout
             .try_at(&logical)
@@ -164,6 +166,15 @@ fn fleet_dir_present(
     Ok(true)
 }
 
+/// The fleet path `abs` (a `/etc/saiife/fleet` constant) as the walk and
+/// the open use it: on macOS through the trusted, root-owned `/etc` link
+/// to `/private/etc` ([`crate::install::beneath_links`],
+/// [`fsops::trusted_link_target`]); as it is on Linux, or when `/etc` is
+/// not that link (the walk then refuses it as no directory).
+fn fleet_path(layout: &Layout, host: &dyn Host, abs: &str) -> PathBuf {
+    crate::install::beneath_links(layout, host, Path::new(layout.logical(abs)))
+}
+
 /// The fleet file `abs`, read through one `O_NOFOLLOW` open: it must be a
 /// regular file of root's, not writable by group or others (checked on
 /// that open file), of at most [`MAX_FLEET_FILE`] bytes. `None` when it
@@ -177,7 +188,10 @@ fn read_fleet_file(
     use rustix::fs::{Mode, OFlags};
     use rustix::io::Errno;
     let logical = Path::new(abs);
-    let p = layout.at(abs);
+    // The path the walk checked (below `/private/etc` on macOS).
+    let p = layout
+        .try_at(&fleet_path(layout, host, abs))
+        .map_err(|e| refused(logical, e.to_string()))?;
     let fd = match rustix::fs::open(
         &p,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -479,5 +493,69 @@ mod tests {
         assert!(e.at(CODEX_REQUIREMENTS).is_file());
         assert!(!e.at(CLAUDE_MANAGED).exists());
         assert!(!e.at(GEMINI_SETTINGS).exists());
+    }
+}
+
+/// The fleet files on the macOS tree: `/etc` is the root-owned link
+/// `private/etc`, as on a Mac.
+#[cfg(all(test, unix))]
+mod macos_tests {
+    use super::*;
+    use crate::install::macos_tests::{mac_env, MacEnv};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn put(e: &MacEnv, abs: &str, bytes: &[u8]) {
+        let real = e.layout.root().join("private").join(&abs[1..]);
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        for d in [
+            "private/etc",
+            "private/etc/saiife",
+            "private/etc/saiife/fleet",
+        ] {
+            let p = e.layout.root().join(d);
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(&real, bytes).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn macos_fleet_files_read_through_the_etc_link() {
+        let e = mac_env();
+        put(&e, FLEET_CONFIG, b"version = 2\nlocked = true\n");
+        put(&e, FLEET_INSTALL, b"agents = [\"claude\"]\n");
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert_eq!(opts.agents, [Agent::Claude]);
+        assert!(opts.config.is_some());
+    }
+
+    #[test]
+    fn macos_fleet_dir_writable_below_the_link_refused() {
+        let e = mac_env();
+        put(&e, FLEET_CONFIG, b"version = 2\nlocked = true\n");
+        let fleet = e.layout.root().join("private/etc/saiife/fleet");
+        fs::set_permissions(&fleet, fs::Permissions::from_mode(0o777)).unwrap();
+        match fleet_options(&e.layout, &e.host) {
+            Err(InstallError::Refused { path, .. }) => {
+                assert_eq!(path, Path::new("/private/etc/saiife/fleet"))
+            }
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("accepted a world-writable fleet dir"),
+        }
+    }
+
+    /// `/etc` pointing anywhere but `private/etc` is not trusted.
+    #[test]
+    fn macos_fleet_etc_not_the_system_link_refused() {
+        let e = mac_env();
+        put(&e, FLEET_CONFIG, b"version = 2\nlocked = true\n");
+        let etc = e.layout.root().join("etc");
+        fs::remove_file(&etc).unwrap();
+        std::os::unix::fs::symlink("private/var", &etc).unwrap();
+        assert!(matches!(
+            fleet_options(&e.layout, &e.host),
+            Err(InstallError::Refused { .. })
+        ));
     }
 }

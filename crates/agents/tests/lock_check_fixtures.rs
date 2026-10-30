@@ -1,16 +1,25 @@
-//! Pins the live lock-check results (docs/lock-check.md) kept as fixtures.
+//! Pins the live lock-check results (docs/lock-check.md) kept as fixtures:
+//! `tests/fixtures/lock-check/<agent>.tsv` for Linux (the Docker run) and
+//! `tests/fixtures/lock-check/macos/<agent>.tsv` for macOS (the VM run,
+//! `scripts/lock-check/macos-vm.sh`).
 
 use std::fs;
 use std::path::PathBuf;
 
+/// The recording of `agent` for Linux (`macos` false) or macOS.
+fn recording_path(agent: &str, macos: bool) -> PathBuf {
+    let mut p: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests/fixtures/lock-check"]
+        .iter()
+        .collect();
+    if macos {
+        p.push("macos");
+    }
+    p.push(format!("{agent}.tsv"));
+    p
+}
+
 fn read(agent: &str) -> String {
-    let p: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "tests/fixtures/lock-check",
-        &format!("{agent}.tsv"),
-    ]
-    .iter()
-    .collect();
+    let p = recording_path(agent, false);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -54,32 +63,46 @@ fn claude_is_lockable() {
     }
 }
 
-/// The lock label saiife reports for Claude Code is the recorded one.
+/// The Linux lock label saiife reports for Claude Code is the recorded one.
 #[test]
 fn claude_label_matches_recording() {
     use saiife_agents::{lock, Agent};
     let tsv = read("claude");
-    assert_eq!(label(&tsv), lock::label(Agent::Claude).id());
+    assert_eq!(label(&tsv), lock::label_for(Agent::Claude, false).id());
 }
 
-/// Codex and Gemini CLI have no recording yet, so they are unverified. When
-/// a recording lands, this fails until `lock::label` follows it.
+/// Both tables follow the recordings: an agent with a recording for a
+/// platform has its recorded label there, and one without is unverified.
+/// When a recording lands (Linux or `macos/`), this fails until
+/// `lock::label_for` follows it.
 #[test]
-fn unrecorded_agents_are_unverified() {
+fn labels_match_recordings_on_both_platforms() {
     use saiife_agents::{lock, Agent};
-    for a in [Agent::Codex, Agent::Gemini] {
-        let p: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "tests/fixtures/lock-check",
-            &format!("{}.tsv", a.name()),
-        ]
-        .iter()
-        .collect();
-        if p.exists() {
-            let tsv = read(a.name());
-            assert_eq!(label(&tsv), lock::label(a).id(), "{}", a.name());
-        } else {
-            assert_eq!(lock::label(a), lock::LockLabel::Unverified, "{}", a.name());
+    for macos in [false, true] {
+        for a in Agent::ALL {
+            let p = recording_path(a.name(), macos);
+            let want = lock::label_for(a, macos);
+            if p.exists() {
+                let tsv = fs::read_to_string(&p).unwrap();
+                assert_eq!(label(&tsv), want.id(), "{}", p.display());
+                if macos {
+                    assert!(
+                        tsv.lines().any(|l| l == "# platform=macos"),
+                        "{} is not a macOS recording (no `# platform=macos`)",
+                        p.display()
+                    );
+                }
+            } else {
+                assert_eq!(want, lock::LockLabel::Unverified, "{}", p.display());
+            }
         }
     }
+}
+
+/// The macOS recordings live in their own dir, which exists before the
+/// first recording (`.gitkeep`).
+#[test]
+fn macos_recording_dir_exists() {
+    let dir = recording_path("x", true);
+    assert!(dir.parent().unwrap().is_dir(), "{}", dir.display());
 }

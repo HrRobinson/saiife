@@ -20,7 +20,7 @@ use crate::approvals::{
 };
 use crate::approvers::{may_decide, Refusal};
 use crate::ops::{Conn, Ctx, VERSION};
-use crate::reauth::{Reauth, ReauthResult};
+use crate::reauth::{parse_auth_hex, Reauth, ReauthResult, Subject};
 use crate::vault::VaultError;
 use saiife_audit::{DecisionKind, Record};
 use saiife_broker::pipeline::{self, Outcome, PendingCall, StoredCall};
@@ -469,8 +469,18 @@ impl Reauth for NoStartTime<'_> {
     fn available(&self) -> bool {
         self.0.available()
     }
-    fn check(&self, _pid: u32, _s: u64, _uid: u32, _d: &str, _t: Duration) -> ReauthResult {
+    fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
         ReauthResult::Error("the approver's process start time is unknown".into())
+    }
+}
+
+/// The optional `auth` argument (macOS): absent or null is `None`; anything
+/// but 64 lowercase hex characters is a bad request.
+pub(crate) fn auth_arg(args: &Map<String, Value>) -> Result<Option<[u8; 32]>, String> {
+    match args.get("auth") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => parse_auth_hex(s).map(Some),
+        Some(_) => Err("auth is 64 lowercase hex characters".into()),
     }
 }
 
@@ -537,6 +547,10 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             Some(s.clone())
         }
         Some(_) => return err(id, ErrorCode::BadRequest, "note is a string"),
+    };
+    let auth = match auth_arg(&req.args) {
+        Ok(a) => a,
+        Err(e) => return err(id, ErrorCode::BadRequest, &e),
     };
     let r = match visible(ctx, peer.uid, rid).await {
         Err(()) => return unavailable(id, ctx),
@@ -613,6 +627,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                         c.proc.as_ref(),
                         &c.reauth_cooldowns,
                         &detail,
+                        auth,
                     )
                 })
                 .await
@@ -1731,5 +1746,47 @@ mod tests {
         assert!(display_is_faithful(&pending(Some("text upload"), Some(&h))));
         assert!(display_is_faithful(&pending(None, None)));
         assert!(!display_is_faithful(&pending(None, Some(&h))));
+    }
+
+    #[test]
+    fn auth_arg_is_optional_hex() {
+        let a = |v: Value| v.as_object().unwrap().clone();
+        assert_eq!(auth_arg(&a(json!({}))), Ok(None));
+        assert_eq!(auth_arg(&a(json!({"auth": null}))), Ok(None));
+        assert_eq!(
+            auth_arg(&a(json!({"auth": "0f".repeat(32)}))),
+            Ok(Some([0x0f; 32]))
+        );
+        for bad in [json!("0F".repeat(32)), json!("ab"), json!(7), json!([1])] {
+            assert!(auth_arg(&a(json!({ "auth": bad }))).is_err(), "{bad}");
+        }
+    }
+
+    /// Bad `auth` hex is a bad request, before anything is looked up.
+    #[tokio::test]
+    async fn bad_auth_hex_is_bad_request() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(d.path(), crate::ops::Mode::Locked, 0);
+        let conn = Conn::new(
+            PeerCred {
+                uid: 1000,
+                gid: 1000,
+                pid: 1,
+            },
+            Some(1),
+        );
+        for bad in [json!("AB".repeat(32)), json!("abc"), json!(1)] {
+            let req = Request {
+                id: 4,
+                op: OP_APPROVAL_DECIDE.into(),
+                args: json!({"request": 1, "action": "approve", "auth": bad})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            };
+            let v = decide(&ctx, &conn, req).await.to_string();
+            assert!(v.contains("bad_request"), "{v}");
+            assert!(v.contains("auth is 64 lowercase hex characters"), "{v}");
+        }
     }
 }

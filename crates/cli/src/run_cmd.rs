@@ -1,7 +1,7 @@
 //! `saiife run --secret <name>[:ENV] -- <cmd> [args]` (spec §6.14): the
 //! daemon leases the secret for one allowed, root-owned command; this puts
 //! it in that command's environment and masks both of its output streams.
-//! Linux only. Exit codes: the command's own (128 + signal when a signal
+//! Linux and macOS. Exit codes: the command's own (128 + signal when a signal
 //! ended it), 2 refused, 5 the daemon cannot be reached, 127 the command
 //! was not found.
 //!
@@ -29,7 +29,7 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn run(args: RunArgs) -> ExitCode {
     let RunArgs {
         system_config,
@@ -38,16 +38,16 @@ pub fn run(args: RunArgs) -> ExitCode {
         command,
     } = args;
     let _ = (system_config, secrets, cloud, command);
-    eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
+    eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn run(args: RunArgs) -> ExitCode {
     linux::run(args)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 /// `NAME` or `NAME:ENV_VAR` into the name and the variable. The default
 /// variable is the name upper-cased with `-` and `.` turned into `_`.
 pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
@@ -76,7 +76,7 @@ pub(crate) fn parse_spec(spec: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), env))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 /// Copy `r` to `w`, replacing every form of a masked value with
 /// `[MASKED]`. The bytes held back between reads (`max_span - 1`) make a
 /// value split across two reads masked whole. A write error stops the
@@ -111,9 +111,9 @@ pub(crate) fn pump(
 }
 
 /// The variables the dynamic loader and libc read that could make the
-/// command load or run other code: `LD_*` and a few more. They are removed
+/// command load or run other code: `LD_*`, `DYLD_*` and a few more. They are removed
 /// before the command starts.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 const LOADER_EXTRA: &[&str] = &[
     "GCONV_PATH",
     "LOCPATH",
@@ -130,26 +130,28 @@ const LOADER_EXTRA: &[&str] = &[
     "TZDIR",
 ];
 
-#[cfg(any(target_os = "linux", test))]
-fn is_loader_var(n: &str) -> bool {
-    n.starts_with("LD_") || LOADER_EXTRA.contains(&n)
+/// `LD_*`, macOS dyld's `DYLD_*` (on every platform: harmless on Linux),
+/// and [`LOADER_EXTRA`].
+#[cfg(any(unix, test))]
+pub(crate) fn is_loader_var(n: &str) -> bool {
+    n.starts_with("LD_") || n.starts_with("DYLD_") || LOADER_EXTRA.contains(&n)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn loader_vars<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     names.into_iter().filter(|n| is_loader_var(n)).collect()
 }
 
 /// What `argv[0]` is for the command: the canonical file's basename, never
 /// the name the user typed (multi-call binaries pick their applet from it).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn argv0_for(exe: &std::path::Path) -> std::ffi::OsString {
     exe.file_name().unwrap_or(exe.as_os_str()).to_os_string()
 }
 
 /// The values to mask for a lease: the value, and for a `basic` secret
 /// (`user:password`) the password on its own when it is long enough.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<String>> {
     let mut out = vec![zeroize::Zeroizing::new(value.to_string())];
     if kind == "basic" {
@@ -175,7 +177,7 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
 /// (fix round 1): `AWS_ENDPOINT_URL`, every `AWS_ENDPOINT_URL_*` and
 /// `AWS_CA_BUNDLE`, so an inherited environment cannot send the leased
 /// credentials to another endpoint.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 const AWS_SCRUB: &[&str] = &[
     "AWS_PROFILE",
     "AWS_DEFAULT_PROFILE",
@@ -189,12 +191,12 @@ const AWS_SCRUB: &[&str] = &[
 ];
 
 /// Prefixes of the inherited variables `run --cloud` removes.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 const AWS_SCRUB_PREFIXES: &[&str] = &["AWS_CONTAINER_", "AWS_ENDPOINT_URL_"];
 
 /// Prepares `cmd`'s environment: the loader variables of `inherited` and
 /// `remove` taken out, `values` put in.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn prepare_env(
     cmd: &mut std::process::Command,
     inherited: Vec<String>,
@@ -213,7 +215,7 @@ pub(crate) fn prepare_env(
 }
 
 /// The lease variables whose values are credentials (masked).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 const AWS_CREDENTIALS: [&str; 3] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -221,7 +223,7 @@ const AWS_CREDENTIALS: [&str; 3] = [
 ];
 
 /// The inherited variables `run --cloud` removes from the command.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn aws_scrub<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     names
         .into_iter()
@@ -232,7 +234,7 @@ pub(crate) fn aws_scrub<I: IntoIterator<Item = String>>(names: I) -> Vec<String>
 }
 
 /// What `run --cloud` sets from a `cloud.lease` answer.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) struct CloudEnv {
     /// The variables to set: the three credentials, the region pair, and
     /// the shared files pointed at `/dev/null`.
@@ -243,7 +245,7 @@ pub(crate) struct CloudEnv {
 
 /// The environment of a `cloud.lease` answer's `env` (decision 16). Only
 /// the five expected variables are taken, and each must be there.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn cloud_env(
     env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<CloudEnv, String> {
@@ -273,7 +275,7 @@ pub(crate) fn cloud_env(
 }
 
 /// The one line `run --cloud` prints to stderr before the command starts.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
     format!(
         "saiife: AWS credentials for {} (STS mode) expire at {}; this command and anything it starts can read them",
@@ -282,7 +284,7 @@ pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod linux {
     use super::{
         argv0_for, aws_scrub, cloud_env, cloud_notice, mask_values, parse_spec, prepare_env, pump,
@@ -608,6 +610,52 @@ mod tests {
             .any(|n| n == "PATH" || n == "HOME" || n == "LANG"));
     }
 
+    /// macOS's dyld reads `DYLD_*` (decision 10): removed on every
+    /// platform, and never a `--secret` variable.
+    #[test]
+    fn loader_vars_include_dyld() {
+        let names = [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "PATH",
+            "MY_DYLD_X",
+        ];
+        let got = loader_vars(names.iter().map(|s| s.to_string()));
+        assert_eq!(
+            got,
+            [
+                "DYLD_INSERT_LIBRARIES",
+                "DYLD_LIBRARY_PATH",
+                "DYLD_FRAMEWORK_PATH",
+                "DYLD_FALLBACK_LIBRARY_PATH"
+            ]
+        );
+        assert!(parse_spec("tok:DYLD_INSERT_LIBRARIES").is_err());
+
+        #[cfg(unix)]
+        {
+            let mut cmd = std::process::Command::new("/usr/bin/env");
+            prepare_env(
+                &mut cmd,
+                vec![
+                    "DYLD_INSERT_LIBRARIES".into(),
+                    "DYLD_LIBRARY_PATH".into(),
+                    "HOME".into(),
+                ],
+                &[],
+                &[],
+            );
+            let removed: Vec<_> = cmd
+                .get_envs()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(removed, ["DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH"]);
+        }
+    }
+
     #[test]
     fn argv0_is_the_canonical_basename() {
         assert_eq!(
@@ -800,7 +848,7 @@ mod tests {
     /// the inherited AWS variables are gone, the lease's are set. Its
     /// output is masked before anything looks at it, so no assertion
     /// message can print a credential.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn cloud_spawned_env_scrubbed_and_set() {
         let a = lease_answer();

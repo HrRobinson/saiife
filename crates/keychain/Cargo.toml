@@ -39,3 +39,6 @@ tempfile = "3"
 # p2p: the tests serve a minimal Secret Service over a socket pair.
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "p2p"] }
 tokio = { version = "=1.53.2", features = ["rt", "net", "time", "macros"] }
+
+[lints]
+workspace = true

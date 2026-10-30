@@ -341,6 +341,57 @@ runtime, and notarized. The hardened runtime makes the binary ignore
 hook process), and Gatekeeper and MDM tools expect signed launch daemons.
 This is v2.1 work (owner decision 2).
 
+**Note (plan 13).** Built in v2.1, with these departures and details:
+
+- **Socket dir** (plan 13 decision 2): `/var/db/saiife-run` (0755
+  `_saiife`), not `/var/run/saiife`. `/var/run` is root:daemon 0775, so the
+  daemon user cannot create a dir there at start, and it is cleared at boot.
+  Install creates the dir; it lasts across reboots, and the daemon replaces
+  stale sockets at bind. The client checks the dir owner as on Linux, and
+  `[daemon] socket_dir` defaults to it on macOS (§8.1).
+- **Vault key mode:** `installed.toml` records `vault_key = "daemon_file"`
+  for `/var/db/saiife/keys/vault.key` (0400 `_saiife`, created with
+  `O_EXCL|O_NOFOLLOW` and changed through its descriptor). On macOS
+  `installed.toml` has `systemd = 0` and gains `auth_rights`.
+- **Daemon log:** the plist sends stderr to `/var/log/saiife/daemon.log`
+  (0640), because macOS has no journal for it.
+- **`ThrottleInterval = 1`** in the plist, like `RestartSec=1` on Linux.
+- **Claude Code** (decision 11): the drop-in dir
+  `/Library/Application Support/ClaudeCode/managed-settings.d/`
+  (`50-saiife.json`, `60-saiife-mcp.json`), as on Linux, not the whole file.
+  If the owner's macOS live check shows that drop-ins are ignored there,
+  install switches to `managed-settings.json` and refuses a foreign one.
+  Install and `doctor` warn when the MDM profile
+  `/Library/Managed Preferences/com.anthropic.claudecode.plist` exists.
+- **Accounts:** `_saiife` (user and group) and `_saiifeaudit`, local
+  directory records only; ids are picked free among both users and groups
+  in 200–400; an existing hidden `_saiife` with `/usr/bin/false` is reused,
+  a login-capable or non-local one is refused.
+- **The `nix` / `saiife-darwin` boundary** (decision 1): `LOCAL_PEERCRED`,
+  `LOCAL_PEERPID`, `getpwnam_r` and `getgrnam_r` come from `nix`'s safe
+  API. `sysctl(KERN_PROC_PID)` is the one FFI call, in the crate
+  `saiife-darwin`, the only crate allowed `unsafe`; `libc` has no Apple
+  `kinfo_proc`, so the crate writes out xnu's LP64 layout with size and
+  offset asserts. The workspace lint `unsafe_code = "forbid"` and
+  `scripts/check-unsafe.sh` (CI) enforce the boundary; `unsafe` that a
+  dependency's macro expands into is not caught.
+- **`LOCAL_PEERPID` is the socket's last pid**, not strictly the
+  connecting process, so on macOS nothing is granted on a pid (§6.3,
+  §6.9.3, §6.10.2).
+- **Minimum:** macOS 15 (§17 question 1).
+- **Signing:** install requires the hardened runtime and a release build;
+  an ad-hoc signature only warns (§14).
+- **Same-user approval is off on macOS** (§6.10.2).
+- **System Integrity Protection is required** (owner ruling, plan 13 CI):
+  the hardened runtime keeps `DYLD_INSERT_LIBRARIES` out of the hook only
+  with SIP on; on the SIP-disabled CI runners an injected library ran
+  inside the ad-hoc signed hook. Install refuses (exit 2, before any
+  change) and `doctor` fails `system.sip` unless `csrutil status` prints
+  exactly `System Integrity Protection status: enabled.`; disabled,
+  unknown, a custom configuration or an error is not enabled. A build with
+  debug assertions honours `SAIIFE_TEST_ALLOW_SIP_OFF=1` (CI only: install
+  warns, `doctor` warns); a release build never reads it.
+
 ### 5.4 How the lock holds
 
 The lock rests on four facts the kernel enforces, not on the guard:
@@ -603,6 +654,16 @@ clients that cannot use Unix sockets. It requires a bearer token from
 `saiife api token` (bound to the uid, valid for 12 h, stored hashed by the
 daemon).
 
+**Note (plan 13).** `LOCAL_PEERPID` gives the pid of the socket's last
+user, not strictly the connecting process, so on macOS nothing is granted
+on a pid; `LOCAL_PEERCRED`'s uid, taken at connect, is what counts.
+**`[gateway] tcp` on macOS** (decision 8): without `/proc` the daemon cannot
+find a TCP peer's uid, so the own-uid check on the TCP listener is skipped
+(`tcp_peer_refused` returns `None`). That is safe because macOS has no
+gateway children (§6.15) and the daemon's own uid cannot mint the bearer
+token: the control socket refuses own-uid peers in locked mode. The token
+is still required.
+
 ### 6.4 Tamper-evident audit
 
 #### 6.4.1 Chain
@@ -707,8 +768,12 @@ least once, to each target. Targets:
   read these on Linux, and on macOS after one click the user may give.
   Built (plan 16): one keychain item (`saiife`/`vault-key`) holds the 32-byte
   vault key, and the secrets stay in `vault.bin` sealed under it, not one item
-  per secret. `saiife daemon --user` on macOS is refused until the plan 13
-  daemon port; the macOS Keychain backend is built and compile-checked.
+  per secret. Built (plan 13, decision 9): `saiife daemon --user` runs on
+  macOS with the key in the login Keychain (`MacKeychain`). Without
+  `XDG_RUNTIME_DIR` the runtime dir is `~/Library/Caches/saiife` (0700,
+  created if missing) with the sockets in `run/`; a purge of the caches
+  needs a broker restart. A socket path over 103 bytes is refused with a
+  clear line.
 - `saiife secret add <name> --kind token [--service shopify]` reads the value
   from the terminal without echo, or from `--from-file <path>` /
   `--from-env <VAR>`. The value goes to the daemon over the socket (admin
@@ -940,6 +1005,14 @@ The process name can be faked by the same user, which is why sessions are
 used only for attribution and finer limits. v3 replaces this with a session
 identity issued by the runner.
 
+**Note (plan 13).** On macOS the match uses process names only (decision
+6): `KERN_PROCARGS2` (the command line) is readable only for one's own uid,
+so a `node` ancestor never matches an agent, and Gemini CLI under `node`
+gets `session = null` (the stricter shared bucket). The peer pid comes
+from `LOCAL_PEERPID` (the socket's last pid); a pid that is gone or was
+reused gives no session, never another one. Attribution only: nothing is
+allowed because of it.
+
 #### 6.9.4 Amount caps (proposed addition; in v2.0, owner decision 1)
 
 Manifests mark operations that move money with `amount = { field =
@@ -993,6 +1066,30 @@ that does not depend on the agent's judgment.
     password each time) and passes the external form to the daemon, which
     checks it. (The v2.1 plan confirms the daemon user can verify a client's
     authorization.)
+- **Note (plan 13): same-user approval is off on macOS.** Plan 13 changed
+  the flow (decisions 3–5): the daemon, not the CLI, acquires the right.
+  The CLI makes an empty authorization reference and sends its external
+  form as `auth` in `approval.decide`; the daemon runs
+  `/usr/bin/security authorize -u -i -d com.saiife.approve` with that form
+  on stdin, `PATH` only and a 120 s timeout, as it runs `pkcheck` on Linux.
+  `-60005`/`-60006` are denied, `-60007` (no GUI, SSH) is unavailable,
+  anything else is an error. The right is written with
+  `security authorizationdb write`: `class = user`,
+  `authenticate-user = true`, `session-owner = true`, `shared = false`,
+  `timeout = 0`, `allow-root = false`. This is built and tested but **not
+  used**: the prompt shows only the right's fixed `default-prompt`, never
+  the request, so a same-user agent could start an approval of its own
+  request while the human believes they confirm another one (polkit shows
+  the daemon's `--detail`; nothing on macOS lets the daemon set the prompt
+  without FFI). So on macOS `same_user = "reauth"` acts as `"deny"`: a
+  same-user decision is refused with `reauth_unavailable` and
+  "re-authentication unavailable: approvals need a second account", with no
+  prompt and no cooldown, and `doctor` reports "same-user approval is off
+  on macOS: approvals need a second account". Approvals need a second
+  account, and only root and `[admin]` users can lift lockdown. Install
+  still registers the right. Spec departure, for the owner to confirm; the
+  follow-up is a daemon-side prompt that carries the request (a small
+  audited FFI in `saiife-darwin`, owner decision).
 - **Fallback without polkit** (owner decision 3). When `pkcheck` or the
   polkit daemon is missing (common on minimal servers), `same_user =
   "reauth"` behaves as `same_user = "deny"`: only a second uid in
@@ -1176,6 +1273,16 @@ interpreter may be listed (the config check refuses `sh`, `bash`, `python`,
 socket. The client execs the command with the variable set. Each use is a
 record. The docs recommend a connector instead wherever one exists.
 
+**Note (plan 13).** `run --secret` and `run --cloud` work on macOS
+(decision 10). `DYLD_*` is removed from the command's environment with the
+other loader variables (`LD_*`), and refused as a `--secret` variable name,
+on every platform, because it is harmless on Linux. `/etc`, `/var` and
+`/tmp` are symlinks into `/private` on macOS, and a link in `run_allow`
+never grants its target, so on macOS an entry through one is a load error
+with a hint: "run_allow entry /var/x goes through the /var symlink on
+macOS; write /private/var/x instead". The root-owned-chain checks accept
+exactly those three root-owned links to `private/<same name>`.
+
 ### 6.15 MCP (proposed additions, after v2.0)
 
 Both parts ship after v2.0 (owner decision 1). Until then, locked mode
@@ -1205,6 +1312,14 @@ still send out what it was given. The daemon refuses socket peers that are
 gateway children and, in locked mode, any peer with the daemon's own uid.
 `via` in a record is declared by the client and is attribution only. See
 `docs/mcp.md`.
+
+**Note (plan 13).** The gateway stays Linux only in v2.1 (decision 7): it
+needs Landlock, and `sandbox-exec` is deprecated, so it is not used. On
+macOS `[mcp.<name>]` is a load error in every mode ("the MCP gateway needs
+Linux (Landlock) in this version"), the same mechanism as the personal
+broker refusal above. `saiife mcp` (the connector tools) works on macOS.
+The follow-up is a macOS sandbox for gateway children (Endpoint Security
+or a separate uid).
 
 ### 6.16 `saiife doctor` (proposed addition; in v2.0, owner decision 1)
 
@@ -1315,7 +1430,7 @@ v2.0: `saiife daemon --user`, the personal-broker side of `secret` and
 |---|---|---|
 | `saiife system install [--config <file>] [--agents claude,codex,gemini] [--approvers <list>] [--non-interactive]` | root | Create users and groups, install the binary to `/opt/saiife/bin`, write `/etc/saiife` (from `--config` or a commented default), the unit or plist, and the managed hooks for the chosen agents; start the daemon; write `installed.toml`; run `doctor`. Idempotent. `--fleet` reads `/etc/saiife/fleet/config.toml` and `install.toml` (plan 18). |
 | `saiife system uninstall [--keep-audit]` | root | Remove exactly what `installed.toml` lists. The audit and vault are kept unless `--purge`. |
-| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. Built (plan 16): Linux only; macOS is refused until the plan 13 daemon port. |
+| `saiife daemon --system \| --user` | service manager | Run the daemon. `--user` is personal broker mode (`$XDG_RUNTIME_DIR/saiife/`), after v2.0. Built (plan 16): Linux. Built (plan 13): macOS too; without `XDG_RUNTIME_DIR` the sockets are in `~/Library/Caches/saiife/run/` (§6.6). |
 | `saiife doctor [--user <name>] [--json]` | anyone (more checks as root) | §6.16 (proposed; in v2.0). |
 | `saiife status` | anyone | v1 checks, plus mode, daemon health, chain head, pending approvals for this user, lockdown state, each agent's lock label (decision 9), and one warning per unbrokered MCP server allowed in policy (decision 10). |
 | `saiife check --managed …` | managed hooks | §6.1.2. |
@@ -1349,7 +1464,7 @@ locked = true                    # v1 reserved this key (v1 §5.1); true = locke
 
 [daemon]
 user = "saiife"                  # "_saiife" on macOS
-socket_dir = "/run/saiife"       # "/var/run/saiife" on macOS; fixed in locked mode
+socket_dir = "/run/saiife"       # "/var/db/saiife-run" on macOS (plan 13); fixed in locked mode
 
 [admin]
 groups = []                      # uids in these groups get admin ops besides root
@@ -1995,6 +2110,21 @@ done when every v1 §9.5 v2 row has shipped: all connector waves,
 collections, cloud credentials and environments (plans 14–15), plus the
 after-v2.0 items in §15.
 
+**Note (plan 13): release signing modes.** The release workflow signs each
+macOS binary with the hardened runtime, always:
+
+- On a tag push with all six signing secrets (Developer ID certificate and
+  its password, identity, team id, notary Apple ID and app-specific
+  password): Developer ID, secure timestamp and notarization. A bare
+  binary cannot be stapled, so Gatekeeper checks the ticket online.
+- Otherwise (no secrets, or not a tag): ad-hoc signed with the hardened
+  runtime, not notarized, and the release notes say so. A partial set of
+  secrets fails the run.
+
+`system install` requires the hardened runtime and a release build; an
+ad-hoc signature only warns, because A4 still holds. On macOS, point 7 is
+met with a second uid only: same-user approval is off (§6.10.2).
+
 ## 15. Delivery plans
 
 The v1 track already uses plan 6 (v0.1.1, v1 gaps), so v2 starts at plan 7.
@@ -2069,7 +2199,9 @@ All six questions of the first draft are answered (§0, decisions 1–5 and 9).
 None is open for v2.0. These remain, for later plans:
 
 1. **macOS minimum version for v2.1** (plan 13). The proposal is the oldest
-   macOS that Apple still updates when plan 13 starts.
+   macOS that Apple still updates when plan 13 starts. Answered (plan 13,
+   decision 13): **macOS 15** (Sequoia), the oldest macOS Apple still
+   updates in October 2026. Install refuses anything older.
 2. **Which wave-2 and wave-3 connectors come first** (plan 14), by customer
    demand.
 

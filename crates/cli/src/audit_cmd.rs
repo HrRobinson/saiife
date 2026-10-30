@@ -90,11 +90,18 @@ pub fn verify(external: Option<&Path>, system_config: Option<&Path>, broker: boo
     ExitCode::from(report.exit_code())
 }
 
-const NOT_AN_AUDITOR: &str = "audit files need the saiife-audit group; ask an auditor";
+/// Why a non-auditor cannot verify the locked log: it names the
+/// platform's audit group (`saiife-audit`, `_saiifeaudit` on macOS).
+fn not_an_auditor() -> String {
+    format!(
+        "audit files need the {} group; ask an auditor",
+        saiife_system::layout::Layout::system().audit_group()
+    )
+}
 
 /// The log `verify` checks, from the one locked-mode decision
 /// ([`audit_locked::source`]). In locked mode it is `[audit] dir` of the
-/// system config, for root and `saiife-audit` members only;
+/// system config, for root and audit group members only;
 /// `$SAIIFE_AUDIT_DIR` overrides it in debug builds alone (tests, CI), so
 /// a release build always checks the log the daemon writes. Otherwise it
 /// is the user's own log (`$SAIIFE_AUDIT_DIR` honoured).
@@ -114,7 +121,7 @@ fn verify_dir(config: &Path) -> Result<PathBuf, String> {
     if auditor {
         Ok(dir)
     } else {
-        Err(NOT_AN_AUDITOR.into())
+        Err(not_an_auditor())
     }
 }
 

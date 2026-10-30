@@ -57,10 +57,9 @@ WantedBy=multi-user.target
 pub fn unit_text(systemd: u32) -> String {
     match vault_key_mode(systemd) {
         VaultKeyMode::Credential => UNIT.to_string(),
-        VaultKeyMode::File => {
-            UNIT.replacen(ENCRYPTED_LINE, PLAIN_LINE, 1)
-                .replacen(OLD_SYSTEMD_COMMENT, "", 1)
-        }
+        VaultKeyMode::File | VaultKeyMode::DaemonFile => UNIT
+            .replacen(ENCRYPTED_LINE, PLAIN_LINE, 1)
+            .replacen(OLD_SYSTEMD_COMMENT, "", 1),
     }
 }
 

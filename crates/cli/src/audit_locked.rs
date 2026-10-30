@@ -1,17 +1,15 @@
 //! Where `saiife audit` reads from in locked mode (spec §6.4.5): an auditor
-//! (root, or a member of `saiife-audit`) reads the locked audit dir
-//! directly; anyone else asks the daemon (`audit.query`), which returns
-//! only that user's records. The user's home log is shown too, labelled
-//! [`V1_LABEL`]. Without a locked system config, developer mode is
-//! unchanged.
+//! (root, or a member of the audit group: `saiife-audit`, `_saiifeaudit`
+//! on macOS) reads the locked audit dir directly; anyone else asks the
+//! daemon (`audit.query`), which returns only that user's records. The
+//! user's home log is shown too, labelled [`V1_LABEL`]. Without a locked
+//! system config, developer mode is unchanged.
 
 use saiife_audit::Record;
 use std::path::{Path, PathBuf};
 
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
 pub const V1_LABEL: &str = "v1, before locked mode, not tamper-evident";
-/// The group whose members read the audit files (spec §5.2).
-pub use saiife_system::layout::AUDIT_GROUP;
 pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
 const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
 
@@ -79,15 +77,20 @@ pub fn auditor(euid_is_root: bool, my_gids: &[u32], audit_gid: Option<u32>) -> b
 /// so a test never depends on the host's groups.
 #[cfg(debug_assertions)]
 fn audit_group() -> String {
-    std::env::var("SAIIFE_TEST_AUDIT_GROUP").unwrap_or_else(|_| AUDIT_GROUP.to_string())
+    std::env::var("SAIIFE_TEST_AUDIT_GROUP").unwrap_or_else(|_| system_audit_group().to_string())
 }
 
 #[cfg(not(debug_assertions))]
 fn audit_group() -> String {
-    AUDIT_GROUP.to_string()
+    system_audit_group().to_string()
 }
 
-/// Root, or a member of `saiife-audit` in this process's current groups.
+/// The group whose members read the audit files (spec §5.2, §5.3).
+fn system_audit_group() -> &'static str {
+    saiife_system::layout::Layout::system().audit_group()
+}
+
+/// Root, or a member of the audit group in this process's current groups.
 #[cfg(unix)]
 pub fn is_auditor() -> bool {
     use rustix::process::{getegid, geteuid, getgroups};
@@ -135,7 +138,7 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// Every page of the caller's records from the daemon, oldest first, and
 /// how many answer entries were not records.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
     use serde_json::{Map, Value};
     use std::time::{Duration, Instant};
@@ -195,7 +198,7 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
     Ok((out, skipped))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), String> {
     // Read every field, so the non-Linux build has no dead fields.
     let QueryArgs {
@@ -207,7 +210,7 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
         service,
     } = q;
     let _ = (config, since, project, agent, blocked, kind, service);
-    Err("locked mode needs Linux in this version (macOS: v2.1)".into())
+    Err(saiife_system::NOT_SUPPORTED_OS.into())
 }
 
 #[cfg(test)]

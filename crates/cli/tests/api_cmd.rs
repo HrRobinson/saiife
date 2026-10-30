@@ -5,7 +5,7 @@
 //! the service's base URL is the IP literal `127.0.0.1`: no test seam in
 //! the daemon. Nothing leaves loopback; signals go to the test's own child
 //! through a syscall.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 
@@ -436,14 +436,14 @@ fn scope_conflict_denied() {
     // check sees it (a group line that lists the user would be caught at
     // load time instead, so skip then).
     let g = own_group();
-    let line = Command::new("getent").args(["group", &g]).output().unwrap();
-    let members = String::from_utf8_lossy(&line.stdout)
-        .trim()
-        .rsplit(':')
-        .next()
-        .unwrap_or("")
-        .to_string();
-    if members.split(',').any(|m| m == own_user()) {
+    // The daemon's own lookup (getent on Linux, Directory Services on
+    // macOS, which has no getent).
+    use saiife_policy::Directory as _;
+    let members = saiife_policy::Getent
+        .group(&g)
+        .map(|e| e.members)
+        .unwrap_or_default();
+    if members.iter().any(|m| *m == own_user()) {
         eprintln!("skipped: {g} lists {} as a member", own_user());
         return;
     }
