@@ -257,6 +257,42 @@ fn fleet_with_no_agents_warns() {
     assert!(!p("etc/gemini-cli").exists());
 }
 
+/// With a fleet config, approvers in install.toml would be dropped without
+/// a word: install refuses them before it changes anything.
+#[cfg(target_os = "linux")]
+#[test]
+fn fleet_approvers_beside_a_fleet_config_refused() {
+    let root = fake_root();
+    let p = |rel: &str| root.path().join(rel);
+    let fleet = p("etc/saiife/fleet");
+    fs::create_dir_all(&fleet).unwrap();
+    for d in ["etc", "etc/saiife", "etc/saiife/fleet"] {
+        fs::set_permissions(p(d), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(fleet.join("config.toml"), "version = 2\nlocked = true\n").unwrap();
+    fs::write(
+        fleet.join("install.toml"),
+        "agents = [\"claude\"]\napprovers = [\"group:ops\"]\n",
+    )
+    .unwrap();
+    for f in ["config.toml", "install.toml"] {
+        fs::set_permissions(fleet.join(f), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    saiife()
+        .args(["system", "install", "--fleet", "--root"])
+        .arg(root.path())
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "saiife: install failed at check: /etc/saiife/fleet/install.toml: approvers is not used",
+        ))
+        .stderr(contains(
+            "[approval] approvers in /etc/saiife/fleet/config.toml",
+        ));
+    assert!(!p("opt").exists());
+    assert!(!p("etc/saiife/config.toml").exists());
+}
+
 #[test]
 fn fleet_conflicts_with_config() {
     let root = fake_root();

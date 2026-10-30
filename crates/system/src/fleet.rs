@@ -5,6 +5,9 @@
 //! - [`FLEET_CONFIG`]: the system config, passed as `--config` (so it is
 //!   checked and copied to `/etc/saiife/config.toml` on every run);
 //! - [`FLEET_INSTALL`]: `agents` and `approvers`, both optional.
+//!   `approvers` only fills a new default config: with [`FLEET_CONFIG`]
+//!   there it is refused (the approvers go in that file's
+//!   `[approval] approvers`).
 //!
 //! The dir (and each dir above it) and both files must be root's and not
 //! writable by group or others. The files must be regular files, opened
@@ -14,7 +17,9 @@
 
 use crate::fsops;
 use crate::host::Host;
-use crate::install::{check_owner_mode_for, refused, InstallError, InstallOptions};
+use crate::install::{
+    check_owner_mode_for, read_previous_record, refused, InstallError, InstallOptions,
+};
 use crate::layout::*;
 use saiife_agents::Agent;
 use saiife_policy::installed::read_installed;
@@ -38,7 +43,12 @@ pub struct FleetInstall {
 /// The install options the fleet files give. The agents come from
 /// `install.toml` when it lists them; otherwise they are the agents
 /// `installed.toml` recorded (an upgrade never adds an agent the admin
-/// left out); with neither, all of them.
+/// left out), or after a plain uninstall the agents its kept copy
+/// recorded; with none of these, all of them.
+///
+/// Dropping an agent from `install.toml` does not remove its managed
+/// hooks (install never removes them); `system uninstall` then `system
+/// install --fleet` does.
 pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions, InstallError> {
     if layout.is_system() && host.euid() != 0 {
         return Err(InstallError::NotRoot);
@@ -65,6 +75,17 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
             approvers: Vec::new(),
         },
     };
+    // The fleet config is copied as it is: approvers here would be dropped
+    // without a word.
+    if config.is_some() && !fleet.approvers.is_empty() {
+        return Err(refused(
+            Path::new(FLEET_INSTALL),
+            format!(
+                "approvers is not used when {FLEET_CONFIG} exists; \
+                 set them as [approval] approvers in {FLEET_CONFIG} and drop approvers here"
+            ),
+        ));
+    }
     let agents = match fleet.agents {
         Some(names) => names
             .iter()
@@ -77,7 +98,7 @@ pub fn fleet_options(layout: &Layout, host: &dyn Host) -> Result<InstallOptions,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
-        None => recorded_agents(layout)?.unwrap_or_else(|| Agent::ALL.to_vec()),
+        None => recorded_agents(layout, host)?.unwrap_or_else(|| Agent::ALL.to_vec()),
     };
     Ok(InstallOptions {
         config: config.map(|_| layout.at(FLEET_CONFIG)),
@@ -94,11 +115,14 @@ fn parse_install(bytes: &[u8]) -> Result<FleetInstall, InstallError> {
     toml::from_str(text).map_err(|e| refused(p, e.message().to_string()))
 }
 
-/// The agents an earlier install recorded (an empty list stays empty);
-/// `None` without a record.
-fn recorded_agents(layout: &Layout) -> Result<Option<Vec<Agent>>, InstallError> {
+/// The agents an earlier install recorded (an empty list stays empty):
+/// `installed.toml`, else the copy a plain uninstall kept (so removing and
+/// reinstalling the package keeps the admin's choice); `None` without
+/// either.
+fn recorded_agents(layout: &Layout, host: &dyn Host) -> Result<Option<Vec<Agent>>, InstallError> {
     let rec =
         read_installed(&layout.at(INSTALLED)).map_err(|e| refused(Path::new(INSTALLED), e))?;
+    let rec = rec.or_else(|| read_previous_record(layout, host));
     Ok(rec.map(|i| {
         i.agents
             .iter()
@@ -237,20 +261,63 @@ mod tests {
     fn fleet_reads_config_and_agents() {
         let e = env(255);
         put(&e, FLEET_CONFIG, CONFIG_TEXT.as_bytes());
-        put(
-            &e,
-            FLEET_INSTALL,
-            b"agents = [\"claude\", \"codex\"]\napprovers = [\"group:ops\"]\n",
-        );
+        put(&e, FLEET_INSTALL, b"agents = [\"claude\", \"codex\"]\n");
         let opts = fleet_options(&e.layout, &e.host).unwrap();
         assert_eq!(opts.agents, [Agent::Claude, Agent::Codex]);
         assert_eq!(
             opts.config,
             Some(e.layout.root().join("etc/saiife/fleet/config.toml"))
         );
-        assert_eq!(opts.approvers, ["group:ops"]);
+        assert!(opts.approvers.is_empty());
         assert!(opts.non_interactive);
         assert!(!opts.allow_test_build);
+    }
+
+    #[test]
+    fn fleet_approvers_with_a_fleet_config_refused() {
+        let e = env(255);
+        put(&e, FLEET_CONFIG, CONFIG_TEXT.as_bytes());
+        put(&e, FLEET_INSTALL, b"approvers = [\"group:ops\"]\n");
+        let (path, detail) = refusal(&e);
+        assert_eq!(path, Path::new(FLEET_INSTALL));
+        assert!(
+            detail.contains("[approval] approvers in /etc/saiife/fleet/config.toml"),
+            "{detail}"
+        );
+        // An empty list is no conflict.
+        put(&e, FLEET_INSTALL, b"approvers = []\n");
+        assert!(fleet_options(&e.layout, &e.host).is_ok());
+        // Without the fleet config, approvers fill a new default config.
+        fs::remove_file(e.at(FLEET_CONFIG)).unwrap();
+        put(&e, FLEET_INSTALL, b"approvers = [\"group:ops\"]\n");
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert_eq!(opts.approvers, ["group:ops"]);
+    }
+
+    #[test]
+    fn fleet_after_plain_uninstall_uses_the_kept_agents() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = vec![Agent::Codex];
+        e.run(&o).unwrap();
+        crate::uninstall::uninstall(
+            &e.layout,
+            &e.host,
+            &crate::uninstall::UninstallOptions { purge: false },
+        )
+        .unwrap();
+        assert!(!e.at(INSTALLED).exists());
+        assert!(e.at(crate::install::PREVIOUS).is_file());
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert_eq!(opts.agents, [Agent::Codex]);
+        // A copy that is not 0600 is not trusted: all agents.
+        fs::set_permissions(
+            e.at(crate::install::PREVIOUS),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert_eq!(opts.agents, Agent::ALL);
     }
 
     #[test]
