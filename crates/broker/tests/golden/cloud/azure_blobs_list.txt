@@ -1,0 +1,4 @@
+GET https://acmedata.blob.core.windows.net/logs?prefix=2026%2F&comp=list&restype=container
+authorization: Bearer fake-minted-access-token
+range: bytes=0-99
+x-ms-version: 2026-04-06

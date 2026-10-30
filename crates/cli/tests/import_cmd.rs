@@ -286,39 +286,73 @@ fn failed_add_leaves_source_untouched() {
 }
 
 #[test]
-fn aws_listed_not_touched() {
+fn kube_listed_not_touched() {
     let d = admin();
     let home = scratch();
-    let text =
-        "[default]\naws_access_key_id = AKIAEXAMPLE0004\naws_secret_access_key = awsvalue0004\n";
-    let aws = put(home.path(), ".aws/credentials", text, 0o600);
     let kube = put(home.path(), ".kube/config", "token: kubevalue0004\n", 0o600);
+    let o = import(&d, home.path(), &["--yes-to", kube.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0), "{}", all(&o));
+    let t = out(&o);
+    assert!(
+        t.contains(&format!(
+            "{}: holds credentials: no importer for this cloud file; remove or rotate by hand",
+            kube.display()
+        )),
+        "{t}"
+    );
+    assert_eq!(fs::read_to_string(&kube).unwrap(), "token: kubevalue0004\n");
+    assert!(names(&d).is_empty());
+    assert!(backups(&d).is_empty());
+}
+
+#[test]
+fn import_aws_profiles_as_aws_kind() {
+    let d = admin();
+    let home = scratch();
+    let akid = concat!("AKI", "A", "TESTTESTTEST0001");
+    let akid2 = concat!("AS", "IA", "TESTTESTTEST0002");
+    let sk = concat!("test-secret-", "access-key-0001");
+    let sk2 = concat!("test-secret-", "access-key-0002");
+    let tok = concat!("test-session-", "token-0002");
+    let text = format!(
+        "[default]\naws_access_key_id = {akid}\naws_secret_access_key = {sk}\nregion = eu-west-1\n\n\
+         [Dev Team]\naws_access_key_id = {akid2}\naws_secret_access_key = {sk2}\naws_session_token = {tok}\n\n\
+         [half]\naws_access_key_id = {akid}\n"
+    );
+    let aws = put(home.path(), ".aws/credentials", &text, 0o600);
     let o = import(
         &d,
         home.path(),
         &[
             "--yes-to",
             aws.to_str().unwrap(),
-            "--yes-to",
-            kube.to_str().unwrap(),
+            "--service",
+            &svc(&aws, "github"),
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", all(&o));
-    let t = out(&o);
-    for p in [&aws, &kube] {
-        assert!(
-            t.contains(&format!(
-                "{}: holds credentials: cloud credentials come with plan 15; remove or rotate by hand",
-                p.display()
-            )),
-            "{t}"
-        );
+    let n = names(&d);
+    assert_eq!(n.len(), 2, "{n:?}");
+    assert_eq!(n[0].0, "aws-default");
+    assert_eq!(n[1].0, "aws-dev-team");
+    let list = saiife(&d, &["list", "--json"]);
+    let l: Value = serde_json::from_slice(&list.stdout).unwrap();
+    for s in l["secrets"].as_array().unwrap() {
+        assert_eq!(s["kind"], "aws");
     }
-    assert_eq!(fs::read_to_string(&aws).unwrap(), text);
-    assert_eq!(fs::read_to_string(&kube).unwrap(), "token: kubevalue0004\n");
-    assert!(names(&d).is_empty());
-    assert!(backups(&d).is_empty());
-    assert!(!all(&o).contains("awsvalue0004"));
+    // Only the key lines are gone; the headers, region and the half profile stay.
+    let left = fs::read_to_string(&aws).unwrap();
+    assert!(left.contains("[default]") && left.contains("region = eu-west-1"));
+    assert!(left.contains("[Dev Team]") && left.contains("[half]"));
+    for v in [sk, sk2, tok, akid2] {
+        assert!(!left.contains(v), "{v} left in the file");
+    }
+    // The half profile's lone key id is not a candidate: it stays.
+    assert_eq!(left.matches(akid).count(), 1);
+    for v in [akid, akid2, sk, sk2, tok] {
+        assert!(!all(&o).contains(v), "{v} printed");
+    }
+    assert_eq!(backups(&d).len(), 1);
 }
 
 #[test]

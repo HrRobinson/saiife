@@ -1,0 +1,6 @@
+POST https://storage.googleapis.com/upload/storage/v1/b/acme-data/o?name=2026%2F10%2Fnew.json&uploadType=media
+authorization: Bearer fake-minted-access-token
+content-type: application/octet-stream
+range: bytes=0-99
+
+{"ok":true}

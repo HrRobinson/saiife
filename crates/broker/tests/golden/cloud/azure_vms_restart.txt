@@ -1,0 +1,2 @@
+POST https://management.azure.com/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/web/providers/Microsoft.Compute/virtualMachines/vm1/restart?api-version=2025-04-01
+authorization: Bearer fake-minted-access-token

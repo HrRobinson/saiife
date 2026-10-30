@@ -1,0 +1,76 @@
+# Google Cloud Storage, JSON API v1.
+#   objects.list:   https://cloud.google.com/storage/docs/json_api/v1/objects/list
+#   objects.get:    https://cloud.google.com/storage/docs/json_api/v1/objects/get   (alt=media downloads the data)
+#   objects.insert: https://cloud.google.com/storage/docs/json_api/v1/objects/insert
+#   media upload:   https://cloud.google.com/storage/docs/uploading-objects#uploading-an-object  (uploadType=media)
+#   objects.delete: https://cloud.google.com/storage/docs/json_api/v1/objects/delete
+#   object names:   https://cloud.google.com/storage/docs/objects#naming   (URL-encode `/` as %2F)
+#   permissions:    https://cloud.google.com/storage/docs/access-control/iam-json
+#   scopes:         https://cloud.google.com/storage/docs/oauth-scopes
+# Auth: an OAuth2 access token minted from a service-account key held in the
+# vault (`gcp_sa`). Object names are `objectname`: the whole name is one
+# encoded segment, so these operations are named-only. `userProject` (who
+# pays) is not a parameter.
+id = "gcp-storage"
+version = 1
+title = "Google Cloud Storage"
+base_url = "https://storage.googleapis.com"
+hosts = ["storage.googleapis.com"]
+auth = [{ kind = "gcp_sa", scope = "https://www.googleapis.com/auth/devstorage.read_write" }]
+request_headers = ["Content-Type", "Range"]
+
+[[operation]]
+id = "storage.objects.list"
+capability = "storage:read"
+qualifier = "projects/_/buckets/{bucket}"
+kind = "read"
+method = "GET"
+path = "/storage/v1/b/{bucket}/o"
+path_params = { bucket = "string:[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]" }
+query = { prefix = "string:.{1,1024}", delimiter = "string:.{1,16}", maxResults = "int:1..1000", pageToken = "string:[A-Za-z0-9+/=_.-]{1,2048}", startOffset = "string:.{1,1024}", endOffset = "string:.{1,1024}" }
+pagination = { cursor = { param = "pageToken", next = "nextPageToken" } }
+iam_action = "storage.objects.list"
+
+[[operation]]
+id = "storage.objects.get"
+capability = "storage:read"
+qualifier = "projects/_/buckets/{bucket}/objects/{object}"
+kind = "read"
+method = "GET"
+path = "/storage/v1/b/{bucket}/o/{object}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]", object = "objectname" }
+iam_action = "storage.objects.get"
+
+[[operation]]
+id = "storage.objects.download"
+capability = "storage:read"
+qualifier = "projects/_/buckets/{bucket}/objects/{object}"
+kind = "read"
+method = "GET"
+path = "/storage/v1/b/{bucket}/o/{object}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]", object = "objectname" }
+fixed_query = { alt = "media" }
+iam_action = "storage.objects.get"
+
+[[operation]]
+id = "storage.objects.insert"
+capability = "storage:write"
+qualifier = "projects/_/buckets/{bucket}/objects/{name}"
+kind = "write"
+method = "POST"
+path = "/upload/storage/v1/b/{bucket}/o"
+path_params = { bucket = "string:[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]" }
+query = { name = "objectname" }
+fixed_query = { uploadType = "media" }
+body = "raw"
+iam_action = "storage.objects.create"
+
+[[operation]]
+id = "storage.objects.delete"
+capability = "storage:delete"
+qualifier = "projects/_/buckets/{bucket}/objects/{object}"
+kind = "delete"
+method = "DELETE"
+path = "/storage/v1/b/{bucket}/o/{object}"
+path_params = { bucket = "string:[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]", object = "objectname" }
+iam_action = "storage.objects.delete"

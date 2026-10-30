@@ -12,7 +12,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use saiife_broker::manifest::{AuthSpec, Manifest};
 use saiife_broker::pipeline::{
-    self, ApprovalFuture, Call, Env, OpRef, Outcome, PendingCall, PolicySnapshot, TokenFuture,
+    self, ApprovalFuture, Call, CredFuture, Env, OpRef, Outcome, PendingCall, PolicySnapshot,
     Trace, Via,
 };
 use saiife_broker::request::AuthMaterial;
@@ -20,7 +20,8 @@ use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request, OP_API_LIST, OP_API_RESULT};
 use saiife_ipc::peer::{comm, PeerCred};
 use saiife_policy::{
-    scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceOverlay, SystemConfig, UserEntry,
+    scope_for, Directory, GroupEntry, PolicyError, Scope, ServiceCfg, ServiceOverlay, SystemConfig,
+    UserEntry,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -76,7 +77,9 @@ pub(crate) struct DaemonEnv<'a> {
 
 /// The auth entry a vault kind can fill: `basic` the basic one, `token` a
 /// bearer, a header or a `basic_token` reading `token`, `header` one reading
-/// `value`, `oauth2` the oauth2 one (its access token from daemon memory).
+/// `value`, `oauth2` the oauth2 one (its access token from daemon memory),
+/// and each cloud kind its own entry (signed or minted by the daemon at
+/// step 9): `aws` `aws_sigv4`, `gcp_sa` `gcp_sa`, `azure_sp` `azure_sp`.
 fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
     auth.iter().find(|a| match kind {
         Kind::Basic => a.kind == "basic",
@@ -86,6 +89,9 @@ fn spec_for(kind: Kind, auth: &[AuthSpec]) -> Option<&AuthSpec> {
         }
         Kind::Header => a.kind == "header" && a.secret_field == "value",
         Kind::OAuth2 => a.kind == "oauth2",
+        Kind::Aws => a.kind == "aws_sigv4",
+        Kind::GcpSa => a.kind == "gcp_sa",
+        Kind::AzureSp => a.kind == "azure_sp",
     })
 }
 
@@ -98,13 +104,39 @@ fn mask_values(kind: Kind, fields: &BTreeMap<String, Zeroizing<String>>) -> Vec<
         Kind::Token => "basic_token",
         k => kind_str(k),
     };
-    AuthMaterial {
+    // The id fields of a cloud secret are not secrets: a short one (a
+    // project called `prod`) would over-mask, so they count from 8 bytes.
+    // The key, secret and token fields are always masked.
+    let fields: BTreeMap<String, Zeroizing<String>> = fields
+        .iter()
+        .filter(|(k, v)| !CLOUD_ID_FIELDS.contains(&k.as_str()) || v.len() >= CLOUD_ID_MIN)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut out = AuthMaterial {
         kind: kind.to_string(),
         name: None,
         fields: fields.clone(),
     }
-    .values()
+    .values();
+    if let Some(k) = fields.get("private_key") {
+        for f in saiife_broker::mask::pem_forms(k) {
+            if !out.iter().any(|o| **o == *f) {
+                out.push(f);
+            }
+        }
+    }
+    out
 }
+
+const CLOUD_ID_FIELDS: [&str; 6] = [
+    "access_key_id",
+    "client_email",
+    "project_id",
+    "tenant_id",
+    "client_id",
+    "private_key_id",
+];
+const CLOUD_ID_MIN: usize = 8;
 
 fn kind_str(k: Kind) -> &'static str {
     match k {
@@ -112,6 +144,9 @@ fn kind_str(k: Kind) -> &'static str {
         Kind::Basic => "basic",
         Kind::Header => "header",
         Kind::OAuth2 => "oauth2",
+        Kind::Aws => "aws",
+        Kind::GcpSa => "gcp_sa",
+        Kind::AzureSp => "azure_sp",
     }
 }
 
@@ -164,23 +199,23 @@ impl Env for DaemonEnv<'_> {
         Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
     }
 
-    fn oauth_token<'b>(
+    fn credential<'b>(
         &'b self,
         secret: &'b str,
         service: &'b str,
         spec: &'b AuthSpec,
         m: &'b Manifest,
-        svc_params: &'b BTreeMap<String, String>,
+        svc: &'b ServiceCfg,
         force: bool,
-    ) -> TokenFuture<'b> {
-        Box::pin(crate::oauth::access_token(
+    ) -> CredFuture<'b> {
+        Box::pin(crate::oauth::credential(
             self.ctx,
             crate::oauth::Want {
                 secret,
                 service,
                 spec,
                 manifest: m,
-                svc_params,
+                svc,
                 force,
             },
         ))
@@ -216,7 +251,7 @@ pub(crate) fn valid_collection(s: &str) -> bool {
 }
 
 /// Parses `overlay` (`{allow, ask, deny}` lists of strings).
-fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
+pub(crate) fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>, &'static str> {
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
@@ -279,6 +314,18 @@ pub(crate) fn parse_env(args: &Map<String, Value>) -> Result<Option<String>, &'s
             Ok(Some(s.clone()))
         }
         Some(_) => Err("env must be an environment name ([a-z0-9_-]{1,64})"),
+    }
+}
+
+/// The optional `project` argument of `api.call` and `cloud.lease`: the
+/// project path the client reports, for the record only (empty if absent).
+pub(crate) fn parse_project(args: &Map<String, Value>) -> Result<String, &'static str> {
+    match args.get("project") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(s)) if s.len() <= MAX_PROJECT && !s.contains(['\n', '\r', '\0']) => {
+            Ok(s.clone())
+        }
+        Some(_) => Err("project must be a path"),
     }
 }
 
@@ -360,13 +407,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         Some(_) => return Err("headers must be an array"),
     }
     let overlay = parse_overlay(args.get("overlay"))?;
-    let project = match args.get("project") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) if s.len() <= MAX_PROJECT && !s.contains(['\n', '\r', '\0']) => {
-            s.clone()
-        }
-        Some(_) => return Err("project must be a path"),
-    };
+    let project = parse_project(args)?;
     let collection = match args.get("collection") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),
@@ -926,6 +967,8 @@ mod tests {
             secret_field: "value".into(),
             prefix: None,
             token_path: None,
+            service: None,
+            scope: None,
         };
         let bearer = AuthSpec {
             kind: "bearer".into(),
@@ -933,6 +976,8 @@ mod tests {
             secret_field: "token".into(),
             prefix: None,
             token_path: None,
+            service: None,
+            scope: None,
         };
         let both = [header.clone(), bearer.clone()];
         assert_eq!(spec_for(Kind::Header, &both), Some(&header));
@@ -953,11 +998,111 @@ mod tests {
             secret_field: String::new(),
             prefix: None,
             token_path: Some("/services/oauth2/token".into()),
+            service: None,
+            scope: None,
         };
         let o = [oauth.clone()];
         assert_eq!(spec_for(Kind::OAuth2, &o), Some(&oauth));
         assert_eq!(spec_for(Kind::Token, &o), None);
         assert_eq!(spec_for(Kind::OAuth2, &both), None);
+        // Each cloud kind serves its own auth entry only.
+        let cloud = |kind: &str| AuthSpec {
+            kind: kind.into(),
+            ..oauth.clone()
+        };
+        let (aws, gcp, az) = (cloud("aws_sigv4"), cloud("gcp_sa"), cloud("azure_sp"));
+        let all = [aws.clone(), gcp.clone(), az.clone(), oauth.clone()];
+        assert_eq!(spec_for(Kind::Aws, &all), Some(&aws));
+        assert_eq!(spec_for(Kind::GcpSa, &all), Some(&gcp));
+        assert_eq!(spec_for(Kind::AzureSp, &all), Some(&az));
+        assert_eq!(spec_for(Kind::Aws, &[gcp.clone(), az.clone()]), None);
+        assert_eq!(spec_for(Kind::GcpSa, &[aws.clone(), az.clone()]), None);
+        assert_eq!(spec_for(Kind::AzureSp, &[aws.clone(), gcp.clone()]), None);
+        assert_eq!(spec_for(Kind::Token, &all), None);
+    }
+
+    #[test]
+    fn mask_values_cover_every_cloud_field() {
+        let pem = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "TESTBODYTESTBODYTESTBODYTESTBODY0001\n",
+            "TESTBODYTESTBODYTESTBODYTESTBODY0002\n-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        const LINE1: &str = "TESTBODYTESTBODYTESTBODYTESTBODY0001";
+        const LINE2: &str = "TESTBODYTESTBODYTESTBODYTESTBODY0002";
+        let sets: [(Kind, Vec<(&str, &str)>); 3] = [
+            (
+                Kind::Aws,
+                vec![
+                    ("access_key_id", concat!("AKI", "A", "TESTTESTTEST0001")),
+                    ("secret_access_key", concat!("test-secret-", "key-0001")),
+                    ("session_token", concat!("test-session-", "token-0001")),
+                ],
+            ),
+            (
+                Kind::GcpSa,
+                vec![
+                    ("client_email", "sa@p.iam.gserviceaccount.com"),
+                    ("private_key", pem),
+                    ("private_key_id", "abcd1234"),
+                    ("project_id", "my-proj-1"),
+                ],
+            ),
+            (
+                Kind::AzureSp,
+                vec![
+                    ("tenant_id", "0123abcd-4567-89ab-cdef-0123456789ab"),
+                    ("client_id", "1123abcd-4567-89ab-cdef-0123456789ab"),
+                    ("client_secret", concat!("client-", "secret-0001")),
+                ],
+            ),
+        ];
+        for (kind, set) in sets {
+            let fields: BTreeMap<String, Zeroizing<String>> = set
+                .iter()
+                .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+                .collect();
+            let vals: Vec<String> = mask_values(kind, &fields)
+                .iter()
+                .map(|v| v.to_string())
+                .collect();
+            let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+            let masker = saiife_broker::mask::Masker::new(&refs);
+            for (k, v) in &set {
+                assert!(vals.contains(&v.to_string()), "{k} not in the mask set");
+                let masked = masker.mask_text(&format!("echo {v} end"));
+                assert!(!masked.contains(v), "{k}");
+            }
+            if kind == Kind::GcpSa {
+                // The key echoed as one base64 run, one line, or escaped
+                // as in Google's key file JSON.
+                let run = format!("{LINE1}{LINE2}");
+                let esc = pem.replace('\n', "\\n");
+                for echo in [run.as_str(), LINE1, LINE2, esc.as_str()] {
+                    let masked = masker.mask_text(&format!("k={echo}"));
+                    assert!(!masked.contains(LINE1) && !masked.contains(LINE2), "{echo}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_cloud_ids_are_not_masked_but_secrets_always_are() {
+        let fields: BTreeMap<String, Zeroizing<String>> = [
+            ("tenant_id", "prod"),
+            ("client_id", "dev"),
+            ("client_secret", "abcd"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
+        .collect();
+        let vals: Vec<String> = mask_values(Kind::AzureSp, &fields)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert_eq!(vals, ["abcd"]);
     }
 
     #[test]

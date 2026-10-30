@@ -52,11 +52,15 @@ and it does not notice that the newest records were removed (see
 In locked mode on Linux, saiife can make API calls for the agent. You store a
 credential in saiife's vault (`saiife secret add`, or `saiife secret import`
 to move plaintext credentials out of the home), connect a service with
-`saiife connect shopify|hubspot|github`, and the agent calls it through
+`saiife connect shopify|hubspot|github|aws-s3|...`, and the agent calls it through
 `saiife api`. The saiife daemon checks each call against your policy, adds
 the credential, sends the request and masks the answer. So the agent never
 holds a credential for a brokered service; it holds its own model-provider
-login unless you run a local model. See [Connectors](docs/connectors/README.md).
+login unless you run a local model. Cloud connectors sign for the agent too:
+Amazon S3 and STS (SigV4), Google Cloud Storage, Azure Resource Manager and
+Azure Blob Storage. An opt-in STS mode for AWS hands a 15-minute credential to
+one command; it is the one case where the agent's code can hold a credential,
+and `doctor` warns about it. See [Connectors](docs/connectors/README.md).
 
 ## Personal broker
 

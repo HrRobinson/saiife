@@ -53,6 +53,29 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             // whole match becomes `[MASKED]`.
             "${1}[MASKED]",
         ),
+        // Cloud key shapes, two alternations (two extra passes). No leading
+        // `\b`: a token glued to an identifier still counts.
+        (
+            concat!(
+                r"ya29\.[A-Za-z0-9_-]{20,}",
+                r"|AIza[0-9A-Za-z_-]{35}",
+                r"|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            ),
+            MASK,
+        ),
+        // Key names keep their prefix (case-insensitive; the JSON quotes may
+        // be backslash-escaped when the document is itself a string).
+        (
+            concat!(
+                r#"((?i:"#,
+                r#"\\?"(?:SecretAccessKey|SessionToken|secret_access_key|session_token|private_key|client_secret|access_token|refresh_token)\\?"\s*:\s*\\?""#,
+                r#"|<(?:SecretAccessKey|SessionToken)>"#,
+                r#"|AccountKey=|SharedAccessSignature="#,
+                r#"|[?&]sig="#,
+                r#"))[^"<;&\s]{8,}"#,
+            ),
+            "${1}[MASKED]",
+        ),
     ]
     .into_iter()
     .map(|(p, r)| (Regex::new(p).expect("mask pattern compiles"), r))
@@ -438,9 +461,12 @@ mod tests {
         );
         assert_eq!(mask(&plain), "[MASKED]");
         assert_eq!(mask(&dotted), "[MASKED]");
-        // JWT-like strings must stay untouched (they start with eyJ).
-        let jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
-        assert_eq!(mask(&jwt), jwt);
+        // A dotted string starting with eyJ but without a second eyJ part is
+        // not a JWT and stays untouched; a real JWT is masked by the cloud rule.
+        let not_jwt = format!("eyJ{}.{}.{}", al('a', 30), al('b', 30), al('c', 30));
+        assert_eq!(mask(&not_jwt), not_jwt);
+        let jwt = format!("eyJ{}.eyJ{}.{}", al('a', 30), al('b', 30), al('c', 30));
+        assert_eq!(mask(&jwt), "[MASKED]");
     }
 
     #[test]
@@ -469,8 +495,127 @@ mod tests {
     }
 
     #[test]
+    fn gcp_access_token() {
+        let tok = format!("{}{}", concat!("ya2", "9."), "A".repeat(40));
+        assert_eq!(mask(&format!("tok={tok}")), "tok=[MASKED]");
+        assert_eq!(mask(&format!("X{tok}-end")), "X[MASKED]");
+        let short = concat!("ya2", "9.short");
+        assert_eq!(mask(short), short);
+    }
+
+    #[test]
+    fn google_api_key() {
+        let key = format!("{}{}", concat!("AIz", "a"), "b".repeat(35));
+        assert_eq!(mask(&format!("?key={key}&x=1")), "?key=[MASKED]&x=1");
+        assert_eq!(mask(&format!("glued{key}")), "glued[MASKED]");
+        // Too short.
+        let short = format!("{}{}", concat!("AIz", "a"), "b".repeat(34));
+        assert_eq!(mask(&short), short);
+    }
+
+    #[test]
+    fn jwt_needs_three_parts() {
+        let al = |c: char, n: usize| c.to_string().repeat(n);
+        let jwt = format!("eyJ{}.eyJ{}.{}", al('a', 20), al('b', 20), al('c', 20));
+        assert_eq!(mask(&format!("Authz {jwt} x")), "Authz [MASKED] x");
+        assert_eq!(mask(&format!("v{jwt}")), "v[MASKED]");
+        assert_eq!(mask(&format!("{jwt}.tail")), "[MASKED].tail");
+        let two = format!("eyJ{}.eyJ{}", al('a', 20), al('b', 20));
+        assert_eq!(mask(&two), two);
+    }
+
+    #[test]
+    fn sa_json_private_key_escaped_newlines() {
+        let pem = format!(
+            "{}\\nMIIEvQIBADANBg\\n{}",
+            concat!("-----BEGIN PRI", "VATE KEY-----"),
+            concat!("-----END PRI", "VATE KEY-----")
+        );
+        let doc = format!(
+            r#"{{"type":"service_account","private_key": "{pem}","client_email":"a@b.c"}}"#
+        );
+        let m = mask(&doc);
+        assert!(!m.contains("MIIEvQ"), "{m}");
+        assert!(m.contains(r#""private_key": "[MASKED]""#), "{m}");
+        assert!(m.contains("client_email"), "{m}");
+        // Case variant and a string-embedded (backslash-escaped) document.
+        let m = mask(&format!(r#"{{\"PRIVATE_KEY\":\"{}\"}}"#, "Q".repeat(30)));
+        assert!(!m.contains("QQQQ"), "{m}");
+    }
+
+    #[test]
+    fn sts_xml_and_json_secret_and_token() {
+        let v = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
+        assert_eq!(
+            mask(&format!("<SecretAccessKey>{v}</SecretAccessKey>")),
+            "<SecretAccessKey>[MASKED]</SecretAccessKey>"
+        );
+        assert_eq!(
+            mask(&format!("<SessionToken>{v}==</SessionToken>")),
+            "<SessionToken>[MASKED]</SessionToken>"
+        );
+        assert_eq!(
+            mask(&format!(r#"{{"SecretAccessKey" : "{v}","x":1}}"#)),
+            r#"{"SecretAccessKey" : "[MASKED]","x":1}"#
+        );
+        for k in [
+            "session_token",
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "secret_access_key",
+        ] {
+            let m = mask(&format!(r#"{{"{k}":"{v}"}}"#));
+            assert!(!m.contains(v), "{k}: {m}");
+        }
+        assert_eq!(
+            mask("<sessiontoken>abcdefghijkl</sessiontoken>"),
+            "<sessiontoken>[MASKED]</sessiontoken>"
+        );
+    }
+
+    #[test]
+    fn azure_account_key_and_sas() {
+        let k = "Zm9vYmFyYmF6cXV4MTIzNA==";
+        assert_eq!(
+            mask(&format!(
+                "DefaultEndpointsProtocol=https;AccountKey={k};EndpointSuffix=x"
+            )),
+            "DefaultEndpointsProtocol=https;AccountKey=[MASKED];EndpointSuffix=x"
+        );
+        assert_eq!(mask(&format!("accountkey={k}")), "accountkey=[MASKED]");
+        assert_eq!(
+            mask("SharedAccessSignature=sv=2020-08-04&sig=abcdefghij"),
+            "SharedAccessSignature=[MASKED]&sig=[MASKED]"
+        );
+        assert_eq!(
+            mask("https://a.blob.core.windows.net/c/b?sv=1&sig=AbCdEf%2Fgh%3D&se=2"),
+            "https://a.blob.core.windows.net/c/b?sv=1&sig=[MASKED]&se=2"
+        );
+        assert_eq!(mask("u?SIG=AbCdEfGhIj"), "u?SIG=[MASKED]");
+    }
+
+    #[test]
+    fn plain_words_untouched() {
+        for s in [
+            "the session token is rotated",
+            "private_key",
+            r#""private_key": "short""#,
+            "design=ok&sig=short",
+            "AccountKey=x",
+            "<SessionToken>abc</SessionToken>",
+            "eyJhbGciOi",
+            "ya29 is a prefix",
+            "AIza",
+        ] {
+            assert_eq!(mask(s), s);
+        }
+    }
+
+    #[test]
     fn one_extra_pass_only() {
-        // Twelve rules before wave 2/3, plus exactly one alternation.
-        assert_eq!(RULES.len(), 13);
+        // Twelve rules before wave 2/3, one wave 2/3 alternation, and two
+        // cloud alternations.
+        assert_eq!(RULES.len(), 15);
     }
 }

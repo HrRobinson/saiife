@@ -12,6 +12,7 @@
 
 use crate::amount;
 use crate::catalog::Catalog;
+use crate::cloud::sigv4::{self, AwsCreds};
 use crate::limits::{Event, Key, Limiter};
 use crate::manifest::{AuthSpec, Manifest, OpKind, Operation, Pagination, Transport};
 use crate::mask::{finish, Finished, Masked, Masker};
@@ -21,12 +22,12 @@ use crate::resolve;
 use crate::upstream::Upstream;
 use crate::BrokerError;
 use bytes::Bytes;
-use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE};
+use http::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
 use http::HeaderValue;
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_policy::capability::Capability;
 use saiife_policy::decide::{decide, Request, Verdict};
-use saiife_policy::{Mode, PolicyError, Scope, ServiceOverlay, SystemConfig};
+use saiife_policy::{Mode, PolicyError, Scope, ServiceCfg, ServiceOverlay, SystemConfig};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -91,7 +92,8 @@ pub struct StoredCall {
     pub params: BTreeMap<String, String>,
     /// Base64 of the agent's body as canonical JSON (the input to
     /// [`prepare_body`], not the bytes sent: for `body = "form"` those are
-    /// its form encoding). `None` when the operation builds its body from
+    /// its form encoding; for `text` and `raw` the bytes as given). `None`
+    /// when the operation builds its body from
     /// the params. At send it is prepared again, and the bytes must hash to
     /// `body_sha256`.
     pub body_b64: Option<String>,
@@ -331,28 +333,74 @@ pub trait Env: Sync {
     /// `approval`/`created` record); the id, or the deny rule
     /// (`approvals_unavailable`, `vault_unavailable`, ...). Nothing is sent.
     fn create_approval<'a>(&'a self, p: &'a PendingCall) -> ApprovalFuture<'a>;
-    /// Step 9 for an `oauth2` credential: the access token of secret
-    /// `secret` (from memory, refreshed when due, or always with `force`),
-    /// or the deny rule. The default has none (`secret_missing`).
+    /// Step 9 for a credential the daemon holds or mints (plan 15, Task 9):
+    /// for `oauth2` the access token of secret `secret` (from memory,
+    /// refreshed when due, or always with `force` after a 401); for
+    /// `gcp_sa` and `azure_sp` an access token minted for the manifest's
+    /// scope; for `aws_sigv4` the keys to sign with (the vault's, or a role
+    /// assumed with them when `svc.cloud.role_arn` is set). Or the deny
+    /// rule. The default has none (`secret_missing`).
+    ///
+    /// What picks the credential (the scope, the role, the region, the
+    /// authority) comes from `spec`, `m` and `svc`: the manifest and the
+    /// admin's service config, never agent input.
     #[allow(clippy::too_many_arguments)]
-    fn oauth_token<'a>(
+    fn credential<'a>(
         &'a self,
         secret: &'a str,
         service: &'a str,
         spec: &'a AuthSpec,
         m: &'a Manifest,
-        svc_params: &'a BTreeMap<String, String>,
+        svc: &'a ServiceCfg,
         force: bool,
-    ) -> TokenFuture<'a> {
-        let _ = (secret, service, spec, m, svc_params, force);
+    ) -> CredFuture<'a> {
+        let _ = (secret, service, spec, m, svc, force);
         Box::pin(async { Err("secret_missing") })
     }
 }
 
-/// The future of [`Env::oauth_token`].
-pub type TokenFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Zeroizing<String>, &'static str>> + Send + 'a>,
+/// A credential for step 9: a bearer token (`oauth2`, `gcp_sa`,
+/// `azure_sp`) or AWS keys to sign with. Its values are zeroized on drop,
+/// and `Debug` never shows them.
+pub enum Cred {
+    Bearer(Zeroizing<String>),
+    Aws(AwsCreds),
+}
+
+impl std::fmt::Debug for Cred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cred::Bearer(_) => f.write_str("Cred::Bearer(..)"),
+            Cred::Aws(_) => f.write_str("Cred::Aws(..)"),
+        }
+    }
+}
+
+impl Cred {
+    /// Every value of the credential, for the masker.
+    pub fn values(&self) -> Vec<Zeroizing<String>> {
+        match self {
+            Cred::Bearer(t) => vec![t.clone()],
+            Cred::Aws(c) => {
+                let mut v = vec![c.access_key_id.clone(), c.secret_access_key.clone()];
+                v.extend(c.session_token.clone());
+                v
+            }
+        }
+    }
+}
+
+/// The future of [`Env::credential`].
+pub type CredFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Arc<Cred>, &'static str>> + Send + 'a>,
 >;
+
+/// An auth kind whose credential comes from [`Env::credential`] rather than
+/// from the vault entry as it is: `oauth2` and the cloud kinds
+/// ([`crate::manifest::CLOUD_AUTH_KINDS`]).
+pub fn is_credential_kind(kind: &str) -> bool {
+    kind == "oauth2" || crate::manifest::CLOUD_AUTH_KINDS.contains(&kind)
+}
 
 /// Parses a JSON body, refusing a duplicate object key anywhere (two
 /// parsers that keep the first and the last value would see different
@@ -468,26 +516,38 @@ pub enum Outcome {
     },
 }
 
-/// Step 8: the body would be shown masked, so it cannot be approved.
-/// The body as the approver will see it, when that is exactly what will be
-/// sent: `None` if the masker would change it, or it is not UTF-8. The
-/// vault forms are compared on the raw bytes (a lossy UTF-8 view would
-/// hide a change inside invalid bytes), then the v1 patterns on the text.
-fn faithful_display(masker: &Masker, b: &[u8]) -> Option<String> {
+/// Step 8: the body as the approver will see it, when that is exactly what
+/// will be sent. `Err(rule)`: [`MASKED_CONTENT_RULE`] if the masker would
+/// change it, [`BODY_NOT_DISPLAYABLE_RULE`] if it is not UTF-8 (a binary
+/// `body = "raw"` upload). The vault forms are compared on the raw bytes
+/// first (a lossy UTF-8 view would hide a change inside invalid bytes), so
+/// a binary body that holds a vault value is still `masked_content`; then
+/// the v1 patterns on the text.
+fn faithful_display(masker: &Masker, b: &[u8]) -> Result<String, &'static str> {
     if masker.mask_bytes(b) != b {
-        return None;
+        return Err(MASKED_CONTENT_RULE);
     }
-    // Unreachable for body = "json" today (canonical JSON by now); defence in depth.
-    let text = std::str::from_utf8(b).ok()?;
-    (masker.mask_text(text) == text).then(|| text.to_string())
+    // Unreachable for body = "json" (canonical JSON by now); a binary raw
+    // body cannot be shown at all.
+    let text = std::str::from_utf8(b).map_err(|_| BODY_NOT_DISPLAYABLE_RULE)?;
+    if masker.mask_text(text) != text {
+        return Err(MASKED_CONTENT_RULE);
+    }
+    Ok(text.to_string())
 }
 
 pub const MASKED_CONTENT_RULE: &str = "masked_content";
+/// An `ask` call whose body is binary (not UTF-8): it cannot be shown to
+/// the approver, so it cannot be approved.
+pub const BODY_NOT_DISPLAYABLE_RULE: &str = "body_not_displayable";
 
 /// The fixed explanation a deny rule carries, if any.
 pub fn deny_reason(rule: &str) -> Option<&'static str> {
     match rule {
         MASKED_CONTENT_RULE => Some("cannot be approved: the request contains masked content"),
+        BODY_NOT_DISPLAYABLE_RULE => {
+            Some("cannot be approved: the request body is binary and cannot be shown for approval")
+        }
         _ => None,
     }
 }
@@ -650,6 +710,42 @@ pub(crate) fn rule_of(e: &BrokerError) -> &'static str {
         BrokerError::RedirectRefused => "redirect_refused",
         BrokerError::RedactNonJson => "redact_non_json",
         _ => "policy_invalid",
+    }
+}
+
+/// Step 9 for a cloud credential: `aws_sigv4` signs `b` (SigV4 for
+/// `params.region` and the manifest's service, at this instant);
+/// `gcp_sa` and `azure_sp` set `Authorization: Bearer`. The deny rule when
+/// the credential does not fit the auth entry or the request cannot be
+/// signed.
+fn apply_cred(
+    b: &mut crate::request::Built,
+    c: &Cred,
+    spec: &AuthSpec,
+    svc: &ServiceCfg,
+) -> Result<(), &'static str> {
+    match (spec.kind.as_str(), c) {
+        ("aws_sigv4", Cred::Aws(k)) => {
+            // Both from the admin: the service param and the manifest.
+            let region = svc.params.get("region").ok_or("policy_invalid")?;
+            let service = spec.service.as_deref().ok_or("policy_invalid")?;
+            sigv4::sign(
+                b,
+                k,
+                &sigv4::for_service(region, service),
+                OffsetDateTime::now_utc(),
+            )
+            // Only a header value that is not visible ASCII can fail here.
+            .map_err(|_| "bad_param")
+        }
+        ("gcp_sa" | "azure_sp", Cred::Bearer(t)) => {
+            let v = Zeroizing::new(format!("Bearer {}", t.as_str()));
+            let mut v = HeaderValue::from_str(&v).map_err(|_| "token_mint_failed")?;
+            v.set_sensitive(true);
+            b.headers.insert(AUTHORIZATION, v);
+            Ok(())
+        }
+        _ => Err("secret_missing"),
     }
 }
 
@@ -821,8 +917,8 @@ async fn steps(
         let mut display = None;
         if let Some(b) = body.as_ref() {
             match faithful_display(masker, b) {
-                Some(text) => display = Some(cut_display(&text, BODY_DISPLAY_MAX)),
-                None => return denied(MASKED_CONTENT_RULE),
+                Ok(text) => display = Some(cut_display(&text, BODY_DISPLAY_MAX)),
+                Err(rule) => return denied(rule),
             }
         }
         let pending = PendingCall {
@@ -894,36 +990,54 @@ async fn steps(
         None if m.auth.is_empty() => AuthMaterial::none(),
         None => return denied("secret_missing"),
     };
-    // ---- oauth2 (plan 14, Task 7) ----
-    // The access token comes from the daemon's memory (refreshed there when
-    // due), never from the vault.
-    let oauth: Option<(&str, &AuthSpec)> = match (&svc.secret, auth.kind == "oauth2") {
-        (Some(name), true) => match m.auth.iter().find(|a| a.kind == "oauth2") {
-            Some(spec) => Some((name.as_str(), spec)),
-            None => return denied("secret_missing"),
-        },
+    // ---- credential (plan 14 Task 7: oauth2; plan 15 Task 9: cloud) ----
+    // An oauth2 access token comes from the daemon's memory (refreshed
+    // there when due), never from the vault; a cloud credential is minted
+    // or assumed by the daemon (or, for AWS keys, read from the vault).
+    // Nothing is minted before this point: a call denied in steps 2–8
+    // costs no token request.
+    let minted: Option<(&str, &AuthSpec)> = match &svc.secret {
+        Some(name) if is_credential_kind(&auth.kind) => {
+            match m.auth.iter().find(|a| a.kind == auth.kind) {
+                Some(spec) => Some((name.as_str(), spec)),
+                None => return denied("secret_missing"),
+            }
+        }
         _ => None,
     };
-    if let Some((name, spec)) = oauth {
+    let oauth = minted.filter(|(_, spec)| spec.kind == "oauth2");
+    let mut cred: Option<Arc<Cred>> = None;
+    if let Some((name, spec)) = minted {
         match env
-            .oauth_token(name, &call.service, spec, &m, &svc.params, false)
+            .credential(name, &call.service, spec, &m, svc, false)
             .await
         {
-            Ok(t) => {
-                auth.fields.insert("access_token".into(), t);
+            Ok(c) => {
+                if oauth.is_some() {
+                    let Cred::Bearer(t) = &*c else {
+                        return denied("secret_missing");
+                    };
+                    auth.fields.insert("access_token".into(), t.clone());
+                } else {
+                    cred = Some(c);
+                }
             }
             Err(rule) => return denied(rule),
         }
     }
     // Every value of the secret in use (each field and the basic pair; for
     // oauth2 the access token, and the refresh token as the vault holds it
-    // now, rotated or not).
+    // now, rotated or not; for a cloud secret the minted token or the
+    // session credentials, and every form of the vault fields).
     let mut mask_values = auth.values();
-    if let Some(v) = oauth.and_then(|(name, _)| env.secret_values(name)) {
+    if let Some(c) = &cred {
+        mask_values.extend(c.values());
+    }
+    if let Some(v) = minted.and_then(|(name, _)| env.secret_values(name)) {
         mask_values.extend(v);
     }
     *masker = masker_of(&mask_values);
-    // ---- end oauth2 ----
+    // ---- end credential ----
     // ---- mail transport (plan 14, Task 6) ----
     // A mail call builds no HTTP request: its params are checked here,
     // before anything counts, and the credential is kept for `mail::run`.
@@ -963,6 +1077,15 @@ async fn steps(
             built
                 .headers
                 .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+        }
+        // ---- cloud credential (plan 15, Task 9) ----
+        // Last, so that every header above is signed; `build` let only the
+        // manifest's `request_headers` through from the agent, and never an
+        // `Authorization` or a SigV4 header.
+        if let (Some(c), Some((_, spec))) = (&cred, minted) {
+            if let Err(rule) = apply_cred(built, c, spec, svc) {
+                return denied(rule);
+            }
         }
     }
     let max = svc
@@ -1030,10 +1153,15 @@ async fn steps(
     // daemon). The resend counts with the first send.
     if resp.status == 401 && !mail {
         if let Some((name, spec)) = oauth {
-            if let Ok(t) = env
-                .oauth_token(name, &call.service, spec, &m, &svc.params, true)
+            let token = env
+                .credential(name, &call.service, spec, &m, svc, true)
                 .await
-            {
+                .ok()
+                .and_then(|c| match &*c {
+                    Cred::Bearer(t) => Some(t.clone()),
+                    Cred::Aws(_) => None,
+                });
+            if let Some(t) = token {
                 mask_values.push(t.clone());
                 // A refresh token rotated by this refresh, too.
                 mask_values.extend(env.secret_values(name).unwrap_or_default());
@@ -1189,6 +1317,20 @@ pub fn prepare_body(
             json: None,
             input: Some(b.clone()),
             content_type: Some("text/plain; charset=utf-8"),
+        });
+    }
+    // `raw` (plan 15): the agent's bytes as they are, never parsed, so the
+    // manifest refuses an amount on such an operation. The Content-Type is
+    // the agent's, if the manifest lists it.
+    if op.body.as_deref() == Some("raw") {
+        let Some(b) = raw else {
+            return Ok(PreparedBody::default());
+        };
+        return Ok(PreparedBody {
+            bytes: Some(b.clone()),
+            json: None,
+            input: Some(b.clone()),
+            content_type: None,
         });
     }
     let (json, input) = if op.builds_body() {
@@ -1372,7 +1514,29 @@ pub fn record(
 /// The limiter event of a `connector` record of a request that was sent,
 /// for the rebuild at start (Task 3). Sent means: allowed (done or failed
 /// upstream) or denied after sending ([`POST_SEND_RULES`]).
+///
+/// A `secret`/`cloud_lease` record is one `requests_per_minute` slot of its
+/// service (plan 15 decision 17) when its `AssumeRole` was sent: granted, or
+/// denied `token_mint_failed`.
 pub fn limit_event(r: &Record) -> Option<Event> {
+    if r.kind() == "secret" && r.extra.get("event").and_then(|e| e.as_str()) == Some("cloud_lease")
+    {
+        let sent =
+            r.decision == DecisionKind::Allow || r.rule.as_deref() == Some("token_mint_failed");
+        if !sent {
+            return None;
+        }
+        return Some(Event {
+            at: r.timestamp()?,
+            key: Key {
+                uid: r.uid?,
+                service: r.extra.get("service")?.as_str()?.to_string(),
+                session: r.session.clone(),
+            },
+            kind: OpKind::Read,
+            amount_minor: None,
+        });
+    }
     if r.kind() != "connector" {
         return None;
     }
@@ -1459,16 +1623,24 @@ mod tests {
         let m = Masker::new(&["s3cr3t-vault-value"]);
         assert_eq!(
             faithful_display(&m, b"{\"a\":1}").as_deref(),
-            Some("{\"a\":1}")
+            Ok("{\"a\":1}")
         );
-        // Not UTF-8: refused even though nothing is masked.
-        assert_eq!(faithful_display(&m, b"{\"a\":\"\xff\xfe\"}"), None);
+        // Not UTF-8: refused even though nothing is masked, as binary.
+        assert_eq!(
+            faithful_display(&m, b"{\"a\":\"\xff\xfe\"}"),
+            Err(BODY_NOT_DISPLAYABLE_RULE)
+        );
         // A vault value, also beside invalid bytes (a lossy view would
-        // have replaced the bytes and hidden the difference).
-        assert_eq!(faithful_display(&m, b"x s3cr3t-vault-value y"), None);
-        assert_eq!(faithful_display(&m, b"\xff s3cr3t-vault-value"), None);
+        // have replaced the bytes and hidden the difference): masked
+        // content, binary or not.
+        for b in [&b"x s3cr3t-vault-value y"[..], b"\xff s3cr3t-vault-value"] {
+            assert_eq!(faithful_display(&m, b), Err(MASKED_CONTENT_RULE));
+        }
         // A v1 pattern.
-        assert_eq!(faithful_display(&m, b"API_TOKEN=x"), None);
+        assert_eq!(
+            faithful_display(&m, b"API_TOKEN=x"),
+            Err(MASKED_CONTENT_RULE)
+        );
     }
 
     #[test]

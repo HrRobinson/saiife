@@ -180,3 +180,11 @@ fn docs_writes_under_ask() {
         }
     }
 }
+
+/// The STS-mode label of spec §6.13 stays on the S3 page, word for word.
+#[test]
+fn aws_s3_page_holds_the_sts_label() {
+    let text = page("aws-s3");
+    let label = "This hands a credential to agent-controlled code. It is scoped and short-lived, but an agent can copy it.";
+    assert!(text.contains(label), "aws-s3.md lost the §6.13 label");
+}

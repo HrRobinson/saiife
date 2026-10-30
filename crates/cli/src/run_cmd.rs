@@ -23,6 +23,8 @@ pub struct RunArgs {
     pub system_config: Option<PathBuf>,
     /// `<name>[:ENV_VAR]`, repeatable.
     pub secrets: Vec<String>,
+    /// `--cloud <service>`: STS mode (never with `secrets`).
+    pub cloud: Option<String>,
     /// The command and its arguments.
     pub command: Vec<String>,
 }
@@ -32,9 +34,10 @@ pub fn run(args: RunArgs) -> ExitCode {
     let RunArgs {
         system_config,
         secrets,
+        cloud,
         command,
     } = args;
-    let _ = (system_config, secrets, command);
+    let _ = (system_config, secrets, cloud, command);
     eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)");
     ExitCode::from(5)
 }
@@ -156,13 +159,137 @@ pub(crate) fn mask_values(kind: &str, value: &str) -> Vec<zeroize::Zeroizing<Str
             }
         }
     }
+    // A PEM key (a service account's) is also hidden in its other forms.
+    for f in saiife_broker::mask::pem_forms(value) {
+        if !out.iter().any(|o| **o == *f) {
+            out.push(f);
+        }
+    }
     out
+}
+
+/// The inherited AWS variables `run --cloud` removes (decision 16): a
+/// profile, a role or web identity, the container credential endpoint
+/// (`AWS_CONTAINER_*`) and the three credential variables. None of them may
+/// point the SDK at credentials other than the lease's. Beyond decision 16
+/// (fix round 1): `AWS_ENDPOINT_URL`, every `AWS_ENDPOINT_URL_*` and
+/// `AWS_CA_BUNDLE`, so an inherited environment cannot send the leased
+/// credentials to another endpoint.
+#[cfg(any(target_os = "linux", test))]
+const AWS_SCRUB: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_ENDPOINT_URL",
+    "AWS_CA_BUNDLE",
+];
+
+/// Prefixes of the inherited variables `run --cloud` removes.
+#[cfg(any(target_os = "linux", test))]
+const AWS_SCRUB_PREFIXES: &[&str] = &["AWS_CONTAINER_", "AWS_ENDPOINT_URL_"];
+
+/// Prepares `cmd`'s environment: the loader variables of `inherited` and
+/// `remove` taken out, `values` put in.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_env(
+    cmd: &mut std::process::Command,
+    inherited: Vec<String>,
+    remove: &[String],
+    values: &[(String, zeroize::Zeroizing<String>)],
+) {
+    for var in loader_vars(inherited) {
+        cmd.env_remove(var);
+    }
+    for var in remove {
+        cmd.env_remove(var);
+    }
+    for (env, v) in values {
+        cmd.env(env, v.as_str());
+    }
+}
+
+/// The lease variables whose values are credentials (masked).
+#[cfg(any(target_os = "linux", test))]
+const AWS_CREDENTIALS: [&str; 3] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+
+/// The inherited variables `run --cloud` removes from the command.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn aws_scrub<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| {
+            AWS_SCRUB.contains(&n.as_str()) || AWS_SCRUB_PREFIXES.iter().any(|p| n.starts_with(p))
+        })
+        .collect()
+}
+
+/// What `run --cloud` sets from a `cloud.lease` answer.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct CloudEnv {
+    /// The variables to set: the three credentials, the region pair, and
+    /// the shared files pointed at `/dev/null`.
+    pub sets: Vec<(String, zeroize::Zeroizing<String>)>,
+    /// The credential values, masked in the command's output.
+    pub masked: Vec<zeroize::Zeroizing<String>>,
+}
+
+/// The environment of a `cloud.lease` answer's `env` (decision 16). Only
+/// the five expected variables are taken, and each must be there.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn cloud_env(
+    env: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<CloudEnv, String> {
+    use zeroize::Zeroizing;
+    let env = env.ok_or("the daemon sent no credentials")?;
+    let mut sets = Vec::new();
+    let mut masked = Vec::new();
+    for name in AWS_CREDENTIALS
+        .iter()
+        .chain(&["AWS_REGION", "AWS_DEFAULT_REGION"])
+    {
+        let v = env
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty() && !v.contains('\0'))
+            .ok_or_else(|| format!("the daemon sent no {name}"))?;
+        let v = Zeroizing::new(v.to_string());
+        if AWS_CREDENTIALS.contains(name) {
+            masked.push(v.clone());
+        }
+        sets.push((name.to_string(), v));
+    }
+    for name in ["AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"] {
+        sets.push((name.to_string(), Zeroizing::new("/dev/null".to_string())));
+    }
+    Ok(CloudEnv { sets, masked })
+}
+
+/// The one line `run --cloud` prints to stderr before the command starts.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
+    format!(
+        "saiife: AWS credentials for {} (STS mode) expire at {}; this command and anything it starts can read them",
+        crate::text::sanitize(service),
+        crate::text::sanitize(expires)
+    )
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{argv0_for, loader_vars, mask_values, parse_spec, pump, RunArgs};
-    use crate::secret_cmd::linux::{call_to, target, Stop};
+    use super::{
+        argv0_for, aws_scrub, cloud_env, cloud_notice, mask_values, parse_spec, prepare_env, pump,
+        RunArgs,
+    };
+    use crate::broker::Target;
+    use crate::secret_cmd::linux::{call_to, call_within, target, Stop};
     use saiife_broker::mask::Masker;
     use serde_json::{json, Map};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -188,8 +315,15 @@ mod linux {
         }
     }
 
+    /// How long `cloud.lease` may take: the daemon's STS call is capped at
+    /// 15 s.
+    const LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn go(args: RunArgs) -> Result<ExitCode, Stop> {
         let config = target(args.system_config.as_deref())?;
+        if let Some(service) = &args.cloud {
+            return go_cloud(&config, service, &args.command);
+        }
         let mut specs: Vec<(String, String)> = Vec::new();
         for s in &args.secrets {
             let spec = parse_spec(s).map_err(Stop::Refused)?;
@@ -228,23 +362,91 @@ mod linux {
             drop(ans);
             values.push((env.clone(), value));
         }
+        spawn_masked(&exe, rest, &[], &values, &masked)
+    }
+
+    /// `run --cloud <service>` (STS mode): one `cloud.lease` for the
+    /// command, the inherited AWS variables removed and the lease's set
+    /// (decision 16).
+    fn go_cloud(config: &Target, service: &str, command: &[String]) -> Result<ExitCode, Stop> {
+        let Some((argv0, rest)) = command.split_first() else {
+            return Err(Stop::Refused("run --cloud needs a command after --".into()));
+        };
+        let exe = resolve(argv0)?;
+        let exe_s = exe
+            .to_str()
+            .ok_or_else(|| Stop::Refused("the command's path is not valid UTF-8".into()))?;
+        let mut a = Map::new();
+        a.insert("service".into(), json!(service));
+        a.insert("exe".into(), json!(exe_s));
+        // The project's overlay for the service, read as `saiife api` reads
+        // it. Only its ask and deny are sent: a lease can only be narrowed.
+        let what = if config.is_locked() {
+            "system"
+        } else {
+            "broker"
+        };
+        let cfg = saiife_policy::load_system(config.config())
+            .map_err(|e| Stop::Unavailable(format!("cannot read the {what} config: {e}")))?
+            .config;
+        // The project `env` too, by the same rule: only to the personal
+        // broker (`project_for` leaves it out for a locked target, whose
+        // daemon takes the scope's).
+        let (project, overlays, env) = crate::api_cmd::linux::project_for(&cfg, config);
+        a.insert("project".into(), json!(project));
+        if let Some(o) = overlays.get(service) {
+            if !o.ask.is_empty() || !o.deny.is_empty() {
+                a.insert("overlay".into(), json!({"ask": o.ask, "deny": o.deny}));
+            }
+        }
+        if let Some(e) = env {
+            a.insert("env".into(), e.into());
+        }
+        let ans = call_within(config, "cloud.lease", a, LEASE_TIMEOUT)?;
+        crate::api_cmd::linux::env_warning(&ans);
+        let lease =
+            cloud_env(ans.get("env").and_then(|e| e.as_object())).map_err(Stop::Unavailable)?;
+        let expires = ans
+            .get("expires")
+            .and_then(|v| v.as_str())
+            .unwrap_or("an unknown time")
+            .to_string();
+        // The answer holds copies of the credentials: drop it now.
+        drop(ans);
+        let remove = aws_scrub(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()));
+        eprintln!("{}", cloud_notice(service, &expires));
+        spawn_masked(&exe, rest, &remove, &lease.sets, &lease.masked)
+    }
+
+    /// Runs `exe` with `args`, the loader variables and `remove` taken out
+    /// of its environment and `sets` put in, both output streams masked
+    /// for `masked`. The command's exit code (128 + signal).
+    fn spawn_masked(
+        exe: &Path,
+        rest: &[String],
+        remove: &[String],
+        values: &[(String, Zeroizing<String>)],
+        masked: &[Zeroizing<String>],
+    ) -> Result<ExitCode, Stop> {
         let refs: Vec<&str> = masked.iter().map(|v| v.as_str()).collect();
         let masker = Masker::new(&refs);
 
-        let mut cmd = Command::new(&exe);
+        let mut cmd = Command::new(exe);
         // The multi-call binaries (busybox, coreutils) pick their applet
         // from argv[0]: it is the canonical file's name, not the typed one.
-        cmd.arg0(argv0_for(&exe))
+        cmd.arg0(argv0_for(exe))
             .args(rest)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for var in loader_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
-            cmd.env_remove(var);
-        }
-        for (env, v) in &values {
-            cmd.env(env, v.as_str());
-        }
+        prepare_env(
+            &mut cmd,
+            std::env::vars_os()
+                .filter_map(|(k, _)| k.into_string().ok())
+                .collect(),
+            remove,
+            values,
+        );
         let mut child = cmd
             .spawn()
             .map_err(|e| Stop::Refused(format!("cannot start {}: {e}", exe.display())))?;
@@ -415,6 +617,31 @@ mod tests {
     }
 
     #[test]
+    fn pem_key_is_masked_in_every_form() {
+        let l1 = "TESTBODYTESTBODYTESTBODYTESTBODY0001";
+        let l2 = "TESTBODYTESTBODYTESTBODYTESTBODY0002";
+        let pem = format!(
+            "{}{}\n{l1}\n{l2}\n{}{}\n",
+            "-----BEGIN ", "PRIVATE KEY-----", "-----END ", "PRIVATE KEY-----"
+        );
+        let v: Vec<String> = mask_values("gcp_sa", &pem)
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        for want in [
+            pem.clone(),
+            pem.trim_end().to_string(),
+            pem.replace('\n', "\\n"),
+            format!("{l1}{l2}"),
+            l1.to_string(),
+            l2.to_string(),
+        ] {
+            assert!(v.contains(&want), "missing {want:?}");
+        }
+        assert_eq!(mask_values("token", "plain-value").len(), 1);
+    }
+
+    #[test]
     fn basic_password_is_masked_on_its_own() {
         let v = mask_values("basic", "alice:s3cr3t-pass");
         let strs: Vec<&str> = v.iter().map(|z| z.as_str()).collect();
@@ -447,5 +674,210 @@ mod tests {
             );
             assert!(t.contains("[MASKED]"), "split {i}: {t}");
         }
+    }
+
+    // Built at runtime: no token-shaped literal in the source.
+    const LEASE_AK: &str = concat!("AS", "IA", "RUNCLOUDTEST0001");
+    const LEASE_SK: &str = concat!("runCloud", "Secret/0123456789", "abcdWXYZ");
+    const LEASE_TOKEN: &str = concat!("runCloud", "SessionToken", "EXAMPLE+value/0099==");
+
+    fn lease_answer() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({
+            "AWS_ACCESS_KEY_ID": LEASE_AK,
+            "AWS_SECRET_ACCESS_KEY": LEASE_SK,
+            "AWS_SESSION_TOKEN": LEASE_TOKEN,
+            "AWS_REGION": "eu-west-1",
+            "AWS_DEFAULT_REGION": "eu-west-1",
+            // Not one of the five: never set.
+            "LD_PRELOAD": "/tmp/evil.so",
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn cloud_env_scrubs_inherited_aws_vars() {
+        let inherited = [
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_ROLE_ARN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_ENDPOINT_URL_STS",
+            "AWS_CA_BUNDLE",
+            "AWS_REGION",
+            "HOME",
+            "PATH",
+            "MY_AWS_PROFILE",
+            "AWS_ENDPOINT_URLX",
+        ];
+        let mut removed = aws_scrub(inherited.iter().map(|s| s.to_string()));
+        removed.sort();
+        let mut want: Vec<String> = inherited[..13].iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(removed, want);
+
+        let a = lease_answer();
+        let env = cloud_env(Some(&a)).unwrap();
+        let sets: std::collections::BTreeMap<&str, &str> = env
+            .sets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            sets.keys().copied().collect::<Vec<_>>(),
+            [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_CONFIG_FILE",
+                "AWS_DEFAULT_REGION",
+                "AWS_REGION",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_SHARED_CREDENTIALS_FILE",
+            ]
+        );
+        assert_eq!(sets["AWS_ACCESS_KEY_ID"], LEASE_AK);
+        assert_eq!(sets["AWS_SECRET_ACCESS_KEY"], LEASE_SK);
+        assert_eq!(sets["AWS_SESSION_TOKEN"], LEASE_TOKEN);
+        assert_eq!(sets["AWS_REGION"], "eu-west-1");
+        assert_eq!(sets["AWS_DEFAULT_REGION"], "eu-west-1");
+        assert_eq!(sets["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
+        assert_eq!(sets["AWS_CONFIG_FILE"], "/dev/null");
+        // Every credential is masked; the region is not a secret.
+        let masked: Vec<&str> = env.masked.iter().map(|v| v.as_str()).collect();
+        assert_eq!(masked, [LEASE_AK, LEASE_SK, LEASE_TOKEN]);
+        // A lease without one of the five is refused.
+        let mut short = lease_answer();
+        short.remove("AWS_SESSION_TOKEN");
+        assert!(cloud_env(Some(&short)).is_err());
+        assert!(cloud_env(None).is_err());
+    }
+
+    #[test]
+    fn cloud_values_masked_in_output() {
+        let a = lease_answer();
+        let env = cloud_env(Some(&a)).unwrap();
+        let values: Vec<&str> = env.masked.iter().map(|v| v.as_str()).collect();
+        let line = format!("key={LEASE_AK} secret={LEASE_SK} token={LEASE_TOKEN}\n");
+        let tok_at = line.find(LEASE_TOKEN).unwrap();
+        // The token split across two reads, at every byte of it.
+        for i in tok_at + 1..tok_at + LEASE_TOKEN.len() {
+            let (x, y) = line.as_bytes().split_at(i);
+            let out = String::from_utf8(pumped(&[x, y], &values)).unwrap();
+            for v in &values {
+                assert!(!out.contains(v), "split {i}: {out}");
+            }
+            assert_eq!(out.matches("[MASKED]").count(), 3, "split {i}: {out}");
+        }
+        // And in three reads.
+        let out = pumped(
+            &[
+                &line.as_bytes()[..tok_at + 3],
+                &line.as_bytes()[tok_at + 3..tok_at + 9],
+                &line.as_bytes()[tok_at + 9..],
+            ],
+            &values,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(LEASE_TOKEN), "{out}");
+        assert!(!out.contains(&LEASE_TOKEN[..12]), "{out}");
+        let notice = cloud_notice("aws", "2026-10-29T12:15:00Z");
+        assert_eq!(
+            notice,
+            "saiife: AWS credentials for aws (STS mode) expire at 2026-10-29T12:15:00Z; \
+             this command and anything it starts can read them"
+        );
+    }
+
+    /// A real child (`/usr/bin/env`) started as `run --cloud` starts it:
+    /// the inherited AWS variables are gone, the lease's are set. Its
+    /// output is masked before anything looks at it, so no assertion
+    /// message can print a credential.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cloud_spawned_env_scrubbed_and_set() {
+        let a = lease_answer();
+        let lease = cloud_env(Some(&a)).unwrap();
+        let inherited_vals = [
+            ("AWS_PROFILE", "inherited-profile"),
+            ("AWS_ACCESS_KEY_ID", "inherited-key-id-0000"),
+            ("AWS_SECRET_ACCESS_KEY", "inherited-secret-0000"),
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "http://127.0.0.1:1/creds",
+            ),
+            ("AWS_ENDPOINT_URL", "https://evil.example"),
+            ("AWS_ENDPOINT_URL_STS", "https://evil-sts.example"),
+            ("AWS_CA_BUNDLE", "/tmp/evil-ca.pem"),
+            ("AWS_REGION", "us-east-1"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("KEEP_ME", "kept"),
+        ];
+        let mut cmd = std::process::Command::new("/usr/bin/env");
+        // The child's inherited environment is this one only.
+        cmd.env_clear();
+        for (k, v) in inherited_vals {
+            cmd.env(k, v);
+        }
+        let names: Vec<String> = inherited_vals.iter().map(|(k, _)| k.to_string()).collect();
+        let remove = aws_scrub(names.clone());
+        prepare_env(&mut cmd, names, &remove, &lease.sets);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        let values: Vec<&str> = lease.masked.iter().map(|v| v.as_str()).collect();
+        let mut masked = Vec::new();
+        pump(&out.stdout[..], &mut masked, &Masker::new(&values));
+        let text = String::from_utf8(masked).unwrap();
+        let vars: std::collections::BTreeMap<&str, &str> =
+            text.lines().filter_map(|l| l.split_once('=')).collect();
+        for gone in [
+            "AWS_PROFILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_STS",
+            "AWS_CA_BUNDLE",
+            "LD_PRELOAD",
+        ] {
+            assert!(!vars.contains_key(gone), "{gone} reached the child");
+        }
+        assert_eq!(vars["KEEP_ME"], "kept");
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            assert_eq!(vars[k], "[MASKED]", "{k}");
+        }
+        assert_eq!(vars["AWS_REGION"], "eu-west-1");
+        assert_eq!(vars["AWS_DEFAULT_REGION"], "eu-west-1");
+        assert_eq!(vars["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
+        assert_eq!(vars["AWS_CONFIG_FILE"], "/dev/null");
+        assert!(
+            !text.contains("inherited-"),
+            "an inherited credential reached the child"
+        );
+        for v in &values {
+            assert!(!text.contains(v));
+        }
+    }
+
+    #[test]
+    fn secret_and_cloud_conflict() {
+        use clap::Parser;
+        let parse = |args: &[&str]| crate::Cli::try_parse_from(args).map(|_| ());
+        assert!(
+            parse(&["saiife", "run", "--secret", "tok", "--cloud", "aws", "--", "true"]).is_err()
+        );
+        // One of the two is required.
+        assert!(parse(&["saiife", "run", "--", "true"]).is_err());
+        assert!(parse(&["saiife", "run", "--cloud", "aws", "--", "true"]).is_ok());
+        assert!(parse(&["saiife", "run", "--secret", "a", "--secret", "b", "--", "true"]).is_ok());
     }
 }

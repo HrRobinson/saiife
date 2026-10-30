@@ -15,6 +15,8 @@ pub mod approvers;
 #[cfg(target_os = "linux")]
 pub mod audit_query;
 #[cfg(target_os = "linux")]
+pub mod cloud_ops;
+#[cfg(target_os = "linux")]
 pub mod disk;
 #[cfg(target_os = "linux")]
 pub mod forward_file;

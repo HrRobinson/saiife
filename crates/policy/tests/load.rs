@@ -1,4 +1,4 @@
-use saiife_policy::{load_system, Fail, Fsync, PolicyError};
+use saiife_policy::{load_system, Fail, Fsync, PolicyError, SystemConfig};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -735,5 +735,174 @@ fn http_forward_target_is_invalid() {
             assert!(detail.contains("audit.forward.a"), "{detail}")
         }
         other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+// ---- plan 15: cloud mode and [services.*.cloud] ----
+
+const ROLE: &str = "arn:aws:iam::123456789012:role/saiife-run";
+
+fn svc_cfg(extra: &str) -> Result<saiife_policy::LoadedPolicy, PolicyError> {
+    let (_d, cfg) = etc(
+        &format!("version = 2\n[services.s3]\nconnector = \"aws-s3\"\n{extra}"),
+        &[],
+    );
+    load_system(&cfg)
+}
+
+fn refused(extra: &str) -> String {
+    svc_cfg(extra).unwrap_err().to_string()
+}
+
+#[test]
+fn mode_defaults_to_sign() {
+    let p = svc_cfg("").unwrap();
+    let s = &p.config.services["s3"];
+    assert_eq!(s.mode, saiife_policy::CloudMode::Sign);
+    assert_eq!(s.cloud, saiife_policy::CloudCfg::default());
+    assert!(toml::from_str::<SystemConfig>(
+        "version = 2\n[services.a]\nconnector = \"x\"\nmode = \"Sts\"\n"
+    )
+    .is_err());
+}
+
+#[test]
+fn sts_needs_role_arn_and_run_allow() {
+    assert!(refused("mode = \"sts\"\n").contains("role_arn"));
+    let only_role = format!("mode = \"sts\"\n[services.s3.cloud]\nrole_arn = \"{ROLE}\"\n");
+    assert!(refused(&only_role).contains("run_allow"));
+    let only_run = "mode = \"sts\"\n[services.s3.cloud]\nrun_allow = [\"/usr/bin/aws\"]\n";
+    assert!(refused(only_run).contains("role_arn"));
+    let ok = format!(
+        "mode = \"sts\"\n[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"/usr/bin/aws\"]\n"
+    );
+    let p = svc_cfg(&ok).unwrap();
+    assert_eq!(p.config.services["s3"].mode, saiife_policy::CloudMode::Sts);
+}
+
+#[test]
+fn bad_role_arn_refused() {
+    for bad in [
+        "arn:aws:iam::12345:role/x",
+        "arn:aws:iam::123456789012:user/x",
+        "arn:aws:iam::123456789012:role/",
+        "arn:aws:s3:::123456789012:role/x",
+        "arn:aws-x:iam::123456789012:role/x",
+        "arn:aws:iam::123456789012:role/a b",
+        "arn:aws:iam::123456789012:role/a\n",
+    ] {
+        let e = refused(&format!("[services.s3.cloud]\nrole_arn = {bad:?}\n"));
+        assert!(e.contains("role_arn"), "{bad}: {e}");
+    }
+    for good in [
+        ROLE,
+        "arn:aws-cn:iam::123456789012:role/path/x_y+z=1,2.@-",
+        "arn:aws-us-gov:iam::123456789012:role/x",
+    ] {
+        svc_cfg(&format!("[services.s3.cloud]\nrole_arn = {good:?}\n")).unwrap();
+    }
+    let long = format!("arn:aws:iam::123456789012:role/{}", "a".repeat(513));
+    assert!(refused(&format!("[services.s3.cloud]\nrole_arn = {long:?}\n")).contains("role_arn"));
+    for bad in ["a", "has space", "semi;colon"] {
+        let e = refused(&format!("[services.s3.cloud]\nexternal_id = {bad:?}\n"));
+        assert!(e.contains("external_id"), "{bad}: {e}");
+    }
+    svc_cfg("[services.s3.cloud]\nexternal_id = \"ab:c/d@e\"\n").unwrap();
+}
+
+#[test]
+fn run_allow_interpreter_refused_in_cloud() {
+    let e = refused("[services.s3.cloud]\nrun_allow = [\"/usr/bin/aws\", \"/bin/bash\"]\n");
+    assert!(e.contains("interpreter") && e.contains("bash"), "{e}");
+    let e = refused("[services.s3.cloud]\nrun_allow = [\"aws\"]\n");
+    assert!(e.contains("absolute"), "{e}");
+}
+
+#[test]
+fn authority_host_allowlist() {
+    for ok in [
+        "login.microsoftonline.com",
+        "login.microsoftonline.us",
+        "login.chinacloudapi.cn",
+    ] {
+        svc_cfg(&format!("[services.s3.cloud]\nauthority_host = {ok:?}\n")).unwrap();
+    }
+    for bad in ["evil.example", "login.microsoftonline.com.evil.test", ""] {
+        let e = refused(&format!("[services.s3.cloud]\nauthority_host = {bad:?}\n"));
+        assert!(e.contains("authority_host"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn cloud_unknown_key_refused() {
+    assert!(toml::from_str::<SystemConfig>(
+        "version = 2\n[services.a]\nconnector = \"x\"\n[services.a.cloud]\ntoken_uri = \"x\"\n"
+    )
+    .is_err());
+    let (_d, cfg) = etc(
+        "version = 2\n[services.a]\nconnector = \"x\"\n[services.a.cloud]\nroles = 1\n",
+        &[],
+    );
+    assert!(load_system(&cfg).is_err());
+}
+
+#[test]
+fn environment_cannot_set_mode_or_cloud() {
+    for (key, val) in [("mode", "\"sts\""), ("cloud", "{ role_arn = \"x\" }")] {
+        let (_d, cfg) = etc(
+            &format!(
+                "version = 2\n[services.a]\nconnector = \"x\"\n[environments.e]\nservices.a.{key} = {val}\n"
+            ),
+            &[],
+        );
+        let e = load_system(&cfg).unwrap_err().to_string();
+        assert!(e.contains(key), "{key}: {e}");
+    }
+}
+
+#[test]
+fn policy_hash_changes_with_mode() {
+    use saiife_policy::{active_packs, effective_policy, policy_hash};
+    let h = |extra: &str| {
+        let p = svc_cfg(extra).unwrap();
+        let (packs, _) = active_packs(&p.config, &[], None);
+        policy_hash(&effective_policy(&p.config, &packs, None, None))
+    };
+    let body =
+        format!("[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"/usr/bin/aws\"]\n");
+    let sts = format!("mode = \"sts\"\n{body}");
+    assert_ne!(h(""), h(&sts));
+    assert_ne!(h(&sts), h(&body));
+    assert_ne!(h(""), h(&body));
+}
+
+const OLD_CFG: &str =
+    "version = 2\n[services.s3]\nconnector = \"aws-s3\"\nallow = [\"objects:read\"]\n";
+
+#[test]
+fn cloud_keys_keep_old_hashes() {
+    use saiife_policy::{active_packs, effective_policy, policy_hash};
+    let (_d, cfg) = etc(OLD_CFG, &[]);
+    let p = load_system(&cfg).unwrap();
+    let (packs, _) = active_packs(&p.config, &[], None);
+    let h = policy_hash(&effective_policy(&p.config, &packs, None, None));
+    // Computed on the tree before the cloud keys existed.
+    assert_eq!(
+        h,
+        "sha256:79401deacbde1d240dbe27a75fd2545ddf4ee4b513a5af949c7265ada1be2b9b"
+    );
+}
+
+#[test]
+fn run_allow_without_file_name_refused() {
+    for bad in ["/", "/usr/bin/.."] {
+        let e = refused(&format!("[services.s3.cloud]\nrun_allow = [{bad:?}]\n"));
+        assert!(e.contains("no file name"), "{bad}: {e}");
+        let (_d, cfg) = etc(
+            &format!("version = 2\n[secrets.k]\nrun_allow = [{bad:?}]\n"),
+            &[],
+        );
+        let e = load_system(&cfg).unwrap_err().to_string();
+        assert!(e.contains("no file name"), "{bad}: {e}");
     }
 }
