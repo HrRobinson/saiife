@@ -19,6 +19,10 @@ case "$arch" in
     arm64) rpm_arch=aarch64 ;;
     *) echo "build.sh: arch must be amd64 or arm64, got '$arch'" >&2; exit 2 ;;
 esac
+if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.~+][0-9A-Za-z.]+)?$'; then
+    echo "build.sh: version must look like 1.2.3 (optionally 1.2.3~rc1), got '$version'" >&2
+    exit 2
+fi
 [ -f "$bin" ] || { echo "build.sh: no such binary: $bin" >&2; exit 2; }
 command -v nfpm >/dev/null || { echo "build.sh: nfpm is not on PATH" >&2; exit 2; }
 

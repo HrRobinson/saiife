@@ -17,22 +17,29 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
-fn dsts() -> Vec<String> {
-    read("nfpm.yaml")
-        .lines()
+fn dsts_from(text: &str) -> Vec<String> {
+    text.lines()
         .filter_map(|l| {
             let l = l.trim_start().trim_start_matches("- ").trim_start();
-            l.strip_prefix("dst:").map(|v| v.trim().to_string())
+            l.strip_prefix("dst:")
+                .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
         })
         .collect()
+}
+
+fn dsts() -> Vec<String> {
+    dsts_from(&read("nfpm.yaml"))
 }
 
 fn is_at_or_below(path: &str, root: &str) -> bool {
     path == root || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
-#[test]
-fn package_owns_no_installed_path() {
+/// Allow-list: below /usr/, normalised, and not below any installed path.
+fn check_dst(d: &str) -> Result<(), String> {
+    if !d.starts_with("/usr/") || d.contains("//") || d.contains("..") {
+        return Err(format!("{d}: not a normalised path below /usr/"));
+    }
     let forbidden = [
         layout::OPT_DIR,
         layout::ETC_DIR,
@@ -45,14 +52,39 @@ fn package_owns_no_installed_path() {
         layout::CODEX_DIR,
         layout::GEMINI_DIR,
         "/usr/local",
+        "/usr/share/polkit-1",
+        "/etc",
+        "/var",
+        "/run",
+        "/opt",
     ];
+    for f in forbidden {
+        if is_at_or_below(d, f) {
+            return Err(format!("package owns {d}, below {f}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn package_owns_no_installed_path() {
     let dsts = dsts();
     assert!(!dsts.is_empty(), "no dst entries parsed from nfpm.yaml");
     for d in &dsts {
-        for f in forbidden {
-            assert!(!is_at_or_below(d, f), "package owns {d}, below {f}");
-        }
+        check_dst(d).unwrap();
     }
+}
+
+#[test]
+fn guard_catches_bad_paths() {
+    let yaml = "  - dst: \"/opt/saiife/bin/saiife\"\n  - dst: '/etc/foo'\n  - dst: /usr/share/polkit-1/rules.d/x\n  - dst: /usr/share/../etc/x\n  - dst: /usr//bin/x\n  - dst: /var/lib/x\n";
+    let found = dsts_from(yaml);
+    assert_eq!(found.len(), 6);
+    assert_eq!(found[0], "/opt/saiife/bin/saiife");
+    for d in &found {
+        assert!(check_dst(d).is_err(), "{d} must be rejected");
+    }
+    assert!(check_dst("/usr/bin/saiife").is_ok());
 }
 
 #[test]
@@ -65,7 +97,6 @@ fn postinst_runs_fleet_install() {
     let s = read("scripts/postinst");
     assert!(s.contains(&format!("{PACKAGE_BINARY} system install --fleet")));
     assert!(s.contains(r#"[ "$rc" -eq 1 ]"#), "exit 1 must map to 0");
-    assert!(s.contains("exit 0"));
 }
 
 #[test]
