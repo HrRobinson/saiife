@@ -47,6 +47,12 @@ zeroize = "=1.9.1"
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same-user approvals: an empty authorization reference whose external form
+# the daemon's `security authorize` uses (plan 13, decision 3). Safe API
+# only; the version saiife-keychain uses.
+security-framework = "=3.7.0"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

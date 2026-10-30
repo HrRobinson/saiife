@@ -257,9 +257,15 @@ pub fn free_change(cur: Option<&Lockdown>, next: Option<LockScope>) -> bool {
 /// May the approver `conn` (not an admin) turn lockdown off? Lockdown has
 /// no requester, so the approver is treated as deciding its own request:
 /// under `same_user = "deny"` it is refused (`reauth_required`), under
-/// `"reauth"` it must pass polkit re-authentication (an unavailable one
-/// refuses). Runs off the runtime thread (the prompt can take 120 s).
-async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn, detail: &'static str) -> Result<(), Refusal> {
+/// `"reauth"` it must pass re-authentication (an unavailable one refuses;
+/// `auth` is the CLI's authorization on macOS). Runs off the runtime thread
+/// (the prompt can take 120 s).
+async fn may_turn_off(
+    ctx: &Arc<Ctx>,
+    conn: &Conn,
+    detail: &'static str,
+    auth: Option<[u8; 32]>,
+) -> Result<(), Refusal> {
     if ctx.mode == crate::ops::Mode::Personal {
         return crate::approvers::personal_may_decide(ctx.own_uid, conn.peer.uid);
     }
@@ -291,6 +297,7 @@ async fn may_turn_off(ctx: &Arc<Ctx>, conn: &Conn, detail: &'static str) -> Resu
             c.proc.as_ref(),
             &c.reauth_cooldowns,
             detail,
+            auth,
         )
     })
     .await
@@ -312,7 +319,7 @@ fn off_refusal(r: &Refusal, what: &str) -> (&'static str, String) {
 /// `lockdown.set {on, scope?, reason?}`. Root and `[admin] groups` may do
 /// anything. An approver may turn it on when it is off or widen it
 /// (`connectors` to `all`); turning it off, narrowing it or replacing an
-/// active lockdown needs polkit re-authentication (`same_user = "reauth"`),
+/// active lockdown needs re-authentication (`same_user = "reauth"`),
 /// since weakening the kill switch is as strong as approving. Everyone else
 /// gets `forbidden` and a `lockdown` record with decision `deny`.
 pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
@@ -341,6 +348,10 @@ pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => clean_reason(s),
         Some(_) => return err(id, ErrorCode::BadRequest, "reason is a string"),
+    };
+    let auth = match crate::approval_ops::auth_arg(&req.args) {
+        Ok(a) => a,
+        Err(e) => return err(id, ErrorCode::BadRequest, &e),
     };
     let action = if on { "on" } else { "off" };
 
@@ -389,7 +400,7 @@ pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             } else {
                 (OFF_DETAIL, "lockdown off")
             };
-            if let Err(r) = may_turn_off(ctx, conn, detail).await {
+            if let Err(r) = may_turn_off(ctx, conn, detail, auth).await {
                 let (rule, why) = off_refusal(&r, what);
                 rec.decision = DecisionKind::Deny;
                 rec.rule = Some(rule.into());

@@ -48,6 +48,14 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
     use serde_json::{json, Map, Value};
 
     let config = config.unwrap_or_else(|| PathBuf::from("/etc/saiife/config.toml"));
+    // Prepares a possible re-authentication; when that fails (macOS: no
+    // authorization reference) the daemon decides without it and refuses
+    // a same-user change (fail closed).
+    let reauth = |args: &mut Map<String, Value>| {
+        crate::approvals_cmd::prepare_reauth(args)
+            .map_err(|e| eprintln!("saiife: warning: {e}"))
+            .ok()
+    };
     let shown = |a: &Map<String, Value>, key: &str| match a.get(key) {
         Some(Value::Object(l)) => {
             let s = |k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -92,12 +100,12 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
                         .map(str::to_string)
                 })
             };
-            let _agent = match active.as_deref() {
+            let _held = match active.as_deref() {
                 Some(cur) if !(cur == "connectors" && scope == "all") => {
                     eprintln!(
-                        "saiife: changing an active lockdown (polkit may ask for your password)"
+                        "saiife: changing an active lockdown (you may be asked for your password)"
                     );
-                    crate::approvals_cmd::start_agent()
+                    reauth(&mut args)
                 }
                 _ => None,
             };
@@ -107,14 +115,13 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             let mut args = Map::new();
             args.insert("on".into(), json!(false));
             // Root never re-authenticates; anyone else may be asked for a
-            // password, so say first what it is for. macOS: no `auth` is
-            // sent yet (`approvals_cmd::mac::external_form`, Task 8), so a
-            // same-user off there is refused by the daemon (fail closed).
-            let _agent = if rustix::process::geteuid().is_root() {
+            // password, so say first what it is for. macOS sends `auth` (the
+            // daemon there refuses same-user re-authentication for now).
+            let _held = if rustix::process::geteuid().is_root() {
                 None
             } else {
-                eprintln!("saiife: turning lockdown off (polkit may ask for your password)");
-                crate::approvals_cmd::start_agent()
+                eprintln!("saiife: turning lockdown off (you may be asked for your password)");
+                reauth(&mut args)
             };
             call(&config, "lockdown.set", args).map(|a| shown(&a, "lockdown"))
         }

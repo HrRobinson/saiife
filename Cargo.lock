@@ -1413,6 +1413,7 @@ dependencies = [
  "saiife-mcp",
  "saiife-policy",
  "saiife-system",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",

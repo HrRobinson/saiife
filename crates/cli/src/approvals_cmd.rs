@@ -3,11 +3,13 @@
 //!
 //! Exit codes: 0 done, 2 refused (the rule is printed), 5 the daemon
 //! cannot be reached (or could not record the decision: `unrecorded`).
-//! Before `approve` the CLI prints what is approved, then starts
-//! `pkttyagent` when the request is the caller's own (so
-//! `same_user = "reauth"` applies) and there is no graphical session to
-//! ask in (decision 7); it stops it, its own child, afterwards (SIGTERM,
-//! then SIGKILL after 1 s). `approvals show --json` prints the whole
+//! Before `approve` the CLI prints what is approved. When the request is
+//! the caller's own (so `same_user = "reauth"` applies), on Linux it then
+//! starts `pkttyagent` if there is no graphical session to ask in
+//! (decision 7), and stops it, its own child, afterwards (SIGTERM, then
+//! SIGKILL after 1 s); on macOS it sends the external form of an empty
+//! authorization reference as `auth` and holds the reference until the
+//! daemon answers (plan 13, decision 3). `approvals show --json` prints the whole
 //! masked request: `--full` only changes the text output.
 
 #[cfg(not(unix))]
@@ -86,8 +88,63 @@ pub fn decide(_config: Option<PathBuf>, d: Decision) -> ExitCode {
     ExitCode::from(5)
 }
 
+/// Same-user re-authentication on macOS (plan 13, decision 3): the CLI
+/// makes an empty authorization reference and sends its external form as
+/// `auth`; the daemon's own `security authorize` acquires
+/// `com.saiife.approve` on it, so the prompt shows in this login session.
+/// The reference must stay alive until `approval.decide` answers.
+#[cfg(target_os = "macos")]
+pub(crate) mod mac {
+    use security_framework::authorization::Authorization;
+
+    /// 64 lowercase hex characters of a 32-byte external form.
+    pub(crate) fn hex(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// An empty authorization (no rights, no prompt) and its external form
+    /// in hex. Keep the `Authorization` until the daemon has answered:
+    /// dropping it frees the reference the external form names.
+    pub(crate) fn external_form() -> Result<(Authorization, String), String> {
+        let auth = Authorization::default()
+            .map_err(|e| format!("cannot create an authorization reference: {e}"))?;
+        let ext = auth
+            .make_external_form()
+            .map_err(|e| format!("cannot externalize the authorization reference: {e}"))?;
+        let bytes: [u8; 32] = ext.bytes.map(|c| c as u8);
+        Ok((auth, hex(&bytes)))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hex_is_64_lowercase() {
+            let mut b = [0u8; 32];
+            b[0] = 0xAB;
+            b[31] = 0x01;
+            let h = hex(&b);
+            assert_eq!(h.len(), 64);
+            assert!(h.starts_with("ab00"));
+            assert!(h.ends_with("01"));
+        }
+
+        /// macOS CI: an empty reference needs no prompt and has a 32-byte
+        /// external form.
+        #[test]
+        fn external_form_is_32_bytes() {
+            let (_auth, h) = external_form().unwrap();
+            assert_eq!(h.len(), 64);
+            assert!(h
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+        }
+    }
+}
+
 #[cfg(unix)]
-pub(crate) use linux::start_agent;
+pub(crate) use linux::prepare_reauth;
 #[cfg(unix)]
 pub use linux::{decide, run};
 
@@ -99,13 +156,16 @@ mod linux {
     use saiife_ipc::client::{Client, ClientError};
     use serde_json::{json, Map, Value};
     use std::path::PathBuf;
-    use std::process::{Child, Command, ExitCode, Stdio};
+    use std::process::ExitCode;
+    #[cfg(target_os = "linux")]
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// A decision may wait for the approver to authenticate (the daemon
     /// gives polkit 120 s).
     const CALL_TIMEOUT: Duration = Duration::from_secs(150);
+    #[cfg(target_os = "linux")]
     #[cfg_attr(debug_assertions, allow(dead_code))]
     const PKTTYAGENT: &str = "/usr/bin/pkttyagent";
     /// The body shown without `--full`, in characters.
@@ -435,14 +495,14 @@ mod linux {
         // when the request is the caller's own (`same_user = "reauth"`).
         // What is approved is printed first, so a password prompt is never
         // answered blind.
-        let _agent = if action == "approve" {
+        let _held = if action == "approve" {
             let shown = call(&mut c, "approval.show", args([("request", json!(id))]))?;
             eprintln!("saiife: approving {}", request_summary(id, &shown["item"]));
             let uid = shown["item"]["uid"].as_u64();
             // The personal broker needs no re-authentication for the
             // user's own requests (spec 6.10.2): no prompt agent.
             if config.is_locked() && uid == Some(u64::from(rustix::process::getuid().as_raw())) {
-                start_agent()
+                Some(prepare_reauth(&mut a).map_err(unavailable)?)
             } else {
                 None
             }
@@ -452,6 +512,39 @@ mod linux {
         let ans = call(&mut c, "approval.decide", a)?;
         let state = ans.get("state").and_then(Value::as_str).unwrap_or(action);
         outln!("request #{id} {state}");
+        Ok(())
+    }
+
+    /// What keeps the prompt possible until the daemon answers.
+    /// Linux: `pkttyagent` for a terminal-only session (maybe none).
+    #[cfg(target_os = "linux")]
+    pub(crate) type Held = Option<Agent>;
+    /// macOS: the authorization reference whose external form is `auth`.
+    #[cfg(target_os = "macos")]
+    pub(crate) type Held = security_framework::authorization::Authorization;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) type Held = ();
+
+    /// Prepares a same-user re-authentication (`approve`, `lockdown off`):
+    /// starts the prompt agent (Linux), or adds the external form of a
+    /// fresh, empty authorization reference to `args` as `auth` (macOS; no
+    /// `pkttyagent`). Keep the result until the daemon has answered. (The
+    /// macOS daemon refuses same-user approvals in this version; `auth` is
+    /// sent so the CLI is ready when they return.)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_reauth(_args: &mut Map<String, Value>) -> Result<Held, String> {
+        Ok(start_agent())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prepare_reauth(args: &mut Map<String, Value>) -> Result<Held, String> {
+        let (auth, hex) = super::mac::external_form()?;
+        args.insert("auth".into(), json!(hex));
+        Ok(auth)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn prepare_reauth(_args: &mut Map<String, Value>) -> Result<Held, String> {
         Ok(())
     }
 
@@ -470,6 +563,7 @@ mod linux {
         out
     }
 
+    #[cfg(target_os = "linux")]
     /// `pkttyagent` is for a terminal-only session: `SSH_TTY` is set, or
     /// there is neither `DISPLAY` nor `WAYLAND_DISPLAY`.
     fn wants_agent(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
@@ -477,25 +571,28 @@ mod linux {
         set("SSH_TTY") || (!set("DISPLAY") && !set("WAYLAND_DISPLAY"))
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(target_os = "linux", debug_assertions))]
     fn agent_path() -> PathBuf {
         std::env::var_os("SAIIFE_TEST_PKTTYAGENT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(PKTTYAGENT))
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(all(target_os = "linux", not(debug_assertions)))]
     fn agent_path() -> PathBuf {
         PathBuf::from(PKTTYAGENT)
     }
 
+    #[cfg(target_os = "linux")]
     /// How long a stopped `pkttyagent` gets to exit on SIGTERM.
     const AGENT_STOP: Duration = Duration::from_secs(1);
 
+    #[cfg(target_os = "linux")]
     /// Our own `pkttyagent` child; stopped and reaped through its handle
     /// when dropped (never by name): SIGTERM, then SIGKILL after 1 s.
     pub(crate) struct Agent(Child);
 
+    #[cfg(target_os = "linux")]
     impl Drop for Agent {
         fn drop(&mut self) {
             if let Ok(None) = self.0.try_wait() {
@@ -516,12 +613,13 @@ mod linux {
         }
     }
 
+    #[cfg(target_os = "linux")]
     /// Start `pkttyagent` for this process when the session is
     /// terminal-only; `None` when it is not needed or cannot run (then a
-    /// hint says how a prompt could appear). Never off Linux: macOS has no
-    /// polkit, and its prompt comes from Authorization Services.
-    pub(crate) fn start_agent() -> Option<Agent> {
-        if !cfg!(target_os = "linux") || !wants_agent(|k| std::env::var_os(k)) {
+    /// hint says how a prompt could appear). Linux only: macOS has no
+    /// polkit (see [`prepare_reauth`]).
+    fn start_agent() -> Option<Agent> {
+        if !wants_agent(|k| std::env::var_os(k)) {
             return None;
         }
         let path = agent_path();

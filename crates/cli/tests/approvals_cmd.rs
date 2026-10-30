@@ -166,9 +166,7 @@ impl saiife_daemon::reauth::Reauth for FakeReauth {
     }
     fn check(
         &self,
-        _pid: u32,
-        _start: u64,
-        _uid: u32,
+        _who: &saiife_daemon::reauth::Subject,
         detail: &str,
         _t: Duration,
     ) -> saiife_daemon::reauth::ReauthResult {

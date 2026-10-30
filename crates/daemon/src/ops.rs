@@ -553,7 +553,8 @@ impl Ctx {
             notifier: crate::notifier::Notifier::new(),
             forwarders: crate::forwarder::Forwarders::default(),
             approvals: i.approvals,
-            reauth: Arc::new(crate::reauth::PkCheck::new()),
+            // polkit on Linux, `security authorize` on macOS.
+            reauth: crate::reauth::host_reauth(),
             reauth_cooldowns: Mutex::default(),
             grants: i.grants,
             signals: Default::default(),

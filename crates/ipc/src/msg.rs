@@ -29,7 +29,8 @@ pub const OP_API_LIST: &str = "api.list";
 pub const OP_API_RESULT: &str = "api.result";
 /// A bearer token for the gateway's loopback TCP listener: `{token, expires}`.
 pub const OP_API_TOKEN: &str = "api.token";
-/// Turn lockdown on or off (admin or approver): `{on, scope?, reason?}`.
+/// Turn lockdown on or off (admin or approver): `{on, scope?, reason?,
+/// auth?}` (`auth` as in [`OP_APPROVAL_DECIDE`]).
 pub const OP_LOCKDOWN_SET: &str = "lockdown.set";
 /// What a user may see of the policy: `{user?, effective?}` -> the user's
 /// scope view, the policy `hash` and, with `effective`, the whole merged
@@ -45,7 +46,12 @@ pub const OP_APPROVAL_LIST: &str = "approval.list";
 /// `{request}` -> `{item}` (the masked request). The id is `request`: a
 /// frame's `id` is its own.
 pub const OP_APPROVAL_SHOW: &str = "approval.show";
-/// `{request, action: "approve"|"reject", note?}` -> `{request, state}`.
+/// `{request, action: "approve"|"reject", note?, ack_truncated?, auth?}` ->
+/// `{request, state}`. `auth` (macOS) is the 64 lowercase hex characters
+/// of the external form of an empty authorization reference the CLI holds
+/// until the answer: the daemon's `security authorize` acquires
+/// `com.saiife.approve` on it for a same-user approval. Without it such an
+/// approval is refused (`reauth_unavailable`); bad hex is `bad_request`.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
 /// The managed hook, for a call a `[guard] ask` rule denied: use up the
 /// caller's grant for it. `{rec}` (the guard record it will send; the
