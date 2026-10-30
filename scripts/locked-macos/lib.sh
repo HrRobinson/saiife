@@ -57,32 +57,27 @@ ok() {
     echo "  ok: $*"
 }
 
-# `defer_fail <message>`: a failure that must still fail the job, but only
-# after every later phase has run (so one finding does not hide the rest).
-# `deferred_failures` (the end of run.sh) exits 1 when any was recorded.
-DEFERRED=()
-defer_fail() {
-    echo "FAIL (deferred to the end): $*" >&2
-    DEFERRED+=("$*")
-}
-
-deferred_failures() {
-    local f
-    [[ "${#DEFERRED[@]}" == 0 ]] && return 0
-    for f in "${DEFERRED[@]}"; do
-        echo "FAIL: $f" >&2
-    done
-    exit 1
-}
-
 phase() {
     echo
     echo "== $*"
 }
 
 # A privileged command (the runner has passwordless sudo).
+# SIP (owner ruling on A4): locked mode needs it, and install refuses
+# without it. The GitHub macos-15 runners have it disabled, so there every
+# root command gets the debug-build seam SAIIFE_TEST_ALLOW_SIP_OFF=1 (the
+# ci-locked build honours it; a release build never does), and A4 is
+# reported as skipped. On a SIP-on Mac nothing is bypassed.
+SIP_STATUS="$(/usr/bin/csrutil status 2>&1 || true)"
+SIP_ON=""
+[[ "$SIP_STATUS" == "System Integrity Protection status: enabled." ]] && SIP_ON=1
+
 as_root() {
-    sudo -n "$@"
+    if [[ -n "$SIP_ON" ]]; then
+        sudo -n "$@"
+    else
+        sudo -n /usr/bin/env SAIIFE_TEST_ALLOW_SIP_OFF=1 "$@"
+    fi
 }
 
 # The home of a CI account.
@@ -507,7 +502,34 @@ phase_install() {
         fail "$BIN is not an ad-hoc signature: $(cat "$WORK/codesign.txt")"
     ok "codesign: ad hoc with the hardened runtime ($(grep -E '^CodeDirectory' "$WORK/codesign.txt"))"
 
+    local code=0 sip_line p
+    sip_line="saiife: locked mode on macOS needs System Integrity Protection: without it the hardened runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP (Recovery: csrutil enable) and run install again."
+    if [[ -z "$SIP_ON" ]]; then
+        echo "  csrutil: $SIP_STATUS"
+        # Without the seam, install refuses before any change. The runner
+        # writes the output file, on purpose.
+        # shellcheck disable=SC2024
+        sudo -n "$BIN" system install --config "$CI_CONFIG" --agents claude,codex,gemini \
+            --approvers "$APPROVER_USER" --non-interactive --allow-test-build \
+            >"$WORK/install-nosip.out" 2>&1 || code=$?
+        cat "$WORK/install-nosip.out"
+        [[ "$code" == 2 ]] || fail "install with SIP off exited $code, want 2"
+        grep -qxF "$sip_line" "$WORK/install-nosip.out" || fail "install with SIP off: not the SIP refusal"
+        for p in /etc/saiife /opt/saiife /var/db/saiife /Library/LaunchDaemons/com.saiife.saiifed.plist; do
+            as_root test ! -e "$p" || fail "install with SIP off created $p"
+        done
+        if dscl . -read "/Users/$DAEMON_USER" >/dev/null 2>&1; then
+            fail "install with SIP off created $DAEMON_USER"
+        fi
+        ok "SIP off: install refused before any change (exit 2)"
+    fi
+
     install_saiife 0
+    if [[ -z "$SIP_ON" ]]; then
+        grep -q '(test build: SIP check bypassed)' "$WORK/install.out" ||
+            fail "install with the SIP seam did not warn"
+        ok "SIP off: the test-build seam went on with a warning"
+    fi
     # CI confirmation (Task 5, inspect_macho on a real ad-hoc build): the
     # test build is named, the ad-hoc signature is a warning, and the
     # hardened runtime is seen.
@@ -724,21 +746,23 @@ phase_attacks() {
     as_root test -f "$control_marker" ||
         fail "A4 control: the library did not run in a plain program, so the probe proves nothing"
     ok "A4 control: DYLD_INSERT_LIBRARIES runs the library in a program without the hardened runtime"
+    # The hardened runtime stops the library only with SIP on (the
+    # macos-15 runners, SIP off, loaded it into the hook). Locked mode
+    # requires SIP; without it A4 cannot be shown here.
+    if [[ -z "$SIP_ON" ]]; then
+        echo "::warning::A4 skipped: SIP is disabled on this runner; verify on a SIP-on Mac (OWNER-TODO)"
+        return 0
+    fi
     allow="$(payload claude/bash-allow.json)"
     expect_hook 0 "" "A4: hook with DYLD_INSERT_LIBRARIES" claude "$allow" \
         DYLD_INSERT_LIBRARIES="$WORK/inject.dylib" SAIIFE_INJECT_MARKER="$marker"
     if as_root test -e "$marker"; then
-        # Which process ran it (the hook itself, or a child it started),
-        # the hook's signature as the kernel sees it, and SIP.
+        # Which process ran it (the hook itself, or a child it started)
+        # and the hook's signature as the kernel sees it.
         as_root cat "$marker" || true
         as_root /usr/bin/codesign -dv --verbose=4 "$OPT_BIN" 2>&1 || true
-        /usr/bin/csrutil status 2>&1 || true
         cat "$WORK/hook.err" || true
-        # Still a failure (the job ends red), recorded so the later phases
-        # run too. Seen on the GitHub macos-15 runners, which run with SIP
-        # disabled and an ad-hoc signature (no Team ID).
-        defer_fail "A4: the injected library ran inside the managed hook (or a child of it): $(as_root cat "$marker" | tr '\n' ' ')($(/usr/bin/csrutil status 2>&1))"
-        return 0
+        fail "A4: the injected library ran inside the managed hook (or a child of it), with SIP on: $(as_root cat "$marker" | tr '\n' ' ')"
     fi
     ok "A4: no marker; the hardened runtime kept the library out of the hook"
 }
@@ -762,6 +786,21 @@ phase_doctor() {
     status="$(jq -r '.checks[] | select(.id == "files.binary") | .status' "$WORK/doctor.json")"
     [[ "$status" == warn ]] || fail "doctor check files.binary: ${status:-missing}, want warn (ad-hoc test build installed)"
     ok "doctor files.binary: warn (ad-hoc test build installed)"
+    status="$(jq -r '.checks[] | select(.id == "system.sip") | .status' "$WORK/doctor.json")"
+    detail="$(jq -r '.checks[] | select(.id == "system.sip") | .detail' "$WORK/doctor.json")"
+    if [[ -n "$SIP_ON" ]]; then
+        [[ "$status" == pass ]] || fail "doctor system.sip: ${status:-missing} ($detail), want pass"
+    else
+        [[ "$status" == warn && "$detail" == *"(test build: SIP check bypassed)"* ]] ||
+            fail "doctor system.sip: ${status:-missing} ($detail), want warn with the seam"
+        # Without the seam: fail. The runner writes the output file.
+        # shellcheck disable=SC2024
+        sudo -n "$OPT_BIN" doctor --json >"$WORK/doctor-nosip.json" 2>/dev/null || true
+        [[ "$(jq -r '.checks[] | select(.id == "system.sip") | .status' "$WORK/doctor-nosip.json")" == fail ]] ||
+            fail "doctor without the seam did not fail system.sip"
+        ok "doctor system.sip without the seam: fail"
+    fi
+    ok "doctor system.sip: $status ($detail)"
     # CI confirmation (Tasks 6, 11): the real `security authorizationdb
     # read` output passes read_ok, so doctor says the right is registered.
     status="$(jq -r '.checks[] | select(.id == "reauth") | .status' "$WORK/doctor.json")"
