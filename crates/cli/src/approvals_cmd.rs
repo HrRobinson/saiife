@@ -9,8 +9,10 @@
 //! (decision 7), and stops it, its own child, afterwards (SIGTERM, then
 //! SIGKILL after 1 s); on macOS it sends the external form of an empty
 //! authorization reference as `auth` and holds the reference until the
-//! daemon answers (plan 13, decision 3). `approvals show --json` prints the whole
-//! masked request: `--full` only changes the text output.
+//! daemon answers (plan 13, decision 3; the daemon refuses same-user
+//! approvals on macOS in this version, so a second account approves).
+//! `approvals show --json` prints the whole masked request: `--full` only
+//! changes the text output.
 
 #[cfg(not(unix))]
 use std::{path::PathBuf, process::ExitCode};

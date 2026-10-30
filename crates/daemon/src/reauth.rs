@@ -13,7 +13,10 @@
 //! error (see [`exit_result`]). Every non-`Authorized` result refuses the
 //! approval.
 //!
-//! On macOS ([`MacAuthorize`], plan 13 decisions 3 to 5) the approving CLI
+//! On macOS same-user re-authentication is off in this version
+//! ([`PromptWithoutDetail`]): the prompt cannot show which request is
+//! approved. [`MacAuthorize`] is built and tested for when it can be: per
+//! plan 13 decisions 3 to 5 the approving CLI
 //! sends the external form of an empty authorization reference, and the
 //! daemon runs `/usr/bin/security authorize -u -i -d com.saiife.approve`
 //! with that form on stdin, the same way: its own child, `PATH` only,
@@ -260,12 +263,13 @@ pub trait Reauth: Send + Sync {
     fn check(&self, who: &Subject, detail: &str, timeout: Duration) -> ReauthResult;
 }
 
-/// The host's re-authentication: `security authorize` on macOS, polkit
-/// elsewhere.
+/// The host's re-authentication: polkit on Linux; on macOS, none in this
+/// version ([`PromptWithoutDetail`]: `same_user = "reauth"` acts as
+/// `"deny"`).
 pub fn host_reauth() -> std::sync::Arc<dyn Reauth> {
     #[cfg(target_os = "macos")]
     {
-        std::sync::Arc::new(MacAuthorize::new())
+        std::sync::Arc::new(PromptWithoutDetail)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -432,7 +436,7 @@ fn run_bounded(
 /// The production `security` (macOS).
 pub const SECURITY: &str = "/usr/bin/security";
 /// The authorization right `system install` registers on macOS.
-pub const RIGHT: &str = right::RIGHT;
+pub use saiife_system::authright::RIGHT;
 /// How long `security authorizationdb read` may take in `available()`.
 pub const RIGHT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The refusal detail when a same-user approval came without `auth`.
@@ -441,29 +445,6 @@ pub const NO_AUTH: &str = "the approving CLI sent no authorization";
 const ERR_DENIED: i32 = -60005;
 const ERR_CANCELED: i32 = -60006;
 const ERR_INTERACTION_NOT_ALLOWED: i32 = -60007;
-
-/// The right's checks, as `saiife_system::authright` has them (plan 13,
-/// Task 6, which lands in parallel): switch to that module once it is on
-/// the branch.
-mod right {
-    pub const RIGHT: &str = "com.saiife.approve";
-
-    const REQUIRED: [&str; 3] = [
-        "<key>session-owner</key><true/>",
-        "<key>shared</key><false/>",
-        "<key>timeout</key><integer>0</integer>",
-    ];
-
-    /// `Ok` when `security authorizationdb read` printed a right that asks
-    /// the session owner every time; `Err` names the first setting missing.
-    pub fn read_ok(stdout: &str) -> Result<(), String> {
-        let squeezed: String = stdout.chars().filter(|c| !c.is_whitespace()).collect();
-        match REQUIRED.iter().find(|r| !squeezed.contains(*r)) {
-            None => Ok(()),
-            Some(r) => Err(format!("the right {RIGHT} lacks {r}")),
-        }
-    }
-}
 
 /// Maps `security authorize`'s answer to a result (decision 5). `out` is
 /// its stdout, then its stderr; the first line matching
@@ -529,11 +510,45 @@ pub fn parse_auth_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// The refusal detail of a same-user approval on macOS.
+pub const MAC_NO_DETAIL: &str =
+    "the macOS password prompt cannot show which request is approved, so same-user approval is off on macOS";
+
+/// macOS in this version: same-user re-authentication is off, so
+/// `same_user = "reauth"` acts as `"deny"` (a second account approves).
+///
+/// Why (security review of plan 13, Task 8): `security authorize` shows
+/// only the right's fixed `default-prompt`, never which request is
+/// approved, so a same-user agent could start an approval of its own
+/// request while the human believes they confirm another one. A prompt
+/// text the CLI supplies (`kAuthorizationEnvironmentPrompt`) would be
+/// chosen by a process the agent can imitate, so it binds nothing either.
+/// polkit on Linux shows the daemon's `--detail`. Until a macOS prompt can
+/// carry a detail the daemon chooses, [`MacAuthorize`] stays unused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptWithoutDetail;
+
+impl Reauth for PromptWithoutDetail {
+    fn available(&self) -> bool {
+        false
+    }
+    fn check(&self, _who: &Subject, _detail: &str, _timeout: Duration) -> ReauthResult {
+        ReauthResult::Unavailable(MAC_NO_DETAIL.into())
+    }
+}
+
+/// How many used external forms [`MacAuthorize`] remembers.
+const USED_FORMS: usize = 1024;
+
 /// `security authorize` on the CLI's authorization reference (macOS). It
 /// builds on every unix, so the Linux tests run it with fake scripts.
+/// Not wired in yet: see [`PromptWithoutDetail`]. Each external form is
+/// single-use: it arrives with the request it decides, and a second check
+/// with the same form is an error, never another prompt.
 #[derive(Debug, Clone)]
 pub struct MacAuthorize {
     security: PathBuf,
+    used: std::sync::Arc<Mutex<std::collections::VecDeque<[u8; 32]>>>,
 }
 
 impl Default for MacAuthorize {
@@ -552,6 +567,7 @@ impl MacAuthorize {
     pub fn with_path(security: impl Into<PathBuf>) -> MacAuthorize {
         MacAuthorize {
             security: security.into(),
+            used: std::sync::Arc::default(),
         }
     }
 
@@ -580,7 +596,7 @@ impl MacAuthorize {
     /// `security authorizationdb read com.saiife.approve` exits 0 within
     /// [`RIGHT_READ_TIMEOUT`] and prints a right that passes `read_ok`.
     fn right_registered(&self) -> bool {
-        let args: Vec<String> = ["authorizationdb", "read", RIGHT]
+        let args: Vec<String> = saiife_system::authright::read_args()
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -593,7 +609,9 @@ impl MacAuthorize {
             RIGHT_READ_TIMEOUT,
         ) {
             Ok(ran) => {
-                ran.code == Some(0) && right::read_ok(&String::from_utf8_lossy(&ran.stdout)).is_ok()
+                ran.code == Some(0)
+                    && saiife_system::authright::read_ok(&String::from_utf8_lossy(&ran.stdout))
+                        .is_ok()
             }
             Err(_) => false,
         }
@@ -615,6 +633,16 @@ impl Reauth for MacAuthorize {
         let Some(auth) = who.auth else {
             return ReauthResult::Unavailable(NO_AUTH.into());
         };
+        {
+            let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
+            if used.contains(&auth) {
+                return ReauthResult::Error("this authorization was already used".into());
+            }
+            if used.len() >= USED_FORMS {
+                used.pop_front();
+            }
+            used.push_back(auth);
+        }
         let mut cmd = self.command(&MacAuthorize::argv(), true);
         match run_bounded(&mut cmd, &self.security, "security", Some(&auth), timeout) {
             Ok(ran) => {
@@ -1235,6 +1263,47 @@ pub(crate) mod tests {
         assert!(!sec.available());
         assert!(!MacAuthorize::with_path(d.path().join("nope")).available());
         assert!(!MacAuthorize::with_path("security").available());
+    }
+
+    /// The security fix: on macOS the prompt cannot show the request, so
+    /// same-user re-authentication is off and never prompts.
+    #[test]
+    fn macos_same_user_reauth_is_off() {
+        let off = PromptWithoutDetail;
+        assert!(!off.available());
+        assert_eq!(
+            off.check(&mac_subject(1, Some(EXT)), "#7 x", Duration::from_secs(1)),
+            ReauthResult::Unavailable(MAC_NO_DETAIL.into())
+        );
+        #[cfg(target_os = "macos")]
+        assert!(!host_reauth().available());
+    }
+
+    /// An external form decides one check: the same form again is an
+    /// error, and `security` is not run for it.
+    #[test]
+    fn reused_external_form_is_refused() {
+        let d = tmp();
+        let sec = MacAuthorize::with_path(fakes::security(d.path(), "YES (0)", false, 0, 0));
+        let who = mac_subject(1, Some(EXT));
+        assert_eq!(
+            sec.check(&who, "x", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
+        fs::remove_file(d.path().join("argv")).unwrap();
+        // A clone (another connection's view) shares the record.
+        match sec.clone().check(&who, "x", Duration::from_secs(10)) {
+            ReauthResult::Error(e) => assert!(e.contains("already used"), "{e}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(!d.path().join("argv").exists());
+        // Another form is fine.
+        let mut other = who;
+        other.auth = Some([0xee; 32]);
+        assert_eq!(
+            sec.check(&other, "x", Duration::from_secs(10)),
+            ReauthResult::Authorized
+        );
     }
 
     /// polkit ignores `auth`: the same argv with or without it.

@@ -738,4 +738,48 @@ mod tests {
         assert_eq!(calls[0].0.auth, ext);
         assert_eq!(calls[0].0.uid, 1000);
     }
+
+    /// macOS (security fix): same-user `reauth` acts as `deny`, with the
+    /// unavailable reason; a second account still approves.
+    #[test]
+    fn same_user_reauth_is_denied_on_macos() {
+        let dir = FixedDirectory::from_text(PASSWD, GROUP);
+        let c = cfg(&["alice", "bob"], SameUser::Reauth);
+        let off = crate::reauth::PromptWithoutDetail;
+        let p = FakeProc::steady();
+        let ext = Some([1u8; 32]);
+        let cd = Mutex::default();
+        let own = may_decide(
+            &c,
+            &dir,
+            "alice",
+            1000,
+            &off,
+            &peer(1000),
+            START,
+            &p,
+            &cd,
+            "",
+            ext,
+        );
+        assert_eq!(own, Err(Refusal::ReauthUnavailable(String::new())));
+        assert_eq!(own.unwrap_err().to_string(), REAUTH_UNAVAILABLE);
+        assert_eq!(cd.lock().unwrap().remaining(1000, Instant::now()), None);
+        assert_eq!(
+            may_decide(
+                &c,
+                &dir,
+                "bob",
+                1000,
+                &off,
+                &peer(1001),
+                START,
+                &p,
+                &cd,
+                "",
+                ext
+            ),
+            Ok(())
+        );
+    }
 }

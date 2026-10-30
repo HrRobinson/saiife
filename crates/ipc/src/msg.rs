@@ -52,6 +52,8 @@ pub const OP_APPROVAL_SHOW: &str = "approval.show";
 /// until the answer: the daemon's `security authorize` acquires
 /// `com.saiife.approve` on it for a same-user approval. Without it such an
 /// approval is refused (`reauth_unavailable`); bad hex is `bad_request`.
+/// In this version the macOS daemon refuses every same-user approval
+/// (`reauth_unavailable`): its prompt cannot show which request it is.
 pub const OP_APPROVAL_DECIDE: &str = "approval.decide";
 /// The managed hook, for a call a `[guard] ask` rule denied: use up the
 /// caller's grant for it. `{rec}` (the guard record it will send; the
