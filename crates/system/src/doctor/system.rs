@@ -10,7 +10,7 @@ use crate::install::MACOS_TOOL_TIMEOUT;
 use crate::launchd;
 use crate::layout::*;
 use crate::supported::{check_supported, Support};
-use saiife_agents::lock::{label, LockLabel};
+use saiife_agents::lock::{label_for, LockLabel};
 use saiife_agents::Agent;
 use saiife_audit::sign::{judge, Kind};
 use saiife_policy::installed::{FileKind, Installed, VaultKeyMode};
@@ -56,7 +56,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.push(daemon_unit(ctx));
     out.push(daemon_health(ctx));
     if let Some(i) = &ctx.installed {
-        out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
+        out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
     }
     if let Ok(p) = &ctx.config {
         // A listed `saiife` changes nothing on Claude Code (pinned by
@@ -1429,11 +1429,13 @@ fn claude_allowlist(ctx: &Ctx, i: &Installed) -> Check {
     )
 }
 
-fn agent_label(name: &str) -> Check {
+/// The label recorded for the layout's platform (the host's, outside
+/// tests), so a macOS tree checked from Linux reads as a Mac reads it.
+fn agent_label(ctx: &Ctx, name: &str) -> Check {
     let id = format!("agents.{name}.label");
     match Agent::from_name(name) {
         Some(a) => {
-            let l = label(a);
+            let l = label_for(a, mac(ctx));
             let title = format!("{} lock label", a.label());
             let status = if l == LockLabel::Lockable {
                 Status::Pass
@@ -2576,10 +2578,13 @@ mod macos_tests {
             "keys",
             "daemon.audit_group",
             "daemon.group",
-            "agents.claude.label",
         ] {
             assert_status(&r, id, Status::Pass);
         }
+        // No macOS lock-check recording yet: unverified on a macOS tree,
+        // whichever host checks it.
+        assert_status(&r, "agents.claude.label", Status::Warn);
+        assert_eq!(get(&r, "agents.claude.label").detail, "unverified");
         assert_status(&r, "reauth", Status::Info);
         let fails: Vec<&str> = r
             .checks
@@ -2787,6 +2792,10 @@ mod macos_tests {
                     shell: "/bin/zsh".into(),
                 },
             );
+            // `admin` as on a Mac (gid 80, no members). Unnamed, the fake
+            // gives it the caller's gid, which is 20 (staff) on a Mac
+            // runner: the agent's primary group, so "an admin".
+            s.groups.insert("admin".into(), 80);
         });
         (
             FixedDirectory::from_text("agent:x:501:20::/Users/agent:/bin/zsh\n", ""),
