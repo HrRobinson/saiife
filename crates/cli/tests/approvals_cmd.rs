@@ -26,7 +26,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use saiife_audit::{ChainWriter, WriterOptions};
 use saiife_daemon::approvals::{dir_in, State};
 use saiife_daemon::ops::{dispatch_conn, Conn, Ctx, CtxInit, PolicyState};
-use saiife_daemon::sessions::RealProc;
+use saiife_daemon::sessions::host_proc;
 use saiife_daemon::vault::{self, Entry, Kind, VaultState};
 use saiife_daemon::writer::{self, WriterConfig};
 use saiife_ipc::msg::Request;
@@ -389,7 +389,7 @@ fn world_capped(erp_extra: &str, result_cap: Option<usize>) -> World {
             socket_dir: t.join("run"),
             config_path: t.join("etc/config.toml"),
             policy,
-            proc: Box::new(RealProc::new("/proc")),
+            proc: host_proc(),
             vault,
             vault_path,
             upstream,

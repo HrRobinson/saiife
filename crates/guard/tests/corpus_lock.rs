@@ -903,8 +903,22 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         "security  authorizationdb merge /tmp/rights.plist",
         "SECURITY AuthorizationDB Write com.saiife.approve allow",
         "timeout 5 security authorizationdb write com.saiife.approve allow",
+        // Global options before the command (review fix round 1).
+        "security -q authorizationdb write com.saiife.approve allow",
+        "security -v authorizationdb remove com.saiife.approve",
+        "security -q -v authorizationdb merge rights.plist",
     ] {
         assert_eq!(rule(cmd).as_deref(), Some("authorizationdb"), "{cmd}");
+    }
+    // Interactive security reads its commands from stdin.
+    for cmd in [
+        "echo 'authorizationdb write com.saiife.approve allow' | security -i",
+        "security -i < cmds.txt",
+        "security -qi",
+        "security -q -i",
+        "security -p 'sec> '",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("security-interactive"), "{cmd}");
     }
     for cmd in [
         "dseditgroup -o edit -a agent -t user _saiifeaudit",
@@ -913,16 +927,53 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         "dscl . -delete /Groups/_saiifeaudit",
         "dscl . -append /Groups/_saiifeaudit GroupMembership agent",
         "DSCL . -passwd /Users/_saiife x",
+        // A shorter prefix with a glob character.
+        "dscl . -append /Groups/_saii* GroupMembership agent",
+        "dscl . -create /Users/_sai?ifeaudit",
+        "dseditgroup -o edit -a agent -t user _sa*",
     ] {
         assert_eq!(rule(cmd).as_deref(), Some("saiife-accounts"), "{cmd}");
     }
+    // An operand whose value only the shell knows, or a glob that matches.
+    for cmd in [
+        "G=_saiifeaudit; dscl . -append /Groups/$G GroupMembership agent",
+        "dscl . -append \"/Groups/${G}\" GroupMembership agent",
+        "dseditgroup -o edit -a agent -t user $G",
+        "dscl . -delete /Groups/?saiifeaudit",
+        "dscl . -delete /Local/Default/Groups/*audit",
+    ] {
+        assert_eq!(
+            rule(cmd).as_deref(),
+            Some("saiife-accounts-pattern"),
+            "{cmd}"
+        );
+    }
+    // dscl with no command after the datasource is interactive.
+    for cmd in [
+        "printf 'append /Groups/_saiifeaudit GroupMembership agent\\n' | dscl .",
+        "dscl . < cmds.txt",
+        "dscl localhost",
+        "dscl -u admin -P pw .",
+        "dscl",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("dscl-interactive"), "{cmd}");
+    }
     for cmd in [
         "security find-generic-password -s x",
+        "security -q find-generic-password -s x",
+        "security list-keychains",
+        "security -h",
         "security authorizationdb read com.saiife.approve",
         "security authorizationdb writer",
         "dscl . -read /Users/agent",
+        "dscl . -list /Users",
+        "dscl . -read /Groups/staff GroupMembership",
+        "dscl localhost -read /Local/Default/Users/agent",
+        "dscl . -read /Users/_salesteam",
         "dseditgroup -o checkmember -m agent staff",
         "echo security authorizationdb write x allow",
+        "echo dscl .",
+        "git commit -m 'security fix'",
     ] {
         let d = e.evaluate(cmd);
         assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");

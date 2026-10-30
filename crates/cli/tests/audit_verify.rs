@@ -316,7 +316,10 @@ fn locked_mode_needs_the_audit_group() {
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(
-        text.contains("audit files need the saiife-audit group; ask an auditor"),
+        text.contains(&format!(
+            "audit files need the {} group; ask an auditor",
+            saiife_system::layout::Layout::system().audit_group()
+        )),
         "{text}"
     );
 

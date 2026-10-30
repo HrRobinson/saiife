@@ -63,17 +63,56 @@ reason = "an agent may not ask for administrator privileges in locked mode; root
 # --- macOS: the approval right and saiife's accounts (plan 13) -----------------
 [[deny]]
 # Rewriting a right (`com.saiife.approve`, or one it is built on) changes
-# who may approve; `authorizationdb read` stays allowed.
+# who may approve; `authorizationdb read` stays allowed. Anywhere in the
+# segment, so the global options (`security -q -v …`) do not hide it.
 id = "authorizationdb"
-pattern = '(?i)^security\s+authorizationdb\s+(?:write|remove|merge)\b'
+pattern = '(?i)^security\s(?:.*\s)?authorizationdb\s+(?:write|remove|merge)\b'
 reason = "an agent may not change the authorization rights in locked mode; saiife's approvals depend on them"
 
 [[deny]]
+# `security -i` (or `-p <prompt>`, which implies it) reads its commands
+# from stdin (`echo … | security -i`, `security -i < f`), out of the
+# guard's sight. Only the global option words before the command count.
+id = "security-interactive"
+pattern = '(?i)^security\s+(?:-[a-z]+\s+)*-[a-z]*[ip][a-z]*(?:\s|$)'
+reason = "interactive security reads commands the guard cannot see; run each command on its own"
+no_redirections = true
+
+[[deny]]
 # `_saiife` runs saiifed and `_saiifeaudit` reads the audit log: adding a
-# member or changing either account changes who holds them.
+# member or changing either account changes who holds them. A shorter
+# prefix followed by a glob character counts too (`_sai?ifeaudit`,
+# `_saii*`), as `saii*` does for systemctl.
 id = "saiife-accounts"
-pattern = '(?i)^(?:dseditgroup|dscl)\s.*\b_saiife'
+pattern = '(?i)^(?:dseditgroup|dscl)\s.*(?:\b_saiif|\b_s(?:a(?:ii?)?)?[*?\[])'
 reason = "an agent may not change saiife's accounts or groups in locked mode"
+
+[[deny]]
+# The same, for an operand that only matches them: a glob (`_saii*`,
+# `/Groups/_sai?ifeaudit`) or a parameter expansion (`/Groups/$G`), whose
+# value is not known until the command runs.
+id = "saiife-accounts-pattern"
+pattern = '(?i)^(?:dseditgroup|dscl)\s'
+reason = "this operand may name saiife's accounts or groups; an agent may not change them in locked mode"
+operand_match = "glob"
+# Every name under every record path dscl takes.
+operand_targets = [
+    "_saiife", "_saiifeaudit",
+    "/Users/_saiife", "/Users/_saiifeaudit",
+    "/Groups/_saiife", "/Groups/_saiifeaudit",
+    "Users/_saiife", "Users/_saiifeaudit",
+    "Groups/_saiife", "Groups/_saiifeaudit",
+    "/Local/Default/Users/_saiife", "/Local/Default/Users/_saiifeaudit",
+    "/Local/Default/Groups/_saiife", "/Local/Default/Groups/_saiifeaudit",
+]
+
+[[deny]]
+# `dscl <datasource>` with no command after it is interactive: it reads
+# its commands from stdin (`printf … | dscl .`), out of the guard's sight.
+id = "dscl-interactive"
+pattern = '(?i)^dscl(?:\s+-(?:u|P|f)\s+\S+|\s+-\S+)*(?:\s+[^-\s]\S*)?\s*$'
+reason = "interactive dscl reads commands the guard cannot see; run each command on its own"
+no_redirections = true
 
 # --- saiife's service ---------------------------------------------------------
 # An operand naming saiife: containing `saiif` (`saiifed`, `saiife*`,
