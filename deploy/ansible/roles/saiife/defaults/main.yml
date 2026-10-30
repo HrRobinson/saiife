@@ -1,0 +1,17 @@
+---
+# Release to install, without the leading v. Required.
+saiife_version: ""
+saiife_package_base_url: "https://github.com/HrRobinson/saiife/releases/download/v{{ saiife_version }}"
+# Package file name -> SHA-256. Required: the role fails without the entry for
+# the file it downloads, e.g. {"saiife_1.2.3_amd64.deb": "<sha256>"}.
+saiife_package_sha256: {}
+# Path on the controller of the section 8.1 system config (locked = true). Required.
+saiife_config_src: ""
+saiife_agents: [claude, codex, gemini]
+saiife_approvers: []
+# Optional controller directory of policy.d drop-ins (*.toml).
+saiife_policy_d_src: ""
+# Set false only for an unsigned rpm.
+saiife_rpm_gpg_check: true
+# doctor exit codes at or above this fail the play (1 = warnings, 2 = failures).
+saiife_doctor_fail_on: 2

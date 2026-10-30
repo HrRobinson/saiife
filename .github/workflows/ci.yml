@@ -81,7 +81,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
       - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/personal-broker/*.sh packaging/linux/build.sh
-      - run: shellcheck -s sh packaging/linux/scripts/*
+      - run: shellcheck -s sh packaging/linux/scripts/* deploy/intune/linux/discovery.sh
+
+  # Lint only: the Ansible role is never run in CI (plan 18, task 5).
+  ansible-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: pipx run --spec ansible-lint==26.10.1 ansible-lint deploy/ansible
 
   # Locked mode on real machines (spec §13 "Daemon integration"): `system
   # install` as root, the §5.2 owners and modes, managed hooks run as an

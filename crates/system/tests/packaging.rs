@@ -123,3 +123,39 @@ fn scripts_are_posix_sh() {
         }
     }
 }
+
+#[test]
+fn intune_rules_match_discovery() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/intune/linux");
+    let script = std::fs::read_to_string(dir.join("discovery.sh")).expect("discovery.sh");
+    let rules: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("rules.json")).expect("rules.json"))
+            .expect("rules.json is JSON");
+    let rules = rules["Rules"].as_array().expect("Rules array");
+    let mut seen = Vec::new();
+    for r in rules {
+        let name = r["SettingName"].as_str().expect("SettingName");
+        assert!(script.contains(name), "{name} missing from discovery.sh");
+        seen.push((
+            name.to_string(),
+            r["Operator"].as_str().unwrap().to_string(),
+            r["Operand"].clone(),
+        ));
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "saiife_doctor_exit".into(),
+                "LessEquals".into(),
+                serde_json::json!(1)
+            ),
+            (
+                "saiife_installed".into(),
+                "IsEquals".into(),
+                serde_json::json!(true)
+            ),
+        ]
+    );
+}
