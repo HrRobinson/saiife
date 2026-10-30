@@ -72,11 +72,18 @@ SIP_STATUS="$(/usr/bin/csrutil status 2>&1 || true)"
 SIP_ON=""
 [[ "$SIP_STATUS" == "System Integrity Protection status: enabled." ]] && SIP_ON=1
 
+# `as_root [-u <user>] <command...>`: sudo's `-u` stays a sudo option, in
+# front of the env that adds the seam.
 as_root() {
+    local who=root
+    if [[ "${1:-}" == -u ]]; then
+        who="$2"
+        shift 2
+    fi
     if [[ -n "$SIP_ON" ]]; then
-        sudo -n "$@"
+        sudo -n -u "$who" "$@"
     else
-        sudo -n /usr/bin/env SAIIFE_TEST_ALLOW_SIP_OFF=1 "$@"
+        sudo -n -u "$who" /usr/bin/env SAIIFE_TEST_ALLOW_SIP_OFF=1 "$@"
     fi
 }
 
