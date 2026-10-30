@@ -3,10 +3,14 @@ name: release
 on:
   push:
     tags: ['v*']
-  # Dry-run the build matrix on PRs that touch the release path. publish,
+  # Dry-run the build and linux-packages jobs on PRs that touch the release path. publish,
   # install-test and release only run for a pushed v* tag.
   pull_request:
-    paths: ['.github/workflows/release.yml', 'install.sh']
+    paths:
+      - '.github/workflows/release.yml'
+      - 'install.sh'
+      - 'packaging/**'
+      - 'scripts/package-linux/**'
   workflow_dispatch:
 
 permissions:
@@ -145,8 +149,86 @@ jobs:
           path: dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  publish:
+  linux-packages:
     needs: [check-version, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      - name: extract the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="saiife-$VERSION-$TARGET"
+          mkdir -p "$RUNNER_TEMP/p18-bin"
+          # The packaged bytes are the tarball's bytes.
+          tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP/p18-bin" "$name/saiife"
+          echo "SAIIFE_BIN=$RUNNER_TEMP/p18-bin/$name/saiife" >> "$GITHUB_ENV"
+      - name: install the pinned nfpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner is x86_64 for both rows; nfpm cross-packages by arch.
+          # shellcheck source=/dev/null
+          . packaging/linux/nfpm.version
+          tgz="nfpm_${version}_Linux_x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tgz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${version}/${tgz}"
+          echo "${sha256_linux_x86_64}  $RUNNER_TEMP/$tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/p18-nfpm"
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP/p18-nfpm" nfpm
+          echo "$RUNNER_TEMP/p18-nfpm" >> "$GITHUB_PATH"
+      # Secrets reach only tag pushes, so PR runs build unsigned packages.
+      - name: stage the rpm signing key
+        shell: bash
+        env:
+          PKG_GPG_PRIVATE_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PRIVATE_KEY || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PKG_GPG_PRIVATE_KEY" ]; then
+            echo "::notice::packages are unsigned (PKG_GPG_PRIVATE_KEY not set)"
+            exit 0
+          fi
+          keyfile="$RUNNER_TEMP/p18-pkg-key.asc"
+          (umask 077 && printf '%s\n' "$PKG_GPG_PRIVATE_KEY" > "$keyfile")
+          echo "SAIIFE_PKG_GPG_KEY_FILE=$keyfile" >> "$GITHUB_ENV"
+      - name: build the deb and rpm
+        shell: bash
+        env:
+          NFPM_RPM_PASSPHRASE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PASSPHRASE || '' }}
+        run: |
+          set -euo pipefail
+          bash packaging/linux/build.sh "$SAIIFE_BIN" "$VERSION" "$ARCH" pkg
+          ls -l pkg
+      - name: remove the signing key
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/p18-pkg-key.asc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pkg-${{ matrix.arch }}
+          path: pkg/*
+          if-no-files-found: error
+
+  publish:
+    needs: [check-version, build, linux-packages]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -162,6 +244,11 @@ jobs:
           pattern: dist-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
       - name: SHA256SUMS
         shell: bash
         run: |
@@ -173,8 +260,34 @@ jobs:
             echo "::error::expected 4 tarballs, found $count"
             exit 1
           fi
-          sha256sum saiife-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS
+          debs="$(ls -1 saiife_*.deb | wc -l)"
+          rpms="$(ls -1 saiife-*.rpm | wc -l)"
+          if [ "$debs" -ne 2 ] || [ "$rpms" -ne 2 ]; then
+            echo "::error::expected 2 debs and 2 rpms, found $debs and $rpms"
+            exit 1
+          fi
+          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm | LC_ALL=C sort -k2 > SHA256SUMS
           cat SHA256SUMS
+      - name: sign SHA256SUMS
+        shell: bash
+        env:
+          PKG_GPG_PRIVATE_KEY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PRIVATE_KEY || '' }}
+          PKG_GPG_PASSPHRASE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.PKG_GPG_PASSPHRASE || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PKG_GPG_PRIVATE_KEY" ]; then
+            echo "::notice::packages are unsigned (PKG_GPG_PRIVATE_KEY not set)"
+            exit 0
+          fi
+          GNUPGHOME="$(mktemp -d -p "$RUNNER_TEMP")"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$PKG_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          # The passphrase goes in on stdin, never on argv.
+          printf '%s' "$PKG_GPG_PASSPHRASE" | gpg --batch --quiet --pinentry-mode loopback \
+            --passphrase-fd 0 --detach-sign --armor -o dist/SHA256SUMS.asc dist/SHA256SUMS
+          ls -l dist/SHA256SUMS.asc
       - name: release notes
         shell: bash
         run: |
@@ -203,11 +316,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          files=(dist/*.tar.gz dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh)
+          if [ -f dist/SHA256SUMS.asc ]; then
+            files+=(dist/SHA256SUMS.asc)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --draft \
             --title "saiife $GITHUB_REF_NAME" \
             --notes-file notes.md \
-            dist/*.tar.gz dist/SHA256SUMS install.sh
+            "${files[@]}"
 
   install-test:
     needs: [check-version, publish]
@@ -245,8 +362,46 @@ jobs:
             *) echo "::error::installed saiife does not report $VERSION"; exit 1 ;;
           esac
 
+  package-test:
+    needs: [check-version, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [deb, rpm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: download the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D rel
+      - name: install and remove the draft package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l rel
+          # The runner is amd64; the draft holds both architectures.
+          if [ "$KIND" = deb ]; then
+            pkg="rel/saiife_${VERSION}_amd64.deb"
+          else
+            pkg="rel/saiife-${VERSION}-1.x86_64.rpm"
+            if [ -f deploy/keys/saiife-packages.asc ] && [ -f rel/SHA256SUMS.asc ]; then
+              export SAIIFE_PKG_PUBKEY=deploy/keys/saiife-packages.asc
+            fi
+          fi
+          SAIIFE_PACKAGE_CI=1 PHASES="fresh remove" \
+            bash scripts/package-linux/run.sh "$KIND" rel "$pkg" "$pkg"
+
   release:
-    needs: install-test
+    needs: [install-test, package-test]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
