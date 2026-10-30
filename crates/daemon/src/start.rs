@@ -176,6 +176,10 @@ pub(crate) fn personal_preflight(
     let runtime = socket_dir
         .parent()
         .ok_or_else(|| format!("{}: no XDG_RUNTIME_DIR above it", socket_dir.display()))?;
+    if cfg!(target_os = "macos") {
+        // No session manager makes a runtime dir here.
+        saiife_system::personal::ensure_runtime_dir(runtime)?;
+    }
     saiife_system::personal::check_runtime_dir(runtime, euid)?;
     if bootstrap(config).locked == Some(true) {
         return Err(format!(

@@ -711,8 +711,8 @@ fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
     if let Some(kind) = &a.print_unit {
         return print_unit(kind);
     }
-    if !cfg!(target_os = "linux") {
-        eprintln!("{}", saiife_daemon::PERSONAL_NEEDS_LINUX);
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        eprintln!("{}", saiife_daemon::PERSONAL_UNSUPPORTED);
         return ExitCode::from(2);
     }
     if a.config.is_some() || a.state_dir.is_some() || a.credentials_dir.is_some() {

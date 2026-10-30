@@ -81,9 +81,8 @@ use saiife_policy::{Directory, PackInfo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The line `saiife daemon --user` refuses with outside Linux (decision 9).
-pub const PERSONAL_NEEDS_LINUX: &str =
-    "saiife: the personal broker needs Linux in this version (macOS: with the v2.1 daemon port)";
+/// The line `saiife daemon --user` refuses with outside Linux and macOS.
+pub const PERSONAL_UNSUPPORTED: &str = "saiife: the personal broker needs Linux or macOS";
 
 /// Which daemon to run.
 pub enum DaemonMode {
@@ -149,7 +148,7 @@ impl saiife_keychain::Keychain for UnavailableKeychain {
 /// root, a locked host (`locked_marker` exists), a bad `$XDG_RUNTIME_DIR`
 /// (the parent of `socket_dir`) and a config with `locked = true`. The CLI
 /// runs this before it opens the keychain; the start runs it again.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn personal_preflight(
     config: &Path,
     socket_dir: &Path,
@@ -158,36 +157,23 @@ pub fn personal_preflight(
     start::personal_preflight(config, socket_dir, locked_marker)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn personal_preflight(
     config: &Path,
     socket_dir: &Path,
     locked_marker: &Path,
 ) -> Result<(), String> {
     let _ = (config, socket_dir, locked_marker);
-    Err(PERSONAL_NEEDS_LINUX
+    Err(PERSONAL_UNSUPPORTED
         .trim_start_matches("saiife: ")
         .to_string())
 }
 
 /// Run the daemon until SIGTERM or SIGINT. Startup refusals print one line
 /// and exit 2.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn run(opts: DaemonOptions) -> ExitCode {
     start::run(opts)
-}
-
-/// macOS: the system daemon runs; the personal broker still refuses until
-/// its own port (plan 13, Task 10).
-#[cfg(target_os = "macos")]
-pub fn run(opts: DaemonOptions) -> ExitCode {
-    match opts.mode {
-        DaemonMode::System => start::run(opts),
-        DaemonMode::Personal { .. } => {
-            eprintln!("{PERSONAL_NEEDS_LINUX}");
-            ExitCode::from(2)
-        }
-    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -196,7 +182,7 @@ pub fn run(opts: DaemonOptions) -> ExitCode {
         DaemonMode::System => {
             eprintln!("saiife: locked mode needs Linux or macOS")
         }
-        DaemonMode::Personal { .. } => eprintln!("{PERSONAL_NEEDS_LINUX}"),
+        DaemonMode::Personal { .. } => eprintln!("{PERSONAL_UNSUPPORTED}"),
     }
     ExitCode::from(2)
 }

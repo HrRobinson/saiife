@@ -11,6 +11,8 @@ use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::layout::Platform;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalPaths {
     pub socket_dir: PathBuf,
@@ -21,16 +23,50 @@ pub struct PersonalPaths {
 
 const NO_RUNTIME: &str = "XDG_RUNTIME_DIR is not set or not absolute; log in through a session manager or run as a systemd --user unit";
 
+const NO_RUNTIME_MACOS: &str =
+    "there is no home directory to put the personal broker's runtime dir in; set XDG_RUNTIME_DIR";
+
 fn abs_var(env: &dyn Fn(&str) -> Option<OsString>, name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(env(name)?);
     p.is_absolute().then_some(p)
 }
 
+/// macOS has no `XDG_RUNTIME_DIR`: the runtime dir is under the home.
+pub const MACOS_RUNTIME_REL: &str = "Library/Caches/saiife";
+
+/// The longest `gateway.sock` path macOS can bind (`sun_path` is 104 bytes
+/// with the NUL).
+pub const MAX_SOCKET_PATH: usize = 103;
+
 pub fn personal_paths(
     env: &dyn Fn(&str) -> Option<OsString>,
     home: Option<&Path>,
 ) -> Result<PersonalPaths, String> {
-    let runtime = abs_var(env, "XDG_RUNTIME_DIR").ok_or_else(|| NO_RUNTIME.to_string())?;
+    // `None` on another OS keeps the Linux (XDG) rules.
+    personal_paths_for(env, home, Platform::current().unwrap_or(Platform::Linux))
+}
+
+pub fn personal_paths_for(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    home: Option<&Path>,
+    platform: Platform,
+) -> Result<PersonalPaths, String> {
+    let socket_dir = match (abs_var(env, "XDG_RUNTIME_DIR"), platform) {
+        (Some(r), _) => r.join("saiife"),
+        (None, Platform::Macos) => match home {
+            Some(h) if h.is_absolute() => h.join(MACOS_RUNTIME_REL).join("run"),
+            _ => return Err(NO_RUNTIME_MACOS.to_string()),
+        },
+        (None, Platform::Linux) => return Err(NO_RUNTIME.to_string()),
+    };
+    if platform == Platform::Macos {
+        let n = socket_dir.join("gateway.sock").as_os_str().len();
+        if n > MAX_SOCKET_PATH {
+            return Err(format!(
+                "the personal broker's socket path is too long for macOS ({n} bytes); set XDG_RUNTIME_DIR to a shorter dir"
+            ));
+        }
+    }
     let base = |var: &str, fallback: &str| -> Result<PathBuf, String> {
         if let Some(p) = abs_var(env, var) {
             return Ok(p);
@@ -46,11 +82,25 @@ pub fn personal_paths(
     let state = base("XDG_STATE_HOME", ".local/state")?;
     let data = base("XDG_DATA_HOME", ".local/share")?;
     Ok(PersonalPaths {
-        socket_dir: runtime.join("saiife"),
+        socket_dir,
         config: config.join("saiife/broker/config.toml"),
         state_dir: state.join("saiife/broker"),
         audit_dir: data.join("saiife/broker/audit"),
     })
+}
+
+/// Create the runtime dir 0700 when it is missing (macOS has no session
+/// manager to make one). An existing dir is left for [`check_runtime_dir`].
+pub fn ensure_runtime_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    if !dir.is_absolute() || std::fs::symlink_metadata(dir).is_ok() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// The `$XDG_RUNTIME_DIR` dir itself: a real dir (no symlink), owned by
@@ -155,6 +205,80 @@ mod tests {
             p.audit_dir,
             Path::new("/home/u/.local/share/saiife/broker/audit")
         );
+    }
+
+    fn lin(m: HashMap<&'static str, String>, home: &str) -> Result<PersonalPaths, String> {
+        personal_paths_for(&envf(m), Some(Path::new(home)), Platform::Linux)
+    }
+    fn mac(m: HashMap<&'static str, String>, home: &str) -> Result<PersonalPaths, String> {
+        personal_paths_for(&envf(m), Some(Path::new(home)), Platform::Macos)
+    }
+
+    #[test]
+    fn macos_paths_without_xdg_runtime() {
+        let p = mac(HashMap::new(), "/Users/u").unwrap();
+        assert_eq!(
+            p.socket_dir,
+            Path::new("/Users/u/Library/Caches/saiife/run")
+        );
+        assert_eq!(
+            p.config,
+            Path::new("/Users/u/.config/saiife/broker/config.toml")
+        );
+        assert!(personal_paths_for(&envf(HashMap::new()), None, Platform::Macos).is_err());
+    }
+
+    #[test]
+    fn macos_xdg_runtime_wins() {
+        let p = mac(
+            HashMap::from([("XDG_RUNTIME_DIR", "/tmp/r".into())]),
+            "/Users/u",
+        )
+        .unwrap();
+        assert_eq!(p.socket_dir, Path::new("/tmp/r/saiife"));
+    }
+
+    #[test]
+    fn macos_runtime_created_0700() {
+        let t = tempfile::tempdir().unwrap();
+        let rt = t.path().join("Library/Caches/saiife");
+        ensure_runtime_dir(&rt).unwrap();
+        assert_eq!(
+            std::fs::metadata(&rt).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        check_runtime_dir(&rt, euid()).unwrap();
+        // An existing dir is not touched: a loose one is still refused.
+        let loose = t.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_dir(&loose).unwrap();
+        assert!(check_runtime_dir(&loose, euid()).is_err());
+    }
+
+    #[test]
+    fn macos_socket_path_too_long_refused() {
+        let home = format!("/Users/{}", "a".repeat(70));
+        let e = mac(HashMap::new(), &home).unwrap_err();
+        assert!(
+            e.starts_with("the personal broker's socket path is too long for macOS ("),
+            "{e}"
+        );
+        assert!(e.ends_with("set XDG_RUNTIME_DIR to a shorter dir"), "{e}");
+        // The same home is fine on Linux, and a short XDG dir fixes macOS.
+        assert!(lin(HashMap::from([("XDG_RUNTIME_DIR", "/run/u".into())]), &home).is_ok());
+        assert!(mac(HashMap::from([("XDG_RUNTIME_DIR", "/tmp/r".into())]), &home).is_ok());
+    }
+
+    #[test]
+    fn linux_paths_unchanged() {
+        assert_eq!(lin(HashMap::new(), "/home/u").unwrap_err(), NO_RUNTIME);
+        let p = lin(
+            HashMap::from([("XDG_RUNTIME_DIR", "/run/user/1000".into())]),
+            "/home/u",
+        )
+        .unwrap();
+        assert_eq!(p.socket_dir, Path::new("/run/user/1000/saiife"));
     }
 
     #[test]
