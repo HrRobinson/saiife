@@ -482,6 +482,8 @@ pub fn fake_elf(interp: Option<&str>, needed: usize, marker: Option<bool>) -> Ve
 
 /// A thin Mach-O for tests: with `sig` (CodeDirectory flags, CMS blob)
 /// one `LC_CODE_SIGNATURE`, then `marker` and the signature.
+// Test support only: never in a release build.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub fn fake_macho_with(sig: Option<(u32, bool)>, marker: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; MACH_HEADER_64];
@@ -527,6 +529,8 @@ pub fn fake_macho_with(sig: Option<(u32, bool)>, marker: &[u8]) -> Vec<u8> {
 
 /// A thin Mach-O with the release build marker, for tests: unsigned
 /// (`None`) or signed with `(adhoc, hardened_runtime, cms)`.
+// Test support only: never in a release build.
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub fn fake_macho(sig: Option<(bool, bool, bool)>) -> Vec<u8> {
     let sig = sig.map(|(adhoc, runtime, cms)| {

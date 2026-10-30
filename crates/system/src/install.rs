@@ -294,7 +294,9 @@ pub fn install(
     // A running daemon picks up a new group membership only at start.
     let restart = binary_changed || unit_changed || member_added;
     if mac {
-        run.start_macos(restart)?;
+        // launchd reads the plist only at bootstrap: a changed plist
+        // reloads the job, anything else restarts it in place.
+        run.start_macos(binary_changed || member_added, unit_changed)?;
     } else {
         run.start(restart)?;
     }
@@ -868,6 +870,12 @@ fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallErro
     use std::os::unix::fs::MetadataExt;
     let daemon_user = layout.daemon_user();
     let saiife_uid = host.user(daemon_user).map(|u| u.uid);
+    // macOS: install itself makes the state and key dirs (as root, then
+    // hands them over), so a root-owned one is what a crashed install left;
+    // it is repaired, as `Run::owned_dir_at` does. A file must be the
+    // daemon user's.
+    let root_uid = host.user("root").map(|u| u.uid);
+    let mac = layout.platform() == Platform::Macos;
     for (abs, want, is_dir) in [
         (STATE_DIR, 0o700, true),
         (KEYS_DIR, 0o700, true),
@@ -888,7 +896,8 @@ fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallErro
                 ),
             ));
         }
-        if Some(m.uid()) != saiife_uid {
+        let crashed = mac && is_dir && Some(m.uid()) == root_uid;
+        if Some(m.uid()) != saiife_uid && !crashed {
             return Err(refused(
                 &p,
                 format!(
@@ -1570,7 +1579,8 @@ impl Run<'_> {
         if !is_dir {
             return Err(refused(&p, "is not a directory"));
         }
-        if !created && !allowed.contains(&uid) {
+        // Checked on a fresh dir too: the one opened must be the one made.
+        if !allowed.contains(&uid) {
             return Err(refused(
                 &p,
                 format!("exists and is owned by uid {uid}; saiife does not adopt it (move it away first)"),
@@ -1620,9 +1630,12 @@ impl Run<'_> {
                     detail: e.to_string(),
                 })?;
                 let mut f = std::fs::File::from(fd);
-                f.write_all(&key[..])
-                    .and_then(|_| f.sync_all())
-                    .map_err(step("vault-key"))?;
+                if let Err(e) = f.write_all(&key[..]).and_then(|_| f.sync_all()) {
+                    // Never leave a short key behind (it would be adopted
+                    // as is on the next run): unlinked fd-relative.
+                    let _ = rustix::fs::unlinkat(keys, name, rustix::fs::AtFlags::empty());
+                    return Err(step("vault-key")(e));
+                }
                 self.changed(shown);
                 OwnedFd::from(f)
             }
@@ -1680,9 +1693,11 @@ impl Run<'_> {
         )
     }
 
-    /// Starts the daemon: a loaded job is restarted (`kickstart -k`) when
-    /// something changed; otherwise the plist is bootstrapped and enabled.
-    fn start_macos(&mut self, changed: bool) -> Result<(), InstallError> {
+    /// Starts the daemon. A loaded job is restarted in place
+    /// (`kickstart -k`) when the binary or a membership changed; when the
+    /// plist changed it is reloaded (`bootout`, `enable`, `bootstrap`). A
+    /// job not loaded is enabled and bootstrapped.
+    fn start_macos(&mut self, changed: bool, plist_changed: bool) -> Result<(), InstallError> {
         let plist = self.at(UNIT).to_string_lossy().into_owned();
         let launchctl = |args: &[&str]| -> Result<(), InstallError> {
             let fail = |detail: String| InstallError::Step {
@@ -1704,14 +1719,20 @@ impl Run<'_> {
             .host
             .launchctl(&["print", launchd::SERVICE])
             .is_ok_and(|o| o.status == 0);
-        if loaded {
+        if loaded && !plist_changed {
             if changed {
                 launchctl(&["kickstart", "-k", launchd::SERVICE])?;
             }
             return Ok(());
         }
-        launchctl(&["bootstrap", "system", &plist])?;
-        launchctl(&["enable", launchd::SERVICE])
+        // A loaded job keeps the plist it was bootstrapped with: take it
+        // out first. `enable` comes before `bootstrap`, so a job disabled
+        // earlier is loaded at all.
+        if loaded {
+            launchctl(&["bootout", launchd::SERVICE])?;
+        }
+        launchctl(&["enable", launchd::SERVICE])?;
+        launchctl(&["bootstrap", "system", &plist])
     }
 
     fn start(&mut self, changed: bool) -> Result<(), InstallError> {
@@ -3557,8 +3578,8 @@ pub(crate) mod macos_tests {
             launch,
             [
                 PRINT,
-                &format!("launchctl bootstrap system {plist}"),
                 "launchctl enable system/com.saiife.saiifed",
+                &format!("launchctl bootstrap system {plist}"),
             ]
         );
         // Loaded, nothing changed: left alone.
@@ -3586,6 +3607,35 @@ pub(crate) mod macos_tests {
             [PRINT, "launchctl kickstart -k system/com.saiife.saiifed"]
         );
         assert_eq!(r.changed, ["/opt/saiife/bin/saiife"]);
+        // A changed plist: launchd reads it only at bootstrap, so the job
+        // is reloaded.
+        let plist_path = e.layout.at(UNIT);
+        fs::write(&plist_path, "<plist/>").unwrap();
+        e.host.set(|s| s.calls.clear());
+        let r = e.install();
+        let launch: Vec<String> = e
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("launchctl"))
+            .collect();
+        let plist = plist_path.display().to_string();
+        assert_eq!(
+            launch,
+            [
+                PRINT.to_string(),
+                "launchctl bootout system/com.saiife.saiifed".to_string(),
+                "launchctl enable system/com.saiife.saiifed".to_string(),
+                format!("launchctl bootstrap system {plist}"),
+            ]
+        );
+        assert_eq!(
+            r.changed,
+            ["/Library/LaunchDaemons/com.saiife.saiifed.plist"]
+        );
+        assert_eq!(
+            fs::read_to_string(&plist_path).unwrap(),
+            launchd::plist_text()
+        );
         // A failed bootstrap names the daemon log.
         let e = mac_env();
         let plist = e.layout.at(UNIT).display().to_string();
@@ -3669,6 +3719,13 @@ pub(crate) mod macos_tests {
         assert!(msg.contains("not hidden"), "{msg}");
     }
 
+    /// On a real Mac, `RealHost::user` already hides a `_saiife` that only
+    /// another directory node has, so install goes on to create it, and
+    /// `host::create_account` refuses that ("exists in a directory node
+    /// other than the local one"; tested in host.rs,
+    /// `unreadable_or_foreign_record_is_refused_before_any_create`). The
+    /// fake's `user` does not model nodes and returns the record: this
+    /// covers the second line of defence, the local-node read here.
     #[test]
     #[allow(non_snake_case)] // the brief's names: `_saiife` is the user
     fn nonlocal__saiife_refused() {
@@ -4017,6 +4074,33 @@ pub(crate) mod macos_tests {
         assert!(e.run(&opts()).is_err());
         assert_eq!(mode(&elsewhere), 0o755);
         assert!(!e.host.state().chowns.iter().any(|c| c.path == elsewhere));
+    }
+
+    /// A root-owned state dir is what a crashed install leaves: the
+    /// pre-check and the fd-relative step agree, and it is handed over.
+    #[test]
+    fn macos_root_owned_state_dir_is_repaired() {
+        let e = mac_env();
+        let st = e.at("/var/db/saiife");
+        fs::create_dir_all(st.join("keys")).unwrap();
+        for d in [&st, &st.join("keys")] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The test user stands in for root here (the fake's root).
+        let r = e.install();
+        let d = e.host.user("_saiife").unwrap();
+        let daemon = (d.uid, e.host.group_id("_saiife").unwrap());
+        assert_eq!(chowned(&e.host, &st), vec![daemon]);
+        assert_eq!(chowned(&e.host, &st.join("keys")), vec![daemon]);
+        assert!(st.join("keys/vault.key").is_file(), "{r:?}");
+        // Anyone else's is refused by both.
+        let e = mac_env();
+        let st = e.at("/var/db/saiife");
+        fs::create_dir_all(&st).unwrap();
+        fs::set_permissions(&st, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::testing::set_root_uid(&e.host, rustix::process::getuid().as_raw() + 1);
+        let msg = e.run(&opts()).unwrap_err().to_string();
+        assert!(msg.contains("not by the _saiife user"), "{msg}");
     }
 
     #[test]

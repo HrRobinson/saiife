@@ -200,13 +200,17 @@ pub fn uninstall(
     }
 
     // --purge: the config and vault key (only when install created them),
-    // state, audit, users and groups.
-    for f in rec
-        .files
-        .iter()
-        .rev()
-        .filter(|f| f.created && matches!(f.kind, FileKind::Config | FileKind::VaultKey))
-    {
+    // state, audit, users and groups. On macOS the vault key lies in the
+    // daemon user's state dir: it goes with that tree, fd-relative, never
+    // by a path the daemon user could redirect.
+    for f in rec.files.iter().rev().filter(|f| {
+        f.created
+            && match f.kind {
+                FileKind::Config => true,
+                FileKind::VaultKey => !mac,
+                _ => false,
+            }
+    }) {
         if fsops::remove_if_listed(&at(&f.path)?).map_err(step("files"))? {
             out.push(format!("removed {}", f.path.display()));
         }
@@ -222,21 +226,23 @@ pub fn uninstall(
             out.push(format!("removed {shown}"));
         }
     }
+    let log_dir = beneath_links(layout, host, Path::new(layout.logical(LOG_DIR)));
     // macOS: the daemon's stderr, in the log dir install made (its parent
-    // was checked with the audit tree's).
+    // was checked with the audit tree's). Unlinked fd-relative: a symlink
+    // there is removed, never followed.
     if mac {
-        let log = layout
-            .try_at(&beneath_links(layout, host, Path::new(DAEMON_LOG)))
-            .map_err(|e| step("purge")(io_at(DAEMON_LOG, e)))?;
-        if fsops::lstat(&log)
-            .map_err(|e| step("purge")(io_at(DAEMON_LOG, e)))?
-            .is_some_and(|m| m.is_file())
-            && fsops::remove_if_listed(&log).map_err(|e| step("purge")(io_at(DAEMON_LOG, e)))?
+        if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(&log_dir))
+            .map_err(|e| step("purge")(io_at(LOG_DIR, e)))?
         {
-            out.push(format!("removed {DAEMON_LOG}"));
+            let name = Path::new(DAEMON_LOG).file_name().unwrap_or_default();
+            let st = fsops::stat_at(&fd, name).map_err(|e| step("purge")(io_at(DAEMON_LOG, e)))?;
+            if st.is_some_and(|st| !fsops::stat_owner_mode(&st).2) {
+                rustix::fs::unlinkat(&fd, name, rustix::fs::AtFlags::empty())
+                    .map_err(|e| step("purge")(io_at(DAEMON_LOG, e.into())))?;
+                out.push(format!("removed {DAEMON_LOG}"));
+            }
         }
     }
-    let log_dir = beneath_links(layout, host, Path::new(layout.logical(LOG_DIR)));
     let (log_parent, log_name) = split(&log_dir);
     if let Some(fd) = fsops::open_dir_beneath(layout.root(), rel(&log_parent))
         .map_err(|e| step("purge")(io_at(&log_parent.to_string_lossy(), e)))?
@@ -1125,6 +1131,32 @@ mod macos_tests {
         }
         let s = e.host.state();
         assert!(s.users.is_empty() && s.groups.is_empty(), "{s:?}");
+    }
+
+    /// The daemon user swaps `keys/` for a link to a dir of its choosing:
+    /// `--purge` removes the link, never what it points at.
+    #[test]
+    fn macos_purge_never_follows_a_swapped_key_dir() {
+        let e = mac_env();
+        e.install();
+        let outside = e._src.path().join("victim");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("vault.key"), [5u8; 32]).unwrap();
+        let keys = e.at("/var/db/saiife/keys");
+        fs::remove_dir_all(&keys).unwrap();
+        std::os::unix::fs::symlink(&outside, &keys).unwrap();
+        // daemon.log as a link too.
+        let log_target = e._src.path().join("log-victim");
+        fs::write(&log_target, "keep").unwrap();
+        let log = e.at(DAEMON_LOG);
+        fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&log_target, &log).unwrap();
+        removable(&e);
+        let out = un(&e, true);
+        assert!(outside.join("vault.key").exists(), "{out:?}");
+        assert_eq!(fs::read(outside.join("vault.key")).unwrap(), [5u8; 32]);
+        assert_eq!(fs::read_to_string(&log_target).unwrap(), "keep");
+        assert_eq!(e.tree(), set(MAC_SETUP), "{out:?}");
     }
 
     #[test]
