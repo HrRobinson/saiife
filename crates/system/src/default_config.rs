@@ -68,9 +68,13 @@ fn toml_str(s: &str) -> String {
 /// the caller) are written uncommented. Under a test root the daemon user,
 /// socket dir and audit dir are written uncommented too, pointing below the
 /// root, so a test never points at the real `/run` or `/var`.
+///
+/// `reauth` (polkit present) writes `same_user = "reauth"` on Linux only.
+/// On macOS a same-user approval is always refused, so the config keeps the
+/// default `"deny"` there and approvals need a second account.
 pub fn default_config(layout: &Layout, approvers: &[String], reauth: bool) -> String {
     let mut set: Vec<(&str, &str, String)> = Vec::new();
-    if reauth {
+    if reauth && layout.platform() == Platform::Linux {
         set.push(("approval", "same_user", toml_str("reauth")));
     }
     if !approvers.is_empty() {
@@ -211,11 +215,15 @@ mod tests {
     #[test]
     fn reauth_default_when_polkit_exists() {
         use saiife_policy::SameUser;
-        let t = default_config(&Layout::system(), &[], true);
+        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], true);
         assert_eq!(load(&t).approval.same_user, SameUser::Reauth);
         assert!(t.contains("same_user = \"reauth\"\n"), "{t}");
         let t = default_config(&Layout::system(), &[], false);
         assert_eq!(load(&t).approval.same_user, SameUser::Deny);
+        // Never on macOS, even with the authorization right registered.
+        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], true);
+        assert_eq!(load(&t).approval.same_user, SameUser::Deny);
+        assert!(!t.contains("same_user = \"reauth\""), "{t}");
     }
 
     #[test]

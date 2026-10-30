@@ -760,7 +760,7 @@ Nothing here runs on Claude's machine. Everything privileged happens in CI or in
   gh secret set APPLE_NOTARY_APPLE_ID -R $R        # your Apple ID e-mail
   gh secret set APPLE_NOTARY_PASSWORD -R $R        # the app-specific password
   ```
-  Then run `release.yml` with `workflow_dispatch` on `main`. Both macOS build logs must say `developer-id`, and the notarization status must be `Accepted`. Delete the local `.p12` afterwards.
+  Then run `release.yml` with `workflow_dispatch` on a `v*` tag ref (for example `gh workflow run release.yml -R $R --ref v2.1.0-rc1`, after pushing that tag), not on `main`: the build step passes the signing secrets only when `github.ref` is a `refs/tags/v*` ref, so a run on `main` gets empty secrets and builds ad-hoc. A `workflow_dispatch` run never publishes (publishing needs a tag push). Both macOS build logs must say `developer-id`, and the notarization status must be `Accepted`. Delete the local `.p12` afterwards.
 - [ ] **The real-Mac live lock check, in a throwaway VM:**
   1. Run `brew install cirruslabs/cli/tart`, then `tart clone ghcr.io/cirruslabs/macos-sequoia-base:latest saiife-lock`, then `tart run saiife-lock` (log in as admin/admin).
   2. In the VM:
@@ -770,14 +770,14 @@ Nothing here runs on Claude's machine. Everything privileged happens in CI or in
   3. Copy in the signed binary from the `workflow_dispatch` run (the `dist-aarch64-apple-darwin` artifact) and a checkout of the repo. Run `sudo ./saiife system install --agents claude,codex,gemini --approvers admin`. `sudo saiife doctor` should pass except for expected warnings.
   4. Run `SAIIFE_LOCKCHECK_MACOS_VM=1 sudo -E bash scripts/lock-check/macos-vm.sh all`. Copy each `target/lock-check/macos-<agent>-*.tsv` to `crates/agents/tests/fixtures/lock-check/macos/<agent>.tsv` and send them to Claude, who sets the labels.
   5. Check that the Claude drop-in is honoured. The `claude` rows fire from `managed-settings.d`. If they do not, tell Claude to switch to the whole file (decision 11).
-  6. **Re-authentication**, logged in to the GUI as `agent`, in Terminal:
-     - set `[approval] same_user = "reauth"` and `approvers = ["agent"]` as root;
-     - make an agent request hit an `ask` rule, then run `saiife approve <id>`;
-     - the macOS password/Touch ID dialog must appear and show the saiife prompt;
-     - Cancel → refused. Authenticate → approved. Run it again → a dialog again (`timeout = 0`);
-     - over `ssh agent@<vm>` → refused with "re-authentication unavailable".
+  6. **Same-user approval is off on macOS**, logged in to the GUI as `agent`, in Terminal:
+     - as root, set `[approval] approvers = ["agent", "admin"]` and keep `same_user = "deny"` (what install writes on macOS); then `sudo launchctl kill SIGHUP system/com.saiife.saiifed` to reload;
+     - make an agent request hit an `ask` rule, then run `saiife approve <id>` as `agent` → refused (rule `same_user`, exit 2). No dialog appears;
+     - as root run `saiife lockdown on`; then as `agent` run `saiife lockdown off` → refused with `reauth_required` (exit 2), and lockdown stays on. No dialog appears;
+     - as root set `same_user = "reauth"` and reload. `saiife approve <id>` and `saiife lockdown off` as `agent` → both refused with `reauth_unavailable` (exit 2). Still no dialog;
+     - from the second account (`ssh admin@<vm>`, then `saiife approve <id>`) → approved. As root, `saiife lockdown off` works. Put `same_user = "deny"` back.
 
-     If no dialog appears from the daemon, report it. Claude then applies decision 3's fallback.
+     If any dialog appears, or `agent` approves its own request or lifts lockdown, report it.
   7. **A4 on the signed binary:**
      - `codesign -dv --verbose=4 /opt/saiife/bin/saiife` shows `flags=0x10000(runtime)` and `Authority=Developer ID Application`;
      - `DYLD_INSERT_LIBRARIES=/tmp/x.dylib /opt/saiife/bin/saiife --version` loads nothing (use `scripts/locked-macos/inject.c`).

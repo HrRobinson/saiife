@@ -180,7 +180,7 @@ gateway you control and allow only that address.
 macOS has no per-uid firewall in `pf` that we can rely on, so there is no
 recipe for it, and the doctor hint is Linux only. On a Mac the exfiltration
 row of the [threat table](threats.md) stays "not covered". Locked mode itself
-is Linux-only in v2.0 (macOS follows in v2.1).
+runs on macOS too (v2.1); only this egress recipe is Linux-only.
 
 ## Doctor hint
 

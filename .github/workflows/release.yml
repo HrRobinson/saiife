@@ -217,7 +217,22 @@ jobs:
             echo "::error::CHANGELOG.md still has the YYYY-MM-DD placeholder; set the release date before tagging"
             exit 1
           fi
-          if grep -qx 'ad-hoc' dist/SIGNING-*.txt 2>/dev/null; then
+          # One SIGNING-<target>.txt per macOS build: a missing one must
+          # not drop the ad-hoc note silently.
+          shopt -s nullglob
+          signing=(dist/SIGNING-*.txt)
+          shopt -u nullglob
+          if [ "${#signing[@]}" -ne 2 ]; then
+            echo "::error::expected 2 SIGNING-*.txt files (one per macOS target), found ${#signing[@]}: ${signing[*]}"
+            exit 1
+          fi
+          for f in "${signing[@]}"; do
+            case "$(cat "$f")" in
+              ad-hoc | developer-id) ;;
+              *) echo "::error::$f holds '$(cat "$f")', want ad-hoc or developer-id"; exit 1 ;;
+            esac
+          done
+          if grep -qx 'ad-hoc' "${signing[@]}"; then
             printf '\nmacOS binaries in this release are ad-hoc signed and not notarized.\n' >> notes.md
           fi
           cat notes.md

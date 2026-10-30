@@ -155,7 +155,8 @@ fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<Agen
         return None;
     }
     let info = ctx.host.user(name);
-    // macOS keeps its accounts in the local directory, not `/etc/passwd`.
+    // macOS keeps its accounts in Directory Services (local or network
+    // nodes), not `/etc/passwd`.
     let local = if mac(ctx) {
         info.is_some()
     } else {
@@ -299,25 +300,36 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
 
 // ------------------------------------------------------------ checks
 
+/// Linux: the user must be in `/etc/passwd` (an NSS-only account is denied
+/// by the locked hooks). macOS: the user must be known to Directory
+/// Services, on the local node or a network one (`getpwnam`).
 fn passwd_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
-    let (place, what) = if mac(ctx) {
-        (
-            "the local directory",
-            "a network or directory-service account",
-        )
+    let mac = mac(ctx);
+    let place = if mac {
+        "Directory Services"
     } else {
-        ("/etc/passwd", "NSS-only")
+        "/etc/passwd"
     };
     let title = format!("user {} in {place}", u.name);
     if u.in_passwd {
         Check::new(id, Status::Pass, title, "")
+    } else if mac {
+        Check::new(
+            id,
+            Status::Fail,
+            title,
+            format!(
+                "{} is not known to Directory Services (no local or network record): saiife cannot check this user",
+                u.name
+            ),
+        )
     } else {
         Check::new(
             id,
             Status::Fail,
             title,
             format!(
-                "{} is not in {place} ({what}): locked-mode hooks deny every call for this user",
+                "{} is not in /etc/passwd (NSS-only): locked-mode hooks deny every call for this user",
                 u.name
             ),
         )
@@ -424,13 +436,13 @@ struct Bins {
     symlinked_dirs: Vec<PathBuf>,
 }
 
-/// Owned by `uid`, or writable by group or others.
 /// `st_mode` as a `u32` (it is a `u16` on macOS).
 #[allow(clippy::useless_conversion)]
 fn wide(mode: rustix::fs::RawMode) -> u32 {
     u32::from(mode)
 }
 
+/// Owned by `uid`, or writable by group or others.
 fn writable_mode(owner: u32, mode: u32, uid: u32) -> bool {
     owner == uid || mode & 0o022 != 0
 }

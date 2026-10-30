@@ -455,6 +455,7 @@ prepare_host() {
         if (((8#$mode & 8#022) != 0 && (8#$mode & 8#1000) == 0)); then
             as_root chmod go-w "$d"
             echo "  changed: $d mode $(printf '%o' $((8#$mode & 8#7777))) -> $(stat -f '%Lp' "$d")"
+            echo "::warning::prepare_host: chmod go-w $d (runner image had mode $(printf '%o' $((8#$mode & 8#7777))))"
         else
             echo "  kept: $d $(stat -f '%Su:%Sg %Lp' "$d")"
         fi
@@ -499,6 +500,9 @@ phase_install() {
         fail "install took the ad-hoc build for an unsigned one"
     fi
     ok "install: test-build and ad-hoc warnings, hardened runtime recognised"
+    grep -q 'same-user approval is off on macOS: approvals need a second account' "$WORK/install.out" ||
+        fail "install did not warn that same-user approval is off on macOS"
+    ok "install: same-user approval is off warning"
     wait_until 30 "the daemon socket" daemon_ready
     expect_print_code zero "loaded"
     ok "saiifed running (pid $(daemon_pid))"

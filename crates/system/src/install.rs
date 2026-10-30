@@ -205,10 +205,12 @@ pub fn install(
     // An unsafe parent of the action dir (say a 0777 /usr/share) is not
     // a reason to abort: the action is skipped and approvals fall back to
     // a second account (`same_user = "deny"` for a new config).
-    // On macOS the authorization right decides it instead, when it is
-    // registered (before the config is written).
+    // On macOS the right is still registered, but a same-user approval is
+    // always refused there: the config keeps `same_user = "deny"` and the
+    // install always says so.
     let mut warnings = warnings;
     let polkit = if mac {
+        warnings.push(MAC_SAME_USER_OFF.to_string());
         false
     } else if !polkit_present(layout, host) {
         warnings.push(REAUTH_UNAVAILABLE.to_string());
@@ -1426,8 +1428,8 @@ impl Run<'_> {
 
     /// Registers the authorization right [`authright::RIGHT`] unless
     /// `authorizationdb read` shows it with the settings it needs. A
-    /// failure warns, and approvals fall back to a second account
-    /// (`same_user = "deny"` for a new config), as without polkit.
+    /// failure warns. Either way a new config keeps `same_user = "deny"`
+    /// on macOS, and approvals need a second account.
     fn auth_right(&mut self) -> Result<(), InstallError> {
         use authright::{read_args, read_ok, write_args, RIGHT, RIGHT_PLIST};
         let current = self
@@ -3340,7 +3342,7 @@ pub(crate) mod macos_tests {
         let e = mac_env();
         let r = e.install();
         assert!(r.started);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.warnings, [MAC_SAME_USER_OFF], "{:?}", r.warnings);
         let h = &e.host;
         let root = (h.user("root").unwrap().uid, h.group_id("wheel").unwrap());
         let d = h.user("_saiife").unwrap();
@@ -3519,9 +3521,12 @@ pub(crate) mod macos_tests {
         assert!(e.calls().contains(&line), "{:?}", e.calls());
         assert_eq!(e.installed().auth_rights, [RIGHT]);
         let cfg = fs::read_to_string(e.layout.at(CONFIG)).unwrap();
-        assert!(cfg.contains("same_user = \"reauth\"\n"), "{cfg}");
+        // Same-user approval is off on macOS: the config keeps "deny".
+        assert!(cfg.contains("# same_user = \"deny\"\n"), "{cfg}");
+        assert!(!cfg.contains("same_user = \"reauth\""), "{cfg}");
         assert!(r.changed.contains(&format!("auth right {RIGHT}")), "{r:?}");
         assert!(!r.warnings.iter().any(|w| w.contains(REAUTH_UNAVAILABLE)));
+        assert!(r.warnings.iter().any(|w| w == MAC_SAME_USER_OFF), "{r:?}");
         // Read back with its settings: not written again.
         e.settle();
         let r = e.install();
@@ -3561,6 +3566,7 @@ pub(crate) mod macos_tests {
             r.warnings
         );
         assert!(e.installed().auth_rights.is_empty());
+        assert!(r.warnings.iter().any(|w| w == MAC_SAME_USER_OFF), "{r:?}");
         assert!(r.started);
     }
 
@@ -3860,10 +3866,10 @@ pub(crate) mod macos_tests {
         let mut o = opts();
         o.agents = vec![Agent::Codex];
         let r = e.run(&o).unwrap();
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.warnings, [MAC_SAME_USER_OFF], "{:?}", r.warnings);
         // No profile, no warning.
         let r = mac_env().install();
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.warnings, [MAC_SAME_USER_OFF], "{:?}", r.warnings);
     }
 
     #[test]

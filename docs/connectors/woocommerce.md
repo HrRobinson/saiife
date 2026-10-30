@@ -140,11 +140,10 @@ on a service with `redact` is withheld.
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches the shop only through `saiifed`:
+In locked mode (Linux and macOS) the agent user reaches the shop only through `saiifed`:
 `saiife api woo ...`, or `gateway.sock` at `/v1/api` and `/v1/proxy`. The
 consumer key and secret live in the daemon's vault (`saiife secret add woo-prod
 --kind basic`, or `saiife connect woocommerce`) and never reach the agent's
 environment, files or audit records. A project overlay can only add `deny` and
 `ask`; in locked mode its `allow` is ignored. Every call is one `connector`
-audit record. On macOS the commands print `saiife: locked mode needs Linux in
-this version (macOS: v2.1)` and exit 5.
+audit record.

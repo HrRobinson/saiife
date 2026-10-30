@@ -5,7 +5,8 @@
 //! narrowing or replacing an active lockdown, by an approver who is not an
 //! admin needs polkit re-authentication (`same_user = "reauth"`), so the
 //! CLI says what it changes and starts `pkttyagent` first (as `approve`
-//! does). Linux and macOS. Exit codes: 0 ok,
+//! does). On macOS same-user re-authentication is off: only root or an
+//! `[admin]` user can lift or narrow lockdown. Linux and macOS. Exit codes: 0 ok,
 //! 2 refused, 5 the daemon cannot be reached.
 
 use std::path::PathBuf;
@@ -48,10 +49,17 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
     use serde_json::{json, Map, Value};
 
     let config = config.unwrap_or_else(|| PathBuf::from("/etc/saiife/config.toml"));
-    // Prepares a possible re-authentication; when that fails (macOS: no
-    // authorization reference) the daemon decides without it and refuses
-    // a same-user change (fail closed).
-    let reauth = |args: &mut Map<String, Value>| {
+    // Prepares a possible re-authentication; when that fails the daemon
+    // decides without it and refuses a same-user change (fail closed). On
+    // macOS same-user re-authentication is off: nothing is prepared, the
+    // daemon still decides (root and `[admin]` pass, an approver is
+    // refused), and the CLI says so first.
+    let mac = cfg!(target_os = "macos");
+    let reauth = |args: &mut Map<String, Value>, what: &str| {
+        eprintln!("saiife: {}", reauth_notice(mac, what));
+        if mac {
+            return None;
+        }
         crate::approvals_cmd::prepare_reauth(args)
             .map_err(|e| eprintln!("saiife: warning: {e}"))
             .ok()
@@ -102,10 +110,7 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             };
             let _held = match active.as_deref() {
                 Some(cur) if !(cur == "connectors" && scope == "all") => {
-                    eprintln!(
-                        "saiife: changing an active lockdown (you may be asked for your password)"
-                    );
-                    reauth(&mut args)
+                    reauth(&mut args, "changing an active lockdown")
                 }
                 _ => None,
             };
@@ -115,13 +120,11 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             let mut args = Map::new();
             args.insert("on".into(), json!(false));
             // Root never re-authenticates; anyone else may be asked for a
-            // password, so say first what it is for. macOS sends `auth` (the
-            // daemon there refuses same-user re-authentication for now).
+            // password (Linux), so say first what it is for.
             let _held = if rustix::process::geteuid().is_root() {
                 None
             } else {
-                eprintln!("saiife: turning lockdown off (you may be asked for your password)");
-                reauth(&mut args)
+                reauth(&mut args, "turning lockdown off")
             };
             call(&config, "lockdown.set", args).map(|a| shown(&a, "lockdown"))
         }
@@ -133,6 +136,18 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             eprintln!("saiife: {m}");
             ExitCode::from(code)
         }
+    }
+}
+
+/// The line printed before a lockdown change that may need
+/// re-authentication. On macOS same-user re-authentication is off, so only
+/// root or an `[admin]` user can make it.
+#[cfg(unix)]
+fn reauth_notice(mac: bool, what: &str) -> String {
+    if mac {
+        format!("{what}: on macOS only root or an [admin] user can do this (same-user re-authentication is off)")
+    } else {
+        format!("{what} (you may be asked for your password)")
     }
 }
 
@@ -158,5 +173,18 @@ mod exit_tests {
         assert_eq!(exit_of(Stop::Unrecorded("x".into())).0, 5);
         assert_eq!(exit_of(Stop::Unavailable("x".into())).0, 5);
         assert_eq!(exit_of(Stop::Refused("x".into())).0, 2);
+    }
+
+    #[test]
+    fn macos_notice_names_root_and_admin_not_a_password() {
+        let m = reauth_notice(true, "turning lockdown off");
+        assert!(m.starts_with("turning lockdown off: "), "{m}");
+        assert!(m.contains("only root or an [admin] user"), "{m}");
+        assert!(!m.contains("password"), "{m}");
+        let l = reauth_notice(false, "turning lockdown off");
+        assert_eq!(
+            l,
+            "turning lockdown off (you may be asked for your password)"
+        );
     }
 }

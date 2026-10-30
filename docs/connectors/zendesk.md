@@ -127,14 +127,13 @@ on a service with `redact` is withheld.
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches Zendesk only through `saiifed`:
+In locked mode (Linux and macOS) the agent user reaches Zendesk only through `saiifed`:
 `saiife api zendesk ...`, or `gateway.sock` at `/v1/api` and `/v1/proxy`.
 The credential lives in the daemon's vault (`saiife secret add zendesk-prod
 --kind basic`, or `saiife connect zendesk`) and never reaches the agent's
 environment, files or audit records. A project overlay can only add `deny` and
 `ask`; in locked mode its `allow` is ignored. Every call is one `connector`
-audit record. On macOS the commands print `saiife: locked mode needs Linux in
-this version (macOS: v2.1)` and exit 5.
+audit record.
 
 Create a dedicated agent user in Zendesk with a role limited to what the policy
 needs, and an API token for it, so a policy mistake is bounded by the token.

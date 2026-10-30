@@ -763,26 +763,26 @@ mod tests {
         assert_eq!(system_entry(0).unwrap().name, "root");
     }
 
-    /// `/var` is a root-owned link to `private/var` on macOS, and the temp
-    /// dir lives below it: the owner check passes through either spelling,
-    /// and a client connects through the `/var` one.
+    /// `/var` is a root-owned link to `private/var` on macOS: the owner
+    /// check passes through either spelling, and a client connects through
+    /// the `/var` one. The dir is made under `/private/var/tmp` explicitly
+    /// (short name: the socket path stays under 104 bytes), so the test
+    /// always runs, whatever `TMPDIR` is.
     #[cfg(target_os = "macos")]
     #[test]
     fn client_accepts_socket_dir_behind_var_link() {
         let d = tempfile::Builder::new()
-            .prefix("p13-t2-")
-            .tempdir_in(std::env::temp_dir())
+            .prefix("p13-")
+            .rand_bytes(6)
+            .tempdir_in("/private/var/tmp")
             .unwrap();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let real = d.path().canonicalize().unwrap();
-        let Ok(rest) = real.strip_prefix("/private/var") else {
-            eprintln!(
-                "skipped: temp dir {} is not under /private/var",
-                real.display()
-            );
-            return;
-        };
+        let rest = real
+            .strip_prefix("/private/var")
+            .unwrap_or_else(|_| panic!("{} is not under /private/var", real.display()));
         let via_var = Path::new("/var").join(rest);
+        assert_eq!(via_var.canonicalize().unwrap(), real);
         let h = fake(&real, |m| Some(json!({"id":m["id"],"ok":true})));
         for dir in [&via_var, &real] {
             check_owner(dir, &dir.join(SOCKET_NAME), me()).unwrap();

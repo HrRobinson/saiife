@@ -64,9 +64,10 @@ reason = "an agent may not ask for administrator privileges in locked mode; root
 [[deny]]
 # Rewriting a right (`com.saiife.approve`, or one it is built on) changes
 # who may approve; `authorizationdb read` stays allowed. Anywhere in the
-# segment, so the global options (`security -q -v …`) do not hide it.
+# segment, so the global options (`security -q -v …`) do not hide it. A
+# `--` before the verb (`authorizationdb -- write`) does not hide it either.
 id = "authorizationdb"
-pattern = '(?i)^security\s(?:.*\s)?authorizationdb\s+(?:write|remove|merge)\b'
+pattern = '(?i)^security\s(?:.*\s)?authorizationdb\s+(?:--\s+)?(?:write|remove|merge)\b'
 reason = "an agent may not change the authorization rights in locked mode; saiife's approvals depend on them"
 
 [[deny]]
@@ -96,7 +97,7 @@ no_redirections = true
 # the command runs: a parameter expansion (`$S write`, `authorizationdb
 # "${A}"`), a command substitution or a glob. Fails closed.
 id = "security-unknown-command"
-pattern = '(?i)^security\s+(?:-\S+\s+)*(?:\S*[$`*?\[]|authorizationdb\s+\S*[$`*?\[])'
+pattern = '(?i)^security\s+(?:-\S+\s+)*(?:\S*[$`*?\[]|authorizationdb\s+(?:--\s+)?\S*[$`*?\[])'
 reason = "the security command here is not known until it runs; an agent may not change the authorization rights in locked mode"
 
 [[deny]]

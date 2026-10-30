@@ -316,7 +316,7 @@ upload text.
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches S3 only through `saiifed`:
+In locked mode (Linux and macOS) the agent user reaches S3 only through `saiifed`:
 `saiife api s3 ...`, or `gateway.sock` at `/v1/api` and `/v1/proxy`. The
 keys live in the daemon's vault (`saiife secret add aws-prod --kind aws
 --service s3`) and never reach the agent's environment, files or audit

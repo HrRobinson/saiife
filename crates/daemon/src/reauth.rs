@@ -254,7 +254,8 @@ pub struct Subject {
 }
 
 /// The re-authentication seam: production is [`PkCheck`] (Linux) or
-/// [`MacAuthorize`] (macOS), tests use fakes.
+/// [`PromptWithoutDetail`] (macOS: same-user re-authentication is off;
+/// [`MacAuthorize`] is not wired in), tests use fakes.
 pub trait Reauth: Send + Sync {
     /// Whether re-authentication can run at all on this host.
     fn available(&self) -> bool;
@@ -1227,23 +1228,51 @@ pub(crate) mod tests {
     #[test]
     fn right_read_needs_the_full_dictionary() {
         let d = tmp();
-        let full = "<plist><dict>\n<key>class</key><string>user</string>\n\
-            <key>session-owner</key>\n\t<true/>\n<key>shared</key> <false/>\n\
-            <key>timeout</key><integer>0</integer></dict></plist>";
+        // What `authorizationdb read` prints for the right install writes.
+        let full = saiife_system::authright::RIGHT_PLIST;
         let sec = MacAuthorize::with_path(fakes::security(d.path(), full, false, 0, 0));
         assert!(sec.right_registered());
         assert_eq!(
             fs::read_to_string(d.path().join("argv")).unwrap(),
             "authorizationdb\nread\ncom.saiife.approve\n"
         );
-        // A right that is shared, or remembered, or missing.
+        // A right that is shared, or lets root in, or remembered, or
+        // weakened by a rule, or missing a key, or not a dict, or missing.
         for (out, code) in [
-            (full.replace("<false/>", "<true/>"), 0),
+            (
+                full.replace(
+                    "<key>shared</key>\n\t<false/>",
+                    "<key>shared</key>\n\t<true/>",
+                ),
+                0,
+            ),
+            (
+                full.replace(
+                    "<key>allow-root</key>\n\t<false/>",
+                    "<key>allow-root</key>\n\t<true/>",
+                ),
+                0,
+            ),
             (
                 full.replace("<integer>0</integer>", "<integer>300</integer>"),
                 0,
             ),
+            (
+                full.replace(
+                    "<key>version</key>",
+                    "<key>rule</key><string>allow</string><key>version</key>",
+                ),
+                0,
+            ),
             (full.replace("session-owner", "x"), 0),
+            (full.replace("authenticate-user", "x"), 0),
+            (
+                "<key>class</key><string>user</string><key>authenticate-user</key><true/>\
+                 <key>allow-root</key><false/><key>session-owner</key><true/>\
+                 <key>shared</key><false/><key>timeout</key><integer>0</integer>"
+                    .to_string(),
+                0,
+            ),
             (full.to_string(), 1),
             (String::new(), 0),
         ] {
@@ -1255,8 +1284,7 @@ pub(crate) mod tests {
     #[test]
     fn mac_available_needs_root_owned_security() {
         let d = tmp();
-        let full = "<key>session-owner</key><true/><key>shared</key><false/>\
-            <key>timeout</key><integer>0</integer>";
+        let full = saiife_system::authright::RIGHT_PLIST;
         // Registered, but the binary is the test user's.
         let sec = MacAuthorize::with_path(fakes::security(d.path(), full, false, 0, 0));
         assert!(sec.right_registered());

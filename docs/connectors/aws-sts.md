@@ -85,7 +85,7 @@ region = "us-east-1"
 
 ## Locked mode
 
-In locked mode (Linux) the agent user reaches STS only through `saiifed`.
+In locked mode (Linux and macOS) the agent user reaches STS only through `saiifed`.
 The keys live in the daemon's vault (`saiife secret add aws-prod --kind aws
 --service sts`) and never reach the agent's environment, files or audit
 records. Every call is one `connector` audit record.

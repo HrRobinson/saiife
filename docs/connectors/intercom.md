@@ -110,10 +110,8 @@ A reply of type `comment` is sent to the customer, so keep it under `ask`.
 
 ## Locked mode
 
-In locked mode (Linux) the agent reaches Intercom only through `saiifed`. The
+In locked mode (Linux and macOS) the agent reaches Intercom only through `saiifed`. The
 token lives in the daemon's vault and never reaches the agent's environment,
 files or audit records. Service params are admin-only, so a project overlay
 cannot point the connector at another host. A project overlay can only add
-`deny` and `ask`. Every call is one `connector` audit record. On macOS the
-commands print `saiife: locked mode needs Linux in this version (macOS: v2.1)`
-and exit 5.
+`deny` and `ask`. Every call is one `connector` audit record.

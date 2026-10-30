@@ -96,9 +96,6 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out
 }
 
-/// One `warn` per service in STS mode (plan 15): `run --cloud` hands a
-/// short-lived AWS credential to agent-controlled code, which can copy it.
-/// With any, one `info` notes how far `run_allow` is checked.
 /// The vault key's mode on record, which must be the platform's.
 fn vault_key(ctx: &Ctx, i: &Installed) -> Check {
     const TITLE: &str = "vault key";
@@ -164,6 +161,9 @@ fn shown<'a>(ctx: &Ctx, c: &'a str) -> &'a str {
     ctx.layout.logical(c)
 }
 
+/// One `warn` per service in STS mode (plan 15): `run --cloud` hands a
+/// short-lived AWS credential to agent-controlled code, which can copy it.
+/// With any, one `info` notes how far `run_allow` is checked.
 fn cloud_sts(config: &saiife_policy::SystemConfig) -> Vec<Check> {
     use saiife_policy::CloudMode;
     let mut out: Vec<Check> = config
@@ -669,11 +669,9 @@ fn reauth(ctx: &Ctx) -> Check {
 /// macOS: the authorization right `com.saiife.approve` is registered as
 /// installed (asks the session owner every time). Read through the host
 /// (`security authorizationdb read`); doctor never writes it.
-/// Same-user approval is off on macOS on purpose: the prompt cannot show
-/// what is being approved, so `same_user = "reauth"` acts as `deny`.
-const MAC_SAME_USER_OFF: &str =
-    "same-user approval is off on macOS: approvals need a second account";
-
+/// Same-user approval is off on macOS on purpose ([`MAC_SAME_USER_OFF`]):
+/// the prompt cannot show what is being approved, so `same_user = "reauth"`
+/// acts as `deny`.
 fn auth_right(ctx: &Ctx) -> Check {
     use crate::authright::{read_args, read_ok, RIGHT};
     const ID: &str = "reauth";
@@ -2808,7 +2806,7 @@ mod macos_tests {
         assert_status(&r, "user.agent.passwd", Status::Pass);
         assert_eq!(
             get(&r, "user.agent.passwd").title,
-            "user agent in the local directory"
+            "user agent in Directory Services"
         );
         e.host.set(|s| {
             s.groups.insert("admin".into(), 80);

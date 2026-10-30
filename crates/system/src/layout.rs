@@ -25,6 +25,9 @@ pub const POLKIT_ACTION_ID: &str = "com.saiife.approve";
 /// The warning when re-authentication is unavailable (install and doctor).
 pub const REAUTH_UNAVAILABLE: &str =
     "re-authentication unavailable: approvals need a second account";
+/// macOS refuses every same-user approval (install and doctor).
+pub const MAC_SAME_USER_OFF: &str =
+    "same-user approval is off on macOS: approvals need a second account";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
 
 /// The polkit action file, byte for byte. `auth_self`, never

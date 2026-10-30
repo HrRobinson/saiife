@@ -85,12 +85,10 @@ To open reads on one team only, use `allow = ["teams:read", "issues:read:team=EN
 
 ## Locked mode
 
-In locked mode (Linux) the agent reaches Linear only through `saiifed`. The
+In locked mode (Linux and macOS) the agent reaches Linear only through `saiifed`. The
 key lives in the daemon's vault (`saiife secret add linear-main`) and never
 reaches the agent's environment, files or audit records. A project overlay can
-only add `deny` and `ask`. Every call is one `connector` audit record. On
-macOS the commands print `saiife: locked mode needs Linux in this version
-(macOS: v2.1)` and exit 5.
+only add `deny` and `ask`. Every call is one `connector` audit record.
 
 Use a personal API key with the narrowest scope Linear offers (read for a
 read-only policy), so a policy mistake is bounded by the key.

@@ -326,9 +326,10 @@ The release binaries are built that way:
 **Same-user approval is off on macOS.** The macOS password or Touch ID prompt
 cannot show which request it approves, so an agent running as you could
 start an approval of its own request and get you to confirm it. So
-`same_user = "reauth"` acts as `"deny"` on macOS (install still registers
-the right, and a new config may say `"reauth"`). `doctor` reports
-`same-user approval is off on macOS: approvals need a second account`, as a
+`same_user = "reauth"` acts as `"deny"` on macOS. Install still registers
+the right, but a new config keeps `same_user = "deny"`, and install always
+warns `same-user approval is off on macOS: approvals need a second account`.
+`doctor` reports the same line, as a
 warning with `re-authentication unavailable: approvals need a second account`
 added when the right is missing or weakened.
 Approve from a second account that is in `[approval] approvers`, at the Mac

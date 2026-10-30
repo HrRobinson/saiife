@@ -907,6 +907,9 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         "security -q authorizationdb write com.saiife.approve allow",
         "security -v authorizationdb remove com.saiife.approve",
         "security -q -v authorizationdb merge rights.plist",
+        // `--` before the verb (final review).
+        "security authorizationdb -- write com.saiife.approve allow",
+        "security -q authorizationdb --  remove com.saiife.approve",
     ] {
         assert_eq!(rule(cmd).as_deref(), Some("authorizationdb"), "{cmd}");
     }
@@ -987,6 +990,7 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         "A=write; security authorizationdb $A com.saiife.approve allow",
         "security authorizationdb \"$A\" com.saiife.approve allow",
         "security authorizationdb ${A} com.saiife.approve allow",
+        "security authorizationdb -- $A com.saiife.approve allow",
         "security ${S} write com.saiife.approve allow",
         "security -q $S write com.saiife.approve allow",
         "security $(cat f) write com.saiife.approve allow",
@@ -1047,6 +1051,7 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         "echo security",
         "security authorizationdb read com.saiife.approve",
         "security authorizationdb writer",
+        "security authorizationdb -- read com.saiife.approve",
         "dscl . -read /Users/agent",
         "dscl . -list /Users",
         "dscl . -read /Groups/staff GroupMembership",
