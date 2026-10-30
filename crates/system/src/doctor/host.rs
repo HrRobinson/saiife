@@ -1,5 +1,5 @@
 //! The per-user host checks of `saiife doctor` (spec §5.6, §6.16): for
-//! each agent user, local passwd entry, no password-less way to root, agent
+//! each agent user, local account, no password-less way to root, agent
 //! binaries out of the user's reach, agent versions, plaintext credentials,
 //! model login and leftover project hooks; once per host, `hidepid`.
 //! Read-only. Agent binaries never run as root.
@@ -8,6 +8,7 @@ use super::report::{Check, Status};
 use super::secrets::{self, read_at, read_under};
 use super::Ctx;
 use crate::host::{valid_name, SUDO};
+use crate::layout::Platform;
 use saiife_agents::integrity::Integrity;
 use saiife_audit::text::sanitize;
 use saiife_ipc::client::{entry_by_name, entry_by_uid, uid_by_name};
@@ -41,6 +42,9 @@ const AGENT_BINARIES: [&str; 3] = ["claude", "codex", "gemini"];
 const USER_BIN_DIRS: [&str; 4] = [".local/bin", ".claude/local", ".npm-global/bin", ".bun/bin"];
 /// Where `saiife init` keeps its integrity records, below the home.
 const RECORDS: &str = ".local/share/saiife/projects";
+/// What macOS offers instead of the Linux per-uid egress recipe.
+const MAC_EGRESS_HINT: &str =
+    "macOS has no per-uid firewall in pf; the egress recipe is Linux only";
 const PASSWD: &str = "/etc/passwd";
 const MOUNTS: &str = "/proc/mounts";
 const GROUP_PREFIX: &str = "group:";
@@ -140,6 +144,10 @@ fn rooted(ctx: &Ctx, p: &Path) -> Option<PathBuf> {
     ctx.layout.try_at(p).ok()
 }
 
+fn mac(ctx: &Ctx) -> bool {
+    ctx.layout.platform() == Platform::Macos
+}
+
 fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<AgentUser> {
     let entry = entry_by_name(passwd, name);
     let dir_uid = ctx.dir.user(name).map(|u| u.uid);
@@ -147,6 +155,12 @@ fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<Agen
         return None;
     }
     let info = ctx.host.user(name);
+    // macOS keeps its accounts in the local directory, not `/etc/passwd`.
+    let local = if mac(ctx) {
+        info.is_some()
+    } else {
+        entry.is_some()
+    };
     let uid = dir_uid
         .or_else(|| uid_by_name(passwd, name))
         .or_else(|| info.as_ref().map(|i| i.uid))
@@ -163,7 +177,7 @@ fn agent_user(ctx: &Ctx, passwd: &str, name: &str, is_self: bool) -> Option<Agen
         name: name.to_string(),
         uid,
         home: home.unwrap_or_default(),
-        in_passwd: entry.is_some(),
+        in_passwd: local,
     })
 }
 
@@ -222,7 +236,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     }
     for u in &users {
         let id = |what: &str| format!("user.{}.{what}", u.name);
-        out.push(passwd_check(u, id("passwd")));
+        out.push(passwd_check(ctx, u, id("passwd")));
         out.push(root_check(ctx, u, id("root")));
         let bins = binaries(ctx, u);
         out.push(binaries_check(u, &bins, id("agent-binaries")));
@@ -249,13 +263,22 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             }));
         }
         out.push(model_login(u, id("model-login")));
-        if dedicated(ctx, &passwd, u) {
+        if mac(ctx) {
+            out.push(Check::new(
+                id("egress"),
+                Status::Info,
+                format!("egress rules for {}", u.name),
+                MAC_EGRESS_HINT,
+            ));
+        } else if dedicated(ctx, &passwd, u) {
             let table = *egress.get_or_insert_with(|| egress_table(ctx));
             out.push(egress_check(u, table, id("egress")));
         }
         out.push(leftover_hooks(ctx, u, id("leftover-hooks")));
     }
-    out.push(hidepid(ctx));
+    if !mac(ctx) {
+        out.push(hidepid(ctx));
+    }
     if !incomplete.is_empty() {
         out.push(Check::new(
             "secrets.incomplete",
@@ -276,8 +299,16 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
 
 // ------------------------------------------------------------ checks
 
-fn passwd_check(u: &AgentUser, id: String) -> Check {
-    let title = format!("user {} in /etc/passwd", u.name);
+fn passwd_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
+    let (place, what) = if mac(ctx) {
+        (
+            "the local directory",
+            "a network or directory-service account",
+        )
+    } else {
+        ("/etc/passwd", "NSS-only")
+    };
+    let title = format!("user {} in {place}", u.name);
     if u.in_passwd {
         Check::new(id, Status::Pass, title, "")
     } else {
@@ -286,7 +317,7 @@ fn passwd_check(u: &AgentUser, id: String) -> Check {
             Status::Fail,
             title,
             format!(
-                "{} is not in /etc/passwd (NSS-only): locked-mode hooks deny every call for this user",
+                "{} is not in {place} ({what}): locked-mode hooks deny every call for this user",
                 u.name
             ),
         )
@@ -320,9 +351,20 @@ fn root_check(ctx: &Ctx, u: &AgentUser, id: String) -> Check {
     let mut bad = Vec::new();
     let mut warn = Vec::new();
     let mut notes = Vec::new();
-    for g in ROOT_EQUIVALENT_GROUPS {
-        if in_group(ctx, u, g) {
-            bad.push(format!("{} is in group {g} (root-equivalent)", u.name));
+    if mac(ctx) {
+        // macOS has no docker or disk groups; `admin` may use sudo, with
+        // its own password.
+        if in_group(ctx, u, "admin") {
+            warn.push(format!(
+                "agent user {} is an admin: sudo needs its password",
+                u.name
+            ));
+        }
+    } else {
+        for g in ROOT_EQUIVALENT_GROUPS {
+            if in_group(ctx, u, g) {
+                bad.push(format!("{} is in group {g} (root-equivalent)", u.name));
+            }
         }
     }
     if !ctx.layout.at(SUDO).exists() {
@@ -383,6 +425,12 @@ struct Bins {
 }
 
 /// Owned by `uid`, or writable by group or others.
+/// `st_mode` as a `u32` (it is a `u16` on macOS).
+#[allow(clippy::useless_conversion)]
+fn wide(mode: rustix::fs::RawMode) -> u32 {
+    u32::from(mode)
+}
+
 fn writable_mode(owner: u32, mode: u32, uid: u32) -> bool {
     owner == uid || mode & 0o022 != 0
 }
@@ -452,8 +500,8 @@ fn binaries(ctx: &Ctx, u: &AgentUser) -> Bins {
             }
             _ => continue,
         };
-        let dir_w =
-            rustix::fs::fstat(&fd).is_ok_and(|st| writable_mode(st.st_uid, st.st_mode, u.uid));
+        let dir_w = rustix::fs::fstat(&fd)
+            .is_ok_and(|st| writable_mode(st.st_uid, wide(st.st_mode), u.uid));
         for name in AGENT_BINARIES {
             let Ok(st) = rustix::fs::statat(&fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
             else {
@@ -463,7 +511,7 @@ fn binaries(ctx: &Ctx, u: &AgentUser) -> Bins {
             if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink {
                 b.symlinks.push(p);
             } else {
-                let w = dir_w || writable_mode(st.st_uid, st.st_mode, u.uid);
+                let w = dir_w || writable_mode(st.st_uid, wide(st.st_mode), u.uid);
                 add(&mut b, name, p, w);
             }
         }
@@ -854,7 +902,8 @@ fn hidepid(ctx: &Ctx) -> Check {
     }
 }
 
-#[cfg(test)]
+// The fixtures are a Linux machine's (`/etc/passwd`, `/proc`, nft).
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::super::{run, Ctx, DoctorOptions, Report, Status};
     use super::*;
