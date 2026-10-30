@@ -18,6 +18,7 @@ pub mod doctor;
 pub mod fsops;
 pub mod host;
 pub mod install;
+pub mod launchd;
 pub mod layout;
 pub mod personal;
 pub mod polkit;

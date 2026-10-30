@@ -267,6 +267,156 @@ fn linking(bytes: &[u8]) -> Result<Linking, String> {
     })
 }
 
+/// The signature state of a Mach-O binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signature {
+    Unsigned,
+    AdHoc,
+    /// A CMS signature and no ad-hoc flag (a Developer ID build).
+    Signed,
+}
+
+/// What locked mode needs to know about a macOS binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachInfo {
+    pub hardened_runtime: bool,
+    pub signature: Signature,
+    pub profile: Profile,
+}
+
+impl MachInfo {
+    /// The refusals, one phrase each; empty when the binary is fit.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.signature == Signature::Unsigned {
+            out.push("it is not code-signed".to_string());
+        } else if !self.hardened_runtime {
+            out.push(
+                "it is signed without the hardened runtime, so the agent could inject \
+                 code into the hook through DYLD_INSERT_LIBRARIES"
+                    .to_string(),
+            );
+        }
+        match self.profile {
+            Profile::Release => {}
+            Profile::DebugAssertions => out.push(
+                "it is a test build (debug assertions on: the SAIIFE_EVAL_FAULT test seam \
+                 is compiled in)"
+                    .to_string(),
+            ),
+            Profile::Unknown => out.push("it carries no saiife build marker".to_string()),
+        }
+        out
+    }
+
+    /// Things worth saying that do not refuse.
+    pub fn warnings(&self) -> Vec<String> {
+        if self.signature == Signature::AdHoc {
+            vec!["ad-hoc signature: not a Developer ID build (spec 5.3)".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+const MH_MAGIC_64: u32 = 0xfeed_facf;
+const FAT_MAGIC: u32 = 0xcafe_babe;
+const FAT_MAGIC_64: u32 = 0xcafe_babf;
+const LC_CODE_SIGNATURE: u32 = 0x1d;
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+const CSSLOT_CODEDIRECTORY: u32 = 0;
+const CSSLOT_SIGNATURESLOT: u32 = 0x10000;
+const CS_ADHOC: u32 = 0x2;
+const CS_RUNTIME: u32 = 0x10000;
+const MACH_HEADER_64: usize = 32;
+
+fn rd(b: &[u8], at: usize, big: bool) -> Result<u32, String> {
+    let end = at.checked_add(4).ok_or("offset out of range")?;
+    let x: [u8; 4] = b
+        .get(at..end)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| "truncated Mach-O file".to_string())?;
+    Ok(if big {
+        u32::from_be_bytes(x)
+    } else {
+        u32::from_le_bytes(x)
+    })
+}
+
+/// The signature and hardened-runtime flag of a thin 64-bit Mach-O, read
+/// from its bytes (no `codesign`). A universal binary is refused.
+pub fn inspect_macho(bytes: &[u8]) -> Result<MachInfo, String> {
+    let magic = rd(bytes, 0, false).map_err(|_| "not a Mach-O file".to_string())?;
+    // Fat headers are big-endian on disk, so a little-endian read swaps them.
+    if magic == FAT_MAGIC.swap_bytes() || magic == FAT_MAGIC_64.swap_bytes() {
+        return Err(
+            "universal binaries are not supported; use the per-architecture release".to_string(),
+        );
+    }
+    if magic != MH_MAGIC_64 {
+        return Err("not a 64-bit Mach-O file".to_string());
+    }
+    let profile = profile(bytes);
+    let ncmds = rd(bytes, 16, false)?;
+    let mut at = MACH_HEADER_64;
+    let mut sig = None;
+    for _ in 0..ncmds {
+        let cmd = rd(bytes, at, false)?;
+        let size = rd(bytes, at + 4, false)? as usize;
+        if size < 8 {
+            return Err("malformed load command".to_string());
+        }
+        if cmd == LC_CODE_SIGNATURE {
+            sig = Some((
+                rd(bytes, at + 8, false)? as usize,
+                rd(bytes, at + 12, false)? as usize,
+            ));
+            break;
+        }
+        at = at.checked_add(size).ok_or("offset out of range")?;
+    }
+    let Some((off, len)) = sig else {
+        return Ok(MachInfo {
+            hardened_runtime: false,
+            signature: Signature::Unsigned,
+            profile,
+        });
+    };
+    let end = off.checked_add(len).ok_or("offset out of range")?;
+    let blob = bytes.get(off..end).ok_or("truncated Mach-O file")?;
+    if rd(blob, 0, true)? != CSMAGIC_EMBEDDED_SIGNATURE {
+        return Err("code signature is not an embedded SuperBlob".to_string());
+    }
+    let count = rd(blob, 8, true)? as usize;
+    let (mut flags, mut cms) = (None, false);
+    for i in 0..count.min(64) {
+        let ent = 12 + i * 8;
+        let (slot, so) = (rd(blob, ent, true)?, rd(blob, ent + 4, true)? as usize);
+        if slot == CSSLOT_CODEDIRECTORY {
+            if rd(blob, so, true)? != CSMAGIC_CODEDIRECTORY {
+                return Err("code signature has no CodeDirectory".to_string());
+            }
+            flags = Some(rd(blob, so + 12, true)?);
+        } else if slot == CSSLOT_SIGNATURESLOT {
+            // A CMS blob is magic + length + data; empty means length 8.
+            cms = rd(blob, so + 4, true)? > 8;
+        }
+    }
+    let flags = flags.ok_or("code signature has no CodeDirectory")?;
+    let signature = if flags & CS_ADHOC != 0 || !cms {
+        // Neither CMS-signed nor anything else but ad-hoc: not Developer ID.
+        Signature::AdHoc
+    } else {
+        Signature::Signed
+    };
+    Ok(MachInfo {
+        hardened_runtime: flags & CS_RUNTIME != 0,
+        signature,
+        profile,
+    })
+}
+
 /// A minimal ELF64 little-endian executable for tests: a header, then a
 /// `PT_INTERP` or a `PT_DYNAMIC` with `needed` `DT_NEEDED` entries when
 /// asked, then the build marker (if `marker` is given).
@@ -372,6 +522,121 @@ mod tests {
         assert_eq!(inspect(b"#!/bin/sh\n").unwrap_err(), "not an ELF file");
         let b = fake_elf(Some("/lib/ld.so"), 0, None);
         assert!(inspect(&b[..100]).is_err());
+    }
+
+    /// A thin Mach-O with one LC_CODE_SIGNATURE (CodeDirectory `flags`, and
+    /// a CMS blob when `cms`), after the release build marker.
+    fn macho_fixture(flags: u32, cms: bool) -> Vec<u8> {
+        macho_with(Some((flags, cms)), &build_marker(false))
+    }
+
+    fn macho_with(sig: Option<(u32, bool)>, marker: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; MACH_HEADER_64];
+        out[..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        out[16..20].copy_from_slice(&u32::from(sig.is_some()).to_le_bytes());
+        out[20..24].copy_from_slice(&16u32.to_le_bytes());
+        if let Some((flags, cms)) = sig {
+            let sig_off = (MACH_HEADER_64 + 16 + marker.len()) as u32;
+            let mut cd = vec![0u8; 44];
+            cd[..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+            cd[4..8].copy_from_slice(&44u32.to_be_bytes());
+            cd[12..16].copy_from_slice(&flags.to_be_bytes());
+            let n: u32 = if cms { 2 } else { 1 };
+            let base = 12 + 8 * n;
+            let mut sb = CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes().to_vec();
+            sb.extend_from_slice(&0u32.to_be_bytes());
+            sb.extend_from_slice(&n.to_be_bytes());
+            sb.extend_from_slice(&CSSLOT_CODEDIRECTORY.to_be_bytes());
+            sb.extend_from_slice(&base.to_be_bytes());
+            if cms {
+                sb.extend_from_slice(&CSSLOT_SIGNATURESLOT.to_be_bytes());
+                sb.extend_from_slice(&(base + 44).to_be_bytes());
+            }
+            sb.extend_from_slice(&cd);
+            if cms {
+                sb.extend_from_slice(&0xfade_0b01u32.to_be_bytes());
+                sb.extend_from_slice(&12u32.to_be_bytes());
+                sb.extend_from_slice(&[1, 2, 3, 4]);
+            }
+            let total = sb.len() as u32;
+            sb[4..8].copy_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+            out.extend_from_slice(&16u32.to_le_bytes());
+            out.extend_from_slice(&sig_off.to_le_bytes());
+            out.extend_from_slice(&total.to_le_bytes());
+            out.extend_from_slice(marker);
+            out.extend_from_slice(&sb);
+        } else {
+            out.extend_from_slice(marker);
+        }
+        out
+    }
+
+    #[test]
+    fn hardened_runtime_flag_read() {
+        let on = inspect_macho(&macho_fixture(CS_RUNTIME, true)).unwrap();
+        assert!(on.hardened_runtime);
+        assert_eq!(on.signature, Signature::Signed);
+        assert!(on.problems().is_empty() && on.warnings().is_empty());
+        let off = inspect_macho(&macho_fixture(0, true)).unwrap();
+        assert!(!off.hardened_runtime);
+    }
+
+    #[test]
+    fn adhoc_is_warning_not_refusal() {
+        let i = inspect_macho(&macho_fixture(CS_ADHOC | CS_RUNTIME, false)).unwrap();
+        assert_eq!(i.signature, Signature::AdHoc);
+        assert!(i.problems().is_empty());
+        assert_eq!(
+            i.warnings(),
+            vec!["ad-hoc signature: not a Developer ID build (spec 5.3)".to_string()]
+        );
+    }
+
+    #[test]
+    fn unsigned_refused() {
+        let i = inspect_macho(&macho_with(None, &build_marker(false))).unwrap();
+        assert_eq!(i.signature, Signature::Unsigned);
+        assert!(i.problems()[0].contains("not code-signed"));
+    }
+
+    #[test]
+    fn no_runtime_refused() {
+        let i = inspect_macho(&macho_fixture(CS_ADHOC, false)).unwrap();
+        assert!(i.problems()[0].contains("hardened runtime"));
+    }
+
+    #[test]
+    fn fat_binary_refused() {
+        let mut b = FAT_MAGIC.to_be_bytes().to_vec();
+        b.extend_from_slice(&[0; 60]);
+        assert_eq!(
+            inspect_macho(&b).unwrap_err(),
+            "universal binaries are not supported; use the per-architecture release"
+        );
+    }
+
+    #[test]
+    fn elf_is_not_macho() {
+        assert!(inspect_macho(&fake_elf(None, 0, Some(false))).is_err());
+        assert!(inspect_macho(b"").is_err());
+        let b = macho_fixture(CS_RUNTIME, true);
+        assert!(inspect_macho(&b[..60]).is_err());
+    }
+
+    #[test]
+    fn debug_marker_refused() {
+        let b = macho_with(Some((CS_RUNTIME, true)), &build_marker(true));
+        let i = inspect_macho(&b).unwrap();
+        assert_eq!(i.profile, Profile::DebugAssertions);
+        assert!(i.problems()[0].contains("test build"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn own_test_binary_parses() {
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert!(inspect_macho(&exe).is_ok());
     }
 
     #[test]
