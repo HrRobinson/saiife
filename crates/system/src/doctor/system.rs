@@ -2171,18 +2171,22 @@ mod tests {
             .unwrap_or_else(|| panic!("no check {id}"))
     }
 
+    #[cfg(target_os = "linux")]
     fn with_server(t: &T, extra: &str) {
         t.append_config(&format!(
             "\n[mcp.fs]\ncommand = \"/usr/bin/true\"\n{extra}\n"
         ));
     }
 
+    #[cfg(target_os = "linux")]
     fn running(tools: u64) -> Result<Vec<serde_json::Value>, String> {
         Ok(vec![
             serde_json::json!({"name":"fs","state":"running","tools":tools,"since":"t","last_error":null}),
         ])
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_server_pass_with_tool_count() {
         let t = T::installed();
@@ -2199,6 +2203,8 @@ mod tests {
         assert!(cs.iter().all(|c| c.id != "mcp.fs"));
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_server_not_running_fails() {
         let t = T::installed();
@@ -2220,6 +2226,8 @@ mod tests {
         assert!(c.title.contains("daemon is unreachable"), "{c:?}");
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_landlock_fails_unless_off() {
         let t = T::installed();
@@ -2262,6 +2270,8 @@ mod tests {
         assert!(cs.iter().all(|c| c.id != "mcp.sandbox"), "{cs:?}");
     }
 
+    // `[mcp.*]` is Linux only (plan 13, decision 7): a load error on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn npx_and_unowned_args_warn() {
         let t = T::installed();
