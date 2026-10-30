@@ -47,6 +47,9 @@ trap 'rm -rf "$stage"' EXIT
 install -m 0755 "$bin" "$stage/saiife"
 install -m 0644 "$root/README.md" "$stage/README.md"
 install -m 0644 "$root/LICENSE" "$stage/LICENSE"
+# Debian policy wants a changelog; gzip -9n (no name, no mtime) is reproducible.
+gzip -9n -c "$root/CHANGELOG.md" >"$stage/changelog.gz"
+chmod 0644 "$stage/changelog.gz"
 install -m 0644 "$root/packaging/linux/lintian-overrides" "$stage/lintian-overrides"
 
 export SAIIFE_STAGE=$stage SAIIFE_VERSION=$version

@@ -204,7 +204,7 @@ Plans 12 and 17 set the style.
     - the symlink `/usr/bin/saiife` → `/usr/libexec/saiife/saiife`;
     - `/usr/share/doc/saiife/README.md`;
     - the license: `/usr/share/doc/saiife/copyright` (deb) or `/usr/share/licenses/saiife/LICENSE` (rpm).
-  - `nfpm.yaml` sets the metadata: `license: FSL-1.1-ALv2`, `homepage: https://github.com/HrRobinson/saiife`, and `maintainer: saiife <OWNER-CONFIRM>` (owner handwork). `version` comes from `${SAIIFE_VERSION}`, `arch` from `${SAIIFE_ARCH}`, `scripts.postinstall` and `scripts.preremove`.
+  - `nfpm.yaml` sets the metadata: `license: FSL-1.1-ALv2`, `homepage: https://github.com/HrRobinson/saiife`, and `maintainer: HrRobinson <126027636+HrRobinson@users.noreply.github.com>` (the owner may change it). `version` comes from `${SAIIFE_VERSION}`, `arch` from `${SAIIFE_ARCH}`, `scripts.postinstall` and `scripts.preremove`.
 
 - [ ] **Step 1: failing tests** in `crates/system/tests/packaging.rs`. Read the repo files as text, with no YAML dependency: collect the `dst:` values of `nfpm.yaml` by line.
   - `package_owns_no_installed_path`: no `dst` equals, or is below, `OPT_DIR`, `ETC_DIR`, `UNIT`, `STATE_DIR`, `LOG_DIR`, `RUN_DIR`, `POLKIT_DIR`, `CLAUDE_MANAGED_DIR`, `CODEX_DIR`, `GEMINI_DIR` or `/usr/local`.
@@ -472,7 +472,7 @@ Plans 12 and 17 set the style.
   - removal uninstalls without a block (decision 6);
   - purge keeps the audit (decision 7);
   - `/usr/bin/saiife` instead of `/usr/local/bin/saiife` in packages.
-- [ ] Set the nfpm `maintainer` string (the `<OWNER-CONFIRM>` placeholder).
+- [x] The nfpm `maintainer` is the owner's noreply address (the owner may change it).
 - [ ] Create the package signing key: an offline primary key with a signing subkey. Add the armored subkey as `PKG_GPG_PRIVATE_KEY` and its passphrase as `PKG_GPG_PASSPHRASE` in the repo secrets. Commit the public key as `deploy/keys/saiife-packages.asc`, and publish its fingerprint in `docs/fleet.md` and on the website.
 - [ ] On a RHEL 9 (or Rocky 9) VM: `dnf install` the signed rpm with fleet files, then `doctor`, an upgrade and `dnf remove`. Record the result in the PR (decision 10).
 - [ ] Run the Ansible role from your controller against one Ubuntu and one RHEL test VM, never your workstation.

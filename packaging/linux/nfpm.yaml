@@ -10,7 +10,7 @@ platform: linux
 version: ${SAIIFE_VERSION}
 section: utils
 priority: optional
-maintainer: saiife <OWNER-CONFIRM>
+maintainer: HrRobinson <126027636+HrRobinson@users.noreply.github.com>
 description: |
   Guard and audit layer for AI coding agents.
   Locked mode is installed by the post-install script (system install --fleet).
@@ -32,12 +32,18 @@ contents:
       mode: 0755
       owner: root
       group: root
-  - src: /usr/libexec/saiife/saiife
+  - src: ../libexec/saiife/saiife
     dst: /usr/bin/saiife
     type: symlink
   - src: ${SAIIFE_STAGE}/README.md
     expand: true
     dst: /usr/share/doc/saiife/README.md
+    file_info:
+      mode: 0644
+  - src: ${SAIIFE_STAGE}/changelog.gz
+    expand: true
+    dst: /usr/share/doc/saiife/changelog.gz
+    packager: deb
     file_info:
       mode: 0644
   - src: ${SAIIFE_STAGE}/LICENSE

@@ -2,3 +2,9 @@
 saiife: statically-linked-binary
 # saiife documents itself through --help and the README; no man page yet.
 saiife: no-manual-page
+# The license is FSL-1.1-ALv2, not Apache-2.0, so the common-license tag
+# does not apply; the full text ships as /usr/share/doc/saiife/copyright.
+saiife: copyright-not-using-common-license-for-apache2
+# The binary is static-pie: it has no DT_NEEDED entries, so lintian reads it
+# as a shared library without prerequisites. False positive.
+saiife: shared-library-lacks-prerequisites
