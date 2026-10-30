@@ -1,13 +1,17 @@
 //! Which systems locked mode supports (spec §0 decision 8): Ubuntu 22.04+,
 //! Debian 12+, RHEL 9+ (and distributions `ID_LIKE` rhel, 9+), each with
-//! systemd running. Alpine and containers get developer mode only.
+//! systemd running, and macOS 15 or later (plan 13 decision 13). Alpine and
+//! containers get developer mode only.
 
 use crate::host::{Host, CONTAINER_UNKNOWN};
-use crate::layout::Layout;
+use crate::layout::{Layout, Platform};
 use std::collections::BTreeMap;
 
-/// The reason on anything but Linux (the 9a text).
-pub const NOT_LINUX: &str = "locked mode needs Linux in this version (macOS: v2.1)";
+/// The reason on any OS but Linux and macOS.
+pub const NOT_SUPPORTED_OS: &str = "locked mode needs Linux or macOS";
+
+/// The oldest macOS locked mode supports (Sequoia, plan 13 decision 13).
+pub const MIN_MACOS: (u32, u32) = (15, 0);
 
 /// The oldest systemd with `LoadCredential=`.
 const MIN_SYSTEMD: u32 = 247;
@@ -24,17 +28,45 @@ pub enum Support {
     Refused(String),
 }
 
-/// Checks this machine (or the tree under `layout`'s root): the OS, a
-/// container, systemd and its version, then the distribution from
-/// `<root>/etc/os-release`.
+/// Checks this machine (or the tree under `layout`'s root) by the
+/// layout's platform. On Linux: a container, systemd and its version, then
+/// the distribution from `<root>/etc/os-release`. On macOS: the version
+/// `sw_vers` reports. Any other OS is refused.
 pub fn check_supported(layout: &Layout, host: &dyn Host) -> Support {
-    supported_on(cfg!(target_os = "linux"), layout, host)
+    supported_on(Platform::current(), layout, host)
 }
 
-pub(crate) fn supported_on(linux: bool, layout: &Layout, host: &dyn Host) -> Support {
-    if !linux {
-        return Support::Refused(NOT_LINUX.to_string());
+/// [`check_supported`] with the running OS given (`None`: neither Linux
+/// nor macOS).
+pub(crate) fn supported_on(current: Option<Platform>, layout: &Layout, host: &dyn Host) -> Support {
+    if current.is_none() {
+        return Support::Refused(NOT_SUPPORTED_OS.to_string());
     }
+    match layout.platform() {
+        Platform::Linux => linux_supported(layout, host),
+        Platform::Macos => macos_supported(host),
+    }
+}
+
+/// macOS [`MIN_MACOS`] or later. There is no systemd: `systemd` is 0.
+fn macos_supported(host: &dyn Host) -> Support {
+    let (major, minor) = match host.macos_version() {
+        Ok(v) => v,
+        Err(e) => return Support::Refused(format!("the macOS version could not be read: {e}")),
+    };
+    if (major, minor) < MIN_MACOS {
+        return Support::Refused(format!(
+            "macOS {major}.{minor} is not supported for locked mode (macOS {} or later)",
+            MIN_MACOS.0
+        ));
+    }
+    Support::Supported {
+        distro: format!("macOS {major}.{minor}"),
+        systemd: 0,
+    }
+}
+
+fn linux_supported(layout: &Layout, host: &dyn Host) -> Support {
     let container = host.container().or_else(|| {
         if layout.root().join(".dockerenv").exists() {
             Some("docker".to_string())
@@ -168,14 +200,14 @@ mod tests {
         fs::create_dir_all(dir.path().join("etc")).unwrap();
         fs::write(dir.path().join("etc/os-release"), os_release).unwrap();
         fs::create_dir_all(dir.path().join("run/systemd/system")).unwrap();
-        let layout = Layout::under(dir.path());
+        let layout = Layout::under_for(dir.path(), Platform::Linux);
         let host = FakeHost::open(dir.path()).unwrap();
         (dir, layout, host)
     }
 
     /// The check as it runs on Linux, so these tests also run on macOS.
     fn check_linux(l: &Layout, h: &FakeHost) -> Support {
-        supported_on(true, l, h)
+        supported_on(Some(Platform::Linux), l, h)
     }
 
     fn check(os_release: &str) -> Support {
@@ -188,11 +220,69 @@ mod tests {
         let (_d, l, h) = root_with(UBUNTU_2404);
         h.set(|s| s.container = Some("docker".into()));
         assert_eq!(
-            refused(supported_on(false, &l, &h)),
-            "locked mode needs Linux in this version (macOS: v2.1)"
+            refused(supported_on(None, &l, &h)),
+            "locked mode needs Linux or macOS"
         );
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(refused(check_supported(&l, &h)), NOT_LINUX);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(refused(check_supported(&l, &h)), NOT_SUPPORTED_OS);
+    }
+
+    /// A macOS tree and its host, reporting `version` from `sw_vers`.
+    fn macos_with(version: (u32, u32)) -> (tempfile::TempDir, Layout, FakeHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::under_for(dir.path(), Platform::Macos);
+        let host = FakeHost::open(dir.path()).unwrap();
+        host.set(|s| s.macos = version);
+        (dir, layout, host)
+    }
+
+    #[test]
+    fn macos_supported_from_15() {
+        assert_eq!(MIN_MACOS, (15, 0));
+        let (_d, l, h) = macos_with((15, 0));
+        assert_eq!(
+            supported_on(Some(Platform::Macos), &l, &h),
+            Support::Supported {
+                distro: "macOS 15.0".into(),
+                systemd: 0
+            }
+        );
+        for v in [(15, 1), (15, 7), (26, 0)] {
+            h.set(|s| s.macos = v);
+            assert!(matches!(
+                supported_on(Some(Platform::Macos), &l, &h),
+                Support::Supported { systemd: 0, .. }
+            ));
+        }
+        // The layout's platform decides, not the OS the tests run on.
+        assert!(matches!(
+            supported_on(Some(Platform::Linux), &l, &h),
+            Support::Supported { .. }
+        ));
+        // The default fake reports 15.0.
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(h.macos_version().unwrap(), (15, 0));
+    }
+
+    #[test]
+    fn macos_14_refused() {
+        let (_d, l, h) = macos_with((14, 6));
+        assert_eq!(
+            refused(supported_on(Some(Platform::Macos), &l, &h)),
+            "macOS 14.6 is not supported for locked mode (macOS 15 or later)"
+        );
+        // A container or a missing systemd is not asked about on macOS.
+        h.set(|s| {
+            s.macos = (15, 0);
+            s.container = Some("docker".into());
+        });
+        assert!(matches!(
+            supported_on(Some(Platform::Macos), &l, &h),
+            Support::Supported { .. }
+        ));
+        // An unsupported OS is refused before the platform is looked at.
+        assert_eq!(refused(supported_on(None, &l, &h)), NOT_SUPPORTED_OS);
     }
 
     fn refused(s: Support) -> String {

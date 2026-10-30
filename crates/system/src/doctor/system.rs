@@ -887,7 +887,7 @@ fn daemon_health(_ctx: &Ctx) -> Check {
         "daemon.health",
         Status::Fail,
         "daemon health",
-        crate::supported::NOT_LINUX,
+        crate::supported::NOT_SUPPORTED_OS,
     )
 }
 
@@ -952,7 +952,7 @@ fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
 
 #[cfg(not(target_os = "linux"))]
 fn daemon_mcp_status(_ctx: &Ctx) -> McpStatus {
-    Err(crate::supported::NOT_LINUX.to_string())
+    Err(crate::supported::NOT_SUPPORTED_OS.to_string())
 }
 
 /// The warning for `saiife` in `[guard.mcp] allow_servers` while an agent

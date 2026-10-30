@@ -3,11 +3,15 @@
 //! `<root>/.fakehost.json` instead (tests and the hidden `--root` flag).
 //! Programs always run from absolute paths.
 
-use crate::layout::{Layout, AUDIT_GROUP, DAEMON_GROUP, DAEMON_USER};
+use crate::layout::{
+    Layout, AUDIT_GROUP, DAEMON_GROUP, DAEMON_USER, MACOS_AUDIT_GROUP, MACOS_DAEMON_GROUP,
+    MACOS_DAEMON_USER,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
+use std::ops::RangeInclusive;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -23,6 +27,16 @@ pub const SYSTEMD_CREDS: &str = "/usr/bin/systemd-creds";
 pub const DETECT_VIRT: &str = "/usr/bin/systemd-detect-virt";
 pub const GPASSWD: &str = "/usr/bin/gpasswd";
 pub const SUDO: &str = "/usr/bin/sudo";
+// macOS (plan 13).
+pub const DSCL: &str = "/usr/bin/dscl";
+pub const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
+pub const LAUNCHCTL: &str = "/bin/launchctl";
+pub const SW_VERS: &str = "/usr/bin/sw_vers";
+pub const SECURITY: &str = "/usr/bin/security";
+
+/// The uids and gids the macOS daemon accounts may take (spec §5.3): below
+/// 500, where macOS keeps its hidden system accounts.
+pub const MACOS_ID_RANGE: RangeInclusive<u32> = 200..=400;
 
 /// Every program locked mode runs (plan 9b global constraints), always by
 /// absolute path.
@@ -37,6 +51,11 @@ pub const PROGRAMS: &[&str] = &[
     SYSTEMD_CREDS,
     DETECT_VIRT,
     SUDO,
+    DSCL,
+    DSEDITGROUP,
+    LAUNCHCTL,
+    SW_VERS,
+    SECURITY,
 ];
 
 /// How long the user and group tools may take.
@@ -98,6 +117,19 @@ pub trait Host: Send + Sync {
     /// Runs `program` (an absolute path) with no stdin; killed after
     /// `timeout`. A non-zero exit is an `Ok` with its status.
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput>;
+    /// Runs `launchctl <args>` (macOS). A non-zero exit is an `Ok` with its
+    /// status.
+    fn launchctl(&self, args: &[&str]) -> io::Result<CmdOutput>;
+    /// The macOS (major, minor) from `sw_vers -productVersion`.
+    fn macos_version(&self) -> io::Result<(u32, u32)>;
+    /// [`Host::run`] with `input` written to the program's stdin.
+    fn run_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<CmdOutput>;
 }
 
 /// What `container` reports when it cannot tell (systemd-detect-virt
@@ -161,45 +193,43 @@ impl Host for RealHost {
     }
 
     fn user(&self, name: &str) -> Option<UserInfo> {
-        find_passwd(&std::fs::read_to_string("/etc/passwd").ok()?, name)
+        accounts::user(name)
     }
 
     fn group_id(&self, name: &str) -> Option<u32> {
-        find_group(&std::fs::read_to_string("/etc/group").ok()?, name)
+        accounts::group_id(name)
     }
 
     fn group_members(&self, name: &str) -> Option<Vec<String>> {
-        find_group_members(&std::fs::read_to_string("/etc/group").ok()?, name)
+        accounts::group_members(name)
     }
 
     fn users_with_primary_gid(&self, gid: u32) -> Vec<String> {
-        std::fs::read_to_string("/etc/passwd")
-            .map(|t| find_primary_gid_users(&t, gid))
-            .unwrap_or_default()
+        accounts::users_with_primary_gid(gid)
     }
 
     fn create_system_group(&self, name: &str) -> io::Result<()> {
-        admin(&argv_create_group(name)?)
+        accounts::create_system_group(name)
     }
 
     fn create_system_user(&self, name: &str, group: &str) -> io::Result<()> {
-        admin(&argv_create_user(name, group)?)
+        accounts::create_system_user(name, group)
     }
 
     fn add_to_group(&self, user: &str, group: &str) -> io::Result<()> {
-        admin(&argv_add_to_group(user, group)?)
+        accounts::add_to_group(user, group)
     }
 
     fn delete_user(&self, name: &str) -> io::Result<()> {
-        admin(&argv_delete_user(name)?)
+        accounts::delete_user(name)
     }
 
     fn delete_group(&self, name: &str) -> io::Result<()> {
-        admin(&argv_delete_group(name)?)
+        accounts::delete_group(name)
     }
 
     fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()> {
-        admin(&argv_remove_from_group(user, group)?)
+        accounts::remove_from_group(user, group)
     }
 
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
@@ -252,6 +282,199 @@ impl Host for RealHost {
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
         exec(program, args, None, timeout)
     }
+
+    fn launchctl(&self, args: &[&str]) -> io::Result<CmdOutput> {
+        exec(LAUNCHCTL, args, None, ADMIN_TIMEOUT)
+    }
+
+    fn macos_version(&self) -> io::Result<(u32, u32)> {
+        let out = exec(SW_VERS, &["-productVersion"], None, QUERY_TIMEOUT)?;
+        if out.status != 0 {
+            return Err(io::Error::other(format!(
+                "{SW_VERS} -productVersion failed (exit {}): {}",
+                out.status,
+                out.stderr.trim()
+            )));
+        }
+        parse_sw_vers(&out.stdout)
+    }
+
+    fn run_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<CmdOutput> {
+        exec(program, args, Some(input), timeout)
+    }
+}
+
+/// The account calls of [`RealHost`] on Linux (and any other unix): the
+/// files `/etc/passwd` and `/etc/group`, and the shadow-utils tools.
+#[cfg(not(target_os = "macos"))]
+mod accounts {
+    use super::*;
+
+    pub(super) fn user(name: &str) -> Option<UserInfo> {
+        find_passwd(&std::fs::read_to_string("/etc/passwd").ok()?, name)
+    }
+
+    pub(super) fn group_id(name: &str) -> Option<u32> {
+        find_group(&std::fs::read_to_string("/etc/group").ok()?, name)
+    }
+
+    pub(super) fn group_members(name: &str) -> Option<Vec<String>> {
+        find_group_members(&std::fs::read_to_string("/etc/group").ok()?, name)
+    }
+
+    pub(super) fn users_with_primary_gid(gid: u32) -> Vec<String> {
+        std::fs::read_to_string("/etc/passwd")
+            .map(|t| find_primary_gid_users(&t, gid))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn create_system_group(name: &str) -> io::Result<()> {
+        admin(&argv_create_group(name)?)
+    }
+
+    pub(super) fn create_system_user(name: &str, group: &str) -> io::Result<()> {
+        admin(&argv_create_user(name, group)?)
+    }
+
+    pub(super) fn add_to_group(user: &str, group: &str) -> io::Result<()> {
+        admin(&argv_add_to_group(user, group)?)
+    }
+
+    pub(super) fn delete_user(name: &str) -> io::Result<()> {
+        admin(&argv_delete_user(name)?)
+    }
+
+    pub(super) fn delete_group(name: &str) -> io::Result<()> {
+        admin(&argv_delete_group(name)?)
+    }
+
+    pub(super) fn remove_from_group(user: &str, group: &str) -> io::Result<()> {
+        admin(&argv_remove_from_group(user, group)?)
+    }
+}
+
+/// The account calls of [`RealHost`] on macOS: lookups through the
+/// directory service (nix's safe `getpwnam_r` and `getgrnam_r`), changes
+/// through `dscl` and `dseditgroup` on the local node.
+#[cfg(target_os = "macos")]
+mod accounts {
+    use super::*;
+    use nix::unistd::{Group, User};
+
+    pub(super) fn user(name: &str) -> Option<UserInfo> {
+        let u = User::from_name(name).ok()??;
+        Some(UserInfo {
+            uid: u.uid.as_raw(),
+            gid: u.gid.as_raw(),
+            home: u.dir,
+            shell: u.shell.to_string_lossy().into_owned(),
+        })
+    }
+
+    pub(super) fn group_id(name: &str) -> Option<u32> {
+        Group::from_name(name).ok()?.map(|g| g.gid.as_raw())
+    }
+
+    pub(super) fn group_members(name: &str) -> Option<Vec<String>> {
+        Group::from_name(name).ok()?.map(|g| g.mem)
+    }
+
+    pub(super) fn users_with_primary_gid(gid: u32) -> Vec<String> {
+        let gid_s = gid.to_string();
+        exec(
+            DSCL,
+            &[".", "-search", "/Users", "PrimaryGroupID", &gid_s],
+            None,
+            QUERY_TIMEOUT,
+        )
+        .ok()
+        .filter(|o| o.status == 0)
+        .map(|o| parse_dscl_search(&o.stdout, gid))
+        .unwrap_or_default()
+    }
+
+    /// Every uid and every gid of the local directory.
+    fn taken_ids() -> io::Result<(BTreeSet<u32>, BTreeSet<u32>)> {
+        let list = |path: &str, attr: &str| -> io::Result<BTreeSet<u32>> {
+            let argv = owned(&[DSCL, ".", "-list", path, attr]);
+            let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+            let out = exec(DSCL, &args, None, QUERY_TIMEOUT)?;
+            check_status(&argv, &out)?;
+            Ok(parse_dscl_ids(&out.stdout))
+        };
+        Ok((
+            list("/Users", "UniqueID")?,
+            list("/Groups", "PrimaryGroupID")?,
+        ))
+    }
+
+    /// Runs `steps` in order. When a step after the first fails, the
+    /// half-made record is deleted again (best effort) and that failure
+    /// returned.
+    fn create_record(steps: &[Vec<String>], undo: &[String]) -> io::Result<()> {
+        for (i, argv) in steps.iter().enumerate() {
+            if let Err(e) = admin(argv) {
+                if i > 0 {
+                    let _ = admin(undo);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn no_free_id() -> io::Error {
+        io::Error::other(format!(
+            "no free id in {}..={} for the saiife accounts: every one is taken by a user or a group",
+            MACOS_ID_RANGE.start(),
+            MACOS_ID_RANGE.end()
+        ))
+    }
+
+    pub(super) fn create_system_group(name: &str) -> io::Result<()> {
+        check_names(&[name])?;
+        let (uids, gids) = taken_ids()?;
+        let gid = pick_free_id(&uids, &gids).ok_or_else(no_free_id)?;
+        create_record(&argv_dscl_group(name, gid), &argv_dscl_delete_group(name)?)
+    }
+
+    pub(super) fn create_system_user(name: &str, group: &str) -> io::Result<()> {
+        check_names(&[name, group])?;
+        let gid = group_id(group).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("group {group} does not exist"),
+            )
+        })?;
+        let (uids, gids) = taken_ids()?;
+        let uid = pick_user_id(gid, &uids, &gids).ok_or_else(no_free_id)?;
+        create_record(
+            &argv_dscl_user(name, uid, gid),
+            &argv_dscl_delete_user(name)?,
+        )
+    }
+
+    pub(super) fn add_to_group(user: &str, group: &str) -> io::Result<()> {
+        admin(&argv_dseditgroup(true, user, group)?)
+    }
+
+    pub(super) fn delete_user(name: &str) -> io::Result<()> {
+        admin(&argv_dscl_delete_user(name)?)
+    }
+
+    pub(super) fn delete_group(name: &str) -> io::Result<()> {
+        admin(&argv_dscl_delete_group(name)?)
+    }
+
+    pub(super) fn remove_from_group(user: &str, group: &str) -> io::Result<()> {
+        admin(&argv_dseditgroup(false, user, group)?)
+    }
 }
 
 /// `systemd-detect-virt --container`'s answer. Exit 0 names the container;
@@ -298,6 +521,7 @@ fn owned(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|s| s.to_string()).collect()
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_create_user(name: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[name, group])?;
     Ok(owned(&[
@@ -314,26 +538,31 @@ pub(crate) fn argv_create_user(name: &str, group: &str) -> io::Result<Vec<String
     ]))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_create_group(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[GROUPADD, "--system", name]))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_add_to_group(user: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[user, group])?;
     Ok(owned(&[USERMOD, "-aG", group, user]))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_delete_user(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[USERDEL, name]))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_remove_from_group(user: &str, group: &str) -> io::Result<Vec<String>> {
     check_names(&[user, group])?;
     Ok(owned(&[GPASSWD, "-d", user, group]))
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn argv_delete_group(name: &str) -> io::Result<Vec<String>> {
     check_names(&[name])?;
     Ok(owned(&[GROUPDEL, name]))
@@ -354,6 +583,147 @@ pub(crate) fn argv_encrypt(name: &str, out: &Path) -> io::Result<Vec<String>> {
         "-".to_string(),
         out_s.to_string(),
     ])
+}
+
+// ------------------------------------------------------------- macOS argv
+
+/// The lowest id in [`MACOS_ID_RANGE`] that neither a user (`uids`) nor a
+/// group (`gids`) has; `None` when the range is full.
+pub fn pick_free_id(uids: &BTreeSet<u32>, gids: &BTreeSet<u32>) -> Option<u32> {
+    MACOS_ID_RANGE
+        .clone()
+        .find(|id| !uids.contains(id) && !gids.contains(id))
+}
+
+/// The uid for a user whose primary group is `gid`: `gid` itself when it
+/// lies in [`MACOS_ID_RANGE`] and no user has it, else [`pick_free_id`].
+pub fn pick_user_id(gid: u32, uids: &BTreeSet<u32>, gids: &BTreeSet<u32>) -> Option<u32> {
+    if MACOS_ID_RANGE.contains(&gid) && !uids.contains(&gid) {
+        Some(gid)
+    } else {
+        pick_free_id(uids, gids)
+    }
+}
+
+/// The ids of `dscl . -list /Users UniqueID` (or `/Groups PrimaryGroupID`):
+/// one `name  id` per line. Lines without a numeric last word (and
+/// negative ids such as nobody's -2) are skipped.
+pub fn parse_dscl_ids(out: &str) -> BTreeSet<u32> {
+    out.lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let _name = words.next()?;
+            words.next_back()?.parse().ok()
+        })
+        .collect()
+}
+
+/// The users of `dscl . -search /Users PrimaryGroupID <gid>` whose value
+/// is `gid`. Each match is a `name<TAB><TAB>PrimaryGroupID = (` line,
+/// then the values one per indented line, then `)`; a value on the same
+/// line (`… = 20` or `… = ( 20 )`) is read as well.
+pub fn parse_dscl_search(out: &str, gid: u32) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut current: Option<&str> = None;
+    let has_gid = |text: &str| {
+        text.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .any(|w| w.parse::<u32>() == Ok(gid))
+    };
+    for line in out.lines() {
+        let values = if line.starts_with(char::is_whitespace) || line.trim() == ")" {
+            line
+        } else {
+            let (name, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            current = (!name.is_empty() && rest.contains('=')).then_some(name);
+            rest.split_once('=').map_or("", |(_, v)| v)
+        };
+        if let Some(name) = current.filter(|_| has_gid(values)) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// `sw_vers -productVersion` (`15.1`, `26.0.1`) as (major, minor); a bare
+/// major is `.0`.
+pub fn parse_sw_vers(out: &str) -> io::Result<(u32, u32)> {
+    let bad = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{SW_VERS} printed no version: {:?}", out.trim()),
+        )
+    };
+    let mut parts = out.trim().split('.');
+    let major = parts
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .ok_or_else(bad)?;
+    let minor = match parts.next() {
+        None => 0,
+        Some(m) => m.parse::<u32>().map_err(|_| bad())?,
+    };
+    Ok((major, minor))
+}
+
+fn dscl_set(record: &str, attr: &str, value: &str) -> Vec<String> {
+    owned(&[DSCL, ".", "-create", record, attr, value])
+}
+
+/// The `dscl` calls that make the hidden group `name` with `gid`. Callers
+/// check the name first ([`valid_name`]).
+pub fn argv_dscl_group(name: &str, gid: u32) -> Vec<Vec<String>> {
+    let rec = format!("/Groups/{name}");
+    vec![
+        owned(&[DSCL, ".", "-create", &rec]),
+        dscl_set(&rec, "PrimaryGroupID", &gid.to_string()),
+        dscl_set(&rec, "RealName", name),
+        dscl_set(&rec, "Password", "*"),
+    ]
+}
+
+/// The `dscl` calls that make the hidden daemon user `name` (spec §5.3):
+/// no password, shell `/usr/bin/false`, home `/var/empty`. Callers check
+/// the name first ([`valid_name`]).
+pub fn argv_dscl_user(name: &str, uid: u32, gid: u32) -> Vec<Vec<String>> {
+    let rec = format!("/Users/{name}");
+    vec![
+        owned(&[DSCL, ".", "-create", &rec]),
+        dscl_set(&rec, "UniqueID", &uid.to_string()),
+        dscl_set(&rec, "PrimaryGroupID", &gid.to_string()),
+        dscl_set(&rec, "UserShell", "/usr/bin/false"),
+        dscl_set(&rec, "NFSHomeDirectory", "/var/empty"),
+        dscl_set(&rec, "RealName", "saiife daemon"),
+        dscl_set(&rec, "Password", "*"),
+        dscl_set(&rec, "IsHidden", "1"),
+    ]
+}
+
+/// `dseditgroup -o edit -a|-d <user> -t user <group>`: adds (`add`) or
+/// removes a supplementary member.
+pub fn argv_dseditgroup(add: bool, user: &str, group: &str) -> io::Result<Vec<String>> {
+    check_names(&[user, group])?;
+    Ok(owned(&[
+        DSEDITGROUP,
+        "-o",
+        "edit",
+        if add { "-a" } else { "-d" },
+        user,
+        "-t",
+        "user",
+        group,
+    ]))
+}
+
+pub fn argv_dscl_delete_user(name: &str) -> io::Result<Vec<String>> {
+    check_names(&[name])?;
+    Ok(owned(&[DSCL, ".", "-delete", &format!("/Users/{name}")]))
+}
+
+pub fn argv_dscl_delete_group(name: &str) -> io::Result<Vec<String>> {
+    check_names(&[name])?;
+    Ok(owned(&[DSCL, ".", "-delete", &format!("/Groups/{name}")]))
 }
 
 /// Runs an admin tool and turns a non-zero exit into an error.
@@ -502,6 +872,7 @@ pub(crate) fn parse_systemd_version(out: &str) -> Option<u32> {
 }
 
 /// The `name` entry of `/etc/passwd` text.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn find_passwd(text: &str, name: &str) -> Option<UserInfo> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -518,6 +889,7 @@ pub(crate) fn find_passwd(text: &str, name: &str) -> Option<UserInfo> {
 }
 
 /// The gid of `name` in `/etc/group` text.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -530,6 +902,7 @@ pub(crate) fn find_group(text: &str, name: &str) -> Option<u32> {
 
 /// The member list of `name` in `/etc/group` text.
 /// Names in `/etc/passwd` text whose primary gid (field 4) is `gid`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn find_primary_gid_users(text: &str, gid: u32) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
@@ -539,6 +912,7 @@ pub(crate) fn find_primary_gid_users(text: &str, gid: u32) -> Vec<String> {
         .collect()
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn find_group_members(text: &str, name: &str) -> Option<Vec<String>> {
     text.lines().find_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
@@ -560,7 +934,14 @@ const STATE_FILE: &str = ".fakehost.json";
 
 /// The names install creates. In a [`FakeHost`] they exist only once
 /// created; every other name resolves to the test user.
-const CREATED_NAMES: [&str; 3] = [DAEMON_USER, DAEMON_GROUP, AUDIT_GROUP];
+const CREATED_NAMES: [&str; 6] = [
+    DAEMON_USER,
+    DAEMON_GROUP,
+    AUDIT_GROUP,
+    MACOS_DAEMON_USER,
+    MACOS_DAEMON_GROUP,
+    MACOS_AUDIT_GROUP,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chown {
@@ -584,15 +965,20 @@ pub struct FakeState {
     pub members: BTreeMap<String, Vec<String>>,
     /// Every chown, in order. None is applied.
     pub chowns: Vec<Chown>,
-    /// Every `systemctl`, `run` and `encrypt_credential` call, as one line.
+    /// Every `systemctl`, `launchctl`, `run`, `run_input` and
+    /// `encrypt_credential` call, as one line. A `run_input` line ends
+    /// `<stdin N bytes>`: the input's length, never its bytes.
     pub calls: Vec<String>,
     /// What `systemd_version` returns (default 255).
     pub systemd: u32,
+    /// What `macos_version` returns (default 15.0).
+    pub macos: (u32, u32),
     /// What `container` returns (default none).
     pub container: Option<String>,
     /// Canned outputs by call line (`"systemctl enable --now saiifed.service"`,
-    /// `"/usr/bin/sudo -n true"`). A `run` without one exits 1 with no
-    /// output; a `systemctl` without one exits 0.
+    /// `"/usr/bin/sudo -n true"`; for `run_input`, the line without its
+    /// stdin note). A `run` or `run_input` without one exits 1 with no
+    /// output; a `systemctl` or `launchctl` without one exits 0.
     pub run: BTreeMap<String, CmdOutput>,
     /// Paths whose `chown` fails (tests of a step failing part-way).
     pub fail_chown: Vec<PathBuf>,
@@ -608,6 +994,7 @@ impl Default for FakeState {
             chowns: Vec::new(),
             calls: Vec::new(),
             systemd: 255,
+            macos: (15, 0),
             container: None,
             run: BTreeMap::new(),
             fail_chown: Vec::new(),
@@ -959,6 +1346,40 @@ impl Host for FakeHost {
                 stderr: String::new(),
             });
             s.calls.push(line);
+            Ok(out)
+        })
+    }
+
+    fn launchctl(&self, args: &[&str]) -> io::Result<CmdOutput> {
+        let line = call_line("launchctl", args);
+        self.update(|s| {
+            let out = s.run.get(&line).cloned().unwrap_or_default();
+            s.calls.push(line);
+            Ok(out)
+        })
+    }
+
+    fn macos_version(&self) -> io::Result<(u32, u32)> {
+        Ok(self.read()?.macos)
+    }
+
+    fn run_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        input: &[u8],
+        _timeout: Duration,
+    ) -> io::Result<CmdOutput> {
+        let line = call_line(program, args);
+        self.update(|s| {
+            let out = s.run.get(&line).cloned().unwrap_or(CmdOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+            // The length only: the input may be a secret.
+            s.calls
+                .push(format!("{line} <stdin {} bytes>", input.len()));
             Ok(out)
         })
     }
@@ -1463,5 +1884,264 @@ mod tests {
         });
         assert_eq!(h.users_with_primary_gid(990), ["alice"]);
         assert!(h.users_with_primary_gid(991).is_empty());
+    }
+
+    // ------------------------------------------------------------ macOS
+
+    fn ids(v: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
+        v.into_iter().collect()
+    }
+
+    #[test]
+    fn sw_vers_parse() {
+        assert_eq!(parse_sw_vers("15.1\n").unwrap(), (15, 1));
+        assert_eq!(parse_sw_vers("26.0.1").unwrap(), (26, 0));
+        assert_eq!(parse_sw_vers("15").unwrap(), (15, 0));
+        for bad in ["x", "", "15.x", ".1", "-15.0"] {
+            let e = parse_sw_vers(bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{bad}");
+        }
+    }
+
+    #[test]
+    fn pick_free_id_skips_users_and_groups() {
+        assert_eq!(MACOS_ID_RANGE, 200..=400);
+        assert_eq!(pick_free_id(&ids([]), &ids([])), Some(200));
+        // A uid or a gid alone takes the id.
+        assert_eq!(pick_free_id(&ids([200, 202]), &ids([201])), Some(203));
+        assert_eq!(pick_free_id(&ids(200..=250), &ids(251..=300)), Some(301));
+        // Ids outside the range do not matter.
+        assert_eq!(pick_free_id(&ids([0, 1, 199, 501]), &ids([20])), Some(200));
+        // The user takes the group's gid when no user has it...
+        assert_eq!(pick_user_id(210, &ids([200]), &ids([210])), Some(210));
+        // ...and a free id otherwise, or when the gid is outside the range.
+        assert_eq!(pick_user_id(210, &ids([210]), &ids([200, 210])), Some(201));
+        assert_eq!(pick_user_id(20, &ids([]), &ids([20])), Some(200));
+    }
+
+    #[test]
+    fn pick_free_id_full_range_is_none() {
+        assert_eq!(pick_free_id(&ids(200..=400), &ids([])), None);
+        assert_eq!(pick_free_id(&ids([]), &ids(200..=400)), None);
+        assert_eq!(pick_free_id(&ids(200..=300), &ids(301..=400)), None);
+        assert_eq!(pick_user_id(500, &ids(200..=400), &ids([])), None);
+        // One id left is found.
+        assert_eq!(
+            pick_free_id(&ids((200..=400).filter(|i| *i != 333)), &ids([])),
+            Some(333)
+        );
+    }
+
+    #[test]
+    fn parse_dscl_ids() {
+        let users = "_amavisd                 83\n_appleevents             55\nnobody                   -2\nroot                     0\njdoe                     501\n_saiife                  250\n\nbroken\n";
+        assert_eq!(super::parse_dscl_ids(users), ids([0, 55, 83, 250, 501]));
+        let groups = "_saiifeaudit\t251\nstaff\t20\nwheel\t0\n";
+        assert_eq!(super::parse_dscl_ids(groups), ids([0, 20, 251]));
+        assert!(super::parse_dscl_ids("").is_empty());
+    }
+
+    #[test]
+    fn parse_dscl_search_reads_matching_users() {
+        let out = "_saiife\t\tPrimaryGroupID = (\n    250\n)\nalice\t\tPrimaryGroupID = (\n    250\n)\nbob\t\tPrimaryGroupID = (\n    2500\n)\ncarol PrimaryGroupID = 250\n";
+        assert_eq!(parse_dscl_search(out, 250), ["_saiife", "alice", "carol"]);
+        assert_eq!(parse_dscl_search(out, 2500), ["bob"]);
+        assert!(parse_dscl_search(out, 25).is_empty());
+        assert!(parse_dscl_search("", 250).is_empty());
+    }
+
+    #[test]
+    fn dscl_user_argv_is_hidden_with_false_shell() {
+        let rec = |a: &[&str]| -> Vec<String> {
+            [DSCL, "."]
+                .iter()
+                .chain(a.iter())
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(
+            argv_dscl_user("_saiife", 250, 251),
+            vec![
+                rec(&["-create", "/Users/_saiife"]),
+                rec(&["-create", "/Users/_saiife", "UniqueID", "250"]),
+                rec(&["-create", "/Users/_saiife", "PrimaryGroupID", "251"]),
+                rec(&["-create", "/Users/_saiife", "UserShell", "/usr/bin/false"]),
+                rec(&[
+                    "-create",
+                    "/Users/_saiife",
+                    "NFSHomeDirectory",
+                    "/var/empty"
+                ]),
+                rec(&["-create", "/Users/_saiife", "RealName", "saiife daemon"]),
+                rec(&["-create", "/Users/_saiife", "Password", "*"]),
+                rec(&["-create", "/Users/_saiife", "IsHidden", "1"]),
+            ]
+        );
+        assert_eq!(
+            argv_dscl_group("_saiifeaudit", 252),
+            vec![
+                rec(&["-create", "/Groups/_saiifeaudit"]),
+                rec(&["-create", "/Groups/_saiifeaudit", "PrimaryGroupID", "252"]),
+                rec(&[
+                    "-create",
+                    "/Groups/_saiifeaudit",
+                    "RealName",
+                    "_saiifeaudit"
+                ]),
+                rec(&["-create", "/Groups/_saiifeaudit", "Password", "*"]),
+            ]
+        );
+        assert_eq!(
+            argv_dseditgroup(true, "_saiife", "_saiifeaudit").unwrap(),
+            [
+                "/usr/sbin/dseditgroup",
+                "-o",
+                "edit",
+                "-a",
+                "_saiife",
+                "-t",
+                "user",
+                "_saiifeaudit"
+            ]
+        );
+        assert_eq!(
+            argv_dseditgroup(false, "_saiife", "_saiifeaudit").unwrap()[3],
+            "-d"
+        );
+        assert_eq!(
+            argv_dscl_delete_user("_saiife").unwrap(),
+            [DSCL, ".", "-delete", "/Users/_saiife"]
+        );
+        assert_eq!(
+            argv_dscl_delete_group("_saiifeaudit").unwrap(),
+            [DSCL, ".", "-delete", "/Groups/_saiifeaudit"]
+        );
+        assert!(argv_dseditgroup(true, "-a", "g").is_err());
+        assert!(argv_dscl_delete_user("../x").is_err());
+        assert!(argv_dscl_delete_group("a,b").is_err());
+        // The macOS programs, all absolute and listed.
+        assert_eq!(DSCL, "/usr/bin/dscl");
+        assert_eq!(DSEDITGROUP, "/usr/sbin/dseditgroup");
+        assert_eq!(LAUNCHCTL, "/bin/launchctl");
+        assert_eq!(SW_VERS, "/usr/bin/sw_vers");
+        assert_eq!(SECURITY, "/usr/bin/security");
+        let mut all = argv_dscl_user("_saiife", 250, 250);
+        all.extend(argv_dscl_group("_saiife", 250));
+        all.push(argv_dseditgroup(true, "_saiife", "_saiifeaudit").unwrap());
+        all.push(argv_dscl_delete_user("_saiife").unwrap());
+        for argv in all {
+            assert!(PROGRAMS.contains(&argv[0].as_str()), "{argv:?}");
+        }
+        for p in [LAUNCHCTL, SW_VERS, SECURITY] {
+            assert!(PROGRAMS.contains(&p));
+        }
+    }
+
+    #[test]
+    fn fake_host_records_launchctl_and_run_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(h.macos_version().unwrap(), (15, 0));
+        h.set(|s| s.macos = (26, 1));
+        assert_eq!(h.macos_version().unwrap(), (26, 1));
+        // launchctl answers 0 unless canned, as systemctl does.
+        assert_eq!(
+            h.launchctl(&["print", "system/com.saiife.saiifed"])
+                .unwrap()
+                .status,
+            0
+        );
+        h.set(|s| {
+            s.run.insert(
+                "launchctl bootstrap system /x.plist".into(),
+                CmdOutput {
+                    status: 5,
+                    stdout: String::new(),
+                    stderr: "Bootstrap failed: 5".into(),
+                },
+            );
+            s.run.insert(
+                "/usr/bin/security authorizationdb write com.saiife.approve".into(),
+                CmdOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: "YES (0)\n".into(),
+                },
+            );
+        });
+        let out = h.launchctl(&["bootstrap", "system", "/x.plist"]).unwrap();
+        assert_eq!(
+            (out.status, out.stderr.as_str()),
+            (5, "Bootstrap failed: 5")
+        );
+        let secret = concat!("not-", "a-secret-", "plist-body");
+        let out = h
+            .run_input(
+                SECURITY,
+                &["authorizationdb", "write", "com.saiife.approve"],
+                secret.as_bytes(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(out.status, 0);
+        // Not canned: exits 1, as `run` does.
+        let out = h
+            .run_input(SECURITY, &["x"], b"", Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(out.status, 1);
+        let again = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(
+            again.state().calls,
+            vec![
+                "launchctl print system/com.saiife.saiifed".to_string(),
+                "launchctl bootstrap system /x.plist".to_string(),
+                format!(
+                    "/usr/bin/security authorizationdb write com.saiife.approve <stdin {} bytes>",
+                    secret.len()
+                ),
+                "/usr/bin/security x <stdin 0 bytes>".to_string(),
+            ]
+        );
+        // The input's bytes are nowhere in the state file.
+        let state = fs::read_to_string(dir.path().join(".fakehost.json")).unwrap();
+        assert!(!state.contains(secret));
+    }
+
+    #[test]
+    fn macos_names_are_valid() {
+        for n in [MACOS_DAEMON_USER, MACOS_DAEMON_GROUP, MACOS_AUDIT_GROUP] {
+            assert!(valid_name(n), "{n}");
+        }
+        assert!(valid_name("_saiife") && valid_name("_saiifeaudit"));
+        // The fake treats them as names install creates: absent until made.
+        let dir = tempfile::tempdir().unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(h.user("_saiife"), None);
+        assert_eq!(h.group_id("_saiife"), None);
+        assert_eq!(h.group_id("_saiifeaudit"), None);
+        h.create_system_group("_saiife").unwrap();
+        h.create_system_user("_saiife", "_saiife").unwrap();
+        assert!(h.user("_saiife").is_some());
+    }
+
+    #[test]
+    fn real_run_input_writes_stdin() {
+        let out = RealHost
+            .run_input("/bin/cat", &[], b"abc", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!((out.status, out.stdout.as_str()), (0, "abc"));
+        let e = RealHost
+            .run_input("cat", &[], b"abc", Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn old_fake_state_files_get_the_macos_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".fakehost.json"), r#"{"systemd": 250}"#).unwrap();
+        let h = FakeHost::open(dir.path()).unwrap();
+        assert_eq!(h.macos_version().unwrap(), (15, 0));
+        assert_eq!(h.systemd_version().unwrap(), 250);
     }
 }

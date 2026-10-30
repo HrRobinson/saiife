@@ -36,5 +36,5 @@ pub use host::{
     CONTAINER_UNKNOWN,
 };
 pub use layout::Layout;
-pub use supported::{check_supported, refusal_line, Support, NOT_LINUX};
+pub use supported::{check_supported, refusal_line, Support, NOT_SUPPORTED_OS};
 pub use unit::{unit_text, vault_key_mode};

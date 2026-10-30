@@ -1052,7 +1052,7 @@ fn daemon_status(
     _host: &dyn Host,
     _cfg: Option<&saiife_policy::SystemConfig>,
 ) -> Result<DaemonStatus, String> {
-    Err(saiife_system::NOT_LINUX.to_string())
+    Err(saiife_system::NOT_SUPPORTED_OS.to_string())
 }
 
 /// Installed files whose fingerprint differs from `installed.toml`: the
