@@ -16,7 +16,7 @@
 //! - MSG is the line, byte for byte, without a BOM.
 //!
 //! Local (`unix:<path>`, normally [`DEFAULT_SOCKET`]): one datagram per record. A
-//! message over 8 KiB is cut at a character boundary and ends with
+//! message over [`MAX_DATAGRAM`] (8 KiB; 2 KiB on macOS) is cut at a character boundary and ends with
 //! `…[truncated]` (that line cannot be verified from the copy). When the
 //! socket is a stream socket, every message goes over it with octet-counting
 //! framing instead, uncut.
@@ -37,7 +37,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixDatagram, UnixStream};
 
 /// The largest local datagram; a longer message is cut.
+#[cfg(not(target_os = "macos"))]
 pub const MAX_DATAGRAM: usize = 8192;
+/// The largest local datagram; a longer message is cut. 2 KiB on macOS:
+/// its local datagram sockets refuse a larger one (`EMSGSIZE`, "Message
+/// too long": `net.local.dgram.maxdgram` is 2048), and 2048 octets is
+/// what RFC 5424 §6.1 asks every receiver to take.
+#[cfg(target_os = "macos")]
+pub const MAX_DATAGRAM: usize = 2048;
 /// Ends a cut message.
 pub const TRUNCATED_MARK: &str = "…[truncated]";
 /// Records per batch.
@@ -463,10 +470,13 @@ mod tests {
         let line = Bytes::from(format!(r#"{{"seq":1,"input":"{}"}}"#, "x".repeat(4000)));
         let lines = vec![line; 5000];
         let err = t.send(&lines).await.unwrap_err();
-        assert!(
-            matches!(&err, SendError::Retry(w) if w.contains("timed out")),
-            "{err:?}"
-        );
+        // macOS does not block a send to a full local datagram queue: it
+        // fails at once (`ENOBUFS`). A retry either way.
+        let full = |w: &str| {
+            w.contains("timed out")
+                || (cfg!(target_os = "macos") && w.contains("No buffer space available"))
+        };
+        assert!(matches!(&err, SendError::Retry(w) if full(w)), "{err:?}");
         // A stream socket that accepts and never reads.
         let path = d.path().join("stream");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
