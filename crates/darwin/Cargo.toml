@@ -1,0 +1,14 @@
+[package]
+name = "saiife-darwin"
+description = "The one crate of saiife allowed unsafe: sysctl(KERN_PROC_PID) on macOS. Empty on other targets."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "saiife_darwin"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

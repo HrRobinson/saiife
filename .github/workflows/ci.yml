@@ -33,11 +33,13 @@ jobs:
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh
-      # The hook path (guard, audit, policy, ipc), saiife-system and saiife-mcp must not link tokio: only
-      # the daemon crate does (spec §4.2).
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp and saiife-darwin must not
+      # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
-        if: matrix.os == 'ubuntu-latest'
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin | grep -c tokio)" = 0
+      # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
+      - name: unsafe only in saiife-darwin
+        run: bash scripts/check-unsafe.sh
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
