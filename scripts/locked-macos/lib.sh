@@ -385,8 +385,10 @@ listed_paths() {
 # `dscl_attr <record> <attribute>`: the first value, in either of dscl's
 # layouts (`Key: value`, or `Key:` and the value on the next line).
 dscl_attr() {
-    dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" '
-        $1 == k { if (NF > 1) { sub(/^[^:]*:[ \t]*/, ""); print; exit } want = 1; next }
+    # A non-standard attribute (IsHidden) reads back as
+    # `dsAttrTypeNative:IsHidden: 1` on a real Mac.
+    dscl . -read "$1" "$2" 2>/dev/null | awk -v k="$2:" -v n="dsAttrTypeNative:$2:" '
+        $1 == k || $1 == n { if (NF > 1) { sub(/^[^ \t]*[ \t]*/, ""); print; exit } want = 1; next }
         want { sub(/^[ \t]+/, ""); print; exit }'
 }
 

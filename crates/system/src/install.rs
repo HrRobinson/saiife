@@ -410,12 +410,15 @@ fn check_macos_key(layout: &Layout) -> Result<(), InstallError> {
 }
 
 /// True when `dscl . -read` output says `IsHidden: 1` (or `YES`), in
-/// either of dscl's layouts ([`crate::host::parse_dscl_attrs`]).
+/// either of dscl's layouts ([`crate::host::parse_dscl_attrs`]). A real
+/// Mac names it `dsAttrTypeNative:IsHidden` (it is no standard attribute;
+/// seen on the macos-15 runners); exactly that prefix is accepted too.
 pub(crate) fn dscl_is_hidden(out: &str) -> bool {
-    crate::host::parse_dscl_attrs(out)
-        .get("IsHidden")
-        .and_then(|v| v.first())
-        .is_some_and(|v| matches!(v.as_str(), "1" | "YES" | "yes" | "true"))
+    let attrs = crate::host::parse_dscl_attrs(out);
+    ["IsHidden", "dsAttrTypeNative:IsHidden"]
+        .iter()
+        .filter_map(|k| attrs.get(*k).and_then(|v| v.first()))
+        .any(|v| matches!(v.as_str(), "1" | "YES" | "yes" | "true"))
 }
 
 /// An existing macOS daemon user must be a record of the local directory
@@ -3792,6 +3795,45 @@ pub(crate) mod macos_tests {
         assert!(!dscl_is_hidden("IsHidden: 0\n"));
         assert!(!dscl_is_hidden("UniqueID: 250\n"));
         assert!(!dscl_is_hidden("NotIsHidden: 1\n"));
+        // Other prefixes stay refused.
+        assert!(!dscl_is_hidden("dsAttrTypeStandard:IsHidden: 1\n"));
+        assert!(!dscl_is_hidden("dsAttrTypeNative:IsHidden: 0\n"));
+    }
+
+    /// `dscl . -read /Users/_saiife` on a macos-15 runner (locked-macos
+    /// log), verbatim but for the GUID.
+    #[test]
+    fn dscl_is_hidden_reads_the_real_native_attribute() {
+        let real = r#"dsAttrTypeNative:accountPolicyData:
+ <?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>creationTime</key>
+	<real>1793353472.3020391</real>
+</dict>
+</plist>
+
+dsAttrTypeNative:IsHidden: 1
+dsAttrTypeNative:record_daemon_version: 9054000
+AppleMetaNodeLocation: /Local/Default
+GeneratedUID: 00000000-0000-0000-0000-000000000000
+NFSHomeDirectory: /var/empty
+Password: *
+PrimaryGroupID: 206
+RealName:
+ saiife daemon
+RecordName: _saiife
+RecordType: dsRecTypeStandard:Users
+UniqueID: 206
+UserShell: /usr/bin/false
+"#;
+        assert!(dscl_is_hidden(real));
+        let attrs = crate::host::parse_dscl_attrs(real);
+        assert_eq!(attrs["UniqueID"], ["206"]);
+        assert_eq!(attrs["UserShell"], ["/usr/bin/false"]);
+        assert_eq!(attrs["AppleMetaNodeLocation"], ["/Local/Default"]);
+        assert!(!dscl_is_hidden(&real.replace("IsHidden: 1", "IsHidden: 0")));
     }
 
     #[test]
