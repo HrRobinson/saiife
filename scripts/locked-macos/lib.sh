@@ -57,6 +57,24 @@ ok() {
     echo "  ok: $*"
 }
 
+# `defer_fail <message>`: a failure that must still fail the job, but only
+# after every later phase has run (so one finding does not hide the rest).
+# `deferred_failures` (the end of run.sh) exits 1 when any was recorded.
+DEFERRED=()
+defer_fail() {
+    echo "FAIL (deferred to the end): $*" >&2
+    DEFERRED+=("$*")
+}
+
+deferred_failures() {
+    local f
+    [[ "${#DEFERRED[@]}" == 0 ]] && return 0
+    for f in "${DEFERRED[@]}"; do
+        echo "FAIL: $f" >&2
+    done
+    exit 1
+}
+
 phase() {
     echo
     echo "== $*"
@@ -716,7 +734,11 @@ phase_attacks() {
         as_root /usr/bin/codesign -dv --verbose=4 "$OPT_BIN" 2>&1 || true
         /usr/bin/csrutil status 2>&1 || true
         cat "$WORK/hook.err" || true
-        fail "A4: the injected library ran inside the managed hook (or a child of it): $(as_root cat "$marker" | tr '\n' ' ')"
+        # Still a failure (the job ends red), recorded so the later phases
+        # run too. Seen on the GitHub macos-15 runners, which run with SIP
+        # disabled and an ad-hoc signature (no Team ID).
+        defer_fail "A4: the injected library ran inside the managed hook (or a child of it): $(as_root cat "$marker" | tr '\n' ' ')($(/usr/bin/csrutil status 2>&1))"
+        return 0
     fi
     ok "A4: no marker; the hardened runtime kept the library out of the hook"
 }

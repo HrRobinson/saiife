@@ -60,5 +60,7 @@ phase_doctor
 phase_approvals
 phase_lockdown
 phase_reinstall_uninstall
+# A deferred failure (A4) still fails the job, after every phase ran.
+deferred_failures
 
 echo "== locked-macos: all phases passed (macOS $(sw_vers -productVersion), $(uname -m))"
