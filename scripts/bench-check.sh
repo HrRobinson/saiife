@@ -10,7 +10,10 @@
 # background and prints the median and p95 of N `saiife check --managed`
 # calls per payload (worker process + daemon ack).
 #
-# Usage: scripts/bench-check.sh [--managed] [N]   (default N = 50)
+# With BENCH_MAX_P95_MS=<ms> (--managed only) it exits 1 when either
+# payload's p95 is above that budget (the macOS CI test job uses 40).
+#
+# Usage: [BENCH_MAX_P95_MS=<ms>] scripts/bench-check.sh [--managed] [N]   (default N = 50)
 set -euo pipefail
 
 managed=0
@@ -19,13 +22,30 @@ if [[ "${1:-}" == "--managed" ]]; then
   shift
 fi
 N="${1:-50}"
+max_p95="${BENCH_MAX_P95_MS:-}"
+if [[ -n "$max_p95" ]]; then
+  if [[ "$managed" == 0 ]]; then
+    echo "BENCH_MAX_P95_MS needs --managed (only managed calls report a p95)" >&2
+    exit 2
+  fi
+  if ! [[ "$max_p95" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "BENCH_MAX_P95_MS must be a number of milliseconds, not \"$max_p95\"" >&2
+    exit 2
+  fi
+fi
+# EPOCHREALTIME is bash 5 (macOS's /bin/bash is 3.2: run this with a newer bash).
+if [[ -z "${EPOCHREALTIME:-}" ]]; then
+  echo "bench-check.sh needs bash 5 or later (EPOCHREALTIME); this is bash $BASH_VERSION" >&2
+  exit 2
+fi
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
 cargo build --release --quiet --manifest-path "$repo/Cargo.toml" -p saiife
 bin="${CARGO_TARGET_DIR:-$repo/target}/release/saiife"
 
 # /tmp can have a tight per-user quota: keep scratch next to the repo.
-tmp="$(mktemp -d -p "$(dirname "$repo")" saiife-bench.XXXXXX)"
+# A template path, not -p: BSD mktemp (macOS) has no -p.
+tmp="$(mktemp -d "$(dirname "$repo")/saiife-bench.XXXXXX")"
 daemon_pid=""
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then
@@ -128,6 +148,28 @@ stats_ms() {
     }'
 }
 
+# `over_budget <stats line>`: true when its p95 is above BENCH_MAX_P95_MS.
+over_budget() {
+  [[ -n "$max_p95" ]] || return 1
+  awk -v max="$max_p95" '
+    { for (i = 1; i < NF; i++) if ($i == "p95") { p = $(i + 1) + 0; found = 1 } }
+    END { exit !(found && p > max + 0) }' <<<"$1"
+}
+
 cd "$tmp/project"
-echo "managed bash: $(stats_ms "$bash_payload")/call"
-echo "managed read: $(stats_ms "$read_payload")/call"
+over=0
+for kind in bash read; do
+  if [[ "$kind" == bash ]]; then p="$bash_payload"; else p="$read_payload"; fi
+  line="$(stats_ms "$p")"
+  echo "managed $kind: $line/call"
+  if over_budget "$line"; then
+    echo "managed $kind: p95 is above the budget of $max_p95 ms" >&2
+    over=1
+  fi
+done
+if [[ -n "$max_p95" ]]; then
+  if [[ "$over" == 1 ]]; then
+    exit 1
+  fi
+  echo "p95 within the budget of $max_p95 ms"
+fi
