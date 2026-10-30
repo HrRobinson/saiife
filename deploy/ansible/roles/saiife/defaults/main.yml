@@ -11,7 +11,10 @@ saiife_agents: [claude, codex, gemini]
 saiife_approvers: []
 # Optional controller directory of policy.d drop-ins (*.toml).
 saiife_policy_d_src: ""
-# Set false only for an unsigned rpm.
+# true needs the signing key in the rpm keyring: set saiife_rpm_gpg_key_src, or
+# import it some other way. Unsigned rpms (CI builds) need false.
 saiife_rpm_gpg_check: true
+# URL or path (on the managed host) of the rpm signing key; imported when set.
+saiife_rpm_gpg_key_src: ""
 # doctor exit codes at or above this fail the play (1 = warnings, 2 = failures).
 saiife_doctor_fail_on: 2

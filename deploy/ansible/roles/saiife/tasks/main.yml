@@ -107,6 +107,12 @@
   when: ansible_os_family == "Debian"
   register: saiife_pkg_deb
 
+- name: Import the rpm signing key
+  ansible.builtin.rpm_key:
+    key: "{{ saiife_rpm_gpg_key_src }}"
+    state: present
+  when: ansible_os_family == "RedHat" and saiife_rpm_gpg_key_src | length > 0
+
 - name: Install the package (the scriptlet runs system install --fleet)
   ansible.builtin.dnf:
     name: "/var/cache/saiife/{{ saiife_pkg_file }}"
@@ -135,26 +141,33 @@
   changed_when: true
   when: >-
     (saiife_policy_d.changed | default(false))
-    and not saiife_pkg_changed
-    and not (saiife_fleet_config.changed or saiife_fleet_install.changed)
+    and saiife_fleet_apply is skipped
 
 - name: Run doctor
   ansible.builtin.command: /opt/saiife/bin/saiife doctor --json
   register: saiife_doctor
   changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: Pick out the doctor checks that did not pass
+  ansible.builtin.set_fact:
+    saiife_doctor_bad: >-
+      {{ (saiife_doctor.stdout | from_json).checks | rejectattr('status', 'in', ['pass', 'info']) | list
+         if (saiife_doctor.stdout | default('')) is match('^\s*\{')
+         else [] }}
+  when: saiife_doctor.rc is defined and saiife_doctor.rc > 0
 
 - name: Show the doctor checks that did not pass
   ansible.builtin.debug:
     msg: "{{ item.id }} {{ item.status }}: {{ item.title }} {{ item.detail }}"
-  loop: "{{ (saiife_doctor.stdout | from_json).checks | rejectattr('status', 'in', ['pass', 'info']) | list }}"
+  loop: "{{ saiife_doctor_bad | default([]) }}"
   loop_control:
     label: "{{ item.id }}"
-  when: saiife_doctor.stdout | length > 0 and saiife_doctor.rc > 0
 
 - name: Fail when doctor reports problems
   ansible.builtin.fail:
     msg: >-
       saiife doctor exited {{ saiife_doctor.rc }} (fails at {{ saiife_doctor_fail_on }}).
       See docs/fleet.md.
-  when: saiife_doctor.rc >= saiife_doctor_fail_on
+  when: saiife_doctor.rc is defined and saiife_doctor.rc >= saiife_doctor_fail_on
