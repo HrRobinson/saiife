@@ -790,12 +790,23 @@ fn daemon_group(ctx: &Ctx) -> Check {
             format!("group {DAEMON_GROUP} does not exist"),
         );
     };
+    let primary = match ctx.host.users_with_primary_gid(gid) {
+        Ok(p) => p,
+        Err(e) => {
+            return Check::new(
+                ID,
+                Status::Fail,
+                TITLE,
+                format!("the members of group {DAEMON_GROUP} could not be read: {e}"),
+            )
+        }
+    };
     let mut others: Vec<String> = ctx
         .host
         .group_members(DAEMON_GROUP)
         .unwrap_or_default()
         .into_iter()
-        .chain(ctx.host.users_with_primary_gid(gid))
+        .chain(primary)
         .filter(|u| u != DAEMON_USER)
         .collect();
     others.sort();

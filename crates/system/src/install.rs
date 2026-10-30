@@ -318,11 +318,17 @@ fn check_daemon_group(host: &dyn Host, live: Option<&Installed>) -> Result<(), I
     let Some(gid) = host.group_id(DAEMON_GROUP) else {
         return Ok(());
     };
+    let primary = host.users_with_primary_gid(gid).map_err(|e| {
+        refused(
+            Path::new("/etc/group"),
+            format!("the members of the group {DAEMON_GROUP} (gid {gid}) could not be read: {e}"),
+        )
+    })?;
     let mut others: Vec<String> = host
         .group_members(DAEMON_GROUP)
         .unwrap_or_default()
         .into_iter()
-        .chain(host.users_with_primary_gid(gid))
+        .chain(primary)
         .filter(|m| m != DAEMON_USER)
         .collect();
     others.sort();

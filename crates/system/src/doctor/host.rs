@@ -90,7 +90,12 @@ fn group_users(ctx: &Ctx, g: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out = entry.members;
-    out.extend(ctx.host.users_with_primary_gid(entry.gid));
+    // An unreadable list adds no one (the Linux host never errs here).
+    out.extend(
+        ctx.host
+            .users_with_primary_gid(entry.gid)
+            .unwrap_or_default(),
+    );
     out
 }
 
@@ -270,10 +275,13 @@ fn in_group(ctx: &Ctx, u: &AgentUser, g: &str) -> bool {
         .host
         .group_members(g)
         .is_some_and(|m| m.iter().any(|x| x == &u.name));
-    let primary = ctx
-        .host
-        .group_id(g)
-        .is_some_and(|gid| ctx.host.users_with_primary_gid(gid).contains(&u.name));
+    // A primary-group list that cannot be read counts as in the group:
+    // this check looks for root-equivalent groups, so it fails closed.
+    let primary = ctx.host.group_id(g).is_some_and(|gid| {
+        ctx.host
+            .users_with_primary_gid(gid)
+            .map_or(true, |us| us.contains(&u.name))
+    });
     listed
         || primary
         || (ctx.layout.is_system() && ctx.dir.groups_of(&u.name).iter().any(|x| x == g))

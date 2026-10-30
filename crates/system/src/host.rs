@@ -93,10 +93,15 @@ pub trait Host: Send + Sync {
     fn group_id(&self, name: &str) -> Option<u32>;
     /// The supplementary members of the group from `/etc/group` (primary
     /// members are not listed there); `None` when the group does not exist.
+    /// On macOS, from the local node; members that cannot be named (nested
+    /// groups, a GUID member without a name, an unreadable record) appear
+    /// as `<…>` entries, which are never a user name, so a "no other
+    /// members" check refuses them.
     fn group_members(&self, name: &str) -> Option<Vec<String>>;
     /// Users in `/etc/passwd` whose primary group is `gid` (they are not
-    /// listed as members in `/etc/group`).
-    fn users_with_primary_gid(&self, gid: u32) -> Vec<String>;
+    /// listed as members in `/etc/group`). On macOS an `Err` when the
+    /// directory could not be asked: callers refuse then.
+    fn users_with_primary_gid(&self, gid: u32) -> io::Result<Vec<String>>;
     fn create_system_group(&self, name: &str) -> io::Result<()>;
     /// A system user with primary group `group`, no home and no login shell.
     fn create_system_user(&self, name: &str, group: &str) -> io::Result<()>;
@@ -204,7 +209,7 @@ impl Host for RealHost {
         accounts::group_members(name)
     }
 
-    fn users_with_primary_gid(&self, gid: u32) -> Vec<String> {
+    fn users_with_primary_gid(&self, gid: u32) -> io::Result<Vec<String>> {
         accounts::users_with_primary_gid(gid)
     }
 
@@ -288,7 +293,15 @@ impl Host for RealHost {
     }
 
     fn macos_version(&self) -> io::Result<(u32, u32)> {
-        let out = exec(SW_VERS, &["-productVersion"], None, QUERY_TIMEOUT)?;
+        // SYSTEM_VERSION_COMPAT=1 makes sw_vers answer 10.16 on macOS 11
+        // and later.
+        let out = exec_with(
+            SW_VERS,
+            &["-productVersion"],
+            None,
+            QUERY_TIMEOUT,
+            &["SYSTEM_VERSION_COMPAT"],
+        )?;
         if out.status != 0 {
             return Err(io::Error::other(format!(
                 "{SW_VERS} -productVersion failed (exit {}): {}",
@@ -328,10 +341,11 @@ mod accounts {
         find_group_members(&std::fs::read_to_string("/etc/group").ok()?, name)
     }
 
-    pub(super) fn users_with_primary_gid(gid: u32) -> Vec<String> {
-        std::fs::read_to_string("/etc/passwd")
+    pub(super) fn users_with_primary_gid(gid: u32) -> io::Result<Vec<String>> {
+        // As before: an unreadable /etc/passwd lists no one.
+        Ok(std::fs::read_to_string("/etc/passwd")
             .map(|t| find_primary_gid_users(&t, gid))
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     pub(super) fn create_system_group(name: &str) -> io::Result<()> {
@@ -365,10 +379,31 @@ mod accounts {
 #[cfg(target_os = "macos")]
 mod accounts {
     use super::*;
-    use nix::unistd::{Group, User};
+    use nix::unistd::{Gid, Group, Uid, User};
+
+    /// Runs one admin argv (the runner [`create_account`] is given).
+    fn run_admin(argv: &[String]) -> io::Result<CmdOutput> {
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        exec(&argv[0], &args, None, ADMIN_TIMEOUT)
+    }
+
+    /// Whether `record` (`/Users/x`, `/Groups/x`) is on the local node.
+    fn local_record(record: &str) -> io::Result<bool> {
+        dscl_read_found(run_admin(&argv_dscl_read(record)))
+    }
+
+    /// A saiife name (`_saiife…`) counts only as a local record: one only
+    /// another directory node has reads as absent here, and creating it
+    /// is then refused (see [`create_account`]).
+    fn local_if_ours(name: &str, record: &str) -> bool {
+        !name.starts_with(MACOS_DAEMON_USER) || local_record(record).unwrap_or(false)
+    }
 
     pub(super) fn user(name: &str) -> Option<UserInfo> {
         let u = User::from_name(name).ok()??;
+        if !local_if_ours(name, &format!("/Users/{name}")) {
+            return None;
+        }
         Some(UserInfo {
             uid: u.uid.as_raw(),
             gid: u.gid.as_raw(),
@@ -378,55 +413,45 @@ mod accounts {
     }
 
     pub(super) fn group_id(name: &str) -> Option<u32> {
-        Group::from_name(name).ok()?.map(|g| g.gid.as_raw())
+        let g = Group::from_name(name).ok()??;
+        local_if_ours(name, &format!("/Groups/{name}")).then(|| g.gid.as_raw())
     }
 
+    /// From the local node's record, so nested groups and GUID-only
+    /// members show (see [`group_members_from`]).
     pub(super) fn group_members(name: &str) -> Option<Vec<String>> {
-        Group::from_name(name).ok()?.map(|g| g.mem)
+        if !valid_name(name) {
+            return None;
+        }
+        group_members_from(run_admin(&argv_dscl_read(&format!("/Groups/{name}"))))
     }
 
-    pub(super) fn users_with_primary_gid(gid: u32) -> Vec<String> {
-        let gid_s = gid.to_string();
-        exec(
-            DSCL,
-            &[".", "-search", "/Users", "PrimaryGroupID", &gid_s],
-            None,
-            QUERY_TIMEOUT,
-        )
-        .ok()
-        .filter(|o| o.status == 0)
-        .map(|o| parse_dscl_search(&o.stdout, gid))
-        .unwrap_or_default()
+    pub(super) fn users_with_primary_gid(gid: u32) -> io::Result<Vec<String>> {
+        let argv = argv_dscl_search_gid(gid);
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        primary_gid_users_from(exec(DSCL, &args, None, QUERY_TIMEOUT), gid)
     }
 
-    /// Every uid and every gid of the local directory.
+    /// Every uid and every gid of the local node, refused unless root's
+    /// uid and wheel's gid are among them.
     fn taken_ids() -> io::Result<(BTreeSet<u32>, BTreeSet<u32>)> {
         let list = |path: &str, attr: &str| -> io::Result<BTreeSet<u32>> {
             let argv = owned(&[DSCL, ".", "-list", path, attr]);
-            let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-            let out = exec(DSCL, &args, None, QUERY_TIMEOUT)?;
+            let out = run_admin(&argv)?;
             check_status(&argv, &out)?;
             Ok(parse_dscl_ids(&out.stdout))
         };
-        Ok((
-            list("/Users", "UniqueID")?,
-            list("/Groups", "PrimaryGroupID")?,
-        ))
+        let uids = list("/Users", "UniqueID")?;
+        let gids = list("/Groups", "PrimaryGroupID")?;
+        check_id_anchors(&uids, &gids)?;
+        Ok((uids, gids))
     }
 
-    /// Runs `steps` in order. When a step after the first fails, the
-    /// half-made record is deleted again (best effort) and that failure
-    /// returned.
-    fn create_record(steps: &[Vec<String>], undo: &[String]) -> io::Result<()> {
-        for (i, argv) in steps.iter().enumerate() {
-            if let Err(e) = admin(argv) {
-                if i > 0 {
-                    let _ = admin(undo);
-                }
-                return Err(e);
-            }
-        }
-        Ok(())
+    /// An id some directory node (not only the local one) already gives a
+    /// user or a group. A lookup error counts as taken.
+    fn taken_elsewhere(id: u32) -> bool {
+        !matches!(User::from_uid(Uid::from_raw(id)), Ok(None))
+            || !matches!(Group::from_gid(Gid::from_raw(id)), Ok(None))
     }
 
     fn no_free_id() -> io::Error {
@@ -437,11 +462,27 @@ mod accounts {
         ))
     }
 
+    fn found_anywhere_user(name: &str) -> bool {
+        !matches!(User::from_name(name), Ok(None))
+    }
+
+    fn found_anywhere_group(name: &str) -> bool {
+        !matches!(Group::from_name(name), Ok(None))
+    }
+
     pub(super) fn create_system_group(name: &str) -> io::Result<()> {
         check_names(&[name])?;
-        let (uids, gids) = taken_ids()?;
-        let gid = pick_free_id(&uids, &gids).ok_or_else(no_free_id)?;
-        create_record(&argv_dscl_group(name, gid), &argv_dscl_delete_group(name)?)
+        create_account(
+            &format!("/Groups/{name}"),
+            found_anywhere_group(name),
+            &mut run_admin,
+            || {
+                let (uids, gids) = taken_ids()?;
+                let gid =
+                    pick_free_id_avoiding(&uids, &gids, &taken_elsewhere).ok_or_else(no_free_id)?;
+                Ok(argv_dscl_group(name, gid))
+            },
+        )
     }
 
     pub(super) fn create_system_user(name: &str, group: &str) -> io::Result<()> {
@@ -452,11 +493,20 @@ mod accounts {
                 format!("group {group} does not exist"),
             )
         })?;
-        let (uids, gids) = taken_ids()?;
-        let uid = pick_user_id(gid, &uids, &gids).ok_or_else(no_free_id)?;
-        create_record(
-            &argv_dscl_user(name, uid, gid),
-            &argv_dscl_delete_user(name)?,
+        create_account(
+            &format!("/Users/{name}"),
+            found_anywhere_user(name),
+            &mut run_admin,
+            || {
+                let (uids, gids) = taken_ids()?;
+                // The user's own primary gid is its group's: only the
+                // uid must be free on other nodes.
+                let uid = pick_user_id_avoiding(gid, &uids, &gids, &|id| {
+                    !matches!(User::from_uid(Uid::from_raw(id)), Ok(None))
+                })
+                .ok_or_else(no_free_id)?;
+                Ok(argv_dscl_user(name, uid, gid))
+            },
         )
     }
 
@@ -590,19 +640,201 @@ pub(crate) fn argv_encrypt(name: &str, out: &Path) -> io::Result<Vec<String>> {
 /// The lowest id in [`MACOS_ID_RANGE`] that neither a user (`uids`) nor a
 /// group (`gids`) has; `None` when the range is full.
 pub fn pick_free_id(uids: &BTreeSet<u32>, gids: &BTreeSet<u32>) -> Option<u32> {
+    pick_free_id_avoiding(uids, gids, &|_| false)
+}
+
+/// [`pick_free_id`], also skipping every id `elsewhere` says another
+/// directory node already gives out.
+pub fn pick_free_id_avoiding(
+    uids: &BTreeSet<u32>,
+    gids: &BTreeSet<u32>,
+    elsewhere: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
     MACOS_ID_RANGE
         .clone()
-        .find(|id| !uids.contains(id) && !gids.contains(id))
+        .find(|id| !uids.contains(id) && !gids.contains(id) && !elsewhere(*id))
 }
 
 /// The uid for a user whose primary group is `gid`: `gid` itself when it
 /// lies in [`MACOS_ID_RANGE`] and no user has it, else [`pick_free_id`].
 pub fn pick_user_id(gid: u32, uids: &BTreeSet<u32>, gids: &BTreeSet<u32>) -> Option<u32> {
-    if MACOS_ID_RANGE.contains(&gid) && !uids.contains(&gid) {
+    pick_user_id_avoiding(gid, uids, gids, &|_| false)
+}
+
+/// [`pick_user_id`], where `elsewhere` names the uids another directory
+/// node already gives out.
+pub fn pick_user_id_avoiding(
+    gid: u32,
+    uids: &BTreeSet<u32>,
+    gids: &BTreeSet<u32>,
+    elsewhere: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
+    if MACOS_ID_RANGE.contains(&gid) && !uids.contains(&gid) && !elsewhere(gid) {
         Some(gid)
     } else {
-        pick_free_id(uids, gids)
+        pick_free_id_avoiding(uids, gids, elsewhere)
     }
+}
+
+/// The local node's id lists must hold root's uid 0 and wheel's gid 0;
+/// anything else is a listing that went wrong, and no id is picked from it.
+pub fn check_id_anchors(uids: &BTreeSet<u32>, gids: &BTreeSet<u32>) -> io::Result<()> {
+    if uids.contains(&0) && gids.contains(&0) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "could not read the local uids/gids (root's uid 0 or wheel's gid 0 is missing from dscl's list)",
+        ))
+    }
+}
+
+/// `dscl . -search /Users PrimaryGroupID <gid>`.
+pub fn argv_dscl_search_gid(gid: u32) -> Vec<String> {
+    owned(&[
+        DSCL,
+        ".",
+        "-search",
+        "/Users",
+        "PrimaryGroupID",
+        &gid.to_string(),
+    ])
+}
+
+/// The users [`argv_dscl_search_gid`] found. A spawn error, a timeout or
+/// a non-zero exit is an `Err`, never an empty list.
+pub fn primary_gid_users_from(res: io::Result<CmdOutput>, gid: u32) -> io::Result<Vec<String>> {
+    let out = res?;
+    check_status(&argv_dscl_search_gid(gid), &out)?;
+    Ok(parse_dscl_search(&out.stdout, gid))
+}
+
+/// `dscl . -read <record>`.
+pub fn argv_dscl_read(record: &str) -> Vec<String> {
+    owned(&[DSCL, ".", "-read", record])
+}
+
+/// What `dscl . -read <record>` says: exit 0 is found; a `-14136`
+/// (`eDSRecordNotFound`) answer is absent; anything else (a timeout, a
+/// spawn error, another failure) is an error, so callers fail closed.
+pub fn dscl_read_found(res: io::Result<CmdOutput>) -> io::Result<bool> {
+    let out = res?;
+    if out.status == 0 {
+        return Ok(true);
+    }
+    let said = |s: &str| out.stdout.contains(s) || out.stderr.contains(s);
+    if said("eDSRecordNotFound") || said("-14136") {
+        return Ok(false);
+    }
+    Err(io::Error::other(format!(
+        "dscl -read failed (exit {}): {}",
+        out.status,
+        out.stderr.trim()
+    )))
+}
+
+/// Creates the local record `record` (`/Users/x`, `/Groups/x`) with the
+/// argv lists `steps` makes, each run through `run`.
+///
+/// - The record must be absent on the local node (`dscl . -read`): one
+///   that exists is `AlreadyExists`, and nothing is created or deleted.
+/// - `any_node` (the name resolves through the directory service) while
+///   the local node lacks it means another node has it: refused.
+/// - When a step after the first fails, the record this call made is
+///   deleted again (best effort) and that failure returned. Only a record
+///   this call created is ever deleted.
+pub fn create_account(
+    record: &str,
+    any_node: bool,
+    run: &mut dyn FnMut(&[String]) -> io::Result<CmdOutput>,
+    steps: impl FnOnce() -> io::Result<Vec<Vec<String>>>,
+) -> io::Result<()> {
+    if dscl_read_found(run(&argv_dscl_read(record)))? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{record} already exists on the local node"),
+        ));
+    }
+    if any_node {
+        return Err(io::Error::other(format!(
+            "{record} exists in a directory node other than the local one; \
+             saiife needs its accounts local (remove that record or rename it first)"
+        )));
+    }
+    let steps = steps()?;
+    for (i, argv) in steps.iter().enumerate() {
+        let res = run(argv).and_then(|out| check_status(argv, &out));
+        if let Err(e) = res {
+            if i > 0 {
+                let _ = run(&owned(&[DSCL, ".", "-delete", record]));
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// The attributes of `dscl . -read` output: `Key: v1 v2` lines, or `Key:`
+/// followed by indented value lines.
+pub fn parse_dscl_attrs(out: &str) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in out.lines() {
+        if line.starts_with(char::is_whitespace) {
+            if let Some(k) = &current {
+                map.entry(k.clone())
+                    .or_default()
+                    .extend(line.split_whitespace().map(str::to_string));
+            }
+            continue;
+        }
+        let (key, values) = if let Some(i) = line.find(": ") {
+            (&line[..i], &line[i + 2..])
+        } else if let Some(k) = line.strip_suffix(':') {
+            (k, "")
+        } else {
+            current = None;
+            continue;
+        };
+        current = Some(key.to_string());
+        map.entry(key.to_string())
+            .or_default()
+            .extend(values.split_whitespace().map(str::to_string));
+    }
+    map
+}
+
+/// The members [`Host::group_members`] reports on macOS, from
+/// `dscl . -read /Groups/<g>`: `None` when the group is absent. The
+/// `GroupMembership` names, plus a `<…>` entry (never a user name) for
+/// each nested group, for `GroupMembers` GUIDs beyond the named members,
+/// and for a record that could not be read.
+pub fn group_members_from(res: io::Result<CmdOutput>) -> Option<Vec<String>> {
+    let out = match res {
+        Ok(out) => out,
+        Err(e) => return Some(vec![format!("<members unreadable: {e}>")]),
+    };
+    let stdout = out.stdout.clone();
+    match dscl_read_found(Ok(out)) {
+        Ok(false) => return None,
+        Err(e) => return Some(vec![format!("<members unreadable: {e}>")]),
+        Ok(true) => {}
+    }
+    let attrs = parse_dscl_attrs(&stdout);
+    let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
+    let mut members = get("GroupMembership");
+    let named = members.len();
+    let guids = get("GroupMembers").len();
+    for n in get("NestedGroups") {
+        members.push(format!("<nested group {n}>"));
+    }
+    if guids > named {
+        members.push(format!(
+            "<{} member(s) by GUID without a name>",
+            guids - named
+        ));
+    }
+    Some(members)
 }
 
 /// The ids of `dscl . -list /Users UniqueID` (or `/Groups PrimaryGroupID`):
@@ -613,7 +845,7 @@ pub fn parse_dscl_ids(out: &str) -> BTreeSet<u32> {
         .filter_map(|l| {
             let mut words = l.split_whitespace();
             let _name = words.next()?;
-            words.next_back()?.parse().ok()
+            digits_u32(words.next_back()?)
         })
         .collect()
 }
@@ -627,7 +859,7 @@ pub fn parse_dscl_search(out: &str, gid: u32) -> Vec<String> {
     let mut current: Option<&str> = None;
     let has_gid = |text: &str| {
         text.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-            .any(|w| w.parse::<u32>() == Ok(gid))
+            .any(|w| digits_u32(w) == Some(gid))
     };
     for line in out.lines() {
         let values = if line.starts_with(char::is_whitespace) || line.trim() == ")" {
@@ -656,15 +888,20 @@ pub fn parse_sw_vers(out: &str) -> io::Result<(u32, u32)> {
         )
     };
     let mut parts = out.trim().split('.');
-    let major = parts
-        .next()
-        .and_then(|m| m.parse::<u32>().ok())
-        .ok_or_else(bad)?;
+    let major = parts.next().and_then(digits_u32).ok_or_else(bad)?;
     let minor = match parts.next() {
         None => 0,
-        Some(m) => m.parse::<u32>().map_err(|_| bad())?,
+        Some(m) => digits_u32(m).ok_or_else(bad)?,
     };
     Ok((major, minor))
+}
+
+/// A plain decimal number: ASCII digits only (no sign, no space).
+fn digits_u32(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 fn dscl_set(record: &str, attr: &str, value: &str) -> Vec<String> {
@@ -753,13 +990,29 @@ fn exec(
     stdin: Option<&[u8]>,
     timeout: Duration,
 ) -> io::Result<CmdOutput> {
+    exec_with(program, args, stdin, timeout, &[])
+}
+
+/// [`exec`] with the variables `remove_env` taken out of the program's
+/// environment.
+fn exec_with(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    remove_env: &[&str],
+) -> io::Result<CmdOutput> {
     if !Path::new(program).is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{program}: programs run from an absolute path only"),
         ));
     }
-    let mut child = Command::new(program)
+    let mut cmd = Command::new(program);
+    for v in remove_env {
+        cmd.env_remove(v);
+    }
+    let mut child = cmd
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -776,8 +1029,15 @@ fn exec(
             k => io::Error::new(k, format!("{program}: {e}")),
         })?;
     if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // A failed write shows as the program's own error below.
-        let _ = pipe.write_all(bytes);
+        // Written from its own thread, so a program that does not read its
+        // input (or fills its output first) is still killed at the
+        // deadline below; the write then ends with a broken pipe. The copy
+        // is wiped when the thread ends: the input may be a secret.
+        let bytes = zeroize::Zeroizing::new(bytes.to_vec());
+        std::thread::spawn(move || {
+            // A failed write shows as the program's own error below.
+            let _ = pipe.write_all(&bytes);
+        });
     }
     // Each pipe is read on its own thread: the first OUTPUT_CAP bytes are
     // kept, the rest drained so the program never blocks on a full pipe.
@@ -1162,8 +1422,9 @@ impl Host for FakeHost {
         self.read().ok()?.group_id(name)
     }
 
-    fn users_with_primary_gid(&self, gid: u32) -> Vec<String> {
-        self.read()
+    fn users_with_primary_gid(&self, gid: u32) -> io::Result<Vec<String>> {
+        Ok(self
+            .read()
             .map(|s| {
                 s.users
                     .iter()
@@ -1171,7 +1432,7 @@ impl Host for FakeHost {
                     .map(|(n, _)| n.clone())
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     fn group_members(&self, name: &str) -> Option<Vec<String>> {
@@ -1882,8 +2143,8 @@ mod tests {
                 },
             );
         });
-        assert_eq!(h.users_with_primary_gid(990), ["alice"]);
-        assert!(h.users_with_primary_gid(991).is_empty());
+        assert_eq!(h.users_with_primary_gid(990).unwrap(), ["alice"]);
+        assert!(h.users_with_primary_gid(991).unwrap().is_empty());
     }
 
     // ------------------------------------------------------------ macOS
@@ -2143,5 +2404,273 @@ mod tests {
         let h = FakeHost::open(dir.path()).unwrap();
         assert_eq!(h.macos_version().unwrap(), (15, 0));
         assert_eq!(h.systemd_version().unwrap(), 250);
+    }
+
+    // ------------------------------------------------ fix round 1 (macOS)
+
+    fn out(status: i32, stdout: &str, stderr: &str) -> io::Result<CmdOutput> {
+        Ok(CmdOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    const NOT_FOUND: &str = "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)";
+
+    #[test]
+    fn primary_gid_users_fail_closed() {
+        let found = "alice\t\tPrimaryGroupID = (\n    250\n)\n";
+        assert_eq!(
+            primary_gid_users_from(out(0, found, ""), 250).unwrap(),
+            ["alice"]
+        );
+        assert!(primary_gid_users_from(out(0, "", ""), 250)
+            .unwrap()
+            .is_empty());
+        // A failed, timed-out or missing dscl is an error, never "no one".
+        assert!(primary_gid_users_from(out(1, found, "boom"), 250).is_err());
+        let timeout = Err(io::Error::new(io::ErrorKind::TimedOut, "slow"));
+        assert_eq!(
+            primary_gid_users_from(timeout, 250).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            argv_dscl_search_gid(250),
+            [DSCL, ".", "-search", "/Users", "PrimaryGroupID", "250"]
+        );
+    }
+
+    #[test]
+    fn dscl_read_found_is_three_way() {
+        assert!(dscl_read_found(out(0, "RecordName: _saiife\n", "")).unwrap());
+        assert!(!dscl_read_found(out(56, "", NOT_FOUND)).unwrap());
+        assert!(!dscl_read_found(out(56, "eDSRecordNotFound", "")).unwrap());
+        // Any other failure cannot tell: an error.
+        assert!(dscl_read_found(out(1, "", "eDSPermissionError")).is_err());
+        assert!(dscl_read_found(Err(io::Error::new(io::ErrorKind::TimedOut, "t"))).is_err());
+        assert_eq!(
+            argv_dscl_read("/Users/_saiife"),
+            [DSCL, ".", "-read", "/Users/_saiife"]
+        );
+    }
+
+    /// Runs [`create_account`] with a scripted runner: `answer` gives each
+    /// call's output by its argv. Returns the result, the calls made, and
+    /// whether the steps were asked for.
+    fn drive(
+        any_node: bool,
+        answer: impl Fn(&[String]) -> io::Result<CmdOutput>,
+    ) -> (io::Result<()>, Vec<String>, bool) {
+        let mut calls = Vec::new();
+        let mut asked = false;
+        let res = create_account(
+            "/Users/_saiife",
+            any_node,
+            &mut |argv: &[String]| {
+                calls.push(argv[1..].join(" "));
+                answer(argv)
+            },
+            || {
+                asked = true;
+                Ok(argv_dscl_user("_saiife", 250, 250))
+            },
+        );
+        (res, calls, asked)
+    }
+
+    fn is_read(argv: &[String]) -> bool {
+        argv.get(2).map(String::as_str) == Some("-read")
+    }
+
+    #[test]
+    fn existing_record_is_never_created_or_deleted() {
+        let (res, calls, asked) = drive(false, |_| out(0, "RecordName: _saiife\n", ""));
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, [". -read /Users/_saiife"]);
+        assert!(!asked, "no id is picked for an existing record");
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("-create") || c.contains("-delete")));
+    }
+
+    #[test]
+    fn unreadable_or_foreign_record_is_refused_before_any_create() {
+        // dscl -read failed in a way that is not "not found".
+        let (res, calls, asked) = drive(false, |_| out(1, "", "eDSPermissionError"));
+        assert!(res.is_err());
+        assert_eq!(calls, [". -read /Users/_saiife"]);
+        assert!(!asked);
+        // Not local, but the directory service resolves the name.
+        let (res, calls, asked) = drive(true, |_| out(56, "", NOT_FOUND));
+        let e = res.unwrap_err();
+        assert!(e.to_string().contains("other than the local one"), "{e}");
+        assert_eq!(calls, [". -read /Users/_saiife"]);
+        assert!(!asked);
+    }
+
+    #[test]
+    fn create_account_rolls_back_only_its_own_record() {
+        // All steps pass: read, then the eight creates, no delete.
+        let (res, calls, asked) = drive(false, |a| {
+            if is_read(a) {
+                out(56, "", NOT_FOUND)
+            } else {
+                out(0, "", "")
+            }
+        });
+        res.unwrap();
+        assert!(asked);
+        assert_eq!(calls.len(), 1 + 8);
+        assert!(!calls.iter().any(|c| c.contains("-delete")));
+        // The record was made, then a later step failed: deleted again.
+        let (res, calls, _) = drive(false, |a| {
+            if is_read(a) {
+                out(56, "", NOT_FOUND)
+            } else if a.iter().any(|w| w == "UserShell") {
+                out(1, "", "boom")
+            } else {
+                out(0, "", "")
+            }
+        });
+        assert!(res.is_err());
+        assert_eq!(calls.last().unwrap(), ". -delete /Users/_saiife");
+        // The first create failed: nothing of ours to delete.
+        let (res, calls, _) = drive(false, |a| {
+            if is_read(a) {
+                out(56, "", NOT_FOUND)
+            } else {
+                out(1, "", "boom")
+            }
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            calls,
+            [". -read /Users/_saiife", ". -create /Users/_saiife"]
+        );
+    }
+
+    #[test]
+    fn id_lists_need_root_and_wheel() {
+        check_id_anchors(&ids([0, 250]), &ids([0, 20])).unwrap();
+        for (u, g) in [
+            (ids([]), ids([])),
+            (ids([250]), ids([0])),
+            (ids([0]), ids([20])),
+        ] {
+            let e = check_id_anchors(&u, &g).unwrap_err();
+            assert!(
+                e.to_string().contains("could not read the local uids/gids"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_taken_on_other_nodes_are_skipped() {
+        let elsewhere = |id: u32| id == 200 || id == 201;
+        assert_eq!(
+            pick_free_id_avoiding(&ids([]), &ids([202]), &elsewhere),
+            Some(203)
+        );
+        assert_eq!(pick_free_id_avoiding(&ids([]), &ids([]), &|_| true), None);
+        // The group's gid is not reused as uid when another node has it.
+        assert_eq!(
+            pick_user_id_avoiding(201, &ids([0]), &ids([0, 201]), &elsewhere),
+            Some(202)
+        );
+        assert_eq!(
+            pick_user_id_avoiding(205, &ids([0]), &ids([0, 205]), &elsewhere),
+            Some(205)
+        );
+    }
+
+    #[test]
+    fn group_members_flag_nested_and_guid_members() {
+        let plain = "GroupMembership: _saiife alice\nGroupMembers: A-1 B-2\nPrimaryGroupID: 251\nRecordName: _saiifeaudit\n";
+        assert_eq!(
+            group_members_from(out(0, plain, "")).unwrap(),
+            ["_saiife", "alice"]
+        );
+        let nested =
+            "GroupMembership: _saiife\nGroupMembers: A-1\nNestedGroups: ABCD-EF\nRecordName: g\n";
+        let m = group_members_from(out(0, nested, "")).unwrap();
+        assert_eq!(m, ["_saiife", "<nested group ABCD-EF>"]);
+        let guid_only = "GroupMembership: _saiife\nGroupMembers:\n A-1\n B-2\n C-3\n";
+        let m = group_members_from(out(0, guid_only, "")).unwrap();
+        assert_eq!(m, ["_saiife", "<2 member(s) by GUID without a name>"]);
+        // None of the markers can be a user name.
+        assert!(m.iter().skip(1).all(|n| !valid_name(n)));
+        // Absent group; unreadable record (refused by "no other members").
+        assert_eq!(group_members_from(out(56, "", NOT_FOUND)), None);
+        let m = group_members_from(out(1, "", "eDSPermissionError")).unwrap();
+        assert!(
+            m.len() == 1 && m[0].starts_with("<members unreadable"),
+            "{m:?}"
+        );
+        let m = group_members_from(Err(io::Error::new(io::ErrorKind::TimedOut, "t"))).unwrap();
+        assert!(m[0].starts_with("<members unreadable"));
+        // No members at all.
+        assert_eq!(
+            group_members_from(out(0, "RecordName: g\n", "")).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn dscl_attrs_parse() {
+        let a = parse_dscl_attrs(
+            "dsAttrTypeNative:foo: x\nGroupMembership: a b\nRealName:\n saiife audit\nbare line\n",
+        );
+        assert_eq!(a["GroupMembership"], ["a", "b"]);
+        assert_eq!(a["RealName"], ["saiife", "audit"]);
+        assert_eq!(a["dsAttrTypeNative:foo"], ["x"]);
+        assert!(!a.contains_key("bare line"));
+    }
+
+    #[test]
+    fn version_and_id_parts_are_plain_digits() {
+        for bad in ["+15.0", "15.+1", " 15.0x", "15. 1", "１５.0"] {
+            assert!(parse_sw_vers(bad).is_err(), "{bad}");
+        }
+        assert_eq!(super::parse_dscl_ids("a +5\nb 7\n"), ids([7]));
+        assert!(parse_dscl_search("a PrimaryGroupID = +20\n", 20).is_empty());
+    }
+
+    #[test]
+    fn real_run_input_large_input_meets_the_deadline() {
+        // A program that never reads 1 MiB of input is still killed at the
+        // deadline (the write is on its own thread).
+        let big = vec![b'x'; 1 << 20];
+        let start = std::time::Instant::now();
+        let e = RealHost
+            .run_input(
+                "/bin/sh",
+                &["-c", "sleep 5"],
+                &big,
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        // One that echoes it does not deadlock on its full output pipe.
+        let out = RealHost
+            .run_input("/bin/cat", &[], &big, Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.stdout.len(), OUTPUT_CAP);
+    }
+
+    #[test]
+    fn exec_with_removes_variables() {
+        // env(1) prints its environment as given (a shell would add PATH).
+        let env = |remove: &[&str]| {
+            exec_with("/usr/bin/env", &[], None, Duration::from_secs(5), remove)
+                .unwrap()
+                .stdout
+        };
+        let has_path = |s: &str| s.lines().any(|l| l.starts_with("PATH="));
+        assert!(has_path(&env(&[])), "the test runs with PATH set");
+        assert!(!has_path(&env(&["PATH"])));
     }
 }
