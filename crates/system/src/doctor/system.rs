@@ -57,6 +57,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.push(daemon_unit(ctx));
     out.push(daemon_health(ctx));
     if let Some(i) = &ctx.installed {
+        if i.agents.is_empty() {
+            out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
+        }
         out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
     }
     if let Ok(p) = &ctx.config {
@@ -1760,6 +1763,19 @@ mod tests {
         put_package(&t, &fs::read(t.at(BINARY)).unwrap());
         fs::remove_file(t.at(INSTALLED)).unwrap();
         assert!(!t.doctor().checks.iter().any(|c| c.id == "files.package"));
+    }
+
+    #[test]
+    fn no_agents_warns() {
+        let t = T::installed();
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "agents"));
+        t.edit_installed(|i| i.agents.clear());
+        let r = t.doctor();
+        assert_status(&r, "agents", Status::Warn);
+        assert_eq!(
+            get(&r, "agents").detail,
+            "no agents listed: no agent is guarded"
+        );
     }
 
     #[test]

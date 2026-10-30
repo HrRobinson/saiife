@@ -227,6 +227,36 @@ fn fleet_install_under_root_flag() {
     assert!(!p("etc/gemini-cli").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn fleet_with_no_agents_warns() {
+    let root = fake_root();
+    let p = |rel: &str| root.path().join(rel);
+    let fleet = p("etc/saiife/fleet");
+    fs::create_dir_all(&fleet).unwrap();
+    for d in ["etc", "etc/saiife", "etc/saiife/fleet"] {
+        fs::set_permissions(p(d), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::write(fleet.join("install.toml"), "agents = []\n").unwrap();
+    fs::set_permissions(
+        fleet.join("install.toml"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    saiife()
+        .args(["system", "install", "--fleet", "--root"])
+        .arg(root.path())
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "saiife: warning: no agents listed: no agent is guarded",
+        ))
+        .stdout(contains("WARN  agents  "));
+    assert!(!p("etc/claude-code").exists());
+    assert!(!p("etc/codex").exists());
+    assert!(!p("etc/gemini-cli").exists());
+}
+
 #[test]
 fn fleet_conflicts_with_config() {
     let root = fake_root();

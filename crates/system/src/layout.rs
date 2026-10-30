@@ -26,6 +26,8 @@ pub const POLKIT_ACTION_ID: &str = "com.saiife.approve";
 pub const REAUTH_UNAVAILABLE: &str =
     "re-authentication unavailable: approvals need a second account";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
+/// The warning when an install lists no agents (install and doctor).
+pub const NO_AGENTS: &str = "no agents listed: no agent is guarded";
 /// Root-owned install options for packages and MDM tools (`system install
 /// --fleet`, plan 18 decision 2).
 pub const FLEET_DIR: &str = "/etc/saiife/fleet";

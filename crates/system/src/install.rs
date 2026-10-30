@@ -218,6 +218,9 @@ pub fn install(
     let mut agents = opts.agents.clone();
     agents.sort();
     agents.dedup();
+    if agents.is_empty() {
+        run.report.warnings.push(NO_AGENTS.to_string());
+    }
     let claude = agents.contains(&Agent::Claude);
     for a in agents {
         run.managed(a)?;
@@ -1624,6 +1627,26 @@ pub(crate) mod tests {
         let mut o = all_agents();
         o.config = Some(p);
         o
+    }
+
+    #[test]
+    fn no_agents_warns() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = Vec::new();
+        let r = e.run(&o).unwrap();
+        assert!(
+            r.warnings.contains(&NO_AGENTS.to_string()),
+            "{:?}",
+            r.warnings
+        );
+        assert!(!e.at(CLAUDE_MANAGED).exists());
+        let r = e.install();
+        assert!(
+            !r.warnings.contains(&NO_AGENTS.to_string()),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]

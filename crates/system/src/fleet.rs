@@ -94,25 +94,22 @@ fn parse_install(bytes: &[u8]) -> Result<FleetInstall, InstallError> {
     toml::from_str(text).map_err(|e| refused(p, e.message().to_string()))
 }
 
-/// The agents an earlier install recorded; `None` without a record or
-/// with an empty list.
+/// The agents an earlier install recorded (an empty list stays empty);
+/// `None` without a record.
 fn recorded_agents(layout: &Layout) -> Result<Option<Vec<Agent>>, InstallError> {
     let rec =
         read_installed(&layout.at(INSTALLED)).map_err(|e| refused(Path::new(INSTALLED), e))?;
-    let agents: Vec<Agent> = rec
-        .map(|i| {
-            i.agents
-                .iter()
-                .filter_map(|a| Agent::from_name(&a.agent))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok((!agents.is_empty()).then_some(agents))
+    Ok(rec.map(|i| {
+        i.agents
+            .iter()
+            .filter_map(|a| Agent::from_name(&a.agent))
+            .collect()
+    }))
 }
 
 /// Walks every dir down to [`FLEET_DIR`]: each must be a directory (not a
-/// symlink) of root's, not writable by group or others. False when one is
-/// missing (no fleet files).
+/// symlink) of root's, not writable by group or others; a sticky bit does
+/// not excuse a writable one. False when one is missing (no fleet files).
 fn fleet_dir_present(
     layout: &Layout,
     host: &dyn Host,
@@ -135,7 +132,7 @@ fn fleet_dir_present(
         check_owner_mode_for(
             &logical,
             host.owner_uid(&p, m.uid()),
-            m.mode() & 0o7777,
+            m.mode() & 0o777,
             root_uid,
             "saiife does not read fleet files below it",
         )?;
@@ -299,6 +296,31 @@ mod tests {
         fs::set_permissions(e.at(FLEET_DIR), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(e.at(ETC_DIR), fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(refusal(&e).0, Path::new("/etc/saiife"));
+    }
+
+    #[test]
+    fn fleet_dir_sticky_world_writable_refused() {
+        let e = env(255);
+        put(&e, FLEET_CONFIG, CONFIG_TEXT.as_bytes());
+        fs::set_permissions(e.at(FLEET_DIR), fs::Permissions::from_mode(0o1777)).unwrap();
+        let (path, detail) = refusal(&e);
+        assert_eq!(path, Path::new(FLEET_DIR));
+        assert!(detail.contains("writable by group or others"), "{detail}");
+    }
+
+    #[test]
+    fn fleet_keeps_an_empty_agents_record() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = Vec::new();
+        e.run(&o).unwrap();
+        assert!(e.installed().agents.is_empty());
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert!(opts.agents.is_empty(), "{:?}", opts.agents);
+        // With install.toml listing agents, those win.
+        put(&e, FLEET_INSTALL, b"agents = [\"gemini\"]\n");
+        let opts = fleet_options(&e.layout, &e.host).unwrap();
+        assert_eq!(opts.agents, [Agent::Gemini]);
     }
 
     #[test]
