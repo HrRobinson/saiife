@@ -72,11 +72,39 @@ reason = "an agent may not change the authorization rights in locked mode; saiif
 [[deny]]
 # `security -i` (or `-p <prompt>`, which implies it) reads its commands
 # from stdin (`echo … | security -i`, `security -i < f`), out of the
-# guard's sight. Only the global option words before the command count.
+# guard's sight. Only the global option words before the command count;
+# any such word holding an `i` or a `p` counts, attached values included
+# (`-ix`, `-qip`, `-pPROMPT`), since security reads them with getopt.
+# (The pack format's `when_option` permutes like GNU getopt, which would
+# also see the command's own `-i`/`-p`, so this stays a regex.)
 id = "security-interactive"
-pattern = '(?i)^security\s+(?:-[a-z]+\s+)*-[a-z]*[ip][a-z]*(?:\s|$)'
+pattern = '(?i)^security\s+(?:-\S+\s+)*-\S*[ip]'
 reason = "interactive security reads commands the guard cannot see; run each command on its own"
 no_redirections = true
+
+[[deny]]
+# With no command after its options, security is interactive too: it reads
+# commands from stdin (`cat cmds | security`, `security -q < f`, and
+# `xargs security`, whose arguments the guard cannot see).
+id = "security-no-command"
+pattern = '(?i)^security(?:\s+-\S*)*\s*$'
+reason = "security without a command reads commands the guard cannot see; run each command on its own"
+no_redirections = true
+
+[[deny]]
+# The command word, or the verb after `authorizationdb`, known only when
+# the command runs: a parameter expansion (`$S write`, `authorizationdb
+# "${A}"`), a command substitution or a glob. Fails closed.
+id = "security-unknown-command"
+pattern = '(?i)^security\s+(?:-\S+\s+)*(?:\S*[$`*?\[]|authorizationdb\s+\S*[$`*?\[])'
+reason = "the security command here is not known until it runs; an agent may not change the authorization rights in locked mode"
+
+[[deny]]
+# `xargs` hands these commands arguments the guard cannot see.
+id = "xargs-security-accounts"
+pattern = '(?i)(?:^|\s)xargs(?:\s.*)?\s(?:\S*/)?(?:security|dscl|dseditgroup)(?:\s|$)'
+reason = "xargs would hand this command arguments the guard cannot see; run it with its arguments written out"
+whole_segment = true
 
 [[deny]]
 # `_saiife` runs saiifed and `_saiifeaudit` reads the audit log: adding a
@@ -95,6 +123,8 @@ id = "saiife-accounts-pattern"
 pattern = '(?i)^(?:dseditgroup|dscl)\s'
 reason = "this operand may name saiife's accounts or groups; an agent may not change them in locked mode"
 operand_match = "glob"
+# `$(…)`, `$((…))` and backticks: the output is not known either.
+operand_substitution = true
 # Every name under every record path dscl takes.
 operand_targets = [
     "_saiife", "_saiifeaudit",

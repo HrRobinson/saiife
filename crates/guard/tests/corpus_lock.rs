@@ -958,11 +958,93 @@ fn macos_rights_and_saiife_accounts_are_denied() {
     ] {
         assert_eq!(rule(cmd).as_deref(), Some("dscl-interactive"), "{cmd}");
     }
+    // Review fix round 2: attached option values, unknown words, no
+    // command, xargs and command substitution.
+    for cmd in [
+        "security -ix",
+        "security -ifoo",
+        "security -qip",
+        "security -p'x'",
+        "security -pX",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("security-interactive"), "{cmd}");
+    }
+    for cmd in [
+        "security",
+        "security -v",
+        "cat cmds | security",
+        "security < f",
+        "security -q < f",
+        "echo x | security -q",
+        "echo authorizationdb | xargs security",
+        "xargs security < args.txt",
+        "xargs -a f security",
+    ] {
+        assert_eq!(rule(cmd).as_deref(), Some("security-no-command"), "{cmd}");
+    }
+    for cmd in [
+        "S=authorizationdb; security $S write com.saiife.approve allow",
+        "A=write; security authorizationdb $A com.saiife.approve allow",
+        "security authorizationdb \"$A\" com.saiife.approve allow",
+        "security authorizationdb ${A} com.saiife.approve allow",
+        "security ${S} write com.saiife.approve allow",
+        "security -q $S write com.saiife.approve allow",
+        "security $(cat f) write com.saiife.approve allow",
+        "security `cat f` write com.saiife.approve allow",
+        "security auth* write com.saiife.approve allow",
+    ] {
+        assert_eq!(
+            rule(cmd).as_deref(),
+            Some("security-unknown-command"),
+            "{cmd}"
+        );
+    }
+    for cmd in [
+        "xargs dseditgroup -o edit -a agent -t user",
+        "xargs -n1 dscl . -append /Groups/staff GroupMembership",
+        "find . -name x | xargs -I{} security {}",
+    ] {
+        assert_eq!(
+            rule(cmd).as_deref(),
+            Some("xargs-security-accounts"),
+            "{cmd}"
+        );
+    }
+    // A substitution's output is unknown: denied whichever rule sees it
+    // first (the literal one when the text names the account).
+    for cmd in [
+        "dscl . -append /Groups/$(echo _saiifeaudit) GroupMembership agent",
+        "dscl . -append /Groups/`echo _saiifeaudit` GroupMembership agent",
+        "dscl . -delete /Groups/_saiife$((1))audit",
+        "security $(echo authorizationdb) write x allow",
+        "security authorizationdb `echo write` x allow",
+    ] {
+        assert!(e.evaluate(cmd).is_deny(), "{cmd}: {:?}", e.evaluate(cmd));
+    }
+    for cmd in [
+        "dscl . -append \"/Groups/$(cat g)\" GroupMembership agent",
+        "dseditgroup -o edit -a agent -t user \"$(cat g)\"",
+        "dseditgroup -o edit -a agent -t user `cat g`",
+        "dscl . -delete /Groups/$((1))",
+        "dscl . -append /Groups/${G} GroupMembership agent",
+    ] {
+        assert_eq!(
+            rule(cmd).as_deref(),
+            Some("saiife-accounts-pattern"),
+            "{cmd}"
+        );
+    }
     for cmd in [
         "security find-generic-password -s x",
         "security -q find-generic-password -s x",
+        "security find-generic-password -w -s \"$SVC\"",
+        "security find-identity -v -p codesigning",
+        "security authorizationdb read \"$R\"",
         "security list-keychains",
-        "security -h",
+        "security help",
+        "xargs rm -f < list.txt",
+        "xargs grep -l foo",
+        "echo security",
         "security authorizationdb read com.saiife.approve",
         "security authorizationdb writer",
         "dscl . -read /Users/agent",
