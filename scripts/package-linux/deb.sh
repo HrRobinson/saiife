@@ -321,11 +321,14 @@ phase_remove() {
         show_file "$WORK/p18-t3-remove.err"
         fail "apt-get remove exited $rc"
     fi
-    grep -qxF "$REMOVAL_LINE" "$WORK/p18-t3-remove.err" || {
+    # prerm writes the warning to its stderr; apt-get relays maintainer
+    # script output on its own stdout, so look in both streams.
+    grep -qxF "$REMOVAL_LINE" "$WORK/p18-t3-remove.err" "$WORK/p18-t3-remove.out" || {
+        show_file "$WORK/p18-t3-remove.out"
         show_file "$WORK/p18-t3-remove.err"
-        fail "stderr lacks the removal warning"
+        fail "apt-get output lacks the removal warning"
     }
-    ok "stderr has the removal warning"
+    ok "apt-get output has the removal warning"
     # shellcheck disable=SC2329 # called by wait_until (lib.sh) by name
     journal_has_line() {
         local j
