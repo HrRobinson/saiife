@@ -55,7 +55,7 @@ check_runtime() {
   echo "+ codesign -d --verbose=4 $bin 2>&1 | grep runtime${authority:+, Authority=$authority}"
   if [ -z "$dry" ]; then
     info="$(codesign -d --verbose=4 "$bin" 2>&1)"
-    grep -q 'runtime' <<<"$info" || die "$bin was not signed with the hardened runtime"
+    grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$info" || die "$bin was not signed with the hardened runtime"
     if [ -n "$authority" ]; then
       grep -q "Authority=$authority" <<<"$info" || die "$bin is not signed by $authority"
     fi
@@ -103,9 +103,25 @@ main() {
   else
     kcpw="$(openssl rand -hex 24)"
   fi
+  # Save the user keychain search list we are about to replace, and put back
+  # exactly that in the trap. Do not assume login.keychain-db exists.
+  oldkcs=()
+  if [ -z "$dry" ]; then
+    while IFS= read -r line; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line#\"}"
+      line="${line%\"}"
+      if [ -n "$line" ]; then oldkcs+=("$line"); fi
+    done < <(security list-keychains -d user)
+  else
+    echo "+ security list-keychains -d user   (saved; the trap restores it)"
+  fi
   # shellcheck disable=SC2329 # invoked by the EXIT trap
   cleanup() {
     if [ -z "$dry" ]; then
+      if [ "${#oldkcs[@]}" -gt 0 ]; then
+        security list-keychains -d user -s "${oldkcs[@]}" >/dev/null 2>&1 || true
+      fi
       security delete-keychain "$kc" >/dev/null 2>&1 || true
       rm -f "$p12" "$zip"
     fi
@@ -113,6 +129,11 @@ main() {
   trap cleanup EXIT
   echo "+ trap: security delete-keychain $kc"
 
+  # Trade-off: the random per-run keychain password, the p12 password and the
+  # notary password travel on argv (unlock-keychain -p, import -P, notarytool
+  # --password). security has no stdin/file option, and notarytool
+  # store-credentials only prompts or takes --password too. Accepted: the
+  # runner is ephemeral and single-job, and the secrets are set on tag pushes only.
   step "security create-keychain -p <random> $kc" security create-keychain -p "$kcpw" "$kc"
   step "security set-keychain-settings -lut 3600 $kc" security set-keychain-settings -lut 3600 "$kc"
   step "security unlock-keychain -p <random> $kc" security unlock-keychain -p "$kcpw" "$kc"
@@ -124,8 +145,8 @@ main() {
     security import "$p12" -k "$kc" -P "$MACOS_SIGN_P12_PASSWORD" -T /usr/bin/codesign
   step "security set-key-partition-list -S apple-tool:,apple: -s -k <random> $kc" \
     security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$kc"
-  step "security list-keychains -d user -s $kc login.keychain-db" \
-    security list-keychains -d user -s "$kc" login.keychain-db
+  step "security list-keychains -d user -s $kc <saved list>" \
+    security list-keychains -d user -s "$kc" ${oldkcs[@]+"${oldkcs[@]}"}
 
   step "codesign --force --options runtime --timestamp --sign \$MACOS_SIGN_IDENTITY $bin" \
     codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$bin"
@@ -140,7 +161,7 @@ main() {
       --password "$APPLE_NOTARY_PASSWORD" --wait --output-format json)" \
       || { echo "$result"; die "notarytool submit failed"; }
     echo "$result"
-    status="$(grep -o '"status" *: *"[^"]*"' <<<"$result" | head -n1 | sed 's/.*: *"\(.*\)"/\1/')"
+    status="$(grep -o '"status" *: *"[^"]*"' <<<"$result" | head -n1 | sed 's/.*: *"\(.*\)"/\1/' || true)"
     [ "$status" = Accepted ] || die "notarization status is '${status:-unknown}', expected Accepted"
   fi
   echo "notarized: $bin"

@@ -77,5 +77,58 @@ rc=0
 (cd "$work" && env -i PATH="$PATH" GITHUB_ACTIONS=true bash "$script" >/dev/null 2>&1) || rc=$?
 [ "$rc" -ne 0 ] || check "no-argument run succeeded"
 
+# Non-dry path against stubs: the notarytool status gate.
+mkdir "$work/fake"
+cat > "$work/fake/security" <<'STUB'
+#!/bin/sh
+if [ "$1" = list-keychains ] && [ "$2" = -d ] && [ "$#" -eq 3 ]; then
+  echo '    "/Users/runner/Library/Keychains/login.keychain-db"'
+fi
+exit 0
+STUB
+cat > "$work/fake/codesign" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -d) echo "CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+2" >&2
+      echo "Authority=Developer ID Application: Test (TEAMID1234)" >&2 ;;
+esac
+exit 0
+STUB
+cat > "$work/fake/ditto" <<'STUB'
+#!/bin/sh
+for last; do :; done
+: > "$last"
+STUB
+cat > "$work/fake/xcrun" <<'STUB'
+#!/bin/sh
+case "$STUB_NOTARY" in
+  accepted) echo '{"id":"x","status":"Accepted"}' ;;
+  invalid) echo '{"id":"x","status":"Invalid"}' ;;
+  *) echo 'this is not json' ;;
+esac
+STUB
+chmod +x "$work/fake/security" "$work/fake/codesign" "$work/fake/ditto" "$work/fake/xcrun"
+: > "$work/fake/saiife"
+
+run_real() {
+  rm -rf "$work/real"
+  mkdir -p "$work/real/tmp"
+  (cd "$work/real" && env -i HOME="$work" PATH="$work/fake:$PATH" GITHUB_ACTIONS=true \
+    RUNNER_TEMP="$work/real/tmp" STUB_NOTARY="$1" \
+    MACOS_SIGN_P12_BASE64=aGVsbG8= MACOS_SIGN_P12_PASSWORD=p MACOS_SIGN_IDENTITY=i \
+    APPLE_TEAM_ID=t APPLE_NOTARY_APPLE_ID=a APPLE_NOTARY_PASSWORD=n \
+    bash "$script" "$work/fake/saiife" aarch64-apple-darwin)
+}
+
+rc=0
+out="$(run_real accepted 2>&1)" || rc=$?
+[ "$rc" -eq 0 ] || check "notary Accepted failed: rc=$rc $out"
+rc=0
+out="$(run_real invalid 2>&1)" || rc=$?
+{ [ "$rc" -ne 0 ] && grep -q "expected Accepted" <<<"$out"; } || check "notary Invalid did not fail: rc=$rc $out"
+rc=0
+out="$(run_real garbage 2>&1)" || rc=$?
+{ [ "$rc" -ne 0 ] && grep -q "'unknown'" <<<"$out"; } || check "notary garbage did not fail as unknown: rc=$rc $out"
+
 if [ "$fail" -ne 0 ]; then exit 1; fi
 echo "test-macos-sign: ok"

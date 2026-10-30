@@ -126,13 +126,16 @@ jobs:
       - name: sign (macOS)
         if: runner.os == 'macOS'
         shell: bash
+        # Secrets exist only on v* tag pushes: PRs and branch runs (same-repo
+        # included) get empty strings, see "none" and take the ad-hoc path.
+        # All six use the same gate, so it can never yield a partial set.
         env:
-          MACOS_SIGN_P12_BASE64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
-          MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
-          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          MACOS_SIGN_P12_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_BASE64 || '' }}
+          MACOS_SIGN_P12_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_PASSWORD || '' }}
+          MACOS_SIGN_IDENTITY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_IDENTITY || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_NOTARY_APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_APPLE_ID || '' }}
+          APPLE_NOTARY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_PASSWORD || '' }}
         run: bash scripts/release/macos-sign.sh "target/$TARGET/release/saiife" "$TARGET"
       - name: saiife --version
         if: matrix.run
