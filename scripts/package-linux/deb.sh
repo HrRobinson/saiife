@@ -125,9 +125,16 @@ phase_refusal() {
         fail "the refusal does not name $FLEET_DIR"
     }
     ok "install refused, naming $FLEET_DIR (exit $RC)"
-    dpkg -s saiife 2>/dev/null | grep -q '^Status: install ok half-configured' ||
-        fail "dpkg -s saiife is not half-configured: $(dpkg -s saiife 2>&1 | grep '^Status' || true)"
+    local dstat
+    dstat="$(dpkg -s saiife 2>&1 || true)"
+    grep -F 'Status: install ok half-configured' >/dev/null <<<"$dstat" ||
+        fail "dpkg -s saiife is not half-configured: $(grep '^Status' <<<"$dstat" || true)"
     ok "the package is half-configured"
+    local p
+    for p in /opt/saiife "$INSTALLED_TOML" /etc/systemd/system/saiifed.service; do
+        if sudo -n test -e "$p"; then fail "the refused install left $p behind"; fi
+    done
+    ok "the refusal left no /opt/saiife, installed.toml or unit"
     sudo -n chmod 0755 "$FLEET_DIR"
     run_logged "$WORK/p18-t3-configure.out" sudo -n env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
     if [[ "$RC" != 0 ]]; then
@@ -182,7 +189,7 @@ phase_fresh() {
 phase_config_change() {
     phase "config-change: a pushed fleet config reloads the running daemon"
     installed_is_current || fail "config-change needs the package installed (run the fresh phase)"
-    local pid before after since
+    local pid before after cursor
     pid="$(daemon_pid)"
     [[ "$pid" != 0 ]] || fail "saiifed has no MainPID"
     before="$(sudo -n /usr/bin/saiife policy show | grep -E '^policy: ' || true)"
@@ -193,7 +200,8 @@ phase_config_change() {
     } >"$WORK/p18-t3-fleet-new.toml"
     cmp -s "$WORK/p18-t3-fleet-new.toml" "$HERE/fleet-config.toml" && fail "the edited fleet config is unchanged"
     sudo -n install -m 0644 -o root -g root "$WORK/p18-t3-fleet-new.toml" "$FLEET_DIR/config.toml"
-    since="$(date '+%Y-%m-%d %H:%M:%S')"
+    cursor="$(sudo -n journalctl -u saiifed -n 1 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')"
+    [[ -n "$cursor" ]] || fail "cannot read a journal cursor for saiifed"
     run_logged "$WORK/p18-t3-config-change.out" sudo -n "$PKG_BIN" system install --fleet
     if [[ "$RC" -gt 1 ]]; then
         show_file "$WORK/p18-t3-config-change.out"
@@ -210,10 +218,10 @@ phase_config_change() {
     wait_until 30 "policy show to print the new hash" config_reloaded
     ok "policy show: $before -> $after"
     local jrn
-    jrn="$(sudo -n journalctl -u saiifed --no-pager --since "$since" 2>&1 || true)"
-    grep -qi reload <<<"$jrn" || {
+    jrn="$(sudo -n journalctl -u saiifed --no-pager --after-cursor "$cursor" 2>&1 || true)"
+    grep -i reload >/dev/null <<<"$jrn" || {
         echo "$jrn"
-        fail "the journal shows no reload of saiifed since $since"
+        fail "the journal shows no reload of saiifed after the cursor"
     }
     ok "the journal shows the reload"
     [[ "$(daemon_pid)" == "$pid" ]] || fail "the daemon restarted during the reload"
@@ -227,8 +235,39 @@ phase_upgrade() {
     starts="$(start_count)"
     managed="$(managed_state)"
     new_sha="$(deb_member_sha "$NEW" ./usr/libexec/saiife/saiife)"
+    # A root watcher: no hook file or /opt binary may be missing at any
+    # moment of the upgrade (the managed files are never removed).
+    local stop="$WORK/p18-t3-watch-stop" seen="$WORK/p18-t3-watch-missing" up="$WORK/p18-t3-watch-up" watcher
+    rm -f "$stop" "$seen" "$up"
+    cat >"$WORK/p18-t3-watch.sh" <<'WATCH'
+stop=$1 seen=$2 up=$3
+shift 3
+: >"$seen"
+: >"$up"
+while [ ! -e "$stop" ]; do
+    for f in "$@"; do
+        [ -e "$f" ] || echo "$f" >>"$seen"
+    done
+    sleep 0.02
+done
+for f in "$@"; do
+    [ -e "$f" ] || echo "$f" >>"$seen"
+done
+WATCH
+    sudo -n sh "$WORK/p18-t3-watch.sh" "$stop" "$seen" "$up" "$CLAUDE_MANAGED" "$CODEX_MANAGED" /opt/saiife/bin/saiife &
+    watcher=$!
+    wait_until 10 "the upgrade watcher to start" test -e "$up"
     run_logged "$WORK/p18-t3-upgrade.out" apt_run install -y "$NEW"
-    if [[ "$RC" != 0 ]]; then
+    local install_rc="$RC"
+    sleep 3
+    : >"$stop"
+    wait "$watcher" || true
+    if [[ -s "$seen" ]]; then
+        sort -u "$seen"
+        fail "files were missing during the upgrade (listed above)"
+    fi
+    ok "no hook file or /opt binary was missing at any point"
+    if [[ "$install_rc" != 0 ]]; then
         show_file "$WORK/p18-t3-upgrade.out"
         fail "apt-get install of the new deb failed"
     fi
@@ -238,6 +277,8 @@ phase_upgrade() {
         now="$(daemon_pid)"
         [[ "$now" != "$pid" ]] || fail "MainPID is still $pid after the upgrade"
         ok "MainPID changed ($pid -> $now)"
+        [[ "$(start_count)" == "$((starts + 1))" ]] || fail "the daemon started $(($(start_count) - starts)) times during the upgrade, want exactly 1"
+        ok "restarted exactly once"
         [[ "$(root_sha /opt/saiife/bin/saiife)" == "$new_sha" ]] || fail "/opt/saiife/bin/saiife is not the new binary ($new_sha)"
         [[ "$(installed_sha /opt/saiife/bin/saiife)" == "$new_sha" ]] || fail "installed.toml does not record the new binary"
         ok "the /opt binary and installed.toml carry the new binary"
@@ -272,7 +313,11 @@ phase_remove() {
         fail "stderr lacks the removal warning"
     }
     ok "stderr has the removal warning"
-    journal_has_line() { sudo -n journalctl -t saiife --no-pager 2>/dev/null | grep -qF "$REMOVAL_LINE"; }
+    journal_has_line() {
+        local j
+        j="$(sudo -n journalctl -t saiife --no-pager 2>/dev/null || true)"
+        grep -F "$REMOVAL_LINE" >/dev/null <<<"$j"
+    }
     wait_until 20 "the removal warning in the journal (journalctl -t saiife)" journal_has_line
     ok "the journal has the removal warning"
 
