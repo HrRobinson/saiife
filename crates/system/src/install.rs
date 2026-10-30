@@ -86,7 +86,7 @@ fn agent_step(name: &str) -> impl Fn(AgentError) -> InstallError + '_ {
     }
 }
 
-fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
+pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
     InstallError::Refused {
         path: path.to_path_buf(),
         detail: detail.into(),
@@ -207,7 +207,7 @@ pub fn install(
     // 4. The binary.
     let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
-    run.config(new_config.as_deref(), &opts.approvers)?;
+    let config_changed = run.config(new_config.as_deref(), &opts.approvers)?;
     // 5b. The polkit action, when polkit is there.
     run.polkit()?;
     // 6. The vault key.
@@ -229,8 +229,12 @@ pub fn install(
     }
     run.save()?;
     // 9. Start (or restart) the daemon.
-    // A running daemon picks up a new group membership only at start.
-    run.start(binary_changed || unit_changed || member_added)?;
+    // A running daemon picks up a new group membership only at start. A
+    // new config.toml alone is a reload (SIGHUP, the unit's ExecReload).
+    run.start(
+        binary_changed || unit_changed || member_added,
+        config_changed,
+    )?;
     // 10. Wait for the socket on the real machine.
     if layout.is_system() {
         let sock = layout.at(SOCKET);
@@ -447,18 +451,28 @@ pub(crate) fn check_trusted_owner_mode(
     mode: u32,
     root_uid: u32,
 ) -> Result<(), InstallError> {
+    check_owner_mode_for(p, uid, mode, root_uid, "saiife does not write below it")
+}
+
+/// [`check_trusted_owner_mode`] with the consequence the refusal names
+/// (`saiife does not ...`).
+pub(crate) fn check_owner_mode_for(
+    p: &Path,
+    uid: u32,
+    mode: u32,
+    root_uid: u32,
+    consequence: &str,
+) -> Result<(), InstallError> {
     if uid != root_uid {
         return Err(refused(
             p,
-            format!("exists and is owned by uid {uid}, not root; saiife does not write below it"),
+            format!("exists and is owned by uid {uid}, not root; {consequence}"),
         ));
     }
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Err(refused(
             p,
-            format!(
-                "mode {mode:04o} is writable by group or others; saiife does not write below it"
-            ),
+            format!("mode {mode:04o} is writable by group or others; {consequence}"),
         ));
     }
     Ok(())
@@ -762,7 +776,8 @@ impl Run<'_> {
         self.file(BINARY, bytes, 0o755, FileKind::Binary, "binary")
     }
 
-    fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<(), InstallError> {
+    /// True when config.toml was written.
+    fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<bool, InstallError> {
         self.dir(ETC_DIR, 0o755, true)?;
         self.dir(POLICY_D, 0o755, true)?;
         let p = self.at(CONFIG);
@@ -772,15 +787,12 @@ impl Run<'_> {
                 // An existing config is kept as it is.
                 Some(_) => {
                     let current = std::fs::read(&p).map_err(step("config"))?;
-                    return self
-                        .file(CONFIG, &current, 0o644, FileKind::Config, "config")
-                        .map(|_| ());
+                    return self.file(CONFIG, &current, 0o644, FileKind::Config, "config");
                 }
                 None => default_config(self.layout, approvers, self.polkit),
             },
         };
         self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
-            .map(|_| ())
     }
 
     /// The polkit action file (root:root 0644), only when `pkcheck` exists.
@@ -974,7 +986,10 @@ impl Run<'_> {
         }
     }
 
-    fn start(&mut self, changed: bool) -> Result<(), InstallError> {
+    /// Starts the daemon, or restarts it when `changed` (binary, unit or
+    /// membership). A running daemon whose only change is `config_changed`
+    /// is reloaded instead.
+    fn start(&mut self, changed: bool, config_changed: bool) -> Result<(), InstallError> {
         let fail = |detail: String| InstallError::Step {
             step: "start".into(),
             detail: format!("{detail} (see: journalctl -u saiifed)"),
@@ -992,6 +1007,8 @@ impl Run<'_> {
             .is_ok_and(|o| o.status == 0 && o.stdout.trim() == "active");
         let args: &[&str] = if changed && active {
             &["restart", UNIT_NAME]
+        } else if config_changed && active {
+            &["reload", UNIT_NAME]
         } else {
             &["enable", "--now", UNIT_NAME]
         };
@@ -1595,6 +1612,90 @@ pub(crate) mod tests {
         assert!(!calls.iter().any(|c| c.contains("enable --now")));
         assert_eq!(fs::read(e.at(BINARY)).unwrap(), v2);
         assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
+    }
+
+    fn config_file(e: &Env, name: &str, budget: u32) -> InstallOptions {
+        let p = e.src.path().join(name);
+        fs::write(
+            &p,
+            format!("version = 2\nlocked = true\n\n[guard]\nbudget_ms = {budget}\n"),
+        )
+        .unwrap();
+        let mut o = all_agents();
+        o.config = Some(p);
+        o
+    }
+
+    #[test]
+    fn config_change_reloads_running_daemon() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host.set(|s| s.calls.clear());
+        let r = e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        assert_eq!(r.changed, vec![CONFIG.to_string()]);
+        let calls = e.host.state().calls;
+        assert!(
+            calls.contains(&"systemctl reload saiifed.service".to_string()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+        // Not running: a new config is a plain start, never a reload.
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let calls = e.host.state().calls;
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"systemctl enable --now saiifed.service".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn same_config_no_reload() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        // Without --config the current file is kept: no reload either.
+        e.install();
+        let calls = e.host.state().calls;
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+    }
+
+    #[test]
+    fn binary_and_config_change_restarts_only() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        let mut v2 = crate::binary::fake_elf(None, 0, Some(false));
+        v2.extend_from_slice(b"v2");
+        fs::write(&e.binary, &v2).unwrap();
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let calls = e.host.state().calls;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| *c == "systemctl restart saiifed.service")
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
     }
 
     /// The daemon regroups the audit dir at start: a membership added while

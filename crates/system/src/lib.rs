@@ -15,6 +15,7 @@
 pub mod binary;
 pub mod default_config;
 pub mod doctor;
+pub mod fleet;
 pub mod fsops;
 pub mod host;
 pub mod install;

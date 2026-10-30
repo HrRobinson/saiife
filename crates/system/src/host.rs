@@ -98,6 +98,10 @@ pub trait Host: Send + Sync {
     /// Runs `program` (an absolute path) with no stdin; killed after
     /// `timeout`. A non-zero exit is an `Ok` with its status.
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput>;
+    /// The owner of `path`, whose `lstat`/`fstat` says `on_disk`. The real
+    /// host returns `on_disk`; the fake host applies the chowns it recorded
+    /// (its chowns are never applied on disk).
+    fn owner_uid(&self, path: &Path, on_disk: u32) -> u32;
 }
 
 /// What `container` reports when it cannot tell (systemd-detect-virt
@@ -247,6 +251,10 @@ impl Host for RealHost {
             exec(DETECT_VIRT, &["--container"], None, QUERY_TIMEOUT),
             Path::new("/run/systemd/system").is_dir(),
         )
+    }
+
+    fn owner_uid(&self, _path: &Path, on_disk: u32) -> u32 {
+        on_disk
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
@@ -889,6 +897,19 @@ impl Host for FakeHost {
             });
             Ok(())
         })
+    }
+
+    fn owner_uid(&self, path: &Path, on_disk: u32) -> u32 {
+        self.read()
+            .ok()
+            .and_then(|s| {
+                s.chowns
+                    .iter()
+                    .rev()
+                    .find(|c| c.path == path)
+                    .map(|c| c.uid)
+            })
+            .unwrap_or(on_disk)
     }
 
     fn systemctl(&self, args: &[&str]) -> io::Result<CmdOutput> {

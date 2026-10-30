@@ -9,6 +9,7 @@ use clap::Subcommand;
 use saiife_agents::Agent;
 use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
+use saiife_system::fleet::fleet_options;
 use saiife_system::install::{install, InstallError, InstallOptions};
 use saiife_system::uninstall::{uninstall, UninstallOptions};
 use saiife_system::{host_for, refusal_line, Host, Layout};
@@ -38,6 +39,9 @@ pub enum SystemAction {
         /// Never ask (install asks nothing yet; for scripts).
         #[arg(long)]
         non_interactive: bool,
+        /// Read the install options from /etc/saiife/fleet/ (packages and MDM tools)
+        #[arg(long, conflicts_with_all = ["config", "agents", "approvers"])]
+        fleet: bool,
         /// Install below this directory with a fake host (tests only).
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -124,6 +128,7 @@ pub fn run(action: SystemAction) -> ExitCode {
             agents,
             approvers,
             non_interactive,
+            fleet,
             root,
             allow_test_build,
         } => {
@@ -140,12 +145,22 @@ pub fn run(action: SystemAction) -> ExitCode {
                     ))
                 }
             };
-            let opts = InstallOptions {
-                config,
-                agents,
-                approvers,
-                non_interactive,
-                allow_test_build,
+            let opts = if fleet {
+                match fleet_options(&layout, host.as_ref()) {
+                    Ok(o) => InstallOptions {
+                        allow_test_build,
+                        ..o
+                    },
+                    Err(e) => return report_error("install", e),
+                }
+            } else {
+                InstallOptions {
+                    config,
+                    agents,
+                    approvers,
+                    non_interactive,
+                    allow_test_build,
+                }
             };
             match install(&layout, host.as_ref(), &opts, &binary) {
                 Ok(r) => {

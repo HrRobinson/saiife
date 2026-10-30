@@ -7,6 +7,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn saiife() -> Command {
@@ -175,6 +177,74 @@ fn step_failure_exits_2_with_the_step() {
         .assert()
         .code(2)
         .stderr(contains("saiife: install failed at "));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fleet_install_under_root_flag() {
+    let root = fake_root();
+    let p = |rel: &str| root.path().join(rel);
+    let fleet = p("etc/saiife/fleet");
+    fs::create_dir_all(&fleet).unwrap();
+    for d in ["etc", "etc/saiife", "etc/saiife/fleet"] {
+        fs::set_permissions(p(d), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let config = "version = 2\nlocked = true\n\n[guard]\nbudget_ms = 40\n";
+    fs::write(fleet.join("config.toml"), config).unwrap();
+    fs::write(
+        fleet.join("install.toml"),
+        "agents = [\"claude\", \"codex\"]\n",
+    )
+    .unwrap();
+    for f in ["config.toml", "install.toml"] {
+        fs::set_permissions(fleet.join(f), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    saiife()
+        .args(["system", "install", "--fleet", "--root"])
+        .arg(root.path())
+        .assert()
+        // Installed; doctor fails the daemon checks under the fake host.
+        .code(1);
+    assert_eq!(
+        fs::read(p("etc/saiife/config.toml")).unwrap(),
+        config.as_bytes()
+    );
+    assert!(p("etc/claude-code/managed-settings.d/50-saiife.json").is_file());
+    assert!(p("etc/codex/requirements.toml").is_file());
+    assert!(!p("etc/gemini-cli/settings.json").exists());
+
+    // A group-writable fleet dir: exit 2 naming it, nothing changed.
+    fs::set_permissions(&fleet, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::write(fleet.join("install.toml"), "agents = [\"gemini\"]\n").unwrap();
+    saiife()
+        .args(["system", "install", "--fleet", "--root"])
+        .arg(root.path())
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "saiife: install failed at check: /etc/saiife/fleet: mode 0775",
+        ));
+    assert!(!p("etc/gemini-cli").exists());
+}
+
+#[test]
+fn fleet_conflicts_with_config() {
+    let root = fake_root();
+    for extra in [
+        ["--config", "/nonexistent/c.toml"],
+        ["--agents", "claude"],
+        ["--approvers", "alice"],
+    ] {
+        saiife()
+            .args(["system", "install", "--fleet", "--root"])
+            .arg(root.path())
+            .args(extra)
+            .assert()
+            .code(2)
+            .stderr(contains("cannot be used with"));
+    }
+    assert!(!root.path().join("opt").exists());
+    assert!(!root.path().join("etc/saiife").exists());
 }
 
 #[test]
