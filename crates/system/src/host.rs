@@ -1671,7 +1671,15 @@ impl Host for FakeHost {
                 gid,
             });
             Ok(())
-        })
+        })?;
+        // As XNU does, even for root: a chown clears the setuid and setgid
+        // bits (only `fchown` callers, all macOS, reach this). So a mode set
+        // before the chown is caught losing its setgid bit.
+        let (_, mode, _) = crate::fsops::stat_owner_mode(&rustix::fs::fstat(fd)?);
+        if mode & 0o6000 != 0 {
+            rustix::fs::fchmod(fd, rustix::fs::Mode::from_raw_mode((mode & !0o6000) as _))?;
+        }
+        Ok(())
     }
 
     fn systemctl(&self, args: &[&str]) -> io::Result<CmdOutput> {

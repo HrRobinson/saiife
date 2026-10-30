@@ -1588,10 +1588,13 @@ impl Run<'_> {
                 format!("exists and is owned by uid {uid}; saiife does not adopt it (move it away first)"),
             ));
         }
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode as _)).map_err(bad)?;
+        // Owner first, then mode: XNU's chown clears the setgid bit (even
+        // for root), so a chmod before it left the audit dir 0750, not
+        // 2750 (seen on the macos-15 runners).
         self.host
             .fchown(fd.as_fd(), &p, owner.0, owner.1)
             .map_err(step("dirs"))?;
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode as _)).map_err(bad)?;
         if created {
             self.changed(logical);
         } else if before != mode {
