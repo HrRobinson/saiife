@@ -382,6 +382,15 @@ This is v2.1 work (owner decision 2).
 - **Signing:** install requires the hardened runtime and a release build;
   an ad-hoc signature only warns (§14).
 - **Same-user approval is off on macOS** (§6.10.2).
+- **System Integrity Protection is required** (owner ruling, plan 13 CI):
+  the hardened runtime keeps `DYLD_INSERT_LIBRARIES` out of the hook only
+  with SIP on; on the SIP-disabled CI runners an injected library ran
+  inside the ad-hoc signed hook. Install refuses (exit 2, before any
+  change) and `doctor` fails `system.sip` unless `csrutil status` prints
+  exactly `System Integrity Protection status: enabled.`; disabled,
+  unknown, a custom configuration or an error is not enabled. A build with
+  debug assertions honours `SAIIFE_TEST_ALLOW_SIP_OFF=1` (CI only: install
+  warns, `doctor` warns); a release build never reads it.
 
 ### 5.4 How the lock holds
 

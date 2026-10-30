@@ -185,10 +185,16 @@ tables say, with these differences:
   you into approving its own request. `same_user = "reauth"` acts as
   `"deny"`: approvals need a second account, and only root and `[admin]`
   users can lift lockdown. See [approvals](approvals.md#macos).
-- **A4 (code injected into the hook).** The binary must have the hardened
-  runtime, which makes macOS ignore `DYLD_INSERT_LIBRARIES`. Tagged releases
-  are signed with a Developer ID and notarized; other builds are ad-hoc
-  signed (hardened, not notarized), and install warns.
+- **A4 (code injected into the hook).** The protection is System Integrity
+  Protection plus the hardened runtime: with both, macOS ignores
+  `DYLD_INSERT_LIBRARIES` for the hook. Without SIP it does not (the
+  locked-macos CI runners, SIP disabled, loaded an injected library into
+  the ad-hoc signed hook), so install refuses and `doctor` fails
+  `system.sip` unless `csrutil status` says SIP is enabled. The binary must
+  have the hardened runtime. Tagged releases are signed with a Developer ID
+  and notarized; other builds are ad-hoc signed (hardened, not notarized),
+  and install warns. A4 is still to be verified on a SIP-on Mac
+  (OWNER-TODO); CI reports it as skipped while its runners have SIP off.
 - **Egress is Linux only.** There is no egress recipe for macOS.
 - **The MCP gateway is Linux only** in v2.1 (`[mcp.<name>]` is a load
   error); `saiife mcp` works.

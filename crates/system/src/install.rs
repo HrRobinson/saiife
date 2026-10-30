@@ -68,6 +68,9 @@ pub enum InstallError {
     Refused { path: PathBuf, detail: String },
     #[error("{step}: {detail}")]
     Step { step: String, detail: String },
+    /// macOS without System Integrity Protection ([`crate::sip`]).
+    #[error("{}", crate::sip::SIP_REQUIRED)]
+    SipRequired,
 }
 
 /// Shells that mean "no login" for an existing `saiife` user.
@@ -124,6 +127,18 @@ pub fn install(
     opts: &InstallOptions,
     binary: &Path,
 ) -> Result<InstallReport, InstallError> {
+    install_with(layout, host, opts, binary, crate::sip::seam_set())
+}
+
+/// [`install`] with the SIP test seam given ([`crate::sip::seam_set`]: a
+/// release build always passes false).
+pub(crate) fn install_with(
+    layout: &Layout,
+    host: &dyn Host,
+    opts: &InstallOptions,
+    binary: &Path,
+    sip_seam: bool,
+) -> Result<InstallReport, InstallError> {
     // 1. Root, then the supported-system check. Nothing runs before these.
     if layout.is_system() && host.euid() != 0 {
         return Err(InstallError::NotRoot);
@@ -131,6 +146,21 @@ pub fn install(
     let systemd = match check_supported(layout, host) {
         Support::Supported { systemd, .. } => systemd,
         Support::Refused(why) => return Err(InstallError::Unsupported(why)),
+    };
+    // macOS: SIP on, or the hardened runtime does not keep an injected
+    // library out of the hook (A4). Refused before any change.
+    let sip_warning = if layout.platform() == Platform::Macos {
+        use crate::sip::{verdict, SipVerdict, SIP_BYPASSED};
+        match verdict(host.sip_enabled(), sip_seam) {
+            SipVerdict::Enabled => None,
+            SipVerdict::Bypassed => Some(format!(
+                "System Integrity Protection is not enabled {SIP_BYPASSED}: \
+                 library injection (DYLD_INSERT_LIBRARIES) is not stopped"
+            )),
+            SipVerdict::Required => return Err(InstallError::SipRequired),
+        }
+    } else {
+        None
     };
 
     // 2. Refusals, before anything is created.
@@ -223,6 +253,7 @@ pub fn install(
     // always refused there: the config keeps `same_user = "deny"` and the
     // install always says so.
     let mut warnings = warnings;
+    warnings.extend(sip_warning);
     let polkit = if mac {
         warnings.push(MAC_SAME_USER_OFF.to_string());
         false
@@ -3843,6 +3874,67 @@ pub(crate) mod macos_tests {
         assert!(e.installed().auth_rights.is_empty());
         assert!(r.warnings.iter().any(|w| w == MAC_SAME_USER_OFF), "{r:?}");
         assert!(r.started);
+    }
+
+    /// SIP not enabled (disabled, unknown, a custom configuration, a
+    /// failing csrutil): refused before any change, with the exact reason.
+    #[test]
+    fn macos_install_refuses_without_sip_before_any_change() {
+        let cases = [
+            Some(ok("System Integrity Protection status: disabled.\n")),
+            Some(ok("System Integrity Protection status: unknown (Custom Configuration).\n\nConfiguration:\n\tKext Signing: enabled\n")),
+            Some(CmdOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "csrutil: failed".into(),
+            }),
+            None,
+        ];
+        for c in cases {
+            let e = mac_env();
+            let before = e.tree();
+            e.host.set(|s| s.csrutil = c.clone());
+            match e.run(&opts()) {
+                Err(InstallError::SipRequired) => {}
+                other => panic!("{c:?}: {other:?}"),
+            }
+            assert_eq!(e.tree(), before, "{c:?}: install changed something");
+            assert!(
+                !e.calls().iter().any(|l| l.contains("dscl")),
+                "{:?}",
+                e.calls()
+            );
+        }
+        assert_eq!(
+            InstallError::SipRequired.to_string(),
+            "locked mode on macOS needs System Integrity Protection: without it the hardened \
+             runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP \
+             (Recovery: csrutil enable) and run install again."
+        );
+    }
+
+    /// The CI seam (debug builds only): install goes on, with a warning.
+    #[test]
+    fn macos_install_with_the_sip_seam_warns() {
+        let e = mac_env();
+        e.host
+            .set(|s| s.csrutil = Some(ok("System Integrity Protection status: disabled.\n")));
+        let r = install_with(&e.layout, &e.host, &opts(), &e.binary, true).unwrap();
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("(test build: SIP check bypassed)")),
+            "{:?}",
+            r.warnings
+        );
+        // SIP on: no warning.
+        let e = mac_env();
+        let r = install_with(&e.layout, &e.host, &opts(), &e.binary, true).unwrap();
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("SIP")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A new config.toml alone on a loaded job: no restart, and the daemon

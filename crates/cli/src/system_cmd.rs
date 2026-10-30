@@ -95,6 +95,7 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
         InstallError::Step { step, detail } => {
             fail(format!("saiife: {cmd} failed at {step}: {detail}"))
         }
+        InstallError::SipRequired => fail(format!("saiife: {}", saiife_system::sip::SIP_REQUIRED)),
     }
 }
 

@@ -42,6 +42,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         ));
         return out;
     }
+    if mac(ctx) {
+        out.push(sip_check(ctx.host.sip_enabled(), crate::sip::seam_set()));
+    }
     out.push(install_record(ctx));
     out.push(config_valid(ctx));
     out.push(paths_owner(ctx));
@@ -159,6 +162,25 @@ fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
 }
 
 /// Whether this layout is macOS's.
+/// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
+/// otherwise ([`crate::sip::SIP_REQUIRED`]); a test build with the seam
+/// reports Warn instead.
+fn sip_check(enabled: bool, seam: bool) -> Check {
+    use crate::sip::{verdict, SipVerdict, SIP_BYPASSED, SIP_REQUIRED};
+    const ID: &str = "system.sip";
+    const TITLE: &str = "System Integrity Protection";
+    match verdict(enabled, seam) {
+        SipVerdict::Enabled => Check::new(ID, Status::Pass, TITLE, "enabled"),
+        SipVerdict::Bypassed => Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!("not enabled {SIP_BYPASSED}: {SIP_REQUIRED}"),
+        ),
+        SipVerdict::Required => Check::new(ID, Status::Fail, TITLE, SIP_REQUIRED),
+    }
+}
+
 fn mac(ctx: &Ctx) -> bool {
     ctx.layout.platform() == Platform::Macos
 }
@@ -2982,6 +3004,34 @@ mod macos_tests {
             "{}",
             r.to_text()
         );
+    }
+
+    #[test]
+    fn macos_sip_check() {
+        let e = installed();
+        assert_status(&doctor(&e), "system.sip", Status::Pass);
+        assert_eq!(get(&doctor(&e), "system.sip").detail, "enabled");
+        e.host.set(|s| {
+            s.csrutil = Some(CmdOutput {
+                status: 0,
+                stdout: "System Integrity Protection status: disabled.\n".into(),
+                stderr: String::new(),
+            })
+        });
+        let r = doctor(&e);
+        assert_status(&r, "system.sip", Status::Fail);
+        assert_eq!(get(&r, "system.sip").detail, crate::sip::SIP_REQUIRED);
+        e.host.set(|s| s.csrutil = None);
+        assert_status(&doctor(&e), "system.sip", Status::Fail);
+        // The seam (debug builds only): Warn, still reported.
+        let c = super::sip_check(false, true);
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.detail.contains("(test build: SIP check bypassed)"),
+            "{}",
+            c.detail
+        );
+        assert_eq!(super::sip_check(true, true).status, Status::Pass);
     }
 
     #[test]

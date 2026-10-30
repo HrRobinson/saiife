@@ -150,13 +150,17 @@ without `--release`) has a test seam (`SAIIFE_EVAL_FAULT`) that can hang the
 guard past an agent's hook timeout; Codex and Gemini CLI then fail open.
 It also has `SAIIFE_TEST_CLAUDE_MCP_DROPIN`, which can point the hook at
 another Claude Code MCP drop-in and so grant `Brokered` to a `saiife`
-server whose command is not pinned. So
+server whose command is not pinned, and (macOS) `SAIIFE_TEST_ALLOW_SIP_OFF=1`,
+which lets install and `doctor` go on without System Integrity Protection
+(install warns, `doctor` reports `system.sip` as a warning; see
+[Locked mode (macOS)](#supported-systems-macos)). A release build never
+reads either. So
 `system install` refuses (exit 2) a binary that is dynamically linked (an
 ELF interpreter or a needed shared library), has debug assertions on, or has
 no saiife build marker, and `saiife doctor` fails `files.binary` on a
 dynamic binary and warns `test build installed` on a debug-assertions build.
-The hidden `--allow-test-build` flag exists for the CI job `locked-linux`
-only; never use it in production.
+The hidden `--allow-test-build` flag exists for the CI jobs `locked-linux`
+and `locked-macos` only; never use it in production.
 
 - `--agents` defaults to all three. Install only adds managed hooks; to
   remove one, uninstall.
@@ -264,6 +268,19 @@ log. The commands are the same. This section lists what differs.
 macOS 15 (Sequoia) or later, on Apple silicon or Intel. Install refuses an
 older macOS with
 `saiife: locked mode is not supported here: macOS 14.6 is not supported for locked mode (macOS 15 or later). Developer mode works as before.`
+
+System Integrity Protection must be on. Without it the hardened runtime
+does not keep an injected library (`DYLD_INSERT_LIBRARIES`) out of the
+managed hook. Install reads `csrutil status` and goes on only when it says,
+exactly, `System Integrity Protection status: enabled.`. Disabled,
+`unknown`, a custom configuration (even one listing every part enabled) or
+an error is refused, exit 2, before anything is changed:
+
+```
+saiife: locked mode on macOS needs System Integrity Protection: without it the hardened runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP (Recovery: csrutil enable) and run install again.
+```
+
+`doctor` fails `system.sip` for the same reason.
 
 ### Install (macOS)
 
@@ -387,7 +404,8 @@ reason, on macOS only root and `[admin]` users can lift or narrow
 sudo saiife doctor
 ```
 
-On macOS `doctor` also checks the launchd job (the plist install recorded,
+On macOS `doctor` also checks System Integrity Protection (`system.sip`),
+the launchd job (the plist install recorded,
 and `launchctl print system/com.saiife.saiifed`), the binary's signature,
 the authorization right, the `_saiifeaudit` group and the MDM profile. It
 skips the Linux-only checks (systemd, polkit, `/proc`, Landlock).

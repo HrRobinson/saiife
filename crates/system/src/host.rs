@@ -162,6 +162,10 @@ pub trait Host: Send + Sync {
     fn launchctl(&self, args: &[&str]) -> io::Result<CmdOutput>;
     /// The macOS (major, minor) from `sw_vers -productVersion`.
     fn macos_version(&self) -> io::Result<(u32, u32)>;
+    /// macOS: System Integrity Protection is on, by `csrutil status`
+    /// ([`crate::sip::parse_status`]). An error, or any answer but the
+    /// plain "enabled." line, is false (fail closed).
+    fn sip_enabled(&self) -> bool;
     /// [`Host::run`] with `input` written to the program's stdin.
     fn run_input(
         &self,
@@ -424,6 +428,11 @@ impl Host for RealHost {
 
     fn launchctl(&self, args: &[&str]) -> io::Result<CmdOutput> {
         exec(LAUNCHCTL, args, None, ADMIN_TIMEOUT)
+    }
+
+    fn sip_enabled(&self) -> bool {
+        exec(crate::sip::CSRUTIL, &["status"], None, QUERY_TIMEOUT)
+            .is_ok_and(|o| crate::sip::parse_status(&o))
     }
 
     fn macos_version(&self) -> io::Result<(u32, u32)> {
@@ -1367,6 +1376,9 @@ pub struct FakeState {
     pub systemd: u32,
     /// What `macos_version` returns (default 15.0).
     pub macos: (u32, u32),
+    /// What `csrutil status` prints for `sip_enabled` (default: the plain
+    /// "enabled." line); `None` fails the call.
+    pub csrutil: Option<CmdOutput>,
     /// What `container` returns (default none).
     pub container: Option<String>,
     /// Canned outputs by call line (`"systemctl enable --now saiifed.service"`,
@@ -1403,6 +1415,11 @@ impl Default for FakeState {
             calls: Vec::new(),
             systemd: 255,
             macos: (15, 0),
+            csrutil: Some(CmdOutput {
+                status: 0,
+                stdout: format!("{}\n", crate::sip::SIP_ENABLED_LINE),
+                stderr: String::new(),
+            }),
             container: None,
             run: BTreeMap::new(),
             fail_chown: Vec::new(),
@@ -1918,6 +1935,13 @@ impl Host for FakeHost {
 
     fn macos_version(&self) -> io::Result<(u32, u32)> {
         Ok(self.read()?.macos)
+    }
+
+    fn sip_enabled(&self) -> bool {
+        // Not recorded in `calls`: doctor's read-only call lists stay as
+        // they are. An unreadable state is "not enabled".
+        self.read()
+            .is_ok_and(|s| s.csrutil.as_ref().is_some_and(crate::sip::parse_status))
     }
 
     fn run_input(
