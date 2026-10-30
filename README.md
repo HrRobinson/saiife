@@ -116,6 +116,8 @@ model.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).
+- [MCP](docs/mcp.md): `saiife mcp` (connectors as MCP tools) and the MCP
+  gateway for third-party servers.
 - [Packs](docs/packs/README.md): the rule sets, what each blocks and allows.
 - Agents: [Claude Code](docs/agents/claude-code.md),
   [Codex](docs/agents/codex.md), [Gemini CLI](docs/agents/gemini.md).

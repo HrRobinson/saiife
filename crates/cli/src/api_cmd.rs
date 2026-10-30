@@ -73,12 +73,12 @@ pub(crate) mod linux {
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     /// A request frame is at most 1 MiB; base64 grows by 4/3.
-    const MAX_BODY: usize = 700 * 1024;
+    pub(crate) const MAX_BODY: usize = 700 * 1024;
 
     /// Why the command stops, with its exit code.
-    struct Stop(u8, String);
+    pub(crate) struct Stop(pub(crate) u8, pub(crate) String);
 
-    fn unavailable(m: impl Into<String>) -> Stop {
+    pub(crate) fn unavailable(m: impl Into<String>) -> Stop {
         Stop(5, m.into())
     }
 
@@ -96,15 +96,15 @@ pub(crate) mod linux {
         }
     }
 
-    struct Daemon {
-        client: Client,
-        cfg: SystemConfig,
-        target: Target,
+    pub(crate) struct Daemon {
+        pub(crate) client: Client,
+        pub(crate) cfg: SystemConfig,
+        pub(crate) target: Target,
     }
 
     /// The target's daemon and the config it serves (the system config,
     /// or the personal broker's own, read after the broker answered).
-    fn connect(t: &Target) -> Result<Daemon, Stop> {
+    pub(crate) fn connect(t: &Target) -> Result<Daemon, Stop> {
         let client = broker::connect(t, Instant::now() + CONNECT_TIMEOUT)
             .map_err(|e| unavailable(broker::unreachable(t, &e)))?;
         let what = if t.is_locked() { "system" } else { "broker" };
@@ -127,7 +127,7 @@ pub(crate) mod linux {
     /// The third value is the project `env` the call asks for: only the
     /// personal broker acts on it (the locked daemon takes the scope's), so
     /// it is sent to the broker only.
-    fn project(
+    pub(crate) fn project(
         d: &Daemon,
     ) -> (
         String,
@@ -240,7 +240,7 @@ pub(crate) mod linux {
         };
 
         let mut d = connect(&config)?;
-        let (code, ans) = call_one(&mut d, service, operation, params, body, None)?;
+        let (code, ans) = call_one(&mut d, service, operation, params, body, None, "cli")?;
         if code == 3 {
             let id = ans.get("pending").and_then(Value::as_u64).unwrap_or(0);
             return match wait {
@@ -257,14 +257,19 @@ pub(crate) mod linux {
     /// step alike. `Ok((0 | 1, answer))` once done (1: upstream status >=
     /// 400; the answer gains `ms`), `Ok((3, answer))` while it waits for
     /// approval (the answer holds `pending`), `Err` for a refusal with its
-    /// exit code. Prints nothing.
-    fn call_one(
+    /// exit code. Prints nothing but the broker's env warning.
+    ///
+    /// `via` is the client the call claims to come from: `"cli"` (`saiife
+    /// api`, not sent: the daemon's default) or `"mcp"` (`saiife mcp`). It
+    /// is attribution only, a claim and not proof of origin.
+    pub(crate) fn call_one(
         d: &mut Daemon,
         service: &str,
         operation: &str,
         params: Map<String, Value>,
         body: Option<Vec<u8>>,
         collection: Option<&str>,
+        via: &str,
     ) -> Result<(u8, Map<String, Value>), Stop> {
         let (project, overlays, env) = project(d);
         let mut args = Map::new();
@@ -286,6 +291,9 @@ pub(crate) mod linux {
         }
         if let Some(e) = env {
             args.insert("env".into(), e.into());
+        }
+        if via != "cli" {
+            args.insert("via".into(), via.into());
         }
         // The daemon waits at most one upstream timeout for a pool slot and
         // one for the upstream; past both, plus slack, it is gone.
@@ -419,6 +427,7 @@ pub(crate) mod linux {
                 params,
                 body,
                 Some(&c.name),
+                "cli",
             );
             let (code, ans) = match r {
                 Ok(x) => x,
@@ -465,12 +474,12 @@ pub(crate) mod linux {
     }
 
     /// The longest `--wait` (decision 3).
-    const MAX_WAIT: Duration = Duration::from_secs(3600);
+    pub(crate) const MAX_WAIT: Duration = Duration::from_secs(3600);
     /// How often `--wait` asks again.
-    const POLL_EVERY: Duration = Duration::from_secs(2);
+    pub(crate) const POLL_EVERY: Duration = Duration::from_secs(2);
 
     /// `--wait <duration>`, at most an hour.
-    fn wait_limit(w: Option<&str>) -> Result<Option<Duration>, Stop> {
+    pub(crate) fn wait_limit(w: Option<&str>) -> Result<Option<Duration>, Stop> {
         match w {
             None => Ok(None),
             Some(w) => Ok(Some(parse_duration(w).map_err(refused)?.min(MAX_WAIT))),
@@ -575,7 +584,7 @@ pub(crate) mod linux {
     }
 
     /// The decoded body of a done answer.
-    fn body_of(ans: &Map<String, Value>) -> Vec<u8> {
+    pub(crate) fn body_of(ans: &Map<String, Value>) -> Vec<u8> {
         ans.get("body_b64")
             .and_then(Value::as_str)
             .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
@@ -619,7 +628,7 @@ pub(crate) mod linux {
     }
 
     /// An `ok: false` answer as its exit code and message.
-    fn refusal(ans: &Map<String, Value>) -> Stop {
+    pub(crate) fn refusal(ans: &Map<String, Value>) -> Stop {
         let s = |k: &str| ans.get(k).and_then(Value::as_str).unwrap_or_default();
         match s("error") {
             "denied" if !s("reason").is_empty() => Stop(

@@ -181,6 +181,21 @@ claude_setup_mcp_allowlist() {
   claude_managed_dropin 70-lockcheck-mcp.json '{"allowedMcpServers": [{"serverName": "other"}]}'
 }
 
+# `serverCommand` pins the command that starts a server (plan 17): the
+# control server's own command is allowed, any other is not. Only once the
+# first row records `ran` may saiife pin `/opt/saiife/bin/saiife mcp`.
+claude_setup_mcp_command() {
+  claude_setup_mcp_control
+  claude_managed_dropin 70-lockcheck-mcp.json "$(jq -n --arg js "$LC_SRC/mcp-marker.js" \
+    '{allowedMcpServers: [{serverCommand: ["node", $js]}]}')"
+}
+
+claude_setup_mcp_command_other() {
+  claude_setup_mcp_control
+  claude_managed_dropin 70-lockcheck-mcp.json "$(jq -n --arg js "$LC_SRC/not-the-marker.js" \
+    '{allowedMcpServers: [{serverCommand: ["node", $js]}]}')"
+}
+
 # `found` if this Claude Code has onFailure (>= 2.1.295).
 claude_probe_onfailure() {
   local out v
@@ -221,5 +236,7 @@ agent_checks() {
   lc_check claude.mcp.hooked design fired allow claude_setup_mcp_hooked
   lc_check claude.mcp.denied design unavailable allow claude_setup_mcp_denied claude.mcp.control
   lc_check claude.mcp.allowlist design unavailable allow claude_setup_mcp_allowlist claude.mcp.control
+  lc_check claude.mcp.command design ran allow claude_setup_mcp_command
+  lc_check claude.mcp.command-other design unavailable allow claude_setup_mcp_command_other claude.mcp.control
   claude_probe_onfailure
 }

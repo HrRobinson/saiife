@@ -1567,6 +1567,38 @@ async fn binary_raw_body_under_ask_not_displayable() {
     assert!(w.st.lock().unwrap().s3.is_empty());
 }
 
+/// Plan 15's `body_not_displayable` meets plan 17's dedupe
+/// (`display_faithful`): the same binary upload asked twice is refused
+/// twice, and no approval request is ever stored for it, so none can be
+/// given back as a duplicate. The same text upload asked twice is deduped
+/// (one request, one id): its display is the body itself.
+#[tokio::test]
+async fn binary_raw_body_never_deduped() {
+    let w = world(|_| {}).await;
+    let put = |b: &[u8]| {
+        json!({"service": "s3_ask", "operation": "s3.put_object",
+               "params": {"bucket": "reports", "key": "logo.png"},
+               "body_b64": STANDARD.encode(b)})
+    };
+    let bin = b"\x89PNG\r\n\x1a\n\x00\xff\xfe";
+    for _ in 0..2 {
+        let a = w.op("api.call", put(bin)).await;
+        assert_eq!(rule(&a), "body_not_displayable", "{a}");
+        assert!(a.get("pending").is_none(), "{a}");
+    }
+    let l = w.op("approval.list", json!({})).await;
+    assert_eq!(l["ok"], true, "{l}");
+    assert_eq!(l["items"], json!([]), "a binary body was stored: {l}");
+    assert!(w.records("approval").is_empty());
+    let a = w.op("api.call", put(b"same text\n")).await;
+    let b = w.op("api.call", put(b"same text\n")).await;
+    assert!(a["pending"].is_u64(), "{a}");
+    assert_eq!(a["pending"], b["pending"], "{a} {b}");
+    let l = w.op("approval.list", json!({})).await;
+    assert_eq!(l["items"].as_array().unwrap().len(), 1, "{l}");
+    assert!(w.st.lock().unwrap().s3.is_empty());
+}
+
 /// Set in the child run of [`cloud_values_never_in_stderr`].
 const LEAK_CHILD: &str = "SAIIFE_CLOUD_SIGN_LEAK_CHILD";
 

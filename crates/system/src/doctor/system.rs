@@ -56,15 +56,25 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
     }
     if let Ok(p) = &ctx.config {
-        out.extend(p.config.guard.mcp.allow_servers.iter().map(|s| {
-            Check::new(
-                format!("mcp.{s}"),
-                Status::Warn,
-                format!("MCP server {s} bypasses saiife: its requests are not brokered or limited"),
-                "",
-            )
+        // A listed `saiife` changes nothing on Claude Code (pinned by
+        // command there). On Codex and Gemini CLI it allows any server a
+        // project or user config registers under that name.
+        let unpinned = ctx
+            .installed
+            .as_ref()
+            .is_some_and(|i| i.agents.iter().any(|a| unpinned_saiife(&a.agent)));
+        out.extend(p.config.guard.mcp.allow_servers.iter().filter_map(|s| {
+            let title = if s != "saiife" {
+                format!("MCP server {s} bypasses saiife: its requests are not brokered or limited")
+            } else if unpinned {
+                SAIIFE_LISTED_UNPINNED.to_string()
+            } else {
+                return None;
+            };
+            Some(Check::new(format!("mcp.{s}"), Status::Warn, title, ""))
         }));
     }
+    out.extend(mcp_checks(ctx));
     if let Ok(p) = &ctx.config {
         out.extend(cloud_sts(&p.config));
     }
@@ -881,6 +891,299 @@ fn daemon_health(_ctx: &Ctx) -> Check {
     )
 }
 
+// ------------------------------------------------------------ MCP gateway
+
+/// The Landlock ABI this machine offers; 0 where there is none.
+fn landlock_abi() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        crate::sandbox::landlock_abi()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// What a partial Landlock ABI leaves unenforced, from the sandbox's own
+/// wording; `None` at no Landlock (a per-server failure) or full strength.
+fn landlock_gap(abi: u32) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        if abi == 0 {
+            return None;
+        }
+        crate::sandbox::Strength::from_abi(abi).gap()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = abi;
+        None
+    }
+}
+
+type McpStatus = Result<Vec<serde_json::Value>, String>;
+
+/// The daemon's `mcp` status list (`[{name, state, tools, since,
+/// last_error}]`), or why the daemon did not answer.
+#[cfg(target_os = "linux")]
+fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
+    use saiife_ipc::client::Client;
+    use saiife_ipc::msg::OP_STATUS;
+    use serde_json::{Map, Value};
+    use std::time::{Duration, Instant};
+    let user = match &ctx.config {
+        Ok(p) => p.config.daemon.user.clone(),
+        Err(_) => DAEMON_USER.to_string(),
+    };
+    let Some(uid) = ctx.host.user(&user).map(|u| u.uid) else {
+        return Err(format!("daemon user {user} is not in /etc/passwd"));
+    };
+    let (_, dir) = socket_dir(ctx);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let m = Client::connect(&dir, uid, deadline)
+        .and_then(|mut c| c.call(OP_STATUS, Map::new(), deadline))
+        .map_err(|e| e.to_string())?;
+    Ok(match m.get("mcp") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_mcp_status(_ctx: &Ctx) -> McpStatus {
+    Err(crate::supported::NOT_LINUX.to_string())
+}
+
+/// The warning for `saiife` in `[guard.mcp] allow_servers` while an agent
+/// that does not pin its command (Codex, Gemini CLI) is installed: there
+/// the listing allows any server registered under that name.
+pub const SAIIFE_LISTED_UNPINNED: &str = "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command";
+
+/// Whether `agent` may run any MCP server named `saiife` (nothing pins its
+/// command): every agent but Claude Code, whose managed drop-in pins it.
+pub fn unpinned_saiife(agent: &str) -> bool {
+    agent != "claude"
+}
+
+fn mcp_checks(ctx: &Ctx) -> Vec<Check> {
+    let has_gateway = ctx.config.as_ref().is_ok_and(|p| !p.config.mcp.is_empty());
+    let (status, abi) = if has_gateway {
+        (daemon_mcp_status(ctx), landlock_abi())
+    } else {
+        (Ok(Vec::new()), 0)
+    };
+    mcp_checks_with(ctx, &status, abi)
+}
+
+/// The MCP checks with the daemon's answer and the Landlock ABI given, so
+/// tests need neither a daemon nor a kernel.
+fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
+    let mut out = Vec::new();
+    if let Ok(p) = &ctx.config {
+        if !p.config.mcp.is_empty() {
+            for (name, cfg) in &p.config.mcp {
+                out.push(mcp_gateway(ctx, name, cfg, status, abi));
+            }
+            out.push(Check::new(
+                "mcp.landlock",
+                Status::Info,
+                format!("Landlock ABI {abi}"),
+                "",
+            ));
+            // Only a server that runs under Landlock has a sandbox to weaken.
+            let uses_landlock = p
+                .config
+                .mcp
+                .values()
+                .any(|c| c.sandbox != saiife_policy::mcp::Sandbox::Off);
+            if let Some(gap) = landlock_gap(abi).filter(|_| uses_landlock) {
+                out.push(Check::new(
+                    "mcp.sandbox",
+                    Status::Warn,
+                    "MCP server sandbox is weaker than full",
+                    gap,
+                ));
+            }
+        }
+    }
+    if let Some(i) = &ctx.installed {
+        let saiife_listed = ctx.config.as_ref().is_ok_and(|p| {
+            p.config
+                .guard
+                .mcp
+                .allow_servers
+                .iter()
+                .any(|s| s == "saiife")
+        });
+        let saiife = if saiife_listed {
+            "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so its calls are allowed by name; nothing checks which program serves them"
+        } else {
+            "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
+        };
+        for a in &i.agents {
+            if matches!(a.agent.as_str(), "codex" | "gemini") {
+                if let Some(ag) = Agent::from_name(&a.agent) {
+                    out.push(Check::new(
+                        format!("mcp.{}.restriction", a.agent),
+                        Status::Info,
+                        format!(
+                            "MCP servers for {} are restricted by the hook only",
+                            ag.label()
+                        ),
+                        saiife,
+                    ));
+                }
+            }
+        }
+        if i.agents.iter().any(|a| a.agent == "claude") {
+            out.push(claude_allowlist(ctx, i));
+        }
+    }
+    out
+}
+
+fn mcp_gateway(
+    ctx: &Ctx,
+    name: &str,
+    cfg: &saiife_policy::McpServerCfg,
+    status: &McpStatus,
+    abi: u32,
+) -> Check {
+    use saiife_policy::Sandbox;
+    let id = format!("mcp.gateway.{name}");
+    // (status, text, the text is the whole title)
+    let mut problems: Vec<(Status, String, bool)> = Vec::new();
+    let mut tools = 0;
+    match status {
+        Err(e) => problems.push((
+            Status::Fail,
+            format!("MCP server {name} is not running: the daemon is unreachable ({e})"),
+            true,
+        )),
+        Ok(list) => {
+            let entry = list
+                .iter()
+                .find(|s| s.get("name").and_then(|v| v.as_str()) == Some(name));
+            let state = entry.and_then(|s| s.get("state")).and_then(|v| v.as_str());
+            tools = entry
+                .and_then(|s| s.get("tools"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if state != Some("running") {
+                let why = entry
+                    .and_then(|s| s.get("last_error"))
+                    .and_then(|v| v.as_str())
+                    .filter(|e| !e.is_empty())
+                    .or(state)
+                    .unwrap_or("the daemon does not list it; reload the policy");
+                problems.push((
+                    Status::Fail,
+                    format!("MCP server {name} is not running: {why}"),
+                    true,
+                ));
+            }
+        }
+    }
+    match cfg.sandbox {
+        Sandbox::Off => problems.push((Status::Warn, "sandbox is off".into(), false)),
+        Sandbox::Landlock if abi == 0 => {
+            problems.push((Status::Fail, "sandbox unavailable".into(), false))
+        }
+        Sandbox::Landlock => {}
+    }
+    for arg in &cfg.args {
+        if arg.starts_with('/') {
+            let bad = match ctx.layout.try_at(Path::new(arg)) {
+                Ok(at) => crate::fsops::root_owned_chain(&at).err(),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(e) = bad {
+                problems.push((
+                    Status::Warn,
+                    format!("argument {arg} is not root-owned ({e})"),
+                    false,
+                ));
+            }
+        }
+    }
+    let launcher = |s: &str| matches!(s.rsplit('/').next(), Some("npx" | "uvx"));
+    if launcher(&cfg.command.to_string_lossy()) || cfg.args.iter().any(|a| launcher(a)) {
+        problems.push((
+            Status::Warn,
+            "npx/uvx download code at run time; install the server as a root-owned file".into(),
+            false,
+        ));
+    }
+    if problems.is_empty() {
+        return Check::new(
+            id,
+            Status::Pass,
+            format!("MCP server {name} is brokered ({tools} tools)"),
+            "",
+        );
+    }
+    let worst = if problems.iter().any(|p| p.0 == Status::Fail) {
+        Status::Fail
+    } else {
+        Status::Warn
+    };
+    let (_, first, whole) = problems.iter().find(|p| p.0 == worst).cloned().unwrap();
+    let title = if whole {
+        first
+    } else {
+        format!("MCP server {name}: {first}")
+    };
+    let detail: Vec<&str> = problems.iter().map(|p| p.1.as_str()).collect();
+    Check::new(id, worst, title, detail.join("; "))
+}
+
+/// The managed Claude Code allowlist against what policy would install now.
+/// Reads only; the install step is what writes it.
+fn claude_allowlist(ctx: &Ctx, i: &Installed) -> Check {
+    const ID: &str = "mcp.claude.allowlist";
+    const DRIFT: &str =
+        "the Claude Code MCP allowlist differs from policy; run saiife system install again";
+    let Ok(p) = &ctx.config else {
+        return Check::new(
+            ID,
+            Status::Info,
+            "Claude Code MCP allowlist",
+            "not checked: the config does not load",
+        );
+    };
+    let want = saiife_agents::claude::managed_mcp_settings(&p.config.guard.mcp.allow_servers);
+    let warn = |d: String| Check::new(ID, Status::Warn, DRIFT, d);
+    let at = ctx.layout.at(CLAUDE_MCP);
+    let read = match fs::symlink_metadata(&at) {
+        Ok(m) if m.is_file() && m.len() <= 1 << 20 => fs::read(&at),
+        Ok(_) => return warn(format!("{CLAUDE_MCP}: not a regular file of sane size")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return warn(format!("{CLAUDE_MCP}: missing"))
+        }
+        Err(e) => return warn(format!("{CLAUDE_MCP}: {e}")),
+    };
+    let got = match read {
+        Ok(g) => g,
+        Err(e) => return warn(format!("{CLAUDE_MCP}: {e}")),
+    };
+    if got != want.as_bytes() {
+        return warn(format!("{CLAUDE_MCP}: content differs from policy"));
+    }
+    let recorded = i.files.iter().find(|f| f.path == Path::new(CLAUDE_MCP));
+    if let Some(want_sha) = recorded.and_then(|f| f.sha256.as_deref()) {
+        if want_sha != crate::fsops::sha256_hex(&got) {
+            return warn(format!("{CLAUDE_MCP}: differs from its install record"));
+        }
+    }
+    Check::new(
+        ID,
+        Status::Pass,
+        "Claude Code MCP allowlist matches policy",
+        "",
+    )
+}
+
 fn agent_label(name: &str) -> Check {
     let id = format!("agents.{name}.label");
     match Agent::from_name(name) {
@@ -1170,7 +1473,16 @@ mod tests {
         assert_status(&r, "reauth", Status::Warn);
         assert_eq!(get(&r, "reauth").detail, REAUTH_UNAVAILABLE);
         assert_eq!(get(&r, "forwarding").detail, "not configured");
-        assert!(!r.checks.iter().any(|c| c.id.starts_with("mcp.")));
+        // No gateway servers and no allow_servers: only the allowlist
+        // check, and it agrees with policy.
+        let mcp: Vec<&str> = r
+            .checks
+            .iter()
+            .filter(|c| c.id.starts_with("mcp."))
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(mcp, ["mcp.claude.allowlist"]);
+        assert_status(&r, "mcp.claude.allowlist", Status::Pass);
         // Doctor asked systemd, through the host, and changed nothing.
         let calls = t.host.state().calls;
         assert_eq!(calls, ["systemctl is-active saiifed.service"]);
@@ -1568,6 +1880,242 @@ mod tests {
                 format!("MCP server {s} bypasses saiife: its requests are not brokered or limited")
             );
         }
+    }
+
+    // ---- MCP gateway checks (plan 17, task 10)
+
+    fn mcp_ctx_checks(
+        t: &T,
+        status: Result<Vec<serde_json::Value>, String>,
+        abi: u32,
+    ) -> Vec<super::Check> {
+        let dir = FixedDirectory::from_text("", "");
+        let opts = DoctorOptions::default();
+        let (installed, installed_error) = match read_installed(&t.layout.at(INSTALLED)) {
+            Ok(i) => (i, None),
+            Err(e) => (None, Some(e)),
+        };
+        let ctx = super::Ctx {
+            layout: &t.layout,
+            host: &t.host,
+            dir: &dir,
+            installed,
+            installed_error,
+            config: saiife_policy::load_and_check(&t.layout.at(CONFIG), &dir)
+                .map_err(|e| e.to_string()),
+            as_root: false,
+            opts: &opts,
+        };
+        super::mcp_checks_with(&ctx, &status, abi)
+    }
+
+    fn pick<'c>(cs: &'c [super::Check], id: &str) -> &'c super::Check {
+        cs.iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("no check {id}"))
+    }
+
+    fn with_server(t: &T, extra: &str) {
+        t.append_config(&format!(
+            "\n[mcp.fs]\ncommand = \"/usr/bin/true\"\n{extra}\n"
+        ));
+    }
+
+    fn running(tools: u64) -> Result<Vec<serde_json::Value>, String> {
+        Ok(vec![
+            serde_json::json!({"name":"fs","state":"running","tools":tools,"since":"t","last_error":null}),
+        ])
+    }
+
+    #[test]
+    fn gateway_server_pass_with_tool_count() {
+        let t = T::installed();
+        with_server(&t, "");
+        let cs = mcp_ctx_checks(&t, running(3), 6);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Pass, "{c:?}");
+        assert_eq!(c.title, "MCP server fs is brokered (3 tools)");
+        let l = pick(&cs, "mcp.landlock");
+        assert_eq!(l.status, Status::Info);
+        assert_eq!(l.title, "Landlock ABI 6");
+        assert!(cs.iter().all(|c| c.id != "mcp.sandbox"));
+        // The unbrokered warning never appears for a gateway server.
+        assert!(cs.iter().all(|c| c.id != "mcp.fs"));
+    }
+
+    #[test]
+    fn gateway_server_not_running_fails() {
+        let t = T::installed();
+        with_server(&t, "");
+        let st = Ok(vec![
+            serde_json::json!({"name":"fs","state":"failed","tools":0,"since":"t","last_error":"command_not_root_owned"}),
+        ]);
+        let cs = mcp_ctx_checks(&t, st, 6);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(
+            c.title,
+            "MCP server fs is not running: command_not_root_owned"
+        );
+        // A daemon that is down is reported, not a crash.
+        let cs = mcp_ctx_checks(&t, Err("no socket".into()), 6);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.title.contains("daemon is unreachable"), "{c:?}");
+    }
+
+    #[test]
+    fn no_landlock_fails_unless_off() {
+        let t = T::installed();
+        with_server(&t, "");
+        let cs = mcp_ctx_checks(&t, running(1), 0);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.title.contains("sandbox unavailable"), "{c:?}");
+        let t = T::installed();
+        with_server(&t, "sandbox = \"off\"");
+        let cs = mcp_ctx_checks(&t, running(1), 0);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.title.contains("sandbox is off"), "{c:?}");
+        assert_eq!(pick(&cs, "mcp.landlock").title, "Landlock ABI 0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weaker_sandbox_warns_with_the_sandbox_wording() {
+        let t = T::installed();
+        with_server(&t, "");
+        let cs = mcp_ctx_checks(&t, running(1), 3);
+        let c = pick(&cs, "mcp.sandbox");
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.detail,
+            crate::sandbox::Strength::from_abi(3).gap().unwrap()
+        );
+        assert_eq!(pick(&cs, "mcp.gateway.fs").status, Status::Pass);
+    }
+
+    /// No server under Landlock: no `mcp.sandbox` warning, whatever the ABI.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn weaker_sandbox_not_warned_when_every_server_is_off() {
+        let t = T::installed();
+        with_server(&t, "sandbox = \"off\"");
+        let cs = mcp_ctx_checks(&t, running(1), 3);
+        assert!(cs.iter().all(|c| c.id != "mcp.sandbox"), "{cs:?}");
+    }
+
+    #[test]
+    fn npx_and_unowned_args_warn() {
+        let t = T::installed();
+        t.append_config(
+            "\n[mcp.fs]\ncommand = \"/usr/bin/env\"\nargs = [\"npx\", \"/srv/x.js\"]\n",
+        );
+        let cs = mcp_ctx_checks(&t, running(1), 6);
+        let c = pick(&cs, "mcp.gateway.fs");
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("npx/uvx"), "{c:?}");
+        assert!(c.detail.contains("/srv/x.js is not root-owned"), "{c:?}");
+    }
+
+    #[test]
+    fn allowlist_drift_warns() {
+        let t = T::installed();
+        let want = saiife_agents::claude::managed_mcp_settings(&[]);
+        let p = t.at(CLAUDE_MCP);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, &want).unwrap();
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        assert_eq!(pick(&cs, "mcp.claude.allowlist").status, Status::Pass);
+        // Policy gains a server: the file no longer matches.
+        t.append_config("\n[guard.mcp]\nallow_servers = [\"github\"]\n");
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        let c = pick(&cs, "mcp.claude.allowlist");
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(
+            c.title,
+            "the Claude Code MCP allowlist differs from policy; run saiife system install again"
+        );
+        // The pinned serverCommand changed in the file is drift too.
+        let want = saiife_agents::claude::managed_mcp_settings(&["github".into()]);
+        fs::write(&p, want.replace("serverCommand", "serverCommandX")).unwrap();
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        assert_eq!(pick(&cs, "mcp.claude.allowlist").status, Status::Warn);
+        fs::write(&p, &want).unwrap();
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        assert_eq!(pick(&cs, "mcp.claude.allowlist").status, Status::Pass);
+        // A missing file warns, and doctor wrote nothing.
+        fs::remove_file(&p).unwrap();
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        assert_eq!(pick(&cs, "mcp.claude.allowlist").status, Status::Warn);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn codex_gemini_restriction_info() {
+        let t = T::installed();
+        for a in ["codex", "gemini"] {
+            t.edit_installed(|i| {
+                i.agents.push(ManagedAgent {
+                    agent: a.into(),
+                    path: CODEX_REQUIREMENTS.into(),
+                    sha256: "0".repeat(64),
+                    whole_file: false,
+                    created_file: true,
+                })
+            });
+        }
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        for id in ["codex", "gemini"] {
+            let c = pick(&cs, &format!("mcp.{id}.restriction"));
+            assert_eq!(c.status, Status::Info);
+            assert!(
+                c.title.starts_with("MCP servers for ")
+                    && c.title.ends_with(" are restricted by the hook only"),
+                "{c:?}"
+            );
+            assert_eq!(
+                c.detail,
+                "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
+            );
+        }
+        // Listed, any server named saiife is allowed by name on these
+        // agents: `mcp.saiife` warns.
+        t.append_config("\n[guard.mcp]\nallow_servers = [\"saiife\"]\n");
+        let cs = mcp_ctx_checks(&t, Ok(vec![]), 6);
+        for id in ["codex", "gemini"] {
+            let c = pick(&cs, &format!("mcp.{id}.restriction"));
+            assert_eq!(
+                c.detail,
+                "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so its calls are allowed by name; nothing checks which program serves them"
+            );
+        }
+        let r = t.doctor();
+        assert_status(&r, "config.valid", Status::Pass);
+        let c = get(&r, "mcp.saiife");
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.title, super::SAIIFE_LISTED_UNPINNED);
+        assert_eq!(
+            c.title,
+            "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command"
+        );
+    }
+
+    /// On Claude Code alone a listed `saiife` changes nothing (the drop-in
+    /// pins it by command and leaves the name out): no warning.
+    #[test]
+    fn listed_saiife_quiet_with_claude_only() {
+        let t = T::installed();
+        t.edit_installed(|i| i.agents.retain(|a| a.agent == "claude"));
+        t.append_config("\n[guard.mcp]\nallow_servers = [\"saiife\"]\n");
+        let r = t.doctor();
+        assert_status(&r, "config.valid", Status::Pass);
+        assert!(r.checks.iter().all(|c| c.id != "mcp.saiife"));
+        assert!(r
+            .checks
+            .iter()
+            .all(|c| !c.title.contains("MCP server saiife")));
     }
 
     const STS_SVC: &str = "\n[services.aws]\nconnector = \"aws-s3\"\nmode = \"sts\"\n\

@@ -19,11 +19,14 @@ saiife-policy = { path = "../policy" }
 saiife-ipc = { path = "../ipc" }
 saiife-system = { path = "../system" }
 saiife-broker = { path = "../broker" }
+# JSON-RPC and the MCP subset (`__fake-mcp-server`, and later `saiife mcp`).
+saiife-mcp = { path = "../mcp" }
 # `saiife daemon --user` opens the keychain that holds the vault key.
 saiife-keychain = { path = "../keychain" }
+# `saiife mcp`: the JSON-RPC/MCP codec and types (tokio-free).
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # The hash of the exact command a grant is for (`raw_sha256`); also the
 # body hash the approvals tests check.
 sha2 = "0.10"

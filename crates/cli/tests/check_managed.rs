@@ -77,6 +77,11 @@ fn managed_as(
         .env("SAIIFE_DATA_DIR", sb.data())
         .env("SAIIFE_AUDIT_DIR", sb.audit())
         .env_remove("SAIIFE_EVAL_FAULT")
+        // Never the real /etc drop-in: none, unless a test writes one.
+        .env(
+            "SAIIFE_TEST_CLAUDE_MCP_DROPIN",
+            sb.dir.path().join("no-dropin"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -996,6 +1001,169 @@ fn listed_mcp_server_allowed_not_judged() {
         "{}",
         stderr(&o)
     );
+}
+
+/// A claude or codex payload calling `tool`.
+fn mcp_payload(agent: &str, tool: &str) -> String {
+    let rel = format!("{agent}/mcp-tool.json");
+    let mut v: Value = serde_json::from_str(&fixture(&rel)).unwrap();
+    v["tool_name"] = json!(tool);
+    v["cwd"] = json!("/");
+    v.to_string()
+}
+
+#[test]
+fn saiife_server_allowed_as_brokered() {
+    let d = TestDaemon::start(Opts::default());
+    let agent = "claude";
+    let drop_in = d.path().join("60-saiife-mcp.json");
+    std::fs::write(
+        &drop_in,
+        saiife_agents::claude::managed_mcp_settings(&["linear".into()]),
+    )
+    .unwrap();
+    let seam = drop_in.display().to_string();
+    let (o, _, _sb) = managed_as(
+        agent,
+        &d.config(),
+        &mcp_payload(agent, "mcp__saiife__shop_orders_list"),
+        &[("SAIIFE_TEST_CLAUDE_MCP_DROPIN", &seam)],
+        &[],
+    );
+    assert_eq!(code(&o), 0, "{agent}: stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_eq!(r["pack"], "guard.mcp", "{r}");
+    assert_eq!(r["rule"], "mcp_brokered", "{r}");
+    assert_eq!(r["reason"], "brokered: judged by the saiife daemon", "{r}");
+    assert_eq!(r["tool"], "mcp__saiife__shop_orders_list", "{r}");
+    assert_eq!(r["agent"], agent, "{r}");
+}
+
+/// Final review I3: on Claude Code `saiife` is brokered only while the
+/// managed MCP drop-in pins its command. Missing, or with a wrong pin: a
+/// server like any other, denied unless listed.
+#[test]
+fn claude_saiife_needs_the_pinned_drop_in() {
+    let d = TestDaemon::start(Opts::default());
+    let payload = mcp_payload("claude", "mcp__saiife__api_call");
+    let blocked = "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers";
+    // Missing (managed_as points the seam at a file that is not there).
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(stderr(&o).trim_end(), blocked);
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    // A wrong pin: extra arguments on the command.
+    let drop_in = d.path().join("60-saiife-mcp.json");
+    std::fs::write(
+        &drop_in,
+        r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp", "--wait", "5m"]}]}"#,
+    )
+    .unwrap();
+    let seam = drop_in.display().to_string();
+    let env = [("SAIIFE_TEST_CLAUDE_MCP_DROPIN", seam.as_str())];
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &env, &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(stderr(&o).trim_end(), blocked);
+    // The good drop-in: brokered.
+    std::fs::write(&drop_in, saiife_agents::claude::managed_mcp_settings(&[])).unwrap();
+    let (o, _, _sb) = managed_as("claude", &d.config(), &payload, &env, &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    assert_eq!(last_guard(&d)["rule"], "mcp_brokered");
+}
+
+/// Controller ruling (T9 follow-up): Codex pins no MCP server command, so
+/// a `saiife` server there may be the agent's own. Denied unless listed;
+/// listed, it is allowed by name ("tool not judged"), unpinned.
+#[test]
+fn codex_saiife_server_needs_listing() {
+    let d = TestDaemon::start(Opts::default());
+    let payload = mcp_payload("codex", "mcp__saiife__api_call");
+    let (o, _, sb) = managed_as("codex", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers"
+    );
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "deny", "{r}");
+    assert_eq!(r["rule"], "mcp_server_not_allowed", "{r}");
+    assert_eq!(r["agent"], "codex", "{r}");
+    assert!(sb.is_untouched());
+
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"saiife\"]\n".into(),
+        ..Opts::default()
+    });
+    let (o, _, _sb) = managed_as("codex", &d.config(), &payload, &[], &[]);
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_ne!(r["rule"], "mcp_brokered", "{r}");
+    assert_eq!(r["reason"], "tool not judged", "{r}");
+    assert_eq!(r["tool"], "mcp__saiife__api_call", "{r}");
+}
+
+#[test]
+fn saiife_lookalike_names_denied() {
+    let d = TestDaemon::start(Opts::default());
+    for tool in ["mcp__saiife__x__y", "mcp__saiife___x", "mcp__saiife__"] {
+        let (o, _, _sb) = managed_as(
+            "claude",
+            &d.config(),
+            &mcp_payload("claude", tool),
+            &[],
+            &[],
+        );
+        assert_eq!(code(&o), 2, "{tool}: stderr: {}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with("BLOCKED by guard.mcp"),
+            "{}",
+            stderr(&o)
+        );
+        assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+    }
+}
+
+/// Gemini CLI pins no MCP server command, so `saiife` is never brokered
+/// there: it needs both the server identity and a listing.
+#[test]
+fn gemini_saiife_needs_server_identity() {
+    let call = |d: &TestDaemon, ctx: Option<Value>| {
+        let mut v = json!({
+            "session_id": "g-1",
+            "cwd": "/",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "mcp_saiife_shop_orders_list",
+            "tool_input": {}
+        });
+        if let Some(c) = ctx {
+            v["mcp_context"] = c;
+        }
+        managed_as("gemini", &d.config(), &v.to_string(), &[], &[]).0
+    };
+    let d = TestDaemon::start(Opts::default());
+    let o = call(&d, Some(json!({"server_name": "saiife"})));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    assert_eq!(
+        stderr(&o).trim_end(),
+        "BLOCKED by guard.mcp: MCP server saiife is not in [guard.mcp] allow_servers"
+    );
+    assert_eq!(last_guard(&d)["rule"], "mcp_server_not_allowed");
+
+    let d = TestDaemon::start(Opts {
+        extra: "[guard.mcp]\nallow_servers = [\"saiife\"]\n".into(),
+        ..Opts::default()
+    });
+    let o = call(&d, None);
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let o = call(&d, Some(json!({"server_name": "saiife_x"})));
+    assert_eq!(code(&o), 2, "stderr: {}", stderr(&o));
+    let o = call(&d, Some(json!({"server_name": "saiife"})));
+    assert_eq!(code(&o), 0, "stderr: {}", stderr(&o));
+    let r = last_guard(&d);
+    assert_eq!(r["decision"], "allow", "{r}");
+    assert_ne!(r["rule"], "mcp_brokered", "{r}");
 }
 
 /// Controller ruling: on Gemini only an explicit server identity in the

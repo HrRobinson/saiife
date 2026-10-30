@@ -48,7 +48,9 @@ pub struct Client {
     stream: UnixStream,
     next_id: u64,
     hello: Map<String, Value>,
-    poisoned: bool,
+    /// The first error that left the stream out of step, as text: every
+    /// later call reports it.
+    poisoned: Option<String>,
 }
 
 fn owner_err(path: &Path, detail: impl Into<String>) -> ClientError {
@@ -190,7 +192,7 @@ impl Client {
             stream,
             next_id: 1,
             hello: Map::new(),
-            poisoned: false,
+            poisoned: None,
         };
         let mut args = Map::new();
         args.insert("proto".into(), Value::from(PROTO));
@@ -209,19 +211,38 @@ impl Client {
         args: Map<String, Value>,
         deadline: Instant,
     ) -> Result<Map<String, Value>, ClientError> {
-        if self.poisoned {
-            return Err(ClientError::Protocol(
-                "connection unusable after an earlier error".into(),
-            ));
-        }
+        self.usable()?;
         let r = self.exchange(op, args, deadline, false);
         if let Err(e) = &r {
-            // A refusal that answers our id leaves the stream in step.
-            if !matches!(e, ClientError::Refused { .. }) || self.poisoned {
-                self.poisoned = true;
+            // A refusal that answers our id leaves the stream in step
+            // (`exchange` poisons on one that does not).
+            if !matches!(e, ClientError::Refused { .. }) || self.poisoned.is_some() {
+                self.poison(e);
             }
         }
         r
+    }
+
+    /// Whether an earlier error left this connection unusable.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// `Err` naming the first error once the connection is unusable.
+    fn usable(&self) -> Result<(), ClientError> {
+        match &self.poisoned {
+            Some(first) => Err(ClientError::Protocol(format!(
+                "connection unusable after an earlier error ({first})"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Mark the connection unusable; the first error is kept.
+    fn poison(&mut self, e: &ClientError) {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(e.to_string());
+        }
     }
 
     /// Like [`Client::call`], but a refusal that answers this call's id is
@@ -233,14 +254,10 @@ impl Client {
         args: Map<String, Value>,
         deadline: Instant,
     ) -> Result<Map<String, Value>, ClientError> {
-        if self.poisoned {
-            return Err(ClientError::Protocol(
-                "connection unusable after an earlier error".into(),
-            ));
-        }
+        self.usable()?;
         let r = self.exchange(op, args, deadline, true);
-        if r.is_err() {
-            self.poisoned = true;
+        if let Err(e) = &r {
+            self.poison(e);
         }
         r
     }
@@ -270,17 +287,20 @@ impl Client {
             Some(false) if keep_refusal && id_ok => Ok(ans),
             Some(false) => {
                 // Includes id-less answers such as the daemon's `bad_frame`.
-                self.poisoned = !id_ok;
                 let s = |k: &str| {
                     ans.get(k)
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string()
                 };
-                Err(ClientError::Refused {
+                let e = ClientError::Refused {
                     code: s("error"),
                     message: s("message"),
-                })
+                };
+                if !id_ok {
+                    self.poison(&e);
+                }
+                Err(e)
             }
             _ if !id_ok => Err(ClientError::Protocol(format!("answer id is not {id}"))),
             Some(true) => Ok(ans),
@@ -616,9 +636,15 @@ mod tests {
             c.call("status", Map::new(), dl(100)),
             Err(ClientError::Timeout)
         ));
-        match c.call("status", Map::new(), dl(2000)) {
-            Err(ClientError::Protocol(m)) => assert!(m.contains("unusable")),
-            o => panic!("{o:?}"),
+        assert!(c.is_poisoned());
+        // Every later call names the first error, not only "unusable".
+        for _ in 0..2 {
+            match c.call("status", Map::new(), dl(2000)) {
+                Err(ClientError::Protocol(m)) => {
+                    assert_eq!(m, "connection unusable after an earlier error (timeout)")
+                }
+                o => panic!("{o:?}"),
+            }
         }
     }
 

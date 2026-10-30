@@ -24,6 +24,7 @@ use saiife_policy::{
     UserEntry,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ const MAX_HEADERS: usize = 64;
 const MAX_PATTERNS: usize = 256;
 const MAX_PATTERN_BYTES: usize = 256;
 const MAX_OVERLAY_SERVICES: usize = 64;
-const MAX_PROJECT: usize = 4096;
+pub(crate) const MAX_PROJECT: usize = 4096;
 
 pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     match req.op.as_str() {
@@ -263,7 +264,7 @@ pub(crate) fn parse_overlay(v: Option<&Value>) -> Result<Option<ServiceOverlay>,
 
 /// Each list at most [`MAX_PATTERNS`] entries of at most
 /// [`MAX_PATTERN_BYTES`] bytes.
-fn check_overlay(o: &ServiceOverlay) -> Result<(), &'static str> {
+pub(crate) fn check_overlay(o: &ServiceOverlay) -> Result<(), &'static str> {
     if [&o.allow, &o.ask, &o.deny]
         .iter()
         .any(|l| l.len() > MAX_PATTERNS || l.iter().any(|p| p.len() > MAX_PATTERN_BYTES))
@@ -413,6 +414,14 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         Some(Value::String(s)) if valid_collection(s) => Some(s.clone()),
         Some(_) => return Err("collection must be a name of [a-z0-9_-], 1 to 64 bytes"),
     };
+    // `via` is attribution only (plan 17 decision 4): a client is `cli`
+    // or `mcp`. `approval` is the daemon's own and `http` the gateway's.
+    let via = match args.get("via") {
+        None | Some(Value::Null) => Via::Cli,
+        Some(Value::String(s)) if s == "cli" => Via::Cli,
+        Some(Value::String(s)) if s == "mcp" => Via::Mcp,
+        Some(_) => return Err("via must be cli or mcp"),
+    };
     // `wait_ms` is accepted and ignored (decision 3): `--wait` polls
     // `api.result` from the client.
     let call = Call {
@@ -426,7 +435,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
         body,
         headers,
         overlay,
-        via: Via::Cli,
+        via,
         collection,
     };
     Ok((service, op, call))
@@ -434,13 +443,13 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
 
 /// The audit-volume gate (as for `audit.append`): a call that cannot be
 /// recorded is not made.
-fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
+pub(crate) fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
     let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
     crate::disk::disk_gate(free, ctx.policy().min_free_mb, uid, ctx.own_uid)
 }
 
 /// A snapshot for the record of a call made without a valid policy.
-fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
+pub(crate) fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
     PolicySnapshot {
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
@@ -505,7 +514,7 @@ impl Caller {
         }
     }
 
-    fn pid(&self) -> Option<u32> {
+    pub(crate) fn pid(&self) -> Option<u32> {
         match self {
             Caller::Unix(p) => Some(p.pid),
             Caller::Token { .. } => None,
@@ -513,12 +522,48 @@ impl Caller {
     }
 
     /// The record's `peer`.
-    fn record(&self) -> Value {
+    pub(crate) fn record(&self) -> Value {
         match self {
             Caller::Unix(p) => json!({"pid": p.pid, "comm": comm(p.pid)}),
             Caller::Token { addr, .. } => json!({"tcp": addr.to_string(), "auth": "token"}),
         }
     }
+}
+
+/// Who makes a call (pipeline step 1), as the daemon finds it: never what
+/// the request says.
+#[derive(Debug, Default)]
+pub(crate) struct Identity {
+    /// From the caller's identity (peer credentials or token).
+    pub(crate) uid: u32,
+    /// The daemon's name for `uid`; empty when it has none.
+    pub(crate) user: String,
+    /// The session of the caller's agent ancestor, by attribution.
+    pub(crate) session: Option<String>,
+    /// The `comm` of that agent process, for an approval request.
+    pub(crate) agent: String,
+    /// `user`'s current groups (cached lookups, off the runtime thread).
+    pub(crate) groups: Vec<String>,
+}
+
+/// Step 1 for every entry point (`api.call`, the HTTP gateway, `mcp.call`):
+/// fills `id` from `caller`.
+pub(crate) async fn identify(ctx: &Ctx, caller: &Caller, id: &mut Identity) {
+    id.uid = caller.uid();
+    id.user = ctx.name_of(id.uid).await.unwrap_or_default();
+    let ancestor = caller
+        .pid()
+        .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
+    id.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
+    id.agent = ancestor
+        .and_then(|(pid, _)| ctx.proc.stat(pid))
+        .map(|s| s.comm)
+        .unwrap_or_default();
+    id.groups = if id.user.is_empty() {
+        Vec::new()
+    } else {
+        ctx.groups_of(&id.user).await
+    };
 }
 
 /// Every entry point (`api.call`, the HTTP gateway) once it has parsed its
@@ -551,21 +596,18 @@ pub(crate) async fn execute_in(
         return Err(Refused::LowDisk(code));
     }
     // 1. Identify: the caller's uid, the session by attribution.
+    let mut who = Identity::default();
+    identify(ctx, caller, &mut who).await;
+    let Identity {
+        uid,
+        user,
+        session,
+        agent,
+        groups,
+    } = who;
     call.uid = uid;
-    call.user = ctx.name_of(uid).await.unwrap_or_default();
-    let ancestor = caller
-        .pid()
-        .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
-    call.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
-    let agent = ancestor
-        .and_then(|(pid, _)| ctx.proc.stat(pid))
-        .map(|s| s.comm)
-        .unwrap_or_default();
-    let groups = if call.user.is_empty() {
-        Vec::new()
-    } else {
-        ctx.groups_of(&call.user).await
-    };
+    call.user = user;
+    call.session = session;
 
     // The policy as it is now: a reload while this call runs does not
     // change what it runs under.
@@ -797,7 +839,11 @@ async fn has_scope(ctx: &Arc<Ctx>, uid: u32) -> bool {
     matches!(scope_for(&g.snap.config, &groups, &user), Ok(Some(_)))
 }
 
-/// `api.list`: [`services_for`] the caller.
+/// `api.list`: [`services_for`] the caller. With `schema: true` each
+/// operation also carries its MCP tool `title`, `input_schema` and
+/// `body_arg`. `tools_hash` is `sha256:<hex>` of the canonical JSON of the
+/// services with their schemas, whatever `schema` is: it moves when a
+/// reload changes what `saiife mcp` would list.
 async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let id = req.id;
     let overlays = match parse_overlays(req.args.get("overlays")) {
@@ -808,13 +854,48 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(e) => e,
         Err(m) => return bad(id, m),
     };
-    let (services, warning) = services_in(ctx, peer.uid, &overlays, project_env.as_deref()).await;
+    let schema = match req.args.get("schema") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return bad(id, "schema must be a boolean"),
+    };
+    let (mut services, warning) =
+        services_in(ctx, peer.uid, &overlays, project_env.as_deref(), true).await;
+    let tools_hash = format!(
+        "sha256:{}",
+        hex(&Sha256::digest(
+            saiife_policy::canonical_json(&Value::Array(services.clone())).as_bytes()
+        ))
+    );
+    if !schema {
+        strip_schemas(&mut services);
+    }
     let mut m = Map::new();
     m.insert("services".into(), Value::Array(services));
+    m.insert("tools_hash".into(), tools_hash.into());
     if let Some(w) = warning {
         m.insert("warning".into(), w.into());
     }
     ok(id, m)
+}
+
+pub(crate) fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Drops what `schema: true` adds to each operation of `api.list`.
+fn strip_schemas(services: &mut [Value]) {
+    for s in services {
+        if let Some(Value::Array(ops)) = s.get_mut("operations") {
+            for op in ops {
+                if let Some(o) = op.as_object_mut() {
+                    for k in ["title", "input_schema", "body_arg"] {
+                        o.remove(k);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The services of `uid`'s scope and their operations, each with the
@@ -825,17 +906,19 @@ pub(crate) async fn services_for(
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
-    services_in(ctx, uid, overlays, None).await.0
+    services_in(ctx, uid, overlays, None, false).await.0
 }
 
 /// [`services_for`] under the environment `api.call` would choose for the
 /// same caller and project `env`, so the list matches what a call allows;
-/// with the warning that choice left.
+/// with the warning that choice left. `schema` as for
+/// [`pipeline::list_operations`].
 pub(crate) async fn services_in(
     ctx: &Arc<Ctx>,
     uid: u32,
     overlays: &BTreeMap<String, ServiceOverlay>,
     project_env: Option<&str>,
+    schema: bool,
 ) -> (Vec<Value>, Option<String>) {
     let mut services = Vec::new();
     let mut warning = None;
@@ -854,7 +937,7 @@ pub(crate) async fn services_in(
         if let (Some(snap), Some(scope)) = (snap, scope) {
             for name in &scope.services {
                 if let Some(ops) =
-                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name))
+                    pipeline::list_operations(name, snap, &g.catalog, overlays.get(name), schema)
                 {
                     services.push(json!({"name": name, "operations": ops}));
                 }

@@ -178,6 +178,12 @@ impl TestDaemon {
             .env("SAIIFE_DATA_DIR", self.path().join("data"))
             .env("SAIIFE_AUDIT_DIR", self.audit_dir())
             .env("XDG_RUNTIME_DIR", self.path().join("no-runtime"))
+            // The test runs the daemon and its clients as one user: the
+            // debug-build seam lets the locked daemon serve its own uid
+            // (gateway children are still refused by pid).
+            .env("SAIIFE_TEST_OWN_UID_PEERS", "allow")
+            // The MCP gateway runs this binary's `__mcp-spawn`.
+            .env("SAIIFE_TEST_MCP_SPAWN", env!("CARGO_BIN_EXE_saiife"))
             .env_remove("NOTIFY_SOCKET")
             .env_remove("STATE_DIRECTORY")
             .env_remove("CREDENTIALS_DIRECTORY")

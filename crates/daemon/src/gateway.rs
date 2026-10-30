@@ -179,6 +179,15 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let Ok(peer) = peer_cred(&s) else {
         return;
     };
+    // A gateway MCP child, or in locked mode any process of the daemon's
+    // own uid (plan 17, decision 12): closed before the request is read.
+    if crate::mcp_gateway::unix_peer_refused(&ctx, &peer) {
+        ctx.notice(
+            peer.uid,
+            Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Gateway),
+        );
+        return;
+    }
     // The personal broker serves its own uid only (decision 3): another
     // uid, root included, is closed before the request is read.
     if ctx.mode == crate::ops::Mode::Personal && !crate::personal::admits(ctx.own_uid, peer.uid) {
@@ -258,6 +267,21 @@ pub async fn serve_tcp(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
                 });
                 let ctx = Arc::clone(&ctx);
                 tokio::spawn(async move {
+                    // A gateway MCP child or one of its processes, or in
+                    // locked mode a socket of the daemon's own uid: found
+                    // in /proc and closed before the request is read.
+                    let refused = match s.local_addr() {
+                        Ok(local) => crate::mcp_gateway::tcp_peer_refused(&ctx, local, addr).await,
+                        Err(_) => (ctx.refuse_own_uid_peers || ctx.mcp.has_children())
+                            .then_some(crate::ops::UNKNOWN_UID),
+                    };
+                    if let Some(uid) = refused {
+                        ctx.notice(
+                            uid,
+                            Notice::McpChildPeer(crate::mcp_gateway::PeerSocket::Tcp),
+                        );
+                        return;
+                    }
                     tokio::select! {
                         _ = serve_conn(s, Source::Tcp(conn), ctx, opts) => {}
                         // Evicted while still pre-auth.
@@ -1265,5 +1289,65 @@ mod personal_tests {
             "{}",
             String::from_utf8_lossy(&got)
         );
+    }
+
+    /// A gateway MCP child (this test process, counted as one) is closed
+    /// on gateway.sock in both modes; locked mode refusing its own uid
+    /// closes any peer of that uid.
+    #[tokio::test]
+    async fn mcp_child_and_own_uid_peers_closed_on_gateway_socket() {
+        let me = rustix::process::getuid().as_raw();
+        for mode in [crate::ops::Mode::Personal, crate::ops::Mode::Locked] {
+            let t = tempfile::tempdir().unwrap();
+            let (ctx, _join) = crate::ops::test_ctx(t.path(), mode, me);
+            ctx.mcp.add_test_pid(std::process::id());
+            let got = answer_bytes(ctx).await;
+            assert!(
+                got.is_empty(),
+                "{mode:?}: {}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, me);
+        Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
+        assert!(answer_bytes(ctx).await.is_empty());
+    }
+
+    async fn tcp_answer(ctx: Arc<Ctx>) -> Vec<u8> {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let task = tokio::spawn(serve_tcp(l, ctx, Opts::default()));
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = s
+            .write_all(b"GET /v1/services HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await;
+        let mut got = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut got)).await;
+        task.abort();
+        assert!(read.is_ok(), "the connection was not closed");
+        got
+    }
+
+    /// The TCP listener finds the client socket in /proc: one held by a
+    /// gateway child (this process, counted as one), or in locked mode of
+    /// the daemon's own uid, is closed unanswered; otherwise HTTP answers.
+    #[tokio::test]
+    async fn tcp_peer_of_child_or_own_uid_closed() {
+        let me = rustix::process::getuid().as_raw();
+        let t = tempfile::tempdir().unwrap();
+        let (ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, me);
+        let got = tcp_answer(Arc::clone(&ctx)).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "{}",
+            String::from_utf8_lossy(&got)
+        );
+        ctx.mcp.add_test_pid(std::process::id());
+        assert!(tcp_answer(ctx).await.is_empty());
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, me);
+        Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
+        assert!(tcp_answer(ctx).await.is_empty());
     }
 }

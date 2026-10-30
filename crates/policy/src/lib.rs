@@ -14,6 +14,7 @@ pub mod effective;
 pub mod environment;
 pub mod installed;
 pub mod load;
+pub mod mcp;
 pub mod project;
 pub mod scope;
 pub mod service;
@@ -29,6 +30,7 @@ pub use environment::{
     applied_for, env_for, env_hashes, EnvGuard, EnvironmentCfg, ServiceOverride,
 };
 pub use load::{check_guard_ask, load_system, split_ask, LoadedPolicy, PolicyError};
+pub use mcp::{decide_tool, tool_kind, valid_server_name, McpServerCfg, Sandbox};
 pub use project::{merge_project, parse_project, Merged, Mode, ProjectOverlay, ServiceOverlay};
 pub use scope::{check_scopes, load_and_check, scope_for};
 pub use service::{

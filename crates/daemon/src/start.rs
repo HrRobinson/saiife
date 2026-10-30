@@ -588,6 +588,32 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     }
     // Checked at load: loopback only. No valid policy, no listener.
     let tcp = gateway_cfg.tcp_addr().ok().flatten();
+    // The MCP gateway (plan 17): children never get read access to the
+    // daemon's own dirs as it really runs.
+    let protected: Vec<PathBuf> = [
+        Some(state_dir.clone()),
+        Some(audit_cfg.dir.clone()),
+        Some(daemon_cfg.socket_dir.clone()),
+        config.parent().map(Path::to_path_buf),
+        credentials_dir.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|p| {
+        std::fs::canonicalize(&p)
+            .ok()
+            .or(p.is_absolute().then_some(p))
+    })
+    .collect();
+    let mcp = Arc::new(crate::mcp_gateway::Gateway::new(
+        crate::mcp_gateway::GatewaySetup {
+            helper: saiife_system::sandbox::spawn_helper(),
+            state_dir: state_dir.clone(),
+            protected,
+            enabled: mode == Mode::Locked,
+            log: crate::mcp_gateway::Log::stderr(),
+        },
+    ));
 
     let ctx = Arc::new(Ctx::new(CtxInit {
         writer: handle,
@@ -612,7 +638,10 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         approvals,
         lockdown,
         grants,
+        mcp,
+        refuse_own_uid_peers: mode == Mode::Locked && !crate::mcp_gateway::own_uid_peers_allowed(),
     }));
+    ctx.mcp.attach(Arc::downgrade(&ctx));
     ctx.tcp.lock().unwrap_or_else(|p| p.into_inner()).configured = gateway_cfg.tcp.clone();
 
     // The forwarding workers start in `serve`, after the start records.
@@ -1167,6 +1196,12 @@ async fn serve(
         ),
     }
 
+    // The MCP gateway's servers, per the policy loaded at start.
+    if let Some(sys) = ctx.policy().system {
+        let vault = ctx.vault.lock();
+        ctx.mcp.reconcile(&sys, &vault);
+    }
+
     // 8. Ready.
     notify::ready();
     let mut writer_died = false;
@@ -1260,6 +1295,8 @@ async fn serve(
     // most the upstream timeout.
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
+    // Gateway children: EOF, 2 s, then killed; never waited on longer.
+    ctx.mcp.stop().await;
     // The forwarders stop first: the stop record waits for the next start
     // (the cursors are on disk).
     ctx.forwarders.stop_all().await;
@@ -1389,6 +1426,10 @@ pub(crate) async fn reload(ctx: &Arc<Ctx>) -> Result<(), String> {
         Ok((l, _, next)) => {
             *ctx.policy.lock().unwrap_or_else(|p| p.into_inner()) = next;
             ctx.forwarders.apply(&l.config.audit.forward).await;
+            {
+                let vault = ctx.vault.lock();
+                ctx.mcp.reconcile(&l.config, &vault);
+            }
             recs.push(policy_record(ctx, "loaded", Some(files_json(&l)), None));
             let changed = restart_only_changes(ctx, &l);
             if !changed.is_empty() {

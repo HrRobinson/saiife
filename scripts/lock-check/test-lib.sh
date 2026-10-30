@@ -1261,7 +1261,7 @@ claude.hooks-empty.user claude.config-dir claude.setting-sources claude.fail.exi
 claude.fail.segv claude.fail.kill9 claude.fail.timeout claude.fail.missing claude.fail.exit1 \
 claude.configchange.fires claude.configchange.control claude.configchange.blocks \
 claude.managed-only claude.mcp.control claude.mcp.hooked claude.mcp.denied claude.mcp.allowlist \
-claude.version.onfailure" "check ids"
+claude.mcp.command claude.mcp.command-other claude.version.onfailure" "check ids"
   # Class, expect, mode, control.
   assert_eq "$(awk -F'\t' '$2 == "gate" && $3 != "blocked" && $3 != "fired"' "$rec")" "" \
     "gate rows that expect neither blocked nor fired"
@@ -1278,6 +1278,7 @@ claude.configchange.fires design fired allow|claude.configchange.control design 
 claude.configchange.blocks design blocked allow|claude.managed-only design blocked allow|\
 claude.mcp.control design ran allow|claude.mcp.hooked design fired allow|\
 claude.mcp.denied design unavailable allow|claude.mcp.allowlist design unavailable allow|\
+claude.mcp.command design ran allow|claude.mcp.command-other design unavailable allow|\
 claude.version.onfailure info - found" "class, expect, mode"
   assert_eq "$(awk -F'\t' '$3 == "unavailable" { print $6 }' "$rec" | sort -u)" claude.mcp.control \
     "control of the unavailable rows"
@@ -1339,7 +1340,7 @@ $LC_PROJECT/.claude/settings.json $LC_PROJECT/.claude/settings.local.json" "sett
     "$s/claude.managed-only/settings-1")" "* touch $LC_MARKERS/0123456789ab" "user hook"
   grep -qF "echo 0123456789ab" "$s/claude.managed-only/prompt" || fail "managed-only prompt"
   local m
-  for m in control hooked denied allowlist; do
+  for m in control hooked denied allowlist command command-other; do
     assert_eq "$(paste -sd' ' "$s/claude.mcp.$m/args")" "--mcp-config $LC_ROOT/work/lockcheck-mcp.json" \
       "mcp.$m args"
     grep -qF touch_marker "$s/claude.mcp.$m/prompt" || fail "mcp.$m prompt"

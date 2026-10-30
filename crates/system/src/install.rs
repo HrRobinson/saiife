@@ -218,8 +218,14 @@ pub fn install(
     let mut agents = opts.agents.clone();
     agents.sort();
     agents.dedup();
+    let claude = agents.contains(&Agent::Claude);
     for a in agents {
         run.managed(a)?;
+    }
+    if claude {
+        run.mcp_allowlist()?;
+    } else {
+        run.drop_stale_mcp()?;
     }
     run.save()?;
     // 9. Start (or restart) the daemon.
@@ -909,6 +915,45 @@ impl Run<'_> {
         self.save()
     }
 
+    /// A reinstall without Claude removes the drop-in an earlier run wrote,
+    /// and its entry in installed.toml.
+    fn drop_stale_mcp(&mut self) -> Result<(), InstallError> {
+        let path = Path::new(CLAUDE_MCP);
+        if !self.rec.files.iter().any(|f| f.path == path) {
+            return Ok(());
+        }
+        let p = self.at(CLAUDE_MCP);
+        if fsops::remove_if_listed(&p).map_err(step("managed"))? {
+            self.changed(format!("removed {CLAUDE_MCP}"));
+        }
+        self.rec.files.retain(|f| f.path != path);
+        self.save()
+    }
+
+    /// The Claude Code MCP allowlist drop-in, from `[guard.mcp]` in the
+    /// config as it is now (so the hook and Claude Code agree). An
+    /// unreadable config leaves only `saiife` allowed, and says so.
+    fn mcp_allowlist(&mut self) -> Result<(), InstallError> {
+        let allow = match saiife_policy::load_system(&self.at(CONFIG)) {
+            Ok(l) => l.config.guard.mcp.allow_servers,
+            Err(e) => {
+                self.report.warnings.push(format!(
+                    "{CLAUDE_MCP}: the config could not be read ({e}); only the saiife MCP server is allowed"
+                ));
+                Vec::new()
+            }
+        };
+        let text = claude::managed_mcp_settings(&allow);
+        self.file(
+            CLAUDE_MCP,
+            text.as_bytes(),
+            0o644,
+            FileKind::Managed,
+            "managed",
+        )?;
+        Ok(())
+    }
+
     /// Records (or refreshes) a managed agent. `created_file` sticks from
     /// the first record.
     fn record_agent(&mut self, a: Agent, file_abs: &str, sha: String, whole: bool, created: bool) {
@@ -1227,6 +1272,10 @@ pub(crate) mod tests {
         ("/etc/systemd/system/saiifed.service", 0o644),
         ("/etc/claude-code/managed-settings.d", 0o755),
         ("/etc/claude-code/managed-settings.d/50-saiife.json", 0o644),
+        (
+            "/etc/claude-code/managed-settings.d/60-saiife-mcp.json",
+            0o644,
+        ),
         ("/etc/codex", 0o755),
         ("/etc/codex/requirements.toml", 0o644),
         ("/etc/gemini-cli", 0o755),
@@ -1419,6 +1468,96 @@ pub(crate) mod tests {
         assert_eq!(after.dirs, before.dirs);
         assert!(after.files.iter().all(|f| f.created));
         assert!(after.agents.iter().all(|a| a.created_file));
+    }
+
+    #[test]
+    fn install_writes_mcp_dropin_from_policy() {
+        let e = env(255);
+        e.install();
+        // The default config lists no servers: only `saiife`.
+        assert_eq!(
+            fs::read_to_string(e.at(CLAUDE_MCP)).unwrap(),
+            "{\n  \"allowedMcpServers\": [\n    {\n      \"serverCommand\": [\n        \"/opt/saiife/bin/saiife\",\n        \"mcp\"\n      ]\n    }\n  ]\n}\n"
+        );
+        let cfg =
+            "version = 2\nlocked = true\n\n[guard.mcp]\nallow_servers = [\"github\", \"jira\"]\n";
+        fs::write(e.at(CONFIG), cfg).unwrap();
+        e.install();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(e.at(CLAUDE_MCP)).unwrap()).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"allowedMcpServers": [
+                {"serverCommand": [BINARY, "mcp"]},
+                {"serverName": "github"}, {"serverName": "jira"}
+            ]})
+        );
+        let f = e
+            .installed()
+            .files
+            .into_iter()
+            .find(|f| f.path == Path::new(CLAUDE_MCP))
+            .unwrap();
+        assert_eq!(f.kind, FileKind::Managed);
+        assert!(f.created);
+        assert_eq!(
+            f.sha256.unwrap(),
+            crate::fsops::sha256_file(&e.at(CLAUDE_MCP))
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dropin_pins_saiife_by_command_not_name() {
+        let e = env(255);
+        e.install();
+        let text = fs::read_to_string(e.at(CLAUDE_MCP)).unwrap();
+        assert!(text.contains("\"serverCommand\""), "{text}");
+        assert!(!text.contains("\"serverName\": \"saiife\""), "{text}");
+    }
+
+    #[test]
+    fn reinstall_without_claude_removes_stale_dropin() {
+        let e = env(255);
+        e.install();
+        assert!(e.at(CLAUDE_MCP).exists());
+        let mut o = all_agents();
+        o.agents = vec![Agent::Codex];
+        e.run(&o).unwrap();
+        assert!(!e.at(CLAUDE_MCP).exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.path == Path::new(CLAUDE_MCP)));
+    }
+
+    #[test]
+    fn install_without_claude_writes_no_dropin() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = vec![Agent::Codex, Agent::Gemini];
+        e.run(&o).unwrap();
+        assert!(!e.at(CLAUDE_MCP).exists());
+        assert!(!e
+            .installed()
+            .files
+            .iter()
+            .any(|f| f.path == Path::new(CLAUDE_MCP)));
+    }
+
+    #[test]
+    fn second_install_unchanged() {
+        let e = env(255);
+        e.install();
+        let r = e.install();
+        assert!(r.changed.is_empty(), "{:?}", r.changed);
+        assert!(
+            r.unchanged.iter().any(|u| u == CLAUDE_MCP),
+            "{:?}",
+            r.unchanged
+        );
     }
 
     fn set_active(h: &FakeHost) {
@@ -1660,7 +1799,7 @@ pub(crate) mod tests {
         let i = e.installed();
         assert_eq!(i.users, ["saiife"]);
         assert_eq!(i.groups, ["saiife", "saiife-audit"]);
-        assert_eq!(i.files.len(), 4);
+        assert_eq!(i.files.len(), 5);
         assert_eq!(i.agents.len(), 3);
     }
 

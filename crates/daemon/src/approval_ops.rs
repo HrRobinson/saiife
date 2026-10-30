@@ -107,6 +107,21 @@ pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
 
 // ------------------------------------------------------------ create
 
+/// The display is the request itself only when masking changed none of it
+/// (step 8 already refused a body it would change, and a binary raw body
+/// as `body_not_displayable`): only then may an identical pending request
+/// be given back (decision 8). A body without a display (plan 15's binary
+/// raw upload, should one ever reach here) is never faithful: its hash
+/// alone is not what the approver reads.
+fn display_is_faithful(p: &PendingCall) -> bool {
+    p.operation == p.stored.operation
+        && p.project == p.stored.project
+        && *p.params.get() == p.stored.params
+        && p.headers == p.stored.headers
+        && p.body_sha256 == p.stored.body_sha256
+        && (p.body_sha256.is_none() || p.body_display.is_some())
+}
+
 /// Step 8 for the daemon: seal `p`'s exact request (bound to its id), store
 /// it with the masked display copy, and write its `approval`/`created`
 /// record. Errs with the deny rule; nothing is left pending on an error.
@@ -122,6 +137,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     let exact = Zeroizing::new(
         serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
     );
+    let faithful = display_is_faithful(p);
     let new = NewRequest {
         uid: p.stored.uid,
         user: p.stored.user.clone(),
@@ -148,6 +164,61 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
             headers: p.headers.clone(),
             env: p.stored.env.clone(),
             env_base: p.stored.env_recorded && p.stored.env.is_none(),
+            faithful,
+        },
+    };
+    store_new(ctx, new, Some(exact), ttl).await
+}
+
+/// Step 9 of an mcp call (plan 17): seal `p`'s exact call (bound to its
+/// id), store it with the masked display copy (type `mcp`: `service`
+/// `mcp:<server>`, `operation` the tool, `body_display` the arguments) and
+/// write its `approval`/`created` record. An identical pending request
+/// gives its id back. Errs with the deny rule; nothing is left pending on
+/// an error.
+pub(crate) async fn create_mcp(
+    ctx: &Arc<Ctx>,
+    p: &crate::mcp_ops::PendingMcp,
+    agent: &str,
+) -> Result<u64, String> {
+    if ctx.approvals.is_err() {
+        return Err("approvals_unavailable".into());
+    }
+    let ttl = ctx
+        .policy()
+        .system
+        .map(|s| s.approval.timeout)
+        .unwrap_or_else(|| saiife_policy::ApprovalCfg::default().timeout);
+    let exact = Zeroizing::new(
+        serde_json::to_vec(&p.stored).map_err(|_| "approvals_unavailable".to_string())?,
+    );
+    let new = NewRequest {
+        uid: p.stored.uid,
+        user: p.stored.user.clone(),
+        session: p.stored.session.clone(),
+        agent: agent.to_string(),
+        project: p.project.clone(),
+        kind: ApprovalType::Mcp,
+        service: Some(format!("mcp:{}", p.stored.server)),
+        operation: Some(p.tool.clone()),
+        capability: None,
+        params: Default::default(),
+        input: None,
+        grant_key: None,
+        scope: None,
+        ask_rule: None,
+        send: SendDisplay {
+            body_display: Some(p.display.clone()),
+            body_sha256: Some(p.stored.arguments_sha256.clone()),
+            body_truncated: p.truncated,
+            amount: None,
+            headers: Vec::new(),
+            env: p.stored.env.clone(),
+            env_base: p.stored.env_recorded && p.stored.env.is_none(),
+            // Step 9 refused a tool name or arguments masking would change
+            // (`masked_content`); the project must be unchanged too.
+            // A cut display is still compared whole by its SHA-256.
+            faithful: p.tool == p.stored.tool && p.project == p.stored.project,
         },
     };
     store_new(ctx, new, Some(exact), ttl).await
@@ -484,15 +555,12 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     // first: no re-authentication prompt for an approval refused anyway.
     let ack = req.args.get("ack_truncated").and_then(Value::as_bool) == Some(true);
     if approve && r.body_truncated && !ack {
-        return refuse(
-            ctx,
-            &r,
-            peer.uid,
-            id,
-            "truncated_not_acknowledged",
-            "the body is over 1 MiB and shown cut; approve with ack_truncated (--accept-truncated)",
-        )
-        .await;
+        let why = if r.kind == ApprovalType::Mcp {
+            "the arguments are over 4 KiB and shown cut; approve with ack_truncated (--accept-truncated)"
+        } else {
+            "the body is over 1 MiB and shown cut; approve with ack_truncated (--accept-truncated)"
+        };
+        return refuse(ctx, &r, peer.uid, id, "truncated_not_acknowledged", why).await;
     }
 
     // The requester may always withdraw its own request: a rejection that
@@ -607,7 +675,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             &format!("request #{rid} is {action}, but its record could not be written: {e}"),
         );
     }
-    if approve && r.kind == ApprovalType::Connector {
+    if approve && matches!(r.kind, ApprovalType::Connector | ApprovalType::Mcp) {
         let c = Arc::clone(ctx);
         let by = peer.uid;
         tokio::spawn(async move { send(c, r, by).await });
@@ -1230,6 +1298,9 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
                 .await
             }
         };
+    if r.kind == ApprovalType::Mcp {
+        return send_mcp(Arc::clone(&ctx), r, by, exact).await;
+    }
     let Ok(stored) = serde_json::from_slice::<StoredCall>(&exact) else {
         return fail(
             &ctx,
@@ -1249,47 +1320,18 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
         )
         .await;
     }
-    let state = ctx.policy();
-    let Some(g) = state.gateway.clone() else {
-        return fail(&ctx, &r, "policy_invalid", "no valid policy is loaded").await;
+    let (g, env_name, groups) = match send_env(
+        &ctx,
+        &stored.user,
+        stored.env.as_deref(),
+        stored.env_recorded,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err((rule, message)) => return fail(&ctx, &r, rule, message).await,
     };
-    let groups = if stored.user.is_empty() {
-        Vec::new()
-    } else {
-        ctx.groups_of(&stored.user).await
-    };
-    // The environment, chosen as for a new call: locked mode takes the
-    // scope's as it is now; developer mode the one the request was asked
-    // under (stored with it).
-    let groups = Groups(groups);
-    let mode = crate::api_ops::gateway_mode(&ctx);
-    let Ok((env_name, _)) = g.select_env(mode, &groups, &stored.user, stored.env.as_deref()) else {
-        return fail(
-            &ctx,
-            &r,
-            crate::ops::UNKNOWN_ENV_RULE,
-            "the scope's environment has no policy snapshot",
-        )
-        .await;
-    };
-    // An approved request is sent under the environment it was asked
-    // under, or not at all: locked mode refuses a scope rebound to another
-    // environment (or from the base config to one) since the ask,
-    // developer mode an environment no longer defined (never the base
-    // config instead). Only a request sealed before the environment was
-    // recorded (`env_recorded` false, no `env`) is not checked.
-    if (stored.env_recorded || stored.env.is_some()) && env_name != stored.env.as_deref() {
-        let message = match mode {
-            saiife_policy::Mode::Locked => {
-                "the scope's environment changed since the request was asked"
-            }
-            saiife_policy::Mode::Developer => {
-                "the environment the request was asked under is no longer defined"
-            }
-        };
-        return fail(&ctx, &r, ENV_CHANGED, message).await;
-    }
-    let snap = g.snapshot_for(env_name);
+    let snap = g.snapshot_for(env_name.as_deref());
     let env = DaemonEnv {
         ctx: &ctx,
         config: &snap.config,
@@ -1340,6 +1382,161 @@ pub(crate) async fn send(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32) {
     let sent = matches!(outcome, Outcome::Done { .. }) || outcome.is_post_send_deny();
     let to = if sent { State::Sent } else { State::SendFailed };
     let mut result = answer(0, outcome);
+    if let Some(o) = result.as_object_mut() {
+        o.remove("id");
+    }
+    if let Err(e) = recorded {
+        // As for a direct call: an unrecorded result is withheld.
+        result = json!({"ok": false, "error": "unrecorded",
+            "message": format!("the connector record could not be written: {e}")});
+    }
+    finish(&ctx, &r, to, Some(result), detail).await;
+}
+
+/// The policy, environment and groups an approved request of `user` is
+/// sent under, chosen as for a new call: locked mode takes the scope's
+/// environment as it is now, developer mode the one the request was asked
+/// under (`env`). An approved request is sent under the environment it was
+/// asked under or not at all (`env_changed`): locked mode refuses a scope
+/// rebound to another environment (or from the base config to one) since
+/// the ask, developer mode an environment no longer defined (never the
+/// base config instead). Only a request sealed before the environment was
+/// recorded (`env_recorded` false, no `env`) is not checked. `Err` is the
+/// failure's rule and message.
+async fn send_env(
+    ctx: &Arc<Ctx>,
+    user: &str,
+    env: Option<&str>,
+    env_recorded: bool,
+) -> Result<SendEnv, (&'static str, &'static str)> {
+    let state = ctx.policy();
+    let Some(g) = state.gateway.clone() else {
+        return Err(("policy_invalid", "no valid policy is loaded"));
+    };
+    let groups = if user.is_empty() {
+        Vec::new()
+    } else {
+        ctx.groups_of(user).await
+    };
+    let groups = Groups(groups);
+    let mode = crate::api_ops::gateway_mode(ctx);
+    let env_name = match g.select_env(mode, &groups, user, env) {
+        Ok((e, _)) => e.map(str::to_string),
+        Err(_) => {
+            return Err((
+                crate::ops::UNKNOWN_ENV_RULE,
+                "the scope's environment has no policy snapshot",
+            ))
+        }
+    };
+    if (env_recorded || env.is_some()) && env_name.as_deref() != env {
+        let message = match mode {
+            saiife_policy::Mode::Locked => {
+                "the scope's environment changed since the request was asked"
+            }
+            saiife_policy::Mode::Developer => {
+                "the environment the request was asked under is no longer defined"
+            }
+        };
+        return Err((ENV_CHANGED, message));
+    }
+    Ok((g, env_name, groups))
+}
+
+/// What [`send_env`] chose: the policy, the environment and the groups.
+type SendEnv = (Arc<crate::ops::GatewayPolicy>, Option<String>, Groups);
+
+/// [`send`] for an mcp request: the sealed `StoredMcpCall`, re-run through
+/// steps 3–8 under the policy in force now, then sent through the daemon's
+/// tool caller. Its `connector` record has `via = approval`.
+async fn send_mcp(ctx: Arc<Ctx>, r: ApprovalRequest, by: u32, exact: Zeroizing<Vec<u8>>) {
+    use crate::mcp_ops::{self, McpOutcome, StoredMcpCall};
+    let rid = r.id;
+    let Ok(stored) = serde_json::from_slice::<StoredMcpCall>(&exact) else {
+        return fail(
+            &ctx,
+            &r,
+            "stored_request_invalid",
+            "the stored request cannot be read",
+        )
+        .await;
+    };
+    drop(exact);
+    let service = format!("mcp:{}", stored.server);
+    if stored.uid != r.uid || r.service.as_deref() != Some(service.as_str()) {
+        return fail(
+            &ctx,
+            &r,
+            "stored_request_invalid",
+            "the stored request is another uid's or another server's",
+        )
+        .await;
+    }
+    let (g, env_name, groups) = match send_env(
+        &ctx,
+        &stored.user,
+        stored.env.as_deref(),
+        stored.env_recorded,
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err((rule, message)) => return fail(&ctx, &r, rule, message).await,
+    };
+    let snap = g.snapshot_for(env_name.as_deref());
+    let tools = Arc::clone(&ctx.tool_caller);
+    let (call, outcome, trace) = mcp_ops::send_approved(
+        &ctx,
+        tools.as_ref(),
+        &stored,
+        r.body_sha256.as_deref(),
+        snap,
+        &groups,
+        &r.agent,
+    )
+    .await;
+    let asked_via = stored.via.clone();
+    drop(stored);
+    if let McpOutcome::Limited { limit } = &outcome {
+        ctx.notify_limit(
+            r.uid,
+            r.service.as_deref().unwrap_or(""),
+            r.operation.as_deref().unwrap_or(""),
+            limit,
+        );
+    }
+    // The connector record of the send: `via = approval`, linked by id,
+    // with how the call first came in.
+    let mut rec = mcp_ops::mcp_record(&call, snap, &trace, &outcome, &r.agent, VERSION);
+    rec.extra.insert("approval".into(), rid.into());
+    rec.extra.insert("approved_by".into(), by.into());
+    rec.extra
+        .insert("asked_via".into(), asked_via.clone().into());
+    let recorded = ctx.writer.append(rec).await;
+    let detail = Detail {
+        rule: match &outcome {
+            McpOutcome::Denied { rule } => Some(rule.clone()),
+            _ => None,
+        },
+        reason: match &outcome {
+            McpOutcome::UpstreamFailed { reason } => Some(format!("upstream failed: {reason}")),
+            McpOutcome::Limited { limit } => Some(format!("limit reached: {limit}")),
+            _ => None,
+        },
+        limit: match &outcome {
+            McpOutcome::Limited { limit } => Some(limit.to_string()),
+            _ => None,
+        },
+        status: None,
+        resp_bytes: trace.resp_bytes,
+        asked_via: Some(asked_via),
+    };
+    let to = if matches!(outcome, McpOutcome::Done { .. }) {
+        State::Sent
+    } else {
+        State::SendFailed
+    };
+    let mut result = mcp_ops::answer(0, outcome);
     if let Some(o) = result.as_object_mut() {
         o.remove("id");
     }
@@ -1495,4 +1692,44 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
         }
     }
     ok(id, m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use saiife_broker::mask::Masker;
+    use serde_json::json;
+
+    fn pending(body_display: Option<&str>, body_sha256: Option<&str>) -> PendingCall {
+        let stored: StoredCall = serde_json::from_value(json!({
+            "uid": 1000, "user": "u", "session": null, "project": "/p",
+            "service": "s3_ask", "operation": "s3.put_object",
+            "params": {"bucket": "reports", "key": "logo.png"},
+            "body_b64": null, "body_sha256": body_sha256, "headers": [],
+            "overlay": null, "via": "cli",
+        }))
+        .unwrap();
+        PendingCall {
+            operation: stored.operation.clone(),
+            capability: None,
+            params: Masker::new(&[]).mask_params(&stored.params),
+            project: stored.project.clone(),
+            body_display: body_display.map(str::to_string),
+            body_truncated: false,
+            body_sha256: body_sha256.map(str::to_string),
+            amount: None,
+            headers: vec![],
+            stored,
+        }
+    }
+
+    /// Plan 15's binary raw body meets plan 17's dedupe: a body the
+    /// approver is not shown is never faithful, so it is never deduped.
+    #[test]
+    fn body_without_display_is_never_faithful() {
+        let h = "ab".repeat(32);
+        assert!(display_is_faithful(&pending(Some("text upload"), Some(&h))));
+        assert!(display_is_faithful(&pending(None, None)));
+        assert!(!display_is_faithful(&pending(None, Some(&h))));
+    }
 }

@@ -147,7 +147,10 @@ write. A dynamically linked binary loads whatever `LD_PRELOAD` names before
 `main`, so an agent could persist `LD_PRELOAD` there and run its own code
 inside the hook that judges it. A build with debug assertions (`cargo build`
 without `--release`) has a test seam (`SAIIFE_EVAL_FAULT`) that can hang the
-guard past an agent's hook timeout; Codex and Gemini CLI then fail open. So
+guard past an agent's hook timeout; Codex and Gemini CLI then fail open.
+It also has `SAIIFE_TEST_CLAUDE_MCP_DROPIN`, which can point the hook at
+another Claude Code MCP drop-in and so grant `Brokered` to a `saiife`
+server whose command is not pinned. So
 `system install` refuses (exit 2) a binary that is dynamically linked (an
 ELF interpreter or a needed shared library), has debug assertions on, or has
 no saiife build marker, and `saiife doctor` fails `files.binary` on a

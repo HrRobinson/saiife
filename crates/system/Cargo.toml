@@ -22,11 +22,15 @@ toml_edit = "0.22.27"
 sha2 = "0.10.9"
 time = { version = "0.3", features = ["formatting", "macros"] }
 getrandom = "0.3"
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["serde"] }
 thiserror = "1"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "process", "system"] }
+rustix = { version = "1", features = ["fs", "process", "system", "thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The sandbox of MCP gateway children (plan 17 decision 12); safe bindings.
+landlock = "=0.4.7"
 
 [dev-dependencies]
 tempfile = "3"

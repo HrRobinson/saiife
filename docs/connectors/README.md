@@ -83,6 +83,14 @@ whatever its status. Limits are rebuilt from the last 24 hours of
 `connector` records when the daemon starts, so a restart does not reset
 them.
 
+## Connectors as MCP tools, and third-party MCP servers
+
+`saiife mcp` lists the operations an agent may call as typed MCP tools
+(`shopify_orders_list`) and sends each call through this same pipeline, with
+`via = "mcp"` in the record. Third-party MCP servers can run behind the
+daemon too, with their tokens in the vault. Where a service has a connector
+here, use the connector rather than a gateway server. See [MCP](../mcp.md).
+
 ## Trusting a private CA
 
 `/etc/saiife/ca/*.pem` adds root certificates for upstreams, next to the
