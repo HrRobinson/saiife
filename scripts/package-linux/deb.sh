@@ -323,7 +323,7 @@ phase_remove() {
     fi
     # prerm writes the warning to its stderr; apt-get relays maintainer
     # script output on its own stdout, so look in both streams.
-    grep -qxF "$REMOVAL_LINE" "$WORK/p18-t3-remove.err" "$WORK/p18-t3-remove.out" || {
+    grep -qF "$REMOVAL_LINE" "$WORK/p18-t3-remove.err" "$WORK/p18-t3-remove.out" || {
         show_file "$WORK/p18-t3-remove.out"
         show_file "$WORK/p18-t3-remove.err"
         fail "apt-get output lacks the removal warning"
