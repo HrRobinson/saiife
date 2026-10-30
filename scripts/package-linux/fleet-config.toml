@@ -1,0 +1,9 @@
+# The fleet system config the package-linux CI job installs as
+# /etc/saiife/fleet/config.toml (scripts/package-linux/deb.sh). Minimal on
+# purpose; the config-change phase edits the approvers line, so keep it
+# exactly as written.
+version = 2
+locked = true
+
+[approval]
+approvers = ["group:saiife-approvers"]
