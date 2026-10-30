@@ -61,7 +61,7 @@ phase_fresh() {
     version="$(rpm -q --qf '%{VERSION}' saiife)"
     "$PKG_BIN" --version | grep -qF "$version" || fail "$PKG_BIN --version does not print $version: $("$PKG_BIN" --version)"
     ok "$PKG_BIN --version prints $version"
-    [ -L /usr/bin/saiife ] && [ "$(readlink /usr/bin/saiife)" = "$PKG_BIN" ] || fail "/usr/bin/saiife is not a symlink to $PKG_BIN"
+    [ -L /usr/bin/saiife ] && [ "$(readlink -f /usr/bin/saiife)" = "$PKG_BIN" ] || fail "/usr/bin/saiife is not a symlink to $PKG_BIN"
     ok "/usr/bin/saiife is a symlink to $PKG_BIN"
     rpm -q --qf '[%{FILEMODES:perms} %{FILEUSERNAME} %{FILEGROUPNAME} %{FILENAMES}\n]' saiife >"$OUT/files.txt"
     cat "$OUT/files.txt"
