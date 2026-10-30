@@ -7,6 +7,8 @@
 #[cfg(target_os = "linux")]
 pub mod daemon;
 #[cfg(target_os = "linux")]
+pub mod mcp;
+#[cfg(target_os = "linux")]
 pub mod personal;
 pub mod tmp;
 

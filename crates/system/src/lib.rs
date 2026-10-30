@@ -21,6 +21,8 @@ pub mod install;
 pub mod layout;
 pub mod personal;
 pub mod polkit;
+#[cfg(target_os = "linux")]
+pub mod sandbox;
 pub mod supported;
 #[doc(hidden)]
 pub mod testing;

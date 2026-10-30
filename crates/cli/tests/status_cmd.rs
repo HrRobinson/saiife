@@ -1311,6 +1311,30 @@ mod locked {
         );
     }
 
+    /// A listed `saiife` warns while Codex (unpinned) is installed, and is
+    /// quiet when only Claude Code (pinned by command) is.
+    #[test]
+    fn status_warns_on_listed_saiife_only_with_unpinned_agents() {
+        const WARN: &str = "  warning: MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command\n";
+        let opts = Opts {
+            extra: "[guard.mcp]\nallow_servers = [\"saiife\"]\n".into(),
+            ..Opts::default()
+        };
+        let d = TestDaemon::start(Opts::default());
+        let root = locked_root(&d.config_text(&opts));
+        let (_, text) = status_at(root.path());
+        assert!(text.contains(WARN), "{text}");
+        assert!(!text.contains("MCP server saiife bypasses"), "{text}");
+
+        let installed = root.path().join("etc/saiife/installed.toml");
+        let mut i = read_installed(&installed).unwrap().unwrap();
+        i.agents.retain(|a| a.agent == "claude");
+        assert!(!i.agents.is_empty());
+        write_installed(&installed, &i).unwrap();
+        let (_, text) = status_at(root.path());
+        assert!(!text.contains("MCP server saiife"), "{text}");
+    }
+
     #[test]
     fn status_says_an_unwritten_managed_hook_does_not_guard() {
         let d = TestDaemon::start(Opts::default());

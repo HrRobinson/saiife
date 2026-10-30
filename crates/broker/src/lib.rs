@@ -22,6 +22,7 @@ pub mod pipeline;
 pub mod redact;
 pub mod request;
 pub mod resolve;
+pub mod tool_schema;
 pub mod upstream;
 
 pub use catalog::Catalog;
@@ -50,6 +51,8 @@ pub enum BrokerError {
     Config(String),
     #[error("unknown connector {0:?}")]
     UnknownConnector(String),
+    #[error("{0}")]
+    UnknownScopeEntry(String),
     #[error("missing required parameter {0:?}")]
     MissingParam(String),
     #[error("bad amount: {0}")]

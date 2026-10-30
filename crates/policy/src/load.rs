@@ -2,6 +2,7 @@
 
 use crate::capability::validate_pattern;
 use crate::effective::PackInfo;
+use crate::mcp::McpServerCfg;
 use crate::service::{
     is_interpreter, valid_external_id, valid_role_arn, CloudMode, SecretCfg, ServiceCfg,
     AUTH_KINDS, AZURE_AUTHORITIES,
@@ -80,6 +81,8 @@ struct DropIn {
     #[serde(default)]
     services: BTreeMap<String, ServiceCfg>,
     #[serde(default)]
+    mcp: BTreeMap<String, McpServerCfg>,
+    #[serde(default)]
     secrets: BTreeMap<String, SecretCfg>,
     #[serde(default)]
     scope: Vec<Scope>,
@@ -118,6 +121,11 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
     let config_name = config_file.display().to_string();
     let mut service_origin: BTreeMap<String, String> = cfg
         .services
+        .keys()
+        .map(|k| (k.clone(), config_name.clone()))
+        .collect();
+    let mut mcp_origin: BTreeMap<String, String> = cfg
+        .mcp
         .keys()
         .map(|k| (k.clone(), config_name.clone()))
         .collect();
@@ -161,6 +169,17 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
             service_origin.insert(svc.clone(), name.clone());
             cfg.services.insert(svc, t);
         }
+        for (srv, c) in d.mcp {
+            if let Some(first) = mcp_origin.get(&srv) {
+                return Err(PolicyError::DuplicateService {
+                    name: format!("mcp:{srv}"),
+                    first: first.clone(),
+                    second: name,
+                });
+            }
+            mcp_origin.insert(srv.clone(), name.clone());
+            cfg.mcp.insert(srv, c);
+        }
         for (sec, c) in d.secrets {
             if let Some(first) = secret_origin.get(&sec) {
                 return Err(invalid(
@@ -183,6 +202,7 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
 
     validate_services(config_file, &cfg, &service_origin)?;
     validate_environments(config_file, &cfg, &service_origin)?;
+    validate_mcp(config_file, &cfg, &mcp_origin)?;
     cfg.gateway
         .tcp_addr()
         .map_err(|why| invalid(config_file, why))?;
@@ -397,6 +417,50 @@ fn validate_cloud(file: &Path, name: &str, svc: &ServiceCfg) -> Result<(), Polic
         }
         if c.run_allow.is_empty() {
             return bad_cloud("mode = \"sts\" needs a non-empty cloud.run_allow".into());
+        }
+    }
+    Ok(())
+}
+
+/// `[mcp.*]` (plan 17 decisions 12 to 14): locked mode only, valid servers,
+/// and no server both brokered and listed in `[guard.mcp] allow_servers`.
+/// `saiife` itself may be listed, spelled exactly so.
+fn validate_mcp(
+    config_file: &Path,
+    cfg: &SystemConfig,
+    origin: &BTreeMap<String, String>,
+) -> Result<(), PolicyError> {
+    if !cfg.mcp.is_empty() && !cfg.locked {
+        return Err(invalid(
+            config_file,
+            "the MCP gateway needs locked mode: in personal broker mode its servers would run as you",
+        ));
+    }
+    for (name, srv) in &cfg.mcp {
+        let file = origin
+            .get(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_file.to_path_buf());
+        srv.validate(name).map_err(|why| invalid(&file, why))?;
+    }
+    for s in &cfg.guard.mcp.allow_servers {
+        // Exactly `saiife` may be listed: on Codex and Gemini CLI, which do
+        // not pin its command, the hook then judges its calls like any
+        // listed server's. A case variant would reach Claude Code's drop-in
+        // by name, next to the pinned command.
+        if s != "saiife" && s.eq_ignore_ascii_case("saiife") {
+            return Err(invalid(
+                config_file,
+                format!("[guard.mcp] allow_servers may not contain {s:?}; write \"saiife\""),
+            ));
+        }
+        if let Some(s) = cfg.mcp.keys().find(|k| k.eq_ignore_ascii_case(s)) {
+            return Err(invalid(
+                config_file,
+                format!(
+                    "MCP server {s} is both unbrokered ([guard.mcp] allow_servers) and brokered ([mcp.{s}]); remove it from allow_servers"
+                ),
+            ));
         }
     }
     Ok(())

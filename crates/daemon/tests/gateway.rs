@@ -2051,3 +2051,132 @@ fn env_override_checked_against_the_catalog() {
     let e = saiife_daemon::ops::check_catalog(&bad, &cat).unwrap_err();
     assert!(e.contains("environment staging"), "{e}");
 }
+
+// ------------------------------------------------- MCP (plan 17 Task 3)
+
+/// `via: "mcp"` is attribution only: the call runs the same pipeline and
+/// its one `connector` record says `via = mcp`, `tool = mcp`.
+#[tokio::test]
+async fn api_call_via_mcp_recorded() {
+    let w = world().await;
+    let mut a = orders(None);
+    a["via"] = "mcp".into();
+    let r = ipc_call(&w, a).await;
+    assert_eq!(r["ok"], true, "{r}");
+    let r = ipc_call(&w, orders(None)).await;
+    assert_eq!(r["ok"], true, "{r}");
+    let recs = w.connector_records();
+    assert_eq!(recs.len(), 2, "{recs:?}");
+    assert_eq!(recs[0]["via"], "mcp");
+    assert_eq!(recs[0]["tool"], "mcp");
+    assert_eq!(recs[0]["decision"], "allow");
+    // Without `via`: the CLI, as before.
+    assert_eq!(recs[1]["via"], "cli");
+    assert_eq!(recs[1]["tool"], "api");
+}
+
+/// A client cannot claim the daemon's own `approval` (or the gateway's
+/// `http`, or anything else): `bad_request`, nothing sent or recorded.
+#[tokio::test]
+async fn api_call_via_approval_refused() {
+    let w = world().await;
+    for via in [json!("approval"), json!("http"), json!("MCP"), json!(1)] {
+        let mut a = orders(None);
+        a["via"] = via.clone();
+        let r = ipc_call(&w, a).await;
+        assert_eq!(r["ok"], false, "{via}: {r}");
+        assert_eq!(r["error"], "bad_request", "{via}: {r}");
+    }
+    let mut a = orders(None);
+    a["via"] = "cli".into();
+    assert_eq!(ipc_call(&w, a).await["ok"], true);
+    assert_eq!(w.hits(), 1);
+    assert_eq!(w.connector_records().len(), 1);
+}
+
+#[tokio::test]
+async fn api_list_schema_flag() {
+    let w = world().await;
+    let plain = ipc_list(&w, json!({})).await;
+    assert_eq!(plain["ok"], true, "{plain}");
+    let with = ipc_list(&w, json!({"schema": true})).await;
+    assert_eq!(with["ok"], true, "{with}");
+    let ops = |v: &Value| v["services"][0]["operations"].as_array().unwrap().clone();
+    for o in ops(&plain) {
+        assert!(o.get("input_schema").is_none(), "{o}");
+        assert!(o.get("title").is_none(), "{o}");
+        assert!(o.get("body_arg").is_none(), "{o}");
+    }
+    let get = ops(&with)
+        .into_iter()
+        .find(|o| o["id"] == "orders.get")
+        .unwrap();
+    assert_eq!(get["title"], "Test echo connector: orders.get");
+    assert_eq!(
+        get["input_schema"],
+        json!({"type": "object", "properties": {"order_id": {"type": "integer"}},
+               "required": ["order_id"], "additionalProperties": false})
+    );
+    let refund = ops(&with)
+        .into_iter()
+        .find(|o| o["id"] == "refunds.create")
+        .unwrap();
+    assert_eq!(refund["body_arg"], "json");
+    // The hash does not depend on the flag.
+    assert!(plain["tools_hash"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(plain["tools_hash"], with["tools_hash"]);
+    let bad = ipc_list(&w, json!({"schema": "yes"})).await;
+    assert_eq!(bad["error"], "bad_request", "{bad}");
+}
+
+/// Puts a policy in force as a reload does: `shop` with `extra` (its
+/// `allow` and `fixed`).
+fn reload_shop(w: &World, extra: &str) {
+    let old = w.ctx.policy();
+    let g = old.gateway.clone().unwrap();
+    let mut config = g.snap.config.clone();
+    let more: saiife_policy::ServiceCfg = toml::from_str(&format!(
+        "connector = \"test-echo\"\nparams = {{ shop = \"acme\" }}\n{extra}"
+    ))
+    .unwrap();
+    let shop = config.services.get_mut("shop").unwrap();
+    shop.fixed = more.fixed;
+    shop.allow = more.allow;
+    let next = PolicyState {
+        gateway: Some(Arc::new(GatewayPolicy {
+            snap: PolicySnapshot {
+                config,
+                hash: "sha256:reloaded".into(),
+                mode: g.snap.mode,
+                env: None,
+            },
+            by_env: Default::default(),
+            catalog: g.catalog.clone(),
+        })),
+        ..old
+    };
+    *w.ctx.policy.lock().unwrap() = next;
+}
+
+#[tokio::test]
+async fn tools_hash_changes_on_reload() {
+    let w = world().await;
+    let hash = |v: Value| v["tools_hash"].as_str().unwrap().to_string();
+    let before = hash(ipc_list(&w, json!({})).await);
+    assert_eq!(before, hash(ipc_list(&w, json!({})).await), "stable");
+    // A reload that fixes a param: the schema (not an action) changes.
+    reload_shop(
+        &w,
+        "allow = [\"orders:read\", \"files:read\"]\nfixed = { status = \"open\" }",
+    );
+    let fixed = hash(ipc_list(&w, json!({})).await);
+    assert_ne!(before, fixed);
+    // A reload that changes an action.
+    reload_shop(
+        &w,
+        "allow = [\"orders:read\"]\nfixed = { status = \"open\" }",
+    );
+    let narrower = hash(ipc_list(&w, json!({})).await);
+    assert_ne!(fixed, narrower);
+    assert_ne!(before, narrower);
+}

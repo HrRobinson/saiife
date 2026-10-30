@@ -16,6 +16,7 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
 use saiife_policy::installed::{read_installed, FileKind, Installed};
 use saiife_policy::{load_system, PackInfo};
+use saiife_system::doctor::system::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use saiife_system::layout::{CONFIG, INSTALLED};
 use saiife_system::{host_for, Host, Layout};
 use saiifeguard::canon::PathVars;
@@ -819,13 +820,16 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         Err(e) => Err(e.to_string()),
     };
     match daemon {
-        Ok((line, lockdown, pending)) => {
+        Ok((line, lockdown, pending, mcp)) => {
             outln!("  daemon: running, {line}");
             outln!("  lockdown: {}", lockdown_line(&lockdown));
             // Spec §7 `status`: the caller's pending approvals, the count
             // and the newest 3 ids.
             if let Some(ids) = pending {
                 outln!("  approvals: {}", pending_line(&ids));
+            }
+            for l in mcp_lines(&mcp) {
+                outln!("  {l}");
             }
         }
         Err(e) => {
@@ -893,11 +897,21 @@ fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
         }
     }
     if let Ok(l) = &config {
+        // A listed `saiife` changes nothing on Claude Code (pinned by
+        // command there). On Codex and Gemini CLI it allows any server a
+        // project or user config registers under that name.
+        let unpinned = installed
+            .as_ref()
+            .is_some_and(|i| i.agents.iter().any(|a| unpinned_saiife(&a.agent)));
         for s in &l.config.guard.mcp.allow_servers {
-            outln!(
-                "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
-                sanitize(s)
-            );
+            if s != "saiife" {
+                outln!(
+                    "  warning: MCP server {} bypasses saiife: its requests are not brokered or limited",
+                    sanitize(s)
+                );
+            } else if unpinned {
+                outln!("  warning: {SAIIFE_LISTED_UNPINNED}");
+            }
         }
     }
     Some(st)
@@ -913,6 +927,25 @@ fn pending_line(ids: &[u64]) -> String {
     newest.sort_unstable_by(|a, b| b.cmp(a));
     let shown: Vec<String> = newest.iter().take(3).map(|i| format!("#{i}")).collect();
     format!("{} pending ({})", ids.len(), shown.join(" "))
+}
+
+/// One line per gateway server from the daemon's `mcp` status list:
+/// `MCP server <name>: brokered, <state> (<n> tools)`.
+fn mcp_lines(mcp: &serde_json::Value) -> Vec<String> {
+    let Some(list) = mcp.as_array() else {
+        return Vec::new();
+    };
+    list.iter()
+        .map(|s| {
+            let text = |k: &str| sanitize(s.get(k).and_then(|v| v.as_str()).unwrap_or("unknown"));
+            let tools = s.get("tools").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "MCP server {}: brokered, {} ({tools} tools)",
+                text("name"),
+                text("state")
+            )
+        })
+        .collect()
 }
 
 fn lockdown_line(l: &serde_json::Value) -> String {
@@ -937,7 +970,12 @@ fn lockdown_line(l: &serde_json::Value) -> String {
 /// `chain <id>, head seq <n>, last checkpoint seq <m>` from the daemon's
 /// The daemon's `status` line, its lockdown flag (`null` when off) and the
 /// ids of the caller's pending approval requests (`None`: not listed).
-type DaemonStatus = (String, serde_json::Value, Option<Vec<u64>>);
+type DaemonStatus = (
+    String,
+    serde_json::Value,
+    Option<Vec<u64>>,
+    serde_json::Value,
+);
 
 /// `status`, its lockdown flag and the caller's pending requests, or why
 /// it did not answer.
@@ -1004,6 +1042,7 @@ fn daemon_status(
         ),
         m.get("lockdown").cloned().unwrap_or(Value::Null),
         pending,
+        m.get("mcp").cloned().unwrap_or(Value::Null),
     ))
 }
 
@@ -1074,6 +1113,18 @@ fn fingerprint_problems(layout: &Layout, i: &Installed) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_prints_gateway_line() {
+        let mcp = serde_json::json!([
+            {"name":"fs","state":"running","tools":3,"since":"t","last_error":null},
+            {"name":"bad\u{1b}[31m","state":"failed","tools":0,"since":"t","last_error":"x"}
+        ]);
+        let lines = mcp_lines(&mcp);
+        assert_eq!(lines[0], "MCP server fs: brokered, running (3 tools)");
+        assert!(!lines[1].contains('\u{1b}'), "{lines:?}");
+        assert!(mcp_lines(&serde_json::Value::Null).is_empty());
+    }
 
     #[test]
     fn pending_line_counts_and_shows_the_newest_three() {

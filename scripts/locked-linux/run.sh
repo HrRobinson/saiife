@@ -45,6 +45,21 @@ WORK="$(mktemp -d)"
 export WORK
 trap 'on_exit $?' EXIT
 
+# The MCP gateway's spawn helper (plan 17 Task 5), unprivileged and before
+# anything is installed: the runner's kernel must have Landlock (ABI >= 1),
+# so the sandbox tests run for real here instead of asserting the
+# no-Landlock fallback.
+phase_mcp_sandbox() {
+    phase "mcp spawn helper and Landlock sandbox"
+    local tmp="$WORK/mcp-spawn"
+    mkdir -p "$tmp"
+    (cd "$REPO" && TMPDIR="$tmp" SAIIFE_TEST_TMP="$tmp" SAIIFE_REQUIRE_LANDLOCK=1 \
+        cargo test --locked -p saiife --test mcp_spawn -- --nocapture) \
+        || fail "mcp_spawn tests (Landlock ABI >= 1 required on this runner)"
+    ok "mcp_spawn tests passed with Landlock"
+}
+
+phase_mcp_sandbox
 prepare_host
 phase_install
 phase_modes

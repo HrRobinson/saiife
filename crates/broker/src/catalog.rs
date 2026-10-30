@@ -54,6 +54,18 @@ impl Catalog {
 /// `deletes_per_day` (it counts writes only).
 pub fn validate(cfg: &SystemConfig, cat: &Catalog) -> Result<Vec<String>, BrokerError> {
     let mut warnings = Vec::new();
+    for sc in &cfg.scope {
+        for entry in &sc.services {
+            if let Some(srv) = entry.strip_prefix("mcp:") {
+                if !cfg.mcp.contains_key(srv) {
+                    return Err(BrokerError::UnknownScopeEntry(format!(
+                        "scope {}: {entry:?} names no [mcp.{srv}]",
+                        sc.name
+                    )));
+                }
+            }
+        }
+    }
     for (name, svc) in &cfg.services {
         let m = cat.manifest_for(name, svc)?;
         for (p, spec) in &m.params {
@@ -245,6 +257,25 @@ mod tests {
     fn concrete_qualifier_matches_a_template() {
         assert!(warnings(r#""messages:read:channel=C0123""#).is_empty());
         assert!(warnings(r#""messages:write:channel=C0123""#).is_empty());
+    }
+
+    fn scope_check(entry: &str) -> Result<Vec<String>, BrokerError> {
+        let cfg: SystemConfig = toml::from_str(&format!(
+            "version = 2\nlocked = true\n[mcp.linear]\ncommand = \"/usr/bin/x\"\n[[scope]]\nname = \"s\"\nusers = [\"u\"]\nservices = [\"{entry}\"]\n"
+        ))
+        .unwrap();
+        validate(&cfg, &Catalog::new(crate::manifest::builtin(), vec![]))
+    }
+
+    #[test]
+    fn scope_known_mcp_entry_accepted() {
+        assert!(scope_check("mcp:linear").is_ok());
+    }
+
+    #[test]
+    fn scope_unknown_mcp_entry_refused() {
+        let e = scope_check("mcp:jira").unwrap_err().to_string();
+        assert!(e.contains("mcp:jira") && e.contains("[mcp.jira]"), "{e}");
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub const CLOUD_AUTH_KINDS: &[&str] = &["aws_sigv4", "gcp_sa", "azure_sp"];
 pub const SIGV4_HEADERS: &[&str] = &["x-amz-date", "x-amz-security-token", "x-amz-content-sha256"];
 /// The body formats of `Operation::body`. `text` is for `transport = "mail"`;
 /// `raw` is the agent's bytes as they are, never parsed.
-const BODY_FORMATS: &[&str] = &["json", "form", "text", "raw"];
+pub(crate) const BODY_FORMATS: &[&str] = &["json", "form", "text", "raw"];
 /// The operation param type of an object key that keeps its `/` (S3,
 /// Azure blobs): the last whole path segment, encoded segment by segment.
 pub const OBJECT_KEY: &str = "objectkey";

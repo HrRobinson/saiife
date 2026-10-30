@@ -120,6 +120,13 @@ pub fn fake_install(root: &Path) -> Installed {
     let unit = unit_text(FAKE_SYSTEMD);
     file(&l(UNIT), unit.as_bytes(), 0o644);
     file(&l(CLAUDE_MANAGED), FAKE_CLAUDE_MANAGED.as_bytes(), 0o644);
+    // The allowlist drop-in an install writes for the fake config's policy
+    // (no `allow_servers`); not on the install record.
+    file(
+        &l(CLAUDE_MCP),
+        saiife_agents::claude::managed_mcp_settings(&[]).as_bytes(),
+        0o644,
+    );
 
     // What systemd and the first daemon start make.
     dir(&l(STATE_DIR), 0o700);

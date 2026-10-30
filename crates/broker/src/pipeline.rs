@@ -59,6 +59,8 @@ pub enum OpRef {
 pub enum Via {
     Cli,
     Http,
+    /// A `tools/call` of `saiife mcp` (plan 17): attribution only.
+    Mcp,
     /// The daemon sending a stored request after its approval.
     Approval,
 }
@@ -68,6 +70,7 @@ impl Via {
         match self {
             Via::Cli => "cli",
             Via::Http => "http",
+            Via::Mcp => "mcp",
             Via::Approval => "approval",
         }
     }
@@ -1453,7 +1456,11 @@ pub fn record(
             agent,
             project: &project,
             session: call.session.as_deref(),
-            tool: "api",
+            // An MCP tool call is recorded as the tool `mcp` (decision 4).
+            tool: match call.via {
+                Via::Mcp => "mcp",
+                Via::Cli | Via::Http | Via::Approval => "api",
+            },
             input: &input,
             decision,
             pack: None,
@@ -1569,11 +1576,16 @@ pub fn limit_event(r: &Record) -> Option<Event> {
 
 /// `api.list` for one service: `{id, capability, kind, action}` per
 /// operation, the action as the policy would decide it with no parameters.
+/// With `schema`, also the MCP tool's `title`, `input_schema`
+/// ([`crate::tool_schema::input_schema`]) and, when the operation takes an
+/// agent body, `body_arg` (`json` or `text`): how its `body` argument is
+/// sent, since a param may itself be named `body`.
 pub fn list_operations(
     name: &str,
     snap: &PolicySnapshot,
     cat: &Catalog,
     overlay: Option<&ServiceOverlay>,
+    schema: bool,
 ) -> Option<Vec<Value>> {
     let svc = snap.config.services.get(name)?;
     let m = cat.manifest_for(name, svc).ok()?;
@@ -1608,6 +1620,16 @@ pub fn list_operations(
                 o.insert("capability".into(), op.capability.clone().into());
                 o.insert("kind".into(), op_kind_str(op.kind).into());
                 o.insert("action".into(), action.into());
+                if schema {
+                    o.insert("title".into(), format!("{}: {}", m.title, op.id).into());
+                    o.insert(
+                        "input_schema".into(),
+                        crate::tool_schema::input_schema(&m, op, svc),
+                    );
+                    if let Some(b) = crate::tool_schema::body_arg(op) {
+                        o.insert("body_arg".into(), b.as_str().into());
+                    }
+                }
                 Value::Object(o)
             })
             .collect(),

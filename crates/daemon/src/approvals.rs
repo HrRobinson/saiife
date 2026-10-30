@@ -67,6 +67,10 @@ pub fn dir_in(state_dir: &Path) -> PathBuf {
 pub enum ApprovalType {
     Connector,
     Command,
+    /// A `tools/call` of an MCP gateway server (plan 17, spec §8.10):
+    /// `service` is `mcp:<server>`, `operation` the tool, `body_display`
+    /// the masked arguments.
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +152,12 @@ pub struct Request {
     /// environment), as recorded at the ask: shown as `env base`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub env_base: bool,
+    /// Masking changed nothing the approver is shown of this request (its
+    /// operation, params, headers, body and project): the display is the
+    /// request itself. Only such requests are ever deduped (decision 8).
+    /// Absent (false) in a request stored before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub display_faithful: bool,
     /// Base64 of the sealed exact request.
     pub request_sealed: Option<String>,
     pub state: State,
@@ -214,6 +224,9 @@ pub struct SendDisplay {
     pub env: Option<String>,
     /// [`Request::env_base`].
     pub env_base: bool,
+    /// [`Request::display_faithful`]: set by the caller only when every
+    /// masked display field equals its raw value.
+    pub faithful: bool,
 }
 
 /// Which requests [`Store::list`] returns: `None`/empty means any.
@@ -337,7 +350,8 @@ pub fn ts(t: SystemTime) -> String {
 /// `service operation`, or the masked command.
 pub fn summary(r: &Request) -> String {
     match r.kind {
-        ApprovalType::Connector => format!(
+        // `mcp:<name> <tool>` for an MCP request.
+        ApprovalType::Connector | ApprovalType::Mcp => format!(
             "{} {}",
             r.service.as_deref().unwrap_or(""),
             r.operation.as_deref().unwrap_or("")
@@ -353,7 +367,7 @@ pub fn summary(r: &Request) -> String {
 /// `command request (<pack>/<rule_id>)`, never the command text.
 pub fn offhost_summary(r: &Request) -> String {
     match r.kind {
-        ApprovalType::Connector => match &r.env {
+        ApprovalType::Connector | ApprovalType::Mcp => match &r.env {
             Some(e) => format!("{} (env {e})", summary(r)),
             None if r.env_base => format!("{} (env base)", summary(r)),
             None => summary(r),
@@ -369,7 +383,7 @@ pub fn offhost_summary(r: &Request) -> String {
 /// `#<id> <service> <operation>` or `#<id> <pack>/<rule_id>`.
 pub fn reauth_detail(r: &Request) -> String {
     let what = match r.kind {
-        ApprovalType::Connector => summary(r),
+        ApprovalType::Connector | ApprovalType::Mcp => summary(r),
         ApprovalType::Command => r.ask_rule.clone().unwrap_or_else(|| "command".into()),
     };
     format!("#{} {what}", r.id)
@@ -404,6 +418,7 @@ pub fn record_for(
     let kind = match r.kind {
         ApprovalType::Connector => "connector",
         ApprovalType::Command => "command",
+        ApprovalType::Mcp => "mcp",
     };
     base.extra.insert("type".into(), kind.into());
     if let Some(s) = &r.service {
@@ -419,6 +434,41 @@ pub fn record_for(
         base.extra.insert("note".into(), n.clone().into());
     }
     base
+}
+
+/// Whether pending request `r` is the one `new` would create (decision 8):
+/// a command by its `grant_key`; a connector or MCP request by everything
+/// its approver is shown (service, operation, capability, params, body
+/// display and SHA-256, amount, headers, environment, project and
+/// session), and only when both displays are faithful (masking changed
+/// none of them): two equal displays are then two equal requests. A
+/// display that masking changed may hide a difference (two different
+/// vault values both shown as `[MASKED]`), so such a request is never
+/// deduped.
+fn same_request(r: &Request, new: &NewRequest) -> bool {
+    if r.kind != new.kind || r.uid != new.uid {
+        return false;
+    }
+    match new.kind {
+        ApprovalType::Command => new.grant_key.is_some() && r.grant_key == new.grant_key,
+        ApprovalType::Connector | ApprovalType::Mcp => {
+            r.display_faithful
+                && new.send.faithful
+                && r.service == new.service
+                && r.operation == new.operation
+                && r.capability == new.capability
+                && &r.params == new.params.get()
+                && r.body_display == new.send.body_display
+                && r.body_sha256 == new.send.body_sha256
+                && r.body_truncated == new.send.body_truncated
+                && r.amount == new.send.amount
+                && r.headers == new.send.headers
+                && r.env == new.send.env
+                && r.env_base == new.send.env_base
+                && r.project == new.project
+                && r.session == new.session
+        }
+    }
 }
 
 /// The magic of a result file: `SAIIFER2 || stored (24-byte timestamp) ||
@@ -654,14 +704,20 @@ impl Store {
         now: SystemTime,
         max_pending: Option<usize>,
     ) -> io::Result<Request> {
-        self.create_dedup(req, seal, ttl, now, max_pending)
+        // Commands only, as before decision 8: a store-level create of a
+        // connector request always makes a new one.
+        let dedupe = req.kind == ApprovalType::Command;
+        self.create_in(req, seal, ttl, now, max_pending, dedupe)
             .map(|(r, _)| r)
     }
 
-    /// [`Store::create_capped`], except that a command request whose
-    /// `grant_key` matches one of the requester's pending (unexpired)
-    /// requests gives that request back (`false`: nothing was created),
-    /// under the store's lock, before the cap is counted.
+    /// [`Store::create_capped`], except that a request identical to one of
+    /// the requester's pending (unexpired) requests gives that request back
+    /// (`false`: nothing was created), under the store's lock, before the
+    /// cap is counted. Identical is [`same_request`]: for a command its
+    /// `grant_key`; for a connector or MCP request what the approver is
+    /// shown of it (plan 17 decision 8), so an agent retrying a call that
+    /// waits gets the same id each time.
     pub fn create_dedup(
         &self,
         req: NewRequest,
@@ -670,8 +726,20 @@ impl Store {
         now: SystemTime,
         max_pending: Option<usize>,
     ) -> io::Result<(Request, bool)> {
+        self.create_in(req, seal, ttl, now, max_pending, true)
+    }
+
+    fn create_in(
+        &self,
+        req: NewRequest,
+        seal: impl FnOnce(u64) -> Result<Option<Vec<u8>>, VaultError>,
+        ttl: Duration,
+        now: SystemTime,
+        max_pending: Option<usize>,
+        dedupe: bool,
+    ) -> io::Result<(Request, bool)> {
         let _g = self.guard();
-        if req.kind == ApprovalType::Command && req.grant_key.is_some() {
+        if dedupe {
             let now_s = ts(now);
             let same = self
                 .list(Filter {
@@ -679,11 +747,7 @@ impl Store {
                     states: vec![State::Pending],
                 })
                 .into_iter()
-                .find(|r| {
-                    r.kind == ApprovalType::Command
-                        && r.grant_key == req.grant_key
-                        && r.expires > now_s
-                });
+                .find(|r| r.expires > now_s && same_request(r, &req));
             if let Some(r) = same {
                 return Ok((r, false));
             }
@@ -734,6 +798,7 @@ impl Store {
             headers: req.send.headers,
             env: req.send.env,
             env_base: req.send.env_base,
+            display_faithful: req.send.faithful,
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
@@ -1026,6 +1091,64 @@ mod tests {
         // An unreadable counter is an error, not a restart at 1.
         std::fs::write(dir.join(NEXT_ID), "x").unwrap();
         assert!(s.create(new_req(1), no_seal, HOUR, t0()).is_err());
+    }
+
+    /// Decision 8: an identical pending connector (or mcp) request gives
+    /// its id back from `create_dedup`; anything the approver would see
+    /// differently makes a new one. A plain `create` never dedupes them.
+    #[test]
+    fn identical_pending_connector_request_is_deduped() {
+        let e = env();
+        let s = &e.store;
+        let d = |mut r: NewRequest| {
+            r.send.faithful = true;
+            s.create_dedup(r, no_seal, HOUR, t0(), Some(20)).unwrap()
+        };
+        let (a, made) = d(new_req(1));
+        assert!(made);
+        let (b, made) = d(new_req(1));
+        assert!(!made);
+        assert_eq!(a.id, b.id);
+        // Another uid, other params, another body hash, another type.
+        assert_ne!(d(new_req(2)).0.id, a.id);
+        let mut other = new_req(1);
+        other.params = saiife_broker::mask::Masker::new(&[])
+            .mask_params(&[("id".to_string(), "43".to_string())].into());
+        assert_ne!(d(other).0.id, a.id);
+        let mut hashed = new_req(1);
+        hashed.send.body_sha256 = Some("ab".repeat(32));
+        assert_ne!(d(hashed).0.id, a.id);
+        let mut mcp = new_req(1);
+        mcp.kind = ApprovalType::Mcp;
+        assert_ne!(d(mcp).0.id, a.id);
+        // A display masking changed is never deduped, either way round.
+        let unfaithful = |r: NewRequest| s.create_dedup(r, no_seal, HOUR, t0(), Some(20)).unwrap();
+        let (u, made) = unfaithful(new_req(1));
+        assert!(made);
+        assert_ne!(u.id, a.id);
+        let (v, made) = unfaithful(new_req(1));
+        assert!(made);
+        assert_ne!(v.id, u.id);
+        // Decided: no longer pending, so a new request.
+        decide(s, a.id, State::Pending, State::Rejected).unwrap();
+        assert_ne!(d(new_req(1)).0.id, a.id);
+        // Expired but not swept: a new one too.
+        let faithful = |mut r: NewRequest| {
+            r.send.faithful = true;
+            r
+        };
+        let (x, _) = s
+            .create_dedup(faithful(new_req(9)), no_seal, MIN, t0(), None)
+            .unwrap();
+        let (y, made) = s
+            .create_dedup(faithful(new_req(9)), no_seal, MIN, t0() + HOUR, None)
+            .unwrap();
+        assert!(made);
+        assert_ne!(x.id, y.id);
+        // The store-level create keeps making new ones.
+        let p = s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
+        let q = s.create(new_req(1), no_seal, HOUR, t0()).unwrap();
+        assert_ne!(p.id, q.id);
     }
 
     #[test]

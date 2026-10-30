@@ -55,6 +55,48 @@ pub fn managed_settings() -> &'static str {
     MANAGED_SETTINGS
 }
 
+/// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only
+/// what it names. The broker's own server is pinned by command, so a
+/// project `.mcp.json` cannot define its own `saiife` server; the admin's
+/// `allow_servers` (gateway servers) follow by name, in order, without
+/// repeats. `saiife` is never allowed by name.
+pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
+    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [SAIIFE_BINARY, "mcp"] })];
+    let mut seen: Vec<&str> = Vec::new();
+    for s in allow_servers {
+        if s != "saiife" && !seen.contains(&s.as_str()) {
+            seen.push(s);
+            entries.push(json!({ "serverName": s }));
+        }
+    }
+    let mut text =
+        serde_json::to_string_pretty(&json!({ "allowedMcpServers": entries })).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
+/// Whether `text` is a drop-in [`managed_mcp_settings`] would write: the
+/// pinned `saiife` command first, then `serverName` entries only, none of
+/// them `saiife`, nothing else. Anything more (another `serverCommand`, a
+/// `serverUrl`, a `saiife` by name, another key) could let a server that
+/// is not saiife's own run under the name `saiife`.
+pub fn managed_mcp_pinned(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(entries) = v.get("allowedMcpServers").and_then(Value::as_array) else {
+        return false;
+    };
+    let names: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.get("serverName")?.as_str().map(str::to_string))
+        .collect();
+    serde_json::from_str::<Value>(&managed_mcp_settings(&names)).is_ok_and(|want| want == v)
+}
+
+/// The installed binary (the same path the hook command uses).
+const SAIIFE_BINARY: &str = "/opt/saiife/bin/saiife";
+
 fn group() -> Value {
     json!({
         "matcher": MATCHER,
@@ -496,5 +538,49 @@ mod tests {
         assert!(errs[0].path.ends_with(".claude/settings.json"));
         assert!(errs[1].managed && errs[2].managed);
         assert!(found.iter().all(|b| b.setting.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+
+    #[test]
+    fn managed_mcp_pinned_only_for_saiifes_own_text() {
+        let good = managed_mcp_settings(&["linear".to_string(), "docs".to_string()]);
+        assert!(managed_mcp_pinned(&good));
+        assert!(managed_mcp_pinned(&managed_mcp_settings(&[])));
+        for bad in [
+            "",
+            "{}",
+            "not json",
+            r#"{"allowedMcpServers": []}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp", "--wait", "5m"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/tmp/saiife", "mcp"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}, {"serverName": "saiife"}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}, {"serverCommand": ["/usr/bin/x"]}]}"#,
+            r#"{"allowedMcpServers": [{"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]}], "x": 1}"#,
+        ] {
+            assert!(!managed_mcp_pinned(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn managed_mcp_settings_pins_saiife_by_command() {
+        let text = managed_mcp_settings(&[
+            "github".into(),
+            "saiife".into(),
+            "jira".into(),
+            "github".into(),
+        ]);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v,
+            json!({"allowedMcpServers": [
+                {"serverCommand": ["/opt/saiife/bin/saiife", "mcp"]},
+                {"serverName": "github"}, {"serverName": "jira"}
+            ]})
+        );
+        assert!(!text.contains("\"serverName\": \"saiife\""));
     }
 }

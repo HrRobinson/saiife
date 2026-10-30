@@ -30,11 +30,11 @@ jobs:
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
-      # The hook path (guard, audit, policy, ipc) and saiife-system must not link tokio: only
+      # The hook path (guard, audit, policy, ipc), saiife-system and saiife-mcp must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates
         if: matrix.os == 'ubuntu-latest'
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp | grep -c tokio)" = 0
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh

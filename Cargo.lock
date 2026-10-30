@@ -902,6 +902,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1380,6 +1391,7 @@ dependencies = [
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
+ "saiife-mcp",
  "saiife-policy",
  "saiife-system",
  "serde",
@@ -1481,6 +1493,7 @@ dependencies = [
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",
+ "saiife-mcp",
  "saiife-policy",
  "saiife-system",
  "serde",
@@ -1531,6 +1544,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "saiife-mcp"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "saiife-policy"
 version = "0.2.0"
 dependencies = [
@@ -1549,6 +1571,7 @@ name = "saiife-system"
 version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
+ "landlock",
  "rustix",
  "saiife-agents",
  "saiife-audit",
@@ -1787,7 +1810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

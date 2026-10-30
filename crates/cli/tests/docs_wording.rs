@@ -139,3 +139,122 @@ fn new_pages_linked() {
         }
     }
 }
+
+// ---- docs/mcp.md (plan 17) ----
+
+fn mcp_page() -> String {
+    fs::read_to_string(root().join("docs/mcp.md")).expect("docs/mcp.md")
+}
+
+#[test]
+fn mcp_page_is_linked() {
+    let root = root();
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(
+        readme.contains("docs/mcp.md"),
+        "README does not link docs/mcp.md"
+    );
+    let index = fs::read_to_string(root.join("docs/connectors/README.md")).unwrap();
+    assert!(
+        index.contains("(../mcp.md)"),
+        "the connector index does not link mcp.md"
+    );
+}
+
+#[test]
+fn mcp_page_holds_the_warning_text() {
+    let t = flat(&mcp_page());
+    assert!(
+        t.contains(&flat(
+            "MCP server linear bypasses saiife: its requests are not brokered or limited"
+        )),
+        "docs/mcp.md lacks the exact unbrokered-server warning"
+    );
+}
+
+#[test]
+fn network_is_never_called_sandboxed() {
+    let root = root();
+    for f in [
+        "docs/mcp.md",
+        "docs/threats.md",
+        "docs/superpowers/specs/2026-10-19-saiife-v2-design.md",
+    ] {
+        let t = flat(&fs::read_to_string(root.join(f)).unwrap());
+        assert!(
+            t.contains("network is **not** sandboxed") || t.contains("network is not sandboxed"),
+            "{f} does not say the gateway child's network is not sandboxed"
+        );
+    }
+}
+
+#[test]
+fn mcp_page_does_not_claim_codex_or_gemini_restrictions() {
+    let t = flat(&mcp_page());
+    assert!(
+        t.contains("saiife does not restrict their mcp servers yet"),
+        "docs/mcp.md must say saiife does not restrict Codex or Gemini MCP servers yet"
+    );
+    assert!(t.contains("restricted by the hook only"));
+    for claim in [
+        "restricts codex",
+        "restricts gemini",
+        "writes a codex",
+        "writes a gemini",
+        "managed keys for codex",
+        "managed keys for gemini",
+        "codex and gemini are restricted by policy",
+        "codex and gemini get a managed",
+    ] {
+        assert!(!t.contains(claim), "docs/mcp.md claims: {claim}");
+    }
+    // A sentence that names Codex or Gemini and "restrict" must carry a
+    // negation or the hook-only wording.
+    for s in t.split(['.', '\n']) {
+        let names = s.contains("codex") || s.contains("gemini");
+        if names && s.contains("restrict") {
+            assert!(
+                s.contains(" not ")
+                    || s.contains("hook only")
+                    || s.contains("no managed")
+                    || s.contains("none is written"),
+                "docs/mcp.md may claim a Codex/Gemini restriction: {s}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mcp_page_example_loads() {
+    let text = mcp_page();
+    let mut blocks = Vec::new();
+    let mut cur: Option<String> = None;
+    for line in text.lines() {
+        match &mut cur {
+            Some(b) if line.trim_start().starts_with("```") => {
+                blocks.push(std::mem::take(b));
+                cur = None;
+            }
+            Some(b) => {
+                b.push_str(line);
+                b.push('\n');
+            }
+            None if line.trim() == "```toml" => cur = Some(String::new()),
+            None => {}
+        }
+    }
+    let ex: Vec<_> = blocks
+        .iter()
+        .filter(|b| b.contains("[mcp.linear]"))
+        .collect();
+    assert_eq!(ex.len(), 1, "expected one [mcp.linear] example");
+    #[derive(serde::Deserialize)]
+    struct Drop {
+        mcp: std::collections::BTreeMap<String, saiife_policy::McpServerCfg>,
+    }
+    let d: Drop = toml::from_str(ex[0]).expect("the mcp-linear.toml example parses");
+    // `read_paths` must exist on a real host; check the other keys.
+    let mut c = d.mcp["linear"].clone();
+    c.read_paths.clear();
+    c.validate("linear").expect("the example validates");
+}

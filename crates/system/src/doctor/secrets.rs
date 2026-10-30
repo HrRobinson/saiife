@@ -250,7 +250,9 @@ fn mcp(home: &Path, out: &mut Vec<Finding>) {
 fn mcp_finding(path: &Path, server: &str, key: &str) -> Finding {
     Finding {
         path: path.to_path_buf(),
-        what: format!("MCP server {server} holds a credential in {key}"),
+        what: format!(
+            "MCP server {server} holds a credential in {key}; move it behind the MCP gateway: docs/mcp.md"
+        ),
     }
 }
 
@@ -835,6 +837,24 @@ mod tests {
     }
 
     #[test]
+    fn secret_finding_has_gateway_hint() {
+        let home = tempfile::tempdir().unwrap();
+        put(
+            home.path(),
+            ".gemini/settings.json",
+            &format!(r#"{{"mcpServers":{{"g":{{"env":{{"API_KEY":"{VALUE}"}}}}}}}}"#),
+        );
+        let found = scan(home.path(), &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .what
+                .ends_with("; move it behind the MCP gateway: docs/mcp.md"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
     fn mcp_token_found_by_key_name() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
@@ -862,26 +882,26 @@ mod tests {
         assert!(!text.contains(VALUE), "{text}");
         let has = |p: &Path, w: &str| found.iter().any(|f| f.path == p && f.what == w);
         assert!(
-            has(&claude, "MCP server gh holds a credential in GITHUB_TOKEN"),
+            has(&claude, "MCP server gh holds a credential in GITHUB_TOKEN; move it behind the MCP gateway: docs/mcp.md"),
             "{text}"
         );
         assert!(
             has(
                 &claude,
-                "MCP server web holds a credential in Authorization"
+                "MCP server web holds a credential in Authorization; move it behind the MCP gateway: docs/mcp.md"
             ),
             "{text}"
         );
         assert!(
-            has(&claude, "MCP server db holds a credential in db_password"),
+            has(&claude, "MCP server db holds a credential in db_password; move it behind the MCP gateway: docs/mcp.md"),
             "{text}"
         );
         assert!(
-            has(&codex, "MCP server s1 holds a credential in API_KEY"),
+            has(&codex, "MCP server s1 holds a credential in API_KEY; move it behind the MCP gateway: docs/mcp.md"),
             "{text}"
         );
         assert!(
-            has(&gemini, "MCP server g holds a credential in x-api-key"),
+            has(&gemini, "MCP server g holds a credential in x-api-key; move it behind the MCP gateway: docs/mcp.md"),
             "{text}"
         );
         assert_eq!(found.len(), 5, "{text}");
