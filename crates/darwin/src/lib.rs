@@ -6,8 +6,10 @@
 //! `/proc`. `scripts/check-unsafe.sh` fails CI when `unsafe` appears in any
 //! other crate.
 //!
-//! On every other target the crate is empty and forbids `unsafe`.
+//! On every other target the crate is empty and forbids `unsafe`. On macOS
+//! `unsafe_code` is denied too, and allowed only on the two blocks below.
 #![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "macos", deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 #[cfg(target_os = "macos")]
@@ -25,6 +27,8 @@ mod macos {
         /// The effective uid (`kp_eproc.e_ucred.cr_uid`).
         pub uid: u32,
         /// The process name (`kp_proc.p_comm`): at most 16 bytes, lossy UTF-8.
+        /// The process sets it itself (exec name, `setprogname`), so it must
+        /// never be used as an identity on its own; `uid` and `ppid` count.
         pub comm: String,
         /// The start time (`kp_proc.p_starttime`) in microseconds since the
         /// epoch. Together with the pid it names one process: a reused pid
@@ -47,6 +51,7 @@ mod macos {
         // zero bytes is a valid `KinfoProc`.
         let mut kp = MaybeUninit::<KinfoProc>::zeroed();
         let mut len: libc::size_t = size_of::<KinfoProc>();
+        #[allow(unsafe_code)] // the one FFI call of saiife
         // SAFETY: `mib` is a live array of 4 c_ints and the length passed is
         // its own. `kp` is a live, writable `KinfoProc` buffer and `len` holds
         // its exact size, so the kernel writes at most that many bytes into
@@ -65,6 +70,7 @@ mod macos {
         if rc != 0 || len != size_of::<KinfoProc>() {
             return None;
         }
+        #[allow(unsafe_code)]
         // SAFETY: `kp` was zero-initialised above, which is a valid
         // `KinfoProc` (integers, integer arrays and raw pointers only), and
         // the kernel overwrote it with a whole `kinfo_proc` (`len` checked).

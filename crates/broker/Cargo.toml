@@ -64,3 +64,6 @@ tokio = { version = "=1.53.2", features = ["rt", "net", "time", "macros", "sync"
 hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 # 0.14.10 is from 2026-08-28. ring only, as above.
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+
+[lints]
+workspace = true

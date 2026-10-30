@@ -9,6 +9,13 @@ version = "0.2.0"
 license = "FSL-1.1-ALv2"
 repository = "https://github.com/HrRobinson/saiife"
 
+# No unsafe anywhere: lib, bins, tests, examples and build scripts alike.
+# Every crate opts in with `[lints] workspace = true`, except saiife-darwin,
+# the one crate allowed unsafe (plan 13, decision 1). scripts/check-unsafe.sh
+# checks that each crate keeps the opt-in.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [profile.release]
 # saiife is spawned per command by agent hooks; a small, fast binary matters.
 opt-level = 3

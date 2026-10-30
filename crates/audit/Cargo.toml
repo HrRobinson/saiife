@@ -30,3 +30,6 @@ tempfile = "3"
 libc = "0.2"
 # Safe getuid for the record's `uid`.
 rustix = { version = "1", features = ["process", "fs"] }
+
+[lints]
+workspace = true

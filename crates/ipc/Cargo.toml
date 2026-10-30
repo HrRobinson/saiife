@@ -20,3 +20,6 @@ rustix = { version = "1", features = ["net", "fs", "process", "event"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

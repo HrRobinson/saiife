@@ -67,3 +67,6 @@ hyper = { version = "=1.12.0", features = ["client", "server", "http1"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
+[lints]
+workspace = true
