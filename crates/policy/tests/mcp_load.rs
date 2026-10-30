@@ -136,10 +136,15 @@ fn no_mcp_hash_is_unchanged() {
     let (_d, cfg) = etc(LOCKED, &[]);
     let p = load_system(&cfg).unwrap();
     let v = saiife_policy::effective_policy(&p.config, &[], None, None);
-    assert_eq!(
-        saiife_policy::policy_hash(&v), // Same value on main (1c975b5) for this config.
+    // Same value on main (1c975b5) for this config. macOS has its own
+    // daemon defaults in the effective policy: the value a macOS runner
+    // computed.
+    let want = if cfg!(target_os = "macos") {
+        "sha256:0b3a35a173f8cdbc4ccf57ad4975654be086498b2ef2ccceeb00176a12bcdabf"
+    } else {
         "sha256:2865f5d87de5b97228c121d4ee0cd5b8c78b75ba2b1f06486c39823035848892"
-    );
+    };
+    assert_eq!(saiife_policy::policy_hash(&v), want);
 }
 
 /// Plan 17 is silent on environments, so `[mcp.*]` is not overridable there:

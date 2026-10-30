@@ -188,7 +188,13 @@ mod tests {
         assert!(etc.contains(&Path::new("/etc/saiife")), "{etc:?}");
         assert!(etc.contains(&real.join("etc").as_path()), "{etc:?}");
         let run = v.values("SAIIFE_RUN");
-        assert!(run.contains(&Path::new("/run/saiife")), "{run:?}");
+        // The platform's system run dir (`/var/db/saiife-run` on macOS).
+        let sys_run = SYSTEM_PATHS
+            .iter()
+            .find(|(n, _)| *n == "SAIIFE_RUN")
+            .unwrap()
+            .1;
+        assert!(run.contains(&Path::new(sys_run)), "{run:?}");
         assert!(run.contains(&real.join("run").as_path()), "{run:?}");
     }
 

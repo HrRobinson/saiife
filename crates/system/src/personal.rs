@@ -283,16 +283,15 @@ mod tests {
 
     #[test]
     fn runtime_dir_table() {
+        // The Linux rule, whatever the build host (macOS falls back to
+        // the home: `macos_paths_without_xdg_runtime` covers it).
+        let linux = |e: &dyn Fn(&str) -> Option<OsString>| {
+            personal_paths_for(e, Some(Path::new("/h")), Platform::Linux)
+        };
         let none = envf(HashMap::new());
-        assert_eq!(
-            personal_paths(&none, Some(Path::new("/h"))).unwrap_err(),
-            NO_RUNTIME
-        );
+        assert_eq!(linux(&none).unwrap_err(), NO_RUNTIME);
         let rel = envf(HashMap::from([("XDG_RUNTIME_DIR", "run".into())]));
-        assert_eq!(
-            personal_paths(&rel, Some(Path::new("/h"))).unwrap_err(),
-            NO_RUNTIME
-        );
+        assert_eq!(linux(&rel).unwrap_err(), NO_RUNTIME);
 
         let t = tempfile::tempdir().unwrap();
         let mk = |name: &str, mode: u32| {

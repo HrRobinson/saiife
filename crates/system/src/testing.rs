@@ -64,7 +64,8 @@ pub fn fake_config(layout: &Layout) -> String {
 #[doc(hidden)]
 pub fn fake_install(root: &Path) -> Installed {
     let host = FakeHost::open(root).unwrap_or_else(|e| panic!("fake host: {e}"));
-    let layout = Layout::under(root);
+    // The Linux tree, whatever the build host (`Layout::under` follows it).
+    let layout = Layout::under_for(root, Platform::Linux);
     let l = |p: &str| layout.at(p);
 
     for g in [DAEMON_GROUP, AUDIT_GROUP] {

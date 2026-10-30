@@ -380,11 +380,18 @@ fn two_secrets_two_records_both_masked() {
         &d,
         &dir,
         &[
-            "--secret", "tok:ONE", "--secret", "tok2:TWO", "--", "printenv", "ONE", "TWO",
+            "--secret", "tok:ONE", "--secret", "tok2:TWO", "--", "printenv",
         ],
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
-    assert_eq!(out(&o), "[MASKED]\n[MASKED]\n");
+    // The whole environment: BSD `printenv` (macOS) prints one name only.
+    let text = out(&o);
+    let mut got: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("ONE=") || l.starts_with("TWO="))
+        .collect();
+    got.sort();
+    assert_eq!(got, ["ONE=[MASKED]", "TWO=[MASKED]"], "{text}");
     let u = uses(&d);
     assert_eq!(u.len(), 2, "{u:?}");
     let names: Vec<&str> = u.iter().map(|r| r["name"].as_str().unwrap()).collect();

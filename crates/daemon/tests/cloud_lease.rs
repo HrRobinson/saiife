@@ -396,8 +396,14 @@ async fn world_setup(
     std::fs::create_dir_all(tmp.path().join("proc")).unwrap();
     std::fs::create_dir_all(tmp.path().join("run")).unwrap();
     let link = tmp.path().join("s3tool");
-    if !link.exists() {
-        std::os::unix::fs::symlink("/usr/bin/bash", &link).unwrap();
+    // Not `exists()`: a restart reuses the dir, and the link stays.
+    if link.symlink_metadata().is_err() {
+        // `/usr/bin/bash` on Linux; macOS has only `/bin/bash`.
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .expect("no bash");
+        std::os::unix::fs::symlink(bash, &link).unwrap();
     }
     let cw = ChainWriter::open(
         &audit,
@@ -624,8 +630,16 @@ async fn lease_run_allow_symlink_to_interpreter_refused() {
         "{a}"
     );
     // The link's target, as `saiife run` sends it (canonical).
-    let a = w.lease("s3link", "/usr/bin/bash").await;
+    let target = std::fs::canonicalize(&link).unwrap();
+    let a = w.lease("s3link", target.to_str().unwrap()).await;
     assert_eq!(rule(&a), "exe_not_allowed", "{a}");
+    assert!(
+        a["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("interpreter"),
+        "{a}"
+    );
     assert_eq!(w.sts_calls(), 0);
 }
 

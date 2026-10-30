@@ -582,9 +582,20 @@ impl World {
 
     /// Bytes written as given, the whole answer read back (the request
     /// asks for `Connection: close`).
+    /// A refusal may close the socket before the whole request is written
+    /// (a 64 KiB head does not fit a macOS socket buffer, 8 KiB): the write
+    /// then fails with `EPIPE`, and the answer is still there to read.
     async fn raw(&self, req: &[u8]) -> String {
         let mut s = UnixStream::connect(&self.sock).await.unwrap();
-        s.write_all(req).await.unwrap();
+        if let Err(e) = s.write_all(req).await {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "{e}"
+            );
+        }
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut out)).await;
         String::from_utf8_lossy(&out).into_owned()

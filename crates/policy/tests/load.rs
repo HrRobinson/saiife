@@ -66,8 +66,14 @@ fn defaults_when_sections_missing() {
     assert_eq!(c.audit.fsync, Fsync::Checkpoint);
     assert_eq!(c.audit.retention_months, 24);
     assert_eq!(c.audit.dir, PathBuf::from("/var/log/saiife/audit"));
-    assert_eq!(c.daemon.user, "saiife");
-    assert_eq!(c.daemon.socket_dir, PathBuf::from("/run/saiife"));
+    // The platform's daemon user and socket dir (spec §5.3 on macOS).
+    let (user, socket_dir) = if cfg!(target_os = "macos") {
+        ("_saiife", "/var/db/saiife-run")
+    } else {
+        ("saiife", "/run/saiife")
+    };
+    assert_eq!(c.daemon.user, user);
+    assert_eq!(c.daemon.socket_dir, PathBuf::from(socket_dir));
     assert_eq!(c.guard.budget_ms, 50);
     assert_eq!(c.guard.fail, Fail::Closed);
     assert_eq!(c.approval.timeout, Duration::from_secs(1800));
@@ -886,11 +892,15 @@ fn cloud_keys_keep_old_hashes() {
     let p = load_system(&cfg).unwrap();
     let (packs, _) = active_packs(&p.config, &[], None);
     let h = policy_hash(&effective_policy(&p.config, &packs, None, None));
-    // Computed on the tree before the cloud keys existed.
-    assert_eq!(
-        h,
+    // Computed on the tree before the cloud keys existed. The effective
+    // policy holds the daemon defaults, which differ on macOS (`_saiife`,
+    // `/var/db/saiife-run`): that value is the one a macOS runner computed.
+    let want = if cfg!(target_os = "macos") {
+        "sha256:5dcdac28a18de32ec594190ff9746a5f89005357a932690b78d671c3b8de2a34"
+    } else {
         "sha256:79401deacbde1d240dbe27a75fd2545ddf4ee4b513a5af949c7265ada1be2b9b"
-    );
+    };
+    assert_eq!(h, want);
 }
 
 #[test]
