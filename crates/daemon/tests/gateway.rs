@@ -5,7 +5,7 @@
 //! where the request target must reach the daemon byte for byte. Nothing
 //! leaves 127.0.0.1. The loopback TCP listener (`gateway::serve_tcp`) runs
 //! beside it on `127.0.0.1:0`, with its bearer tokens on an injected clock.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -285,6 +285,12 @@ async fn world_with(s: Setup) -> World {
     // The vault: the service's token, as `saiife secret add` would store it.
     let key_file = tmp.path().join("vault-key");
     std::fs::write(&key_file, [7u8; 32]).unwrap();
+    // The key is the daemon's own and private (macOS checks it).
+    std::fs::set_permissions(
+        &key_file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let vault_path = state.join("vault").join("vault.bin");
     let mut vault = vault::open(&key_file, &vault_path);
     let VaultState::Ready(v) = &mut vault else {
@@ -427,8 +433,13 @@ allow = ["orders:read"]
     }));
 
     // The socket path through the held dir: short whatever the scratch dir.
+    // macOS has no /proc: the plain path (its temp dirs fit in 104 bytes).
     let dir_fd = std::fs::File::open(tmp.path().join("run")).unwrap();
-    let sock = PathBuf::from(format!("/proc/self/fd/{}/gateway.sock", dir_fd.as_raw_fd()));
+    let sock = if cfg!(target_os = "linux") {
+        PathBuf::from(format!("/proc/self/fd/{}/gateway.sock", dir_fd.as_raw_fd()))
+    } else {
+        tmp.path().join("run").join("gateway.sock")
+    };
     let listener = UnixListener::bind(&sock).unwrap();
     tokio::spawn(gateway::serve_with(listener, Arc::clone(&ctx), s.opts));
     let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();

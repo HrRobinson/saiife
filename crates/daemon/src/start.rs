@@ -29,7 +29,37 @@ use tokio::signal::unix::{signal, SignalKind};
 const STARTUP_CHECK_RECORDS: usize = 1000;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// The group that may read the audit log (spec §5.2).
-use saiife_system::layout::AUDIT_GROUP;
+use crate::audit_query::AUDIT_GROUP;
+
+/// The vault key's name in the credentials dir: systemd's `LoadCredential`
+/// name on Linux, `/var/db/saiife/keys/vault.key` on macOS (spec §5.3).
+#[cfg(not(target_os = "macos"))]
+pub const VAULT_KEY_FILE: &str = "vault-key";
+/// The vault key's name in the credentials dir: systemd's `LoadCredential`
+/// name on Linux, `/var/db/saiife/keys/vault.key` on macOS (spec §5.3).
+#[cfg(target_os = "macos")]
+pub const VAULT_KEY_FILE: &str = "vault.key";
+
+/// No core dumps: `PR_SET_DUMPABLE` 0 on Linux (which also keeps other
+/// processes of this uid from ptrace and `/proc/<pid>/mem`); a core limit
+/// of 0 elsewhere (macOS: other processes of this uid are kept out by the
+/// hardened runtime, plan 13 decision 13).
+#[cfg(target_os = "linux")]
+fn no_core_dumps() -> rustix::io::Result<()> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_core_dumps() -> rustix::io::Result<()> {
+    use rustix::process::{setrlimit, Resource, Rlimit};
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+}
 
 /// A startup refusal: one line on stderr, exit 2.
 struct Refuse(String);
@@ -366,9 +396,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     let boot = bootstrap(&config);
     let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(directory);
     // 2. No core dumps (the signing key or the vault key is in memory).
-    if let Err(e) =
-        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-    {
+    if let Err(e) = no_core_dumps() {
         eprintln!("saiife: warning: cannot turn off core dumps: {e}");
     }
     let (mode, personal) = match daemon_mode {
@@ -507,7 +535,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         Some(p) => (p.vault, Some(p.lock)),
         None => (
             match &credentials_dir {
-                Some(d) => vault::open(&d.join("vault-key"), &vault_path),
+                Some(d) => vault::open(&d.join(VAULT_KEY_FILE), &vault_path),
                 None => VaultState::Unavailable("no vault key".into()),
             },
             None,
@@ -607,7 +635,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
     .collect();
     let mcp = Arc::new(crate::mcp_gateway::Gateway::new(
         crate::mcp_gateway::GatewaySetup {
-            helper: saiife_system::sandbox::spawn_helper(),
+            helper: crate::mcp_gateway::default_helper(),
             state_dir: state_dir.clone(),
             protected,
             enabled: mode == Mode::Locked,
@@ -628,7 +656,7 @@ fn start(opts: DaemonOptions) -> Result<ExitCode, Refuse> {
         config_path: config.clone(),
         catalog,
         policy,
-        proc: Box::new(crate::sessions::RealProc::new("/proc")),
+        proc: crate::sessions::host_proc(),
         vault,
         vault_path,
         limiter,
@@ -1013,15 +1041,17 @@ fn bind(
 
 /// `chmod` (`sock_mode`) on the socket just bound, never through a symlink: an
 /// `O_PATH | O_NOFOLLOW` handle is checked to be this uid's socket and
-/// changed through `/proc/self/fd`. Without `/proc`, `fchmodat` on the
-/// checked name in the held dir, which only this uid or root can change.
+/// changed through `/proc/self/fd`. Without `/proc` (and on macOS, which has
+/// neither `O_PATH` nor `/proc`), `fchmodat` on the checked name in the held
+/// dir, which only this uid or root can change.
+#[cfg(target_os = "linux")]
 fn chmod_socket(
     dirfd: &rustix::fd::OwnedFd,
     name: &str,
     uid: u32,
     sock_mode: u32,
 ) -> std::io::Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::fs::{Mode, OFlags};
     use std::os::fd::AsRawFd;
     let mode = Mode::from_raw_mode(sock_mode);
     let fd = rustix::fs::openat(
@@ -1036,14 +1066,40 @@ fn chmod_socket(
     }
     match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            let st = rustix::fs::statat(dirfd, name, AtFlags::SYMLINK_NOFOLLOW)?;
-            if st.st_mode & 0o170000 != 0o140000 || st.st_uid != uid {
-                return Err(std::io::Error::other("not the socket this daemon bound"));
-            }
-            Ok(rustix::fs::chmodat(dirfd, name, mode, AtFlags::empty())?)
-        }
+        Err(_) => chmod_socket_at(dirfd, name, uid, sock_mode),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn chmod_socket(
+    dirfd: &rustix::fd::OwnedFd,
+    name: &str,
+    uid: u32,
+    sock_mode: u32,
+) -> std::io::Result<()> {
+    chmod_socket_at(dirfd, name, uid, sock_mode)
+}
+
+/// The no-`/proc` branch of [`chmod_socket`]: `statat` (no follow) checks
+/// the name is this uid's socket, then `chmodat` changes it in the held dir.
+fn chmod_socket_at(
+    dirfd: &rustix::fd::OwnedFd,
+    name: &str,
+    uid: u32,
+    sock_mode: u32,
+) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, FileType, Mode, RawMode};
+    let st = rustix::fs::statat(dirfd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::Socket || st.st_uid != uid {
+        return Err(std::io::Error::other("not the socket this daemon bound"));
+    }
+    let mode = RawMode::try_from(sock_mode).map_err(|_| std::io::Error::other("bad mode"))?;
+    Ok(rustix::fs::chmodat(
+        dirfd,
+        name,
+        Mode::from_raw_mode(mode),
+        AtFlags::empty(),
+    )?)
 }
 
 /// A periodic blocking job that runs at most once at a time.
@@ -1499,6 +1555,15 @@ fn restart_only_changes(ctx: &Ctx, l: &LoadedPolicy) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn vault_key_file_name_per_platform() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(VAULT_KEY_FILE, "vault.key");
+        } else {
+            assert_eq!(VAULT_KEY_FILE, "vault-key");
+        }
+    }
 
     /// Locked mode checks the services before `[guard] ask` (as main did,
     /// at start and reload): a config that fails both names the service.

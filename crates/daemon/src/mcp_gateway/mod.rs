@@ -14,6 +14,10 @@
 //! ([`Gateway::is_child_or_descendant`]): the control and gateway sockets
 //! refuse them (`mcp_child_peer`), since a pathname-socket connect is not
 //! covered by Landlock.
+//!
+//! Linux only in v2.1 (plan 13, decision 7): `[mcp.*]` is a load error
+//! elsewhere, so on macOS no child is ever spawned, [`Gateway::has_children`]
+//! is always false and no pid is ever judged a child.
 
 pub mod child;
 
@@ -22,7 +26,10 @@ use crate::vault::{Kind, VaultState};
 use child::{Conn, Running, StartError};
 use saiife_broker::mask::Masker;
 use saiife_mcp::types::Tool;
-use saiife_policy::{McpServerCfg, Sandbox, SystemConfig};
+#[cfg(target_os = "linux")]
+use saiife_policy::Sandbox;
+use saiife_policy::{McpServerCfg, SystemConfig};
+#[cfg(target_os = "linux")]
 use saiife_system::sandbox::SpawnSpec;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -160,12 +167,25 @@ impl std::fmt::Debug for Log {
     }
 }
 
+/// `saiife __mcp-spawn`'s binary: the installed one (or, in debug builds,
+/// the seam's).
+#[cfg(target_os = "linux")]
+pub fn default_helper() -> PathBuf {
+    saiife_system::sandbox::spawn_helper()
+}
+
+/// No spawn helper outside Linux (decision 7): nothing is ever spawned.
+#[cfg(not(target_os = "linux"))]
+pub fn default_helper() -> PathBuf {
+    PathBuf::new()
+}
+
 impl GatewaySetup {
     /// The defaults for a state dir: the installed (or, in debug builds,
     /// the seam's) helper, enabled.
     pub fn in_state(state_dir: &Path) -> GatewaySetup {
         GatewaySetup {
-            helper: saiife_system::sandbox::spawn_helper(),
+            helper: default_helper(),
             state_dir: state_dir.to_path_buf(),
             protected: vec![state_dir.to_path_buf()],
             enabled: true,
@@ -430,7 +450,7 @@ impl Gateway {
 
     /// Whether any child is running (or starting).
     pub fn has_children(&self) -> bool {
-        !lock(&self.inner.pids).is_empty()
+        cfg!(target_os = "linux") && !lock(&self.inner.pids).is_empty()
     }
 
     /// Whether `pid` is a gateway child or descends from one: one of its
@@ -444,7 +464,14 @@ impl Gateway {
     /// in between by an unrelated process, that process is judged instead;
     /// in locked mode the own-uid rule still refuses a child's socket
     /// whatever its pid shows.
+    ///
+    /// Always false outside Linux, where no child runs. This matters on
+    /// macOS, whose `LOCAL_PEERPID` is the socket's last user, not strictly
+    /// its connector: no decision there may rest on the pid alone.
     pub fn is_child_or_descendant(&self, pid: u32) -> bool {
+        if !self.has_children() {
+            return false;
+        }
         let pids = lock(&self.inner.pids).clone();
         descends(&pids, pid, &|p| proc_stat(Path::new("/proc"), p))
     }
@@ -668,6 +695,7 @@ impl Inner {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn home_of(&self, name: &str) -> Result<PathBuf, String> {
         let base = self.setup.state_dir.join("mcp");
         let home = base.join(name);
@@ -679,7 +707,16 @@ impl Inner {
         Ok(home)
     }
 
+    /// Outside Linux no child is spawned (decision 7; the loader already
+    /// refuses `[mcp.*]` there).
+    #[cfg(not(target_os = "linux"))]
+    async fn start(&self, srv: &Server, d: &Desired) -> Result<(Running, Vec<Tool>), StartError> {
+        let _ = (srv, d, &self.setup.helper, &self.setup.protected);
+        Err(StartError::permanent(saiife_policy::mcp::MCP_NEEDS_LINUX))
+    }
+
     /// Spawn, initialize and list the tools of one child.
+    #[cfg(target_os = "linux")]
     async fn start(&self, srv: &Server, d: &Desired) -> Result<(Running, Vec<Tool>), StartError> {
         if d.cfg.sandbox == Sandbox::Landlock && saiife_system::sandbox::landlock_abi() == 0 {
             return Err(StartError::permanent(
@@ -1116,6 +1153,14 @@ pub(crate) async fn tcp_peer_refused(
     local: SocketAddr,
     peer: SocketAddr,
 ) -> Option<u32> {
+    // macOS (decision 8): no `/proc/net`, so the socket's uid cannot be
+    // found, and there are no gateway children. The own-uid check is
+    // skipped; the bearer token is still required, and the daemon's own
+    // uid cannot mint one (the control socket refuses it in locked mode).
+    if !cfg!(target_os = "linux") {
+        let _ = (ctx, local, peer);
+        return None;
+    }
     let own = ctx.refuse_own_uid_peers;
     let children = ctx.mcp.has_children();
     if !own && !children {
@@ -1163,6 +1208,8 @@ mod tests {
         assert!(!descends_strict(&kids, 999, &stat));
     }
 
+    // Reads /proc (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_stat_reads_ppid_and_session_past_odd_comm() {
         let t = tempfile::tempdir().unwrap();
@@ -1180,6 +1227,8 @@ mod tests {
         assert_eq!(ppid, std::os::unix::process::parent_id());
     }
 
+    // Reads /proc (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn real_descendant_found() {
         let gw = Gateway::new(GatewaySetup::in_state(Path::new("/nonexistent")));
@@ -1194,6 +1243,18 @@ mod tests {
         assert!(gw.is_child_or_descendant(std::process::id()));
         let _ = sleeper.kill();
         let _ = sleeper.wait();
+    }
+
+    /// Outside Linux no pid is ever a gateway child (decision 7): macOS's
+    /// `LOCAL_PEERPID` names the socket's last user, so nothing may rest on
+    /// it, and there are no children to find.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn no_children_off_linux() {
+        let gw = Gateway::new(GatewaySetup::in_state(Path::new("/nonexistent")));
+        gw.add_test_pid(std::process::id());
+        assert!(!gw.has_children());
+        assert!(!gw.is_child_or_descendant(std::process::id()));
     }
 
     #[test]
@@ -1214,6 +1275,8 @@ mod tests {
         assert_eq!(parse_addr("zz"), None);
     }
 
+    // Reads /proc (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn tcp_peer_found_with_uid_and_inode() {
         use std::os::fd::AsRawFd;

@@ -207,7 +207,8 @@ enum Cmd {
         /// Where the signing key lives (default $STATE_DIRECTORY, else /var/lib/saiife).
         #[arg(long = "state-dir", value_name = "DIR")]
         state_dir: Option<std::path::PathBuf>,
-        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY).
+        /// Where `vault-key` lives (default $CREDENTIALS_DIRECTORY; macOS:
+        /// `vault.key` in /var/db/saiife/keys).
         #[arg(long = "credentials-dir", value_name = "DIR", hide = true)]
         credentials_dir: Option<std::path::PathBuf>,
     },
@@ -666,6 +667,8 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
         credentials_dir,
         ..
     } = a;
+    let platform = saiife_system::layout::Platform::current()
+        .unwrap_or(saiife_system::layout::Platform::Linux);
     // systemd's StateDirectory= may list several dirs, colon-separated.
     let state_dir = state_dir
         .or_else(|| {
@@ -673,17 +676,32 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
                 .and_then(|v| v.to_str().and_then(|s| s.split(':').next()).map(Into::into))
                 .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
         })
-        .unwrap_or_else(|| "/var/lib/saiife".into());
+        .unwrap_or_else(|| daemon_default_dirs(platform).0.into());
     saiife_daemon::run(saiife_daemon::DaemonOptions {
         config: config.unwrap_or_else(|| "/etc/saiife/config.toml".into()),
         state_dir,
         credentials_dir: credentials_dir
             .or_else(|| std::env::var_os("CREDENTIALS_DIRECTORY").map(Into::into))
-            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty()),
+            .filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
+            .or_else(|| daemon_default_dirs(platform).1.map(Into::into)),
         catalog: daemon_catalog(),
         directory: Box::new(saiife_policy::Getent),
         mode: saiife_daemon::DaemonMode::System,
     })
+}
+
+/// `saiife daemon --system`'s state and credentials dirs when neither a
+/// flag nor systemd (`$STATE_DIRECTORY`, `$CREDENTIALS_DIRECTORY`) names
+/// them. launchd sets neither, so macOS has both (spec 5.3).
+fn daemon_default_dirs(p: saiife_system::layout::Platform) -> (&'static str, Option<&'static str>) {
+    use saiife_system::layout::{macos_path, Platform, KEYS_DIR, STATE_DIR};
+    match p {
+        Platform::Linux => (STATE_DIR, None),
+        Platform::Macos => (
+            macos_path(STATE_DIR).unwrap_or(STATE_DIR),
+            macos_path(KEYS_DIR),
+        ),
+    }
 }
 
 /// `saiife daemon --user` (plan 16): the personal paths, the refusals that
@@ -922,4 +940,22 @@ fn trace(decision: Decision) -> String {
 
 pub(crate) fn warn(msg: &str) {
     let _ = writeln!(std::io::stderr(), "saiife: {msg}");
+}
+
+#[cfg(test)]
+mod daemon_default_tests {
+    use super::daemon_default_dirs;
+    use saiife_system::layout::Platform;
+
+    #[test]
+    fn daemon_defaults_per_platform() {
+        assert_eq!(
+            daemon_default_dirs(Platform::Linux),
+            ("/var/lib/saiife", None)
+        );
+        assert_eq!(
+            daemon_default_dirs(Platform::Macos),
+            ("/var/db/saiife", Some("/var/db/saiife/keys"))
+        );
+    }
 }

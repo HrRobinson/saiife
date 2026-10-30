@@ -269,7 +269,8 @@ pub async fn serve_tcp(listener: TcpListener, ctx: Arc<Ctx>, opts: Opts) {
                 tokio::spawn(async move {
                     // A gateway MCP child or one of its processes, or in
                     // locked mode a socket of the daemon's own uid: found
-                    // in /proc and closed before the request is read.
+                    // in /proc and closed before the request is read. Not
+                    // on macOS (no /proc, no children: decision 8).
                     let refused = match s.local_addr() {
                         Ok(local) => crate::mcp_gateway::tcp_peer_refused(&ctx, local, addr).await,
                         Err(_) => (ctx.refuse_own_uid_peers || ctx.mcp.has_children())
@@ -1292,12 +1293,17 @@ mod personal_tests {
     }
 
     /// A gateway MCP child (this test process, counted as one) is closed
-    /// on gateway.sock in both modes; locked mode refusing its own uid
-    /// closes any peer of that uid.
+    /// on gateway.sock in both modes (Linux: no children elsewhere); locked
+    /// mode refusing its own uid closes any peer of that uid.
     #[tokio::test]
     async fn mcp_child_and_own_uid_peers_closed_on_gateway_socket() {
         let me = rustix::process::getuid().as_raw();
-        for mode in [crate::ops::Mode::Personal, crate::ops::Mode::Locked] {
+        let modes = if cfg!(target_os = "linux") {
+            vec![crate::ops::Mode::Personal, crate::ops::Mode::Locked]
+        } else {
+            Vec::new()
+        };
+        for mode in modes {
             let t = tempfile::tempdir().unwrap();
             let (ctx, _join) = crate::ops::test_ctx(t.path(), mode, me);
             ctx.mcp.add_test_pid(std::process::id());
@@ -1332,6 +1338,7 @@ mod personal_tests {
     /// The TCP listener finds the client socket in /proc: one held by a
     /// gateway child (this process, counted as one), or in locked mode of
     /// the daemon's own uid, is closed unanswered; otherwise HTTP answers.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn tcp_peer_of_child_or_own_uid_closed() {
         let me = rustix::process::getuid().as_raw();
@@ -1349,5 +1356,22 @@ mod personal_tests {
         let (mut ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, me);
         Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
         assert!(tcp_answer(ctx).await.is_empty());
+    }
+
+    /// macOS (plan 13, decision 8): no `/proc/net`, so the TCP listener
+    /// does not check the peer's uid; the bearer token still decides.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn tcp_peer_uid_not_checked_off_linux() {
+        let me = rustix::process::getuid().as_raw();
+        let t = tempfile::tempdir().unwrap();
+        let (mut ctx, _join) = crate::ops::test_ctx(t.path(), crate::ops::Mode::Locked, me);
+        Arc::get_mut(&mut ctx).unwrap().refuse_own_uid_peers = true;
+        let got = tcp_answer(ctx).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "{}",
+            String::from_utf8_lossy(&got)
+        );
     }
 }

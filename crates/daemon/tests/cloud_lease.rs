@@ -3,7 +3,7 @@
 //! built-in `aws-s3` manifest, and a loopback TLS mock of STS with an
 //! `rcgen` certificate for the real host name. The test resolver maps it to
 //! 127.0.0.1; nothing leaves the host.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -417,6 +417,12 @@ async fn world_setup(
 
     let key_file = tmp.path().join("vault-key");
     std::fs::write(&key_file, [7u8; 32]).unwrap();
+    // The key is the daemon's own and private (macOS checks it).
+    std::fs::set_permissions(
+        &key_file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let vault_file = state.join("vault").join("vault.bin");
     let mut vault = vault::open(&key_file, &vault_file);
     let VaultState::Ready(v) = &mut vault else {

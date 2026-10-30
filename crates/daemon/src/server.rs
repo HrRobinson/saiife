@@ -211,6 +211,8 @@ mod tests {
     /// A gateway MCP child (here: this test process, counted as one) is
     /// closed before its hello, in both modes; the pid check is all the
     /// personal broker has, since its clients share its uid.
+    /// Linux only: no gateway children elsewhere (plan 13, decision 7).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mcp_child_peer_closed_before_hello() {
         let me = rustix::process::getuid().as_raw();

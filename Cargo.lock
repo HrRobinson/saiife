@@ -1509,6 +1509,7 @@ dependencies = [
  "rustls",
  "saiife-audit",
  "saiife-broker",
+ "saiife-darwin",
  "saiife-guard",
  "saiife-ipc",
  "saiife-keychain",

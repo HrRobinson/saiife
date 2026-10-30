@@ -11,7 +11,7 @@
 //! before the runtime starts and drops the keychain, so neither the OAuth2
 //! token cache nor the mail transport can reach one. Nothing leaves
 //! 127.0.0.1.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 #[allow(dead_code)]
 #[path = "../../broker/tests/common/mail_mock.rs"]

@@ -295,7 +295,11 @@ impl Reauth for PkCheck {
     /// root-owned and not group/other-writable, and a polkit daemon binary
     /// is installed.
     fn available(&self) -> bool {
-        root_owned_file(&self.pkcheck)
+        // polkit's subject is the pid; outside Linux (macOS: the socket's
+        // last pid, not strictly its connector) no approval may rest on a
+        // pid, so polkit is never used there (plan 13, Task 7).
+        cfg!(target_os = "linux")
+            && root_owned_file(&self.pkcheck)
             && root_owned_file(&self.action_file)
             && polkitd_present(&self.polkitd)
     }
@@ -407,11 +411,13 @@ pub fn start_time_of(proc: &dyn Proc, pid: u32) -> Option<u64> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
     /// A fake `pkcheck`: records its argv and its initial environment (from
     /// `/proc/$$/environ`, so nothing the shell adds), then exits `code`, or
     /// sleeps `sleep` seconds when that is not 0.
+    #[cfg(target_os = "linux")]
     fn fake(dir: &Path, code: i32, sleep: u32) -> PathBuf {
         let script = dir.join("pkcheck");
         let out = dir.display();
@@ -439,6 +445,8 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_argv_exact() {
         let d = tmp();
@@ -460,6 +468,8 @@ mod tests {
         assert_eq!(env, "PATH=/usr/bin:/bin\n");
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_exit_codes() {
         use ReauthResult as R;
@@ -492,6 +502,7 @@ mod tests {
     }
 
     /// A fake `pkcheck` that writes `stderr` there, then exits `code`.
+    #[cfg(target_os = "linux")]
     fn fake_stderr(dir: &Path, code: i32, stderr: &str) -> PathBuf {
         let script = dir.join("pkcheck-err");
         fs::write(
@@ -503,6 +514,8 @@ mod tests {
         script
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_stderr_first_line_is_the_reason() {
         use ReauthResult as R;
@@ -587,6 +600,8 @@ mod tests {
         drop((b, again));
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn pkcheck_timeout_is_error() {
         let d = tmp();
@@ -615,6 +630,8 @@ mod tests {
         assert!(InFlight::begin(1000).is_some());
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn missing_pkcheck_is_error() {
         let d = tmp();
@@ -625,6 +642,8 @@ mod tests {
         ));
     }
 
+    // polkit (Linux).
+    #[cfg(target_os = "linux")]
     #[test]
     fn available_needs_root_owned_binary_and_action_file() {
         let d = tmp();
@@ -666,6 +685,18 @@ mod tests {
         assert!(!PkCheck::with_paths(&root_file, &root_file)
             .with_polkitd(vec![d.path().join("no-polkitd")])
             .available());
+    }
+
+    /// Outside Linux polkit is never used: its subject is a pid, and no
+    /// approval may rest on a pid there (macOS `LOCAL_PEERPID`).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn pkcheck_never_available_off_linux() {
+        let root_file = PathBuf::from("/etc/passwd");
+        assert!(!PkCheck::with_paths(&root_file, &root_file)
+            .with_polkitd(vec![root_file.clone()])
+            .available());
+        assert!(!PkCheck::new().available());
     }
 
     #[test]

@@ -1,78 +1,80 @@
 //! saiifed: the locked-mode daemon (spec §4.1, §6.2, §6.3). Control server
 //! on `saiife.sock`, the single audit writer, signed checkpoints, policy
-//! reload on SIGHUP and a clean stop on SIGTERM/SIGINT. Linux only in this
-//! version; elsewhere `run` refuses.
+//! reload on SIGHUP and a clean stop on SIGTERM/SIGINT. Linux and macOS
+//! (plan 13); elsewhere `run` refuses.
 #![forbid(unsafe_code)]
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod api_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod approval_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod approvals;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod approvers;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod audit_query;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod cloud_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod disk;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod forward_file;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod forward_https;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod forward_syslog;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod forwarder;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod gateway;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod grants;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod import_backup;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod limits;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod lockdown;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod mcp_gateway;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod mcp_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod notifier;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod notify;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod oauth;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod personal;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod policy_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod reauth;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod secret_ops;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod server;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod sessions;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod signals;
 /// The SMTP client lives in the broker's mail transport (plan 14, Task 6);
 /// the notifier sends through it.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use saiife_broker::mail::smtp;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod start;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+pub use start::VAULT_KEY_FILE;
+#[cfg(unix)]
 pub mod tokens;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod vault;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};
@@ -175,11 +177,24 @@ pub fn run(opts: DaemonOptions) -> ExitCode {
     start::run(opts)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the system daemon runs; the personal broker still refuses until
+/// its own port (plan 13, Task 10).
+#[cfg(target_os = "macos")]
+pub fn run(opts: DaemonOptions) -> ExitCode {
+    match opts.mode {
+        DaemonMode::System => start::run(opts),
+        DaemonMode::Personal { .. } => {
+            eprintln!("{PERSONAL_NEEDS_LINUX}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn run(opts: DaemonOptions) -> ExitCode {
     match opts.mode {
         DaemonMode::System => {
-            eprintln!("saiife: locked mode needs Linux in this version (macOS: v2.1)")
+            eprintln!("saiife: locked mode needs Linux or macOS")
         }
         DaemonMode::Personal { .. } => eprintln!("{PERSONAL_NEEDS_LINUX}"),
     }

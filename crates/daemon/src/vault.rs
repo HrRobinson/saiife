@@ -200,7 +200,15 @@ pub fn valid_name(n: &str) -> bool {
 }
 
 fn read_key(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, &'static str> {
+    use std::os::unix::fs::MetadataExt;
     let f = open_regular(key_file).map_err(|_| "no vault key")?;
+    let md = f.metadata().map_err(|_| "no vault key")?;
+    key_file_ok(
+        cfg!(target_os = "macos"),
+        md.uid(),
+        md.mode(),
+        rustix::process::geteuid().as_raw(),
+    )?;
     let mut buf = Zeroizing::new(Vec::with_capacity(64));
     f.take(33)
         .read_to_end(&mut buf)
@@ -211,6 +219,24 @@ fn read_key(key_file: &Path) -> Result<Zeroizing<[u8; 32]>, &'static str> {
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&buf);
     Ok(key)
+}
+
+/// The key file's owner and mode. On Linux it is systemd's credential
+/// (`$CREDENTIALS_DIRECTORY`, root's to manage), so nothing more is asked.
+/// On macOS it is `/var/db/saiife/keys/vault.key`, which install writes
+/// 0400 for the daemon user: it must be the daemon's own (`euid`), and
+/// group and others must have no access.
+fn key_file_ok(macos: bool, uid: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
+    if !macos {
+        return Ok(());
+    }
+    if uid != euid {
+        return Err("vault key is not owned by the daemon user");
+    }
+    if mode & 0o077 != 0 {
+        return Err("vault key is open to group or others (must be 0400)");
+    }
+    Ok(())
 }
 
 fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
@@ -812,6 +838,12 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let key = t.path().join("vault-key");
         std::fs::write(&key, KEY).unwrap();
+        // The key is the daemon's own and private (macOS checks it).
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
         let file = t.path().join("vault").join("vault.bin");
         Env { _t: t, key, file }
     }
@@ -1246,17 +1278,58 @@ mod tests {
     }
 
     #[test]
-    fn fifo_or_symlinked_key_is_unavailable_without_blocking() {
+    fn macos_key_must_be_own_and_private() {
+        // Linux: the systemd credential, as before.
+        assert_eq!(key_file_ok(false, 0, 0o100644, 990), Ok(()));
+        // macOS: 0400 (or 0600) of the daemon uid.
+        assert_eq!(key_file_ok(true, 990, 0o100400, 990), Ok(()));
+        assert_eq!(key_file_ok(true, 990, 0o100600, 990), Ok(()));
+        assert_eq!(
+            key_file_ok(true, 0, 0o100400, 990),
+            Err("vault key is not owned by the daemon user")
+        );
+        assert_eq!(
+            key_file_ok(true, 990, 0o100440, 990),
+            Err("vault key is open to group or others (must be 0400)")
+        );
+        assert_eq!(
+            key_file_ok(true, 990, 0o100404, 990),
+            Err("vault key is open to group or others (must be 0400)")
+        );
+    }
+
+    #[test]
+    fn own_0400_key_opens() {
         let e = env();
-        std::fs::remove_file(&e.key).unwrap();
+        std::fs::set_permissions(&e.key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        ready(&e);
+    }
+
+    /// A FIFO at `p` (rustix has no `mknodat` on macOS: `mkfifo(1)` there).
+    fn mkfifo(p: &Path) {
+        #[cfg(target_os = "linux")]
         rustix::fs::mknodat(
             rustix::fs::CWD,
-            &e.key,
+            p,
             rustix::fs::FileType::Fifo,
             rustix::fs::Mode::from_raw_mode(0o600),
             0,
         )
         .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        assert!(std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(p)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn fifo_or_symlinked_key_is_unavailable_without_blocking() {
+        let e = env();
+        std::fs::remove_file(&e.key).unwrap();
+        mkfifo(&e.key);
         let t = Instant::now();
         assert_eq!(reason(&e), "no vault key");
         assert!(t.elapsed() < Duration::from_secs(1));
@@ -1276,14 +1349,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &e.file).unwrap();
         assert_eq!(reason(&e), "vault file is not a saiife vault");
         std::fs::remove_file(&e.file).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &e.file,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
+        mkfifo(&e.file);
         let t = Instant::now();
         assert_eq!(reason(&e), "vault file is not a saiife vault");
         assert!(t.elapsed() < Duration::from_secs(1));

@@ -8,10 +8,15 @@
 //! kept as JSON values and masked, and stderr is masked and rate-capped
 //! before it reaches the daemon's journal.
 
+// Only the spawn path is Linux-only (plan 13, decision 7); the pipe and
+// session code it drives stays compiled elsewhere, unreached.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use saiife_broker::mask::Masker;
 use saiife_mcp::codec::{decode_line, encode};
 use saiife_mcp::jsonrpc::{Id, Message, RpcError};
 use saiife_mcp::types::{self as t, Tool};
+#[cfg(target_os = "linux")]
 use saiife_system::sandbox::{encode_spec, SpawnSpec};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -232,11 +237,18 @@ fn kill_group(pid: u32) {
 /// are unavailable, `waitid(P_PID, WEXITED | WNOWAIT)` on a blocking
 /// thread.
 pub(crate) enum ExitWatch {
+    #[cfg(target_os = "linux")]
     Pidfd(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, u32),
     Waitid(u32),
 }
 
 impl ExitWatch {
+    #[cfg(not(target_os = "linux"))]
+    fn new(pid: u32) -> ExitWatch {
+        ExitWatch::Waitid(pid)
+    }
+
+    #[cfg(target_os = "linux")]
     fn new(pid: u32) -> ExitWatch {
         use rustix::process::{pidfd_open, Pid, PidfdFlags};
         let fd = Pid::from_raw(pid as i32)
@@ -253,6 +265,7 @@ impl ExitWatch {
     /// Returns once the leader has exited; it stays unreaped.
     pub async fn exited(&self) {
         let pid = match self {
+            #[cfg(target_os = "linux")]
             ExitWatch::Pidfd(fd, pid) => {
                 // Readiness is never cleared: once exited, always exited.
                 if fd.readable().await.is_ok() {
@@ -347,6 +360,8 @@ impl StartError {
 
 /// Spawn the helper with `spec`, then start the pipe tasks. The spec frame
 /// goes first on stdin; the JSON-RPC session follows on the same pipe.
+/// Linux only (plan 13, decision 7).
+#[cfg(target_os = "linux")]
 pub(crate) async fn spawn(
     helper: &Path,
     name: &str,
@@ -1004,6 +1019,7 @@ mod tests {
 
     /// The exit watch sees an exit without reaping: the leader is still a
     /// zombie (so its group can be killed safely) until `wait`. Both ways.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn exit_watch_does_not_reap() {
         for fallback in [false, true] {

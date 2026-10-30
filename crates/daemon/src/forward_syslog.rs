@@ -15,7 +15,7 @@
 //!   without a `seq`), always `-` in `rfc5424-json`.
 //! - MSG is the line, byte for byte, without a BOM.
 //!
-//! Local (`unix:<path>`, normally `/dev/log`): one datagram per record. A
+//! Local (`unix:<path>`, normally [`DEFAULT_SOCKET`]): one datagram per record. A
 //! message over 8 KiB is cut at a character boundary and ends with
 //! `…[truncated]` (that line cannot be verified from the copy). When the
 //! socket is a stream socket, every message goes over it with octet-counting
@@ -48,10 +48,19 @@ pub const MAX_BYTES: usize = 1 << 20;
 const SEV_WARNING: u8 = 4;
 const SEV_INFO: u8 = 6;
 
+/// The host's local syslog socket: `/dev/log` on Linux, `/var/run/syslog`
+/// on macOS.
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SOCKET: &str = "/dev/log";
+/// The host's local syslog socket: `/dev/log` on Linux, `/var/run/syslog`
+/// on macOS.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SOCKET: &str = "/var/run/syslog";
+
 /// Where the messages go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dest {
-    /// A local socket (`unix:/dev/log`).
+    /// A local socket (`unix:/dev/log`, `unix:/var/run/syslog`).
     Unix(PathBuf),
     /// `tls://host:port`; `host` without IPv6 brackets.
     Tls { host: String, port: u16 },
@@ -323,6 +332,19 @@ mod tests {
             "box1".into(),
             TargetClient::new(|| Err("no TLS for a local socket".into())),
         )
+    }
+
+    #[test]
+    fn default_socket_per_platform() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(DEFAULT_SOCKET, "/var/run/syslog");
+        } else {
+            assert_eq!(DEFAULT_SOCKET, "/dev/log");
+        }
+        assert_eq!(
+            Dest::parse(&format!("unix:{DEFAULT_SOCKET}")).unwrap(),
+            Dest::Unix(PathBuf::from(DEFAULT_SOCKET))
+        );
     }
 
     #[test]

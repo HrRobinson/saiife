@@ -1051,5 +1051,6 @@ pub(crate) async fn servers_for(
     out
 }
 
-#[cfg(test)]
+// The tests load `[mcp.*]`, a load error outside Linux (plan 13, decision 7).
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

@@ -4,7 +4,7 @@
 //! real host names (S3, STS, the GCP and Azure token endpoints, GCS, ARM).
 //! The test resolver maps those names to 127.0.0.1; nothing leaves the host.
 //! Calls go through `api.call` as a client would send them.
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
@@ -778,6 +778,12 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
 
     let key_file = tmp.path().join("vault-key");
     std::fs::write(&key_file, [7u8; 32]).unwrap();
+    // The key is the daemon's own and private (macOS checks it).
+    std::fs::set_permissions(
+        &key_file,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .unwrap();
     let vault_file = state.join("vault").join("vault.bin");
     let mut vault = vault::open(&key_file, &vault_file);
     let VaultState::Ready(v) = &mut vault else {

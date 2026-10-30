@@ -430,6 +430,8 @@ fn validate_mcp(
     cfg: &SystemConfig,
     origin: &BTreeMap<String, String>,
 ) -> Result<(), PolicyError> {
+    crate::mcp::validate_mcp(&cfg.mcp, cfg!(target_os = "linux"))
+        .map_err(|why| invalid(config_file, why))?;
     if !cfg.mcp.is_empty() && !cfg.locked {
         return Err(invalid(
             config_file,

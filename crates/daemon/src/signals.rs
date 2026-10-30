@@ -105,13 +105,28 @@ impl Signals {
 pub(crate) fn hostname() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/hostname")
+        read_hostname()
             .map(|s| s.trim().to_string())
-            .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown".into())
     })
     .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn read_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+}
+
+/// No `/proc` on macOS: `uname(3)`'s nodename.
+#[cfg(not(target_os = "linux"))]
+fn read_hostname() -> Option<String> {
+    Some(
+        rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Masked, one line, at most [`SUMMARY_MAX`] characters.
