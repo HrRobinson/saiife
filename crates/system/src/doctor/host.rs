@@ -84,22 +84,39 @@ fn caller(ctx: &Ctx, passwd: &str) -> Option<String> {
 }
 
 /// The members of `group:<g>`: its listed members plus the local users
-/// whose primary group it is.
-fn group_users(ctx: &Ctx, g: &str) -> Vec<String> {
+/// whose primary group it is. An `Err` when the primary-group list could
+/// not be read: [`checks`] then fails the run (see [`unreadable_groups`]).
+fn group_users(ctx: &Ctx, g: &str) -> std::io::Result<Vec<String>> {
     let Some(entry) = ctx.dir.group(g) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut out = entry.members;
-    // An unreadable list adds no one (the Linux host never errs here).
-    out.extend(
-        ctx.host
-            .users_with_primary_gid(entry.gid)
-            .unwrap_or_default(),
-    );
+    out.extend(ctx.host.users_with_primary_gid(entry.gid)?);
+    Ok(out)
+}
+
+/// The `group:<g>` scope entries whose members could not be listed, as
+/// `(group, why)`. While any is there, the users doctor scans and the
+/// scopes they belong to may be partial, so the run fails.
+fn unreadable_groups(ctx: &Ctx) -> Vec<(String, String)> {
+    let Ok(p) = &ctx.config else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in p.config.scope.iter().flat_map(|s| &s.users) {
+        if let Some(g) = entry.strip_prefix(GROUP_PREFIX) {
+            if let Err(e) = group_users(ctx, g) {
+                if !out.iter().any(|(x, _)| x == g) {
+                    out.push((g.to_string(), e.to_string()));
+                }
+            }
+        }
+    }
     out
 }
 
-/// Every user named by a `[[scope]]`, groups expanded.
+/// Every user named by a `[[scope]]`, groups expanded. A group whose list
+/// cannot be read adds no one here; [`checks`] fails the run for it.
 fn scoped_names(ctx: &Ctx) -> BTreeSet<String> {
     let Ok(p) = &ctx.config else {
         return BTreeSet::new();
@@ -108,7 +125,7 @@ fn scoped_names(ctx: &Ctx) -> BTreeSet<String> {
     for scope in &p.config.scope {
         for entry in &scope.users {
             match entry.strip_prefix(GROUP_PREFIX) {
-                Some(g) => out.extend(group_users(ctx, g)),
+                Some(g) => out.extend(group_users(ctx, g).unwrap_or_default()),
                 None => {
                     out.insert(entry.clone());
                 }
@@ -191,6 +208,15 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     let mut egress: Option<Egress> = None;
     let mut any_finding = false;
     let mut incomplete: Vec<String> = Vec::new();
+    for (g, why) in unreadable_groups(ctx) {
+        out.push(Check::new(
+            format!("scope.group.{g}"),
+            Status::Fail,
+            format!("members of group {g}"),
+            format!("could not list members of group {g}: {why}"),
+        ));
+        incomplete.push(format!("members of group {g} unknown"));
+    }
     if users.is_empty() {
         incomplete.push("no agent user to scan".to_string());
     }
@@ -573,7 +599,8 @@ fn project_roots(ctx: &Ctx, u: &AgentUser) -> Vec<PathBuf> {
             .users
             .iter()
             .any(|e| match e.strip_prefix(GROUP_PREFIX) {
-                Some(g) => group_users(ctx, g).contains(&u.name),
+                // Unreadable: no membership here, and `checks` fails the run.
+                Some(g) => group_users(ctx, g).is_ok_and(|us| us.contains(&u.name)),
                 None => e == &u.name,
             });
         if !member {
@@ -1223,6 +1250,32 @@ mod tests {
         t.user("alice", 5001, 5001, true);
         t.append_config("\n[[scope]]\nname = \"a\"\nusers = [\"alice\"]\n");
         assert_eq!(t.users(), ["me"]);
+    }
+
+    #[test]
+    fn unreadable_scope_group_fails_the_scan() {
+        let mut t = T::new(true);
+        t.user("alice", 5001, 5001, true);
+        t.user("bob", 5002, 3000, true);
+        t.group_line("devs:x:3000:alice");
+        t.append_config("\n[[scope]]\nname = \"d\"\nusers = [\"group:devs\"]\n");
+        let r = t.doctor();
+        assert!(!r.checks.iter().any(|c| c.id == "scope.group.devs"));
+        // The directory cannot list devs' primary members (dscl failing).
+        t.host.set(|s| s.fail_primary_gid = vec![3000]);
+        let r = t.doctor();
+        let c = get(&r, "scope.group.devs");
+        assert_eq!(c.status, Status::Fail, "{}", r.to_text());
+        assert!(
+            c.detail
+                .starts_with("could not list members of group devs: "),
+            "{c:?}"
+        );
+        // The partial list is never taken as complete.
+        assert!(!r.checks.iter().any(|c| c.id == "secrets.none"));
+        assert!(get(&r, "secrets.incomplete")
+            .detail
+            .contains("members of group devs unknown"));
     }
 
     fn nologin_user(t: &mut T, name: &str, uid: u32) {

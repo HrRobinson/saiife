@@ -1242,6 +1242,9 @@ pub struct FakeState {
     pub run: BTreeMap<String, CmdOutput>,
     /// Paths whose `chown` fails (tests of a step failing part-way).
     pub fail_chown: Vec<PathBuf>,
+    /// Gids whose `users_with_primary_gid` fails (a directory that could
+    /// not be asked, as dscl failing on macOS).
+    pub fail_primary_gid: Vec<u32>,
 }
 
 impl Default for FakeState {
@@ -1258,6 +1261,7 @@ impl Default for FakeState {
             container: None,
             run: BTreeMap::new(),
             fail_chown: Vec::new(),
+            fail_primary_gid: Vec::new(),
         }
     }
 }
@@ -1423,16 +1427,19 @@ impl Host for FakeHost {
     }
 
     fn users_with_primary_gid(&self, gid: u32) -> io::Result<Vec<String>> {
-        Ok(self
-            .read()
-            .map(|s| {
-                s.users
-                    .iter()
-                    .filter(|(_, u)| u.gid == gid)
-                    .map(|(n, _)| n.clone())
-                    .collect()
-            })
-            .unwrap_or_default())
+        let Ok(s) = self.read() else {
+            return Ok(Vec::new());
+        };
+        if s.fail_primary_gid.contains(&gid) {
+            return Err(io::Error::other(format!(
+                "users of primary gid {gid}: fake failure"
+            )));
+        }
+        Ok(s.users
+            .iter()
+            .filter(|(_, u)| u.gid == gid)
+            .map(|(n, _)| n.clone())
+            .collect())
     }
 
     fn group_members(&self, name: &str) -> Option<Vec<String>> {
