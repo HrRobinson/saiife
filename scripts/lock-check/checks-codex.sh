@@ -12,7 +12,10 @@
 # and project configs are snapshotted by in-container.sh and restored before
 # every check and at exit; ~/.codex/auth.json (the login) is never touched,
 # only symlinked from ~/alt. With LC_ROOT set (offline tests) every path is
-# under $LC_ROOT, also the paths written into the config files.
+# under $LC_ROOT, also the paths written into the config files. The macOS VM
+# (LOCKCHECK_PLATFORM=macos) uses the same /etc/codex path (spec 5.3; /etc
+# is a link to /private/etc there), ~ is /Users/agent and /work is
+# /opt/lockcheck/work.
 #
 # Unverified keys can be overridden from the host (live-check-locked.sh
 # passes these through):

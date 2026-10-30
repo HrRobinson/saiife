@@ -24,20 +24,22 @@ stop:
 
 ## Pick your setup
 
-saiife v2.0 has four ways of working. Each has its own table below.
+saiife v2 has four ways of working. Each has its own table below.
 Legend: **covered**, **partly**, **not covered**.
 
 | Setup | Platform | Section |
 | --- | --- | --- |
 | Developer: hooks in your own account | any | [Developer](#setup-developer) |
-| Personal broker | Linux (macOS: v2.1) | [Personal broker](#setup-personal-broker) |
-| Locked, on a person's account | supported Linux | [Locked, person's account](#setup-locked-on-a-persons-account) |
-| Locked, on a dedicated agent account (recommended for unattended work) | supported Linux | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
+| Personal broker | Linux, macOS | [Personal broker](#setup-personal-broker) |
+| Locked, on a person's account | supported Linux, macOS 15+ | [Locked, person's account](#setup-locked-on-a-persons-account) |
+| Locked, on a dedicated agent account (recommended for unattended work) | supported Linux, macOS 15+ | [Locked, dedicated account](#setup-locked-on-a-dedicated-account) |
 
-Supported Linux in v2.0 means Ubuntu 22.04+, Debian 12+ and RHEL 9+. Macs
-(until v2.1), Alpine and containers fall under Developer. An agent whose lock
-label is not "lockable" falls back to the Developer column for the first two
-rows, even on a locked machine. The label of each agent is on its page:
+Supported Linux means Ubuntu 22.04+, Debian 12+ and RHEL 9+. Locked mode on
+macOS (v2.1) needs macOS 15 or later; its differences are listed in
+[Locked mode on macOS](#locked-mode-on-macos). Alpine and containers fall
+under Developer. An agent whose lock label is not "lockable" falls back to
+the Developer column for the first two rows, even on a locked machine. Lock
+labels are per platform, and on macOS every agent is unverified for now. The label of each agent is on its page:
 [Claude Code](agents/claude-code.md), [Codex](agents/codex.md),
 [Gemini CLI](agents/gemini.md).
 
@@ -89,7 +91,7 @@ Use locked mode, ideally on a dedicated account.
 ## Setup: Personal broker
 
 `saiife daemon --user` runs a broker as your own user, with the vault key in
-the OS keychain (Linux in this version). It is for trying connectors on your
+the OS keychain (the Secret Service on Linux, the login Keychain on macOS). It is for trying connectors on your
 own machine; **not a security boundary**. Same-user approvals are a workflow
 aid, not a control. Setup and limits: [Personal broker](personal-broker.md).
 
@@ -97,7 +99,7 @@ aid, not a control. Setup and limits: [Personal broker](personal-broker.md).
 | --- | --- | --- |
 | Mistake | **Covered** by packs; fails open | As Developer. |
 | Helpful bypass | **Partly covered** | [core.self](packs/core.self.md) also blocks the usual ways to stop the broker. It runs as your own user, so this is a mistake layer only. |
-| Agent obtains a brokered credential | **Partly covered** | The key is in the keychain; a same-user script can read it (Linux). The guard rules deny the obvious readers; a script that calls the Secret Service is not seen. |
+| Agent obtains a brokered credential | **Partly covered** | The key is in the keychain; a same-user script can read it (on Linux at once, on macOS after one click the user may give). The guard rules deny the obvious readers; a script that calls the Secret Service or the Keychain from a library is not seen. |
 | Agent uses an external service beyond rules | **Partly covered** | There is no boundary; workflow only. The agent can stop the broker and bind its socket. |
 | Agent erases or rewrites the audit | Same as Developer | The chain is unsigned: there is no signing key in your own home. |
 | Agent's own script does local damage | Not covered | |
@@ -136,9 +138,11 @@ agent cannot write. The agent runs as you.
 | Agent reads your other files and logins (SSH keys, browser data, git credentials) | **Not covered** beyond `core.secrets` | |
 | Data exfiltration to arbitrary hosts | Not covered | |
 | Nested or patched agent without hooks | Not covered | It has no keys and writes no audit. |
+| Agent injects code into the hook (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) | **Covered** | Linux installs only the static release build. macOS installs only a binary with the hardened runtime, which ignores `DYLD_*` (an ad-hoc signed build keeps that, but is not notarized). See [install](install.md). |
+| Agent gets you to approve its own request (`same_user = "reauth"`) | **Covered** on Linux; on macOS the option is off | Linux: polkit asks for your password and shows the request. Same-user approval is off on macOS: the prompt cannot show the request, so approvals need a second account. See [approvals](approvals.md#macos). |
 | Model-provider login used or copied by the agent | **Not covered, by design** | The agent holds its own model login. |
 | MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
-| MCP servers behind the gateway | **Covered** (brokered, limited, audited) | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
+| MCP servers behind the gateway | **Covered** (brokered, limited, audited) on Linux; macOS has no gateway in v2.1 | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
 | Attacker with root | **Detected** with forwarding | |
 | Tools without a hook (Codex hosted web search) | Not covered | Not visible to any hook. |
 
@@ -158,11 +162,11 @@ the recommended setup for unattended agents.
 | Agent erases or rewrites the audit | **Covered** against the agent; **detected** against root with forwarding | |
 | Agent's own script does local damage | **Not covered** | Damage is limited to what the agent account can write. |
 | Agent reads the person's other files and logins | **Covered by setup** | The account does not have them. |
-| Data exfiltration to arbitrary hosts | **Partly covered** with the [egress recipe](egress.md) (Linux); otherwise not covered | |
+| Data exfiltration to arbitrary hosts | **Partly covered** with the [egress recipe](egress.md) (Linux only); otherwise not covered | macOS has no recipe: `pf` has no per-uid firewall to rely on. |
 | Nested or patched agent without hooks | Not covered | No keys, no audit. |
 | Model-provider login used or copied by the agent | **Not covered, by design**, unless the agent uses a local model (Ollama, vLLM): then there is no key | |
 | MCP servers an admin allowed in locked mode | **Not covered** | Unbrokered, but hooked, audited and warned about. |
-| MCP servers behind the gateway | **Covered** (brokered, limited, audited) | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
+| MCP servers behind the gateway | **Covered** (brokered, limited, audited) on Linux; macOS has no gateway in v2.1 | Run by the daemon with their tokens in the vault, a per-tool policy and a record of every call. The server's network is **not** sandboxed (Landlock covers files and exec), so a hostile server can still send out what it was given. See [MCP](mcp.md#the-sandbox-and-its-limits). |
 | Attacker with root | **Detected** with forwarding | |
 | Tools without a hook | Not covered | |
 
@@ -170,6 +174,30 @@ What still applies in every setup: the guard's own limits (see
 [Limits of the guard as a whole](#limits-of-the-guard-as-a-whole) and each
 pack's "Not covered" section), such as `cd` not being tracked, dynamic
 program names and recursive reads of folders.
+
+## Locked mode on macOS
+
+Locked mode on macOS (v2.1, macOS 15 or later) covers what the two locked
+tables say, with these differences:
+
+- **Same-user approval is off on macOS.** The password or Touch ID prompt
+  cannot show which request it approves, so a same-user agent could trick
+  you into approving its own request. `same_user = "reauth"` acts as
+  `"deny"`: approvals need a second account, and only root and `[admin]`
+  users can lift lockdown. See [approvals](approvals.md#macos).
+- **A4 (code injected into the hook).** The binary must have the hardened
+  runtime, which makes macOS ignore `DYLD_INSERT_LIBRARIES`. Tagged releases
+  are signed with a Developer ID and notarized; other builds are ad-hoc
+  signed (hardened, not notarized), and install warns.
+- **Egress is Linux only.** There is no egress recipe for macOS.
+- **The MCP gateway is Linux only** in v2.1 (`[mcp.<name>]` is a load
+  error); `saiife mcp` works.
+- **Identity.** The uid comes from `LOCAL_PEERCRED`. The pid from
+  `LOCAL_PEERPID` is the socket's last user, so nothing is granted on a pid;
+  sessions are matched by process name only (attribution).
+- **Lock labels** on macOS are unverified until the lock check runs in a
+  macOS VM. Until then every agent falls back to the Developer column for
+  the hook rows, as above.
 
 ## Fail-closed matrix
 
@@ -276,7 +304,7 @@ shows the state.
   off, or widen it (`connectors` to `all`). Turning it off, narrowing it, or
   replacing an active lockdown (even the same scope with a new reason): root
   and users in an `[admin]` group, or an approver who passes polkit
-  re-authentication (`same_user = "reauth"`; the
+  re-authentication (`same_user = "reauth"`, Linux only; the
   CLI says what it is for and starts `pkttyagent` first). Under
   `same_user = "deny"`, or when re-authentication is unavailable, an approver
   who is not an admin cannot make those changes (`reauth_required`,

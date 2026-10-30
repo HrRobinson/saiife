@@ -258,3 +258,54 @@ fn mcp_page_example_loads() {
     c.read_paths.clear();
     c.validate("linear").expect("the example validates");
 }
+
+// ---- macOS locked mode (plan 13) ----
+
+fn page_text(rel: &str) -> String {
+    fs::read_to_string(root().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+#[test]
+fn install_page_has_the_macos_locked_mode_facts() {
+    let t = page_text("docs/install.md");
+    for want in [
+        "## Locked mode (macOS)",
+        "`_saiife`",
+        "`_saiifeaudit`",
+        "/var/db/saiife-run",
+        "/var/log/saiife/daemon.log",
+        "macOS 15",
+        saiife_system::layout::REAUTH_UNAVAILABLE,
+    ] {
+        assert!(t.contains(want), "docs/install.md lacks {want:?}");
+    }
+    assert!(
+        flat(&t).contains("same-user approval is off on macos"),
+        "docs/install.md must say same-user approval is off on macOS"
+    );
+}
+
+#[test]
+fn mcp_page_says_the_gateway_is_linux_only() {
+    let t = mcp_page();
+    assert!(
+        flat(&t).contains("the mcp gateway is linux only in v2.1"),
+        "docs/mcp.md must say the MCP gateway is Linux only in v2.1"
+    );
+    assert!(
+        t.contains(saiife_policy::mcp::MCP_NEEDS_LINUX),
+        "docs/mcp.md must quote the macOS load error"
+    );
+}
+
+/// Same-user approval is off on macOS (plan 13, Task 8): the approvals
+/// page and the threat page say so.
+#[test]
+fn macos_same_user_approval_is_documented_as_off() {
+    for rel in ["docs/approvals.md", "docs/threats.md"] {
+        assert!(
+            flat(&page_text(rel)).contains("same-user approval is off on macos"),
+            "{rel} must say same-user approval is off on macOS"
+        );
+    }
+}

@@ -2,8 +2,9 @@
 # shellcheck shell=bash disable=SC2034,SC2317,SC2329
 # lib.sh: runner library for the live lock checks (scripts/live-check-locked.sh).
 #
-# Sourced (not run) by in-container.sh, by every checks-<agent>.sh it loads,
-# and by test-lib.sh. It expects the caller to have `set -euo pipefail`.
+# Sourced (not run) by in-container.sh, macos-vm.sh, by every
+# checks-<agent>.sh they load, and by test-lib.sh. It expects the caller to
+# have `set -euo pipefail` (and bash 4 or later).
 # Inside the container it runs as root and writes only container paths:
 # /run/lockcheck, /opt/saiife, /opt/lockcheck, /work/project, the managed
 # files the agent script names, /out, and the settings files it snapshots
@@ -13,18 +14,30 @@
 # ---------------------------------------------------------------------------
 # API (Tasks 3-5 write checks-<agent>.sh against this)
 # ---------------------------------------------------------------------------
+# Platform: LOCKCHECK_PLATFORM=linux (default; the Docker container) or
+# macos (a throwaway macOS VM, scripts/lock-check/macos-vm.sh). It is read
+# once, when sourced, into LC_PLATFORM. macOS has no writable /run or /work,
+# so the harness dirs move under /opt/lockcheck there; the agents' managed
+# paths are the spec 5.3 ones (the checks-<agent>.sh files pick them).
+#
 # Paths (set when sourced; all already prefixed by $LC_ROOT, so agent scripts
 # must use them, or "$LC_ROOT/etc/...", never a bare /etc or ~):
 #   LC_ROOT     ""        (tests: a temp dir)
 #   LC_SRC      dir of lib.sh (/lockcheck in the container)
 #   LC_MANAGED  $LC_ROOT/lockcheck-managed (override with LC_MANAGED=...)
-#   LC_HOME     $LC_ROOT/home/agent      the agent's HOME ("~")
-#   LC_PROJECT  $LC_ROOT/work/project    the agent's cwd
+#   LC_HOME     the agent's HOME ("~"): $LC_ROOT/home/agent
+#               (macos: $LC_ROOT/Users/agent)
+#   LC_WORK     $LC_ROOT/work (macos: $LC_ROOT/opt/lockcheck/work)
+#   LC_PROJECT  $LC_WORK/project         the agent's cwd
 #   LC_MARKERS  $LC_PROJECT/markers
-#   LC_RUN      $LC_ROOT/run/lockcheck   mode files, calls.log, witness.log
+#   LC_RUN      mode files, calls.log, witness.log: $LC_ROOT/run/lockcheck
+#               (macos: $LC_ROOT/opt/lockcheck/run)
 #   LC_STUB     $LC_ROOT/opt/saiife/bin/saiife
 #   LC_WITNESS  $LC_ROOT/opt/lockcheck/witness
-#   LC_RESULTS  the result .tsv (set by in-container.sh); LC_LOG its .log
+#   LC_RESULTS  the result .tsv (set by the runner); LC_LOG its .log
+#   LC_AGENT_GROUP, LC_ROOT_GROUP   agent and root (macos: staff and wheel)
+#   LC_SECRET_ENV=(K=V ...)  extra env for every agent run, never logged
+#                            (macos-vm.sh fills it from LOCKCHECK_AGENT_ENV_FILE)
 #
 # Per-check state (cleared by lc_reset; setup fns set these):
 #   LC_AGENT_ENV=(K=V ...)  extra env for the agent run
@@ -69,8 +82,10 @@
 #                            agent env (used for agent_version); prints its output
 #   lc_require_path <path>   exit 0 iff path may be written by the harness:
 #                            under $LC_ROOT/ offline, under /home/agent/ or
-#                            /work/ in the container (settings, login files and
-#                            lc_as_agent_write are checked with it)
+#                            /work/ in the container, under /Users/agent/ or
+#                            /opt/lockcheck/work/ in the macOS VM (settings,
+#                            login files and lc_as_agent_write are checked
+#                            with it)
 #
 # Safety (offline): sourcing lib.sh with LC_ROOT set canonicalizes LC_ROOT
 # (realpath; `/` refused), exports HOME=$LC_ROOT/root so a stray `~` cannot
@@ -105,6 +120,11 @@
 # ---------------------------------------------------------------------------
 
 LC_ROOT="${LC_ROOT:-}"
+LC_PLATFORM="${LOCKCHECK_PLATFORM:-linux}"
+if [[ "$LC_PLATFORM" != linux && "$LC_PLATFORM" != macos ]]; then
+  echo "lib.sh: LOCKCHECK_PLATFORM must be linux or macos, not '$LC_PLATFORM'" >&2
+  return 2
+fi
 if [[ -n "$LC_ROOT" ]]; then
   if ! LC_ROOT="$(realpath -e -- "$LC_ROOT" 2>/dev/null)" || [[ ! -d "$LC_ROOT" || "$LC_ROOT" == / ]]; then
     echo "lib.sh: LC_ROOT must be an existing directory other than /" >&2
@@ -112,24 +132,43 @@ if [[ -n "$LC_ROOT" ]]; then
   fi
   HOME="$LC_ROOT/root"
   export HOME
+elif [[ "$LC_PLATFORM" == macos ]]; then
+  if [[ "$(uname -s)" != Darwin || "${SAIIFE_LOCKCHECK_MACOS_VM:-}" != 1 ]]; then
+    echo "lib.sh: LC_ROOT is empty and this is not a lock-check macOS VM; refusing" >&2
+    return 2
+  fi
 elif [[ ! -e /.dockerenv ]]; then
   echo "lib.sh: LC_ROOT is empty and this is not the lock-check container; refusing" >&2
   return 2
 fi
 LC_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LC_MANAGED="${LC_MANAGED:-$LC_ROOT/lockcheck-managed}"
-LC_HOME="$LC_ROOT/home/agent"
-LC_PROJECT="$LC_ROOT/work/project"
+if [[ "$LC_PLATFORM" == macos ]]; then
+  LC_HOME="$LC_ROOT/Users/agent"
+  LC_WORK="$LC_ROOT/opt/lockcheck/work"
+  LC_RUN="$LC_ROOT/opt/lockcheck/run"
+  LC_AGENT_GROUP=staff
+  LC_ROOT_GROUP=wheel
+  # Node and the agents: Homebrew (Apple silicon, then Intel) or nodejs.org.
+  LC_AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+else
+  LC_HOME="$LC_ROOT/home/agent"
+  LC_WORK="$LC_ROOT/work"
+  LC_RUN="$LC_ROOT/run/lockcheck"
+  LC_AGENT_GROUP=agent
+  LC_ROOT_GROUP=root
+  LC_AGENT_PATH="/usr/local/bin:/usr/bin:/bin"
+fi
+LC_PROJECT="$LC_WORK/project"
 LC_MARKERS="$LC_PROJECT/markers"
-LC_RUN="$LC_ROOT/run/lockcheck"
 LC_STUB="$LC_ROOT/opt/saiife/bin/saiife"
 LC_WITNESS="$LC_ROOT/opt/lockcheck/witness"
 LC_RESULTS="${LC_RESULTS:-}"
 LC_LOG="${LC_LOG:-/dev/null}"
-LC_AGENT_PATH="/usr/local/bin:/usr/bin:/bin"
 LC_UNSUPPORTED_RE='unknown (option|argument)|unexpected argument|unrecognized|invalid option'
 LC_AGENT_ENV=()
 LC_AGENT_ARGS=()
+LC_SECRET_ENV=()
 LC_PROMPT=""
 LC_FIRED_EVENT=""
 LC_POST=""
@@ -208,7 +247,10 @@ lc_label_text() {
 
 lc_summarize() {
   local f="$1" label
-  sed -i '/^# label=/d' "$f"
+  # Not `sed -i`: BSD sed (macOS) spells it differently.
+  awk '!/^# label=/' "$f" >"$f.tmp"
+  cat "$f.tmp" >"$f"
+  rm -f "$f.tmp"
   label="$(lc_label "$f")"
   printf '# label=%s\n' "$label" >>"$f"
   awk -F'\t' '!/^#/ && NF { printf "%-5s %s  expect=%s observed=%s  %s\n", $5, $1, $3, $4, $6 }' "$f"
@@ -271,7 +313,16 @@ lc_validate() {
 # chown to agent; a no-op under LC_ROOT (tests run unprivileged).
 lc_chown_agent() {
   if [[ -z "$LC_ROOT" ]]; then
-    chown agent:agent "$@"
+    chown "agent:$LC_AGENT_GROUP" "$@"
+  fi
+}
+
+# Run "$@" as the user `agent` (as root, never offline).
+lc_as_agent() {
+  if [[ "$LC_PLATFORM" == macos ]]; then
+    sudo -u agent -- "$@"
+  else
+    setpriv --reuid=agent --regid=agent --init-groups -- "$@"
   fi
 }
 
@@ -280,6 +331,8 @@ lc_require_path() {
   real="$(realpath -m -- "$path")"
   if [[ -n "$LC_ROOT" ]]; then
     [[ "$real" == "$LC_ROOT/"* ]] && return 0
+  elif [[ "$LC_PLATFORM" == macos ]]; then
+    [[ "$real" == /Users/agent/* || "$real" == /opt/lockcheck/work/* ]] && return 0
   else
     [[ "$real" == /home/agent/* || "$real" == /work/* ]] && return 0
   fi
@@ -295,7 +348,7 @@ lc_as_agent_write() {
     printf '%s\n' "$content" >"$path"
   else
     # shellcheck disable=SC2016 # expanded by the inner shell
-    setpriv --reuid=agent --regid=agent --init-groups -- \
+    lc_as_agent \
       bash -c 'mkdir -p "$(dirname "$1")" && printf "%s\n" "$2" >"$1"' lc-write "$path" "$content"
   fi
 }
@@ -355,13 +408,28 @@ lc_restore_snapshot() {
   done <"$dir/list"
 }
 
+# Install hook script $1 at $2 (0755). The stub and the witness log to
+# ${LC_ROOT:-}/run/lockcheck; where LC_RUN is elsewhere (macOS) that path is
+# written into the copy, because a hook gets no harness environment.
+lc_install_hook() {
+  local src="$1" dst="$2" tmp
+  if [[ "$LC_RUN" == "$LC_ROOT/run/lockcheck" ]]; then
+    install -m 0755 "$src" "$dst"
+    return 0
+  fi
+  tmp="$dst.tmp"
+  awk -v run="$LC_RUN" '{ gsub(/[$][{]LC_ROOT:-[}]\/run\/lockcheck/, run); print }' "$src" >"$tmp"
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$dst"
+}
+
 lc_reset() {
   lc_restore_snapshot
   rm -rf "$LC_HOME/alt"
   mkdir -p "$(dirname "$LC_STUB")" "$(dirname "$LC_WITNESS")" "$LC_RUN" "$LC_MARKERS"
   chmod 0755 "$LC_RUN"
-  install -m 0755 "$LC_SRC/stub-saiife.sh" "$LC_STUB"
-  install -m 0755 "$LC_SRC/witness.sh" "$LC_WITNESS"
+  lc_install_hook "$LC_SRC/stub-saiife.sh" "$LC_STUB"
+  lc_install_hook "$LC_SRC/witness.sh" "$LC_WITNESS"
   lc_set_mode allow
   lc_set_mode allow config-change
   : >"$LC_RUN/calls.log"
@@ -410,10 +478,14 @@ lc_hostbin() {
 lc_agent_cmd() {
   if [[ -n "$LC_ROOT" ]]; then
     LC_CMD=(env -i "HOME=$LC_HOME" "PATH=$LC_ROOT/usr/local/bin:$(lc_hostbin)" TERM=dumb
-      "LC_ROOT=$LC_ROOT" "${LC_AGENT_ENV[@]}")
+      "LC_ROOT=$LC_ROOT" "${LC_SECRET_ENV[@]}" "${LC_AGENT_ENV[@]}")
+  elif [[ "$LC_PLATFORM" == macos ]]; then
+    LC_CMD=(sudo -u agent --
+      env -i "HOME=$LC_HOME" USER=agent LOGNAME=agent "PATH=$LC_AGENT_PATH" TERM=dumb
+      "${LC_SECRET_ENV[@]}" "${LC_AGENT_ENV[@]}")
   else
     LC_CMD=(setpriv --reuid=agent --regid=agent --init-groups --
-      env -i HOME=/home/agent "PATH=$LC_AGENT_PATH" TERM=dumb "${LC_AGENT_ENV[@]}")
+      env -i HOME=/home/agent "PATH=$LC_AGENT_PATH" TERM=dumb "${LC_SECRET_ENV[@]}" "${LC_AGENT_ENV[@]}")
   fi
 }
 

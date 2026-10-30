@@ -11,7 +11,9 @@
 # and asks `claude -p` to touch a marker: `blocked` means the stub saiife
 # denied the call and the witness saw it, `ran` means the bypass worked.
 #
-# What it touches (container paths; under $LC_ROOT in the offline tests):
+# What it touches (container paths; under $LC_ROOT in the offline tests;
+# in the macOS VM the managed dir is /Library/Application Support/ClaudeCode/
+# instead of /etc/claude-code/, spec 5.3, and /work is /opt/lockcheck/work):
 #   /etc/claude-code/managed-settings.d/   rebuilt by every reset (root 0755,
 #                                          files root 0644); 50-saiife.json,
 #                                          60-lockcheck-witness.json, and the
@@ -29,8 +31,13 @@
 #   bash scripts/live-check-locked.sh claude        (on the host)
 #   bash scripts/lock-check/test-lib.sh claude_checks_static   (offline test)
 
-CLAUDE_MANAGED_DIR="$LC_ROOT/etc/claude-code/managed-settings.d"
-CLAUDE_MCP_CONFIG="$LC_ROOT/work/lockcheck-mcp.json"
+if [[ "$LC_PLATFORM" == macos ]]; then
+  CLAUDE_MANAGED_BASE="$LC_ROOT/Library/Application Support/ClaudeCode"
+else
+  CLAUDE_MANAGED_BASE="$LC_ROOT/etc/claude-code"
+fi
+CLAUDE_MANAGED_DIR="$CLAUDE_MANAGED_BASE/managed-settings.d"
+CLAUDE_MCP_CONFIG="$LC_WORK/lockcheck-mcp.json"
 CLAUDE_MIN_ONFAILURE="2.1.295"
 
 # --- contract ----------------------------------------------------------------
@@ -44,7 +51,7 @@ agent_invoke() {
 }
 
 agent_baseline() {
-  local etc="$LC_ROOT/etc/claude-code"
+  local etc="$CLAUDE_MANAGED_BASE"
   rm -f "$etc/managed-settings.json"
   rm -rf "$CLAUDE_MANAGED_DIR"
   mkdir -p "$CLAUDE_MANAGED_DIR"
@@ -73,7 +80,7 @@ claude_managed_dropin() {
   printf '%s\n' "$2" >"$f"
   chmod 0644 "$f"
   if [[ -z "$LC_ROOT" ]]; then
-    chown root:root "$f"
+    chown "root:$LC_ROOT_GROUP" "$f"
   fi
 }
 

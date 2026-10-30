@@ -128,7 +128,8 @@ CLI are restricted by the hook only". See [MCP](../mcp.md).
 - `read_many_files` with a broad pattern (`**/*`) relies on Gemini CLI's own
   handling of git-ignored files.
 - Gemini CLI's `GEMINI_CLI_HOME` folder is not covered.
-- Company-wide Gemini CLI settings (`/etc/gemini-cli/settings.json` on Linux)
+- Company-wide Gemini CLI settings (`/etc/gemini-cli/settings.json` on Linux,
+  `/Library/Application Support/GeminiCli/settings.json` on macOS)
   may take priority over the project file. Gemini CLI's docs and code disagree
   on this. `status` does not read them.
 - A determined agent running as your user can get around the guard, for
@@ -139,9 +140,15 @@ CLI are restricted by the hook only". See [MCP](../mcp.md).
 
 ## Locked mode (v2)
 
-Lock label: **unverified**. The [lock-check](../lock-check.md) for Gemini CLI has
-not been run with a logged-in account yet, so we do not know whether
-Gemini CLI can be locked. Until it has, treat Gemini CLI as running in the
+Lock label: **unverified**, on Linux and on macOS. The
+[lock-check](../lock-check.md) for Gemini CLI has not been run with a
+logged-in account yet, so we do not know whether Gemini CLI can be locked.
+The managed file is `/etc/gemini-cli/settings.json` on Linux and
+`/Library/Application Support/GeminiCli/settings.json` on macOS; the macOS
+results will go to `crates/agents/tests/fixtures/lock-check/macos/gemini.tsv`.
+On macOS the daemon matches sessions by process name only, so a Gemini CLI
+running as `node` gets no session: its requests share the per-uid limits
+(attribution only). Until it has, treat Gemini CLI as running in the
 Developer setup even on a locked machine, and do not rely on the lock for it
 ([threats](../threats.md)).
 

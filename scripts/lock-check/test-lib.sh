@@ -1372,6 +1372,79 @@ $LC_PROJECT/.claude/settings.json $LC_PROJECT/.claude/settings.local.json" "sett
   assert_eq "$(find "$HOME" -mindepth 1)" "" "files written to HOME"
 }
 
+# --- macOS (plan 13) -----------------------------------------------------------
+
+# LOCKCHECK_PLATFORM=macos: the §5.3 managed paths, /Users/agent, and the
+# harness dirs under /opt/lockcheck (macOS has no writable /run or /work).
+test_macos_platform_paths() {
+  LOCKCHECK_PLATFORM=macos new_root
+  LC_MANAGED="$REPO/crates/agents/tests/fixtures/managed"
+  assert_eq "$LC_PLATFORM" macos
+  assert_eq "$LC_HOME" "$LC_ROOT/Users/agent" "LC_HOME"
+  assert_eq "$LC_PROJECT" "$LC_ROOT/opt/lockcheck/work/project" "LC_PROJECT"
+  assert_eq "$LC_RUN" "$LC_ROOT/opt/lockcheck/run" "LC_RUN"
+  assert_eq "$LC_STUB" "$LC_ROOT/opt/saiife/bin/saiife" "LC_STUB"
+  (
+    source "$HERE/checks-claude.sh"
+    assert_eq "$CLAUDE_MANAGED_DIR" "$LC_ROOT/Library/Application Support/ClaudeCode/managed-settings.d"
+    assert_eq "$CLAUDE_MCP_CONFIG" "$LC_ROOT/opt/lockcheck/work/lockcheck-mcp.json"
+    mkdir -p "$LC_PROJECT"
+    lc_reset
+    [[ -f "$CLAUDE_MANAGED_DIR/50-saiife.json" ]] || fail "no Claude drop-in"
+    [[ ! -e "$LC_ROOT/etc/claude-code" ]] || fail "wrote the Linux Claude path"
+    # The stub and witness log to the macOS run dir, with LC_ROOT unset
+    # (as an agent's hook sees it).
+    printf '{"tool_name":"Bash","n":"abc"}' | env -u LC_ROOT "$LC_STUB" check --managed >/dev/null 2>&1 || true
+    printf '{"tool_name":"Bash","n":"abc"}' | env -u LC_ROOT "$LC_WITNESS"
+    grep -q abc "$LC_RUN/calls.log" || fail "stub did not log to $LC_RUN"
+    grep -q abc "$LC_RUN/witness.log" || fail "witness did not log to $LC_RUN"
+    [[ ! -e "$LC_ROOT/run" ]] || fail "wrote under /run"
+  ) || exit 1
+  (
+    source "$HERE/checks-gemini.sh"
+    GEMINI_TOGGLES_LOADED=1
+    mkdir -p "$LC_PROJECT"
+    gemini_write_managed nopin
+    [[ -f "$LC_ROOT/Library/Application Support/GeminiCli/settings.json" ]] || fail "no Gemini system settings"
+    [[ ! -e "$LC_ROOT/etc/gemini-cli" ]] || fail "wrote the Linux Gemini path"
+  ) || exit 1
+  (
+    source "$HERE/checks-codex.sh"
+    assert_eq "$CODEX_REQUIREMENTS" "$LC_ROOT/etc/codex/requirements.toml"
+  ) || exit 1
+  # Linux stays as it was.
+  LOCKCHECK_PLATFORM=linux new_root
+  assert_eq "$LC_HOME" "$LC_ROOT/home/agent"
+  assert_eq "$LC_PROJECT" "$LC_ROOT/work/project"
+  assert_eq "$LC_RUN" "$LC_ROOT/run/lockcheck"
+  (
+    LOCKCHECK_PLATFORM=bsd
+    new_root 2>/dev/null
+  ) && fail "an unknown platform was accepted"
+  true
+}
+
+# Outside a macOS VM the harness refuses before doing anything (exit 2).
+test_macos_vm_refuses_outside_darwin() {
+  local out rc=0
+  out="$(bash "$HERE/macos-vm.sh" all 2>&1)" || rc=$?
+  if [[ "$(uname -s)" == Darwin ]]; then
+    out="$(env -u SAIIFE_LOCKCHECK_MACOS_VM bash "$HERE/macos-vm.sh" all 2>&1)" || rc=$?
+  fi
+  assert_eq "$rc" 2 "exit code"
+  grep -q "refusing" <<<"$out" || fail "no refusal: $out"
+  rc=0
+  out="$(SAIIFE_LOCKCHECK_MACOS_VM=1 bash "$HERE/macos-vm.sh" claude 2>&1)" || rc=$?
+  if [[ "$(uname -s)" != Darwin ]]; then
+    assert_eq "$rc" 2 "exit code with the env set"
+    grep -q "Darwin" <<<"$out" || fail "no Darwin refusal: $out"
+  fi
+  # Sourcing lib.sh for macOS outside a VM is refused too.
+  rc=0
+  out="$(LC_ROOT='' LOCKCHECK_PLATFORM=macos bash -c 'source "$1"' lc "$HERE/lib.sh" 2>&1)" || rc=$?
+  [[ "$rc" != 0 ]] || fail "lib.sh accepted macOS without a VM"
+}
+
 # --- runner ------------------------------------------------------------------
 
 main() {

@@ -94,11 +94,21 @@ with code 1.
 
 ## Locked mode (v2)
 
-Lock label: **lockable** (checked live with Claude Code 2.1.308 on
+Lock label on Linux: **lockable** (checked live with Claude Code 2.1.308 on
 2026-10-22, see [lock-check](../lock-check.md); results in
 `crates/agents/tests/fixtures/lock-check/claude.tsv`).
 
-With saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
+Lock label on macOS: **unverified**. saiife installs the same managed hook
+in `/Library/Application Support/ClaudeCode/managed-settings.d/`
+(`50-saiife.json` and `60-saiife-mcp.json`), but the lock check has not
+been run in a macOS VM yet, so the project hook keeps judging and
+`saiife status` says so. The results will go to
+`crates/agents/tests/fixtures/lock-check/macos/claude.tsv`. When an MDM
+profile (`/Library/Managed Preferences/com.anthropic.claudecode.plist`)
+also delivers managed settings, Claude Code may ignore the drop-in;
+install and `doctor` warn.
+
+On Linux, with saiife's managed settings in `/etc/claude-code/managed-settings.d/`:
 
 - The hook cannot be turned off: `disableAllHooks` in user, project or local
   settings or on the command line, empty user `hooks`, `CLAUDE_CONFIG_DIR`

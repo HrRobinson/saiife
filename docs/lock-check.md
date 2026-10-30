@@ -12,6 +12,11 @@ stub that allows, denies, crashes or hangs on request.
 
 You run this yourself. CI never runs it, and neither do tests or agents.
 
+Lock labels are per platform. The Docker run gives the Linux labels. The
+macOS labels come from the same checks run in a throwaway macOS VM
+([macOS, in a throwaway VM](#macos-in-a-throwaway-vm)); until that has been
+done, every agent is `unverified` on macOS.
+
 ## What it touches on your machine
 
 It touches only these:
@@ -150,12 +155,76 @@ Example:
 LOCKCHECK_GEMINI_TOGGLE="hooksConfig.enabled" bash scripts/live-check-locked.sh gemini
 ```
 
+## macOS, in a throwaway VM
+
+`scripts/lock-check/macos-vm.sh` runs the same check tables against the
+macOS paths of spec §5.3:
+
+| Agent | Managed path on macOS |
+|---|---|
+| Claude Code | `/Library/Application Support/ClaudeCode/managed-settings.d/` |
+| Codex | `/etc/codex/requirements.toml` |
+| Gemini CLI | `/Library/Application Support/GeminiCli/settings.json` |
+
+It writes those system-wide files and runs the agents as a standard user, so
+it runs only inside a throwaway macOS VM, as root through `sudo`. It refuses
+(exit 2) before it touches anything unless `uname` is `Darwin` and
+`SAIIFE_LOCKCHECK_MACOS_VM=1` is set. It also refuses when saiife is
+installed or any of those managed files already exists, so run it in a VM
+clone where `saiife system install` has not run (or after
+`saiife system uninstall --purge`). At exit it removes what it wrote:
+`/opt/saiife` (the stub), `/opt/lockcheck` (its copy of the scripts, the run
+dir and the project) and the managed files.
+
+Steps (`tart` is one way to get a VM; any throwaway macOS 15 VM works):
+
+1. On your Mac: `brew install cirruslabs/cli/tart`, then
+   `tart clone ghcr.io/cirruslabs/macos-sequoia-base:latest saiife-lock` and
+   `tart run saiife-lock` (log in as admin/admin).
+2. In the VM, as the admin:
+   - install Node 22 and the agents system-wide:
+     `sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli`;
+   - install bash 4+ and GNU coreutils: `brew install bash coreutils`
+     (`jq` ships with macOS 15);
+   - create a standard (not admin) user `agent` in System Settings, Users
+     & Groups.
+3. Log in as `agent` once, sign in to each agent (as in
+   [Logging in](#logging-in---setup)), then log `agent` out again: the
+   harness ends `agent`'s processes after each run and refuses while
+   `agent` owns the console.
+4. Copy a checkout of this repository into the VM, and from its root run
+   `SAIIFE_LOCKCHECK_MACOS_VM=1 sudo -E bash scripts/lock-check/macos-vm.sh all`
+   (or `claude`, `codex`, `gemini`).
+
+Results go to `target/lock-check/macos-<agent>-<UTC time>.tsv` and the
+matching `.log`, handed to the user who ran `sudo`. Their header has
+`# platform=macos`. `AGENT_TIMEOUT` and the `LOCKCHECK_*` knobs below work as
+in the Docker run.
+
+**Logins the Keychain holds.** An agent that keeps its login in the macOS
+Keychain (Claude Code does on macOS) may not find it in a `sudo` run, because nothing
+unlocks `agent`'s Keychain there. The control row then reads `inconclusive`.
+Put the login in a root-owned file of `NAME=value` lines, mode 0600, and pass
+it with `LOCKCHECK_AGENT_ENV_FILE=/var/root/lockcheck.env`; the harness adds
+those variables to every agent run and never writes them to the log (for
+Claude Code, the token from `claude setup-token` as
+`CLAUDE_CODE_OAUTH_TOKEN`). Delete the file afterwards.
+
+**The Claude drop-in.** On macOS saiife installs Claude Code's managed hook
+as a drop-in in `managed-settings.d/`, as on Linux. `claude.managed.fires`
+and the `claude.deny` row show whether Claude Code reads drop-ins there. If
+they do not fire, say so: install then switches to the whole file
+`managed-settings.json`.
+
 ## What to send back
 
 Send the newest `target/lock-check/<agent>-*.tsv` for each agent. Add the
 matching `.log` files if any row is `FAIL`, `ERROR` or has a `hint:`. These
 results become the fixtures under `crates/agents/tests/fixtures/lock-check/`
-and the "Locked mode" line on each agent page.
+and the "Locked mode" line on each agent page. The macOS results
+(`macos-<agent>-*.tsv`) become
+`crates/agents/tests/fixtures/lock-check/macos/<agent>.tsv`, and the macOS
+labels follow them.
 
 When you are done, `--forget` removes the logins. The image stays until you
 remove it with `docker image rm saiife-lockcheck:local`.

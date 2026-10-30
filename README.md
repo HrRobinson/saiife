@@ -49,7 +49,7 @@ and it does not notice that the newest records were removed (see
 
 ## Brokered services
 
-In locked mode on Linux, saiife can make API calls for the agent. You store a
+In locked mode (Linux and macOS), saiife can make API calls for the agent. You store a
 credential in saiife's vault (`saiife secret add`, or `saiife secret import`
 to move plaintext credentials out of the home), connect a service with
 `saiife connect shopify|hubspot|github|aws-s3|...`, and the agent calls it through
@@ -65,7 +65,8 @@ and `doctor` warns about it. See [Connectors](docs/connectors/README.md).
 ## Personal broker
 
 `saiife daemon --user` runs a broker as your own user, with the vault key in
-the OS keychain (Linux, Secret Service). It is for trying connectors on your
+the OS keychain (the Secret Service on Linux, the login Keychain on macOS).
+It is for trying connectors on your
 own machine; **not a security boundary**: a script of the same user can read
 the key. The agent never holds a credential for a brokered service; it holds
 its own model-provider login unless you run a local model, but in this mode
@@ -74,11 +75,14 @@ that is a workflow aid, not a control. See
 
 ## Locked mode, audit forwarding and policy checks
 
-Locked mode is Linux only (macOS follows in v2.1). On supported Linux an
-admin can install saiife as root (`saiife system install`): for agents
-labelled lockable (currently Claude Code) the agent cannot turn the guard
-off, the audit is written by a daemon the agent cannot touch, and locked
-mode fails closed. The agent never holds a credential for a brokered
+Locked mode runs on supported Linux and, since v2.1, on macOS 15 or later
+([install](docs/install.md#locked-mode-macos)). An admin installs saiife as
+root (`saiife system install`): for agents labelled lockable (currently
+Claude Code, on Linux) the agent cannot turn the guard off, the audit is
+written by a daemon the agent cannot touch, and locked mode fails closed.
+On macOS every agent is still unverified (the macOS lock check has not been
+recorded), same-user approval is off (approvals need a second account), and
+the MCP gateway and the egress recipe are Linux only. The agent never holds a credential for a brokered
 service; it holds its own model-provider login unless you run a local
 model.
 
