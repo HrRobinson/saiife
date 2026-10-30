@@ -18,6 +18,11 @@ thiserror = "1"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["net", "fs", "process", "event"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# LOCAL_PEERCRED / LOCAL_PEERPID and getpwnam_r through nix's safe API.
+nix = { version = "=0.31.3", default-features = false, features = ["socket", "user"] }
+saiife-darwin = { path = "../darwin" }
+
 [dev-dependencies]
 tempfile = "3"
 

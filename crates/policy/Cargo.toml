@@ -26,5 +26,9 @@ tempfile = "3"
 # Only the O_NONBLOCK / O_NOFOLLOW constants; no unsafe calls.
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# getpwnam_r / getgrnam_r through nix's safe API (macOS has no getent).
+nix = { version = "=0.31.3", default-features = false, features = ["user"] }
+
 [lints]
 workspace = true

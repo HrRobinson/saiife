@@ -3,9 +3,10 @@ use crate::frame::{read_frame_max, write_frame, FrameError, MAX_ANSWER_FRAME};
 use crate::msg::{OP_HELLO, PROTO, SOCKET_NAME};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::io::Errno;
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 use serde_json::{Map, Value};
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -128,16 +129,31 @@ fn errno_io(e: Errno) -> io::Error {
     io::Error::from_raw_os_error(e.raw_os_error())
 }
 
+/// A close-on-exec, non-blocking unix stream socket.
+#[cfg(not(target_os = "macos"))]
+fn nonblocking_stream() -> Result<OwnedFd, Errno> {
+    rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+    )
+}
+
+/// macOS has no `SOCK_CLOEXEC` or `SOCK_NONBLOCK`: the flags are set right
+/// after `socket`, as std's own `UnixStream::connect` does there.
+#[cfg(target_os = "macos")]
+fn nonblocking_stream() -> Result<OwnedFd, Errno> {
+    let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::ioctl_fionbio(&fd, true)?;
+    Ok(fd)
+}
+
 /// Non-blocking connect bounded by `deadline`; the returned stream is blocking.
 fn connect_by(path: &Path, deadline: Instant) -> Result<UnixStream, ClientError> {
     let addr = SocketAddrUnix::new(path).map_err(|e| ClientError::Connect(errno_io(e)))?;
-    let fd = rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-        None,
-    )
-    .map_err(|e| ClientError::Connect(errno_io(e)))?;
+    let fd = nonblocking_stream().map_err(|e| ClientError::Connect(errno_io(e)))?;
     loop {
         let left = remaining(deadline).ok_or(ClientError::Timeout)?;
         match rustix::net::connect(&fd, &addr) {
@@ -178,15 +194,12 @@ impl Client {
         check_owner(socket_dir, &sock, daemon_uid)?;
         let stream = connect_by(&sock, deadline)?;
         // Closes the check-then-connect race: whoever answers must be the daemon.
-        #[cfg(target_os = "linux")]
-        {
-            let pc = crate::peer::peer_cred(&stream).map_err(ClientError::Connect)?;
-            if pc.uid != daemon_uid {
-                return Err(owner_err(
-                    &sock,
-                    format!("peer is uid {}, expected {daemon_uid}", pc.uid),
-                ));
-            }
+        let pc = crate::peer::peer_cred(&stream).map_err(ClientError::Connect)?;
+        if pc.uid != daemon_uid {
+            return Err(owner_err(
+                &sock,
+                format!("peer is uid {}, expected {daemon_uid}", pc.uid),
+            ));
         }
         let mut c = Client {
             stream,
@@ -322,10 +335,22 @@ pub fn uid_by_name(passwd: &str, name: &str) -> Option<u32> {
     })
 }
 
-/// Reads `/etc/passwd` directly: the daemon user is a local system user, so
-/// no NSS lookup (and no helper process) happens on the hook path.
+/// Linux reads `/etc/passwd` directly: the daemon user is a local system
+/// user, so no NSS lookup (and no helper process) happens on the hook path.
+#[cfg(not(target_os = "macos"))]
 pub fn system_uid(name: &str) -> Option<u32> {
     uid_by_name(&std::fs::read_to_string("/etc/passwd").ok()?, name)
+}
+
+/// macOS asks Directory Services (`getpwnam_r`): a user created with `dscl`
+/// is not in `/etc/passwd`.
+#[cfg(target_os = "macos")]
+pub fn system_uid(name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let u = nix::unistd::User::from_name(name).ok()??;
+    Some(u.uid.as_raw())
 }
 
 /// One `/etc/passwd` line's name and home directory.
@@ -367,11 +392,22 @@ pub fn entry_by_name(passwd: &str, name: &str) -> Option<PasswdEntry> {
 }
 
 /// The `/etc/passwd` entry of `uid`, read directly as `system_uid` does.
+#[cfg(not(target_os = "macos"))]
 pub fn system_entry(uid: u32) -> Option<PasswdEntry> {
     entry_by_uid(&std::fs::read_to_string("/etc/passwd").ok()?, uid)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+/// The Directory Services entry of `uid` (`getpwuid_r`), as `system_uid`.
+#[cfg(target_os = "macos")]
+pub fn system_entry(uid: u32) -> Option<PasswdEntry> {
+    let u = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok()??;
+    (u.uid.as_raw() == uid && !u.name.is_empty()).then_some(PasswdEntry {
+        name: u.name,
+        home: u.dir,
+    })
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::frame::{read_frame, write_frame};
@@ -590,6 +626,9 @@ mod tests {
         );
     }
 
+    /// Linux only: a full unix-socket backlog makes a non-blocking connect
+    /// wait (`EAGAIN`) there, while BSD kernels refuse it at once.
+    #[cfg(target_os = "linux")]
     #[test]
     fn full_backlog_connect_times_out() {
         use rustix::net::{bind, listen, socket, AddressFamily, SocketAddrUnix, SocketType};
@@ -715,6 +754,43 @@ mod tests {
         assert_eq!(entry_by_name(p, "bad"), None);
         assert_eq!(entry_by_name(p, ""), None);
         assert_eq!(entry_by_name(p, "nobody"), None);
+    }
+
+    #[test]
+    fn system_uid_of_root_is_0() {
+        assert_eq!(system_uid("root"), Some(0));
+        assert_eq!(system_uid(""), None);
+        assert_eq!(system_entry(0).unwrap().name, "root");
+    }
+
+    /// `/var` is a root-owned link to `private/var` on macOS, and the temp
+    /// dir lives below it: the owner check passes through either spelling,
+    /// and a client connects through the `/var` one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn client_accepts_socket_dir_behind_var_link() {
+        let d = tempfile::Builder::new()
+            .prefix("p13-t2-")
+            .tempdir_in(std::env::temp_dir())
+            .unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = d.path().canonicalize().unwrap();
+        let Ok(rest) = real.strip_prefix("/private/var") else {
+            eprintln!(
+                "skipped: temp dir {} is not under /private/var",
+                real.display()
+            );
+            return;
+        };
+        let via_var = Path::new("/var").join(rest);
+        let h = fake(&real, |m| Some(json!({"id":m["id"],"ok":true})));
+        for dir in [&via_var, &real] {
+            check_owner(dir, &dir.join(SOCKET_NAME), me()).unwrap();
+        }
+        let mut c = Client::connect(&via_var, me(), dl(2000)).unwrap();
+        c.call("status", Map::new(), dl(2000)).unwrap();
+        drop(c);
+        h.join().unwrap();
     }
 
     #[test]
