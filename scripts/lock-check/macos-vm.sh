@@ -128,6 +128,7 @@ if [[ -n "$secret_file" ]]; then
     refuse "LOCKCHECK_AGENT_ENV_FILE must not be readable by group or others (chmod 600)"
 fi
 
+# shellcheck disable=SC2329 # invoked by the EXIT trap below
 vm_cleanup() {
   local d
   rm -rf /opt/lockcheck /opt/saiife
@@ -163,6 +164,7 @@ image="macos-$(sw_vers -productVersion)-$(uname -m)"
 run_agent() {
   local agent="$1" line stamp version node_version
   export LOCKCHECK_PLATFORM=macos
+  # shellcheck disable=SC2034 # read by the lib.sh sourced next
   LC_MANAGED=/opt/lockcheck/managed
   # shellcheck source=/dev/null
   source /opt/lockcheck/src/lib.sh
@@ -208,6 +210,7 @@ run_agent() {
     fi
   }
   hand_results
+  # shellcheck disable=SC2329 # invoked by the EXIT trap below
   agent_cleanup() {
     lc_restore_snapshot || true
     rm -rf "$LC_HOME/alt" "$LC_SNAPSHOT"

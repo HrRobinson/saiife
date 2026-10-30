@@ -1385,6 +1385,7 @@ test_macos_platform_paths() {
   assert_eq "$LC_RUN" "$LC_ROOT/opt/lockcheck/run" "LC_RUN"
   assert_eq "$LC_STUB" "$LC_ROOT/opt/saiife/bin/saiife" "LC_STUB"
   (
+    # shellcheck source=/dev/null
     source "$HERE/checks-claude.sh"
     assert_eq "$CLAUDE_MANAGED_DIR" "$LC_ROOT/Library/Application Support/ClaudeCode/managed-settings.d"
     assert_eq "$CLAUDE_MCP_CONFIG" "$LC_ROOT/opt/lockcheck/work/lockcheck-mcp.json"
@@ -1401,6 +1402,7 @@ test_macos_platform_paths() {
     [[ ! -e "$LC_ROOT/run" ]] || fail "wrote under /run"
   ) || exit 1
   (
+    # shellcheck source=/dev/null
     source "$HERE/checks-gemini.sh"
     GEMINI_TOGGLES_LOADED=1
     mkdir -p "$LC_PROJECT"
@@ -1409,6 +1411,7 @@ test_macos_platform_paths() {
     [[ ! -e "$LC_ROOT/etc/gemini-cli" ]] || fail "wrote the Linux Gemini path"
   ) || exit 1
   (
+    # shellcheck source=/dev/null
     source "$HERE/checks-codex.sh"
     assert_eq "$CODEX_REQUIREMENTS" "$LC_ROOT/etc/codex/requirements.toml"
   ) || exit 1

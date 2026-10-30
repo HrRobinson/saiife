@@ -99,7 +99,7 @@ main() {
   zip="$tmp/saiife-notarize-$target.zip"
   local kcpw
   if [ -n "$dry" ]; then
-    kcpw=dry-run
+    kcpw="dry-run"
   else
     kcpw="$(openssl rand -hex 24)"
   fi
