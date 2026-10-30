@@ -21,6 +21,7 @@ use saiife_policy::installed::{
     VaultKeyMode, INSTALLED_VERSION,
 };
 use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -404,55 +405,57 @@ fn check_macos_key(layout: &Layout) -> Result<(), InstallError> {
     }
 }
 
-/// True when `dscl . -read /Users/<name>` says `IsHidden: 1` (or `YES`),
-/// on the same line or the next.
+/// True when `dscl . -read` output says `IsHidden: 1` (or `YES`), in
+/// either of dscl's layouts ([`crate::host::parse_dscl_attrs`]).
 pub(crate) fn dscl_is_hidden(out: &str) -> bool {
-    let mut lines = out.lines();
-    while let Some(l) = lines.next() {
-        let Some(rest) = l.strip_prefix("IsHidden:") else {
-            continue;
-        };
-        let value = match rest.trim() {
-            "" => lines.next().unwrap_or("").trim(),
-            v => v,
-        };
-        return matches!(value, "1" | "YES" | "yes" | "true");
-    }
-    false
+    crate::host::parse_dscl_attrs(out)
+        .get("IsHidden")
+        .and_then(|v| v.first())
+        .is_some_and(|v| matches!(v.as_str(), "1" | "YES" | "yes" | "true"))
 }
 
 /// An existing macOS daemon user must be a record of the local directory
-/// (`dscl .`), never a directory-service account. Unless the live
-/// installed.toml says install created it, it must also be hidden, have the
-/// shell `/usr/bin/false` and a uid below 500.
+/// (`dscl .`), never a directory-service account; a read that cannot tell
+/// refuses (fail closed). Unless the live installed.toml says install
+/// created it, it must also be hidden, have the shell `/usr/bin/false` and
+/// a uid below 500. It is reused as it is, never created again.
 fn check_macos_daemon_user(
     layout: &Layout,
     host: &dyn Host,
     previous: Option<&Installed>,
 ) -> Result<(), InstallError> {
+    use crate::host::{argv_dscl_read, dscl_read_found};
     let name = layout.daemon_user();
     let Some(u) = host.user(name) else {
         return Ok(());
     };
     let shown = PathBuf::from(format!("/Local/Default/Users/{name}"));
-    let record = format!("/Users/{name}");
-    let read = host
-        .run(DSCL, &[".", "-read", &record], MACOS_TOOL_TIMEOUT)
-        .ok()
-        .filter(|o| o.status == 0);
-    let Some(read) = read else {
-        return Err(refused(
-            &shown,
-            format!(
-                "a user {name} exists but is not in the local directory (dscl . -read failed); \
-                 saiife never adopts a directory-service account as its daemon user"
-            ),
-        ));
-    };
+    let argv = argv_dscl_read(&format!("/Users/{name}"));
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let res = host.run(DSCL, &args, MACOS_TOOL_TIMEOUT);
+    let stdout = res.as_ref().map(|o| o.stdout.clone()).unwrap_or_default();
+    match dscl_read_found(res) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(refused(
+                &shown,
+                format!(
+                    "a user {name} exists but is not in the local directory; \
+                     saiife never adopts a directory-service account as its daemon user"
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err(refused(
+                &shown,
+                format!("the user {name} could not be read from the local directory: {e}"),
+            ))
+        }
+    }
     if previous.is_some_and(|p| p.users.iter().any(|n| n == name)) {
         return Ok(());
     }
-    let hidden = dscl_is_hidden(&read.stdout);
+    let hidden = dscl_is_hidden(&stdout);
     if !hidden || u.shell != MACOS_FALSE_SHELL || u.uid >= MACOS_FIRST_LOGIN_ID {
         return Err(refused(
             &shown,
@@ -500,6 +503,109 @@ pub(crate) fn beneath_links(layout: &Layout, host: &dyn Host, logical: &Path) ->
         return logical.to_path_buf();
     }
     Path::new("/private").join(top).join(parts.as_path())
+}
+
+/// The existing file `name` in the open directory `dir`, opened with
+/// `O_NOFOLLOW` and checked on the descriptor: a regular file with one
+/// link, owned by one of `allowed`, of `len` bytes when given. `None` when
+/// it is missing. A symlink or a hard link (say to a root-owned file the
+/// daemon user linked there) is refused, so root never chowns it.
+fn open_daemon_file(
+    dir: &OwnedFd,
+    name: &std::ffi::OsStr,
+    shown: &Path,
+    len: Option<u64>,
+    allowed: &[u32],
+) -> Result<Option<OwnedFd>, InstallError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    let bad = |e: rustix::io::Errno| refused(shown, io::Error::from(e).to_string());
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(bad(e)),
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+            return Err(refused(shown, "is a symlink; saiife does not follow it"))
+        }
+        Ok(_) => {}
+    }
+    let fd = match rustix::fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => {
+            return Err(refused(shown, "is a symlink; saiife does not follow it"))
+        }
+        Err(e) => return Err(bad(e)),
+    };
+    let st = rustix::fs::fstat(&fd).map_err(bad)?;
+    check_daemon_file(shown, &st, len, allowed)?;
+    Ok(Some(fd))
+}
+
+/// What [`open_daemon_file`] requires of the open file's `stat`.
+#[allow(clippy::unnecessary_cast)] // st_nlink and st_size differ per OS
+fn check_daemon_file(
+    shown: &Path,
+    st: &fsops::Stat,
+    len: Option<u64>,
+    allowed: &[u32],
+) -> Result<(), InstallError> {
+    use rustix::fs::FileType;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(refused(shown, "exists and is not a regular file"));
+    }
+    let links = st.st_nlink as u64;
+    if links != 1 {
+        return Err(refused(
+            shown,
+            format!(
+                "has {links} hard links; saiife does not adopt a linked file (remove it first)"
+            ),
+        ));
+    }
+    let uid = st.st_uid as u32;
+    if !allowed.contains(&uid) {
+        return Err(refused(
+            shown,
+            format!(
+                "exists and is owned by uid {uid}; saiife does not adopt it (move it away first)"
+            ),
+        ));
+    }
+    let size = st.st_size as u64;
+    if let Some(want) = len.filter(|w| *w != size) {
+        return Err(refused(
+            shown,
+            format!("exists with {size} bytes, not {want}; saiife does not adopt it (move it away first)"),
+        ));
+    }
+    Ok(())
+}
+
+/// A new file `name` in the open `dir`: `O_CREAT|O_EXCL|O_NOFOLLOW` with
+/// `mode`, so nothing planted there is opened.
+fn create_daemon_file(
+    dir: &OwnedFd,
+    name: &std::ffi::OsStr,
+    shown: &Path,
+    mode: u32,
+) -> Result<OwnedFd, InstallError> {
+    use rustix::fs::{Mode, OFlags};
+    rustix::fs::openat(
+        dir,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(mode as _),
+    )
+    .map_err(|e| refused(shown, io::Error::from(e).to_string()))
+}
+
+/// `fchmod` on the open file.
+fn set_mode_fd(fd: &OwnedFd, shown: &Path, mode: u32) -> Result<(), InstallError> {
+    rustix::fs::fchmod(fd, rustix::fs::Mode::from_raw_mode(mode as _))
+        .map_err(|e| refused(shown, io::Error::from(e).to_string()))
 }
 
 fn now() -> String {
@@ -1375,98 +1481,187 @@ impl Run<'_> {
     /// decision 2): the state and key dirs, the vault key, the socket dir,
     /// the log and audit dirs and `daemon.log`. Not listed in
     /// installed.toml (`--purge` removes them, as on Linux).
+    ///
+    /// The state dir is the daemon user's to write, so everything below
+    /// the root-owned `/var/db` and `/var/log` is made and changed
+    /// fd-relative: each entry is opened with `O_NOFOLLOW` from its
+    /// parent's descriptor, checked on that descriptor (type, owner, link
+    /// count), and its mode and owner are set on it (`fchmod`, `fchown`),
+    /// never by path. A symlink or hard link the daemon user planted is
+    /// refused, never chowned.
     fn macos_state(&mut self) -> Result<(), InstallError> {
         let user = self.layout.daemon_user();
         let daemon = self.ids(user, self.layout.daemon_group())?;
         let audit = self.ids(user, self.layout.audit_group())?;
         let root = self.root_ids()?;
-        self.owned_dir(STATE_DIR, 0o700, daemon)?;
-        self.owned_dir(KEYS_DIR, 0o700, daemon)?;
-        self.macos_vault_key(daemon)?;
-        self.owned_dir(RUN_DIR, 0o755, daemon)?;
-        self.owned_dir(LOG_DIR, 0o755, root)?;
-        self.owned_dir(AUDIT_DIR, 0o2750, audit)?;
-        self.daemon_log(audit)
+        let allowed = [root.0, daemon.0];
+        let db = self.root_parent(STATE_DIR)?;
+        let state = self.owned_dir_at(&db, STATE_DIR, 0o700, daemon, &allowed)?;
+        let keys = self.owned_dir_at(&state, KEYS_DIR, 0o700, daemon, &allowed)?;
+        self.macos_vault_key(&keys, daemon, &allowed)?;
+        let db = self.root_parent(RUN_DIR)?;
+        self.owned_dir_at(&db, RUN_DIR, 0o755, daemon, &allowed)?;
+        let var_log = self.root_parent(LOG_DIR)?;
+        let log = self.owned_dir_at(&var_log, LOG_DIR, 0o755, root, &[root.0])?;
+        self.owned_dir_at(&log, AUDIT_DIR, 0o2750, audit, &allowed)?;
+        self.daemon_log(&log, audit, &allowed)
     }
 
-    /// Ensures the directory `abs` (its parent as [`Run::dir`] does) with
-    /// `mode` and `owner`. An existing one gets both.
-    fn owned_dir(
-        &mut self,
-        abs: &'static str,
-        mode: u32,
-        owner: (u32, u32),
-    ) -> Result<(), InstallError> {
-        let logical = self.layout.logical(abs);
-        let parent = Path::new(logical)
+    /// The root-owned parent of `abs` (`/var/db`, `/var/log`), checked as
+    /// [`Run::dir`] checks it, then opened fd-relative from the root (below
+    /// the trusted `/var` link).
+    fn root_parent(&mut self, abs: &'static str) -> Result<OwnedFd, InstallError> {
+        let parent = Path::new(self.layout.logical(abs))
             .parent()
             .and_then(Path::to_str)
             .unwrap_or("/");
         self.dir(parent, 0o755, false)?;
+        let real = beneath_links(self.layout, self.host, Path::new(parent));
+        let rel = real.strip_prefix("/").unwrap_or(&real);
+        let shown = self
+            .layout
+            .try_at(&real)
+            .map_err(|e| refused(&real, e.to_string()))?;
+        fsops::open_dir_beneath(self.layout.root(), rel)
+            .map_err(|e| refused(&shown, e.to_string()))?
+            .ok_or_else(|| refused(&shown, "disappeared"))
+    }
+
+    /// Ensures the directory `abs` in the open `parent` with `mode` and
+    /// `owner`, fd-relative. An existing one must be a directory (never a
+    /// symlink) owned by one of `allowed`; it gets `mode` and `owner`.
+    /// Returns it, open.
+    fn owned_dir_at(
+        &mut self,
+        parent: &OwnedFd,
+        abs: &'static str,
+        mode: u32,
+        owner: (u32, u32),
+        allowed: &[u32],
+    ) -> Result<OwnedFd, InstallError> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+        let logical = self.layout.logical(abs);
+        let name = Path::new(logical).file_name().unwrap_or_default();
         let p = self.at(abs);
-        let before = fsops::mode_of(&p).map_err(|e| refused(&p, e.to_string()))?;
-        let created = fsops::create_dir_mode(&p, mode).map_err(|e| refused(&p, e.to_string()))?;
-        if !created {
-            fsops::set_dir_mode(&p, mode).map_err(|e| refused(&p, e.to_string()))?;
+        let bad = |e: rustix::io::Errno| refused(&p, io::Error::from(e).to_string());
+        let created = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if FileType::from_raw_mode(st.st_mode) != FileType::Directory => {
+                return Err(refused(
+                    &p,
+                    "exists and is not a directory (or is a symlink)",
+                ))
+            }
+            Ok(_) => false,
+            Err(rustix::io::Errno::NOENT) => {
+                rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(bad)?;
+                true
+            }
+            Err(e) => return Err(bad(e)),
+        };
+        let fd = rustix::fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(bad)?;
+        let st = rustix::fs::fstat(&fd).map_err(bad)?;
+        let (uid, before, is_dir) = fsops::stat_owner_mode(&st);
+        if !is_dir {
+            return Err(refused(&p, "is not a directory"));
         }
+        if !created && !allowed.contains(&uid) {
+            return Err(refused(
+                &p,
+                format!("exists and is owned by uid {uid}; saiife does not adopt it (move it away first)"),
+            ));
+        }
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode as _)).map_err(bad)?;
         self.host
-            .chown(&p, owner.0, owner.1)
+            .fchown(fd.as_fd(), &p, owner.0, owner.1)
             .map_err(step("dirs"))?;
         if created {
             self.changed(logical);
-        } else if before != Some(mode) {
+        } else if before != mode {
             self.changed(format!("{logical} (mode {mode:o})"));
         }
-        Ok(())
+        Ok(fd)
     }
 
-    /// The macOS vault key: 32 random bytes, 0400, owned by the daemon user
-    /// (the daemon reads it itself). Never rotated.
-    fn macos_vault_key(&mut self, owner: (u32, u32)) -> Result<(), InstallError> {
+    /// The macOS vault key in the open key dir: 32 random bytes, 0400,
+    /// owned by the daemon user (the daemon reads it itself). Never
+    /// rotated. A new key is made with `O_CREAT|O_EXCL|O_NOFOLLOW`; an
+    /// existing one must be a regular file with one link, 32 bytes, owned
+    /// by root or the daemon user. Mode and owner are set on the open file.
+    fn macos_vault_key(
+        &mut self,
+        keys: &OwnedFd,
+        owner: (u32, u32),
+        allowed: &[u32],
+    ) -> Result<(), InstallError> {
+        use std::io::Write;
         let p = self.at(VAULT_KEY);
         let shown = self.layout.logical(VAULT_KEY);
-        let exists = fsops::lstat(&p)
-            .map_err(|e| refused(&p, e.to_string()))?
-            .is_some();
+        let name = Path::new(shown).file_name().unwrap_or_default();
+        let existing = open_daemon_file(keys, name, &p, Some(32), allowed)?;
         // Listed before it is made, never with a digest.
-        self.record_file(VAULT_KEY, FileKind::VaultKey, None, !exists);
+        self.record_file(VAULT_KEY, FileKind::VaultKey, None, existing.is_none());
         self.save()?;
-        if !exists {
-            let mut key = Zeroizing::new([0u8; 32]);
-            getrandom::fill(&mut key[..]).map_err(|e| InstallError::Step {
-                step: "vault-key".into(),
-                detail: e.to_string(),
-            })?;
-            fsops::write_new_file(&p, &key[..], 0o400).map_err(step("vault-key"))?;
-            self.changed(shown);
-        } else {
-            self.unchanged(shown);
-        }
-        fsops::set_file_mode(&p, 0o400).map_err(step("vault-key"))?;
+        let fd = match existing {
+            Some(fd) => {
+                self.unchanged(shown);
+                fd
+            }
+            None => {
+                let fd = create_daemon_file(keys, name, &p, 0o400)?;
+                let mut key = Zeroizing::new([0u8; 32]);
+                getrandom::fill(&mut key[..]).map_err(|e| InstallError::Step {
+                    step: "vault-key".into(),
+                    detail: e.to_string(),
+                })?;
+                let mut f = std::fs::File::from(fd);
+                f.write_all(&key[..])
+                    .and_then(|_| f.sync_all())
+                    .map_err(step("vault-key"))?;
+                self.changed(shown);
+                OwnedFd::from(f)
+            }
+        };
+        set_mode_fd(&fd, &p, 0o400)?;
         self.host
-            .chown(&p, owner.0, owner.1)
+            .fchown(fd.as_fd(), &p, owner.0, owner.1)
             .map_err(step("vault-key"))
     }
 
-    /// `daemon.log`, the daemon's stderr (launchd opens it as root and
-    /// would make it 0644 root otherwise).
-    fn daemon_log(&mut self, owner: (u32, u32)) -> Result<(), InstallError> {
+    /// `daemon.log` in the open log dir, the daemon's stderr (launchd opens
+    /// it as root and would make it 0644 root otherwise). Checked and
+    /// changed on the open file, as the vault key is.
+    fn daemon_log(
+        &mut self,
+        log: &OwnedFd,
+        owner: (u32, u32),
+        allowed: &[u32],
+    ) -> Result<(), InstallError> {
         let p = self.at(DAEMON_LOG);
-        match fsops::lstat(&p).map_err(|e| refused(&p, e.to_string()))? {
-            None => {
-                fsops::write_new_file(&p, b"", 0o640).map_err(step("log"))?;
-                self.changed(DAEMON_LOG);
-            }
-            Some(m) if !m.is_file() => return Err(refused(&p, "exists and is not a regular file")),
-            Some(_) => {
-                let before = fsops::mode_of(&p).map_err(step("log"))?;
-                fsops::set_file_mode(&p, 0o640).map_err(step("log"))?;
-                if before != Some(0o640) {
+        let name = Path::new(DAEMON_LOG).file_name().unwrap_or_default();
+        let fd = match open_daemon_file(log, name, &p, None, allowed)? {
+            Some(fd) => {
+                let st = rustix::fs::fstat(&fd).map_err(|e| refused(&p, e.to_string()))?;
+                if fsops::stat_owner_mode(&st).1 != 0o640 {
                     self.changed(format!("{DAEMON_LOG} (mode 640)"));
                 }
+                fd
             }
-        }
-        self.host.chown(&p, owner.0, owner.1).map_err(step("log"))
+            None => {
+                let fd = create_daemon_file(log, name, &p, 0o640)?;
+                self.changed(DAEMON_LOG);
+                fd
+            }
+        };
+        set_mode_fd(&fd, &p, 0o640)?;
+        self.host
+            .fchown(fd.as_fd(), &p, owner.0, owner.1)
+            .map_err(step("log"))
     }
 
     /// The launchd plist (root:wheel 0644). True when written.
@@ -3691,5 +3886,156 @@ pub(crate) mod macos_tests {
             beneath_links(&l, &e.host, Path::new("/var/db")),
             PathBuf::from("/var/db")
         );
+    }
+
+    /// A root-owned file outside the tree, as /etc/sudoers would be.
+    fn outside_file(e: &MacEnv, bytes: &[u8]) -> PathBuf {
+        let p = e._src.path().join("sudoers");
+        fs::write(&p, bytes).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o440)).unwrap();
+        p
+    }
+
+    fn untouched(e: &MacEnv, p: &Path) {
+        assert_eq!(mode(p), 0o440, "{}", p.display());
+        let s = e.host.state();
+        assert!(
+            !s.chowns.iter().any(|c| c.path == p),
+            "{} was chowned",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn hard_linked_vault_key_refused() {
+        let e = mac_env();
+        e.install();
+        e.settle();
+        let key = e.at("/var/db/saiife/keys/vault.key");
+        let target = outside_file(&e, &[9u8; 32]);
+        fs::remove_file(&key).unwrap();
+        fs::hard_link(&target, &key).unwrap();
+        let chowns_before = e.host.state().chowns.len();
+        match e.run(&opts()) {
+            Err(InstallError::Refused { path, detail }) => {
+                assert_eq!(path, key);
+                assert!(detail.contains("2 hard links"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        untouched(&e, &target);
+        // Nothing was chowned under the key's name either.
+        let s = e.host.state();
+        assert!(!s.chowns[chowns_before..].iter().any(|c| c.path == key));
+    }
+
+    #[test]
+    fn symlinked_vault_key_refused() {
+        let e = mac_env();
+        e.install();
+        e.settle();
+        let key = e.at("/var/db/saiife/keys/vault.key");
+        let target = outside_file(&e, &[9u8; 32]);
+        fs::remove_file(&key).unwrap();
+        std::os::unix::fs::symlink(&target, &key).unwrap();
+        let err = e.run(&opts()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        untouched(&e, &target);
+    }
+
+    #[test]
+    fn foreign_owned_daemon_file_refused() {
+        let e = mac_env();
+        e.install();
+        let keys =
+            fsops::open_dir_beneath(e.layout.root(), Path::new("private/var/db/saiife/keys"))
+                .unwrap()
+                .unwrap();
+        let shown = e.at("/var/db/saiife/keys/vault.key");
+        let name = std::ffi::OsStr::new("vault.key");
+        let own = rustix::process::getuid().as_raw();
+        // Owned by root or the daemon user: fine.
+        assert!(open_daemon_file(&keys, name, &shown, Some(32), &[own])
+            .unwrap()
+            .is_some());
+        // Anyone else's (the test user's file stands in for it).
+        match open_daemon_file(&keys, name, &shown, Some(32), &[own + 1]) {
+            Err(InstallError::Refused { detail, .. }) => {
+                assert!(detail.contains(&format!("owned by uid {own}")), "{detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // The wrong size.
+        let err = open_daemon_file(&keys, name, &shown, Some(16), &[own]).unwrap_err();
+        assert!(err.to_string().contains("not 16"), "{err}");
+        // Missing: None, never created here.
+        assert!(
+            open_daemon_file(&keys, std::ffi::OsStr::new("nope"), &shown, None, &[own])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn linked_daemon_log_refused() {
+        // A hard link.
+        let e = mac_env();
+        e.install();
+        e.settle();
+        let log = e.at(DAEMON_LOG);
+        let target = outside_file(&e, b"");
+        fs::remove_file(&log).unwrap();
+        fs::hard_link(&target, &log).unwrap();
+        let err = e.run(&opts()).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        untouched(&e, &target);
+        // A symlink.
+        let e = mac_env();
+        e.install();
+        e.settle();
+        let log = e.at(DAEMON_LOG);
+        let target = outside_file(&e, b"");
+        fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        let err = e.run(&opts()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        untouched(&e, &target);
+    }
+
+    #[test]
+    fn symlinked_state_dir_entry_refused() {
+        // The daemon user swaps keys/ for a link to a root-owned dir.
+        let e = mac_env();
+        e.install();
+        e.settle();
+        let keys = e.at("/var/db/saiife/keys");
+        let elsewhere = e._src.path().join("etc-like");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&keys).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &keys).unwrap();
+        assert!(e.run(&opts()).is_err());
+        assert_eq!(mode(&elsewhere), 0o755);
+        assert!(!e.host.state().chowns.iter().any(|c| c.path == elsewhere));
+    }
+
+    #[test]
+    fn unreadable_local_record_refused() {
+        let e = mac_env();
+        preset_saiife(&e, 250, "/usr/bin/false", exit(1, "eDSPermissionError"));
+        let msg = e.run(&opts()).unwrap_err().to_string();
+        assert!(msg.contains("could not be read"), "{msg}");
+        assert!(!e.layout.at(ETC_DIR).exists());
+    }
+
+    #[test]
+    fn unreadable_primary_gid_members_refused() {
+        let e = mac_env();
+        preset_saiife(&e, 250, "/usr/bin/false", ok("IsHidden: 1\n"));
+        e.host.set(|s| s.fail_primary_gid = vec![250]);
+        let msg = e.run(&opts()).unwrap_err().to_string();
+        assert!(msg.contains("could not be read"), "{msg}");
+        assert!(msg.contains("_saiife"), "{msg}");
+        assert!(!e.layout.at(ETC_DIR).exists());
     }
 }

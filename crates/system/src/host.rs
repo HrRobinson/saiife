@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::ops::RangeInclusive;
+use std::os::fd::BorrowedFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -112,6 +113,10 @@ pub trait Host: Send + Sync {
     fn remove_from_group(&self, user: &str, group: &str) -> io::Result<()>;
     /// Changes owner and group of `path` itself; never follows a symlink.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
+    /// Changes owner and group of the open file `fd` (`fchown`), so a path
+    /// swapped after it was checked cannot redirect the change. `shown`
+    /// names it in errors (and in a fake's record).
+    fn fchown(&self, fd: BorrowedFd<'_>, shown: &Path, uid: u32, gid: u32) -> io::Result<()>;
     /// Runs `systemctl <args>`. A non-zero exit is an `Ok` with its status.
     fn systemctl(&self, args: &[&str]) -> io::Result<CmdOutput>;
     fn systemd_version(&self) -> io::Result<u32>;
@@ -252,6 +257,23 @@ impl Host for RealHost {
             io::Error::new(
                 io::Error::from(e).kind(),
                 format!("chown {}: {e}", path.display()),
+            )
+        })
+    }
+
+    fn fchown(&self, fd: BorrowedFd<'_>, shown: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        if uid == u32::MAX || gid == u32::MAX {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid id -1"));
+        }
+        rustix::fs::fchown(
+            fd,
+            Some(rustix::fs::Uid::from_raw(uid)),
+            Some(rustix::fs::Gid::from_raw(gid)),
+        )
+        .map_err(|e| {
+            io::Error::new(
+                io::Error::from(e).kind(),
+                format!("chown {}: {e}", shown.display()),
             )
         })
     }
@@ -1284,7 +1306,7 @@ fn fake_dscl_read(uid: u32, gid: u32) -> String {
 
 /// The call line of `dscl . -read /Users/<name>`.
 pub(crate) fn dscl_read_line(name: &str) -> String {
-    format!("{DSCL} . -read /Users/{name}")
+    argv_dscl_read(&format!("/Users/{name}")).join(" ")
 }
 
 impl FakeState {
@@ -1620,6 +1642,31 @@ impl Host for FakeHost {
             }
             s.chowns.push(Chown {
                 path: path.to_path_buf(),
+                uid,
+                gid,
+            });
+            Ok(())
+        })
+    }
+
+    fn fchown(&self, fd: BorrowedFd<'_>, shown: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        // Like the real call: the descriptor must be open. Recorded under
+        // `shown`, never applied.
+        rustix::fs::fstat(fd).map_err(|e| {
+            io::Error::new(
+                io::Error::from(e).kind(),
+                format!("chown {}: {e}", shown.display()),
+            )
+        })?;
+        self.update(|s| {
+            if s.fail_chown.iter().any(|p| p == shown) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("chown {}: fake failure", shown.display()),
+                ));
+            }
+            s.chowns.push(Chown {
+                path: shown.to_path_buf(),
                 uid,
                 gid,
             });
