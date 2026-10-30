@@ -30,6 +30,9 @@ jobs:
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
+      - name: release signing script (offline)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/release/test-macos-sign.sh
       # The hook path (guard, audit, policy, ipc), saiife-system and saiife-mcp must not link tokio: only
       # the daemon crate does (spec §4.2).
       - name: no tokio in hook crates
@@ -80,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/personal-broker/*.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/personal-broker/*.sh scripts/release/*.sh
 
   # Locked mode on real machines (spec §13 "Daemon integration"): `system
   # install` as root, the §5.2 owners and modes, managed hooks run as an
