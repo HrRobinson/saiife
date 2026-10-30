@@ -101,6 +101,20 @@ struct DropGuard {
 /// Reads `config_file`, then `<its dir>/policy.d/*.toml` in name order.
 /// Only regular files are read (symlinks are refused), each at most 1 MiB.
 pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
+    let dropins = config_file
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("policy.d");
+    load_system_with(config_file, &dropins)
+}
+
+/// [`load_system`] with the drop-ins from `dropin_dir` instead of the
+/// config's own `policy.d`: a config checked before it is copied into
+/// place meets the drop-ins it will be loaded with.
+pub fn load_system_with(
+    config_file: &Path,
+    dropin_dir: &Path,
+) -> Result<LoadedPolicy, PolicyError> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
 
@@ -141,7 +155,7 @@ pub fn load_system(config_file: &Path) -> Result<LoadedPolicy, PolicyError> {
         }
     }
 
-    for path in dropin_paths(config_file)? {
+    for path in dropin_paths(dropin_dir)? {
         let text = read_policy_file(&path, &mut files)?;
         let table = parse_table(&path, &text)?;
         check_reserved(&path, &table)?;
@@ -666,15 +680,12 @@ fn check_dropin_keys(path: &Path, table: &toml::Table) -> Result<(), PolicyError
     Ok(())
 }
 
-/// `<dir of config_file>/policy.d/*.toml`, sorted by file name (bytes). A
-/// missing `policy.d` means no drop-ins; a symlinked one is refused, as a
-/// symlinked drop-in is. Dot-files (editor lock links such as emacs
-/// `.#a.toml`, hidden backups) are skipped.
-fn dropin_paths(config_file: &Path) -> Result<Vec<PathBuf>, PolicyError> {
-    let dir = config_file
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("policy.d");
+/// `<dropin_dir>/*.toml`, sorted by file name (bytes). A missing dir means
+/// no drop-ins; a symlinked one is refused, as a symlinked drop-in is.
+/// Dot-files (editor lock links such as emacs `.#a.toml`, hidden backups)
+/// are skipped.
+fn dropin_paths(dropin_dir: &Path) -> Result<Vec<PathBuf>, PolicyError> {
+    let dir = dropin_dir.to_path_buf();
     match std::fs::symlink_metadata(&dir) {
         Ok(m) if m.file_type().is_symlink() => {
             return Err(invalid(&dir, "is a symlink (symlinks are not followed)"))

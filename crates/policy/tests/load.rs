@@ -916,3 +916,24 @@ fn run_allow_without_file_name_refused() {
         assert!(e.contains("no file name"), "{bad}: {e}");
     }
 }
+
+/// `load_system_with` reads the drop-ins from the dir it is given, never
+/// from the config's own `policy.d`.
+#[test]
+fn load_system_with_uses_the_given_dropin_dir() {
+    let (_a, cfg) = etc(
+        "version = 2\nlocked = true\n",
+        &[("50-bad.toml", "this is = not toml [\n")],
+    );
+    assert!(load_system(&cfg).is_err());
+    let other = tempfile::tempdir().unwrap();
+    let missing = other.path().join("policy.d");
+    let l = saiife_policy::load_system_with(&cfg, &missing).unwrap();
+    assert_eq!(l.files.len(), 1, "{:?}", l.files);
+    fs::create_dir(&missing).unwrap();
+    fs::write(missing.join("60-bad.toml"), "nope = [\n").unwrap();
+    match saiife_policy::load_system_with(&cfg, &missing) {
+        Err(PolicyError::Parse { path, .. }) => assert!(path.ends_with("60-bad.toml"), "{path:?}"),
+        other => panic!("{other:?}"),
+    }
+}

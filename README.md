@@ -117,6 +117,8 @@ model.
   protects and what it does not.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
+- [Fleet install](docs/fleet.md): `.deb` and `.rpm` packages, Ansible and an Intune
+  compliance policy for Linux.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).
 - [Connectors](docs/connectors/README.md), [environments](docs/environments.md)
   and [collections](docs/collections.md).

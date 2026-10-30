@@ -193,6 +193,16 @@ Once it runs, you can forward the audit elsewhere
 ([forwarding](forwarding.md)), give auditors read access ([auditors](auditors.md))
 and limit a dedicated agent account's network ([egress](egress.md)).
 
+### Packages (.deb, .rpm)
+
+For many machines, install the `.deb` or `.rpm` from the release page instead.
+The package puts the binary in `/usr/libexec/saiife/` and runs
+`saiife system install --fleet`, which reads its options from
+`/etc/saiife/fleet/`. Removing the package uninstalls locked mode, with a
+warning. Check the files with `SHA256SUMS` and `SHA256SUMS.asc` first. See
+[Fleet install](fleet.md) for the fleet files, upgrades, removal, Ansible and
+Intune.
+
 ### Check it
 
 ```sh

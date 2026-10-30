@@ -1,0 +1,14 @@
+#!/bin/sh
+# Uninstalls locked mode on package removal only (plan 18, decisions 3 and 6).
+# deb: remove; rpm: 0. Upgrades (upgrade, 1) and everything else do nothing.
+set -e
+
+case "$1" in
+    remove|0)
+        msg="saiife: removing the package uninstalls locked mode: agents on this machine will no longer be locked"
+        echo "$msg" >&2
+        logger -t saiife -p auth.warning "$msg" 2>/dev/null || true
+        /usr/libexec/saiife/saiife system uninstall
+        ;;
+    *) exit 0 ;;
+esac

@@ -77,6 +77,36 @@ pub struct CmdOutput {
     pub stderr: String,
 }
 
+/// The daemon's answer to `policy.reload` (spec §7): whether the policy
+/// on disk now is the one it enforces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadAnswer {
+    /// `result = "loaded"`; anything else is a rejection.
+    pub loaded: bool,
+    /// Why it was rejected (empty when loaded).
+    pub reason: String,
+    /// The policy hash the daemon enforces after the call.
+    pub hash: Option<String>,
+}
+
+impl ReloadAnswer {
+    /// From the `policy.reload` answer fields.
+    pub fn from_answer(a: &serde_json::Map<String, serde_json::Value>) -> ReloadAnswer {
+        let s = |k: &str| a.get(k).and_then(serde_json::Value::as_str);
+        let result = s("result").unwrap_or("");
+        ReloadAnswer {
+            loaded: result == "loaded",
+            reason: match s("reason") {
+                Some(r) if !r.is_empty() => r.to_string(),
+                _ if result == "loaded" => String::new(),
+                _ if result.is_empty() => "no result in the answer".to_string(),
+                _ => format!("result {result:?}"),
+            },
+            hash: s("hash").map(str::to_string),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInfo {
     pub uid: u32,
@@ -140,6 +170,60 @@ pub trait Host: Send + Sync {
         input: &[u8],
         timeout: Duration,
     ) -> io::Result<CmdOutput>;
+    /// The owner of `path`, whose `lstat`/`fstat` says `on_disk`. The real
+    /// host returns `on_disk`; the fake host applies the chowns it recorded
+    /// (its chowns are never applied on disk).
+    fn owner_uid(&self, path: &Path, on_disk: u32) -> u32;
+    /// Asks the running daemon on the socket in `socket_dir` (owned by
+    /// `daemon_uid`) to load the policy again, synchronously, and returns
+    /// its answer. Waits at most `wait` for the socket and the answer.
+    fn policy_reload(
+        &self,
+        socket_dir: &Path,
+        daemon_uid: u32,
+        wait: Duration,
+    ) -> io::Result<ReloadAnswer>;
+}
+
+/// [`Host::policy_reload`] over the control socket. A socket that does not
+/// answer yet is tried again until `wait` has passed. Linux and macOS: the
+/// caller passes the configured socket dir (`/run/saiife`, or
+/// `/var/db/saiife-run` on macOS).
+#[cfg(unix)]
+pub fn call_policy_reload(
+    socket_dir: &Path,
+    daemon_uid: u32,
+    wait: Duration,
+) -> io::Result<ReloadAnswer> {
+    use saiife_ipc::client::{Client, ClientError};
+    use saiife_ipc::msg::OP_POLICY_RELOAD;
+    let deadline = Instant::now() + wait;
+    loop {
+        let err = match Client::connect(socket_dir, daemon_uid, deadline) {
+            Ok(mut c) => {
+                return match c.call(OP_POLICY_RELOAD, serde_json::Map::new(), deadline) {
+                    Ok(a) => Ok(ReloadAnswer::from_answer(&a)),
+                    Err(ClientError::Timeout) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("no answer to policy.reload within {} s", wait.as_secs()),
+                    )),
+                    Err(e) => Err(io::Error::other(format!("policy.reload: {e}"))),
+                };
+            }
+            Err(e) => e,
+        };
+        let pause = Duration::from_millis(200);
+        if Instant::now() + pause >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the daemon socket did not answer within {} s: {err}",
+                    wait.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(pause);
+    }
 }
 
 /// What `container` reports when it cannot tell (systemd-detect-virt
@@ -304,6 +388,34 @@ impl Host for RealHost {
             exec(DETECT_VIRT, &["--container"], None, QUERY_TIMEOUT),
             Path::new("/run/systemd/system").is_dir(),
         )
+    }
+
+    fn owner_uid(&self, _path: &Path, on_disk: u32) -> u32 {
+        on_disk
+    }
+
+    #[cfg(unix)]
+    fn policy_reload(
+        &self,
+        socket_dir: &Path,
+        daemon_uid: u32,
+        wait: Duration,
+    ) -> io::Result<ReloadAnswer> {
+        call_policy_reload(socket_dir, daemon_uid, wait)
+    }
+
+    #[cfg(not(unix))]
+    fn policy_reload(
+        &self,
+        socket_dir: &Path,
+        daemon_uid: u32,
+        wait: Duration,
+    ) -> io::Result<ReloadAnswer> {
+        let _ = (socket_dir, daemon_uid, wait);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::supported::NOT_SUPPORTED_OS,
+        ))
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
@@ -1274,6 +1386,10 @@ pub struct FakeState {
     /// every account change records its `dscl`/`dseditgroup` argv in
     /// `calls`.
     pub dscl: bool,
+    /// What `policy_reload` answers (default: loaded, hash `fake`).
+    pub policy_reload: ReloadAnswer,
+    /// When set, `policy_reload` fails with this error instead.
+    pub policy_reload_error: Option<String>,
 }
 
 impl Default for FakeState {
@@ -1292,6 +1408,12 @@ impl Default for FakeState {
             fail_chown: Vec::new(),
             fail_primary_gid: Vec::new(),
             dscl: false,
+            policy_reload: ReloadAnswer {
+                loaded: true,
+                reason: String::new(),
+                hash: Some("fake".into()),
+            },
+            policy_reload_error: None,
         }
     }
 }
@@ -1682,6 +1804,37 @@ impl Host for FakeHost {
         Ok(())
     }
 
+    fn owner_uid(&self, path: &Path, on_disk: u32) -> u32 {
+        self.read()
+            .ok()
+            .and_then(|s| {
+                s.chowns
+                    .iter()
+                    .rev()
+                    .find(|c| c.path == path)
+                    .map(|c| c.uid)
+            })
+            .unwrap_or(on_disk)
+    }
+
+    fn policy_reload(
+        &self,
+        socket_dir: &Path,
+        daemon_uid: u32,
+        _wait: Duration,
+    ) -> io::Result<ReloadAnswer> {
+        let line = format!("ipc policy.reload {} {daemon_uid}", socket_dir.display());
+        // The call is recorded even when it fails.
+        let r = self.update(|s| {
+            s.calls.push(line);
+            Ok(match &s.policy_reload_error {
+                Some(e) => Err(e.clone()),
+                None => Ok(s.policy_reload.clone()),
+            })
+        })?;
+        r.map_err(io::Error::other)
+    }
+
     fn systemctl(&self, args: &[&str]) -> io::Result<CmdOutput> {
         let line = call_line("systemctl", args);
         self.update(|s| {
@@ -1793,6 +1946,99 @@ impl Host for FakeHost {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn reload_answer_from_the_daemon_fields() {
+        let m = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let a =
+            ReloadAnswer::from_answer(&m(serde_json::json!({"result": "loaded", "hash": "h1"})));
+        assert_eq!(
+            a,
+            ReloadAnswer {
+                loaded: true,
+                reason: String::new(),
+                hash: Some("h1".into())
+            }
+        );
+        let a = ReloadAnswer::from_answer(&m(
+            serde_json::json!({"result": "rejected", "reason": "bad", "hash": "h0"}),
+        ));
+        assert!(!a.loaded);
+        assert_eq!(a.reason, "bad");
+        assert_eq!(a.hash.as_deref(), Some("h0"));
+        let a = ReloadAnswer::from_answer(&m(serde_json::json!({})));
+        assert!(!a.loaded);
+        assert_eq!(a.reason, "no result in the answer");
+    }
+
+    /// A fake daemon on a socket in a temp dir: answers hello, then
+    /// `policy.reload` with `answer`.
+    #[cfg(target_os = "linux")]
+    fn fake_daemon(
+        dir: &Path,
+        answer: serde_json::Value,
+    ) -> std::thread::JoinHandle<serde_json::Map<String, serde_json::Value>> {
+        use saiife_ipc::frame::{read_frame, write_frame};
+        let l =
+            std::os::unix::net::UnixListener::bind(dir.join(saiife_ipc::msg::SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let h = read_frame(&mut s).unwrap();
+            assert_eq!(h["op"], "hello");
+            write_frame(
+                &mut s,
+                &serde_json::json!({"id": h["id"], "ok": true, "proto": 1}),
+            )
+            .unwrap();
+            let req = read_frame(&mut s).unwrap();
+            let mut a = answer.as_object().unwrap().clone();
+            a.insert("id".into(), req["id"].clone());
+            a.insert("ok".into(), true.into());
+            write_frame(&mut s, &serde_json::Value::Object(a)).unwrap();
+            req
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_reload_over_the_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let t = fake_daemon(
+            d.path(),
+            serde_json::json!({"result": "rejected", "reason": "scope conflict", "hash": "old"}),
+        );
+        let a = call_policy_reload(d.path(), me, Duration::from_secs(5)).unwrap();
+        assert_eq!(t.join().unwrap()["op"], "policy.reload");
+        assert!(!a.loaded);
+        assert_eq!(a.reason, "scope conflict");
+        assert_eq!(a.hash.as_deref(), Some("old"));
+        fs::remove_file(d.path().join(saiife_ipc::msg::SOCKET_NAME)).unwrap();
+        let t = fake_daemon(
+            d.path(),
+            serde_json::json!({"result": "loaded", "hash": "new"}),
+        );
+        let a = call_policy_reload(d.path(), me, Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
+        assert!(a.loaded);
+        assert_eq!(a.hash.as_deref(), Some("new"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn policy_reload_without_a_daemon_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let me = rustix::process::getuid().as_raw();
+        let started = Instant::now();
+        let e = call_policy_reload(d.path(), me, Duration::from_millis(600)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("did not answer"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     fn own_ids() -> (u32, u32) {
         (

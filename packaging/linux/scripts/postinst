@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs locked-mode install after the package lands (plan 18, decision 3).
+# deb: configure, abort-*; rpm: 1 (install), 2 (upgrade).
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure|1|2) ;;
+    *) exit 0 ;;
+esac
+
+rc=0
+/usr/libexec/saiife/saiife system install --fleet || rc=$?
+# 1 = installed, but doctor found failures (already printed): not fatal.
+# 2 = install error or unsupported host: fail loudly, never lock silently.
+if [ "$rc" -eq 1 ]; then
+    exit 0
+fi
+exit "$rc"

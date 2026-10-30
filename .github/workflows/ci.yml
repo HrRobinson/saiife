@@ -90,7 +90,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/locked-macos/*.sh scripts/personal-broker/*.sh scripts/release/*.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/locked-macos/*.sh scripts/personal-broker/*.sh scripts/release/*.sh packaging/linux/build.sh
+      - run: shellcheck -s sh packaging/linux/scripts/* deploy/intune/linux/discovery.sh
+      - run: shellcheck -x scripts/package-linux/run.sh scripts/package-linux/deb.sh
+      - run: shellcheck -s sh scripts/package-linux/rpm-container.sh
+
+  # Lint only: the Ansible role is never run in CI (plan 18, task 5).
+  ansible-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: pipx run --spec ansible-lint==26.10.1 ansible-lint deploy/ansible
 
   # Locked mode on real machines (spec §13 "Daemon integration"): `system
   # install` as root, the §5.2 owners and modes, managed hooks run as an
@@ -180,6 +190,83 @@ jobs:
         with:
           name: locked-macos-logs-${{ matrix.os }}
           path: target/locked-macos-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The deb and rpm (plan 18, Task 3): install (and its refusal), a fleet
+  # config change, upgrade, remove, purge and lintian on real Ubuntu
+  # runners; the rpm in a Rocky 9 container (locked mode refuses containers,
+  # so that row covers payload, scriptlets, refusal, upgrade and removal).
+  # Like locked-linux, scripts/package-linux/run.sh refuses outside GitHub
+  # Actions and calls sudo itself. The binary is the strict release build.
+  package-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, kind: deb }
+          - { os: ubuntu-24.04, kind: deb }
+          - { os: ubuntu-24.04, kind: rpm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: install musl-tools and jq
+        run: sudo apt-get update && sudo apt-get install -y musl-tools jq
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p saiife
+      - name: install nfpm (pinned, sha256 checked)
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^version=//p' packaging/linux/nfpm.version)"
+          sum="$(sed -n 's/^sha256_linux_x86_64=//p' packaging/linux/nfpm.version)"
+          [ -n "$v" ] && [ -n "$sum" ]
+          tgz="$RUNNER_TEMP/nfpm.tar.gz"
+          curl -fsSL -o "$tgz" "https://github.com/goreleaser/nfpm/releases/download/v${v}/nfpm_${v}_Linux_x86_64.tar.gz"
+          echo "$sum  $tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/nfpm-bin"
+          tar -xzf "$tgz" -C "$RUNNER_TEMP/nfpm-bin" nfpm
+          echo "$RUNNER_TEMP/nfpm-bin" >> "$GITHUB_PATH"
+      # old = the cargo version; new = the same build with an extra ELF
+      # section, so its bytes differ and it stays static (upgrade phase).
+      - name: build the old and the new package
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/saiife
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "saiife") | .version')"
+          printf 'upgrade' > "$RUNNER_TEMP/p18-t3-ci-section"
+          objcopy --add-section .saiife_ci="$RUNNER_TEMP/p18-t3-ci-section" "$bin" "$RUNNER_TEMP/saiife-ci1"
+          rm -rf dist
+          bash packaging/linux/build.sh "$bin" "$ver" amd64 dist
+          bash packaging/linux/build.sh "$RUNNER_TEMP/saiife-ci1" "${ver}+ci1" amd64 dist
+          # build.sh writes a Cargo prerelease '-' as '~'.
+          pv="$(printf '%s' "$ver" | tr '-' '~')"
+          ext="${{ matrix.kind }}"
+          if [ "$ext" = deb ]; then
+            echo "OLD_PKG=dist/saiife_${pv}_amd64.deb" >> "$GITHUB_ENV"
+            echo "NEW_PKG=dist/saiife_${pv}+ci1_amd64.deb" >> "$GITHUB_ENV"
+          else
+            echo "OLD_PKG=dist/saiife-${pv}-1.x86_64.rpm" >> "$GITHUB_ENV"
+            echo "NEW_PKG=dist/saiife-${pv}+ci1-1.x86_64.rpm" >> "$GITHUB_ENV"
+          fi
+          ls -l dist
+      - name: install, upgrade, remove (sudo inside, this job only)
+        env:
+          SAIIFE_PACKAGE_CI: "1"
+          SAIIFE_PACKAGE_LOGS: ${{ github.workspace }}/target/package-linux-logs
+        run: bash scripts/package-linux/run.sh "${{ matrix.kind }}" dist "$OLD_PKG" "$NEW_PKG"
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-linux-logs-${{ matrix.os }}-${{ matrix.kind }}
+          path: target/package-linux-logs
           if-no-files-found: ignore
           retention-days: 7
 
