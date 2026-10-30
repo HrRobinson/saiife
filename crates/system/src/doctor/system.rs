@@ -86,6 +86,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
             match i.vault_key {
                 VaultKeyMode::Credential => "encrypted systemd credential",
                 VaultKeyMode::File => "plain key file (systemd < 250)",
+                VaultKeyMode::DaemonFile => "plain key file owned by the daemon user (macOS)",
             },
         ));
     }
@@ -662,6 +663,9 @@ fn files_modes(ctx: &Ctx) -> Check {
                 Ty::File,
                 false,
             ),
+            VaultKeyMode::DaemonFile => {
+                want(VAULT_KEY, l(VAULT_KEY), daemon, 0o400, Ty::File, false)
+            }
         });
     }
     wants.push(want(UNIT, l(UNIT), root, 0o644, Ty::File, false));

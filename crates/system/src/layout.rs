@@ -250,6 +250,8 @@ impl Layout {
 
     /// `abs` below the root. `abs` must be absolute with plain components
     /// only (no `..`, no `.`), so the result never leaves the root.
+    /// Never pass a layout constant: it is joined as given, never mapped,
+    /// so map it with [`Layout::logical`] first (or use [`Layout::at`]).
     pub fn try_at(&self, abs: &Path) -> io::Result<PathBuf> {
         let mut parts = abs.components();
         let rooted = parts.next() == Some(Component::RootDir);

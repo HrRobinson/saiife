@@ -1245,6 +1245,13 @@ pub struct FakeState {
     /// Gids whose `users_with_primary_gid` fails (a directory that could
     /// not be asked, as dscl failing on macOS).
     pub fail_primary_gid: Vec<u32>,
+    /// Acts as macOS's local directory (default false): a created group or
+    /// user gets an id from [`MACOS_ID_RANGE`] ([`pick_free_id`],
+    /// [`pick_user_id`]), a user gets shell `/usr/bin/false` and home
+    /// `/var/empty` and answers `dscl . -read /Users/<name>` as hidden, and
+    /// every account change records its `dscl`/`dseditgroup` argv in
+    /// `calls`.
+    pub dscl: bool,
 }
 
 impl Default for FakeState {
@@ -1262,11 +1269,36 @@ impl Default for FakeState {
             run: BTreeMap::new(),
             fail_chown: Vec::new(),
             fail_primary_gid: Vec::new(),
+            dscl: false,
         }
     }
 }
 
+/// What the fake's `dscl . -read /Users/<name>` prints for a user it made.
+fn fake_dscl_read(uid: u32, gid: u32) -> String {
+    format!(
+        "IsHidden: 1\nNFSHomeDirectory: /var/empty\nPrimaryGroupID: {gid}\n\
+         UniqueID: {uid}\nUserShell: /usr/bin/false\n"
+    )
+}
+
+/// The call line of `dscl . -read /Users/<name>`.
+pub(crate) fn dscl_read_line(name: &str) -> String {
+    format!("{DSCL} . -read /Users/{name}")
+}
+
 impl FakeState {
+    fn taken_ids(&self) -> (BTreeSet<u32>, BTreeSet<u32>) {
+        (
+            self.users.values().map(|u| u.uid).collect(),
+            self.groups.values().copied().collect(),
+        )
+    }
+
+    fn record_argv(&mut self, argv: &[String]) {
+        self.calls.push(argv.join(" "));
+    }
+
     fn user(&self, name: &str) -> Option<UserInfo> {
         if let Some(u) = self.users.get(name) {
             return Some(u.clone());
@@ -1454,6 +1486,16 @@ impl Host for FakeHost {
             if s.group_id(name).is_some() {
                 return Err(already("group", name));
             }
+            if s.dscl {
+                let (uids, gids) = s.taken_ids();
+                let gid = pick_free_id(&uids, &gids)
+                    .ok_or_else(|| io::Error::other("no free id in the macOS range"))?;
+                for argv in argv_dscl_group(name, gid) {
+                    s.record_argv(&argv);
+                }
+                s.groups.insert(name.to_string(), gid);
+                return Ok(());
+            }
             s.groups
                 .insert(name.to_string(), rustix::process::getgid().as_raw());
             Ok(())
@@ -1467,6 +1509,32 @@ impl Host for FakeHost {
                 return Err(already("user", name));
             }
             let gid = s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if s.dscl {
+                let (uids, gids) = s.taken_ids();
+                let uid = pick_user_id(gid, &uids, &gids)
+                    .ok_or_else(|| io::Error::other("no free id in the macOS range"))?;
+                for argv in argv_dscl_user(name, uid, gid) {
+                    s.record_argv(&argv);
+                }
+                s.users.insert(
+                    name.to_string(),
+                    UserInfo {
+                        uid,
+                        gid,
+                        home: PathBuf::from("/var/empty"),
+                        shell: "/usr/bin/false".to_string(),
+                    },
+                );
+                s.run.insert(
+                    dscl_read_line(name),
+                    CmdOutput {
+                        status: 0,
+                        stdout: fake_dscl_read(uid, gid),
+                        stderr: String::new(),
+                    },
+                );
+                return Ok(());
+            }
             s.users.insert(
                 name.to_string(),
                 UserInfo {
@@ -1485,6 +1553,9 @@ impl Host for FakeHost {
         self.update(|s| {
             s.user(user).ok_or_else(|| missing("user", user))?;
             s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if s.dscl {
+                s.record_argv(&argv_dseditgroup(true, user, group)?);
+            }
             let m = s.members.entry(group.to_string()).or_default();
             if !m.iter().any(|u| u == user) {
                 m.push(user.to_string());
@@ -1497,6 +1568,10 @@ impl Host for FakeHost {
         check_names(&[name])?;
         self.update(|s| {
             s.users.remove(name).ok_or_else(|| missing("user", name))?;
+            if s.dscl {
+                s.record_argv(&argv_dscl_delete_user(name)?);
+                s.run.remove(&dscl_read_line(name));
+            }
             for m in s.members.values_mut() {
                 m.retain(|u| u != name);
             }
@@ -1510,6 +1585,9 @@ impl Host for FakeHost {
             s.groups
                 .remove(name)
                 .ok_or_else(|| missing("group", name))?;
+            if s.dscl {
+                s.record_argv(&argv_dscl_delete_group(name)?);
+            }
             s.members.remove(name);
             Ok(())
         })
@@ -1519,6 +1597,9 @@ impl Host for FakeHost {
         check_names(&[user, group])?;
         self.update(|s| {
             s.group_id(group).ok_or_else(|| missing("group", group))?;
+            if s.dscl {
+                s.record_argv(&argv_dseditgroup(false, user, group)?);
+            }
             if let Some(m) = s.members.get_mut(group) {
                 m.retain(|u| u != user);
             }

@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authright;
 pub mod binary;
 pub mod default_config;
 pub mod doctor;

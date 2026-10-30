@@ -303,6 +303,7 @@ impl Etc {
             memberships: vec![],
             dirs: vec![],
             files: vec![],
+            auth_rights: vec![],
             agents: agents
                 .iter()
                 .map(|(a, sha)| ManagedAgent {

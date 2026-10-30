@@ -480,6 +480,68 @@ pub fn fake_elf(interp: Option<&str>, needed: usize, marker: Option<bool>) -> Ve
     out
 }
 
+/// A thin Mach-O for tests: with `sig` (CodeDirectory flags, CMS blob)
+/// one `LC_CODE_SIGNATURE`, then `marker` and the signature.
+#[doc(hidden)]
+pub fn fake_macho_with(sig: Option<(u32, bool)>, marker: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; MACH_HEADER_64];
+    out[..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+    out[16..20].copy_from_slice(&u32::from(sig.is_some()).to_le_bytes());
+    out[20..24].copy_from_slice(&16u32.to_le_bytes());
+    if let Some((flags, cms)) = sig {
+        let sig_off = (MACH_HEADER_64 + 16 + marker.len()) as u32;
+        let mut cd = vec![0u8; 44];
+        cd[..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+        cd[4..8].copy_from_slice(&44u32.to_be_bytes());
+        cd[12..16].copy_from_slice(&flags.to_be_bytes());
+        let n: u32 = if cms { 2 } else { 1 };
+        let base = 12 + 8 * n;
+        let mut sb = CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes().to_vec();
+        sb.extend_from_slice(&0u32.to_be_bytes());
+        sb.extend_from_slice(&n.to_be_bytes());
+        sb.extend_from_slice(&CSSLOT_CODEDIRECTORY.to_be_bytes());
+        sb.extend_from_slice(&base.to_be_bytes());
+        if cms {
+            sb.extend_from_slice(&CSSLOT_SIGNATURESLOT.to_be_bytes());
+            sb.extend_from_slice(&(base + 44).to_be_bytes());
+        }
+        sb.extend_from_slice(&cd);
+        if cms {
+            sb.extend_from_slice(&0xfade_0b01u32.to_be_bytes());
+            sb.extend_from_slice(&12u32.to_be_bytes());
+            sb.extend_from_slice(&[1, 2, 3, 4]);
+        }
+        let total = sb.len() as u32;
+        sb[4..8].copy_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&sig_off.to_le_bytes());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(marker);
+        out.extend_from_slice(&sb);
+    } else {
+        out.extend_from_slice(marker);
+    }
+    out
+}
+
+/// A thin Mach-O with the release build marker, for tests: unsigned
+/// (`None`) or signed with `(adhoc, hardened_runtime, cms)`.
+#[doc(hidden)]
+pub fn fake_macho(sig: Option<(bool, bool, bool)>) -> Vec<u8> {
+    let sig = sig.map(|(adhoc, runtime, cms)| {
+        let mut flags = 0;
+        if adhoc {
+            flags |= CS_ADHOC;
+        }
+        if runtime {
+            flags |= CS_RUNTIME;
+        }
+        (flags, cms)
+    });
+    fake_macho_with(sig, &build_marker(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,47 +603,7 @@ mod tests {
         macho_with(Some((flags, cms)), &build_marker(false))
     }
 
-    fn macho_with(sig: Option<(u32, bool)>, marker: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; MACH_HEADER_64];
-        out[..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
-        out[16..20].copy_from_slice(&u32::from(sig.is_some()).to_le_bytes());
-        out[20..24].copy_from_slice(&16u32.to_le_bytes());
-        if let Some((flags, cms)) = sig {
-            let sig_off = (MACH_HEADER_64 + 16 + marker.len()) as u32;
-            let mut cd = vec![0u8; 44];
-            cd[..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
-            cd[4..8].copy_from_slice(&44u32.to_be_bytes());
-            cd[12..16].copy_from_slice(&flags.to_be_bytes());
-            let n: u32 = if cms { 2 } else { 1 };
-            let base = 12 + 8 * n;
-            let mut sb = CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes().to_vec();
-            sb.extend_from_slice(&0u32.to_be_bytes());
-            sb.extend_from_slice(&n.to_be_bytes());
-            sb.extend_from_slice(&CSSLOT_CODEDIRECTORY.to_be_bytes());
-            sb.extend_from_slice(&base.to_be_bytes());
-            if cms {
-                sb.extend_from_slice(&CSSLOT_SIGNATURESLOT.to_be_bytes());
-                sb.extend_from_slice(&(base + 44).to_be_bytes());
-            }
-            sb.extend_from_slice(&cd);
-            if cms {
-                sb.extend_from_slice(&0xfade_0b01u32.to_be_bytes());
-                sb.extend_from_slice(&12u32.to_be_bytes());
-                sb.extend_from_slice(&[1, 2, 3, 4]);
-            }
-            let total = sb.len() as u32;
-            sb[4..8].copy_from_slice(&total.to_be_bytes());
-            out.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
-            out.extend_from_slice(&16u32.to_le_bytes());
-            out.extend_from_slice(&sig_off.to_le_bytes());
-            out.extend_from_slice(&total.to_le_bytes());
-            out.extend_from_slice(marker);
-            out.extend_from_slice(&sb);
-        } else {
-            out.extend_from_slice(marker);
-        }
-        out
-    }
+    use super::fake_macho_with as macho_with;
 
     #[test]
     fn hardened_runtime_flag_read() {
