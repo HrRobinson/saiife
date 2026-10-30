@@ -46,6 +46,10 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.push(files_installed(ctx, i));
     }
     out.push(files_binary(ctx));
+    #[cfg(target_os = "linux")]
+    if ctx.installed.is_some() {
+        out.extend(files_package(ctx));
+    }
     out.push(files_modes(ctx));
     out.push(keys(ctx));
     out.push(audit_group(ctx));
@@ -53,6 +57,9 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
     out.push(daemon_unit(ctx));
     out.push(daemon_health(ctx));
     if let Some(i) = &ctx.installed {
+        if i.agents.is_empty() {
+            out.push(Check::new("agents", Status::Warn, "agents", NO_AGENTS));
+        }
         out.extend(i.agents.iter().map(|a| agent_label(&a.agent)));
     }
     if let Ok(p) = &ctx.config {
@@ -511,6 +518,49 @@ fn files_binary(ctx: &Ctx) -> Check {
             format!("{BINARY}: no saiife build marker; its build is unknown"),
         ),
     }
+}
+
+/// A package's staging copy ([`PACKAGE_BINARY`]) must be what install
+/// copied to [`BINARY`]: after a package upgrade whose `postinst` did not
+/// run (or failed), the hooks still run the old binary. Only when the
+/// package binary exists (a package install).
+#[cfg(target_os = "linux")]
+fn files_package(ctx: &Ctx) -> Option<Check> {
+    const ID: &str = "files.package";
+    const TITLE: &str = "package binary";
+    let package = ctx.layout.at(PACKAGE_BINARY);
+    if fs::symlink_metadata(&package).is_err() {
+        return None;
+    }
+    let read = |p: &Path| crate::fsops::sha256_file(p);
+    let (pkg, opt) = match (read(&package), read(&ctx.layout.at(BINARY))) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            let status = if e.kind() == io::ErrorKind::PermissionDenied && !ctx.as_root {
+                Status::Info
+            } else {
+                Status::Warn
+            };
+            return Some(Check::new(
+                ID,
+                status,
+                TITLE,
+                format!("cannot compare: {e}"),
+            ));
+        }
+    };
+    if pkg.is_some() && pkg == opt {
+        return Some(Check::new(ID, Status::Pass, TITLE, ""));
+    }
+    Some(Check::new(
+        ID,
+        Status::Warn,
+        TITLE,
+        format!(
+            "the package's {PACKAGE_BINARY} differs from {BINARY}: \
+             run sudo {PACKAGE_BINARY} system install --fleet"
+        ),
+    ))
 }
 
 /// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
@@ -1666,6 +1716,66 @@ mod tests {
         fs::remove_file(t.at(BINARY)).unwrap();
         let r = t.doctor();
         assert_eq!(get(&r, "files.binary").detail, format!("{BINARY}: missing"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn put_package(t: &T, bytes: &[u8]) {
+        let p = t.at(PACKAGE_BINARY);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, bytes).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_binary_same_passes() {
+        let t = T::installed();
+        put_package(&t, &fs::read(t.at(BINARY)).unwrap());
+        let r = t.doctor();
+        assert_status(&r, "files.package", Status::Pass);
+        assert_eq!(get(&r, "files.package").title, "package binary");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_binary_drift_warns() {
+        let t = T::installed();
+        let mut newer = fs::read(t.at(BINARY)).unwrap();
+        newer.extend_from_slice(b"v2");
+        put_package(&t, &newer);
+        let r = t.doctor();
+        assert_status(&r, "files.package", Status::Warn);
+        assert_eq!(
+            get(&r, "files.package").detail,
+            "the package's /usr/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
+             run sudo /usr/libexec/saiife/saiife system install --fleet"
+        );
+        // A missing /opt binary is drift too.
+        fs::remove_file(t.at(BINARY)).unwrap();
+        assert_status(&t.doctor(), "files.package", Status::Warn);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_package_binary_no_check() {
+        let t = T::installed();
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "files.package"));
+        // Nor without installed.toml.
+        put_package(&t, &fs::read(t.at(BINARY)).unwrap());
+        fs::remove_file(t.at(INSTALLED)).unwrap();
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "files.package"));
+    }
+
+    #[test]
+    fn no_agents_warns() {
+        let t = T::installed();
+        assert!(!t.doctor().checks.iter().any(|c| c.id == "agents"));
+        t.edit_installed(|i| i.agents.clear());
+        let r = t.doctor();
+        assert_status(&r, "agents", Status::Warn);
+        assert_eq!(
+            get(&r, "agents").detail,
+            "no agents listed: no agent is guarded"
+        );
     }
 
     #[test]

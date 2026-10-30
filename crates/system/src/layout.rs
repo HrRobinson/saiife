@@ -26,6 +26,18 @@ pub const POLKIT_ACTION_ID: &str = "com.saiife.approve";
 pub const REAUTH_UNAVAILABLE: &str =
     "re-authentication unavailable: approvals need a second account";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
+/// The warning when an install lists no agents (install and doctor).
+pub const NO_AGENTS: &str = "no agents listed: no agent is guarded";
+/// Root-owned install options for packages and MDM tools (`system install
+/// --fleet`, plan 18 decision 2).
+pub const FLEET_DIR: &str = "/etc/saiife/fleet";
+/// The fleet's system config: copied to [`CONFIG`] on every `--fleet` run.
+pub const FLEET_CONFIG: &str = "/etc/saiife/fleet/config.toml";
+/// The fleet's `agents` and `approvers`.
+pub const FLEET_INSTALL: &str = "/etc/saiife/fleet/install.toml";
+/// The staging copy a Linux package ships; `install` copies it to [`BINARY`].
+#[cfg(target_os = "linux")]
+pub const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
 
 /// The polkit action file, byte for byte. `auth_self`, never
 /// `auth_self_keep`: every approval asks for the password again. The
@@ -309,5 +321,10 @@ mod tests {
         assert_eq!(DAEMON_GROUP, "saiife");
         assert_eq!(AUDIT_GROUP, "saiife-audit");
         assert_eq!(UNIT_NAME, "saiifed.service");
+        assert_eq!(FLEET_DIR, "/etc/saiife/fleet");
+        assert_eq!(FLEET_CONFIG, "/etc/saiife/fleet/config.toml");
+        assert_eq!(FLEET_INSTALL, "/etc/saiife/fleet/install.toml");
+        #[cfg(target_os = "linux")]
+        assert_eq!(PACKAGE_BINARY, "/usr/libexec/saiife/saiife");
     }
 }

@@ -1,0 +1,15 @@
+---
+galaxy_info:
+  author: saiife
+  description: Install the saiife package and the fleet files for locked mode
+  license: FSL-1.1-ALv2
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: Debian
+      versions: [bookworm]
+    - name: EL
+      versions: ["9"]
+  galaxy_tags: [saiife, security]
+dependencies: []

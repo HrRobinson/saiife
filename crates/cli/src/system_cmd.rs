@@ -9,6 +9,7 @@ use clap::Subcommand;
 use saiife_agents::Agent;
 use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
+use saiife_system::fleet::fleet_options;
 use saiife_system::install::{install, InstallError, InstallOptions};
 use saiife_system::uninstall::{uninstall, UninstallOptions};
 use saiife_system::{host_for, refusal_line, Host, Layout};
@@ -38,6 +39,9 @@ pub enum SystemAction {
         /// Never ask (install asks nothing yet; for scripts).
         #[arg(long)]
         non_interactive: bool,
+        /// Read the install options from /etc/saiife/fleet/ (packages and MDM tools)
+        #[arg(long, conflicts_with_all = ["config", "agents", "approvers"])]
+        fleet: bool,
         /// Install below this directory with a fake host (tests only).
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -95,9 +99,9 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
 }
 
 /// `doctor` after a successful install (spec §7): its text on stdout.
-/// Exit 0 when it found nothing worse than a warning, 1 on a failure (the
-/// install itself stays done; install errors are exit 2).
-fn after_install_doctor(layout: &Layout, host: &dyn Host) -> ExitCode {
+/// True when it found a failure (the caller exits 1; the install itself
+/// stays done; install errors are exit 2).
+fn after_install_doctor(layout: &Layout, host: &dyn Host) -> bool {
     let opts = DoctorOptions {
         user: None,
         home: std::env::var_os("HOME")
@@ -111,9 +115,9 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> ExitCode {
         eprintln!(
             "saiife: installed, but doctor found failures: fix them before relying on the lock"
         );
-        ExitCode::from(1)
+        true
     } else {
-        ExitCode::SUCCESS
+        false
     }
 }
 
@@ -124,6 +128,7 @@ pub fn run(action: SystemAction) -> ExitCode {
             agents,
             approvers,
             non_interactive,
+            fleet,
             root,
             allow_test_build,
         } => {
@@ -140,12 +145,22 @@ pub fn run(action: SystemAction) -> ExitCode {
                     ))
                 }
             };
-            let opts = InstallOptions {
-                config,
-                agents,
-                approvers,
-                non_interactive,
-                allow_test_build,
+            let opts = if fleet {
+                match fleet_options(&layout, host.as_ref()) {
+                    Ok(o) => InstallOptions {
+                        allow_test_build,
+                        ..o
+                    },
+                    Err(e) => return report_error("install", e),
+                }
+            } else {
+                InstallOptions {
+                    config,
+                    agents,
+                    approvers,
+                    non_interactive,
+                    allow_test_build,
+                }
             };
             match install(&layout, host.as_ref(), &opts, &binary) {
                 Ok(r) => {
@@ -160,7 +175,25 @@ pub fn run(action: SystemAction) -> ExitCode {
                     } else {
                         println!("saiife: locked mode is installed; the daemon is running");
                     }
-                    after_install_doctor(&layout, host.as_ref())
+                    if let Some(h) = &r.policy_hash {
+                        println!("saiife: the daemon reloaded the new config (policy {h})");
+                    }
+                    let doctor_failed = after_install_doctor(&layout, host.as_ref());
+                    // Last, so it is the line an admin sees: the old policy
+                    // may still be in force.
+                    if let Some(p) = &r.reload_problem {
+                        eprintln!("saiife: error: {p}");
+                        eprintln!(
+                            "saiife: installed, but the running daemon may still enforce the old \
+                             policy: fix the config, then run `saiife policy reload` or \
+                             `systemctl restart saiifed`"
+                        );
+                    }
+                    if doctor_failed || r.reload_problem.is_some() {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
                 }
                 Err(e) => report_error("install", e),
             }

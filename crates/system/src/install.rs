@@ -43,7 +43,17 @@ pub struct InstallReport {
     /// Said but not refused: a test build under `--root` or with
     /// `--allow-test-build`.
     pub warnings: Vec<String>,
+    /// After a reload: the policy hash the daemon confirmed it enforces.
+    pub policy_hash: Option<String>,
+    /// After a reload: why the daemon is not known to enforce the new
+    /// config (it rejected it, or did not answer). Installed, but the old
+    /// policy may still be in force: the CLI exits 1.
+    pub reload_problem: Option<String>,
 }
+
+/// The start of [`InstallReport::reload_problem`] (the Ansible role and
+/// the docs match on it).
+pub const RELOAD_NOT_TAKEN: &str = "the daemon did not take the new config";
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -71,6 +81,8 @@ type EntryFn = fn(&Path) -> Result<Option<String>, AgentError>;
 
 /// How long a system install waits for the daemon's socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
+/// How long install waits for the daemon to confirm a reload.
+const RELOAD_WAIT: Duration = Duration::from_secs(15);
 
 pub(crate) fn step(name: &str) -> impl Fn(io::Error) -> InstallError + '_ {
     move |e| InstallError::Step {
@@ -86,7 +98,7 @@ fn agent_step(name: &str) -> impl Fn(AgentError) -> InstallError + '_ {
     }
 }
 
-fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
+pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
     InstallError::Refused {
         path: path.to_path_buf(),
         detail: detail.into(),
@@ -132,7 +144,9 @@ pub fn install(
         }
     }
     let new_config = match &opts.config {
-        Some(p) => Some(validated_config(p)?),
+        // Checked with the drop-ins it will be loaded with: the live
+        // policy.d, not the one beside the file.
+        Some(p) => Some(validated_config(p, &layout.at(POLICY_D))?),
         None => None,
     };
     // The bytes checked are the bytes copied.
@@ -207,7 +221,7 @@ pub fn install(
     // 4. The binary.
     let binary_changed = run.binary(&binary_bytes)?;
     // 5. /etc/saiife, policy.d, config.toml.
-    run.config(new_config.as_deref(), &opts.approvers)?;
+    let config_changed = run.config(new_config.as_deref(), &opts.approvers)?;
     // 5b. The polkit action, when polkit is there.
     run.polkit()?;
     // 6. The vault key.
@@ -218,6 +232,9 @@ pub fn install(
     let mut agents = opts.agents.clone();
     agents.sort();
     agents.dedup();
+    if agents.is_empty() {
+        run.report.warnings.push(NO_AGENTS.to_string());
+    }
     let claude = agents.contains(&Agent::Claude);
     for a in agents {
         run.managed(a)?;
@@ -229,8 +246,12 @@ pub fn install(
     }
     run.save()?;
     // 9. Start (or restart) the daemon.
-    // A running daemon picks up a new group membership only at start.
-    run.start(binary_changed || unit_changed || member_added)?;
+    // A running daemon picks up a new group membership only at start. A
+    // new config.toml alone is a reload (SIGHUP, the unit's ExecReload).
+    run.start(
+        binary_changed || unit_changed || member_added,
+        config_changed,
+    )?;
     // 10. Wait for the socket on the real machine.
     if layout.is_system() {
         let sock = layout.at(SOCKET);
@@ -380,25 +401,7 @@ const MAX_PREVIOUS: u64 = 1024 * 1024;
 /// (binary, unit, managed configs) are not taken over; their `created`
 /// flags are found again on the next write.
 pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installed> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let p = layout.at(PREVIOUS);
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
-        .open(&p)
-        .ok()?;
-    let m = f.metadata().ok()?;
-    let root_uid = host.user("root")?.uid;
-    if !m.is_file() || m.uid() != root_uid || m.mode() & 0o7777 != 0o600 || m.len() > MAX_PREVIOUS {
-        return None;
-    }
-    let mut text = String::new();
-    f.take(MAX_PREVIOUS).read_to_string(&mut text).ok()?;
-    let mut i: Installed = toml::from_str(&text).ok()?;
-    if i.version != INSTALLED_VERSION {
-        return None;
-    }
+    let mut i = read_previous_record(layout, host)?;
     i.users.retain(|u| u == DAEMON_USER);
     i.groups.retain(|g| g == DAEMON_GROUP || g == AUDIT_GROUP);
     i.memberships
@@ -428,6 +431,31 @@ pub(crate) fn read_previous(layout: &Layout, host: &dyn Host) -> Option<Installe
     Some(i)
 }
 
+/// The copy a plain uninstall left, whole, with the checks of
+/// [`read_previous`] on the file (root's, 0600, a regular file opened
+/// without following a symlink, at most 1 MiB) but none on its content.
+/// For what it says about the admin's choices (the agents), never for
+/// what install may take over.
+pub(crate) fn read_previous_record(layout: &Layout, host: &dyn Host) -> Option<Installed> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let p = layout.at(PREVIOUS);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(&p)
+        .ok()?;
+    let m = f.metadata().ok()?;
+    let root_uid = host.user("root")?.uid;
+    if !m.is_file() || m.uid() != root_uid || m.mode() & 0o7777 != 0o600 || m.len() > MAX_PREVIOUS {
+        return None;
+    }
+    let mut text = String::new();
+    f.take(MAX_PREVIOUS).read_to_string(&mut text).ok()?;
+    let i: Installed = toml::from_str(&text).ok()?;
+    (i.version == INSTALLED_VERSION).then_some(i)
+}
+
 /// A directory root writes into must be root's and not writable by group
 /// or others (sticky dirs excepted), so no other user can swap what is
 /// below it while install or uninstall works there.
@@ -447,18 +475,28 @@ pub(crate) fn check_trusted_owner_mode(
     mode: u32,
     root_uid: u32,
 ) -> Result<(), InstallError> {
+    check_owner_mode_for(p, uid, mode, root_uid, "saiife does not write below it")
+}
+
+/// [`check_trusted_owner_mode`] with the consequence the refusal names
+/// (`saiife does not ...`).
+pub(crate) fn check_owner_mode_for(
+    p: &Path,
+    uid: u32,
+    mode: u32,
+    root_uid: u32,
+    consequence: &str,
+) -> Result<(), InstallError> {
     if uid != root_uid {
         return Err(refused(
             p,
-            format!("exists and is owned by uid {uid}, not root; saiife does not write below it"),
+            format!("exists and is owned by uid {uid}, not root; {consequence}"),
         ));
     }
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Err(refused(
             p,
-            format!(
-                "mode {mode:04o} is writable by group or others; saiife does not write below it"
-            ),
+            format!("mode {mode:04o} is writable by group or others; {consequence}"),
         ));
     }
     Ok(())
@@ -548,9 +586,9 @@ fn check_state_paths(layout: &Layout, host: &dyn Host) -> Result<(), InstallErro
 
 /// The `--config` file: it loads and checks (unknown keys, scopes) and says
 /// `locked = true`. Returns its text.
-fn validated_config(path: &Path) -> Result<String, InstallError> {
+fn validated_config(path: &Path, dropins: &Path) -> Result<String, InstallError> {
     let text = std::fs::read_to_string(path).map_err(|e| refused(path, e.to_string()))?;
-    let loaded = saiife_policy::load_and_check(path, &saiife_policy::Getent)
+    let loaded = saiife_policy::load_and_check_with(path, dropins, &saiife_policy::Getent)
         .map_err(|e| refused(path, e.to_string()))?;
     if !loaded.config.locked {
         return Err(refused(
@@ -762,7 +800,8 @@ impl Run<'_> {
         self.file(BINARY, bytes, 0o755, FileKind::Binary, "binary")
     }
 
-    fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<(), InstallError> {
+    /// True when config.toml was written.
+    fn config(&mut self, new: Option<&str>, approvers: &[String]) -> Result<bool, InstallError> {
         self.dir(ETC_DIR, 0o755, true)?;
         self.dir(POLICY_D, 0o755, true)?;
         let p = self.at(CONFIG);
@@ -772,15 +811,12 @@ impl Run<'_> {
                 // An existing config is kept as it is.
                 Some(_) => {
                     let current = std::fs::read(&p).map_err(step("config"))?;
-                    return self
-                        .file(CONFIG, &current, 0o644, FileKind::Config, "config")
-                        .map(|_| ());
+                    return self.file(CONFIG, &current, 0o644, FileKind::Config, "config");
                 }
                 None => default_config(self.layout, approvers, self.polkit),
             },
         };
         self.file(CONFIG, text.as_bytes(), 0o644, FileKind::Config, "config")
-            .map(|_| ())
     }
 
     /// The polkit action file (root:root 0644), only when `pkcheck` exists.
@@ -974,7 +1010,10 @@ impl Run<'_> {
         }
     }
 
-    fn start(&mut self, changed: bool) -> Result<(), InstallError> {
+    /// Starts the daemon, or restarts it when `changed` (binary, unit or
+    /// membership). A running daemon whose only change is `config_changed`
+    /// is reloaded instead.
+    fn start(&mut self, changed: bool, config_changed: bool) -> Result<(), InstallError> {
         let fail = |detail: String| InstallError::Step {
             step: "start".into(),
             detail: format!("{detail} (see: journalctl -u saiifed)"),
@@ -990,8 +1029,11 @@ impl Run<'_> {
             .host
             .systemctl(&["is-active", UNIT_NAME])
             .is_ok_and(|o| o.status == 0 && o.stdout.trim() == "active");
+        let reloading = !changed && config_changed && active;
         let args: &[&str] = if changed && active {
             &["restart", UNIT_NAME]
+        } else if reloading {
+            &["reload", UNIT_NAME]
         } else {
             &["enable", "--now", UNIT_NAME]
         };
@@ -1004,7 +1046,37 @@ impl Run<'_> {
                 msg.to_string()
             }));
         }
+        if reloading {
+            self.confirm_reload();
+        }
         Ok(())
+    }
+
+    /// `systemctl reload` only sends SIGHUP: the daemon may still reject
+    /// the new config and keep the old policy. `policy.reload` loads it
+    /// again and answers synchronously (it waits for the SIGHUP reload to
+    /// finish), so its answer says what the daemon enforces now.
+    fn confirm_reload(&mut self) {
+        let why = match self.host.user(DAEMON_USER) {
+            None => format!("user {DAEMON_USER} not found"),
+            Some(u) => match self
+                .host
+                .policy_reload(&self.at(RUN_DIR), u.uid, RELOAD_WAIT)
+            {
+                Ok(a) if a.loaded => {
+                    self.report.policy_hash = a.hash;
+                    return;
+                }
+                Ok(a) => format!(
+                    "it rejected the new config and keeps the old policy: {}",
+                    a.reason
+                ),
+                Err(e) => format!("it did not confirm the reload: {e}"),
+            },
+        };
+        self.report.reload_problem = Some(format!(
+            "{RELOAD_NOT_TAKEN} ({CONFIG}): {why} (see: journalctl -u saiifed)"
+        ));
     }
 }
 
@@ -1595,6 +1667,190 @@ pub(crate) mod tests {
         assert!(!calls.iter().any(|c| c.contains("enable --now")));
         assert_eq!(fs::read(e.at(BINARY)).unwrap(), v2);
         assert_eq!(r.changed, vec!["/opt/saiife/bin/saiife".to_string()]);
+    }
+
+    fn config_file(e: &Env, name: &str, budget: u32) -> InstallOptions {
+        let p = e.src.path().join(name);
+        fs::write(
+            &p,
+            format!("version = 2\nlocked = true\n\n[guard]\nbudget_ms = {budget}\n"),
+        )
+        .unwrap();
+        let mut o = all_agents();
+        o.config = Some(p);
+        o
+    }
+
+    #[test]
+    fn no_agents_warns() {
+        let e = env(255);
+        let mut o = all_agents();
+        o.agents = Vec::new();
+        let r = e.run(&o).unwrap();
+        assert!(
+            r.warnings.contains(&NO_AGENTS.to_string()),
+            "{:?}",
+            r.warnings
+        );
+        assert!(!e.at(CLAUDE_MANAGED).exists());
+        let r = e.install();
+        assert!(
+            !r.warnings.contains(&NO_AGENTS.to_string()),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn config_change_reloads_running_daemon() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host.set(|s| s.calls.clear());
+        let r = e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        assert_eq!(r.changed, vec![CONFIG.to_string()]);
+        let calls = e.host.state().calls;
+        assert!(
+            calls.contains(&"systemctl reload saiifed.service".to_string()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+        // The reload is confirmed over the socket, after the SIGHUP.
+        let pos = |want: &str| calls.iter().position(|c| c.starts_with(want));
+        let ipc = pos("ipc policy.reload ").expect("policy.reload call");
+        assert!(pos("systemctl reload").unwrap() < ipc, "{calls:?}");
+        assert!(
+            calls[ipc].contains(&e.at(RUN_DIR).display().to_string()),
+            "{calls:?}"
+        );
+        assert_eq!(r.policy_hash.as_deref(), Some("fake"));
+        assert_eq!(r.reload_problem, None);
+        // Not running: a new config is a plain start, never a reload.
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let calls = e.host.state().calls;
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"systemctl enable --now saiifed.service".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("ipc policy.reload")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_reload_is_reported() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host.set(|s| {
+            s.policy_reload = crate::host::ReloadAnswer {
+                loaded: false,
+                reason: "bad drop-in".into(),
+                hash: Some("old".into()),
+            }
+        });
+        let r = e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let p = r.reload_problem.expect("a reload problem");
+        assert!(p.starts_with(RELOAD_NOT_TAKEN), "{p}");
+        assert!(p.contains("rejected the new config"), "{p}");
+        assert!(p.contains("bad drop-in"), "{p}");
+        assert_eq!(r.policy_hash, None);
+        // Installed all the same: the new config is in place.
+        assert!(fs::read_to_string(e.at(CONFIG)).unwrap().contains("40"));
+    }
+
+    #[test]
+    fn unanswered_reload_is_reported() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host
+            .set(|s| s.policy_reload_error = Some("no answer within 15 s".into()));
+        let r = e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let p = r.reload_problem.expect("a reload problem");
+        assert!(p.starts_with(RELOAD_NOT_TAKEN), "{p}");
+        assert!(p.contains("did not confirm the reload: no answer"), "{p}");
+        // A restart (binary changed) needs no confirmation: the daemon
+        // starts on the new config or not at all.
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host
+            .set(|s| s.policy_reload_error = Some("unreachable".into()));
+        let mut v2 = crate::binary::fake_elf(None, 0, Some(false));
+        v2.extend_from_slice(b"v2");
+        fs::write(&e.binary, &v2).unwrap();
+        let r = e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        assert_eq!(r.reload_problem, None);
+    }
+
+    /// The config is checked with the drop-ins the daemon will load: the
+    /// live policy.d, not one beside the source file.
+    #[test]
+    fn config_checked_against_the_live_policy_d() {
+        let e = env(255);
+        e.install();
+        let bad = "this is = not toml [\n";
+        fs::write(e.at(POLICY_D).join("50-bad.toml"), bad).unwrap();
+        let err = e.run(&config_file(&e, "a.toml", 30)).unwrap_err();
+        assert!(err.to_string().contains("50-bad.toml"), "{err}");
+        fs::remove_file(e.at(POLICY_D).join("50-bad.toml")).unwrap();
+        // A broken policy.d beside the source config is not what the
+        // daemon loads: it does not matter.
+        let side = e.src.path().join("policy.d");
+        fs::create_dir_all(&side).unwrap();
+        fs::write(side.join("50-bad.toml"), bad).unwrap();
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+    }
+
+    #[test]
+    fn same_config_no_reload() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        // Without --config the current file is kept: no reload either.
+        e.install();
+        let calls = e.host.state().calls;
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("restart")), "{calls:?}");
+    }
+
+    #[test]
+    fn binary_and_config_change_restarts_only() {
+        let e = env(255);
+        e.run(&config_file(&e, "a.toml", 30)).unwrap();
+        set_active(&e.host);
+        let mut v2 = crate::binary::fake_elf(None, 0, Some(false));
+        v2.extend_from_slice(b"v2");
+        fs::write(&e.binary, &v2).unwrap();
+        e.host.set(|s| s.calls.clear());
+        e.run(&config_file(&e, "b.toml", 40)).unwrap();
+        let calls = e.host.state().calls;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| *c == "systemctl restart saiifed.service")
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("reload saiifed")),
+            "{calls:?}"
+        );
     }
 
     /// The daemon regroups the audit dir at start: a membership added while

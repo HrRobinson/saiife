@@ -111,6 +111,18 @@ pub fn load_and_check(
     Ok(loaded)
 }
 
+/// [`load_and_check`] with the drop-ins from `dropin_dir` (see
+/// [`crate::load::load_system_with`]).
+pub fn load_and_check_with(
+    config_file: &Path,
+    dropin_dir: &Path,
+    dir: &dyn Directory,
+) -> Result<LoadedPolicy, PolicyError> {
+    let loaded = crate::load::load_system_with(config_file, dropin_dir)?;
+    check_scopes(&loaded.config, dir)?;
+    Ok(loaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

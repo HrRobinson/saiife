@@ -1,0 +1,188 @@
+---
+- name: Check the host is supported and the required variables are set
+  ansible.builtin.assert:
+    that:
+      - ansible_service_mgr == "systemd"
+      - >-
+        (ansible_distribution == "Ubuntu" and ansible_distribution_version is version("22.04", ">="))
+        or (ansible_distribution == "Debian" and ansible_distribution_version is version("12", ">="))
+        or (ansible_os_family == "RedHat" and ansible_distribution != "Fedora"
+        and ansible_distribution_major_version | int >= 9)
+      - ansible_architecture in ["x86_64", "aarch64"]
+      - saiife_version | length > 0
+      - saiife_config_src | length > 0
+      - saiife_agents is sequence
+    fail_msg: >-
+      saiife supports Ubuntu 22.04+, Debian 12+ and RHEL-family 9+ on x86_64 or
+      aarch64 with systemd, and needs saiife_version and saiife_config_src.
+    quiet: true
+
+- name: Refuse saiife_approvers (approvers live in the fleet config)
+  ansible.builtin.assert:
+    that:
+      - saiife_approvers is not defined
+    fail_msg: >-
+      saiife_approvers is gone: with a fleet config, install refuses approvers in
+      install.toml. Set [approval] approvers in the file saiife_config_src names.
+    quiet: true
+
+- name: Work out the package file for this host
+  ansible.builtin.set_fact:
+    saiife_pkg_file: >-
+      {{ 'saiife_%s_%s.deb' | format(saiife_version, 'amd64' if ansible_architecture == 'x86_64' else 'arm64')
+         if ansible_os_family == 'Debian'
+         else 'saiife-%s-1.%s.rpm' | format(saiife_version, ansible_architecture) }}
+
+- name: Require a SHA-256 for that package file
+  ansible.builtin.assert:
+    that:
+      - saiife_package_sha256[saiife_pkg_file] is defined
+      - saiife_package_sha256[saiife_pkg_file] | length == 64
+    fail_msg: "saiife_package_sha256 needs an entry for {{ saiife_pkg_file }} (64 hex characters)."
+    quiet: true
+
+# The fleet files go down first, so the package's postinst finds them.
+- name: Create the saiife config directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/saiife
+    - /etc/saiife/fleet
+
+- name: Write the fleet config
+  ansible.builtin.copy:
+    src: "{{ saiife_config_src }}"
+    dest: /etc/saiife/fleet/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+  register: saiife_fleet_config
+
+- name: Write the fleet install options
+  ansible.builtin.template:
+    src: install.toml.j2
+    dest: /etc/saiife/fleet/install.toml
+    owner: root
+    group: root
+    mode: "0644"
+  register: saiife_fleet_install
+
+- name: Create the policy.d directory
+  ansible.builtin.file:
+    path: /etc/saiife/policy.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: saiife_policy_d_src | length > 0
+
+- name: Write the policy.d drop-ins
+  ansible.builtin.copy:
+    src: "{{ saiife_policy_d_src | regex_replace('/*$', '/') }}"
+    dest: /etc/saiife/policy.d/
+    owner: root
+    group: root
+    directory_mode: "0755"
+    mode: "0644"
+  when: saiife_policy_d_src | length > 0
+  register: saiife_policy_d
+
+- name: Create the package cache directory
+  ansible.builtin.file:
+    path: /var/cache/saiife
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the package, verifying its SHA-256
+  ansible.builtin.get_url:
+    url: "{{ saiife_package_base_url }}/{{ saiife_pkg_file }}"
+    dest: "/var/cache/saiife/{{ saiife_pkg_file }}"
+    checksum: "sha256:{{ saiife_package_sha256[saiife_pkg_file] }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the package (postinst runs system install --fleet)
+  ansible.builtin.apt:
+    deb: "/var/cache/saiife/{{ saiife_pkg_file }}"
+    state: present
+  when: ansible_os_family == "Debian"
+  register: saiife_pkg_deb
+
+- name: Import the rpm signing key
+  ansible.builtin.rpm_key:
+    key: "{{ saiife_rpm_gpg_key_src }}"
+    state: present
+  when: ansible_os_family == "RedHat" and saiife_rpm_gpg_key_src | length > 0
+
+- name: Install the package (the scriptlet runs system install --fleet)
+  ansible.builtin.dnf:
+    name: "/var/cache/saiife/{{ saiife_pkg_file }}"
+    state: present
+    disable_gpg_check: "{{ not saiife_rpm_gpg_check }}"
+  when: ansible_os_family == "RedHat"
+  register: saiife_pkg_rpm
+
+- name: Remember whether the package changed
+  ansible.builtin.set_fact:
+    saiife_pkg_changed: "{{ (saiife_pkg_deb.changed | default(false)) or (saiife_pkg_rpm.changed | default(false)) }}"
+
+# The package is already in place, so postinst will not run again. Apply the
+# new fleet files ourselves. Exit 1 means installed but doctor has findings.
+- name: Apply changed fleet files
+  ansible.builtin.command: /usr/libexec/saiife/saiife system install --fleet
+  register: saiife_fleet_apply
+  changed_when: "'nothing changed' not in saiife_fleet_apply.stdout"
+  # Exit 1 is doctor findings (checked below) or a reload the daemon did not
+  # take; the second keeps the old policy running, so it fails the play.
+  failed_when: >-
+    saiife_fleet_apply.rc == 2
+    or 'the daemon did not take the new config' in saiife_fleet_apply.stderr
+  when: >-
+    (saiife_fleet_config.changed or saiife_fleet_install.changed)
+    and not saiife_pkg_changed
+
+# install --fleet reloads only for a changed config.toml, so changed
+# drop-ins always need their own reload, unless the package task just
+# (re)started the daemon on them.
+- name: Reload the policy after drop-in changes
+  ansible.builtin.command: /opt/saiife/bin/saiife policy reload
+  changed_when: true
+  when: >-
+    (saiife_policy_d.changed | default(false))
+    and not saiife_pkg_changed
+
+- name: Run doctor
+  ansible.builtin.command: /opt/saiife/bin/saiife doctor --json
+  register: saiife_doctor
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Pick out the doctor checks that did not pass
+  ansible.builtin.set_fact:
+    saiife_doctor_bad: >-
+      {{ (saiife_doctor.stdout | from_json).checks | rejectattr('status', 'in', ['pass', 'info']) | list
+         if (saiife_doctor.stdout | default('')) is match('^\s*\{')
+         else [] }}
+  when: saiife_doctor.rc is defined and saiife_doctor.rc > 0
+
+- name: Show the doctor checks that did not pass
+  ansible.builtin.debug:
+    msg: "{{ item.id }} {{ item.status }}: {{ item.title }} {{ item.detail }}"
+  loop: "{{ saiife_doctor_bad | default([]) }}"
+  loop_control:
+    label: "{{ item.id }}"
+
+- name: Fail when doctor reports problems
+  ansible.builtin.fail:
+    msg: >-
+      saiife doctor exited {{ saiife_doctor.rc }} (fails at {{ saiife_doctor_fail_on }}).
+      See docs/fleet.md.
+  when: saiife_doctor.rc is defined and saiife_doctor.rc >= saiife_doctor_fail_on

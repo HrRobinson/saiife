@@ -15,6 +15,7 @@
 pub mod binary;
 pub mod default_config;
 pub mod doctor;
+pub mod fleet;
 pub mod fsops;
 pub mod host;
 pub mod install;
@@ -31,8 +32,8 @@ pub mod unit;
 pub mod user_unit;
 
 pub use host::{
-    host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost, UserInfo,
-    CONTAINER_UNKNOWN,
+    host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost,
+    ReloadAnswer, UserInfo, CONTAINER_UNKNOWN,
 };
 pub use layout::Layout;
 pub use supported::{check_supported, refusal_line, Support, NOT_LINUX};

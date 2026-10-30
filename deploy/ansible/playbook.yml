@@ -1,0 +1,7 @@
+---
+# Never targets localhost: put the machines in an inventory group saiife_fleet.
+- name: Install saiife in locked mode
+  hosts: saiife_fleet
+  become: true
+  roles:
+    - saiife

@@ -1,0 +1,32 @@
+{
+  "Rules": [
+    {
+      "SettingName": "saiife_installed",
+      "Operator": "IsEquals",
+      "DataType": "Boolean",
+      "Operand": true,
+      "MoreInfoUrl": "https://github.com/HrRobinson/saiife/blob/main/docs/fleet.md",
+      "RemediationStrings": [
+        {
+          "Language": "en_US",
+          "Title": "saiife is not installed",
+          "Description": "Install the saiife package so agents on this device are locked. See docs/fleet.md."
+        }
+      ]
+    },
+    {
+      "SettingName": "saiife_doctor_exit",
+      "Operator": "LessEquals",
+      "DataType": "Int64",
+      "Operand": 1,
+      "MoreInfoUrl": "https://github.com/HrRobinson/saiife/blob/main/docs/fleet.md",
+      "RemediationStrings": [
+        {
+          "Language": "en_US",
+          "Title": "saiife doctor reports failures",
+          "Description": "Run 'sudo saiife doctor' on the device and fix the failing checks. See docs/fleet.md."
+        }
+      ]
+    }
+  ]
+}

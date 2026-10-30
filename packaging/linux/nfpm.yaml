@@ -1,0 +1,82 @@
+# nfpm config for the saiife deb and rpm (plan 18, decisions 1 and 3).
+# The package owns only the staging binary, its symlink and the docs.
+# Everything locked mode lays down is written by `saiife system install --fleet`
+# in postinst and recorded in installed.toml; no packaged path may overlap it.
+# build.sh stages the files and exports SAIIFE_STAGE, SAIIFE_VERSION, SAIIFE_ARCH
+# and NFPM_RPM_KEY_FILE.
+name: saiife
+arch: ${SAIIFE_ARCH}
+platform: linux
+version: ${SAIIFE_VERSION}
+section: utils
+priority: optional
+maintainer: HrRobinson <126027636+HrRobinson@users.noreply.github.com>
+description: |
+  Guard and audit layer for AI coding agents.
+  Locked mode is installed by the post-install script (system install --fleet).
+homepage: https://github.com/HrRobinson/saiife
+license: FSL-1.1-ALv2
+contents:
+  # The staging dir is the package's own: rpm removes only the dirs a
+  # package lists, so without this entry /usr/libexec/saiife stays behind.
+  - dst: /usr/libexec/saiife
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ${SAIIFE_STAGE}/saiife
+    expand: true
+    dst: /usr/libexec/saiife/saiife
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ../libexec/saiife/saiife
+    dst: /usr/bin/saiife
+    type: symlink
+  - src: ${SAIIFE_STAGE}/README.md
+    expand: true
+    dst: /usr/share/doc/saiife/README.md
+    file_info:
+      mode: 0644
+  - src: ${SAIIFE_STAGE}/changelog.gz
+    expand: true
+    dst: /usr/share/doc/saiife/changelog.gz
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ${SAIIFE_STAGE}/LICENSE
+    expand: true
+    dst: /usr/share/doc/saiife/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ${SAIIFE_STAGE}/lintian-overrides
+    expand: true
+    dst: /usr/share/lintian/overrides/saiife
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ${SAIIFE_STAGE}/LICENSE
+    expand: true
+    dst: /usr/share/licenses/saiife/LICENSE
+    packager: rpm
+    file_info:
+      mode: 0644
+scripts:
+  postinstall: packaging/linux/scripts/postinst
+  preremove: packaging/linux/scripts/prerm
+# nfpm reads the rpm key only from here (expanded from the environment;
+# build.sh sets it from SAIIFE_PKG_GPG_KEY_FILE, the passphrase comes from
+# NFPM_RPM_PASSPHRASE). Empty means an unsigned rpm.
+rpm:
+  signature:
+    key_file: ${NFPM_RPM_KEY_FILE}
+overrides:
+  deb:
+    recommends:
+      - polkitd | policykit-1
+  rpm:
+    recommends:
+      - polkit
