@@ -159,3 +159,65 @@ fn intune_rules_match_discovery() {
         ]
     );
 }
+
+/// rpm removes only the dirs a package lists: the staging dir must be one.
+#[test]
+fn package_owns_its_staging_dir() {
+    let y = read("nfpm.yaml");
+    assert!(
+        y.contains(
+            "  - dst: /usr/libexec/saiife\n    type: dir\n    file_info:\n      mode: 0755\n"
+        ),
+        "nfpm.yaml lacks the /usr/libexec/saiife dir entry"
+    );
+}
+
+/// nfpm takes the rpm key only from the YAML; an empty value is unsigned.
+#[test]
+fn rpm_key_file_is_in_the_yaml() {
+    let y = read("nfpm.yaml");
+    assert!(
+        y.contains("\nrpm:\n  signature:\n    key_file: ${NFPM_RPM_KEY_FILE}\n"),
+        "nfpm.yaml lacks rpm.signature.key_file"
+    );
+    let b = read("build.sh");
+    assert!(b.contains("export NFPM_RPM_KEY_FILE=$SAIIFE_PKG_GPG_KEY_FILE"));
+}
+
+fn build_sh(version: &str) -> (Option<i32>, String) {
+    let out = std::process::Command::new("bash")
+        .arg(linux_dir().join("build.sh"))
+        .args(["/nonexistent/p18-saiife", version, "amd64"])
+        .arg(linux_dir().join("../../target/p18-never-written"))
+        .output()
+        .expect("bash");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A Cargo prerelease becomes a dpkg/rpm one ('-' -> '~'); the version
+/// check runs before anything is built.
+#[test]
+fn build_maps_a_cargo_prerelease() {
+    for (given, want) in [
+        ("0.3.0", "0.3.0"),
+        ("0.3.0-rc.1", "0.3.0~rc.1"),
+        ("0.3.0~rc.1", "0.3.0~rc.1"),
+        ("0.3.0-rc.1+ci1", "0.3.0~rc.1+ci1"),
+    ] {
+        let (code, err) = build_sh(given);
+        assert_eq!(code, Some(2), "{given}: {err}");
+        assert!(
+            err.contains(&format!("build.sh: package version {want}\n")),
+            "{given}: {err}"
+        );
+        assert!(err.contains("no such binary"), "{given}: {err}");
+    }
+    for bad in ["1.2", "v1.2.3", "1.2.3-", "1.2.3 x"] {
+        let (code, err) = build_sh(bad);
+        assert_eq!(code, Some(2), "{bad}: {err}");
+        assert!(err.contains("version must look like"), "{bad}: {err}");
+    }
+}

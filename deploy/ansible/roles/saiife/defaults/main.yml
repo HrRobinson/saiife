@@ -8,7 +8,8 @@ saiife_package_sha256: {}
 # Path on the controller of the section 8.1 system config (locked = true). Required.
 saiife_config_src: ""
 saiife_agents: [claude, codex, gemini]
-saiife_approvers: []
+# Approvers belong in the fleet config: [approval] approvers in the file
+# saiife_config_src names. install.toml has no approvers with a fleet config.
 # Optional controller directory of policy.d drop-ins (*.toml).
 saiife_policy_d_src: ""
 # true needs the signing key in the rpm keyring: set saiife_rpm_gpg_key_src, or

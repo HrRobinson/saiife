@@ -217,6 +217,26 @@ jobs:
           set -euo pipefail
           bash packaging/linux/build.sh "$SAIIFE_BIN" "$VERSION" "$ARCH" pkg
           ls -l pkg
+      # With a key, an unsigned rpm is a failed release, never a quiet one.
+      - name: check the rpm signature
+        if: env.SAIIFE_PKG_GPG_KEY_FILE != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rpm >/dev/null || { sudo apt-get update && sudo apt-get install -y rpm; }
+          shopt -s nullglob
+          rpms=(pkg/*.rpm)
+          [ "${#rpms[@]}" -eq 1 ] || { echo "::error::expected 1 rpm in pkg, found ${#rpms[@]}"; exit 1; }
+          # nfpm adds a header (RSAHEADER/DSAHEADER) and a header+payload
+          # (SIGPGP/SIGGPG) signature; an unsigned rpm has neither.
+          hdr="$(rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}|%{DSAHEADER:pgpsig}' "${rpms[0]}")"
+          body="$(rpm -qp --nosignature --qf '%{SIGPGP:pgpsig}|%{SIGGPG:pgpsig}' "${rpms[0]}")"
+          echo "header signature: $hdr"
+          echo "header+payload signature: $body"
+          if [ "$hdr" = '(none)|(none)' ] || [ "$body" = '(none)|(none)' ]; then
+            echo "::error::${rpms[0]} is not signed, but PKG_GPG_PRIVATE_KEY is set"
+            exit 1
+          fi
       - name: remove the signing key
         if: always()
         shell: bash
@@ -391,16 +411,31 @@ jobs:
           set -euo pipefail
           ls -l rel
           # The runner is amd64; the draft holds both architectures.
+          # build.sh writes a Cargo prerelease '-' as '~'.
+          pv="$(printf '%s' "$VERSION" | tr '-' '~')"
+          # With the package key in the repo, the release must be signed.
+          if [ -f deploy/keys/saiife-packages.asc ]; then
+            [ -f rel/SHA256SUMS.asc ] || { echo "::error::deploy/keys/saiife-packages.asc exists, but the draft has no SHA256SUMS.asc"; exit 1; }
+            GNUPGHOME="$(mktemp -d -p "$RUNNER_TEMP")"
+            export GNUPGHOME
+            chmod 700 "$GNUPGHOME"
+            gpg --batch --quiet --import deploy/keys/saiife-packages.asc
+            gpg --batch --verify rel/SHA256SUMS.asc rel/SHA256SUMS
+            echo "SHA256SUMS.asc verifies with deploy/keys/saiife-packages.asc"
+            rm -rf "$GNUPGHOME"
+            unset GNUPGHOME
+          fi
           phases="fresh remove"
           if [ "$KIND" = deb ]; then
-            pkg="rel/saiife_${VERSION}_amd64.deb"
+            pkg="rel/saiife_${pv}_amd64.deb"
           else
-            pkg="rel/saiife-${VERSION}-1.x86_64.rpm"
+            pkg="rel/saiife-${pv}-1.x86_64.rpm"
             if [ -f deploy/keys/saiife-packages.asc ] && [ -f rel/SHA256SUMS.asc ]; then
               export SAIIFE_PKG_PUBKEY=deploy/keys/saiife-packages.asc
               phases="fresh remove signature"
             fi
           fi
+          (cd rel && sha256sum -c --ignore-missing SHA256SUMS)
           SAIIFE_PACKAGE_CI=1 PHASES="$phases" \
             bash scripts/package-linux/run.sh "$KIND" rel "$pkg" "$pkg"
 

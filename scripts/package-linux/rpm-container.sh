@@ -26,6 +26,7 @@ OUT=/tmp/p18-t3-rpm
 mkdir -p "$OUT"
 PKG_BIN=/usr/libexec/saiife/saiife
 REFUSAL='locked mode is not supported here'
+REMOVAL='saiife: removing the package uninstalls locked mode'
 
 phase() {
     echo
@@ -84,6 +85,9 @@ phase_upgrade() {
     cat "$OUT/upgrade.out"
     has "$OUT/upgrade.out" "$REFUSAL" || fail "rpm -Uvh output lacks '$REFUSAL'"
     ok "the scriptlet refused again"
+    # The old package's %preun runs with $1 = 1 on an upgrade: no uninstall.
+    if has "$OUT/upgrade.out" "$REMOVAL"; then fail "rpm -Uvh printed the removal warning"; fi
+    ok "no removal warning during the upgrade"
     [ "$(sha "$PKG_BIN")" = "$new_sha" ] || fail "$PKG_BIN is not the new binary ($new_sha)"
     ok "the staging copy is the new binary ($new_sha)"
 }

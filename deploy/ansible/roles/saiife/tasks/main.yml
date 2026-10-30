@@ -12,10 +12,18 @@
       - saiife_version | length > 0
       - saiife_config_src | length > 0
       - saiife_agents is sequence
-      - saiife_approvers is sequence
     fail_msg: >-
       saiife supports Ubuntu 22.04+, Debian 12+ and RHEL-family 9+ on x86_64 or
       aarch64 with systemd, and needs saiife_version and saiife_config_src.
+    quiet: true
+
+- name: Refuse saiife_approvers (approvers live in the fleet config)
+  ansible.builtin.assert:
+    that:
+      - saiife_approvers is not defined
+    fail_msg: >-
+      saiife_approvers is gone: with a fleet config, install refuses approvers in
+      install.toml. Set [approval] approvers in the file saiife_config_src names.
     quiet: true
 
 - name: Work out the package file for this host
@@ -131,17 +139,24 @@
   ansible.builtin.command: /usr/libexec/saiife/saiife system install --fleet
   register: saiife_fleet_apply
   changed_when: "'nothing changed' not in saiife_fleet_apply.stdout"
-  failed_when: saiife_fleet_apply.rc == 2
+  # Exit 1 is doctor findings (checked below) or a reload the daemon did not
+  # take; the second keeps the old policy running, so it fails the play.
+  failed_when: >-
+    saiife_fleet_apply.rc == 2
+    or 'the daemon did not take the new config' in saiife_fleet_apply.stderr
   when: >-
     (saiife_fleet_config.changed or saiife_fleet_install.changed)
     and not saiife_pkg_changed
 
+# install --fleet reloads only for a changed config.toml, so changed
+# drop-ins always need their own reload, unless the package task just
+# (re)started the daemon on them.
 - name: Reload the policy after drop-in changes
   ansible.builtin.command: /opt/saiife/bin/saiife policy reload
   changed_when: true
   when: >-
     (saiife_policy_d.changed | default(false))
-    and saiife_fleet_apply is skipped
+    and not saiife_pkg_changed
 
 - name: Run doctor
   ansible.builtin.command: /opt/saiife/bin/saiife doctor --json

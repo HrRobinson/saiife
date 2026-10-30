@@ -105,6 +105,11 @@ trap 'pkg_on_exit $?' EXIT
 PHASES="${PHASES:-refusal fresh config-change upgrade remove purge lintian}"
 want() { [[ " $PHASES " == *" $1 "* ]]; }
 
+# GitHub's runner images ship /opt (and others) group- or world-writable;
+# install refuses to write below such a dir. lib.sh's prepare_host makes
+# them go-w first, as the locked-linux job does.
+prepare_host
+
 if want refusal; then phase_refusal; fi
 if want fresh; then phase_fresh; fi
 if want config-change; then phase_config_change; fi

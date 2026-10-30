@@ -2,7 +2,8 @@
 # The package owns only the staging binary, its symlink and the docs.
 # Everything locked mode lays down is written by `saiife system install --fleet`
 # in postinst and recorded in installed.toml; no packaged path may overlap it.
-# build.sh stages the files and exports SAIIFE_STAGE, SAIIFE_VERSION, SAIIFE_ARCH.
+# build.sh stages the files and exports SAIIFE_STAGE, SAIIFE_VERSION, SAIIFE_ARCH
+# and NFPM_RPM_KEY_FILE.
 name: saiife
 arch: ${SAIIFE_ARCH}
 platform: linux
@@ -16,6 +17,14 @@ description: |
 homepage: https://github.com/HrRobinson/saiife
 license: FSL-1.1-ALv2
 contents:
+  # The staging dir is the package's own: rpm removes only the dirs a
+  # package lists, so without this entry /usr/libexec/saiife stays behind.
+  - dst: /usr/libexec/saiife
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - src: ${SAIIFE_STAGE}/saiife
     expand: true
     dst: /usr/libexec/saiife/saiife
@@ -52,6 +61,12 @@ contents:
 scripts:
   postinstall: packaging/linux/scripts/postinst
   preremove: packaging/linux/scripts/prerm
+# nfpm reads the rpm key only from here (expanded from the environment;
+# build.sh sets it from SAIIFE_PKG_GPG_KEY_FILE, the passphrase comes from
+# NFPM_RPM_PASSPHRASE). Empty means an unsigned rpm.
+rpm:
+  signature:
+    key_file: ${NFPM_RPM_KEY_FILE}
 overrides:
   deb:
     recommends:

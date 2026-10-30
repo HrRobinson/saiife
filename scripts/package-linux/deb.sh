@@ -82,6 +82,7 @@ last_events() {
 }
 
 audit_verify() {
+    # shellcheck disable=SC2024 # the redirect is meant to run as the runner user: the output file is in $WORK, the runner's
     sudo -n /usr/bin/saiife audit verify >"$WORK/p18-t3-verify.out" 2>&1 || {
         show_file "$WORK/p18-t3-verify.out"
         fail "$1: saiife audit verify failed"
@@ -100,8 +101,11 @@ pkg_on_exit() {
     if [[ "$code" != 0 ]]; then
         echo "package-linux failed (exit $code); collecting logs in $LOGS" >&2
         dpkg -s saiife >"$LOGS/dpkg-status.txt" 2>&1 || true
+        # shellcheck disable=SC2024 # the logs are written as the runner user into $LOGS for the upload; only the read needs root
         sudo -n journalctl -t saiife --no-pager -o short-precise >"$LOGS/journal-saiife-tag.txt" 2>&1 || true
+        # shellcheck disable=SC2024 # the logs are written as the runner user into $LOGS for the upload; only the read needs root
         sudo -n cat /var/log/apt/term.log /var/log/dpkg.log >"$LOGS/apt-dpkg.txt" 2>&1 || true
+        # shellcheck disable=SC2024 # the logs are written as the runner user into $LOGS for the upload; only the read needs root
         sudo -n sh -c 'ls -laR /etc/saiife /usr/libexec/saiife /opt/saiife' >"$LOGS/ls-package.txt" 2>&1 || true
         cp "$WORK"/*.out "$WORK"/*.err "$LOGS/" 2>/dev/null || true
         echo "-- dpkg status"
@@ -177,6 +181,7 @@ phase_fresh() {
     ok "staging copy, /opt binary and installed.toml agree on $opt"
 
     local rc=0
+    # shellcheck disable=SC2024 # the redirect is meant to run as the runner user: the output file is in $WORK, the runner's
     sudo -n /usr/bin/saiife doctor >"$WORK/p18-t3-doctor.out" 2>&1 || rc=$?
     if [[ "$rc" -gt 1 ]]; then
         show_file "$WORK/p18-t3-doctor.out"
@@ -207,10 +212,18 @@ phase_config_change() {
         show_file "$WORK/p18-t3-config-change.out"
         fail "system install --fleet exited $RC"
     fi
+    # install confirms the reload over the socket (policy.reload).
+    if grep -qF "the daemon did not take the new config" "$WORK/p18-t3-config-change.out" ||
+        ! grep -qF "saiife: the daemon reloaded the new config (policy " "$WORK/p18-t3-config-change.out"; then
+        show_file "$WORK/p18-t3-config-change.out"
+        fail "install did not confirm that the daemon took the new config"
+    fi
+    ok "install confirmed the reload"
     sudo -n cmp -s "$FLEET_DIR/config.toml" "$SYS_CONFIG" || fail "$SYS_CONFIG did not follow the fleet config"
     ok "$SYS_CONFIG follows the fleet config"
     [[ "$(daemon_pid)" == "$pid" ]] || fail "the daemon restarted (MainPID $pid -> $(daemon_pid)); a config change must only reload"
     ok "MainPID unchanged ($pid)"
+    # shellcheck disable=SC2329 # called by wait_until (lib.sh) by name
     config_reloaded() {
         after="$(sudo -n /usr/bin/saiife policy show | grep -E '^policy: ' || true)"
         [[ -n "$after" && "$after" != "$before" ]]
@@ -313,6 +326,7 @@ phase_remove() {
         fail "stderr lacks the removal warning"
     }
     ok "stderr has the removal warning"
+    # shellcheck disable=SC2329 # called by wait_until (lib.sh) by name
     journal_has_line() {
         local j
         j="$(sudo -n journalctl -t saiife --no-pager 2>/dev/null || true)"

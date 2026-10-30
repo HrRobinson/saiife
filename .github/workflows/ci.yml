@@ -192,13 +192,15 @@ jobs:
           rm -rf dist
           bash packaging/linux/build.sh "$bin" "$ver" amd64 dist
           bash packaging/linux/build.sh "$RUNNER_TEMP/saiife-ci1" "${ver}+ci1" amd64 dist
+          # build.sh writes a Cargo prerelease '-' as '~'.
+          pv="$(printf '%s' "$ver" | tr '-' '~')"
           ext="${{ matrix.kind }}"
           if [ "$ext" = deb ]; then
-            echo "OLD_PKG=dist/saiife_${ver}_amd64.deb" >> "$GITHUB_ENV"
-            echo "NEW_PKG=dist/saiife_${ver}+ci1_amd64.deb" >> "$GITHUB_ENV"
+            echo "OLD_PKG=dist/saiife_${pv}_amd64.deb" >> "$GITHUB_ENV"
+            echo "NEW_PKG=dist/saiife_${pv}+ci1_amd64.deb" >> "$GITHUB_ENV"
           else
-            echo "OLD_PKG=dist/saiife-${ver}-1.x86_64.rpm" >> "$GITHUB_ENV"
-            echo "NEW_PKG=dist/saiife-${ver}+ci1-1.x86_64.rpm" >> "$GITHUB_ENV"
+            echo "OLD_PKG=dist/saiife-${pv}-1.x86_64.rpm" >> "$GITHUB_ENV"
+            echo "NEW_PKG=dist/saiife-${pv}+ci1-1.x86_64.rpm" >> "$GITHUB_ENV"
           fi
           ls -l dist
       - name: install, upgrade, remove (sudo inside, this job only)

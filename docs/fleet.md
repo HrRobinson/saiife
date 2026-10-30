@@ -49,18 +49,35 @@ When it is there, install checks it and copies it to
 edits.** Change the fleet file, not `/etc/saiife/config.toml`. Without it,
 install keeps the current config or writes a commented default.
 
-`/etc/saiife/fleet/install.toml` sets the agents and the approvers:
+`/etc/saiife/fleet/install.toml` sets the agents:
 
 ```toml
 agents = ["claude", "codex", "gemini"]
-approvers = ["group:security"]
 ```
 
 Unknown keys are refused. If `agents` is missing, install uses the agents
 recorded in `installed.toml`, so an upgrade never adds an agent you left out.
-With no record, it uses all three. An empty list means no agent is guarded:
-install then prints `saiife: warning: no agents listed: no agent is guarded`,
-and `saiife doctor` warns with an `agents` check.
+After a plain `system uninstall` (a package removal), it uses the agents in
+the copy that uninstall kept (`/etc/saiife/installed.previous.toml`). With no
+record, it uses all three. An empty list means no agent is guarded: install
+then prints `saiife: warning: no agents listed: no agent is guarded`, and
+`saiife doctor` warns with an `agents` check.
+
+Dropping an agent from `agents` does not remove its managed hooks: install
+adds and updates hooks, it never removes them. To stop guarding an agent,
+uninstall, then install again with the new list:
+
+```sh
+sudo saiife system uninstall
+sudo /usr/libexec/saiife/saiife system install --fleet
+```
+
+`install.toml` may also set `approvers`, but only without a fleet
+`config.toml`: then they go into the commented default config that install
+writes when there is none. With a fleet `config.toml`, install refuses
+`approvers` in `install.toml` (exit 2, nothing changed), because that file is
+copied as it is. Set `[approval] approvers` in `/etc/saiife/fleet/config.toml`
+instead, as in the example above.
 
 `--fleet` cannot be combined with `--config`, `--agents` or `--approvers`.
 
@@ -72,14 +89,17 @@ Install refuses (exit 2, nothing changed) unless all of this holds:
 - each file is at most 1 MiB.
 
 `policy.d/*.toml` stays yours. Write `/etc/saiife/policy.d/` directly, then run
-`sudo saiife policy reload`.
+`sudo saiife policy reload`. Install checks the fleet config together with the
+drop-ins in `/etc/saiife/policy.d/`, the ones the daemon loads, so a config
+that conflicts with them is refused before anything changes.
 
 ## Exit codes and failures
 
 `system install --fleet` uses the usual install codes:
 
 - 0: installed;
-- 1: installed, but `doctor` found a failure (the report is already printed);
+- 1: installed, but `doctor` found a failure (the report is already printed),
+  or the running daemon did not take the new config (see below);
 - 2: install error or unsupported system.
 
 The maintainer script passes on 0 and 1 and fails on 2. A fleet package exists
@@ -95,6 +115,27 @@ Either way, run `doctor` after the install. The recipes below do.
 When the config changes and the daemon is running, install reloads it
 (`systemctl reload saiifed.service`). It restarts the daemon only when the
 binary, the unit or the group membership changed.
+
+`systemctl reload` only sends a signal, so install then asks the daemon over
+its socket to load the policy again and waits up to 15 s for the answer. On
+success it prints `saiife: the daemon reloaded the new config (policy <hash>)`.
+If the daemon rejects the config, or does not answer, install exits 1 and its
+last lines say so:
+
+```
+saiife: error: the daemon did not take the new config (/etc/saiife/config.toml): ...
+```
+
+The daemon then still enforces the old policy. Fix the config, then run
+`sudo saiife policy reload` or `sudo systemctl restart saiifed`.
+
+A reload cannot change everything. These settings take effect only when the
+daemon restarts: `[daemon] user`, `[daemon] socket_dir`, `[gateway] tcp`,
+`[audit] dir`, `[audit] checkpoint_every`, `[audit] checkpoint_interval` and
+`[audit] fsync`, as well as dropping `locked = true`. The daemon accepts a
+reload that changes one of them, keeps running as started, and logs a
+`reload_warning` (in the journal and the audit). After changing one, run
+`sudo systemctl restart saiifed`.
 
 `doctor` also checks `files.package`. It warns when the staging copy in
 `/usr/libexec/saiife/saiife` differs from `/opt/saiife/bin/saiife`, for
@@ -135,7 +176,14 @@ sudo apt remove saiife        # or: sudo dnf remove saiife
 `prerm` then finds nothing to uninstall.
 
 If the uninstall step fails, read its error. Do not assume the machine is
-clean, and check that the package state is what you expect.
+clean, and check that the package state is what you expect. On rpm, a failed
+`%preun` stops the removal and keeps the package, but the uninstall may have
+gone part of the way (the daemon stopped, some hooks gone). To put locked mode
+back after a failed `%preun`, run:
+
+```sh
+sudo /usr/libexec/saiife/saiife system install --fleet
+```
 
 ## Verify packages
 
@@ -173,8 +221,11 @@ rpm -K saiife-<version>-1.x86_64.rpm
 ```
 
 `rpm -K` should report the digests and signature as OK. An unsigned rpm (a CI
-build) fails the signature check, and `dnf` refuses it unless you turn the GPG
-check off.
+build) fails the signature check. Run `rpm -K` yourself before you install: a
+plain `sudo dnf install ./saiife-<version>-1.x86_64.rpm` does not check the
+signature of a local file unless `localpkg_gpgcheck=1` is set in
+`/etc/dnf/dnf.conf`. The Ansible role below does check it (unless you set
+`saiife_rpm_gpg_check: false`).
 
 ## Ansible
 
@@ -196,7 +247,6 @@ Variables, for example in `group_vars/saiife_fleet.yml`:
 saiife_version: "<version>"          # without the leading v
 saiife_config_src: /path/on/controller/saiife-config.toml   # locked = true
 saiife_agents: [claude, codex, gemini]
-saiife_approvers: ["group:security"]
 saiife_package_sha256:               # from SHA256SUMS, one entry per file
   saiife_<version>_amd64.deb: "<sha256>"
   saiife-<version>-1.x86_64.rpm: "<sha256>"
@@ -209,10 +259,16 @@ Run it on your controller, not on the managed machines:
 ansible-playbook -i inventory deploy/ansible/playbook.yml
 ```
 
+The approvers go in the config file `saiife_config_src` names (`[approval]
+approvers`). The role has no `saiife_approvers`, and fails if you still set it.
+
 The role writes the two fleet files first, then downloads the package for the
 host, checks its SHA-256, installs it (so the maintainer script runs
-`system install --fleet`) and runs `saiife doctor --json`. The play fails when
-`doctor` exits at or above `saiife_doctor_fail_on` (default 2).
+`system install --fleet`) and runs `saiife doctor --json`. When the package is
+already in place, it runs `system install --fleet` itself for changed fleet
+files, and `saiife policy reload` for changed `policy.d` drop-ins. The play
+fails when the daemon did not take a new config, and when `doctor` exits at or
+above `saiife_doctor_fail_on` (default 2).
 
 Other variables: `saiife_policy_d_src` (a controller directory of `policy.d`
 drop-ins), `saiife_package_base_url` and `saiife_rpm_gpg_check`. On RHEL hosts
