@@ -260,10 +260,12 @@ jobs:
             echo "::error::expected 4 tarballs, found $count"
             exit 1
           fi
-          debs="$(ls -1 saiife_*.deb | wc -l)"
-          rpms="$(ls -1 saiife-*.rpm | wc -l)"
-          if [ "$debs" -ne 2 ] || [ "$rpms" -ne 2 ]; then
-            echo "::error::expected 2 debs and 2 rpms, found $debs and $rpms"
+          shopt -s nullglob
+          debs=(saiife_*.deb)
+          rpms=(saiife-*.rpm)
+          shopt -u nullglob
+          if [ "${#debs[@]}" -ne 2 ] || [ "${#rpms[@]}" -ne 2 ]; then
+            echo "::error::expected 2 debs and 2 rpms, found ${#debs[@]} and ${#rpms[@]}"
             exit 1
           fi
           sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm | LC_ALL=C sort -k2 > SHA256SUMS
@@ -389,15 +391,17 @@ jobs:
           set -euo pipefail
           ls -l rel
           # The runner is amd64; the draft holds both architectures.
+          phases="fresh remove"
           if [ "$KIND" = deb ]; then
             pkg="rel/saiife_${VERSION}_amd64.deb"
           else
             pkg="rel/saiife-${VERSION}-1.x86_64.rpm"
             if [ -f deploy/keys/saiife-packages.asc ] && [ -f rel/SHA256SUMS.asc ]; then
               export SAIIFE_PKG_PUBKEY=deploy/keys/saiife-packages.asc
+              phases="fresh remove signature"
             fi
           fi
-          SAIIFE_PACKAGE_CI=1 PHASES="fresh remove" \
+          SAIIFE_PACKAGE_CI=1 PHASES="$phases" \
             bash scripts/package-linux/run.sh "$KIND" rel "$pkg" "$pkg"
 
   release:
