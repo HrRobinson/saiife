@@ -49,6 +49,9 @@ use zeroize::Zeroizing;
 pub const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// After EOF on stdin, a child gets this long to exit before it is killed.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
+/// After a child exits (its group killed), the most its stdout reader may
+/// take to reach EOF before the calls still waiting fail.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(500);
 /// The first and the longest wait before a restart.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -933,6 +936,8 @@ async fn run(
             _ = r.exit.exited() => {
                 // Exited, not yet reaped: the group goes first.
                 let st = r.reap_exited().await;
+                // Its last answers still reach their calls.
+                r.drain_stdout(DRAIN_AFTER_EXIT).await;
                 let why = format!("mcp server exited: {}", exit_text(st));
                 return End::Exited(why);
             }

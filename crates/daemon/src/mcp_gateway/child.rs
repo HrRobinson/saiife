@@ -310,6 +310,8 @@ pub(crate) struct Running {
     /// The reader's one fatal protocol break, already sanitized.
     pub fatal: mpsc::UnboundedReceiver<String>,
     pub exit: ExitWatch,
+    /// The stdout reader: done at EOF.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Running {
@@ -320,6 +322,17 @@ impl Running {
         let st = self.process.wait().await;
         self.reaper.disarm();
         st
+    }
+
+    /// After [`Running::reap_exited`]: let the reader take what the child
+    /// wrote before it exited (an answer sent just before a crash), up to
+    /// EOF, bounded by `within` (a process outside the group may still
+    /// hold the pipe). The exit watch can fire before that last line is
+    /// read; without this the call it answers would fail as `Exited`.
+    pub async fn drain_stdout(&mut self, within: Duration) {
+        if let Some(h) = self.reader.take() {
+            let _ = tokio::time::timeout(within, h).await;
+        }
     }
 
     /// Kill the child's group and the leader (before any reap), through
@@ -421,7 +434,7 @@ pub(crate) async fn spawn(
     });
     let conn = Arc::new(Conn::new(tx, masker, log));
     let (fatal_tx, fatal) = mpsc::unbounded_channel();
-    tokio::spawn(read_stdout(
+    let reader = tokio::spawn(read_stdout(
         BufReader::new(stdout),
         Arc::clone(&conn),
         fatal_tx,
@@ -434,6 +447,7 @@ pub(crate) async fn spawn(
         conn,
         fatal,
         exit: ExitWatch::new(pid),
+        reader: Some(reader),
     })
 }
 
