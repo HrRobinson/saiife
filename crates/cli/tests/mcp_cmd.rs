@@ -1632,20 +1632,223 @@ fn reload_revokes_listed_tool() {
     c.initialize();
     wait_tool(&mut c, "fake__introspect");
     assert!(c.next_notification(Duration::from_millis(800)).is_none());
-    reload_gw(&w, &fake_server(&[], "allow = [\"echo\"]\n"));
+    // The restarted child takes a while to start, so the gap below is there.
+    reload_and_wait(
+        &w,
+        gw_policy(
+            w.m.port,
+            &fake_server(&["--init-delay-ms", "1000"], "allow = [\"echo\"]\n"),
+        ),
+    );
+    // The new policy is in force: this client still has the name, and the
+    // daemon refuses it.
+    let r = c.call("fake__introspect", json!({}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(texts(&r).starts_with("denied ("), "{r}");
     let n = c
         .next_notification(Duration::from_secs(20))
         .unwrap_or_else(|| panic!("no list_changed: {}", c.stderr_text()));
     assert_eq!(n["method"], "notifications/tools/list_changed");
-    let names = c.tool_names();
-    assert!(names.iter().any(|n| n == "fake__echo"), "{names:?}");
-    assert!(!names.iter().any(|n| n == "fake__introspect"), "{names:?}");
+    // A changed `[mcp.fake]` restarts the child, and a server that is not
+    // running lists nothing: `list_changed` can come before `fake__echo` is
+    // back. No list, at any point of that, holds the revoked tool.
+    let ok = wait_for(Duration::from_secs(30), || {
+        let names = c.tool_names();
+        assert!(!names.iter().any(|n| n == "fake__introspect"), "{names:?}");
+        names.iter().any(|n| n == "fake__echo")
+    });
+    assert!(ok, "fake__echo never came back: {}", c.stderr_text());
     // And the tool is no longer callable by name.
     let r = c.request(
         "tools/call",
         json!({"name": "fake__introspect", "arguments": {}}),
     );
     assert_eq!(rpc_code(&r), -32602, "{r}");
+}
+
+/// How many reloads the daemon has finished and recorded. The record is
+/// written after the swap, so once it is there the new policy is in force.
+fn policies_loaded(w: &World) -> usize {
+    w.d.of_kind("policy")
+        .iter()
+        .filter(|r| r["result"] == "loaded")
+        .count()
+}
+
+/// Rewrites the policy, reloads and waits until the new one is in force.
+fn reload_and_wait(w: &World, text: String) {
+    let before = policies_loaded(w);
+    w.d.write_config(&Opts {
+        extra: text,
+        ..Opts::default()
+    });
+    w.d.signal("HUP");
+    let ok = wait_for(Duration::from_secs(20), || policies_loaded(w) > before);
+    assert!(ok, "the reload was not recorded: {}", w.d.stderr_text());
+}
+
+/// A call that came in before a reload, waiting for a slot of the child,
+/// was decided under the old policy. `revoked` is the policy that takes it
+/// away; the 4 slots are held by hanging calls until the server's timeout.
+#[cfg(target_os = "linux")]
+fn gateway_call_queued_over_reload(revoked: impl FnOnce(u16) -> String) -> Value {
+    const TIMEOUT_S: u64 = 8;
+    let servers = fake_server(
+        &["--hang-tool", "slow"],
+        &format!("allow = [\"echo\", \"slow\"]\ntimeout = \"{TIMEOUT_S}s\"\n"),
+    );
+    let w = gw_world(&servers);
+    // A client has 4 call workers: the queued call needs a second client.
+    let mut hold = w.mcp(&[]);
+    let mut queued = w.mcp(&[]);
+    wait_tool(&mut hold, "fake__slow");
+    wait_tool(&mut queued, "fake__echo");
+    let sent = || {
+        w.d.stderr_text()
+            .matches("fake-mcp: got tools/call")
+            .count()
+    };
+    let t0 = std::time::Instant::now();
+    for _ in 0..4 {
+        hold.send_request("tools/call", json!({"name": "fake__slow", "arguments": {}}));
+    }
+    assert!(
+        wait_for(Duration::from_secs(20), || sent() == 4),
+        "the slots were not taken: {}",
+        w.d.stderr_text()
+    );
+    let id = queued.send_request("tools/call", json!({"name": "fake__echo", "arguments": {}}));
+    // Time for it to reach the slot wait. A call slower than this is decided
+    // after the reload and denied, so this can hide the bug, never fake it.
+    std::thread::sleep(Duration::from_millis(500));
+    reload_and_wait(&w, revoked(w.m.port));
+    let reloaded_at = t0.elapsed();
+    assert!(
+        reloaded_at < Duration::from_secs(TIMEOUT_S),
+        "the reload took {reloaded_at:?}, past the slots' timeout"
+    );
+    let a = queued
+        .answer_within(&id, Duration::from_secs(TIMEOUT_S + 30))
+        .unwrap_or_else(|| panic!("no answer: {}", queued.stderr_text()));
+    eprintln!(
+        "queued call answered {:?} after the reload, sent to the child: {}",
+        t0.elapsed() - reloaded_at,
+        sent() > 4
+    );
+    assert_eq!(a["result"]["isError"], true, "{a}");
+    assert_eq!(sent(), 4, "sent after the reload: {}", w.d.stderr_text());
+    a
+}
+
+/// The scope loses the server and its config stays: the child keeps running
+/// and its slots come free, yet the queued call is not sent.
+#[cfg(target_os = "linux")]
+#[test]
+fn reload_stops_a_queued_gateway_call_scope_revoked() {
+    if !gateway_runnable() {
+        return;
+    }
+    let a = gateway_call_queued_over_reload(|port| {
+        let same = fake_server(
+            &["--hang-tool", "slow"],
+            "allow = [\"echo\", \"slow\"]\ntimeout = \"8s\"\n",
+        );
+        policy(
+            port,
+            "\"erp\"",
+            "",
+            "\"invoices:read\", \"invoices:delete\"",
+            &same,
+        )
+    });
+    // How the agent sees it.
+    assert!(
+        texts(&a["result"]).starts_with("denied (policy_changed)"),
+        "{a}"
+    );
+}
+
+/// The server's own `allow` loses the tool: the changed config stops the
+/// child, so the queued call has nowhere to go.
+#[cfg(target_os = "linux")]
+#[test]
+fn reload_stops_a_queued_gateway_call_allow_revoked() {
+    if !gateway_runnable() {
+        return;
+    }
+    gateway_call_queued_over_reload(|port| {
+        gw_policy(
+            port,
+            &fake_server(
+                &["--hang-tool", "slow"],
+                "allow = [\"slow\"]\ntimeout = \"8s\"\n",
+            ),
+        )
+    });
+}
+
+/// The same with the mock's gate holding the service's 4 slots: a connector
+/// call queued for a slot is not sent once a reload took its operation away.
+#[test]
+fn reload_stops_a_queued_connector_call() {
+    let w = world();
+    let mut hold = w.mcp(&[]);
+    let mut queued = w.mcp(&[]);
+    // A name not yet listed re-lists at most once per 5 s: list first.
+    hold.tool_names();
+    queued.tool_names();
+    for _ in 0..4 {
+        hold.send_request(
+            "tools/call",
+            json!({"name": "erp_invoices_block", "arguments": {}}),
+        );
+    }
+    let blocked = || {
+        w.m.hits()
+            .iter()
+            .filter(|h| h.contains("/api/block"))
+            .count()
+    };
+    assert!(
+        wait_for(Duration::from_secs(20), || blocked() == 4),
+        "the slots were not taken: {:?}",
+        w.m.hits()
+    );
+    let id = queued.send_request(
+        "tools/call",
+        json!({"name": "erp_invoices_list", "arguments": {}}),
+    );
+    // As for the gateway call above: this can hide the bug, never fake it.
+    std::thread::sleep(Duration::from_millis(500));
+    reload_and_wait(
+        &w,
+        policy(w.m.port, "\"erp\"", "", "\"invoices:delete\"", ""),
+    );
+    let reloaded = std::time::Instant::now();
+    // The slots stay taken a while after the reload.
+    std::thread::sleep(Duration::from_secs(3));
+    w.m.release();
+    let a = queued
+        .answer_within(&id, Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("no answer: {}", queued.stderr_text()));
+    eprintln!(
+        "queued call answered {:?} after the reload, sent upstream: {}",
+        reloaded.elapsed(),
+        w.m.hits().iter().any(|h| h.contains("/api/echo"))
+    );
+    assert_eq!(a["result"]["isError"], true, "{a}");
+    assert!(
+        texts(&a["result"]).starts_with("denied (policy_changed)"),
+        "{a}"
+    );
+    let recs = w.connector();
+    let last = recs.iter().rfind(|r| r["operation"] == "invoices.list");
+    assert_eq!(last.unwrap()["rule"], "policy_changed", "{recs:?}");
+    assert!(
+        !w.m.hits().iter().any(|h| h.contains("/api/echo")),
+        "sent after the reload: {:?}",
+        w.m.hits()
+    );
 }
 
 #[cfg(target_os = "linux")]

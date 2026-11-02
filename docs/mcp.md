@@ -272,6 +272,12 @@ A call can be denied with: `lockdown`, `no_scope`, `scope_conflict`,
 `limits_unavailable` and `masked_content`; and, after an approval,
 `policy_changed`, `env_changed` and `body_changed`.
 
+A call that waits for a slot of the server (4 per server) when a reload moves
+the policy is denied with `policy_changed` once it gets the slot: it is not
+sent and does not count against limits. Any change to the policy does this,
+whichever tool it touches, so the agent can simply call again. A call already
+sent finishes.
+
 ### Approvals of type `mcp`
 
 An `ask` tool call creates an approval request of type `mcp`: `service` is

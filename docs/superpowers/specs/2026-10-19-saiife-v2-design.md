@@ -616,7 +616,11 @@ their MCP servers are restricted by the hook only.
   last 24 h, binds both sockets, then tells systemd it is ready.
 - **Reload** (SIGHUP or `policy reload`): parses, validates and swaps the
   policy in one step. An invalid new policy is refused, the old one stays,
-  and a `policy` record with `result = "rejected"` is written.
+  and a `policy` record with `result = "rejected"` is written. A call takes
+  the policy in force when it starts. If a reload moves the policy hash of
+  its environment while the call waits for an upstream slot, it is denied
+  with `policy_changed`: nothing is sent and nothing counts against limits. A
+  call already sent finishes.
 - **Stop:** writes a `daemon`/`stop` record and a checkpoint.
 - **Crash:** systemd and launchd restart it. At start, the daemon writes
   `daemon`/`start` with `previous_clean_stop = false` when the last record is
@@ -816,7 +820,10 @@ For every request, from any entry point (`saiife api`, HTTP, MCP):
    from the vault, only the headers the manifest allows (agent-supplied
    `Authorization`, `Cookie` and `Host` are dropped). TLS with rustls and the
    system root store plus `/etc/saiife/ca`. Redirects are followed only to
-   the same host, at most 3. Timeout 30 s by default.
+   the same host, at most 3. Timeout 30 s by default. After each wait for a
+   slot of the service's pool, a call whose environment's policy hash moved
+   (a reload, §6.2) is denied with `policy_changed` and not sent. The resend
+   after a 401 is not made in that case: the 401 of the one send is the answer.
 10. **Mask the response:** replace every vault value in use (and its
     base64, URL-encoded and hex forms) and every v1 masking pattern
     (§6.3 in v1) with `[MASKED]`. Apply field redaction (proposed, §6.7.3).
@@ -1310,8 +1317,10 @@ is a load error. Children are confined with Landlock (files and exec) and
 `no_new_privs`; **their network is not sandboxed**, so a hostile server can
 still send out what it was given. The daemon refuses socket peers that are
 gateway children and, in locked mode, any peer with the daemon's own uid.
-`via` in a record is declared by the client and is attribution only. See
-`docs/mcp.md`.
+`via` in a record is declared by the client and is attribution only. A call
+waiting for a child's slot follows the same rule as a connector call: if a
+reload moves its environment's policy hash during the wait, it is denied with
+`policy_changed` (§6.2). See `docs/mcp.md`.
 
 **Note (plan 13).** The gateway stays Linux only in v2.1 (decision 7): it
 needs Landlock, and `sandbox-exec` is deprecated, so it is not used. On

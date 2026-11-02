@@ -166,6 +166,8 @@ struct FakeEnv {
     pool: Option<Arc<Semaphore>>,
     /// Every request step 8 stored; ids from 42.
     approvals: Mutex<Vec<PendingCall>>,
+    /// What `policy_in_force` answers.
+    in_force: bool,
 }
 
 impl FakeEnv {
@@ -182,6 +184,7 @@ impl FakeEnv {
             pools: Pools::new(),
             pool: None,
             approvals: Mutex::new(Vec::new()),
+            in_force: true,
         }
     }
 }
@@ -189,6 +192,9 @@ impl FakeEnv {
 impl Env for FakeEnv {
     fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
         None
+    }
+    fn policy_in_force(&self, _snap: &PolicySnapshot) -> bool {
+        self.in_force
     }
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError> {
         match &self.scope {
@@ -1238,6 +1244,32 @@ async fn full_pool_is_a_limit_and_closed_pool_fails_closed() {
     );
     assert!(saiife_broker::pipeline::limit_event(&r).is_none());
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+}
+
+/// The policy moved during the wait for a slot: denied, nothing sent, and it
+/// counts neither now nor at a rebuild.
+#[tokio::test]
+async fn policy_moved_during_the_slot_wait_is_denied_and_not_counted() {
+    let (m, up) = mock().await;
+    let lim = Limiter::new();
+    let snap = snapshot("[services.shop.limits]\nrequests_per_minute = 1\n");
+    let mut env = FakeEnv::ok();
+    env.in_force = false;
+    let c = call("orders.list", &[]);
+    let (o, tr) = run(&c, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "policy_changed");
+    assert!(!tr.sent);
+    let r = record(&c, &snap, &tr, &o, "", "0.2.0");
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["decision"], serde_json::json!("deny"));
+    assert_eq!(v["rule"], serde_json::json!("policy_changed"));
+    assert!(saiife_broker::pipeline::limit_event(&r).is_none());
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    // The one call of the minute is still there.
+    env.in_force = true;
+    let o = go(&c, &snap, &env, &up, &lim).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1);
 }
 
 // ------------------------------------------------- built-in connectors

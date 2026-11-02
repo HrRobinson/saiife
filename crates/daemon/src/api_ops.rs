@@ -196,6 +196,10 @@ impl Env for DaemonEnv<'_> {
         self.ctx.pools.get(service)
     }
 
+    fn policy_in_force(&self, snap: &PolicySnapshot) -> bool {
+        self.ctx.snapshot_in_force(snap)
+    }
+
     fn create_approval<'b>(&'b self, p: &'b PendingCall) -> ApprovalFuture<'b> {
         Box::pin(crate::approval_ops::create(self.ctx, p, &self.agent))
     }
@@ -609,8 +613,10 @@ pub(crate) async fn execute_in(
     call.user = user;
     call.session = session;
 
-    // The policy as it is now: a reload while this call runs does not
-    // change what it runs under.
+    // The policy as it is now: this call is decided under it and a reload
+    // does not change that. A reload that moves its environment's hash while
+    // the call waits for an upstream slot denies it (`policy_changed`,
+    // nothing sent, nothing counted); a call already sent finishes.
     let state = ctx.policy();
     let mut warning = None;
     let (outcome, trace, gw, env_name): (Outcome, Trace, Arc<GatewayPolicy>, Option<String>) =

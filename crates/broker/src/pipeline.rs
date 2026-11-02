@@ -313,6 +313,13 @@ pub trait Env: Sync {
     /// Step 2: the lockdown flag, `None` when it is off. Either scope
     /// denies a connector request.
     fn lockdown(&self) -> Option<Lockdown>;
+    /// Whether `snap`, which this call was decided under, is still the
+    /// policy in force for its environment. Asked after each wait for a
+    /// pool slot: the wait can outlast a reload.
+    fn policy_in_force(&self, snap: &PolicySnapshot) -> bool {
+        let _ = snap;
+        true
+    }
     /// The caller's single scope (decision 6); `ScopeConflict` when it
     /// matches more than one.
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError>;
@@ -1111,6 +1118,11 @@ async fn steps(
             }
         }
     };
+    // A reload during the wait: this call was decided under a policy no
+    // longer in force. Nothing was sent, so nothing counts.
+    if !env.policy_in_force(snap) {
+        return denied("policy_changed");
+    }
     // Decision 6: what was sent counts, whatever came back. Committed
     // before the send, so a caller that drops this future mid-send (a
     // client gone) cannot release a slot the upstream may have used.
@@ -1188,7 +1200,9 @@ async fn steps(
                     let permit =
                         tokio::time::timeout(up.timeout(), env.pool(&call.service).acquire_owned())
                             .await;
-                    if let Ok(Ok(_permit)) = permit {
+                    // No resend once a reload moved the policy during the
+                    // refresh or the wait: the one send's 401 is the answer.
+                    if let (Ok(Ok(_permit)), true) = (permit, env.policy_in_force(snap)) {
                         tr.auth_retry = true;
                         resp = match up.send(b, read_limit).await {
                             Ok(r) => r,

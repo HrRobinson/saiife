@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::approvals::{Filter, State, Store};
-use crate::mcp_gateway::{CallFuture, ChildError};
+use crate::mcp_gateway::{Admit, CallFuture, ChildError};
 use crate::ops::{CtxInit, PolicyState};
 use crate::writer::WriterConfig;
 use saiife_ipc::msg::Request as IpcRequest;
@@ -34,6 +34,8 @@ struct Fake {
     answer: Mutex<Answer>,
     /// The server's secret values (the token by default).
     secrets: Mutex<Vec<String>>,
+    /// Runs in `call`, where the real supervisor waits for a slot.
+    in_slot_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Fake {
@@ -48,6 +50,7 @@ impl Fake {
                 )
             })),
             secrets: Mutex::new(vec![token()]),
+            in_slot_wait: Mutex::new(None),
         }
     }
 
@@ -89,7 +92,15 @@ impl ToolCaller for Fake {
         args: Value,
         timeout: Duration,
         cap: usize,
+        admit: Admit<'a>,
     ) -> CallFuture<'a> {
+        let in_slot_wait = self.in_slot_wait.lock().unwrap().take();
+        if let Some(f) = in_slot_wait {
+            f();
+        }
+        if !admit() {
+            return Box::pin(async { Err(ChildError::NotAdmitted) });
+        }
         self.calls.lock().unwrap().push((
             server.to_string(),
             tool.to_string(),
@@ -181,6 +192,16 @@ fn world(services: &str, extra: &str) -> W {
 }
 
 fn world_with(services: &str, extra: &str, tail: &str) -> W {
+    let dirs = Arc::new(saiife_policy::FixedDirectory::from_text("", ""));
+    world_dir(services, extra, tail, dirs)
+}
+
+fn world_dir(
+    services: &str,
+    extra: &str,
+    tail: &str,
+    dirs: Arc<dyn saiife_policy::Directory + Send + Sync>,
+) -> W {
     let t = tempfile::tempdir().unwrap();
     for d in ["etc", "audit", "state", "run"] {
         std::fs::create_dir_all(t.path().join(d)).unwrap();
@@ -211,8 +232,6 @@ fn world_with(services: &str, extra: &str, tail: &str) -> W {
     .unwrap();
     let vault = crate::vault::open(&key, &t.path().join("state/vault/vault.bin"));
     let state = t.path().join("state");
-    let dirs: Arc<dyn saiife_policy::Directory + Send + Sync> =
-        Arc::new(saiife_policy::FixedDirectory::from_text("", ""));
     let mut ctx = Ctx::new(CtxInit {
         own_uid: me().uid,
         own_user: "ann".into(),
@@ -762,6 +781,125 @@ async fn policy_changed_after_approval_denied() {
     let sends: Vec<&Value> = recs.iter().filter(|r| r["via"] == "approval").collect();
     assert_eq!(sends.len(), 2);
     assert!(sends.iter().all(|r| r["rule"] == "policy_changed"));
+}
+
+/// A directory whose group lookup is where a reload lands: once `armed`, the
+/// next lookup puts that policy in force. Until then a lookup fails, and a
+/// failed lookup is not cached, so the send's own lookup really runs.
+#[derive(Default)]
+struct ReloadInLookup {
+    ctx: std::sync::OnceLock<std::sync::Weak<Ctx>>,
+    armed: Mutex<Option<PolicyState>>,
+}
+
+impl saiife_policy::Directory for ReloadInLookup {
+    fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+        None
+    }
+    fn name_of(&self, _: u32) -> Option<String> {
+        None
+    }
+    fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+        None
+    }
+    fn groups_of(&self, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn try_groups_of(&self, _: &str) -> Result<Vec<String>, String> {
+        let Some(p) = self.armed.lock().unwrap().take() else {
+            return Err("not yet".into());
+        };
+        let ctx = self.ctx.get().unwrap().upgrade().unwrap();
+        *ctx.policy.lock().unwrap() = p;
+        Ok(Vec::new())
+    }
+}
+
+/// `send_env` reads the policy before the group lookup: a reload during the
+/// lookup that denies the tool must still stop the approved send.
+#[tokio::test]
+async fn reload_during_the_approved_sends_group_lookup_stops_it() {
+    let dir = Arc::new(ReloadInLookup::default());
+    let w = world_dir("[\"mcp:linear\"]", "", "", dir.clone());
+    dir.ctx.set(Arc::downgrade(&w.ctx)).unwrap();
+    let id = w.call("create_issue", r#"{"a":1}"#).await["pending"]
+        .as_u64()
+        .unwrap();
+    let text = policy_text(w.t.path(), "[\"mcp:linear\"]", "", "").replace(
+        "deny = [\"delete_*\"]",
+        "deny = [\"delete_*\", \"create_*\"]",
+    );
+    *dir.armed.lock().unwrap() = Some(load(w.t.path(), &text));
+    w.approve(id).await;
+    assert!(
+        dir.armed.lock().unwrap().is_none(),
+        "the send made no group lookup"
+    );
+    assert!(w.fake.calls().is_empty(), "sent after the reload");
+    let r = w.result(id).await;
+    assert_eq!(r["state"], "send_failed", "{r}");
+    assert_eq!(r["result"]["rule"], "policy_changed", "{r}");
+}
+
+/// A reload lands while a call waits for a slot of the child: it is denied,
+/// recorded, and counts against nothing.
+#[tokio::test]
+async fn reload_during_the_slot_wait_denies_and_counts_nothing() {
+    let w = world(
+        "[\"mcp:linear\"]",
+        "[mcp.linear.limits]\nrequests_per_minute = 1\n",
+    );
+    let text = policy_text(
+        w.t.path(),
+        "[\"mcp:linear\"]",
+        "[mcp.linear.limits]\nrequests_per_minute = 1\n",
+        "",
+    )
+    .replace("get_issue", "get_issue_gone");
+    let revoked = load(w.t.path(), &text);
+    let ctx = Arc::clone(&w.ctx);
+    let before = w.ctx.policy();
+    *w.fake.in_slot_wait.lock().unwrap() = Some(Box::new(move || {
+        *ctx.policy.lock().unwrap() = revoked;
+    }));
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(denied_rule(&a), "policy_changed", "{a}");
+    assert!(w.fake.calls().is_empty(), "sent after the reload");
+    let recs = w.connector();
+    let last = recs.last().unwrap();
+    assert_eq!(last["decision"], "deny", "{last}");
+    assert_eq!(last["rule"], "policy_changed", "{last}");
+    // Nor at a rebuild from the records.
+    let records: Vec<saiife_audit::Record> = w
+        .audit_text()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(records
+        .iter()
+        .all(|r| saiife_broker::pipeline::limit_event(r).is_none()));
+    // The one call of the minute is still there, and goes through.
+    *w.ctx.policy.lock().unwrap() = before;
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(a["result"]["isError"], false, "{a}");
+    assert_eq!(w.fake.calls().len(), 1);
+}
+
+/// A reload that changes nothing for the call's policy leaves it alone.
+#[tokio::test]
+async fn unchanged_reload_during_the_slot_wait_sends() {
+    let w = world("[\"mcp:linear\"]", "");
+    let same = load(
+        w.t.path(),
+        &policy_text(w.t.path(), "[\"mcp:linear\"]", "", ""),
+    );
+    let ctx = Arc::clone(&w.ctx);
+    *w.fake.in_slot_wait.lock().unwrap() = Some(Box::new(move || {
+        *ctx.policy.lock().unwrap() = same;
+    }));
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(a["result"]["isError"], false, "{a}");
+    assert_eq!(w.fake.calls().len(), 1);
 }
 
 #[tokio::test]

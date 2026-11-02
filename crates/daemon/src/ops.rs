@@ -572,6 +572,16 @@ impl Ctx {
         lock(&self.policy).clone()
     }
 
+    /// Whether `snap`, which a call was decided under, is still the policy
+    /// in force for its environment. Checked after every wait for an
+    /// upstream slot: the wait can outlast a reload.
+    pub fn snapshot_in_force(&self, snap: &PolicySnapshot) -> bool {
+        lock(&self.policy)
+            .gateway
+            .as_ref()
+            .is_some_and(|g| g.snapshot_for(snap.env.as_deref()).hash == snap.hash)
+    }
+
     /// A record the daemon writes about itself: `tool` = kind, `input` =
     /// a short summary, its own uid and user, the current policy hash.
     pub fn record(&self, kind: &str, input: &str) -> Record {

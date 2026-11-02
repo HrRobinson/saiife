@@ -568,6 +568,58 @@ async fn upstream_401_refreshes_once_and_retries_once() {
     assert_eq!(rec[2]["decision"], "allow");
 }
 
+/// A reload takes the service away while the forced refresh of a 401 runs:
+/// the resend is not made, and the 401 of the one send is the answer.
+#[tokio::test]
+async fn reload_during_the_refresh_stops_the_resend() {
+    let w = Arc::new(world(|_| {}).await);
+    assert_eq!(status(&w.call().await), 200);
+    {
+        let mut s = w.st.lock().unwrap();
+        s.current = String::new();
+        s.delay_ms = 1000;
+    }
+    let call = {
+        let w = Arc::clone(&w);
+        tokio::spawn(async move { w.call().await })
+    };
+    // The first send got its 401: the refresh is under way.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while w.api().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut p = w.ctx.policy();
+    let mut config = p.gateway.as_ref().unwrap().snap.config.clone();
+    config.scope[0].services.clear();
+    p.hash = Some("sha256:revoked".into());
+    p.system = Some(Arc::new(config.clone()));
+    p.gateway = Some(Arc::new(GatewayPolicy {
+        snap: PolicySnapshot {
+            config,
+            hash: "sha256:revoked".into(),
+            mode: Mode::Locked,
+            env: None,
+        },
+        by_env: Default::default(),
+        catalog: Catalog::new(&[], vec![Manifest::parse(MANIFEST).unwrap()]),
+    }));
+    *w.ctx.policy.lock().unwrap() = p;
+    let reloaded = std::time::Instant::now();
+    let a = call.await.unwrap();
+    eprintln!(
+        "answered {:?} after the reload, upstream sends for this call: {}",
+        reloaded.elapsed(),
+        w.api().len() - 1
+    );
+    assert_eq!(w.api().len(), 2, "resent after the reload");
+    assert_eq!(status(&a), 401);
+    let rec = w.records("connector");
+    assert!(rec[1].get("auth_retry").is_none(), "{}", rec[1]);
+}
+
 #[tokio::test]
 async fn rotated_refresh_token_persisted_first() {
     let w = world(|s| s.rotate = true).await;

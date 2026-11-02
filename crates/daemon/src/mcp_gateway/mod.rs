@@ -81,6 +81,8 @@ pub enum ChildError {
     TooLarge,
     Protocol(String),
     NotRunning(String),
+    /// [`Admit`] refused the call when it got its slot: nothing was sent.
+    NotAdmitted,
 }
 
 impl std::fmt::Display for ChildError {
@@ -91,6 +93,7 @@ impl std::fmt::Display for ChildError {
             ChildError::TooLarge => f.write_str("mcp server answer too large"),
             ChildError::Protocol(m) => write!(f, "mcp server protocol error: {m}"),
             ChildError::NotRunning(m) => write!(f, "mcp server not running: {m}"),
+            ChildError::NotAdmitted => f.write_str("the call was not admitted to its slot"),
         }
     }
 }
@@ -99,6 +102,11 @@ impl std::error::Error for ChildError {}
 
 /// A boxed future, for the object-safe [`ToolCaller`].
 pub type CallFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ChildError>> + Send + 'a>>;
+
+/// Runs once a call holds a slot of the child, right before it is sent;
+/// `false` stops it there ([`ChildError::NotAdmitted`]). A call that ends
+/// before it (not running, no slot in time) never runs it.
+pub type Admit<'a> = Box<dyn FnOnce() -> bool + Send + 'a>;
 
 /// What the gateway pipeline (Task 7) needs from the supervisor; tests use
 /// a fake.
@@ -109,7 +117,8 @@ pub trait ToolCaller: Send + Sync {
     /// value (never read into a closed type): an object with a `content`
     /// array, image/audio and unknown items replaced with text, and every
     /// string masked with the server's secret values and the v1 patterns.
-    /// `tool` is sent byte-for-byte as the server listed it.
+    /// `tool` is sent byte-for-byte as the server listed it, if `admit`
+    /// says so once the call holds a slot.
     fn call<'a>(
         &'a self,
         server: &'a str,
@@ -117,6 +126,7 @@ pub trait ToolCaller: Send + Sync {
         args: Value,
         timeout: Duration,
         cap: usize,
+        admit: Admit<'a>,
     ) -> CallFuture<'a>;
     /// The secret values (every form the vault holds) of `server`, for
     /// masking what the pipeline records. Empty for a server without
@@ -394,6 +404,20 @@ impl Gateway {
         timeout: Duration,
         cap: usize,
     ) -> Result<Value, ChildError> {
+        self.call_admitted(server, tool, args, timeout, cap, Box::new(|| true))
+            .await
+    }
+
+    /// [`Gateway::call`], sent only if `admit` says so once it holds a slot.
+    pub async fn call_admitted(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+        timeout: Duration,
+        cap: usize,
+        admit: Admit<'_>,
+    ) -> Result<Value, ChildError> {
         let srv = lock(&self.servers)
             .get(server)
             .cloned()
@@ -419,6 +443,9 @@ impl Gateway {
             .await
             .map_err(|_| ChildError::Timeout)?
             .map_err(|_| ChildError::Exited)?;
+        if !admit() {
+            return Err(ChildError::NotAdmitted);
+        }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let params = json!({"name": tool, "arguments": arguments});
         let masked = |e: ChildError| match e {
@@ -587,8 +614,9 @@ impl ToolCaller for Gateway {
         args: Value,
         timeout: Duration,
         cap: usize,
+        admit: Admit<'a>,
     ) -> CallFuture<'a> {
-        Box::pin(Gateway::call(self, server, tool, args, timeout, cap))
+        Box::pin(self.call_admitted(server, tool, args, timeout, cap, admit))
     }
 
     fn secret_values(&self, server: &str) -> Vec<Zeroizing<String>> {

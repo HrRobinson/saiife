@@ -24,7 +24,7 @@
 //! `via` is what the client says (attribution only, never a decision).
 
 use crate::api_ops::{self, Caller, Groups, Identity, Refused, LOW_DISK};
-use crate::mcp_gateway::ToolCaller;
+use crate::mcp_gateway::{ChildError, ToolCaller};
 use crate::ops::{Ctx, GatewayPolicy, Notice, VERSION};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_broker::limits::{Key, Limiter};
@@ -694,7 +694,6 @@ async fn steps(
     // The canonical arguments are sent: the bytes the record hashes and an
     // approver was shown (they parse: they were just written).
     let send_args = saiife_mcp::codec::parse_strict(&canonical).unwrap_or(Value::Object(args));
-    reservation.commit();
     tr.sent = true;
     let sent = tools
         .call(
@@ -703,10 +702,25 @@ async fn steps(
             send_args,
             cfg.timeout,
             max.saturating_add(READ_SLACK),
+            // The wait for a slot can outlast a reload: a call this policy
+            // decided goes only if it is still in force. Committed before
+            // the send; until then the reservation drops with this closure,
+            // so what was never sent counts for nothing.
+            Box::new(move || {
+                let in_force = ctx.snapshot_in_force(snap);
+                if in_force {
+                    reservation.commit();
+                }
+                in_force
+            }),
         )
         .await;
     let result = match sent {
         Ok(v) => v,
+        Err(ChildError::NotAdmitted) => {
+            tr.sent = false;
+            return denied("policy_changed");
+        }
         Err(e) => {
             return McpOutcome::UpstreamFailed {
                 reason: masker.mask_text(&e.to_string()),
