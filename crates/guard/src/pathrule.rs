@@ -112,11 +112,11 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
         return Ok((Some("HOME"), &glob[glob.len() - rest.len() - 1..]));
     }
     let Some(after) = glob.strip_prefix('$') else {
-        if glob.starts_with('/') || glob.starts_with("**/") {
+        if glob.starts_with('/') || glob.starts_with("**/") || drive_anchored(glob) {
             return Ok((None, glob));
         }
         return Err(format!(
-            "path glob {glob:?} must start with /, ~/, **/ or a variable"
+            "path glob {glob:?} must start with /, ~/, **/, a drive (`c:/`, `?:/`) or a variable"
         ));
     };
     let end = after.find('/').unwrap_or(after.len());
@@ -128,6 +128,13 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
             VARIABLES.join(", ")
         )),
     }
+}
+
+/// A glob anchored at a Windows drive: `c:/…` or, for any drive, `?:/…`. Only
+/// a Windows path can match it (a Linux path starts with `/`).
+fn drive_anchored(glob: &str) -> bool {
+    let b = glob.as_bytes();
+    b.len() > 3 && (b[0].is_ascii_alphabetic() || b[0] == b'?') && b[1] == b':' && b[2] == b'/'
 }
 
 /// The variable a valid glob starts with (`~` is `HOME`), if any.
@@ -344,6 +351,28 @@ mod tests {
             .with_var("HOME", "/home/u")
             .with_var("SAIIFE_BIN", "/opt/saiife/bin/saiife")
             .with_var("SAIIFE_BIN", "/usr/local/bin/saiife")
+    }
+
+    #[test]
+    fn drive_anchored_globs_are_valid_and_match_only_windows_paths() {
+        for g in ["c:/programdata/saiife/**", "?:/programdata/saiife", "D:/x"] {
+            assert!(validate_glob(g).is_ok(), "{g}");
+        }
+        for g in ["cc:/x", "c:x", "c:/", ":/x", "1:/x", "c:\\x"] {
+            assert!(validate_glob(g).is_err(), "{g}");
+        }
+        let win = PathVars::new().with_style(PathStyle::Windows);
+        let re = compile_glob("?:/programdata/saiife/**", &win, false)
+            .unwrap()
+            .unwrap();
+        assert!(re.is_match("c:/ProgramData/saiife/bin/saiife.exe"));
+        assert!(re.is_match("d:/programdata/saiife/x"));
+        assert!(!re.is_match("c:/programdata/other/x"));
+        let posix = compile_glob("?:/programdata/saiife/**", &vars(), false)
+            .unwrap()
+            .unwrap();
+        assert!(!posix.is_match("/programdata/saiife/x"));
+        assert!(!posix.is_match("/home/u/c:/programdata/saiife/x"));
     }
 
     fn m(glob: &str, path: &str) -> bool {

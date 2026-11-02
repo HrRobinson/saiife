@@ -25,11 +25,11 @@ id = "core.lock"
 name = "Core: lock"
 description = "Locked mode: privilege changes, saiife's service, persistence, agent safety switches, saiife's system paths and the managed agent settings."
 default_on = false
-version = 1
+version = 2
 # `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
 # substitution argument must not block every `kill` or `systemctl`.
 substitution_failsafe = false
-triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system", "(?i)icacls", "(?i)takeown", "(?i)cacls", "(?i)set-acl", "(?i)sc ", "(?i)sc.exe", "(?i)net ", "(?i)net1", "(?i)-service", "(?i)localgroup", "(?i)claudecode", "(?i)saiifed", "(?i)reg import", "(?i)reg.exe import", "(?i)reg restore", "(?i)reg.exe restore"]
 
 # --- read-only carve-outs (whole segment: no wrapper in front) ----------------
 [[allow]]
@@ -526,3 +526,89 @@ reason = "polkit's actions and rules decide how an approval is re-authenticated;
 glob = "/usr/local/share/polkit-1"
 access = "write"
 reason = "removing or moving polkit's local actions and rules changes how approvals are re-authenticated"
+
+# --- Windows (plan 19a, W7; used by locked mode in plan 19b) -------------------
+# Case-insensitive, any drive letter, `\` and `/` alike; on other systems they
+# match nothing real. PowerShell and cmd forms of `rm`, `mv`, `cp` and `kill`
+# arrive translated; the rest (`icacls`, `sc`, `reg`, the `*-Service` and
+# `*-ItemProperty` cmdlets) arrive as written. The files themselves are
+# guarded by the path rules below, whatever command writes them.
+[[deny]]
+# `icacls C:\ProgramData\saiife /grant Users:F`, `takeown /f …`, `Set-Acl`:
+# changing who may write saiife's install, the managed settings of Claude
+# Code, Codex and Gemini CLI. `%ProgramData%` and `$env:ProgramData` count.
+id = "windows-files"
+pattern = '(?i)^(?:\S*[\\/])?(?:icacls|takeown|cacls|xcacls|set-acl)(?:\.exe)?\s+(?:\S+\s+)*?(?:(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+programdata|%(?:programdata|allusersprofile)%|\$\{?env:(?:programdata|allusersprofile)\}?)[\\/]+(?:saiife|openai[\\/]+codex|gemini-cli)|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+(?:program ?files|progra~\d)|%programfiles%|%programw6432%|\$\{?env:programfiles\}?)[\\/]+claudecode)(?:[\\/]|\s|$)'
+reason = "changing who may write saiife's install or the managed agent settings lets an agent switch the guard off"
+
+[[deny]]
+# `sc.exe stop|config|delete|failure|sdset saiifed` (also `sc \\host …`), `net
+# stop saiifed` (or its display name), `Stop-Service|Set-Service|Remove-Service
+# |Restart-Service` of it, of a name that can match it (`sai*`, `*`) or fed from
+# a pipe, and registry edits of its service key. `sc.exe query` and `Get-Service`
+# stay allowed.
+id = "windows-service"
+pattern = '(?i)^(?:\S*[\\/])?(?:sc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:stop|pause|control|config|delete|failure|failureflag|sdset|privs|sidtype|triggerinfo)\s+saiifed(?:\.exe)?(?:\s|$)|net1?(?:\.exe)?\s+(?:stop|pause)\s+saiife(?:d|\s+daemon)(?:\s|$)|(?:stop|set|remove|restart|suspend)-service(?:\s+(?:\S+\s+)*?(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\s+-(?:force|nowait|passthru|whatif|confirm))*\s*$)|(?:reg(?:\.exe)?\s+(?:add|delete|import|copy|restore|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mi|rni|rnp|clp|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]+system[\\/]+(?:currentcontrolset|controlset\d+)[\\/]+services[\\/]+saiifed(?:[\\/]|\s|$))'
+reason = "stopping or changing the saiifed service leaves agent calls unrecorded"
+
+[[deny]]
+# `reg add|delete HKLM\SOFTWARE\Policies\ClaudeCode …` and the registry
+# provider's `Set-ItemProperty`, `New-ItemProperty`, `Remove-ItemProperty`,
+# `Remove-Item` and friends on it: the policy that holds the saiife hook.
+# `reg import` and `reg restore` take their keys from a file the guard cannot
+# read, so they are refused in locked mode whatever they name.
+id = "windows-claude-policy"
+pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+(?:import|restore)(?:\s|$)|(?:reg(?:\.exe)?\s+(?:add|delete|copy|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mi|rni|rnp|clp|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]+software[\\/]+(?:wow6432node[\\/]+)?policies[\\/]+claudecode(?:[\\/]|\s|$))'
+reason = "the ClaudeCode policy key holds the saiife hook; an agent may not change it"
+
+[[deny]]
+# `net localgroup saiife-audit alice /add`, `/delete`, and the LocalAccounts
+# cmdlets: membership of the group is what lets a person read the audit trail.
+id = "windows-audit-group"
+pattern = '(?i)^(?:\S*[\\/])?(?:net1?(?:\.exe)?\s+localgroup\s+(?:saiife-audit\s+(?:\S+\s+)*?/(?:add|delete)|(?:\S+\s+)*?/(?:add|delete)\s+(?:\S+\s+)*?saiife-audit)(?:\s|$)|(?:add-localgroupmember|remove-localgroupmember|remove-localgroup|rename-localgroup|set-localgroup)\s+(?:\S+\s+)*?saiife-audit(?:\s|$))'
+reason = "membership of the saiife-audit group decides who may read the audit trail"
+
+[[deny_path]]
+glob = "?:/programdata/saiife/**"
+access = "write"
+reason = "replacing or removing saiife's installed program switches the guard off"
+
+[[deny_path]]
+glob = "?:/programdata/saiife"
+access = "write"
+reason = "removing or moving saiife's install folder switches the guard off"
+
+[[deny_path]]
+glob = "?:/programdata/saiife/state/**"
+access = "any"
+reason = "saiife's state holds the audit signing key; reading it lets the audit trail be forged"
+
+[[deny_path]]
+glob = "?:/program files/claudecode/**"
+access = "write"
+reason = "Claude Code's managed settings hold the saiife hook"
+
+[[deny_path]]
+glob = "?:/program files/claudecode"
+access = "write"
+reason = "removing or moving Claude Code's managed settings removes the saiife hook"
+
+[[deny_path]]
+glob = "?:/programdata/openai/codex/**"
+access = "write"
+reason = "Codex's managed requirements hold the saiife hook"
+
+[[deny_path]]
+glob = "?:/programdata/openai/codex"
+access = "write"
+reason = "removing or moving Codex's managed config removes the saiife hook"
+
+[[deny_path]]
+glob = "?:/programdata/gemini-cli/**"
+access = "write"
+reason = "Gemini CLI's system settings hold the saiife hook"
+
+[[deny_path]]
+glob = "?:/programdata/gemini-cli"
+access = "write"
+reason = "removing or moving Gemini CLI's system settings removes the saiife hook"

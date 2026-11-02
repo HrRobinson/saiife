@@ -1,6 +1,6 @@
-//! The cmd reader, and the engine reading a line in a dialect. The packs' Windows
-//! rules arrive with Task 7, so `core.filesystem` here is a stand-in holding the
-//! W7 shape of its `rm` rule.
+//! The cmd reader, and the engine reading a line in a dialect. The engine here
+//! holds the shipped `core.filesystem` (so `rm -r C:\` is denied by the real
+//! rule) beside a stand-in pack of two secret path rules.
 
 use super::*;
 use crate::builtins::Catalog;
@@ -42,12 +42,8 @@ fn has_rm_r(cmd: &str, path: &str) -> bool {
 
 const PACK: &str = r#"
 [pack]
-id = "core.filesystem"
+id = "test.secrets"
 triggers = ["rm"]
-
-[[deny]]
-pattern = '(?i)^rm\s+(?:\S+\s+)*-[a-z]*r[a-z]*\s+(?:\S+\s+)*[a-z]:[\\/]?\*?(?:\s|$)'
-reason = "recursive rm of a drive root"
 
 [[deny_path]]
 glob = "**/.env"
@@ -60,11 +56,15 @@ access = "any"
 reason = "secret"
 "#;
 
-fn pack() -> crate::pack::Pack {
-    let mut warnings = Vec::new();
-    let p = load_pack_str("<t>", PACK, &mut warnings).unwrap();
+/// The shipped `core.filesystem`, then the stand-in path rules.
+fn packs() -> Vec<crate::pack::Pack> {
+    let (all, warnings) = Catalog::builtin().load_all();
     assert!(warnings.is_empty(), "{warnings:?}");
-    p
+    let fs = all.into_iter().find(|p| p.id == "core.filesystem").unwrap();
+    let mut warnings = Vec::new();
+    let paths = load_pack_str("<t>", PACK, &mut warnings).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    vec![fs, paths]
 }
 
 fn windows_vars() -> PathVars {
@@ -75,7 +75,7 @@ fn windows_vars() -> PathVars {
 }
 
 fn engine() -> Engine {
-    Engine::new(vec![pack()]).with_paths(windows_vars())
+    Engine::new(packs()).with_paths(windows_vars())
 }
 
 fn default_engine() -> Engine {
@@ -400,7 +400,7 @@ fn posix_engine_unchanged() {
         assert_eq!(e.evaluate(cmd), e.evaluate_call(cmd, POSIX), "{cmd}");
     }
     // POSIX style: `pwsh -c` stays as it was, a program with arguments.
-    let posix = Engine::new(vec![pack()]);
+    let posix = Engine::new(packs());
     assert!(is_clean(&posix.evaluate(r"pwsh -c 'ri -r C:\'")));
 }
 
@@ -409,7 +409,7 @@ fn posix_engine_unchanged() {
 /// `R`m` is `Rm` to PowerShell and an unterminated substitution to POSIX.
 #[test]
 fn a_powershell_payload_is_judged_as_powershell() {
-    let e = Engine::new(vec![pack()]).with_paths(windows_vars());
+    let e = Engine::new(packs()).with_paths(windows_vars());
     let cmd = r"R`m -Recurse -Force C:\";
     let input = serde_json::json!({"tool_name": "PowerShell", "tool_input": {"command": cmd}});
     for windows in [false, true] {
@@ -453,7 +453,7 @@ fn an_unreadable_powershell_command_is_no_allow() {
         assert!(d.is_deny(), "{cmd}: {d:?}");
     }
     // Over budget.
-    let slow = Engine::new(vec![pack()])
+    let slow = Engine::new(packs())
         .with_paths(windows_vars())
         .with_budget(std::time::Duration::ZERO);
     assert!(matches!(
@@ -501,7 +501,7 @@ fn unquoted_windows_paths_on_a_shell_tool_are_denied() {
 /// and one that names no path stays a value.
 #[test]
 fn a_powershell_variable_path_in_posix_style_is_no_allow() {
-    let e = Engine::new(vec![pack()]).with_paths(PathVars::new().with_cwd("/p"));
+    let e = Engine::new(packs()).with_paths(PathVars::new().with_cwd("/p"));
     for cmd in [
         "Get-Content $x",
         "gc ./$x/id_rsa",
@@ -862,7 +862,7 @@ fn cmd_files_and_globs() {
 /// Windows style lets `cd` and `rm` know a drive; POSIX style stays exact.
 #[test]
 fn cd_tracking_stays_posix_on_posix() {
-    let e = Engine::new(vec![pack()]);
+    let e = Engine::new(packs());
     assert!(!e.evaluate("cd C:/ && rm -rf *").is_deny());
 }
 

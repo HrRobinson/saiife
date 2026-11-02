@@ -10,13 +10,14 @@ id = "core.filesystem"
 name = "Core: filesystem"
 description = "Guards catastrophic filesystem destruction (root/home/system wipes, device writes, mkfs)."
 default_on = true
-version = 1
+version = 2
 # `sudo` (with or without flags/options) is unwrapped structurally by the
 # engine before matching (see `wrappers::unwrap_transparent_prefix`), so
 # these rules see the effective command at argv[0], not `sudo` itself. The
 # `(?:sudo\s+)?` prefix below predates that and is now redundant/harmless —
 # kept rather than churned. Triggers stay broad + cheap.
-triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/"]
+# A `(?i)` trigger ignores case (Windows commands do): the Windows rules below.
+triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/", "(?i)format", "(?i)diskpart", "(?i)clear-disk", "(?i)remove-partition", "(?i)initialize-disk", "(?i)reset-physicaldisk", "(?i)remove-virtualdisk", "(?i)cipher", "(?i)vssadmin", "(?i)wbadmin", "(?i)wmic"]
 
 # --- rm: recursive delete of a catastrophic target ----------------------------
 # Requires a recursive flag (combined like -rf/-fr/-Rf, or -r/-R, or
@@ -69,3 +70,42 @@ reason = "recursive chmod on a filesystem root or system directory breaks the sy
 [[deny]]
 pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+\s+(?:/\*|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
 reason = "recursive chown on a filesystem root or system directory breaks ownership system-wide"
+
+# --- Windows (plan 19a, W7) -----------------------------------------------------
+# These patterns apply on every OS, where they match nothing real: a drive
+# letter followed by a colon is not a Linux or macOS path. They are case-
+# insensitive, accept any drive letter and read `\` and `/` alike. PowerShell
+# and cmd forms arrive translated (`Remove-Item -Recurse -Force C:\`, `rd /s
+# /q C:\` are `rm -r -f C:\`), so `rm` is what is named here. The lines are
+# matched as written: a drive, `\\?\C:\`, an admin share (`\\localhost\c$\`),
+# a Git Bash mount (`/c/`, `/cygdrive/c/`) or an unexpanded system variable
+# (`%SystemRoot%`, `$env:windir`) can stand for the root.
+#
+# Not matched, by design: a user's own profile spelled as a path
+# (`C:\Users\a`), because a profile name may hold a space and the line cannot
+# tell `C:\Users\John Smith\proj` from `C:\Users\John` (`~`, `$HOME`,
+# `$env:USERPROFILE` and `%USERPROFILE%` are judged by the rule above).
+[[deny]]
+id = "windows-root-rm"
+pattern = '(?i)^rm\s+(?:\S+\s+)*(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:\S+\s+)*(?:\\+(?:\*(?:\.\*)?)?|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|[\\/]{2}(?:localhost|127\.0\.0\.1)[\\/][a-z]\$)[\\/]*(?:\*(?:\.\*)?)?|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|[\\/]{2}(?:localhost|127\.0\.0\.1)[\\/][a-z]\$)[\\/]+(?:windows|program files(?: \(x86\))?|programdata|users)[\\/]*(?:\*(?:\.\*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?|/cygdrive/[a-z]/?(?:\*(?:\.\*)?)?|/[a-z]/\*|/[a-z]/(?:windows|program files(?: \(x86\))?|programdata|users)/?(?:\*(?:\.\*)?)?)|(?:\\+(?:\*(?:\.\*)?)?|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|[\\/]{2}(?:localhost|127\.0\.0\.1)[\\/][a-z]\$)[\\/]*(?:\*(?:\.\*)?)?|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|[\\/]{2}(?:localhost|127\.0\.0\.1)[\\/][a-z]\$)[\\/]+(?:windows|program files(?: \(x86\))?|programdata|users)[\\/]*(?:\*(?:\.\*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?|/cygdrive/[a-z]/?(?:\*(?:\.\*)?)?|/[a-z]/\*|/[a-z]/(?:windows|program files(?: \(x86\))?|programdata|users)/?(?:\*(?:\.\*)?)?)\s+(?:\S+\s+)*(?:-[a-z]*r[a-z]*|--recursive))(?:\s|$)'
+reason = "recursive delete of a drive root, Windows, Program Files, ProgramData or Users is catastrophic and irreversible"
+
+[[deny]]
+# `format C: /q`, `format.com D: /fs:ntfs`, the storage cmdlets (even fed from
+# a pipe: `Get-Volume D | Format-Volume`) and `diskpart`, which runs commands
+# the guard cannot see. `Format-Table` and `Format-List` do not match.
+id = "windows-format"
+pattern = '(?i)^(?:\S*[\\/])?(?:format(?:\.com|\.exe)?\s+(?:\S+\s+)*(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|\\\\\?\\volume\{\S+)[\\/]*(?:\s|$)|diskpart(?:\.exe)?(?:\s|$)|(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk|remove-virtualdisk)(?:\s|$))'
+reason = "formatting, partitioning or wiping a disk destroys its data"
+
+[[deny]]
+# `cipher /w:C:\` overwrites all free space; `cipher /e` and `/d` stay allowed.
+id = "windows-cipher-wipe"
+pattern = '(?i)^(?:\S*[\\/])?cipher(?:\.exe)?\s+(?:\S+\s+)*/w(?::|\s|$)'
+reason = "cipher /w overwrites all the free space on a volume, which erases deleted files for good"
+
+[[deny]]
+# Shadow copies and backups are the way back from a bad delete.
+id = "windows-shadow-copies"
+pattern = '(?i)^(?:\S*[\\/])?(?:vssadmin(?:\.exe)?\s+(?:delete\s+shadows|resize\s+shadowstorage)|wbadmin(?:\.exe)?\s+delete\s|wmic(?:\.exe)?\s+(?:\S+\s+)*shadowcopy\s+(?:\S+\s+)*delete)'
+reason = "deleting shadow copies or backups removes the way back from a bad delete"
