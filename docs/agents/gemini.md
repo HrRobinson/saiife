@@ -53,6 +53,13 @@ If saiife does not answer in time, Gemini CLI runs the tool anyway (it
 records `error_allowed` in the audit log. One case may work the other way;
 see "If saiife is missing" below.
 
+On Windows, Gemini CLI runs `powershell.exe -NoProfile -Command`, according to its
+docs (not checked on a live install), and it can be pointed at `cmd.exe` through
+`ComSpec`. saiife reads each `run_shell_command` call as both PowerShell and POSIX,
+the stricter verdict wins, and a cmd reading can add a deny. A line the PowerShell
+reading cannot read is denied. There is no separate `PowerShell` tool to match. See
+[Windows](../windows.md#shells-and-the-guard).
+
 ## If saiife is missing
 
 If the `saiife` program is not on your `PATH` (moved, uninstalled), the shell

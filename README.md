@@ -16,6 +16,9 @@ The script verifies the SHA-256 checksum and installs `saiife` to `~/.local/bin`
 More options (pinned version, all users, manual install, uninstall):
 [docs/install.md](docs/install.md).
 
+On Windows, use `install.ps1` (developer mode only, and not yet run outside CI):
+see [docs/windows.md](docs/windows.md).
+
 To build from source instead, with Rust installed:
 `cargo install --path crates/cli` (this puts `saiife` in `~/.cargo/bin`, which
 must be on your `PATH`).
@@ -117,6 +120,8 @@ model.
   protects and what it does not.
 - [Audit forwarding](docs/forwarding.md), [auditors](docs/auditors.md) and
   the [egress recipe](docs/egress.md).
+- [Windows](docs/windows.md): developer mode, how each shell is read, and the
+  limits.
 - [Fleet install](docs/fleet.md): `.deb`, `.rpm` and macOS `.pkg` packages, with
   Ansible, Jamf and Intune recipes.
 - [Approvals](docs/approvals.md) and [notifications](docs/notifications.md).

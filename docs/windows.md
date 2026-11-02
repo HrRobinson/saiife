@@ -1,0 +1,119 @@
+# saiife on Windows
+
+**Nothing here has run on a real Windows machine yet.** The code was compiled for
+Windows and its pure logic was tested on Linux. The first real run is the
+`windows-latest` CI job, including the check of the readers against real
+PowerShell and cmd. Until that job is green, treat all of this page as designed
+behaviour, not observed behaviour.
+
+Supported: Windows 11 23H2 (build 22631) or later and Windows Server 2022 (build
+20348) or later, on x64 and ARM64. Windows 10 is not supported.
+
+## Developer mode
+
+Developer mode needs no administrator rights. Download `install.ps1` from a release,
+read it, then run it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+It checks the zip against the release's `SHA256SUMS` and installs `saiife.exe` to
+`%LOCALAPPDATA%\Programs\saiife\bin`, adding that folder to your user `Path` once.
+Do not pipe it into `Invoke-Expression`. The zip's Authenticode signature is
+checked too; a build that is not signed installs with a warning, and until the
+project has a signing identity the signer's name is not pinned.
+
+Then run `saiife init` in a project, as on the other platforms. The hook is
+`saiife check --hook-exit --agent <agent>`, found through `Path`, in Git Bash,
+PowerShell and cmd alike.
+
+The audit log is in `%LOCALAPPDATA%\saiife\audit`, not the roaming `%APPDATA%`, so
+a roaming profile never syncs it. Its files get no ACL of their own: they rely on
+your profile's `AppData\Local` allowing only you, SYSTEM and Administrators.
+`SAIIFE_DATA_DIR` and `SAIIFE_AUDIT_DIR` still win.
+
+A project hooked before this version needs `saiife init` once: the old matcher does
+not include the `PowerShell` tool, so those calls skip the hook. `saiife status`
+warns `hook matcher predates the PowerShell tool; run saiife init to update`.
+
+Developer mode on Windows has the same trust model as on other platforms: it stops
+mistakes and helpful bypasses, not a determined agent running as you. See
+[threats](threats.md#setup-developer).
+
+## Shells and the guard
+
+The guard reads a command the way the shell that will run it reads it:
+
+| Call | Read as |
+|---|---|
+| Claude Code `Bash` | POSIX (on Windows this is Git Bash) |
+| Claude Code `PowerShell` | PowerShell, on every OS |
+| Codex `Bash`, Gemini CLI `run_shell_command`, on a Windows host | PowerShell and POSIX; the stricter verdict wins. A third cmd reading can add a deny |
+| An unknown or renamed shell tool on a Windows host | Same as Codex and Gemini CLI |
+
+Cmdlets, their aliases and cmd builtins are translated to their POSIX equivalents
+(`Remove-Item -r -fo x` is `rm -r -f x`, `rd /s /q x` too), so the packs apply
+as they are. Parameters match by unambiguous prefix. `powershell -c`,
+`-EncodedCommand`, `cmd /c`, `iex` of one literal string, `Invoke-Command
+-ScriptBlock` and `& { … }` are judged inside.
+
+Paths are folded to one spelling before the path rules run: `\` and `/`, drive
+case, `\\?\C:\`, `\\localhost\c$\`, `/c/` and `/cygdrive/c/`, trailing dots and
+spaces, and `::$DATA`. `~`, `$HOME`, `$env:USERPROFILE` and `%USERPROFILE%` all mean
+your profile.
+
+What happens when the guard cannot judge something:
+
+| Case | Developer mode |
+|---|---|
+| The PowerShell or cmd reader cannot read the line (`$x` as a path, `.ps1` scripts, .NET calls, `Set-Alias`), under the PowerShell tool or the PowerShell reading of a Codex or Gemini CLI call | denied, and recorded as a deny |
+| A broken payload from the PowerShell tool | `error_denied` |
+| Out of time, a panic, or an oversize line | `error_allowed`. A rule that matches the remaining segments of a reader's line still denies it |
+| A note from the POSIX reading, or from the cmd reading under Codex and Gemini CLI | `error_allowed` |
+
+## Limits
+
+- **Nothing has run on real Windows until CI does.** The readers' grammar comes from
+  documentation and reasoning. `scripts/differential-windows.ps1` compares them
+  with `[System.Management.Automation.Language.Parser]::ParseInput` and with
+  harmless `cmd.exe` probes on `windows-latest`. It covers the assumptions listed
+  in the script, not all of PowerShell.
+- **Same-line reassignment is not resolved.** `export HOME=/tmp/x; cat ~/id_rsa` and
+  `USERPROFILE=/tmp/x; cat $USERPROFILE/id_rsa` are judged with the old value, so a
+  rule on `~/.ssh` can miss what really gets read. This is true on Linux and macOS
+  too.
+- **`eval 'cd ...'` is not tracked.** In `eval 'cd ~/.ssh' && cat id_rsa`, the guard
+  does not carry the `cd` back out, so `id_rsa` is read as relative to the old
+  directory. This is true on Linux and macOS too.
+- **A dead mapped drive can stall into a recorded allow.** The hook resolves paths
+  through the filesystem. If a mapped drive or a local symlink to a share hangs, the
+  call runs out of time and, in developer mode, is allowed and recorded as
+  `error_allowed`. A hung NFS mount does the same on Linux. The record shows it.
+  So can a very long line, unless a rule matches a segment of it.
+- **It blocks more than it should in places.** A command with no entry in the
+  guard's table is treated as reading every path-shaped word it is given.
+  `Test-Path .env` is denied, as are `npm run x .env`, `node ./x/.env` and a bare
+  drive-shaped word such as `tool h:mm`. An agent is refused and tries another way.
+- **UNC paths are lexical.** The hook does not touch a host named in a command, so a
+  symlink on a share is not resolved: `\\host\share\link` is judged as written.
+  `\\localhost\c$\…` and `\\127.0.0.1\c$\…` are read as `C:\…`.
+- **Some writers are judged as reads.** `Start-BitsTransfer -Destination`,
+  `Export-Certificate` and `Save-Module` get only a read of their paths, so a rule
+  that blocks writes and not reads does not see them.
+- **Git Bash is read as POSIX.** So `pwsh -c '...'` from it is limited: nested
+  shells are read on a Windows host, but an unreadable result stays a recorded
+  `error_allowed` rather than a deny, because that route is POSIX. On Linux and
+  macOS `pwsh -c '...'` from the `Bash` tool is not read inside at all.
+- **Out of scope for the readers:** aliases and functions defined in the same
+  command (`Set-Alias`, `function f {…}`), the contents of `.ps1` scripts, .NET calls
+  (`[IO.File]::Delete(…)`) and COM objects. Under the PowerShell reading these are
+  denied rather than read. Under cmd only, on a Codex or Gemini CLI call, they
+  are recorded.
+- **Agents.** Every Windows lock label is `unverified`, and which shells Codex and
+  Gemini CLI use comes from their docs, not a run.
+
+## Locked mode
+
+Locked mode on Windows is plan 19b. It is not available yet: `saiife system install`
+is refused on Windows. The design is in the v2 spec, section 5.3a.

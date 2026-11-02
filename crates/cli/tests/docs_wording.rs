@@ -101,6 +101,64 @@ fn readme_and_threats_carry_the_full_sentence() {
 }
 
 #[test]
+fn windows_page_states_its_facts_and_limits() {
+    let root = root();
+    let text = fs::read_to_string(root.join("docs/windows.md")).unwrap();
+    for needle in [
+        "install.ps1",
+        r"%LOCALAPPDATA%\saiife\audit",
+        "PowerShell",
+        "Windows 11 23H2",
+        // The anchors other pages link to.
+        "## Developer mode",
+        "## Shells and the guard",
+        "## Limits",
+        "## Locked mode",
+        // Honest about what has run.
+        "has run on a real Windows machine yet",
+        // The limits the rulings named.
+        "export HOME=",
+        "eval 'cd",
+        "dead mapped drive",
+        "Test-Path .env",
+        "UNC paths are lexical",
+        "Start-BitsTransfer -Destination",
+        "Export-Certificate",
+        "Save-Module",
+        "pwsh -c '...'",
+    ] {
+        assert!(text.contains(needle), "docs/windows.md lacks {needle}");
+    }
+    let locked = text.split("## Locked mode").nth(1).unwrap();
+    assert!(locked.contains("plan 19b"), "the locked section names 19b");
+}
+
+#[test]
+fn threats_lists_the_windows_limits() {
+    let text = fs::read_to_string(root().join("docs/threats.md")).unwrap();
+    assert!(
+        text.contains("Set-Alias"),
+        "docs/threats.md lacks Set-Alias"
+    );
+    assert!(text.contains("windows.md#limits"));
+}
+
+#[test]
+fn install_and_readme_point_windows_at_its_page() {
+    let root = root();
+    for f in ["docs/install.md", "README.md"] {
+        let text = fs::read_to_string(root.join(f)).unwrap();
+        assert!(text.contains("install.ps1"), "{f} lacks install.ps1");
+        assert!(text.contains("windows.md"), "{f} lacks the Windows page");
+    }
+    for f in ["claude-code", "codex", "gemini"] {
+        let text = fs::read_to_string(root.join(format!("docs/agents/{f}.md"))).unwrap();
+        assert!(text.contains("PowerShell"), "{f}.md lacks PowerShell");
+        assert!(text.contains("windows.md"), "{f}.md lacks the Windows page");
+    }
+}
+
+#[test]
 fn new_pages_exist_and_are_linked_from_the_readme() {
     let root = root();
     let readme = fs::read_to_string(root.join("README.md")).unwrap();

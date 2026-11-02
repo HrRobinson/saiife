@@ -40,7 +40,8 @@ and accept it. `/hooks` in Claude Code shows the saiife hook.
 
 | Claude Code tool | Judged as | Main pack |
 | --- | --- | --- |
-| `Bash` | a shell command | all packs that are on |
+| `Bash` | a shell command (read as POSIX; on Windows this is Git Bash) | all packs that are on |
+| `PowerShell` | a shell command, read as PowerShell on every OS | all packs that are on |
 | `Read`, `Grep`, `Glob`, `LS` | a file read | [core.secrets](../packs/core.secrets.md) |
 | `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | a file change | [core.self](../packs/core.self.md) |
 
@@ -48,7 +49,14 @@ The timeout is 10 seconds. If saiife does not answer in time, or cannot
 start, Claude Code runs the tool anyway (it "fails open"). This is on
 purpose for v1, where a person is nearby: a broken guard should not stop your
 work. When saiife itself hits an error, it allows the tool and records
-`error_allowed` in the audit log.
+`error_allowed` in the audit log. A line the PowerShell reader cannot read, such
+as a .NET call, is denied instead: see [Windows](../windows.md#shells-and-the-guard).
+
+On Windows, Claude Code's `Bash` tool runs Git Bash and its `PowerShell` tool runs
+PowerShell. The hook's matcher names both. A project hooked before the `PowerShell`
+tool was added skips the hook for those calls until you run `saiife init` once;
+`saiife status` warns `hook matcher predates the PowerShell tool; run saiife init to
+update`. See [Windows](../windows.md).
 
 ## Turning it off
 
