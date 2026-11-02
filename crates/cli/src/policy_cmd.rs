@@ -485,7 +485,14 @@ fn run_case(
             });
             // Long enough that a slow runner never fails open.
             let budget = Duration::from_millis(cfg.guard.budget_ms.max(10_000));
-            let a = judge_with(&payload, &ids, budget, locked.as_ref(), &cfg.guard.ask);
+            let a = judge_with(
+                &payload,
+                &ids,
+                budget,
+                locked.as_ref(),
+                &cfg.guard.ask,
+                None,
+            );
             let why = a.reason.as_deref().unwrap_or("");
             let rule = a.rule_id.as_deref().or(a.rule.as_deref()).unwrap_or("");
             Ok(match a.verdict {

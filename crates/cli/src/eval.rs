@@ -17,7 +17,7 @@ use saiifeguard::canon::{expand_glob_partial, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 use saiifeguard::payload::{
-    classify, context_from_hook_json_bounded, search_globs, PayloadError, ToolCall,
+    classify_for, context_from_hook_json_bounded, search_globs, Dialects, PayloadError, ToolCall,
     MAX_PAYLOAD_BYTES,
 };
 
@@ -72,6 +72,10 @@ pub struct EvalRequest {
     /// is checked again without all of them (`askable`).
     #[serde(default)]
     pub ask: Vec<String>,
+    /// The agent whose hook this is: with the tool and the host it picks the
+    /// dialect of a shell command (`payload::dialects_for`).
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 /// What the worker answers on stdout.
@@ -111,6 +115,7 @@ pub enum Verdict {
 pub enum Plan {
     Shell {
         command: String,
+        dialects: Dialects,
     },
     Files(FileCall),
     /// A write with no path to judge (an `apply_patch` without file
@@ -121,6 +126,7 @@ pub enum Plan {
     /// A shell call in a payload over `MAX_PAYLOAD_BYTES`: not judged.
     TooLarge {
         command: String,
+        dialects: Dialects,
     },
     Unusable(PayloadError),
 }
@@ -143,14 +149,31 @@ impl FileCall {
     }
 }
 
+/// Does this call have to fail closed whatever the config says? A reader's
+/// command that went unjudged (too large, unusable, the guard crashed) is
+/// never an allow. A payload that did not parse names its tool only in its
+/// text: over-matching one blocks a call that could not be judged anyway.
+pub fn must_fail_closed(plan: &Plan, buf: &str) -> bool {
+    match plan {
+        Plan::Shell { dialects, .. } | Plan::TooLarge { dialects, .. } => dialects.has_reader(),
+        Plan::Unusable(_) => names_powershell(buf),
+        Plan::Files(_) | Plan::NoPath | Plan::Other => false,
+    }
+}
+
+/// The text of a payload too large or too broken to parse names PowerShell.
+pub fn names_powershell(buf: &str) -> bool {
+    buf.to_ascii_lowercase().contains("powershell")
+}
+
 /// Classify `buf` (a payload of at most `PARSE_MAX_BYTES`) into what the
-/// guard must judge.
-pub fn plan(buf: &str) -> Plan {
-    match classify(buf, PARSE_MAX_BYTES) {
-        Ok(ToolCall::Shell { command }) if buf.len() > MAX_PAYLOAD_BYTES => {
-            Plan::TooLarge { command }
+/// guard must judge. `agent` and the host pick a shell command's dialect.
+pub fn plan(buf: &str, agent: Option<&str>) -> Plan {
+    match classify_for(buf, PARSE_MAX_BYTES, agent, cfg!(windows)) {
+        Ok(ToolCall::Shell { command, dialects }) if buf.len() > MAX_PAYLOAD_BYTES => {
+            Plan::TooLarge { command, dialects }
         }
-        Ok(ToolCall::Shell { command }) => Plan::Shell { command },
+        Ok(ToolCall::Shell { command, dialects }) => Plan::Shell { command, dialects },
         Ok(ToolCall::File {
             tool,
             mut paths,
@@ -282,7 +305,7 @@ pub fn judge_paths(engine: &Engine, access: Access, paths: &[String]) -> Decisio
 /// `judge_with` on a host with the default system paths.
 #[cfg(test)]
 pub fn judge(payload: &str, packs: &[String], budget: Duration) -> EvalAnswer {
-    judge_with(payload, packs, budget, None, &[])
+    judge_with(payload, packs, budget, None, &[], None)
 }
 
 /// Judge one hook payload with exactly `packs` compiled and `budget` for
@@ -295,6 +318,7 @@ pub fn judge_with(
     budget: Duration,
     locked: Option<&LockedPaths>,
     ask: &[String],
+    agent: Option<&str>,
 ) -> EvalAnswer {
     let ctx = context_from_hook_json_bounded(payload, PARSE_MAX_BYTES);
     let answer = |verdict, input: String, reason: &str| EvalAnswer {
@@ -311,8 +335,8 @@ pub fn judge_with(
         return answer(Verdict::Unjudged, String::new(), &reason);
     }
     let engine = || engine_for(packs, ctx.cwd.as_deref(), budget, locked);
-    match plan(payload) {
-        Plan::TooLarge { command } => {
+    match plan(payload, agent) {
+        Plan::TooLarge { command, .. } => {
             let e = PayloadError::TooLarge {
                 limit: MAX_PAYLOAD_BYTES,
             };
@@ -329,9 +353,9 @@ pub fn judge_with(
         ),
         Plan::NoPath => answer(Verdict::Unjudged, String::new(), "no path to judge"),
         Plan::Other => answer(Verdict::Allow, String::new(), "tool not judged"),
-        Plan::Shell { command } => {
+        Plan::Shell { command, dialects } => {
             let (engine, _) = engine();
-            let d = engine.evaluate(&command);
+            let d = engine.evaluate_call(&command, dialects);
             let rule_id = match &d {
                 Decision::Deny { pack, pattern, .. } => {
                     engine.rule_id(pack, pattern).map(str::to_string)
@@ -340,7 +364,7 @@ pub fn judge_with(
             };
             let askable = match (&d, &rule_id) {
                 (Decision::Deny { pack, .. }, Some(id)) => {
-                    askable(&engine, &command, pack, id, ask)
+                    askable(&engine, &command, dialects, pack, id, ask)
                 }
                 _ => false,
             };
@@ -361,13 +385,22 @@ pub fn judge_with(
 /// Whether a deny of `command` by `pack/id` may be approved: `pack/id` is
 /// in `ask`, and the engine without every `ask` rule allows the command
 /// (no other deny anywhere in it). One more evaluation, on ask paths only.
-fn askable(engine: &Engine, command: &str, pack: &str, id: &str, ask: &[String]) -> bool {
+fn askable(
+    engine: &Engine,
+    command: &str,
+    dialects: Dialects,
+    pack: &str,
+    id: &str,
+    ask: &[String],
+) -> bool {
     let listed: Vec<(&str, &str)> = ask.iter().filter_map(|a| a.split_once('/')).collect();
     if !listed.contains(&(pack, id)) {
         return false;
     }
     matches!(
-        engine.without_deny_rules(&listed).evaluate(command),
+        engine
+            .without_deny_rules(&listed)
+            .evaluate_call(command, dialects),
         Decision::Allow {
             trace: AllowTrace::NoMatch | AllowTrace::AllowRule { .. }
         }
@@ -793,6 +826,7 @@ pub fn worker_main() -> ExitCode {
             Duration::from_millis(req.budget_ms),
             req.locked.as_ref(),
             &req.ask,
+            req.agent.as_deref(),
         ),
         Some("config-change") => judge_config_change(&req.payload),
         Some(other) => EvalAnswer {
@@ -949,6 +983,60 @@ mod tests {
         assert_eq!(a.input, key);
     }
 
+    /// A `PowerShell` tool call goes through the PowerShell reader in the
+    /// worker, and what that reader cannot read is no allow.
+    #[test]
+    fn a_powershell_call_is_read_as_powershell_in_the_worker() {
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let ask = |tool: &str, cmd: &str| {
+            judge(
+                &payload(cwd, tool, serde_json::json!({ "command": cmd })),
+                &defaults(),
+                BUDGET,
+            )
+        };
+        // `g`it` is `git` to PowerShell, an unterminated substitution to POSIX.
+        let cmd = "g`it reset --hard";
+        let a = ask("PowerShell", cmd);
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+        assert_eq!(a.pack.as_deref(), Some("core.git"), "{a:?}");
+        assert_ne!(ask("Bash", cmd).verdict, Verdict::Deny);
+        for cmd in ["iex $x", "[IO.File]::Delete('x')", "pwsh -e !!notbase64"] {
+            let a = ask("PowerShell", cmd);
+            assert_eq!(a.verdict, Verdict::Deny, "{cmd}: {a:?}");
+        }
+        assert_eq!(ask("PowerShell", "git status").verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn plan_carries_the_dialect() {
+        let shell = |tool: &str, agent| {
+            let input = format!(r#"{{"tool_name":"{tool}","tool_input":{{"command":"ls"}}}}"#);
+            match plan(&input, agent) {
+                Plan::Shell { dialects, .. } => dialects,
+                other => panic!("{other:?}"),
+            }
+        };
+        let ps = Dialects::One(saiifeguard::wintable::Dialect::PowerShell);
+        assert_eq!(shell("PowerShell", Some("claude")), ps);
+        assert_eq!(shell("PowerShell", None), ps);
+        assert!(!shell("Bash", Some("claude")).has_reader());
+        // Over the size limit it keeps its dialect, and fails closed.
+        let big = format!(
+            r#"{{"tool_name":"PowerShell","tool_input":{{"command":"{}"}}}}"#,
+            "x".repeat(MAX_PAYLOAD_BYTES)
+        );
+        let large = plan(&big, None);
+        assert!(matches!(large, Plan::TooLarge { dialects, .. } if dialects == ps));
+        assert!(must_fail_closed(&large, &big));
+        // Not parsed: its text is all there is.
+        let broken = r#"{"tool_name":"PowerShell""#;
+        assert!(must_fail_closed(&plan(broken, None), broken));
+        let broken = r#"{"tool_name":"Bash""#;
+        assert!(!must_fail_closed(&plan(broken, None), broken));
+    }
+
     #[test]
     fn askable_only_when_ask_rules_alone_deny() {
         let p = tempfile::tempdir().unwrap();
@@ -961,6 +1049,7 @@ mod tests {
                 BUDGET,
                 None,
                 ask,
+                None,
             )
         };
         let a = run("git push --force origin main", &ask);

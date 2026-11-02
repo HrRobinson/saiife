@@ -45,7 +45,7 @@ const NOTE_STOP_PARSING: &str = "--% hands raw text to the program";
 const NOTE_REDIRECT: &str = "a redirection target cannot be read";
 const NOTE_OPAQUE: &str = "this PowerShell command cannot be judged";
 const NOTE_SCRIPT: &str = "a script's contents cannot be read";
-const NOTE_NESTED: &str = "a nested command cannot be read";
+const NOTE_NESTED: &str = crate::engine::UNRESOLVED_REASON;
 const NOTE_FOREACH: &str = "ForEach-Object without a script block calls a method";
 const NOTE_PROVIDER: &str = "a variable reads through a PowerShell drive";
 const NOTE_FUNCTION: &str = "a function or alias is defined through its drive";
@@ -53,7 +53,7 @@ const NOTE_COMMENT: &str = "`<#` touching a word may or may not open a comment";
 
 /// Commands whose effect the table cannot follow: defining a name, a provider,
 /// .NET or COM, or a file operation with no row of its own.
-const OPAQUE: &[&str] = &[
+pub(crate) const OPAQUE: &[&str] = &[
     "set-alias",
     "sal",
     "new-alias",
@@ -221,7 +221,7 @@ fn is_member(c: char) -> bool {
 }
 
 /// Variables `winpath` reads: as literal text the path rules see through them.
-fn known_variable(name: &str) -> bool {
+pub(crate) fn known_variable(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(lower.as_str(), "home" | "pwd") {
         return true;
@@ -1490,7 +1490,8 @@ reason = "secret"
         assert_eq!(
             classify(input, 4096).unwrap(),
             ToolCall::Shell {
-                command: "ls".into()
+                command: "ls".into(),
+                dialects: crate::payload::Dialects::One(Dialect::PowerShell),
             }
         );
     }

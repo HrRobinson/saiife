@@ -27,6 +27,7 @@ use crate::canon::{
     PathVars, GLOB_SCAN_LIMIT,
 };
 use crate::cdtrack::RuleCwd;
+use crate::cmdexe;
 use crate::lexer::{
     find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
 };
@@ -34,10 +35,12 @@ use crate::normalize::build_argv;
 use crate::operands::{operands, Operand, Source};
 use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
-use crate::payload::{inline_payload, watch_payload};
+use crate::payload::{inline_payload, watch_payload, Dialects};
 use crate::prefilter::Prefilter;
+use crate::pwsh;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::winpath;
+use crate::wintable::Dialect;
 use crate::wrappers::{
     effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
     unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
@@ -69,6 +72,16 @@ const CD_RESOLVED_PACK: &str = "core.filesystem";
 /// pattern: no rule of any pack decided it.
 const UNREADABLE_PACK: &str = "guard.winpath";
 const UNREADABLE_PATTERN: &str = "unreadable Windows path";
+
+/// Why a value that decides what runs is not judged (`eval "$x"`, an
+/// `-EncodedCommand` that does not decode).
+pub(crate) const UNRESOLVED_REASON: &str = "eval of a command substitution cannot be judged";
+
+/// The deny for what the PowerShell or cmd reader could not read.
+const UNREADABLE_COMMAND_PATTERN: &str = "reader-could-not-judge";
+
+/// The guarded-argument fail-safe's pattern (`command_rules_phase`).
+const GUARDED_SUBSTITUTION_PATTERN: &str = "guarded-command-substitution-argument";
 
 /// The engine's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,12 +417,77 @@ impl Engine {
 
     /// Evaluate a raw command line and return the decision.
     pub fn evaluate(&self, raw_cmd: &str) -> Decision {
+        self.reading(raw_cmd, Dialect::Posix)
+    }
+
+    /// Evaluate `raw_cmd` as written in `dialects`. `Strictest`: every reading,
+    /// and the stricter wins (`stricter`). A reading's outcome is what the
+    /// engine found; `evaluate_call` is what a hook answers.
+    pub fn evaluate_in(&self, raw_cmd: &str, dialects: Dialects) -> Decision {
+        self.readings(raw_cmd, dialects, |_, d| d)
+    }
+
+    /// `evaluate_in` for a hook call: what the PowerShell or cmd reader could
+    /// not read (a note, a value it cannot see, the budget) is a deny, not a
+    /// recorded allow. A misread command is a live bypass there, and `eval`'s
+    /// POSIX outcome stays as it was.
+    pub fn evaluate_call(&self, raw_cmd: &str, dialects: Dialects) -> Decision {
+        self.readings(raw_cmd, dialects, |dialect, d| {
+            if dialect == Dialect::Posix {
+                d
+            } else {
+                closed_reading(d)
+            }
+        })
+    }
+
+    fn readings(
+        &self,
+        raw_cmd: &str,
+        dialects: Dialects,
+        finish: impl Fn(Dialect, Decision) -> Decision,
+    ) -> Decision {
+        let (a, b) = match dialects {
+            Dialects::One(d) => return finish(d, self.reading(raw_cmd, d)),
+            Dialects::Strictest(a, b) => (a, b),
+        };
+        let first = finish(a, self.reading(raw_cmd, a));
+        let second = finish(b, self.reading(raw_cmd, b));
+        let both = if a == Dialect::PowerShell || b != Dialect::PowerShell {
+            stricter(first, second)
+        } else {
+            stricter(second, first)
+        };
+        if a == Dialect::Cmd || b == Dialect::Cmd {
+            return both;
+        }
+        // The shell may be cmd (`ComSpec`), which neither reading sees:
+        // `r^d /s /q C:\`. Its grammar over text meant for another shell is
+        // noise (`%` in `git log --format=%h%d`, `'` is no quote), so only a
+        // deny by a rule counts; a fail-safe deny there is a recorded unknown.
+        match self.reading(raw_cmd, Dialect::Cmd) {
+            Decision::Deny { pattern, .. } if pattern == GUARDED_SUBSTITUTION_PATTERN => stricter(
+                both,
+                Decision::Allow {
+                    trace: AllowTrace::Unjudgeable {
+                        reason: "as cmd, a variable decides this command".to_string(),
+                    },
+                },
+            ),
+            d @ Decision::Deny { .. } => stricter(both, d),
+            Decision::Allow { .. } => both,
+        }
+    }
+
+    /// One reading, with a budget of its own.
+    fn reading(&self, raw_cmd: &str, dialect: Dialect) -> Decision {
         self.path_rules();
         let start = Instant::now();
         let state = ShellState {
             cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
             cwd_unknown: false,
-            rule_cwd: RuleCwd::start(self.vars.cwd()),
+            rule_cwd: RuleCwd::start(self.vars.cwd())
+                .styled(self.vars.style() == PathStyle::Windows),
             env_changed: false,
             ifs_named: false,
         };
@@ -417,7 +495,7 @@ impl Engine {
             start,
             spent: Cell::default(),
         };
-        self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None)
+        self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None, dialect)
     }
 
     /// `state`: the shell state at the start of `raw_cmd`; a nested
@@ -425,6 +503,8 @@ impl Engine {
     /// `$(…)` (lexed as bash lexes one: `split_substitution_noted`).
     /// `out`: receives where the line's `cd`s leave the shell (for a line
     /// that runs in the calling shell: `eval`), unless it is denied.
+    /// `dialect`: which reader reads `raw_cmd`.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_inner(
         &self,
         raw_cmd: &str,
@@ -433,26 +513,37 @@ impl Engine {
         state: &ShellState,
         sub_body: bool,
         out: Option<&mut RuleCwd>,
+        dialect: Dialect,
     ) -> Decision {
         let start = clock.start;
         let mut state = state.clone();
+        let reader = dialect != Dialect::Posix;
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
         // comment): values are still judged, the unresolved words too.
-        state.ifs_named |= mentions_ifs(raw_cmd);
+        state.ifs_named |= !reader && mentions_ifs(raw_cmd);
         let mut found = Findings::default();
-        let (segments, lex_note) = if sub_body {
-            split_substitution_noted(raw_cmd)
-        } else {
-            split_segments_noted(raw_cmd)
+        let (mut segments, lex_note) = match dialect {
+            Dialect::PowerShell => pwsh::split_segments_noted(raw_cmd),
+            Dialect::Cmd => cmdexe::split_segments_noted(raw_cmd),
+            Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
+            Dialect::Posix => split_segments_noted(raw_cmd),
         };
+        if reader {
+            reader_assignments(&mut segments, &mut found);
+        }
         if let Some(reason) = lex_note {
             found.unjudged(reason);
         }
         let cx = Ctx {
             start,
             depth,
-            literal_path: has_literal_path_ref(raw_cmd) || !path_refs_are_plain(raw_cmd, &segments),
+            // Both checks read POSIX quoting off the raw line. A reader's
+            // `PATH` assignment always counts as a change.
+            literal_path: reader
+                || has_literal_path_ref(raw_cmd)
+                || !path_refs_are_plain(raw_cmd, &segments),
             clock,
+            dialect,
         };
 
         for seg in segments {
@@ -491,13 +582,17 @@ impl Engine {
         // the engine reasons about the *effective* command, not the
         // wrapper, so packs never need to know these wrappers exist.
         let effective = unwrap_transparent_prefix(seg);
-        match self.command_position_phase(seg, effective, cx, state, found) {
-            Flow::Proceed => {}
-            Flow::NextSegment => return None,
-            Flow::Done(d) => return Some(d),
-        }
-        if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
-            return Some(d);
+        // Both phases read a word's text as POSIX. The readers already made
+        // segments of what a `$(…)` holds, and noted what they could not read.
+        if cx.dialect == Dialect::Posix {
+            match self.command_position_phase(seg, effective, cx, state, found) {
+                Flow::Proceed => {}
+                Flow::NextSegment => return None,
+                Flow::Done(d) => return Some(d),
+            }
+            if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
+                return Some(d);
+            }
         }
         // A wrapper option saiife does not know may take a value, which
         // would make the wrong word the command: not fully judged.
@@ -519,12 +614,20 @@ impl Engine {
                     via_inline: None,
                 });
             }
-            let nested = self.recurse(&split.line, cx, state, false, "env -S command", None);
+            let nested = self.recurse_in(
+                Dialect::Posix,
+                &split.line,
+                cx,
+                state,
+                false,
+                "env -S command",
+                None,
+            );
             if let Some(d) = found.nested(nested) {
                 return Some(d);
             }
         }
-        let view = SegmentView::new(seg, effective, state, cx.literal_path, &self.vars, found);
+        let view = SegmentView::new(seg, effective, state, cx, &self.vars, found);
         if view.argv.is_empty() || view.argv[0].is_empty() {
             return self.bare_segment_phase(&view, cx, state, found);
         }
@@ -541,7 +644,10 @@ impl Engine {
         if let Some(d) = self.cd_phase(&view, state) {
             return Some(d);
         }
-        self.inline_payload_phase(&view, cx, state, found)
+        if let Some(d) = self.inline_payload_phase(&view, cx, state, found) {
+            return Some(d);
+        }
+        self.nested_shell_phase(&view, cx, state, found)
     }
 
     /// The one place that enforces `MAX_INLINE_DEPTH`, the budget, and the
@@ -550,6 +656,21 @@ impl Engine {
     /// `what` names the construct in that note.
     fn recurse(
         &self,
+        inner: &str,
+        cx: &Ctx,
+        state: &ShellState,
+        sub_body: bool,
+        what: &str,
+        out: Option<&mut RuleCwd>,
+    ) -> Nested {
+        self.recurse_in(cx.dialect, inner, cx, state, sub_body, what, out)
+    }
+
+    /// `recurse`, with `inner` read in `dialect`.
+    #[allow(clippy::too_many_arguments)]
+    fn recurse_in(
+        &self,
+        dialect: Dialect,
         inner: &str,
         cx: &Ctx,
         state: &ShellState,
@@ -566,7 +687,7 @@ impl Engine {
         if start.elapsed() > self.budget {
             return Nested::TimedOut;
         }
-        match self.evaluate_inner(inner, cx.clock, depth + 1, state, sub_body, out) {
+        match self.evaluate_inner(inner, cx.clock, depth + 1, state, sub_body, out, dialect) {
             Decision::Deny {
                 pack,
                 pattern,
@@ -747,7 +868,7 @@ impl Engine {
         {
             return Some(Decision::Deny {
                 pack: SUBSTITUTION_GUARD_PACK.to_string(),
-                pattern: "guarded-command-substitution-argument".to_string(),
+                pattern: GUARDED_SUBSTITUTION_PATTERN.to_string(),
                 reason: format!(
                     "{} has a command-substitution argument; the guard cannot see \
                      what it expands to, so it fails safe and blocks",
@@ -838,6 +959,9 @@ impl Engine {
         state: &ShellState,
         found: &mut Findings,
     ) -> Option<Decision> {
+        if cx.dialect != Dialect::Posix && self.reader_path_is_unknown(view) {
+            found.unjudged(UNRESOLVED_REASON);
+        }
         let ops = self.shell_ops(
             &view.seg_ops,
             &view.resolved,
@@ -898,7 +1022,7 @@ impl Engine {
         }
         let effective = &view.resolved;
         if effective.iter().any(|w| w.has_substitution) {
-            found.unjudged("eval of a command substitution cannot be judged");
+            found.unjudged(UNRESOLVED_REASON);
         }
         // `eval -- ARGS`: the `--` ends eval's (empty) options.
         let args = match effective.get(1) {
@@ -1002,7 +1126,34 @@ impl Engine {
         found: &mut Findings,
     ) -> Option<Decision> {
         let inner = inline_payload(&view.argv).or_else(|| watch_payload(&view.argv))?;
-        let nested = self.recurse(&inner, cx, state, false, "inline command", None);
+        // The program is a POSIX shell, whichever shell started it.
+        let nested = self.recurse_in(
+            Dialect::Posix,
+            &inner,
+            cx,
+            state,
+            false,
+            "inline command",
+            None,
+        );
+        found.nested(nested)
+    }
+
+    /// `powershell -enc …`, `cmd /c …`, `iex '…'`: the text is a command line
+    /// in that shell's own dialect. Under POSIX only on a Windows host (Git
+    /// Bash starting `powershell`): POSIX style stays as it was.
+    fn nested_shell_phase(
+        &self,
+        view: &SegmentView,
+        cx: &Ctx,
+        state: &ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        if cx.dialect == Dialect::Posix && self.vars.style() != PathStyle::Windows {
+            return None;
+        }
+        let (dialect, inner) = cmdexe::nested(&view.resolved)?;
+        let nested = self.recurse_in(dialect, &inner, cx, state, false, "nested command", None);
         found.nested(nested)
     }
 
@@ -1145,6 +1296,33 @@ impl Engine {
 
     /// The paths a shell segment touches (`operands`), plus `extra` (files
     /// a peeled-off wrapper reads). Empty without path rules.
+    /// POSIX style (`pwsh` on Linux or macOS): `operands` skips a word it cannot
+    /// see, so `Get-Content $x` would have no path to judge. A reader's word is
+    /// a path it does not know, as `winpath::path_words` makes it on Windows.
+    fn reader_path_is_unknown(&self, view: &SegmentView) -> bool {
+        if !self.has_path_rules
+            || self.vars.style() == PathStyle::Windows
+            || !view.seg_ops.iter().any(|w| w.has_substitution)
+        {
+            return false;
+        }
+        let seen = |words: &[Word]| -> Vec<Word> {
+            words
+                .iter()
+                .cloned()
+                .map(|mut w| {
+                    w.has_substitution = false;
+                    w
+                })
+                .collect()
+        };
+        let all = operands(&seen(&view.seg_ops), &seen(&view.resolved), &view.argv);
+        view.seg_ops
+            .iter()
+            .filter(|w| w.has_substitution)
+            .any(|w| all.iter().any(|op| op.path.contains(&w.text)))
+    }
+
     fn shell_ops(
         &self,
         seg: &[Word],
@@ -1444,6 +1622,69 @@ impl Engine {
         let ops = operands(&seg, &seg, &self.path_argv(&argv, &seg));
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
         self.judge_operands(ops, &cwds, false, Instant::now())
+    }
+}
+
+/// The stricter of two decisions; `a` when they rank alike. Deny, then what
+/// was not judged (never hidden by a reading that judged it), then an allow
+/// rule's trace, then no match.
+fn stricter(a: Decision, b: Decision) -> Decision {
+    let rank = |d: &Decision| match d {
+        Decision::Deny { .. } => 4,
+        Decision::Allow { trace } => match trace {
+            AllowTrace::FailedOpenTimeout => 3,
+            AllowTrace::Unjudgeable { .. } => 2,
+            AllowTrace::AllowRule { .. } => 1,
+            AllowTrace::NoMatch => 0,
+        },
+    };
+    if rank(&b) > rank(&a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// A reader's decision as a hook call answers it: what was not read is a deny.
+fn closed_reading(d: Decision) -> Decision {
+    let why = match &d {
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { reason },
+        } => reason.as_str(),
+        Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        } => "the guard ran out of time",
+        _ => return d,
+    };
+    Decision::Deny {
+        pack: SUBSTITUTION_GUARD_PACK.to_string(),
+        pattern: UNREADABLE_COMMAND_PATTERN.to_string(),
+        reason: format!("{why}; the guard cannot read this command, so it fails safe and blocks"),
+        via_inline: None,
+    }
+}
+
+/// Variable names ignore case on Windows, and the profile's variables are its
+/// `HOME`: an assignment as `PROTECTED_ENV` reads it. A path spelled with one
+/// of them means something else after it, so the line is not fully judged.
+fn reader_assignments(segments: &mut [Vec<Word>], found: &mut Findings) {
+    for w in segments.iter_mut().flatten().filter(|w| w.assignment) {
+        let Some((name, value)) = w.text.split_once('=') else {
+            continue;
+        };
+        let (name, plus) = match name.strip_suffix('+') {
+            Some(n) => (n, "+"),
+            None => (name, ""),
+        };
+        let mut upper = name.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH" | "LOCALAPPDATA" | "APPDATA"
+        ) {
+            found.unjudged("a profile variable changes on this line");
+            upper = "HOME".to_string();
+        }
+        w.text = format!("{upper}{plus}={value}");
     }
 }
 
@@ -1806,6 +2047,8 @@ struct Ctx<'a> {
     /// `has_literal_path_ref`, `path_refs_are_plain`).
     literal_path: bool,
     clock: &'a Clock,
+    /// Which reader read this line.
+    dialect: Dialect,
 }
 
 /// One evaluation's clock, shared by its nested lines.
@@ -1923,10 +2166,11 @@ impl<'a> SegmentView<'a> {
         seg: &'a [Word],
         effective: &'a [Word],
         state: &ShellState,
-        literal_path: bool,
+        cx: &Ctx,
         vars: &PathVars,
         found: &mut Findings,
     ) -> Self {
+        let literal_path = cx.literal_path;
         // Leading assignments and redirections (`LANG=C sort f`,
         // `2>/dev/null cat f`) are not the command either.
         let effective = effective_command(effective);
@@ -1938,9 +2182,20 @@ impl<'a> SegmentView<'a> {
         // Words in front of the command (wrappers, assignments,
         // redirections), counted before the arguments are resolved.
         let prefix_len = seg.len() - effective.len();
-        let (mut forms, args_unquoted) = resolve_forms(effective, false);
+        // `resolve_forms` reads a word's `$(…)` as POSIX: a reader's stays
+        // unknown.
+        let posix = cx.dialect == Dialect::Posix;
+        let (mut forms, args_unquoted) = if posix {
+            resolve_forms(effective, false)
+        } else {
+            (vec![effective.to_vec()], false)
+        };
         // Redirection targets are resolved the same way.
-        let (mut target_forms, targets_unquoted) = resolve_forms(seg, true);
+        let (mut target_forms, targets_unquoted) = if posix {
+            resolve_forms(seg, true)
+        } else {
+            (vec![seg.to_vec()], false)
+        };
         // A line naming IFS may split a value anywhere: what was judged
         // is a guess, so a non-deny outcome is recorded.
         if state.ifs_named && (args_unquoted || targets_unquoted) {

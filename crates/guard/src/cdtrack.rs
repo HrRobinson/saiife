@@ -38,7 +38,39 @@ impl Dir {
         }
     }
 
+    /// `C:/x`: the drive, lower case, is its first part. `..` stops there.
+    fn from_windows(path: &str) -> Option<Dir> {
+        let bytes = path.as_bytes();
+        let rooted = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        if !rooted {
+            return None;
+        }
+        let drive = format!("{}:", path[..1].to_ascii_lowercase());
+        let mut dir = Dir {
+            home: false,
+            parts: vec![drive],
+        };
+        for part in path[3..].split(['/', '\\']) {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if dir.parts.len() > 1 {
+                        dir.parts.pop();
+                    }
+                }
+                p => dir.parts.push(p.to_string()),
+            }
+        }
+        Some(dir)
+    }
+
     fn from_path(path: &Path) -> Option<Dir> {
+        if let Some(d) = path.to_str().and_then(Dir::from_windows) {
+            return Some(d);
+        }
         if !path.is_absolute() {
             return None;
         }
@@ -63,6 +95,10 @@ impl Dir {
             match part {
                 "" | "." => {}
                 ".." => {
+                    // A drive is the top: `c:/..` is `c:/`.
+                    if dir.parts.len() == 1 && dir.parts[0].ends_with(':') {
+                        continue;
+                    }
                     if dir.parts.pop().is_none() && dir.home {
                         dir = Dir::from_path(home?)?;
                         dir.parts.pop();
@@ -89,6 +125,13 @@ impl Dir {
         match (dir.home, dir.parts.is_empty()) {
             (true, true) => "~".to_string(),
             (true, false) => format!("~/{}", dir.parts.join("/")),
+            (false, _) if dir.parts.first().is_some_and(|p| p.ends_with(':')) => {
+                if dir.parts.len() == 1 {
+                    format!("{}/", dir.parts[0])
+                } else {
+                    dir.parts.join("/")
+                }
+            }
             (false, _) => format!("/{}", dir.parts.join("/")),
         }
     }
@@ -119,6 +162,8 @@ pub(crate) struct RuleCwd {
     /// Past `MAX_DIRS` / `MAX_CDS`: a relative destructive target can no
     /// longer be judged against every possible directory.
     overflowed: bool,
+    /// Paths are spelled the Windows way (`C:\x`, `\\h\s`, `%USERPROFILE%`).
+    windows: bool,
 }
 
 /// Leading words that make a segment a condition or time it (`if cd /;
@@ -151,7 +196,14 @@ impl RuleCwd {
             moved: false,
             cds: 0,
             overflowed: false,
+            windows: false,
         }
+    }
+
+    /// Read paths the Windows way.
+    pub(crate) fn styled(mut self, windows: bool) -> RuleCwd {
+        self.windows = windows;
+        self
     }
 
     /// A segment ran: the target of a `cd`/`pushd` (`argv` normalized,
@@ -188,7 +240,7 @@ impl RuleCwd {
             .chain(self.unknown.then_some(None))
             .collect();
         for from in froms {
-            match target(from.as_ref(), argv, words, pushd, home) {
+            match target(from.as_ref(), argv, words, pushd, home, self.windows) {
                 Some(d) => self.add(d),
                 None => self.unknown = true,
             }
@@ -211,7 +263,7 @@ impl RuleCwd {
     /// destructive command (`rm`, `chmod`, `chown`) with a relative path
     /// operand, and the set overflowed earlier on the line.
     pub(crate) fn too_many_dirs_for(&self, argv: &[String]) -> bool {
-        self.overflowed && rewrite_in(&Dir::root(), argv, None).is_some()
+        self.overflowed && rewrite_in(&Dir::root(), argv, None, self.windows).is_some()
     }
 
     /// `argv` with the path operands of a filesystem-destructive command
@@ -224,7 +276,7 @@ impl RuleCwd {
         }
         let mut out: Vec<Vec<String>> = Vec::new();
         for dir in &self.dirs {
-            if let Some(v) = rewrite_in(dir, argv, home) {
+            if let Some(v) = rewrite_in(dir, argv, home, self.windows) {
                 if !out.contains(&v) {
                     out.push(v);
                 }
@@ -242,6 +294,7 @@ fn target(
     words: &[Word],
     pushd: bool,
     home: Option<&Path>,
+    windows: bool,
 ) -> Option<Dir> {
     let mut operand = None;
     let mut options_done = false;
@@ -267,6 +320,9 @@ fn target(
     if word.is_some_and(|w| w.has_substitution) || a == "-" {
         return None;
     }
+    if windows {
+        return windows_target(from, a, home);
+    }
     let (base, rest) = if let Some(rest) = home_prefixed(a) {
         (Dir::home(), rest)
     } else if a.contains('$') || a.starts_with('~') {
@@ -279,10 +335,53 @@ fn target(
     base.join(rest, home)
 }
 
+/// Where `cd a` leaves a shell in `from`, with `a` spelled the Windows way.
+/// `/x` and `\x` are on the current drive, `C:x` is relative to that drive's
+/// directory and `\\h\s` is a share: none of them is known here, and an
+/// unknown directory is judged as written. `/c/x` is Git Bash's `c:/x`.
+fn windows_target(from: Option<&Dir>, a: &str, home: Option<&Path>) -> Option<Dir> {
+    if let Some(d) = git_bash_drive(a) {
+        return Some(d);
+    }
+    let a = a.replace('\\', "/");
+    if let Some(d) = Dir::from_windows(&a) {
+        return Some(d);
+    }
+    let lower = a.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("%userprofile%")
+        .filter(|r| r.is_empty() || r.starts_with('/'))
+    {
+        let rest = a[a.len() - rest.len()..].trim_start_matches('/');
+        return Dir::home().join(rest, home);
+    }
+    if let Some(rest) = home_prefixed(&a) {
+        return Dir::home().join(rest, home);
+    }
+    if a.contains(['$', '%', '!', ':']) || a.starts_with(['/', '~']) {
+        return None;
+    }
+    from?.join(&a, home)
+}
+
+/// `/c`, `/c/x`: Git Bash's drive `c:`.
+fn git_bash_drive(a: &str) -> Option<Dir> {
+    let rest = a.strip_prefix('/')?;
+    let rest = rest.replace('\\', "/");
+    let (drive, tail) = rest.split_once('/').unwrap_or((&rest, ""));
+    let letter = drive.chars().next().filter(|c| c.is_ascii_alphabetic())?;
+    (drive.len() == 1).then(|| Dir::from_windows(&format!("{letter}:/{tail}")))?
+}
+
 /// `argv` with its relative path operands joined onto `dir`; `None` when
 /// the command is not one `core.filesystem` judges by target or nothing
 /// changes.
-fn rewrite_in(dir: &Dir, argv: &[String], home: Option<&Path>) -> Option<Vec<String>> {
+fn rewrite_in(
+    dir: &Dir,
+    argv: &[String],
+    home: Option<&Path>,
+    windows: bool,
+) -> Option<Vec<String>> {
     // The mode / owner operand of chmod / chown is not a path.
     let mut not_paths = match argv.first().map(String::as_str) {
         Some("rm") => 0,
@@ -307,7 +406,16 @@ fn rewrite_in(dir: &Dir, argv: &[String], home: Option<&Path>) -> Option<Vec<Str
         if a.is_empty() || a.starts_with(['/', '~', '$']) {
             continue;
         }
-        if let Some(joined) = dir.join(a, home) {
+        // Rooted, on a share, or a variable: not relative to `dir`.
+        if windows && (a.starts_with(['\\', '%', '!']) || a.contains(':')) {
+            continue;
+        }
+        let spelled = if windows {
+            a.replace('\\', "/")
+        } else {
+            a.clone()
+        };
+        if let Some(joined) = dir.join(&spelled, home) {
             *a = joined.render(home);
             changed = true;
         }

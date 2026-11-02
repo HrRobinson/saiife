@@ -534,6 +534,7 @@ mod imp {
                 locked: Some(locked_paths(cfg, config)),
                 event: event.map(str::to_string),
                 ask: cfg.guard.ask.clone(),
+                agent: Some(agent.to_string()),
             })),
             _ => None,
         };
@@ -621,8 +622,8 @@ mod imp {
     /// What the record names when the worker gave no answer: the command
     /// or the paths, as the worker would have.
     fn recorded_input(payload: &str) -> String {
-        match eval::plan(payload) {
-            Plan::Shell { command } | Plan::TooLarge { command } => command,
+        match eval::plan(payload, None) {
+            Plan::Shell { command, .. } | Plan::TooLarge { command, .. } => command,
             Plan::Files(call) => call.input(),
             Plan::NoPath | Plan::Other | Plan::Unusable(_) => String::new(),
         }

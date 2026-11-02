@@ -15,6 +15,7 @@
 pub mod builtins;
 pub mod canon;
 mod cdtrack;
+pub mod cmdexe;
 pub mod engine;
 pub mod getopt;
 pub mod lexer;

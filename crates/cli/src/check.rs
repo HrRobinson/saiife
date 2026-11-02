@@ -115,6 +115,10 @@ pub fn run(
         let audit = Audit::new(agent, HookContext::default(), cli_packs);
         let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
         let warning = format!("{reason}; failing open (allow)");
+        let fail = Fail {
+            closed: fail.closed || eval::names_powershell(&buf),
+            ..fail
+        };
         return fail.unjudged(&audit, "", &reason, Some(&warning));
     }
     drop(stdin);
@@ -132,8 +136,13 @@ pub fn run(
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
         cli_packs,
     );
-    match eval::plan(&buf) {
-        Plan::TooLarge { command } => unusable(
+    let plan = eval::plan(&buf, Some(agent));
+    let fail = Fail {
+        closed: fail.closed || eval::must_fail_closed(&plan, &buf),
+        ..fail
+    };
+    match plan {
+        Plan::TooLarge { command, .. } => unusable(
             fail,
             &audit,
             &command,
@@ -141,12 +150,14 @@ pub fn run(
                 limit: MAX_PAYLOAD_BYTES,
             },
         ),
-        Plan::Shell { command } => {
+        Plan::Shell { command, dialects } => {
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config, building the engine or hashing the policy
             // fails open too.
             decide(&audit, &command, fail, |c| {
-                active_engine(&audit, cli_packs).0.evaluate(c)
+                active_engine(&audit, cli_packs)
+                    .0
+                    .evaluate_call(c, dialects)
             })
         }
         Plan::Files(call) => decide(&audit, &call.input(), fail, |_| {
