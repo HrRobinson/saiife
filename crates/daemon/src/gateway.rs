@@ -1071,6 +1071,14 @@ fn respond(outcome: Outcome, route: Route) -> Resp {
             }
             json_resp(StatusCode::FORBIDDEN, b)
         }
+        Outcome::PolicyMoved => json_resp(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "denied",
+                "rule": saiife_broker::pipeline::POLICY_MOVED_RULE,
+                "reason": saiife_broker::pipeline::POLICY_MOVED_REASON,
+            }),
+        ),
         Outcome::Limited { limit } => json_resp(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "limit", "limit": limit}),

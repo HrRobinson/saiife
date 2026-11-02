@@ -113,6 +113,11 @@ impl Conn {
         lock(&self.out).take();
     }
 
+    /// Whether [`Conn::close_stdin`] ran: nothing more can be sent.
+    pub fn stdin_closed(&self) -> bool {
+        lock(&self.out).is_none()
+    }
+
     async fn send_line(&self, m: &Message) -> Result<(), ChildError> {
         let tx = lock(&self.out).clone().ok_or(ChildError::Exited)?;
         tx.send(encode(m)).await.map_err(|_| ChildError::Exited)

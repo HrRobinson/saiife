@@ -298,6 +298,41 @@ mod tests {
         assert_ne!(hash_of(&a, &catalog(), None), hash_of(&d, &catalog(), None));
     }
 
+    /// A queued connector or gateway call is stopped by this hash moving
+    /// (`Ctx::snapshot_in_force`): it must move for what can revoke a call.
+    #[test]
+    fn hash_changes_with_scope_and_mcp_server() {
+        const CFG: &str = "version = 2\n\
+            [[scope]]\nname = \"s\"\nusers = [\"u\"]\nprojects = [\"/p\"]\nservices = [\"mcp:m\", \"erp\"]\n\
+            [mcp.m]\ncommand = \"/usr/bin/env\"\nallow = [\"a\"]\nask = [\"b\"]\ndeny = [\"c\"]\n";
+        let base = hash_of(&cfg(CFG), &catalog(), None);
+        for (from, to) in [
+            // `[[scope]]`
+            ("services = [\"mcp:m\", \"erp\"]", "services = [\"erp\"]"),
+            ("services = [\"mcp:m\", \"erp\"]", "services = [\"mcp:m\"]"),
+            ("users = [\"u\"]", "users = [\"v\"]"),
+            ("projects = [\"/p\"]", "projects = [\"/q\"]"),
+            // `[mcp.*]`
+            ("allow = [\"a\"]", "allow = []"),
+            ("ask = [\"b\"]", "ask = []"),
+            ("deny = [\"c\"]", "deny = [\"c\", \"d\"]"),
+            ("command = \"/usr/bin/env\"", "command = \"/usr/bin/true\""),
+        ] {
+            assert!(CFG.contains(from), "{from}");
+            let moved = hash_of(&cfg(&CFG.replace(from, to)), &catalog(), None);
+            assert_ne!(base, moved, "{from} -> {to}");
+        }
+        // The whole server and the whole scope gone.
+        let (head, _) = CFG.split_once("[mcp.m]").unwrap();
+        assert_ne!(base, hash_of(&cfg(head), &catalog(), None));
+        let (first, _) = CFG.split_once("[[scope]]").unwrap();
+        let (_, server) = CFG.split_once("[mcp.m]").unwrap();
+        assert_ne!(
+            base,
+            hash_of(&cfg(&format!("{first}[mcp.m]{server}")), &catalog(), None)
+        );
+    }
+
     #[test]
     fn notes_do_not_change_hash() {
         let c = cfg(CFG_A);

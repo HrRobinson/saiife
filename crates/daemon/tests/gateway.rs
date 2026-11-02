@@ -390,6 +390,7 @@ allow = ["orders:read"]
             }
             Arc::new(GatewayPolicy {
                 snap: PolicySnapshot {
+                    catalog_digest: String::new(),
                     config,
                     hash: "sha256:test".into(),
                     mode: s.daemon_mode.policy_mode(),
@@ -2171,6 +2172,7 @@ fn reload_shop(w: &World, extra: &str) {
     let next = PolicyState {
         gateway: Some(Arc::new(GatewayPolicy {
             snap: PolicySnapshot {
+                catalog_digest: String::new(),
                 config,
                 hash: "sha256:reloaded".into(),
                 mode: g.snap.mode,
