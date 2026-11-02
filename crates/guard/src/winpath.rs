@@ -20,16 +20,20 @@
 //!
 //! It never guesses a form that could be wrong. `read` says why there is none:
 //!
-//! - `Unread::Unreadable`: an unknown variable, a device namespace path
-//!   (`\\?\Volume{…}`, `\\.\PhysicalDrive0`), a PowerShell drive (`HKLM:\`,
-//!   `temp:\`), or a character Win32 refuses or reads as a wildcard (`<`, `>`,
-//!   `"`, `|`, control characters). It could name anything, so the engine
-//!   denies it.
+//! - `Unread::Unreadable`: an unknown variable, a cmd substring or replace
+//!   (`%VAR:~0%`), a device namespace path (`\\?\Volume{…}`,
+//!   `\\.\PhysicalDrive0`) or a `..` after a device prefix, Git Bash's `/proc`,
+//!   a PowerShell drive (`HKLM:\`, `temp:\`), a drive or `admin$` share on a
+//!   host not known to be this machine, a component of only dots, spaces or a
+//!   stream (only exact `.` and `..` navigate), or a character Win32 refuses or
+//!   reads as a wildcard (`<`, `>`, `"`, `|`, control characters). It could
+//!   name anything, so the engine denies it.
 //! - `Unread::NoAnchor`: an empty path, or a relative one with no working
 //!   directory known. The engine treats it as it does in POSIX style.
 //!
 //! Not lexically knowable, and left to `resolved` when the path exists: 8.3
-//! short names (`PROGRA~1`), junctions and symlinks.
+//! short names (`PROGRA~1`), junctions and symlinks. A UNC path stays lexical:
+//! asking the OS would call a host the command chose.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -38,6 +42,8 @@ use crate::canon::PathVars;
 
 /// The variable holding this machine's name (not a path).
 pub const COMPUTER_NAME: &str = "COMPUTERNAME";
+/// What `\\.\NUL` and `NUL:` canonicalize to: it names no file.
+const NULL_DEVICE: &str = "//./NUL";
 
 /// Why a spelling has no canonical form (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +145,9 @@ const WIN_PATH_MAX: usize = 32767;
 const RESOLVE_TRIES: usize = 32;
 
 fn resolved_with(canon: &str, vars: &PathVars, os: impl Fn(&str) -> Option<String>) -> String {
-    if canon.len() > WIN_PATH_MAX {
+    // A UNC path is a call to a host the command chose: SMB can stall past
+    // the budget, which fails open, and it sends NTLM to that host.
+    if canon.len() > WIN_PATH_MAX || canon.starts_with("//") {
         return canon.to_string();
     }
     let (root, _) = split_root(canon);
@@ -273,10 +281,20 @@ fn expand_vars(raw: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
 }
 
 /// The expansion of the `%…` at the start of `s` and the bytes it used. A `%`
-/// that does not open a variable (`100%.txt`, `%%`) is itself.
+/// that does not open a variable (`100%.txt`, `%%`) is itself. cmd also
+/// expands `%VAR:~0%` and `%VAR:a=b%`, separators in them included: what those
+/// produce is not worked out here.
 fn percent_var(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<(String, usize), Unread> {
     let name = s[1..].find('%').map(|end| &s[1..1 + end]);
+    let is_name = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
+    };
     match name {
+        Some(n) if n.split_once(':').is_some_and(|(v, _)| is_name(v)) => Err(Unread::Unreadable(
+            "a cmd variable with a substring or replace",
+        )),
         Some(n) if !n.is_empty() && !n.contains(['/', '\\', ':']) => {
             Ok((var(n, cwd, vars)?, n.len() + 2))
         }
@@ -362,12 +380,19 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
         // `/??/x` written with slashes is a glob, not the NT namespace.
         .or_else(|| t.strip_prefix("/??/").filter(|_| s.starts_with('\\')));
     let (root, rest): (String, String) = if let Some(after) = device_ns {
-        device(after, vars).ok_or(Unread::Unreadable("a device namespace path"))?
+        // After `\\.\` a `..` can pop the drive itself.
+        if after.split('/').any(|c| c == "..") {
+            return Err(Unread::Unreadable("a `..` after a device prefix"));
+        }
+        device(after, vars)?
     } else if t.starts_with("//") && !t.starts_with("///") {
-        unc(&t[2..], vars).ok_or(Unread::Unreadable("a UNC path with no usable host"))?
+        unc(&t[2..], vars)?
     } else if let Some(body) = t.strip_prefix('/') {
         // Three or more slashes are one to Git Bash.
         let body = body.trim_start_matches('/');
+        if s.starts_with('/') && is_git_bash_proc(body) {
+            return Err(Unread::Unreadable("Git Bash's /proc"));
+        }
         // A leading backslash is Win32's "root of this drive"; only a `/`
         // can be Git Bash's drive form.
         match s.starts_with('/').then(|| git_bash_drive(body)).flatten() {
@@ -398,13 +423,23 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
             n.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         });
+        if t.eq_ignore_ascii_case("NUL:") {
+            return Ok(NULL_DEVICE.to_string());
+        }
         if is_ps_drive {
             return Err(Unread::Unreadable("a PowerShell drive"));
         }
         let (root, base) = cwd_root()?;
         (root.to_string(), format!("{base}/{t}"))
     };
-    Ok(assemble(&root, &rest))
+    assemble(&root, &rest)
+}
+
+/// `body` (no leading slash) is under Git Bash's process table, which is no
+/// directory on a drive. Its `cygdrive` is a drive path.
+fn is_git_bash_proc(body: &str) -> bool {
+    body.eq_ignore_ascii_case("proc")
+        || (strip_ci(body, "proc/").is_some() && strip_ci(body, "proc/cygdrive/").is_none())
 }
 
 /// `body` (no leading slash) as a Git Bash, Cygwin or WSL drive path.
@@ -418,43 +453,59 @@ fn git_bash_drive(body: &str) -> Option<(char, &str)> {
 
 /// After `\\?\`: a drive, `UNC\…`, or a device namespace nothing here can
 /// read (`Volume{…}`, `GLOBALROOT`, `PhysicalDrive0`, `pipe`).
-fn device(after: &str, vars: &PathVars) -> Option<(String, String)> {
+fn device(after: &str, vars: &PathVars) -> Result<(String, String), Unread> {
     let (seg, tail) = split_seg(after);
     if seg.eq_ignore_ascii_case("UNC") {
         return unc(tail, vars);
     }
-    let drive = drive_letter(seg.strip_suffix(':')?)?;
-    Some((format!("{drive}:/"), tail.to_string()))
+    if seg.eq_ignore_ascii_case("NUL") && tail.is_empty() {
+        return Ok((NULL_DEVICE.to_string(), String::new()));
+    }
+    let drive = seg
+        .strip_suffix(':')
+        .and_then(drive_letter)
+        .ok_or(Unread::Unreadable("a device namespace path"))?;
+    Ok((format!("{drive}:/"), tail.to_string()))
 }
 
 /// After `\\`: `host/share/rest`. An admin share of this machine is what it
-/// shares; any other share is judged by its own name.
-fn unc(after: &str, vars: &PathVars) -> Option<(String, String)> {
+/// shares. On any other host it could still be this machine's (`\\<own-IP>\c$`
+/// cannot be told from a remote host's), so it is not read. Any other share is
+/// judged by its own name.
+fn unc(after: &str, vars: &PathVars) -> Result<(String, String), Unread> {
     let (host, tail) = split_seg(after);
     let host = host.trim_end_matches(['.', ' ']);
     if host.is_empty() || host == "?" {
-        return None;
+        return Err(Unread::Unreadable("a UNC path with no usable host"));
     }
-    let (share, tail) = split_seg(tail.trim_start_matches('/'));
-    let share = component_name(share);
+    let (spelled, tail) = split_seg(tail.trim_start_matches('/'));
+    if spelled.is_empty() {
+        return Ok((format!("//{host}"), String::new()));
+    }
+    let share = component_name(spelled);
     if share.is_empty() {
-        return Some((format!("//{host}"), String::new()));
+        return Err(Unread::Unreadable("a UNC share of only dots or spaces"));
     }
-    if is_local_host(host, vars) {
-        if let Some(drive) = share.strip_suffix('$').and_then(drive_letter) {
-            return Some((format!("{drive}:/"), tail.to_string()));
+    let drive = share.strip_suffix('$').and_then(drive_letter);
+    let admin = share.eq_ignore_ascii_case("admin$");
+    if !is_local_host(host, vars) {
+        if drive.is_some() || admin {
+            return Err(Unread::Unreadable(
+                "an admin share on a host not known to be this machine",
+            ));
         }
-        if share.eq_ignore_ascii_case("admin$") {
-            let windows = lookup("SYSTEMROOT", None, vars)?;
-            let (root, base) = split_root(&windows);
-            return Some((root.to_string(), format!("{base}/{tail}")));
-        }
+    } else if let Some(drive) = drive {
+        return Ok((format!("{drive}:/"), tail.to_string()));
+    } else if admin {
+        let windows = var("SYSTEMROOT", None, vars)?;
+        let (root, base) = split_root(&windows);
+        return Ok((root.to_string(), format!("{base}/{tail}")));
     }
-    Some((format!("//{host}/{share}"), tail.to_string()))
+    Ok((format!("//{host}/{share}"), tail.to_string()))
 }
 
 /// A component without its stream suffix and trailing dots and spaces. A
-/// component of only dots and spaces comes back empty.
+/// component of only dots, spaces or a stream comes back empty.
 fn component_name(c: &str) -> &str {
     c.split(':')
         .next()
@@ -463,28 +514,35 @@ fn component_name(c: &str) -> &str {
 }
 
 /// `root` and the normalized components of `rest`. `..` stops at the root.
-fn assemble(root: &str, rest: &str) -> String {
+/// Only exact `.` and `..` navigate: what `...`, `.. ` or `..::$DATA` do
+/// depends on where they stand and on the API, so they are not read.
+fn assemble(root: &str, rest: &str) -> Result<String, Unread> {
     let mut comps: Vec<&str> = Vec::new();
     for c in rest.split('/') {
-        let name = component_name(c);
-        if !name.is_empty() {
-            comps.push(name);
-        } else if c.split(':').next().unwrap_or("").matches('.').count() == 2 {
-            // `..`, also as `.. ` or `..::$DATA`: Win32 strips those back to
-            // `..`. `.`, `...` and the like add nothing to where a path
-            // lands: dropping them judges the tail as if they were not there.
-            comps.pop();
+        match c {
+            "" | "." => {}
+            ".." => {
+                comps.pop();
+            }
+            _ => {
+                let name = component_name(c);
+                if name.is_empty() {
+                    return Err(Unread::Unreadable(
+                        "a path component of only dots, spaces or a stream",
+                    ));
+                }
+                comps.push(name);
+            }
         }
     }
     let root = root.trim_end_matches('/');
-    if comps.is_empty() {
-        return if root.starts_with("//") {
-            root.to_string()
-        } else {
-            format!("{root}/")
-        };
-    }
-    format!("{root}/{}", comps.join("/"))
+    Ok(if !comps.is_empty() {
+        format!("{root}/{}", comps.join("/"))
+    } else if root.starts_with("//") {
+        root.to_string()
+    } else {
+        format!("{root}/")
+    })
 }
 
 /// A host name that is this machine: `localhost`, a loopback or unspecified
@@ -639,9 +697,6 @@ mod tests {
         r"FileSystem::\\localhost\c$\Users\a\.ssh\id_rsa",
         r"C:\Users\a\.ssh\.\id_rsa",
         r"C:\Users\a\x\..\.ssh\id_rsa",
-        r"C:\Users\a\x\.. \.ssh\id_rsa",
-        r"C:\Users\a\x\..::$DATA\.ssh\id_rsa",
-        r"C:\Users\a\.ssh\...\id_rsa",
         r"C:\..\..\Users\a\.ssh\id_rsa",
         r"C:\\Users\\a\\.ssh\\id_rsa",
         r"C:/Users\a//.ssh\id_rsa",
@@ -688,6 +743,15 @@ mod tests {
         for raw in ID_RSA_SPELLINGS {
             for (i, m) in mutations.iter().enumerate() {
                 let spelled = m(raw);
+                // A `..` after a device prefix is unreadable on purpose.
+                if spelled.contains(r"x\..\")
+                    && [r"\\?\", r"\\.\", r"\??\", "//?/"]
+                        .iter()
+                        .any(|p| spelled.starts_with(p))
+                {
+                    assert_eq!(c(&spelled), None, "#{i} {spelled}");
+                    continue;
+                }
                 let got = c(&spelled).unwrap_or_else(|| panic!("#{i} {spelled} has no form"));
                 assert_eq!(fold(&got), fold(ID_RSA), "#{i} {spelled} gave {got}");
             }
@@ -732,11 +796,10 @@ mod tests {
         want("//server/share/x", "//server/share/x");
         want(r"\\server\share", "//server/share");
         want(r"\\server", "//server");
-        // A remote admin share is remote, and a local share that is not an
-        // admin share cannot be mapped to a directory by its name.
-        want(r"\\server\c$\x", "//server/c$/x");
-        want(r"\\128.0.0.1\c$\x", "//128.0.0.1/c$/x");
+        // A local share that is not an admin share cannot be mapped to a
+        // directory by its name.
         want(r"\\localhost\docs\x", "//localhost/docs/x");
+        want(r"\\server\ipc$", "//server/ipc$");
         want(r"\\server\share\..\..\x", "//server/share/x");
         want(r"\\Server\Share.\x.", "//Server/Share/x");
     }
@@ -1256,6 +1319,268 @@ mod tests {
             assert_eq!(e.evaluate(&format!("cat '{raw}'")), clean, "{raw}");
         }
         assert_eq!(e.evaluate(r"cd '%NOPE%' && cat notes.txt"), clean);
+    }
+
+    fn unreadable(raw: &str) {
+        assert!(
+            matches!(read(raw, None, &vars()), Err(Unread::Unreadable(_))),
+            "{raw}: {:?}",
+            read(raw, None, &vars())
+        );
+    }
+
+    /// `build_argv` collapses leading slashes for the pack regexes; the path
+    /// rules must see what was written: `//host` is not `/host`.
+    #[test]
+    fn leading_slashes_reach_the_path_rules_uncollapsed() {
+        let e = secrets_engine(vars());
+        for cmd in [
+            "cat //localhost/c$/Users/a/.claude/.credentials.json",
+            "cat //./C:/Users/a/.claude/.credentials.json",
+            "cat '//?/C:/Users/a/.ssh/id_rsa'",
+            "cp //localhost/c$/Users/a/.ssh/id_rsa /c/p/x",
+            "xargs -a //localhost/c$/Users/a/.ssh/id_rsa echo",
+            "cd //localhost/c$/Users/a/.ssh && cat id_rsa",
+            r"cd '\\localhost\c$\Users\a\.ssh' && cat id_rsa",
+            r"cd '$env:USERPROFILE\.ssh' && cat id_rsa",
+            r"cd '%USERPROFILE%\.ssh' && cat id_rsa",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+        for cmd in [
+            "cat '//?/GLOBALROOT/Device/HarddiskVolume1/Users/a/.ssh/id_rsa'",
+            "cat //./PhysicalDrive0",
+            "cd '//?/GLOBALROOT/Device/HarddiskVolume1/Users/a/.ssh' && cat id_rsa",
+            "cd //./PhysicalDrive0",
+        ] {
+            assert_unreadable_deny(&e.evaluate(cmd), cmd);
+        }
+        // A `$` that is part of a name leaves the directory known.
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        assert_eq!(e.evaluate(r"cd 'C:\$Recycle.Bin' && cat notes.txt"), clean);
+        // The pack regexes keep the collapsed line.
+        let (packs, _) = builtin_packs();
+        let fs: Vec<_> = packs
+            .into_iter()
+            .filter(|p| p.id == "core.filesystem")
+            .collect();
+        let e = Engine::new(fs).with_paths(vars());
+        assert!(e.evaluate("rm -rf //").is_deny());
+    }
+
+    /// Only exact `.` and `..` navigate: Win32's handling of `...`, `.. ` and
+    /// `..::$DATA` is not one a text rule can stand behind.
+    #[test]
+    fn dot_only_components_do_not_navigate() {
+        want(
+            r"~\x\..\.claude\.credentials.json",
+            "c:/Users/a/.claude/.credentials.json",
+        );
+        want(r"C:\a\.\b\..\c", "c:/a/c");
+        for raw in [
+            r"~\...\..\.claude\.credentials.json",
+            r"C:\Users\a\.ssh\...\id_rsa",
+            r"C:\Users\a\b\.. \..\a\.claude\.credentials.json",
+            r"C:\Users\a\b\..::$DATA\..\a\.claude\.credentials.json",
+            r"C:\Users\a\x\.. \.ssh\id_rsa",
+            r"C:\Users\a\x\. \.ssh\id_rsa",
+            r"C:\Users\a\x\.:s\.ssh\id_rsa",
+            r"C:\Users\a\ \.ssh\id_rsa",
+            r"C:\Users\a\:s\.ssh\id_rsa",
+            r"...\x",
+            r"C:\p\...",
+        ] {
+            unreadable(raw);
+        }
+        let e = secrets_engine(vars());
+        let raw = r"~\...\..\.claude\.credentials.json";
+        assert_unreadable_deny(&e.evaluate_path(Access::Read, raw), raw);
+    }
+
+    #[test]
+    fn dot_dot_after_a_device_prefix_is_unreadable() {
+        for raw in [
+            r"\\.\C:\..\C:\Users\a\.claude\.credentials.json",
+            "//./C:/../C:/Users/a/.claude/.credentials.json",
+            r"\\?\C:\..\C:\Users\a\.ssh\id_rsa",
+            r"\??\C:\x\..\y",
+            r"\\.\UNC\localhost\c$\..\x",
+        ] {
+            unreadable(raw);
+        }
+        want(r"\\.\C:\x\.\y", "c:/x/y");
+    }
+
+    /// cmd expands `%VAR:~0%` and `%VAR:a=b%`, separators in them included.
+    #[test]
+    fn cmd_substring_and_replace_are_unreadable() {
+        for raw in [
+            r"%USERPROFILE:~0%\.claude\.credentials.json",
+            r"%USERPROFILE:a=a%\.claude\.credentials.json",
+            r"%USERPROFILE:\=\%\.claude\.credentials.json",
+            r"%USERPROFILE:/=/%\.claude\.credentials.json",
+            r"C:\Users\%USERNAME:~0%\.ssh\id_rsa",
+            r"%NOPE:~0%\x",
+        ] {
+            unreadable(raw);
+        }
+        want(r"C:\p\100%.txt", "c:/p/100%.txt");
+        want(r"C:\a%b\c%d", "c:/a%b/c%d");
+        want(".env:a%", "c:/p/.env");
+    }
+
+    /// `/proc` in Git Bash is the process table, not a directory on the drive.
+    #[test]
+    fn git_bash_proc_is_unreadable() {
+        for raw in [
+            "/proc",
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "/PROC/self/environ",
+            "/proc/self/cwd/.claude/.credentials.json",
+            "///proc/self/environ",
+            "/proc/cygdrive",
+        ] {
+            unreadable(raw);
+        }
+        want("/proc/cygdrive/c/x", "c:/x");
+        want(r"\proc\x", "c:/proc/x");
+        want("/process/x", "c:/process/x");
+        let e = secrets_engine(vars());
+        for cmd in ["cat /proc/self/environ", "cat /proc/self/cwd/.env"] {
+            assert_unreadable_deny(&e.evaluate(cmd), cmd);
+        }
+        for cmd in [
+            "echo hi > /dev/null",
+            "cat /etc/hosts",
+            "git status 2> /dev/null",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    /// The guard never calls the OS on a host a command names: SMB can stall
+    /// past the budget (a fail-open) and sends NTLM to that host.
+    #[test]
+    fn unc_paths_never_reach_the_os() {
+        let v = vars();
+        let never = |p: &str| -> Option<String> { panic!("asked the OS about {p}") };
+        for p in ["//10.255.255.1/s/f", "//h/s", "//h"] {
+            assert_eq!(resolved_with(p, &v, never), p);
+        }
+        // A local path still does.
+        let local = |_: &str| Some(r"\\?\C:\Program Files".to_string());
+        assert_eq!(resolved_with("c:/PROGRA~1", &v, local), "c:/Program Files");
+    }
+
+    /// Copy targets and sources: `is_dir` and `read_dir` on a UNC path are
+    /// calls to that host. `//…` is a real local path to a POSIX test host,
+    /// so an OS call shows up as a verdict.
+    #[cfg(unix)]
+    #[test]
+    fn copies_do_not_list_or_probe_unc_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::create_dir(root.join("source")).unwrap();
+        std::fs::write(root.join("source/entry.txt"), "").unwrap();
+        let toml = r#"
+[pack]
+id = "test.landing"
+
+[[deny_path]]
+glob = "**/target/marker.txt"
+access = "write"
+reason = "reached only by asking the OS that target is a directory"
+
+[[deny_path]]
+glob = "**/landed/entry.txt"
+access = "write"
+reason = "reached only by listing the source"
+"#;
+        let mut w = Vec::new();
+        let pack = load_pack_str("<t>", toml, &mut w).unwrap();
+        let e = Engine::new(vec![pack]).with_paths(vars());
+        let target = format!("/{}/target", root.display());
+        let source = format!("/{}/source", root.display());
+        assert!(target.starts_with("//"));
+        let probe = format!("cp marker.txt '{target}'");
+        assert!(!e.evaluate(&probe).is_deny(), "{probe}");
+        let list = format!("cp -rT '{source}' 'C:\\p\\landed'");
+        assert!(!e.evaluate(&list).is_deny(), "{list}");
+    }
+
+    /// `/x` is on whichever drive the shell is on, and a `cd` may have moved it.
+    #[test]
+    fn rooted_paths_are_judged_against_every_cwd() {
+        let e = secrets_engine(
+            PathVars::new()
+                .with_style(PathStyle::Windows)
+                .with_cwd(r"D:\p")
+                .with_var("USERPROFILE", r"C:\Users\a"),
+        );
+        for cmd in [
+            r"cd 'C:\'; cat /Users/a/.claude/.credentials.json",
+            r"cd 'C:\'; cat '\Users\a\.ssh\id_rsa'",
+            r"cd 'C:\p'; cat '~+\.env'",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+        assert!(!e
+            .evaluate("cat /Users/a/.claude/.credentials.json")
+            .is_deny());
+    }
+
+    #[test]
+    fn a_unc_share_that_is_only_dots_is_unreadable() {
+        for raw in [
+            r"\\host\.\.ssh\id_rsa",
+            r"\\host\..\x",
+            r"\\host\ \x",
+            r"\\host\...\x",
+        ] {
+            unreadable(raw);
+        }
+        want(r"\\host\", "//host");
+    }
+
+    /// `\\<own-IP>\c$` cannot be told from a remote host's: an admin share on
+    /// any host not known to be this machine could be this machine's.
+    #[test]
+    fn admin_shares_on_unknown_hosts_are_unreadable() {
+        for raw in [
+            r"\\192.168.1.5\C$\Users\a\.ssh\id_rsa",
+            r"\\server\c$\x",
+            r"\\server\D$",
+            r"\\server\ADMIN$\System32",
+            r"\\128.0.0.1\c$\x",
+            r"\\?\UNC\server\c$\x",
+        ] {
+            unreadable(raw);
+        }
+        want(r"\\server\share\x", "//server/share/x");
+        want(r"\\server\share$\x", "//server/share$/x");
+        want(r"\\localhost\c$\x", "c:/x");
+    }
+
+    /// The null device names no file: `> NUL:` is not worth a deny.
+    #[test]
+    fn the_null_device_is_harmless() {
+        for raw in [
+            r"\\.\NUL", r"\\.\nul", "//./NUL", r"\\?\NUL", "NUL:", "nul:",
+        ] {
+            want(raw, "//./NUL");
+        }
+        unreadable(r"\\.\NUL\x");
+        unreadable(r"\\.\NULL");
+        unreadable("NULL:");
+        let e = secrets_engine(vars());
+        for cmd in [r"echo hi > '\\.\NUL'", "echo hi > NUL:", r"cat '\\.\NUL'"] {
+            assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+        assert!(!e.evaluate_path(Access::Write, "NUL:").is_deny());
     }
 
     const MIXED_CASE_PACK: &str = r#"

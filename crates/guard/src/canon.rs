@@ -701,6 +701,13 @@ fn expand_alternatives(
         let Some((abs, root)) = anchored else {
             continue;
         };
+        // Listing `\\host\share` would be a call to a host the command chose.
+        if vars.style() == PathStyle::Windows && root.to_string_lossy().starts_with("//") {
+            if several {
+                all.push(root.join(&abs));
+            }
+            continue;
+        }
         let comps: Vec<Component> = abs.components().collect();
         if comps.len() > GLOB_MAX_COMPONENTS || abs.as_os_str().len() > PATH_MAX {
             overflow = true;
@@ -1100,6 +1107,25 @@ mod tests {
         );
         assert!(run(".EN*", false).is_empty());
         assert!(run("SUB*/t[a-z]ken.TXT", false).is_empty());
+    }
+
+    /// Expanding a glob under `\\host\share` would be a call to that host.
+    /// `//…` is a real local path on a POSIX test host, so a walk would find it.
+    #[cfg(unix)]
+    #[test]
+    fn windows_globs_do_not_walk_unc_paths() {
+        let (_d, root) = tmp();
+        fs::write(root.join("found.txt"), "").unwrap();
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_cwd(r"C:\p");
+        let pattern = format!("/{}/*.txt", root.display());
+        assert!(pattern.starts_with("//"));
+        assert_eq!(expand_glob_partial(&pattern, None, &v), (Vec::new(), false));
+        // With alternatives, each comes back as spelled.
+        let (found, over) = expand_glob_partial(&format!("/{}/{{a,b}}*", root.display()), None, &v);
+        assert!(!over);
+        assert_eq!(found.len(), 2);
     }
 
     #[test]

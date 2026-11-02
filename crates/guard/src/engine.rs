@@ -13,6 +13,7 @@
 //! (`a&&rm -rf /`) is never missed and a quoted one (`echo "a && b"`) is
 //! never manufactured.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -934,8 +935,8 @@ impl Engine {
             .rule_cwd
             .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
-            let target = view
-                .argv
+            let argv = self.path_argv(&view.argv, &view.resolved);
+            let target = argv
                 .iter()
                 .zip(&view.resolved)
                 .skip(1)
@@ -947,9 +948,34 @@ impl Engine {
                     return Some(d);
                 }
             }
-            state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
+            state.cwd_unknown |= self.cd(&argv, &view.resolved, &mut state.cwds);
         }
         None
+    }
+
+    /// `argv` as the path rules read it. `build_argv` collapses leading
+    /// slashes for the pack regexes, but on Windows `//host/share` and
+    /// `//./C:/x` are not `/host/share` and `/C:/x`: there the words stay as
+    /// written.
+    fn path_argv<'a>(&self, argv: &'a [String], effective: &[Word]) -> Cow<'a, [String]> {
+        if self.vars.style() != PathStyle::Windows {
+            return Cow::Borrowed(argv);
+        }
+        Cow::Owned(
+            argv.iter()
+                .enumerate()
+                .map(|(i, a)| match effective.get(i) {
+                    Some(w) if i > 0 => w.text.clone(),
+                    _ => a.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Windows: `path` is on a host the command chose, so asking the OS about
+    /// it would be a call to that host.
+    fn is_remote(&self, path: &Path) -> bool {
+        self.vars.style() == PathStyle::Windows && path.to_string_lossy().starts_with("//")
     }
 
     /// Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`, and
@@ -1000,8 +1026,15 @@ impl Engine {
         };
         // A path that does not depend on the working directory is judged
         // once.
-        let absolute =
-            |raw: &str| raw.starts_with('/') || raw.starts_with('~') || raw.starts_with("$HOME");
+        // On Windows `/x` and `~+` depend on it: `/x` is on the current drive.
+        let windows = self.vars.style() == PathStyle::Windows;
+        let absolute = |raw: &str| {
+            if windows {
+                (raw.starts_with('~') && !raw.starts_with("~+")) || raw.starts_with("$HOME")
+            } else {
+                raw.starts_with('/') || raw.starts_with('~') || raw.starts_with("$HOME")
+            }
+        };
         let anchors = |raw: &str| -> &[Option<&Path>] {
             if absolute(raw) {
                 &all[..1]
@@ -1116,7 +1149,7 @@ impl Engine {
         if !self.has_path_rules {
             return Vec::new();
         }
-        let mut ops = operands(seg, effective, argv);
+        let mut ops = operands(seg, effective, &self.path_argv(argv, effective));
         ops.extend(extra);
         ops
     }
@@ -1162,6 +1195,9 @@ impl Engine {
                 let Some(dir) = canonicalize(&path, cwd, &self.vars) else {
                     continue;
                 };
+                if self.is_remote(&dir) {
+                    continue;
+                }
                 let Ok(list) = std::fs::read_dir(&dir) else {
                     continue;
                 };
@@ -1176,7 +1212,8 @@ impl Engine {
             }
         }
         let is_dir = target.ends_with('/')
-            || canonicalize(target, cwd, &self.vars).is_some_and(|p| p.is_dir());
+            || canonicalize(target, cwd, &self.vars)
+                .is_some_and(|p| !self.is_remote(&p) && p.is_dir());
         let mut full = Vec::new();
         if is_dir {
             full.extend(into_dir(target, &names));
@@ -1210,7 +1247,15 @@ impl Engine {
                 Some(h) => (vec![h.to_path_buf()], false),
                 None => (Vec::new(), true),
             },
-            Some((a, w)) if a == "-" || w.has_substitution || a.contains('$') => (Vec::new(), true),
+            // A `$` is a variable to POSIX. On Windows `winpath` reads it: `c$`
+            // and `$Recycle.Bin` are names, and `$env:X` has a value or denies.
+            Some((a, w))
+                if a == "-"
+                    || w.has_substitution
+                    || (a.contains('$') && self.vars.style() != PathStyle::Windows) =>
+            {
+                (Vec::new(), true)
+            }
             Some((a, _)) => {
                 let anchors: Vec<Option<&Path>> = if cwds.is_empty() {
                     vec![None]
