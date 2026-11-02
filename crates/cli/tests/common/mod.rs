@@ -51,10 +51,16 @@ impl Env {
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_saiife"), env.bin.path().join("saiife"))
             .unwrap();
         // Creating a symlink needs a privilege on Windows: copy the binary.
-        // The exact name `saiife` is what `which` looks for; a test that
-        // runs it by that name is `#[cfg(unix)]`.
+        // The copy carries the platform's executable suffix (`saiife.exe`),
+        // the name production has; `which` finds it through `PATHEXT`.
         #[cfg(not(unix))]
-        fs::copy(env!("CARGO_BIN_EXE_saiife"), env.bin.path().join("saiife")).unwrap();
+        fs::copy(
+            env!("CARGO_BIN_EXE_saiife"),
+            env.bin
+                .path()
+                .join(format!("saiife{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
         env
     }
 

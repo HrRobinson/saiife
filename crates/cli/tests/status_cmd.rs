@@ -38,16 +38,15 @@ fn untouched_project_passes() {
     assert!(text.contains("cannot stop a determined agent"), "{text}");
 }
 
-/// Upgrade path (plan 3): a hook written by plan 2's saiife (Claude matcher
-/// without Glob/LS) passes its own fingerprint but is out of date; status
-/// says so and `saiife init` brings it up to date.
-#[test]
-fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
-    use saiife_agents::claude::{MATCHER, MATCHER_V1};
+/// Upgrade path: a hook written by an older saiife (a Claude matcher
+/// without PowerShell) passes its own fingerprint but is out of date;
+/// status says so and `saiife init` brings it up to date.
+fn old_matcher_is_reported_and_init_updates_it(old_matcher: &str) {
+    use saiife_agents::claude::MATCHER;
     let env = initialized(&["claude"]);
     let old = env
         .read(".claude/settings.json")
-        .replace(MATCHER, MATCHER_V1);
+        .replace(MATCHER, old_matcher);
     env.write(".claude/settings.json", &old);
     let old_fp = saiife_agents::Agent::Claude.entries(env.root()).unwrap()[0].clone();
     for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
@@ -60,11 +59,7 @@ fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
     let (c, text) = status(&env);
     assert_eq!(c, 1, "{text}");
     assert!(
-        text.contains("was written by an older saiife and does not cover every tool"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Fix: run `saiife init` to update it"),
+        text.contains("hook matcher predates the PowerShell tool; run saiife init to update"),
         "{text}"
     );
 
@@ -73,6 +68,17 @@ fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
     assert!(env.read(".claude/settings.json").contains(MATCHER));
     let (c, text) = status(&env);
     assert_eq!(c, 0, "{text}");
+}
+
+#[test]
+fn status_warns_on_old_matcher() {
+    old_matcher_is_reported_and_init_updates_it(saiife_agents::claude::MATCHER_V2);
+}
+
+/// Plan 2's matcher (no Glob/LS either) is upgraded the same way.
+#[test]
+fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
+    old_matcher_is_reported_and_init_updates_it(saiife_agents::claude::MATCHER_V1);
 }
 
 #[test]

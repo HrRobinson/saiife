@@ -1,7 +1,8 @@
 //! Lock labels: can a managed saiife hook lock this agent? The label comes
 //! from the live lock checks (docs/lock-check.md), recorded as fixtures in
 //! `tests/fixtures/lock-check/<agent>.tsv` (Linux) and
-//! `tests/fixtures/lock-check/macos/<agent>.tsv` (macOS). Labels are per
+//! `tests/fixtures/lock-check/macos/<agent>.tsv` (macOS) and
+//! `tests/fixtures/lock-check/windows/<agent>.tsv` (Windows). Labels are per
 //! platform (plan 13 decision 12): an agent without a recording for the
 //! platform is `Unverified` (plan 7 gate rule, spec §0 decision 9).
 
@@ -62,24 +63,65 @@ impl LockLabel {
     }
 }
 
-/// The recorded label of each agent on this platform.
-pub fn label(agent: Agent) -> LockLabel {
-    label_for(agent, cfg!(target_os = "macos"))
+/// The platform a lock label is recorded for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockPlatform {
+    Linux,
+    Macos,
+    Windows,
 }
 
-/// The recorded label of each agent on Linux (`macos` false) or macOS.
+impl LockPlatform {
+    pub const ALL: [LockPlatform; 3] = [
+        LockPlatform::Linux,
+        LockPlatform::Macos,
+        LockPlatform::Windows,
+    ];
+
+    /// The platform this binary runs on (anything but macOS and Windows
+    /// reads the Linux table, as before).
+    pub fn current() -> LockPlatform {
+        if cfg!(target_os = "macos") {
+            LockPlatform::Macos
+        } else if cfg!(windows) {
+            LockPlatform::Windows
+        } else {
+            LockPlatform::Linux
+        }
+    }
+
+    /// The directory under `tests/fixtures/lock-check/` holding this
+    /// platform's recordings (`None`: the top level, Linux).
+    pub fn fixture_dir(self) -> Option<&'static str> {
+        match self {
+            LockPlatform::Linux => None,
+            LockPlatform::Macos => Some("macos"),
+            LockPlatform::Windows => Some("windows"),
+        }
+    }
+}
+
+/// The recorded label of each agent on this platform.
+pub fn label(agent: Agent) -> LockLabel {
+    label_for(agent, LockPlatform::current())
+}
+
+/// The recorded label of each agent on `platform`.
 /// `tests/lock_check_fixtures.rs` fails when this and the recordings
 /// disagree.
-pub fn label_for(agent: Agent, macos: bool) -> LockLabel {
-    if macos {
+pub fn label_for(agent: Agent, platform: LockPlatform) -> LockLabel {
+    match platform {
         // No macOS recording yet (tests/fixtures/lock-check/macos/).
-        return LockLabel::Unverified;
-    }
-    match agent {
-        // Plan 7 recording, claude.tsv.
-        Agent::Claude => LockLabel::Lockable,
-        // No recording yet.
-        Agent::Codex | Agent::Gemini => LockLabel::Unverified,
+        LockPlatform::Macos => LockLabel::Unverified,
+        // No Windows recording yet (tests/fixtures/lock-check/windows/;
+        // plan 19b Task 14).
+        LockPlatform::Windows => LockLabel::Unverified,
+        LockPlatform::Linux => match agent {
+            // Plan 7 recording, claude.tsv.
+            Agent::Claude => LockLabel::Lockable,
+            // No recording yet.
+            Agent::Codex | Agent::Gemini => LockLabel::Unverified,
+        },
     }
 }
 
@@ -98,7 +140,7 @@ mod tests {
     #[test]
     fn only_a_written_holding_managed_hook_replaces_the_project_hook() {
         // Claude Code holds on Linux; on macOS it is unverified for now.
-        assert!(label_for(Agent::Claude, false).holds());
+        assert!(label_for(Agent::Claude, LockPlatform::Linux).holds());
         assert_eq!(
             replaces_project_hook("claude", "ab"),
             label(Agent::Claude).holds()
@@ -138,13 +180,67 @@ mod tests {
         assert!(dir.is_dir(), "{} is missing", dir.display());
         for a in Agent::ALL {
             if !dir.join(format!("{}.tsv", a.name())).exists() {
-                assert_eq!(label_for(a, true), LockLabel::Unverified, "{}", a.name());
+                assert_eq!(
+                    label_for(a, LockPlatform::Macos),
+                    LockLabel::Unverified,
+                    "{}",
+                    a.name()
+                );
             }
         }
         if cfg!(target_os = "macos") {
             for a in Agent::ALL {
-                assert_eq!(label(a), label_for(a, true), "{}", a.name());
+                assert_eq!(label(a), label_for(a, LockPlatform::Macos), "{}", a.name());
             }
+        }
+    }
+
+    /// Every Windows label is `unverified` until the owner records
+    /// `tests/fixtures/lock-check/windows/<agent>.tsv` (plan 19b Task 14).
+    #[test]
+    fn windows_labels_unverified_without_recordings() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lock-check/windows");
+        assert!(dir.is_dir(), "{} is missing", dir.display());
+        for a in Agent::ALL {
+            if !dir.join(format!("{}.tsv", a.name())).exists() {
+                assert_eq!(
+                    label_for(a, LockPlatform::Windows),
+                    LockLabel::Unverified,
+                    "{}",
+                    a.name()
+                );
+            }
+        }
+        if cfg!(windows) {
+            for a in Agent::ALL {
+                assert_eq!(
+                    label(a),
+                    label_for(a, LockPlatform::Windows),
+                    "{}",
+                    a.name()
+                );
+            }
+        }
+    }
+
+    /// Linux and macOS labels are what plan 13 shipped.
+    #[test]
+    fn linux_and_macos_labels_unchanged() {
+        assert_eq!(
+            label_for(Agent::Claude, LockPlatform::Linux),
+            LockLabel::Lockable
+        );
+        assert_eq!(
+            label_for(Agent::Codex, LockPlatform::Linux),
+            LockLabel::Unverified
+        );
+        assert_eq!(
+            label_for(Agent::Gemini, LockPlatform::Linux),
+            LockLabel::Unverified
+        );
+        for a in Agent::ALL {
+            assert_eq!(label_for(a, LockPlatform::Macos), LockLabel::Unverified);
         }
     }
 

@@ -224,6 +224,19 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
                 fix: format!("repair {rel}, then {}", restore(&root)),
             }),
             Ok(f) if f.contains(&rec.sha256) && rec.sha256 != agent.expected_entry() => {
+                if agent == Agent::Claude
+                    && saiife_agents::claude::project_matcher(&root)
+                        .is_some_and(|m| saiife_agents::claude::matcher_is_outdated(&m))
+                {
+                    problems.push(Problem {
+                        what: format!(
+                            "The saiife hook for {} in {rel}: hook matcher predates the PowerShell tool; run saiife init to update",
+                            agent.label()
+                        ),
+                        fix: String::new(),
+                    });
+                    continue;
+                }
                 problems.push(Problem {
                     what: format!(
                         "The saiife hook for {} in {rel} was written by an older saiife and does not cover every tool this version guards.",

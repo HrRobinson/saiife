@@ -1,25 +1,28 @@
 //! Pins the live lock-check results (docs/lock-check.md) kept as fixtures:
 //! `tests/fixtures/lock-check/<agent>.tsv` for Linux (the Docker run) and
 //! `tests/fixtures/lock-check/macos/<agent>.tsv` for macOS (the VM run,
-//! `scripts/lock-check/macos-vm.sh`).
+//! `scripts/lock-check/macos-vm.sh`) and `tests/fixtures/lock-check/windows/
+//! <agent>.tsv` for Windows (none yet; plan 19b Task 14).
 
 use std::fs;
 use std::path::PathBuf;
 
-/// The recording of `agent` for Linux (`macos` false) or macOS.
-fn recording_path(agent: &str, macos: bool) -> PathBuf {
+use saiife_agents::lock::LockPlatform;
+
+/// The recording of `agent` for `platform`.
+fn recording_path(agent: &str, platform: LockPlatform) -> PathBuf {
     let mut p: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests/fixtures/lock-check"]
         .iter()
         .collect();
-    if macos {
-        p.push("macos");
+    if let Some(d) = platform.fixture_dir() {
+        p.push(d);
     }
     p.push(format!("{agent}.tsv"));
     p
 }
 
 fn read(agent: &str) -> String {
-    let p = recording_path(agent, false);
+    let p = recording_path(agent, LockPlatform::Linux);
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -68,27 +71,31 @@ fn claude_is_lockable() {
 fn claude_label_matches_recording() {
     use saiife_agents::{lock, Agent};
     let tsv = read("claude");
-    assert_eq!(label(&tsv), lock::label_for(Agent::Claude, false).id());
+    assert_eq!(
+        label(&tsv),
+        lock::label_for(Agent::Claude, LockPlatform::Linux).id()
+    );
 }
 
-/// Both tables follow the recordings: an agent with a recording for a
+/// All tables follow the recordings: an agent with a recording for a
 /// platform has its recorded label there, and one without is unverified.
 /// When a recording lands (Linux or `macos/`), this fails until
 /// `lock::label_for` follows it.
 #[test]
 fn labels_match_recordings_on_both_platforms() {
     use saiife_agents::{lock, Agent};
-    for macos in [false, true] {
+    for platform in LockPlatform::ALL {
         for a in Agent::ALL {
-            let p = recording_path(a.name(), macos);
-            let want = lock::label_for(a, macos);
+            let p = recording_path(a.name(), platform);
+            let want = lock::label_for(a, platform);
             if p.exists() {
                 let tsv = fs::read_to_string(&p).unwrap();
                 assert_eq!(label(&tsv), want.id(), "{}", p.display());
-                if macos {
+                if let Some(d) = platform.fixture_dir() {
+                    let marker = format!("# platform={d}");
                     assert!(
-                        tsv.lines().any(|l| l == "# platform=macos"),
-                        "{} is not a macOS recording (no `# platform=macos`)",
+                        tsv.lines().any(|l| l == marker),
+                        "{} is not a {d} recording (no `{marker}`)",
                         p.display()
                     );
                 }
@@ -99,10 +106,12 @@ fn labels_match_recordings_on_both_platforms() {
     }
 }
 
-/// The macOS recordings live in their own dir, which exists before the
-/// first recording (`.gitkeep`).
+/// The macOS and Windows recordings live in their own dirs, which exist
+/// before the first recording (`.gitkeep`).
 #[test]
-fn macos_recording_dir_exists() {
-    let dir = recording_path("x", true);
-    assert!(dir.parent().unwrap().is_dir(), "{}", dir.display());
+fn macos_and_windows_recording_dirs_exist() {
+    for platform in [LockPlatform::Macos, LockPlatform::Windows] {
+        let dir = recording_path("x", platform);
+        assert!(dir.parent().unwrap().is_dir(), "{}", dir.display());
+    }
 }
