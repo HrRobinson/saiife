@@ -675,8 +675,8 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
             Status::Warn,
             TITLE,
             format!(
-                "{why}: root runs this copy on the next package install; make it root's \
-                 and not writable by group or others"
+                "{why}: root runs this copy on the next package install; make it root's, \
+                 not writable by group or others, with no ACL"
             ),
         ));
     }
@@ -713,7 +713,10 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
 
 /// What the pkg's `postinstall` refuses: the staging copy and each dir up to
 /// `/usr`, which is not itself checked, must be no symlink, root's, and not
-/// writable by group or others. `/usr/local` has no SIP protection.
+/// writable by group or others. `/usr/local` has no SIP protection, so on
+/// macOS each must also have no ACL: one can grant write that the mode bits
+/// do not show. std has no API for ACLs, so `ls -ld` shows it, as a `+`. Not
+/// on Linux, whose package path is below the distribution's `/usr`.
 fn package_path_problem(ctx: &Ctx) -> Option<String> {
     let root = ctx.host.user("root")?;
     let logical = Path::new(shown(ctx, PACKAGE_BINARY));
@@ -736,6 +739,24 @@ fn package_path_problem(ctx: &Ctx) -> Option<String> {
             .next()
         {
             return Some(format!("{}: {problem}", p.display()));
+        }
+        if mac(ctx) {
+            let shown = p.display();
+            let path = at.to_string_lossy();
+            let ls = ctx.host.run(
+                "/bin/ls",
+                &["-ld", &path],
+                std::time::Duration::from_secs(5),
+            );
+            let mode = match &ls {
+                Ok(out) if out.status == 0 => out.stdout.split_whitespace().next(),
+                _ => None,
+            };
+            match mode {
+                Some(m) if m.contains('+') => return Some(format!("{shown}: has an ACL")),
+                Some(_) => {}
+                None => return Some(format!("{shown}: cannot check for an ACL")),
+            }
         }
     }
     None
@@ -2738,6 +2759,24 @@ mod macos_tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    /// What `ls -ld` says for each step of the staging path.
+    fn staging_ls(e: &MacEnv, mode: &str) {
+        let root = e.layout.root().to_path_buf();
+        e.host.set(|s| {
+            for p in [
+                "usr/local",
+                "usr/local/libexec",
+                "usr/local/libexec/saiife",
+                "usr/local/libexec/saiife/saiife",
+            ] {
+                s.run.insert(
+                    format!("/bin/ls -ld {}", root.join(p).display()),
+                    ok(&format!("{mode} 1 root wheel 0 Nov 2 07:00 {p}\n")),
+                );
+            }
+        });
+    }
+
     fn put_binary(e: &MacEnv, bytes: &[u8]) {
         let p = e.layout.at(BINARY);
         fs::write(&p, bytes).unwrap();
@@ -3053,6 +3092,7 @@ mod macos_tests {
         assert!(package.ends_with("usr/local/libexec/saiife/saiife"));
         fs::create_dir_all(package.parent().unwrap()).unwrap();
         fs::write(&package, fs::read(e.layout.at(BINARY)).unwrap()).unwrap();
+        staging_ls(&e, "drwxr-xr-x");
         assert_status(&doctor(&e), "files.package", Status::Pass);
         fs::write(&package, b"another build").unwrap();
         let r = doctor(&e);
@@ -3072,7 +3112,33 @@ mod macos_tests {
         fs::create_dir_all(&dir).unwrap();
         let same = fs::read(e.layout.at(BINARY)).unwrap();
         fs::write(&package, &same).unwrap();
+        staging_ls(&e, "drwxr-xr-x");
         assert_status(&doctor(&e), "files.package", Status::Pass);
+
+        // An ACL: the mode bits are clean, the `+` is what shows it.
+        staging_ls(&e, "drwxr-xr-x+");
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: has an ACL: "),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        // Could not look: not taken as clean.
+        e.host
+            .set(|s| s.run.retain(|k, _| !k.starts_with("/bin/ls ")));
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: cannot check for an ACL"),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        staging_ls(&e, "drwxr-xr-x");
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
         let r = doctor(&e);
@@ -3095,7 +3161,7 @@ mod macos_tests {
         assert_eq!(
             get(&r, "files.package").detail,
             "/usr/local/libexec/saiife/saiife: is a symlink: root runs this copy on the next \
-             package install; make it root's and not writable by group or others"
+             package install; make it root's, not writable by group or others, with no ACL"
         );
     }
 

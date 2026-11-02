@@ -528,11 +528,64 @@ fn pkg_postinstall_passes_on_0_and_1_and_fails_loudly_on_2() {
     let (rc, out, err, logged) = postinstall(2, "/");
     assert_eq!(rc, Some(2), "a refusal must fail the pkg: {out}{err}");
     assert!(out.contains("the last line"), "the refusal is shown: {out}");
-    let want = "saiife: install did not complete; any earlier install is unchanged: \
+    let want = "saiife: install did not complete and may be partial; do not assume locked \
+                mode is active; run /opt/saiife/bin/saiife doctor: \
                 system install --fleet exited 2: saiife: the last line";
     assert!(err.contains(want), "{err}");
     assert!(logged.contains("-p auth.err"), "{logged}");
     assert!(logged.contains(want), "{logged}");
+}
+
+/// Only an install that says it changed nothing gets the claim.
+#[test]
+fn pkg_postinstall_claims_unchanged_only_when_install_says_so() {
+    let d = tempfile::tempdir().unwrap();
+    let (local, bin) = staging_tree(d.path(), 2);
+    std::fs::write(
+        &bin,
+        "echo 'saiife: locked mode on macOS needs SIP' >&2\n\
+         echo 'saiife: nothing was changed' >&2\nexit 2\n",
+    )
+    .unwrap();
+    let (rc, out, err, logged) = postinstall_in(d.path(), &local, "/");
+    assert_eq!(rc, Some(2), "{out}{err}");
+    let want = "saiife: install did not complete; any earlier install is unchanged: \
+                system install --fleet exited 2: saiife: locked mode on macOS needs SIP";
+    assert!(err.contains(want), "{err}");
+    assert!(logged.contains(want), "{logged}");
+    assert!(!err.contains("may be partial"), "{err}");
+}
+
+/// `ls -ld` here cannot show a macOS ACL, so a stub does: clean mode bits, a
+/// `+` after them.
+#[test]
+fn pkg_postinstall_refuses_an_acl() {
+    let d = tempfile::tempdir().unwrap();
+    let (local, _) = staging_tree(d.path(), 0);
+    let ls = d.path().join("fake-ls");
+    std::fs::write(
+        &ls,
+        format!("echo 'drwxr-xr-x+ 3 {} 0 96 Nov  2 07:00 x'\n", my_uid()),
+    )
+    .unwrap();
+    let (rc, out, err) = run_copy(
+        d.path(),
+        POSTINSTALL,
+        &[
+            ("/usr/local", local.display().to_string()),
+            ("STAGING_UID=0", format!("STAGING_UID={}", my_uid())),
+            ("ls -ldn", format!("sh '{}'", ls.display())),
+            ("logger -t", ": -t".to_string()),
+        ],
+        &["/some/saiife.pkg", "/", "/"],
+    );
+    assert_eq!(rc, Some(2), "{out}{err}");
+    assert!(!out.contains("called:"), "must not run it: {out}");
+    assert!(
+        err.contains(&format!("{} has an ACL", local.display())),
+        "{err}"
+    );
+    assert!(err.contains("chmod -N"), "{err}");
 }
 
 #[test]

@@ -341,23 +341,32 @@ The pkg's `postinstall` runs
 
 **Exit codes.** When install exits 0 or 1, the `postinstall` exits 0. When
 install exits 2, the `postinstall` fails too, so `installer` and your MDM report
-a failed install. The payload stays on disk, but this install did not take
-effect. On a new Mac nothing is locked. On an upgrade, the earlier install stays
-in place and keeps locking. The reason goes to `/var/log/install.log` and to
-syslog (`logger -t saiife -p auth.err`). For example, on a Mac with SIP off:
+a failed install, and the payload stays on disk. The reason goes to
+`/var/log/install.log` and to syslog (`logger -t saiife -p auth.err`).
+
+What the failure means depends on how far install got, and the message says which.
+When install was refused before it changed anything, such as on a Mac with SIP
+off, any earlier install is unchanged and keeps locking:
 
 ```
 saiife: locked mode on macOS needs System Integrity Protection: without it the hardened runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP (Recovery: csrutil enable) and run install again.
 saiife: install did not complete; any earlier install is unchanged: system install --fleet exited 2: ...
 ```
 
-Fix the cause, then install the pkg again.
+When install failed partway, it may be partial. Do not assume locked mode is
+active, and run `sudo /opt/saiife/bin/saiife doctor`:
+
+```
+saiife: install did not complete and may be partial; do not assume locked mode is active; run /opt/saiife/bin/saiife doctor: system install --fleet exited 2: ...
+```
+
+Either way, fix the cause, then install the pkg again.
 
 **The staging path.** SIP does not protect `/usr/local`, and root runs the staging
 copy. So before it runs, the `postinstall` and the fleet scripts check
 `/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/saiife` and the binary.
-Each must be no symlink, owned by root and not writable by group or others.
-Otherwise they exit 2 and name the path, and `doctor` warns in `files.package`:
+Each must be no symlink, owned by root, not writable by group or others, and have
+no ACL (an ACL can grant write that the mode bits do not show). Otherwise they exit 2 and name the path, and `doctor` warns in `files.package`:
 
 ```
 saiife: the staging copy is not safe to run: /usr/local is not owned by root; ...
@@ -365,6 +374,7 @@ saiife: the staging copy is not safe to run: /usr/local is not owned by root; ..
 
 Some Macs have a user-owned `/usr/local`. Make it root's before you install, for
 example with `sudo chown root:wheel /usr/local` and `sudo chmod go-w /usr/local`.
+Remove an ACL with `sudo chmod -N <path>`.
 Check first what else on the Mac needs it to stay as it is. Homebrew on Intel
 keeps its files below `/usr/local` and its own dirs can stay the user's: only the
 four paths above are checked.

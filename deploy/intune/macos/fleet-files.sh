@@ -47,7 +47,8 @@ PKG_BIN=/usr/local/libexec/saiife/saiife
 # --- staging check: the same in postinstall and both fleet-files.sh ---
 # /usr/local is not protected by SIP, and root runs the staging copy. Prints
 # why it is not safe to run, or nothing: each step must be no symlink, owned
-# by root, and not writable by group or others.
+# by root, not writable by group or others, and with no ACL (a "+" after the
+# mode: an ACL can grant write that the mode bits do not show).
 STAGING_UID=0
 staging_problem() {
     for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$PKG_BIN"; do
@@ -69,6 +70,10 @@ EOF
             return 0
         fi
         case "$mode" in
+            *+*)
+                echo "$p has an ACL"
+                return 0
+                ;;
             ?????w* | ????????w*)
                 echo "$p is writable by group or others"
                 return 0
@@ -85,7 +90,7 @@ have_staging=""
 if [ -e "$PKG_BIN" ] || [ -L "$PKG_BIN" ]; then
     have_staging=1
     why=$(staging_problem)
-    [ -z "$why" ] || refuse "the staging copy is not safe to run: $why; make it root's and not writable by group or others"
+    [ -z "$why" ] || refuse "the staging copy is not safe to run: $why; make it root's, not writable by group or others, with no ACL (chmod -N)"
 fi
 
 for d in "$ETC" "$FLEET"; do

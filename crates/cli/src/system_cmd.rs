@@ -10,7 +10,9 @@ use saiife_agents::Agent;
 use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::fleet::fleet_options;
-use saiife_system::install::{install_locked, lock_install, InstallError, InstallOptions};
+use saiife_system::install::{
+    install_locked, lock_install, InstallError, InstallOptions, NOTHING_CHANGED,
+};
 use saiife_system::layout::Platform;
 use saiife_system::uninstall::{uninstall, UninstallOptions};
 use saiife_system::{host_for, refusal_line, Host, Layout};
@@ -102,6 +104,14 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
     }
 }
 
+/// An install that failed before its first change: the error, then the line
+/// that says so, last (the pkg's `postinstall` matches on it).
+fn report_untouched(e: InstallError) -> ExitCode {
+    let code = report_error("install", e);
+    eprintln!("{NOTHING_CHANGED}");
+    code
+}
+
 /// `doctor` after a successful install (spec §7): its text on stdout.
 /// True when it found a failure (the caller exits 1; the install itself
 /// stays done; install errors are exit 2).
@@ -164,7 +174,7 @@ pub fn run(action: SystemAction) -> ExitCode {
             // about to change what they say.
             let lock = match lock_install(&layout, host.as_ref()) {
                 Ok(l) => l,
-                Err(e) => return report_error("install", e),
+                Err(e) => return report_untouched(e),
             };
             let opts = if fleet {
                 match fleet_options(&layout, host.as_ref()) {
@@ -172,7 +182,7 @@ pub fn run(action: SystemAction) -> ExitCode {
                         allow_test_build,
                         ..o
                     },
-                    Err(e) => return report_error("install", e),
+                    Err(e) => return report_untouched(e),
                 }
             } else {
                 InstallOptions {
@@ -183,7 +193,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                     allow_test_build,
                 }
             };
-            match install_locked(&lock, &layout, host.as_ref(), &opts, &binary) {
+            let began = std::cell::Cell::new(false);
+            match install_locked(&lock, &layout, host.as_ref(), &opts, &binary, &began) {
                 Ok(r) => {
                     for w in &r.warnings {
                         eprintln!("saiife: warning: {w}");
@@ -217,7 +228,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
-                Err(e) => report_error("install", e),
+                Err(e) if began.get() => report_error("install", e),
+                Err(e) => report_untouched(e),
             }
         }
         SystemAction::Uninstall {

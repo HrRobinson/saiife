@@ -118,7 +118,8 @@ first_unsafe() {
             return 0
         fi
         line="$(stat -f '%u %Lp' "$p")"
-        if [[ "${line%% *}" != 0 ]] || (((8#${line##* } & 022) != 0)); then
+        if [[ "${line%% *}" != 0 ]] || (((8#${line##* } & 022) != 0)) ||
+            [[ "$(ls -ld "$p" | cut -d' ' -f1)" == *+* ]]; then
             echo "$p"
             return 0
         fi
@@ -287,6 +288,10 @@ sudo -n chmod g-w /usr/local/libexec/saiife
 sudo -n chown "$(id -un)" /usr/local/libexec
 expect_staging_refusal "runner-owned libexec" /usr/local/libexec
 sudo -n chown root:wheel /usr/local/libexec
+# An ACL grants write with clean mode bits.
+sudo -n chmod +a "everyone allow write" /usr/local/libexec
+expect_staging_refusal "an ACL on libexec" /usr/local/libexec
+sudo -n chmod -N /usr/local/libexec
 [[ -z "$(first_unsafe)" ]] || fail "the dirs are still unsafe: $(first_unsafe)"
 
 phase "6. the fleet install from the staging copy"
@@ -309,6 +314,12 @@ as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor-unsafe.out" 2>/dev/null || 
     { cat "$WORK/doctor-unsafe.out"; fail "doctor files.package does not warn on a writable staging dir"; }
 sudo -n chmod g-w /usr/local/libexec/saiife
 ok "doctor warns on a writable staging dir"
+sudo -n chmod +a "everyone allow write" /usr/local/libexec/saiife
+as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor-acl.out" 2>/dev/null || true
+[[ "$(jq -r '.checks[] | select(.id == "files.package") | .detail' "$WORK/doctor-acl.out")" == "/usr/local/libexec/saiife: has an ACL"* ]] ||
+    { cat "$WORK/doctor-acl.out"; fail "doctor files.package does not name the ACL"; }
+sudo -n chmod -N /usr/local/libexec/saiife
+ok "doctor warns on an ACL"
 got="$(as_root_seam sh "$REPO/deploy/jamf/extension-attribute.sh")"
 [[ "$got" == "<result>warn</result>" || "$got" == "<result>pass</result>" ]] || fail "extension attribute: $got"
 ok "extension attribute: $got"

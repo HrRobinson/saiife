@@ -122,6 +122,10 @@ pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
     }
 }
 
+/// The last line of a failed install that had not begun to change anything
+/// (the pkg's `postinstall` matches on it).
+pub const NOTHING_CHANGED: &str = "saiife: nothing was changed";
+
 /// How long install waits for another install to finish.
 #[cfg(not(test))]
 const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(120);
@@ -235,15 +239,17 @@ pub fn install(
 }
 
 /// [`install`] for a caller that took the lock itself: it read the fleet
-/// files under the same lock.
+/// files under the same lock. `began` turns true just before the first change,
+/// so on an error the caller knows whether the install may be partial.
 pub fn install_locked(
     _lock: &InstallLock,
     layout: &Layout,
     host: &dyn Host,
     opts: &InstallOptions,
     binary: &Path,
+    began: &std::cell::Cell<bool>,
 ) -> Result<InstallReport, InstallError> {
-    install_unlocked(layout, host, opts, binary, crate::sip::seam_set())
+    install_unlocked(layout, host, opts, binary, crate::sip::seam_set(), began)
 }
 
 /// [`install`] with the SIP test seam given ([`crate::sip::seam_set`]: a
@@ -256,7 +262,14 @@ pub(crate) fn install_with(
     sip_seam: bool,
 ) -> Result<InstallReport, InstallError> {
     let _lock = lock_install_within(layout, host, sip_seam, INSTALL_LOCK_WAIT)?;
-    install_unlocked(layout, host, opts, binary, sip_seam)
+    install_unlocked(
+        layout,
+        host,
+        opts,
+        binary,
+        sip_seam,
+        &std::cell::Cell::new(false),
+    )
 }
 
 /// Root, the supported-system check and SIP. These write nothing, so they
@@ -298,6 +311,7 @@ fn install_unlocked(
     opts: &InstallOptions,
     binary: &Path,
     sip_seam: bool,
+    began: &std::cell::Cell<bool>,
 ) -> Result<InstallReport, InstallError> {
     // 1. The refusals again: the lock may have taken a while.
     let (systemd, sip_warning) = host_refusals(layout, host, sip_seam)?;
@@ -407,6 +421,7 @@ fn install_unlocked(
     } else {
         true
     };
+    began.set(true);
     let mut run = Run {
         layout,
         host,
@@ -2085,6 +2100,29 @@ pub(crate) mod tests {
             assert!(!e.at(ETC_DIR).exists());
             drop(first);
             assert!(e.run(&all_agents()).is_ok());
+        }
+
+        fn began(e: &crate::install::tests::Env) -> (bool, bool) {
+            let lock = lock_install(&e.layout, &e.host).expect("lock");
+            let began = std::cell::Cell::new(false);
+            let got = install_locked(&lock, &e.layout, &e.host, &all_agents(), &e.binary, &began);
+            (got.is_ok(), began.get())
+        }
+
+        #[test]
+        fn install_says_whether_it_had_begun_when_it_fails() {
+            // A refusal before the first change.
+            let e = env(255);
+            fs::create_dir_all(e.at(STATE_DIR).parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/nowhere", e.at(STATE_DIR)).unwrap();
+            assert_eq!(began(&e), (false, false));
+            // Refused on the way: /etc is another uid's, seen by the run.
+            let e = env(255);
+            crate::testing::set_root_uid(&e.host, rustix::process::getuid().as_raw() + 1);
+            assert_eq!(began(&e), (false, true));
+            // A normal install.
+            let e = env(255);
+            assert_eq!(began(&e), (true, true));
         }
 
         #[test]
