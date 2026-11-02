@@ -51,6 +51,9 @@ ca = "/etc/saiife/ca/siem.pem"   # optional extra CA for tls://
   sockets take no more) is truncated at a character boundary and ends with
   `…[truncated]` (a truncated line cannot be verified). If `/dev/log` is a stream socket,
   every message goes over it with octet-counting framing instead, uncut.
+  The lower limit on macOS means more long records lose verifiability there.
+  If you use `saiife audit verify --external` on macOS, forward with
+  `tls://`, `file` or `https` instead of `unix:/var/run/syslog`.
   Note that syslog-ng's `unix-stream()` source expects newline framing by
   default; point a `unix:` target at a datagram socket (`unix-dgram()`), or
   use a framing-aware source.

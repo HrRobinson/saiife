@@ -526,8 +526,8 @@ fn is_empty_config(agent: &str, p: &Path) -> bool {
     }
 }
 
-// Locked mode is Linux-only: on macOS `check_supported` refuses every
-// install (and these tests install first) (spec §0 decision 8), so these tests run on Linux only.
+// These tests install first with the Linux tree, and `Layout::under` takes
+// the host's platform, so they run on Linux only.
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

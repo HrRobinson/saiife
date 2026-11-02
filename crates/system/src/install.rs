@@ -1893,8 +1893,9 @@ impl Run<'_> {
     }
 }
 
-// Locked mode is Linux-only: on macOS `check_supported` refuses every
-// install (spec §0 decision 8), so these tests run on Linux only.
+// These tests assert the Linux tree, and `Layout::under` takes the host's
+// platform, so they run on Linux only. The macOS tree has its own tests,
+// through `Layout::under_for` (they run on Linux too).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use super::*;

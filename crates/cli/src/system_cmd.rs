@@ -11,6 +11,7 @@ use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::fleet::fleet_options;
 use saiife_system::install::{install, InstallError, InstallOptions};
+use saiife_system::layout::Platform;
 use saiife_system::uninstall::{uninstall, UninstallOptions};
 use saiife_system::{host_for, refusal_line, Host, Layout};
 
@@ -122,6 +123,14 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> bool {
     }
 }
 
+/// The command an admin runs to restart the daemon on `platform`.
+fn restart_command(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Linux => "systemctl restart saiifed",
+        Platform::Macos => "launchctl kickstart -k system/com.saiife.saiifed",
+    }
+}
+
 pub fn run(action: SystemAction) -> ExitCode {
     match action {
         SystemAction::Install {
@@ -187,7 +196,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                         eprintln!(
                             "saiife: installed, but the running daemon may still enforce the old \
                              policy: fix the config, then run `saiife policy reload` or \
-                             `systemctl restart saiifed`"
+                             `{}`",
+                            restart_command(layout.platform())
                         );
                     }
                     if doctor_failed || r.reload_problem.is_some() {
@@ -225,5 +235,22 @@ pub fn run(action: SystemAction) -> ExitCode {
                 Err(e) => report_error("uninstall", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_command_follows_the_platform() {
+        assert_eq!(
+            restart_command(Platform::Linux),
+            "systemctl restart saiifed"
+        );
+        assert_eq!(
+            restart_command(Platform::Macos),
+            format!("launchctl kickstart -k {}", saiife_system::launchd::SERVICE)
+        );
     }
 }

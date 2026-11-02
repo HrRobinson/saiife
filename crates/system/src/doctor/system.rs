@@ -161,7 +161,6 @@ fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
     ))
 }
 
-/// Whether this layout is macOS's.
 /// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
 /// otherwise ([`crate::sip::SIP_REQUIRED`]); a test build with the seam
 /// reports Warn instead.
@@ -181,6 +180,7 @@ fn sip_check(enabled: bool, seam: bool) -> Check {
     }
 }
 
+/// Whether this layout is macOS's.
 fn mac(ctx: &Ctx) -> bool {
     ctx.layout.platform() == Platform::Macos
 }
@@ -636,8 +636,8 @@ fn macho_binary(bytes: &[u8]) -> Check {
     match info.profile {
         Profile::Release => {}
         Profile::DebugAssertions => notes.push(
-            "test build installed: debug assertions are on (the SAIIFE_EVAL_FAULT test seam \
-             can hang the guard); install the release build"
+            "test build installed: debug assertions are on (SAIIFE_EVAL_FAULT can hang the \
+             guard, SAIIFE_TEST_ALLOW_SIP_OFF skips the SIP check); install the release build"
                 .to_string(),
         ),
         Profile::Unknown => notes.push("no saiife build marker; its build is unknown".to_string()),

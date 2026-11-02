@@ -4,8 +4,9 @@
 //! environment the agent can shape (Claude Code's settings `env`, for
 //! one). A dynamically linked binary honours `LD_PRELOAD` and
 //! `LD_LIBRARY_PATH` there, so the agent could run its own code inside the
-//! hook. A build with debug assertions honours the `SAIIFE_EVAL_FAULT` test
-//! seam, which can hang the guard past an agent's hook timeout. Locked mode
+//! hook. A build with debug assertions honours test seams: `SAIIFE_EVAL_FAULT`
+//! can hang the guard past an agent's hook timeout, and others widen what
+//! the hook allows (docs/install.md lists them). Locked mode
 //! therefore wants the static release build. [`inspect`] reads both facts
 //! from the file's bytes: the ELF program headers (no external tools), and
 //! a build marker every saiife binary carries.
@@ -83,8 +84,8 @@ impl BinaryInfo {
         match self.profile {
             Profile::Release => {}
             Profile::DebugAssertions => out.push(
-                "it is a test build (debug assertions on: the SAIIFE_EVAL_FAULT test seam \
-                 is compiled in)"
+                "it is a test build (debug assertions on: test seams such as \
+                 SAIIFE_EVAL_FAULT and SAIIFE_TEST_CLAUDE_MCP_DROPIN are compiled in)"
                     .to_string(),
             ),
             Profile::Unknown => out.push("it carries no saiife build marker".to_string()),
@@ -302,8 +303,8 @@ impl MachInfo {
         match self.profile {
             Profile::Release => {}
             Profile::DebugAssertions => out.push(
-                "it is a test build (debug assertions on: the SAIIFE_EVAL_FAULT test seam \
-                 is compiled in)"
+                "it is a test build (debug assertions on: test seams such as \
+                 SAIIFE_EVAL_FAULT and SAIIFE_TEST_ALLOW_SIP_OFF are compiled in)"
                     .to_string(),
             ),
             Profile::Unknown => out.push("it carries no saiife build marker".to_string()),

@@ -154,7 +154,7 @@ server whose command is not pinned, and (macOS) `SAIIFE_TEST_ALLOW_SIP_OFF=1`,
 which lets install and `doctor` go on without System Integrity Protection
 (install warns, `doctor` reports `system.sip` as a warning; see
 [Locked mode (macOS)](#supported-systems-macos)). A release build never
-reads either. So
+reads any of the three. So
 `system install` refuses (exit 2) a binary that is dynamically linked (an
 ELF interpreter or a needed shared library), has debug assertions on, or has
 no saiife build marker, and `saiife doctor` fails `files.binary` on a
