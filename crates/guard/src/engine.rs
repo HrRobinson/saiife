@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use regex::{Regex, RegexSet};
 
 use crate::canon::{
-    canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathStyle,
+    canonicalize, expand_operand_glob_dots, lexical_form, path_forms, GlobExpansion, PathStyle,
     PathVars, GLOB_SCAN_LIMIT,
 };
 use crate::cdtrack::RuleCwd;
@@ -1083,7 +1083,7 @@ impl Engine {
                     return timed_out();
                 }
                 let words = if op.glob {
-                    match expand_operand_glob(&op.path, *cwd, &self.vars) {
+                    match expand_operand_glob_dots(&op.path, *cwd, &self.vars, op.dots) {
                         GlobExpansion::Matches(m) if !m.is_empty() => m
                             .into_iter()
                             .map(|p| p.to_string_lossy().into_owned())
@@ -1174,7 +1174,7 @@ impl Engine {
         let mut scanned = 0usize;
         for src in sources {
             let paths: Vec<String> = if src.glob {
-                match expand_operand_glob(&src.path, cwd, &self.vars) {
+                match expand_operand_glob_dots(&src.path, cwd, &self.vars, src.dots) {
                     GlobExpansion::Matches(m) if !m.is_empty() => {
                         m.iter().map(|p| p.to_string_lossy().into_owned()).collect()
                     }
@@ -1426,6 +1426,19 @@ fn base_name(path: &str) -> Option<String> {
         .next()
         .filter(|b| !b.is_empty())
         .map(str::to_string)
+}
+
+/// The path rules on one already-read segment, for the readers' tests:
+/// Task 6 wires the PowerShell and cmd readers into `evaluate`.
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn judge_words(&self, seg: &[Word]) -> Option<Decision> {
+        self.path_rules();
+        let argv = crate::normalize::build_argv(seg);
+        let ops = operands(seg, seg, &argv);
+        let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
+        self.judge_operands(ops, &cwds, false, Instant::now())
+    }
 }
 
 /// `dir/<name>` for each name copied or moved into `dir`.
@@ -1947,6 +1960,7 @@ impl<'a> SegmentView<'a> {
                 path,
                 access: Access::Read,
                 glob,
+                dots: false,
                 into: Vec::new(),
             })
             .collect();

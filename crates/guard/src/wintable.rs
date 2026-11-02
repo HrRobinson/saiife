@@ -1,0 +1,1986 @@
+//! The Windows translation table (plan 19a, W5): PowerShell cmdlets, their
+//! aliases and cmd builtins as the POSIX commands the packs judge, and the
+//! commands nested in `powershell`, `cmd`, `iex` and `Invoke-Command`.
+//!
+//! A pure function of the words. Where a real parameter would confuse the
+//! POSIX operand parser it is removed, not passed through: `Copy-Item -Filter`
+//! holds a `t`, and `operands` would read `-t ilter` and take the wrong word as
+//! the target. That is a departure from W5's "others pass through as written",
+//! for `cp`, `mv` and the redirect rows.
+
+use crate::canon::PathStyle;
+use crate::lexer::Word;
+
+/// How a command line is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+/// What `nested` returns for a nested command it knows is there and cannot
+/// read: an `-EncodedCommand` that does not decode, `-File`, a script block in
+/// a variable, a shell fed on stdin. It reads as a variable in command
+/// position, so `pwsh::split_segments_noted` gives it the unresolved outcome.
+pub const UNRESOLVED: &str = "$saiife_unresolved";
+
+const MAX_ENCODED: usize = 64 * 1024;
+/// `Start-Process Start-Process …`: how many times the table re-enters itself.
+const MAX_START_DEPTH: u32 = 8;
+
+pub(crate) const NOTE_AMBIGUOUS: &str = "a PowerShell parameter is ambiguous";
+const NOTE_UNKNOWN: &str = "a PowerShell parameter is not in the table";
+const NOTE_PIPELINE: &str = "a path comes from the pipeline";
+const NOTE_TARGET: &str = "a PowerShell file command has no visible target";
+const NOTE_LINK: &str = "a link is created: later paths may go through it";
+const NOTE_ITEM_TYPE: &str = "New-Item has an item type that cannot be read";
+const NOTE_WORKDIR: &str = "Start-Process changes its working directory";
+const NOTE_START: &str = "Start-Process has no readable program";
+const NOTE_PURGE: &str = "robocopy deletes files in its target";
+const NOTE_ROBOCOPY: &str = "robocopy has no readable source and target";
+
+/// What one parameter does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Act {
+    /// Becomes this POSIX flag; any value (`-Recurse:$true`) is dropped.
+    Flag(&'static str),
+    /// Its value is an operand; wildcards expand.
+    Path,
+    /// Its value is an operand, taken literally.
+    Literal,
+    /// Its value is the copy or move target, or `curl -o`.
+    Target,
+    /// `Select-String -Pattern`.
+    Pattern,
+    /// `Invoke-WebRequest -InFile`.
+    InFile,
+    /// `Stop-Process -Name`.
+    ProcName,
+    /// `New-Item -ItemType`.
+    ItemType,
+    /// `New-Item -Name`.
+    ItemName,
+    /// `New-Item -Value`: file contents, or a link's target.
+    ItemValue,
+    /// `Start-Process -ArgumentList`.
+    Args,
+    /// `Start-Process -RedirectStandardOutput`.
+    Out,
+    /// `Start-Process -RedirectStandardInput`.
+    In,
+    /// A real parameter left as written.
+    Keep,
+    /// A real switch that names no path: removed.
+    Drop,
+    /// A real parameter that names no path: removed with its value.
+    Skip,
+    /// Removed with its value; the command is not fully read.
+    Unread(&'static str),
+    /// A switch removed; the command is not fully read.
+    UnreadSwitch(&'static str),
+}
+
+impl Act {
+    fn takes_value(self) -> bool {
+        !matches!(
+            self,
+            Act::Flag(_) | Act::Keep | Act::Drop | Act::UnreadSwitch(_)
+        )
+    }
+
+    /// Two spellings of one thing are no ambiguity (`-l`: `LiteralPath`, `LP`).
+    fn same(self, other: Act) -> bool {
+        let class = |a| match a {
+            Act::Literal => Act::Path,
+            a => a,
+        };
+        class(self) == class(other)
+    }
+}
+
+/// What a row becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum To {
+    Rm,
+    Cp,
+    Robocopy,
+    Mv,
+    Rename,
+    Cat,
+    Write,
+    NewItem,
+    Ls,
+    Grep,
+    Cd,
+    Pushd,
+    Popd,
+    Kill,
+    Curl,
+    Start,
+}
+
+struct Row {
+    /// Lower case: the PowerShell names, then the cmd names.
+    ps: &'static [&'static str],
+    cmd: &'static [&'static str],
+    to: To,
+    params: &'static [(&'static str, Act)],
+    /// `/x` switches. Read in both dialects: `del /s /q C:\` must not pass
+    /// under PowerShell, where it fails, as if it were harmless.
+    slash: &'static [(&'static str, Act)],
+}
+
+const LITERAL: [(&str, Act); 3] = [
+    ("LiteralPath", Act::Literal),
+    ("LP", Act::Literal),
+    ("PSPath", Act::Literal),
+];
+
+macro_rules! with_literal {
+    ($($p:expr),* $(,)?) => {
+        &[LITERAL[0], LITERAL[1], LITERAL[2], ("Path", Act::Path), $($p),*]
+    };
+}
+
+const WRITE_PARAMS: &[(&str, Act)] = with_literal![
+    ("FilePath", Act::Path),
+    ("Value", Act::Skip),
+    ("InputObject", Act::Skip),
+    ("Encoding", Act::Skip),
+    ("Width", Act::Skip),
+    ("Stream", Act::Skip),
+    ("Filter", Act::Skip),
+    ("Include", Act::Skip),
+    ("Exclude", Act::Skip),
+    ("Credential", Act::Skip),
+    ("Append", Act::Drop),
+    ("Force", Act::Drop),
+    ("NoClobber", Act::Drop),
+    ("NoNewline", Act::Drop),
+    ("PassThru", Act::Drop),
+    ("AsByteStream", Act::Drop),
+    ("WhatIf", Act::Drop),
+    ("Confirm", Act::Drop),
+];
+
+const COPY_RECURSE: &[(&str, Act)] = &[
+    ("s", Act::Flag("-r")),
+    ("e", Act::Flag("-r")),
+    ("mir", Act::Flag("-r")),
+];
+
+const TABLE: &[Row] = &[
+    Row {
+        ps: &["remove-item", "ri", "rm", "rmdir", "del", "erase", "rd"],
+        cmd: &["del", "erase", "rd", "rmdir"],
+        to: To::Rm,
+        params: with_literal![
+            ("Recurse", Act::Flag("-r")),
+            ("Force", Act::Flag("-f")),
+            ("Filter", Act::Keep),
+            ("Include", Act::Keep),
+            ("Exclude", Act::Keep),
+            ("Credential", Act::Keep),
+            ("Stream", Act::Keep),
+        ],
+        slash: &[
+            ("s", Act::Flag("-r")),
+            ("q", Act::Flag("-f")),
+            ("f", Act::Flag("-f")),
+        ],
+    },
+    Row {
+        ps: &["copy-item", "cp", "copy", "cpi"],
+        cmd: &["copy", "xcopy"],
+        to: To::Cp,
+        params: with_literal![
+            ("Recurse", Act::Flag("-r")),
+            ("Destination", Act::Target),
+            ("Force", Act::Drop),
+            ("PassThru", Act::Drop),
+            ("Container", Act::Drop),
+            ("WhatIf", Act::Drop),
+            ("Confirm", Act::Drop),
+            ("Filter", Act::Skip),
+            ("Include", Act::Skip),
+            ("Exclude", Act::Skip),
+            ("Credential", Act::Skip),
+            ("FromSession", Act::Skip),
+            ("ToSession", Act::Skip),
+        ],
+        slash: COPY_RECURSE,
+    },
+    Row {
+        ps: &["robocopy"],
+        cmd: &["robocopy"],
+        to: To::Robocopy,
+        params: &[],
+        slash: &[
+            ("s", Act::Flag("-r")),
+            ("e", Act::Flag("-r")),
+            ("mir", Act::Flag("-r")),
+            ("mov", Act::Flag("--move")),
+            ("move", Act::Flag("--move")),
+            ("purge", Act::UnreadSwitch(NOTE_PURGE)),
+        ],
+    },
+    Row {
+        ps: &["move-item", "mv", "move", "mi"],
+        cmd: &["move"],
+        to: To::Mv,
+        params: with_literal![
+            ("Destination", Act::Target),
+            ("Force", Act::Drop),
+            ("PassThru", Act::Drop),
+            ("WhatIf", Act::Drop),
+            ("Confirm", Act::Drop),
+            ("Filter", Act::Skip),
+            ("Include", Act::Skip),
+            ("Exclude", Act::Skip),
+            ("Credential", Act::Skip),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &["rename-item", "ren", "rni"],
+        cmd: &["ren", "rename"],
+        to: To::Rename,
+        params: with_literal![
+            ("NewName", Act::Target),
+            ("Force", Act::Drop),
+            ("PassThru", Act::Drop),
+            ("WhatIf", Act::Drop),
+            ("Confirm", Act::Drop),
+            ("Credential", Act::Skip),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &["get-content", "gc", "cat", "type"],
+        cmd: &["type"],
+        to: To::Cat,
+        params: with_literal![
+            ("Tail", Act::Keep),
+            ("TotalCount", Act::Keep),
+            ("Head", Act::Keep),
+            ("First", Act::Keep),
+            ("ReadCount", Act::Keep),
+            ("Raw", Act::Keep),
+            ("Encoding", Act::Keep),
+            ("Delimiter", Act::Keep),
+            ("Wait", Act::Keep),
+            ("Stream", Act::Keep),
+            ("Filter", Act::Keep),
+            ("Include", Act::Keep),
+            ("Exclude", Act::Keep),
+            ("Force", Act::Keep),
+            ("Credential", Act::Keep),
+            ("AsByteStream", Act::Keep),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &[
+            "set-content",
+            "sc",
+            "add-content",
+            "ac",
+            "out-file",
+            "clear-content",
+            "clc",
+        ],
+        cmd: &[],
+        to: To::Write,
+        params: WRITE_PARAMS,
+        slash: &[],
+    },
+    Row {
+        ps: &["new-item", "ni", "md", "mkdir"],
+        cmd: &[],
+        to: To::NewItem,
+        params: &[
+            ("Path", Act::Path),
+            ("Name", Act::ItemName),
+            ("ItemType", Act::ItemType),
+            ("Type", Act::ItemType),
+            ("Value", Act::ItemValue),
+            ("Target", Act::ItemValue),
+            ("Force", Act::Drop),
+            ("WhatIf", Act::Drop),
+            ("Confirm", Act::Drop),
+            ("Credential", Act::Skip),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &["get-childitem", "gci", "ls", "dir"],
+        cmd: &["dir"],
+        to: To::Ls,
+        params: with_literal![
+            ("Recurse", Act::Flag("-R")),
+            ("s", Act::Flag("-R")),
+            ("Filter", Act::Keep),
+            ("Include", Act::Keep),
+            ("Exclude", Act::Keep),
+            ("Force", Act::Keep),
+            ("Name", Act::Keep),
+            ("Depth", Act::Keep),
+            ("Attributes", Act::Keep),
+            ("Directory", Act::Keep),
+            ("File", Act::Keep),
+            ("Hidden", Act::Keep),
+            ("ReadOnly", Act::Keep),
+            ("System", Act::Keep),
+            ("FollowSymlink", Act::Keep),
+        ],
+        slash: &[("s", Act::Flag("-R"))],
+    },
+    Row {
+        ps: &["select-string", "sls", "findstr"],
+        cmd: &["findstr"],
+        to: To::Grep,
+        params: with_literal![
+            ("Pattern", Act::Pattern),
+            ("InputObject", Act::Skip),
+            ("Context", Act::Skip),
+            ("Culture", Act::Skip),
+            ("Encoding", Act::Skip),
+            ("Exclude", Act::Skip),
+            ("Include", Act::Skip),
+            ("AllMatches", Act::Drop),
+            ("CaseSensitive", Act::Drop),
+            ("List", Act::Drop),
+            ("NoEmphasis", Act::Drop),
+            ("NotMatch", Act::Drop),
+            ("Quiet", Act::Drop),
+            ("Raw", Act::Drop),
+            ("SimpleMatch", Act::Drop),
+        ],
+        slash: &[
+            ("c", Act::Pattern),
+            ("r", Act::Pattern),
+            ("f", Act::Path),
+            ("g", Act::Path),
+        ],
+    },
+    Row {
+        ps: &["set-location", "cd", "sl", "chdir"],
+        cmd: &["cd", "chdir"],
+        to: To::Cd,
+        params: with_literal![("PassThru", Act::Drop), ("StackName", Act::Skip)],
+        slash: &[],
+    },
+    Row {
+        ps: &["push-location", "pushd"],
+        cmd: &["pushd"],
+        to: To::Pushd,
+        params: with_literal![("PassThru", Act::Drop), ("StackName", Act::Skip)],
+        slash: &[],
+    },
+    Row {
+        ps: &["pop-location", "popd"],
+        cmd: &["popd"],
+        to: To::Popd,
+        params: &[],
+        slash: &[],
+    },
+    Row {
+        ps: &["stop-process", "kill", "spps", "taskkill"],
+        cmd: &["taskkill"],
+        to: To::Kill,
+        params: &[
+            ("Id", Act::Path),
+            ("PID", Act::Path),
+            ("Name", Act::ProcName),
+            ("ProcessName", Act::ProcName),
+            ("InputObject", Act::Keep),
+            ("Force", Act::Keep),
+            ("PassThru", Act::Keep),
+        ],
+        slash: &[
+            ("pid", Act::Path),
+            ("im", Act::ProcName),
+            ("f", Act::Drop),
+            ("t", Act::Drop),
+            ("fi", Act::Skip),
+            ("s", Act::Skip),
+            ("u", Act::Skip),
+            ("p", Act::Skip),
+        ],
+    },
+    Row {
+        ps: &[
+            "invoke-webrequest",
+            "iwr",
+            "curl",
+            "wget",
+            "invoke-restmethod",
+            "irm",
+        ],
+        cmd: &[],
+        to: To::Curl,
+        params: &[
+            ("Uri", Act::Path),
+            ("OutFile", Act::Target),
+            ("InFile", Act::InFile),
+            ("Body", Act::Keep),
+            ("Method", Act::Keep),
+            ("Headers", Act::Keep),
+            ("Form", Act::Keep),
+            ("ContentType", Act::Keep),
+            ("UseBasicParsing", Act::Keep),
+            ("UseDefaultCredentials", Act::Keep),
+            ("UserAgent", Act::Keep),
+            ("TimeoutSec", Act::Keep),
+            ("Token", Act::Keep),
+            ("TransferEncoding", Act::Keep),
+            ("Proxy", Act::Keep),
+            ("Credential", Act::Keep),
+            ("Certificate", Act::Keep),
+            ("WebSession", Act::Keep),
+            ("SessionVariable", Act::Keep),
+            ("DisableKeepAlive", Act::Keep),
+            ("MaximumRedirection", Act::Keep),
+            ("PassThru", Act::Keep),
+            ("FollowRelLink", Act::Keep),
+            ("HttpVersion", Act::Keep),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &["start-process", "saps", "start"],
+        cmd: &["start"],
+        to: To::Start,
+        params: &[
+            ("FilePath", Act::Path),
+            ("Path", Act::Path),
+            ("PSPath", Act::Path),
+            ("ArgumentList", Act::Args),
+            ("Args", Act::Args),
+            ("RedirectStandardOutput", Act::Out),
+            ("RSO", Act::Out),
+            ("RedirectStandardError", Act::Out),
+            ("RSE", Act::Out),
+            ("RedirectStandardInput", Act::In),
+            ("RSI", Act::In),
+            ("WorkingDirectory", Act::Unread(NOTE_WORKDIR)),
+            ("Verb", Act::Skip),
+            ("WindowStyle", Act::Skip),
+            ("Credential", Act::Skip),
+            ("Environment", Act::Skip),
+            ("Wait", Act::Drop),
+            ("NoNewWindow", Act::Drop),
+            ("PassThru", Act::Drop),
+            ("UseNewEnvironment", Act::Drop),
+            ("LoadUserProfile", Act::Drop),
+        ],
+        slash: &[("d", Act::Unread(NOTE_WORKDIR))],
+    },
+];
+
+/// Programs with `/x` switches on every shell: read the cmd way in both
+/// dialects, since PowerShell just hands them the words.
+const SLASH_PROGRAMS: &[&str] = &["taskkill", "xcopy", "robocopy", "findstr"];
+
+/// A name with a path or an extension is a program, not an alias: these keep
+/// their own (POSIX) options. `rm.exe -rf x`, `curl.exe -i URL`.
+const POSIX_PROGRAMS: &[&str] = &[
+    "rm", "cp", "mv", "cat", "ls", "curl", "wget", "kill", "mkdir", "rmdir", "sc",
+];
+
+/// The translation's context beyond the words: the reader knows these.
+#[derive(Default)]
+pub(crate) struct Context<'a> {
+    /// Input arrives on the pipeline (`x | Remove-Item`).
+    pub piped: bool,
+    /// `array[i]`: `argv[i]` followed a comma, so it extends the array before
+    /// it (`Set-Content a,b hello`: `b` is a path, `hello` the value).
+    pub array: &'a [bool],
+    pub depth: u32,
+}
+
+/// The W5 table: `argv` as the POSIX command the packs judge. `argv[0]` is
+/// matched without case, directory or extension; parameters by unambiguous
+/// prefix among the row's entries. An ambiguous prefix stays as written.
+pub fn translate(argv: &[Word], dialect: Dialect) -> Vec<Word> {
+    translate_noted(argv, dialect, &Context::default()).0
+}
+
+/// `translate`, plus why the words were not fully read.
+pub(crate) fn translate_noted(
+    argv: &[Word],
+    dialect: Dialect,
+    cx: &Context,
+) -> (Vec<Word>, Option<&'static str>) {
+    let Some(first) = argv.first() else {
+        return (Vec::new(), None);
+    };
+    if dialect == Dialect::Posix || first.has_substitution {
+        return (argv.to_vec(), None);
+    }
+    let name = CommandName::of(&first.text);
+    let lower = name.lower();
+    let renamed = || {
+        let mut out = argv.to_vec();
+        out[0].text = name.base.to_string();
+        out
+    };
+    if name.program && POSIX_PROGRAMS.contains(&lower.as_str()) {
+        return (renamed(), None);
+    }
+    let names = |r: &Row| match dialect {
+        Dialect::Cmd => r.cmd.contains(&lower.as_str()),
+        _ => r.ps.contains(&lower.as_str()),
+    };
+    let Some(row) = TABLE.iter().find(|r| names(r)) else {
+        return (renamed(), None);
+    };
+    let mut b = Builder {
+        dialect,
+        note: None,
+        redirects: Vec::new(),
+    };
+    let cmd_mode = dialect == Dialect::Cmd || SLASH_PROGRAMS.contains(&lower.as_str());
+    let array = cx.array.get(1..).unwrap_or(&[]);
+    let items = b.parse(row, &argv[1..], array, cmd_mode);
+    let mut out = match row.to {
+        To::Rm => b.in_order("rm", items, cx.piped),
+        To::Cat => b.in_order("cat", items, cx.piped),
+        To::Ls => b.in_order("ls", items, false),
+        To::Cd => b.in_order("cd", items, cx.piped),
+        To::Pushd => b.in_order("pushd", items, cx.piped),
+        To::Popd => vec![plain("popd")],
+        To::Cp => b.copy("cp", items, false, cx.piped),
+        To::Mv => b.copy("mv", items, false, cx.piped),
+        To::Rename => b.copy("mv", items, true, cx.piped),
+        To::Robocopy => b.robocopy(items),
+        To::Write => b.write(&lower, &argv[1..], items),
+        To::NewItem => b.new_item(&lower, items),
+        To::Grep => b.grep(items),
+        To::Kill => b.kill(items, cx.piped),
+        To::Curl => b.curl(items),
+        To::Start => b.start(items, cx.depth),
+    };
+    out.append(&mut b.redirects);
+    (out, b.note)
+}
+
+/// A command word without its directory and extension.
+pub(crate) struct CommandName<'a> {
+    pub base: &'a str,
+    /// It had a directory or an extension: a program, not an alias. A module
+    /// qualifier (`Microsoft.PowerShell.Management\Remove-Item`) does not count.
+    pub program: bool,
+}
+
+impl<'a> CommandName<'a> {
+    pub fn of(text: &'a str) -> Self {
+        let trimmed = text.trim_end_matches(['.', ' ']);
+        let (dir, file) = match trimmed.rfind(['\\', '/']) {
+            Some(at) => (&trimmed[..at], &trimmed[at + 1..]),
+            None => ("", trimmed),
+        };
+        if file.is_empty() {
+            return CommandName {
+                base: text,
+                program: false,
+            };
+        }
+        let stem = file.rfind('.').and_then(|at| {
+            let ext = &file[at + 1..];
+            (at > 0
+                && ["exe", "com", "cmd", "bat"]
+                    .iter()
+                    .any(|e| ext.eq_ignore_ascii_case(e)))
+            .then(|| &file[..at])
+        });
+        let module = dir
+            .get(.."microsoft.powershell.".len())
+            .is_some_and(|d| d.eq_ignore_ascii_case("microsoft.powershell."));
+        CommandName {
+            base: stem.unwrap_or(file),
+            program: stem.is_some() || (!dir.is_empty() && !module),
+        }
+    }
+
+    pub fn lower(&self) -> String {
+        self.base.to_lowercase()
+    }
+}
+
+fn plain(text: &str) -> Word {
+    Word {
+        text: text.to_string(),
+        ..Word::default()
+    }
+}
+
+fn redirect(text: &str) -> Word {
+    Word {
+        text: text.to_string(),
+        redirect: true,
+        ..Word::default()
+    }
+}
+
+/// A leading `//` as `\\`, on Windows: `normalize::build_argv` collapses
+/// leading slashes, and `//host/s` is a share there. Elsewhere it is `/host/s`.
+fn unc_text(text: &str, windows: bool) -> String {
+    let rest = text.trim_start_matches('/');
+    if windows && text.len() - rest.len() >= 2 {
+        format!(r"\\{rest}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// `$env:USERPROFILE` and `$env:HOME` as `$HOME`, which every path style reads.
+fn home_spelled(text: &str) -> Option<String> {
+    for prefix in [
+        "$env:userprofile",
+        "${env:userprofile}",
+        "$env:home",
+        "${env:home}",
+        "$home",
+    ] {
+        let Some(head) = text.get(..prefix.len()) else {
+            continue;
+        };
+        let rest = &text[prefix.len()..];
+        let ends = !rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if head.eq_ignore_ascii_case(prefix) && ends {
+            return Some(format!("$HOME{rest}"));
+        }
+    }
+    None
+}
+
+/// `\` as `/`, the leading run kept apart: `engine.rs` finds a directory by a
+/// trailing `/` and a base name after the last `/`.
+fn forward(text: &str) -> String {
+    let rest = text.trim_start_matches('\\');
+    format!(
+        "{}{}",
+        &text[..text.len() - rest.len()],
+        rest.replace('\\', "/")
+    )
+}
+
+enum Item {
+    Param {
+        act: Act,
+        value: Option<Word>,
+        written: Word,
+    },
+    Pos {
+        word: Word,
+        /// It followed a comma.
+        cont: bool,
+    },
+    Raw(Word),
+}
+
+struct Builder {
+    dialect: Dialect,
+    note: Option<&'static str>,
+    redirects: Vec<Word>,
+}
+
+impl Builder {
+    fn noted(&mut self, why: &'static str) {
+        self.note.get_or_insert(why);
+    }
+
+    /// The row's words as parameters and positionals; redirections go aside.
+    fn parse(&mut self, row: &Row, args: &[Word], array: &[bool], cmd_mode: bool) -> Vec<Item> {
+        let mut out = Vec::new();
+        let mut done = false;
+        let mut seen_pos = false;
+        let mut i = 0;
+        while i < args.len() {
+            let w = &args[i];
+            let at = i;
+            i += 1;
+            if w.redirect {
+                self.redirects.push(w.clone());
+                if let Some(t) = args.get(i) {
+                    self.redirects.push(t.clone());
+                    i += 1;
+                }
+                continue;
+            }
+            if !done && w.text == "--" {
+                done = true;
+                out.push(Item::Raw(w.clone()));
+                continue;
+            }
+            if !done && !w.has_substitution && w.text.starts_with('/') && w.text.len() > 1 {
+                if let Some(parts) = slash_parts(row, &w.text, cmd_mode) {
+                    for part in parts {
+                        self.slash_item(row, part, w, args, &mut i, &mut out);
+                    }
+                    continue;
+                }
+            }
+            if !done {
+                if let Some((name, value)) = param_shape(w) {
+                    match lookup(row.params, name) {
+                        Lookup::Found(act) => {
+                            let value = take_value(act, value, w, args, &mut i);
+                            out.push(Item::Param {
+                                act,
+                                value,
+                                written: w.clone(),
+                            });
+                            continue;
+                        }
+                        Lookup::Ambiguous => {
+                            self.noted(NOTE_AMBIGUOUS);
+                            out.push(Item::Raw(w.clone()));
+                            continue;
+                        }
+                        Lookup::Unknown => {
+                            out.push(Item::Raw(w.clone()));
+                            continue;
+                        }
+                    }
+                }
+            }
+            // `start "title" prog`: the first quoted word is cmd's title. All
+            // after the program belongs to the program.
+            if row.to == To::Start && cmd_mode && !seen_pos {
+                if w.quoted {
+                    continue;
+                }
+                done = true;
+            }
+            seen_pos = true;
+            out.push(Item::Pos {
+                word: w.clone(),
+                cont: array.get(at).copied().unwrap_or(false),
+            });
+        }
+        out
+    }
+
+    fn slash_item(
+        &mut self,
+        row: &Row,
+        part: &str,
+        w: &Word,
+        args: &[Word],
+        i: &mut usize,
+        out: &mut Vec<Item>,
+    ) {
+        let (name, attached) = match part.split_once(':') {
+            Some((n, v)) => (n, Some(v)),
+            None => (part, None),
+        };
+        let Some(&(_, act)) = row.slash.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) else {
+            return;
+        };
+        let value = take_value(act, attached, w, args, i);
+        out.push(Item::Param {
+            act,
+            value,
+            written: w.clone(),
+        });
+    }
+
+    /// A word as an operand of a file cmdlet: readable spellings, and whether
+    /// the cmdlet expands wildcards. PowerShell's do so even inside quotes.
+    fn operand(&self, w: &Word, literal: bool) -> Word {
+        let mut out = w.clone();
+        if w.has_substitution {
+            return out;
+        }
+        if let Some(home) = home_spelled(&out.text) {
+            out.text = home;
+        }
+        out.text = unc_text(&out.text, PathStyle::host() == PathStyle::Windows);
+        let meta: &[char] = match self.dialect {
+            Dialect::Cmd => &['*', '?'],
+            _ => &['*', '?', '['],
+        };
+        let wild = !literal && out.text.contains(meta);
+        out.glob = wild;
+        out.glob_dots = wild;
+        if wild {
+            out.text = forward(&out.text);
+        }
+        out
+    }
+
+    fn path(&self, w: &Word, literal: bool) -> Word {
+        let mut out = self.operand(w, literal);
+        if !out.has_substitution {
+            out.text = forward(&out.text);
+        }
+        out
+    }
+
+    fn unknown_from_pipeline(&mut self) -> Word {
+        self.noted(NOTE_PIPELINE);
+        Word {
+            text: "$input".to_string(),
+            has_substitution: true,
+            ..Word::default()
+        }
+    }
+
+    /// `rm`, `cat`, `ls`, `cd`, `pushd`: the words in place.
+    fn in_order(&mut self, name: &str, items: Vec<Item>, piped: bool) -> Vec<Word> {
+        let mut out = vec![plain(name)];
+        let mut operands = 0;
+        for item in items {
+            match item {
+                Item::Param {
+                    act,
+                    value,
+                    written,
+                } => match (act, value) {
+                    (Act::Flag(f), _) => out.push(plain(f)),
+                    (Act::Keep, _) => out.push(written),
+                    (Act::Path, Some(v)) => {
+                        operands += 1;
+                        out.push(self.operand(&v, false));
+                    }
+                    (Act::Literal, Some(v)) => {
+                        operands += 1;
+                        out.push(self.operand(&v, true));
+                    }
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => {
+                    operands += 1;
+                    out.push(self.operand(&word, false));
+                }
+                Item::Raw(w) => out.push(w),
+            }
+        }
+        if piped && operands == 0 {
+            out.push(self.unknown_from_pipeline());
+        }
+        out
+    }
+
+    fn dropped(&mut self, act: Act) {
+        if let Act::Unread(why) | Act::UnreadSwitch(why) = act {
+            self.noted(why);
+        }
+    }
+
+    /// `cp` and `mv`: flags, sources, and the target last. Nothing of
+    /// PowerShell's stays: `operands` would read a `t` in it as `-t`.
+    fn copy(&mut self, name: &str, items: Vec<Item>, rename: bool, piped: bool) -> Vec<Word> {
+        let mut flags = Vec::new();
+        let mut sources = Vec::new();
+        let mut target = None;
+        for item in items {
+            match item {
+                Item::Param { act, value, .. } => match (act, value) {
+                    (Act::Flag(f), _) => flags.push(plain(f)),
+                    (Act::Path, Some(v)) => sources.push(self.path(&v, false)),
+                    (Act::Literal, Some(v)) => sources.push(self.path(&v, true)),
+                    (Act::Target, Some(v)) => target = Some(self.path(&v, false)),
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => sources.push(self.path(&word, false)),
+                Item::Raw(w) if w.text == "--" => {}
+                Item::Raw(_) => self.noted(NOTE_UNKNOWN),
+            }
+        }
+        if piped && sources.is_empty() {
+            sources.push(self.unknown_from_pipeline());
+        }
+        if target.is_none() && sources.len() >= 2 {
+            target = sources.pop();
+        }
+        let mut target = target.unwrap_or_else(|| plain("./"));
+        if rename {
+            // `-NewName` is a name beside the item, not under the cwd.
+            let parent = sources
+                .first()
+                .filter(|s| !s.has_substitution)
+                .and_then(|s| s.text.rfind('/').map(|at| s.text[..at].to_string()));
+            if let Some(parent) = parent {
+                if !target.has_substitution && !target.text.contains('/') {
+                    target.text = format!("{parent}/{}", target.text);
+                }
+            }
+        }
+        let mut out = vec![plain(name)];
+        out.append(&mut flags);
+        out.append(&mut sources);
+        out.push(target);
+        out
+    }
+
+    /// `robocopy SRC DST [FILE…]`: the files are names under `SRC`.
+    fn robocopy(&mut self, items: Vec<Item>) -> Vec<Word> {
+        let mut flags = Vec::new();
+        let mut name = "cp";
+        let mut pos = Vec::new();
+        for item in items {
+            match item {
+                Item::Param {
+                    act: Act::Flag("--move"),
+                    ..
+                } => name = "mv",
+                Item::Param {
+                    act: Act::Flag(f), ..
+                } => flags.push(plain(f)),
+                Item::Param { act, .. } => self.dropped(act),
+                Item::Pos { word, .. } => pos.push(self.path(&word, false)),
+                Item::Raw(_) => {}
+            }
+        }
+        if pos.len() < 2 {
+            self.noted(NOTE_ROBOCOPY);
+            let mut out = vec![plain(name)];
+            out.append(&mut pos);
+            return out;
+        }
+        let dir = |w: &Word| {
+            let mut out = w.clone();
+            if !out.text.ends_with('/') {
+                out.text.push('/');
+            }
+            out
+        };
+        let src = dir(&pos[0]);
+        let dst = dir(&pos[1]);
+        let mut out = vec![plain(name)];
+        out.append(&mut flags);
+        if pos.len() == 2 {
+            out.push(src.clone());
+        }
+        for file in &pos[2..] {
+            let mut f = file.clone();
+            f.text = format!("{}{}", src.text, file.text);
+            f.has_substitution |= src.has_substitution;
+            out.push(f);
+        }
+        out.push(dst);
+        out
+    }
+
+    /// `Set-Content` and friends: `> path` for each target. The first
+    /// positional is the path, the next the value; array items go with the
+    /// one before them.
+    fn write(&mut self, lower: &str, args: &[Word], items: Vec<Item>) -> Vec<Word> {
+        let mut targets = Vec::new();
+        let mut last_was_target = false;
+        for item in items {
+            match item {
+                Item::Param { act, value, .. } => {
+                    last_was_target = false;
+                    match (act, value) {
+                        (Act::Path, Some(v)) => {
+                            targets.push(self.operand(&v, false));
+                            last_was_target = true;
+                        }
+                        (Act::Literal, Some(v)) => {
+                            targets.push(self.operand(&v, true));
+                            last_was_target = true;
+                        }
+                        (act, _) => self.dropped(act),
+                    }
+                }
+                Item::Pos { word, cont } => {
+                    if targets.is_empty() || (cont && last_was_target) {
+                        targets.push(self.operand(&word, false));
+                        last_was_target = true;
+                    } else {
+                        last_was_target = false;
+                    }
+                }
+                Item::Raw(w) if w.text == "--" => {}
+                Item::Raw(_) => self.noted(NOTE_UNKNOWN),
+            }
+        }
+        if targets.is_empty() || targets.iter().any(|t| t.has_substitution) {
+            self.noted(NOTE_TARGET);
+        }
+        // `sc` is `Set-Content` in 5.1 and `sc.exe` in 7: both stay readable.
+        let mut out = Vec::new();
+        if lower == "sc" {
+            out.push(plain("sc"));
+            out.extend(args.iter().filter(|w| !w.redirect).cloned());
+        }
+        for t in targets {
+            out.push(redirect(">"));
+            out.push(t);
+        }
+        out
+    }
+
+    /// `New-Item`: `touch`, `mkdir`, or `ln -s` for a link. A link is judged by
+    /// its target, and noted: what comes after may go through it.
+    fn new_item(&mut self, lower: &str, items: Vec<Item>) -> Vec<Word> {
+        let mut paths = Vec::new();
+        let mut leaf = None;
+        let mut kind = None;
+        let mut value = None;
+        let mut rest = Vec::new();
+        for item in items {
+            match item {
+                Item::Param { act, value: v, .. } => match (act, v) {
+                    (Act::Path, Some(v)) => paths.push(self.path(&v, false)),
+                    (Act::ItemName, Some(v)) => leaf = Some(v),
+                    (Act::ItemType, Some(v)) => kind = Some(v),
+                    (Act::ItemValue, Some(v)) => value = Some(v),
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => paths.push(self.path(&word, false)),
+                Item::Raw(w) if w.text == "--" => {}
+                Item::Raw(w) => rest.push(w),
+            }
+        }
+        if let Some(leaf) = leaf {
+            if paths.is_empty() {
+                paths.push(self.path(&leaf, false));
+            } else {
+                for p in &mut paths {
+                    p.text = format!("{}/{}", p.text.trim_end_matches('/'), forward(&leaf.text));
+                    p.has_substitution |= leaf.has_substitution;
+                }
+            }
+        }
+        let is_kind = |full: &str, w: &Word| {
+            let t = w.text.to_lowercase();
+            !t.is_empty() && full.starts_with(&t)
+        };
+        let (name, link) = match &kind {
+            Some(k) if k.has_substitution => {
+                self.noted(NOTE_ITEM_TYPE);
+                ("touch", false)
+            }
+            Some(k) if is_kind("directory", k) => ("mkdir", false),
+            Some(k) if is_kind("file", k) => ("touch", false),
+            Some(k)
+                if is_kind("symboliclink", k)
+                    || is_kind("junction", k)
+                    || is_kind("hardlink", k) =>
+            {
+                ("ln", true)
+            }
+            Some(_) => {
+                self.noted(NOTE_ITEM_TYPE);
+                ("touch", false)
+            }
+            None if lower == "md" || lower == "mkdir" => ("mkdir", false),
+            None => ("touch", false),
+        };
+        let mut out = vec![plain(name)];
+        if link {
+            self.noted(NOTE_LINK);
+            out.push(plain("-s"));
+            if let Some(v) = value {
+                out.push(self.path(&v, true));
+            }
+        }
+        out.append(&mut paths);
+        out.append(&mut rest);
+        out
+    }
+
+    /// `grep PATTERN PATH…`: the pattern must come first for `operands`.
+    fn grep(&mut self, items: Vec<Item>) -> Vec<Word> {
+        let mut pattern = None;
+        let mut paths = Vec::new();
+        let mut rest = Vec::new();
+        for item in items {
+            match item {
+                Item::Param { act, value, .. } => match (act, value) {
+                    (Act::Pattern, Some(v)) => pattern = Some(v),
+                    (Act::Path, Some(v)) => paths.push(self.operand(&v, false)),
+                    (Act::Literal, Some(v)) => paths.push(self.operand(&v, true)),
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => paths.push(word),
+                Item::Raw(w) => rest.push(w),
+            }
+        }
+        // Positionals were left raw: the first may be the pattern.
+        let positional_pattern = pattern.is_none() && !paths.is_empty();
+        let mut out = vec![plain("grep")];
+        if let Some(p) = pattern {
+            out.push(p);
+        } else if positional_pattern {
+            out.push(paths.remove(0));
+        }
+        for p in &paths {
+            out.push(self.operand(p, false));
+        }
+        out.append(&mut rest);
+        out
+    }
+
+    fn kill(&mut self, items: Vec<Item>, piped: bool) -> Vec<Word> {
+        let mut out = vec![plain("kill")];
+        let mut targets = 0;
+        let mut in_names = false;
+        for item in items {
+            match item {
+                Item::Param {
+                    act,
+                    value,
+                    written,
+                } => {
+                    in_names = false;
+                    match (act, value) {
+                        (Act::Path, Some(v)) => {
+                            targets += 1;
+                            out.push(v);
+                        }
+                        (Act::ProcName, Some(v)) => {
+                            targets += 1;
+                            in_names = true;
+                            out.push(plain("-n"));
+                            out.push(v);
+                        }
+                        (Act::Keep, _) => out.push(written),
+                        (act, _) => self.dropped(act),
+                    }
+                }
+                Item::Pos { word, cont } => {
+                    targets += 1;
+                    if cont && in_names {
+                        out.push(plain("-n"));
+                    } else {
+                        in_names = false;
+                    }
+                    out.push(word);
+                }
+                Item::Raw(w) => out.push(w),
+            }
+        }
+        if piped && targets == 0 {
+            out.push(self.unknown_from_pipeline());
+        }
+        out
+    }
+
+    fn curl(&mut self, items: Vec<Item>) -> Vec<Word> {
+        let mut out = vec![plain("curl")];
+        for item in items {
+            match item {
+                Item::Param {
+                    act,
+                    value,
+                    written,
+                } => match (act, value) {
+                    (Act::Path, Some(v)) => out.push(v),
+                    (Act::Target, Some(v)) => {
+                        out.push(plain("-o"));
+                        out.push(self.operand(&v, true));
+                    }
+                    // PowerShell 7's bare `curl` is the real one: `curl -i URL`.
+                    (Act::InFile, Some(v)) if v.text.contains("://") => {
+                        out.push(written);
+                        out.push(v);
+                    }
+                    (Act::InFile, Some(v)) => {
+                        let file = self.operand(&v, true);
+                        out.push(plain("--data-binary"));
+                        out.push(Word {
+                            text: format!("@{}", file.text),
+                            ..file
+                        });
+                    }
+                    (Act::Keep, _) => out.push(written),
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => out.push(word),
+                Item::Raw(w) => out.push(w),
+            }
+        }
+        out
+    }
+
+    /// `Start-Process`: the argv it starts, read again as a command.
+    fn start(&mut self, items: Vec<Item>, depth: u32) -> Vec<Word> {
+        let mut file = None;
+        let mut args = Vec::new();
+        for item in items {
+            match item {
+                Item::Param { act, value, .. } => match (act, value) {
+                    (Act::Path, Some(v)) => file = Some(v),
+                    (Act::Args, Some(v)) => args.extend(split_arguments(&v)),
+                    (Act::Out, Some(v)) => {
+                        self.redirects.push(redirect(">"));
+                        self.redirects.push(self.operand(&v, true));
+                    }
+                    (Act::In, Some(v)) => {
+                        self.redirects.push(redirect("<"));
+                        self.redirects.push(self.operand(&v, true));
+                    }
+                    (act, _) => self.dropped(act),
+                },
+                Item::Pos { word, .. } => {
+                    if file.is_none() {
+                        file = Some(word);
+                    } else {
+                        args.extend(split_arguments(&word));
+                    }
+                }
+                Item::Raw(w) if w.text == "--" => {}
+                Item::Raw(w) => {
+                    self.noted(NOTE_UNKNOWN);
+                    args.push(w);
+                }
+            }
+        }
+        let Some(file) = file else {
+            self.noted(NOTE_START);
+            return vec![plain("start-process")];
+        };
+        let mut argv = vec![file];
+        argv.append(&mut args);
+        if depth >= MAX_START_DEPTH {
+            self.noted(NOTE_START);
+            return argv;
+        }
+        let cx = Context {
+            depth: depth + 1,
+            ..Context::default()
+        };
+        let (out, note) = translate_noted(&argv, self.dialect, &cx);
+        if let Some(n) = note {
+            self.noted(n);
+        }
+        out
+    }
+}
+
+/// The `/x` switches of a word, when it is switches here. In cmd anything with
+/// a leading `/` is; elsewhere only what the row knows, or `/tmp` would go.
+fn slash_parts<'a>(row: &Row, text: &'a str, cmd_mode: bool) -> Option<Vec<&'a str>> {
+    let parts: Vec<&str> = text[1..].split('/').collect();
+    let known = |p: &&str| {
+        let name = p.split(':').next().unwrap_or(p);
+        row.slash.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+    };
+    (cmd_mode || parts.iter().all(known)).then_some(parts)
+}
+
+/// `-Name` or `-Name:value`, when the word has that shape.
+fn param_shape(w: &Word) -> Option<(&str, Option<&str>)> {
+    let rest = w.text.strip_prefix('-')?;
+    let (name, value) = match rest.split_once(':') {
+        Some((n, v)) => (n, Some(v)),
+        None => (rest, None),
+    };
+    let first = name.chars().next()?;
+    (first.is_alphabetic() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .then_some((name, value))
+}
+
+enum Lookup {
+    Found(Act),
+    Ambiguous,
+    Unknown,
+}
+
+fn lookup(params: &[(&str, Act)], name: &str) -> Lookup {
+    if let Some(&(_, act)) = params.iter().find(|(p, _)| p.eq_ignore_ascii_case(name)) {
+        return Lookup::Found(act);
+    }
+    let mut hits = params.iter().filter(|(p, _)| {
+        p.get(..name.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    });
+    let Some(&(_, act)) = hits.next() else {
+        return Lookup::Unknown;
+    };
+    if hits.all(|&(_, other)| act.same(other)) {
+        Lookup::Found(act)
+    } else {
+        Lookup::Ambiguous
+    }
+}
+
+/// The value of a parameter: attached, or the next word. A `-Word` there is
+/// the next parameter (PowerShell would refuse the line).
+fn take_value(
+    act: Act,
+    attached: Option<&str>,
+    w: &Word,
+    args: &[Word],
+    i: &mut usize,
+) -> Option<Word> {
+    let attached = attached.filter(|a| !a.is_empty());
+    if let Some(a) = attached {
+        return Some(Word {
+            text: a.to_string(),
+            ..w.clone()
+        });
+    }
+    if !act.takes_value() {
+        // `-Recurse: $false`: the value of a switch, when spelled with a colon.
+        if w.text.ends_with(':') && args.get(*i).is_some_and(|n| !n.redirect) {
+            *i += 1;
+        }
+        return None;
+    }
+    let next = args.get(*i)?;
+    if next.redirect || (!next.quoted && param_shape(next).is_some()) {
+        return None;
+    }
+    *i += 1;
+    Some(next.clone())
+}
+
+/// `-ArgumentList` strings hold whole command lines: split them on blanks, with
+/// double quotes grouping, as the program would.
+fn split_arguments(w: &Word) -> Vec<Word> {
+    if w.has_substitution {
+        return vec![w.clone()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut in_quote = false;
+    for c in w.text.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                in_word = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if in_word {
+                    out.push(plain(&std::mem::take(&mut cur)));
+                    in_word = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        out.push(plain(&cur));
+    }
+    out
+}
+
+/// The nested command of `powershell`/`pwsh -Command|-c|-EncodedCommand|-enc|-e`,
+/// `cmd /c|/k`, `iex '<literal>'` and `Invoke-Command -ScriptBlock {…}`. A form
+/// it recognizes and cannot read gives `UNRESOLVED`, in PowerShell.
+pub fn nested(argv: &[Word]) -> Option<(Dialect, String)> {
+    let first = argv.first()?;
+    if first.has_substitution {
+        return None;
+    }
+    let args = &argv[1..];
+    let ps = |s: String| Some((Dialect::PowerShell, s));
+    match CommandName::of(&first.text).lower().as_str() {
+        "powershell" | "pwsh" => powershell_nested(args).and_then(ps),
+        "cmd" => cmd_nested(args).map(|s| (Dialect::Cmd, s)),
+        "iex" | "invoke-expression" => iex_nested(args).and_then(ps),
+        "invoke-command" | "icm" => invoke_command_nested(args).and_then(ps),
+        _ => None,
+    }
+}
+
+/// Is it a shell, or `iex`: a command whose text `nested` reads?
+pub(crate) fn is_nesting_command(text: &str) -> bool {
+    matches!(
+        CommandName::of(text).lower().as_str(),
+        "powershell" | "pwsh" | "cmd" | "iex" | "invoke-expression"
+    )
+}
+
+fn abbreviates(name: &str, full: &str, min: usize) -> bool {
+    name.len() >= min && full.starts_with(name)
+}
+
+fn joined(head: Option<&str>, rest: &[Word]) -> String {
+    head.into_iter()
+        .chain(rest.iter().map(|w| w.text.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn powershell_nested(args: &[Word]) -> Option<String> {
+    let unresolved = || Some(UNRESOLVED.to_string());
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        i += 1;
+        if w.text == "-" {
+            return unresolved();
+        }
+        let option = ["--", "-", "/"].iter().find_map(|p| w.text.strip_prefix(p));
+        let Some(option) = option.filter(|_| !w.quoted && !w.has_substitution) else {
+            // `powershell.exe`'s default parameter is -Command. `pwsh` takes a
+            // file there: the text is judged either way.
+            return Some(joined(None, &args[i - 1..]));
+        };
+        let (name, attached) = match option.split_once(':') {
+            Some((n, v)) => (n, Some(v).filter(|v| !v.is_empty())),
+            None => (option, None),
+        };
+        let name = name.to_ascii_lowercase();
+        let n = name.as_str();
+        let takes_value = abbreviates(n, "executionpolicy", 2)
+            || abbreviates(n, "inputformat", 2)
+            || abbreviates(n, "outputformat", 1)
+            || abbreviates(n, "windowstyle", 1)
+            || abbreviates(n, "configurationname", 4)
+            || abbreviates(n, "configurationfile", 8)
+            || abbreviates(n, "psconsolefile", 2)
+            || abbreviates(n, "version", 1)
+            || abbreviates(n, "workingdirectory", 2)
+            || abbreviates(n, "custompipename", 2)
+            || abbreviates(n, "settingsfile", 2)
+            || abbreviates(n, "encodedarguments", 8)
+            || matches!(n, "ep" | "if" | "of" | "wd" | "ea");
+        if takes_value {
+            if attached.is_none() {
+                i += 1;
+            }
+        } else if abbreviates(n, "file", 1) {
+            return unresolved();
+        } else if n == "ec" || abbreviates(n, "encodedcommand", 1) {
+            return match attached {
+                Some(text) => decode_encoded(text),
+                None => match args.get(i) {
+                    Some(v) if !v.has_substitution => decode_encoded(&v.text),
+                    _ => None,
+                },
+            }
+            .or_else(unresolved);
+        } else if abbreviates(n, "command", 1) {
+            let text = joined(attached, &args[i..]);
+            return if text.is_empty() || text == "-" {
+                unresolved()
+            } else {
+                Some(text)
+            };
+        }
+    }
+    None
+}
+
+fn cmd_nested(args: &[Word]) -> Option<String> {
+    for (i, w) in args.iter().enumerate() {
+        let mut s = w.text.as_str();
+        while s.starts_with('/') {
+            let end = s[1..].find('/').map_or(s.len(), |at| at + 1);
+            let letter = s[1..].chars().next().map(|c| c.to_ascii_lowercase());
+            if matches!(letter, Some('c' | 'k' | 'r')) {
+                let head = s.get(2..).filter(|h| !h.is_empty());
+                let text = joined(head, &args[i + 1..]);
+                return (!text.is_empty()).then_some(text);
+            }
+            s = &s[end..];
+        }
+    }
+    None
+}
+
+fn iex_nested(args: &[Word]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let w = &args[i];
+        i += 1;
+        let Some((name, value)) = param_shape(w).filter(|_| !w.quoted) else {
+            return Some(w.text.clone());
+        };
+        if abbreviates(&name.to_ascii_lowercase(), "command", 1) {
+            return match value.filter(|v| !v.is_empty()) {
+                Some(v) => Some(v.to_string()),
+                None => Some(
+                    args.get(i)
+                        .map_or_else(|| UNRESOLVED.to_string(), |v| v.text.clone()),
+                ),
+            };
+        }
+    }
+    None
+}
+
+fn invoke_command_nested(args: &[Word]) -> Option<String> {
+    let block = args.iter().find_map(|w| {
+        (!w.quoted)
+            .then(|| w.text.strip_prefix('{')?.strip_suffix('}'))
+            .flatten()
+    });
+    if let Some(body) = block {
+        return Some(body.to_string());
+    }
+    let script_file = args.iter().any(|w| {
+        param_shape(w).is_some_and(|(n, _)| abbreviates(&n.to_ascii_lowercase(), "filepath", 1))
+    });
+    (script_file || args.iter().any(|w| w.has_substitution)).then(|| UNRESOLVED.to_string())
+}
+
+/// Base64 of UTF-16LE, at most `MAX_ENCODED` decoded. As strict as .NET's
+/// `Convert.FromBase64String`, apart from blanks.
+fn decode_encoded(text: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut bits = 0u32;
+    let mut held = 0u32;
+    let mut count = 0usize;
+    let mut padding = 0usize;
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                count += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        if padding > 0 {
+            return None;
+        }
+        count += 1;
+        bits = (bits << 6) | u32::from(v);
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+            if bytes.len() > MAX_ENCODED {
+                return None;
+            }
+        }
+    }
+    if count == 0 || !count.is_multiple_of(4) || padding > 2 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let text = String::from_utf16(&units).ok()?;
+    Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(text: &str) -> Word {
+        Word {
+            text: text.to_string(),
+            ..Word::default()
+        }
+    }
+
+    fn tr(argv: &[&str], d: Dialect) -> Vec<String> {
+        let words: Vec<Word> = argv.iter().map(|a| w(a)).collect();
+        translate(&words, d).into_iter().map(|w| w.text).collect()
+    }
+
+    fn nest(argv: &[&str]) -> Option<(Dialect, String)> {
+        let words: Vec<Word> = argv.iter().map(|a| w(a)).collect();
+        nested(&words)
+    }
+
+    /// Base64 of the UTF-16LE of `s`, as `powershell -enc` takes it.
+    fn encode(s: &str) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn posix_is_untouched() {
+        assert_eq!(tr(&["del", "/s", "x"], Dialect::Posix), ["del", "/s", "x"]);
+        assert_eq!(tr(&["git.exe"], Dialect::Posix), ["git.exe"]);
+    }
+
+    #[test]
+    fn an_empty_argv_stays_empty() {
+        assert!(translate(&[], Dialect::PowerShell).is_empty());
+        assert_eq!(nested(&[]), None);
+    }
+
+    #[test]
+    fn a_substitution_in_command_position_is_kept() {
+        let words = [
+            Word {
+                text: "$x".into(),
+                has_substitution: true,
+                ..Word::default()
+            },
+            w("-Recurse"),
+        ];
+        let out = translate(&words, Dialect::PowerShell);
+        assert!(out[0].has_substitution);
+        assert_eq!(out[1].text, "-Recurse");
+    }
+
+    #[test]
+    fn matching_ignores_case_directory_and_extension() {
+        for name in [
+            "Remove-Item",
+            "REMOVE-ITEM",
+            r"Microsoft.PowerShell.Management\Remove-Item",
+            "ri",
+            "RI",
+        ] {
+            assert_eq!(
+                tr(&[name, "-r", "x"], Dialect::PowerShell),
+                ["rm", "-r", "x"],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameters_match_by_unambiguous_prefix() {
+        for p in ["-r", "-R", "-re", "-rec", "-Recu", "-Recurse", "-RECURSE"] {
+            assert_eq!(tr(&["ri", p, "x"], Dialect::PowerShell), ["rm", "-r", "x"]);
+        }
+        for p in ["-fo", "-Fo", "-for", "-Force"] {
+            assert_eq!(tr(&["ri", p, "x"], Dialect::PowerShell), ["rm", "-f", "x"]);
+        }
+        // Force and Filter: ambiguous, so as written whatever the case.
+        assert_eq!(
+            tr(&["ri", "-f", "x"], Dialect::PowerShell),
+            ["rm", "-f", "x"]
+        );
+        assert_eq!(
+            tr(&["ri", "-F", "x"], Dialect::PowerShell),
+            ["rm", "-F", "x"]
+        );
+        // Not a prefix of anything: as written, its value still an operand.
+        assert_eq!(
+            tr(&["ri", "-Nope", "x"], Dialect::PowerShell),
+            ["rm", "-Nope", "x"]
+        );
+        assert_eq!(
+            tr(&["ri", "-rf", "x"], Dialect::PowerShell),
+            ["rm", "-rf", "x"]
+        );
+    }
+
+    #[test]
+    fn cmd_rows() {
+        let cmd = Dialect::Cmd;
+        assert_eq!(
+            tr(&["rd", "/s", "/q", r"C:\"], cmd),
+            ["rm", "-r", "-f", r"C:\"]
+        );
+        assert_eq!(
+            tr(&["RMDIR", "/S", "/Q", "x"], cmd),
+            ["rm", "-r", "-f", "x"]
+        );
+        assert_eq!(
+            tr(&["del", "/s", "/q", "/f", r"C:\Users\a"], cmd),
+            ["rm", "-r", "-f", "-f", r"C:\Users\a"]
+        );
+        assert_eq!(tr(&["del", "/s/q", "x"], cmd), ["rm", "-r", "-f", "x"]);
+        assert_eq!(tr(&["erase", "/p", "x"], cmd), ["rm", "x"]);
+        assert_eq!(tr(&["copy", "/y", "a", "b"], cmd), ["cp", "a", "b"]);
+        assert_eq!(tr(&["copy", "a", "b", "/y"], cmd), ["cp", "a", "b"]);
+        assert_eq!(tr(&["xcopy", "/e", "a", "b"], cmd), ["cp", "-r", "a", "b"]);
+        assert_eq!(tr(&["move", "/y", "a", "b"], cmd), ["mv", "a", "b"]);
+        assert_eq!(tr(&["ren", "a", "b"], cmd), ["mv", "a", "b"]);
+        assert_eq!(tr(&["type", "a"], cmd), ["cat", "a"]);
+        assert_eq!(tr(&["dir", "/s", "/b", "src"], cmd), ["ls", "-R", "src"]);
+        assert_eq!(
+            tr(&["findstr", "/s", "key", "a"], cmd),
+            ["grep", "key", "a"]
+        );
+        assert_eq!(tr(&["findstr", "/c:key", "a"], cmd), ["grep", "key", "a"]);
+        assert_eq!(tr(&["cd", "/d", "x"], cmd), ["cd", "x"]);
+        assert_eq!(tr(&["chdir", "x"], cmd), ["cd", "x"]);
+        assert_eq!(tr(&["pushd", "x"], cmd), ["pushd", "x"]);
+        assert_eq!(
+            tr(&["taskkill", "/f", "/im", "saiife.exe"], cmd),
+            ["kill", "-n", "saiife.exe"]
+        );
+        assert_eq!(
+            tr(&["start", "/b", "cmd", "/c", "x"], cmd),
+            ["cmd", "/c", "x"]
+        );
+        // The `/` switches of an alias stay paths in PowerShell, except the
+        // ones the review needs in both readings.
+        assert_eq!(
+            tr(&["del", "/s", "/q", r"C:\"], Dialect::PowerShell),
+            ["rm", "-r", "-f", r"C:\"]
+        );
+        assert_eq!(tr(&["ls", "/tmp"], Dialect::PowerShell), ["ls", "/tmp"]);
+        assert_eq!(tr(&["cat", "/s"], Dialect::PowerShell), ["cat", "/s"]);
+    }
+
+    #[test]
+    fn cmd_title_of_start_is_no_program() {
+        let words = [
+            w("start"),
+            Word {
+                text: "t".into(),
+                quoted: true,
+                ..Word::default()
+            },
+            w("rd"),
+            w("/s"),
+            w("x"),
+        ];
+        let out: Vec<_> = translate(&words, Dialect::Cmd)
+            .into_iter()
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(out, ["rm", "-r", "x"]);
+    }
+
+    #[test]
+    fn robocopy_sources_join_their_directory() {
+        let cmd = Dialect::Cmd;
+        assert_eq!(
+            tr(&["robocopy", r"C:\a", r"C:\b", ".env", "/s"], cmd),
+            ["cp", "-r", "C:/a/.env", "C:/b/"]
+        );
+        assert_eq!(
+            tr(&["robocopy", r"C:\a", r"C:\b"], cmd),
+            ["cp", "C:/a/", "C:/b/"]
+        );
+        assert_eq!(
+            tr(&["robocopy", r"C:\a", r"C:\b", "/mov"], cmd),
+            ["mv", "C:/a/", "C:/b/"]
+        );
+    }
+
+    #[test]
+    fn leading_slashes_of_a_share_survive_on_windows() {
+        assert_eq!(unc_text("//host/s", true), r"\\host/s");
+        assert_eq!(unc_text("///host/s", true), r"\\host/s");
+        assert_eq!(unc_text("//host/s", false), "//host/s");
+        assert_eq!(unc_text("/x", true), "/x");
+        assert_eq!(unc_text(r"\\host\s", true), r"\\host\s");
+    }
+
+    #[test]
+    fn nested_powershell_forms() {
+        for flag in [
+            "-c",
+            "-C",
+            "-co",
+            "-Command",
+            "-COMMAND",
+            "/c",
+            "/Command",
+            "--command",
+        ] {
+            assert_eq!(
+                nest(&["powershell", flag, "rm", "x"]),
+                Some((Dialect::PowerShell, "rm x".to_string())),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            nest(&[
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "-nop",
+                "-w",
+                "hidden",
+                "-c",
+                "rm x"
+            ]),
+            Some((Dialect::PowerShell, "rm x".to_string()))
+        );
+        assert_eq!(
+            nest(&[
+                "pwsh",
+                "-NoLogo",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command:rm",
+                "x"
+            ]),
+            Some((Dialect::PowerShell, "rm x".to_string()))
+        );
+        // powershell.exe's default parameter is -Command.
+        assert_eq!(
+            nest(&["powershell", "rm x"]),
+            Some((Dialect::PowerShell, "rm x".to_string()))
+        );
+        assert_eq!(nest(&["powershell"]), None);
+        assert_eq!(nest(&["powershell", "-NoProfile"]), None);
+        assert_eq!(nest(&["git", "-c", "rm x"]), None);
+        for unread in [
+            vec!["pwsh", "-File", "x.ps1"],
+            vec!["pwsh", "-f", "x.ps1"],
+            vec!["powershell", "-"],
+            vec!["powershell", "-Command", "-"],
+            vec!["powershell", "-Command"],
+        ] {
+            assert_eq!(
+                nest(&unread),
+                Some((Dialect::PowerShell, UNRESOLVED.to_string())),
+                "{unread:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_encoded_command() {
+        let inner = r"Remove-Item -Recurse -Force C:\";
+        let b64 = encode(inner);
+        for flag in [
+            "-e",
+            "-E",
+            "-ec",
+            "-en",
+            "-enc",
+            "-Enc",
+            "-EncodedCommand",
+            "/enc",
+            "/e",
+        ] {
+            assert_eq!(
+                nest(&["powershell", flag, &b64]),
+                Some((Dialect::PowerShell, inner.to_string())),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            nest(&["pwsh", "-EncodedCommand:", &b64]).map(|n| n.1),
+            Some(inner.to_string())
+        );
+        assert_eq!(
+            nest(&["pwsh", &format!("-enc:{b64}")]).map(|n| n.1),
+            Some(inner.to_string())
+        );
+    }
+
+    #[test]
+    fn a_bad_encoded_command_is_unresolved() {
+        let unresolved = Some((Dialect::PowerShell, UNRESOLVED.to_string()));
+        for bad in [
+            "!!notbase64",
+            "abc",  // .NET refuses what is not padded to four
+            "QQ==", // one byte: not UTF-16
+            "AND$", // not base64
+            "ANg=", // half of a surrogate pair
+        ] {
+            assert_eq!(nest(&["pwsh", "-e", bad]), unresolved, "{bad}");
+        }
+        assert_eq!(nest(&["pwsh", "-enc"]), unresolved);
+        let words = [
+            w("pwsh"),
+            w("-enc"),
+            Word {
+                text: "$x".into(),
+                has_substitution: true,
+                ..Word::default()
+            },
+        ];
+        assert_eq!(nested(&words), unresolved);
+    }
+
+    #[test]
+    fn encoded_size_limit() {
+        let fits = "a".repeat(64 * 1024 / 2);
+        assert_eq!(
+            nest(&["pwsh", "-e", &encode(&fits)]).map(|n| n.1),
+            Some(fits)
+        );
+        let over = "a".repeat(64 * 1024 / 2 + 1);
+        assert_eq!(
+            nest(&["pwsh", "-e", &encode(&over)]).map(|n| n.1),
+            Some(UNRESOLVED.to_string())
+        );
+    }
+
+    #[test]
+    fn nested_cmd_forms() {
+        for argv in [
+            vec!["cmd", "/c", "rd", "/s", "x"],
+            vec!["cmd", "/C", "rd /s x"],
+            vec!["cmd.exe", "/k", "rd /s x"],
+            vec!["CMD.EXE", "/K", "rd /s x"],
+            vec![r"C:\Windows\System32\cmd.exe", "/c", "rd /s x"],
+            vec!["cmd", "/d", "/s", "/c", "rd /s x"],
+            vec!["cmd", "/s/c", "rd /s x"],
+            vec!["cmd", "/crd /s x"],
+            vec!["cmd", "/c", "rd", "/s x"],
+            vec!["cmd", "/q", "/v:on", "/e:on", "/c", "rd /s x"],
+            vec!["cmd", "/r", "rd /s x"],
+        ] {
+            assert_eq!(
+                nest(&argv),
+                Some((Dialect::Cmd, "rd /s x".to_string())),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(nest(&["cmd"]), None);
+        assert_eq!(nest(&["cmd", "/q"]), None);
+    }
+
+    #[test]
+    fn nested_iex_and_invoke_command() {
+        let ps = |s: &str| Some((Dialect::PowerShell, s.to_string()));
+        assert_eq!(nest(&["iex", "rm x"]), ps("rm x"));
+        assert_eq!(nest(&["IEX", "rm x"]), ps("rm x"));
+        assert_eq!(nest(&["Invoke-Expression", "rm x"]), ps("rm x"));
+        assert_eq!(nest(&["Invoke-Expression", "-Command", "rm x"]), ps("rm x"));
+        assert_eq!(nest(&["iex", "-c", "rm x"]), ps("rm x"));
+        assert_eq!(nest(&["iex", "-Command:rm x"]), ps("rm x"));
+        assert_eq!(nest(&["iex"]), None);
+
+        let block = Word {
+            text: "{ rm x }".into(),
+            has_substitution: true,
+            ..Word::default()
+        };
+        for argv in [
+            vec![w("Invoke-Command"), w("-ScriptBlock"), block.clone()],
+            vec![w("icm"), block.clone()],
+            vec![w("ICM"), w("-ComputerName"), w("h"), w("-s"), block.clone()],
+        ] {
+            assert_eq!(nested(&argv), ps(" rm x "), "{argv:?}");
+        }
+        // A quoted brace is a string.
+        let quoted = Word {
+            text: "{ rm x }".into(),
+            quoted: true,
+            ..Word::default()
+        };
+        assert_eq!(nested(&[w("icm"), quoted]), None);
+        let var = Word {
+            text: "$sb".into(),
+            has_substitution: true,
+            ..Word::default()
+        };
+        assert_eq!(nested(&[w("icm"), w("-ScriptBlock"), var]), ps(UNRESOLVED));
+        assert_eq!(nest(&["icm", "-FilePath", "x.ps1"]), ps(UNRESOLVED));
+    }
+}

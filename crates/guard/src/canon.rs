@@ -653,16 +653,27 @@ pub fn expand_glob_partial(
     let Some(alternatives) = expand_braces(word) else {
         return (Vec::new(), true);
     };
-    expand_alternatives(&alternatives, cwd, vars)
+    expand_alternatives(&alternatives, cwd, vars, false)
 }
 
 /// `expand_glob` for a shell operand the lexer already brace-expanded:
 /// braces left in it were quoted, so they are literal here.
 pub fn expand_operand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpansion {
+    expand_operand_glob_dots(word, cwd, vars, false)
+}
+
+/// `expand_operand_glob`; with `dots`, wildcards also match a leading `.`,
+/// as PowerShell's and cmd's do: their `*` finds `.env` and `.ssh`.
+pub fn expand_operand_glob_dots(
+    word: &str,
+    cwd: Option<&Path>,
+    vars: &PathVars,
+    dots: bool,
+) -> GlobExpansion {
     if !word.contains(['*', '?', '[']) {
         return GlobExpansion::NotAGlob;
     }
-    match expand_alternatives(&[word.to_string()], cwd, vars) {
+    match expand_alternatives(&[word.to_string()], cwd, vars, dots) {
         (_, true) => GlobExpansion::Overflow,
         (m, false) => GlobExpansion::Matches(m),
     }
@@ -672,6 +683,7 @@ fn expand_alternatives(
     alternatives: &[String],
     cwd: Option<&Path>,
     vars: &PathVars,
+    dots: bool,
 ) -> (Vec<PathBuf>, bool) {
     let has_meta = |w: &str| w.contains(['*', '?', '[']);
     if alternatives.len() == 1 && !has_meta(&alternatives[0]) {
@@ -684,6 +696,7 @@ fn expand_alternatives(
     ordered.sort_by_key(|a| !a.rsplit('/').next().is_some_and(|l| l.starts_with('.')));
     let mut budget = Budget {
         fold: vars.style() == PathStyle::Windows,
+        dots,
         ..Budget::default()
     };
     let mut all = Vec::new();
@@ -735,6 +748,8 @@ struct Budget {
     spent: usize,
     /// Names compare case-folded (Windows): `.EN*` finds `.env`.
     fold: bool,
+    /// Wildcards match a leading `.` (PowerShell, cmd).
+    dots: bool,
 }
 
 impl Budget {
@@ -848,7 +863,7 @@ fn walk(
                         } else {
                             name.chars().collect()
                         };
-                        if s.first() == Some(&'.') && pat.first() != Some(&'.') {
+                        if !budget.dots && s.first() == Some(&'.') && pat.first() != Some(&'.') {
                             continue;
                         }
                         if glob_match(&pat, &s) {
@@ -899,7 +914,7 @@ fn descend(
                 return None;
             }
             let n = e.file_name();
-            if n.to_string_lossy().starts_with('.') {
+            if !budget.dots && n.to_string_lossy().starts_with('.') {
                 continue;
             }
             let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
@@ -1096,7 +1111,11 @@ mod tests {
         let run = |pattern: &str, fold: bool| {
             let pattern = Path::new(pattern);
             let comps: Vec<Component> = pattern.components().collect();
-            let mut budget = Budget { spent: 0, fold };
+            let mut budget = Budget {
+                spent: 0,
+                fold,
+                dots: false,
+            };
             expand_from(&comps, vec![root.clone()], &mut budget).0
         };
         assert_eq!(run(".EN*", true), vec![root.join(".env")]);

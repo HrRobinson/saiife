@@ -97,6 +97,9 @@ pub struct Word {
     /// Contains an unquoted glob character (`*`, `?`, `[`), so the shell
     /// would expand it against the filesystem.
     pub glob: bool,
+    /// Its wildcards also match dotfiles (PowerShell and cmd do, bash does
+    /// not). The POSIX lexer never sets it.
+    pub glob_dots: bool,
     /// A shell assignment word as bash sees it: an unquoted `NAME=`,
     /// `NAME+=`, `NAME[…]=` or `NAME[…]+=` prefix. In front of a command
     /// it sets a variable; it is not the command.
@@ -404,6 +407,7 @@ impl Lexer<'_, '_> {
             has_substitution: w.has_sub,
             redirect: false,
             glob: w.glob,
+            glob_dots: false,
             assignment: w.assignment,
             brace_overflow: false,
             quoted: w.quoted,
@@ -1189,6 +1193,7 @@ fn redirect_tok(text: String) -> LexTok {
         has_substitution: false,
         redirect: true,
         glob: false,
+        glob_dots: false,
         assignment: false,
         brace_overflow: false,
         quoted: false,

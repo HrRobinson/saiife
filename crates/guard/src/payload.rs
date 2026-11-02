@@ -241,8 +241,9 @@ pub enum ToolCall {
     },
 }
 
-/// Shell tools: Claude Code and Codex `Bash`, Gemini `run_shell_command`.
-const SHELL_TOOLS: &[&str] = &["Bash", "run_shell_command"];
+/// Shell tools: Claude Code and Codex `Bash`, Claude Code `PowerShell`,
+/// Gemini `run_shell_command`.
+const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "run_shell_command"];
 
 /// File tools that only read or list.
 const READ_TOOLS: &[&str] = &[
