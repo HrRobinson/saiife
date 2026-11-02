@@ -834,6 +834,47 @@ fn true_false_and_null_are_values() {
     );
 }
 
+/// `$null` is the null device only to PowerShell. To bash it is a variable, and
+/// the line can set it.
+#[test]
+fn null_is_a_variable_where_the_shell_is_bash() {
+    let e = developer();
+    assert_all(
+        &e,
+        true,
+        &[
+            (POSIX, "null=.env; cat $null"),
+            (POSIX, "null=.env cat $null"),
+            (POSIX, "cat $null"),
+            (POSIX, "NULL=.env; cat $NULL"),
+            (POSIX, "null=.env; echo x > $null"),
+            // Where the shell is not known, the POSIX reading still counts when
+            // the line sets it, or when it is no redirection target.
+            (STRICTEST, "null=.env; cat $null"),
+            (STRICTEST, "null=.env; npm test > $null"),
+            (STRICTEST, "export NULL=.env; npm test > $NULL"),
+            (STRICTEST, "read null; npm test > ${null}"),
+            (STRICTEST, "cat $null"),
+        ],
+    );
+    assert_all(
+        &e,
+        false,
+        &[
+            (PS, "Get-Content $null"),
+            (PS, "npm test > $null"),
+            (PS, "Foo -Bar $null"),
+            (CMD, "npm test > $null"),
+            (STRICTEST, "npm test > $null"),
+            (STRICTEST, "npm test 2> $null"),
+            (STRICTEST, "npm test *> $NULL"),
+            (STRICTEST, "Foo -Bar $null"),
+            (STRICTEST, "npm test nullable > $null"),
+            (STRICTEST, "npm test > $null 2>/dev/null"),
+        ],
+    );
+}
+
 // --- Ruling: parity with Linux ---------------------------------------------
 
 #[test]

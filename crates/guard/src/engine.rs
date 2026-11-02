@@ -182,6 +182,46 @@ struct BoundPathRule {
 /// case-insensitive (macOS: `.ENV` opens `.env`).
 const PATHS_CASE_INSENSITIVE: bool = cfg!(target_os = "macos");
 
+/// What `$null` is depends on the shell. To PowerShell it is the null device. To
+/// cmd it is a file by that name, and no rule protects that. To bash it is a
+/// variable, which `null=.env; cat $null` sets, so under a shell known to be POSIX
+/// (Git Bash) it stays a variable. Where the shell is not known, `npm test > $null`
+/// must not be denied for what its POSIX reading would mean, so an unquoted `$null`
+/// after a redirection discards there, if nothing on the line can set it.
+fn null_device_words(segments: &mut [Vec<Word>], dialect: Dialect, redirect_discards: bool) {
+    let is_null = |w: &Word| w.text.eq_ignore_ascii_case("$null");
+    let discard = |w: &mut Word| {
+        w.text = "NUL".to_string();
+        w.has_substitution = false;
+        w.literal_dollars = false;
+    };
+    for seg in segments {
+        if dialect != Dialect::Posix {
+            seg.iter_mut().filter(|w| is_null(w)).for_each(discard);
+        } else if redirect_discards {
+            for at in 1..seg.len() {
+                if seg[at - 1].redirect && is_null(&seg[at]) && !seg[at].quoted {
+                    discard(&mut seg[at]);
+                }
+            }
+        }
+    }
+}
+
+/// The name `null` on the line in any form but `$null` and `/dev/null`, so a POSIX
+/// shell may be given a value for it (`null=x`, `read null`, `${null:-x}`).
+fn names_null(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    lower.match_indices("null").any(|(at, _)| {
+        let before = &lower[..at];
+        !before.ends_with(is_name)
+            && !lower[at + 4..].starts_with(is_name)
+            && !before.ends_with('$')
+            && !before.ends_with("/dev/")
+    })
+}
+
 impl Engine {
     /// Build an engine from loaded packs.
     pub fn new(packs: Vec<Pack>) -> Self {
@@ -472,8 +512,8 @@ impl Engine {
             Dialects::One(d) => return finish(d, self.reading(raw_cmd, d)),
             Dialects::Strictest(a, b) => (a, b),
         };
-        let first = finish(a, self.reading(raw_cmd, a));
-        let second = finish(b, self.reading(raw_cmd, b));
+        let first = finish(a, self.reading_as(raw_cmd, a, true));
+        let second = finish(b, self.reading_as(raw_cmd, b, true));
         let both = if a == Dialect::PowerShell || b != Dialect::PowerShell {
             stricter(first, second)
         } else {
@@ -482,11 +522,17 @@ impl Engine {
         if a == Dialect::Cmd || b == Dialect::Cmd {
             return both;
         }
-        with_cmd_reading(both, self.reading(raw_cmd, Dialect::Cmd))
+        with_cmd_reading(both, self.reading_as(raw_cmd, Dialect::Cmd, true))
     }
 
-    /// One reading, with a budget of its own.
+    /// One reading of a line whose shell is known.
     fn reading(&self, raw_cmd: &str, dialect: Dialect) -> Decision {
+        self.reading_as(raw_cmd, dialect, false)
+    }
+
+    /// One reading, with a budget of its own. `undecided`: this is one of
+    /// several readings, because the shell is not known.
+    fn reading_as(&self, raw_cmd: &str, dialect: Dialect, undecided: bool) -> Decision {
         self.path_rules();
         let start = Instant::now();
         let state = ShellState {
@@ -498,6 +544,7 @@ impl Engine {
             ),
             env_changed: false,
             ifs_named: false,
+            null_redirect_discards: undecided && !names_null(raw_cmd),
         };
         let clock = Clock {
             start,
@@ -540,6 +587,7 @@ impl Engine {
         if reader {
             reader_assignments(&mut segments, &mut found);
         }
+        null_device_words(&mut segments, dialect, state.null_redirect_discards);
         if let Some(reason) = lex_note {
             found.unjudged(reason);
         }
@@ -2126,6 +2174,8 @@ struct ShellState {
     /// The line names IFS somewhere: values are still judged, the
     /// unresolved words too.
     ifs_named: bool,
+    /// `> $null` discards under a POSIX reading (`null_device_words`).
+    null_redirect_discards: bool,
 }
 
 /// The outcome of a nested evaluation (`Engine::recurse`).

@@ -191,9 +191,6 @@ pub fn canonical(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<Strin
 
 /// `canonical`, saying why when there is no form.
 pub fn read(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Result<String, Unread> {
-    if is_null_variable(raw) {
-        return Ok(NULL_DEVICE.to_string());
-    }
     let anchor = match cwd {
         Some(c) => c.to_str().and_then(|c| absolute_text(c, None, vars).ok()),
         None => vars.cwd().and_then(Path::to_str).map(str::to_string),
@@ -454,19 +451,7 @@ pub(crate) fn path_words<'a>(words: &'a [Word], vars: &PathVars) -> Cow<'a, [Wor
     Cow::Owned(words.iter().map(|w| path_word(w, vars)).collect())
 }
 
-/// PowerShell's `$null`: as a redirection target (`npm test > $null`) it names no
-/// file. Where the shell may instead be bash it is a variable nobody sets.
-fn is_null_variable(raw: &str) -> bool {
-    raw.eq_ignore_ascii_case("$null")
-}
-
 fn path_word(w: &Word, vars: &PathVars) -> Word {
-    if is_null_variable(&w.text) {
-        return Word {
-            has_substitution: false,
-            ..w.clone()
-        };
-    }
     let mut text = if w.literal_dollars {
         w.text.clone()
     } else {
