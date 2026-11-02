@@ -58,6 +58,21 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: BENCH_MAX_P95_MS=50 bash scripts/bench-check.sh 50
+      # The guard's readers against the real shells: [Parser]::ParseInput and
+      # harmless cmd.exe probes. Any mismatch fails. Only a debug build has
+      # the seam it reads with.
+      - name: build for the reader differential (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: cargo build --locked -p saiife --bin saiife
+      - name: reader differential (PowerShell 7)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
+      - name: reader differential (Windows PowerShell 5.1)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
       # The macOS managed hook against a live `daemon --system` (plan 13):
       # p95 of 50 calls per payload within 40 ms. The script needs bash 5
       # (EPOCHREALTIME); the runner's /bin/bash is 3.2, so Homebrew's.

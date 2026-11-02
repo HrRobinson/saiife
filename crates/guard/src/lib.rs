@@ -16,6 +16,8 @@ pub mod builtins;
 pub mod canon;
 mod cdtrack;
 pub mod cmdexe;
+#[cfg(debug_assertions)]
+pub mod debug_read;
 pub mod engine;
 pub mod getopt;
 pub mod lexer;

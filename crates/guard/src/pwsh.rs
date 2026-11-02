@@ -123,20 +123,24 @@ const PREFIX_KEYWORDS: &[&str] = &["return", "throw", "exit"];
 /// argv-order words after translation; the note is `Some(reason)` when
 /// something was not fully read.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    let mut r = Reader {
-        c: cmd.chars().collect(),
-        i: 0,
-        out: Vec::new(),
-        note: None,
-        depth: 0,
-        last_value: None,
-        pending: Vec::new(),
-        live: false,
-        joined: 0,
-        lists_all_processes: false,
-    };
+    let mut r = Reader::new(cmd);
     r.statements(None, Mode::Top);
     (r.out, r.note)
+}
+
+/// The commands as read before the table, then what `split_segments_noted` gives.
+#[cfg(debug_assertions)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn read_with_commands(
+    cmd: &str,
+) -> (
+    Vec<Vec<crate::debug_read::RawWord>>,
+    Vec<Segment>,
+    Option<&'static str>,
+) {
+    let mut r = Reader::new(cmd);
+    r.statements(None, Mode::Top);
+    (r.commands, r.out, r.note)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -261,9 +265,27 @@ struct Reader {
     joined: usize,
     /// The command just read lists every process (`Get-Process`).
     lists_all_processes: bool,
+    #[cfg(debug_assertions)]
+    commands: Vec<Vec<crate::debug_read::RawWord>>,
 }
 
 impl Reader {
+    fn new(cmd: &str) -> Self {
+        Reader {
+            c: cmd.chars().collect(),
+            i: 0,
+            out: Vec::new(),
+            note: None,
+            depth: 0,
+            last_value: None,
+            pending: Vec::new(),
+            live: false,
+            joined: 0,
+            lists_all_processes: false,
+            #[cfg(debug_assertions)]
+            commands: Vec::new(),
+        }
+    }
     fn noted(&mut self, why: &'static str) {
         self.note.get_or_insert(why);
     }
@@ -1189,6 +1211,17 @@ impl Reader {
 
     /// A command: the notes its name earns, then the table.
     fn command(&mut self, words: Vec<Raw>, piped: bool) {
+        #[cfg(debug_assertions)]
+        self.commands.push(
+            words
+                .iter()
+                .map(|r| crate::debug_read::RawWord {
+                    word: r.w.clone(),
+                    from_quote: r.from_quote,
+                    block: matches!(r.kind, Kind::Block | Kind::Paren),
+                })
+                .collect(),
+        );
         let name = CommandName::of(&words[0].w.text).lower();
         let all_processes = std::mem::replace(
             &mut self.lists_all_processes,

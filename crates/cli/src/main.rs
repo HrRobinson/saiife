@@ -56,6 +56,8 @@ mod packs_cmd;
 mod paths;
 mod policy_cmd;
 mod project;
+#[cfg(debug_assertions)]
+mod read_segments_cmd;
 mod report;
 mod report_html;
 mod run_cmd;
@@ -240,6 +242,14 @@ enum Cmd {
     #[cfg(debug_assertions)]
     #[command(name = "__fake-mcp-server", hide = true)]
     FakeMcpServer(fake_mcp::FakeArgs),
+    /// Test seam (debug builds): what the shell readers took each line to be,
+    /// for scripts/differential-windows.ps1. A JSON file in, a JSON file out.
+    #[cfg(debug_assertions)]
+    #[command(name = "__read-segments", hide = true)]
+    ReadSegments {
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+    },
     /// Locked mode (Linux, macOS, admin): add, list, rotate or remove the
     /// secrets in the daemon's vault. Values never leave the daemon.
     Secret {
@@ -460,7 +470,7 @@ fn locked_only(cmd: &Cmd) -> bool {
         | Cmd::Status { .. }
         | Cmd::Packs { .. } => false,
         #[cfg(debug_assertions)]
-        Cmd::FakeMcpServer(_) => false,
+        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => false,
     }
 }
 
@@ -509,6 +519,10 @@ fn main() -> ExitCode {
     #[cfg(debug_assertions)]
     if let Cmd::FakeMcpServer(args) = cli.command {
         return fake_mcp::run(args);
+    }
+    #[cfg(debug_assertions)]
+    if let Cmd::ReadSegments { input, output } = cli.command {
+        return read_segments_cmd::run(&input, &output);
     }
     #[cfg(unix)]
     if let Cmd::Daemon {
@@ -663,7 +677,7 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(debug_assertions)]
-        Cmd::FakeMcpServer(_) => unreachable!("handled above"),
+        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => unreachable!("handled above"),
         Cmd::Check { .. }
         | Cmd::Eval
         | Cmd::McpSpawn
