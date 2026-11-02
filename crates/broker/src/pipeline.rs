@@ -278,6 +278,9 @@ pub struct PolicySnapshot {
     /// The environment applied to `config` (spec §6.11), `None` for the
     /// base config. The record's `env`, so it always matches `hash`.
     pub env: Option<String>,
+    /// [`crate::Catalog::digest`] of the catalog the call runs with: `hash`
+    /// does not cover the manifests.
+    pub catalog_digest: String,
 }
 
 /// What lockdown stops (spec §6.18).
@@ -316,10 +319,7 @@ pub trait Env: Sync {
     /// Whether `snap`, which this call was decided under, is still the
     /// policy in force for its environment. Asked after each wait for a
     /// pool slot: the wait can outlast a reload.
-    fn policy_in_force(&self, snap: &PolicySnapshot) -> bool {
-        let _ = snap;
-        true
-    }
+    fn policy_in_force(&self, snap: &PolicySnapshot) -> bool;
     /// The caller's single scope (decision 6); `ScopeConflict` when it
     /// matches more than one.
     fn scope(&self, user: &str) -> Result<Option<Scope>, PolicyError>;
@@ -513,6 +513,11 @@ pub enum Outcome {
     Denied {
         rule: String,
     },
+    /// A reload moved the policy while a new call waited for a slot: denied
+    /// with [`POLICY_MOVED_RULE`] and [`POLICY_MOVED_REASON`], nothing sent.
+    /// An approved request stopped this way is a plain deny: it is not called
+    /// again.
+    PolicyMoved,
     Limited {
         limit: &'static str,
     },
@@ -550,6 +555,25 @@ pub const MASKED_CONTENT_RULE: &str = "masked_content";
 /// An `ask` call whose body is binary (not UTF-8): it cannot be shown to
 /// the approver, so it cannot be approved.
 pub const BODY_NOT_DISPLAYABLE_RULE: &str = "body_not_displayable";
+
+/// The rule of [`Outcome::PolicyMoved`], the one an approved request gets when
+/// the policy no longer lets it through (there, a final answer).
+pub const POLICY_MOVED_RULE: &str = "policy_changed";
+/// What the agent is told for [`Outcome::PolicyMoved`].
+pub const POLICY_MOVED_REASON: &str =
+    "the policy was reloaded while this call waited: nothing was sent, call again";
+
+/// The rule that stops a request after a wait, before a send: lockdown (spec
+/// §6.18) or a moved policy.
+fn stopped_after_wait(env: &dyn Env, snap: &PolicySnapshot) -> Option<&'static str> {
+    if env.lockdown().is_some() {
+        Some("lockdown")
+    } else if !env.policy_in_force(snap) {
+        Some(POLICY_MOVED_RULE)
+    } else {
+        None
+    }
+}
 
 /// The fixed explanation a deny rule carries, if any.
 pub fn deny_reason(rule: &str) -> Option<&'static str> {
@@ -598,6 +622,9 @@ pub struct Trace {
     pub sent: bool,
     /// An oauth2 call was sent again after a 401 and a forced refresh.
     pub auth_retry: bool,
+    /// Why a 401 was not refreshed and sent again (a deny rule): the answer
+    /// is that 401.
+    pub auth_retry_skipped: Option<&'static str>,
 }
 
 /// A masker of `values` (and the v1 patterns).
@@ -786,10 +813,10 @@ async fn steps(
             *masker = Masker::new(&refs);
         }
     }
-    // 2. Lockdown (either scope). The flag is read once, here: a request
-    // already past this point when lockdown is turned on runs to its end
-    // (it was admitted before the flag); every later request is denied.
-    // `lockdown.set` does not wait for requests in flight.
+    // 2. Lockdown (either scope). Read here and again after each wait for a
+    // slot (spec §6.18, "at once"): a request not yet sent when lockdown is
+    // turned on is denied; one already sent runs to its end. `lockdown.set`
+    // does not wait for requests in flight.
     if env.lockdown().is_some() {
         return denied("lockdown");
     }
@@ -1118,10 +1145,12 @@ async fn steps(
             }
         }
     };
-    // A reload during the wait: this call was decided under a policy no
-    // longer in force. Nothing was sent, so nothing counts.
-    if !env.policy_in_force(snap) {
-        return denied("policy_changed");
+    // A lockdown or a reload during the wait: this call was decided under
+    // what no longer holds. Nothing was sent, so nothing counts.
+    match (stopped_after_wait(env, snap), stage) {
+        (None, _) => {}
+        (Some(POLICY_MOVED_RULE), Stage::New) => return Outcome::PolicyMoved,
+        (Some(rule), _) => return denied(rule),
     }
     // Decision 6: what was sent counts, whatever came back. Committed
     // before the send, so a caller that drops this future mid-send (a
@@ -1165,8 +1194,14 @@ async fn steps(
     // A 401 with an oauth2 credential: the session expired or was revoked.
     // One forced refresh and one resend; a second 401 is the answer, and so
     // is the first when the refresh fails (its failure is recorded by the
-    // daemon). The resend counts with the first send.
-    if resp.status == 401 && !mail {
+    // daemon). The resend counts with the first send. A lockdown or a reload
+    // since the first send stops the refresh (a call no longer allowed must
+    // not rotate a refresh token) and the resend: that 401 is the answer, and
+    // the call stays allowed, because it was sent.
+    if resp.status == 401 && !mail && oauth.is_some() {
+        tr.auth_retry_skipped = stopped_after_wait(env, snap);
+    }
+    if resp.status == 401 && !mail && tr.auth_retry_skipped.is_none() {
         if let Some((name, spec)) = oauth {
             let token = env
                 .credential(name, &call.service, spec, &m, svc, true)
@@ -1200,9 +1235,8 @@ async fn steps(
                     let permit =
                         tokio::time::timeout(up.timeout(), env.pool(&call.service).acquire_owned())
                             .await;
-                    // No resend once a reload moved the policy during the
-                    // refresh or the wait: the one send's 401 is the answer.
-                    if let (Ok(Ok(_permit)), true) = (permit, env.policy_in_force(snap)) {
+                    tr.auth_retry_skipped = stopped_after_wait(env, snap);
+                    if let (Ok(Ok(_permit)), None) = (permit, tr.auth_retry_skipped) {
                         tr.auth_retry = true;
                         resp = match up.send(b, read_limit).await {
                             Ok(r) => r,
@@ -1442,6 +1476,12 @@ pub fn record(
             deny_reason(rule).map(str::to_string),
             None,
         ),
+        Outcome::PolicyMoved => (
+            DecisionKind::Deny,
+            Some(POLICY_MOVED_RULE.to_string()),
+            Some(POLICY_MOVED_REASON.to_string()),
+            None,
+        ),
         Outcome::Limited { limit } => (
             DecisionKind::Deny,
             None,
@@ -1515,6 +1555,9 @@ pub fn record(
     e.insert("secret".into(), json!(tr.secret));
     e.insert("limit".into(), json!(limit));
     e.insert("via".into(), call.via.as_str().into());
+    if let Some(rule) = tr.auth_retry_skipped {
+        e.insert("auth_retry_skipped".into(), rule.into());
+    }
     if tr.auth_retry {
         e.insert("auth_retry".into(), true.into());
     }

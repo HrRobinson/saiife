@@ -727,6 +727,9 @@ struct FakeEnv {
 }
 
 impl Env for FakeEnv {
+    fn policy_in_force(&self, _snap: &PolicySnapshot) -> bool {
+        true
+    }
     fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
         None
     }
@@ -769,6 +772,7 @@ fn env_for(service: &'static str, token: &'static str) -> FakeEnv {
 
 fn snap(text: &str) -> PolicySnapshot {
     PolicySnapshot {
+        catalog_digest: String::new(),
         config: toml::from_str(&format!("version = 2\nlocked = true\n{text}")).unwrap(),
         hash: "sha256:test".into(),
         mode: Mode::Locked,

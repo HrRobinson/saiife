@@ -1631,7 +1631,17 @@ fn reload_revokes_listed_tool() {
     let mut c = McpClient::spawn_env(&w.d, &[], &[("SAIIFE_TEST_MCP_HASH_MS", "200")]);
     c.initialize();
     wait_tool(&mut c, "fake__introspect");
-    assert!(c.next_notification(Duration::from_millis(800)).is_none());
+    // A second client lists now and never again: it keeps the stale name.
+    let mut stale = w.mcp(&[]);
+    wait_tool(&mut stale, "fake__introspect");
+    // A poll that overlapped the start may still announce it: wait for quiet,
+    // so the `list_changed` below is the reload's.
+    assert!(
+        wait_for(Duration::from_secs(20), || c
+            .next_notification(Duration::from_millis(800))
+            .is_none()),
+        "list_changed never went quiet"
+    );
     // The restarted child takes a while to start, so the gap below is there.
     reload_and_wait(
         &w,
@@ -1658,7 +1668,17 @@ fn reload_revokes_listed_tool() {
         names.iter().any(|n| n == "fake__echo")
     });
     assert!(ok, "fake__echo never came back: {}", c.stderr_text());
-    // And the tool is no longer callable by name.
+    // The child is back and lists the tool, and the daemon itself refuses
+    // the stale name: by policy, not because the server is down.
+    let r = stale.call("fake__introspect", json!({}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(texts(&r).starts_with("denied (default_deny)"), "{r}");
+    assert!(
+        !w.d.stderr_text().contains("fake-mcp: got tools/call"),
+        "a refused call reached the child: {}",
+        w.d.stderr_text()
+    );
+    // And a client that listed since no longer has the name.
     let r = c.request(
         "tools/call",
         json!({"name": "fake__introspect", "arguments": {}}),
@@ -1776,7 +1796,7 @@ fn reload_stops_a_queued_gateway_call_allow_revoked() {
     if !gateway_runnable() {
         return;
     }
-    gateway_call_queued_over_reload(|port| {
+    let a = gateway_call_queued_over_reload(|port| {
         gw_policy(
             port,
             &fake_server(
@@ -1785,6 +1805,10 @@ fn reload_stops_a_queued_gateway_call_allow_revoked() {
             ),
         )
     });
+    assert!(
+        texts(&a["result"]).starts_with("denied (policy_changed)"),
+        "{a}"
+    );
 }
 
 /// The same with the mock's gate holding the service's 4 slots: a connector

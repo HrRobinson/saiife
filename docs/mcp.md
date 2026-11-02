@@ -272,11 +272,17 @@ A call can be denied with: `lockdown`, `no_scope`, `scope_conflict`,
 `limits_unavailable` and `masked_content`; and, after an approval,
 `policy_changed`, `env_changed` and `body_changed`.
 
-A call that waits for a slot of the server (4 per server) when a reload moves
+A call that waits for a slot of the server (4 per server) when a reload changes
 the policy is denied with `policy_changed` once it gets the slot: it is not
-sent and does not count against limits. Any change to the policy does this,
-whichever tool it touches, so the agent can simply call again. A call already
-sent finishes.
+sent and does not count against limits. Any change does this, to the config or
+a connector manifest, whichever tool it touches, and the answer tells the agent
+to call again. Lockdown turned on during the wait denies the call the same way
+(`lockdown`). A slot not had in time is the `concurrency` limit and a server
+that is not running is `upstream_unavailable`; neither counts.
+
+A call past that point is sent and finishes. If a child has stopped reading its
+stdin, the line may wait in the writer's queue and reach the child later, within
+the call's timeout, after a reload or a lockdown. It counts against limits.
 
 ### Approvals of type `mcp`
 

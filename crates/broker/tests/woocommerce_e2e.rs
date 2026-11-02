@@ -135,6 +135,9 @@ struct FakeEnv {
 }
 
 impl Env for FakeEnv {
+    fn policy_in_force(&self, _snap: &PolicySnapshot) -> bool {
+        true
+    }
     fn lockdown(&self) -> Option<Lockdown> {
         None
     }
@@ -185,6 +188,7 @@ allow = ["orders:read", "refunds:write"]
     )
     .unwrap();
     PolicySnapshot {
+        catalog_digest: String::new(),
         config,
         hash: "sha256:test".into(),
         mode: Mode::Locked,

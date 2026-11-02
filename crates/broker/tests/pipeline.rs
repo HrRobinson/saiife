@@ -168,6 +168,9 @@ struct FakeEnv {
     approvals: Mutex<Vec<PendingCall>>,
     /// What `policy_in_force` answers.
     in_force: bool,
+    /// Lockdown comes on after the first look, as during a wait for a slot.
+    lockdown_in_wait: bool,
+    lockdown_asked: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeEnv {
@@ -185,13 +188,21 @@ impl FakeEnv {
             pool: None,
             approvals: Mutex::new(Vec::new()),
             in_force: true,
+            lockdown_in_wait: false,
+            lockdown_asked: Default::default(),
         }
     }
 }
 
 impl Env for FakeEnv {
     fn lockdown(&self) -> Option<saiife_broker::pipeline::Lockdown> {
-        None
+        let asked = self.lockdown_asked.fetch_add(1, Ordering::SeqCst);
+        (self.lockdown_in_wait && asked > 0).then(|| saiife_broker::pipeline::Lockdown {
+            scope: saiife_broker::pipeline::LockScope::Connectors,
+            reason: "t".into(),
+            by_uid: 0,
+            since: "2026-01-01T00:00:00Z".into(),
+        })
     }
     fn policy_in_force(&self, _snap: &PolicySnapshot) -> bool {
         self.in_force
@@ -334,6 +345,7 @@ ask = ["refunds:write"]
     );
     let config: SystemConfig = toml::from_str(&text).unwrap();
     PolicySnapshot {
+        catalog_digest: String::new(),
         config,
         hash: "sha256:test".into(),
         mode: Mode::Locked,
@@ -1257,12 +1269,16 @@ async fn policy_moved_during_the_slot_wait_is_denied_and_not_counted() {
     env.in_force = false;
     let c = call("orders.list", &[]);
     let (o, tr) = run(&c, &snap, &catalog(), &lim, &env, Some(&up)).await;
-    assert_eq!(rule(&o), "policy_changed");
+    assert!(matches!(o, Outcome::PolicyMoved), "{o:?}");
     assert!(!tr.sent);
     let r = record(&c, &snap, &tr, &o, "", "0.2.0");
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["decision"], serde_json::json!("deny"));
     assert_eq!(v["rule"], serde_json::json!("policy_changed"));
+    assert_eq!(
+        v["reason"],
+        serde_json::json!(saiife_broker::pipeline::POLICY_MOVED_REASON)
+    );
     assert!(saiife_broker::pipeline::limit_event(&r).is_none());
     assert_eq!(m.hits.load(Ordering::SeqCst), 0);
     // The one call of the minute is still there.
@@ -1270,6 +1286,23 @@ async fn policy_moved_during_the_slot_wait_is_denied_and_not_counted() {
     let o = go(&c, &snap, &env, &up, &lim).await;
     assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
     assert_eq!(m.hits.load(Ordering::SeqCst), 1);
+}
+
+/// Lockdown turned on during the wait for a slot (spec §6.18, "at once").
+#[tokio::test]
+async fn lockdown_during_the_slot_wait_is_denied_and_not_counted() {
+    let (m, up) = mock().await;
+    let lim = Limiter::new();
+    let snap = snapshot("[services.shop.limits]\nrequests_per_minute = 1\n");
+    let mut env = FakeEnv::ok();
+    env.lockdown_in_wait = true;
+    let c = call("orders.list", &[]);
+    let (o, tr) = run(&c, &snap, &catalog(), &lim, &env, Some(&up)).await;
+    assert_eq!(rule(&o), "lockdown");
+    assert!(!tr.sent);
+    assert_eq!(m.hits.load(Ordering::SeqCst), 0);
+    let o = go(&c, &snap, &FakeEnv::ok(), &up, &lim).await;
+    assert!(matches!(o, Outcome::Done { .. }), "{o:?}");
 }
 
 // ------------------------------------------------- built-in connectors
@@ -1280,6 +1313,7 @@ fn builtin_catalog() -> Catalog {
 
 fn snap_of(text: &str) -> PolicySnapshot {
     PolicySnapshot {
+        catalog_digest: String::new(),
         config: toml::from_str(&format!("version = 2\nlocked = true\n{text}")).unwrap(),
         hash: "sha256:test".into(),
         mode: Mode::Locked,

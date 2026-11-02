@@ -850,6 +850,7 @@ async fn world(setup: impl FnOnce(&mut State)) -> World {
         system: Some(Arc::new(config.clone())),
         gateway: Some(Arc::new(GatewayPolicy {
             snap: PolicySnapshot {
+                catalog_digest: String::new(),
                 config,
                 hash: "sha256:test".into(),
                 mode: Mode::Locked,

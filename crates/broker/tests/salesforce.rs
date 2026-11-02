@@ -811,6 +811,9 @@ impl<'a> SfEnv<'a> {
 }
 
 impl Env for SfEnv<'_> {
+    fn policy_in_force(&self, _snap: &PolicySnapshot) -> bool {
+        true
+    }
     fn lockdown(&self) -> Option<Lockdown> {
         None
     }
@@ -897,6 +900,7 @@ allow = ["query:read", "sobjects:read", "records:read"]
     ))
     .unwrap();
     PolicySnapshot {
+        catalog_digest: String::new(),
         config,
         hash: "sha256:test".into(),
         mode: Mode::Locked,

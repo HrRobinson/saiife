@@ -455,6 +455,7 @@ pub(crate) fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
 /// A snapshot for the record of a call made without a valid policy.
 pub(crate) fn no_policy_snapshot(hash: Option<String>, mode: crate::ops::Mode) -> PolicySnapshot {
     PolicySnapshot {
+        catalog_digest: String::new(),
         config: toml::from_str("version = 2").expect("a minimal config parses"),
         hash: hash.unwrap_or_default(),
         mode: mode.policy_mode(),
@@ -614,9 +615,10 @@ pub(crate) async fn execute_in(
     call.session = session;
 
     // The policy as it is now: this call is decided under it and a reload
-    // does not change that. A reload that moves its environment's hash while
-    // the call waits for an upstream slot denies it (`policy_changed`,
-    // nothing sent, nothing counted); a call already sent finishes.
+    // does not change that. A reload that moves its environment's policy or
+    // any connector manifest while the call waits for an upstream slot denies
+    // it (`policy_changed`, nothing sent, nothing counted), and so does a
+    // lockdown; a call already sent finishes.
     let state = ctx.policy();
     let mut warning = None;
     let (outcome, trace, gw, env_name): (Outcome, Trace, Arc<GatewayPolicy>, Option<String>) =
@@ -748,6 +750,17 @@ pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
                 m.insert("reason".into(), why.into());
             }
             err_with(id, ErrorCode::Denied, &msg, m)
+        }
+        Outcome::PolicyMoved => {
+            use saiife_broker::pipeline::{POLICY_MOVED_REASON, POLICY_MOVED_RULE};
+            let mut m = one("rule", POLICY_MOVED_RULE.into());
+            m.insert("reason".into(), POLICY_MOVED_REASON.into());
+            err_with(
+                id,
+                ErrorCode::Denied,
+                &format!("denied ({POLICY_MOVED_RULE}): {POLICY_MOVED_REASON}"),
+                m,
+            )
         }
         Outcome::Limited { limit } => err_with(
             id,

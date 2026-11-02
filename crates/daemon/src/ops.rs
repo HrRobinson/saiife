@@ -90,10 +90,12 @@ impl GatewayPolicy {
         catalog: Catalog,
         mode: PolicyMode,
     ) -> Result<GatewayPolicy, String> {
+        let catalog_digest = catalog.digest();
         let snap_of = |cfg: SystemConfig, env: Option<&str>| {
             let (active, _) = active_packs(&cfg, packs, None);
             let hash = policy_hash(&effective_policy(&cfg, &active, None, env));
             PolicySnapshot {
+                catalog_digest: catalog_digest.clone(),
                 config: cfg,
                 hash,
                 mode,
@@ -573,13 +575,26 @@ impl Ctx {
     }
 
     /// Whether `snap`, which a call was decided under, is still the policy
-    /// in force for its environment. Checked after every wait for an
-    /// upstream slot: the wait can outlast a reload.
+    /// in force for its environment: its config and the connector manifests.
+    /// Checked after every wait for an upstream slot: the wait can outlast a
+    /// reload.
     pub fn snapshot_in_force(&self, snap: &PolicySnapshot) -> bool {
-        lock(&self.policy)
-            .gateway
-            .as_ref()
-            .is_some_and(|g| g.snapshot_for(snap.env.as_deref()).hash == snap.hash)
+        lock(&self.policy).gateway.as_ref().is_some_and(|g| {
+            let now = g.snapshot_for(snap.env.as_deref());
+            now.hash == snap.hash && now.catalog_digest == snap.catalog_digest
+        })
+    }
+
+    /// The deny rule that stops a gateway call after its wait for a slot of
+    /// the child: lockdown (spec §6.18) or a moved policy.
+    pub fn stopped_after_wait(&self, snap: &PolicySnapshot) -> Option<&'static str> {
+        if self.lockdown.get().is_some() {
+            Some("lockdown")
+        } else if !self.snapshot_in_force(snap) {
+            Some("policy_changed")
+        } else {
+            None
+        }
     }
 
     /// A record the daemon writes about itself: `tool` = kind, `input` =

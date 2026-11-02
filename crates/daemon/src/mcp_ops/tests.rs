@@ -36,6 +36,8 @@ struct Fake {
     secrets: Mutex<Vec<String>>,
     /// Runs in `call`, where the real supervisor waits for a slot.
     in_slot_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The next call ends with this, as the supervisor does before a send.
+    before_send: Mutex<Option<ChildError>>,
 }
 
 impl Fake {
@@ -51,6 +53,7 @@ impl Fake {
             })),
             secrets: Mutex::new(vec![token()]),
             in_slot_wait: Mutex::new(None),
+            before_send: Mutex::new(None),
         }
     }
 
@@ -94,13 +97,19 @@ impl ToolCaller for Fake {
         cap: usize,
         admit: Admit<'a>,
     ) -> CallFuture<'a> {
+        // A slot is free at once; the reload or lockdown lands in the "wait".
         let in_slot_wait = self.in_slot_wait.lock().unwrap().take();
         if let Some(f) = in_slot_wait {
             f();
         }
-        if !admit() {
-            return Box::pin(async { Err(ChildError::NotAdmitted) });
+        let before_send = self.before_send.lock().unwrap().take();
+        if let Some(e) = before_send {
+            return Box::pin(async move { Err(e) });
         }
+        if let Some(rule) = (admit.check)() {
+            return Box::pin(async move { Err(ChildError::NotAdmitted(rule)) });
+        }
+        (admit.commit)();
         self.calls.lock().unwrap().push((
             server.to_string(),
             tool.to_string(),
@@ -839,6 +848,8 @@ async fn reload_during_the_approved_sends_group_lookup_stops_it() {
     let r = w.result(id).await;
     assert_eq!(r["state"], "send_failed", "{r}");
     assert_eq!(r["result"]["rule"], "policy_changed", "{r}");
+    // A final answer: the approved request is not called again.
+    assert!(r["result"].get("reason").is_none(), "{r}");
 }
 
 /// A reload lands while a call waits for a slot of the child: it is denied,
@@ -864,11 +875,14 @@ async fn reload_during_the_slot_wait_denies_and_counts_nothing() {
     }));
     let a = w.call("list_issues", "{}").await;
     assert_eq!(denied_rule(&a), "policy_changed", "{a}");
+    // The agent is told it can call again.
+    assert_eq!(a["reason"], POLICY_MOVED_REASON, "{a}");
     assert!(w.fake.calls().is_empty(), "sent after the reload");
     let recs = w.connector();
     let last = recs.last().unwrap();
     assert_eq!(last["decision"], "deny", "{last}");
     assert_eq!(last["rule"], "policy_changed", "{last}");
+    assert_eq!(last["reason"], POLICY_MOVED_REASON, "{last}");
     // Nor at a rebuild from the records.
     let records: Vec<saiife_audit::Record> = w
         .audit_text()
@@ -883,6 +897,65 @@ async fn reload_during_the_slot_wait_denies_and_counts_nothing() {
     let a = w.call("list_issues", "{}").await;
     assert_eq!(a["result"]["isError"], false, "{a}");
     assert_eq!(w.fake.calls().len(), 1);
+}
+
+/// Lockdown turned on while a call waits for a slot stops it (spec §6.18:
+/// "at once"), and it counts for nothing.
+#[tokio::test]
+async fn lockdown_during_the_slot_wait_denies_and_counts_nothing() {
+    let w = world(
+        "[\"mcp:linear\"]",
+        "[mcp.linear.limits]\nrequests_per_minute = 1\n",
+    );
+    let ctx = Arc::clone(&w.ctx);
+    *w.fake.in_slot_wait.lock().unwrap() = Some(Box::new(move || {
+        ctx.lockdown
+            .set(Some(saiife_broker::pipeline::Lockdown {
+                scope: saiife_broker::pipeline::LockScope::Connectors,
+                reason: "t".into(),
+                by_uid: 0,
+                since: "2026-01-01T00:00:00Z".into(),
+            }))
+            .unwrap();
+    }));
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(denied_rule(&a), "lockdown", "{a}");
+    assert!(w.fake.calls().is_empty(), "sent during lockdown");
+    w.ctx.lockdown.set(None).unwrap();
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(a["result"]["isError"], false, "{a}");
+}
+
+/// A call that ended before it was sent: a deny or a limit, not an allowed
+/// `upstream failed`, and it counts neither now nor at a rebuild.
+#[tokio::test]
+async fn call_not_sent_is_not_allowed_and_counts_nothing() {
+    let w = world(
+        "[\"mcp:linear\"]",
+        "[mcp.linear.limits]\nrequests_per_minute = 1\n",
+    );
+    *w.fake.before_send.lock().unwrap() = Some(ChildError::NotRunning("stopping".into()));
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(denied_rule(&a), "upstream_unavailable", "{a}");
+    let recs = w.connector();
+    assert_eq!(recs.last().unwrap()["decision"], "deny");
+    *w.fake.before_send.lock().unwrap() = Some(ChildError::SlotTimeout);
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(a["error"], "limited", "{a}");
+    assert_eq!(a["limit"], "concurrency", "{a}");
+    let recs = w.connector();
+    assert_eq!(recs.last().unwrap()["decision"], "deny");
+    let records: Vec<saiife_audit::Record> = w
+        .audit_text()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(records
+        .iter()
+        .all(|r| saiife_broker::pipeline::limit_event(r).is_none()));
+    // The one call of the minute is still there.
+    let a = w.call("list_issues", "{}").await;
+    assert_eq!(a["result"]["isError"], false, "{a}");
 }
 
 /// A reload that changes nothing for the call's policy leaves it alone.

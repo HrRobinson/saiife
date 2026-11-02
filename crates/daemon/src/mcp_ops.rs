@@ -24,14 +24,15 @@
 //! `via` is what the client says (attribution only, never a decision).
 
 use crate::api_ops::{self, Caller, Groups, Identity, Refused, LOW_DISK};
-use crate::mcp_gateway::{ChildError, ToolCaller};
+use crate::mcp_gateway::{Admit, ChildError, ToolCaller};
 use crate::ops::{Ctx, GatewayPolicy, Notice, VERSION};
 use saiife_audit::{DecisionKind, NewRecord, Record};
 use saiife_broker::limits::{Key, Limiter};
 use saiife_broker::manifest::OpKind;
 use saiife_broker::mask::Masker;
 use saiife_broker::pipeline::{
-    cut_display, deny_reason, Outcome, PolicySnapshot, Via, MASKED_CONTENT_RULE, READ_SLACK,
+    cut_display, deny_reason, Outcome, PolicySnapshot, Via, MASKED_CONTENT_RULE,
+    POLICY_MOVED_REASON, POLICY_MOVED_RULE, READ_SLACK,
 };
 use saiife_ipc::frame::MAX_ANSWER_FRAME;
 use saiife_ipc::msg::{err, ok, ErrorCode, Request, OP_MCP_LIST};
@@ -200,6 +201,8 @@ pub enum McpOutcome {
     Denied {
         rule: String,
     },
+    /// As [`Outcome::PolicyMoved`].
+    PolicyMoved,
     Limited {
         limit: &'static str,
     },
@@ -702,24 +705,34 @@ async fn steps(
             send_args,
             cfg.timeout,
             max.saturating_add(READ_SLACK),
-            // The wait for a slot can outlast a reload: a call this policy
-            // decided goes only if it is still in force. Committed before
-            // the send; until then the reservation drops with this closure,
-            // so what was never sent counts for nothing.
-            Box::new(move || {
-                let in_force = ctx.snapshot_in_force(snap);
-                if in_force {
-                    reservation.commit();
-                }
-                in_force
-            }),
+            // The wait for a slot can outlast a reload or a lockdown. Committed
+            // right before the send; until then the reservation drops with
+            // this, so what was never sent counts for nothing.
+            Admit {
+                check: Box::new(move || ctx.stopped_after_wait(snap)),
+                commit: Box::new(move || reservation.commit()),
+            },
         )
         .await;
     let result = match sent {
         Ok(v) => v,
-        Err(ChildError::NotAdmitted) => {
+        Err(ChildError::NotAdmitted(rule)) => {
             tr.sent = false;
-            return denied("policy_changed");
+            return match (rule, stage) {
+                ("policy_changed", Stage::New) => McpOutcome::PolicyMoved,
+                _ => denied(rule),
+            };
+        }
+        // As a connector call at its pool: not sent, so a limit or a deny.
+        Err(ChildError::SlotTimeout) => {
+            tr.sent = false;
+            return McpOutcome::Limited {
+                limit: "concurrency",
+            };
+        }
+        Err(ChildError::NotRunning(_)) => {
+            tr.sent = false;
+            return denied("upstream_unavailable");
         }
         Err(e) => {
             return McpOutcome::UpstreamFailed {
@@ -800,6 +813,12 @@ pub fn mcp_record(
             DecisionKind::Deny,
             Some(rule.clone()),
             deny_reason(rule).map(str::to_string),
+            None,
+        ),
+        McpOutcome::PolicyMoved => (
+            DecisionKind::Deny,
+            Some(POLICY_MOVED_RULE.to_string()),
+            Some(POLICY_MOVED_REASON.to_string()),
             None,
         ),
         McpOutcome::Limited { limit } => (
@@ -978,6 +997,7 @@ pub(crate) fn answer(id: u64, outcome: McpOutcome) -> Value {
             ok(id, m)
         }
         McpOutcome::Denied { rule } => api_ops::answer(id, Outcome::Denied { rule }),
+        McpOutcome::PolicyMoved => api_ops::answer(id, Outcome::PolicyMoved),
         McpOutcome::Limited { limit } => api_ops::answer(id, Outcome::Limited { limit }),
         McpOutcome::UpstreamFailed { reason } => {
             api_ops::answer(id, Outcome::UpstreamFailed { reason })
