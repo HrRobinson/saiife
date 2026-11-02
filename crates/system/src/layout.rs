@@ -38,8 +38,10 @@ pub const FLEET_DIR: &str = "/etc/saiife/fleet";
 pub const FLEET_CONFIG: &str = "/etc/saiife/fleet/config.toml";
 /// The fleet's `agents` and `approvers`.
 pub const FLEET_INSTALL: &str = "/etc/saiife/fleet/install.toml";
-/// The staging copy a Linux package ships; `install` copies it to [`BINARY`].
-#[cfg(target_os = "linux")]
+/// Held while `system install` runs. Beside `/etc/saiife`, not in it: a
+/// refused install leaves `/etc/saiife` alone.
+pub const INSTALL_LOCK: &str = "/etc/saiife-install.lock";
+/// The staging copy a package ships; `install` copies it to [`BINARY`].
 pub const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
 
 /// The polkit action file, byte for byte. `auth_self`, never
@@ -142,6 +144,8 @@ pub fn macos_path(linux: &str) -> Option<&'static str> {
         }
         GEMINI_DIR => "/Library/Application Support/GeminiCli",
         GEMINI_SETTINGS => "/Library/Application Support/GeminiCli/settings.json",
+        // SIP protects /usr, except /usr/local.
+        PACKAGE_BINARY => "/usr/local/libexec/saiife/saiife",
         _ => return None,
     })
 }
@@ -451,12 +455,11 @@ mod tests {
         assert_eq!(FLEET_DIR, "/etc/saiife/fleet");
         assert_eq!(FLEET_CONFIG, "/etc/saiife/fleet/config.toml");
         assert_eq!(FLEET_INSTALL, "/etc/saiife/fleet/install.toml");
-        #[cfg(target_os = "linux")]
         assert_eq!(PACKAGE_BINARY, "/usr/libexec/saiife/saiife");
     }
 
     /// The Linux constants that differ on macOS, with their §5.3 value.
-    const MACOS_TABLE: [(&str, &str); 12] = [
+    const MACOS_TABLE: [(&str, &str); 13] = [
         (STATE_DIR, "/var/db/saiife"),
         (KEYS_DIR, "/var/db/saiife/keys"),
         (AUDIT_KEY, "/var/db/saiife/keys/audit.ed25519"),
@@ -481,6 +484,7 @@ mod tests {
             GEMINI_SETTINGS,
             "/Library/Application Support/GeminiCli/settings.json",
         ),
+        (PACKAGE_BINARY, "/usr/local/libexec/saiife/saiife"),
     ];
 
     /// Every path constant of this module.

@@ -10,7 +10,10 @@ use saiife_agents::Agent;
 use saiife_policy::Getent;
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::fleet::fleet_options;
-use saiife_system::install::{install, InstallError, InstallOptions};
+use saiife_system::install::{
+    install_locked, lock_install, InstallError, InstallOptions, NOTHING_CHANGED,
+};
+use saiife_system::layout::Platform;
 use saiife_system::uninstall::{uninstall, UninstallOptions};
 use saiife_system::{host_for, refusal_line, Host, Layout};
 
@@ -46,8 +49,10 @@ pub enum SystemAction {
         #[arg(long, hide = true, value_name = "DIR")]
         root: Option<PathBuf>,
         /// Install a dynamically linked or debug-assertions build (the CI
-        /// job locked-linux only). Never for production: such a binary lets
-        /// an agent inject code into, or hang, the managed hook.
+        /// jobs locked-linux, locked-macos and macos-pkg only). Never for
+        /// production: such a binary lets an agent inject code into, or hang,
+        /// the managed hook. A release build does not have this flag.
+        #[cfg(debug_assertions)]
         #[arg(long, hide = true)]
         allow_test_build: bool,
     },
@@ -99,6 +104,14 @@ fn report_error(cmd: &str, e: InstallError) -> ExitCode {
     }
 }
 
+/// An install that failed before its first change: the error, then the line
+/// that says so, last (the pkg's `postinstall` matches on it).
+fn report_untouched(e: InstallError) -> ExitCode {
+    let code = report_error("install", e);
+    eprintln!("{NOTHING_CHANGED}");
+    code
+}
+
 /// `doctor` after a successful install (spec §7): its text on stdout.
 /// True when it found a failure (the caller exits 1; the install itself
 /// stays done; install errors are exit 2).
@@ -122,6 +135,14 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> bool {
     }
 }
 
+/// The command an admin runs to restart the daemon on `platform`.
+fn restart_command(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Linux => "systemctl restart saiifed",
+        Platform::Macos => "launchctl kickstart -k system/com.saiife.saiifed",
+    }
+}
+
 pub fn run(action: SystemAction) -> ExitCode {
     match action {
         SystemAction::Install {
@@ -131,8 +152,11 @@ pub fn run(action: SystemAction) -> ExitCode {
             non_interactive,
             fleet,
             root,
+            #[cfg(debug_assertions)]
             allow_test_build,
         } => {
+            #[cfg(not(debug_assertions))]
+            let allow_test_build = false;
             let layout = layout_for(root);
             let host = match host_for(&layout) {
                 Ok(h) => h,
@@ -146,13 +170,19 @@ pub fn run(action: SystemAction) -> ExitCode {
                     ))
                 }
             };
+            // Before the fleet files are read: an overlapping run may be
+            // about to change what they say.
+            let lock = match lock_install(&layout, host.as_ref()) {
+                Ok(l) => l,
+                Err(e) => return report_untouched(e),
+            };
             let opts = if fleet {
                 match fleet_options(&layout, host.as_ref()) {
                     Ok(o) => InstallOptions {
                         allow_test_build,
                         ..o
                     },
-                    Err(e) => return report_error("install", e),
+                    Err(e) => return report_untouched(e),
                 }
             } else {
                 InstallOptions {
@@ -163,7 +193,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                     allow_test_build,
                 }
             };
-            match install(&layout, host.as_ref(), &opts, &binary) {
+            let began = std::cell::Cell::new(false);
+            match install_locked(&lock, &layout, host.as_ref(), &opts, &binary, &began) {
                 Ok(r) => {
                     for w in &r.warnings {
                         eprintln!("saiife: warning: {w}");
@@ -187,7 +218,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                         eprintln!(
                             "saiife: installed, but the running daemon may still enforce the old \
                              policy: fix the config, then run `saiife policy reload` or \
-                             `systemctl restart saiifed`"
+                             `{}`",
+                            restart_command(layout.platform())
                         );
                     }
                     if doctor_failed || r.reload_problem.is_some() {
@@ -196,7 +228,8 @@ pub fn run(action: SystemAction) -> ExitCode {
                         ExitCode::SUCCESS
                     }
                 }
-                Err(e) => report_error("install", e),
+                Err(e) if began.get() => report_error("install", e),
+                Err(e) => report_untouched(e),
             }
         }
         SystemAction::Uninstall {
@@ -225,5 +258,22 @@ pub fn run(action: SystemAction) -> ExitCode {
                 Err(e) => report_error("uninstall", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_command_follows_the_platform() {
+        assert_eq!(
+            restart_command(Platform::Linux),
+            "systemctl restart saiifed"
+        );
+        assert_eq!(
+            restart_command(Platform::Macos),
+            format!("launchctl kickstart -k {}", saiife_system::launchd::SERVICE)
+        );
     }
 }

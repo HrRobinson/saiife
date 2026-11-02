@@ -43,6 +43,13 @@ pub const MAX_DATAGRAM: usize = 8192;
 /// its local datagram sockets refuse a larger one (`EMSGSIZE`, "Message
 /// too long": `net.local.dgram.maxdgram` is 2048), and 2048 octets is
 /// what RFC 5424 §6.1 asks every receiver to take.
+///
+/// A documented limit, on purpose: a bigger `SO_SNDBUF` lifts only the
+/// sender's half, and nothing here can check the receiver. An undersized
+/// receive buffer could refuse the datagram with a retryable error and
+/// stall the batch; a reader with a smaller buffer could cut it without the
+/// mark, which is worse than the marked cut. Neither was tried on a Mac.
+/// For verifiable copies on macOS, use `tls://`, `file` or `https`.
 #[cfg(target_os = "macos")]
 pub const MAX_DATAGRAM: usize = 2048;
 /// Ends a cut message.

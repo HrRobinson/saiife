@@ -52,7 +52,6 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.push(files_installed(ctx, i));
     }
     out.push(files_binary(ctx));
-    #[cfg(target_os = "linux")]
     if ctx.installed.is_some() {
         out.extend(files_package(ctx));
     }
@@ -161,7 +160,6 @@ fn claude_mdm(ctx: &Ctx, i: &Installed) -> Option<Check> {
     ))
 }
 
-/// Whether this layout is macOS's.
 /// `system.sip` (macOS): Pass with System Integrity Protection on, Fail
 /// otherwise ([`crate::sip::SIP_REQUIRED`]); a test build with the seam
 /// reports Warn instead.
@@ -181,6 +179,7 @@ fn sip_check(enabled: bool, seam: bool) -> Check {
     }
 }
 
+/// Whether this layout is macOS's.
 fn mac(ctx: &Ctx) -> bool {
     ctx.layout.platform() == Platform::Macos
 }
@@ -636,8 +635,8 @@ fn macho_binary(bytes: &[u8]) -> Check {
     match info.profile {
         Profile::Release => {}
         Profile::DebugAssertions => notes.push(
-            "test build installed: debug assertions are on (the SAIIFE_EVAL_FAULT test seam \
-             can hang the guard); install the release build"
+            "test build installed: debug assertions are on (SAIIFE_EVAL_FAULT can hang the \
+             guard, SAIIFE_TEST_ALLOW_SIP_OFF skips the SIP check); install the release build"
                 .to_string(),
         ),
         Profile::Unknown => notes.push("no saiife build marker; its build is unknown".to_string()),
@@ -663,13 +662,23 @@ fn macho_binary(bytes: &[u8]) -> Check {
 /// copied to [`BINARY`]: after a package upgrade whose `postinst` did not
 /// run (or failed), the hooks still run the old binary. Only when the
 /// package binary exists (a package install).
-#[cfg(target_os = "linux")]
 fn files_package(ctx: &Ctx) -> Option<Check> {
     const ID: &str = "files.package";
     const TITLE: &str = "package binary";
     let package = ctx.layout.at(PACKAGE_BINARY);
     if fs::symlink_metadata(&package).is_err() {
         return None;
+    }
+    if let Some(why) = package_path_problem(ctx) {
+        return Some(Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!(
+                "{why}: root runs this copy on the next package install; make it root's, \
+                 not writable by group or others, with no ACL"
+            ),
+        ));
     }
     let read = |p: &Path| crate::fsops::sha256_file(p);
     let (pkg, opt) = match (read(&package), read(&ctx.layout.at(BINARY))) {
@@ -696,10 +705,70 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
         Status::Warn,
         TITLE,
         format!(
-            "the package's {PACKAGE_BINARY} differs from {BINARY}: \
-             run sudo {PACKAGE_BINARY} system install --fleet"
+            "the package's {} differs from {BINARY}: install the package again",
+            shown(ctx, PACKAGE_BINARY)
         ),
     ))
+}
+
+/// What the pkg's `postinstall` refuses: the staging copy and each dir up to
+/// `/usr`, which is not itself checked, must be no symlink, root's, and not
+/// writable by group or others. `/usr/local` has no SIP protection, so on
+/// macOS each must also have no ACL: one can grant write that the mode bits
+/// do not show. std has no API for ACLs, so `ls -lde` shows them, on lines of
+/// their own (the `+` after the mode alone is not enough: `@` replaces it when
+/// the path also has an extended attribute). Not on Linux, whose package path
+/// is below the distribution's `/usr`.
+fn package_path_problem(ctx: &Ctx) -> Option<String> {
+    let root = ctx.host.user("root")?;
+    let logical = Path::new(shown(ctx, PACKAGE_BINARY));
+    let mut chain: Vec<&Path> = logical
+        .ancestors()
+        .take_while(|p| *p != Path::new("/usr"))
+        .collect();
+    chain.reverse();
+    for p in chain {
+        let at = ctx.layout.root().join(p.strip_prefix("/").ok()?);
+        let m = match fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) => return Some(format!("{}: cannot check: {e}", p.display())),
+        };
+        if m.file_type().is_symlink() {
+            return Some(format!("{}: is a symlink", p.display()));
+        }
+        if let Some(problem) = crate::fsops::root_owned_problems(&m, root.uid)
+            .into_iter()
+            .next()
+        {
+            return Some(format!("{}: {problem}", p.display()));
+        }
+        if mac(ctx) {
+            let shown = p.display();
+            let path = at.to_string_lossy();
+            let ls = ctx.host.run(
+                "/bin/ls",
+                &["-lde", &path],
+                std::time::Duration::from_secs(5),
+            );
+            let listing = match &ls {
+                Ok(out) if out.status == 0 && !out.stdout.trim().is_empty() => {
+                    Some(out.stdout.as_str())
+                }
+                _ => None,
+            };
+            match listing {
+                Some(l) if l.trim_end().lines().count() > 1 => {
+                    return Some(format!("{shown}: has an ACL"))
+                }
+                Some(l) if l.split_whitespace().next().is_some_and(|m| m.contains('+')) => {
+                    return Some(format!("{shown}: has an ACL"))
+                }
+                Some(_) => {}
+                None => return Some(format!("{shown}: cannot check for an ACL")),
+            }
+        }
+    }
+    None
 }
 
 /// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
@@ -2025,7 +2094,7 @@ mod tests {
         assert_eq!(
             get(&r, "files.package").detail,
             "the package's /usr/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
-             run sudo /usr/libexec/saiife/saiife system install --fleet"
+             install the package again"
         );
         // A missing /opt binary is drift too.
         fs::remove_file(t.at(BINARY)).unwrap();
@@ -2699,6 +2768,28 @@ mod macos_tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
+    /// What `ls -lde` says for each step of the staging path.
+    fn staging_ls(e: &MacEnv, mode: &str) {
+        staging_ls_entries(e, mode, "")
+    }
+
+    fn staging_ls_entries(e: &MacEnv, mode: &str, entries: &str) {
+        let root = e.layout.root().to_path_buf();
+        e.host.set(|s| {
+            for p in [
+                "usr/local",
+                "usr/local/libexec",
+                "usr/local/libexec/saiife",
+                "usr/local/libexec/saiife/saiife",
+            ] {
+                s.run.insert(
+                    format!("/bin/ls -lde {}", root.join(p).display()),
+                    ok(&format!("{mode} 1 root wheel 0 Nov 2 07:00 {p}\n{entries}")),
+                );
+            }
+        });
+    }
+
     fn put_binary(e: &MacEnv, bytes: &[u8]) {
         let p = e.layout.at(BINARY);
         fs::write(&p, bytes).unwrap();
@@ -3003,6 +3094,103 @@ mod macos_tests {
             r.checks.iter().all(|c| !c.detail.contains("/proc")),
             "{}",
             r.to_text()
+        );
+    }
+
+    #[test]
+    fn macos_package_binary_is_compared() {
+        let e = installed();
+        assert!(!doctor(&e).checks.iter().any(|c| c.id == "files.package"));
+        let package = e.layout.at(PACKAGE_BINARY);
+        assert!(package.ends_with("usr/local/libexec/saiife/saiife"));
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        fs::write(&package, fs::read(e.layout.at(BINARY)).unwrap()).unwrap();
+        staging_ls(&e, "drwxr-xr-x");
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+        fs::write(&package, b"another build").unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert_eq!(
+            get(&r, "files.package").detail,
+            "the package's /usr/local/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
+             install the package again"
+        );
+    }
+
+    #[test]
+    fn macos_unsafe_staging_path_warns_without_advice_to_run_it() {
+        let e = installed();
+        let package = e.layout.at(PACKAGE_BINARY);
+        let dir = package.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let same = fs::read(e.layout.at(BINARY)).unwrap();
+        fs::write(&package, &same).unwrap();
+        staging_ls(&e, "drwxr-xr-x");
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+
+        // An ACL: the mode bits are clean, the `+` is what shows it.
+        staging_ls(&e, "drwxr-xr-x+");
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: has an ACL: "),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        // "@" replaces the "+" when there is an extended attribute too: the
+        // entry line is what shows the ACL.
+        staging_ls_entries(&e, "drwxr-xr-x@", " 0: group:everyone allow write\n");
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: has an ACL: "),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        // An extended attribute alone is no ACL.
+        staging_ls(&e, "drwxr-xr-x@");
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+
+        // Could not look: not taken as clean.
+        e.host
+            .set(|s| s.run.retain(|k, _| !k.starts_with("/bin/ls ")));
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: cannot check for an ACL"),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        staging_ls(&e, "drwxr-xr-x");
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        let detail = &get(&r, "files.package").detail;
+        assert!(
+            detail.starts_with("/usr/local/libexec/saiife: "),
+            "{detail}"
+        );
+        assert!(!detail.contains("sudo"), "{detail}");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A swapped binary: a symlink, even to identical bytes.
+        let elsewhere = e.layout.root().join("elsewhere");
+        fs::write(&elsewhere, &same).unwrap();
+        fs::remove_file(&package).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &package).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert_eq!(
+            get(&r, "files.package").detail,
+            "/usr/local/libexec/saiife/saiife: is a symlink: root runs this copy on the next \
+             package install; make it root's, not writable by group or others, with no ACL"
         );
     }
 
