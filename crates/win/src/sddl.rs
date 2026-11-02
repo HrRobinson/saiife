@@ -241,6 +241,9 @@ pub fn render(sd: &Sd) -> String {
 /// The SIDs an allow ACE grants any [`WRITE_LIKE`] bit, inherit-only ACEs
 /// aside. Deny ACEs are not subtracted: an allow is enough to fail, which errs
 /// on the safe side.
+///
+/// This covers DACL ACEs only. The owner holds implicit `WRITE_DAC` unless an
+/// `OW` ACE limits it, so callers must check the owner separately.
 pub fn writers(sd: &Sd) -> BTreeSet<String> {
     sd.aces
         .iter()

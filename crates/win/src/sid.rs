@@ -52,6 +52,9 @@ pub fn service_sid(service_name: &str) -> String {
 /// value in `0x4000_0000..=0x7fff_ffff`, derived from SHA-256 of the SID: never
 /// 0, never `u32::MAX`, and clear of Linux-style ids in mixed fleets' audit
 /// views.
+///
+/// The uid is a display label, and two SIDs can collide. The SID is the
+/// identity: never use the uid as a security key.
 pub fn uid_of(sid: &str, elevated_admin: bool) -> u32 {
     if sid == SYSTEM || elevated_admin {
         return 0;
