@@ -60,11 +60,16 @@ impl Sandbox {
     /// the system config named does not exist.
     fn audit(&self) -> Command {
         let mut c = Command::cargo_bin("saiife").unwrap();
-        c.arg("audit")
-            .arg("--system-config")
-            .arg(self.work.path().join("absent.toml"))
-            .env(DIR_ENV, self.audit.path())
+        c.arg("audit");
+        // Windows refuses this flag as a locked one and reads no system config
+        // in developer mode.
+        if cfg!(not(windows)) {
+            c.arg("--system-config")
+                .arg(self.work.path().join("absent.toml"));
+        }
+        c.env(DIR_ENV, self.audit.path())
             .env("HOME", self.home.path())
+            .env("USERPROFILE", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .current_dir(self.work.path());
         c

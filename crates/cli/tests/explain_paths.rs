@@ -14,10 +14,19 @@ fn explain_read_and_write_of_a_path() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("path:     .env\n"), "{text}");
-    assert!(
-        text.contains(&format!("resolved: {}\n", root.join(".env").display())),
-        "{text}"
-    );
+    // Windows: the guard's own spelling of the path (`d:/x`), not the verbatim
+    // one `fs::canonicalize` gives.
+    let resolved = if cfg!(windows) {
+        let text = root.join(".env").display().to_string();
+        let plain = text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .replace('\\', "/");
+        plain[..1].to_ascii_lowercase() + &plain[1..]
+    } else {
+        root.join(".env").display().to_string()
+    };
+    assert!(text.contains(&format!("resolved: {resolved}\n")), "{text}");
     assert!(text.contains("access:   read\n"), "{text}");
     assert!(text.contains("decision: DENY\n"), "{text}");
     assert!(text.contains("pack:     core.secrets\n"), "{text}");

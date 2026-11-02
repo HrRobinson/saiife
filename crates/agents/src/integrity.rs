@@ -89,17 +89,8 @@ pub fn data_dir() -> Option<PathBuf> {
 fn data_dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match var {
         Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
-        _ => default_base().map(|d| d.join("saiife")),
+        _ => saiife_win::profile::data_base_dir().map(|d| d.join("saiife")),
     }
-}
-
-/// W3: the local (non-roaming) app data on Windows, `dirs::data_dir()`
-/// elsewhere.
-fn default_base() -> Option<PathBuf> {
-    #[cfg(windows)]
-    return dirs::data_local_dir();
-    #[cfg(not(windows))]
-    dirs::data_dir()
 }
 
 /// The project path that identifies a project: canonical, so a project
@@ -243,9 +234,14 @@ mod tests {
         let default = data_dir_from(None);
         assert!(default.as_ref().unwrap().ends_with("saiife"));
         assert_eq!(data_dir_from(Some("rel-data".into())), default);
+        let absolute = if cfg!(windows) {
+            r"C:\abs\data"
+        } else {
+            "/abs/data"
+        };
         assert_eq!(
-            data_dir_from(Some("/abs/data".into())),
-            Some(PathBuf::from("/abs/data"))
+            data_dir_from(Some(absolute.into())),
+            Some(PathBuf::from(absolute))
         );
     }
 

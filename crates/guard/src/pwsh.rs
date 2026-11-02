@@ -3172,9 +3172,10 @@ reason = "hook settings"
         let hidden = root.join("sub").join(".ssh");
         std::fs::create_dir_all(&hidden).unwrap();
         std::fs::write(hidden.join("id_rsa"), "x").unwrap();
+        // The host's style: POSIX on Linux and macOS (the `pwsh` there), and on
+        // a Windows host what a user has.
         let e = secrets().with_paths(
             PathVars::new()
-                .with_style(PathStyle::Posix)
                 .with_var("HOME", root.join("sub"))
                 .with_cwd(&root),
         );

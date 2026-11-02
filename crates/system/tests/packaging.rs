@@ -186,6 +186,7 @@ fn rpm_key_file_is_in_the_yaml() {
     assert!(b.contains("export NFPM_RPM_KEY_FILE=$SAIIFE_PKG_GPG_KEY_FILE"));
 }
 
+#[cfg(unix)]
 fn build_sh(version: &str) -> (Option<i32>, String) {
     let out = std::process::Command::new("bash")
         .arg(linux_dir().join("build.sh"))
@@ -201,6 +202,9 @@ fn build_sh(version: &str) -> (Option<i32>, String) {
 
 /// A Cargo prerelease becomes a dpkg/rpm one ('-' -> '~'); the version
 /// check runs before anything is built.
+// Runs `packaging/build.sh`, the Linux .deb and .rpm build, with its tools. Windows
+// Git Bash exits earlier on a missing tool, and nothing packages for Linux there.
+#[cfg(unix)]
 #[test]
 fn build_maps_a_cargo_prerelease() {
     for (given, want) in [

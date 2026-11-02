@@ -843,7 +843,7 @@ fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let home = dirs::home_dir();
+    let home = saiife_win::profile::home_dir();
     let paths =
         match saiife_system::personal::personal_paths(&|k| std::env::var_os(k), home.as_deref()) {
             Ok(p) => p,

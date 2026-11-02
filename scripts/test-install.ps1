@@ -33,6 +33,8 @@ foreach ($f in @($installer, $PSCommandPath)) {
 function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 
 function New-ZipFrom([string]$Dir, [string]$Zip) {
+  # Both: Windows PowerShell 5.1 finds CompressionLevel only in the first.
+  Add-Type -AssemblyName System.IO.Compression
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::CreateFromDirectory($Dir, $Zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
 }
@@ -73,8 +75,11 @@ function Invoke-Install([string]$Case, [string]$Rel, [string]$Arch, [string[]]$E
   $env:PROCESSOR_ARCHITECTURE = $Arch
   $env:PROCESSOR_ARCHITEW6432 = ''
   if ($Rel -match '^[a-z]+://') { $url = $Rel } else { $url = ([System.Uri]($Rel.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri }
-  $out = & $pwsh -NoProfile -File $installer -BaseUrl $url @ExtraArgs 2>&1 | Out-String
-  return @{ Status = $LASTEXITCODE; Out = $out; Dir = (Join-Path $Case 'local\Programs\saiife\bin') }
+  # Joined by hand: Out-String wraps long lines at the host's width, which would
+  # split the install path the cases look for.
+  $lines = & $pwsh -NoProfile -File $installer -BaseUrl $url @ExtraArgs 2>&1 | ForEach-Object { "$_" }
+  $status = $LASTEXITCODE
+  return @{ Status = $status; Out = (@($lines) -join "`n"); Dir = (Join-Path $Case 'local\Programs\saiife\bin') }
 }
 
 # The user Path is read and restored raw (unexpanded, same value kind), like
@@ -232,3 +237,6 @@ finally {
 
 Write-Output "test-install: $($script:pass) passed, $($script:fail) failed"
 if ($script:fail -ne 0) { exit 1 }
+# The runner ends the step with `exit $LASTEXITCODE`, and the last child here
+# (http_base_refused) exits 1 on purpose.
+exit 0

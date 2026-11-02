@@ -1093,6 +1093,9 @@ expect = "deny"
         assert!(o.out.contains("FAIL example 2"), "{o:?}");
     }
 
+    // `/etc/saiife/config.toml` is a POSIX lock path; Windows has no locked mode until
+    // plan 19b, and `corpus_windows` pins the rules it will use.
+    #[cfg(unix)]
     #[test]
     fn test_command_example_protects_the_deployed_path() {
         // The file under test is somewhere else; the paths core.lock guards

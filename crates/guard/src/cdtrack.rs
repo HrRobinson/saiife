@@ -361,6 +361,19 @@ impl RuleCwd {
                 out.push(v);
             }
         }
+        // `cd ~` with the profile unknown names no path, but `rm -rf *` from
+        // there is still `~/*` to the rules.
+        for dir in self
+            .dirs
+            .iter()
+            .filter(|d| d.windows_anchor(home).is_none())
+        {
+            if let Some(v) = rewrite_in(dir, argv, home, true) {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
         out
     }
 }
@@ -500,7 +513,14 @@ fn windows_target(from: Option<&Dir>, a: &str, home: Option<&Path>) -> Option<Di
         return None;
     }
     if let Some(rest) = a.strip_prefix('/') {
-        return drive_of(from?, home)?.join(rest, home, true);
+        // A root is the same whichever drive it is on, as in
+        // `windows_rm_operand`: with the drive unknown, `cd /` is still a root.
+        // Git Bash's own `/` is its install dir, no safer to empty.
+        let drive = from.and_then(|f| drive_of(f, home)).unwrap_or_else(|| Dir {
+            home: false,
+            parts: vec!["c:".to_string()],
+        });
+        return drive.join(rest, home, true);
     }
     from?.join(&a, home, true)
 }
@@ -667,9 +687,11 @@ mod tests {
             Some("rm -rf /x:/etc | rm -rf /etc")
         );
         assert_eq!(r(&["cd /x:"], "rm -rf .").as_deref(), Some("rm -rf /x:"));
-        // A cwd named like a drive is not one either.
-        let relative = RuleCwd::start(Some(Path::new("c:/x")));
-        assert!(relative.unknown && relative.dirs.is_empty());
+        // A cwd named like a drive is not one either: relative off Windows.
+        if cfg!(not(windows)) {
+            let relative = RuleCwd::start(Some(Path::new("c:/x")));
+            assert!(relative.unknown && relative.dirs.is_empty());
+        }
     }
 
     #[test]
@@ -714,6 +736,9 @@ mod tests {
         assert_eq!(r(&["cd /"], "ls *"), None);
     }
 
+    // POSIX style with a POSIX start: a Windows host calls `/home/u/proj` relative,
+    // and no Windows host runs POSIX style. `corpus_windows*` pin `C:\\p` as a start.
+    #[cfg(unix)]
     #[test]
     fn a_known_start_resolves_relative_cds() {
         let home = Some("/home/u");

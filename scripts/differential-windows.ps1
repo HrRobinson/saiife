@@ -346,6 +346,11 @@ function Test-Paths {
   $reads = Read-Lines @($fixtures | ForEach-Object { @{ dialect = 'path'; line = $_.raw } })
   $fold = { param($p) $p.Replace('\', '/').TrimEnd('/').ToLowerInvariant() }
   $cygpath = Get-Command cygpath -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $cygpath) {
+    # Git for Windows has it, off PATH on some images.
+    $inGit = Join-Path $env:ProgramFiles 'Git\usr\bin\cygpath.exe'
+    if (Test-Path -LiteralPath $inGit) { $cygpath = Get-Command $inGit }
+  }
   # The reader's working directory is C:\, so GetFullPath needs the same.
   $here = [Environment]::CurrentDirectory
   [Environment]::CurrentDirectory = 'C:\'
@@ -387,3 +392,5 @@ if ($script:Failures.Count -gt 0) {
   exit 1
 }
 Write-Output 'the readers agree with the real shells on every fixture'
+# The runner ends the step with `exit $LASTEXITCODE`.
+exit 0

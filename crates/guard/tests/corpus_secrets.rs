@@ -77,6 +77,16 @@ fn deny_pack(e: &Engine, cmd: &str) -> String {
     }
 }
 
+/// `path` as one word of a POSIX shell line. A Windows path holds backslashes
+/// the shell would eat, so there it is quoted, as an agent has to write it.
+fn shell_word(path: &str) -> String {
+    if cfg!(windows) && path.contains('\\') {
+        format!("'{path}'")
+    } else {
+        path.to_string()
+    }
+}
+
 fn assert_allows(e: &Engine, cmds: &[&str]) {
     for cmd in cmds {
         let d = e.evaluate(cmd);
@@ -149,7 +159,21 @@ fn secret_files_through_shell_readers() {
         "cat .envrc",
         "cat ../app/.envrc",
     ] {
-        assert_eq!(deny_pack(&e, cmd), "core.secrets", "{cmd}");
+        // Under Windows style these deny before any secret rule: `host:/tmp/`
+        // reads as a PowerShell drive and `/proc` is no Windows path. See
+        // `corpus_windows_ci` for `.env` as the source of a copy.
+        let want = if cfg!(windows)
+            && matches!(
+                cmd,
+                "scp .env host:/tmp/"
+                    | "cat /proc/self/environ"
+                    | "cat /proc/self/task/1234/environ"
+            ) {
+            "guard.winpath"
+        } else {
+            "core.secrets"
+        };
+        assert_eq!(deny_pack(&e, cmd), want, "{cmd}");
     }
 }
 
@@ -504,15 +528,15 @@ fn read_tools_are_judged_by_the_same_path_rules() {
     assert!(!e.evaluate_path(Access::Write, ".env").is_deny());
 }
 
-/// Review Focus: macOS file systems are case-insensitive, so `.ENV` opens
-/// `.env` there; on Linux it is a different file.
+/// Review Focus: macOS and Windows file systems are case-insensitive, so `.ENV`
+/// opens `.env` there; on Linux it is a different file.
 #[test]
 fn case_follows_the_platform() {
     let f = Fixture::new();
     let e = f.engine();
     assert_eq!(
         e.evaluate("cat .ENV").is_deny(),
-        cfg!(target_os = "macos"),
+        cfg!(any(windows, target_os = "macos")),
         "cat .ENV"
     );
 }
@@ -1013,7 +1037,7 @@ fn agent_credential_files_are_secret() {
             Decision::Deny { pack, .. } => assert_eq!(pack, "core.secrets", "{path}"),
             d => panic!("expected DENY for read of {path:?}, got {d:?}"),
         }
-        let cmd = format!("cat {path}");
+        let cmd = format!("cat {}", shell_word(&path));
         assert_eq!(deny_pack(&e, &cmd), "core.secrets", "{cmd}");
     }
     // Without the variables bound, the default locations stay guarded.

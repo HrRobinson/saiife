@@ -4,10 +4,8 @@
 //!
 //! What these tests touch: `SAIIFE_DATA_DIR` and `SAIIFE_AUDIT_DIR` are temp
 //! dirs, and `init`, `check` and `status` run in a dedicated temp project
-//! directory. HOME and USERPROFILE are set too, but `dirs` 5 `home_dir()` on
-//! Windows asks the known-folder API and ignores both, so anything that reads
-//! the user's home (agent config lookups) sees the runner's real profile. The
-//! tests only read there; the runner is disposable.
+//! directory. USERPROFILE and LOCALAPPDATA are temp dirs too, and saiife reads
+//! them first (ruling P4), so nothing reads or writes the runner's real profile.
 #![cfg(windows)]
 
 use assert_cmd::Command;
@@ -26,6 +24,42 @@ fn saiife(home: &Path) -> Command {
         .env("SAIIFE_DATA_DIR", home.join("data"))
         .env("SAIIFE_AUDIT_DIR", home.join("audit"));
     c
+}
+
+/// Ruling P4: `~` is what `USERPROFILE` says, and the audit log's default sits
+/// under what `LOCALAPPDATA` says, not the known folders.
+#[test]
+fn the_profile_comes_from_the_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let name = home.path().file_name().unwrap().to_str().unwrap();
+    let out = saiife(home.path())
+        .args(["explain", "--read", "~/.ssh/id_rsa"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("decision: DENY"), "{text}");
+    let resolved = text
+        .lines()
+        .find(|l| l.starts_with("resolved:"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(resolved.contains(name), "{text}");
+
+    let out = saiife(home.path())
+        .env_remove("SAIIFE_AUDIT_DIR")
+        .env_remove("SAIIFE_DATA_DIR")
+        .args(["check", "--agent", "claude"])
+        .current_dir(home.path())
+        .write_stdin(r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let log = home
+        .path()
+        .join("AppData")
+        .join("Local")
+        .join("saiife")
+        .join("audit");
+    assert!(log.is_dir(), "{}", log.display());
 }
 
 #[test]

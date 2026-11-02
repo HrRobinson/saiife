@@ -34,7 +34,7 @@ sha2 = "0.10"
 toml = "0.8"
 toml_edit = "0.22.27"
 time = { version = "0.3", features = ["formatting", "macros"] }
-dirs = "5"
+saiife-win = { path = "../win" }
 # `saiife api` sends and reads bodies as base64 (the version saiife-broker uses).
 base64 = "=0.23.1"
 # Secret values `saiife secret` reads are wiped when dropped.

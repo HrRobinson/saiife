@@ -603,6 +603,8 @@ fn off_success_header_unchanged() {
     assert!(text.starts_with("saiife is off for"), "{text}");
 }
 
+// Windows forbids a control character in a file name, so this directory cannot exist.
+#[cfg(unix)]
 #[test]
 fn off_header_sanitizes_root() {
     let env = Env::new(&["claude"]);

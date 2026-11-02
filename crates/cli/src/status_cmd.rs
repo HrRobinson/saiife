@@ -160,7 +160,7 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
         .map(|(a, _)| a.as_str())
         .collect();
     let (last_calls, scan) = last_calls(&root, &hooked, &mut problems, &mut notes);
-    let home = dirs::home_dir();
+    let home = saiife_win::profile::home_dir();
 
     for agent in Agent::ALL {
         let rel = agent.config_rel();
@@ -1152,21 +1152,29 @@ mod tests {
     fn inactive_lines_name_the_unbound_variable_and_its_packs() {
         let (packs, _) = saiifeguard::builtins::builtin_packs();
         let active: Vec<Pack> = packs.into_iter().filter(|p| p.default_on).collect();
+        // A Windows host calls `/home/u` relative, so the value would not bind.
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:{p}")
+            } else {
+                p.to_string()
+            }
+        };
         let bound = PathVars::new()
-            .with_var("HOME", "/home/u")
-            .with_var("PROJECT", "/home/u/app")
-            .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
-            .with_var("CLAUDE_CONFIG_DIR", "/home/u/.claude")
-            .with_var("CODEX_HOME", "/home/u/.codex")
-            .with_var("SAIIFE_BIN", "/usr/bin/saiife")
-            .with_var("XDG_CONFIG_HOME", "/home/u/.config");
+            .with_var("HOME", abs("/home/u"))
+            .with_var("PROJECT", abs("/home/u/app"))
+            .with_var("SAIIFE_DATA_DIR", abs("/home/u/.local/share/saiife"))
+            .with_var("CLAUDE_CONFIG_DIR", abs("/home/u/.claude"))
+            .with_var("CODEX_HOME", abs("/home/u/.codex"))
+            .with_var("SAIIFE_BIN", abs("/usr/bin/saiife"))
+            .with_var("XDG_CONFIG_HOME", abs("/home/u/.config"));
         let text = inactive_lines(&active, &bound);
         assert!(
             text.starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),
             "{text}"
         );
         assert!(text.contains("core.self"), "{text}");
-        let all = bound.with_var("SAIIFE_AUDIT_DIR", "/home/u/.local/share/saiife/audit");
+        let all = bound.with_var("SAIIFE_AUDIT_DIR", abs("/home/u/.local/share/saiife/audit"));
         assert_eq!(inactive_lines(&active, &all), "");
     }
 }

@@ -282,6 +282,9 @@ fn mcp_page_does_not_claim_codex_or_gemini_restrictions() {
     }
 }
 
+// The page documents the locked-mode MCP gateway with a POSIX command path. The
+// gateway does not exist on Windows until plan 19b.
+#[cfg(unix)]
 #[test]
 fn mcp_page_example_loads() {
     let text = mcp_page();

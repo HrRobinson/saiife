@@ -159,14 +159,14 @@ pub fn path_vars_locked(
     if let Some(c) = cwd {
         v = v.with_cwd(c);
     }
-    if let Some(h) = dirs::home_dir() {
+    if let Some(h) = saiife_win::profile::home_dir() {
         v = v.with_var("HOME", h);
     }
     // The agents' config dirs: the variable when set (and absolute), else
     // the default under HOME, so the rules naming them are always active.
     // `XDG_CONFIG_HOME` the same way (`~/.config`); in locked mode the
     // worker's environment is cleared, so it is always the default there.
-    let home = dirs::home_dir();
+    let home = saiife_win::profile::home_dir();
     for (name, agent) in [
         ("CLAUDE_CONFIG_DIR", Agent::Claude),
         ("CODEX_HOME", Agent::Codex),
@@ -213,16 +213,26 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    /// An absolute path on this host.
+    fn host_absolute() -> &'static str {
+        if cfg!(windows) {
+            r"C:\opt\x"
+        } else {
+            "/opt/x"
+        }
+    }
+
     #[test]
     fn config_dir_falls_back_to_the_default_under_home() {
         let home = || Some(PathBuf::from("/home/u"));
-        let want = Some(PathBuf::from("/home/u/.claude"));
+        let want = Some(PathBuf::from("/home/u").join(".claude"));
         assert_eq!(config_dir(None, home(), ".claude"), want);
         assert_eq!(config_dir(Some(OsString::new()), home(), ".claude"), want);
         assert_eq!(config_dir(Some("rel/dir".into()), home(), ".claude"), want);
+        let absolute = host_absolute();
         assert_eq!(
-            config_dir(Some("/opt/claude".into()), home(), ".claude"),
-            Some(PathBuf::from("/opt/claude"))
+            config_dir(Some(absolute.into()), home(), ".claude"),
+            Some(PathBuf::from(absolute))
         );
         assert_eq!(config_dir(None, None, ".claude"), None);
     }
@@ -241,8 +251,8 @@ mod tests {
                     want
                 );
                 assert_eq!(
-                    agent_config_dir(Some("/opt/x".into()), Some(home), agent, windows),
-                    Some(PathBuf::from("/opt/x"))
+                    agent_config_dir(Some(host_absolute().into()), Some(home), agent, windows),
+                    Some(PathBuf::from(host_absolute()))
                 );
                 assert_eq!(agent_config_dir(None, None, agent, windows), None);
             }
@@ -282,16 +292,29 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let real = std::fs::canonicalize(d.path()).unwrap();
         let v = path_vars(Some(d.path()), None);
-        assert_eq!(v.cwd(), Some(real.as_path()));
+        // Each compared in the form this host's rules read it (Windows:
+        // `d:/x`, where `fs::canonicalize` gives `\\\\?\\D:\\x`).
+        let read = |p: &Path| {
+            PathVars::new()
+                .with_style(PathStyle::host())
+                .with_var("X", p)
+        };
+        let form = |p: &Path| read(p).values("X")[0].to_path_buf();
+        assert_eq!(v.cwd(), Some(form(&real).as_path()));
         // Both the spelled and the resolved value are bound (they differ on
         // macOS, where the temp dir is `/var/…` -> `/private/var/…`).
-        assert!(v.values("PROJECT").contains(&real.as_path()));
-        assert!(v.values("PROJECT").contains(&d.path()));
+        assert!(v.values("PROJECT").contains(&form(&real).as_path()));
+        assert!(read(d.path())
+            .values("X")
+            .iter()
+            .all(|p| v.values("PROJECT").contains(p)));
         let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        assert!(v.values("SAIIFE_BIN").contains(&exe.as_path()));
+        assert!(v.values("SAIIFE_BIN").contains(&form(&exe).as_path()));
         assert!(path_vars(None, None).cwd().is_none());
     }
 
+    // Locked mode with the POSIX system paths; Windows has none until plan 19b.
+    #[cfg(unix)]
     #[test]
     fn locked_paths_add_values() {
         let d = tempfile::tempdir().unwrap();
@@ -388,7 +411,7 @@ mod tests {
             config_dir(None, Some(PathBuf::from("/home/u")), ".config"),
             Some(PathBuf::from("/home/u/.config"))
         );
-        if dirs::home_dir().is_some() {
+        if saiife_win::profile::home_dir().is_some() {
             assert!(!v.values("XDG_CONFIG_HOME").is_empty());
         }
     }

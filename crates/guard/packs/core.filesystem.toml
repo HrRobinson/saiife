@@ -94,6 +94,20 @@ id = "windows-root-rm"
 pattern = '(?i)^rm\s+(?:\S+\s+)*(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:\S+\s+)*(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)|(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)\s+(?:\S+\s+)*(?:-[a-z]*r[a-z]*|--recursive))(?:\s|$)'
 reason = "recursive delete of a drive root, Windows, Program Files, ProgramData or Users is catastrophic and irreversible"
 
+# `cd / && chmod -R 777 *` arrives as `chmod -R 777 c:/*` (ruling P1): the same
+# deny as POSIX `/*`.
+[[deny]]
+platform = "windows"
+id = "windows-root-chmod"
+pattern = '(?i)^(?:sudo\s+)?chmod\s+(?:\S+\s+)*-[a-z]*r[a-z]*\s+(?:\S+\s+)*[a-z]:/+\*?(?:\s|$)'
+reason = "recursive chmod on a drive root breaks the system"
+
+[[deny]]
+platform = "windows"
+id = "windows-root-chown"
+pattern = '(?i)^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-z]*r[a-z]*\s+(?:\S+\s+)*\S+\s+[a-z]:/+\*?(?:\s|$)'
+reason = "recursive chown on a drive root breaks ownership system-wide"
+
 [[deny]]
 platform = "windows"
 # `format C: /q`, `format.com D: /fs:ntfs`, the storage cmdlets (even fed from

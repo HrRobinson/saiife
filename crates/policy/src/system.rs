@@ -707,6 +707,9 @@ mod tests {
         fwd(body).unwrap().audit.validate()
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn forward_types_parse() {
         let c = fwd(concat!(
@@ -880,6 +883,9 @@ mod tests {
         }
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn bad_target_name_refused() {
         for n in ["Siem", "a.b", "has space", &"a".repeat(33)] {
@@ -907,6 +913,9 @@ mod tests {
         assert!(t("[notify]\non = [\"refresh_failed\"]\n").is_ok());
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn notify_targets_are_validated() {
         let v = |body: &str| {

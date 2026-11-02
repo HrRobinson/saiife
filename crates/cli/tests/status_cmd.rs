@@ -225,6 +225,7 @@ fn last_hook_call_is_shown_per_agent() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", "claude"])
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -264,6 +265,7 @@ fn unreadable_audit_dir_is_a_failed_check() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", &file)
@@ -324,6 +326,7 @@ fn with_real_copy(agents: &[&str]) -> Env {
             .current_dir(env.root())
             .env("PATH", env.bin.path())
             .env("HOME", env.home.path())
+            .env("USERPROFILE", env.home.path())
             .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
             .env("SAIIFE_DATA_DIR", env.data.path())
             .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -548,6 +551,7 @@ fn last_hook_call_through_a_symlinked_cwd_is_shown() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", "claude"])
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -597,6 +601,7 @@ fn unhashable_binary_at_init_is_a_failed_check() {
             .current_dir(env.root())
             .env("PATH", env.bin.path())
             .env("HOME", env.home.path())
+            .env("USERPROFILE", env.home.path())
             .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
             .env("SAIIFE_DATA_DIR", env.data.path())
             .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -887,6 +892,7 @@ fn unreadable_audit_dir_says_last_call_unknown() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", &audit)
@@ -994,7 +1000,10 @@ fn packs_line_names_a_config_from_another_directory() {
     let out = env.saiife_in(&proj, &["status"]);
     let text = stdout(&out);
     let root = std::fs::canonicalize(env.root()).unwrap();
-    let want = format!("packs (from {}/.saiife/config.toml):", root.display());
+    let want = format!(
+        "packs (from {}):",
+        root.join(".saiife/config.toml").display()
+    );
     assert!(text.contains(&want), "{text}");
 }
 
@@ -1056,6 +1065,7 @@ fn scan_stops_at_limit() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())

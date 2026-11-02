@@ -101,7 +101,9 @@ fn turning_saiife_off_from_the_shell() {
         "cp /tmp/empty.json ~/.claude/settings.json",
         "rm ~/.codex/config.toml",
         "echo {} > ~/.gemini/settings.json",
+        #[cfg(unix)] // Through the fixture's symlink, which Windows does not make.
         "rm ~/.local/bin/saiife",
+        #[cfg(unix)]
         "ln -sf /bin/true ~/.local/bin/saiife",
         "PATH=/tmp/fake:$PATH claude",
         "env PATH=/tmp/fake codex exec fix",
@@ -224,6 +226,7 @@ fn write_tools_are_judged_by_the_same_path_rules() {
         f.p("data/audit/2026-10.jsonl"),
         f.p("data/projects/abc.json"),
         f.p("opt/saiife"),
+        #[cfg(unix)] // Through the fixture's symlink, which Windows does not make.
         "~/.local/bin/saiife".to_string(),
     ] {
         match e.evaluate_path(Access::Write, &path) {
@@ -307,9 +310,14 @@ fn removing_a_parent_of_the_data_dir_or_binary_is_denied() {
     }
     assert!(only_self.evaluate("rm -rf ~").is_deny());
     assert!(only_self.evaluate("rm -rf /").is_deny());
-    assert!(only_self
-        .evaluate(&format!("rm -rf {}", home.display()))
-        .is_deny());
+    // A Windows path holds backslashes a POSIX shell would eat, so an agent has
+    // to quote it there.
+    let home_word = if cfg!(windows) {
+        format!("'{}'", home.display())
+    } else {
+        home.display().to_string()
+    };
+    assert!(only_self.evaluate(&format!("rm -rf {home_word}")).is_deny());
     // Reads, and writes to other children, stay allowed.
     for path in ["~/.local", "~/.local/share", "~/.local/bin"] {
         assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
@@ -696,6 +704,8 @@ fn cd_into_a_variable_is_an_unknown_directory() {
     assert_allowed(&e, &["cd \"$HOME/proj\" && cargo test"]);
     for cmd in ["cd \"$D\" && cat notes.txt", "cd $D && cat notes.txt"] {
         match e.evaluate(cmd) {
+            // Under Windows style a variable with no known value denies (W5).
+            d if cfg!(windows) => assert!(d.is_deny(), "{cmd}: {d:?}"),
             Decision::Allow {
                 trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
             } => {}

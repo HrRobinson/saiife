@@ -736,6 +736,15 @@ fn expand_alternatives(
         }
         all.extend(found);
     }
+    // A walk joins with the host's separator: `d:/a\\b` on Windows. The rest of
+    // the guard reads `/` as the one separator of a Windows path.
+    if vars.style() == PathStyle::Windows {
+        for p in &mut all {
+            if let Some(mixed) = p.to_str().filter(|s| s.contains('\\')) {
+                *p = PathBuf::from(mixed.replace('\\', "/"));
+            }
+        }
+    }
     all.sort();
     all.dedup();
     (all, overflow)
@@ -1166,10 +1175,17 @@ mod tests {
         );
     }
 
-    /// A temp dir by its canonical path (macOS: /var -> /private/var).
+    /// A temp dir by its canonical path (macOS: /var -> /private/var). Windows:
+    /// without the `\\\\?\\` that `fs::canonicalize` adds. `Path` compares by
+    /// component there, so `D:\\a\\b` equals the reader's `d:/a/b`, and a verbatim
+    /// path equals neither.
     fn tmp() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let p = fs::canonicalize(d.path()).unwrap();
+        let p = match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => p,
+        };
         (d, p)
     }
 
@@ -1189,9 +1205,12 @@ mod tests {
         assert_eq!(c("$PWD/.env"), app.join(".env"));
         assert_eq!(c(".env"), app.join(".env"));
         assert_eq!(c("./.env"), app.join(".env"));
-        // Not variables: left as literal names.
-        assert_eq!(c("$HOMEDIR/x"), app.join("$HOMEDIR/x"));
-        assert_eq!(c("~user/x"), app.join("~user/x"));
+        // Not variables: left as literal names. Windows has no form for them:
+        // the engine denies a variable it does not know (W5).
+        if cfg!(not(windows)) {
+            assert_eq!(c("$HOMEDIR/x"), app.join("$HOMEDIR/x"));
+            assert_eq!(c("~user/x"), app.join("~user/x"));
+        }
     }
 
     #[test]
@@ -1204,7 +1223,10 @@ mod tests {
         assert_eq!(c("src/../.env"), app.join(".env"));
         assert_eq!(c("nope/../.env"), app.join(".env"));
         assert_eq!(c("src/../../app/.env"), app.join(".env"));
-        assert_eq!(c("/../../.."), PathBuf::from("/"));
+        // Windows: `/` is the root of the working directory's drive.
+        if cfg!(not(windows)) {
+            assert_eq!(c("/../../.."), PathBuf::from("/"));
+        }
     }
 
     #[cfg(unix)]
@@ -1243,13 +1265,22 @@ mod tests {
         assert!(path_forms("x", None, &PathVars::new()).is_empty());
     }
 
+    /// An absolute path on this host.
+    fn host_absolute() -> &'static str {
+        if cfg!(windows) {
+            r"C:\etc\hosts"
+        } else {
+            "/etc/hosts"
+        }
+    }
+
     #[test]
     fn relative_without_cwd_or_tilde_without_home_is_none() {
         let v = PathVars::new();
         assert_eq!(canonicalize(".env", None, &v), None);
         assert_eq!(canonicalize("~/.ssh/id_rsa", None, &v), None);
         assert_eq!(canonicalize("", None, &v), None);
-        assert!(canonicalize("/etc/hosts", None, &v).is_some());
+        assert!(canonicalize(host_absolute(), None, &v).is_some());
     }
 
     #[test]
@@ -1338,7 +1369,7 @@ mod tests {
         assert_eq!(canonicalize(".env", Some(Path::new("sub")), &v), None);
         assert!(path_forms(".env", Some(Path::new("sub")), &v).is_empty());
         // An absolute path does not need the cwd.
-        assert!(canonicalize("/etc/hosts", Some(Path::new("sub")), &v).is_some());
+        assert!(canonicalize(host_absolute(), Some(Path::new("sub")), &v).is_some());
     }
 
     #[cfg(unix)]
@@ -1422,6 +1453,9 @@ mod tests {
         ));
     }
 
+    // POSIX spellings: a Windows host calls `/h` and `/p` relative. No Windows host
+    // runs POSIX style; `style_can_be_set_after_the_values` pins the Windows form.
+    #[cfg(unix)]
     #[test]
     fn lexical_form_needs_no_filesystem() {
         let v = PathVars::new().with_var("HOME", "/h");

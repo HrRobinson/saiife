@@ -775,7 +775,8 @@ fn read_regular(path: &Path) -> Result<Vec<u8>, PolicyError> {
     Ok(bytes)
 }
 
-#[cfg(test)]
+// The `run_allow` entries here are POSIX paths; see the comment on the test.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -786,6 +787,8 @@ mod tests {
 
     /// Plan 13 decision 10: `/etc`, `/var` and `/tmp` are symlinks on
     /// macOS, and a link in `run_allow` never grants its target.
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
     #[test]
     fn run_allow_through_var_symlink_refused_with_hint() {
         assert_eq!(

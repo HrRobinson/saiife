@@ -169,6 +169,10 @@ fn touching_the_service_is_denied() {
     }
 }
 
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn persistence_is_denied() {
     let f = Fixture::new();
@@ -515,6 +519,10 @@ fn safety_switches_are_denied() {
     }
 }
 
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn writes_to_saiifes_system_paths_are_denied() {
     let f = Fixture::new();
@@ -679,6 +687,10 @@ fn everyday_work_and_reading_the_setup_are_allowed() {
 
 /// The locked config dir and audit dir are guarded under every value they
 /// are bound to, not only the defaults.
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn extra_locked_values_are_guarded() {
     let f = Fixture::new();
@@ -785,6 +797,10 @@ fn signal_words_do_not_hide_options() {
 
 /// Fix round 4 (F2): the file `xargs` reads is found whatever the
 /// spelling of `--arg-file`.
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn xargs_arg_file_abbreviations_are_read() {
     let f = Fixture::new();

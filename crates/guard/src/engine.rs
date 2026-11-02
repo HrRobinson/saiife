@@ -1463,8 +1463,11 @@ impl Engine {
             let landing = if op.into.is_empty() {
                 vec![op.path.clone()]
             } else if op.path.ends_with('/') && op.into.iter().all(|s| !s.glob && !s.contents) {
-                let names: Vec<String> =
-                    op.into.iter().filter_map(|s| base_name(&s.path)).collect();
+                let names: Vec<String> = op
+                    .into
+                    .iter()
+                    .filter_map(|s| base_name(&s.path, self.vars.style()))
+                    .collect();
                 into_dir(&op.path, &names)
             } else {
                 continue;
@@ -1634,7 +1637,7 @@ impl Engine {
             };
             for path in paths {
                 if !src.contents {
-                    names.extend(base_name(&path));
+                    names.extend(base_name(&path, self.vars.style()));
                     continue;
                 }
                 let Some(dir) = canonicalize(&path, cwd, &self.vars) else {
@@ -1868,10 +1871,16 @@ impl Engine {
 /// starting one plus `cd` targets).
 const MAX_CWDS: usize = 16;
 
-/// The last component of `path` (`a/b/` is `b`).
-fn base_name(path: &str) -> Option<String> {
-    path.trim_end_matches('/')
-        .rsplit('/')
+/// The last component of `path` (`a/b/` is `b`). Under Windows style `\\`
+/// separates too: `cp 'C:\\x\\settings.json' .claude/` lands on that one name.
+fn base_name(path: &str, style: PathStyle) -> Option<String> {
+    let seps: &[char] = if style == PathStyle::Windows {
+        &['/', '\\']
+    } else {
+        &['/']
+    };
+    path.trim_end_matches(seps)
+        .rsplit(seps)
         .next()
         .filter(|b| !b.is_empty())
         .map(str::to_string)
@@ -2936,10 +2945,8 @@ reason = "saiife config"
                 assert_eq!(pack, "test.paths");
                 assert_eq!(pattern, "**/.env");
                 assert!(reason.contains("secret file"), "{reason}");
-                assert!(
-                    reason.contains(&app.join(".env").display().to_string()),
-                    "{reason}"
-                );
+                let form = lexical_form(".env", Some(&app), &PathVars::new()).unwrap();
+                assert!(reason.contains(&form.display().to_string()), "{reason}");
             }
             other => panic!("expected deny, got {other:?}"),
         }
@@ -2974,10 +2981,13 @@ reason = "saiife config"
         ));
         // Rules without variables still apply to absolute paths; rules with
         // an unbound variable do not.
-        assert!(e.evaluate_path(Access::Read, "/srv/app/.env").is_deny());
-        assert!(!e
-            .evaluate_path(Access::Read, "/home/u/.ssh/id_rsa")
-            .is_deny());
+        let (env, key) = if cfg!(windows) {
+            (r"C:\srv\app\.env", r"C:\Users\u\.ssh\id_rsa")
+        } else {
+            ("/srv/app/.env", "/home/u/.ssh/id_rsa")
+        };
+        assert!(e.evaluate_path(Access::Read, env).is_deny());
+        assert!(!e.evaluate_path(Access::Read, key).is_deny());
     }
 
     #[test]
@@ -3055,10 +3065,15 @@ reason = "other pack says no"
             "cd src && cat .env.example",
             "cat .locked/state",
             "echo x > notes.txt",
-            "cat $(ls -t | head -1)",
         ] {
             assert!(!e.evaluate(cmd).is_deny(), "expected ALLOW for {cmd:?}");
         }
+        // A path no reader can see: unjudged on POSIX, a deny under Windows
+        // style (W5, ruling on nested non-POSIX Unjudged).
+        assert_eq!(
+            e.evaluate("cat $(ls -t | head -1)").is_deny(),
+            cfg!(windows)
+        );
     }
 
     #[cfg(unix)]
@@ -3354,6 +3369,10 @@ reason = "other pack says no"
         assert!(!g.evaluate("FOO=1 git status").is_deny());
     }
 
+    // `cd $(x)` is unjudged only on POSIX: under Windows style what the reader cannot
+    // read denies (W5), pinned by `corpus_windows_round1`. Also `/tmp`, `/d0` are
+    // POSIX absolutes here.
+    #[cfg(unix)]
     #[test]
     fn an_unknown_working_directory_is_recorded() {
         let (_d, root) = canonical_tmp();
@@ -3407,6 +3426,12 @@ reason = "other pack says no"
             trace: AllowTrace::FailedOpenTimeout,
         };
         let e = test_engine().with_budget(Duration::ZERO);
+        // Under Windows style each segment is judged once before the first
+        // budget check, so a zero budget still finds the rule (owner ruling).
+        if cfg!(windows) {
+            assert!(e.evaluate("git reset --hard").is_deny());
+            return;
+        }
         assert_eq!(e.evaluate("git reset --hard"), timeout);
         let (_d, root) = canonical_tmp();
         std::fs::create_dir_all(root.join("app")).unwrap();

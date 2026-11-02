@@ -392,6 +392,10 @@ mod tests {
         assert!(!m("**/.env.*", "/p/.env"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn home_and_star() {
         assert!(m("~/.ssh/id_*", "/home/u/.ssh/id_ed25519"));
@@ -402,6 +406,10 @@ mod tests {
         assert!(m("~/.ssh/id_?sa", "/home/u/.ssh/id_rsa"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn trailing_double_star_includes_the_directory() {
         assert!(m("~/.config/gcloud/**", "/home/u/.config/gcloud"));
@@ -421,6 +429,10 @@ mod tests {
         assert!(!m("/a/**/b", "/a/xb"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn multi_valued_variable_is_an_alternation() {
         assert!(m("$SAIIFE_BIN", "/opt/saiife/bin/saiife"));
@@ -459,6 +471,10 @@ mod tests {
         }
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn ancestors_match_proper_ancestors_only() {
         let v = PathVars::new()
@@ -502,25 +518,27 @@ mod tests {
     /// must not move because Windows rules were added.
     #[test]
     fn posix_regex_sources_are_unchanged() {
+        // A root no host has: on macOS `/home` is a firmlink, and a resolved
+        // value would add its own alternative to the pinned text.
         let v = PathVars::new()
             .with_style(PathStyle::Posix)
-            .with_var("HOME", "/home/u");
+            .with_var("HOME", "/zz/u");
         if cfg!(windows) {
             return;
         }
         let src = |g: &str| glob_source(g, &v, false).unwrap().unwrap();
         assert_eq!(src("**/.env"), r"(?s)^(?:/.*)?/\.env$");
-        assert_eq!(src("~/.ssh/id_*"), r"(?s)^(?:/home/u)/\.ssh/id_[^/]*$");
-        assert_eq!(src("~/.ssh/id_?sa"), r"(?s)^(?:/home/u)/\.ssh/id_[^/]sa$");
+        assert_eq!(src("~/.ssh/id_*"), r"(?s)^(?:/zz/u)/\.ssh/id_[^/]*$");
+        assert_eq!(src("~/.ssh/id_?sa"), r"(?s)^(?:/zz/u)/\.ssh/id_[^/]sa$");
         assert_eq!(src("/a/**/b"), r"(?s)^/a(?:/[^/]+)*/b$");
-        assert_eq!(src("$HOME/x/**"), r"(?s)^(?:/home/u)/x(?:/.*)?$");
+        assert_eq!(src("$HOME/x/**"), r"(?s)^(?:/zz/u)/x(?:/.*)?$");
         assert_eq!(
             glob_source("**/.ENV", &v, true).unwrap().unwrap(),
             r"(?is)^(?:/.*)?/\.ENV$"
         );
         assert_eq!(
             ancestors_source("$HOME/a", &v, false).unwrap().unwrap(),
-            "(?s)^(?:/|/home|/home/u)$"
+            "(?s)^(?:/|/zz|/zz/u)$"
         );
     }
 
@@ -598,6 +616,10 @@ mod tests {
         assert!(!RuleAccess::Write.covers(Access::Read));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn double_star_and_star_match_names_with_newlines() {
         assert!(m("~/.claude/**", "/home/u/.claude/a\nb"));
@@ -617,6 +639,10 @@ mod tests {
         }
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn a_variable_bound_to_the_root_matches_the_root() {
         let root = PathVars::new().with_var("HOME", "/");

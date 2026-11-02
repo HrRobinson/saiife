@@ -982,7 +982,7 @@ mod tests {
             assert_eq!(a.input, cmd);
             assert_eq!(a.tool.as_deref(), Some("Bash"));
         }
-        let home = dirs::home_dir().unwrap();
+        let home = saiife_win::profile::home_dir().unwrap();
         let key = home.join(".ssh/id_rsa").display().to_string();
         let a = judge(
             &payload(cwd, "Read", serde_json::json!({ "file_path": key })),
@@ -1014,7 +1014,9 @@ mod tests {
         let a = ask("PowerShell", cmd);
         assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
         assert_eq!(a.pack.as_deref(), Some("core.git"), "{a:?}");
-        assert_ne!(ask("Bash", cmd).verdict, Verdict::Deny);
+        // Windows denies the unterminated substitution too: what the reader
+        // cannot read is no allow there (W5).
+        assert_eq!(ask("Bash", cmd).verdict == Verdict::Deny, cfg!(windows));
         for cmd in ["iex $x", "[IO.File]::Delete('x')", "pwsh -e !!notbase64"] {
             let a = ask("PowerShell", cmd);
             assert_eq!(a.verdict, Verdict::Deny, "{cmd}: {a:?}");

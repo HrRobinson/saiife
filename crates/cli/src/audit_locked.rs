@@ -254,6 +254,9 @@ mod tests {
         assert!(!auditor(false, &[10, 3000], None));
     }
 
+    // Reads the locked config, which Windows never does in plan 19a:
+    // `windows_source_is_developer_whatever_the_config_says` pins that.
+    #[cfg(unix)]
     #[test]
     fn no_locked_config_is_developer_mode() {
         let d = tempfile::tempdir().unwrap();
@@ -291,6 +294,8 @@ mod tests {
         assert!(source(Some(&file.join("config.toml"))).is_err());
     }
 
+    // Locked config with POSIX paths; Windows has no locked mode until plan 19b.
+    #[cfg(unix)]
     #[test]
     fn locked_audit_dir_reads_the_system_config() {
         let d = tempfile::tempdir().unwrap();

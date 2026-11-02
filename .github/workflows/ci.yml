@@ -28,7 +28,9 @@ jobs:
       # system temp dir) stays off a quota'd or shared /tmp.
       # On windows-latest (plan 19a) TMP, TEMP and LOCALAPPDATA sit under the
       # runner temp dir too, so no test writes the runner's real profile
-      # paths that honour them; the other OSes ignore the three.
+      # paths that honour them; the other OSes ignore the three. USERPROFILE is
+      # not set here: cargo and rustup find their own homes through it. Each test
+      # child sets it instead (`common::set_profile`).
       - run: cargo test --workspace --no-fail-fast
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s

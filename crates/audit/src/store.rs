@@ -30,11 +30,7 @@ fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// data dir. On Windows that is the local (non-roaming) app data (W3), so the
 /// log never follows a roaming profile; elsewhere it is `dirs::data_dir()`.
 pub fn default_audit_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let base = dirs::data_local_dir();
-    #[cfg(not(windows))]
-    let base = dirs::data_dir();
-    base.map(|d| d.join("saiife").join("audit"))
+    saiife_win::profile::data_base_dir().map(|d| d.join("saiife").join("audit"))
 }
 
 /// Append one record as a single line to `<dir>/<YYYY-MM>.jsonl`, creating the
@@ -320,7 +316,10 @@ mod tests {
     #[test]
     fn default_audit_dir_windows_is_local() {
         // W3: local app data, never the roaming profile. CI-only (windows-latest).
-        let want = dirs::data_local_dir().unwrap().join("saiife").join("audit");
+        let want = saiife_win::profile::data_base_dir()
+            .unwrap()
+            .join("saiife")
+            .join("audit");
         assert_eq!(default_audit_dir(), Some(want));
     }
 
@@ -708,11 +707,13 @@ mod tests {
     #[test]
     fn default_dir_honors_env_override() {
         // Only this test touches DIR_ENV in this test binary.
-        std::env::set_var(DIR_ENV, "/tmp/saiife-audit-override");
-        assert_eq!(
-            default_dir(),
-            Some(PathBuf::from("/tmp/saiife-audit-override"))
-        );
+        let absolute = if cfg!(windows) {
+            r"C:\saiife-audit-override"
+        } else {
+            "/tmp/saiife-audit-override"
+        };
+        std::env::set_var(DIR_ENV, absolute);
+        assert_eq!(default_dir(), Some(PathBuf::from(absolute)));
         std::env::set_var(DIR_ENV, "");
         assert!(default_dir().unwrap().ends_with("saiife/audit"));
         std::env::remove_var(DIR_ENV);
@@ -786,9 +787,14 @@ mod tests {
         assert!(default.as_ref().unwrap().ends_with("saiife/audit"));
         assert_eq!(dir_from(Some("rel-audit".into())), default);
         assert_eq!(dir_from(Some("".into())), default);
+        let absolute = if cfg!(windows) {
+            r"C:\abs\audit"
+        } else {
+            "/abs/audit"
+        };
         assert_eq!(
-            dir_from(Some("/abs/audit".into())),
-            Some(PathBuf::from("/abs/audit"))
+            dir_from(Some(absolute.into())),
+            Some(PathBuf::from(absolute))
         );
     }
 

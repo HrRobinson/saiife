@@ -100,6 +100,7 @@ pub fn launchd_plist_text(exe: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     const EXPECT: &str = "[Unit]
 Description=saiife personal broker (not a security boundary)
 
@@ -120,11 +121,17 @@ LimitCORE=0
 WantedBy=default.target
 ";
 
+    // systemd and launchd units: the personal broker is Linux and macOS only (plan 16),
+    // and `/opt/x/saiife` is not absolute to a Windows host.
+    #[cfg(unix)]
     #[test]
     fn unit_text_exact() {
         assert_eq!(user_unit_text(Path::new("/opt/x/saiife")).unwrap(), EXPECT);
     }
 
+    // systemd and launchd units: the personal broker is Linux and macOS only (plan 16),
+    // and `/opt/x/saiife` is not absolute to a Windows host.
+    #[cfg(unix)]
     #[test]
     fn unit_escapes_percent() {
         let t = user_unit_text(Path::new("/opt/50%/saiife")).unwrap();
@@ -158,6 +165,9 @@ WantedBy=default.target
         }
     }
 
+    // systemd and launchd units: the personal broker is Linux and macOS only (plan 16),
+    // and `/opt/x/saiife` is not absolute to a Windows host.
+    #[cfg(unix)]
     #[test]
     fn plist_escapes_xml_and_parses_shape() {
         let t = launchd_plist_text(Path::new("/opt/a&b<c>/saiife")).unwrap();

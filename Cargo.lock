@@ -1397,7 +1397,6 @@ dependencies = [
  "assert_cmd",
  "base64 0.23.1",
  "clap",
- "dirs",
  "libc",
  "predicates",
  "rcgen",
@@ -1413,6 +1412,7 @@ dependencies = [
  "saiife-mcp",
  "saiife-policy",
  "saiife-system",
+ "saiife-win",
  "security-framework",
  "serde",
  "serde_json",
@@ -1429,8 +1429,8 @@ dependencies = [
 name = "saiife-agents"
 version = "0.2.0"
 dependencies = [
- "dirs",
  "rustix",
+ "saiife-win",
  "serde",
  "serde_json",
  "sha2",
@@ -1444,12 +1444,12 @@ name = "saiife-audit"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
- "dirs",
  "ed25519-dalek",
  "getrandom 0.3.4",
  "libc",
  "regex",
  "rustix",
+ "saiife-win",
  "serde",
  "serde_json",
  "sha2",
@@ -1624,6 +1624,7 @@ dependencies = [
 name = "saiife-win"
 version = "0.2.0"
 dependencies = [
+ "dirs",
  "sha1",
  "sha2",
  "windows-sys 0.61.2",
