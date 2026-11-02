@@ -20,7 +20,17 @@
 #   - crates/darwin/src/lib.rs drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-macOS forbid or its macOS
 #     deny, or crates/darwin/src has other than exactly two
-#     `allow(unsafe_code)` sites.
+#     `allow(unsafe_code)` sites;
+#   - crates/win (saiife-win, plan 19a) drops its `unsafe_op_in_unsafe_fn` /
+#     `undocumented_unsafe_blocks` lints, leaves `ffi` compiled off Windows, or
+#     has an `allow(unsafe_code)`. Linux never compiles `ffi`, so the compiler
+#     lint alone would catch those only on Windows.
+#
+# saiife-win has no FFI in plan 19a, so it gets no exemption: the rules above
+# hold for it as for any other crate, on every target. Plan 19b, which adds the
+# FFI, makes it the second exempt crate in this script: crates/win/src/ffi/ for
+# the grep, and its `cfg_attr(not(windows), forbid(unsafe_code))` form for the
+# crate root.
 #
 # Known limit: `unsafe` that a dependency's macro expands into our code is
 # invisible to the grep. The compiler lint still catches it, unless the macro
@@ -101,6 +111,22 @@ if [ -e "$d" ]; then
         | grep -cvE '^[[:space:]]*(//|/\*)' || true)"
     if [ "$allows" != 2 ]; then
         err "crates/darwin/src has $allows allow(unsafe_code) sites, want exactly 2"
+    fi
+fi
+
+# 5. The win crate's guard rails.
+w=crates/win/src/lib.rs
+if [ -e "$w" ]; then
+    grep -qE '^#!\[deny\(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks\)\]' "$w" \
+        || err "$w lacks #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]"
+    ffi=crates/win/src/ffi/mod.rs
+    if [ -e "$ffi" ] && ! grep -qE '^#!\[cfg\(windows\)\]' "$ffi"; then
+        err "$ffi lacks #![cfg(windows)] at column 0"
+    fi
+    allows="$(grep -rhE --include='*.rs' 'allow\([^)]*unsafe_code' crates/win/src \
+        | grep -cvE '^[[:space:]]*(//|/\*)' || true)"
+    if [ "$allows" != 0 ]; then
+        err "crates/win/src has $allows allow(unsafe_code) sites, want none"
     fi
 fi
 

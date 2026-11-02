@@ -42,13 +42,19 @@ jobs:
           bash5="$(brew --prefix)/bin/bash"
           [ -x "$bash5" ] || brew install bash
           BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
-      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp and saiife-darwin must not
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin | grep -c tokio)" = 0
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
       # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
       - name: unsafe only in saiife-darwin
         run: bash scripts/check-unsafe.sh
+      # Windows code compile-checked from Linux, with a stand-in C compiler (plan 19a).
+      - name: windows target check
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          bash scripts/check-windows.sh
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
