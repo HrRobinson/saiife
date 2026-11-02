@@ -40,12 +40,12 @@ const NOTE_START: &str = "Start-Process has no readable program";
 const NOTE_PURGE: &str = "robocopy deletes files in its target";
 const NOTE_ROBOCOPY: &str = "robocopy has no readable source and target";
 const NOTE_FUNCTION: &str = "a function or alias is defined through its drive";
-const NOTE_TOO_LONG: &str = "a path list too long to join";
+pub(crate) const NOTE_TOO_LONG: &str = "a path list too long to join";
 
 /// Bytes the paths joined from a list and a name may come to: `ni a,a,… -Name
 /// bbb…` is a product, and the hook runs on every call. Past this they stay
 /// apart, and the note says so.
-const MAX_JOINED: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_JOINED: usize = 4 * 1024 * 1024;
 
 /// PowerShell's common parameters, on every cmdlet. None names a path.
 const COMMON: &[(&str, Act)] = &[
@@ -203,6 +203,26 @@ const WRITE_PARAMS: &[(&str, Act)] = with_literal![
     ("Confirm", Act::Drop),
 ];
 
+/// `Tee-Object`, `Export-Csv`, `Export-Clixml`: the file they write.
+const OUTPUT_PARAMS: &[(&str, Act)] = with_literal![
+    ("FilePath", Act::Path),
+    ("Variable", Act::Skip),
+    ("InputObject", Act::Skip),
+    ("Encoding", Act::Skip),
+    ("Delimiter", Act::Skip),
+    ("Depth", Act::Skip),
+    ("QuoteFields", Act::Skip),
+    ("UseQuotes", Act::Skip),
+    ("Append", Act::Drop),
+    ("Force", Act::Drop),
+    ("NoClobber", Act::Drop),
+    ("NoTypeInformation", Act::Drop),
+    ("NTI", Act::Drop),
+    ("IncludeTypeInformation", Act::Drop),
+    ("ITI", Act::Drop),
+    ("UseCulture", Act::Drop),
+];
+
 const COPY_RECURSE: &[(&str, Act)] = &[
     ("s", Act::Flag("-r")),
     ("e", Act::Flag("-r")),
@@ -249,6 +269,20 @@ const TABLE: &[Row] = &[
             ("ToSession", Act::Skip),
         ],
         slash: COPY_RECURSE,
+    },
+    // An archive reads its sources and writes its destination.
+    Row {
+        ps: &["compress-archive", "expand-archive"],
+        cmd: &[],
+        to: To::Cp,
+        params: with_literal![
+            ("DestinationPath", Act::Target),
+            ("CompressionLevel", Act::Skip),
+            ("Force", Act::Drop),
+            ("Update", Act::Drop),
+            ("PassThru", Act::Drop),
+        ],
+        slash: &[],
     },
     Row {
         ps: &["robocopy"],
@@ -335,7 +369,30 @@ const TABLE: &[Row] = &[
         slash: &[],
     },
     Row {
-        ps: &["start-transcript", "export-alias"],
+        ps: &["tee-object", "tee", "export-csv", "epcsv", "export-clixml"],
+        cmd: &[],
+        to: To::Write,
+        params: OUTPUT_PARAMS,
+        slash: &[],
+    },
+    Row {
+        ps: &["set-acl"],
+        cmd: &[],
+        to: To::Write,
+        params: with_literal![
+            ("AclObject", Act::Skip),
+            ("InputObject", Act::Skip),
+            ("CentralAccessPolicy", Act::Skip),
+            ("Filter", Act::Skip),
+            ("Include", Act::Skip),
+            ("Exclude", Act::Skip),
+            ("ClearCentralAccessPolicy", Act::Drop),
+            ("PassThru", Act::Drop),
+        ],
+        slash: &[],
+    },
+    Row {
+        ps: &["start-transcript", "export-alias", "epal"],
         cmd: &[],
         to: To::Write,
         params: with_literal![
@@ -649,19 +706,51 @@ fn has_row(lower: &str, dialect: Dialect) -> bool {
 }
 
 /// Path-shaped: it holds a separator or a wildcard, or starts like a relative
-/// or home path. A URL is not one.
+/// or home path.
 fn path_shaped(text: &str) -> bool {
-    !text.contains("://")
-        && (text.contains(['\\', '/', '*', '?', '['])
-            || text.starts_with('.')
-            || text.starts_with('~'))
+    text.contains(['\\', '/', '*', '?', '[']) || text.starts_with('.') || text.starts_with('~')
 }
 
-/// The default for a command the table and `operands` do not know: `cat` of its
-/// path-shaped non-parameter words, so the read rules see them. `Test-Path
-/// .env` is denied by this, an accepted cost: `Format-Hex`, `Get-FileHash`,
-/// `Send-MailMessage -Attachments`, `notepad` and `certutil` all read, and no
-/// list of them could be complete.
+/// Can this word name a file? Not a URL. Not a bare word no file can be called
+/// (`a|b`, `<a>`, blanks): the path rules would call it unreadable and deny
+/// `Where-Object Name -match 'a|b'`, with no file at stake. A word with a path's
+/// shape stays, whatever else is in it.
+fn may_be_a_file(text: &str) -> bool {
+    let impossible = text.trim().is_empty()
+        || text.contains(|c: char| matches!(c, '<' | '>' | '"' | '|') || c.is_control());
+    !text.contains("://") && (path_shaped(text) || !impossible)
+}
+
+/// The parts of an argument that may name a file: the value of `-x=v`, `-x:v`
+/// and `--x=v`, and for `k=v` the word, its first value and its last
+/// (`--from-file=k=.env`). At most three, so a word of `=` stays linear.
+fn file_parts(text: &str) -> Vec<&str> {
+    let body = if text.starts_with('-') {
+        match text.find(['=', ':']) {
+            Some(at) => &text[at + 1..],
+            None => return Vec::new(),
+        }
+    } else {
+        text
+    };
+    let mut parts = vec![body];
+    if let (Some(first), Some(last)) = (body.find('='), body.rfind('=')) {
+        parts.push(&body[first + 1..]);
+        if last != first {
+            parts.push(&body[last + 1..]);
+        }
+    }
+    parts.retain(|p| may_be_a_file(p));
+    parts
+}
+
+/// The default for a command the table and `operands` do not know: `cat` of
+/// every word that may name a file, parameter values included, so the read
+/// rules see them. A bare word counts: `notepad id_rsa` reads the file in the
+/// working directory, and nothing tells it from `npm test`, whose read matches
+/// no rule. `Test-Path .env` is denied by this, an accepted cost: `Format-Hex`,
+/// `Get-FileHash`, `Send-MailMessage -Attachments`, `notepad` and `certutil` all
+/// read, and no list of them could be complete.
 pub(crate) fn companion_read(seg: &[Word], dialect: Dialect) -> Option<Vec<Word>> {
     let first = seg.first()?;
     if first.redirect || first.has_substitution {
@@ -693,24 +782,29 @@ pub(crate) fn companion_read(seg: &[Word], dialect: Dialect) -> Option<Vec<Word>
         if w.has_substitution {
             continue;
         }
-        let value = if is_parameter(w) {
-            param_shape(w).and_then(|(_, v)| v).unwrap_or("")
-        } else if w.text.starts_with("--") {
-            w.text.split_once('=').map_or("", |(_, v)| v)
-        } else if w.text.starts_with('-') {
-            ""
-        } else {
-            w.text.as_str()
-        };
-        if path_shaped(value) {
+        for part in file_parts(&w.text) {
             out.push(b.operand(
                 &Word {
-                    text: value.to_string(),
+                    text: part.to_string(),
                     ..w.clone()
                 },
                 false,
             ));
         }
+    }
+    (out.len() > 1).then_some(out)
+}
+
+/// `cat` of the strings a pipeline starts with.
+pub(crate) fn value_read(values: &[Word]) -> Option<Vec<Word>> {
+    let b = Builder {
+        dialect: Dialect::PowerShell,
+        note: None,
+        redirects: Vec::new(),
+    };
+    let mut out = vec![plain("cat")];
+    for w in values.iter().filter(|w| may_be_a_file(&w.text)) {
+        out.push(b.operand(w, false));
     }
     (out.len() > 1).then_some(out)
 }
@@ -1184,7 +1278,9 @@ impl Builder {
                     }
                 }
                 Item::Pos { word, cont } => {
-                    if targets.is_empty() || (cont && last_was_target) {
+                    // `Tee-Object` has one, but the real `tee` writes them all.
+                    let tee = lower == "tee";
+                    if targets.is_empty() || (cont && last_was_target) || tee {
                         targets.push(self.operand(&word, false));
                         last_was_target = true;
                     } else {
@@ -1199,9 +1295,15 @@ impl Builder {
             self.noted(NOTE_TARGET);
         }
         // `sc` is `Set-Content` in 5.1 and `sc.exe` in 7: both stay readable.
+        // `Set-Acl` is a write and a name the packs know.
         let mut out = Vec::new();
-        if lower == "sc" {
-            out.push(plain("sc"));
+        let named = match lower {
+            "sc" => Some("sc"),
+            "set-acl" => Some("Set-Acl"),
+            _ => None,
+        };
+        if let Some(name) = named {
+            out.push(plain(name));
             out.extend(args.iter().filter(|w| !w.redirect).cloned());
         }
         for t in targets {
@@ -1651,6 +1753,16 @@ fn powershell_nested(args: &[Word]) -> Option<String> {
         // Quotes do not count: PowerShell strips them for a native program, so
         // `powershell '-c' 'x'` is `-c x`. Blanks mean a string, not an option.
         let option = option.filter(|o| !w.has_substitution && !o.contains(char::is_whitespace));
+        // `/tmp/x.ps1` is no `/option`: that name holds no path or extension.
+        if w.text.starts_with('/')
+            && option.is_some_and(|o| {
+                o.split(':')
+                    .next()
+                    .is_some_and(|n| n.contains(['/', '\\', '.']))
+            })
+        {
+            return unresolved();
+        }
         let Some(option) = option else {
             // `powershell.exe`'s default parameter is -Command. `pwsh` takes a
             // file there: the text is judged either way.
@@ -1744,7 +1856,10 @@ fn iex_nested(args: &[Word]) -> Option<String> {
                     None => return Some(UNRESOLVED.to_string()),
                 },
             }
-        } else if value.is_none() && matches!(lookup(COMMON, name), Lookup::Found(Act::Skip)) {
+        } else if value.is_none()
+            && (w.text.ends_with(':') || matches!(lookup(COMMON, name), Lookup::Found(Act::Skip)))
+        {
+            // `-Verbose: $true`: a trailing colon takes the next word.
             i += 1;
         }
     }
