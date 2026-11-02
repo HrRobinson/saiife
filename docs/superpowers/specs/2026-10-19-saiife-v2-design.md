@@ -710,12 +710,20 @@ applies and the engine is unchanged.
   one literal string, `Invoke-Command -ScriptBlock { … }`, `& { … }` and
   `. { … }`. A nested string whose dialect is known is read in that
   dialect.
-- **What the readers cannot see** is treated like the POSIX lexer's
-  unresolved substitution (`Word.has_substitution`). The engine's existing
-  handling applies, the same outcome `eval "$x"` gets today. This covers
-  `$var` and `$(…)` in a command position or an operand, `& $x`, `iex` of a
-  non-literal, cmd `%VAR%` and `!VAR!`, an `-EncodedCommand` that does not
-  decode, and a here-string with expansions.
+- **What the readers cannot see** is marked like the POSIX lexer's
+  unresolved substitution (`Word.has_substitution`), and **denied, in every
+  mode**: the attacker chooses this syntax, so a recorded allow would be a
+  bypass. (POSIX `eval "$x"` keeps its own outcome.) This covers `$var` and
+  `$(…)` in a command position or an operand, `& $x`, `iex` of a non-literal,
+  cmd `%VAR%` and `!VAR!`, an `-EncodedCommand` that does not decode, a
+  here-string with expansions, and a broken payload whose tool is `PowerShell`.
+  Under `Strictest` this holds for the PowerShell reading. A note from the POSIX
+  or cmd reading there is recorded, and follows `Fail` below, because that
+  grammar over text meant for another shell is noise (`%h%d`, a backtick).
+- **Budget, panic and oversize follow `Fail`,** in every dialect:
+  `error_allowed` in developer mode, `error_denied` in locked. A failed stdin
+  read in developer mode stays open. So a padded line can force a recorded
+  allow in developer mode, the gap POSIX already has; the record shows it.
 - **Limits, written down** (as `cd` tracking is for POSIX in §10):
   aliases and functions defined in the same command (`Set-Alias`,
   `function f {…}`), `.ps1` script contents, .NET calls

@@ -462,7 +462,7 @@ fn an_unreadable_powershell_command_is_no_allow() {
             trace: AllowTrace::FailedOpenTimeout
         }
     ));
-    assert!(slow.evaluate_call("a; b", PS).is_deny());
+    assert!(!slow.evaluate_call("a; b", PS).is_deny());
     // The PowerShell reading decides for a shell that may be PowerShell; a POSIX
     // reading's note does not block (a backtick is no POSIX mistake here).
     assert!(e.evaluate_call("iex $x", STRICTEST).is_deny());
@@ -864,6 +864,13 @@ fn cmd_files_and_globs() {
 fn cd_tracking_stays_posix_on_posix() {
     let e = Engine::new(packs());
     assert!(!e.evaluate("cd C:/ && rm -rf *").is_deny());
+    // A colon is an ordinary character, and `..` climbs out of it.
+    let (shipped, _) = Catalog::builtin().load_active(&[]);
+    let e = Engine::new(shipped);
+    for cmd in ["cd /x: && rm -rf ../etc", "cd /x: && cd .. && rm -rf etc"] {
+        let got = e.evaluate(cmd);
+        assert!(got.is_deny(), "{cmd}: {got:?}");
+    }
 }
 
 #[test]
@@ -905,4 +912,421 @@ fn long_lines_stay_linear() {
     let start = std::time::Instant::now();
     let _ = read(&line);
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Bare `else` ends nothing outside an `if`: it is an argument there.
+#[test]
+fn else_splits_only_after_an_if() {
+    let e = engine();
+    for d in [CMD, PS, STRICTEST] {
+        for cmd in [r"cmd /c rd /s /q else C:\", "cmd /c type else .env"] {
+            let got = e.evaluate_in(cmd, d);
+            assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+        }
+    }
+    assert_eq!(
+        one(r"rd /s /q else C:\"),
+        ["rm", "-r", "-f", "else", r"C:\"]
+    );
+    assert_eq!(one("type else .env"), ["cat", "else", ".env"]);
+    // After an `if`, both readings: all of it is arguments (what cmd does), and
+    // what follows `else` runs (the over-read).
+    assert!(has_rm_r(r"if a==b rd /s /q else C:\", r"C:\"));
+    assert!(e.evaluate_in("if a==b type else .env", CMD).is_deny());
+    assert!(has_rm_r(r"if a==b echo x else rd /s /q C:\", r"C:\"));
+    assert!(has_rm_r(r"if a==b (echo x) else rd /s /q C:\", r"C:\"));
+    // Each `else` of a chain, while the cap lasts; past it, a note.
+    let chain = format!("{} rd /s /q C:\\", "if a==a b else ".repeat(4));
+    assert!(has_rm_r(&chain, r"C:\"), "{:?}", read(&chain));
+    assert!(noted(&"if a==a b else ".repeat(40)));
+    assert!(!noted("if a==a b else c"));
+}
+
+/// `==""`: the right operand is there, it is only empty.
+#[test]
+fn an_empty_operand_is_an_operand() {
+    for cmd in [
+        r#"if ""=="" rd /s /q C:\"#,
+        r#"if a=="" rd /s /q C:\"#,
+        r#"if a =="" rd /s /q C:\"#,
+        r#"if "" =="" rd /s /q C:\"#,
+        r#"if "" == "" rd /s /q C:\"#,
+    ] {
+        assert!(has_rm_r(cmd, r"C:\"), "{cmd}: {:?}", read(cmd));
+    }
+    let e = engine();
+    assert!(e.evaluate_in(r#"if ""=="" rd /s /q C:\"#, CMD).is_deny());
+    assert!(e
+        .evaluate_in(r#"cmd /c 'if a=="" type .env'"#, PS)
+        .is_deny());
+    // A word after a bare `==` is still the operand, not the command.
+    assert_eq!(read(r"if a== b c"), [["c"]]);
+    assert_eq!(read(r"if a == b c"), [["c"]]);
+}
+
+/// A caret is gone before the inner `cmd` reads the line, so `^&` is an
+/// operator there. Only a real quote keeps a word whole.
+#[test]
+fn a_caret_does_not_requote() {
+    let e = engine();
+    for (cmd, d) in [
+        (r#"cmd /c "cmd /c echo a ^& rd /s /q C:\""#, PS),
+        (r#"cmd /c "cmd /c echo a ^& rd /s /q C:\""#, CMD),
+        (r"cmd /c echo a ^& rd /s /q C:\", CMD),
+        (r"cmd /c echo a ^&^& rd /s /q C:\", CMD),
+        (r"cmd /c echo a ^| rd /s /q C:\", CMD),
+    ] {
+        let got = e.evaluate_in(cmd, d);
+        assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+    }
+    assert!(!split_segments_noted("a^&b").0[0][0].quoted);
+    let got = e.evaluate_in(r#"cmd /c echo x "a & rd /s /q C:\""#, CMD);
+    assert!(!got.is_deny(), "{got:?}");
+}
+
+/// `,`, `;` and `=` are blanks to cmd in front of its own switch.
+#[test]
+fn delimiters_before_a_cmd_switch() {
+    let e = engine();
+    for (cmd, d) in [
+        (r"cmd;/c rd /s /q C:\", STRICTEST),
+        (r"cmd;/c rd /s /q C:\", CMD),
+        (r"cmd,/c rd /s /q C:\", CMD),
+        (r"cmd=/c rd /s /q C:\", CMD),
+        (r"cmd /s,/c rd /s /q C:\", CMD),
+        ("cmd /c cmd=/c type .env", PS),
+        ("cmd /c cmd=/c type .env", CMD),
+        ("cmd /c cmd;/c type .env", PS),
+        (r"cmd =/c rd /s /q C:\", PS),
+    ] {
+        let got = e.evaluate_in(cmd, d);
+        assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+    }
+    assert!(!noted("cmd ;/q"));
+}
+
+/// Lines built to make the reader rewind or rescan: `(name, line)`.
+fn hostile_lines() -> Vec<(&'static str, String)> {
+    // The most a hook payload holds, whatever the unit's length.
+    let r = |s: &str| s.repeat(256 * 1024 / s.len());
+    vec![
+        ("for", r("for ")),
+        ("for tab", r("for\t")),
+        ("for then in", format!("{}in y", r("for "))),
+        ("for in", r("for in ")),
+        ("for in (", r("for in (")),
+        ("for x in (a) do", r("for x in (a) do ")),
+        ("for /f", r("for /f ")),
+        ("for slash", r("for/")),
+        ("for in blocks", format!("{}in y", r("(for "))),
+        ("if", r("if ")),
+        ("if a==a", r("if a==a ")),
+        ("if else", r("if a==a b else ")),
+        ("if else plain", format!("if a==a {}", r("else "))),
+        ("else", r("else ")),
+        ("else(", r("else(")),
+        ("call", r("call ")),
+        ("start", format!("start {}", r("start "))),
+        ("set", r("set ")),
+        ("open", r("(")),
+        ("close", r(")")),
+        ("amp", r("&")),
+        ("pipe", r("|")),
+        ("newline", r("\n")),
+        ("caret", r("^")),
+        ("caret newline", r("^\n")),
+        ("quote", r("\"")),
+        ("percent", r("%")),
+        ("percent a", r("%a")),
+        ("percent space", r("% ")),
+        ("bang", r("!")),
+        ("bang a", r("!a")),
+        ("bang space", r("! ")),
+        ("redirect", r(">")),
+        ("redirect word", r(">a ")),
+        ("redirect digit", r("2>a ")),
+        ("slash", r("/")),
+        ("name slash", r("rd/")),
+        ("dot", r(".")),
+        ("name dot", r("cd.")),
+        ("name plus", r("rd+")),
+        ("del words", format!("del {}", r("a "))),
+        ("del delims", format!("del {}", r("a,"))),
+        ("cd words", format!("cd {}", r("a "))),
+        ("copy plus", format!("copy {}", r("a+"))),
+        ("mklink", format!("mklink {}", r("a "))),
+        ("find words", format!("find {}", r("./a "))),
+        ("find switches", format!("find {}", r("/a:b "))),
+        ("cmd switches", format!("cmd {}", r("/a "))),
+        ("cmd run", format!("cmd {}", r("/a"))),
+        ("cmd cmd", r("cmd /c ")),
+        ("equals", format!("if {}", r("=="))),
+    ]
+}
+
+/// The reader runs before any budget is checked, and past the hook's timeout
+/// Codex and Gemini run the command (§9.3). So it stays linear on any line.
+#[test]
+fn hostile_lines_stay_linear() {
+    for (name, line) in hostile_lines() {
+        let start = std::time::Instant::now();
+        let _ = split_segments_noted(&line);
+        let took = start.elapsed();
+        println!("{name}: {took:?}");
+        assert!(took < std::time::Duration::from_secs(5), "{name}: {took:?}");
+    }
+}
+
+/// The attack the line above is for: what comes first is still judged, in time.
+#[test]
+fn a_rewinding_tail_does_not_hide_the_command() {
+    // The budget is the hook's business: this is about the reader's time.
+    let e = engine().with_budget(std::time::Duration::from_secs(60));
+    let line = format!(r"rd /s /q C:\ & {}", "for ".repeat(64_000));
+    let start = std::time::Instant::now();
+    let got = e.evaluate_in(&line, CMD);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(got.is_deny(), "{got:?}");
+}
+
+/// Under `Strictest` the cmd reading never denies by a note, and never vanishes.
+#[test]
+fn strictest_keeps_what_the_cmd_reading_could_not_read() {
+    let e = engine();
+    let quiet = "git log --format=%h%d";
+    assert!(!e.evaluate_call(quiet, PS).is_deny());
+    let got = e.evaluate_call(quiet, STRICTEST);
+    assert!(is_unjudged(&got), "{got:?}");
+    for cmd in [r"set x=rd& %x% /s /q C:\", "evil.bat"] {
+        let got = e.evaluate_in(cmd, STRICTEST);
+        assert!(!is_clean(&got), "{cmd}: {got:?}");
+    }
+    let got = e.evaluate_in(r"for %i in (a) do@rd /s /q C:\", STRICTEST);
+    assert!(got.is_deny(), "{got:?}");
+}
+
+/// Fail policy: what the attacker wrote and the reader cannot read denies; a
+/// budget follows `Fail`, so the reading stays a recorded outcome.
+#[test]
+fn unreadable_denies_and_the_budget_follows_fail() {
+    let e = engine();
+    for (cmd, d) in [
+        ("iex $x", PS),
+        ("iex $x", STRICTEST),
+        (r"%x% /s /q C:\", CMD),
+        ("x.bat", CMD),
+    ] {
+        let got = e.evaluate_call(cmd, d);
+        assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+    }
+    let slow = Engine::new(packs())
+        .with_paths(windows_vars())
+        .with_budget(std::time::Duration::ZERO);
+    for d in [PS, CMD, STRICTEST] {
+        let got = slow.evaluate_call("a; b", d);
+        assert!(
+            matches!(
+                got,
+                Decision::Allow {
+                    trace: AllowTrace::FailedOpenTimeout
+                }
+            ),
+            "{d:?}: {got:?}"
+        );
+    }
+}
+
+/// `\` and `/` are the root of the drive the shell is on.
+#[test]
+fn a_rooted_cd_lands_on_the_current_drive() {
+    let e = engine();
+    for cmd in [
+        r"cd\ & rd /s /q .",
+        r"cd \ & rd /s /q .",
+        "cd / & rd /s /q .",
+        r"pushd \ & rd /s /q .",
+        r"chdir \ & rd /s /q .",
+        r"cd \ & rd /s /q *",
+        r"cd \x\.. & rd /s /q .",
+    ] {
+        let got = e.evaluate_in(cmd, CMD);
+        assert!(got.is_deny(), "{cmd}: {got:?}");
+    }
+    assert!(!e.evaluate_in(r"cd \x & rd /s /q .", CMD).is_deny());
+    // A share is not on the drive.
+    assert!(!e.evaluate_in(r"cd \\h\s & rd /s /q .", CMD).is_deny());
+}
+
+#[test]
+fn start_splits_a_name_at_its_switch() {
+    let e = engine();
+    for cmd in [
+        "start cmd/c type .env",
+        r"start cmd/c rd /s /q C:\",
+        r#"start "title" cmd/c type .env"#,
+        "start /b cmd/c type .env",
+    ] {
+        let got = e.evaluate_in(cmd, CMD);
+        assert!(got.is_deny(), "{cmd}: {got:?} {:?}", read(cmd));
+    }
+}
+
+#[test]
+fn keywords_end_at_a_paren_or_at_sign() {
+    let e = engine();
+    for (cmd, d) in [
+        (r"if a==b (echo x) else(rd /s /q C:\)", CMD),
+        (r"cmd /c 'if a==b (echo x) else(rd /s /q C:\)'", PS),
+        (r"if a==b (echo x) else@rd /s /q C:\", CMD),
+        (r"for %i in (a) do(rd /s /q C:\)", CMD),
+        (r"for %i in (a) do@rd /s /q C:\", CMD),
+        (r"for %i in (a) do,rd /s /q C:\", CMD),
+        (r"if(a)==(a) rd /s /q C:\", CMD),
+    ] {
+        let got = e.evaluate_in(cmd, d);
+        assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+    }
+    // A program named so is not the keyword.
+    assert_eq!(read("done x")[0][0], "done");
+    assert_eq!(read("elsewhere x")[0][0], "elsewhere");
+}
+
+/// cmd reads these as the builtin, whatever else it does with the rest.
+#[test]
+fn a_builtin_name_ends_at_more_than_a_slash() {
+    let e = engine();
+    for cmd in [
+        r"rd+ /s /q C:\",
+        r"rd: /s /q C:\",
+        r"rd[ /s /q C:\",
+        r"rd] /s /q C:\",
+        "type\".env\"",
+        "type+.env",
+        "type:.env",
+        "type[.env",
+    ] {
+        let got = e.evaluate_in(cmd, CMD);
+        assert!(got.is_deny(), "{cmd}: {got:?} {:?}", read(cmd));
+    }
+    assert_eq!(read("a+b c")[0][0], "a+b");
+}
+
+/// The no-row rule, as for PowerShell: a program the table does not know gets a
+/// `cat` of its path-shaped words.
+#[test]
+fn a_cmd_command_with_no_row_reads_its_paths() {
+    let e = engine();
+    for cmd in [
+        r#"find "x" .env"#,
+        r#"find /i "x" .env"#,
+        r"find x C:\Users\a\.ssh\id_rsa",
+        "fc .env y",
+        "fc /b .env y",
+        "comp .env y",
+        "certutil -encode .env out",
+        "certutil -dump .env",
+        "expand .env y",
+        "makecab .env y",
+        "print /d:lpt1 .env",
+        "replace .env y",
+        "attrib .env",
+        "tool /in:.env",
+    ] {
+        let got = e.evaluate_in(cmd, CMD);
+        assert!(got.is_deny(), "{cmd}: {got:?} {:?}", read(cmd));
+        assert!(!noted(cmd), "{cmd}");
+    }
+    for cmd in [
+        "rem .env",
+        "title .env",
+        "echo .env",
+        "npm test",
+        "npm run build ./src",
+        "certutil -urlcache -f https://example.com/a x",
+    ] {
+        let got = e.evaluate_in(cmd, CMD);
+        assert!(!got.is_deny(), "{cmd}: {got:?}");
+    }
+    assert_eq!(read("fc /b src/a src/b")[1], ["cat", "src/a", "src/b"]);
+}
+
+/// `tee` and the other commands with a row are judged by what they write, not
+/// noted as unreadable, as a hook call answers it.
+#[test]
+fn tee_is_judged_by_its_target() {
+    const WRITES: &str = r#"
+[pack]
+id = "t.writes"
+triggers = ["rm"]
+
+[[deny_path]]
+glob = "**/.env"
+access = "write"
+reason = "no writing it"
+"#;
+    let mut warnings = Vec::new();
+    let pack = load_pack_str("<t>", WRITES, &mut warnings).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let writes = Engine::new(vec![pack]).with_paths(windows_vars());
+    for d in [CMD, PS, STRICTEST] {
+        let got = writes.evaluate_call("echo x | tee log.txt", d);
+        assert!(is_clean(&got), "{d:?}: {got:?}");
+        let got = writes.evaluate_call("echo x | tee .env", d);
+        let by_rule = matches!(&got, Decision::Deny { pack, .. } if pack == "t.writes");
+        assert!(by_rule, "{d:?}: {got:?}");
+    }
+    let e = default_engine();
+    for cmd in [
+        "Export-Csv out.csv",
+        "Export-Clixml out.xml",
+        "Compress-Archive a b.zip",
+        "Expand-Archive a.zip b",
+        "Tee-Object log.txt",
+    ] {
+        let got = e.evaluate_call(cmd, PS);
+        assert!(is_clean(&got), "{cmd}: {got:?}");
+    }
+}
+
+/// `h:mm` is a format, not a path on drive `h:`, for this parameter of this
+/// command. Anywhere else the spelling is still another drive's path.
+#[test]
+fn a_time_format_is_no_drive() {
+    let e = default_engine();
+    for d in [PS, CMD, STRICTEST] {
+        for cmd in [
+            "Get-Date -Format h:mm",
+            "Get-Date -f h:mm:ss",
+            "get-date -UFormat h:mm",
+            "Get-Date -Format:h:mm",
+            "Get-Date -Format hh:mm",
+        ] {
+            let got = e.evaluate_call(cmd, d);
+            assert!(is_clean(&got), "{cmd} {d:?}: {got:?}");
+        }
+    }
+    for (cmd, d) in [
+        ("Get-Content h:mm", PS),
+        ("type h:mm", CMD),
+        ("Format-Hex -Format h:mm", PS),
+        ("Get-Date -Format .env", PS),
+        ("Get-Date -Format c:.env", PS),
+        (r"Get-Date -Format c:\x\.env", PS),
+    ] {
+        let got = e.evaluate_call(cmd, d);
+        assert!(got.is_deny(), "{cmd} {d:?}: {got:?}");
+    }
+}
+
+/// Windows style reads a relative operand against the starting directory.
+#[test]
+fn a_relative_operand_is_read_from_the_cwd() {
+    let e = engine();
+    assert!(e.evaluate_in(r"rd /s /q ..", CMD).is_deny());
+    assert!(e.evaluate_in(r"Remove-Item -Recurse ..", PS).is_deny());
+    assert!(!e.evaluate_in(r"rd /s /q build", CMD).is_deny());
+    assert!(!e.evaluate_in(r"Remove-Item -Recurse .\build", PS).is_deny());
+    // POSIX style has not changed: no `cd`, no join.
+    let posix = Engine::new(packs());
+    assert!(!posix.evaluate("rm -rf ..").is_deny());
 }

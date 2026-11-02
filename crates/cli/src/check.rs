@@ -115,10 +115,6 @@ pub fn run(
         let audit = Audit::new(agent, HookContext::default(), cli_packs);
         let reason = format!("hook payload larger than {PARSE_MAX_BYTES} bytes; not judged");
         let warning = format!("{reason}; failing open (allow)");
-        let fail = Fail {
-            closed: fail.closed || eval::names_powershell(&buf),
-            ..fail
-        };
         return fail.unjudged(&audit, "", &reason, Some(&warning));
     }
     drop(stdin);
@@ -600,6 +596,42 @@ mod tests {
         );
         // Open, the same calls are allowed.
         assert_eq!(decide(&audit, "x", OPEN, |_| timeout()), ExitCode::SUCCESS);
+    }
+
+    /// Fail policy under `Strictest`: a note from the POSIX or cmd reading, a
+    /// timeout and a panic are recorded and follow `Fail`: `error_allowed` in
+    /// developer mode, `error_denied` in locked. A PowerShell reading it cannot
+    /// read is a deny in both.
+    #[test]
+    fn fail_policy_under_strictest() {
+        use saiifeguard::payload::Dialects;
+        use saiifeguard::wintable::Dialect::{Posix, PowerShell};
+        const STRICTEST: Dialects = Dialects::Strictest(PowerShell, Posix);
+        let engine = Engine::new(Vec::new());
+        let timeout = || Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        };
+        for (fail, code, kind) in [
+            (OPEN, ExitCode::SUCCESS, DecisionKind::ErrorAllowed),
+            (CLOSED, ExitCode::from(2), DecisionKind::ErrorDenied),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let audit = audit_in(dir.path());
+            // cmd: `%h%d`. POSIX: a brace expansion too large to judge.
+            for cmd in ["git log --format=%h%d", "echo a{1..99999999}b"] {
+                let got = decide(&audit, cmd, fail, |c| engine.evaluate_call(c, STRICTEST));
+                assert_eq!(got, code, "{cmd}");
+            }
+            assert_eq!(decide(&audit, "x", fail, |_| timeout()), code);
+            assert_eq!(decide(&audit, "y", fail, |_| panic!("engine bug")), code);
+            let got = decide(&audit, "iex $x", fail, |c| {
+                engine.evaluate_call(c, STRICTEST)
+            });
+            assert_eq!(got, ExitCode::from(2));
+            let recs = store::read_all(dir.path()).records;
+            let kinds: Vec<_> = recs.iter().rev().take(5).map(|r| r.decision).collect();
+            assert_eq!(kinds, [DecisionKind::Deny, kind, kind, kind, kind]);
+        }
     }
 
     fn audit_in(dir: &std::path::Path) -> Audit {

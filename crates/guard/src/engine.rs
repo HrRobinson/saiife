@@ -428,9 +428,10 @@ impl Engine {
     }
 
     /// `evaluate_in` for a hook call: what the PowerShell or cmd reader could
-    /// not read (a note, a value it cannot see, the budget) is a deny, not a
+    /// not read (a note, a value it cannot see) is a deny, in every mode, not a
     /// recorded allow. A misread command is a live bypass there, and `eval`'s
-    /// POSIX outcome stays as it was.
+    /// POSIX outcome stays as it was. Running out of budget is no such thing: it
+    /// stays `FailedOpenTimeout`, which the caller answers by its fail policy.
     pub fn evaluate_call(&self, raw_cmd: &str, dialects: Dialects) -> Decision {
         self.readings(raw_cmd, dialects, |dialect, d| {
             if dialect == Dialect::Posix {
@@ -461,22 +462,7 @@ impl Engine {
         if a == Dialect::Cmd || b == Dialect::Cmd {
             return both;
         }
-        // The shell may be cmd (`ComSpec`), which neither reading sees:
-        // `r^d /s /q C:\`. Its grammar over text meant for another shell is
-        // noise (`%` in `git log --format=%h%d`, `'` is no quote), so only a
-        // deny by a rule counts; a fail-safe deny there is a recorded unknown.
-        match self.reading(raw_cmd, Dialect::Cmd) {
-            Decision::Deny { pattern, .. } if pattern == GUARDED_SUBSTITUTION_PATTERN => stricter(
-                both,
-                Decision::Allow {
-                    trace: AllowTrace::Unjudgeable {
-                        reason: "as cmd, a variable decides this command".to_string(),
-                    },
-                },
-            ),
-            d @ Decision::Deny { .. } => stricter(both, d),
-            Decision::Allow { .. } => both,
-        }
+        with_cmd_reading(both, self.reading(raw_cmd, Dialect::Cmd))
     }
 
     /// One reading, with a budget of its own.
@@ -486,8 +472,10 @@ impl Engine {
         let state = ShellState {
             cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
             cwd_unknown: false,
-            rule_cwd: RuleCwd::start(self.vars.cwd())
-                .styled(self.vars.style() == PathStyle::Windows),
+            rule_cwd: RuleCwd::start_styled(
+                self.vars.cwd(),
+                self.vars.style() == PathStyle::Windows,
+            ),
             env_changed: false,
             ifs_named: false,
         };
@@ -1645,17 +1633,40 @@ fn stricter(a: Decision, b: Decision) -> Decision {
     }
 }
 
-/// A reader's decision as a hook call answers it: what was not read is a deny.
+/// `both` readings, and the shell may be cmd (`ComSpec`), which neither sees:
+/// `r^d /s /q C:\`. cmd's grammar over text meant for another shell is noise (`%`
+/// in `git log --format=%h%d`, `'` is no quote), so only a deny by a rule denies.
+/// What it could not judge stays on the record, for the caller's fail policy:
+/// a fail-safe deny, a note and a timeout are all that.
+fn with_cmd_reading(both: Decision, cmd: Decision) -> Decision {
+    match cmd {
+        Decision::Deny { pattern, .. } if pattern == GUARDED_SUBSTITUTION_PATTERN => stricter(
+            both,
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable {
+                    reason: "as cmd, a variable decides this command".to_string(),
+                },
+            },
+        ),
+        d @ (Decision::Deny { .. }
+        | Decision::Allow {
+            trace: AllowTrace::Unjudgeable { .. } | AllowTrace::FailedOpenTimeout,
+        }) => stricter(both, d),
+        Decision::Allow { .. } => both,
+    }
+}
+
+/// A reader's decision as a hook call answers it: what it could not read is a
+/// deny (the attacker picks that syntax). A timeout passes: its answer is the
+/// caller's fail policy, and it must not be recorded as a deny.
 fn closed_reading(d: Decision) -> Decision {
-    let why = match &d {
-        Decision::Allow {
-            trace: AllowTrace::Unjudgeable { reason },
-        } => reason.as_str(),
-        Decision::Allow {
-            trace: AllowTrace::FailedOpenTimeout,
-        } => "the guard ran out of time",
-        _ => return d,
+    let Decision::Allow {
+        trace: AllowTrace::Unjudgeable { reason },
+    } = &d
+    else {
+        return d;
     };
+    let why = reason.as_str();
     Decision::Deny {
         pack: SUBSTITUTION_GUARD_PACK.to_string(),
         pattern: UNREADABLE_COMMAND_PATTERN.to_string(),
@@ -2569,6 +2580,39 @@ reason = "saiife config"
         let d = tempfile::tempdir().unwrap();
         let p = std::fs::canonicalize(d.path()).unwrap();
         (d, p)
+    }
+
+    /// The cmd reading under `Strictest`: a timeout or a note stays on the
+    /// record and does not deny; a clean one adds nothing; a rule's deny denies.
+    #[test]
+    fn the_cmd_reading_is_never_dropped() {
+        let allow = |trace| Decision::Allow { trace };
+        let clean = || allow(AllowTrace::NoMatch);
+        let timeout = || allow(AllowTrace::FailedOpenTimeout);
+        let note = || {
+            allow(AllowTrace::Unjudgeable {
+                reason: "a note".to_string(),
+            })
+        };
+        let deny = |pattern: &str| Decision::Deny {
+            pack: "p".to_string(),
+            pattern: pattern.to_string(),
+            reason: "r".to_string(),
+            via_inline: None,
+        };
+        assert_eq!(with_cmd_reading(clean(), timeout()), timeout());
+        assert_eq!(with_cmd_reading(clean(), note()), note());
+        assert_eq!(with_cmd_reading(clean(), clean()), clean());
+        assert_eq!(with_cmd_reading(note(), timeout()), timeout());
+        assert_eq!(with_cmd_reading(clean(), deny("rule")), deny("rule"));
+        assert!(matches!(
+            with_cmd_reading(clean(), deny(GUARDED_SUBSTITUTION_PATTERN)),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { .. }
+            }
+        ));
+        // Another reading's deny stands.
+        assert_eq!(with_cmd_reading(deny("a"), timeout()), deny("a"));
     }
 
     #[test]

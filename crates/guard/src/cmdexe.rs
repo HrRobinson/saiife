@@ -48,6 +48,11 @@ const NOTE_LABEL: &str = "call to a label cannot be read";
 const NOTE_NESTED: &str = crate::engine::UNRESOLVED_REASON;
 const NOTE_WILDCARD: &str = "a quoted < or > is a wildcard to a file command";
 
+/// How many unparenthesised `else`s are read twice on one line: as arguments and
+/// as a command of their own. Each is one more pass over the rest of the line,
+/// so past this the line is noted, and stays linear.
+const MAX_ELSE_REREADS: u32 = 8;
+
 /// Lower case: cmd's own commands. `,`, `;` and `=` separate their words.
 const BUILTINS: &[&str] = &[
     "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "echo",
@@ -63,16 +68,7 @@ const OPAQUE: &[&str] = &["assoc", "ftype", "doskey", "path"];
 /// words after translation; the note is `Some(reason)` when something was not
 /// fully read.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
-    let mut r = Reader {
-        c: cmd.chars().collect(),
-        i: 0,
-        out: Vec::new(),
-        note: None,
-        depth: 0,
-        piped: false,
-    };
-    r.statements(false);
-    (r.out, r.note)
+    split_nested(cmd, 0)
 }
 
 /// The nested command of `argv` (`wintable::nested`). For `cmd`, which reads
@@ -105,11 +101,13 @@ pub(crate) fn nested(argv: &[Word]) -> Option<(Dialect, String)> {
     wintable::nested(&quoted)
 }
 
-/// `/c`, `/k`, `/r`, alone or in a run (`/s/c`), attached text included.
+/// `/c`, `/k`, `/r`, alone or in a run (`/s/c`), attached text included, with
+/// the separators cmd skips in front of a switch (`cmd;/c`).
 fn is_run_option(w: &Word) -> bool {
+    let text = w.text.trim_start_matches(is_delim);
     !w.quoted
-        && w.text.starts_with('/')
-        && w.text[1..].split('/').any(|p| {
+        && text.starts_with('/')
+        && text[1..].split('/').any(|p| {
             p.chars()
                 .next()
                 .is_some_and(|c| matches!(c.to_ascii_lowercase(), 'c' | 'k' | 'r'))
@@ -143,10 +141,16 @@ struct Read {
     w: Word,
     /// An unquoted `==` is in it, and where.
     eq: Option<usize>,
+    /// Something follows that `==` in the raw line. `""` leaves no text, but it
+    /// is an operand.
+    eq_tail: bool,
     /// Raw position and text length of its first unquoted `/`, before any
-    /// quote; likewise of its first `\` or `.`.
+    /// quote; likewise of its first `\` or `.`; of its first `+`, `:`, `[`, `]`
+    /// or `"`; and of its first `(` or `@`.
     slash: Option<(usize, usize)>,
     dot: Option<(usize, usize)>,
+    stop: Option<(usize, usize)>,
+    open: Option<(usize, usize)>,
     /// A real `"` is in it. A caret-escaped keyword is still the keyword.
     dq: bool,
 }
@@ -159,6 +163,11 @@ struct Reader {
     depth: u32,
     /// The statement being read takes the last one's output.
     piped: bool,
+    /// Before this position a `for` has no `in (`: an earlier scan found none,
+    /// so the `for`s of `for for for …` do not each scan the line again.
+    no_set_until: usize,
+    /// `else`s read twice so far (`MAX_ELSE_REREADS`).
+    else_rereads: u32,
 }
 
 impl Reader {
@@ -242,6 +251,7 @@ impl Reader {
     /// One statement; stops at the operator that ends it.
     fn statement(&mut self, closing: bool) {
         let mut redirects = Vec::new();
+        let mut after_if = false;
         loop {
             self.skip_to_command();
             if self.at_end(closing) {
@@ -266,6 +276,7 @@ impl Reader {
             if !first.dq {
                 match name.as_str() {
                     "if" => {
+                        after_if = true;
                         self.condition(closing);
                         continue;
                     }
@@ -282,13 +293,13 @@ impl Reader {
                         continue;
                     }
                     "set" => {
-                        self.set(closing, redirects);
+                        self.set(closing, redirects, after_if);
                         return;
                     }
                     _ => {}
                 }
             }
-            self.command(first, closing, redirects);
+            self.command(first, closing, redirects, after_if);
             return;
         }
     }
@@ -306,22 +317,43 @@ impl Reader {
 
     /// `rd/s/q` is `rd /s/q`; a builtin's `cd\` and `cd..` are `cd \` and
     /// `cd ..`. The rest is read again as words. `./x`, `C:/x` and `a.b/c`
-    /// name a path.
-    fn split_name(&mut self, mut first: Read) -> Read {
+    /// name a path. `else(x)`, `else@x` and `if(a)==(a)` are the keyword; `rd+`,
+    /// `rd:`, `rd[` and `type".env"` are the builtin, an over-read.
+    fn split_name(&mut self, first: Read) -> Read {
         if let Some((raw, len)) = first.slash {
             let head = &first.w.text[..len];
             if !head.is_empty() && !head.contains(['.', ':', '\\']) {
-                first.w.text.truncate(len);
-                self.i = raw;
-                return first;
+                return self.cut(first, raw, len);
             }
         }
         if let Some((raw, len)) = first.dot {
             if is_builtin(&first.w.text[..len]) {
-                first.w.text.truncate(len);
-                self.i = raw;
+                return self.cut(first, raw, len);
             }
         }
+        if let Some((raw, len)) = first.open {
+            let head = first.w.text[..len].to_ascii_lowercase();
+            if head == "else" || head == "if" {
+                return self.cut(first, raw, len);
+            }
+        }
+        if let Some((raw, len)) = first.stop {
+            if is_builtin(&first.w.text[..len]) {
+                // A quote opens the next word; the others are gone.
+                let next = raw + usize::from(self.c.get(raw) != Some(&'"'));
+                return self.cut(first, next, len);
+            }
+        }
+        first
+    }
+
+    /// The name is the first `len` of `first`'s text, and the line goes on from
+    /// `raw`. Every position above is before any quote, so the name has none.
+    fn cut(&mut self, mut first: Read, raw: usize, len: usize) -> Read {
+        first.w.text.truncate(len);
+        first.w.quoted = false;
+        first.dq = false;
+        self.i = raw;
         first
     }
 
@@ -352,8 +384,8 @@ impl Reader {
                 }
             }
             // `a==b`, `a== b`, `a ==b`, `a == b`, `a equ b`.
-            if let Some(at) = word.eq {
-                if at + 2 == word.w.text.len() {
+            if word.eq.is_some() {
+                if !word.eq_tail {
                     self.skip_word();
                 }
                 return;
@@ -366,7 +398,7 @@ impl Reader {
                 return;
             };
             if op.eq == Some(0) {
-                if op.w.text.len() == 2 {
+                if !op.eq_tail {
                     self.skip_word();
                 }
                 return;
@@ -399,13 +431,18 @@ impl Reader {
         self.noted(NOTE_FOR);
         let mut lines = false;
         let start = self.i;
+        if start < self.no_set_until {
+            return;
+        }
         loop {
             self.skip_blanks(false);
             if self.at_end(closing) {
+                self.no_set_until = self.i;
                 self.i = start;
                 return;
             }
             let Some(w) = self.read_word(false) else {
+                self.no_set_until = self.i;
                 self.i = start;
                 return;
             };
@@ -418,6 +455,7 @@ impl Reader {
         }
         self.skip_blanks(false);
         if self.peek() != Some('(') {
+            self.no_set_until = self.i;
             self.i = start;
             return;
         }
@@ -442,10 +480,27 @@ impl Reader {
             self.for_lines(set.trim());
         }
         self.skip_blanks(false);
+        // `do(x)`, `do@x` and `do,x` are `do` too.
+        if self.keyword_at("do") {
+            self.i += 2;
+            return;
+        }
         let at = self.i;
         match self.read_word(false) {
             Some(w) if !w.dq && w.w.text.eq_ignore_ascii_case("do") => {}
             _ => self.i = at,
+        }
+    }
+
+    /// `word` starts here, and ends at a blank, `@` or the end of the line.
+    fn keyword_at(&self, word: &str) -> bool {
+        let is = word
+            .chars()
+            .enumerate()
+            .all(|(n, c)| self.at(n).is_some_and(|x| x.eq_ignore_ascii_case(&c)));
+        is && match self.at(word.len()) {
+            None | Some('@' | '(' | ',' | ';' | '=') => true,
+            Some(c) => is_blank(c),
         }
     }
 
@@ -475,10 +530,17 @@ impl Reader {
 
     /// `set NAME=v`, `set "NAME=v"`: an assignment. `/a` and `/p` set a value
     /// that cannot be read. Anything else only prints.
-    fn set(&mut self, closing: bool, redirects: Vec<Word>) {
+    fn set(&mut self, closing: bool, redirects: Vec<Word>, after_if: bool) {
         let mut words: Vec<Word> = Vec::new();
         let mut redirects = redirects;
-        self.words(closing, false, &mut words, &mut redirects);
+        let else_at = self.words(closing, false, &mut words, &mut redirects, after_if);
+        self.set_words(words, redirects);
+        if let Some((at, _)) = else_at {
+            self.reread_else(at);
+        }
+    }
+
+    fn set_words(&mut self, mut words: Vec<Word>, mut redirects: Vec<Word>) {
         let mut computed = false;
         while words.first().is_some_and(|w| {
             !w.quoted && (w.text.eq_ignore_ascii_case("/a") || w.text.eq_ignore_ascii_case("/p"))
@@ -514,21 +576,28 @@ impl Reader {
         self.emit(seg);
     }
 
-    /// The words of a statement up to its end; redirections go aside.
+    /// The words of a statement up to its end; redirections go aside. After an
+    /// `if`, also where its first unquoted `else` is, and how many words came
+    /// before it. It stays a word here: `rd /s /q else C:\` removes both.
     fn words(
         &mut self,
         closing: bool,
         delims: bool,
         out: &mut Vec<Word>,
         redirects: &mut Vec<Word>,
-    ) {
+        after_if: bool,
+    ) -> Option<(usize, usize)> {
+        let mut else_at = None;
         loop {
             self.skip_blanks(delims);
-            if self.at_end(closing) || self.else_ends_statement() {
-                return;
+            if self.at_end(closing) {
+                return else_at;
             }
             if self.redirect(redirects) {
                 continue;
+            }
+            if after_if && else_at.is_none() && self.keyword_at("else") {
+                else_at = Some((self.i, out.len()));
             }
             match self.read_word(delims) {
                 Some(r) => out.push(r.w),
@@ -537,24 +606,42 @@ impl Reader {
         }
     }
 
-    /// `if x (a) else b`, and over-read in `if x a else b`: an unquoted `else`
-    /// starts a command of its own.
-    fn else_ends_statement(&self) -> bool {
-        let is = |n: usize, c: char| self.at(n).is_some_and(|x| x.eq_ignore_ascii_case(&c));
-        is(0, 'e') && is(1, 'l') && is(2, 's') && is(3, 'e') && self.at(4).is_some_and(is_blank)
+    /// `if x a else b`: to cmd all of it is `a`'s arguments, and `b` is also read
+    /// as a command, an over-read: the line goes on from `else`.
+    fn reread_else(&mut self, at: usize) {
+        if self.else_rereads < MAX_ELSE_REREADS {
+            self.else_rereads += 1;
+            self.i = at;
+        } else {
+            self.noted(NOTE_IF);
+        }
     }
 
     /// The rest of a command, and the table.
-    fn command(&mut self, first: Read, closing: bool, mut redirects: Vec<Word>) {
+    fn command(&mut self, first: Read, closing: bool, mut redirects: Vec<Word>, after_if: bool) {
         let name = first.w.text.clone();
         let lower = name.to_ascii_lowercase();
         let delims = !first.dq && is_builtin(&lower);
         let mut args = Vec::new();
-        self.words(closing, delims, &mut args, &mut redirects);
-        let base = CommandName::of(&name).lower();
+        let else_at = self.words(closing, delims, &mut args, &mut redirects, after_if);
         let piped = self.piped;
+        if let Some((_, before)) = else_at {
+            // The words before `else` alone: `if x cd \ else y` may be a `cd \`.
+            let head = args[..before].to_vec();
+            self.judged(first.w.clone(), head, Vec::new(), piped);
+        }
+        self.judged(first.w, args, redirects, piped);
+        if let Some((at, _)) = else_at {
+            self.reread_else(at);
+        }
+    }
+
+    /// One command's words through the table.
+    fn judged(&mut self, name: Word, mut args: Vec<Word>, redirects: Vec<Word>, piped: bool) {
+        let lower = name.text.to_ascii_lowercase();
+        let base = CommandName::of(&name.text).lower();
         self.notes_for(&lower, &base);
-        let mut argv = vec![first.w];
+        let mut argv = vec![name];
         if let Some(seg) = self.links(&base, &args) {
             self.emit_with(seg, redirects);
             return;
@@ -562,6 +649,7 @@ impl Reader {
         match base.as_str() {
             "cd" | "chdir" => cd_words(&mut args),
             "copy" => args = split_plus(args),
+            "start" => split_start_name(&mut args),
             _ => {}
         }
         argv.append(&mut args);
@@ -571,7 +659,11 @@ impl Reader {
         }
         self.check_wildcards(&seg);
         self.check_nested(&mut seg, piped, &redirects);
+        let read = no_row_read(&seg);
         self.emit_with(seg, redirects);
+        if let Some(read) = read {
+            self.emit(read);
+        }
     }
 
     fn notes_for(&mut self, lower: &str, base: &str) {
@@ -705,6 +797,7 @@ impl Reader {
         let mut r = Read::default();
         let mut quote = false;
         let mut seen_quote = false;
+        let mut eq_raw = None;
         let start = self.i;
         while let Some(c) = self.peek() {
             if quote {
@@ -735,6 +828,9 @@ impl Reader {
             }
             match c {
                 '"' => {
+                    if !seen_quote {
+                        r.stop.get_or_insert((self.i, r.w.text.len()));
+                    }
                     quote = true;
                     seen_quote = true;
                     r.dq = true;
@@ -748,13 +844,13 @@ impl Reader {
                             self.i += 1;
                             if let Some(next) = self.peek() {
                                 r.w.text.push(next);
-                                r.w.quoted = true;
                                 self.i += 1;
                             }
                         }
+                        // Not `quoted`: the caret is gone when a nested `cmd`
+                        // reads the line, so `^&` is an operator there.
                         Some(next) => {
                             r.w.text.push(next);
-                            r.w.quoted = true;
                             self.i += 1;
                         }
                         None => {}
@@ -769,10 +865,15 @@ impl Reader {
                             r.slash.get_or_insert(at);
                         } else if c == '\\' || c == '.' {
                             r.dot.get_or_insert(at);
+                        } else if matches!(c, '+' | ':' | '[' | ']') {
+                            r.stop.get_or_insert(at);
+                        } else if matches!(c, '(' | '@') {
+                            r.open.get_or_insert(at);
                         }
                     }
                     if c == '=' && self.at(1) == Some('=') && r.eq.is_none() {
                         r.eq = Some(r.w.text.len());
+                        eq_raw = Some(self.i);
                     }
                     r.w.text.push(c);
                     self.i += 1;
@@ -785,6 +886,7 @@ impl Reader {
         if self.i == start {
             return None;
         }
+        r.eq_tail = eq_raw.is_some_and(|raw| self.i > raw + 2);
         if r.w.text.contains(['*', '?']) {
             r.w.glob = true;
             r.w.glob_dots = true;
@@ -866,9 +968,79 @@ fn split_nested(cmd: &str, depth: u32) -> (Vec<Segment>, Option<&'static str>) {
         note: None,
         depth,
         piped: false,
+        no_set_until: 0,
+        else_rereads: 0,
     };
     r.statements(false);
     (r.out, r.note)
+}
+
+/// `start cmd/c x`: the program's name ends at its switch, as at command
+/// position. The first quoted word is a title, and `/d` takes a directory.
+fn split_start_name(args: &mut Vec<Word>) {
+    let mut i = usize::from(args.first().is_some_and(|w| w.quoted));
+    while let Some(w) = args.get(i) {
+        if !w.text.starts_with('/') {
+            break;
+        }
+        i += if w.text.eq_ignore_ascii_case("/d") {
+            2
+        } else {
+            1
+        };
+    }
+    let Some(w) = args.get(i).filter(|w| !w.quoted) else {
+        return;
+    };
+    let Some(at) = w.text.find('/') else {
+        return;
+    };
+    let head = &w.text[..at];
+    if head.is_empty() || head.contains(['.', ':', '\\']) {
+        return;
+    }
+    let mut name = w.clone();
+    let mut rest = w.clone();
+    rest.text = name.text.split_off(at);
+    args[i] = name;
+    args.insert(i + 1, rest);
+}
+
+/// The no-row rule (`wintable::companion_read`), with cmd's switches: `/x` is no
+/// path, and `/x:v` has a value. cmd's own commands that have no row do not read
+/// their words as files (`rem`, `title`).
+fn no_row_read(seg: &[Word]) -> Option<Vec<Word>> {
+    let first = seg.first()?;
+    if is_builtin(&first.text) {
+        return None;
+    }
+    let mut words = Vec::with_capacity(seg.len());
+    words.push(first.clone());
+    // `operands` takes `find` for the POSIX one, whose first word is a path and
+    // whose expression is not. cmd's has a string first, and files after it.
+    if first.text.eq_ignore_ascii_case("find") {
+        words[0].text = "find.exe".to_string();
+    }
+    for w in &seg[1..] {
+        match switch_value(w) {
+            None => words.push(w.clone()),
+            Some("") => {}
+            Some(value) => {
+                let mut value_word = w.clone();
+                value_word.text = value.to_string();
+                words.push(value_word);
+            }
+        }
+    }
+    wintable::companion_read(&words, Dialect::Cmd)
+}
+
+/// `Some` when `w` is a switch: the value of `/x:v`, or nothing. `/usr/x` has a
+/// second separator in its name, so it stays a path.
+fn switch_value(w: &Word) -> Option<&str> {
+    let rest = w.text.strip_prefix('/').filter(|_| !w.quoted)?;
+    let (name, value) = rest.split_once(':').unwrap_or((rest, ""));
+    (!name.contains(['/', '\\'])).then_some(value)
 }
 
 /// `cd /d C:\x` changes the drive too, and `cd C:\Program Files` is one path.

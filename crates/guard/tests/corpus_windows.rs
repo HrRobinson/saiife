@@ -660,7 +660,6 @@ fn posix_verdicts_change_only_for_drive_mounts() {
 /// same gap. Passes once relative operands are resolved against the starting
 /// directory too.
 #[test]
-#[ignore = "needs cdtrack to resolve relative operands without a cd (Task 6)"]
 fn relative_parent_of_a_one_level_cwd_is_the_drive_root() {
     let e = only("core.filesystem");
     assert!(e.evaluate_in(r"rd /s /q ..", CMD).is_deny());

@@ -744,6 +744,24 @@ fn file_parts(text: &str) -> Vec<&str> {
     parts
 }
 
+/// `Get-Date`'s `-Format` and `-UFormat`, by any prefix.
+fn is_format_parameter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    abbreviates(&name, "format", 1) || abbreviates(&name, "uformat", 1)
+}
+
+/// `h:mm`, `h:mm:ss tt`: a one-letter `x:` that a drive-relative path would look
+/// like, followed by text no such path needs. `c:.env` and `c:\x` are not this.
+fn is_time_format(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b' '))
+}
+
 /// The default for a command the table and `operands` do not know: `cat` of
 /// every word that may name a file, parameter values included, so the read
 /// rules see them. A bare word counts: `notepad id_rsa` reads the file in the
@@ -774,6 +792,8 @@ pub(crate) fn companion_read(seg: &[Word], dialect: Dialect) -> Option<Vec<Word>
     };
     let mut out = vec![plain("cat")];
     let mut words = seg[1..].iter();
+    let date = lower == "get-date";
+    let mut format_next = false;
     while let Some(w) = words.next() {
         if w.redirect {
             words.next();
@@ -781,6 +801,19 @@ pub(crate) fn companion_read(seg: &[Word], dialect: Dialect) -> Option<Vec<Word>
         }
         if w.has_substitution {
             continue;
+        }
+        if date {
+            let is_value = format_next;
+            let shape = param_shape(w).filter(|(n, _)| is_format_parameter(n));
+            format_next = shape.is_some_and(|(_, v)| v.is_none());
+            let value = if is_value {
+                Some(w.text.as_str())
+            } else {
+                shape.and_then(|(_, v)| v)
+            };
+            if value.is_some_and(is_time_format) {
+                continue;
+            }
         }
         for part in file_parts(&w.text) {
             out.push(b.operand(
@@ -1816,7 +1849,8 @@ fn powershell_nested(args: &[Word]) -> Option<String> {
 
 fn cmd_nested(args: &[Word]) -> Option<String> {
     for (i, w) in args.iter().enumerate() {
-        let mut s = w.text.as_str();
+        // cmd skips these in front of a switch: `cmd;/c`, `cmd =/c`.
+        let mut s = w.text.trim_start_matches([',', ';', '=']);
         while s.starts_with('/') {
             let end = s[1..].find('/').map_or(s.len(), |at| at + 1);
             let letter = s[1..].chars().next().map(|c| c.to_ascii_lowercase());

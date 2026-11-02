@@ -126,7 +126,6 @@ pub enum Plan {
     /// A shell call in a payload over `MAX_PAYLOAD_BYTES`: not judged.
     TooLarge {
         command: String,
-        dialects: Dialects,
     },
     Unusable(PayloadError),
 }
@@ -149,29 +148,43 @@ impl FileCall {
     }
 }
 
-/// Does this call have to fail closed whatever the config says? A reader's
-/// command that went unjudged (too large, unusable, the guard crashed) is
-/// never an allow. A payload that did not parse names its tool only in its
-/// text: over-matching one blocks a call that could not be judged anyway.
+/// Does this call have to fail closed whatever the config says? Only a broken
+/// payload whose tool is `PowerShell`: its command reaches no reader, and that
+/// reader's unreadable is a deny (`Engine::evaluate_call`). A budget, a panic and
+/// a size follow `Fail` in every dialect: `error_allowed` in developer mode,
+/// `error_denied` in locked.
 pub fn must_fail_closed(plan: &Plan, buf: &str) -> bool {
     match plan {
-        Plan::Shell { dialects, .. } | Plan::TooLarge { dialects, .. } => dialects.has_reader(),
+        Plan::Unusable(PayloadError::TooLarge { .. }) => false,
         Plan::Unusable(_) => names_powershell(buf),
+        Plan::Shell { .. } | Plan::TooLarge { .. } => false,
         Plan::Files(_) | Plan::NoPath | Plan::Other => false,
     }
 }
 
-/// The text of a payload too large or too broken to parse names PowerShell.
-pub fn names_powershell(buf: &str) -> bool {
-    buf.to_ascii_lowercase().contains("powershell")
+/// The payload's first `tool_name` is `PowerShell`, in any case, read off the
+/// text because it may not parse. Inside a command's string the key's quotes are
+/// escaped, so a command cannot spell it.
+fn names_powershell(buf: &str) -> bool {
+    const KEY: &str = "\"tool_name\"";
+    const TOOL: &str = "powershell";
+    let tool = buf.find(KEY).and_then(|at| {
+        let rest = buf[at + KEY.len()..].trim_start();
+        rest.strip_prefix(':')?.trim_start().strip_prefix('"')
+    });
+    tool.is_some_and(|t| {
+        t.get(..TOOL.len())
+            .is_some_and(|name| name.eq_ignore_ascii_case(TOOL))
+            && t[TOOL.len()..].starts_with('"')
+    })
 }
 
 /// Classify `buf` (a payload of at most `PARSE_MAX_BYTES`) into what the
 /// guard must judge. `agent` and the host pick a shell command's dialect.
 pub fn plan(buf: &str, agent: Option<&str>) -> Plan {
     match classify_for(buf, PARSE_MAX_BYTES, agent, cfg!(windows)) {
-        Ok(ToolCall::Shell { command, dialects }) if buf.len() > MAX_PAYLOAD_BYTES => {
-            Plan::TooLarge { command, dialects }
+        Ok(ToolCall::Shell { command, .. }) if buf.len() > MAX_PAYLOAD_BYTES => {
+            Plan::TooLarge { command }
         }
         Ok(ToolCall::Shell { command, dialects }) => Plan::Shell { command, dialects },
         Ok(ToolCall::File {
@@ -1022,19 +1035,80 @@ mod tests {
         assert_eq!(shell("PowerShell", Some("claude")), ps);
         assert_eq!(shell("PowerShell", None), ps);
         assert!(!shell("Bash", Some("claude")).has_reader());
-        // Over the size limit it keeps its dialect, and fails closed.
+        // Over the size limit no reader runs, and it follows `Fail`.
         let big = format!(
             r#"{{"tool_name":"PowerShell","tool_input":{{"command":"{}"}}}}"#,
             "x".repeat(MAX_PAYLOAD_BYTES)
         );
         let large = plan(&big, None);
-        assert!(matches!(large, Plan::TooLarge { dialects, .. } if dialects == ps));
-        assert!(must_fail_closed(&large, &big));
-        // Not parsed: its text is all there is.
-        let broken = r#"{"tool_name":"PowerShell""#;
-        assert!(must_fail_closed(&plan(broken, None), broken));
-        let broken = r#"{"tool_name":"Bash""#;
-        assert!(!must_fail_closed(&plan(broken, None), broken));
+        assert!(matches!(large, Plan::TooLarge { .. }));
+        assert!(!must_fail_closed(&large, &big));
+    }
+
+    /// Fail policy. Only a broken payload whose tool is `PowerShell` always
+    /// denies; a budget, a panic and a size follow `Fail`, in every dialect.
+    #[test]
+    fn what_must_fail_closed() {
+        use saiifeguard::wintable::Dialect::{Posix, PowerShell};
+        for dialects in [
+            Dialects::One(PowerShell),
+            Dialects::Strictest(PowerShell, Posix),
+            Dialects::One(Posix),
+        ] {
+            let command = "x".to_string();
+            let shell = Plan::Shell { command, dialects };
+            assert!(!must_fail_closed(&shell, ""), "{dialects:?}");
+        }
+        let large = Plan::TooLarge {
+            command: "x".to_string(),
+        };
+        assert!(!must_fail_closed(&large, ""));
+        for broken in [
+            r#"{"tool_name":"PowerShell""#,
+            r#"{"tool_name": "powershell", "tool_input":"#,
+            r#"{"tool_name":"PowerShell","tool_input":{}}"#,
+            r#"{ "tool_input":{}, "tool_name" : "PowerShell" }"#,
+        ] {
+            let p = plan(broken, None);
+            assert!(matches!(p, Plan::Unusable(_)), "{broken}: {p:?}");
+            assert!(must_fail_closed(&p, broken), "{broken}");
+        }
+        // The word anywhere else in the text is not the tool.
+        for broken in [
+            r#"{"tool_name":"Bash""#,
+            r#"{"tool_name":"Bash","tool_input":{"command":"powershell"#,
+            r#"{"tool_name":"Bash","tool_input":{"command":"\"tool_name\":\"PowerShell\""#,
+            r#"{"tool_name":"PowerShellish""#,
+            "powershell",
+        ] {
+            let p = plan(broken, None);
+            assert!(matches!(p, Plan::Unusable(_)), "{broken}: {p:?}");
+            assert!(!must_fail_closed(&p, broken), "{broken}");
+        }
+        let too_large = Plan::Unusable(saiifeguard::payload::PayloadError::TooLarge { limit: 1 });
+        let text = r#"{"tool_name":"PowerShell""#;
+        assert!(!must_fail_closed(&too_large, text));
+    }
+
+    /// Fail policy in the worker, which is what a locked hook asks: what cannot
+    /// be read is a deny, what ran out of budget or size is `Unjudged`, which
+    /// the managed hook records as `error_denied`.
+    #[test]
+    fn the_worker_tells_unreadable_from_out_of_budget() {
+        let p = tempfile::tempdir().unwrap();
+        let cwd = p.path().to_str().unwrap();
+        let call = |cmd: &str, budget: Duration| {
+            judge(
+                &payload(cwd, "PowerShell", serde_json::json!({ "command": cmd })),
+                &defaults(),
+                budget,
+            )
+            .verdict
+        };
+        assert_eq!(call("iex $x", BUDGET), Verdict::Deny);
+        assert_eq!(call("a; b", Duration::ZERO), Verdict::Unjudged);
+        let big = "x".repeat(MAX_PAYLOAD_BYTES);
+        assert_eq!(call(&big, BUDGET), Verdict::Unjudged);
     }
 
     #[test]

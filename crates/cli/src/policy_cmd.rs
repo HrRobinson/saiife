@@ -131,6 +131,8 @@ enum Case {
     Command {
         command: String,
         tool: &'static str,
+        /// Whose hook judges it: with the tool and the host it picks the dialect.
+        agent: &'static str,
     },
 }
 
@@ -170,9 +172,10 @@ fn parse_example(ex: &Example) -> Result<Case, String> {
             if c.trim().is_empty() {
                 return Err("command is empty".into());
             }
-            let tool = match ex.agent.as_deref() {
-                None | Some("claude" | "codex") => "Bash",
-                Some("gemini") => "run_shell_command",
+            let (tool, agent) = match ex.agent.as_deref() {
+                None | Some("claude") => ("Bash", "claude"),
+                Some("codex") => ("Bash", "codex"),
+                Some("gemini") => ("run_shell_command", "gemini"),
                 Some(other) => {
                     return Err(format!("agent {other:?} is not claude, codex or gemini"))
                 }
@@ -180,6 +183,7 @@ fn parse_example(ex: &Example) -> Result<Case, String> {
             Ok(Case::Command {
                 command: c.clone(),
                 tool,
+                agent,
             })
         }
     }
@@ -464,7 +468,11 @@ fn run_case(
                 },
             })
         }
-        Case::Command { command, tool } => {
+        Case::Command {
+            command,
+            tool,
+            agent,
+        } => {
             let (active, _) = active_packs(cfg, &pack_catalog(), None);
             let ids: Vec<String> = active.into_iter().map(|p| p.id).collect();
             let payload = serde_json::json!({
@@ -491,7 +499,7 @@ fn run_case(
                 budget,
                 locked.as_ref(),
                 &cfg.guard.ask,
-                None,
+                Some(agent),
             );
             let why = a.reason.as_deref().unwrap_or("");
             let rule = a.rule_id.as_deref().or(a.rule.as_deref()).unwrap_or("");
@@ -1014,6 +1022,35 @@ expect = "deny"
         .replace("connector = \"shopify\"", "connector = \"nope\"");
         let (_d, f) = write(&text);
         assert_eq!(test(&f, &dir()).code, 1);
+    }
+
+    /// `policy test` reads a command as the hook of that agent does, so on a
+    /// Windows host Claude's `Bash` is Git Bash there too.
+    #[test]
+    fn a_command_example_names_its_agent() {
+        let case = |agent: Option<&str>| {
+            parse_example(&Example {
+                user: "alice".into(),
+                request: None,
+                command: Some("ls".into()),
+                agent: agent.map(str::to_string),
+                expect: saiife_policy::system::Expect::Allow,
+            })
+            .unwrap()
+        };
+        for (given, tool, agent) in [
+            (None, "Bash", "claude"),
+            (Some("claude"), "Bash", "claude"),
+            (Some("codex"), "Bash", "codex"),
+            (Some("gemini"), "run_shell_command", "gemini"),
+        ] {
+            match case(given) {
+                Case::Command {
+                    tool: t, agent: a, ..
+                } => assert_eq!((t, a), (tool, agent)),
+                Case::Request { .. } => panic!("{given:?}"),
+            }
+        }
     }
 
     #[test]
