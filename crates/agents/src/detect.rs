@@ -77,32 +77,40 @@ pub fn agent_paths(home: &Path, windows: bool) -> AgentPaths {
     AgentPaths(
         Agent::ALL
             .into_iter()
-            .map(|agent| {
-                let name = agent.binary();
-                let binaries = if windows {
-                    let (first, second) = match agent {
-                        Agent::Claude => ("exe", "cmd"),
-                        Agent::Codex | Agent::Gemini => ("cmd", "exe"),
-                    };
-                    vec![format!("{name}.{first}"), format!("{name}.{second}")]
-                } else {
-                    vec![name.to_string()]
-                };
-                AgentPath {
-                    agent,
-                    config_dir: home.join(format!(".{name}")),
-                    binaries,
-                }
+            .map(|agent| AgentPath {
+                agent,
+                config_dir: home.join(format!(".{}", agent.binary())),
+                binaries: agent_binaries(agent, windows),
             })
             .collect(),
     )
 }
 
+/// The file names `agent`'s executable goes by on `PATH`, most likely
+/// first: the bare name, or on Windows the name with its extension.
+pub fn agent_binaries(agent: Agent, windows: bool) -> Vec<String> {
+    let name = agent.binary();
+    if !windows {
+        return vec![name.to_string()];
+    }
+    let (first, second) = match agent {
+        Agent::Claude => ("exe", "cmd"),
+        Agent::Codex | Agent::Gemini => ("cmd", "exe"),
+    };
+    vec![format!("{name}.{first}"), format!("{name}.{second}")]
+}
+
 /// Agents whose binary is on this process's `PATH`, in `Agent::ALL` order.
+/// Each is looked up by the names [`agent_binaries`] lists (the bare name
+/// off Windows, so Linux and macOS look up exactly `a.binary()`).
 pub fn detect_agents() -> Vec<Agent> {
     Agent::ALL
         .into_iter()
-        .filter(|a| which(a.binary()).is_some())
+        .filter(|a| {
+            agent_binaries(*a, cfg!(windows))
+                .iter()
+                .any(|b| which(b).is_some())
+        })
         .collect()
 }
 
@@ -197,6 +205,9 @@ mod tests {
         let g = w.of(Agent::Gemini).unwrap();
         assert_eq!(g.config_dir, home.join(".gemini"));
         assert_eq!(g.binaries, ["gemini.cmd", "gemini.exe"]);
+        for a in Agent::ALL {
+            assert_eq!(agent_binaries(a, true), w.of(a).unwrap().binaries);
+        }
         // Elsewhere the executables are the bare names.
         let u = agent_paths(&home, false);
         for a in Agent::ALL {

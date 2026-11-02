@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use saiife_agents::detect::which;
+use saiife_agents::detect::{agent_paths, which};
 use saiife_agents::integrity;
+use saiife_agents::Agent;
 use saiife_audit::store;
 use saiife_system::layout::Platform;
 use saiifeguard::canon::{PathStyle, PathVars};
@@ -33,6 +34,22 @@ fn config_dir(
     match value {
         Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
         _ => home.map(|h| h.join(default)),
+    }
+}
+
+/// An agent's config dir: `value` when set and absolute, else the default
+/// from [`agent_paths`] under `home`.
+fn agent_config_dir(
+    value: Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    agent: Agent,
+    windows: bool,
+) -> Option<PathBuf> {
+    match value {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
+        _ => agent_paths(home?, windows)
+            .of(agent)
+            .map(|p| p.config_dir.clone()),
     }
 }
 
@@ -149,14 +166,18 @@ pub fn path_vars_locked(
     // the default under HOME, so the rules naming them are always active.
     // `XDG_CONFIG_HOME` the same way (`~/.config`); in locked mode the
     // worker's environment is cleared, so it is always the default there.
-    for (name, default) in [
-        ("CLAUDE_CONFIG_DIR", ".claude"),
-        ("CODEX_HOME", ".codex"),
-        ("XDG_CONFIG_HOME", ".config"),
+    let home = dirs::home_dir();
+    for (name, agent) in [
+        ("CLAUDE_CONFIG_DIR", Agent::Claude),
+        ("CODEX_HOME", Agent::Codex),
     ] {
-        if let Some(d) = config_dir(std::env::var_os(name), dirs::home_dir(), default) {
+        let value = std::env::var_os(name);
+        if let Some(d) = agent_config_dir(value, home.as_deref(), agent, cfg!(windows)) {
             v = v.with_var(name, d);
         }
+    }
+    if let Some(d) = config_dir(std::env::var_os("XDG_CONFIG_HOME"), home, ".config") {
+        v = v.with_var("XDG_CONFIG_HOME", d);
     }
     if let Some(p) = project.or(cwd) {
         v = v.with_var("PROJECT", p);
@@ -204,6 +225,28 @@ mod tests {
             Some(PathBuf::from("/opt/claude"))
         );
         assert_eq!(config_dir(None, None, ".claude"), None);
+    }
+
+    /// The defaults now come from `agent_paths`; they are the ones the
+    /// literals gave (`~/.claude`, `~/.codex`) on every platform.
+    #[test]
+    fn agent_config_dirs_match_the_old_defaults() {
+        let home = Path::new("/home/u");
+        for windows in [false, true] {
+            for (agent, old) in [(Agent::Claude, ".claude"), (Agent::Codex, ".codex")] {
+                let want = config_dir(None, Some(home.to_path_buf()), old);
+                assert_eq!(agent_config_dir(None, Some(home), agent, windows), want);
+                assert_eq!(
+                    agent_config_dir(Some("rel".into()), Some(home), agent, windows),
+                    want
+                );
+                assert_eq!(
+                    agent_config_dir(Some("/opt/x".into()), Some(home), agent, windows),
+                    Some(PathBuf::from("/opt/x"))
+                );
+                assert_eq!(agent_config_dir(None, None, agent, windows), None);
+            }
+        }
     }
 
     #[test]

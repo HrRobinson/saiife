@@ -167,8 +167,9 @@ fn config_deleted_is_reported() {
 #[test]
 fn swapped_binary_on_path_is_reported() {
     let env = initialized(&["claude"]);
-    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
-    fake_exe(env.bin.path(), "saiife", "echo 'saiife 0.1.0'");
+    let name = format!("saiife{}", std::env::consts::EXE_SUFFIX);
+    std::fs::remove_file(env.bin.path().join(&name)).unwrap();
+    fake_exe(env.bin.path(), &name, "echo 'saiife 0.1.0'");
     let (c, text) = status(&env);
     assert_eq!(c, 1);
     assert!(
@@ -180,7 +181,8 @@ fn swapped_binary_on_path_is_reported() {
 #[test]
 fn saiife_missing_from_path_is_reported() {
     let env = initialized(&["claude"]);
-    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
+    let name = format!("saiife{}", std::env::consts::EXE_SUFFIX);
+    std::fs::remove_file(env.bin.path().join(name)).unwrap();
     let (c, text) = status(&env);
     assert_eq!(c, 1);
     assert!(text.contains("`saiife` is not on PATH"), "{text}");
