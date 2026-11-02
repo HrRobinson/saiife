@@ -1247,12 +1247,15 @@ impl Engine {
                 Some(h) => (vec![h.to_path_buf()], false),
                 None => (Vec::new(), true),
             },
-            // A `$` is a variable to POSIX. On Windows `winpath` reads it: `c$`
-            // and `$Recycle.Bin` are names, and `$env:X` has a value or denies.
+            // A `$` is a variable to POSIX. On Windows `c$/` opens nothing and
+            // `$env:X` has a value or denies, but `$x` with no value may be one.
             Some((a, w))
                 if a == "-"
                     || w.has_substitution
-                    || (a.contains('$') && self.vars.style() != PathStyle::Windows) =>
+                    || match self.vars.style() {
+                        PathStyle::Windows => winpath::has_unbound_dollar(a, &self.vars),
+                        PathStyle::Posix => a.contains('$'),
+                    } =>
             {
                 (Vec::new(), true)
             }

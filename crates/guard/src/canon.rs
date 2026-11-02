@@ -1121,9 +1121,10 @@ mod tests {
             .with_cwd(r"C:\p");
         let pattern = format!("/{}/*.txt", root.display());
         assert!(pattern.starts_with("//"));
+        // A wildcard there has no form at all: the engine denies the word.
         assert_eq!(expand_glob_partial(&pattern, None, &v), (Vec::new(), false));
-        // With alternatives, each comes back as spelled.
-        let (found, over) = expand_glob_partial(&format!("/{}/{{a,b}}*", root.display()), None, &v);
+        // A brace with no wildcard: each alternative comes back as spelled.
+        let (found, over) = expand_glob_partial(&format!("/{}/{{a,b}}", root.display()), None, &v);
         assert!(!over);
         assert_eq!(found.len(), 2);
     }

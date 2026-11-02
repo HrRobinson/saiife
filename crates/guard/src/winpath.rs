@@ -22,12 +22,14 @@
 //!
 //! - `Unread::Unreadable`: an unknown variable, a cmd substring or replace
 //!   (`%VAR:~0%`), a device namespace path (`\\?\Volume{…}`,
-//!   `\\.\PhysicalDrive0`) or a `..` after a device prefix, Git Bash's `/proc`,
-//!   a PowerShell drive (`HKLM:\`, `temp:\`), a drive or `admin$` share on a
-//!   host not known to be this machine, a component of only dots, spaces or a
-//!   stream (only exact `.` and `..` navigate), or a character Win32 refuses or
-//!   reads as a wildcard (`<`, `>`, `"`, `|`, control characters). It could
-//!   name anything, so the engine denies it.
+//!   `\\.\PhysicalDrive0`) or a `..` after a device prefix, Git Bash's `/proc`
+//!   and `/dev/fd`, a `..` above the root of a path spelled with `/`, a
+//!   PowerShell drive (`HKLM:\`, `temp:\`), a drive or `admin$` share on a host
+//!   not known to be this machine, a wildcard under a UNC root (it is never
+//!   expanded), a component of only dots, spaces or a stream (only exact `.`
+//!   and `..` navigate), or a character Win32 refuses or reads as a wildcard
+//!   (`<`, `>`, `"`, `|`, control characters). It could name anything, so the
+//!   engine denies it.
 //! - `Unread::NoAnchor`: an empty path, or a relative one with no working
 //!   directory known. The engine treats it as it does in POSIX style.
 //!
@@ -282,24 +284,44 @@ fn expand_vars(raw: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
 
 /// The expansion of the `%…` at the start of `s` and the bytes it used. A `%`
 /// that does not open a variable (`100%.txt`, `%%`) is itself. cmd also
-/// expands `%VAR:~0%` and `%VAR:a=b%`, separators in them included: what those
-/// produce is not worked out here.
+/// expands `%VAR:~0%`, `%VAR:a=b%` (separators in them included) and `%=C:%`:
+/// what those produce is not worked out here.
 fn percent_var(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<(String, usize), Unread> {
     let name = s[1..].find('%').map(|end| &s[1..1 + end]);
-    let is_name = |n: &str| {
-        !n.is_empty()
-            && n.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')'))
-    };
     match name {
-        Some(n) if n.split_once(':').is_some_and(|(v, _)| is_name(v)) => Err(Unread::Unreadable(
-            "a cmd variable with a substring or replace",
-        )),
+        Some(n)
+            if n.split_once(':')
+                .is_some_and(|(v, _)| !v.contains(['/', '\\'])) =>
+        {
+            Err(Unread::Unreadable(
+                "a cmd variable with a colon, such as a substring or replace",
+            ))
+        }
         Some(n) if !n.is_empty() && !n.contains(['/', '\\', ':']) => {
             Ok((var(n, cwd, vars)?, n.len() + 2))
         }
         _ => Ok(("%".to_string(), 1)),
     }
+}
+
+/// The length of the identifier at the start of `t`: 0 when there is none.
+fn identifier_len(t: &str) -> usize {
+    if t.starts_with(|c: char| c.is_ascii_digit()) {
+        return 0;
+    }
+    t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(t.len())
+}
+
+/// `raw` holds `$` and an identifier with no known value. As a path it reads
+/// as a name (`C:\$Recycle.Bin`), but a shell may expand it, so a working
+/// directory spelled that way is not known.
+pub(crate) fn has_unbound_dollar(raw: &str, vars: &PathVars) -> bool {
+    raw.match_indices('$').any(|(i, _)| {
+        let after = &raw[i + 1..];
+        let n = identifier_len(after);
+        n > 0 && strip_ci(after, "env:").is_none() && lookup(&after[..n], None, vars).is_none()
+    })
 }
 
 /// The expansion of the `$…` at the start of `s` and the bytes it used.
@@ -321,19 +343,17 @@ fn dollar_var(
         let name = strip_ci(name, "env:").unwrap_or(name);
         return Ok((var(name, cwd, vars)?, end + 3));
     }
-    let word = |t: &str| {
-        t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(t.len())
-    };
     if let Some(env) = strip_ci(after, "env:") {
-        let n = word(env);
+        let n = env
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(env.len());
         if n == 0 {
             return Err(Unread::Unreadable("a `$env:` with no name"));
         }
         return Ok((var(&env[..n], cwd, vars)?, "$env:".len() + n));
     }
-    let n = word(after);
-    if n == 0 || after.as_bytes()[0].is_ascii_digit() {
+    let n = identifier_len(after);
+    if n == 0 {
         return Ok(("$".to_string(), 1));
     }
     match var(&after[..n], cwd, vars) {
@@ -374,30 +394,38 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
     }
     let cwd_root = || cwd.map(split_root).ok_or(Unread::NoAnchor);
     let t = s.replace('\\', "/");
+    let is_unc = t.starts_with("//") && !t.starts_with("///");
     let device_ns = ["//?/", "//./"]
         .iter()
         .find_map(|p| t.strip_prefix(p))
         // `/??/x` written with slashes is a glob, not the NT namespace.
         .or_else(|| t.strip_prefix("/??/").filter(|_| s.starts_with('\\')));
+    // Spelled with `/` it may be Git Bash's: `..` cannot climb past a root it
+    // would stop at, and `/proc` is the process table on every drive. With a
+    // `\` it is Win32's: `..` stops at the root, and `\proc` is a directory.
+    let slash_spelled = !is_unc && device_ns.is_none() && (s.starts_with('/') || !s.contains('\\'));
     let (root, rest): (String, String) = if let Some(after) = device_ns {
         // After `\\.\` a `..` can pop the drive itself.
         if after.split('/').any(|c| c == "..") {
             return Err(Unread::Unreadable("a `..` after a device prefix"));
         }
         device(after, vars)?
-    } else if t.starts_with("//") && !t.starts_with("///") {
+    } else if is_unc {
         unc(&t[2..], vars)?
     } else if let Some(body) = t.strip_prefix('/') {
-        // Three or more slashes are one to Git Bash.
-        let body = body.trim_start_matches('/');
-        if s.starts_with('/') && is_git_bash_proc(body) {
-            return Err(Unread::Unreadable("Git Bash's /proc"));
-        }
-        // A leading backslash is Win32's "root of this drive"; only a `/`
-        // can be Git Bash's drive form.
-        match s.starts_with('/').then(|| git_bash_drive(body)).flatten() {
-            Some((drive, tail)) => (format!("{drive}:/"), tail.to_string()),
-            None => (cwd_root()?.0.to_string(), body.to_string()),
+        if s.starts_with('/') {
+            // `.` and `..` first, or `/./proc` and `/c/../c` pass the checks.
+            let body = normalize_rooted(body)?;
+            if is_git_bash_virtual(&body) {
+                return Err(Unread::Unreadable("Git Bash's /proc or /dev/fd"));
+            }
+            match git_bash_drive(&body) {
+                Some((drive, tail)) => (format!("{drive}:/"), tail.to_string()),
+                None => (cwd_root()?.0.to_string(), body),
+            }
+        } else {
+            // A leading backslash is Win32's "root of this drive".
+            (cwd_root()?.0.to_string(), body.to_string())
         }
     } else if t.chars().nth(1) == Some(':') {
         let first = t.chars().next().unwrap_or(':');
@@ -432,13 +460,43 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
         let (root, base) = cwd_root()?;
         (root.to_string(), format!("{base}/{t}"))
     };
-    assemble(&root, &rest)
+    let out = assemble(&root, &rest, slash_spelled)?;
+    if slash_spelled && is_git_bash_virtual(split_root(&out).1) {
+        return Err(Unread::Unreadable("Git Bash's /proc or /dev/fd"));
+    }
+    // Never expanded (`canon` will not list a host's share), so its literal
+    // text would match no rule: `.en*` misses `**/.env`.
+    if out.starts_with("//") && out.contains(['*', '?', '[']) {
+        return Err(Unread::Unreadable("a wildcard under a UNC path"));
+    }
+    Ok(out)
 }
 
-/// `body` (no leading slash) is under Git Bash's process table, which is no
-/// directory on a drive. Its `cygdrive` is a drive path.
-fn is_git_bash_proc(body: &str) -> bool {
+/// `body` (no leading slash) with exact `.` and `..` applied. `..` above the
+/// root is an error: Git Bash's root is not the drive's.
+fn normalize_rooted(body: &str) -> Result<String, Unread> {
+    let mut comps: Vec<&str> = Vec::new();
+    for c in body.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                comps
+                    .pop()
+                    .ok_or(Unread::Unreadable("a `..` above the root"))?;
+            }
+            _ => comps.push(c),
+        }
+    }
+    Ok(comps.join("/"))
+}
+
+/// `body` (no leading slash) is under Git Bash's process table or its file
+/// descriptors, which are no directories on a drive. `proc/cygdrive` is a
+/// drive path.
+fn is_git_bash_virtual(body: &str) -> bool {
     body.eq_ignore_ascii_case("proc")
+        || body.eq_ignore_ascii_case("dev/fd")
+        || strip_ci(body, "dev/fd/").is_some()
         || (strip_ci(body, "proc/").is_some() && strip_ci(body, "proc/cygdrive/").is_none())
 }
 
@@ -513,16 +571,19 @@ fn component_name(c: &str) -> &str {
         .trim_end_matches(['.', ' '])
 }
 
-/// `root` and the normalized components of `rest`. `..` stops at the root.
-/// Only exact `.` and `..` navigate: what `...`, `.. ` or `..::$DATA` do
-/// depends on where they stand and on the API, so they are not read.
-fn assemble(root: &str, rest: &str) -> Result<String, Unread> {
+/// `root` and the normalized components of `rest`. `..` stops at the root, or
+/// is an error there when `strict`. Only exact `.` and `..` navigate: what
+/// `...`, `.. ` or `..::$DATA` do depends on where they stand and on the API,
+/// so they are not read.
+fn assemble(root: &str, rest: &str, strict: bool) -> Result<String, Unread> {
     let mut comps: Vec<&str> = Vec::new();
     for c in rest.split('/') {
         match c {
             "" | "." => {}
             ".." => {
-                comps.pop();
+                if comps.pop().is_none() && strict {
+                    return Err(Unread::Unreadable("a `..` above the root"));
+                }
             }
             _ => {
                 let name = component_name(c);
@@ -1355,11 +1416,14 @@ mod tests {
         ] {
             assert_unreadable_deny(&e.evaluate(cmd), cmd);
         }
-        // A `$` that is part of a name leaves the directory known.
-        let clean = Decision::Allow {
-            trace: AllowTrace::NoMatch,
-        };
-        assert_eq!(e.evaluate(r"cd 'C:\$Recycle.Bin' && cat notes.txt"), clean);
+        // `$` and an identifier with no value: it may be a variable, so the
+        // directory is unknown. Even when quoted, as a name it is rare.
+        assert!(matches!(
+            e.evaluate(r"cd 'C:\$Recycle.Bin' && cat notes.txt"),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { .. }
+            }
+        ));
         // The pack regexes keep the collapsed line.
         let (packs, _) = builtin_packs();
         let fs: Vec<_> = packs
@@ -1581,6 +1645,178 @@ reason = "reached only by listing the source"
             assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
         }
         assert!(!e.evaluate_path(Access::Write, "NUL:").is_deny());
+    }
+
+    /// `.` and `..` collapse before the `/proc` and drive checks look at the
+    /// path, or `/./proc` and `/c/../c` slip past them.
+    #[test]
+    fn slash_spelled_paths_normalize_before_the_checks() {
+        for raw in [
+            "/./proc/self/environ",
+            "/c/../proc/self/environ",
+            "/x/../proc/self/environ",
+            "/proc/cygdrive/c/../../self/environ",
+            "/./dev/fd/0",
+            // `..` above the root.
+            "/..",
+            "/../c/x",
+            "/c/../..",
+            "/c/../../x",
+            "../../c/Users/a/.claude/.credentials.json",
+            "../../x",
+            "C:/../x",
+            "C:/a/../../x",
+            // A canonical `/proc`, spelled with `/`.
+            "c:/proc/self/environ",
+            "C:/PROC/self/environ",
+            "/c/proc/self/environ",
+            "/d/proc/x",
+        ] {
+            unreadable(raw);
+        }
+        assert!(matches!(
+            read("proc/self/environ", Some(Path::new(r"C:\")), &vars()),
+            Err(Unread::Unreadable(_))
+        ));
+        for (raw, form) in [
+            ("/./c/Users/a/x", "c:/Users/a/x"),
+            ("/c/../c/Users/a/x", "c:/Users/a/x"),
+            ("/c/./Users/a/x", "c:/Users/a/x"),
+            ("/x/../c/Users/a/x", "c:/Users/a/x"),
+            ("/c/a/../b", "c:/b"),
+            ("/cygdrive/./c/x", "c:/x"),
+            ("/mnt/../c/x", "c:/x"),
+            ("/c/..", "c:/"),
+            ("/.", "c:/"),
+            ("../x", "c:/x"),
+            ("./x", "c:/p/x"),
+            ("C:/a/../x", "c:/x"),
+        ] {
+            want(raw, form);
+        }
+        // A backslash is Win32's: `..` stops at the root, and `\proc` is a
+        // directory on the drive.
+        want(r"C:\..\..\x", "c:/x");
+        want(r"..\..\..\x", "c:/x");
+        want(r"\proc\x", "c:/proc/x");
+        want(r"C:\proc\x", "c:/proc/x");
+        let e = secrets_engine(vars());
+        for cmd in [
+            "cat /./proc/self/environ",
+            "cat /c/../proc/self/environ",
+            "cat /proc/cygdrive/c/../../self/environ",
+            "cat ../../c/Users/a/.claude/.credentials.json",
+            "cd /; cat proc/self/environ",
+            "cd /proc/self; cat environ",
+        ] {
+            assert_unreadable_deny(&e.evaluate(cmd), cmd);
+        }
+        for cmd in [
+            "cat /./c/Users/a/.claude/.credentials.json",
+            "cat /c/../c/Users/a/.claude/.credentials.json",
+            "cat /c/Users/x/../a/.claude/.credentials.json",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn git_bash_dev_fd_is_like_proc() {
+        for raw in ["/dev/fd", "/dev/fd/3", "/DEV/FD/3"] {
+            unreadable(raw);
+        }
+        want("/dev/null", "c:/dev/null");
+        want("/dev/fda", "c:/dev/fda");
+    }
+
+    /// A glob under a UNC root is never expanded (that would call the host),
+    /// so its literal text would match no rule: `.en*` misses `**/.env`.
+    #[test]
+    fn a_glob_under_a_unc_root_is_unreadable() {
+        for raw in [
+            "//localhost/docs/.en*",
+            "//server/share/*",
+            "//server/share/.en?",
+            "//server/share/.en[v]",
+            r"\\server\share\d\*\x",
+            r"\\?\UNC\server\share\*",
+        ] {
+            unreadable(raw);
+        }
+        assert!(matches!(
+            read("*", Some(Path::new(r"\\server\share")), &vars()),
+            Err(Unread::Unreadable(_))
+        ));
+        // A drive path is expanded as usual; a local admin share is one.
+        want("//localhost/c$/.en*", "c:/.en*");
+        want(r"C:\p\.en*", "c:/p/.en*");
+        let e = secrets_engine(vars());
+        assert_unreadable_deny(
+            &e.evaluate("cat //localhost/docs/.en*"),
+            "cat //localhost/docs/.en*",
+        );
+        assert_unreadable_deny(
+            &e.evaluate_path(Access::Read, "//localhost/docs/.en*"),
+            "//localhost/docs/.en*",
+        );
+        assert!(!e.evaluate("cat //localhost/docs/notes.txt").is_deny());
+    }
+
+    /// `$` and an identifier with no value may be a variable: the directory
+    /// is unknown, as in POSIX style. A `$` that opens nothing is a name.
+    #[test]
+    fn cd_to_an_unbound_dollar_leaves_the_directory_unknown() {
+        let e = secrets_engine(vars());
+        let unknown = |cmd: &str| {
+            assert!(
+                matches!(
+                    e.evaluate(cmd),
+                    Decision::Allow {
+                        trace: AllowTrace::Unjudgeable { .. }
+                    }
+                ),
+                "{cmd}: {:?}",
+                e.evaluate(cmd)
+            );
+        };
+        for cmd in [
+            "cd ./$x && cat id_rsa",
+            "cd \"./$x\" && cat id_rsa",
+            "cd './$x' && cat id_rsa",
+            r"cd 'C:\a\$x\b' && cat id_rsa",
+            r"cd 'C:\$Recycle.Bin' && cat notes.txt",
+        ] {
+            unknown(cmd);
+        }
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        for cmd in [
+            "cd //localhost/docs$/x && cat notes.txt",
+            r"cd 'C:\c$\x' && cat notes.txt",
+            r"cd '$env:USERPROFILE\x' && cat notes.txt",
+            r"cd '$HOME\x' && cat notes.txt",
+            r"cd 'C:\a\$HOME' && cat notes.txt",
+        ] {
+            assert_eq!(e.evaluate(cmd), clean, "{cmd}");
+        }
+    }
+
+    /// `%=C:%` is cmd's per-drive working directory, and any `%v:…%` with no
+    /// separator in `v` may be expanded.
+    #[test]
+    fn any_percent_colon_variable_is_unreadable() {
+        for raw in [
+            r"%=C:%\.claude\.credentials.json",
+            r"%:x%\y",
+            r"%a b:c%\x",
+            r"C:\p\%=D:%\x",
+            r"%=ExitCode%\x",
+        ] {
+            unreadable(raw);
+        }
+        // A separator before the colon: no variable name, ordinary text.
+        want(r"C:\a%b\c:d%e", "c:/a%b/c");
     }
 
     const MIXED_CASE_PACK: &str = r#"
