@@ -109,6 +109,48 @@ wait_running() {
     ok "$1: launchctl print $SERVICE: running"
 }
 
+# The path the postinstall's staging check should name, or nothing.
+first_unsafe() {
+    local p line
+    for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$STAGING"; do
+        if [[ -L "$p" ]]; then
+            echo "$p"
+            return 0
+        fi
+        line="$(stat -f '%u %Lp' "$p")"
+        if [[ "${line%% *}" != 0 ]] || (((8#${line##* } & 022) != 0)); then
+            echo "$p"
+            return 0
+        fi
+    done
+}
+
+# `run_installer`: `installer` must fail. The new install.log lines go to
+# $WORK/install-log.out.
+run_installer() {
+    local what="$1" code=0 lines
+    lines="$(sudo -n cat /var/log/install.log | wc -l | tr -d ' ')"
+    # shellcheck disable=SC2024 # the output file is the runner's
+    sudo -n installer -pkg "$PKG" -target / >"$WORK/installer.out" 2>&1 || code=$?
+    cat "$WORK/installer.out"
+    [[ "$code" != 0 ]] || fail "$what: installer exited 0, but it must refuse"
+    # shellcheck disable=SC2024 # the output file is the runner's
+    sudo -n tail -n "+$((lines + 1))" /var/log/install.log >"$WORK/install-log.out"
+    ok "$what: installer exit $code"
+}
+
+# `expect_staging_refusal <what> <path>`: installer refuses, naming the path,
+# before anything runs from the staging copy.
+expect_staging_refusal() {
+    run_installer "$1"
+    grep -qF "saiife: the staging copy is not safe to run: $2 " "$WORK/install-log.out" ||
+        fail "$1: no staging refusal naming $2 in install.log: $(grep -F saiife "$WORK/install-log.out" || true)"
+    if grep -qF "$SIP_LINE" "$WORK/install-log.out"; then
+        fail "$1: the staging copy ran"
+    fi
+    ok "$1: refused, naming $2; the staging copy did not run"
+}
+
 # Owner, group and mode of the dirs the payload passes through.
 shared_dirs() {
     stat -f '%N %Su:%Sg %Lp' /usr/local /usr/local/bin
@@ -172,24 +214,18 @@ ok "fleet files are root:wheel, 0755 and 0644"
 
 # The postinstall must refuse; with SIP on, the test build is what it refuses.
 install_refused() {
-    local what="$1" code=0 lines
-    lines="$(sudo -n cat /var/log/install.log | wc -l | tr -d ' ')"
-    # shellcheck disable=SC2024 # the output file is the runner's
-    sudo -n installer -pkg "$PKG" -target / >"$WORK/installer.out" 2>&1 || code=$?
-    cat "$WORK/installer.out"
-    [[ "$code" != 0 ]] || fail "$what: installer exited 0, but install must refuse"
-    # shellcheck disable=SC2024 # the output file is the runner's
-    sudo -n tail -n "+$((lines + 1))" /var/log/install.log >"$WORK/install-log.out"
+    local what="$1"
+    run_installer "$what"
     if [[ -n "$SIP_ON" ]]; then
         grep -qF 'test build' "$WORK/install-log.out" || fail "$what: no test-build refusal in install.log"
     else
         grep -qF "$SIP_LINE" "$WORK/install-log.out" || fail "$what: no SIP refusal in install.log"
     fi
-    grep -qF 'saiife: locked mode is NOT active' "$WORK/install-log.out" ||
-        fail "$what: the postinstall did not say that locked mode is not active"
+    grep -qF 'saiife: install did not complete; any earlier install is unchanged' "$WORK/install-log.out" ||
+        fail "$what: the postinstall did not say that install did not complete"
     [[ -f "$STAGING" ]] || fail "$what: $STAGING is missing"
     [[ -L "$LINK" && "$(readlink "$LINK")" == "$STAGING" ]] || fail "$what: $LINK is not the link"
-    ok "$what: installer exit $code, the refusal is in install.log, the payload is in place"
+    ok "$what: the refusal is in install.log, the payload is in place"
 }
 
 # The postinstall's command, by hand, with the test build's flag and seam.
@@ -204,15 +240,54 @@ fleet_install() {
     ok "$what: system install --fleet exit $code, config and binary in place"
 }
 
-phase "5. installer: the postinstall refuses loudly, nothing changes"
+phase "5. installer on the dirs as found: the postinstall refuses, nothing changes"
 before_dirs="$(shared_dirs)"
-install_refused "first install"
+run_installer "first install"
+as_found="$(first_unsafe)"
+if [[ -n "$as_found" ]]; then
+    # The runner image keeps /usr/local as the runner's: the staging check is
+    # right to refuse it. The check is not loosened for this: phase 5b makes
+    # the dirs what the check asks, as an admin would.
+    grep -qF "saiife: the staging copy is not safe to run: $as_found " "$WORK/install-log.out" ||
+        fail "first install: no staging refusal naming $as_found: $(grep -F saiife "$WORK/install-log.out" || true)"
+    ok "first install: the runner's $as_found is refused"
+else
+    ok "the dirs as found pass the staging check"
+fi
 for p in /opt/saiife /etc/saiife/config.toml /etc/saiife/installed.toml /var/db/saiife "$PLIST"; do
     if sudo -n test -e "$p"; then fail "the refused install created $p"; fi
 done
 ok "the refused install changed nothing else"
 [[ "$(shared_dirs)" == "$before_dirs" ]] || fail "the pkg changed /usr/local: $before_dirs -> $(shared_dirs)"
 ok "the pkg left /usr/local and /usr/local/bin alone"
+
+phase "5b. root-owned dirs: the staging copy runs, and refuses on SIP"
+for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife; do
+    sudo -n chown root:wheel "$p"
+    sudo -n chmod go-w "$p"
+done
+[[ -z "$(first_unsafe)" ]] || fail "the dirs are still unsafe: $(first_unsafe)"
+install_refused "root-owned dirs"
+for p in /opt/saiife /etc/saiife/config.toml /etc/saiife/installed.toml /var/db/saiife "$PLIST"; do
+    if sudo -n test -e "$p"; then fail "the refused install created $p"; fi
+done
+ok "the refused install changed nothing else"
+
+phase "5c. a writable step in the walk stops the staging copy from running"
+sudo -n chmod g+w /usr/local/libexec/saiife
+expect_staging_refusal "group-writable staging dir" /usr/local/libexec/saiife
+code=0
+sudo -n sh "$REPO/deploy/jamf/fleet-files.sh" / ci-host root \
+    "$(base64 <"$HERE/fleet-config.toml" | tr -d '\n')" claude,codex,gemini 2>"$WORK/fleet-refused.out" || code=$?
+[[ "$code" == 2 ]] || fail "fleet-files.sh exited $code on a group-writable staging dir, want 2"
+grep -qF "/usr/local/libexec/saiife is writable by group or others" "$WORK/fleet-refused.out" ||
+    fail "fleet-files.sh: $(cat "$WORK/fleet-refused.out")"
+ok "fleet-files.sh refuses it too (exit 2)"
+sudo -n chmod g-w /usr/local/libexec/saiife
+sudo -n chown "$(id -un)" /usr/local/libexec
+expect_staging_refusal "runner-owned libexec" /usr/local/libexec
+sudo -n chown root:wheel /usr/local/libexec
+[[ -z "$(first_unsafe)" ]] || fail "the dirs are still unsafe: $(first_unsafe)"
 
 phase "6. the fleet install from the staging copy"
 fleet_install "fleet install"
@@ -225,6 +300,15 @@ as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor.out" 2>"$WORK/doctor-err.ou
 [[ "$(jq -r '.checks[] | select(.id == "files.package") | .status' "$WORK/doctor.out")" == pass ]] ||
     { cat "$WORK/doctor.out"; fail "doctor files.package does not pass"; }
 ok "doctor exit $code, files.package passes"
+[[ "$(sudo -n stat -f '%Su:%Sg %Lp' /etc/saiife-install.lock)" == "root:wheel 600" ]] ||
+    fail "/etc/saiife-install.lock: wrong owner or mode"
+ok "the install lock is root:wheel 0600"
+sudo -n chmod g+w /usr/local/libexec/saiife
+as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor-unsafe.out" 2>/dev/null || true
+[[ "$(jq -r '.checks[] | select(.id == "files.package") | .status' "$WORK/doctor-unsafe.out")" == warn ]] ||
+    { cat "$WORK/doctor-unsafe.out"; fail "doctor files.package does not warn on a writable staging dir"; }
+sudo -n chmod g-w /usr/local/libexec/saiife
+ok "doctor warns on a writable staging dir"
 got="$(as_root_seam sh "$REPO/deploy/jamf/extension-attribute.sh")"
 [[ "$got" == "<result>warn</result>" || "$got" == "<result>pass</result>" ]] || fail "extension attribute: $got"
 ok "extension attribute: $got"

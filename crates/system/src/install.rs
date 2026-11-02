@@ -32,7 +32,8 @@ pub struct InstallOptions {
     pub approvers: Vec<String>,
     pub non_interactive: bool,
     /// Install a dynamic or debug-assertions build on the real system
-    /// (the CI job `locked-linux` only; never for production).
+    /// (the CI jobs `locked-linux`, `locked-macos` and `macos-pkg` only; never
+    /// for production).
     pub allow_test_build: bool,
 }
 
@@ -121,6 +122,109 @@ pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
     }
 }
 
+/// How long install waits for another install to finish.
+#[cfg(not(test))]
+const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const INSTALL_LOCK_WAIT: Duration = Duration::from_millis(300);
+
+/// Held for one `system install`: an MDM can overlap the pkg's postinstall
+/// and its own fleet script. Released when dropped, or when the process ends.
+#[derive(Debug)]
+pub struct InstallLock {
+    _file: std::fs::File,
+}
+
+/// Takes [`INSTALL_LOCK`], waiting up to [`INSTALL_LOCK_WAIT`]. The file must
+/// be a regular file of root's, with no access for group or others. The
+/// `flock` is on the file checked, through one `O_NOFOLLOW` open.
+pub fn lock_install(layout: &Layout, host: &dyn Host) -> Result<InstallLock, InstallError> {
+    lock_install_within(layout, host, crate::sip::seam_set(), INSTALL_LOCK_WAIT)
+}
+
+fn lock_install_within(
+    layout: &Layout,
+    host: &dyn Host,
+    sip_seam: bool,
+    wait: Duration,
+) -> Result<InstallLock, InstallError> {
+    use rustix::fs::{flock, FlockOperation, Mode, OFlags};
+    use rustix::io::Errno;
+    use std::os::unix::fs::MetadataExt;
+
+    host_refusals(layout, host, sip_seam)?;
+    let shown = Path::new(INSTALL_LOCK);
+    let path = layout.at(INSTALL_LOCK);
+    if !layout.is_system() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(step("lock"))?;
+        }
+    }
+    let not_a_symlink = |e: Errno| match e {
+        Errno::LOOP => refused(shown, "is a symlink; saiife does not use it"),
+        e => refused(shown, format!("cannot open: {e}")),
+    };
+    let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    // A file made here is ours. One that was there must prove it is root's.
+    let file = match rustix::fs::open(
+        &path,
+        flags | OFlags::CREATE | OFlags::EXCL,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(Errno::EXIST) => {
+            let fd = rustix::fs::open(&path, flags, Mode::empty()).map_err(not_a_symlink)?;
+            let file = std::fs::File::from(fd);
+            let m = file
+                .metadata()
+                .map_err(|e| refused(shown, format!("cannot stat: {e}")))?;
+            let root_uid = host
+                .user("root")
+                .map(|u| u.uid)
+                .ok_or_else(|| refused(shown, "user root is not in /etc/passwd"))?;
+            if !m.is_file() {
+                return Err(refused(
+                    shown,
+                    "is not a regular file; saiife does not use it",
+                ));
+            }
+            if host.owner_uid(&path, m.uid()) != root_uid {
+                return Err(refused(
+                    shown,
+                    "is not owned by root; saiife does not use it",
+                ));
+            }
+            if m.mode() & 0o077 != 0 {
+                return Err(refused(
+                    shown,
+                    "gives access to group or others; saiife does not use it",
+                ));
+            }
+            file
+        }
+        Err(e) => return Err(not_a_symlink(e)),
+    };
+    let start = Instant::now();
+    loop {
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(InstallLock { _file: file }),
+            Err(Errno::WOULDBLOCK | Errno::INTR) => {}
+            Err(e) => return Err(refused(shown, format!("cannot lock: {e}"))),
+        }
+        if start.elapsed() >= wait {
+            return Err(InstallError::Step {
+                step: "lock".into(),
+                detail: format!(
+                    "another saiife system install holds {INSTALL_LOCK}; gave up after {} s. \
+                     Nothing was changed: run install again when it has finished",
+                    wait.as_secs()
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn install(
     layout: &Layout,
     host: &dyn Host,
@@ -128,6 +232,18 @@ pub fn install(
     binary: &Path,
 ) -> Result<InstallReport, InstallError> {
     install_with(layout, host, opts, binary, crate::sip::seam_set())
+}
+
+/// [`install`] for a caller that took the lock itself: it read the fleet
+/// files under the same lock.
+pub fn install_locked(
+    _lock: &InstallLock,
+    layout: &Layout,
+    host: &dyn Host,
+    opts: &InstallOptions,
+    binary: &Path,
+) -> Result<InstallReport, InstallError> {
+    install_unlocked(layout, host, opts, binary, crate::sip::seam_set())
 }
 
 /// [`install`] with the SIP test seam given ([`crate::sip::seam_set`]: a
@@ -139,7 +255,20 @@ pub(crate) fn install_with(
     binary: &Path,
     sip_seam: bool,
 ) -> Result<InstallReport, InstallError> {
-    // 1. Root, then the supported-system check. Nothing runs before these.
+    let _lock = lock_install_within(layout, host, sip_seam, INSTALL_LOCK_WAIT)?;
+    install_unlocked(layout, host, opts, binary, sip_seam)
+}
+
+/// Root, the supported-system check and SIP. These write nothing, so they
+/// come before the lock too: a refused host gets no lock file.
+///
+/// macOS: SIP on, or the hardened runtime does not keep an injected library
+/// out of the hook (A4). Returns the systemd version and any SIP warning.
+fn host_refusals(
+    layout: &Layout,
+    host: &dyn Host,
+    sip_seam: bool,
+) -> Result<(u32, Option<String>), InstallError> {
     if layout.is_system() && host.euid() != 0 {
         return Err(InstallError::NotRoot);
     }
@@ -147,8 +276,6 @@ pub(crate) fn install_with(
         Support::Supported { systemd, .. } => systemd,
         Support::Refused(why) => return Err(InstallError::Unsupported(why)),
     };
-    // macOS: SIP on, or the hardened runtime does not keep an injected
-    // library out of the hook (A4). Refused before any change.
     let sip_warning = if layout.platform() == Platform::Macos {
         use crate::sip::{verdict, SipVerdict, SIP_BYPASSED};
         match verdict(host.sip_enabled(), sip_seam) {
@@ -162,6 +289,18 @@ pub(crate) fn install_with(
     } else {
         None
     };
+    Ok((systemd, sip_warning))
+}
+
+fn install_unlocked(
+    layout: &Layout,
+    host: &dyn Host,
+    opts: &InstallOptions,
+    binary: &Path,
+    sip_seam: bool,
+) -> Result<InstallReport, InstallError> {
+    // 1. The refusals again: the lock may have taken a while.
+    let (systemd, sip_warning) = host_refusals(layout, host, sip_seam)?;
 
     // 2. Refusals, before anything is created.
     let previous =
@@ -1899,6 +2038,74 @@ impl Run<'_> {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod tests {
     use super::*;
+
+    mod lock {
+        use super::super::tests::{all_agents, env};
+        use super::super::*;
+        use rustix::fs::{flock, FlockOperation};
+        use std::fs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        #[test]
+        fn a_held_lock_makes_install_wait_then_refuse_and_change_nothing() {
+            let e = env(255);
+            let lock = e.layout.at(INSTALL_LOCK);
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let held = fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock)
+                .unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+            flock(&held, FlockOperation::NonBlockingLockExclusive).unwrap();
+            let start = Instant::now();
+            let err = lock_install(&e.layout, &e.host).expect_err("held");
+            assert!(start.elapsed() >= INSTALL_LOCK_WAIT);
+            let text = err.to_string();
+            assert!(
+                text.starts_with("lock: another saiife system install holds"),
+                "{text}"
+            );
+            assert!(text.contains(INSTALL_LOCK), "{text}");
+            drop(held);
+            let got = lock_install(&e.layout, &e.host);
+            assert!(got.is_ok(), "free again");
+            // The lock is released with the guard.
+            drop(got);
+            assert!(lock_install(&e.layout, &e.host).is_ok());
+        }
+
+        #[test]
+        fn a_held_lock_stops_install_before_any_change() {
+            let e = env(255);
+            let first = lock_install(&e.layout, &e.host).expect("first");
+            let err = e.run(&all_agents()).expect_err("held");
+            assert!(err.to_string().starts_with("lock: "), "{err}");
+            assert!(!e.at(ETC_DIR).exists());
+            drop(first);
+            assert!(e.run(&all_agents()).is_ok());
+        }
+
+        #[test]
+        fn lock_file_is_root_only_and_refuses_a_symlink_or_loose_mode() {
+            let e = env(255);
+            drop(lock_install(&e.layout, &e.host).expect("create"));
+            let lock = e.layout.at(INSTALL_LOCK);
+            let m = fs::symlink_metadata(&lock).unwrap();
+            assert_eq!(m.permissions().mode() & 0o777, 0o600);
+
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o660)).unwrap();
+            let err = lock_install(&e.layout, &e.host).expect_err("mode");
+            assert!(err.to_string().contains("group or others"), "{err}");
+
+            fs::remove_file(&lock).unwrap();
+            symlink(e.layout.root().join("elsewhere"), &lock).unwrap();
+            let err = lock_install(&e.layout, &e.host).expect_err("symlink");
+            assert!(err.to_string().contains("is a symlink"), "{err}");
+            assert!(!e.layout.root().join("elsewhere").exists());
+        }
+    }
     use crate::host::{CmdOutput, FakeHost, UserInfo};
     use saiife_policy::installed::{read_installed, FileKind, Installed, VaultKeyMode};
     use std::collections::BTreeSet;

@@ -159,8 +159,9 @@ reads any of the three. So
 ELF interpreter or a needed shared library), has debug assertions on, or has
 no saiife build marker, and `saiife doctor` fails `files.binary` on a
 dynamic binary and warns `test build installed` on a debug-assertions build.
-The hidden `--allow-test-build` flag exists for the CI jobs `locked-linux`
-and `locked-macos` only; never use it in production.
+The hidden `--allow-test-build` flag exists for the CI jobs `locked-linux`,
+`locked-macos` and `macos-pkg` only, and only in a build with debug assertions.
+A release build does not have it. Never use it in production.
 
 - `--agents` defaults to all three. Install only adds managed hooks; to
   remove one, uninstall.

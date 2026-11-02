@@ -302,8 +302,8 @@ fn pkg_payload_owns_no_installed_path() {
 #[test]
 fn pkg_postinstall_runs_fleet_install() {
     let s = repo_read("packaging/macos/scripts/postinstall");
-    let call = format!("{PKG_BINARY} system install --fleet");
-    assert_eq!(s.matches(&call).count(), 1, "{s}");
+    assert!(s.contains(&format!("PKG_BIN={PKG_BINARY}\n")));
+    assert_eq!(s.matches(r#""$PKG_BIN" system install --fleet"#).count(), 1);
     assert!(s.contains(r#"[ "$3" != "/" ]"#));
     assert!(s.contains(r#"exit "$rc""#));
 }
@@ -361,30 +361,156 @@ fn run_copy(
 
 const POSTINSTALL: &str = "packaging/macos/scripts/postinstall";
 
-/// The postinstall with stubs for `saiife` (exits `code`) and `logger`; the
-/// `logger` arguments, if any, are returned last.
-fn postinstall(code: i32, volume: &str) -> (Option<i32>, String, String, String) {
-    let d = tempfile::tempdir().unwrap();
-    let fake = d.path().join("fake-saiife");
+/// The test's uid: a staging tree here cannot be root's.
+fn my_uid() -> String {
+    let out = std::process::Command::new("id").arg("-u").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A safe staging tree below `d`, as `/usr/local`: returns that dir and the
+/// binary, a stub that exits `code`.
+fn staging_tree(d: &std::path::Path, code: i32) -> (PathBuf, PathBuf) {
+    let local = d.join("local");
+    let bin = local.join("libexec/saiife/saiife");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     std::fs::write(
-        &fake,
+        &bin,
         format!("echo \"called: $*\"\necho 'saiife: the last line'\nexit {code}\n"),
     )
     .unwrap();
-    let log = d.path().join("logged");
-    let logger = d.path().join("fake-logger");
+    // Whatever the umask of the run.
+    for p in [
+        local.clone(),
+        local.join("libexec"),
+        local.join("libexec/saiife"),
+        bin.clone(),
+    ] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (local, bin)
+}
+
+/// The postinstall in the tree `local`, with a `logger` stub; the `logger`
+/// arguments, if any, are returned last. The check's expected owner is the
+/// test's uid.
+fn postinstall_in(
+    d: &std::path::Path,
+    local: &std::path::Path,
+    volume: &str,
+) -> (Option<i32>, String, String, String) {
+    let log = d.join("logged");
+    let logger = d.join("fake-logger");
     std::fs::write(&logger, format!("echo \"$*\" >>'{}'\n", log.display())).unwrap();
     let (rc, out, err) = run_copy(
-        d.path(),
+        d,
         POSTINSTALL,
         &[
-            (PKG_BINARY, format!("sh '{}'", fake.display())),
+            ("/usr/local", local.display().to_string()),
+            ("STAGING_UID=0", format!("STAGING_UID={}", my_uid())),
+            (
+                r#""$PKG_BIN" system install"#,
+                r#"sh "$PKG_BIN" system install"#.to_string(),
+            ),
             ("logger -t", format!("sh '{}' -t", logger.display())),
         ],
         &["/some/saiife.pkg", "/", volume],
     );
     let logged = std::fs::read_to_string(&log).unwrap_or_default();
     (rc, out, err, logged)
+}
+
+fn postinstall(code: i32, volume: &str) -> (Option<i32>, String, String, String) {
+    let d = tempfile::tempdir().unwrap();
+    let (local, _) = staging_tree(d.path(), code);
+    postinstall_in(d.path(), &local, volume)
+}
+
+#[test]
+fn pkg_postinstall_refuses_an_unsafe_staging_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let chmod = |p: &std::path::Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    let refused = |d: &std::path::Path, local: &std::path::Path, want: String| {
+        let (rc, out, err, logged) = postinstall_in(d, local, "/");
+        assert_eq!(rc, Some(2), "{out}{err}");
+        assert!(!out.contains("called:"), "must not run it: {out}");
+        assert!(err.contains(&want), "want {want}: {err}");
+        assert!(logged.contains("-p auth.err"), "{logged}");
+    };
+    // Each step of the walk: group- or world-writable.
+    let d = tempfile::tempdir().unwrap();
+    let (local, bin) = staging_tree(d.path(), 0);
+    for (p, mode, back) in [
+        (local.clone(), 0o775, 0o755),
+        (local.join("libexec"), 0o757, 0o755),
+        (local.join("libexec/saiife"), 0o775, 0o755),
+        (bin.clone(), 0o775, 0o755),
+    ] {
+        chmod(&p, mode);
+        refused(
+            d.path(),
+            &local,
+            format!("{} is writable by group or others", p.display()),
+        );
+        chmod(&p, back);
+    }
+    let (rc, out, ..) = postinstall_in(d.path(), &local, "/");
+    assert_eq!(rc, Some(0));
+    assert!(out.contains("called: system install --fleet"), "{out}");
+
+    // A symlink for the binary or a dir, even to a safe target.
+    let moved = d.path().join("moved");
+    std::fs::rename(&bin, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &bin).unwrap();
+    refused(
+        d.path(),
+        &local,
+        format!("{} is a symbolic link", bin.display()),
+    );
+    std::fs::remove_file(&bin).unwrap();
+    // Missing, and a directory where the binary should be.
+    refused(d.path(), &local, format!("{} is missing", bin.display()));
+    std::fs::create_dir(&bin).unwrap();
+    refused(
+        d.path(),
+        &local,
+        format!("{} is not a regular file", bin.display()),
+    );
+
+    // Someone else's: the real script wants uid 0.
+    let d = tempfile::tempdir().unwrap();
+    let (local, _) = staging_tree(d.path(), 0);
+    let (rc, out, err) = run_copy(
+        d.path(),
+        POSTINSTALL,
+        &[
+            ("/usr/local", local.display().to_string()),
+            ("STAGING_UID=0", "STAGING_UID=4242".to_string()),
+            ("logger -t", ": -t".to_string()),
+        ],
+        &["/some/saiife.pkg", "/", "/"],
+    );
+    assert_eq!(rc, Some(2), "{out}{err}");
+    assert!(
+        err.contains(&format!("{} is not owned by root", local.display())),
+        "{err}"
+    );
+}
+
+#[test]
+fn staging_check_is_the_same_in_all_three_scripts() {
+    let check = |rel: &str| -> String {
+        let s = repo_read(rel);
+        let (_, rest) = s.split_once("# --- staging check:").expect(rel);
+        let (body, _) = rest.split_once("# --- end staging check ---").expect(rel);
+        body.to_string()
+    };
+    let p = check(POSTINSTALL);
+    assert!(p.contains("STAGING_UID=0\n"));
+    assert_eq!(p, check("deploy/jamf/fleet-files.sh"));
+    assert_eq!(p, check("deploy/intune/macos/fleet-files.sh"));
 }
 
 #[test]
@@ -402,8 +528,8 @@ fn pkg_postinstall_passes_on_0_and_1_and_fails_loudly_on_2() {
     let (rc, out, err, logged) = postinstall(2, "/");
     assert_eq!(rc, Some(2), "a refusal must fail the pkg: {out}{err}");
     assert!(out.contains("the last line"), "the refusal is shown: {out}");
-    let want = "saiife: locked mode is NOT active: system install --fleet exited 2: \
-                saiife: the last line";
+    let want = "saiife: install did not complete; any earlier install is unchanged: \
+                system install --fleet exited 2: saiife: the last line";
     assert!(err.contains(want), "{err}");
     assert!(logged.contains("-p auth.err"), "{logged}");
     assert!(logged.contains(want), "{logged}");
@@ -523,6 +649,10 @@ fn fleet_scripts_share_one_body() {
     assert!(jamf.contains("chown root:wheel"));
     assert!(jamf.contains(&format!("PKG_BIN={PKG_BINARY}\n")));
     assert!(jamf.contains(r#""$PKG_BIN" system install --fleet"#));
+    // Checked before anything is written, and before it is run.
+    let check = jamf.find("why=$(staging_problem)").unwrap();
+    assert!(check < jamf.find(r#"put "$FLEET/config.toml""#).unwrap());
+    assert!(check < jamf.find(r#""$PKG_BIN" system install"#).unwrap());
     let top = repo_read("deploy/jamf/fleet-files.sh");
     assert!(top.contains("CONFIG_B64=$4\nAGENTS=$5\n"));
     assert!(repo_read("deploy/intune/macos/fleet-files.sh").contains("CONFIG_B64=\"\"\n"));
@@ -586,8 +716,13 @@ fn macos_scripts_are_posix_sh() {
     ] {
         let s = repo_read(rel);
         assert_eq!(s.lines().next(), Some("#!/bin/sh"), "{rel}");
-        for bad in ["[[", "local ", "$'"] {
+        for bad in ["[[", "$'"] {
             assert!(!s.contains(bad), "{rel} uses {bad}");
         }
+        // Not the /usr/local of a path.
+        assert!(
+            !s.lines().any(|l| l.trim_start().starts_with("local ")),
+            "{rel} uses local"
+        );
     }
 }

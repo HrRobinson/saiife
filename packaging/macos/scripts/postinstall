@@ -10,8 +10,53 @@ if [ "$3" != "/" ]; then
     exit 0
 fi
 
+PKG_BIN=/usr/local/libexec/saiife/saiife
+
+# --- staging check: the same in postinstall and both fleet-files.sh ---
+# /usr/local is not protected by SIP, and root runs the staging copy. Prints
+# why it is not safe to run, or nothing: each step must be no symlink, owned
+# by root, and not writable by group or others.
+STAGING_UID=0
+staging_problem() {
+    for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$PKG_BIN"; do
+        if [ -L "$p" ]; then
+            echo "$p is a symbolic link"
+            return 0
+        fi
+        # ls -n is the POSIX way to read a numeric owner.
+        # shellcheck disable=SC2012
+        if ! line=$(ls -ldn "$p" 2>/dev/null); then
+            echo "$p is missing"
+            return 0
+        fi
+        read -r mode _ uid _ <<EOF
+$line
+EOF
+        if [ "$uid" != "$STAGING_UID" ]; then
+            echo "$p is not owned by root"
+            return 0
+        fi
+        case "$mode" in
+            ?????w* | ????????w*)
+                echo "$p is writable by group or others"
+                return 0
+                ;;
+        esac
+    done
+    [ -f "$PKG_BIN" ] || echo "$PKG_BIN is not a regular file"
+}
+# --- end staging check ---
+
+why=$(staging_problem)
+if [ -n "$why" ]; then
+    msg="saiife: the staging copy is not safe to run: $why; make it root's and not writable by group or others, then install the pkg again"
+    echo "$msg" >&2
+    logger -t saiife -p auth.err "$msg" 2>/dev/null || true
+    exit 2
+fi
+
 rc=0
-out=$(/usr/local/libexec/saiife/saiife system install --fleet 2>&1) || rc=$?
+out=$("$PKG_BIN" system install --fleet 2>&1) || rc=$?
 printf '%s\n' "$out"
 
 # 0 = installed.
@@ -26,7 +71,7 @@ if [ "$rc" -eq 1 ]; then
 fi
 # 2 = install error or unsupported host (SIP off, say): fail loudly, never
 # lock silently.
-msg="saiife: locked mode is NOT active: system install --fleet exited $rc: $last"
+msg="saiife: install did not complete; any earlier install is unchanged: system install --fleet exited $rc: $last"
 echo "$msg" >&2
 logger -t saiife -p auth.err "$msg" 2>/dev/null || true
 exit "$rc"

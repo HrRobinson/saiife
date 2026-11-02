@@ -285,6 +285,9 @@ pub fn uninstall(
     if fsops::remove_if_listed(&layout.at(PREVIOUS)).map_err(step("installed.toml"))? {
         out.push(format!("removed {PREVIOUS}"));
     }
+    if fsops::remove_if_listed(&layout.at(INSTALL_LOCK)).map_err(step("lock"))? {
+        out.push(format!("removed {INSTALL_LOCK}"));
+    }
     for d in rec.dirs.iter().rev().filter(|d| d.starts_with(etc)) {
         let p = at(d)?;
         if fsops::remove_if_listed(&p).map_err(step("dirs"))? {
@@ -581,6 +584,8 @@ mod tests {
             "etc/saiife/credstore/vault-key",
             // The copy for a later install or --purge (root 0600).
             "etc/saiife/installed.previous.toml",
+            // Only --purge removes the lock file.
+            "etc/saiife-install.lock",
         ]));
         assert_eq!(e.tree(), want);
         let calls = e.host.state().calls;
@@ -1016,6 +1021,8 @@ mod macos_tests {
             "private/var/log/saiife",
             "private/var/log/saiife/audit",
             "private/var/log/saiife/daemon.log",
+            // Only --purge removes the lock file.
+            "private/etc/saiife-install.lock",
         ]));
         assert_eq!(e.tree(), want);
         let calls = e.calls();

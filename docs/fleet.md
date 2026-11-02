@@ -339,19 +339,35 @@ The pkg's `postinstall` runs
 `/etc/saiife/fleet/`, which macOS resolves through its `/etc` link to
 `/private/etc`, and they are `root:wheel`.
 
-**Exit codes.** A `postinstall` that exits 0 or 1 passes. When install exits 2,
-the `postinstall` fails too, so `installer` and your MDM report a failed
-install. The payload stays on disk, but locked mode is not active. The reason
-goes to `/var/log/install.log` and to syslog (`logger -t saiife -p auth.err`).
-For example, on a Mac with SIP off:
+**Exit codes.** When install exits 0 or 1, the `postinstall` exits 0. When
+install exits 2, the `postinstall` fails too, so `installer` and your MDM report
+a failed install. The payload stays on disk, but this install did not take
+effect. On a new Mac nothing is locked. On an upgrade, the earlier install stays
+in place and keeps locking. The reason goes to `/var/log/install.log` and to
+syslog (`logger -t saiife -p auth.err`). For example, on a Mac with SIP off:
 
 ```
 saiife: locked mode on macOS needs System Integrity Protection: without it the hardened runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP (Recovery: csrutil enable) and run install again.
-saiife: locked mode is NOT active: system install --fleet exited 2: ...
+saiife: install did not complete; any earlier install is unchanged: system install --fleet exited 2: ...
 ```
 
-Fix the cause, then install the pkg again or run
-`sudo /usr/local/libexec/saiife/saiife system install --fleet`.
+Fix the cause, then install the pkg again.
+
+**The staging path.** SIP does not protect `/usr/local`, and root runs the staging
+copy. So before it runs, the `postinstall` and the fleet scripts check
+`/usr/local`, `/usr/local/libexec`, `/usr/local/libexec/saiife` and the binary.
+Each must be no symlink, owned by root and not writable by group or others.
+Otherwise they exit 2 and name the path, and `doctor` warns in `files.package`:
+
+```
+saiife: the staging copy is not safe to run: /usr/local is not owned by root; ...
+```
+
+Some Macs have a user-owned `/usr/local`. Make it root's before you install, for
+example with `sudo chown root:wheel /usr/local` and `sudo chmod go-w /usr/local`.
+Check first what else on the Mac needs it to stay as it is. Homebrew on Intel
+keeps its files below `/usr/local` and its own dirs can stay the user's: only the
+four paths above are checked.
 
 On a target other than the boot volume, the `postinstall` prints
 `saiife: not the boot volume; run system install --fleet after boot` and exits
@@ -382,7 +398,9 @@ A pkg has no removal hook, and Installer has no uninstall. Run
 4. runs `pkgutil --forget com.saiife.pkg`.
 
 It keeps the audit, the vault key, the state, the config and the users, as on
-Linux. For a full wipe, run `sudo saiife system uninstall --purge` first.
+Linux. For a full wipe, run `sudo /opt/saiife/bin/saiife system uninstall --purge`
+first. Use that path, not `sudo saiife`: on an Intel Mac with Homebrew, a user owns
+`/usr/local/bin` and can replace the `saiife` link there.
 
 ### Jamf
 
@@ -397,8 +415,14 @@ architecture. In each policy:
 
 The script writes `/etc/saiife/fleet/` as `root:wheel`, 0755 and 0644. It refuses
 (exit 2) an empty or invalid config or an unknown agent. When the staging copy is
-already there, it also runs `system install --fleet`, so running the script again
-pushes a changed config.
+already there, it checks it and runs `system install --fleet`, so running the
+script again pushes a changed config.
+
+**Upgrades with a new config.** With priority Before, the script runs first, so
+the old staging copy applies the new config, before the pkg replaces that copy. If
+the old binary rejects the new config (say it uses a setting only the new version
+knows), the script exits 2 and the pkg does not run. To roll out such a config,
+first upgrade with the old config, then push the new one.
 
 For reporting, add `deploy/jamf/extension-attribute.sh` as an extension attribute.
 It prints `<result>pass</result>`, `warn`, `fail` or `not installed`, from
@@ -419,11 +443,18 @@ Intune needs a signed pkg, so take it from a release.
    type string, to report `doctor`'s exit code (`not installed` when there is no
    install).
 
-Intune does not promise that the script runs before the app. Either order ends in
-the same place, once both have run: the script applies the files if the pkg got
-there first, and the `postinstall` applies them otherwise. If the pkg runs first
-with no fleet files, install writes the commented default config until the script
-runs.
+Intune does not promise that the script runs before the app, and the two can
+overlap. An install waits up to 2 minutes for another one (see
+[below](#macos-limits)). Once both have run, the fleet config is in place in either
+order: the script applies the files if the pkg got there first, and the
+`postinstall` applies them otherwise. If the pkg runs first with no fleet files,
+install writes the commented default config until the script runs.
+
+**The agents may differ.** If the pkg runs first with no fleet files, install hooks
+all three agents. A later `AGENTS=claude` adds nothing and removes no hooks, because
+install never removes one. So with a subset of agents, the order matters. To get
+just the subset, uninstall, then install again from the fleet files: run
+`sudo /opt/saiife/bin/saiife system uninstall`, then install the pkg again.
 
 ### macOS limits
 
@@ -432,14 +463,19 @@ runs.
 - **Second account.** Same-user approval is off on macOS, so set approvers in the
   fleet `config.toml`. See
   [Approvals on macOS](install.md#approvals-on-macos-a-second-account).
+- **Overlapping installs.** `system install` holds `/etc/saiife-install.lock` (root
+  only) while it runs, on Linux too. Another install waits up to 2 minutes, then
+  exits 2 and changes nothing. `system uninstall --purge` removes the file.
 - **CI coverage.** CI runs the pkg on real macOS runners, which have SIP off, with
-  a test build. It checks the refusal through the real `installer`, then runs the
-  `postinstall`'s command by hand with the test seam, then `doctor`, the
-  attributes, the Jamf uninstall and a reinstall. A `postinstall` that passes,
-  and a signed pkg on a Mac with SIP on, are not covered. Try one Mac of each chip
-  before you roll out.
-- **`.env*` scan.** macOS may hide a user's Desktop, Documents and Downloads from
-  root without Full Disk Access, so `doctor` may not see `.env*` files in a project
-  there. saiife ships no PPPC profile.
+  a test build. It checks the staging refusals and the SIP refusal through the real
+  `installer`, then runs the `postinstall`'s command by hand with the test seam,
+  then `doctor`, the attributes, the Jamf uninstall and a reinstall. A `postinstall`
+  that passes, and a signed pkg on a Mac with SIP on, are not covered. Try one Mac
+  of each chip before you roll out.
+- **`.env*` scan.** Without Full Disk Access, macOS may deny root a user's Desktop,
+  Documents, Downloads, iCloud Drive and removable volumes. `doctor` then reports
+  the Info check `secrets.incomplete` for what it could not scan. An Info check does
+  not change the exit code, so the extension attribute and the custom attribute can
+  still say pass. saiife ships no PPPC profile.
 - **Syslog.** Long records lose verifiability over `unix:/var/run/syslog`. See
   [Forwarding](forwarding.md#syslog).

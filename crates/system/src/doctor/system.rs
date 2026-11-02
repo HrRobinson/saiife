@@ -669,6 +669,17 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
     if fs::symlink_metadata(&package).is_err() {
         return None;
     }
+    if let Some(why) = package_path_problem(ctx) {
+        return Some(Check::new(
+            ID,
+            Status::Warn,
+            TITLE,
+            format!(
+                "{why}: root runs this copy on the next package install; make it root's \
+                 and not writable by group or others"
+            ),
+        ));
+    }
     let read = |p: &Path| crate::fsops::sha256_file(p);
     let (pkg, opt) = match (read(&package), read(&ctx.layout.at(BINARY))) {
         (Ok(a), Ok(b)) => (a, b),
@@ -689,16 +700,45 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
     if pkg.is_some() && pkg == opt {
         return Some(Check::new(ID, Status::Pass, TITLE, ""));
     }
-    let shown_package = shown(ctx, PACKAGE_BINARY);
     Some(Check::new(
         ID,
         Status::Warn,
         TITLE,
         format!(
-            "the package's {shown_package} differs from {BINARY}: \
-             run sudo {shown_package} system install --fleet"
+            "the package's {} differs from {BINARY}: install the package again",
+            shown(ctx, PACKAGE_BINARY)
         ),
     ))
+}
+
+/// What the pkg's `postinstall` refuses: the staging copy and each dir up to
+/// `/usr`, which is not itself checked, must be no symlink, root's, and not
+/// writable by group or others. `/usr/local` has no SIP protection.
+fn package_path_problem(ctx: &Ctx) -> Option<String> {
+    let root = ctx.host.user("root")?;
+    let logical = Path::new(shown(ctx, PACKAGE_BINARY));
+    let mut chain: Vec<&Path> = logical
+        .ancestors()
+        .take_while(|p| *p != Path::new("/usr"))
+        .collect();
+    chain.reverse();
+    for p in chain {
+        let at = ctx.layout.root().join(p.strip_prefix("/").ok()?);
+        let m = match fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) => return Some(format!("{}: cannot check: {e}", p.display())),
+        };
+        if m.file_type().is_symlink() {
+            return Some(format!("{}: is a symlink", p.display()));
+        }
+        if let Some(problem) = crate::fsops::root_owned_problems(&m, root.uid)
+            .into_iter()
+            .next()
+        {
+            return Some(format!("{}: {problem}", p.display()));
+        }
+    }
+    None
 }
 
 /// Re-authentication for approvals needs polkit: `pkcheck` and `polkitd`
@@ -2024,7 +2064,7 @@ mod tests {
         assert_eq!(
             get(&r, "files.package").detail,
             "the package's /usr/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
-             run sudo /usr/libexec/saiife/saiife system install --fleet"
+             install the package again"
         );
         // A missing /opt binary is drift too.
         fs::remove_file(t.at(BINARY)).unwrap();
@@ -3020,7 +3060,42 @@ mod macos_tests {
         assert_eq!(
             get(&r, "files.package").detail,
             "the package's /usr/local/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
-             run sudo /usr/local/libexec/saiife/saiife system install --fleet"
+             install the package again"
+        );
+    }
+
+    #[test]
+    fn macos_unsafe_staging_path_warns_without_advice_to_run_it() {
+        let e = installed();
+        let package = e.layout.at(PACKAGE_BINARY);
+        let dir = package.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let same = fs::read(e.layout.at(BINARY)).unwrap();
+        fs::write(&package, &same).unwrap();
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        let detail = &get(&r, "files.package").detail;
+        assert!(
+            detail.starts_with("/usr/local/libexec/saiife: "),
+            "{detail}"
+        );
+        assert!(!detail.contains("sudo"), "{detail}");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A swapped binary: a symlink, even to identical bytes.
+        let elsewhere = e.layout.root().join("elsewhere");
+        fs::write(&elsewhere, &same).unwrap();
+        fs::remove_file(&package).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &package).unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert_eq!(
+            get(&r, "files.package").detail,
+            "/usr/local/libexec/saiife/saiife: is a symlink: root runs this copy on the next \
+             package install; make it root's and not writable by group or others"
         );
     }
 

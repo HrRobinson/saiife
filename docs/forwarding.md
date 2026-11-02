@@ -48,7 +48,7 @@ ca = "/etc/saiife/ca/siem.pem"   # optional extra CA for tls://
 - The TIMESTAMP is the record's own `ts`.
 - `unix:/dev/log` (`unix:/var/run/syslog` on macOS): one datagram per
   record. A message over 8 KiB (2 KiB on macOS, whose local datagram
-  sockets take no more) is truncated at a character boundary and ends with
+  sockets take no more by default) is truncated at a character boundary and ends with
   `…[truncated]` (a truncated line cannot be verified). If `/dev/log` is a stream socket,
   every message goes over it with octet-counting framing instead, uncut.
   The lower limit on macOS means more long records lose verifiability there.

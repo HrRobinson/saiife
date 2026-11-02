@@ -38,6 +38,9 @@ pub const FLEET_DIR: &str = "/etc/saiife/fleet";
 pub const FLEET_CONFIG: &str = "/etc/saiife/fleet/config.toml";
 /// The fleet's `agents` and `approvers`.
 pub const FLEET_INSTALL: &str = "/etc/saiife/fleet/install.toml";
+/// Held while `system install` runs. Beside `/etc/saiife`, not in it: a
+/// refused install leaves `/etc/saiife` alone.
+pub const INSTALL_LOCK: &str = "/etc/saiife-install.lock";
 /// The staging copy a package ships; `install` copies it to [`BINARY`].
 pub const PACKAGE_BINARY: &str = "/usr/libexec/saiife/saiife";
 

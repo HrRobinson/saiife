@@ -44,6 +44,50 @@ ETC=/etc/saiife
 FLEET=$ETC/fleet
 PKG_BIN=/usr/local/libexec/saiife/saiife
 
+# --- staging check: the same in postinstall and both fleet-files.sh ---
+# /usr/local is not protected by SIP, and root runs the staging copy. Prints
+# why it is not safe to run, or nothing: each step must be no symlink, owned
+# by root, and not writable by group or others.
+STAGING_UID=0
+staging_problem() {
+    for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$PKG_BIN"; do
+        if [ -L "$p" ]; then
+            echo "$p is a symbolic link"
+            return 0
+        fi
+        # ls -n is the POSIX way to read a numeric owner.
+        # shellcheck disable=SC2012
+        if ! line=$(ls -ldn "$p" 2>/dev/null); then
+            echo "$p is missing"
+            return 0
+        fi
+        read -r mode _ uid _ <<EOF
+$line
+EOF
+        if [ "$uid" != "$STAGING_UID" ]; then
+            echo "$p is not owned by root"
+            return 0
+        fi
+        case "$mode" in
+            ?????w* | ????????w*)
+                echo "$p is writable by group or others"
+                return 0
+                ;;
+        esac
+    done
+    [ -f "$PKG_BIN" ] || echo "$PKG_BIN is not a regular file"
+}
+# --- end staging check ---
+
+# Before anything is written. No staging copy yet: the pkg's postinstall
+# checks it.
+have_staging=""
+if [ -e "$PKG_BIN" ] || [ -L "$PKG_BIN" ]; then
+    have_staging=1
+    why=$(staging_problem)
+    [ -z "$why" ] || refuse "the staging copy is not safe to run: $why; make it root's and not writable by group or others"
+fi
+
 for d in "$ETC" "$FLEET"; do
     [ ! -L "$d" ] || refuse "$d is a symbolic link"
 done
@@ -72,7 +116,7 @@ echo "saiife: fleet files written to $FLEET"
 
 # The pkg is already there (a changed config, or the pkg ran first): apply
 # them now. Otherwise the pkg's postinstall does.
-if [ -x "$PKG_BIN" ]; then
+if [ -n "$have_staging" ]; then
     rc=0
     "$PKG_BIN" system install --fleet || rc=$?
     # 1 = installed, but doctor found failures (already printed).
