@@ -94,8 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: shellcheck --version
-      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/locked-macos/*.sh scripts/personal-broker/*.sh scripts/release/*.sh packaging/linux/build.sh
-      - run: shellcheck -s sh packaging/linux/scripts/* deploy/intune/linux/discovery.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/lock-check/*.sh scripts/lock-check/testdata/*.sh scripts/locked-linux/*.sh scripts/locked-macos/*.sh scripts/personal-broker/*.sh scripts/release/*.sh scripts/macos-pkg/*.sh packaging/linux/build.sh packaging/macos/build-pkg.sh
+      - run: shellcheck -s sh packaging/linux/scripts/* packaging/macos/scripts/* deploy/intune/linux/discovery.sh deploy/intune/macos/*.sh deploy/jamf/*.sh
       - run: shellcheck -x scripts/package-linux/run.sh scripts/package-linux/deb.sh
       - run: shellcheck -s sh scripts/package-linux/rpm-container.sh
 
@@ -194,6 +194,43 @@ jobs:
         with:
           name: locked-macos-logs-${{ matrix.os }}
           path: target/locked-macos-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The pkg on real Macs (plan 18, Task 7): build, payload, the Jamf fleet
+  # files, installer and its SIP refusal, the fleet install from the staging
+  # copy, doctor, the MDM attributes, the Jamf uninstall and a reinstall. The
+  # ci-locked build: the runners have SIP off and a release binary never
+  # honours the SIP seam, so it could only prove the refusal. Like
+  # locked-macos, run.sh refuses outside GitHub Actions on macOS and calls
+  # sudo itself. No secrets here: the pkg is unsigned.
+  macos-pkg:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --locked --profile ci-locked --bin saiife
+      - name: sign ad hoc with the hardened runtime
+        run: codesign --force --options runtime --sign - target/ci-locked/saiife
+      - name: build, install, uninstall and reinstall the pkg (sudo inside, this job only)
+        env:
+          SAIIFE_PACKAGE_CI: "1"
+          SAIIFE_PACKAGE_LOGS: ${{ github.workspace }}/target/macos-pkg-logs
+        run: bash scripts/macos-pkg/run.sh "$PWD/target/ci-locked/saiife"
+      - name: upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-pkg-logs-${{ matrix.os }}
+          path: target/macos-pkg-logs
           if-no-files-found: ignore
           retention-days: 7
 

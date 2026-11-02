@@ -1,0 +1,8 @@
+# The fleet system config the macos-pkg CI job writes through
+# deploy/jamf/fleet-files.sh (scripts/macos-pkg/run.sh).
+version = 2
+locked = true
+
+[approval]
+approvers = ["group:admin"]
+same_user = "deny"

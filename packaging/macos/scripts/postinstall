@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs locked-mode install after the pkg lands (plan 18, decision 3).
+# Installer passes: $1 the package, $2 the install location, $3 the target
+# volume. Its output goes to /var/log/install.log, so a failure is also sent
+# to syslog: a fleet package exists to lock, and an admin must see that it
+# did not.
+
+if [ "$3" != "/" ]; then
+    echo "saiife: not the boot volume; run system install --fleet after boot"
+    exit 0
+fi
+
+rc=0
+out=$(/usr/local/libexec/saiife/saiife system install --fleet 2>&1) || rc=$?
+printf '%s\n' "$out"
+
+# 0 = installed.
+if [ "$rc" -eq 0 ]; then
+    exit 0
+fi
+last=$(printf '%s\n' "$out" | tail -n 1)
+# 1 = installed, but doctor found failures (already printed): not fatal.
+if [ "$rc" -eq 1 ]; then
+    logger -t saiife -p auth.warning "saiife: installed, with problems: $last" 2>/dev/null || true
+    exit 0
+fi
+# 2 = install error or unsupported host (SIP off, say): fail loudly, never
+# lock silently.
+msg="saiife: locked mode is NOT active: system install --fleet exited $rc: $last"
+echo "$msg" >&2
+logger -t saiife -p auth.err "$msg" 2>/dev/null || true
+exit "$rc"

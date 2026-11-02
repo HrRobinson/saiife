@@ -52,7 +52,6 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         out.push(files_installed(ctx, i));
     }
     out.push(files_binary(ctx));
-    #[cfg(target_os = "linux")]
     if ctx.installed.is_some() {
         out.extend(files_package(ctx));
     }
@@ -663,7 +662,6 @@ fn macho_binary(bytes: &[u8]) -> Check {
 /// copied to [`BINARY`]: after a package upgrade whose `postinst` did not
 /// run (or failed), the hooks still run the old binary. Only when the
 /// package binary exists (a package install).
-#[cfg(target_os = "linux")]
 fn files_package(ctx: &Ctx) -> Option<Check> {
     const ID: &str = "files.package";
     const TITLE: &str = "package binary";
@@ -691,13 +689,14 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
     if pkg.is_some() && pkg == opt {
         return Some(Check::new(ID, Status::Pass, TITLE, ""));
     }
+    let shown_package = shown(ctx, PACKAGE_BINARY);
     Some(Check::new(
         ID,
         Status::Warn,
         TITLE,
         format!(
-            "the package's {PACKAGE_BINARY} differs from {BINARY}: \
-             run sudo {PACKAGE_BINARY} system install --fleet"
+            "the package's {shown_package} differs from {BINARY}: \
+             run sudo {shown_package} system install --fleet"
         ),
     ))
 }
@@ -3003,6 +3002,25 @@ mod macos_tests {
             r.checks.iter().all(|c| !c.detail.contains("/proc")),
             "{}",
             r.to_text()
+        );
+    }
+
+    #[test]
+    fn macos_package_binary_is_compared() {
+        let e = installed();
+        assert!(!doctor(&e).checks.iter().any(|c| c.id == "files.package"));
+        let package = e.layout.at(PACKAGE_BINARY);
+        assert!(package.ends_with("usr/local/libexec/saiife/saiife"));
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        fs::write(&package, fs::read(e.layout.at(BINARY)).unwrap()).unwrap();
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+        fs::write(&package, b"another build").unwrap();
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert_eq!(
+            get(&r, "files.package").detail,
+            "the package's /usr/local/libexec/saiife/saiife differs from /opt/saiife/bin/saiife: \
+             run sudo /usr/local/libexec/saiife/saiife system install --fleet"
         );
     }
 

@@ -268,8 +268,65 @@ jobs:
           path: pkg/*
           if-no-files-found: error
 
+  # One pkg per architecture from the thin binaries the build job signed:
+  # `system install` refuses a universal binary. An unsigned pkg is built as a
+  # check and never published; a failed signing or notarization fails the
+  # release.
+  macos-pkg:
+    needs: [check-version, build]
+    runs-on: macos-latest
+    outputs:
+      signed: ${{ steps.pkgs.outputs.signed }}
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*-apple-darwin
+          path: dist
+          merge-multiple: true
+      # Secrets exist only on v* tag pushes: PRs and branch runs get empty
+      # strings and build the unsigned pkg. The installer pair is all or none;
+      # build-pkg.sh fails on half a set.
+      - id: pkgs
+        name: build the pkgs
+        shell: bash
+        env:
+          MACOS_INSTALLER_CERT_P12: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_INSTALLER_CERT_P12 || '' }}
+          MACOS_INSTALLER_CERT_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_INSTALLER_CERT_PASSWORD || '' }}
+          MACOS_SIGN_P12_BASE64: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_BASE64 || '' }}
+          MACOS_SIGN_P12_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.MACOS_SIGN_P12_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_NOTARY_APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_APPLE_ID || '' }}
+          APPLE_NOTARY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          signed=true
+          for row in x86_64-apple-darwin:x86_64 aarch64-apple-darwin:arm64; do
+            target="${row%%:*}"
+            arch="${row##*:}"
+            name="saiife-$VERSION-$target"
+            mkdir -p "$RUNNER_TEMP/p18b-bin"
+            # The packaged bytes are the tarball's bytes.
+            tar -xzf "dist/$name.tar.gz" -C "$RUNNER_TEMP/p18b-bin" "$name/saiife"
+            pkg="$(bash packaging/macos/build-pkg.sh "$RUNNER_TEMP/p18b-bin/$name/saiife" "$VERSION" "$arch" pkg-out)"
+            echo "built $pkg ($(cat "$pkg.mode"))"
+            if [ "$(cat "$pkg.mode")" != signed ]; then signed=false; fi
+          done
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+      - name: upload the signed pkgs
+        if: steps.pkgs.outputs.signed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-pkg-signed
+          path: pkg-out/*.pkg
+          if-no-files-found: error
+
   publish:
-    needs: [check-version, build, linux-packages]
+    needs: [check-version, build, linux-packages, macos-pkg]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -290,8 +347,16 @@ jobs:
           pattern: pkg-*
           path: dist
           merge-multiple: true
+      - name: download the signed macOS pkgs
+        if: needs.macos-pkg.outputs.signed == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-pkg-signed
+          path: dist
       - name: SHA256SUMS
         shell: bash
+        env:
+          PKG_SIGNED: ${{ needs.macos-pkg.outputs.signed }}
         run: |
           set -euo pipefail
           cd dist
@@ -304,12 +369,19 @@ jobs:
           shopt -s nullglob
           debs=(saiife_*.deb)
           rpms=(saiife-*.rpm)
+          pkgs=(saiife-*.pkg)
           shopt -u nullglob
           if [ "${#debs[@]}" -ne 2 ] || [ "${#rpms[@]}" -ne 2 ]; then
             echo "::error::expected 2 debs and 2 rpms, found ${#debs[@]} and ${#rpms[@]}"
             exit 1
           fi
-          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm | LC_ALL=C sort -k2 > SHA256SUMS
+          want_pkgs=0
+          if [ "$PKG_SIGNED" = true ]; then want_pkgs=2; fi
+          if [ "${#pkgs[@]}" -ne "$want_pkgs" ]; then
+            echo "::error::expected $want_pkgs signed pkgs, found ${#pkgs[@]}"
+            exit 1
+          fi
+          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm ${pkgs[@]+"${pkgs[@]}"} | LC_ALL=C sort -k2 > SHA256SUMS
           cat SHA256SUMS
       - name: sign SHA256SUMS
         shell: bash
@@ -371,6 +443,9 @@ jobs:
           if grep -qx 'ad-hoc' "${signing[@]}"; then
             printf '\nmacOS binaries in this release are ad-hoc signed and not notarized.\n' >> notes.md
           fi
+          if ! ls dist/saiife-*.pkg >/dev/null 2>&1; then
+            printf '\nThis release has no macOS pkg: the installer signing secrets are not set.\n' >> notes.md
+          fi
           cat notes.md
       # Draft first: nothing is public (or "latest") until install-test passes.
       - name: create draft release
@@ -380,6 +455,9 @@ jobs:
           files=(dist/*.tar.gz dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh)
           if [ -f dist/SHA256SUMS.asc ]; then
             files+=(dist/SHA256SUMS.asc)
+          fi
+          if ls dist/saiife-*.pkg >/dev/null 2>&1; then
+            files+=(dist/saiife-*.pkg)
           fi
           gh release create "$GITHUB_REF_NAME" \
             --draft \

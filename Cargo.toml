@@ -41,7 +41,7 @@ opt-level = 3
 opt-level = 3
 
 # The CI jobs `locked-linux` (built for x86_64-unknown-linux-musl: a static
-# binary) and `locked-macos` only: debug assertions on, so the test seams
+# binary), `locked-macos` and `macos-pkg` only: debug assertions on, so the test seams
 # exist (SAIIFE_EVAL_FAULT; on macOS SAIIFE_TEST_ALLOW_SIP_OFF), installed
 # with `system install --allow-test-build`. Never
 # for production (spec §9.2 A4). opt-level 1 keeps it small and fast enough

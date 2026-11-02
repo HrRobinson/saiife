@@ -1,12 +1,14 @@
-# Fleet install (Linux packages and recipes)
+# Fleet install (packages and recipes)
 
-This page is for admins who roll saiife out to many Linux machines. It covers
-the `.deb` and `.rpm` packages, an Ansible role and an Intune compliance policy.
-They all end in the same place: `saiife system install --fleet`, which sets up
-locked mode as described in [Install](install.md#locked-mode-linux).
+This page is for admins who roll saiife out to many machines. For Linux it
+covers the `.deb` and `.rpm` packages, an Ansible role and an Intune compliance
+policy. For macOS, see [macOS (v2.1)](#macos-v21): a `.pkg` with Jamf and Intune
+recipes. They all end in the same place: `saiife system install --fleet`, which
+sets up locked mode as described in [Install](install.md#locked-mode-linux).
 
 Supported systems are the same as for locked mode: Ubuntu 22.04+, Debian 12+
-and RHEL 9+ (also Rocky and Alma), with systemd running.
+and RHEL 9+ (also Rocky and Alma), with systemd running; macOS 15 or later with
+System Integrity Protection on.
 
 ## What the package owns
 
@@ -192,7 +194,10 @@ A release has these assets:
 - two `.deb` files (`saiife_<version>_amd64.deb`, `saiife_<version>_arm64.deb`);
 - two `.rpm` files (`saiife-<version>-1.x86_64.rpm`, `saiife-<version>-1.aarch64.rpm`);
 - the four static tarballs;
-- `SHA256SUMS`, which lists all eight files;
+- two `.pkg` files for macOS (`saiife-<version>-arm64.pkg`,
+  `saiife-<version>-x86_64.pkg`), when the release has them. See
+  [macOS](#macos-v21);
+- `SHA256SUMS`, which lists all of these;
 - `SHA256SUMS.asc`, a detached signature of `SHA256SUMS`. It is there only when
   the release was signed.
 
@@ -308,5 +313,133 @@ exits 0 or 1. A `doctor` exit of 2, or a missing install, is non-compliant.
 
 ## macOS (v2.1)
 
-macOS packages, Jamf and Intune for macOS come after plan 13 (macOS locked
-mode). This section is filled in then.
+### The pkg
+
+A release has one signed and notarized pkg per architecture:
+
+- `saiife-<version>-arm64.pkg` for Apple silicon;
+- `saiife-<version>-x86_64.pkg` for Intel.
+
+Send each Mac the one for its chip. There is no universal pkg: `system install`
+refuses a universal binary (see
+[Signature](install.md#locked-mode-macos)). A release built without the
+installer certificate has no pkg at all, and its notes say so. saiife never
+publishes an unsigned pkg.
+
+The pkg owns these paths, and ships nothing under `/opt/saiife`, `/etc`, `/var`
+or `/Library`:
+
+- `/usr/local/libexec/saiife/saiife`, the staging copy of the binary;
+- the directory it is in;
+- `/usr/local/bin/saiife`, a symlink to the staging copy.
+
+The pkg's `postinstall` runs
+`/usr/local/libexec/saiife/saiife system install --fleet`, the same as on Linux.
+[Fleet files](#fleet-files) work the same too. They live at
+`/etc/saiife/fleet/`, which macOS resolves through its `/etc` link to
+`/private/etc`, and they are `root:wheel`.
+
+**Exit codes.** A `postinstall` that exits 0 or 1 passes. When install exits 2,
+the `postinstall` fails too, so `installer` and your MDM report a failed
+install. The payload stays on disk, but locked mode is not active. The reason
+goes to `/var/log/install.log` and to syslog (`logger -t saiife -p auth.err`).
+For example, on a Mac with SIP off:
+
+```
+saiife: locked mode on macOS needs System Integrity Protection: without it the hardened runtime does not stop library injection (DYLD_INSERT_LIBRARIES). Enable SIP (Recovery: csrutil enable) and run install again.
+saiife: locked mode is NOT active: system install --fleet exited 2: ...
+```
+
+Fix the cause, then install the pkg again or run
+`sudo /usr/local/libexec/saiife/saiife system install --fleet`.
+
+On a target other than the boot volume, the `postinstall` prints
+`saiife: not the boot volume; run system install --fleet after boot` and exits
+0. Run that command after you boot from the volume. Nothing is locked until then.
+
+**Upgrades.** Install the new pkg. As on Linux, it replaces only the staging
+copy, and then install replaces `/opt/saiife/bin/saiife` atomically and restarts
+the daemon.
+
+**Reloads.** Where this page says `systemctl`, macOS uses launchd. Restart the
+daemon with `sudo launchctl kickstart -k system/com.saiife.saiifed`. A changed
+config needs no restart: install asks the daemon to load it and says so, as on
+Linux. If the daemon does not take it, read `/var/log/saiife/daemon.log`.
+
+### Removal
+
+A pkg has no removal hook, and Installer has no uninstall. Run
+`deploy/jamf/uninstall.sh` as root, from any MDM or by hand. It:
+
+1. prints this line and sends it to syslog with
+   `logger -t saiife -p auth.warning`:
+   ```
+   saiife: removing the package uninstalls locked mode: agents on this machine will no longer be locked
+   ```
+2. runs `/opt/saiife/bin/saiife system uninstall`. If that fails, it stops and
+   keeps the staging copy;
+3. removes `/usr/local/libexec/saiife` and the symlink;
+4. runs `pkgutil --forget com.saiife.pkg`.
+
+It keeps the audit, the vault key, the state, the config and the users, as on
+Linux. For a full wipe, run `sudo saiife system uninstall --purge` first.
+
+### Jamf
+
+Upload the pkgs, then make one policy per chip, scoped to a smart group on the
+architecture. In each policy:
+
+1. Add `deploy/jamf/fleet-files.sh` with priority **Before**. Parameter 4 is the
+   base64 of your `config.toml` (`base64 -i config.toml`). Parameter 5 is a comma
+   list of agents, such as `claude,codex,gemini`. Leave it empty to use the
+   agents install already recorded.
+2. Add the pkg for that chip.
+
+The script writes `/etc/saiife/fleet/` as `root:wheel`, 0755 and 0644. It refuses
+(exit 2) an empty or invalid config or an unknown agent. When the staging copy is
+already there, it also runs `system install --fleet`, so running the script again
+pushes a changed config.
+
+For reporting, add `deploy/jamf/extension-attribute.sh` as an extension attribute.
+It prints `<result>pass</result>`, `warn`, `fail` or `not installed`, from
+`doctor`'s exit code.
+
+### Intune for macOS
+
+Intune needs a signed pkg, so take it from a release.
+
+1. Edit `deploy/intune/macos/fleet-files.sh`. Intune scripts take no parameters,
+   so set `CONFIG_B64` and `AGENTS` at the top. Treat your copy as you would the
+   config itself.
+2. Under **Devices > macOS**, add it as a shell script. Set **Run script as
+   signed-in user** to **No**.
+3. Under **Apps > macOS**, add each pkg as a **macOS app (PKG)**. Assign each one
+   to a group of Macs with that chip.
+4. Add `deploy/intune/macos/custom-attribute.sh` as a custom attribute, with data
+   type string, to report `doctor`'s exit code (`not installed` when there is no
+   install).
+
+Intune does not promise that the script runs before the app. Either order ends in
+the same place, once both have run: the script applies the files if the pkg got
+there first, and the `postinstall` applies them otherwise. If the pkg runs first
+with no fleet files, install writes the commented default config until the script
+runs.
+
+### macOS limits
+
+- **SIP is required.** A Mac with SIP off fails the pkg install. There is no
+  override in a release build.
+- **Second account.** Same-user approval is off on macOS, so set approvers in the
+  fleet `config.toml`. See
+  [Approvals on macOS](install.md#approvals-on-macos-a-second-account).
+- **CI coverage.** CI runs the pkg on real macOS runners, which have SIP off, with
+  a test build. It checks the refusal through the real `installer`, then runs the
+  `postinstall`'s command by hand with the test seam, then `doctor`, the
+  attributes, the Jamf uninstall and a reinstall. A `postinstall` that passes,
+  and a signed pkg on a Mac with SIP on, are not covered. Try one Mac of each chip
+  before you roll out.
+- **`.env*` scan.** macOS may hide a user's Desktop, Documents and Downloads from
+  root without Full Disk Access, so `doctor` may not see `.env*` files in a project
+  there. saiife ships no PPPC profile.
+- **Syslog.** Long records lose verifiability over `unix:/var/run/syslog`. See
+  [Forwarding](forwarding.md#syslog).

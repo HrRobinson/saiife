@@ -348,6 +348,14 @@ The release binaries are built that way:
   notes then say so ("macOS binaries in this release are ad-hoc signed and
   not notarized"), and install warns.
 
+### Packages (.pkg)
+
+For many Macs, install the `.pkg` for the Mac's chip from the release page. It
+puts the binary in `/usr/local/libexec/saiife/` and runs
+`saiife system install --fleet`, which reads its options from
+`/etc/saiife/fleet/`. See [Fleet install](fleet.md#macos-v21) for the fleet files,
+removal, Jamf and Intune.
+
 ### Approvals on macOS: a second account
 
 **Same-user approval is off on macOS.** The macOS password or Touch ID prompt
