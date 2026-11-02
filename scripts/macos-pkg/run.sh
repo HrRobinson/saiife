@@ -248,9 +248,10 @@ before_dirs="$(shared_dirs)"
 run_installer "first install"
 as_found="$(first_unsafe)"
 if [[ -n "$as_found" ]]; then
-    # The runner image keeps /usr/local as the runner's: the staging check is
-    # right to refuse it. The check is not loosened for this: phase 5b makes
-    # the dirs what the check asks, as an admin would.
+    # Never runs on the macos-15 and macos-15-intel images: both have a
+    # root-owned /usr/local, so the dirs pass the check as found. It is here for
+    # an image that does not; phase 5b then stops the job. Phase 5c is what
+    # exercises the check.
     grep -qF "saiife: the staging copy is not safe to run: $as_found " "$WORK/install-log.out" ||
         fail "first install: no staging refusal naming $as_found: $(grep -F saiife "$WORK/install-log.out" || true)"
     ok "first install: the runner's $as_found is refused"
@@ -265,11 +266,8 @@ ok "the refused install changed nothing else"
 ok "the pkg left /usr/local and /usr/local/bin alone"
 
 phase "5b. root-owned dirs: the staging copy runs, and refuses on SIP"
-for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife; do
-    sudo -n chown root:wheel "$p"
-    sudo -n chmod go-w "$p"
-done
-[[ -z "$(first_unsafe)" ]] || fail "the dirs are still unsafe: $(first_unsafe)"
+# The check is not loosened, and the dirs are not changed here to pass it.
+[[ -z "$(first_unsafe)" ]] || fail "this image's dirs fail the staging check: $(first_unsafe)"
 install_refused "root-owned dirs"
 for p in /opt/saiife /etc/saiife/config.toml /etc/saiife/installed.toml /var/db/saiife "$PLIST"; do
     if sudo -n test -e "$p"; then fail "the refused install created $p"; fi
