@@ -23,7 +23,8 @@
 //! - `Unread::Unreadable`: an unknown variable, a cmd substring or replace
 //!   (`%VAR:~0%`), a device namespace path (`\\?\Volume{…}`,
 //!   `\\.\PhysicalDrive0`) or a `..` after a device prefix, Git Bash's `/proc`
-//!   and `/dev/fd`, a `..` above the root of a path spelled with `/`, a
+//!   and `/dev/fd`, a `..` above the root of a path spelled with `/`, a relative
+//!   path into a Git Bash mount (`c/Users` from `/`), a
 //!   PowerShell drive (`HKLM:\`, `temp:\`), a drive or `admin$` share on a host
 //!   not known to be this machine, a wildcard under a UNC root (it is never
 //!   expanded), a component of only dots, spaces or a stream (only exact `.`
@@ -33,14 +34,20 @@
 //! - `Unread::NoAnchor`: an empty path, or a relative one with no working
 //!   directory known. The engine treats it as it does in POSIX style.
 //!
+//! A shell's word is more than its text: `path_words` makes a word whose value
+//! the shell decides (`./$x`, `$(x)`) read as the variable it is. That is what
+//! a command's paths go through; a file tool's path has no shell in front of it.
+//!
 //! Not lexically knowable, and left to `resolved` when the path exists: 8.3
 //! short names (`PROGRA~1`), junctions and symlinks. A UNC path stays lexical:
 //! asking the OS would call a host the command chose.
 
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
-use crate::canon::PathVars;
+use crate::canon::{PathStyle, PathVars};
+use crate::lexer::Word;
 
 /// The variable holding this machine's name (not a path).
 pub const COMPUTER_NAME: &str = "COMPUTERNAME";
@@ -313,15 +320,68 @@ fn identifier_len(t: &str) -> usize {
         .unwrap_or(t.len())
 }
 
-/// `raw` holds `$` and an identifier with no known value. As a path it reads
-/// as a name (`C:\$Recycle.Bin`), but a shell may expand it, so a working
-/// directory spelled that way is not known.
-pub(crate) fn has_unbound_dollar(raw: &str, vars: &PathVars) -> bool {
-    raw.match_indices('$').any(|(i, _)| {
-        let after = &raw[i + 1..];
-        let n = identifier_len(after);
-        n > 0 && strip_ci(after, "env:").is_none() && lookup(&after[..n], None, vars).is_none()
-    })
+/// A command's words as the path rules read them. On Windows a word whose
+/// value the shell decides reads as what it is, a variable with no known value
+/// or a substitution, so `read` calls it unreadable: every position a path is
+/// read from (operands, redirections, `cd`, a wrapper's files) denies alike.
+/// Unchanged in POSIX style, and for a file tool's path, which no shell expands.
+pub(crate) fn path_words<'a>(words: &'a [Word], vars: &PathVars) -> Cow<'a, [Word]> {
+    if vars.style() != PathStyle::Windows {
+        return Cow::Borrowed(words);
+    }
+    Cow::Owned(words.iter().map(|w| path_word(w, vars)).collect())
+}
+
+fn path_word(w: &Word, vars: &PathVars) -> Word {
+    let mut text = if w.literal_dollars {
+        w.text.clone()
+    } else {
+        brace_unknown_parameters(&w.text, vars)
+    };
+    if w.has_substitution && !text.contains("$(") {
+        text.insert_str(text.find('`').unwrap_or(0), "$(");
+    }
+    Word {
+        text,
+        has_substitution: false,
+        ..w.clone()
+    }
+}
+
+/// `raw` with each parameter that has no known value in the `${name}` form
+/// `read` never takes for a name: `./$x` looks like a directory called `$x`.
+/// A `$` that opens nothing stays (`c$/`, `admin$`), as does what `read` has its
+/// own answer for (`$env:X`, `${x}`, `$(x)`). Bash's special parameters count,
+/// since `$1`, `$@` and `$*` hold whatever a caller passed.
+fn brace_unknown_parameters(raw: &str, vars: &PathVars) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let n = if after.starts_with(|c: char| c.is_ascii_digit() || "@*#?-$!".contains(c)) {
+            1
+        } else if strip_ci(after, "env:").is_some() {
+            0
+        } else {
+            let n = identifier_len(after);
+            if lookup(&after[..n], None, vars).is_some() {
+                0
+            } else {
+                n
+            }
+        };
+        if n == 0 {
+            out.push('$');
+        } else {
+            out.push_str("${");
+            out.push_str(&after[..n]);
+            out.push('}');
+        }
+        rest = &after[n..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The expansion of the `$…` at the start of `s` and the bytes it used.
@@ -464,6 +524,10 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
     if slash_spelled && is_git_bash_virtual(split_root(&out).1) {
         return Err(Unread::Unreadable("Git Bash's /proc or /dev/fd"));
     }
+    let relative = slash_spelled && !s.starts_with('/') && t.chars().nth(1) != Some(':');
+    if relative && enters_git_bash_mount(&out, cwd) {
+        return Err(Unread::Unreadable("a relative path into a Git Bash mount"));
+    }
     // Never expanded (`canon` will not list a host's share), so its literal
     // text would match no rule: `.en*` misses `**/.env`.
     if out.starts_with("//") && out.contains(['*', '?', '[']) {
@@ -498,6 +562,22 @@ fn is_git_bash_virtual(body: &str) -> bool {
         || body.eq_ignore_ascii_case("dev/fd")
         || strip_ci(body, "dev/fd/").is_some()
         || (strip_ci(body, "proc/").is_some() && strip_ci(body, "proc/cygdrive/").is_none())
+}
+
+/// `out`, a relative path made absolute, may be a drive that Git Bash mounts:
+/// `c/Users` from `/`, `c/Users` from `/cygdrive`. A one-letter directory the
+/// working directory is already in is a directory (`D:\a\repo`).
+fn enters_git_bash_mount(out: &str, cwd: Option<&str>) -> bool {
+    if out.starts_with("//") {
+        return false;
+    }
+    let body = split_root(out).1;
+    if git_bash_drive(body).is_none() {
+        return false;
+    }
+    let first = split_seg(body).0;
+    let is_mount_dir = drive_letter(component_name(first)).is_none();
+    is_mount_dir || !cwd.is_some_and(|c| split_seg(split_root(c).1).0.eq_ignore_ascii_case(first))
 }
 
 /// `body` (no leading slash) as a Git Bash, Cygwin or WSL drive path.
@@ -677,7 +757,7 @@ fn aton(h: &str) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
     use crate::builtins::builtin_packs;
-    use crate::canon::{path_forms, PathStyle};
+    use crate::canon::path_forms;
     use crate::engine::{AllowTrace, Decision, Engine};
     use crate::pack::load_pack_str;
     use crate::pathrule::Access;
@@ -1416,14 +1496,13 @@ mod tests {
         ] {
             assert_unreadable_deny(&e.evaluate(cmd), cmd);
         }
-        // `$` and an identifier with no value: it may be a variable, so the
-        // directory is unknown. Even when quoted, as a name it is rare.
-        assert!(matches!(
+        // Single-quoted, a `$` is a name: the directory is known.
+        assert_eq!(
             e.evaluate(r"cd 'C:\$Recycle.Bin' && cat notes.txt"),
             Decision::Allow {
-                trace: AllowTrace::Unjudgeable { .. }
+                trace: AllowTrace::NoMatch
             }
-        ));
+        );
         // The pack regexes keep the collapsed line.
         let (packs, _) = builtin_packs();
         let fs: Vec<_> = packs
@@ -1671,6 +1750,9 @@ reason = "reached only by listing the source"
             "C:/PROC/self/environ",
             "/c/proc/self/environ",
             "/d/proc/x",
+            // A sibling that may be a mount: `cd /usr; cat ../c/Users/…`.
+            "../x",
+            "../c/Users/a/x",
         ] {
             unreadable(raw);
         }
@@ -1688,7 +1770,7 @@ reason = "reached only by listing the source"
             ("/mnt/../c/x", "c:/x"),
             ("/c/..", "c:/"),
             ("/.", "c:/"),
-            ("../x", "c:/x"),
+            ("../xy", "c:/xy"),
             ("./x", "c:/p/x"),
             ("C:/a/../x", "c:/x"),
         ] {
@@ -1762,41 +1844,306 @@ reason = "reached only by listing the source"
         assert!(!e.evaluate("cat //localhost/docs/notes.txt").is_deny());
     }
 
-    /// `$` and an identifier with no value may be a variable: the directory
-    /// is unknown, as in POSIX style. A `$` that opens nothing is a name.
+    /// What a live word may expand to, in every position a path is read from.
+    const LIVE_WORDS: &[&str] = &[
+        "./$x/id_rsa",
+        "$x/id_rsa",
+        r"$x\id_rsa",
+        r"./$x\id_rsa",
+        "${x}/id_rsa",
+        "./${x}/id_rsa",
+        r"$env:NOPE\id_rsa",
+        r"./$env:NOPE\id_rsa",
+        "foo$x/id_rsa",
+        "\"./$x/id_rsa\"",
+        "\"foo$x/id_rsa\"",
+        // A literal part does not make the rest literal.
+        "'lit'/$x/id_rsa",
+        r"\$y/$x/id_rsa",
+        // Each brace alternative carries the word's reading.
+        "./{$x,b}/id_rsa",
+        "./$x/*",
+        // Parameters that hold what a caller passed: `bash -c '…' _ .ssh`.
+        "./$0/id_rsa",
+        "./$1/id_rsa",
+        "./$@/id_rsa",
+        "./$*/id_rsa",
+        "./$_/id_rsa",
+        // Substitutions whose value is not known.
+        "$(getdir)/id_rsa",
+        "./$(getdir)/id_rsa",
+        "\"./$(getdir)/id_rsa\"",
+        "`getdir`/id_rsa",
+        "./`getdir`/id_rsa",
+    ];
+
+    /// Every place a word is read as a path, where `F` is that word.
+    const PATH_POSITIONS: &[&str] = &[
+        "cat F",
+        "git status; cat F",
+        "sudo cat F",
+        "cat < F",
+        "echo x > F",
+        "echo x >> F",
+        "make 2> F",
+        "> F",
+        "cp F out",
+        "cp in F",
+        "cp in F/",
+        "mv F out",
+        "mv in F",
+        "rm F",
+        "dd if=F",
+        "xargs -a F cat",
+        "cd F && cat notes.txt",
+        "pushd F && cat notes.txt",
+    ];
+
+    /// `$` and a name with no known value, unquoted or double-quoted, may be
+    /// anything at run time: `./$x/id_rsa` with `x=.ssh`.
     #[test]
-    fn cd_to_an_unbound_dollar_leaves_the_directory_unknown() {
+    fn a_word_the_shell_may_expand_is_unreadable_as_a_path() {
         let e = secrets_engine(vars());
-        let unknown = |cmd: &str| {
-            assert!(
-                matches!(
-                    e.evaluate(cmd),
-                    Decision::Allow {
-                        trace: AllowTrace::Unjudgeable { .. }
-                    }
-                ),
-                "{cmd}: {:?}",
-                e.evaluate(cmd)
-            );
+        for word in LIVE_WORDS {
+            for at in PATH_POSITIONS {
+                let cmd = at.replace('F', word);
+                assert_unreadable_deny(&e.evaluate(&cmd), &cmd);
+            }
+            // The same when it reaches the lexer a second time.
+            let nested = format!("bash -c 'cat {word}'");
+            if !word.contains('\'') {
+                assert_unreadable_deny(&e.evaluate(&nested), &nested);
+            }
+        }
+    }
+
+    /// `%x%` is cmd's, and expands even inside single quotes there.
+    #[test]
+    fn an_unknown_percent_variable_is_unreadable_as_a_path() {
+        let e = secrets_engine(vars());
+        for word in [
+            r"%x%\id_rsa",
+            r"'%x%\id_rsa'",
+            r#""%x%\id_rsa""#,
+            r"foo%x%\id_rsa",
+            r"./%x%\id_rsa",
+            "./%x%/id_rsa",
+        ] {
+            for at in PATH_POSITIONS {
+                let cmd = at.replace('F', word);
+                assert_unreadable_deny(&e.evaluate(&cmd), &cmd);
+            }
+        }
+    }
+
+    /// Single quotes, an escape and `$'…'` leave a `$` as text: the path is
+    /// judged as spelled, and a file it names is still found.
+    #[test]
+    fn a_dollar_the_shell_leaves_alone_is_a_name() {
+        let e = secrets_engine(vars());
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        for word in [
+            "'./$x/id_rsa'",
+            r"./\$x/id_rsa",
+            "\"./\\$x/id_rsa\"",
+            "$'./$x/id_rsa'",
+            "'foo$x/id_rsa'",
+            r"'C:\$Recycle.Bin\x'",
+            r"'.\$x\id_rsa'",
+            "'./$1/id_rsa'",
+        ] {
+            for at in PATH_POSITIONS {
+                let cmd = at.replace('F', word);
+                assert_eq!(e.evaluate(&cmd), clean, "{cmd}");
+            }
+        }
+        for cmd in [
+            "cat './$x/.env'",
+            "cd './$x' && cat .env",
+            r"cd 'C:\$Recycle.Bin' && cat .env",
+            "cd '~/.ssh::$INDEX_ALLOCATION' && cat id_rsa",
+        ] {
+            assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    /// A `$` that opens nothing is a share name or part of one, and a variable
+    /// with a known value is that value.
+    #[test]
+    fn share_names_and_known_variables_stay_readable() {
+        let e = secrets_engine(vars());
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        for word in [
+            "c$/x",
+            "admin$/x",
+            "docs$/x",
+            "docs$",
+            r#""docs$/x""#,
+            "//localhost/c$/x",
+            "//localhost/docs$/x",
+            "//localhost/admin$/x",
+            "//server/docs$/x",
+            "\"$HOME/x\"",
+            "$USERPROFILE/x",
+            "./$USERNAME/x",
+            r"'$env:USERPROFILE\x'",
+            "$env:USERPROFILE/x",
+            "${HOME}/x",
+            "$PWD/x",
+            "%USERPROFILE%/x",
+        ] {
+            for at in PATH_POSITIONS {
+                let cmd = at.replace('F', word);
+                assert_eq!(e.evaluate(&cmd), clean, "{cmd}");
+            }
+        }
+        assert!(e
+            .evaluate("cat //localhost/c$/Users/a/.ssh/id_rsa")
+            .is_deny());
+        assert!(e.evaluate("cat \"$HOME/.ssh/id_rsa\"").is_deny());
+    }
+
+    /// Words no path rule reads stay out of it.
+    #[test]
+    fn a_variable_outside_a_path_is_not_judged() {
+        let e = secrets_engine(vars());
+        for cmd in [
+            "git status",
+            "git commit -m \"$msg\"",
+            "git commit -m \"$(cat <<'EOF'\nhello\nEOF\n)\"",
+            "git log --format=%H",
+            "git diff $(git merge-base a b)",
+            "echo \"$x\" > out.txt",
+            "echo $(date) > out.txt",
+            "echo \"$(getdir)\"",
+            "npm test $x",
+            "ls $x",
+            "grep \"$pat\" README.md",
+            "grep \"$(getpat)\" README.md",
+            "sed -e \"s/$x/y/\" README.md",
+            "curl -H \"A: $T\" https://x.test",
+            "x=1; echo $x",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+        // Nothing is protected without a path rule.
+        let none = Engine::new(Vec::new()).with_paths(vars());
+        for cmd in ["cat ./$x/id_rsa", "cd ./$x && cat id_rsa", "cat $(getdir)"] {
+            assert!(!none.evaluate(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    /// POSIX style keeps what it did, word for word.
+    #[test]
+    fn posix_style_reads_a_live_word_as_before() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let v = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_cwd("/nonexistent-p19a/p")
+            .with_var("HOME", "/nonexistent-p19a/home");
+        let e = secrets_engine(v);
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        for cmd in [
+            "cat ./$x/id_rsa",
+            "cat foo$x/id_rsa",
+            "cat '$x/id_rsa'",
+            "cat $(getdir)/id_rsa",
+            "cat `getdir`/id_rsa",
+            "echo x > ./$x/id_rsa",
+            "cat %x%/id_rsa",
+        ] {
+            assert_eq!(e.evaluate(cmd), clean, "{cmd}");
+        }
+        let unknown = Decision::Allow {
+            trace: AllowTrace::Unjudgeable {
+                reason: "working directory unknown after cd".to_string(),
+            },
         };
         for cmd in [
             "cd ./$x && cat id_rsa",
-            "cd \"./$x\" && cat id_rsa",
-            "cd './$x' && cat id_rsa",
-            r"cd 'C:\a\$x\b' && cat id_rsa",
-            r"cd 'C:\$Recycle.Bin' && cat notes.txt",
+            "cd '$x' && cat id_rsa",
+            "cd $(getdir) && cat id_rsa",
         ] {
-            unknown(cmd);
+            assert_eq!(e.evaluate(cmd), unknown, "{cmd}");
+        }
+    }
+
+    /// Every spelling, end to end: as an operand, a redirect, a copy source,
+    /// nested, and through a `cd` to its directory.
+    #[test]
+    fn spellings_are_denied_end_to_end() {
+        let e = secrets_engine(vars());
+        for raw in ID_RSA_SPELLINGS {
+            let escaped = raw.replace('\\', r"\\");
+            let mut cmds = vec![
+                format!("cat '{raw}'"),
+                format!("cat < '{raw}'"),
+                format!("cp '{raw}' out"),
+                format!("mv '{raw}' out"),
+                format!("git status; cat '{raw}'"),
+                format!("bash -c \"cat '{escaped}'\""),
+            ];
+            let split = raw.rfind(['\\', '/']).expect("a separator");
+            let (dir, file) = (&raw[..split], &raw[split + 1..]);
+            cmds.push(format!("cd '{dir}' && cat '{file}'"));
+            cmds.push(format!("pushd '{dir}'; cat '{file}'"));
+            cmds.push(format!("cd '{dir}' && cp '{file}' /c/p/out"));
+            for cmd in cmds {
+                assert!(e.evaluate(&cmd).is_deny(), "{cmd}");
+            }
+        }
+    }
+
+    /// Git Bash's `/` holds its drive mounts: from there `c/Users` is the
+    /// drive, though it reads as `c:/c/Users`. A `~`-rooted rule would miss it.
+    #[test]
+    fn a_relative_walk_into_a_git_bash_mount_is_unreadable() {
+        let mut w = Vec::new();
+        let pack = load_pack_str("<t>", MIXED_CASE_PACK, &mut w).unwrap();
+        let e = Engine::new(vec![pack]).with_paths(vars());
+        for cmd in [
+            "cd /; cat c/Users/a/MyKeys/x",
+            "cd /; cat ./c/Users/a/MyKeys/x",
+            "cd /; cat cygdrive/c/Users/a/MyKeys/x",
+            "cd /; cat mnt/c/Users/a/MyKeys/x",
+            "cd /; cat proc/cygdrive/c/Users/a/MyKeys/x",
+            "cd /cygdrive; cat c/Users/a/MyKeys/x",
+            "cd /mnt; cat c/Users/a/MyKeys/x",
+            "cd /; cd c/Users/a; cat MyKeys/x",
+            "cd /cygdrive; cd c; cat Users/a/MyKeys/x",
+            "cd /x; cat ../c/Users/a/MyKeys/x",
+            "cd /usr; cat ../c/Users/a/MyKeys/x",
+        ] {
+            assert_unreadable_deny(&e.evaluate(cmd), cmd);
         }
         let clean = Decision::Allow {
             trace: AllowTrace::NoMatch,
         };
         for cmd in [
-            "cd //localhost/docs$/x && cat notes.txt",
-            r"cd 'C:\c$\x' && cat notes.txt",
-            r"cd '$env:USERPROFILE\x' && cat notes.txt",
-            r"cd '$HOME\x' && cat notes.txt",
-            r"cd 'C:\a\$HOME' && cat notes.txt",
+            // A one-letter directory the working directory is already in:
+            // CI's `D:\a\repo`, and `C:\p` here.
+            "cat c/x",
+            "cat p/x",
+            r"cd 'D:\a\repo'; cat src/main.rs",
+            r"cd 'D:\a\repo'; cat ../other/x",
+            "cd C:/c/x; cat y",
+            // Named with its drive, or as Win32 reads it.
+            "cat C:/c/x",
+            "cat C:/mnt/c/x",
+            r"cd /; cat 'c\x'",
+            // Not a drive.
+            "cd /; cat src/x",
+            "cd /mnt/data; cat x",
+            "cd /; cat mnt/data/x",
+            r"cd '\\server\share'; cat c/x",
         ] {
             assert_eq!(e.evaluate(cmd), clean, "{cmd}");
         }

@@ -524,7 +524,7 @@ impl Engine {
                 return Some(d);
             }
         }
-        let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
+        let view = SegmentView::new(seg, effective, state, cx.literal_path, &self.vars, found);
         if view.argv.is_empty() || view.argv[0].is_empty() {
             return self.bare_segment_phase(&view, cx, state, found);
         }
@@ -935,20 +935,26 @@ impl Engine {
             .rule_cwd
             .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
-            let argv = self.path_argv(&view.argv, &view.resolved);
+            let words = winpath::path_words(&view.resolved, &self.vars);
+            let argv = self.path_argv(&view.argv, &words);
             let target = argv
                 .iter()
-                .zip(&view.resolved)
+                .zip(words.iter())
                 .skip(1)
                 .find(|(a, _)| !a.starts_with('-'))
                 .filter(|(_, w)| !w.has_substitution);
             if let Some((a, _)) = target {
-                let first = state.cwds.first().map(PathBuf::as_path);
-                if let Some(d) = self.unreadable(a, first) {
-                    return Some(d);
+                // From any directory the shell may be in: `cd /; cd c/Users`
+                // reads fine from the old one.
+                let d = match state.cwds.as_slice() {
+                    [] => self.unreadable(a, None),
+                    cwds => cwds.iter().find_map(|c| self.unreadable(a, Some(c))),
+                };
+                if d.is_some() {
+                    return d;
                 }
             }
-            state.cwd_unknown |= self.cd(&argv, &view.resolved, &mut state.cwds);
+            state.cwd_unknown |= self.cd(&argv, &words, &mut state.cwds);
         }
         None
     }
@@ -1149,7 +1155,9 @@ impl Engine {
         if !self.has_path_rules {
             return Vec::new();
         }
-        let mut ops = operands(seg, effective, &self.path_argv(argv, effective));
+        let seg = winpath::path_words(seg, &self.vars);
+        let effective = winpath::path_words(effective, &self.vars);
+        let mut ops = operands(&seg, &effective, &self.path_argv(argv, &effective));
         ops.extend(extra);
         ops
     }
@@ -1247,15 +1255,12 @@ impl Engine {
                 Some(h) => (vec![h.to_path_buf()], false),
                 None => (Vec::new(), true),
             },
-            // A `$` is a variable to POSIX. On Windows `c$/` opens nothing and
-            // `$env:X` has a value or denies, but `$x` with no value may be one.
+            // A `$` is a variable to POSIX. On Windows `path_words` has already
+            // told a variable from a name.
             Some((a, w))
                 if a == "-"
                     || w.has_substitution
-                    || match self.vars.style() {
-                        PathStyle::Windows => winpath::has_unbound_dollar(a, &self.vars),
-                        PathStyle::Posix => a.contains('$'),
-                    } =>
+                    || (self.vars.style() == PathStyle::Posix && a.contains('$')) =>
             {
                 (Vec::new(), true)
             }
@@ -1918,6 +1923,7 @@ impl<'a> SegmentView<'a> {
         effective: &'a [Word],
         state: &ShellState,
         literal_path: bool,
+        vars: &PathVars,
         found: &mut Findings,
     ) -> Self {
         // Leading assignments and redirections (`LANG=C sort f`,
@@ -1954,7 +1960,7 @@ impl<'a> SegmentView<'a> {
         };
         let resolved = forms.swap_remove(0);
         let seg_ops = target_forms.swap_remove(0);
-        let reads: Vec<Operand> = wrapper_reads(seg)
+        let reads: Vec<Operand> = wrapper_reads(&winpath::path_words(seg, vars))
             .into_iter()
             .map(|(path, glob)| Operand {
                 path,
