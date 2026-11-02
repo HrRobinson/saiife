@@ -81,6 +81,11 @@ pub enum ChildError {
     TooLarge,
     Protocol(String),
     NotRunning(String),
+    /// No slot of the child in time: nothing was sent.
+    SlotTimeout,
+    /// [`Admit`] stopped the call when it got its slot, with this deny rule:
+    /// nothing was sent.
+    NotAdmitted(&'static str),
 }
 
 impl std::fmt::Display for ChildError {
@@ -91,6 +96,8 @@ impl std::fmt::Display for ChildError {
             ChildError::TooLarge => f.write_str("mcp server answer too large"),
             ChildError::Protocol(m) => write!(f, "mcp server protocol error: {m}"),
             ChildError::NotRunning(m) => write!(f, "mcp server not running: {m}"),
+            ChildError::SlotTimeout => f.write_str("no slot of the mcp server in time"),
+            ChildError::NotAdmitted(rule) => write!(f, "the call was stopped: {rule}"),
         }
     }
 }
@@ -99,6 +106,25 @@ impl std::error::Error for ChildError {}
 
 /// A boxed future, for the object-safe [`ToolCaller`].
 pub type CallFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ChildError>> + Send + 'a>>;
+
+/// What a call runs once it holds a slot of the child. `check` may stop it
+/// with a deny rule ([`ChildError::NotAdmitted`]). `commit` runs only when
+/// the call goes on to be sent: a call that ends before that (not running,
+/// no slot in time, stopped) never runs it.
+pub struct Admit<'a> {
+    pub check: Box<dyn Fn() -> Option<&'static str> + Send + 'a>,
+    pub commit: Box<dyn FnOnce() + Send + 'a>,
+}
+
+impl Admit<'_> {
+    /// Nothing to check, nothing to commit.
+    fn always() -> Admit<'static> {
+        Admit {
+            check: Box::new(|| None),
+            commit: Box::new(|| {}),
+        }
+    }
+}
 
 /// What the gateway pipeline (Task 7) needs from the supervisor; tests use
 /// a fake.
@@ -109,7 +135,8 @@ pub trait ToolCaller: Send + Sync {
     /// value (never read into a closed type): an object with a `content`
     /// array, image/audio and unknown items replaced with text, and every
     /// string masked with the server's secret values and the v1 patterns.
-    /// `tool` is sent byte-for-byte as the server listed it.
+    /// `tool` is sent byte-for-byte as the server listed it, if `admit`
+    /// says so once the call holds a slot.
     fn call<'a>(
         &'a self,
         server: &'a str,
@@ -117,6 +144,7 @@ pub trait ToolCaller: Send + Sync {
         args: Value,
         timeout: Duration,
         cap: usize,
+        admit: Admit<'a>,
     ) -> CallFuture<'a>;
     /// The secret values (every form the vault holds) of `server`, for
     /// masking what the pipeline records. Empty for a server without
@@ -394,6 +422,22 @@ impl Gateway {
         timeout: Duration,
         cap: usize,
     ) -> Result<Value, ChildError> {
+        self.call_admitted(server, tool, args, timeout, cap, Admit::always())
+            .await
+    }
+
+    /// [`Gateway::call`], sent only if `admit` lets it once it holds a slot.
+    /// [`ChildError::NotRunning`], [`ChildError::SlotTimeout`] and
+    /// [`ChildError::NotAdmitted`] mean nothing was sent.
+    pub async fn call_admitted(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+        timeout: Duration,
+        cap: usize,
+        admit: Admit<'_>,
+    ) -> Result<Value, ChildError> {
         let srv = lock(&self.servers)
             .get(server)
             .cloned()
@@ -417,8 +461,18 @@ impl Gateway {
         let deadline = tokio::time::Instant::now() + timeout;
         let _slot = tokio::time::timeout_at(deadline, conn.pool.acquire())
             .await
-            .map_err(|_| ChildError::Timeout)?
-            .map_err(|_| ChildError::Exited)?;
+            .map_err(|_| ChildError::SlotTimeout)?
+            .map_err(|_| ChildError::NotRunning(format!("mcp server {server} has stopped")))?;
+        if let Some(rule) = (admit.check)() {
+            return Err(ChildError::NotAdmitted(rule));
+        }
+        // Stopped during the wait: this line would have nowhere to go.
+        if conn.stdin_closed() {
+            return Err(ChildError::NotRunning(format!(
+                "mcp server {server} is stopping"
+            )));
+        }
+        (admit.commit)();
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let params = json!({"name": tool, "arguments": arguments});
         let masked = |e: ChildError| match e {
@@ -587,8 +641,9 @@ impl ToolCaller for Gateway {
         args: Value,
         timeout: Duration,
         cap: usize,
+        admit: Admit<'a>,
     ) -> CallFuture<'a> {
-        Box::pin(Gateway::call(self, server, tool, args, timeout, cap))
+        Box::pin(self.call_admitted(server, tool, args, timeout, cap, admit))
     }
 
     fn secret_values(&self, server: &str) -> Vec<Zeroizing<String>> {

@@ -1,0 +1,93 @@
+#!/bin/sh
+# Runs locked-mode install after the pkg lands (plan 18, decision 3).
+# Installer passes: $1 the package, $2 the install location, $3 the target
+# volume. Its output goes to /var/log/install.log, so a failure is also sent
+# to syslog: a fleet package exists to lock, and an admin must see that it
+# did not.
+
+if [ "$3" != "/" ]; then
+    echo "saiife: not the boot volume; run system install --fleet after boot"
+    exit 0
+fi
+
+PKG_BIN=/usr/local/libexec/saiife/saiife
+
+# --- staging check: the same in postinstall and both fleet-files.sh ---
+# /usr/local is not protected by SIP, and root runs the staging copy. Prints
+# why it is not safe to run, or nothing: each step must be no symlink, owned
+# by root, not writable by group or others, and with no ACL (one can grant
+# write that the mode bits do not show). ls -e prints ACL entries on lines of
+# their own; the "+" after the mode is not enough, since "@" replaces it when
+# the path also has an extended attribute.
+STAGING_UID=0
+staging_problem() {
+    for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$PKG_BIN"; do
+        if [ -L "$p" ]; then
+            echo "$p is a symbolic link"
+            return 0
+        fi
+        # ls -n is the POSIX way to read a numeric owner; -e is macOS's.
+        # shellcheck disable=SC2012
+        if ! line=$(ls -ldne "$p" 2>/dev/null); then
+            echo "$p is missing"
+            return 0
+        fi
+        read -r mode _ uid _ <<EOF
+$line
+EOF
+        if [ "$uid" != "$STAGING_UID" ]; then
+            echo "$p is not owned by root"
+            return 0
+        fi
+        if [ "$(printf '%s\n' "$line" | wc -l)" -gt 1 ]; then
+            echo "$p has an ACL"
+            return 0
+        fi
+        case "$mode" in
+            *+*)
+                echo "$p has an ACL"
+                return 0
+                ;;
+            ?????w* | ????????w*)
+                echo "$p is writable by group or others"
+                return 0
+                ;;
+        esac
+    done
+    [ -f "$PKG_BIN" ] || echo "$PKG_BIN is not a regular file"
+}
+# --- end staging check ---
+
+why=$(staging_problem)
+if [ -n "$why" ]; then
+    msg="saiife: the staging copy is not safe to run: $why; make it root's, not writable by group or others, with no ACL (chmod -N), then install the pkg again"
+    echo "$msg" >&2
+    logger -t saiife -p auth.err "$msg" 2>/dev/null || true
+    exit 2
+fi
+
+rc=0
+out=$("$PKG_BIN" system install --fleet 2>&1) || rc=$?
+printf '%s\n' "$out"
+
+# 0 = installed.
+if [ "$rc" -eq 0 ]; then
+    exit 0
+fi
+last=$(printf '%s\n' "$out" | tail -n 1)
+# 1 = installed, but doctor found failures (already printed): not fatal.
+if [ "$rc" -eq 1 ]; then
+    logger -t saiife -p auth.warning "saiife: installed, with problems: $last" 2>/dev/null || true
+    exit 0
+fi
+# 2 = install error or unsupported host (SIP off, say): fail loudly, never
+# lock silently. Only install knows whether it had begun: it says so last.
+if [ "$last" = "saiife: nothing was changed" ]; then
+    why=$(printf '%s\n' "$out" | tail -n 2 | head -n 1)
+    msg="saiife: install did not complete; any earlier install is unchanged: system install --fleet exited $rc: $why"
+else
+    msg="saiife: install did not complete and may be partial; do not assume locked mode is active; run /opt/saiife/bin/saiife doctor: system install --fleet exited $rc: $last"
+fi
+echo "$msg" >&2
+logger -t saiife -p auth.err "$msg" 2>/dev/null || true
+exit "$rc"

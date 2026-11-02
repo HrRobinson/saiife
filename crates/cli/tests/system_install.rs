@@ -165,7 +165,8 @@ fn unsupported_root_exits_2_with_the_refusal_line() {
         .assert()
         .code(2)
         .stderr(contains("saiife: locked mode is not supported here: "))
-        .stderr(contains(". Developer mode works as before."));
+        .stderr(contains(". Developer mode works as before."))
+        .stderr(contains("saiife: nothing was changed\n"));
     assert!(!root.path().join("etc/saiife").exists());
 }
 

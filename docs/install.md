@@ -154,13 +154,14 @@ server whose command is not pinned, and (macOS) `SAIIFE_TEST_ALLOW_SIP_OFF=1`,
 which lets install and `doctor` go on without System Integrity Protection
 (install warns, `doctor` reports `system.sip` as a warning; see
 [Locked mode (macOS)](#supported-systems-macos)). A release build never
-reads either. So
+reads any of the three. So
 `system install` refuses (exit 2) a binary that is dynamically linked (an
 ELF interpreter or a needed shared library), has debug assertions on, or has
 no saiife build marker, and `saiife doctor` fails `files.binary` on a
 dynamic binary and warns `test build installed` on a debug-assertions build.
-The hidden `--allow-test-build` flag exists for the CI jobs `locked-linux`
-and `locked-macos` only; never use it in production.
+The hidden `--allow-test-build` flag exists for the CI jobs `locked-linux`,
+`locked-macos` and `macos-pkg` only, and only in a build with debug assertions.
+A release build does not have it. Never use it in production.
 
 - `--agents` defaults to all three. Install only adds managed hooks; to
   remove one, uninstall.
@@ -347,6 +348,14 @@ The release binaries are built that way:
   ad-hoc signed with the hardened runtime and not notarized. The release
   notes then say so ("macOS binaries in this release are ad-hoc signed and
   not notarized"), and install warns.
+
+### Packages (.pkg)
+
+For many Macs, install the `.pkg` for the Mac's chip from the release page. It
+puts the binary in `/usr/local/libexec/saiife/` and runs
+`saiife system install --fleet`, which reads its options from
+`/etc/saiife/fleet/`. See [Fleet install](fleet.md#macos-v21) for the fleet files,
+removal, Jamf and Intune.
 
 ### Approvals on macOS: a second account
 

@@ -6,6 +6,7 @@ use crate::request::bare_hostname;
 use crate::BrokerError;
 use saiife_policy::capability::{glob_with, matches_with, Capability};
 use saiife_policy::{CloudMode, Mode, ServiceCfg, SystemConfig};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -23,6 +24,14 @@ impl Catalog {
             manifests.entry(m.id.clone()).or_insert(m);
         }
         Catalog { manifests }
+    }
+
+    /// A digest of every manifest, for telling a reload that changed one:
+    /// the effective-policy hash covers the config, not the manifests.
+    /// Stable for the same manifests: they hold no unordered map.
+    pub fn digest(&self) -> String {
+        let text = format!("{:?}", self.manifests);
+        format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
     }
 
     /// The manifest of service `name`: its connector's, or for `http` one

@@ -90,6 +90,9 @@ struct State {
     always_401: bool,
     /// How long the token endpoint takes.
     delay_ms: u64,
+    /// API requests begun, and how long each takes before it is answered.
+    api_seen: usize,
+    api_delay_ms: u64,
     /// The vault's refresh token, read when the API was called.
     vault_at_api: Vec<String>,
     vault: Option<(PathBuf, PathBuf)>,
@@ -170,6 +173,14 @@ async fn answer(req: Request<Incoming>, st: Shared) -> Result<Response<Full<Byte
             o["refresh_token"] = format!("rt-rot-{n}-{}", "c3".repeat(8)).into();
         }
         return Ok(json(200, o.to_string()));
+    }
+    let delay = {
+        let mut s = st.lock().unwrap();
+        s.api_seen += 1;
+        s.api_delay_ms
+    };
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let bearer = parts
         .headers
@@ -359,6 +370,7 @@ allow = ["limits:read"]
         system: Some(Arc::new(config.clone())),
         gateway: Some(Arc::new(GatewayPolicy {
             snap: PolicySnapshot {
+                catalog_digest: String::new(),
                 config,
                 hash: "sha256:test".into(),
                 mode: Mode::Locked,
@@ -431,6 +443,38 @@ impl World {
     async fn call(&self) -> Value {
         self.op("api.call", json!({"service": "sf", "operation": "limits"}))
             .await
+    }
+
+    /// A reload that takes the service out of the scope.
+    fn revoke(&self) {
+        let mut p = self.ctx.policy();
+        let mut config = p.gateway.as_ref().unwrap().snap.config.clone();
+        config.scope[0].services.clear();
+        p.hash = Some("sha256:revoked".into());
+        p.system = Some(Arc::new(config.clone()));
+        p.gateway = Some(Arc::new(GatewayPolicy {
+            snap: PolicySnapshot {
+                catalog_digest: String::new(),
+                config,
+                hash: "sha256:revoked".into(),
+                mode: Mode::Locked,
+                env: None,
+            },
+            by_env: Default::default(),
+            catalog: Catalog::new(&[], vec![Manifest::parse(MANIFEST).unwrap()]),
+        }));
+        *self.ctx.policy.lock().unwrap() = p;
+    }
+
+    /// The same config with this manifest, built as a reload builds it.
+    fn set_catalog(&self, manifest: &str) {
+        let mut p = self.ctx.policy();
+        let config = p.gateway.as_ref().unwrap().snap.config.clone();
+        let catalog = Catalog::new(&[], vec![Manifest::parse(manifest).unwrap()]);
+        p.gateway = Some(Arc::new(
+            GatewayPolicy::build(&config, &[], catalog, Mode::Locked).unwrap(),
+        ));
+        *self.ctx.policy.lock().unwrap() = p;
     }
 
     fn posts(&self) -> Vec<String> {
@@ -566,6 +610,112 @@ async fn upstream_401_refreshes_once_and_retries_once() {
     assert_eq!(rec[2]["auth_retry"], true);
     assert_eq!(rec[2]["status"], 401);
     assert_eq!(rec[2]["decision"], "allow");
+}
+
+/// A reload takes the service away while the forced refresh of a 401 runs:
+/// the resend is not made, and the 401 of the one send is the answer.
+#[tokio::test]
+async fn reload_during_the_refresh_stops_the_resend() {
+    let w = Arc::new(world(|_| {}).await);
+    assert_eq!(status(&w.call().await), 200);
+    {
+        let mut s = w.st.lock().unwrap();
+        s.current = String::new();
+        s.delay_ms = 1000;
+    }
+    let call = {
+        let w = Arc::clone(&w);
+        tokio::spawn(async move { w.call().await })
+    };
+    // The first send got its 401: the refresh is under way.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while w.api().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    w.revoke();
+    let reloaded = std::time::Instant::now();
+    let a = call.await.unwrap();
+    eprintln!(
+        "answered {:?} after the reload, upstream sends for this call: {}",
+        reloaded.elapsed(),
+        w.api().len() - 1
+    );
+    assert_eq!(w.api().len(), 2, "resent after the reload");
+    assert_eq!(status(&a), 401);
+    let rec = w.records("connector");
+    assert!(rec[1].get("auth_retry").is_none(), "{}", rec[1]);
+    assert_eq!(rec[1]["auth_retry_skipped"], "policy_changed", "{}", rec[1]);
+    // The one send counts.
+    assert_eq!(rec[1]["decision"], "allow", "{}", rec[1]);
+}
+
+/// A reload that changes only a connector manifest (`<config>/connectors`):
+/// the config, so its hash, stays the same, yet the call decided on the old
+/// manifest and waiting for a slot is not sent. In process, because a locked
+/// daemon loads that directory only when root owns it.
+#[tokio::test]
+async fn manifest_change_during_the_slot_wait_stops_the_call() {
+    let w = Arc::new(world(|_| {}).await);
+    w.set_catalog(MANIFEST);
+    let hash = w.ctx.policy().gateway.unwrap().snap.hash.clone();
+    let held = w.ctx.pools.get("sf").acquire_many_owned(4).await.unwrap();
+    let call = {
+        let w = Arc::clone(&w);
+        tokio::spawn(async move { w.call().await })
+    };
+    // The token is fetched before the slot wait: the call is there once it is.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while w.posts().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let edited = format!("{MANIFEST}\n[[operation]]\nid = \"more\"\ncapability = \"more:read\"\nkind = \"read\"\nmethod = \"GET\"\npath = \"/more\"\n");
+    w.set_catalog(&edited);
+    assert_eq!(w.ctx.policy().gateway.unwrap().snap.hash, hash);
+    drop(held);
+    let a = call.await.unwrap();
+    assert!(w.api().is_empty(), "sent after the reload: {a}");
+    assert_eq!(a["rule"], "policy_changed", "{a}");
+}
+
+/// A reload lands during the send that gets the 401: no refresh for a revoked
+/// call, so a rotating refresh token is left alone, and no resend.
+#[tokio::test]
+async fn reload_before_the_refresh_skips_it() {
+    let w = Arc::new(world(|s| s.rotate = true).await);
+    assert_eq!(status(&w.call().await), 200);
+    let posts = w.posts().len();
+    let refresh = w.vault_refresh();
+    {
+        let mut s = w.st.lock().unwrap();
+        s.current = String::new();
+        s.api_delay_ms = 500;
+    }
+    let call = {
+        let w = Arc::clone(&w);
+        tokio::spawn(async move { w.call().await })
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while w.st.lock().unwrap().api_seen < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    w.revoke();
+    assert_eq!(status(&call.await.unwrap()), 401);
+    assert_eq!(w.posts().len(), posts, "refreshed after the reload");
+    assert_eq!(w.vault_refresh(), refresh);
+    assert_eq!(w.api().len(), 2);
+    let rec = w.records("connector");
+    assert_eq!(rec[1]["auth_retry_skipped"], "policy_changed", "{}", rec[1]);
+    assert_eq!(rec[1]["decision"], "allow", "{}", rec[1]);
 }
 
 #[tokio::test]

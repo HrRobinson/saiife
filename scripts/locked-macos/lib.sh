@@ -1138,6 +1138,25 @@ phase_reinstall_uninstall() {
     after="$(daemon_pid)"
     [[ -n "$before" && "$before" == "$after" ]] || fail "the daemon restarted: pid $before -> $after"
     ok "no restart (pid $after)"
+    # CI confirmation (confirm_reload on macOS): a changed --config alone
+    # goes through policy.reload over the socket, with no restart. A real
+    # change, so the daemon has a new config to load; 7a ends with the CI
+    # config back in place.
+    sed -e 's/^min_free_mb = 512$/min_free_mb = 500/' "$CI_CONFIG" >"$WORK/config-reload.toml"
+    grep -qx 'min_free_mb = 500' "$WORK/config-reload.toml" || fail "the changed config lacks min_free_mb = 500"
+    CI_CONFIG="$WORK/config-reload.toml" install_saiife 0
+    grep -q 'the daemon reloaded the new config' "$WORK/install.out" ||
+        fail "install with a changed --config did not confirm the reload"
+    as_root grep -qx 'min_free_mb = 500' /etc/saiife/config.toml || fail "the changed config was not installed"
+    after="$(daemon_pid)"
+    [[ "$before" == "$after" ]] || fail "the config reload restarted the daemon: pid $before -> $after"
+    ok "changed --config: the daemon reloaded it, no restart (pid $after)"
+    install_saiife 0
+    grep -q 'the daemon reloaded the new config' "$WORK/install.out" ||
+        fail "install with the CI config back did not confirm the reload"
+    after="$(daemon_pid)"
+    [[ "$before" == "$after" ]] || fail "the second config reload restarted the daemon: pid $before -> $after"
+    ok "CI config back: reloaded, no restart (pid $after)"
 
     phase "7b. system uninstall keeps the config, vault key, state and audit"
     as_root cat /etc/saiife/installed.toml >"$WORK/installed.toml"

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The product archive around the one component pkg. build-pkg.sh fills in
+     the version and the architecture. -->
+<installer-gui-script minSpecVersion="2">
+    <title>saiife</title>
+    <options customize="never" require-scripts="true" hostArchitectures="@ARCH@"/>
+    <domains enable_anywhere="true" enable_currentUserHome="false" enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="com.saiife.pkg"/>
+    </choices-outline>
+    <choice id="com.saiife.pkg" visible="false">
+        <pkg-ref id="com.saiife.pkg"/>
+    </choice>
+    <pkg-ref id="com.saiife.pkg" version="@VERSION@" onConclusion="none">saiife-component.pkg</pkg-ref>
+</installer-gui-script>

@@ -804,6 +804,60 @@ fn hung_server_times_out_and_is_cancelled() {
     assert_eq!(text_of(&r), r#"{"x":"y"}"#);
 }
 
+/// Takes all 4 slots of `fake` with calls that hang for 20 s.
+fn hold_all_slots(w: &World) {
+    for _ in 0..4 {
+        let c = Arc::clone(&w.ctx);
+        w.rt.spawn(async move {
+            let _ = c
+                .mcp
+                .call("fake", "slow", json!({}), Duration::from_secs(20), 1 << 20)
+                .await;
+        });
+    }
+    let ok = wait_for(Duration::from_secs(20), || {
+        w.log_text().matches("fake-mcp: got tools/call").count() == 4
+    });
+    assert!(ok, "{}", w.log_text());
+}
+
+/// No slot in time: nothing was sent, and the error says so.
+#[test]
+fn no_slot_in_time_is_a_slot_timeout() {
+    if !env_runnable() {
+        return;
+    }
+    let w = World::new(&server("fake", &["--hang-tool", "slow"], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    hold_all_slots(&w);
+    let r = w.call("fake", "echo", json!({}), Duration::from_millis(200));
+    assert_eq!(r, Err(ChildError::SlotTimeout));
+    assert_eq!(w.log_text().matches("fake-mcp: got tools/call").count(), 4);
+}
+
+/// A call whose slot comes free because the server is stopping: nothing is
+/// sent, and the error says so.
+#[test]
+fn slot_freed_by_a_stop_is_not_running() {
+    if !env_runnable() {
+        return;
+    }
+    let w = World::new(&server("fake", &["--hang-tool", "slow"], ""), &[]);
+    w.wait_event("mcp_server_started", "fake", 1);
+    hold_all_slots(&w);
+    let c = Arc::clone(&w.ctx);
+    let queued = w.rt.spawn(async move {
+        c.mcp
+            .call("fake", "echo", json!({}), Duration::from_secs(20), 1 << 20)
+            .await
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let c = Arc::clone(&w.ctx);
+    w.rt.block_on(async move { c.mcp.stop().await });
+    let r = w.rt.block_on(queued).unwrap();
+    assert!(matches!(r, Err(ChildError::NotRunning(_))), "{r:?}");
+}
+
 #[test]
 fn oversized_line_stops_child() {
     if !env_runnable() {
