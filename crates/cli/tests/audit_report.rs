@@ -160,14 +160,18 @@ fn refuses_non_html_path() {
 #[test]
 fn refuses_symlink_target() {
     let s = Sandbox::new();
-    std::fs::write(s.path("target.json"), "precious").unwrap();
-    std::os::unix::fs::symlink(s.path("target.json"), s.path("r.html")).unwrap();
-    s.audit()
-        .args(["--report", "r.html"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("is not a regular file"));
-    assert_eq!(read(&s.path("target.json")), "precious");
+    // Symlink creation is privileged on Windows, so that half is Unix only.
+    #[cfg(unix)]
+    {
+        std::fs::write(s.path("target.json"), "precious").unwrap();
+        std::os::unix::fs::symlink(s.path("target.json"), s.path("r.html")).unwrap();
+        s.audit()
+            .args(["--report", "r.html"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("is not a regular file"));
+        assert_eq!(read(&s.path("target.json")), "precious");
+    }
 
     std::fs::create_dir(s.path("d.html")).unwrap();
     s.audit()
@@ -191,6 +195,8 @@ fn overwrites_existing_regular_report() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
+// Modes: Windows files inherit the folder's ACL (W-decision for dev mode).
+#[cfg(unix)]
 #[test]
 fn report_is_mode_0600_even_over_an_existing_0644_file() {
     use std::os::unix::fs::PermissionsExt;

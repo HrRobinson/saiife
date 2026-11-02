@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
 pub const V1_LABEL: &str = "v1, before locked mode, not tamper-evident";
-pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+pub const SYSTEM_CONFIG: &str = crate::paths::DEV_SYSTEM_CONFIG;
 const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
 
 /// Where the records come from: the one locked-mode decision behind both
@@ -69,23 +69,27 @@ pub fn locked_audit_dir(config: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 /// Root, or `audit_gid` among the process's groups.
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 pub fn auditor(euid_is_root: bool, my_gids: &[u32], audit_gid: Option<u32>) -> bool {
     euid_is_root || audit_gid.is_some_and(|g| my_gids.contains(&g))
 }
 
 /// The audit group's name; debug builds take `SAIIFE_TEST_AUDIT_GROUP`
 /// so a test never depends on the host's groups.
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 #[cfg(debug_assertions)]
 fn audit_group() -> String {
     std::env::var("SAIIFE_TEST_AUDIT_GROUP").unwrap_or_else(|_| system_audit_group().to_string())
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 #[cfg(not(debug_assertions))]
 fn audit_group() -> String {
     system_audit_group().to_string()
 }
 
 /// The group whose members read the audit files (spec §5.2, §5.3).
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 fn system_audit_group() -> &'static str {
     saiife_system::layout::Layout::system().audit_group()
 }

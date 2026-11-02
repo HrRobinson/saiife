@@ -1,6 +1,9 @@
 //! `saiife doctor` against a fake locked-mode tree (`--root`): never root,
 //! never the real /etc, /opt, /var or /run.
 
+// Locked-mode checks of a fake Unix tree; `doctor` is refused on Windows (19a).
+#![cfg(unix)]
+
 mod common;
 
 use assert_cmd::Command;

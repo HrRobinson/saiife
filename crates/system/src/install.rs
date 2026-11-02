@@ -1015,7 +1015,7 @@ fn validated_config(path: &Path, dropins: &Path) -> Result<String, InstallError>
 /// Root's group: `root` on Linux, `wheel` (gid 0) on macOS.
 pub(crate) fn root_group(layout: &Layout) -> &'static str {
     match layout.platform() {
-        Platform::Linux => "root",
+        Platform::Linux | Platform::Windows => "root",
         Platform::Macos => "wheel",
     }
 }

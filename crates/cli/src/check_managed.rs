@@ -29,7 +29,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 /// Where the system policy lives; `--system-config` overrides it in tests.
-pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+pub const SYSTEM_CONFIG: &str = crate::paths::DEV_SYSTEM_CONFIG;
 
 /// Exit 2 with `saiife: BLOCKED (fail closed): <reason>` on stderr.
 fn blocked(reason: &str) -> ExitCode {

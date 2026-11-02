@@ -8,7 +8,9 @@
 use std::io::Read;
 use std::path::Path;
 
+#[cfg(not(windows))]
 use saiife_agents::lock::replaces_project_hook;
+#[cfg(not(windows))]
 use saiife_policy::installed::read_installed;
 
 use crate::warn;
@@ -53,6 +55,17 @@ pub fn read(config: &Path) -> SystemView {
         Ok(None) => {}
         Err(e) => view.warnings.push(ignored(config, &e)),
     }
+    // Windows (plan 19a): no locked install exists, so no agent has a managed
+    // hook, and ProgramData is not root-owned: an `installed.toml` there must
+    // not silence the project hooks. Plan 19b reads it again behind a DACL
+    // check through `saiife-win`.
+    #[cfg(not(windows))]
+    read_installed_into(config, &mut view);
+    view
+}
+
+#[cfg(not(windows))]
+fn read_installed_into(config: &Path, view: &mut SystemView) {
     let installed = config
         .parent()
         .unwrap_or(Path::new("/"))
@@ -74,7 +87,6 @@ pub fn read(config: &Path) -> SystemView {
             view.warnings.push(e);
         }
     }
-    view
 }
 
 fn ignored(path: &Path, error: &str) -> String {

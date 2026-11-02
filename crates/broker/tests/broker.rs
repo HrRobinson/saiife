@@ -5,7 +5,6 @@ use saiife_broker::resolve::{named, proxy};
 use saiife_broker::BrokerError;
 use saiife_policy::{AuthCfg, HttpOperationCfg, ServiceCfg, SystemConfig};
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
 
 const ECHO: &str = include_str!("../connectors/test-echo.toml");
 
@@ -222,8 +221,16 @@ fn proxy_method_mismatch_is_unknown_operation() {
     }
 }
 
+#[cfg(unix)]
 fn own_uid(dir: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
     std::fs::metadata(dir).unwrap().uid()
+}
+
+// Windows has no uid; the manifest loader ignores the owner there (19a).
+#[cfg(not(unix))]
+fn own_uid(_dir: &std::path::Path) -> u32 {
+    0
 }
 
 #[test]
@@ -238,9 +245,13 @@ fn local_manifest_cannot_shadow_builtin() {
     // Without the clash it loads.
     let ok = load_local_with(dir, &[], uid).unwrap();
     assert_eq!(ok.len(), 1);
-    // A file not owned by the required uid is refused.
-    let r = load_local_with(dir, &[], uid + 1);
-    assert!(matches!(r, Err(BrokerError::Manifest(_))));
+    // A file not owned by the required uid is refused (Unix only: the Windows
+    // loader has no owner check until plan 19b adds the DACL one).
+    #[cfg(unix)]
+    {
+        let r = load_local_with(dir, &[], uid + 1);
+        assert!(matches!(r, Err(BrokerError::Manifest(_))));
+    }
     // Missing directory means no local manifests.
     assert!(load_local_with(&dir.join("absent"), &[], uid)
         .unwrap()
@@ -257,6 +268,7 @@ fn local_manifest_cannot_shadow_builtin() {
     ));
 }
 
+#[cfg(unix)] // modes and symlink creation; the Windows reparse check is CI-only
 #[test]
 fn local_manifest_refuses_symlink_and_writable() {
     use std::os::unix::fs::PermissionsExt;

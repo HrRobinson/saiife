@@ -15,6 +15,14 @@ use saiife_audit::store;
 use saiife_system::layout::Platform;
 use saiifeguard::canon::PathVars;
 
+/// The system config the developer hook and `saiife audit` read for locked
+/// mode (`locked = true`, `[guard] fail`). On Windows it is under ProgramData
+/// (plan 19a, W-decisions); no locked install writes it before plan 19b.
+#[cfg(unix)]
+pub const DEV_SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+#[cfg(windows)]
+pub const DEV_SYSTEM_CONFIG: &str = r"C:\ProgramData\saiife\etc\config.toml";
+
 /// An agent config dir: `value` when set and absolute, else `default` under
 /// `home` (`None` when neither is known).
 fn config_dir(
@@ -42,7 +50,7 @@ const SYSTEM_PATHS: [(&str, &str); 6] = system_paths(if cfg!(target_os = "macos"
 const fn system_paths(p: Platform) -> [(&'static str, &'static str); 6] {
     use saiife_system::layout::{ETC_DIR, LOG_DIR, OPT_DIR, RUN_DIR, STATE_DIR, UNIT};
     let (state, run, unit) = match p {
-        Platform::Linux => (STATE_DIR, RUN_DIR, UNIT),
+        Platform::Linux | Platform::Windows => (STATE_DIR, RUN_DIR, UNIT),
         Platform::Macos => (
             "/var/db/saiife",
             "/var/db/saiife-run",

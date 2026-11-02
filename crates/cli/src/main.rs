@@ -38,7 +38,9 @@ mod check_managed;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod collection;
 mod connect_cmd;
+#[cfg(unix)]
 mod doctor_cmd;
+#[cfg(unix)]
 mod env_cmd;
 mod eval;
 #[cfg(debug_assertions)]
@@ -58,7 +60,9 @@ mod report;
 mod report_html;
 mod run_cmd;
 mod secret_cmd;
+#[cfg_attr(not(unix), allow(dead_code, unused_imports))] // the locked block is unix-only
 mod status_cmd;
+#[cfg(unix)]
 mod system_cmd;
 mod system_view;
 mod text;
@@ -350,6 +354,7 @@ enum Cmd {
     },
     /// Environments (`[environments.<name>]`): list them, or choose the
     /// one that applies (locked mode: root rebinds a scope).
+    #[cfg(unix)]
     Env {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true, global = true)]
@@ -357,10 +362,23 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
+    /// Locked mode (not on Windows until plan 19b): environments.
+    #[cfg(windows)]
+    Env {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Locked mode on Linux: install or uninstall the system setup (root).
+    #[cfg(unix)]
     System {
         #[command(subcommand)]
         action: system_cmd::SystemAction,
+    },
+    /// Locked mode (not on Windows until plan 19b): install or uninstall.
+    #[cfg(windows)]
+    System {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -381,11 +399,74 @@ enum AuditAction {
     },
 }
 
+/// What a locked-mode subcommand prints and exits 2 with on Windows, until
+/// plan 19b brings locked mode there. Developer mode (`init`, `status`,
+/// `check`, `test`, `explain`, `packs`, `audit`) works.
+#[cfg(windows)]
+pub const LOCKED_ON_WINDOWS_LATER: &str =
+    "saiife: locked mode on Windows arrives in plan 19b. Developer mode works.";
+
+/// The subcommands (and flags) that need locked mode or the personal broker,
+/// neither of which exists on Windows yet.
+#[cfg(windows)]
+fn locked_only(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::Check { managed, event, .. } => *managed || event.is_some(),
+        Cmd::Audit {
+            action,
+            broker,
+            system_config,
+            kind,
+            service,
+            ..
+        } => {
+            *broker
+                || system_config.is_some()
+                || kind.is_some()
+                || service.is_some()
+                || matches!(action, Some(AuditAction::Verify { broker: true, .. }))
+                || matches!(
+                    action,
+                    Some(AuditAction::Verify {
+                        system_config: Some(_),
+                        ..
+                    })
+                )
+        }
+        Cmd::Policy { action, .. } => matches!(
+            action,
+            policy_cmd::PolicyAction::Show { .. } | policy_cmd::PolicyAction::Reload
+        ),
+        Cmd::Daemon { .. }
+        | Cmd::Doctor { .. }
+        | Cmd::Eval
+        | Cmd::McpSpawn
+        | Cmd::Secret { .. }
+        | Cmd::Connect(..)
+        | Cmd::Run { .. }
+        | Cmd::Api(_)
+        | Cmd::Mcp(_)
+        | Cmd::Approvals { .. }
+        | Cmd::Approve { .. }
+        | Cmd::Reject { .. }
+        | Cmd::Lockdown { .. }
+        | Cmd::Env { .. }
+        | Cmd::System { .. } => true,
+        _ => false,
+    }
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return arg_error(e),
     };
+
+    #[cfg(windows)]
+    if locked_only(&cli.command) {
+        eprintln!("{LOCKED_ON_WINDOWS_LATER}");
+        return ExitCode::from(2);
+    }
 
     // Hook mode compiles only the packs it needs (it runs on every agent
     // tool call); every other command lists or judges across all packs.
@@ -421,6 +502,7 @@ fn main() -> ExitCode {
     if let Cmd::FakeMcpServer(args) = cli.command {
         return fake_mcp::run(args);
     }
+    #[cfg(unix)]
     if let Cmd::Daemon {
         system,
         user,
@@ -521,6 +603,7 @@ fn main() -> ExitCode {
     {
         return policy_cmd::run(system_config, action);
     }
+    #[cfg(unix)]
     if let Cmd::Env {
         system_config,
         action,
@@ -528,9 +611,11 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
+    #[cfg(unix)]
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
+    #[cfg(unix)]
     if let Cmd::Doctor { user, json, root } = cli.command {
         return doctor_cmd::run(user, json, root);
     }
@@ -637,6 +722,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 /// The `saiife daemon` flags.
 struct DaemonArgs {
     system: bool,
@@ -649,6 +735,7 @@ struct DaemonArgs {
     credentials_dir: Option<std::path::PathBuf>,
 }
 
+#[cfg(unix)]
 /// `saiife daemon --system`: the system daemon, as the `[daemon] user`.
 /// `saiife daemon --user`: the personal broker, as the logged-in user.
 fn cmd_daemon(a: DaemonArgs) -> ExitCode {
@@ -690,23 +777,25 @@ fn cmd_daemon(a: DaemonArgs) -> ExitCode {
     })
 }
 
+#[cfg(unix)]
 /// `saiife daemon --system`'s config when `--config` does not name one:
 /// the platform's `layout::CONFIG`.
 fn daemon_default_config(p: saiife_system::layout::Platform) -> &'static str {
     use saiife_system::layout::{macos_path, Platform, CONFIG};
     match p {
-        Platform::Linux => CONFIG,
+        Platform::Linux | Platform::Windows => CONFIG,
         Platform::Macos => macos_path(CONFIG).unwrap_or(CONFIG),
     }
 }
 
+#[cfg(unix)]
 /// `saiife daemon --system`'s state and credentials dirs when neither a
 /// flag nor systemd (`$STATE_DIRECTORY`, `$CREDENTIALS_DIRECTORY`) names
 /// them. launchd sets neither, so macOS has both (spec 5.3).
 fn daemon_default_dirs(p: saiife_system::layout::Platform) -> (&'static str, Option<&'static str>) {
     use saiife_system::layout::{macos_path, Platform, KEYS_DIR, STATE_DIR};
     match p {
-        Platform::Linux => (STATE_DIR, None),
+        Platform::Linux | Platform::Windows => (STATE_DIR, None),
         Platform::Macos => (
             macos_path(STATE_DIR).unwrap_or(STATE_DIR),
             macos_path(KEYS_DIR),
@@ -714,6 +803,7 @@ fn daemon_default_dirs(p: saiife_system::layout::Platform) -> (&'static str, Opt
     }
 }
 
+#[cfg(unix)]
 /// `saiife daemon --user` (plan 16): the personal paths, the refusals that
 /// need nothing opened, then the keychain. A keychain that cannot be
 /// opened still starts the broker, with the vault unavailable.
@@ -770,6 +860,7 @@ fn cmd_daemon_user(a: DaemonArgs) -> ExitCode {
     })
 }
 
+#[cfg(unix)]
 /// `saiife daemon --user --print-unit systemd|launchd`: the text for this
 /// binary on stdout.
 fn print_unit(kind: &str) -> ExitCode {
@@ -796,6 +887,7 @@ fn print_unit(kind: &str) -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 /// The built-in packs as the daemon's policy catalog.
 fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
     let (packs, warnings) = builtin_packs();
@@ -952,7 +1044,7 @@ pub(crate) fn warn(msg: &str) {
     let _ = writeln!(std::io::stderr(), "saiife: {msg}");
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod daemon_default_tests {
     use super::{daemon_default_config, daemon_default_dirs};
     use saiife_system::layout::Platform;

@@ -30,10 +30,16 @@ pub struct Env {
 
 /// An executable shell script `dir/name` with `body` after the shebang.
 pub fn fake_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
     fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    // Unix needs the executable bit. On Windows `which` accepts any file of
+    // that exact name, so the script is found but never run: a test that
+    // runs the script is `#[cfg(unix)]`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     p
 }
 
@@ -41,8 +47,14 @@ impl Env {
     /// Fake `agents` on PATH plus a symlink `saiife` -> the binary under test.
     pub fn new(agents: &[&str]) -> Env {
         let env = Env::bare(agents);
+        #[cfg(unix)]
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_saiife"), env.bin.path().join("saiife"))
             .unwrap();
+        // Creating a symlink needs a privilege on Windows: copy the binary.
+        // The exact name `saiife` is what `which` looks for; a test that
+        // runs it by that name is `#[cfg(unix)]`.
+        #[cfg(not(unix))]
+        fs::copy(env!("CARGO_BIN_EXE_saiife"), env.bin.path().join("saiife")).unwrap();
         env
     }
 
@@ -81,6 +93,7 @@ impl Env {
             .current_dir(dir)
             .env("PATH", self.bin.path())
             .env("HOME", self.home.path())
+            .env("USERPROFILE", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .env("SAIIFE_AUDIT_DIR", self.audit.path())
             .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path())
@@ -151,6 +164,7 @@ pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&data).unwrap();
     cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("SAIIFE_DATA_DIR", &data)
         .env("SAIIFE_AUDIT_DIR", audit);
     sandbox

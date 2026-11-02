@@ -22,8 +22,19 @@ pub fn default_dir() -> Option<PathBuf> {
 fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match var {
         Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
-        _ => dirs::data_dir().map(|d| d.join("saiife").join("audit")),
+        _ => default_audit_dir(),
     }
+}
+
+/// The per-user audit directory with no override: `saiife/audit` under the
+/// data dir. On Windows that is the local (non-roaming) app data (W3), so the
+/// log never follows a roaming profile; elsewhere it is `dirs::data_dir()`.
+pub fn default_audit_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let base = dirs::data_dir();
+    base.map(|d| d.join("saiife").join("audit"))
 }
 
 /// Append one record as a single line to `<dir>/<YYYY-MM>.jsonl`, creating the
@@ -304,6 +315,14 @@ mod tests {
     use super::*;
     use crate::record::NewRecord;
     use time::macros::datetime;
+
+    #[cfg(windows)]
+    #[test]
+    fn default_audit_dir_windows_is_local() {
+        // W3: local app data, never the roaming profile. CI-only (windows-latest).
+        let want = dirs::data_local_dir().unwrap().join("saiife").join("audit");
+        assert_eq!(default_audit_dir(), Some(want));
+    }
 
     fn rec(project: &str, agent: &str, decision: DecisionKind, at: OffsetDateTime) -> Record {
         Record::at(

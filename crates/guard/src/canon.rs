@@ -1216,6 +1216,7 @@ mod tests {
         assert_eq!(expand_glob_partial("plain", None, &v), (vec![], false));
     }
 
+    #[cfg(unix)] // symlink creation needs a privilege on Windows (W-decision: dev mode skips)
     #[test]
     fn variables_keep_the_spelled_form_of_a_symlink() {
         let (_d, root) = tmp();

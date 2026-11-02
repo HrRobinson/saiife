@@ -57,7 +57,7 @@ pub fn personal_paths_for(
             Some(h) if h.is_absolute() => h.join(MACOS_RUNTIME_REL).join("run"),
             _ => return Err(NO_RUNTIME_MACOS.to_string()),
         },
-        (None, Platform::Linux) => return Err(NO_RUNTIME.to_string()),
+        (None, Platform::Linux | Platform::Windows) => return Err(NO_RUNTIME.to_string()),
     };
     if platform == Platform::Macos {
         let n = socket_dir.join("gateway.sock").as_os_str().len();

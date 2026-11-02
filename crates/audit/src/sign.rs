@@ -7,7 +7,9 @@
 //! through a symlink or silently replaced.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -23,6 +25,7 @@ const SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 const KEY_PREFIX: &str = "ed25519:";
+#[cfg(unix)]
 const SEED_LEN: u64 = 32;
 
 /// The daemon's checkpoint signing key. The secret is zeroized when the key
@@ -524,6 +527,7 @@ fn sync_parent(path: &Path) {
 mod tests {
     use super::*;
     use base64::Engine;
+    #[cfg(unix)]
     use std::fs;
 
     #[test]

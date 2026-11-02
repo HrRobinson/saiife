@@ -1101,6 +1101,27 @@ pub fn load_local(dir: &Path) -> Result<Vec<Manifest>, BrokerError> {
     load_local_with(dir, builtin(), 0)
 }
 
+/// Whether a manifest directory or file passes the owner and mode check.
+/// Unix: owned by `owner_uid` and not writable by group or others.
+#[cfg(unix)]
+fn manifest_meta_trusted(meta: &std::fs::Metadata, owner_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == owner_uid && meta.mode() & 0o022 == 0
+}
+
+/// Windows (developer mode, plan 19a): a reparse point (symlink, junction,
+/// mount point) is refused, and there is NO owner or DACL check. That is a
+/// known gap: the locked daemon and its root-owned manifests do not exist on
+/// Windows until plan 19b, whose Task adds the DACL check through
+/// `saiife-win` (W-decision on developer-mode paths). `owner_uid` is unused.
+#[cfg(not(unix))]
+fn manifest_meta_trusted(meta: &std::fs::Metadata, owner_uid: u32) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let _ = owner_uid;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
 /// [`load_local`] with the built-in list and the required owner as inputs
 /// (a seam for tests, which cannot create root-owned files).
 pub fn load_local_with(
@@ -1108,7 +1129,6 @@ pub fn load_local_with(
     builtin: &[Manifest],
     owner_uid: u32,
 ) -> Result<Vec<Manifest>, BrokerError> {
-    use std::os::unix::fs::MetadataExt;
     let err = |p: &Path, why: &str| BrokerError::Manifest(format!("{}: {why}", p.display()));
     // Root for the locked daemon, the user for the personal broker.
     let who = if owner_uid == 0 { "root" } else { "this user" };
@@ -1121,7 +1141,7 @@ pub fn load_local_with(
     if !dmeta.is_dir() {
         return Err(err(dir, "not a directory"));
     }
-    if dmeta.uid() != owner_uid || dmeta.mode() & 0o022 != 0 {
+    if !manifest_meta_trusted(&dmeta, owner_uid) {
         return Err(err(dir, &owned));
     }
     let mut names = Vec::new();
@@ -1140,7 +1160,7 @@ pub fn load_local_with(
         if !meta.file_type().is_file() {
             return Err(err(&path, "not a regular file (symlinks are not followed)"));
         }
-        if meta.uid() != owner_uid || meta.mode() & 0o022 != 0 {
+        if !manifest_meta_trusted(&meta, owner_uid) {
             return Err(err(&path, &owned));
         }
         if meta.len() > MAX_MANIFEST_BYTES {

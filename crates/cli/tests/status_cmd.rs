@@ -300,6 +300,7 @@ fn symlinked_path_and_subdirectory_find_the_same_project() {
 
 /// Replace the symlink to the binary under test with a real copy, so the
 /// test can later change the file's content in place.
+#[cfg(unix)]
 fn with_real_copy(agents: &[&str]) -> Env {
     let env = Env::new(agents);
     let exe = env.bin.path().join("saiife");
@@ -352,6 +353,7 @@ fn binary_replaced_in_place_is_reported() {
 /// Absolute path of `sleep`: the fakes run with PATH = the test's bin dir
 /// only, where a bare `sleep` would not be found (and no grandchild would
 /// hold the pipe).
+#[cfg(unix)]
 fn sleep_bin() -> std::path::PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .chain([std::path::PathBuf::from("/bin")])

@@ -602,7 +602,7 @@ pub fn mcp_check_pinned(
 /// that parses and is exactly what `managed_mcp_settings` writes
 /// (`saiife_agents::claude::managed_mcp_pinned`). Any doubt is `false`.
 // Used by the locked hook (Linux and macOS).
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(unix)]
 pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     const MAX: u64 = 1 << 20;
@@ -624,6 +624,14 @@ pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
         return false;
     }
     saiife_agents::claude::managed_mcp_pinned(&text)
+}
+
+/// Windows has no root-owned drop-in until plan 19b (spec 5.3a), so the pin
+/// can never be confirmed: any doubt is `false`, never a pass.
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub fn claude_pin_ok(_path: &std::path::Path, _owner: u32) -> bool {
+    false
 }
 
 /// The MCP server identity a payload states (Gemini CLI's `mcp_context`).
@@ -1357,6 +1365,7 @@ mod tests {
 
     /// The drop-in file: missing, a wrong pin, a symlink, writable by the
     /// group, another owner: not pinned. saiife's own text: pinned.
+    #[cfg(unix)] // owner, modes and symlinks; the Windows pin is always false
     #[test]
     fn claude_pin_ok_reads_the_drop_in_strictly() {
         use std::os::unix::fs::PermissionsExt;

@@ -16,9 +16,12 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
 use saiife_policy::installed::{read_installed, FileKind, Installed};
 use saiife_policy::{load_system, PackInfo};
+#[cfg(unix)]
 use saiife_system::doctor::system::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use saiife_system::layout::{CONFIG, INSTALLED};
-use saiife_system::{host_for, Host, Layout};
+use saiife_system::Layout;
+#[cfg(unix)]
+use saiife_system::{host_for, Host};
 use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
@@ -775,6 +778,14 @@ struct LockedState {
 /// Spec section 10, verbatim.
 const WORDING_RULE: &str = "note: the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model";
 
+/// Windows: no locked mode exists until plan 19b, so there is no install
+/// record to read and `status` reports developer mode only.
+#[cfg(not(unix))]
+fn locked_block(_layout: &Layout, _builtin: &[Pack]) -> Option<LockedState> {
+    None
+}
+
+#[cfg(unix)]
 fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     let installed_path = layout.at(INSTALLED);
     // A dangling or symlinked record still means locked mode (and fails).
@@ -1044,15 +1055,6 @@ fn daemon_status(
         pending,
         m.get("mcp").cloned().unwrap_or(Value::Null),
     ))
-}
-
-#[cfg(not(unix))]
-fn daemon_status(
-    _layout: &Layout,
-    _host: &dyn Host,
-    _cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<DaemonStatus, String> {
-    Err(saiife_system::NOT_SUPPORTED_OS.to_string())
 }
 
 /// Installed files whose fingerprint differs from `installed.toml`: the

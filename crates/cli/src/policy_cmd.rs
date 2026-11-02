@@ -256,7 +256,7 @@ fn validate(file: &Path, loaded: LoadedPolicy, dir: &dyn Directory) -> Checked {
     // the daemon does, except for the owner: a policy kept in git belongs to
     // whoever checked it out.
     let cdir = file.parent().unwrap_or(Path::new("")).join("connectors");
-    let me = rustix::process::geteuid().as_raw();
+    let me = manifest_owner();
     let local = match manifest::load_local_with(&cdir, manifest::builtin(), me) {
         Ok(l) => l,
         Err(e) => {
@@ -513,8 +513,27 @@ fn run_case(
 // ------------------------------------------------------------------- show
 
 /// The user running this command.
+#[cfg(unix)]
 fn current_user() -> Option<String> {
     Getent.name_of(rustix::process::getuid().as_raw())
+}
+
+/// `policy show` is locked mode: `main` refuses it on Windows first.
+#[cfg(not(unix))]
+fn current_user() -> Option<String> {
+    None
+}
+
+/// The uid `load_local_with` expects as the manifests' owner. Windows has no
+/// uid and the loader ignores it there (no owner check before plan 19b).
+#[cfg(unix)]
+fn manifest_owner() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn manifest_owner() -> u32 {
+    0
 }
 
 fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitCode {

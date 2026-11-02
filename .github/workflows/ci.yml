@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -26,10 +26,16 @@ jobs:
       # A short temp base keeps unix socket paths under 108 bytes.
       # TMPDIR too: tempfile::tempdir() (and anything else using the
       # system temp dir) stays off a quota'd or shared /tmp.
+      # On windows-latest (plan 19a) TMP, TEMP and LOCALAPPDATA sit under the
+      # runner temp dir too, so no test writes the runner's real profile
+      # paths that honour them; the other OSes ignore the three.
       - run: cargo test --workspace --no-fail-fast
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          LOCALAPPDATA: ${{ runner.temp }}/localappdata
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh
@@ -45,9 +51,11 @@ jobs:
       # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
+        shell: bash
         run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
       # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
       - name: unsafe only in saiife-darwin
+        if: matrix.os != 'windows-latest'
         run: bash scripts/check-unsafe.sh
       # Windows code compile-checked from Linux, with a stand-in C compiler (plan 19a).
       - name: windows target check
@@ -58,6 +66,7 @@ jobs:
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
+        if: matrix.os != 'windows-latest'
         run: bash scripts/test-install.sh
       # End-to-end demo in a sandboxed HOME: three recorded Claude Code calls
       # must be blocked and the HTML report written (docs/demo.md).
