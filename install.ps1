@@ -57,21 +57,24 @@ function Test-Version([string]$Value) {
   if ($Value -notmatch '^[0-9A-Za-z.+-]+$') { Fail "invalid version: '$Value'" }
 }
 
-# Fetch <url> to <dest>. https (TLS 1.2 or newer) or file; never http.
+# Fetch <url> to <dest>. https goes through System32 curl.exe (TLS 1.2 or
+# newer, https-only redirects; no .NET protocol defaults, so Windows
+# PowerShell 5.1 cannot fall back to TLS 1.0 or follow a redirect to http).
+# file:// exists for offline tests and local mirrors, and only when the caller
+# passed -BaseUrl: the default base is https, so a default install can never
+# reach it.
 function Get-Download([string]$Url, [string]$Dest) {
   $uri = [System.Uri]$Url
   switch ($uri.Scheme) {
     'file' {
+      if ($BaseUrl -eq '') { Fail "only https downloads are allowed: $Url" }
       [System.IO.File]::Copy($uri.LocalPath, $Dest, $true)
     }
     'https' {
-      # Windows PowerShell 5.1 may default to older protocols.
-      try {
-        [Net.ServicePointManager]::SecurityProtocol =
-          [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-      } catch { }
-      $ProgressPreference = 'SilentlyContinue'
-      Invoke-WebRequest -UseBasicParsing -Uri $uri.AbsoluteUri -OutFile $Dest
+      $curl = Join-Path ([Environment]::GetFolderPath('System')) 'curl.exe'
+      if (-not (Test-Path -LiteralPath $curl)) { Fail "curl.exe not found at $curl; Windows 10 1803 or newer is required" }
+      & $curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o $Dest $uri.AbsoluteUri
+      if ($LASTEXITCODE -ne 0) { throw "curl.exe failed ($LASTEXITCODE) for $Url" }
     }
     default { Fail "only https downloads are allowed: $Url" }
   }
@@ -83,15 +86,30 @@ function Test-PathEntryEqual([string]$A, [string]$B) {
   return [string]::Equals($x, $y, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-# Add <dir> to the user's Path once; never touches the machine Path.
+# Add <dir> to the user's Path once; never touches the machine Path. The
+# value is read unexpanded and written back as REG_EXPAND_SZ, so existing
+# %VAR% entries stay variables. Entries are compared raw and expanded.
 function Add-UserPath([string]$Dir) {
-  $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if ($null -eq $current) { $current = '' }
-  foreach ($entry in $current.Split(';')) {
-    if ($entry -ne '' -and (Test-PathEntryEqual $entry $Dir)) { return $false }
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+  if ($null -eq $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }
+  try {
+    $current = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($null -eq $current) { $current = '' }
+    $current = [string]$current
+    foreach ($entry in $current.Split(';')) {
+      if ($entry -eq '') { continue }
+      if ((Test-PathEntryEqual $entry $Dir) -or (Test-PathEntryEqual ([Environment]::ExpandEnvironmentVariables($entry)) $Dir)) { return $false }
+    }
+    if ($current -eq '' -or $current.EndsWith(';')) { $new = "$current$Dir" } else { $new = "$current;$Dir" }
+    $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  } finally {
+    $key.Dispose()
   }
-  if ($current -eq '' -or $current.EndsWith(';')) { $new = "$current$Dir" } else { $new = "$current;$Dir" }
-  [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+  # Tell running programs (Explorer, new terminals) that the environment
+  # changed: setting then clearing a dummy User variable broadcasts it.
+  $dummy = 'SAIIFE_ENV_BROADCAST_' + [System.Guid]::NewGuid().ToString('N')
+  [Environment]::SetEnvironmentVariable($dummy, '1', 'User')
+  [Environment]::SetEnvironmentVariable($dummy, $null, 'User')
   # This session too.
   $inSession = $false
   foreach ($entry in $env:Path.Split(';')) {
@@ -188,6 +206,19 @@ function Install-Saiife {
         try { $in.CopyTo($out) } finally { $out.Dispose() }
       } finally { $in.Dispose() }
     } finally { $archive.Dispose() }
+
+    # The binary's Authenticode state, before it is placed anywhere.
+    $sig = Get-AuthenticodeSignature -LiteralPath $exeTmp
+    switch ([string]$sig.Status) {
+      'Valid' { }
+      'NotSigned' {
+        [Console]::Error.WriteLine('saiife: WARNING: saiife.exe is not Authenticode-signed; Windows SmartScreen may warn on first run. Only continue if you trust where this release came from.')
+      }
+      default { Fail "saiife.exe has an invalid Authenticode signature ($($sig.Status)); refusing to install" }
+    }
+    # TODO(publisher pin): once the signing identity exists, also require
+    # $sig.SignerCertificate.Subject (or its thumbprint) to match it when the
+    # status is Valid. Not pinned yet, so any valid signature is accepted.
 
     try {
       New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null

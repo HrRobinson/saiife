@@ -3,5 +3,5 @@
 # only (/DEPENDENTLOADFLAG:0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32), never in the
 # application or current directory. scripts/check-windows.sh sets RUSTFLAGS,
 # which replaces these for its compile-only check.
-[target.'cfg(windows)']
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]

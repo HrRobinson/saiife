@@ -63,6 +63,8 @@ function Write-Sums([string]$Dir) {
 # runs install.ps1 in a child pwsh with a redirected profile; returns
 # @{ Status; Out; Dir }.
 function Invoke-Install([string]$Case, [string]$Rel, [string]$Arch, [string[]]$ExtraArgs = @()) {
+  # Windows PowerShell 5.1 turns native stderr into terminating errors under Stop.
+  $ErrorActionPreference = 'Continue'
   New-Item -ItemType Directory -Force -Path (Join-Path $Case 'profile'), (Join-Path $Case 'local'), (Join-Path $Case 'tmp') | Out-Null
   $env:USERPROFILE = Join-Path $Case 'profile'
   $env:LOCALAPPDATA = Join-Path $Case 'local'
@@ -75,7 +77,25 @@ function Invoke-Install([string]$Case, [string]$Rel, [string]$Arch, [string[]]$E
   return @{ Status = $LASTEXITCODE; Out = $out; Dir = (Join-Path $Case 'local\Programs\saiife\bin') }
 }
 
-$origPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+# The user Path is read and restored raw (unexpanded, same value kind), like
+# install.ps1 does, so the test never rewrites %VAR% entries either.
+function Get-RawUserPath {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+  try {
+    if ($null -eq $k.GetValue('Path', $null)) { return $null }
+    return @{
+      Value = $k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      Kind = $k.GetValueKind('Path')
+    }
+  } finally { $k.Dispose() }
+}
+function Set-RawUserPath($Saved) {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+  try {
+    if ($null -eq $Saved) { $k.DeleteValue('Path', $false) } else { $k.SetValue('Path', $Saved.Value, $Saved.Kind) }
+  } finally { $k.Dispose() }
+}
+$origPath = Get-RawUserPath
 $saved = @{}
 foreach ($n in 'USERPROFILE', 'LOCALAPPDATA', 'TEMP', 'TMP', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_ARCHITEW6432') {
   $saved[$n] = [Environment]::GetEnvironmentVariable($n)
@@ -84,10 +104,11 @@ foreach ($n in 'USERPROFILE', 'LOCALAPPDATA', 'TEMP', 'TMP', 'PROCESSOR_ARCHITEC
 try {
   # Never leave the runner's user Path pointing at test dirs, even on failure
   # of an earlier case: each case starts from the original value.
-  function Reset-UserPath { [Environment]::SetEnvironmentVariable('Path', $origPath, 'User') }
+  function Reset-UserPath { Set-RawUserPath $origPath }
   function Count-PathEntry([string]$Dir) {
-    $p = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($null -eq $p) { return 0 }
+    $raw = Get-RawUserPath
+    if ($null -eq $raw) { return 0 }
+    $p = [string]$raw.Value
     return @($p.Split(';') | Where-Object { $_.TrimEnd('\') -ieq $Dir.TrimEnd('\') }).Count
   }
 
@@ -99,7 +120,8 @@ try {
   $exe = Join-Path $r.Dir 'saiife.exe'
   if ($r.Status -eq 0 -and (Test-Path $exe) -and
     ([System.IO.File]::ReadAllText($exe) -eq 'MZ fake saiife 0.1.0 x86_64-pc-windows-msvc') -and
-    $r.Out.Contains("saiife 0.1.0 installed to $exe") -and $r.Out.Contains('saiife init')) { Ok 'install_pinned_version' }
+    $r.Out.Contains("saiife 0.1.0 installed to $exe") -and $r.Out.Contains('saiife init') -and
+    $r.Out.Contains('not Authenticode-signed')) { Ok 'install_pinned_version' }
   else { Bad 'install_pinned_version' "status=$($r.Status); $($r.Out)" }
 
   # --- install_latest (ARM64 picks the aarch64 zip) ------------------------
@@ -203,7 +225,7 @@ try {
   else { Bad 'http_base_refused' "status=$($r.Status); $($r.Out)" }
 }
 finally {
-  [Environment]::SetEnvironmentVariable('Path', $origPath, 'User')
+  Set-RawUserPath $origPath
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
   Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
