@@ -89,8 +89,17 @@ pub fn data_dir() -> Option<PathBuf> {
 fn data_dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match var {
         Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
-        _ => dirs::data_dir().map(|d| d.join("saiife")),
+        _ => default_base().map(|d| d.join("saiife")),
     }
+}
+
+/// W3: the local (non-roaming) app data on Windows, `dirs::data_dir()`
+/// elsewhere.
+fn default_base() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return dirs::data_local_dir();
+    #[cfg(not(windows))]
+    dirs::data_dir()
 }
 
 /// The project path that identifies a project: canonical, so a project

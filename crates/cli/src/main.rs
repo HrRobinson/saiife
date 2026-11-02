@@ -452,7 +452,15 @@ fn locked_only(cmd: &Cmd) -> bool {
         | Cmd::Lockdown { .. }
         | Cmd::Env { .. }
         | Cmd::System { .. } => true,
-        _ => false,
+        // Developer mode. No wildcard: a new subcommand must be put on one
+        // side or the other here, or this does not compile.
+        Cmd::Test { .. }
+        | Cmd::Explain { .. }
+        | Cmd::Init { .. }
+        | Cmd::Status { .. }
+        | Cmd::Packs { .. } => false,
+        #[cfg(debug_assertions)]
+        Cmd::FakeMcpServer(_) => false,
     }
 }
 

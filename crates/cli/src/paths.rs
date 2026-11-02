@@ -41,6 +41,8 @@ fn config_dir(
 /// in locked mode (or when a project turns it on).
 const SYSTEM_PATHS: [(&str, &str); 6] = system_paths(if cfg!(target_os = "macos") {
     Platform::Macos
+} else if cfg!(windows) {
+    Platform::Windows
 } else {
     Platform::Linux
 });
@@ -50,7 +52,21 @@ const SYSTEM_PATHS: [(&str, &str); 6] = system_paths(if cfg!(target_os = "macos"
 const fn system_paths(p: Platform) -> [(&'static str, &'static str); 6] {
     use saiife_system::layout::{ETC_DIR, LOG_DIR, OPT_DIR, RUN_DIR, STATE_DIR, UNIT};
     let (state, run, unit) = match p {
-        Platform::Linux | Platform::Windows => (STATE_DIR, RUN_DIR, UNIT),
+        Platform::Linux => (STATE_DIR, RUN_DIR, UNIT),
+        // Spec §5.3a: everything under C:\ProgramData\saiife. Windows has no
+        // run dir (the endpoint is a pipe) and no unit file; those two names
+        // bind the run dir path and the service binary so `core.lock` still
+        // protects what is there.
+        Platform::Windows => {
+            return [
+                ("SAIIFE_ETC", r"C:\ProgramData\saiife\etc"),
+                ("SAIIFE_STATE", r"C:\ProgramData\saiife\state"),
+                ("SAIIFE_LOG", r"C:\ProgramData\saiife\log"),
+                ("SAIIFE_RUN", r"C:\ProgramData\saiife\run"),
+                ("SAIIFE_OPT", r"C:\ProgramData\saiife"),
+                ("SAIIFE_UNIT", r"C:\ProgramData\saiife\bin\saiife.exe"),
+            ];
+        }
         Platform::Macos => (
             "/var/db/saiife",
             "/var/db/saiife-run",
@@ -290,6 +306,18 @@ mod tests {
         assert_eq!(SYSTEM_PATHS, mac);
         #[cfg(target_os = "linux")]
         assert_eq!(SYSTEM_PATHS, system_paths(Platform::Linux));
+    }
+
+    #[test]
+    fn system_paths_windows_values() {
+        let w = system_paths(Platform::Windows);
+        assert_eq!(w[0], ("SAIIFE_ETC", r"C:\ProgramData\saiife\etc"));
+        assert_eq!(w[4], ("SAIIFE_OPT", r"C:\ProgramData\saiife"));
+        assert!(w
+            .iter()
+            .all(|(_, v)| v.starts_with(r"C:\ProgramData\saiife")));
+        #[cfg(windows)]
+        assert_eq!(SYSTEM_PATHS, w);
     }
 
     #[test]

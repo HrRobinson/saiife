@@ -99,6 +99,9 @@ mod imp {
     ) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        #[cfg(windows)]
+        eprintln!("{}", crate::LOCKED_ON_WINDOWS_LATER);
+        #[cfg(not(windows))]
         crate::warn(saiife_system::NOT_SUPPORTED_OS);
         ExitCode::from(2)
     }

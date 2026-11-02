@@ -22,6 +22,17 @@ use crate::project::project_root;
 /// whose lock does not hold still gets a project hook. An unreadable record
 /// is locked mode with no agent known to be managed.
 fn locked_mode(system_root: Option<PathBuf>) -> Option<Vec<String>> {
+    locked_mode_on(cfg!(windows), system_root)
+}
+
+/// [`locked_mode`] with the OS given. On Windows there is no locked mode
+/// before plan 19b, and `\etc\saiife\installed.toml` on the current drive
+/// is not root-owned: a planted file must not make `init` skip the project
+/// hook. Plan 19b reads the record again behind a DACL check.
+fn locked_mode_on(windows: bool, system_root: Option<PathBuf>) -> Option<Vec<String>> {
+    if windows {
+        return None;
+    }
     let layout = system_root
         .map(Layout::under)
         .unwrap_or_else(Layout::system);
@@ -539,5 +550,22 @@ fn describe(change: &Change, updated: &str, unchanged: &str) -> String {
         Change::Updated => updated.into(),
         Change::Unchanged => unchanged.into(),
         Change::Deleted => "deleted".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locked_mode_on;
+
+    /// A planted install record makes `init` skip the project hook on Unix
+    /// (locked mode); on Windows it must not (no locked mode before 19b).
+    #[test]
+    fn a_planted_installed_toml_cannot_silence_init_on_windows() {
+        let root = tempfile::tempdir().unwrap();
+        let etc = root.path().join("etc/saiife");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("installed.toml"), "not toml [").unwrap();
+        assert!(locked_mode_on(false, Some(root.path().into())).is_some());
+        assert_eq!(locked_mode_on(true, Some(root.path().into())), None);
     }
 }

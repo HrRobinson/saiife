@@ -1,0 +1,3 @@
+# CRLF checkouts on windows-latest would break fixtures, hashes and shell
+# scripts. `text=auto` leaves binary files alone (`* text` would not).
+* text=auto eol=lf

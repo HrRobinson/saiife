@@ -50,6 +50,9 @@ impl SystemView {
 /// the v1 default too, with one warning in `warnings`.
 pub fn read(config: &Path) -> SystemView {
     let mut view = SystemView::default();
+    // Windows too (spec §5.3a): `config.toml` is read there, because
+    // `parse_config` can only tighten (fail closed). Plan 19b adds the DACL
+    // check on the file before it is trusted.
     match read_regular(config, false, MAX_BYTES).and_then(|b| b.map(parse_config).transpose()) {
         Ok(Some(closed)) => view.fail_closed = closed,
         Ok(None) => {}

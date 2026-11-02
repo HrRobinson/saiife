@@ -30,6 +30,16 @@ pub enum Source {
 /// read it is an error naming the path (fail closed: a locked host never
 /// falls back to the home log alone).
 pub fn source(system_config: Option<&Path>) -> Result<Source, String> {
+    source_on(cfg!(windows), system_config)
+}
+
+/// [`source`] with the OS given. Windows is always `Developer` until plan
+/// 19b reads the config behind a DACL check: ProgramData is not root-owned,
+/// and a planted locked config would otherwise hide the user's own log.
+fn source_on(windows: bool, system_config: Option<&Path>) -> Result<Source, String> {
+    if windows {
+        return Ok(Source::Developer);
+    }
     let config = system_config.unwrap_or(Path::new(SYSTEM_CONFIG));
     let Some(dir) = locked_audit_dir(config)? else {
         return Ok(Source::Developer);
@@ -220,6 +230,20 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows reads no locked config before plan 19b (DACL check): a
+    /// planted `locked = true` file there cannot change the audit source.
+    #[test]
+    fn windows_source_is_developer_whatever_the_config_says() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "locked = true\n").unwrap();
+        assert!(matches!(source_on(true, Some(&cfg)), Ok(Source::Developer)));
+        assert!(!matches!(
+            source_on(false, Some(&cfg)),
+            Ok(Source::Developer)
+        ));
+    }
 
     #[test]
     fn auditor_is_root_or_a_group_member() {
