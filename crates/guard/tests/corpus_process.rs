@@ -47,7 +47,10 @@ fn engine() -> Engine {
         .collect();
     assert_eq!(process.len(), 1, "core.process ships");
     assert!(process[0].default_on, "core.process is on by default");
-    Engine::new(process).with_budget(TEST_BUDGET)
+    // The compile allowance is wall-clock time: see `corpus_lock`.
+    Engine::new(process)
+        .with_budget(TEST_BUDGET)
+        .with_pattern_allowance(std::time::Duration::MAX)
 }
 
 fn assert_all_deny(e: &Engine, cmds: &[&str]) {

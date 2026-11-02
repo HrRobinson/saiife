@@ -6,7 +6,7 @@
 //! Windows host does, and judged by one built-in pack alone, so a deny is that
 //! pack's doing. Each deny has a benign neighbour that must stay allowed.
 
-use saiifeguard::builtins::{builtin_packs, Catalog};
+use saiifeguard::builtins::{builtin_packs_for, Catalog};
 use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{Decision, Engine};
 use saiifeguard::payload::Dialects;
@@ -30,23 +30,29 @@ fn windows_vars() -> PathVars {
 
 /// One built-in pack, alone, on a Windows host.
 fn only(pack: &str) -> Engine {
-    let (packs, warnings) = builtin_packs();
+    let (packs, warnings) = builtin_packs_for(PathStyle::Windows);
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     let p = packs.into_iter().find(|p| p.id == pack).unwrap();
     Engine::new(vec![p])
         .with_paths(windows_vars())
         .with_budget(BUDGET)
+        .with_pattern_allowance(std::time::Duration::MAX)
 }
 
 /// Every default-on pack plus `core.lock`, on a Windows host (or a POSIX one).
 fn everything(windows: bool) -> Engine {
-    let (packs, warnings) = Catalog::builtin().load_active(&["core.lock".to_string()]);
+    let style = if windows {
+        PathStyle::Windows
+    } else {
+        PathStyle::Posix
+    };
+    let (packs, warnings) = Catalog::builtin_for(style).load_active(&["core.lock".to_string()]);
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     let e = Engine::new(packs).with_budget(BUDGET);
     if windows {
         e.with_paths(windows_vars())
     } else {
-        e
+        e.with_paths(PathVars::new().with_style(PathStyle::Posix))
     }
 }
 

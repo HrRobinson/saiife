@@ -873,7 +873,7 @@ fn aton(h: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::builtin_packs;
+    use crate::builtins::builtin_packs_for;
     use crate::canon::path_forms;
     use crate::engine::{AllowTrace, Decision, Engine};
     use crate::pack::load_pack_str;
@@ -1354,7 +1354,7 @@ mod tests {
     }
 
     fn secrets_engine(v: PathVars) -> Engine {
-        let (packs, warnings) = builtin_packs();
+        let (packs, warnings) = builtin_packs_for(v.style());
         assert!(warnings.is_empty(), "{warnings:?}");
         let secrets: Vec<_> = packs
             .into_iter()
@@ -1627,7 +1627,7 @@ mod tests {
             }
         );
         // The pack regexes keep the collapsed line.
-        let (packs, _) = builtin_packs();
+        let (packs, _) = builtin_packs_for(PathStyle::Windows);
         let fs: Vec<_> = packs
             .into_iter()
             .filter(|p| p.id == "core.filesystem")

@@ -56,15 +56,25 @@ access = "any"
 reason = "secret"
 "#;
 
-/// The shipped `core.filesystem`, then the stand-in path rules.
+/// The shipped `core.filesystem` of a Windows host, then the stand-in path rules.
 fn packs() -> Vec<crate::pack::Pack> {
-    let (all, warnings) = Catalog::builtin().load_all();
+    packs_for(PathStyle::Windows)
+}
+
+fn packs_for(style: PathStyle) -> Vec<crate::pack::Pack> {
+    let (all, warnings) = Catalog::builtin_for(style).load_all();
     assert!(warnings.is_empty(), "{warnings:?}");
     let fs = all.into_iter().find(|p| p.id == "core.filesystem").unwrap();
     let mut warnings = Vec::new();
     let paths = load_pack_str("<t>", PACK, &mut warnings).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     vec![fs, paths]
+}
+
+/// The same packs on a POSIX host, whatever this host is.
+fn posix_engine() -> Engine {
+    Engine::new(packs_for(PathStyle::Posix))
+        .with_paths(PathVars::new().with_style(PathStyle::Posix))
 }
 
 fn windows_vars() -> PathVars {
@@ -79,7 +89,7 @@ fn engine() -> Engine {
 }
 
 fn default_engine() -> Engine {
-    let (packs, _) = Catalog::builtin().load_active(&[]);
+    let (packs, _) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
     Engine::new(packs).with_paths(windows_vars())
 }
 
@@ -400,7 +410,7 @@ fn posix_engine_unchanged() {
         assert_eq!(e.evaluate(cmd), e.evaluate_call(cmd, POSIX), "{cmd}");
     }
     // POSIX style: `pwsh -c` stays as it was, a program with arguments.
-    let posix = Engine::new(packs());
+    let posix = posix_engine();
     assert!(is_clean(&posix.evaluate(r"pwsh -c 'ri -r C:\'")));
 }
 
@@ -501,7 +511,8 @@ fn unquoted_windows_paths_on_a_shell_tool_are_denied() {
 /// and one that names no path stays a value.
 #[test]
 fn a_powershell_variable_path_in_posix_style_is_no_allow() {
-    let e = Engine::new(packs()).with_paths(PathVars::new().with_cwd("/p"));
+    let e = Engine::new(packs_for(PathStyle::Posix))
+        .with_paths(PathVars::new().with_style(PathStyle::Posix).with_cwd("/p"));
     for cmd in [
         "Get-Content $x",
         "gc ./$x/id_rsa",
@@ -862,11 +873,11 @@ fn cmd_files_and_globs() {
 /// Windows style lets `cd` and `rm` know a drive; POSIX style stays exact.
 #[test]
 fn cd_tracking_stays_posix_on_posix() {
-    let e = Engine::new(packs());
+    let e = posix_engine();
     assert!(!e.evaluate("cd C:/ && rm -rf *").is_deny());
     // A colon is an ordinary character, and `..` climbs out of it.
-    let (shipped, _) = Catalog::builtin().load_active(&[]);
-    let e = Engine::new(shipped);
+    let (shipped, _) = Catalog::builtin_for(PathStyle::Posix).load_active(&[]);
+    let e = Engine::new(shipped).with_paths(PathVars::new().with_style(PathStyle::Posix));
     for cmd in ["cd /x: && rm -rf ../etc", "cd /x: && cd .. && rm -rf etc"] {
         let got = e.evaluate(cmd);
         assert!(got.is_deny(), "{cmd}: {got:?}");
@@ -1327,6 +1338,6 @@ fn a_relative_operand_is_read_from_the_cwd() {
     assert!(!e.evaluate_in(r"rd /s /q build", CMD).is_deny());
     assert!(!e.evaluate_in(r"Remove-Item -Recurse .\build", PS).is_deny());
     // POSIX style has not changed: no `cd`, no join.
-    let posix = Engine::new(packs());
+    let posix = posix_engine();
     assert!(!posix.evaluate("rm -rf ..").is_deny());
 }

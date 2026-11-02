@@ -24,7 +24,8 @@ version = 6
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl", "loginctl", "(?i)setx", "(?i)saiife_"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl", "loginctl"]
+windows_triggers = ["(?i)setx", "(?i)saiife_"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -296,21 +297,24 @@ reason = "a drop-in can override the personal broker's unit; only you may change
 # --- Windows (plan 19a, W7) -----------------------------------------------------
 # The developer data dir is `%LOCALAPPDATA%\saiife` (audit trail, integrity
 # records). Named by its place under a profile, so it holds when the variable
-# is not bound; on other systems these globs match nothing real. The running
+# is not bound. On a Windows-style host only: other systems never compile them. The running
 # `saiife.exe` is `$SAIIFE_BIN` above, and the project hook files
 # (`.claude\settings.json`, `.codex\config.toml`, `.gemini\settings.json`) are
 # covered by the `**/.claude/…` rules, which fold case and read `\` on Windows.
 [[deny_path]]
+platform = "windows"
 glob = "**/AppData/Local/saiife/**"
 access = "write"
 reason = "saiife's data directory holds the audit trail and the integrity records"
 
 [[deny_path]]
+platform = "windows"
 glob = "**/AppData/Local/saiife"
 access = "write"
 reason = "removing or moving saiife's data directory removes the audit trail"
 
 [[deny]]
+platform = "windows"
 # `setx SAIIFE_DATA_DIR D:\x` (also `/m`) moves the audit and integrity dirs
 # for every program started afterwards. So do the registry values setx writes
 # (`reg add HKCU\Environment`, `Set-ItemProperty`), and .NET's

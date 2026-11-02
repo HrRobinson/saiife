@@ -912,7 +912,7 @@ fn print_unit(kind: &str) -> ExitCode {
 #[cfg(unix)]
 /// The built-in packs as the daemon's policy catalog.
 fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
-    let (packs, warnings) = builtin_packs();
+    let (packs, warnings) = saiifeguard::builtins::builtin_packs_every_rule();
     for w in &warnings {
         warn(&format!("pack warning ({}): {}", w.source, w.message));
     }

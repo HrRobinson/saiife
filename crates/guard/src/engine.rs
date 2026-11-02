@@ -128,6 +128,9 @@ pub struct Engine {
     packs: Vec<Pack>,
     combined: Prefilter,
     budget: Duration,
+    /// How long one evaluation may spend compiling operand patterns before any
+    /// further pattern counts as a match: `pack::MAX_PATTERN_COMPILE`.
+    pattern_allowance: Duration,
     /// Case-folded command names that at least one active pack has a deny
     /// rule for. Used only to scope the command-substitution-in-a-guarded-
     /// position policy — see `command_rules_phase`.
@@ -238,6 +241,7 @@ impl Engine {
             has_path_rules: packs.iter().any(|p| !p.deny_path.is_empty()),
             packs,
             budget: DEFAULT_BUDGET,
+            pattern_allowance: crate::pack::MAX_PATTERN_COMPILE,
             guarded_commands,
             vars: PathVars::default(),
             path_rules: OnceLock::new(),
@@ -251,8 +255,23 @@ impl Engine {
     /// this, only rules without variables apply and relative paths cannot
     /// be judged.
     pub fn with_paths(mut self, vars: PathVars) -> Self {
+        // Both come from `PathStyle::host()` in production. A test that forces a
+        // style must load the packs for it (`Catalog::builtin_for`), or it
+        // judges without the rules it means to test.
+        debug_assert!(
+            self.packs.iter().all(|p| p.fits(vars.style())),
+            "packs loaded for another host style than these paths"
+        );
         self.vars = vars;
         self.path_rules = OnceLock::new();
+        self
+    }
+
+    /// [`crate::pack::MAX_PATTERN_COMPILE`] in place of its default. That one is
+    /// wall-clock time, so a test whose verdict must not depend on how loaded the
+    /// machine is sets this, as it sets `with_budget`.
+    pub fn with_pattern_allowance(mut self, allowance: Duration) -> Self {
+        self.pattern_allowance = allowance;
         self
     }
 
@@ -473,6 +492,7 @@ impl Engine {
         Engine::new(packs)
             .with_paths(self.vars.clone())
             .with_budget(self.budget)
+            .with_pattern_allowance(self.pattern_allowance)
     }
 
     /// Evaluate a raw command line and return the decision.
@@ -1675,8 +1695,15 @@ impl Engine {
                 (None, _) => Hit::Yes,
                 // Read with the command's own options: `pkill -u 0 node`
                 // has the one operand `node`.
-                (Some(m), Some(t)) => m.hits(&t.operand_args(operands), &over_budget, spent),
-                (Some(m), None) => m.hits(operands, &over_budget, spent),
+                (Some(m), Some(t)) => m.hits_within(
+                    &t.operand_args(operands),
+                    &over_budget,
+                    spent,
+                    self.pattern_allowance,
+                ),
+                (Some(m), None) => {
+                    m.hits_within(operands, &over_budget, spent, self.pattern_allowance)
+                }
             }
         };
         let mut allowed: Option<AllowTrace> = None;

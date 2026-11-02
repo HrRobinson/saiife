@@ -189,9 +189,10 @@ fn parse_example(ex: &Example) -> Result<Case, String> {
     }
 }
 
-/// The built-in packs with their `[[deny]]` rule ids (for `[guard] ask`).
+/// The built-in packs with their `[[deny]]` rule ids (for `[guard] ask`), those
+/// of every OS: a policy can be shared across a fleet and checked on any host.
 fn pack_catalog() -> Vec<PackInfo> {
-    let (packs, _) = saiifeguard::builtins::builtin_packs();
+    let (packs, _) = saiifeguard::builtins::builtin_packs_every_rule();
     packs
         .iter()
         .map(|p| PackInfo {
@@ -836,6 +837,15 @@ fn print_show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_catalog_names_the_rules_of_every_os() {
+        let catalog = pack_catalog();
+        let rules = |id: &str| &catalog.iter().find(|p| p.id == id).unwrap().rules;
+        assert!(rules("core.filesystem").contains(&"windows-format".to_string()));
+        assert!(rules("core.lock").contains(&"windows-service".to_string()));
+        assert!(rules("core.git").contains(&"force-push".to_string()));
+    }
 
     const PASSWD: &str = "alice:x:1000:1000::/home/alice:/bin/sh\n\
         bob:x:1001:1001::/home/bob:/bin/sh\n\

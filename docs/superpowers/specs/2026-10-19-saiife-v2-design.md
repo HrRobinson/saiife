@@ -755,18 +755,36 @@ run.
   written for `/etc/...` never matches a Windows path. Windows targets get
   their own rules.
 
-**New pack rules (W7).** All patterns apply on every OS, where they are
-harmless. Deviation from the plan's text: the rules have no `[[example]]` lines,
+**New pack rules (W7).** Amended by the owner's ruling on the hook budget (plan 19a
+Task 10, +1 ms against `main`): compiling these rules on every OS cost about 5 ms
+per hook call. So every rule in the table below carries `platform = "windows"`, and
+its triggers are in `windows_triggers`. They exist on a Windows-style host only: a
+Windows build of saiife, whichever dialect a line is read in, Git Bash included.
+Linux and macOS never compile them, and WSL is Linux. `"windows"` is the only value
+of the marker. Any other fails the pack's load, like an unknown key.
+
+The shipped packs skip a rule for another OS unread. Any other load
+(`load_pack_str`, `load_pack_for`, `load_packs_dir`) compiles and checks it, then
+leaves it out with a warning that names it, so a marker cannot hide a deny or a
+broken rule without saying so. saiife loads only its built-in packs today, so no
+user pack is in force at runtime; those functions are what a later user-pack feature
+has to go through. A policy's `[guard] ask` may name a rule of any OS, on any OS.
+
+Deviation from the plan's text: the rules have no `[[example]]` lines,
 because packs have no such mechanism (`[[example]]` belongs to policies, §8.1).
 The examples are the deny and allow cases in `crates/guard/tests/corpus_windows.rs`
 and `corpus_windows_round1.rs`, end to end under the shipped packs.
 
 `windows-root-rm` reads a Windows host's `rm` operands as W6 names them
-(`c:/Windows`, `~` for the profile), so it holds no spellings of its own, and it
-does not reach Linux or macOS paths such as `/x/windows` or `\`. What remains
-different there from before this plan, on purpose: `rm -r` of a literal `c:/`,
-`c:/windows`-shaped or `%SYSTEMROOT%`-shaped word; `kill s*` and `kill *`; and
-the commands of Windows programs named by these rules, which do not exist there.
+(`c:/Windows`, `~` for the profile), so it holds no spellings of its own.
+
+What remains different on Linux and macOS from before this plan, on purpose, is one
+rule: `core.process/kill-saiife-name` has no marker. It denies `kill` of a wildcard
+that can match saiife, or of every process (`kill s*`, `kill *`). The PowerShell tool
+runs there too, and `Stop-Process -Name sai*` arrives as that `kill` and really
+stops the process. It costs a hook nothing, since `core.process` compiles only on a
+line that names `kill`. Everything else, `rm -rf /mnt/c/Windows`, `rm -r c:/` and the
+names of Windows programs included, gets the verdict it had before this plan.
 
 A word on a PowerShell provider drive names no file, so it is judged by what is
 done to it: `HKCU:`, `HKLM:`, `Cert:` and `Env:` read freely, but for
@@ -782,6 +800,8 @@ a line a PowerShell or cmd reader read, the rest of the line still gets the rule
 and the path rules on lexical forms, with no system call. Only a deny comes of
 that; otherwise the answer stays the timeout. A POSIX line on Linux or macOS
 keeps its order and its record.
+
+Windows-style hosts only:
 
 | Pack | Rules |
 |---|---|

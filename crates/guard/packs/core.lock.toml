@@ -29,7 +29,8 @@ version = 3
 # `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
 # substitution argument must not block every `kill` or `systemctl`.
 substitution_failsafe = false
-triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system", "(?i)icacls", "(?i)takeown", "(?i)cacls", "(?i)set-acl", "(?i)sc ", "(?i)sc.exe", "(?i)net ", "(?i)net.exe", "(?i)net1", "(?i)-service", "(?i)localgroup", "(?i)claudecode", "(?i)saiifed", "(?i)reg import", "(?i)reg.exe import", "(?i)reg restore", "(?i)reg.exe restore", "(?i)hklm", "(?i)hkey_local_machine", "(?i)registry::"]
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system"]
+windows_triggers = ["(?i)icacls", "(?i)takeown", "(?i)cacls", "(?i)set-acl", "(?i)sc ", "(?i)sc.exe", "(?i)net ", "(?i)net.exe", "(?i)net1", "(?i)-service", "(?i)localgroup", "(?i)claudecode", "(?i)saiifed", "(?i)reg import", "(?i)reg.exe import", "(?i)reg restore", "(?i)reg.exe restore", "(?i)hklm", "(?i)hkey_local_machine", "(?i)registry::"]
 
 # --- read-only carve-outs (whole segment: no wrapper in front) ----------------
 [[allow]]
@@ -528,13 +529,14 @@ access = "write"
 reason = "removing or moving polkit's local actions and rules changes how approvals are re-authenticated"
 
 # --- Windows (plan 19a, W7; used by locked mode in plan 19b) -------------------
-# Case-insensitive, any drive letter, `\` and `/` alike; on other systems they
-# match nothing real. PowerShell and cmd forms of `rm`, `mv`, `cp` and `kill`
+# Case-insensitive, any drive letter, `\` and `/` alike. On a Windows-style host
+# only: other systems never compile them. PowerShell and cmd forms of `rm`, `mv`, `cp` and `kill`
 # arrive translated; the rest (`icacls`, `sc`, `reg`, the `*-Service` and
 # `*-ItemProperty` cmdlets) arrive as written. A provider path may have no slash
 # after its drive (`HKLM:SOFTWARE`) or name its provider (`Registry::HKLM\x`). The files themselves are
 # guarded by the path rules below, whatever command writes them.
 [[allow]]
+platform = "windows"
 # `icacls PATH` with nothing but `/t /c /l /q` only lists. A path word cannot
 # start with `/` and only the first can hold a colon, so neither a switch nor
 # `Users:F` that changes something ends up in the path.
@@ -542,6 +544,7 @@ pattern = '(?i)^(?:\S*[\\/])?icacls(?:\.exe)?\s+[^\s/]\S*(?:\s+[^\s/:][^\s:]*)*(
 reason = "icacls with no change named only lists permissions"
 
 [[deny]]
+platform = "windows"
 # `icacls C:\ProgramData\saiife /grant Users:F`, `takeown /f …`, `Set-Acl`:
 # changing who may write saiife's install, the managed settings of Claude
 # Code, Codex and Gemini CLI. `%ProgramData%` and `$env:ProgramData` count. So
@@ -552,6 +555,7 @@ pattern = '(?i)^(?:\S*[\\/])?(?:(?:icacls|takeown|cacls|xcacls|set-acl)(?:\.exe)
 reason = "changing who may write saiife's install or the managed agent settings lets an agent switch the guard off"
 
 [[deny]]
+platform = "windows"
 # `sc.exe stop|config|delete|failure|sdset saiifed` (also `sc \\host …`), `net
 # stop saiifed` (or its display name), `Stop-Service|Set-Service|Remove-Service
 # |Restart-Service` of it, of a name that can match it (`sai*`, `*`) or fed from
@@ -562,6 +566,7 @@ pattern = '(?i)^(?:\S*[\\/])?(?:sc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:stop|pause|cont
 reason = "stopping or changing the saiifed service leaves agent calls unrecorded"
 
 [[deny]]
+platform = "windows"
 # `reg add|delete HKLM\SOFTWARE\Policies\ClaudeCode …` and the registry
 # provider's `Set-ItemProperty`, `New-ItemProperty`, `Remove-ItemProperty`,
 # `Remove-Item` and friends on it: the policy that holds the saiife hook.
@@ -574,6 +579,7 @@ pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+(?:import|restore)(?:\s|$)|(?:re
 reason = "the ClaudeCode policy key holds the saiife hook; an agent may not change it"
 
 [[deny]]
+platform = "windows"
 # `net localgroup saiife-audit alice /add`, `/delete`, and the LocalAccounts
 # cmdlets: membership of the group is what lets a person read the audit trail.
 id = "windows-audit-group"
@@ -581,46 +587,55 @@ pattern = '(?i)^(?:\S*[\\/])?(?:net1?(?:\.exe)?\s+localgroup\s+(?:saiife-audit\s
 reason = "membership of the saiife-audit group decides who may read the audit trail"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/saiife/**"
 access = "write"
 reason = "replacing or removing saiife's installed program switches the guard off"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/saiife"
 access = "write"
 reason = "removing or moving saiife's install folder switches the guard off"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/saiife/state/**"
 access = "any"
 reason = "saiife's state holds the audit signing key; reading it lets the audit trail be forged"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/program files/claudecode/**"
 access = "write"
 reason = "Claude Code's managed settings hold the saiife hook"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/program files/claudecode"
 access = "write"
 reason = "removing or moving Claude Code's managed settings removes the saiife hook"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/openai/codex/**"
 access = "write"
 reason = "Codex's managed requirements hold the saiife hook"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/openai/codex"
 access = "write"
 reason = "removing or moving Codex's managed config removes the saiife hook"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/gemini-cli/**"
 access = "write"
 reason = "Gemini CLI's system settings hold the saiife hook"
 
 [[deny_path]]
+platform = "windows"
 glob = "?:/programdata/gemini-cli"
 access = "write"
 reason = "removing or moving Gemini CLI's system settings removes the saiife hook"

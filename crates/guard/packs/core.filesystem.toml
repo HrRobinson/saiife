@@ -16,8 +16,10 @@ version = 3
 # these rules see the effective command at argv[0], not `sudo` itself. The
 # `(?:sudo\s+)?` prefix below predates that and is now redundant/harmless —
 # kept rather than churned. Triggers stay broad + cheap.
-# A `(?i)` trigger ignores case (Windows commands do): the Windows rules below.
-triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/", "(?i)format", "(?i)diskpart", "(?i)clear-disk", "(?i)remove-partition", "(?i)initialize-disk", "(?i)reset-physicaldisk", "(?i)remove-virtualdisk", "(?i)cipher", "(?i)vssadmin", "(?i)wbadmin", "(?i)wmic", "(?i)bcdedit", "(?i)hklm", "(?i)hkcu", "(?i)hkcr", "(?i)hku", "(?i)hkcc", "(?i)hkey_"]
+# A `(?i)` trigger ignores case (Windows commands do). `windows_triggers` and the
+# rules marked `platform = "windows"` exist on a Windows-style host only.
+triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/"]
+windows_triggers = ["(?i)format", "(?i)diskpart", "(?i)clear-disk", "(?i)remove-partition", "(?i)initialize-disk", "(?i)reset-physicaldisk", "(?i)remove-virtualdisk", "(?i)cipher", "(?i)vssadmin", "(?i)wbadmin", "(?i)wmic", "(?i)bcdedit", "(?i)hklm", "(?i)hkcu", "(?i)hkcr", "(?i)hku", "(?i)hkcc", "(?i)hkey_"]
 
 # --- rm: recursive delete of a catastrophic target ----------------------------
 # Requires a recursive flag (combined like -rf/-fr/-Rf, or -r/-R, or
@@ -72,7 +74,8 @@ pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+
 reason = "recursive chown on a filesystem root or system directory breaks ownership system-wide"
 
 # --- Windows (plan 19a, W7) -----------------------------------------------------
-# These patterns apply on every OS. PowerShell and cmd forms arrive translated
+# These rules exist only on a Windows-style host, Git Bash included: Linux and
+# macOS, WSL too, never compile them. PowerShell and cmd forms arrive translated
 # (`Remove-Item -Recurse -Force C:\`, `rd /s /q C:\` are `rm -r -f C:\`), so
 # `rm` is what is named here.
 #
@@ -82,17 +85,17 @@ reason = "recursive chown on a filesystem root or system directory breaks owners
 # `\Windows`, `C:\.\Windows`, `C:\Users\a\..\..\Windows`, `\\?\C:\`, an admin
 # share, `/c/`, `/cygdrive/c/`, `/mnt/c/`, and the profile, which the home rules
 # above judge as `~`. The rule reads only that form and the variables below,
-# whose value may not be known. It does not read `/x/...` or `\` as written: on
-# Linux and macOS those are ordinary paths (`rm -rf /a/*`, `/x/windows`), and
-# only `c:/` and a `%VAR%` can be matched there, which nobody has as a directory.
-# A top-level wildcard counts, since it can name a protected directory
+# whose value may not be known. A top-level wildcard counts, since it can name a
+# protected directory
 # (`C:\Win*`). 8.3 names are matched by shape (`PROGRA~1`).
 [[deny]]
+platform = "windows"
 id = "windows-root-rm"
 pattern = '(?i)^rm\s+(?:\S+\s+)*(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:\S+\s+)*(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)|(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)\s+(?:\S+\s+)*(?:-[a-z]*r[a-z]*|--recursive))(?:\s|$)'
 reason = "recursive delete of a drive root, Windows, Program Files, ProgramData or Users is catastrophic and irreversible"
 
 [[deny]]
+platform = "windows"
 # `format C: /q`, `format.com D: /fs:ntfs`, the storage cmdlets (even fed from
 # a pipe: `Get-Volume D | Format-Volume`) and `diskpart`, which runs commands
 # the guard cannot see. `Format-Table` and `Format-List` do not match.
@@ -101,12 +104,14 @@ pattern = '(?i)^(?:\S*[\\/])?(?:format(?:\.com|\.exe)?\s+(?:\S+\s+)*(?:(?:[\\/]{
 reason = "formatting, partitioning or wiping a disk destroys its data"
 
 [[deny]]
+platform = "windows"
 # `cipher /w:C:\` overwrites all free space; `cipher /e` and `/d` stay allowed.
 id = "windows-cipher-wipe"
 pattern = '(?i)^(?:\S*[\\/])?cipher(?:\.exe)?\s+(?:\S+\s+)*/w(?::|\s|$)'
 reason = "cipher /w overwrites all the free space on a volume, which erases deleted files for good"
 
 [[deny]]
+platform = "windows"
 # `bcdedit /delete` and `/set` (also `/deletevalue`, `/import`): an unbootable
 # machine, or a boot with its protections off. `/enum` only reads.
 id = "windows-boot-config"
@@ -114,6 +119,7 @@ pattern = '(?i)^(?:\S*[\\/])?bcdedit(?:\.exe)?\s+(?:\S+\s+)*/+(?:delete|deleteva
 reason = "changing the boot configuration can leave the machine unbootable or switch its protections off"
 
 [[deny]]
+platform = "windows"
 # A hive root: `reg delete HKLM /f`, `Remove-Item -Recurse HKCU:\`. Keys under
 # it stay allowed, and `rm hklm` is a file: a provider path has its colon.
 id = "windows-registry-root"
@@ -121,6 +127,7 @@ pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+delete\s+(?:\S+\s+)*?(?:hklm|hkc
 reason = "deleting a registry hive root is catastrophic and irreversible"
 
 [[deny]]
+platform = "windows"
 # Shadow copies and backups are the way back from a bad delete.
 id = "windows-shadow-copies"
 pattern = '(?i)^(?:\S*[\\/])?(?:vssadmin(?:\.exe)?\s+(?:delete\s+shadows|resize\s+shadowstorage)|wbadmin(?:\.exe)?\s+delete\s|wmic(?:\.exe)?\s+(?:\S+\s+)*shadowcopy\s+(?:\S+\s+)*delete)'

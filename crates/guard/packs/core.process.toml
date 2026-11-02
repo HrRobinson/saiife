@@ -32,7 +32,8 @@ version = 3
 # `kill $(cat app.pid)` is everyday use; a substitution argument must not
 # block every `kill`.
 substitution_failsafe = false
-triggers = ["kill", "(?i)kill", "(?i)wmic"]
+triggers = ["kill"]
+windows_triggers = ["(?i)kill", "(?i)wmic"]
 # Compiled only when a command line holds `kill` (pkill, killall, killall5
 # included): most hook calls never do.
 lazy = true
@@ -298,6 +299,7 @@ reason = "this kill pid is computed when it runs and may be -1, 0 or 1; kill the
 
 # --- Windows (plan 19a, W7) -----------------------------------------------------
 [[deny]]
+platform = "windows"
 # `taskkill /im saiife.exe /f` and `Stop-Process -Name saiife` arrive as `kill
 # -n saiife.exe` / `kill -n saiife`. The name may be `saiife`, `saiifed`,
 # `saiife-broker` (with `.exe`), or a wildcard that can match it: a name that
@@ -307,4 +309,14 @@ reason = "this kill pid is computed when it runs and may be -1, 0 or 1; kill the
 # (`Get-Process saiife | Stop-Process`) is not visible: stated limits.
 id = "windows-kill-saiife"
 pattern = '(?i)^(?:kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\S*[\\/])?taskkill(?:\.exe)?\s+(?:\S+\s+)*?(?:/+im\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|/+fi\s+(?:imagename\s+eq\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|services\s+eq\s+saiif|imagename\s+ne\s|pid\s+(?:ne|gt|lt|ge|le)\s|(?:status|username|memusage|cputime|session|sessionname|modules)\s))|(?:\S*[\\/])?wmic(?:\.exe)?\s+(?:/\S+\s+)*process\s+(?:.*\s)?(?:terminate|delete)(?:\s|$))'
+reason = "an agent may not stop saiife (or every process): saiife records every agent call; stop it in your own terminal"
+
+# --- kill by name ---------------------------------------------------------------
+[[deny]]
+# Not Windows-only. `Stop-Process -Name saiife` under the PowerShell tool on Linux
+# or macOS arrives as `kill -n saiife` and does stop it there. In bash, `kill s*`
+# and `kill saiife` name no pid: refusing costs nothing, as for `pkill s*`. On a
+# Windows-style host the rule above matches first and names the verdict.
+id = "kill-saiife-name"
+pattern = '(?i)^kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)'
 reason = "an agent may not stop saiife (or every process): saiife records every agent call; stop it in your own terminal"

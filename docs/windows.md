@@ -54,7 +54,10 @@ The guard reads a command the way the shell that will run it reads it:
 
 Cmdlets, their aliases and cmd builtins are translated to their POSIX equivalents
 (`Remove-Item -r -fo x` is `rm -r -f x`, `rd /s /q x` too), so the packs apply
-as they are. Parameters match by unambiguous prefix. `powershell -c`,
+as they are. The packs' Windows rules (drive roots, `format`, `reg`, `icacls`,
+`sc`, `taskkill` and the rest) are compiled only on Windows, whichever shell a line
+comes from, Git Bash included. Linux and macOS never compile them, and WSL counts as
+Linux. Parameters match by unambiguous prefix. `powershell -c`,
 `-EncodedCommand`, `cmd /c`, `iex` of one literal string, `Invoke-Command
 -ScriptBlock` and `& { … }` are judged inside.
 

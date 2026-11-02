@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use saiifeguard::builtins::{builtin_packs, Catalog};
+use saiifeguard::builtins::{builtin_packs_for, Catalog};
 use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::{classify_for, Dialects, ToolCall};
@@ -31,7 +31,7 @@ fn windows_vars() -> PathVars {
 }
 
 fn only(pack: &str) -> Engine {
-    let (packs, warnings) = builtin_packs();
+    let (packs, warnings) = builtin_packs_for(PathStyle::Windows);
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     let p = packs.into_iter().find(|p| p.id == pack).unwrap();
     Engine::new(vec![p])
@@ -41,7 +41,7 @@ fn only(pack: &str) -> Engine {
 
 /// The packs a developer has: the default ones.
 fn developer() -> Engine {
-    let (packs, warnings) = Catalog::builtin().load_active(&[]);
+    let (packs, warnings) = Catalog::builtin_for(PathStyle::Windows).load_active(&[]);
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     Engine::new(packs)
         .with_paths(windows_vars())
@@ -50,7 +50,8 @@ fn developer() -> Engine {
 
 /// The default packs plus `core.lock`.
 fn locked() -> Engine {
-    let (packs, warnings) = Catalog::builtin().load_active(&["core.lock".to_string()]);
+    let (packs, warnings) =
+        Catalog::builtin_for(PathStyle::Windows).load_active(&["core.lock".to_string()]);
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     Engine::new(packs)
         .with_paths(windows_vars())
@@ -60,9 +61,12 @@ fn locked() -> Engine {
 /// Default packs (`lock`: plus `core.lock`) on a Linux or macOS host.
 fn posix_host(lock: bool) -> Engine {
     let extra: &[String] = &["core.lock".to_string()];
-    let (packs, warnings) = Catalog::builtin().load_active(if lock { extra } else { &[] });
+    let (packs, warnings) =
+        Catalog::builtin_for(PathStyle::Posix).load_active(if lock { extra } else { &[] });
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(packs).with_budget(BUDGET)
+    Engine::new(packs)
+        .with_paths(PathVars::new().with_style(PathStyle::Posix))
+        .with_budget(BUDGET)
 }
 
 fn assert_all(e: &Engine, deny: bool, cases: &[(Dialects, &str)]) {
@@ -159,7 +163,7 @@ fn assert_rule_any(e: &Engine, cases: &[(Dialects, &str)]) {
 
 #[test]
 fn a_root_with_no_working_directory_is_still_a_root() {
-    let (packs, _) = builtin_packs();
+    let (packs, _) = builtin_packs_for(PathStyle::Windows);
     let p = packs
         .into_iter()
         .find(|p| p.id == "core.filesystem")
@@ -232,9 +236,39 @@ fn a_windows_host_keeps_its_ordinary_deletes() {
 
 // --- 2. POSIX verdicts ------------------------------------------------------
 
-/// `core.filesystem`'s Windows rules must not reach Linux and macOS. Taken from
-/// `main` (the plan's base) with default packs and `core.lock`.
+/// The Windows rules must not reach Linux and macOS, WSL included: they are not
+/// even compiled there. Taken from `main` (471c730, the plan's base) with default
+/// packs and `core.lock`, from a real build of it.
 const MAIN_VERDICTS: &[(&str, bool)] = &[
+    // Named by the rules that are now Windows-only.
+    ("rm -r c:/", false),
+    ("rm -rf c:/", false),
+    ("rm -rf c:/windows", false),
+    ("rm -rf c:/*", false),
+    ("rm -rf c:/Win*", false),
+    ("rm -rf %systemroot%", false),
+    ("rm -rf hklm:", false),
+    ("rm -rf hklm/software/policies/claudecode", false),
+    ("rm -rf /mnt/c", false),
+    ("format a:", false),
+    ("format $(x)", false),
+    ("cipher $(x)", false),
+    ("diskpart $(x)", false),
+    ("taskkill /im saiife.exe", false),
+    ("wmic process where name='saiife.exe' call terminate", false),
+    ("bcdedit /set testsigning on", false),
+    ("bcdedit /delete {current}", false),
+    ("reg delete HKLM /f", false),
+    ("setx SAIIFE_DATA_DIR x", false),
+    ("cat /home/a/AppData/Roaming/gcloud/x", false),
+    ("cat /home/a/AppData/Local/saiife/x", false),
+    ("echo x > /home/a/AppData/Local/saiife/x", false),
+    // Protect on these systems too, and stay where they were on main.
+    ("kill saiife", true),
+    ("kill -9 saiifed", true),
+    ("kill -n saiife", true),
+    ("pkill saiife", true),
+    ("killall saiifed", true),
     ("rm -rf /a/*", false),
     ("rm -rf /x/windows", false),
     ("rm -rf /u/users", false),
@@ -303,32 +337,34 @@ fn posix_verdicts_match_main() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// The POSIX verdicts that differ from `main`, each on purpose: the word is not
-/// an ordinary command on these systems, or stands for every process.
+/// Every POSIX verdict that differs from `main`, each on purpose. `main` allows
+/// them. They name saiife or every process, so they deny for the same reason
+/// `pkill s*` does, under `core.process/kill-saiife-name`. It stays off the hook's
+/// clock: the pack compiles only on a line with `kill` in it.
 #[test]
 fn posix_verdicts_that_differ_from_main_on_purpose() {
+    for lock in [false, true] {
+        let e = posix_host(lock);
+        for cmd in ["kill s*", "kill *", "kill sai*", "kill saiif?"] {
+            assert!(e.evaluate(cmd).is_deny(), "lock={lock} {cmd}");
+        }
+    }
+}
+
+/// Why that rule is not Windows-only: the PowerShell tool runs on Linux and macOS
+/// too, and `Stop-Process -Name` there really stops the process.
+#[test]
+fn powershell_on_a_posix_host_cannot_stop_saiife_by_name() {
     let e = posix_host(false);
     for cmd in [
-        // Canonical Windows spellings: a directory really called `c:`.
-        "rm -rf c:/",
-        "rm -rf c:/windows",
-        "rm -rf c:/*",
-        "rm -rf %systemroot%",
-        // Parity with `pkill s*`: these name saiife or every process.
-        "kill s*",
-        "kill *",
-        "kill saiife",
-        // Windows programs, which do not exist here.
-        "format a:",
-        "taskkill /im saiife.exe",
-        "wmic process where name='saiife.exe' call terminate",
-        "bcdedit /set testsigning on",
-        "bcdedit /delete {current}",
-        r"reg delete HKLM /f",
-        "setx SAIIFE_DATA_DIR x",
+        "Stop-Process -Name saiife",
+        "Stop-Process -Name saiifed",
+        "Stop-Process -Name sai*",
+        "Stop-Process -Name *",
     ] {
-        assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        assert!(e.evaluate_in(cmd, PS).is_deny(), "{cmd}");
     }
+    assert!(!e.evaluate_in("Stop-Process -Name node", PS).is_deny());
 }
 
 // --- 3. Triggers ------------------------------------------------------------
@@ -1000,7 +1036,7 @@ fn boot_configuration_and_registry_hives() {
 // --- 10. The budget ---------------------------------------------------------
 
 fn no_time(pack_vars: PathVars) -> Engine {
-    let (packs, _) = Catalog::builtin().load_active(&[]);
+    let (packs, _) = Catalog::builtin_for(pack_vars.style()).load_active(&[]);
     Engine::new(packs)
         .with_paths(pack_vars)
         .with_budget(Duration::ZERO)
@@ -1073,8 +1109,7 @@ fn the_last_look_at_a_long_line_is_linear() {
 /// and the record says so.
 #[test]
 fn a_posix_host_keeps_its_budget_order() {
-    let (packs, _) = Catalog::builtin().load_active(&[]);
-    let e = Engine::new(packs).with_budget(Duration::ZERO);
+    let e = posix_host(false).with_budget(Duration::ZERO);
     for cmd in ["rm -rf /", "git status", "echo x & rm -rf /"] {
         assert!(timed_out(&e.evaluate(cmd)), "{cmd}");
     }
