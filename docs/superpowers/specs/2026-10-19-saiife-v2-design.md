@@ -22,7 +22,7 @@ touch say so where they apply.
 | # | Decision | Label | Applies in |
 |---|---|---|---|
 | 1 | v2.0 includes these proposed additions: `saiife doctor`, the `core.lock` pack, command approvals (`[guard] ask`), notifications, `saiife lockdown`, amount caps, `saiife policy check`/`test`. These come **after v2.0**: `saiife mcp`, the MCP gateway, fleet packages and MDM recipes. Response field redaction and the egress recipe were left to the designer: both stay in v2.0, because each fits into an existing plan for about one evening (redaction is one more step in the masking pass of plan 10; the recipe is one docs page in plan 12). | Owner decision (2026-10-19); last sentence: designer's call | §6, §15, §16.1 |
-| 2 | Linux first. In v2.0, locked mode is **Linux only**. macOS locked mode (Developer ID, hardened runtime, notarization, launchd, `LOCAL_PEERCRED`, macOS re-authentication) moves to **v2.1**. Macs keep v1 developer mode in v2.0. | Owner decision (2026-10-19) | §1.1, §5.3, §14, §15 |
+| 2 | Linux first. In v2.0, locked mode is **Linux only**. macOS locked mode (Developer ID, hardened runtime, notarization, launchd, `LOCAL_PEERCRED`, macOS re-authentication) moves to **v2.1**. Macs keep v1 developer mode in v2.0. Windows follows in v2.2 (§5.3a). | Owner decision (2026-10-19) | §1.1, §5.3, §14, §15 |
 | 3 | Same-user approvals: re-authentication through polkit ships in v2.0. Without polkit, only a second uid can approve, and `doctor` says so. | Owner decision (2026-10-19) | §6.10.2, §6.16 |
 | 4 | First-wave connectors stay Shopify, HubSpot, GitHub and generic HTTP. Writes are allowed under policy, with `ask` and amount caps available. | Owner decision (2026-10-19) | §6.8.3 |
 | 5 | The model-provider key is **not brokered** in v2. The agent holds its own model login, or uses a local model (for example Ollama). "The agent never holds a credential" excludes the model login, and the docs say so. | Owner decision (2026-10-19) | §1, §1.3, §10 |
@@ -61,9 +61,9 @@ credentials, and environments.
 
 | Setup | Who installs | Agent runs as | Meant for | Platforms |
 |---|---|---|---|---|
-| **Developer** (v1 mode, still the default) | the developer, no root | the developer | a person nearby; same guarantees as v1 plus a hash-chained log | v2.0: Linux (any, including Alpine and containers) and macOS |
+| **Developer** (v1 mode, still the default) | the developer, no root | the developer | a person nearby; same guarantees as v1 plus a hash-chained log | v2.0: Linux (any, including Alpine and containers) and macOS. Windows from v2.2 (§5.3a) |
 | **Personal broker** (after v2.0, decision 7) | the developer, no root | the developer | trying connectors on your own machine; **not a security boundary** (§10) | later |
-| **Locked** | an admin, as root | the person's own account | company laptops and workstations, attended or unattended | v2.0: Linux only (Ubuntu 22.04+, Debian 12+, RHEL 9+, systemd required). macOS in v2.1. |
+| **Locked** | an admin, as root | the person's own account | company laptops and workstations, attended or unattended | v2.0: Linux only (Ubuntu 22.04+, Debian 12+, RHEL 9+, systemd required). macOS in v2.1. Windows in v2.2 (§5.3a). |
 | **Locked, dedicated agent account** (recommended for unattended) | an admin, as root | an OS account that exists only for agents (for example `agent-shop`) | unattended agents on servers or shared machines | as Locked |
 
 Alpine, other non-systemd Linux systems and containers get developer mode
@@ -136,9 +136,10 @@ the agent's *own* code. That is v3.
 - Brokering the agent's model-provider key (owner decision 5).
 
 Designed here, but shipped after v2.0 (§15): macOS locked mode (v2.1),
-Windows locked mode (v2.2), personal broker mode, `saiife mcp`, the MCP gateway, fleet packages and MDM
-recipes, connector waves 2 and 3, cloud connectors, environments and
-collections.
+Windows developer mode (v2.2, plan 19a) and Windows locked mode (v2.2,
+plan 19b; §5.3a), personal broker mode, `saiife mcp`, the MCP gateway,
+fleet packages and MDM recipes, connector waves 2 and 3, cloud connectors,
+environments and collections.
 
 ## 2. Decisions
 
@@ -151,7 +152,7 @@ collections.
 | D12 | Lock location | Hooks go into each agent's system-level policy file (managed settings). The binary goes in `/opt/saiife/bin/saiife`, and the hook calls it by absolute path. On Windows: `C:\ProgramData\saiife\bin\saiife.exe` (§5.3a). | v1 §9.1. On macOS with Homebrew, `/usr/local/bin` is often owned by the user, so it cannot hold a locked binary. |
 | D13 | Vault | A file encrypted at rest, owned by the daemon user (locked mode). The OS keychain is used in personal broker mode (after v2.0). | The OS keychain's per-user model cannot keep a secret from the same user's processes. |
 | D14 | Connector shape | Declarative TOML manifests embedded in the binary (like packs). Operations are typed and map to capabilities (`orders:read`). A generic HTTP connector covers the rest. | Manifests are reviewable, testable without network, and cheap to add (about 1 evening each for most services). |
-| D15 | Agent access to connectors | v2.0: `saiife api` on the command line and an HTTP gateway on a Unix socket (`curl --unix-socket`, SDKs via proxy paths). After v2.0: an MCP server **(proposed addition)**. | The CLI works for every agent today. HTTP lets existing SDKs work. MCP is how agents prefer to call tools. |
+| D15 | Agent access to connectors | v2.0: `saiife api` on the command line and an HTTP gateway on a Unix socket (`curl --unix-socket`, SDKs via proxy paths; on Windows there is no `gateway.sock`, only loopback TCP with a bearer token, §5.3a.2). After v2.0: an MCP server **(proposed addition)**. | The CLI works for every agent today. HTTP lets existing SDKs work. MCP is how agents prefer to call tools. |
 | D16 | Approvals | `ask` rules create a request. The agent gets "pending #N" right away and never waits inside a hook. Only an approver identity the agent's user cannot be can decide (§6.10). | Hooks have timeouts. An approval the agent could give itself is worthless. |
 | D17 | Audit format | JSONL, `v = 2`, one global hash chain per machine (`seq`, `prev`), signed checkpoints, v1 fields kept so 0.1.0 readers still work. | v1 §9.3. |
 | D18 | State store | Files only (JSON and JSONL), no database. Rate-limit counters are rebuilt from the audit log at startup. | Keeps the static musl build and the "one binary" rule (v1 D4). The audit log is the source of truth. |
@@ -400,11 +401,12 @@ layout is fixed now so that 19a does not block it. This section is numbered
 5.3a because §5.4–§5.6 are cited from about 400 places in code and docs.
 Windows follows the Linux design (§5.2) with the differences below.
 
-Windows is a third value of `Platform`, with the name `windows`.
+**Platform (W2).** Windows is a third value of `Platform`, with the name
+`windows`. Developer mode is v2.2 too, and needs no admin.
 
 #### 5.3a.1 Layout
 
-Supported: Windows 11 23H2 (build 22631) or later, and Windows Server 2022
+Supported (W2): Windows 11 23H2 (build 22631) or later, and Windows Server 2022
 (build 20348) or later, on x64 and ARM64. Windows 10 is out, because its
 consumer ESU ended on 2026-10-13.
 
@@ -414,7 +416,7 @@ consumer ESU ended on 2026-10-13.
 | `/opt/saiife`, `bin/`, `bin/saiife` | `C:\ProgramData\saiife`, `…\bin`, `…\bin\saiife.exe` |
 | `/etc/saiife`, `config.toml`, `policy.d`, `installed.toml`, `ca/`, fleet dir | `C:\ProgramData\saiife\etc`, `…\etc\config.toml`, `…\etc\policy.d`, `…\etc\installed.toml`, `…\etc\ca`, `…\etc\fleet` |
 | `/var/lib/saiife`, `keys/`, audit key, vault key | `C:\ProgramData\saiife\state`, `…\state\keys`, `…\state\keys\audit.ed25519`, `…\state\keys\vault.key` |
-| `/var/log/saiife`, audit dir, daemon log | `C:\ProgramData\saiife\log`, `…\log\audit`, `…\log\daemon.log` |
+| `/var/log/saiife`, audit dir, daemon log | `C:\ProgramData\saiife\log`, `…\log\audit`, `…\log\daemon\daemon.log` |
 | `/run/saiife` and the control socket | none. The control endpoint is the pipe `\\.\pipe\saiife` (§5.3a.2) |
 | systemd unit | the service `saiifed` (display name `saiife daemon`) in the service manager |
 | Claude managed settings | `C:\Program Files\ClaudeCode\managed-settings.d\50-saiife.json` and `60-saiife-mcp.json` |
@@ -443,7 +445,8 @@ Rules:
   `ProgramFilesDir` is `C:\Program Files` and `ProgramData` is
   `C:\ProgramData`: `non-default system folders are not supported in this
   version`. It never reads them from environment variables.
-- **The service (W10).** Name `saiifed`, own process, auto start, binary
+- **The service (W10).** Name `saiifed`, own process, auto start, logon
+  account `NT SERVICE\saiifed`, binary
   `C:\ProgramData\saiife\bin\saiife.exe` with arguments `daemon --system`,
   no password. Failure actions: restart after 1 s, three times, reset after
   86 400 s, also on non-crash failures. This is `Restart=always`,
@@ -453,7 +456,11 @@ Rules:
   Only SYSTEM and Administrators can stop, pause, reconfigure or delete it.
   `SERVICE_CONTROL_PARAMCHANGE` reloads the policy (SIGHUP on Linux). Stop
   and shutdown are a clean stop (SIGTERM). The daemon's stderr goes to
-  `daemon.log`. A file over 10 MiB is renamed to `daemon.log.1` at start.
+  `C:\ProgramData\saiife\log\daemon\daemon.log`. At service start,
+  `SetStdHandle(STD_ERROR_HANDLE, <file>)` points stderr there. A file over
+  10 MiB is renamed to `daemon.log.1` in the same dir. The log has its own
+  dir because the service SID has only read and execute on `…\log`, so it
+  could neither rename the file nor create a missing one there.
 
 References: Microsoft Learn, "Service accounts"; code.claude.com/docs/en/settings,
 code.claude.com/docs/en/managed-settings; Codex managed configuration
@@ -527,7 +534,9 @@ configuration (geminicli.com/docs/reference/configuration).
     maintainers`. In practice this does not happen.
   - The non-elevated token of an admin user gets that user's own hash, not
     0. This matches UAC: admin rights count only when elevated.
-- **Gateway (W13).** There is no `gateway.sock`. `tcp_peer_refused` returns
+- **Gateway (W13).** The loopback TCP gateway is opt-in through
+  `[gateway] tcp`, as on Linux, so D9's "No TCP by default" holds. There is
+  no `gateway.sock`. `tcp_peer_refused` returns
   `None` on Windows, as on macOS. There are no gateway children, and the
   daemon's own uid cannot mint a token. `saiife api` and `saiife mcp` use
   the control pipe and need no gateway.
@@ -569,7 +578,7 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
 | `…\state\keys\vault.key` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<S>)` |
 | `…\log` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;<S>)(A;;0x1200a9;;;BU)` |
 | `…\log\audit` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;0x1200a9;;;<A>)` |
-| `…\log\daemon.log` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<S>)(A;;FR;;;<A>)` |
+| `…\log\daemon` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;FR;;;<A>)` |
 | the managed files and every dir install creates for them | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)` |
 
 - **New dirs are created with their descriptor** (`CreateDirectoryW` with
@@ -586,7 +595,9 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
   and so owned by them. Install never takes over a dir someone else may
   still control.
 - **Ancestors** (`C:\`, `C:\ProgramData`, `C:\Program Files`) must satisfy
-  `ancestor_ok`. The owner is an admin. There is no reparse point. No
+  `ancestor_ok`. The owner is SYSTEM, Administrators or TrustedInstaller
+  (`C:\Program Files` is owned by TrustedInstaller by default). There is no
+  reparse point. No
   non-admin allow ACE (not inherit-only) holds `WRITE_DAC`, `WRITE_OWNER`,
   `DELETE`, `FILE_DELETE_CHILD`, `GENERIC_WRITE` or `GENERIC_ALL`. Users may
   create new entries in `C:\ProgramData`. That is the default, and it is
@@ -1201,7 +1212,8 @@ used for attribution only.
 
 Gateway socket `gateway.sock`: plain HTTP/1.1 (§8.8). An optional loopback
 TCP listener (`[gateway] tcp = "127.0.0.1:7431"`, off by default) exists for
-clients that cannot use Unix sockets. It requires a bearer token from
+clients that cannot use Unix sockets. On Windows it is the only gateway
+listener (§5.3a.2, W13). It requires a bearer token from
 `saiife api token` (bound to the uid, valid for 12 h, stored hashed by the
 daemon).
 
@@ -2471,7 +2483,7 @@ Legend: **covered**, **partly**, **not covered**.
 Platforms in v2.0: the two locked columns apply to supported Linux systems
 only (Ubuntu 22.04+, Debian 12+, RHEL 9+). Macs, Alpine and containers are
 in the Developer column until v2.1 (macOS) or for good (Alpine,
-containers). The Personal broker column describes the mode that ships after
+containers). Windows is in the Developer column until v2.2 (§5.3a). The Personal broker column describes the mode that ships after
 v2.0 (decision 7). An agent labelled "not lockable" by the plan 7 gate
 (decision 9) falls back to the Developer column for the first two rows,
 even on a locked machine.

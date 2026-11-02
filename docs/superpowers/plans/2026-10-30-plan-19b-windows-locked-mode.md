@@ -55,7 +55,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
      | `OPT_DIR`, `BIN_DIR`, `BINARY` | `C:\ProgramData\saiife`, `…\bin`, `…\bin\saiife.exe` |
      | `ETC_DIR`, `CONFIG`, `POLICY_D`, `INSTALLED`, `ca/`, `FLEET_DIR` | `C:\ProgramData\saiife\etc`, `…\etc\config.toml`, `…\etc\policy.d`, `…\etc\installed.toml`, `…\etc\ca`, `…\etc\fleet` |
      | `STATE_DIR`, `KEYS_DIR`, `AUDIT_KEY`, `VAULT_KEY` | `C:\ProgramData\saiife\state`, `…\state\keys`, `…\state\keys\audit.ed25519`, `…\state\keys\vault.key` |
-     | `LOG_DIR`, `AUDIT_DIR`, `DAEMON_LOG` | `C:\ProgramData\saiife\log`, `…\log\audit`, `…\log\daemon.log` |
+     | `LOG_DIR`, `AUDIT_DIR`, `DAEMON_LOG` | `C:\ProgramData\saiife\log`, `…\log\audit`, `…\log\daemon\daemon.log` |
      | `RUN_DIR`, `SOCKET` | none: the control endpoint is the pipe `\\.\pipe\saiife` |
      | `UNIT` | none: the service `saiifed` in the service manager |
      | `CLAUDE_MANAGED_DIR`, `CLAUDE_MANAGED`, `CLAUDE_MCP` | `C:\Program Files\ClaudeCode\managed-settings.d`, `…\50-saiife.json`, `…\60-saiife-mcp.json` |
@@ -68,13 +68,13 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
      - The paths come from Claude Code's docs (`C:\Program Files\ClaudeCode\`; it does not read the legacy `C:\ProgramData\ClaudeCode\managed-settings.json`), Codex's docs (`%ProgramData%\OpenAI\Codex\requirements.toml`) and Gemini CLI's docs (`C:\ProgramData\gemini-cli\settings.json`).
      - Install refuses unless the registry's `ProgramFilesDir` is `C:\Program Files` and `ProgramData` is `C:\ProgramData`: `non-default system folders are not supported in this version`. It never reads them from environment variables.
   10. **W10. The service identity is the virtual account `NT SERVICE\saiifed`.**
-      - The service is `saiifed` (display name `saiife daemon`), own process, auto start, binary `C:\ProgramData\saiife\bin\saiife.exe` with arguments `daemon --system`, no password.
+      - The service is `saiifed` (display name `saiife daemon`), own process, auto start, binary `C:\ProgramData\saiife\bin\saiife.exe` with arguments `daemon --system`, logon account `NT SERVICE\saiifed`, no password.
       - The service SID type is unrestricted. The account's SID is `service_sid("saiifed")`, a pure function, so every ACL can name it without a lookup.
       - Failure actions: restart after 1 s, three times, reset after 86 400 s, and also on non-crash failures. This is the analogue of `Restart=always`, `RestartSec=1`.
       - The service's own DACL is set with `sc.exe sdset saiifed D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLORC;;;AU)`. That is the Windows default plus query rights for Authenticated Users. Nobody but SYSTEM and Administrators can stop, pause, reconfigure or delete it.
       - Why a virtual account: it has its own SID (no shared `LocalService` identity), no password to manage, cannot log on interactively, and needs no user creation. A dedicated local user would need a password and its own hardening.
       - `SERVICE_CONTROL_PARAMCHANGE` reloads the policy (SIGHUP on Linux). Stop and shutdown are a clean stop (SIGTERM).
-      - The daemon's stderr goes to `C:\ProgramData\saiife\log\daemon.log`. At service start, `SetStdHandle(STD_ERROR_HANDLE, <file>)` points it there; at start, a file over 10 MiB is renamed to `daemon.log.1`.
+      - The daemon's stderr goes to `C:\ProgramData\saiife\log\daemon\daemon.log`. At service start, `SetStdHandle(STD_ERROR_HANDLE, <file>)` points it there; at start, a file over 10 MiB is renamed to `daemon.log.1` in the same dir. The log has its own dir because `<S>` has only RX on `…\log` and could neither rename nor create the file there.
   11. **W11. The control pipe.**
       - The name is `\\.\pipe\saiife`. Its security descriptor is `O:<S>G:<S>D:P(D;;GA;;;NU)(A;;GA;;;<S>)(A;;GA;;;SY)(A;;0x12019b;;;BU)`, with `<S> = service_sid("saiifed")`.
       - `0x12019b` is `FILE_GENERIC_READ | FILE_GENERIC_WRITE` without `FILE_APPEND_DATA`. For a pipe, `FILE_APPEND_DATA` is `FILE_CREATE_PIPE_INSTANCE`, so a client may connect but never add a server instance. Network logons are denied, and `reject_remote_clients(true)` is set too.
@@ -100,13 +100,13 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
       | `…\state\keys\vault.key` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<S>)` |
       | `…\log` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;<S>)(A;;0x1200a9;;;BU)` |
       | `…\log\audit` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;0x1200a9;;;<A>)` |
-      | `…\log\daemon.log` | `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<S>)(A;;FR;;;<A>)` |
+      | `…\log\daemon` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;FR;;;<A>)` |
       | the managed files and every dir install creates for them | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)` |
 
       - **New dirs are created with their descriptor** (`CreateDirectoryW` with security attributes). So there is no moment where a user could add a file through the inherited `C:\ProgramData` ACL, which lets Users create entries.
       - **Our own paths** must satisfy `protected_ok`: the owner is SYSTEM, Administrators or TrustedInstaller; there is no reparse point; and `writers` ⊆ {SYSTEM, Administrators, TrustedInstaller, plus `<S>` where the table grants it}.
       - **An existing path that fails `protected_ok`** — for example a `C:\ProgramData\saiife`, `C:\ProgramData\OpenAI` or `C:\ProgramData\gemini-cli` created by a user, and so owned by them — is refused with exit 2 naming the path. Install never takes over a dir someone else may still control.
-      - **Ancestors** (`C:\`, `C:\ProgramData`, `C:\Program Files`) must satisfy `ancestor_ok`: an admin owner, no reparse point, and no non-admin allow ACE (not inherit-only) with `WRITE_DAC`, `WRITE_OWNER`, `DELETE`, `FILE_DELETE_CHILD`, `GENERIC_WRITE` or `GENERIC_ALL`. Users may create new entries in `C:\ProgramData`; that is the default, and it is harmless, because they cannot rename or delete ours.
+      - **Ancestors** (`C:\`, `C:\ProgramData`, `C:\Program Files`) must satisfy `ancestor_ok`: an owner that is SYSTEM, Administrators or TrustedInstaller (`C:\Program Files` is owned by TrustedInstaller by default), no reparse point, and no non-admin allow ACE (not inherit-only) with `WRITE_DAC`, `WRITE_OWNER`, `DELETE`, `FILE_DELETE_CHILD`, `GENERIC_WRITE` or `GENERIC_ALL`. Users may create new entries in `C:\ProgramData`; that is the default, and it is harmless, because they cannot rename or delete ours.
   15. **W15. The vault key** is `state\keys\vault.key`: 32 random bytes written by install, mode `daemon_file`, never rotated, readable only by `<S>` (plus SYSTEM and Administrators).
       - DPAPI is not used. Install runs as an admin, not as the virtual account, so it cannot seal a key for that account. A DPAPI key that the daemon makes at first start would be lost when the service profile is reset, and the vault with it.
       - On a running machine, the DACL is the barrier, as the file mode is on Linux. Disk encryption (BitLocker) protects backups and images. doctor does not probe it; it prints one Info line that points to the docs.
@@ -385,7 +385,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   4. Create `C:\ProgramData\saiife` and its subdirs with `create_dir_sddl` (W14), then the bin dir. Copy the binary in through `inspect_pe` (refusing on `problems()`, warning on `warnings()`; `--allow-test-build` as on Linux). Write `etc\` (config, policy.d, fleet when `--fleet`), `state\keys\vault.key` and the log files, each followed by `set_sddl` with its table entry.
   5. Write the three managed files. Create `C:\Program Files\ClaudeCode` and `managed-settings.d`, `C:\ProgramData\OpenAI\Codex` and `C:\ProgramData\gemini-cli` when they are missing, with descriptors. Read the HKLM policy (W24); `Overrides` adds a failure line.
   6. Service: `Query`. When it is missing, `Create`; when its spec differs, `Update`. Then `SetSddl(WIN_SERVICE_SDDL)`. Start it when it is stopped. When it runs and the binary, the spec or membership changed, `Stop` (10 s) and `Start`. When only `config.toml` changed, `ParamChange` (plan 18 decision 5).
-  7. Wait 10 s for the pipe (connect with the owner check). The failure text ends with `(see C:\ProgramData\saiife\log\daemon.log)`.
+  7. Wait 10 s for the pipe (connect with the owner check). The failure text ends with `(see C:\ProgramData\saiife\log\daemon\daemon.log)`.
   8. Write `installed.toml`, including `FileKind::Service` with the fingerprint, then run doctor as today.
 - Uninstall on Windows:
   - `Stop` (wait 10 s; if it still runs, refuse, as `stopped_or_refuse` does), then `Delete`;
