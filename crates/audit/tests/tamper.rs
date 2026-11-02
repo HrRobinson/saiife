@@ -315,9 +315,9 @@ fn fixture_has_the_written_shape() {
 #[test]
 fn windows_refuses_the_signing_key() {
     let d = tempfile::tempdir().unwrap();
-    let e = saiife_audit::sign::AuditKey::load_or_create(&d.path().join("k"))
-        .err()
-        .expect("no key on Windows");
+    let Err(e) = saiife_audit::sign::AuditKey::load_or_create(&d.path().join("k")) else {
+        panic!("no key on Windows");
+    };
     assert!(e.to_string().contains("needs a Unix system"), "{e}");
     assert!(!d.path().join("k").exists());
 }

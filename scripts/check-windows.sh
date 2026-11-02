@@ -24,7 +24,12 @@ if [ "$#" -eq 0 ]; then
     set -- --workspace
 fi
 
-CC_x86_64_pc_windows_msvc="$PWD/scripts/fake-cc.sh" \
-    AR_x86_64_pc_windows_msvc="$PWD/scripts/fake-cc.sh" \
-    RUSTFLAGS="-D warnings" \
+export CC_x86_64_pc_windows_msvc="$PWD/scripts/fake-cc.sh"
+export AR_x86_64_pc_windows_msvc="$PWD/scripts/fake-cc.sh"
+
+RUSTFLAGS="-D warnings" \
     cargo check --all-targets --target "$target" --target-dir target/check-windows "$@"
+
+# Clippy too (CI runs it on windows-latest); --keep-going reports every crate.
+cargo clippy --all-targets --target "$target" --target-dir target/check-windows \
+    --keep-going "$@" -- -D warnings
