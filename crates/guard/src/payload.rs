@@ -344,7 +344,9 @@ pub fn classify_for(
     let Some(tool) = env.tool() else {
         return env.command().map(shell);
     };
-    if SHELL_TOOLS.contains(&tool) {
+    // `dialects_for` reads `PowerShell` in any case; the POSIX tools keep their
+    // exact names.
+    if SHELL_TOOLS.contains(&tool) || tool.eq_ignore_ascii_case("PowerShell") {
         return env.command().map(shell);
     }
     let empty = ToolInput::default();

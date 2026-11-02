@@ -28,11 +28,11 @@ id = "core.process"
 name = "Core: process"
 description = "Signalling processes without naming a target: pkill -n/-o with no pattern, user-only kills, kill -1/0/1, killall5."
 default_on = true
-version = 2
+version = 3
 # `kill $(cat app.pid)` is everyday use; a substitution argument must not
 # block every `kill`.
 substitution_failsafe = false
-triggers = ["kill"]
+triggers = ["kill", "(?i)kill", "(?i)wmic"]
 # Compiled only when a command line holds `kill` (pkill, killall, killall5
 # included): most hook calls never do.
 lazy = true
@@ -306,5 +306,5 @@ reason = "this kill pid is computed when it runs and may be -1, 0 or 1; kill the
 # (`Stop-Process -Id 4242`) names no program and a name from a pipe
 # (`Get-Process saiife | Stop-Process`) is not visible: stated limits.
 id = "windows-kill-saiife"
-pattern = '(?i)^kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)'
+pattern = '(?i)^(?:kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\S*[\\/])?taskkill(?:\.exe)?\s+(?:\S+\s+)*?(?:/+im\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|/+fi\s+(?:imagename\s+eq\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|services\s+eq\s+saiif|imagename\s+ne\s|pid\s+(?:ne|gt|lt|ge|le)\s|(?:status|username|memusage|cputime|session|sessionname|modules)\s))|(?:\S*[\\/])?wmic(?:\.exe)?\s+(?:/\S+\s+)*process\s+(?:.*\s)?(?:terminate|delete)(?:\s|$))'
 reason = "an agent may not stop saiife (or every process): saiife records every agent call; stop it in your own terminal"

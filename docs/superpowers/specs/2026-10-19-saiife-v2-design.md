@@ -755,16 +755,41 @@ run.
   written for `/etc/...` never matches a Windows path. Windows targets get
   their own rules.
 
-**New pack rules (W7).** Each has `[[example]]` lines. All patterns apply on
-every OS, where they are harmless.
+**New pack rules (W7).** All patterns apply on every OS, where they are
+harmless. Deviation from the plan's text: the rules have no `[[example]]` lines,
+because packs have no such mechanism (`[[example]]` belongs to policies, §8.1).
+The examples are the deny and allow cases in `crates/guard/tests/corpus_windows.rs`
+and `corpus_windows_round1.rs`, end to end under the shipped packs.
+
+`windows-root-rm` reads a Windows host's `rm` operands as W6 names them
+(`c:/Windows`, `~` for the profile), so it holds no spellings of its own, and it
+does not reach Linux or macOS paths such as `/x/windows` or `\`. What remains
+different there from before this plan, on purpose: `rm -r` of a literal `c:/`,
+`c:/windows`-shaped or `%SYSTEMROOT%`-shaped word; `kill s*` and `kill *`; and
+the commands of Windows programs named by these rules, which do not exist there.
+
+A word on a PowerShell provider drive names no file, so it is judged by what is
+done to it: `HKCU:`, `HKLM:`, `Cert:` and `Env:` read freely, but for
+`HKLM:\SAM` and `HKLM:\SECURITY`; `HKCU:` writes pass but for `Environment`;
+`HKLM:` and `Cert:` writes are denied; `Env:` writes are denied for `SAIIFE_*`.
+Any other drive is denied, as is a provider path in a file tool. `name:rest`
+without a slash is a drive only for a name PowerShell gives a provider
+(`HKLM:x`, not `test:unit` or `nginx:latest`), and `x::y` only with `Registry::`
+and a hive, `Environment::` or `Certificate::`.
+
+The budget (D10) is no way past these: when it runs out on a Windows host, or on
+a line a PowerShell or cmd reader read, the rest of the line still gets the rules
+and the path rules on lexical forms, with no system call. Only a deny comes of
+that; otherwise the answer stays the timeout. A POSIX line on Linux or macOS
+keeps its order and its record.
 
 | Pack | Rules |
 |---|---|
-| `core.filesystem` | recursive `rm` on `c:/`, `c:/windows`, `c:/program files`, `c:/program files (x86)`, `c:/programdata`, `c:/users` or `~`, for any drive letter; `format <drive>:`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `diskpart`, `cipher /w`, `vssadmin delete shadows`, `wbadmin delete` |
+| `core.filesystem` | recursive `rm` on `c:/`, `c:/windows`, `c:/program files`, `c:/program files (x86)`, `c:/programdata`, `c:/users` or `~`, for any drive letter; `format <drive>:`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `diskpart`, `cipher /w`, `vssadmin delete shadows`, `wbadmin delete`; `bcdedit /delete` and `/set`; `reg delete` of a hive root |
 | `core.secrets` | `cmdkey /list`, `vaultcmd /list…`, `reg save` and `reg export` of `HKLM\SAM`, `HKLM\SECURITY` or `HKLM\SYSTEM`. The existing `~/.ssh`, `~/.aws` and `.env` path rules already cover the profile through W6 |
-| `core.self` | writes and deletes under `%LOCALAPPDATA%/saiife` (the developer data dir), of the running `saiife.exe`, and of the project hook files |
-| `core.process` | `kill`, `taskkill` and `Stop-Process` of `saiife` |
-| `core.lock` (locked mode) | writes, deletes, `icacls`, `takeown` and `Set-Acl` under `c:/programdata/saiife`, `c:/program files/claudecode`, `c:/programdata/openai/codex` and `c:/programdata/gemini-cli`; `sc` or `sc.exe` with `stop`, `config`, `delete`, `failure` or `sdset` on `saiifed`; `Stop-Service`, `Set-Service` and `Remove-Service` on `saiifed`; `net stop saiifed`; `reg add` and `reg delete`, and `Set-ItemProperty`, `Remove-ItemProperty` and `New-ItemProperty`, on `HKLM\SOFTWARE\Policies\ClaudeCode`; `net localgroup saiife-audit … /add` and `/delete` |
+| `core.self` | writes and deletes under `%LOCALAPPDATA%/saiife` (the developer data dir), of the running `saiife.exe`, and of the project hook files; moving the data or audit dir for later programs (`setx`, `reg add …\Environment`, `Set-ItemProperty`, `[Environment]::SetEnvironmentVariable`, `Set-Item Env:`) |
+| `core.process` | `kill`, `taskkill` (with `/fi` filters that name it or that name no process) and `Stop-Process` of `saiife`; `wmic process … terminate`; `Get-Process \| Stop-Process` |
+| `core.lock` (locked mode) | writes, deletes, `icacls`, `takeown` and `Set-Acl` under `c:/programdata/saiife`, `c:/program files/claudecode`, `c:/programdata/openai/codex` and `c:/programdata/gemini-cli`; `sc` or `sc.exe` with `stop`, `config`, `delete`, `failure` or `sdset` on `saiifed`; `Stop-Service`, `Set-Service` and `Remove-Service` on `saiifed`; `net stop saiifed`; `reg add` and `reg delete`, and `Set-ItemProperty`, `Remove-ItemProperty` and `New-ItemProperty`, on `HKLM\SOFTWARE\Policies\ClaudeCode`; deleting a parent key of it or of the service key; recursive or inherited ACL changes on a parent of those folders; `net localgroup saiife-audit … /add` and `/delete`. Listing ACLs (`icacls PATH` with only `/t /c /l /q`) is allowed |
 
 **Project hooks (W8).** The project hook command stays `saiife check
 --hook-exit --agent <a>` through `PATH`. It works in Git Bash, PowerShell

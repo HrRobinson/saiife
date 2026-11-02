@@ -26,6 +26,7 @@
 //! `wintable::nested` hands those to the engine.
 
 use crate::lexer::{Segment, Word};
+use crate::winpath;
 #[cfg(test)]
 use crate::wintable::Dialect;
 use crate::wintable::{self, CommandName, Context, UNRESOLVED};
@@ -132,6 +133,7 @@ pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
         pending: Vec::new(),
         live: false,
         joined: 0,
+        lists_all_processes: false,
     };
     r.statements(None, Mode::Top);
     (r.out, r.note)
@@ -257,6 +259,8 @@ struct Reader {
     live: bool,
     /// Bytes of chained assignments so far (`wintable::MAX_JOINED`).
     joined: usize,
+    /// The command just read lists every process (`Get-Process`).
+    lists_all_processes: bool,
 }
 
 impl Reader {
@@ -1186,8 +1190,22 @@ impl Reader {
     /// A command: the notes its name earns, then the table.
     fn command(&mut self, words: Vec<Raw>, piped: bool) {
         let name = CommandName::of(&words[0].w.text).lower();
-        if OPAQUE.contains(&name.as_str()) {
+        let all_processes = std::mem::replace(
+            &mut self.lists_all_processes,
+            lists_every_process(&name, &words),
+        ) && piped;
+        let item = item_on_data_drive(&name, &words);
+        if OPAQUE.contains(&name.as_str()) && item.is_none() {
             self.noted(NOTE_OPAQUE);
+        }
+        // `Set-Item Env:PATH x` is `$env:PATH = 'x'`.
+        if let Some(var) = item.as_deref().and_then(winpath::provider_env_name) {
+            self.emit(vec![Word {
+                text: format!("{var}="),
+                has_substitution: true,
+                assignment: true,
+                ..Word::default()
+            }]);
         }
         if [".ps1", ".psm1", ".psd1"].iter().any(|e| name.ends_with(e)) {
             self.noted(NOTE_SCRIPT);
@@ -1210,6 +1228,7 @@ impl Reader {
             piped,
             array: &array,
             from_quote: &from_quote,
+            all_processes,
             ..Context::default()
         };
         let (mut seg, note) = wintable::translate_noted(&argv, wintable::Dialect::PowerShell, &cx);
@@ -1218,8 +1237,28 @@ impl Reader {
         }
         self.check_nested(&mut seg, piped);
         let companion = wintable::companion_read(&seg, wintable::Dialect::PowerShell);
+        let write = wintable::companion_write(&seg);
+        // `Get-ChildItem HKLM:\SAM` reads the key; `ls` has no operands to judge.
+        let listed: Vec<Word> = seg
+            .iter()
+            .skip(1)
+            .filter(|w| !w.has_substitution && winpath::is_data_provider(&w.text))
+            .cloned()
+            .collect();
+        let listing = seg.first().is_some_and(|w| w.text == "ls") && !listed.is_empty();
         self.emit(seg);
         if let Some(read) = companion {
+            self.emit(read);
+        }
+        if let Some(write) = write {
+            self.emit(write);
+        }
+        if listing {
+            let mut read = vec![Word {
+                text: "cat".to_string(),
+                ..Word::default()
+            }];
+            read.extend(listed);
             self.emit(read);
         }
     }
@@ -1325,6 +1364,35 @@ fn namespace(name: &str) -> Namespace {
         "function" | "alias" => Namespace::Function,
         _ => Namespace::Drive,
     }
+}
+
+/// `Get-Process`, or `Get-Process *`: no filter names a process.
+fn lists_every_process(name: &str, words: &[Raw]) -> bool {
+    if !matches!(name, "get-process" | "gps" | "ps") {
+        return false;
+    }
+    let args: Vec<&str> = words[1..]
+        .iter()
+        .filter(|r| !r.w.redirect)
+        .map(|r| r.w.text.as_str())
+        .collect();
+    match args.as_slice() {
+        [] | ["*"] => true,
+        [param, "*"] => param.len() > 1 && "-name".starts_with(&param.to_ascii_lowercase()),
+        _ => false,
+    }
+}
+
+/// The path `Set-Item` or `Clear-Item` changes, when it is the registry, the
+/// certificate store or the environment: what those do can be judged. On any
+/// other drive it may define a command (`Set-Item Function:x`).
+fn item_on_data_drive(name: &str, words: &[Raw]) -> Option<String> {
+    if !matches!(name, "set-item" | "si" | "clear-item" | "cli") {
+        return None;
+    }
+    let target = words[1..].iter().find(|r| !r.w.text.starts_with('-'))?;
+    (!target.w.has_substitution && winpath::is_data_provider(&target.w.text))
+        .then(|| target.w.text.clone())
 }
 
 /// `${C:\p\.env}`: `C:\p\.env`.

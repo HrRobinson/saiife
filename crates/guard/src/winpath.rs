@@ -25,7 +25,8 @@
 //!   `\\.\PhysicalDrive0`) or a `..` after a device prefix, Git Bash's `/proc`
 //!   and `/dev/fd`, a `..` above the root of a path spelled with `/`, a relative
 //!   path into a Git Bash mount (`c/Users` from `/`), a
-//!   PowerShell drive (`HKLM:\`, `temp:\`), a drive or `admin$` share on a host
+//!   PowerShell drive (`HKLM:\`, `HKLM:x`, `Registry::HKLM\x`, `temp:\`), a drive
+//!   or `admin$` share on a host
 //!   not known to be this machine, a wildcard under a UNC root (it is never
 //!   expanded), a component of only dots, spaces or a stream (only exact `.`
 //!   and `..` navigate), or a character Win32 refuses or reads as a wildcard
@@ -33,6 +34,9 @@
 //!   engine denies it.
 //! - `Unread::NoAnchor`: an empty path, or a relative one with no working
 //!   directory known. The engine treats it as it does in POSIX style.
+//!
+//! A command on a provider drive touches no file, so a shell's words get a
+//! verdict of their own: `provider_access`. A file tool has no provider.
 //!
 //! A shell's word is more than its text: `path_words` makes a word whose value
 //! the shell decides (`./$x`, `$(x)`) read as the variable it is. That is what
@@ -63,6 +67,121 @@ pub enum Unread {
     Unreadable(&'static str),
 }
 
+/// A PowerShell provider path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider<'a> {
+    Hklm(&'a str),
+    Hkcu(&'a str),
+    Cert,
+    Env(&'a str),
+    /// `Env:` and friends: a drive by that name, whatever follows it.
+    Named {
+        slash: bool,
+    },
+    /// `foo:\x`: a drive by shape, and nothing is known about it.
+    Unknown,
+}
+
+/// `t` (`/` separated) as a provider path, or `None` when it is not one. A name
+/// alone does not make a drive: `test:unit`, `nginx:latest` and `foo::bar` are in
+/// ordinary commands, and `.env:s` is a stream. So after the colon a slash is
+/// needed, unless the name is one PowerShell gives a provider; a `::` needs the
+/// provider's name and, for the registry, a hive.
+fn provider_path(t: &str) -> Option<Provider<'_>> {
+    let t = strip_ci(t, "microsoft.powershell.core/").unwrap_or(t);
+    if let Some(rest) = strip_ci(t, "registry::") {
+        let (hive, tail) = split_seg(rest.trim_start_matches('/'));
+        return match hive.to_ascii_lowercase().as_str() {
+            "hklm" | "hkey_local_machine" => Some(Provider::Hklm(tail)),
+            "hkcu" | "hkey_current_user" => Some(Provider::Hkcu(tail)),
+            h if h.starts_with("hk") => Some(Provider::Unknown),
+            _ => None,
+        };
+    }
+    if let Some(rest) = strip_ci(t, "environment::") {
+        return Some(Provider::Env(rest.trim_start_matches('/')));
+    }
+    if strip_ci(t, "certificate::").is_some() {
+        return Some(Provider::Cert);
+    }
+    let (name, rest) = t.split_once(':')?;
+    let plain = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if name.len() < 2 || !plain || rest.starts_with(':') {
+        return None;
+    }
+    let slash = rest.is_empty() || rest.starts_with('/');
+    let tail = rest.trim_start_matches('/');
+    match name.to_ascii_lowercase().as_str() {
+        "hklm" => Some(Provider::Hklm(tail)),
+        "hkcu" => Some(Provider::Hkcu(tail)),
+        "cert" => Some(Provider::Cert),
+        "env" => Some(Provider::Env(tail)),
+        "temp" | "function" | "variable" | "alias" | "wsman" => Some(Provider::Named { slash }),
+        _ => slash.then_some(Provider::Unknown),
+    }
+}
+
+/// What a command may do on a provider drive (`raw`, as a shell's word). `None`:
+/// no verdict, because it is no provider path, or nothing is known about the
+/// drive, and `read` says what it says.
+///
+/// - `HKCU:` and `HKLM:` read; `HKLM:\SAM` and `HKLM:\SECURITY` hold secrets.
+/// - `HKCU:` writes, but for `Environment`: every later program starts with it.
+/// - `HKLM:` and `Cert:` writes change the machine, so they are denied.
+/// - `Env:` reads. Writes are this process's, but for `SAIIFE_*`, and a wildcard
+///   or the whole drive may reach it.
+pub fn provider_access(raw: &str, write: bool) -> Option<Result<(), &'static str>> {
+    let t = raw.replace('\\', "/");
+    let first = |tail: &'_ str| split_seg(tail).0.to_ascii_lowercase();
+    match provider_path(&t)? {
+        Provider::Hklm(tail) if matches!(first(tail).as_str(), "sam" | "security") => {
+            Some(Err("the registry hives that hold secrets"))
+        }
+        Provider::Hklm(_) if write => Some(Err("a write to HKLM")),
+        Provider::Hkcu(tail) if write && first(tail) == "environment" => {
+            Some(Err("a write to the environment later programs start with"))
+        }
+        Provider::Hklm(_) | Provider::Hkcu(_) => Some(Ok(())),
+        Provider::Cert if write => Some(Err("a write to the certificate store")),
+        Provider::Cert => Some(Ok(())),
+        Provider::Env(tail) if write => {
+            let name = tail.to_ascii_lowercase();
+            let reaches =
+                name.is_empty() || name.starts_with("saiife_") || name.contains(['*', '?', '[']);
+            if reaches {
+                Some(Err("a write to saiife's own environment"))
+            } else {
+                Some(Ok(()))
+            }
+        }
+        Provider::Env(_) => Some(Ok(())),
+        Provider::Named { slash: false } if write => Some(Err("a write to a PowerShell drive")),
+        Provider::Named { .. } | Provider::Unknown => None,
+    }
+}
+
+/// A provider path a command can change without running anything later: the
+/// registry, the certificate store, the environment. `Function:` and `Alias:`
+/// make commands.
+pub fn is_data_provider(raw: &str) -> bool {
+    let t = raw.replace('\\', "/");
+    matches!(
+        provider_path(&t),
+        Some(Provider::Hklm(_) | Provider::Hkcu(_) | Provider::Cert | Provider::Env(_))
+    )
+}
+
+/// The name of the variable `raw` writes on `Env:`, if that is what it is.
+pub fn provider_env_name(raw: &str) -> Option<String> {
+    let t = raw.replace('\\', "/");
+    match provider_path(&t) {
+        Some(Provider::Env(tail)) if !tail.is_empty() => Some(tail.to_string()),
+        _ => None,
+    }
+}
+
 /// `raw` as the canonical text of what it names, or `None` if it cannot be
 /// read. `cwd` is the working directory at this point of a command line, else
 /// the one in `vars` applies.
@@ -72,6 +191,9 @@ pub fn canonical(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<Strin
 
 /// `canonical`, saying why when there is no form.
 pub fn read(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Result<String, Unread> {
+    if is_null_variable(raw) {
+        return Ok(NULL_DEVICE.to_string());
+    }
     let anchor = match cwd {
         Some(c) => c.to_str().and_then(|c| absolute_text(c, None, vars).ok()),
         None => vars.cwd().and_then(Path::to_str).map(str::to_string),
@@ -332,7 +454,19 @@ pub(crate) fn path_words<'a>(words: &'a [Word], vars: &PathVars) -> Cow<'a, [Wor
     Cow::Owned(words.iter().map(|w| path_word(w, vars)).collect())
 }
 
+/// PowerShell's `$null`: as a redirection target (`npm test > $null`) it names no
+/// file. Where the shell may instead be bash it is a variable nobody sets.
+fn is_null_variable(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("$null")
+}
+
 fn path_word(w: &Word, vars: &PathVars) -> Word {
+    if is_null_variable(&w.text) {
+        return Word {
+            has_substitution: false,
+            ..w.clone()
+        };
+    }
     let mut text = if w.literal_dollars {
         w.text.clone()
     } else {
@@ -507,13 +641,11 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, 
             }
         }
     } else {
-        let is_ps_drive = split_seg(&t).0.strip_suffix(':').is_some_and(|n| {
-            n.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        });
         if t.eq_ignore_ascii_case("NUL:") {
             return Ok(NULL_DEVICE.to_string());
         }
+        // `temp:x` read as a file is what it was before: a stream of `temp`.
+        let is_ps_drive = provider_path(&t).is_some_and(|p| p != Provider::Named { slash: false });
         if is_ps_drive {
             return Err(Unread::Unreadable("a PowerShell drive"));
         }
@@ -1327,7 +1459,13 @@ mod tests {
     #[test]
     fn an_unreadable_shell_operand_is_denied() {
         let e = secrets_engine(vars());
-        for raw in UNREADABLE {
+        // A shell's word on a known provider drive has its own verdict
+        // (`provider_access`); a drive nothing is known about is unreadable.
+        let shell = UNREADABLE
+            .iter()
+            .filter(|raw| !raw.starts_with("HKLM:"))
+            .chain(&[r"Foo:\SOFTWARE\x"]);
+        for raw in shell {
             for cmd in [
                 format!("cat '{raw}'"),
                 format!("cp '{raw}' /c/p/out"),

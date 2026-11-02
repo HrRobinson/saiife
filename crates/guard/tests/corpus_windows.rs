@@ -122,7 +122,7 @@ fn filesystem_windows_rules() {
         (POSIX, r"rm -rf C:/", "windows-root-rm"),
         (POSIX, r"rm C:/ -rf", "windows-root-rm"),
         (POSIX, "rm -rf /c/Windows", "windows-root-rm"),
-        (POSIX, "rm -rf /c/Program Files", "windows-root-rm"),
+        (POSIX, "rm -rf '/c/Program Files'", "windows-root-rm"),
         (POSIX, "rm -rf /cygdrive/d/", "windows-root-rm"),
         (POSIX, "rm -rf /c/*", "windows-root-rm"),
         (
@@ -629,15 +629,18 @@ fn benign_windows_commands_allowed_both_ways() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// What the Windows rules change for POSIX commands, on purpose: a Git Bash
-/// mount of a drive (`/c`) is a root like `C:\`. Everything near it stays.
+/// A Git Bash mount is a Windows host's reading (`rm -rf /c/Windows` above). On
+/// Linux and macOS these are ordinary paths: `corpus_windows_round1` pins them
+/// against `main`.
 #[test]
-fn posix_verdicts_change_only_for_drive_mounts() {
+fn a_posix_host_has_no_drive_mounts() {
     let e = everything(false);
-    for cmd in ["rm -rf /c/*", "rm -rf /cygdrive/c", "rm -rf /c/Windows"] {
-        assert!(e.evaluate(cmd).is_deny(), "{cmd}");
-    }
     for cmd in [
+        "rm -rf /c/*",
+        "rm -rf /d/*",
+        "rm -rf /x/windows",
+        "rm -rf /cygdrive/c",
+        "rm -rf /c/Windows",
         "rm -rf /tmp/c",
         "rm -rf ./c",
         "rm -rf c",
@@ -654,11 +657,9 @@ fn posix_verdicts_change_only_for_drive_mounts() {
     }
 }
 
-/// `rd /s /q ..` from `C:\p` is the drive root, but the engine joins a
-/// relative operand onto the working directory only after a `cd` on the line
-/// (`cdtrack.rs`, Task 6), and no pack regex can resolve `..`. POSIX has the
-/// same gap. Passes once relative operands are resolved against the starting
-/// directory too.
+/// `rd /s /q ..` from `C:\p` is the drive root: on a Windows host a relative
+/// operand is joined onto the starting directory (`cdtrack.rs`). POSIX style
+/// keeps the gap: there a line without `cd` is judged as written.
 #[test]
 fn relative_parent_of_a_one_level_cwd_is_the_drive_root() {
     let e = only("core.filesystem");

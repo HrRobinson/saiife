@@ -311,15 +311,35 @@ impl Engine {
             return None;
         }
         match winpath::read(raw, cwd, &self.vars) {
-            Err(winpath::Unread::Unreadable(why)) => Some(Decision::Deny {
-                pack: UNREADABLE_PACK.to_string(),
-                pattern: UNREADABLE_PATTERN.to_string(),
-                reason: format!(
-                    "cannot read the Windows path {raw:?} ({why}), so it cannot be judged"
-                ),
-                via_inline: None,
-            }),
+            Err(winpath::Unread::Unreadable(why)) => Some(Self::unreadable_deny(raw, why)),
             _ => None,
+        }
+    }
+
+    fn unreadable_deny(raw: &str, why: &str) -> Decision {
+        Decision::Deny {
+            pack: UNREADABLE_PACK.to_string(),
+            pattern: UNREADABLE_PATTERN.to_string(),
+            reason: format!("cannot read the Windows path {raw:?} ({why}), so it cannot be judged"),
+            via_inline: None,
+        }
+    }
+
+    /// `unreadable`, for a word of a shell command: the shell may be PowerShell,
+    /// so a provider drive is judged by what is done to it.
+    fn unreadable_operand(
+        &self,
+        raw: &str,
+        cwd: Option<&Path>,
+        access: Access,
+    ) -> Option<Decision> {
+        if self.vars.style() != PathStyle::Windows || !self.has_path_rules {
+            return None;
+        }
+        match winpath::provider_access(raw, access == Access::Write) {
+            Some(Ok(())) => None,
+            Some(Err(why)) => Some(Self::unreadable_deny(raw, why)),
+            None => self.unreadable(raw, cwd),
         }
     }
 
@@ -482,6 +502,7 @@ impl Engine {
         let clock = Clock {
             start,
             spent: Cell::default(),
+            lexical: false,
         };
         self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None, dialect)
     }
@@ -534,14 +555,17 @@ impl Engine {
             dialect,
         };
 
-        for seg in segments {
+        for (at, seg) in segments.iter().enumerate() {
             if start.elapsed() > self.budget {
-                return timed_out();
+                return self.out_of_budget(&segments[at..], &cx, &mut state, &mut found);
             }
             if seg.is_empty() {
                 continue;
             }
-            if let Some(d) = self.evaluate_segment(&seg, &cx, &mut state, &mut found) {
+            if let Some(d) = self.evaluate_segment(seg, &cx, &mut state, &mut found) {
+                if is_timed_out(&d) {
+                    return self.out_of_budget(&segments[at..], &cx, &mut state, &mut found);
+                }
                 return d;
             }
         }
@@ -549,6 +573,49 @@ impl Engine {
             *out = state.rule_cwd.clone();
         }
         found.finish()
+    }
+
+    /// The budget ran out with `segments` left to judge. On a Windows host, and
+    /// for a line a reader read, that must not be a way past the rules: a reader
+    /// costs time by the length of the line, so padding could spend the budget
+    /// before `rd /s /q C:\` is reached. So what is left still gets the rules and
+    /// the path rules on its lexical forms, with no budget and no system call,
+    /// which is linear in the line. Only a deny comes of it; otherwise the answer
+    /// is the timeout it was. A POSIX line on Linux or macOS times out as it did.
+    fn out_of_budget(
+        &self,
+        segments: &[Vec<Word>],
+        cx: &Ctx,
+        state: &mut ShellState,
+        found: &mut Findings,
+    ) -> Decision {
+        let looks = cx.dialect != Dialect::Posix || self.vars.style() == PathStyle::Windows;
+        if !looks || cx.clock.lexical {
+            return timed_out();
+        }
+        // An `Instant` ahead of now has no time elapsed: nothing is over budget.
+        let Some(start) = Instant::now().checked_add(Duration::from_secs(86_400)) else {
+            return timed_out();
+        };
+        let clock = Clock {
+            start,
+            spent: Cell::default(),
+            lexical: true,
+        };
+        let cx = Ctx {
+            start,
+            depth: cx.depth,
+            literal_path: cx.literal_path,
+            clock: &clock,
+            dialect: cx.dialect,
+        };
+        for seg in segments.iter().filter(|s| !s.is_empty()) {
+            match self.evaluate_segment(seg, &cx, state, found) {
+                Some(d) if d.is_deny() => return d,
+                _ => {}
+            }
+        }
+        timed_out()
     }
 
     /// Judge one segment, phase by phase. `Some` ends the whole evaluation
@@ -629,7 +696,7 @@ impl Engine {
             return Some(d);
         }
         Self::environment_phase(&view, cx, state);
-        if let Some(d) = self.cd_phase(&view, state) {
+        if let Some(d) = self.cd_phase(&view, state, cx) {
             return Some(d);
         }
         if let Some(d) = self.inline_payload_phase(&view, cx, state, found) {
@@ -820,7 +887,13 @@ impl Engine {
                 .chain(alt_ops)
                 .collect();
         for ops in all_ops {
-            let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+            let judged = self.judge_operands(
+                ops,
+                &state.cwds,
+                state.cwd_unknown,
+                cx.start,
+                cx.clock.lexical,
+            );
             if let Some(d) = found.operands(judged) {
                 return Some(d);
             }
@@ -908,7 +981,12 @@ impl Engine {
                 via_inline: None,
             });
         }
-        for argv in state.rule_cwd.rewrite(&view.argv, self.vars.home()) {
+        // `build_argv` collapses a leading `//`, which on Windows is a share.
+        let written = self.path_argv(&view.argv, &view.resolved);
+        for argv in state
+            .rule_cwd
+            .rewrite(&written, self.vars.home(), &self.vars)
+        {
             let mut line = argv.join(" ");
             if !view.peeled.is_empty() {
                 line.push(' ');
@@ -956,7 +1034,13 @@ impl Engine {
             &view.argv,
             view.reads.clone(),
         );
-        let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+        let judged = self.judge_operands(
+            ops,
+            &state.cwds,
+            state.cwd_unknown,
+            cx.start,
+            cx.clock.lexical,
+        );
         if let Some(d) = found.operands(judged) {
             return Some(d);
         }
@@ -987,7 +1071,13 @@ impl Engine {
                 }
             }
             let ops = self.shell_ops(alt_seg, alt_eff, &alt_argv, view.reads.clone());
-            let judged = self.judge_operands(ops, &state.cwds, state.cwd_unknown, cx.start);
+            let judged = self.judge_operands(
+                ops,
+                &state.cwds,
+                state.cwd_unknown,
+                cx.start,
+                cx.clock.lexical,
+            );
             if let Some(d) = found.operands(judged) {
                 return Some(d);
             }
@@ -1042,7 +1132,7 @@ impl Engine {
     /// `cd`/`pushd`: the later segments may run in its target too.
     /// `Some`: its target cannot be read (Windows), so what follows could not
     /// be judged either.
-    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) -> Option<Decision> {
+    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState, cx: &Ctx) -> Option<Decision> {
         state
             .rule_cwd
             .command(&view.argv, &view.resolved, self.vars.home());
@@ -1066,7 +1156,11 @@ impl Engine {
                     return d;
                 }
             }
-            state.cwd_unknown |= self.cd(&argv, &words, &mut state.cwds);
+            // Out of budget: `cd` resolves through the filesystem, so the
+            // directories stay what they were.
+            if !cx.clock.lexical {
+                state.cwd_unknown |= self.cd(&argv, &words, &mut state.cwds);
+            }
         }
         None
     }
@@ -1160,6 +1254,7 @@ impl Engine {
         cwds: &[PathBuf],
         cwd_unknown: bool,
         start: Instant,
+        lexical: bool,
     ) -> Option<Decision> {
         if !self.has_path_rules || ops.is_empty() {
             return None;
@@ -1206,10 +1301,12 @@ impl Engine {
             };
             for raw in &landing {
                 for cwd in anchors(raw) {
+                    // A provider's word has its own verdict; a name that reads
+                    // as a file (`temp:x`) is also judged as one.
+                    if let Some(d) = self.unreadable_operand(raw, *cwd, op.access) {
+                        return Some(d);
+                    }
                     let Some(form) = lexical_form(raw, *cwd, &self.vars) else {
-                        if let Some(d) = self.unreadable(raw, *cwd) {
-                            return Some(d);
-                        }
                         continue;
                     };
                     match self.judge_path(op.access, &form, start) {
@@ -1221,6 +1318,10 @@ impl Engine {
             }
         }
 
+        // What follows reaches the filesystem.
+        if lexical {
+            return None;
+        }
         let mut unjudged = None;
         for op in &ops {
             for cwd in anchors(&op.path) {
@@ -1260,7 +1361,7 @@ impl Engine {
                         landing
                     };
                     for raw in landing {
-                        if let Some(d) = self.unreadable(&raw, *cwd) {
+                        if let Some(d) = self.unreadable_operand(&raw, *cwd, op.access) {
                             return Some(d);
                         }
                         for form in path_forms(&raw, *cwd, &self.vars) {
@@ -1609,7 +1710,7 @@ impl Engine {
         let seg = winpath::path_words(seg, &self.vars);
         let ops = operands(&seg, &seg, &self.path_argv(&argv, &seg));
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
-        self.judge_operands(ops, &cwds, false, Instant::now())
+        self.judge_operands(ops, &cwds, false, Instant::now(), false)
     }
 }
 
@@ -2068,6 +2169,9 @@ struct Clock {
     /// Time spent compiling operand patterns so far
     /// (`pack::MAX_PATTERN_COMPILE`).
     spent: Cell<Duration>,
+    /// The budget ran out (`out_of_budget`): nothing is judged through the
+    /// filesystem.
+    lexical: bool,
 }
 
 /// What the segments of one command line found short of a deny.
@@ -2136,6 +2240,15 @@ fn timed_out() -> Decision {
     Decision::Allow {
         trace: AllowTrace::FailedOpenTimeout,
     }
+}
+
+fn is_timed_out(d: &Decision) -> bool {
+    matches!(
+        d,
+        Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout
+        }
+    )
 }
 
 /// A segment with its leading words peeled off and its arguments resolved,

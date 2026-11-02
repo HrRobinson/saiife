@@ -21,7 +21,8 @@ Yes. It is always on. It cannot be turned off in `.saiife/config.toml`: the
   `Program Files`, `ProgramData` or `Users`, on any drive. `format C:`,
   `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`,
   `diskpart`, `cipher /w` and deleting shadow copies or backups
-  (`vssadmin delete shadows`, `wbadmin delete`) are blocked too.
+  (`vssadmin delete shadows`, `wbadmin delete`) are blocked too, as are
+  `bcdedit /delete` and `/set`, and `reg delete` of a registry hive root.
 - `rm --no-preserve-root`. This option exists only to defeat the root-delete
   safety check.
 - `dd` writing to a disk device (`of=/dev/...`). It overwrites the raw disk.

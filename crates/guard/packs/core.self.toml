@@ -20,11 +20,11 @@ id = "core.self"
 name = "Core: self-protection"
 description = "Guards saiife itself: turning it off, editing its config, agent hook settings, binary, audit log and integrity records."
 default_on = true
-version = 5
+version = 6
 # `claude -p "$(cat prompt.md)"` is normal use; a substitution argument must
 # not block every agent or saiife command.
 substitution_failsafe = false
-triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl", "loginctl", "(?i)setx"]
+triggers = ["saiife", "SAIIFE_", "alias", "path=", "PATH=", "home=", "HOME=", "xdg_data_home=", "XDG_DATA_HOME=", "GEMINI_CLI_SYSTEM", "CODEX_HOME", "codex_home", "CLAUDE_CONFIG_DIR", "claude_config_dir", "claude", "codex", "gemini", "saiife-broker", "com.saiife.broker", "pkill", "killall", "kill", "systemctl", "loginctl", "(?i)setx", "(?i)saiife_"]
 
 [[deny]]
 pattern = '^saiife\s+(?:\S+\s+)*init\s+(?:\S+\s+)*--off(?:\s|$)'
@@ -312,7 +312,9 @@ reason = "removing or moving saiife's data directory removes the audit trail"
 
 [[deny]]
 # `setx SAIIFE_DATA_DIR D:\x` (also `/m`) moves the audit and integrity dirs
-# for every program started afterwards.
+# for every program started afterwards. So do the registry values setx writes
+# (`reg add HKCU\Environment`, `Set-ItemProperty`), and .NET's
+# `SetEnvironmentVariable`. `Set-Item Env:` is this process's, like `$env:x = y`.
 id = "windows-data-dir"
-pattern = '(?i)^(?:\S*[\\/])?setx(?:\.exe)?\s+(?:/\S+\s+)*saiife_(?:audit|data)_dir(?:\s|$)'
+pattern = '(?i)^(?:\S*[\\/])?(?:setx(?:\.exe)?\s+(?:/\S+\s+)*saiife_(?:audit|data)_dir(?:\s|$)|reg(?:\.exe)?\s+(?:add|delete)\s+.*environment\s+(?:\S+\s+)*?/+v\s+saiife_(?:audit|data)_dir(?:\s|$)|(?:(?:set|new|remove|rename|clear)-itemproperty|sp|rp|rnp|clp)\s+.*environment\s+.*saiife_(?:audit|data)_dir(?:\s|$)|(?:set-item|si|clear-item|cli)\s+(?:\S+\s+)*?(?:env:[\\/]*|\S*environment::)saiife_(?:audit|data)_dir(?:\s|$)|\[(?:system\.)?environment\]::setenvironmentvariable\(\s*[\x27\x22]?saiife_(?:audit|data)_dir)'
 reason = "moving saiife's audit or data directory hides decisions from the audit trail"

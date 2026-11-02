@@ -114,6 +114,8 @@ enum Act {
     Drop,
     /// A real parameter that names no path: removed with its value.
     Skip,
+    /// `taskkill /fi "imagename eq x"`: which processes a filter selects.
+    ProcFilter,
     /// Removed with its value; the command is not fully read.
     Unread(&'static str),
     /// A switch removed; the command is not fully read.
@@ -247,6 +249,8 @@ const TABLE: &[Row] = &[
             ("s", Act::Flag("-r")),
             ("q", Act::Flag("-f")),
             ("f", Act::Flag("-f")),
+            ("a", Act::Drop),
+            ("p", Act::Drop),
         ],
     },
     Row {
@@ -518,7 +522,7 @@ const TABLE: &[Row] = &[
             ("im", Act::ProcName),
             ("f", Act::Drop),
             ("t", Act::Drop),
-            ("fi", Act::Skip),
+            ("fi", Act::ProcFilter),
             ("s", Act::Skip),
             ("u", Act::Skip),
             ("p", Act::Skip),
@@ -617,6 +621,8 @@ pub(crate) struct Context<'a> {
     /// `-Path:'x'`, which is the parameter.
     pub from_quote: &'a [bool],
     pub depth: u32,
+    /// The pipeline's input is every process (`Get-Process | Stop-Process`).
+    pub all_processes: bool,
 }
 
 /// The W5 table: `argv` as the POSIX command the packs judge. `argv[0]` is
@@ -678,7 +684,7 @@ pub(crate) fn translate_noted(
         To::Write => b.write(&lower, &argv[1..], items),
         To::NewItem => b.new_item(&lower, items),
         To::Grep => b.grep(items),
-        To::Kill => b.kill(items, cx.piped),
+        To::Kill => b.kill(items, cx.piped, cx.all_processes),
         To::Curl => b.curl(items),
         To::Start => b.start(items, cx.depth),
     };
@@ -687,6 +693,119 @@ pub(crate) fn translate_noted(
         b.noted(NOTE_FUNCTION);
     }
     (out, b.note)
+}
+
+/// The processes `taskkill /fi` selects, as operands of `kill`: a name, a pid, or
+/// `*` for a filter that does not name them. A title names no process that
+/// matters here.
+fn filter_targets(value: &Word) -> Vec<Word> {
+    if value.has_substitution {
+        return vec![value.clone()];
+    }
+    let lower = value.text.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split_whitespace().collect();
+    let original: Vec<&str> = value.text.split_whitespace().collect();
+    match parts.as_slice() {
+        ["imagename", "eq", ..] if original.len() >= 3 => {
+            vec![plain("-n"), plain(&original[2..].join(" "))]
+        }
+        ["services", "eq", ..] if original.len() >= 3 => {
+            vec![plain("-n"), plain(&original[2..].join(" "))]
+        }
+        ["pid", "eq", pid] if pid.bytes().all(|b| b.is_ascii_digit()) => vec![plain(pid)],
+        ["windowtitle", ..] => Vec::new(),
+        _ => vec![plain("*")],
+    }
+}
+
+/// `Set-ItemProperty` and its kind: no table row, since they change items and no
+/// file's bytes. The path they change.
+const ITEM_WRITERS: &[&str] = &[
+    "set-itemproperty",
+    "sp",
+    "new-itemproperty",
+    "remove-itemproperty",
+    "rp",
+    "rename-itemproperty",
+    "rnp",
+    "copy-itemproperty",
+    "cpp",
+    "move-itemproperty",
+    "mp",
+    "clear-itemproperty",
+    "clp",
+    "set-item",
+    "si",
+    "clear-item",
+    "cli",
+    "import-certificate",
+    "import-pfxcertificate",
+    "new-selfsignedcertificate",
+];
+
+/// `touch` of what an `ITEM_WRITERS` command changes: its first word when that
+/// is an operand, its `-Path`, and every word on a provider drive. Parameters may
+/// be switches or take values, which is not known here, so any provider word
+/// counts, wherever it stands.
+pub(crate) fn companion_write(seg: &[Word]) -> Option<Vec<Word>> {
+    let first = seg.first()?;
+    if first.redirect
+        || first.has_substitution
+        || !ITEM_WRITERS.contains(&first.text.to_lowercase().as_str())
+    {
+        return None;
+    }
+    let b = Builder {
+        dialect: Dialect::PowerShell,
+        note: None,
+        redirects: Vec::new(),
+    };
+    let mut out = vec![plain("touch")];
+    let mut path_next = false;
+    let mut words = seg[1..].iter().enumerate();
+    while let Some((i, w)) = words.next() {
+        if w.redirect {
+            words.next();
+            continue;
+        }
+        if w.has_substitution {
+            path_next = false;
+            continue;
+        }
+        let shape = is_parameter(w).then(|| param_shape(w)).flatten();
+        let is_path = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            abbreviates(&name, "path", 1)
+                || abbreviates(&name, "literalpath", 1)
+                || name == "lp"
+                || name == "pspath"
+                || abbreviates(&name, "certstorelocation", 1)
+        };
+        let named = shape.filter(|(n, _)| is_path(n));
+        let target = if let Some((_, Some(v))) = named {
+            Some(v)
+        } else if shape.is_some() {
+            path_next = named.is_some();
+            shape
+                .and_then(|(_, v)| v)
+                .filter(|v| crate::winpath::is_data_provider(v))
+        } else if path_next || i == 0 || crate::winpath::is_data_provider(&w.text) {
+            path_next = false;
+            Some(w.text.as_str())
+        } else {
+            None
+        };
+        if let Some(t) = target {
+            out.push(b.operand(
+                &Word {
+                    text: t.to_string(),
+                    ..w.clone()
+                },
+                false,
+            ));
+        }
+    }
+    (out.len() > 1).then_some(out)
 }
 
 /// `function:foo`, `alias:foo`: what is written there is a command later.
@@ -718,7 +837,10 @@ fn path_shaped(text: &str) -> bool {
 fn may_be_a_file(text: &str) -> bool {
     let impossible = text.trim().is_empty()
         || text.contains(|c: char| matches!(c, '<' | '>' | '"' | '|') || c.is_control());
-    !text.contains("://") && (path_shaped(text) || !impossible)
+    let constant = ["$true", "$false", "$null"]
+        .iter()
+        .any(|k| text.eq_ignore_ascii_case(k));
+    !constant && !text.contains("://") && (path_shaped(text) || !impossible)
 }
 
 /// The parts of an argument that may name a file: the value of `-x=v`, `-x:v`
@@ -1464,7 +1586,7 @@ impl Builder {
         out
     }
 
-    fn kill(&mut self, items: Vec<Item>, piped: bool) -> Vec<Word> {
+    fn kill(&mut self, items: Vec<Item>, piped: bool, all_processes: bool) -> Vec<Word> {
         let mut out = vec![plain("kill")];
         let mut targets = 0;
         let mut in_names = false;
@@ -1487,6 +1609,10 @@ impl Builder {
                             out.push(plain("-n"));
                             out.push(v);
                         }
+                        (Act::ProcFilter, Some(v)) => {
+                            targets += 1;
+                            out.extend(filter_targets(&v));
+                        }
                         (Act::Keep, _) => out.push(written),
                         (act, _) => self.dropped(act),
                     }
@@ -1504,6 +1630,9 @@ impl Builder {
             }
         }
         if piped && targets == 0 {
+            if all_processes {
+                out.push(plain("*"));
+            }
             out.push(self.unknown_from_pipeline());
         }
         out

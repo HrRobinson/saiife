@@ -13,7 +13,9 @@
 
 use std::path::{Component, Path};
 
+use crate::canon::PathVars;
 use crate::lexer::Word;
+use crate::winpath;
 
 /// A directory spelled lexically: from `/`, or from the home directory
 /// (`~`), so the rules' `~` / `$HOME` targets match it.
@@ -119,7 +121,18 @@ impl Dir {
         let mut dir = self.clone();
         if !dir.home {
             if let Some(h) = home.and_then(|h| Dir::from_path(h, windows)) {
-                if !h.parts.is_empty() && dir.parts.starts_with(&h.parts) {
+                let inside = if windows {
+                    dir.parts.len() >= h.parts.len()
+                        && h.parts
+                            .iter()
+                            .zip(&dir.parts)
+                            .all(|(a, b)| winpath::fold(a) == winpath::fold(b))
+                } else {
+                    dir.parts.starts_with(&h.parts)
+                };
+                // A profile at a drive's root would make all of it `~`.
+                let at_root = windows && h.parts.len() < 2;
+                if !h.parts.is_empty() && !at_root && inside {
                     dir.parts.drain(..h.parts.len());
                     dir.home = true;
                 }
@@ -137,6 +150,24 @@ impl Dir {
             }
             (false, _) => format!("/{}", dir.parts.join("/")),
         }
+    }
+
+    /// The directory as a path the Windows reader takes. `None` for one in a
+    /// home directory whose location is unknown.
+    fn windows_anchor(&self, home: Option<&Path>) -> Option<String> {
+        let full = if self.home {
+            let mut h = Dir::from_path(home?, true)?;
+            h.parts.extend(self.parts.iter().cloned());
+            h
+        } else {
+            self.clone()
+        };
+        full.parts.first().filter(|p| p.ends_with(':'))?;
+        Some(if full.parts.len() == 1 {
+            format!("{}/", full.parts[0])
+        } else {
+            full.parts.join("/")
+        })
     }
 }
 
@@ -279,7 +310,17 @@ impl RuleCwd {
     /// changes something. Empty when no `cd` ran or no operand is relative. In
     /// Windows style the starting directory counts without a `cd`: `rd /s /q ..`
     /// from `C:\p` is the drive root. POSIX style stays as written.
-    pub(crate) fn rewrite(&self, argv: &[String], home: Option<&Path>) -> Vec<Vec<String>> {
+    ///
+    /// A Windows `rm` goes further: see `rewrite_windows_rm`.
+    pub(crate) fn rewrite(
+        &self,
+        argv: &[String],
+        home: Option<&Path>,
+        vars: &PathVars,
+    ) -> Vec<Vec<String>> {
+        if self.windows && argv.first().is_some_and(|a| a == "rm") {
+            return self.rewrite_windows_rm(argv, home, vars);
+        }
         if !self.moved && !self.windows {
             return Vec::new();
         }
@@ -293,6 +334,94 @@ impl RuleCwd {
         }
         out
     }
+
+    /// A Windows `rm` with each operand as the path reader (W6) names it, once
+    /// per directory the shell may be in: `\Windows`, `C:\.\Windows` and
+    /// `/cygdrive/c/Windows` are one `c:/Windows` to the rules. With no directory
+    /// known, what does not depend on one still is.
+    fn rewrite_windows_rm(
+        &self,
+        argv: &[String],
+        home: Option<&Path>,
+        vars: &PathVars,
+    ) -> Vec<Vec<String>> {
+        let mut anchors: Vec<Option<String>> = self
+            .dirs
+            .iter()
+            .map(|d| d.windows_anchor(home))
+            .filter(Option::is_some)
+            .collect();
+        if anchors.is_empty() || self.unknown {
+            anchors.push(None);
+        }
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for anchor in &anchors {
+            let v = windows_rm_in(anchor.as_deref(), argv, home, vars);
+            if v != argv && !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        out
+    }
+}
+
+/// `rm` `argv` with its operands read from `anchor`.
+fn windows_rm_in(
+    anchor: Option<&str>,
+    argv: &[String],
+    home: Option<&Path>,
+    vars: &PathVars,
+) -> Vec<String> {
+    let mut out = argv.to_vec();
+    let mut options_done = false;
+    for a in out.iter_mut().skip(1) {
+        if !options_done && a == "--" {
+            options_done = true;
+            continue;
+        }
+        if a.is_empty() || (!options_done && a.starts_with('-')) {
+            continue;
+        }
+        if let Some(form) = windows_rm_operand(a, anchor, home, vars) {
+            *a = form;
+        }
+    }
+    out
+}
+
+/// `a`, a Windows path, as the rules spell it. `None` when it cannot be read: it
+/// is then judged as written, and the path rules say what they say about it.
+///
+/// A deleted root is the same whichever drive it is on, so where the reader
+/// lacks a drive or a directory this takes the root it names:
+/// - `C:` alone is a directory on that drive that may be its root;
+/// - `D:x` from another drive is relative to a directory nothing here knows;
+/// - `\x` with no working directory is on a drive nothing here knows.
+fn windows_rm_operand(
+    a: &str,
+    anchor: Option<&str>,
+    home: Option<&Path>,
+    vars: &PathVars,
+) -> Option<String> {
+    let drive = a
+        .strip_prefix(|c: char| c.is_ascii_alphabetic())
+        .filter(|rest| rest.starts_with(':') && !rest.starts_with(":/") && !rest.starts_with(":\\"))
+        .map(|rest| format!("{}:/", a[..a.len() - rest.len()].to_ascii_lowercase()));
+    if a.len() == 2 {
+        if let Some(d) = drive {
+            return Some(d);
+        }
+    }
+    let read = |from: Option<&str>| winpath::read(a, from.map(Path::new), vars);
+    let canon = match (read(anchor), &drive) {
+        (Ok(c), _) => c,
+        (Err(_), Some(root)) => read(Some(root.as_str())).ok()?,
+        (Err(winpath::Unread::NoAnchor), None) if a.starts_with(['\\', '/']) => {
+            read(Some("c:/")).ok()?
+        }
+        (Err(_), None) => return None,
+    };
+    Dir::from_windows(&canon).map(|d| d.render(home, true))
 }
 
 /// Where `cd`/`pushd` `argv` leaves a shell that is in `from` (`None`:
@@ -481,7 +610,7 @@ mod tests {
             cwd.command(&a, &words, home);
         }
         let lines: Vec<String> = cwd
-            .rewrite(&argv(cmd), home)
+            .rewrite(&argv(cmd), home, &PathVars::new())
             .iter()
             .map(|v| v.join(" "))
             .collect();
@@ -632,7 +761,7 @@ mod tests {
         let (a, w) = cd("cd /");
         cwd.command(&a, &w, None);
         assert!(!cwd
-            .rewrite(&argv("rm -rf *"), None)
+            .rewrite(&argv("rm -rf *"), None, &PathVars::new())
             .iter()
             .any(|v| v[2] == "/*"));
         assert!(cwd.too_many_dirs_for(&argv("rm -rf *")));
@@ -660,6 +789,8 @@ mod tests {
             },
         ];
         cwd.command(&a, &words, None);
-        assert!(cwd.rewrite(&argv("rm -rf *"), None).is_empty());
+        assert!(cwd
+            .rewrite(&argv("rm -rf *"), None, &PathVars::new())
+            .is_empty());
     }
 }

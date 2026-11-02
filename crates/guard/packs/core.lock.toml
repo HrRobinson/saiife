@@ -25,11 +25,11 @@ id = "core.lock"
 name = "Core: lock"
 description = "Locked mode: privilege changes, saiife's service, persistence, agent safety switches, saiife's system paths and the managed agent settings."
 default_on = false
-version = 2
+version = 3
 # `kill $(cat app.pid)` and `systemctl restart $(…)` are everyday use; a
 # substitution argument must not block every `kill` or `systemctl`.
 substitution_failsafe = false
-triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system", "(?i)icacls", "(?i)takeown", "(?i)cacls", "(?i)set-acl", "(?i)sc ", "(?i)sc.exe", "(?i)net ", "(?i)net1", "(?i)-service", "(?i)localgroup", "(?i)claudecode", "(?i)saiifed", "(?i)reg import", "(?i)reg.exe import", "(?i)reg restore", "(?i)reg.exe restore"]
+triggers = ["sudo", "su", "doas", "pkexec", "run0", "osascript", "security", "dseditgroup", "dscl", "systemctl", "launchctl", "loginctl", "kill", "pkill", "killall", "crontab", "at", "batch", "systemd-run", "--dangerously-bypass-hook-trust", "GEMINI_CLI_SYSTEM", "gemini_cli_system", "(?i)icacls", "(?i)takeown", "(?i)cacls", "(?i)set-acl", "(?i)sc ", "(?i)sc.exe", "(?i)net ", "(?i)net.exe", "(?i)net1", "(?i)-service", "(?i)localgroup", "(?i)claudecode", "(?i)saiifed", "(?i)reg import", "(?i)reg.exe import", "(?i)reg restore", "(?i)reg.exe restore", "(?i)hklm", "(?i)hkey_local_machine", "(?i)registry::"]
 
 # --- read-only carve-outs (whole segment: no wrapper in front) ----------------
 [[allow]]
@@ -531,14 +531,24 @@ reason = "removing or moving polkit's local actions and rules changes how approv
 # Case-insensitive, any drive letter, `\` and `/` alike; on other systems they
 # match nothing real. PowerShell and cmd forms of `rm`, `mv`, `cp` and `kill`
 # arrive translated; the rest (`icacls`, `sc`, `reg`, the `*-Service` and
-# `*-ItemProperty` cmdlets) arrive as written. The files themselves are
+# `*-ItemProperty` cmdlets) arrive as written. A provider path may have no slash
+# after its drive (`HKLM:SOFTWARE`) or name its provider (`Registry::HKLM\x`). The files themselves are
 # guarded by the path rules below, whatever command writes them.
+[[allow]]
+# `icacls PATH` with nothing but `/t /c /l /q` only lists. A path word cannot
+# start with `/` and only the first can hold a colon, so neither a switch nor
+# `Users:F` that changes something ends up in the path.
+pattern = '(?i)^(?:\S*[\\/])?icacls(?:\.exe)?\s+[^\s/]\S*(?:\s+[^\s/:][^\s:]*)*(?:\s+/[tclq])*\s*$'
+reason = "icacls with no change named only lists permissions"
+
 [[deny]]
 # `icacls C:\ProgramData\saiife /grant Users:F`, `takeown /f …`, `Set-Acl`:
 # changing who may write saiife's install, the managed settings of Claude
-# Code, Codex and Gemini CLI. `%ProgramData%` and `$env:ProgramData` count.
+# Code, Codex and Gemini CLI. `%ProgramData%` and `$env:ProgramData` count. So
+# does a recursive or inherited change on a parent of them (`icacls C:\ProgramData
+# /grant Users:F /t`, `takeown /f C:\ /r`): it reaches them from above.
 id = "windows-files"
-pattern = '(?i)^(?:\S*[\\/])?(?:icacls|takeown|cacls|xcacls|set-acl)(?:\.exe)?\s+(?:\S+\s+)*?(?:(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+programdata|%(?:programdata|allusersprofile)%|\$\{?env:(?:programdata|allusersprofile)\}?)[\\/]+(?:saiife|openai[\\/]+codex|gemini-cli)|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+(?:program ?files|progra~\d)|%programfiles%|%programw6432%|\$\{?env:programfiles\}?)[\\/]+claudecode)(?:[\\/]|\s|$)'
+pattern = '(?i)^(?:\S*[\\/])?(?:(?:icacls|takeown|cacls|xcacls|set-acl)(?:\.exe)?\s+(?:\S+\s+)*?(?:(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+programdata|%(?:programdata|allusersprofile)%|\$\{?env:(?:programdata|allusersprofile)\}?)[\\/]+(?:saiife|openai[\\/]+codex|gemini-cli)|(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]+(?:program ?files|progra~\d)|%programfiles%|%programw6432%|\$\{?env:programfiles\}?)[\\/]+claudecode)(?:[\\/]|\s|$)|(?:icacls|takeown|cacls|xcacls)(?:\.exe)?\s+(?:\S+\s+)*?(?:(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]*(?:programdata(?:[\\/]+openai)?|program ?files|progra~\d)?|%(?:programdata|allusersprofile|programfiles|programw6432|systemdrive)%|\$\{?env:(?:programdata|allusersprofile|programfiles|programw6432|systemdrive)\}?)[\\/]*)\s+(?:\S+\s+)*?(?:/+[tr]|\S*\((?:oi|ci)\)\S*)(?:\s|$)|takeown(?:\.exe)?\s+(?:\S+\s+)*?/+r\s+(?:\S+\s+)*?(?:(?:(?:[\\/]{2}[?.][\\/])?[a-z]:[\\/]*(?:programdata(?:[\\/]+openai)?|program ?files|progra~\d)?|%(?:programdata|allusersprofile|programfiles|programw6432|systemdrive)%|\$\{?env:(?:programdata|allusersprofile|programfiles|programw6432|systemdrive)\}?)[\\/]*)(?:\s|$))'
 reason = "changing who may write saiife's install or the managed agent settings lets an agent switch the guard off"
 
 [[deny]]
@@ -546,9 +556,9 @@ reason = "changing who may write saiife's install or the managed agent settings 
 # stop saiifed` (or its display name), `Stop-Service|Set-Service|Remove-Service
 # |Restart-Service` of it, of a name that can match it (`sai*`, `*`) or fed from
 # a pipe, and registry edits of its service key. `sc.exe query` and `Get-Service`
-# stay allowed.
+# stay allowed. Its parent keys count, as for the policy key below.
 id = "windows-service"
-pattern = '(?i)^(?:\S*[\\/])?(?:sc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:stop|pause|control|config|delete|failure|failureflag|sdset|privs|sidtype|triggerinfo)\s+saiifed(?:\.exe)?(?:\s|$)|net1?(?:\.exe)?\s+(?:stop|pause)\s+saiife(?:d|\s+daemon)(?:\s|$)|(?:stop|set|remove|restart|suspend)-service(?:\s+(?:\S+\s+)*?(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\s+-(?:force|nowait|passthru|whatif|confirm))*\s*$)|(?:reg(?:\.exe)?\s+(?:add|delete|import|copy|restore|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mi|rni|rnp|clp|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]+system[\\/]+(?:currentcontrolset|controlset\d+)[\\/]+services[\\/]+saiifed(?:[\\/]|\s|$))'
+pattern = '(?i)^(?:\S*[\\/])?(?:sc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:stop|pause|control|config|delete|failure|failureflag|sdset|privs|sidtype|triggerinfo)\s+saiifed(?:\.exe)?(?:\s|$)|net1?(?:\.exe)?\s+(?:stop|pause)\s+saiife(?:d|\s+daemon)(?:\s|$)|(?:stop|set|remove|restart|suspend)-service(?:\s+(?:\S+\s+)*?(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\s+-(?:force|nowait|passthru|whatif|confirm))*\s*$)|(?:reg(?:\.exe)?\s+(?:add|delete|import|copy|restore|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mp|mi|rni|rnp|clp|cli|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine)(?::[\\/]*|[\\/]+)system[\\/]+(?:currentcontrolset|controlset\d+)[\\/]+services[\\/]+saiifed(?:[\\/]|\s|$)|(?:reg(?:\.exe)?\s+(?:delete|copy|load|unload)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]*|(?:remove-item|ri|rm|rmdir|rd|del|erase|mv|move|move-item|mi|rename-item|rni|ren|rename)\s+(?:\S+\s+)*?\S*(?:hk(?:lm|ey_local_machine):|registry::hk(?:lm|ey_local_machine))[\\/]*)(?:system[\\/]+(?:currentcontrolset|controlset\d+)(?:[\\/]+services)?|system)[\\/]*(?:\s|$))'
 reason = "stopping or changing the saiifed service leaves agent calls unrecorded"
 
 [[deny]]
@@ -556,9 +566,11 @@ reason = "stopping or changing the saiifed service leaves agent calls unrecorded
 # provider's `Set-ItemProperty`, `New-ItemProperty`, `Remove-ItemProperty`,
 # `Remove-Item` and friends on it: the policy that holds the saiife hook.
 # `reg import` and `reg restore` take their keys from a file the guard cannot
-# read, so they are refused in locked mode whatever they name.
+# read, so they are refused in locked mode whatever they name. Deleting, moving
+# or copying over a parent key (`HKLM\SOFTWARE\Policies`, `HKLM\SOFTWARE`, `HKLM`)
+# takes the policy with it.
 id = "windows-claude-policy"
-pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+(?:import|restore)(?:\s|$)|(?:reg(?:\.exe)?\s+(?:add|delete|copy|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mi|rni|rnp|clp|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]+software[\\/]+(?:wow6432node[\\/]+)?policies[\\/]+claudecode(?:[\\/]|\s|$))'
+pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+(?:import|restore)(?:\s|$)|(?:reg(?:\.exe)?\s+(?:add|delete|copy|load|unload)|(?:set|new|remove|clear|rename|copy|move)-item(?:property)?|si|ni|ri|sp|rp|cpp|mp|mi|rni|rnp|clp|cli|cpi|mv|cp|rm|rmdir|rd|del|erase|mkdir|md|touch|tee|move|copy|ren|rename)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine)(?::[\\/]*|[\\/]+)software[\\/]+(?:wow6432node[\\/]+)?policies[\\/]+claudecode(?:[\\/]|\s|$)|(?:reg(?:\.exe)?\s+(?:delete|copy|load|unload)\s+(?:\S+\s+)*?\S*hk(?:lm|ey_local_machine):?[\\/]*|(?:remove-item|ri|rm|rmdir|rd|del|erase|mv|move|move-item|mi|rename-item|rni|ren|rename)\s+(?:\S+\s+)*?\S*(?:hk(?:lm|ey_local_machine):|registry::hk(?:lm|ey_local_machine))[\\/]*)(?:software(?:[\\/]+wow6432node)?(?:[\\/]+policies)?[\\/]*)?(?:\s|$))'
 reason = "the ClaudeCode policy key holds the saiife hook; an agent may not change it"
 
 [[deny]]
