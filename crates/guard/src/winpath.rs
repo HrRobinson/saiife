@@ -130,8 +130,9 @@ fn provider_path(t: &str) -> Option<Provider<'_>> {
 /// - `HKCU:` and `HKLM:` read; `HKLM:\SAM` and `HKLM:\SECURITY` hold secrets.
 /// - `HKCU:` writes, but for `Environment`: every later program starts with it.
 /// - `HKLM:` and `Cert:` writes change the machine, so they are denied.
-/// - `Env:` reads. Writes are this process's, but for `SAIIFE_*`, and a wildcard
-///   or the whole drive may reach it.
+/// - `Env:` reads one variable, as `printenv X` does; the whole drive or a
+///   wildcard is a dump, as `env` is. Writes are this process's, but for
+///   `SAIIFE_*`, and a wildcard or the whole drive may reach it.
 pub fn provider_access(raw: &str, write: bool) -> Option<Result<(), &'static str>> {
     let t = raw.replace('\\', "/");
     let first = |tail: &'_ str| split_seg(tail).0.to_ascii_lowercase();
@@ -155,6 +156,9 @@ pub fn provider_access(raw: &str, write: bool) -> Option<Result<(), &'static str
             } else {
                 Some(Ok(()))
             }
+        }
+        Provider::Env(tail) if tail.is_empty() || tail.contains(['*', '?', '[']) => {
+            Some(Err("a read of the whole environment, as `env` is"))
         }
         Provider::Env(_) => Some(Ok(())),
         Provider::Named { slash: false } if write => Some(Err("a write to a PowerShell drive")),

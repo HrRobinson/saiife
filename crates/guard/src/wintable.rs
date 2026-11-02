@@ -8,7 +8,6 @@
 //! the target. That is a departure from W5's "others pass through as written",
 //! for `cp`, `mv` and the redirect rows.
 
-use crate::canon::PathStyle;
 use crate::lexer::Word;
 
 /// How a command line is written.
@@ -1022,15 +1021,12 @@ fn redirect(text: &str) -> Word {
     }
 }
 
-/// A leading `//` as `\\`, on Windows: `normalize::build_argv` collapses
-/// leading slashes, and `//host/s` is a share there. Elsewhere it is `/host/s`.
-fn unc_text(text: &str, windows: bool) -> String {
+/// A leading `//` as `\\`, for a Windows-style host: `normalize::build_argv`
+/// collapses leading slashes, and `//host/s` is a share there. The engine calls
+/// this, so a forced style and real Windows run one branch.
+pub(crate) fn unc_text(text: &str) -> Option<String> {
     let rest = text.trim_start_matches('/');
-    if windows && text.len() - rest.len() >= 2 {
-        format!(r"\\{rest}")
-    } else {
-        text.to_string()
-    }
+    (text.len() - rest.len() >= 2).then(|| format!(r"\\{rest}"))
 }
 
 /// `$env:USERPROFILE` and `$env:HOME` as `$HOME`, which every path style reads.
@@ -1231,7 +1227,6 @@ impl Builder {
         if out.text.len() > 1 && out.text.starts_with('-') {
             out.text = format!("./{}", out.text);
         }
-        out.text = unc_text(&out.text, PathStyle::host() == PathStyle::Windows);
         let meta: &[char] = match self.dialect {
             Dialect::Cmd => &['*', '?'],
             _ => &['*', '?', '['],
@@ -1891,6 +1886,137 @@ pub(crate) fn is_nesting_command(text: &str) -> bool {
     )
 }
 
+/// A POSIX shell by name, as `operands` and `inline_payload` know them.
+pub(crate) fn is_posix_shell(name: &str) -> bool {
+    POSIX_SHELLS.contains(&name)
+}
+
+const POSIX_SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "mksh"];
+
+/// `words` without the redirections of the outer shell and their targets.
+pub(crate) fn without_redirects(words: &[Word]) -> Vec<Word> {
+    let mut out = Vec::with_capacity(words.len());
+    let mut it = words.iter();
+    while let Some(w) = it.next() {
+        if w.redirect {
+            it.next();
+        } else {
+            out.push(w.clone());
+        }
+    }
+    out
+}
+
+const NOTE_STDIN: &str = "this shell has no command here, so it reads its commands from stdin";
+pub(crate) const NOTE_WSL: &str =
+    "wsl with no command, or with an option the guard does not know, cannot be judged";
+
+/// A shell (`argv`, program name stripped) given no command to read: it runs what
+/// is on its stdin (`echo 'rd /s /q C:\\' | cmd`), which nothing here sees. An
+/// option that only asks the shell about itself is not that. The reason, if so.
+/// `wsl` has its own reading (`wsl_lines`).
+pub(crate) fn unread_shell(argv: &[Word]) -> Option<&'static str> {
+    let (first, args) = argv.split_first()?;
+    if first.has_substitution {
+        return None;
+    }
+    let name = CommandName::of(&first.text).lower();
+    let text = |w: &'_ Word| w.text.to_ascii_lowercase();
+    match name.as_str() {
+        "cmd" => {
+            let about = args.iter().any(|w| text(w) == "/?");
+            (!about && nested(argv).is_none()).then_some(NOTE_STDIN)
+        }
+        "powershell" | "pwsh" => {
+            let about = args.iter().any(|w| {
+                matches!(
+                    text(w).as_str(),
+                    "-?" | "/?"
+                        | "-h"
+                        | "-help"
+                        | "--help"
+                        | "/help"
+                        | "-v"
+                        | "-version"
+                        | "--version"
+                )
+            });
+            (!about && nested(argv).is_none()).then_some(NOTE_STDIN)
+        }
+        n if is_posix_shell(n) => {
+            let about = args
+                .iter()
+                .any(|w| matches!(w.text.as_str(), "--version" | "--help"));
+            // `-s`: stdin, whatever follows. A first word that is no option is a
+            // script, and `-c` has its text read by `inline_payload`.
+            let dashed = |w: &&Word| w.text.starts_with('-') && !w.text.starts_with("--");
+            let stdin = args.iter().filter(dashed).any(|w| w.text.contains('s'));
+            let command = args
+                .iter()
+                .filter(|w| w.has_substitution || !w.text.starts_with('-'))
+                .count();
+            let inline = args.iter().filter(dashed).any(|w| w.text.contains('c'))
+                || args.iter().any(|w| w.text.starts_with("--command"));
+            (!about && !inline && (stdin || command == 0)).then_some(NOTE_STDIN)
+        }
+        _ => None,
+    }
+}
+
+/// `wsl [options] [--] line`: the POSIX lines the Linux side may run, for the
+/// engine to judge. Empty when it only reports on itself, and `UNRESOLVED` when
+/// nothing can be read (no command: stdin; an option not known here, which
+/// `--unregister` is). `wsl` hands its raw command line to a shell, so `bash -c
+/// 'a b'` may reach it with its quotes or without them. Both are judged.
+pub(crate) fn wsl_lines(argv: &[Word]) -> Option<Vec<String>> {
+    let (first, args) = argv.split_first()?;
+    if first.has_substitution || CommandName::of(&first.text).lower() != "wsl" {
+        return None;
+    }
+    let unread = || Some(vec![UNRESOLVED.to_string()]);
+    let mut i = 0;
+    let command = loop {
+        let Some(w) = args.get(i) else {
+            return unread();
+        };
+        if w.has_substitution {
+            return unread();
+        }
+        i += 1;
+        match w.text.as_str() {
+            "--" | "-e" | "--exec" => break &args[i..],
+            "-d" | "--distribution" | "--distribution-id" | "-u" | "--user" | "--cd"
+            | "--shell-type" => i += 1,
+            "--system" => {}
+            "-l" | "--list" | "--status" | "--version" | "-v" | "--help" | "-h" => {
+                return Some(Vec::new());
+            }
+            t if t.starts_with('-') => return unread(),
+            _ => break &args[i - 1..],
+        }
+    };
+    if command.first().is_none_or(|w| w.has_substitution) {
+        return unread();
+    }
+    let plain = joined(None, command);
+    let quoted = command
+        .iter()
+        .map(|w| {
+            if w.text.contains(char::is_whitespace) {
+                format!("'{}'", w.text.replace('\'', r"'\''"))
+            } else {
+                w.text.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut lines = vec![quoted];
+    if lines[0] != plain {
+        lines.push(plain);
+    }
+    Some(lines)
+}
+
 fn abbreviates(name: &str, full: &str, min: usize) -> bool {
     name.len() >= min && full.starts_with(name)
 }
@@ -2143,6 +2269,8 @@ mod tests {
 
     #[test]
     fn posix_is_untouched() {
+        // The table only: on a Windows-style host the engine strips argv[0]
+        // before the POSIX reading (`normalize::windows_program_names`).
         assert_eq!(tr(&["del", "/s", "x"], Dialect::Posix), ["del", "/s", "x"]);
         assert_eq!(tr(&["git.exe"], Dialect::Posix), ["git.exe"]);
     }
@@ -2302,11 +2430,10 @@ mod tests {
 
     #[test]
     fn leading_slashes_of_a_share_survive_on_windows() {
-        assert_eq!(unc_text("//host/s", true), r"\\host/s");
-        assert_eq!(unc_text("///host/s", true), r"\\host/s");
-        assert_eq!(unc_text("//host/s", false), "//host/s");
-        assert_eq!(unc_text("/x", true), "/x");
-        assert_eq!(unc_text(r"\\host\s", true), r"\\host\s");
+        assert_eq!(unc_text("//host/s").as_deref(), Some(r"\\host/s"));
+        assert_eq!(unc_text("///host/s").as_deref(), Some(r"\\host/s"));
+        assert_eq!(unc_text("/x"), None);
+        assert_eq!(unc_text(r"\\host\s"), None);
     }
 
     #[test]

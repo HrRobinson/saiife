@@ -320,5 +320,5 @@ platform = "windows"
 # (`reg add HKCU\Environment`, `Set-ItemProperty`), and .NET's
 # `SetEnvironmentVariable`. `Set-Item Env:` is this process's, like `$env:x = y`.
 id = "windows-data-dir"
-pattern = '(?i)^(?:\S*[\\/])?(?:setx(?:\.exe)?\s+(?:/\S+\s+)*saiife_(?:audit|data)_dir(?:\s|$)|reg(?:\.exe)?\s+(?:add|delete)\s+.*environment\s+(?:\S+\s+)*?/+v\s+saiife_(?:audit|data)_dir(?:\s|$)|(?:(?:set|new|remove|rename|clear)-itemproperty|sp|rp|rnp|clp)\s+.*environment\s+.*saiife_(?:audit|data)_dir(?:\s|$)|(?:set-item|si|clear-item|cli)\s+(?:\S+\s+)*?(?:env:[\\/]*|\S*environment::)saiife_(?:audit|data)_dir(?:\s|$)|\[(?:system\.)?environment\]::setenvironmentvariable\(\s*[\x27\x22]?saiife_(?:audit|data)_dir)'
+pattern = '(?i)^(?:\S*[\\/])?(?:setx(?:\.exe)?\s+(?:\S+\s+)*?saiife_(?:audit|data)_dir(?:\s|$)|reg(?:\.exe)?\s+(?:add|delete)\s+.*environment\s+(?:\S+\s+)*?[/-]+v\s+saiife_(?:audit|data)_dir(?:\s|$)|(?:(?:set|new|remove|rename|clear)-itemproperty|sp|rp|rnp|clp)\s+.*environment\s+.*saiife_(?:audit|data)_dir(?:\s|$)|(?:set-item|si|clear-item|cli)\s+(?:\S+\s+)*?(?:env:[\\/]*|\S*environment::)saiife_(?:audit|data)_dir(?:\s|$)|\[(?:system\.)?environment\]::setenvironmentvariable\(\s*[\x27\x22]?saiife_(?:audit|data)_dir)'
 reason = "moving saiife's audit or data directory hides decisions from the audit trail"

@@ -31,7 +31,7 @@ use crate::cmdexe;
 use crate::lexer::{
     find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
 };
-use crate::normalize::build_argv;
+use crate::normalize::{build_argv, windows_program_names};
 use crate::operands::{operands, Operand, Source};
 use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
@@ -40,7 +40,7 @@ use crate::prefilter::Prefilter;
 use crate::pwsh;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
 use crate::winpath;
-use crate::wintable::Dialect;
+use crate::wintable::{self, Dialect};
 use crate::wrappers::{
     effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
     unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
@@ -205,6 +205,22 @@ fn null_device_words(segments: &mut [Vec<Word>], dialect: Dialect, redirect_disc
             for at in 1..seg.len() {
                 if seg[at - 1].redirect && is_null(&seg[at]) && !seg[at].quoted {
                     discard(&mut seg[at]);
+                }
+            }
+        }
+    }
+}
+
+/// What a Windows-style host means by a segment's words: its programs' names
+/// (`normalize::windows_program_names`), and for a reader a leading `//`, which
+/// is a share there. `build_argv` would collapse it to `/`.
+fn windows_words(segments: &mut [Vec<Word>], reader: bool) {
+    for seg in segments {
+        windows_program_names(seg);
+        if reader {
+            for w in seg.iter_mut().skip(1).filter(|w| !w.has_substitution) {
+                if let Some(share) = wintable::unc_text(&w.text) {
+                    w.text = share;
                 }
             }
         }
@@ -608,6 +624,9 @@ impl Engine {
             reader_assignments(&mut segments, &mut found);
         }
         null_device_words(&mut segments, dialect, state.null_redirect_discards);
+        if self.vars.style() == PathStyle::Windows {
+            windows_words(&mut segments, reader);
+        }
         if let Some(reason) = lex_note {
             found.unjudged(reason);
         }
@@ -771,6 +790,31 @@ impl Engine {
             return Some(d);
         }
         self.nested_shell_phase(&view, cx, state, found)
+    }
+
+    /// A reader on a Windows-style host: a value it cannot see, on a command a
+    /// pack names, may be that pack's verdict (`saiife ('in'+'it') --off`). The
+    /// packs that opt out of the fail-safe do so for bash, where most such values
+    /// resolve or the command is common. A reader's value resolves to nothing, so
+    /// it counts here, but for `set`, which is no program in PowerShell, and for
+    /// `kill` without a name: `Stop-Process -Id $p` names no program (W7).
+    fn reader_guards(&self, view: &SegmentView, cx: &Ctx) -> bool {
+        if cx.dialect == Dialect::Posix
+            || self.vars.style() != PathStyle::Windows
+            || !view.resolved.iter().skip(1).any(|w| w.has_substitution)
+        {
+            return false;
+        }
+        let name = view.argv[0].as_str();
+        match name {
+            "set" => false,
+            "kill" => view.rule_args.iter().any(|a| a == "-n"),
+            _ => self.packs.iter().filter(|p| p.has_deny()).any(|p| {
+                p.triggers
+                    .iter()
+                    .any(|t| looks_like_bare_command_name(t) && t.eq_ignore_ascii_case(name))
+            }),
+        }
     }
 
     /// The one place that enforces `MAX_INLINE_DEPTH`, the budget, and the
@@ -986,7 +1030,7 @@ impl Engine {
         // (never argv[0] itself) and to already-guarded commands, so an
         // unguarded command with a substitution (`echo $(date)`) gains
         // no new scrutiny.
-        if self.guarded_commands.contains(&argv[0])
+        if (self.guarded_commands.contains(&argv[0]) || self.reader_guards(view, cx))
             && (view.resolved.iter().skip(1).any(|w| w.has_substitution)
                 || (state.ifs_named
                     && view
@@ -1275,6 +1319,27 @@ impl Engine {
         state: &ShellState,
         found: &mut Findings,
     ) -> Option<Decision> {
+        // cmd's quotes are not a POSIX shell's. The program splits its own command
+        // line: `bash -c 'cat x'` from cmd is `cat x`.
+        if cx.dialect == Dialect::Cmd
+            && self.vars.style() == PathStyle::Windows
+            && wintable::is_posix_shell(&view.argv[0])
+            && view.argv.iter().any(|a| a.contains('\''))
+        {
+            let line = view.argv.join(" ");
+            let nested = self.recurse_in(
+                Dialect::Posix,
+                &line,
+                cx,
+                state,
+                false,
+                "inline command",
+                None,
+            );
+            if let Some(d) = found.nested(nested) {
+                return Some(d);
+            }
+        }
         let inner = inline_payload(&view.argv).or_else(|| watch_payload(&view.argv))?;
         // The program is a POSIX shell, whichever shell started it.
         let nested = self.recurse_in(
@@ -1299,12 +1364,49 @@ impl Engine {
         state: &ShellState,
         found: &mut Findings,
     ) -> Option<Decision> {
-        if cx.dialect == Dialect::Posix && self.vars.style() != PathStyle::Windows {
+        let windows = self.vars.style() == PathStyle::Windows;
+        if cx.dialect == Dialect::Posix && !windows {
             return None;
         }
-        let (dialect, inner) = cmdexe::nested(&view.resolved)?;
-        let nested = self.recurse_in(dialect, &inner, cx, state, false, "nested command", None);
-        found.nested(nested)
+        if !windows {
+            let (dialect, inner) = cmdexe::nested(&view.resolved)?;
+            let nested = self.recurse_in(dialect, &inner, cx, state, false, "nested command", None);
+            return found.nested(nested);
+        }
+        // A redirection is the outer shell's, and judged there: it is no text of
+        // the nested command, and `powershell > f` still reads stdin.
+        let words = wintable::without_redirects(&view.resolved);
+        // Under a reader a line it could not read is `Unjudgeable`, which
+        // `evaluate_call` closes at the top. The POSIX route closes it here (W5).
+        let unread = |reason: String, found: &mut Findings| {
+            if cx.dialect == Dialect::Posix {
+                Some(unreadable_command(reason))
+            } else {
+                found.unjudged(reason);
+                None
+            }
+        };
+        if let Some(lines) = wintable::wsl_lines(&words) {
+            for line in lines {
+                if line == wintable::UNRESOLVED {
+                    return unread(wintable::NOTE_WSL.to_string(), found);
+                }
+                let nested =
+                    self.recurse_in(Dialect::Posix, &line, cx, state, false, "wsl command", None);
+                if let Some(d) = found.nested(nested) {
+                    return Some(d);
+                }
+            }
+            return None;
+        }
+        if let Some(reason) = wintable::unread_shell(&words) {
+            return unread(reason.to_string(), found);
+        }
+        let (dialect, inner) = cmdexe::nested(&words)?;
+        match self.recurse_in(dialect, &inner, cx, state, false, "nested command", None) {
+            Nested::Unjudged(reason) => unread(reason, found),
+            nested => found.nested(nested),
+        }
     }
 
     /// Judge every path the segment reads or writes, against every
@@ -1849,6 +1951,13 @@ fn closed_reading(d: Decision) -> Decision {
         reason: format!("{why}; the guard cannot read this command, so it fails safe and blocks"),
         via_inline: None,
     }
+}
+
+/// `closed_reading` of what could not be read, for `reason`.
+fn unreadable_command(reason: String) -> Decision {
+    closed_reading(Decision::Allow {
+        trace: AllowTrace::Unjudgeable { reason },
+    })
 }
 
 /// Variable names ignore case on Windows, and the profile's variables are its

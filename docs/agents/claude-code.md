@@ -14,7 +14,7 @@ saiife creates it.
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit",
+        "matcher": "Bash|PowerShell|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",

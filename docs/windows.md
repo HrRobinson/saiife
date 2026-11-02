@@ -59,7 +59,15 @@ as they are. The packs' Windows rules (drive roots, `format`, `reg`, `icacls`,
 comes from, Git Bash included. Linux and macOS never compile them, and WSL counts as
 Linux. Parameters match by unambiguous prefix. `powershell -c`,
 `-EncodedCommand`, `cmd /c`, `iex` of one literal string, `Invoke-Command
--ScriptBlock` and `& { … }` are judged inside.
+-ScriptBlock` and `& { … }` are judged inside. `wsl CMD` is judged as a POSIX line.
+A program is judged by its name, without directory or extension, in every shell:
+`rm.exe`, `git.cmd` and `C:\Git\usr\bin\cat.exe` are `rm`, `git` and `cat`, past
+`sudo`, `env` and the other wrappers too. A Windows tool's `-x` is its `/x`.
+
+A value PowerShell computes is unknown, not the words it is written in: `('.en'+'v')`,
+`'{0}'-f'x'`, `'x'[0]` and `'x'.Trim()`. Only a bracket of whole quoted words is read
+as those words (`('.env')`, `('a','b')`). On a path that is a deny, and so it is on an
+argument of a command a pack names (`saiife ('in'+'it') --off`, `Stop-Process -Name $x`).
 
 Paths are folded to one spelling before the path rules run: `\` and `/`, drive
 case, `\\?\C:\`, `\\localhost\c$\`, `/c/` and `/cygdrive/c/`, trailing dots and
@@ -73,7 +81,9 @@ What happens when the guard cannot judge something:
 | The PowerShell or cmd reader cannot read the line (`$x` as a path, `.ps1` scripts, .NET calls, `Set-Alias`), under the PowerShell tool or the PowerShell reading of a Codex or Gemini CLI call | denied, and recorded as a deny |
 | A broken payload from the PowerShell tool | `error_denied` |
 | Out of time, a panic, or an oversize line | `error_allowed`. A rule that matches the remaining segments of a reader's line still denies it |
-| A note from the POSIX reading, or from the cmd reading under Codex and Gemini CLI | `error_allowed` |
+| From Git Bash, a nested `powershell`, `pwsh` or `cmd` the reader cannot read (`-File x.ps1`, `-enc` that does not decode, a .NET call) | denied, and recorded as a deny |
+| A shell with no command to read, so it runs its stdin (`echo x \| cmd`, `cat f \| bash`, `cmd < f`), or `wsl` with an option the guard does not know | denied, and recorded as a deny |
+| A note from the POSIX reading itself, or from the cmd reading under Codex and Gemini CLI | `error_allowed` |
 
 ## Limits
 
@@ -104,10 +114,20 @@ What happens when the guard cannot judge something:
 - **Some writers are judged as reads.** `Start-BitsTransfer -Destination`,
   `Export-Certificate` and `Save-Module` get only a read of their paths, so a rule
   that blocks writes and not reads does not see them.
-- **Git Bash is read as POSIX.** So `pwsh -c '...'` from it is limited: nested
-  shells are read on a Windows host, but an unreadable result stays a recorded
-  `error_allowed` rather than a deny, because that route is POSIX. On Linux and
-  macOS `pwsh -c '...'` from the `Bash` tool is not read inside at all.
+- **`pwsh -c '...'` from the `Bash` tool on Linux and macOS is not read inside at
+  all,** and neither is `cmd` or `wsl`: those verdicts stay what they were before
+  Windows support. On a Windows host all of them are read, and what cannot be read is
+  denied.
+- **Some wrappers are not read, on any OS.** `find . -exec cat .env \;`, `$(echo cat)
+  .env` and `busybox rm -rf /` are not judged as the command they run. On Windows,
+  add `git-bash -c ...` and a distro's own launcher (`ubuntu run ...`).
+- **`wsl` under the readers is denied whatever follows,** `wsl --list` included. Only
+  from Git Bash is it read, and `wsl --shutdown` is denied there, as an option the
+  guard does not read.
+- **`set NAME` in cmd is denied,** as `set` is: it prints every variable that starts
+  with `NAME`, so it is a wildcard on the environment. `Get-Item Env:X` is allowed.
+  `dir env:` is denied on Windows only. The `PowerShell` tool on Linux and macOS
+  keeps its old verdict.
 - **Out of scope for the readers:** aliases and functions defined in the same
   command (`Set-Alias`, `function f {…}`), the contents of `.ps1` scripts, .NET calls
   (`[IO.File]::Delete(…)`) and COM objects. Under the PowerShell reading these are

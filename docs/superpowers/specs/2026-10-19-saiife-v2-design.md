@@ -720,6 +720,12 @@ applies and the engine is unchanged.
   Under `Strictest` this holds for the PowerShell reading. A note from the POSIX
   or cmd reading there is recorded, and follows `Fail` below, because that
   grammar over text meant for another shell is noise (`%h%d`, a backtick).
+  The same outcome holds for the `Bash` route on a Windows-style host (owner's
+  ruling, plan 19a review): a nested `powershell`, `pwsh` or `cmd` the reader cannot
+  read denies, and so does a shell with no command to read, because it runs its
+  stdin (`echo x | cmd`, `cat f | bash`), and `wsl` with an unknown option. `wsl CMD`
+  is a nested POSIX line. On Linux and macOS this route stays as it was: `pwsh -c`
+  from the `Bash` tool is not read inside.
 - **Budget, panic and oversize follow `Fail`,** in every dialect:
   `error_allowed` in developer mode, `error_denied` in locked. A failed stdin
   read in developer mode stays open. So a padded line can force a recorded
@@ -780,15 +786,20 @@ and `corpus_windows_round1.rs`, end to end under the shipped packs.
 
 What remains different on Linux and macOS from before this plan, on purpose, is one
 rule: `core.process/kill-saiife-name` has no marker. It denies `kill` of a wildcard
-that can match saiife, or of every process (`kill s*`, `kill *`). The PowerShell tool
+that can match saiife, or of every process, wherever the word stands and however it
+is reached: `kill s*`, `kill *`, `kill "*"`, `kill 12 13 ?`, `kill -s TERM s*`, `sudo
+kill s*`, `sh -c 'kill *'`. The PowerShell tool
 runs there too, and `Stop-Process -Name sai*` arrives as that `kill` and really
 stops the process. It costs a hook nothing, since `core.process` compiles only on a
 line that names `kill`. Everything else, `rm -rf /mnt/c/Windows`, `rm -r c:/` and the
 names of Windows programs included, gets the verdict it had before this plan.
 
 A word on a PowerShell provider drive names no file, so it is judged by what is
-done to it: `HKCU:`, `HKLM:`, `Cert:` and `Env:` read freely, but for
-`HKLM:\SAM` and `HKLM:\SECURITY`; `HKCU:` writes pass but for `Environment`;
+done to it: `HKCU:`, `HKLM:` and `Cert:` read freely, but for `HKLM:\SAM` and
+`HKLM:\SECURITY`. `Env:` reads one variable freely (`Get-Item Env:X`, as `printenv
+X`), but a read of the whole drive or a wildcard on it (`dir env:`, `gc env:*`) is
+denied, as `env` is, by the owner's ruling in the plan 19a review. `HKCU:` writes pass
+but for `Environment`;
 `HKLM:` and `Cert:` writes are denied; `Env:` writes are denied for `SAIIFE_*`.
 Any other drive is denied, as is a provider path in a file tool. `name:rest`
 without a slash is a drive only for a name PowerShell gives a provider

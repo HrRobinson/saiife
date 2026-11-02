@@ -16,7 +16,11 @@
   - Paths: saiife's reading of a path against [IO.Path]::GetFullPath and cygpath.
 
   Any mismatch exits 1. A line the reader noted as not fully read is denied at the
-  hook, so it counts as agreeing, and is printed.
+  hook, so it counts as agreeing, and is printed. So is a line PowerShell cannot
+  parse. Neither is compared, so a run that compared fewer lines than the floors below
+  fails as well: a reader that notes everything agrees with everything.
+
+  A bracket the reader folds to words is compared against the constants in the AST.
 
 .PARAMETER Saiife
   A debug build of saiife: only those have __read-segments.
@@ -28,6 +32,10 @@ param(
 
 Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
+
+# The fewest fixtures each shell must really compare. Raise these with the fixtures.
+$PowerShellFloor = 55
+$CmdFloor = 50
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Failures = New-Object System.Collections.Generic.List[string]
@@ -59,8 +67,60 @@ function Get-Dashless([string]$Text) {
   return $Text
 }
 
+# The one statement of a block, if it is an expression: what the bracket's value is.
+function Get-OnlyExpression($Statement) {
+  if ($null -eq $Statement -or $Statement.GetType().Name -ne 'PipelineAst') { return $null }
+  if ($Statement.PipelineElements.Count -ne 1) { return $null }
+  $element = $Statement.PipelineElements[0]
+  if ($element.GetType().Name -ne 'CommandExpressionAst' -or $element.Redirections.Count -gt 0) { return $null }
+  return $element.Expression
+}
+
+function Get-BlockExpression($Block) {
+  if ($Block.Statements.Count -ne 1) { return $null }
+  return Get-OnlyExpression $Block.Statements[0]
+}
+
+# The strings of an expression that is only quoted strings, brackets and commas, which
+# is what the reader folds. $null for anything else: `'.en'+'v'` is computed, and has
+# no text to compare.
+function Get-ConstantValues($Expression) {
+  if ($null -eq $Expression) { return $null }
+  switch ($Expression.GetType().Name) {
+    'StringConstantExpressionAst' { return , [string[]]@($Expression.Value) }
+    'ExpandableStringExpressionAst' { return , [string[]]@($Expression.Value) }
+    'ParenExpressionAst' {
+      $inner = Get-ConstantValues (Get-OnlyExpression $Expression.Pipeline)
+      if ($null -eq $inner) { return $null }
+      return , [string[]]$inner
+    }
+    { $_ -in 'ArrayExpressionAst', 'SubExpressionAst' } {
+      $inner = Get-ConstantValues (Get-BlockExpression $Expression.SubExpression)
+      if ($null -eq $inner) { return $null }
+      return , [string[]]$inner
+    }
+    'ArrayLiteralAst' {
+      $all = @()
+      foreach ($e in $Expression.Elements) {
+        $values = Get-ConstantValues $e
+        if ($null -eq $values) { return $null }
+        $all += $values
+      }
+      return , [string[]]$all
+    }
+  }
+  return $null
+}
+
+function Get-ConstantTokens($Expression) {
+  $values = Get-ConstantValues $Expression
+  if ($null -eq $values) { return @() }
+  return @($values | ForEach-Object { "S|$_" })
+}
+
 # The parser's arguments, as tokens: P|name for a parameter, S|text for anything else.
-# A word in brackets has no text to compare; the commands inside it are found on their own.
+# A bracket that is not all constants has no text to compare; the commands inside it
+# are found on their own. The reader keeps `$(…)`'s text, unless it folds to one string.
 function Get-ElementToken($Element) {
   $name = $Element.GetType().Name
   switch ($name) {
@@ -77,9 +137,13 @@ function Get-ElementToken($Element) {
     'StringConstantExpressionAst' { return , ("S|" + $Element.Value) }
     'ExpandableStringExpressionAst' { return , ("S|" + $Element.Value) }
     'ScriptBlockExpressionAst' { return @() }
-    'ParenExpressionAst' { return @() }
-    'SubExpressionAst' { return @() }
-    'ArrayExpressionAst' { return @() }
+    'ParenExpressionAst' { return Get-ConstantTokens $Element }
+    'SubExpressionAst' {
+      $values = Get-ConstantValues $Element
+      if ($null -ne $values -and $values.Count -eq 1) { return , ("S|" + $values[0]) }
+      return , ("S|" + $Element.Extent.Text)
+    }
+    'ArrayExpressionAst' { return Get-ConstantTokens $Element }
     'HashtableAst' { return @() }
     default { return , ("S|" + $Element.Extent.Text) }
   }
@@ -155,6 +219,7 @@ function Test-PowerShell {
   $over = @($Fixtures.powershell_over)
   $lines = @($Fixtures.powershell) + $over
   $reads = Read-Lines @($lines | ForEach-Object { @{ dialect = 'powershell'; line = $_ } })
+  $compared = 0
   for ($i = 0; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
     $shown = ($line -replace "`r", '\r') -replace "`n", '\n'
@@ -167,6 +232,7 @@ function Test-PowerShell {
       Write-Output "noted, denied at the hook: $shown :: $($reads[$i].note)"
       continue
     }
+    $compared++
     $read = Get-ReaderCommands $reads[$i]
     if ($over -ccontains $line) {
       foreach ($c in $parsed.Commands) {
@@ -182,6 +248,10 @@ function Test-PowerShell {
         Add-Failure "powershell redirect: $shown`n  target $t is not among the reader's: $($read.Targets -join ', ')"
       }
     }
+  }
+  Write-Output "powershell: compared $compared of $($lines.Count) lines"
+  if ($compared -lt $PowerShellFloor) {
+    Add-Failure "powershell: compared only $compared lines, under the floor of $PowerShellFloor"
   }
 }
 
@@ -248,6 +318,7 @@ function Test-Cmd {
   [IO.File]::WriteAllText((Join-Path $dir 'p19a-probe.txt'), "probe`r`n", [Text.Encoding]::ASCII)
   $fixtures = @($Fixtures.cmd)
   $reads = Read-Lines @($fixtures | ForEach-Object { @{ dialect = 'cmd'; line = $_.line } })
+  $compared = 0
   for ($i = 0; $i -lt $fixtures.Count; $i++) {
     $line = $fixtures[$i].line
     $shown = ($line -replace "`n", '\n')
@@ -255,6 +326,7 @@ function Test-Cmd {
     $ran = Invoke-CmdLine $line $dir $log
     $read = [bool]$reads[$i].sees_stub
     $noted = $null -ne $reads[$i].note
+    if (-not $noted) { $compared++ }
     if ($ran -and -not $read -and -not $noted) {
       Add-Failure "cmd, a bypass: it ran the stub and the reader did not see it: $shown"
     } elseif (-not $ran -and $read -and -not $over) {
@@ -262,6 +334,10 @@ function Test-Cmd {
     } elseif ($ran -and -not $read) {
       Write-Output "noted, denied at the hook under cmd alone: $shown :: $($reads[$i].note)"
     }
+  }
+  Write-Output "cmd: compared $compared of $($fixtures.Count) lines"
+  if ($compared -lt $CmdFloor) {
+    Add-Failure "cmd: compared only $compared lines, under the floor of $CmdFloor"
   }
 }
 

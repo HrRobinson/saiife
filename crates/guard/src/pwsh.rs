@@ -50,6 +50,7 @@ const NOTE_NESTED: &str = crate::engine::UNRESOLVED_REASON;
 const NOTE_FOREACH: &str = "ForEach-Object without a script block calls a method";
 const NOTE_PROVIDER: &str = "a variable reads through a PowerShell drive";
 const NOTE_FUNCTION: &str = "a function or alias is defined through its drive";
+const NOTE_COMPUTED: &str = "a value computed here goes on down the pipeline";
 const NOTE_COMMENT: &str = "`<#` touching a word may or may not open a comment";
 
 /// Commands whose effect the table cannot follow: defining a name, a provider,
@@ -170,6 +171,10 @@ struct Raw {
     cont: bool,
     /// It started with a quote: a value, never a command name.
     from_quote: bool,
+    /// One whole quoted word, or a bracket that folded to one, with nothing
+    /// glued to it. Only such a word is a literal (`Reader::finish`). In an
+    /// expression `'a'+'b'` and `'a'[0]` compute a value.
+    whole: bool,
 }
 
 impl Raw {
@@ -265,6 +270,11 @@ struct Reader {
     joined: usize,
     /// The command just read lists every process (`Get-Process`).
     lists_all_processes: bool,
+    /// Where a `$(…)` that folded to a literal ended.
+    folded_end: Option<usize>,
+    /// `out[n]` is strings an operator computes with (`'.en'+'v'`): a value that
+    /// cannot be read, so it cannot go on as a path (`read_piped_value`).
+    computed_value: Option<usize>,
     #[cfg(debug_assertions)]
     commands: Vec<Vec<crate::debug_read::RawWord>>,
 }
@@ -282,6 +292,8 @@ impl Reader {
             live: false,
             joined: 0,
             lists_all_processes: false,
+            folded_end: None,
+            computed_value: None,
             #[cfg(debug_assertions)]
             commands: Vec::new(),
         }
@@ -391,6 +403,7 @@ impl Reader {
                         kind: Kind::Assign,
                         cont: false,
                         from_quote: false,
+                        whole: false,
                     },
                 );
                 return;
@@ -419,6 +432,7 @@ impl Reader {
                     kind: Kind::Plain,
                     cont: true,
                     from_quote: true,
+                    whole: true,
                 },
             );
         }
@@ -449,6 +463,10 @@ impl Reader {
     /// `'.env' | Get-Item | Format-Hex`: a string piped onward is likely a
     /// path, and what the pipeline does with it cannot be followed.
     fn read_piped_value(&mut self) {
+        let last = self.out.len();
+        if self.computed_value.take_if(|at| *at + 1 == last).is_some() {
+            self.noted(NOTE_COMPUTED);
+        }
         let Some(at) = self.last_value.take_if(|at| *at + 1 == self.out.len()) else {
             return;
         };
@@ -559,6 +577,7 @@ impl Reader {
                 kind: Kind::Plain,
                 cont: false,
                 from_quote: false,
+                whole: false,
             },
         );
     }
@@ -598,6 +617,7 @@ impl Reader {
                     kind: Kind::Plain,
                     cont: false,
                     from_quote: false,
+                    whole: false,
                 },
             );
         }
@@ -624,6 +644,7 @@ impl Reader {
         let mut kind = Kind::Plain;
         let mut from_quote = false;
         let mut after_piece = false;
+        let mut literal = false;
         match (c, self.at(1)) {
             ('{', _) => {
                 self.i += 1;
@@ -643,6 +664,7 @@ impl Reader {
                     w = items.remove(0);
                     self.live |= has_live_dollar(&w);
                     from_quote = true;
+                    literal = true;
                     self.pending = items;
                 } else {
                     w.text = self.text(start);
@@ -662,6 +684,7 @@ impl Reader {
             ('@', Some(q)) if (is_single(q) || is_double(q)) && self.here_string_opens() => {
                 self.here_string(&mut w, is_double(q));
                 from_quote = true;
+                literal = true;
                 after_piece = true;
             }
             ('@', Some(n)) if is_name(n) => {
@@ -676,11 +699,13 @@ impl Reader {
             (q, _) if is_single(q) => {
                 self.single_quoted(&mut w);
                 from_quote = true;
+                literal = true;
                 after_piece = true;
             }
             (q, _) if is_double(q) => {
                 self.double_quoted(&mut w);
                 from_quote = true;
+                literal = true;
                 after_piece = true;
             }
             _ => {}
@@ -688,6 +713,7 @@ impl Reader {
         // After a closed piece only a member access continues the word:
         // `(x).Delete()`, `"a".Replace('b','c')`.
         let member_next = matches!(self.peek(), Some('.' | '[')) || self.at(0) == Some(':');
+        let piece_ends_it = literal && !member_next;
         if !after_piece || member_next {
             self.bare(
                 &mut w,
@@ -695,6 +721,11 @@ impl Reader {
                 can_assign && kind == Kind::Plain && !from_quote,
             );
         }
+        let folded = self.folded_end.take() == Some(self.i);
+        let whole = (piece_ends_it || (c == '$' && folded))
+            && self
+                .peek()
+                .is_none_or(|n| n.is_whitespace() || matches!(n, ',' | ')'));
         if !w.quoted && w.text.contains("]::") {
             self.noted(NOTE_DOTNET);
         }
@@ -708,6 +739,7 @@ impl Reader {
             kind,
             cont: false,
             from_quote,
+            whole,
         }
     }
 
@@ -938,6 +970,7 @@ impl Reader {
                     self.live |= has_live_dollar(&items[0]);
                     w.text.push_str(&items[0].text);
                     w.quoted = true;
+                    self.folded_end = Some(self.i);
                     return false;
                 }
                 true
@@ -1084,15 +1117,25 @@ impl Reader {
             if call || !expression {
                 self.noted(NOTE_COMMAND);
             }
+            // `('.en'+'v') | gi`: the bracket's value is this statement's.
+            if first.kind == Kind::Paren
+                && self
+                    .computed_value
+                    .is_some_and(|at| at + 1 == self.out.len())
+            {
+                self.computed_value = Some(self.out.len());
+            }
             self.emit(words.into_iter().map(|r| r.w).collect());
             return;
         }
         if first.from_quote && !call {
             if words
                 .iter()
-                .all(|r| r.w.quoted && !r.w.has_substitution && !r.w.redirect)
+                .all(|r| r.whole && r.w.quoted && !r.w.has_substitution && !r.w.redirect)
             {
                 self.last_value = Some(self.out.len());
+            } else if words.iter().all(|r| !r.w.has_substitution && !r.w.redirect) {
+                self.computed_value = Some(self.out.len());
             }
             self.emit(words.into_iter().map(|r| r.w).collect());
             return;
@@ -1243,6 +1286,12 @@ impl Reader {
         if [".ps1", ".psm1", ".psd1"].iter().any(|e| name.ends_with(e)) {
             self.noted(NOTE_SCRIPT);
         }
+        // A batch file named by its path, as `cmd x.bat` and `.\x.ps1` are. A bare
+        // `npm.cmd` is a program on PATH, and W5 reads it as `npm`.
+        let written = words[0].w.text.trim_end_matches(['.', ' ']).to_lowercase();
+        if written.contains(['/', '\\']) && [".bat", ".cmd"].iter().any(|e| written.ends_with(e)) {
+            self.noted(NOTE_SCRIPT);
+        }
         if matches!(name.as_str(), "foreach-object" | "%")
             && !words.iter().any(|r| r.kind == Kind::Block)
         {
@@ -1326,6 +1375,7 @@ fn call_word() -> Raw {
         kind: Kind::Call,
         cont: false,
         from_quote: false,
+        whole: false,
     }
 }
 

@@ -338,8 +338,10 @@ fn strictest_of_both_dialects() {
 #[test]
 fn strictest_ordering() {
     let e = engine();
-    // An unread reading is not hidden by a clean one, whichever is first.
-    let line = "iex $x";
+    // An unread reading is not hidden by a clean one, whichever is first. (`iex $x`
+    // would not do: under Windows style the POSIX route denies a nested shell it
+    // cannot read, which is the stricter verdict.)
+    let line = "Set-Alias x y";
     for d in [STRICTEST, Dialects::Strictest(Posix, PowerShell)] {
         assert!(is_unjudged(&e.evaluate_in(line, d)), "{d:?}");
     }

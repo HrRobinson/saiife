@@ -553,8 +553,9 @@ impl Reader {
             .and_then(|w| w.text.find('='))
             .filter(|at| *at > 0);
         let Some(at) = eq else {
+            // `set S` prints every variable that starts with S: as `gci env:S*`,
+            // and the same word for `core.secrets` as a bare `set`.
             let mut seg = vec![plain("set")];
-            seg.append(&mut words);
             seg.append(&mut redirects);
             self.emit(seg);
             return;

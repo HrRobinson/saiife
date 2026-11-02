@@ -339,13 +339,25 @@ fn posix_verdicts_match_main() {
 
 /// Every POSIX verdict that differs from `main`, each on purpose. `main` allows
 /// them. They name saiife or every process, so they deny for the same reason
-/// `pkill s*` does, under `core.process/kill-saiife-name`. It stays off the hook's
-/// clock: the pack compiles only on a line with `kill` in it.
+/// `pkill s*` does, under `core.process/kill-saiife-name`: the true set is a wildcard
+/// that can match saiife, anywhere among `kill`'s words and past any wrapper or nested
+/// shell. It stays off the hook's clock: the pack compiles only on a line with `kill`
+/// in it.
 #[test]
 fn posix_verdicts_that_differ_from_main_on_purpose() {
     for lock in [false, true] {
         let e = posix_host(lock);
-        for cmd in ["kill s*", "kill *", "kill sai*", "kill saiif?"] {
+        for cmd in [
+            "kill s*",
+            "kill *",
+            "kill sai*",
+            "kill saiif?",
+            "kill \"*\"",
+            "kill 12 13 ?",
+            "kill -s TERM s*",
+            "sudo kill s*",
+            "sh -c 'kill *'",
+        ] {
             assert!(e.evaluate(cmd).is_deny(), "lock={lock} {cmd}");
         }
     }
@@ -717,8 +729,6 @@ fn provider_drives_are_judged_by_what_is_done_to_them() {
                 r"Get-ItemProperty Registry::HKEY_CURRENT_USER\Software\Foo",
             ),
             (PS, r"Get-ChildItem Cert:\LocalMachine\My"),
-            (PS, r"Get-ChildItem Env:"),
-            (PS, r"Get-ChildItem Env:\"),
             (PS, "Get-Content Env:FOO"),
             (PS, "Test-Path Env:SAIIFE_DATA_DIR"),
             // HKCU writes.

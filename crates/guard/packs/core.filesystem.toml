@@ -107,7 +107,7 @@ reason = "formatting, partitioning or wiping a disk destroys its data"
 platform = "windows"
 # `cipher /w:C:\` overwrites all free space; `cipher /e` and `/d` stay allowed.
 id = "windows-cipher-wipe"
-pattern = '(?i)^(?:\S*[\\/])?cipher(?:\.exe)?\s+(?:\S+\s+)*/w(?::|\s|$)'
+pattern = '(?i)^(?:\S*[\\/])?cipher(?:\.exe)?\s+(?:\S+\s+)*[/-]+w(?::|\s|$)'
 reason = "cipher /w overwrites all the free space on a volume, which erases deleted files for good"
 
 [[deny]]
@@ -115,7 +115,7 @@ platform = "windows"
 # `bcdedit /delete` and `/set` (also `/deletevalue`, `/import`): an unbootable
 # machine, or a boot with its protections off. `/enum` only reads.
 id = "windows-boot-config"
-pattern = '(?i)^(?:\S*[\\/])?bcdedit(?:\.exe)?\s+(?:\S+\s+)*/+(?:delete|deletevalue|set|import)(?:\s|$)'
+pattern = '(?i)^(?:\S*[\\/])?bcdedit(?:\.exe)?\s+(?:\S+\s+)*[/-]+(?:delete|deletevalue|set|import)(?:\s|$)'
 reason = "changing the boot configuration can leave the machine unbootable or switch its protections off"
 
 [[deny]]

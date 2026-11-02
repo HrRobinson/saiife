@@ -305,17 +305,20 @@ platform = "windows"
 # `saiife-broker` (with `.exe`), or a wildcard that can match it: a name that
 # starts like it (`sai*`, `saiif?`) or is only wildcards (`*`). A wildcard
 # with a literal part that cannot (`*node*`, `node*`) is not matched. A pid
-# (`Stop-Process -Id 4242`) names no program and a name from a pipe
-# (`Get-Process saiife | Stop-Process`) is not visible: stated limits.
+# (`Stop-Process -Id 4242`) names no program: a stated limit. A name from a pipe
+# (`Get-Process saiife | Stop-Process`) is denied by the PowerShell reader, as a
+# stop of whatever the pipe holds.
 id = "windows-kill-saiife"
-pattern = '(?i)^(?:kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\S*[\\/])?taskkill(?:\.exe)?\s+(?:\S+\s+)*?(?:/+im\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|/+fi\s+(?:imagename\s+eq\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|services\s+eq\s+saiif|imagename\s+ne\s|pid\s+(?:ne|gt|lt|ge|le)\s|(?:status|username|memusage|cputime|session|sessionname|modules)\s))|(?:\S*[\\/])?wmic(?:\.exe)?\s+(?:/\S+\s+)*process\s+(?:.*\s)?(?:terminate|delete)(?:\s|$))'
+pattern = '(?i)^(?:kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|(?:\S*[\\/])?taskkill(?:\.exe)?\s+(?:\S+\s+)*?(?:[/-]+im\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|[/-]+fi\s+(?:imagename\s+eq\s+(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)|services\s+eq\s+saiif|imagename\s+ne\s|pid\s+(?:ne|gt|lt|ge|le)\s|(?:status|username|memusage|cputime|session|sessionname|modules)\s))|(?:\S*[\\/])?wmic(?:\.exe)?\s+(?:[/-]\S+\s+)*process\s+(?:.*\s)?(?:terminate|delete)(?:\s|$))'
 reason = "an agent may not stop saiife (or every process): saiife records every agent call; stop it in your own terminal"
 
 # --- kill by name ---------------------------------------------------------------
 [[deny]]
 # Not Windows-only. `Stop-Process -Name saiife` under the PowerShell tool on Linux
-# or macOS arrives as `kill -n saiife` and does stop it there. In bash, `kill s*`
-# and `kill saiife` name no pid: refusing costs nothing, as for `pkill s*`. On a
+# or macOS arrives as `kill -n saiife` and does stop it there. In bash, such a word
+# names no pid: refusing costs nothing, as for `pkill s*`. The rule takes it anywhere
+# among the words and past a wrapper or nested shell: `kill s*`, `kill *`, `kill "*"`,
+# `kill 12 13 ?`, `kill -s TERM s*`, `sudo kill s*`, `sh -c 'kill *'`. On a
 # Windows-style host the rule above matches first and names the verdict.
 id = "kill-saiife-name"
 pattern = '(?i)^kill\s+(?:\S+\s+)*(?:saiif\S*|(?:s|sa|sai|saii)[*?]\S*|[*?]+)(?:\s|$)'
