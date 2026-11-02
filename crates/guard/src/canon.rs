@@ -20,11 +20,43 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+use crate::winpath;
+
+/// Which operating system's rules a path follows. Windows paths are judged
+/// by pure text rules (`winpath`), so any host can run them. The default is
+/// the host's style, so a `PathVars` nobody configured is still right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStyle {
+    Posix,
+    Windows,
+}
+
+impl PathStyle {
+    pub fn host() -> PathStyle {
+        if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Posix
+        }
+    }
+}
+
+impl Default for PathStyle {
+    fn default() -> Self {
+        Self::host()
+    }
+}
+
 /// Directories the engine resolves paths and rule variables against.
 #[derive(Debug, Clone, Default)]
 pub struct PathVars {
+    style: PathStyle,
     cwd: Option<PathBuf>,
     vars: Vec<(String, PathBuf)>,
+    /// Every `with_cwd` (`None`) and `with_var` as given, in order, so
+    /// `with_style` can read them again: `C:\Users\a` is not absolute under
+    /// `Posix`, and must not be lost when the style is set afterwards.
+    given: Vec<(Option<String>, PathBuf)>,
 }
 
 impl PathVars {
@@ -32,11 +64,39 @@ impl PathVars {
         Self::default()
     }
 
+    /// Read paths by `style`'s rules. Values already given are read again,
+    /// so the order of the `with_*` calls does not matter.
+    pub fn with_style(self, style: PathStyle) -> Self {
+        if style == self.style {
+            return self;
+        }
+        let mut out = PathVars {
+            style,
+            ..PathVars::default()
+        };
+        for (name, value) in self.given {
+            out = match name {
+                Some(n) => out.with_var(&n, value),
+                None => out.with_cwd(value),
+            };
+        }
+        out
+    }
+
+    pub fn style(&self) -> PathStyle {
+        self.style
+    }
+
     /// The working directory relative paths are joined to. Must be
     /// absolute; anything else is ignored.
     pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
         let cwd = cwd.as_ref();
-        if cwd.is_absolute() {
+        self.given.push((None, cwd.to_path_buf()));
+        if self.style == PathStyle::Windows {
+            if let Some(c) = winpath::value_forms(cwd, &self).into_iter().next() {
+                self.cwd = Some(PathBuf::from(c));
+            }
+        } else if cwd.is_absolute() {
             self.cwd = resolve(cwd);
         }
         self
@@ -47,7 +107,21 @@ impl PathVars {
     /// on `PATH`). Relative values are ignored; values are canonicalized.
     pub fn with_var(mut self, name: &str, value: impl AsRef<Path>) -> Self {
         let value = value.as_ref();
-        if value.is_absolute() {
+        self.given
+            .push((Some(name.to_string()), value.to_path_buf()));
+        if self.style == PathStyle::Windows {
+            // The computer's name is no path: it tells `\\NAME\c$` is local.
+            let forms = if name == winpath::COMPUTER_NAME {
+                vec![value.to_string_lossy().into_owned()]
+            } else {
+                winpath::value_forms(value, &self)
+            };
+            for v in forms.into_iter().map(PathBuf::from) {
+                if !self.vars.iter().any(|(n, x)| n == name && *x == v) {
+                    self.vars.push((name.to_string(), v));
+                }
+            }
+        } else if value.is_absolute() {
             // The resolved value first, then the value as spelled (`..`
             // removed lexically): a symlinked directory is guarded under
             // both names.
@@ -70,23 +144,59 @@ impl PathVars {
     }
 
     pub fn values(&self, name: &str) -> Vec<&Path> {
+        // On Windows `~` and `$HOME` mean the profile dir, whichever
+        // variable named it (W6).
+        if self.style == PathStyle::Windows && name == "HOME" {
+            let mut out: Vec<&Path> = Vec::new();
+            for wanted in ["USERPROFILE", "HOME"] {
+                for (_, v) in self.vars.iter().filter(|(n, _)| n == wanted) {
+                    if !out.contains(&v.as_path()) {
+                        out.push(v);
+                    }
+                }
+            }
+            return out;
+        }
         self.vars
             .iter()
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_path())
             .collect()
     }
+
+    /// The first value of `name`, its case ignored as Windows ignores it.
+    pub(crate) fn value_ignoring_case(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.to_str())
+    }
 }
 
 /// Canonicalize `raw` against `cwd` (the working directory at this point
 /// of a command line, else the one in `vars`) and the home in `vars`.
 pub fn canonicalize(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        let spelled = winpath::canonical(raw, cwd, vars)?;
+        return Some(PathBuf::from(winpath::resolved(&spelled, vars)));
+    }
     absolute(raw, cwd, vars).and_then(|a| resolve(&a))
 }
 
 /// The forms path rules are matched against: the resolved path, and the
 /// path as spelled (absolute, lexically normalized) when that differs.
 pub fn path_forms(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Vec<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        let Some(spelled) = winpath::canonical(raw, cwd, vars) else {
+            return Vec::new();
+        };
+        let resolved = winpath::resolved(&spelled, vars);
+        return if resolved == spelled {
+            vec![PathBuf::from(spelled)]
+        } else {
+            vec![PathBuf::from(resolved), PathBuf::from(spelled)]
+        };
+    }
     let Some(abs) = absolute(raw, cwd, vars) else {
         return Vec::new();
     };
@@ -106,6 +216,9 @@ pub fn path_forms(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Vec<PathBuf
 /// resolution. `cwd` is used as given and should already be canonical
 /// (the engine's working directories are).
 pub fn lexical_form(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        return winpath::canonical(raw, cwd, vars).map(PathBuf::from);
+    }
     let abs = absolute_with(raw, cwd.map(Path::to_path_buf), cwd.is_some(), vars)?;
     Some(push_lexical(
         PathBuf::from("/"),
@@ -573,21 +686,30 @@ fn expand_alternatives(
     let mut all = Vec::new();
     let mut overflow = false;
     for alt in ordered {
-        let Some(abs) = absolute(alt, cwd, vars) else {
+        // The components below the root, and the root the walk starts at.
+        let anchored = if vars.style() == PathStyle::Windows {
+            winpath::canonical(alt, cwd, vars).map(|c| {
+                let (root, rest) = winpath::split_root(&c);
+                (PathBuf::from(rest), PathBuf::from(root))
+            })
+        } else {
+            absolute(alt, cwd, vars).map(|a| (a, PathBuf::from("/")))
+        };
+        let Some((abs, root)) = anchored else {
             continue;
         };
         let comps: Vec<Component> = abs.components().collect();
         if comps.len() > GLOB_MAX_COMPONENTS || abs.as_os_str().len() > PATH_MAX {
             overflow = true;
             if several {
-                all.push(abs);
+                all.push(root.join(&abs));
             }
             continue;
         }
-        let (found, over) = expand_from(&comps, vec![PathBuf::from("/")], &mut budget);
+        let (found, over) = expand_from(&comps, vec![root.clone()], &mut budget);
         overflow |= over;
         if several && (over || found.is_empty()) {
-            all.push(push_lexical(PathBuf::from("/"), &comps));
+            all.push(push_lexical(root, &comps));
         }
         all.extend(found);
     }
@@ -852,6 +974,113 @@ fn push_lexical(mut base: PathBuf, rest: &[Component]) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// POSIX behaviour is pinned byte for byte, Windows-looking spellings
+    /// included: under `Posix` a backslash is an ordinary character.
+    #[test]
+    fn posix_style_unchanged() {
+        if cfg!(windows) {
+            return;
+        }
+        let v = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_cwd("/nonexistent-p19a/p")
+            .with_var("HOME", "/nonexistent-p19a/home")
+            .with_var("USERPROFILE", "/nonexistent-p19a/profile");
+        assert_eq!(v.style(), PathStyle::Posix);
+        assert_eq!(v.home(), Some(Path::new("/nonexistent-p19a/home")));
+        for (raw, want) in [
+            (".env", "/nonexistent-p19a/p/.env"),
+            ("../q/./x", "/nonexistent-p19a/q/x"),
+            ("~/.ssh/id_rsa", "/nonexistent-p19a/home/.ssh/id_rsa"),
+            ("$HOME/x", "/nonexistent-p19a/home/x"),
+            ("${PWD}/x", "/nonexistent-p19a/p/x"),
+            (".env.", "/nonexistent-p19a/p/.env."),
+            (".env ", "/nonexistent-p19a/p/.env "),
+            (".env::$DATA", "/nonexistent-p19a/p/.env::$DATA"),
+            (r"~\.ssh\id_rsa", r"/nonexistent-p19a/p/~\.ssh\id_rsa"),
+            (r"C:\Users\a", r"/nonexistent-p19a/p/C:\Users\a"),
+            ("c:/Users/a", "/nonexistent-p19a/p/c:/Users/a"),
+            ("/c/Users/a", "/c/Users/a"),
+            ("%USERPROFILE%/x", "/nonexistent-p19a/p/%USERPROFILE%/x"),
+            (
+                "$env:USERPROFILE/x",
+                "/nonexistent-p19a/p/$env:USERPROFILE/x",
+            ),
+            ("$USERPROFILE/x", "/nonexistent-p19a/p/$USERPROFILE/x"),
+        ] {
+            let want = PathBuf::from(want);
+            assert_eq!(lexical_form(raw, None, &v).as_ref(), Some(&want), "{raw}");
+            assert_eq!(canonicalize(raw, None, &v).as_ref(), Some(&want), "{raw}");
+            assert_eq!(path_forms(raw, None, &v), vec![want], "{raw}");
+        }
+        // Values a POSIX host cannot call absolute stay unbound.
+        let w = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_var("HOME", r"C:\Users\a")
+            .with_cwd(r"C:\p");
+        assert!(w.home().is_none() && w.cwd().is_none());
+        assert_eq!(lexical_form("", None, &v), None);
+        assert_eq!(lexical_form("a\0b", None, &v), None);
+    }
+
+    #[test]
+    fn host_style_is_the_default() {
+        let want = if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Posix
+        };
+        assert_eq!(PathStyle::host(), want);
+        assert_eq!(PathVars::new().style(), want);
+        assert_eq!(PathVars::default().style(), want);
+    }
+
+    #[test]
+    fn style_can_be_set_after_the_values() {
+        let early = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_cwd(r"C:\p");
+        let late = PathVars::new()
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_cwd(r"C:\p")
+            .with_style(PathStyle::Windows);
+        for v in [early, late] {
+            assert_eq!(v.home(), Some(Path::new("c:/Users/a")));
+            assert_eq!(v.cwd(), Some(Path::new("c:/p")));
+            assert_eq!(
+                path_forms(".env", None, &v),
+                vec![PathBuf::from("c:/p/.env")]
+            );
+            assert_eq!(
+                canonicalize("~/x", None, &v),
+                Some(PathBuf::from("c:/Users/a/x"))
+            );
+            assert_eq!(
+                lexical_form(r"..\y", Some(Path::new(r"D:\q\r")), &v),
+                Some(PathBuf::from("d:/q/y"))
+            );
+        }
+    }
+
+    #[test]
+    fn windows_globs_keep_their_root() {
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_cwd(r"C:\p");
+        // Nothing exists there on a test host: each alternative comes back
+        // as spelled, from its own root.
+        let (found, over) = expand_glob_partial(r"Q:\p19a-none\{a,b}*", None, &v);
+        assert!(!over);
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("q:/").join("p19a-none").join("a*"),
+                PathBuf::from("q:/").join("p19a-none").join("b*")
+            ]
+        );
+    }
 
     /// A temp dir by its canonical path (macOS: /var -> /private/var).
     fn tmp() -> (tempfile::TempDir, PathBuf) {

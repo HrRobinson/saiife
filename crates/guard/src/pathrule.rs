@@ -21,7 +21,8 @@
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::canon::PathVars;
+use crate::canon::{PathStyle, PathVars};
+use crate::winpath;
 
 /// What a tool or command does to a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,23 +202,35 @@ pub fn ancestors_source(
     let Some(name) = var else {
         return Err(format!("path glob {glob:?}: ancestors need a variable"));
     };
+    let windows = vars.style() == PathStyle::Windows;
     let mut alts: Vec<String> = vec![];
     for v in vars.values(name) {
         let Some(v) = v.to_str() else {
             return Ok(None);
         };
         let full = format!("{}{}", v.trim_end_matches('/'), rest);
+        let full = if windows { winpath::fold(&full) } else { full };
         alts.push("/".to_string());
         for (i, c) in full.char_indices() {
             if c == '/' && i > 0 {
-                alts.push(regex::escape(&full[..i]));
+                let ancestor = &full[..i];
+                // A drive's root is `c:/`, never `c:`.
+                alts.push(if windows && ancestor.ends_with(':') {
+                    regex::escape(&format!("{ancestor}/"))
+                } else {
+                    regex::escape(ancestor)
+                });
             }
         }
     }
     if alts.is_empty() {
         return Ok(None);
     }
-    let flags = if case_insensitive { "(?is)" } else { "(?s)" };
+    let flags = if case_insensitive || windows {
+        "(?is)"
+    } else {
+        "(?s)"
+    };
     Ok(Some(format!("{flags}^(?:{})$", alts.join("|"))))
 }
 
@@ -240,7 +253,26 @@ pub fn glob_source(
 ) -> Result<Option<String>, String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
-    let mut re = String::from(if case_insensitive { "(?is)^" } else { "(?s)^" });
+    // Windows: names compare case-folded (the glob is folded here, the regex
+    // folds the path), and a path the OS joined may hold a `\` separator.
+    let windows = vars.style() == PathStyle::Windows;
+    let (sep, name_char) = if windows {
+        (r"[/\\]", r"[^/\\]")
+    } else {
+        ("/", "[^/]")
+    };
+    let folded;
+    let rest = if windows {
+        folded = winpath::fold(rest);
+        folded.as_str()
+    } else {
+        rest
+    };
+    let mut re = String::from(if case_insensitive || windows {
+        "(?is)^"
+    } else {
+        "(?s)^"
+    });
     if let Some(name) = var {
         let values = vars.values(name);
         if values.is_empty() {
@@ -258,6 +290,15 @@ pub fn glob_source(
             // variable must still match `/`.
             alts.push(if v.is_empty() && rest.is_empty() {
                 "/".to_string()
+            } else if windows {
+                // A bare variable bound to a drive's root must match `c:/`.
+                let v = winpath::fold(v);
+                let tail = if rest.is_empty() && v.ends_with(':') {
+                    "/"
+                } else {
+                    ""
+                };
+                format!("{}{tail}", regex::escape(&v))
             } else {
                 regex::escape(v)
             });
@@ -271,17 +312,19 @@ pub fn glob_source(
             // The empty component before a leading `/` (or after a
             // variable): nothing to add, the separator comes next.
             (0, "") => {}
+            // A Windows path starts with its drive or share, not a `/`.
+            (0, "**") if windows => re.push_str(".*"),
             (0, "**") => re.push_str("(?:/.*)?"),
-            (_, "**") if i == last => re.push_str("(?:/.*)?"),
-            (_, "**") => re.push_str("(?:/[^/]+)*"),
+            (_, "**") if i == last => re.push_str(&format!("(?:{sep}.*)?")),
+            (_, "**") => re.push_str(&format!("(?:{sep}{name_char}+)*")),
             _ => {
                 if i > 0 {
-                    re.push('/');
+                    re.push_str(sep);
                 }
                 for c in comp.chars() {
                     match c {
-                        '*' => re.push_str("[^/]*"),
-                        '?' => re.push_str("[^/]"),
+                        '*' => re.push_str(&format!("{name_char}*")),
+                        '?' => re.push_str(name_char),
                         c => re.push_str(&regex::escape(&c.to_string())),
                     }
                 }
@@ -424,6 +467,97 @@ mod tests {
             .unwrap();
         assert!(sub.is_match("/home/u/.local/share/saiife"));
         assert!(compile_ancestors("$HOME", &v, false).unwrap().is_none());
+    }
+
+    /// The regex text of POSIX rules is pinned: Linux and macOS behaviour
+    /// must not move because Windows rules were added.
+    #[test]
+    fn posix_regex_sources_are_unchanged() {
+        let v = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_var("HOME", "/home/u");
+        if cfg!(windows) {
+            return;
+        }
+        let src = |g: &str| glob_source(g, &v, false).unwrap().unwrap();
+        assert_eq!(src("**/.env"), r"(?s)^(?:/.*)?/\.env$");
+        assert_eq!(src("~/.ssh/id_*"), r"(?s)^(?:/home/u)/\.ssh/id_[^/]*$");
+        assert_eq!(src("~/.ssh/id_?sa"), r"(?s)^(?:/home/u)/\.ssh/id_[^/]sa$");
+        assert_eq!(src("/a/**/b"), r"(?s)^/a(?:/[^/]+)*/b$");
+        assert_eq!(src("$HOME/x/**"), r"(?s)^(?:/home/u)/x(?:/.*)?$");
+        assert_eq!(
+            glob_source("**/.ENV", &v, true).unwrap().unwrap(),
+            r"(?is)^(?:/.*)?/\.ENV$"
+        );
+        assert_eq!(
+            ancestors_source("$HOME/a", &v, false).unwrap().unwrap(),
+            "(?s)^(?:/|/home|/home/u)$"
+        );
+    }
+
+    fn win_vars() -> PathVars {
+        PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+    }
+
+    fn wm(glob: &str, path: &str) -> bool {
+        compile_glob(glob, &win_vars(), false)
+            .unwrap()
+            .unwrap()
+            .is_match(path)
+    }
+
+    #[test]
+    fn windows_globs_match_case_folded_under_any_root() {
+        assert!(wm("**/.env", "c:/p/.env"));
+        assert!(wm("**/.env", "c:/P/.ENV"));
+        assert!(wm("**/.env", "c:/.env"));
+        assert!(wm("**/.env", "//server/share/.env"));
+        assert!(!wm("**/.env", "c:/p/.env.example"));
+        assert!(!wm("**/.env", "c:/p/my.env"));
+        assert!(wm("~/.ssh/id_*", "c:/users/A/.SSH/ID_RSA"));
+        assert!(wm("~/.ssh/id_*", "c:/Users/a/.ssh/id_rsa"));
+        assert!(!wm("~/.ssh/id_*", "c:/Users/b/.ssh/id_rsa"));
+        assert!(!wm("~/.ssh/id_*", "c:/Users/a/.ssh/keys/id_rsa"));
+        assert!(wm("~/.ssh/ID_*", "c:/Users/a/.ssh/id_rsa"));
+        assert!(wm("**/.saiife/**", "c:/p/.saiife"));
+        assert!(wm("**/.saiife/**", "c:/p/.SAIIFE/config.toml"));
+        // A POSIX-rooted rule never matches a Windows path (W6).
+        assert!(!wm("/etc/passwd", "c:/etc/passwd"));
+    }
+
+    #[test]
+    fn windows_globs_accept_a_separator_the_os_joined() {
+        assert!(wm("**/.env", r"c:/p\.env"));
+        assert!(wm("~/.ssh/id_*", r"c:/Users/a/.ssh\id_rsa"));
+        assert!(!wm("~/.ssh/id_*", r"c:/Users/a/.ssh\keys\id_rsa"));
+    }
+
+    #[test]
+    fn windows_variable_bound_to_a_drive_root() {
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("HOME", r"C:\");
+        let c = |g: &str| compile_glob(g, &v, false).unwrap().unwrap();
+        assert!(c("~").is_match("c:/"));
+        assert!(!c("~").is_match("c:/x"));
+        assert!(c("~/**").is_match("c:/"));
+        assert!(c("~/.ssh/id_*").is_match("c:/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn windows_ancestors_stop_at_the_drive_root() {
+        let v = win_vars().with_var("SAIIFE_DATA_DIR", r"C:\Users\a\AppData\Local\saiife");
+        let r = compile_ancestors("$SAIIFE_DATA_DIR", &v, false)
+            .unwrap()
+            .unwrap();
+        for yes in ["c:/", "C:/", "c:/users", "c:/Users/A/AppData/Local"] {
+            assert!(r.is_match(yes), "{yes}");
+        }
+        for no in ["c:", "c:/Users/a/AppData/Local/saiife", "d:/", "c:/other"] {
+            assert!(!r.is_match(no), "{no}");
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod payload;
 pub mod prefilter;
 pub mod profile;
 pub mod subst;
+pub mod winpath;
 pub mod wrappers;
 
 pub use engine::{AllowTrace, Decision, Engine};

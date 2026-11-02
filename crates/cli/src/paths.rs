@@ -13,7 +13,7 @@ use saiife_agents::detect::which;
 use saiife_agents::integrity;
 use saiife_audit::store;
 use saiife_system::layout::Platform;
-use saiifeguard::canon::PathVars;
+use saiifeguard::canon::{PathStyle, PathVars};
 
 /// The system config the developer hook and `saiife audit` read for locked
 /// mode (`locked = true`, `[guard] fail`). On Windows it is under ProgramData
@@ -79,6 +79,31 @@ pub struct LockedPaths {
     pub socket_dir: PathBuf,
 }
 
+/// The Windows variables a path may be spelled with (W6), bound when set.
+const WINDOWS_VARS: [&str; 12] = [
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "PROGRAMDATA",
+    "ALLUSERSPROFILE",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "COMPUTERNAME",
+];
+
+/// `v` in `PathStyle::Windows`, with the variables `env` has a value for.
+fn bind_windows_vars(v: PathVars, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathVars {
+    let v = v.with_style(PathStyle::Windows);
+    WINDOWS_VARS.iter().fold(v, |v, name| match env(name) {
+        Some(value) => v.with_var(name, value),
+        None => v,
+    })
+}
+
 /// `cwd`: where relative paths start (the hook payload's `cwd`); `project`:
 /// the saiife project root, `cwd` if there is none. Every value the
 /// process cannot determine is left out, so rules that need it do not apply.
@@ -94,7 +119,10 @@ pub fn path_vars_locked(
     project: Option<&Path>,
     locked: Option<&LockedPaths>,
 ) -> PathVars {
-    let mut v = PathVars::new();
+    let mut v = PathVars::new().with_style(PathStyle::host());
+    if v.style() == PathStyle::Windows {
+        v = bind_windows_vars(v, |name| std::env::var_os(name));
+    }
     if let Some(c) = cwd {
         v = v.with_cwd(c);
     }
@@ -160,6 +188,34 @@ mod tests {
             Some(PathBuf::from("/opt/claude"))
         );
         assert_eq!(config_dir(None, None, ".claude"), None);
+    }
+
+    #[test]
+    fn windows_variables_are_bound_in_windows_style() {
+        let env = |name: &str| match name {
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\a")),
+            "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\a\AppData\Local")),
+            "APPDATA" => Some(OsString::from(r"C:\Users\a\AppData\Roaming")),
+            "TEMP" => Some(OsString::from(r"C:\Users\a\AppData\Local\Temp")),
+            _ => None,
+        };
+        let v = bind_windows_vars(PathVars::new(), env);
+        assert_eq!(v.style(), PathStyle::Windows);
+        assert_eq!(v.home(), Some(Path::new("c:/Users/a")));
+        for (name, want) in [
+            ("LOCALAPPDATA", "c:/Users/a/AppData/Local"),
+            ("APPDATA", "c:/Users/a/AppData/Roaming"),
+            ("TEMP", "c:/Users/a/AppData/Local/Temp"),
+        ] {
+            assert_eq!(v.values(name), vec![Path::new(want)], "{name}");
+        }
+        assert!(v.values("PROGRAMDATA").is_empty());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn the_cli_uses_posix_style_off_windows() {
+        assert_eq!(path_vars(None, None).style(), PathStyle::Posix);
     }
 
     #[test]
