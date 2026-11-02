@@ -118,6 +118,8 @@ first_unsafe() {
             return 0
         fi
         line="$(stat -f '%u %Lp' "$p")"
+        # ls is what shows an ACL, as a "+" after the mode.
+        # shellcheck disable=SC2012
         if [[ "${line%% *}" != 0 ]] || (((8#${line##* } & 022) != 0)) ||
             [[ "$(ls -ld "$p" | cut -d' ' -f1)" == *+* ]]; then
             echo "$p"
