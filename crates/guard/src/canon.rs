@@ -682,7 +682,10 @@ fn expand_alternatives(
     // it runs out on the broad ones.
     let mut ordered: Vec<&String> = alternatives.iter().collect();
     ordered.sort_by_key(|a| !a.rsplit('/').next().is_some_and(|l| l.starts_with('.')));
-    let mut budget = Budget::default();
+    let mut budget = Budget {
+        fold: vars.style() == PathStyle::Windows,
+        ..Budget::default()
+    };
     let mut all = Vec::new();
     let mut overflow = false;
     for alt in ordered {
@@ -723,6 +726,8 @@ fn expand_alternatives(
 #[derive(Default)]
 struct Budget {
     spent: usize,
+    /// Names compare case-folded (Windows): `.EN*` finds `.env`.
+    fold: bool,
 }
 
 impl Budget {
@@ -800,7 +805,11 @@ fn walk(
                     literal_tail = false;
                     continue;
                 }
-                let pat: Vec<char> = text.chars().collect();
+                let pat: Vec<char> = if budget.fold {
+                    winpath::fold(&text).chars().collect()
+                } else {
+                    text.chars().collect()
+                };
                 if !pat.iter().any(|c| matches!(c, '*' | '?' | '[')) {
                     bases.iter_mut().for_each(|b| b.push(name));
                     literal_tail = true;
@@ -826,7 +835,12 @@ fn walk(
                             };
                         }
                         let n = e.file_name();
-                        let s: Vec<char> = n.to_string_lossy().chars().collect();
+                        let name = n.to_string_lossy();
+                        let s: Vec<char> = if budget.fold {
+                            winpath::fold(&name).chars().collect()
+                        } else {
+                            name.chars().collect()
+                        };
                         if s.first() == Some(&'.') && pat.first() != Some(&'.') {
                             continue;
                         }
@@ -1062,6 +1076,30 @@ mod tests {
                 Some(PathBuf::from("d:/q/y"))
             );
         }
+    }
+
+    /// `.EN*` finds `.env` on Windows: a glob that missed it would come back
+    /// as spelled and match no rule. Exact everywhere else.
+    #[test]
+    fn windows_glob_matching_ignores_case() {
+        let (_d, root) = tmp();
+        fs::create_dir(root.join("Sub")).unwrap();
+        fs::write(root.join(".env"), "").unwrap();
+        fs::write(root.join("Sub/Token.txt"), "").unwrap();
+        let run = |pattern: &str, fold: bool| {
+            let pattern = Path::new(pattern);
+            let comps: Vec<Component> = pattern.components().collect();
+            let mut budget = Budget { spent: 0, fold };
+            expand_from(&comps, vec![root.clone()], &mut budget).0
+        };
+        assert_eq!(run(".EN*", true), vec![root.join(".env")]);
+        assert_eq!(run(".E?V", true), vec![root.join(".env")]);
+        assert_eq!(
+            run("SUB*/t[a-z]ken.TXT", true),
+            vec![root.join("Sub/Token.txt")]
+        );
+        assert!(run(".EN*", false).is_empty());
+        assert!(run("SUB*/t[a-z]ken.TXT", false).is_empty());
     }
 
     #[test]

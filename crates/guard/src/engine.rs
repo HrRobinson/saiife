@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use regex::{Regex, RegexSet};
 
 use crate::canon::{
-    canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathVars,
-    GLOB_SCAN_LIMIT,
+    canonicalize, expand_operand_glob, lexical_form, path_forms, GlobExpansion, PathStyle,
+    PathVars, GLOB_SCAN_LIMIT,
 };
 use crate::cdtrack::RuleCwd;
 use crate::lexer::{
@@ -36,6 +36,7 @@ use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
 use crate::subst::{command_position_substitution, command_position_substitution_kind};
+use crate::winpath;
 use crate::wrappers::{
     effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
     unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
@@ -62,6 +63,11 @@ const SUBSTITUTION_GUARD_PACK: &str = "saiifeguard.core";
 /// (`cd / && rm -rf *` is matched as `rm -rf /*`); see `crate::cdtrack`.
 /// Other packs see the command as written.
 const CD_RESOLVED_PACK: &str = "core.filesystem";
+
+/// What a deny for a Windows path that cannot be read names as its pack and
+/// pattern: no rule of any pack decided it.
+const UNREADABLE_PACK: &str = "guard.winpath";
+const UNREADABLE_PATTERN: &str = "unreadable Windows path";
 
 /// The engine's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +260,9 @@ impl Engine {
         let start = Instant::now();
         let forms = path_forms(path, None, &self.vars);
         if forms.is_empty() {
+            if let Some(d) = self.unreadable(path, None) {
+                return d;
+            }
             return Decision::Allow {
                 trace: AllowTrace::Unjudgeable {
                     reason: format!("cannot resolve {path:?} to an absolute path"),
@@ -276,6 +285,28 @@ impl Engine {
         carved.unwrap_or(Decision::Allow {
             trace: AllowTrace::NoMatch,
         })
+    }
+
+    /// Windows only: a deny when `raw` cannot be read at all (an unknown
+    /// variable, a device namespace path, …). It could name a protected file,
+    /// so it fails closed; a relative path with no working directory does not
+    /// count, and is treated as in POSIX style. `None` also when no path rule
+    /// is active: nothing is protected then.
+    fn unreadable(&self, raw: &str, cwd: Option<&Path>) -> Option<Decision> {
+        if self.vars.style() != PathStyle::Windows || !self.has_path_rules {
+            return None;
+        }
+        match winpath::read(raw, cwd, &self.vars) {
+            Err(winpath::Unread::Unreadable(why)) => Some(Decision::Deny {
+                pack: UNREADABLE_PACK.to_string(),
+                pattern: UNREADABLE_PATTERN.to_string(),
+                reason: format!(
+                    "cannot read the Windows path {raw:?} ({why}), so it cannot be judged"
+                ),
+                via_inline: None,
+            }),
+            _ => None,
+        }
     }
 
     /// Path rules for one resolved path: per pack, an `allow_path` match
@@ -506,7 +537,9 @@ impl Engine {
             return Some(d);
         }
         Self::environment_phase(&view, cx, state);
-        self.cd_phase(&view, state);
+        if let Some(d) = self.cd_phase(&view, state) {
+            return Some(d);
+        }
         self.inline_payload_phase(&view, cx, state, found)
     }
 
@@ -894,13 +927,29 @@ impl Engine {
     }
 
     /// `cd`/`pushd`: the later segments may run in its target too.
-    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) {
+    /// `Some`: its target cannot be read (Windows), so what follows could not
+    /// be judged either.
+    fn cd_phase(&self, view: &SegmentView, state: &mut ShellState) -> Option<Decision> {
         state
             .rule_cwd
             .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
+            let target = view
+                .argv
+                .iter()
+                .zip(&view.resolved)
+                .skip(1)
+                .find(|(a, _)| !a.starts_with('-'))
+                .filter(|(_, w)| !w.has_substitution);
+            if let Some((a, _)) = target {
+                let first = state.cwds.first().map(PathBuf::as_path);
+                if let Some(d) = self.unreadable(a, first) {
+                    return Some(d);
+                }
+            }
             state.cwd_unknown |= self.cd(&view.argv, &view.resolved, &mut state.cwds);
         }
+        None
     }
 
     /// Structural inline-payload re-entry: `bash -c '…'`, `su -c '…'`, and
@@ -980,6 +1029,9 @@ impl Engine {
             for raw in &landing {
                 for cwd in anchors(raw) {
                     let Some(form) = lexical_form(raw, *cwd, &self.vars) else {
+                        if let Some(d) = self.unreadable(raw, *cwd) {
+                            return Some(d);
+                        }
                         continue;
                     };
                     match self.judge_path(op.access, &form, start) {
@@ -1030,6 +1082,9 @@ impl Engine {
                         landing
                     };
                     for raw in landing {
+                        if let Some(d) = self.unreadable(&raw, *cwd) {
+                            return Some(d);
+                        }
                         for form in path_forms(&raw, *cwd, &self.vars) {
                             match self.judge_path(op.access, &form, start) {
                                 JudgeOutcome::Decided(d @ Decision::Deny { .. }) => return Some(d),

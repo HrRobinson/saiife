@@ -18,12 +18,15 @@
 //! - `~`, `$HOME`, `$env:NAME`, `${env:NAME}`, `%NAME%` expand from `PathVars`;
 //! - relative paths join the working directory; `C:x` only one on that drive.
 //!
-//! **`None` means "this spelling cannot be read"**: an unknown variable, a
-//! device namespace path (`\\?\Volume{…}`, `\\.\PhysicalDrive0`), a PowerShell
-//! drive (`HKLM:\`, `temp:\`), a character Win32 refuses or reads as a
-//! wildcard (`<`, `>`, `"`, `|`, control characters), or a relative path with
-//! nothing to anchor it. It never guesses a form that could be wrong; the
-//! caller decides what `None` means.
+//! It never guesses a form that could be wrong. `read` says why there is none:
+//!
+//! - `Unread::Unreadable`: an unknown variable, a device namespace path
+//!   (`\\?\Volume{…}`, `\\.\PhysicalDrive0`), a PowerShell drive (`HKLM:\`,
+//!   `temp:\`), or a character Win32 refuses or reads as a wildcard (`<`, `>`,
+//!   `"`, `|`, control characters). It could name anything, so the engine
+//!   denies it.
+//! - `Unread::NoAnchor`: an empty path, or a relative one with no working
+//!   directory known. The engine treats it as it does in POSIX style.
 //!
 //! Not lexically knowable, and left to `resolved` when the path exists: 8.3
 //! short names (`PROGRA~1`), junctions and symlinks.
@@ -36,12 +39,26 @@ use crate::canon::PathVars;
 /// The variable holding this machine's name (not a path).
 pub const COMPUTER_NAME: &str = "COMPUTERNAME";
 
+/// Why a spelling has no canonical form (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// Empty, or relative with no working directory known.
+    NoAnchor,
+    /// It could name anything: the text says what it is.
+    Unreadable(&'static str),
+}
+
 /// `raw` as the canonical text of what it names, or `None` if it cannot be
-/// read (see the module docs). `cwd` is the working directory at this point
-/// of a command line, else the one in `vars` applies.
+/// read. `cwd` is the working directory at this point of a command line, else
+/// the one in `vars` applies.
 pub fn canonical(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<String> {
+    read(raw, cwd, vars).ok()
+}
+
+/// `canonical`, saying why when there is no form.
+pub fn read(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Result<String, Unread> {
     let anchor = match cwd {
-        Some(c) => c.to_str().and_then(|c| absolute_text(c, None, vars)),
+        Some(c) => c.to_str().and_then(|c| absolute_text(c, None, vars).ok()),
         None => vars.cwd().and_then(Path::to_str).map(str::to_string),
     };
     let anchor = anchor.as_deref();
@@ -81,7 +98,10 @@ pub fn split_root(canon: &str) -> (&str, &str) {
 /// `with_var`: the resolved one first, then as spelled. Empty when the value
 /// is not an absolute Windows path. No variables are expanded in it.
 pub(crate) fn value_forms(value: &Path, vars: &PathVars) -> Vec<String> {
-    let Some(spelled) = value.to_str().and_then(|v| absolute_text(v, None, vars)) else {
+    let Some(spelled) = value
+        .to_str()
+        .and_then(|v| absolute_text(v, None, vars).ok())
+    else {
         return Vec::new();
     };
     let real = resolved(&spelled, vars);
@@ -126,7 +146,7 @@ fn resolved_with(canon: &str, vars: &PathVars, os: impl Fn(&str) -> Option<Strin
     let mut head = canon;
     for _ in 0..RESOLVE_TRIES {
         // What the OS returns is a real name: no variables to expand in it.
-        if let Some(real) = os(head).and_then(|r| absolute_text(&r, None, vars)) {
+        if let Some(real) = os(head).and_then(|r| absolute_text(&r, None, vars).ok()) {
             let tail = canon[head.len()..].trim_start_matches('/');
             return if tail.is_empty() {
                 real
@@ -192,28 +212,42 @@ fn lookup(name: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> {
     }
 }
 
-/// `raw` with its variables replaced. `None` for what looks like a variable
+/// `lookup`, saying why there is no value: the working directory's own
+/// variables are `NoAnchor` when it is unknown, as a relative path is.
+fn var(name: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, Unread> {
+    lookup(name, cwd, vars).ok_or_else(|| {
+        let of_cwd = name.eq_ignore_ascii_case("PWD") || name.eq_ignore_ascii_case("CD");
+        if of_cwd && cwd.is_none() {
+            Unread::NoAnchor
+        } else {
+            Unread::Unreadable("a variable with no known value")
+        }
+    })
+}
+
+/// `raw` with its variables replaced. An error for what looks like a variable
 /// and has no value, except a bare `$name` inside a path: `$` is an ordinary
 /// character there (`C:\$Recycle.Bin`, `\\host\c$`).
-fn expand_vars(raw: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> {
+fn expand_vars(raw: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, Unread> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     if let Some(after) = rest.strip_prefix('~') {
         let end = after.find(['/', '\\']);
         match (&after[..end.unwrap_or(after.len())], end) {
             ("", _) => {
-                out.push_str(&lookup("HOME", cwd, vars)?);
+                out.push_str(&var("HOME", cwd, vars)?);
                 rest = after;
             }
             ("+", _) => {
-                out.push_str(cwd?);
+                out.push_str(cwd.ok_or(Unread::NoAnchor)?);
                 rest = &after[1..];
             }
-            ("-", _) => return None,
+            ("-", _) => return Err(Unread::Unreadable("the previous directory, `~-`")),
             // `~name/…`, as bash reads it: a sibling of this profile dir.
             (_, Some(_)) => {
-                let home = lookup("HOME", cwd, vars)?;
-                out.push_str(home.rsplit_once('/')?.0);
+                let home = var("HOME", cwd, vars)?;
+                let parent = home.rsplit_once('/').map(|(parent, _)| parent);
+                out.push_str(parent.ok_or(Unread::Unreadable("another user's home"))?);
                 out.push('/');
                 rest = after;
             }
@@ -235,18 +269,18 @@ fn expand_vars(raw: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> 
         rest = &tail[used..];
     }
     out.push_str(rest);
-    Some(out)
+    Ok(out)
 }
 
 /// The expansion of the `%…` at the start of `s` and the bytes it used. A `%`
 /// that does not open a variable (`100%.txt`, `%%`) is itself.
-fn percent_var(s: &str, cwd: Option<&str>, vars: &PathVars) -> Option<(String, usize)> {
+fn percent_var(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<(String, usize), Unread> {
     let name = s[1..].find('%').map(|end| &s[1..1 + end]);
     match name {
         Some(n) if !n.is_empty() && !n.contains(['/', '\\', ':']) => {
-            Some((lookup(n, cwd, vars)?, n.len() + 2))
+            Ok((var(n, cwd, vars)?, n.len() + 2))
         }
-        _ => Some(("%".to_string(), 1)),
+        _ => Ok(("%".to_string(), 1)),
     }
 }
 
@@ -256,16 +290,18 @@ fn dollar_var(
     at_start: bool,
     cwd: Option<&str>,
     vars: &PathVars,
-) -> Option<(String, usize)> {
+) -> Result<(String, usize), Unread> {
     let after = &s[1..];
     if after.starts_with('(') {
-        return None;
+        return Err(Unread::Unreadable("a command substitution"));
     }
     if let Some(inner) = after.strip_prefix('{') {
-        let end = inner.find('}')?;
+        let end = inner
+            .find('}')
+            .ok_or(Unread::Unreadable("an unterminated `${`"))?;
         let name = &inner[..end];
         let name = strip_ci(name, "env:").unwrap_or(name);
-        return Some((lookup(name, cwd, vars)?, end + 3));
+        return Ok((var(name, cwd, vars)?, end + 3));
     }
     let word = |t: &str| {
         t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -274,18 +310,18 @@ fn dollar_var(
     if let Some(env) = strip_ci(after, "env:") {
         let n = word(env);
         if n == 0 {
-            return None;
+            return Err(Unread::Unreadable("a `$env:` with no name"));
         }
-        return Some((lookup(&env[..n], cwd, vars)?, "$env:".len() + n));
+        return Ok((var(&env[..n], cwd, vars)?, "$env:".len() + n));
     }
     let n = word(after);
     if n == 0 || after.as_bytes()[0].is_ascii_digit() {
-        return Some(("$".to_string(), 1));
+        return Ok(("$".to_string(), 1));
     }
-    match lookup(&after[..n], cwd, vars) {
-        Some(v) => Some((v, n + 1)),
-        None if at_start => None,
-        None => Some(("$".to_string(), 1)),
+    match var(&after[..n], cwd, vars) {
+        Ok(v) => Ok((v, n + 1)),
+        Err(e) if at_start => Err(e),
+        Err(_) => Ok(("$".to_string(), 1)),
     }
 }
 
@@ -309,10 +345,16 @@ fn drive_letter(seg: &str) -> Option<char> {
 }
 
 /// `s` (variables already expanded) made absolute. `cwd` is canonical.
-fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> {
-    if s.is_empty() || illegal(s) {
-        return None;
+fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Result<String, Unread> {
+    if s.is_empty() {
+        return Err(Unread::NoAnchor);
     }
+    if illegal(s) {
+        return Err(Unread::Unreadable(
+            "a character Windows refuses or reads as a wildcard",
+        ));
+    }
+    let cwd_root = || cwd.map(split_root).ok_or(Unread::NoAnchor);
     let t = s.replace('\\', "/");
     let device_ns = ["//?/", "//./"]
         .iter()
@@ -320,9 +362,9 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> 
         // `/??/x` written with slashes is a glob, not the NT namespace.
         .or_else(|| t.strip_prefix("/??/").filter(|_| s.starts_with('\\')));
     let (root, rest): (String, String) = if let Some(after) = device_ns {
-        device(after, vars)?
+        device(after, vars).ok_or(Unread::Unreadable("a device namespace path"))?
     } else if t.starts_with("//") && !t.starts_with("///") {
-        unc(&t[2..], vars)?
+        unc(&t[2..], vars).ok_or(Unread::Unreadable("a UNC path with no usable host"))?
     } else if let Some(body) = t.strip_prefix('/') {
         // Three or more slashes are one to Git Bash.
         let body = body.trim_start_matches('/');
@@ -330,19 +372,23 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> 
         // can be Git Bash's drive form.
         match s.starts_with('/').then(|| git_bash_drive(body)).flatten() {
             Some((drive, tail)) => (format!("{drive}:/"), tail.to_string()),
-            None => (split_root(cwd?).0.to_string(), body.to_string()),
+            None => (cwd_root()?.0.to_string(), body.to_string()),
         }
     } else if t.chars().nth(1) == Some(':') {
-        let drive = drive_letter(t.chars().next()?.encode_utf8(&mut [0; 4]))?;
+        let first = t.chars().next().unwrap_or(':');
+        let drive = drive_letter(first.encode_utf8(&mut [0; 4]))
+            .ok_or(Unread::Unreadable("a drive that is not a letter"))?;
         let after = &t[2..];
         match after.strip_prefix('/') {
             Some(tail) => (format!("{drive}:/"), tail.to_string()),
             // `C:x` is relative to that drive's own working directory; only
             // the current drive's is known.
             None => {
-                let (root, base) = split_root(cwd?);
+                let (root, base) = cwd_root()?;
                 if !root.starts_with(drive) {
-                    return None;
+                    return Err(Unread::Unreadable(
+                        "a path relative to another drive's working directory",
+                    ));
                 }
                 (root.to_string(), format!("{base}/{after}"))
             }
@@ -353,12 +399,12 @@ fn absolute_text(s: &str, cwd: Option<&str>, vars: &PathVars) -> Option<String> 
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         });
         if is_ps_drive {
-            return None;
+            return Err(Unread::Unreadable("a PowerShell drive"));
         }
-        let (root, base) = split_root(cwd?);
+        let (root, base) = cwd_root()?;
         (root.to_string(), format!("{base}/{t}"))
     };
-    Some(assemble(&root, &rest))
+    Ok(assemble(&root, &rest))
 }
 
 /// `body` (no leading slash) as a Git Bash, Cygwin or WSL drive path.
@@ -514,6 +560,7 @@ mod tests {
     use crate::builtins::builtin_packs;
     use crate::canon::{path_forms, PathStyle};
     use crate::engine::{AllowTrace, Decision, Engine};
+    use crate::pack::load_pack_str;
     use crate::pathrule::Access;
 
     fn vars() -> PathVars {
@@ -1031,18 +1078,136 @@ mod tests {
         }
     }
 
-    /// `Unjudgeable`, never a clean `NoMatch`: the audit shows what the guard
-    /// could not read. Whether that should deny is the engine's policy.
+    const UNREADABLE: &[&str] = &[
+        r"%NOPE%\.ssh\id_rsa",
+        r"C:\Users\%NOPE%\.ssh\id_rsa",
+        r"$env:NOPE\.ssh\id_rsa",
+        r"${env:NOPE}\.ssh\id_rsa",
+        r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\Users\a\.ssh\id_rsa",
+        r"\\?\GLOBALROOT\Device\HarddiskVolume1\Users\a\.ssh\id_rsa",
+        r"\\.\PhysicalDrive0",
+        r"HKLM:\SOFTWARE\x",
+        r"D:.env",
+        r"C:\Users\a\.ssh\id_rs<",
+    ];
+
+    fn assert_unreadable_deny(d: &Decision, raw: &str) {
+        match d {
+            Decision::Deny { pack, reason, .. } => {
+                assert_eq!(pack, "guard.winpath", "{raw}");
+                assert!(reason.contains("cannot read the Windows path"), "{reason}");
+            }
+            other => panic!("{raw}: {other:?}"),
+        }
+    }
+
     #[test]
-    fn an_unreadable_spelling_is_unjudgeable_in_the_engine() {
+    fn an_unreadable_spelling_is_denied_by_the_engine() {
         let e = secrets_engine(vars());
+        for raw in UNREADABLE {
+            let d = e.evaluate_path(Access::Read, raw);
+            assert_unreadable_deny(&d, raw);
+            assert_unreadable_deny(&e.evaluate_path(Access::Write, raw), raw);
+        }
+        // The reason says which path and why.
+        match e.evaluate_path(Access::Read, r"%NOPE%\x") {
+            Decision::Deny { reason, .. } => {
+                assert!(reason.contains("%NOPE%"), "{reason}");
+                assert!(reason.contains("no known value"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A command, end to end: the lexer, `operands` and `judge_operands`.
+    #[test]
+    fn an_unreadable_shell_operand_is_denied() {
+        let e = secrets_engine(vars());
+        for raw in UNREADABLE {
+            for cmd in [
+                format!("cat '{raw}'"),
+                format!("cp '{raw}' /c/p/out"),
+                format!("cp /c/p/in '{raw}'"),
+                format!("rm '{raw}'"),
+                format!("echo hi > '{raw}'"),
+                format!("git status; cat '{raw}'"),
+            ] {
+                assert_unreadable_deny(&e.evaluate(&cmd), &cmd);
+            }
+            // Escaped for the double quotes, so the inner shell sees `raw`.
+            let escaped = raw.replace('\\', r"\\");
+            let nested = format!("bash -c \"cat '{escaped}'\"");
+            assert_unreadable_deny(&e.evaluate(&nested), &nested);
+        }
+        // A `cd` to where nothing can be judged would hide what follows.
+        for cmd in [
+            r"cd '\\?\Volume{1}\Users\a\.ssh' && cat id_rsa",
+            r"pushd '%NOPE%' && cat id_rsa",
+        ] {
+            assert_unreadable_deny(&e.evaluate(cmd), cmd);
+        }
+        // Ordinary commands and odd but readable names stay allowed.
+        for cmd in [
+            "git status",
+            "cat README.md",
+            r"cat 'C:\p\100%.txt'",
+            r"cat 'C:\$Recycle.Bin\x'",
+            r"cd 'C:\q' && cat notes.txt",
+            "cd - && cat notes.txt",
+        ] {
+            assert!(!e.evaluate(cmd).is_deny(), "{cmd}");
+        }
+    }
+
+    /// With no path rule active nothing is protected: nothing to fail closed for.
+    #[test]
+    fn no_path_rules_means_no_unreadable_deny() {
+        let e = Engine::new(Vec::new()).with_paths(vars());
+        assert!(matches!(
+            e.evaluate_path(Access::Read, r"%NOPE%\x"),
+            Decision::Allow {
+                trace: AllowTrace::Unjudgeable { .. }
+            }
+        ));
+        assert!(!e.evaluate(r"cat '%NOPE%\x'").is_deny());
+    }
+
+    /// A relative path with no working directory is what POSIX style makes of
+    /// it: `Unjudgeable` from a file tool, skipped in a command.
+    #[test]
+    fn relative_without_a_cwd_keeps_the_posix_behaviour() {
+        let win = secrets_engine(
+            PathVars::new()
+                .with_style(PathStyle::Windows)
+                .with_var("USERPROFILE", r"C:\Users\a"),
+        );
+        let posix = secrets_engine(
+            PathVars::new()
+                .with_style(PathStyle::Posix)
+                .with_var("HOME", "/nonexistent-p19a/home"),
+        );
+        for raw in ["notes.txt", "x/notes.txt", ".env", "../x"] {
+            let d = win.evaluate_path(Access::Read, raw);
+            assert_eq!(
+                d,
+                Decision::Allow {
+                    trace: AllowTrace::Unjudgeable {
+                        reason: format!("cannot resolve {raw:?} to an absolute path"),
+                    }
+                },
+                "{raw}"
+            );
+            if !cfg!(windows) {
+                assert_eq!(posix.evaluate_path(Access::Read, raw), d, "{raw}");
+            }
+        }
+        // Windows-only spellings that also need the working directory.
         for raw in [
-            r"%NOPE%\.ssh\id_rsa",
-            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\Users\a\.ssh\id_rsa",
+            r"..\x", r"\x", "/etc/x", "C:x", r"$PWD\x", r"%CD%\x", r"~+\x",
         ] {
             assert!(
                 matches!(
-                    e.evaluate_path(Access::Read, raw),
+                    win.evaluate_path(Access::Read, raw),
                     Decision::Allow {
                         trace: AllowTrace::Unjudgeable { .. }
                     }
@@ -1050,6 +1215,148 @@ mod tests {
                 "{raw}"
             );
         }
+        for cmd in ["cat notes.txt", "cp notes.txt other.txt"] {
+            let d = win.evaluate(cmd);
+            assert_eq!(
+                d,
+                Decision::Allow {
+                    trace: AllowTrace::NoMatch
+                },
+                "{cmd}"
+            );
+            if !cfg!(windows) {
+                assert_eq!(posix.evaluate(cmd), d, "{cmd}");
+            }
+        }
+        // What cannot be read is denied with or without a working directory.
+        for raw in [r"%NOPE%\x", r"\\?\Volume{1}\x"] {
+            assert_unreadable_deny(&win.evaluate_path(Access::Read, raw), raw);
+            let cmd = format!("cat '{raw}'");
+            assert_unreadable_deny(&win.evaluate(&cmd), raw);
+        }
+    }
+
+    /// The same text under POSIX is an ordinary file name.
+    #[test]
+    fn posix_style_does_not_deny_the_same_text() {
+        if cfg!(windows) {
+            return;
+        }
+        let e = secrets_engine(
+            PathVars::new()
+                .with_style(PathStyle::Posix)
+                .with_cwd("/nonexistent-p19a/p")
+                .with_var("HOME", "/nonexistent-p19a/home"),
+        );
+        let clean = Decision::Allow {
+            trace: AllowTrace::NoMatch,
+        };
+        for raw in UNREADABLE {
+            assert_eq!(e.evaluate_path(Access::Read, raw), clean, "{raw}");
+            assert_eq!(e.evaluate(&format!("cat '{raw}'")), clean, "{raw}");
+        }
+        assert_eq!(e.evaluate(r"cd '%NOPE%' && cat notes.txt"), clean);
+    }
+
+    const MIXED_CASE_PACK: &str = r#"
+[pack]
+id = "test.mixed"
+
+[[deny_path]]
+glob = "**/Secrets/TOKEN.*"
+access = "read"
+reason = "token"
+
+[[allow_path]]
+glob = "**/Secrets/TOKEN.Example"
+access = "read"
+reason = "template"
+
+[[deny_path]]
+glob = "~/MyKeys/**"
+access = "any"
+reason = "keys"
+
+[[deny_path]]
+glob = "**/ΑΣ/Å.txt"
+access = "read"
+reason = "non-ASCII"
+
+[[deny_path]]
+glob = "$SAIIFE_DATA_DIR/Audit"
+access = "write"
+reason = "data dir"
+ancestors = true
+"#;
+
+    /// The engine never folds the path it judges: the folded glob and the
+    /// regex's `(?i)` must cover every matcher between them, in any case mix
+    /// on either side.
+    #[test]
+    fn mixed_case_rules_match_any_case() {
+        let mut w = Vec::new();
+        let pack = load_pack_str("<t>", MIXED_CASE_PACK, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        let e = Engine::new(vec![pack])
+            .with_paths(vars().with_var("SAIIFE_DATA_DIR", r"C:\Users\a\AppData\Local\Saiife"));
+        for raw in [
+            r"C:\p\Secrets\TOKEN.txt",
+            r"C:\p\secrets\token.txt",
+            r"C:\P\SECRETS\TOKEN.TXT",
+            r"c:\p\sEcReTs\tOkEn.TxT",
+            r"secrets\token.txt",
+            r"~\mykeys\a",
+            r"~\MYKEYS",
+            r"C:\USERS\A\mykeys\a",
+            r"c:\p\ασ\å.txt",
+            r"c:\p\ας\Å.TXT",
+            r"c:\p\ΑΣ\å.txt",
+        ] {
+            assert!(e.evaluate_path(Access::Read, raw).is_deny(), "{raw}");
+        }
+        // The allow rule carves out in any case too.
+        for raw in [r"C:\p\Secrets\TOKEN.Example", r"c:\p\secrets\token.example"] {
+            assert!(
+                matches!(
+                    e.evaluate_path(Access::Read, raw),
+                    Decision::Allow {
+                        trace: AllowTrace::AllowRule { .. }
+                    }
+                ),
+                "{raw}"
+            );
+        }
+        // Ancestor rules: removing a directory above the data dir.
+        for raw in [
+            r"C:\",
+            r"c:\users",
+            r"C:\USERS\A\APPDATA\LOCAL",
+            r"C:\Users\a\AppData\Local\saiife",
+        ] {
+            assert!(e.evaluate_path(Access::Write, raw).is_deny(), "{raw}");
+        }
+        assert!(!e.evaluate_path(Access::Write, r"c:\users\b").is_deny());
+        // And through a command.
+        assert!(e.evaluate(r"cat 'C:\P\SECRETS\token.txt'").is_deny());
+        assert!(e.evaluate(r"rm -rf 'C:\USERS\A\APPDATA'").is_deny());
+        assert!(!e.evaluate(r"cat 'C:\P\notes.txt'").is_deny());
+    }
+
+    /// POSIX stays case-sensitive on the same rules (off macOS, which folds).
+    #[test]
+    fn mixed_case_rules_stay_exact_under_posix() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let mut w = Vec::new();
+        let pack = load_pack_str("<t>", MIXED_CASE_PACK, &mut w).unwrap();
+        let e = Engine::new(vec![pack]).with_paths(
+            PathVars::new()
+                .with_style(PathStyle::Posix)
+                .with_cwd("/nonexistent-p19a/p"),
+        );
+        assert!(e.evaluate_path(Access::Read, "Secrets/TOKEN.txt").is_deny());
+        assert!(!e.evaluate_path(Access::Read, "secrets/token.txt").is_deny());
     }
 
     #[test]
