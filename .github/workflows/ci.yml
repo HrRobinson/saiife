@@ -43,13 +43,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-windows-sign-mode.sh
       # install.ps1 against a fake file:// release (parses both scripts first).
-      - name: install.ps1
+      - name: install.ps1 (PowerShell 7)
         if: matrix.os == 'windows-latest'
         shell: pwsh
-        run: |
-          pwsh -File scripts/test-install.ps1
-          # Windows PowerShell 5.1 is what users have.
-          powershell -NoProfile -File scripts/test-install.ps1
+        run: ./scripts/test-install.ps1
+      # Windows PowerShell 5.1 is what users have.
+      - name: install.ps1 (Windows PowerShell 5.1)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ./scripts/test-install.ps1
       # The macOS managed hook against a live `daemon --system` (plan 13):
       # p95 of 50 calls per payload within 40 ms. The script needs bash 5
       # (EPOCHREALTIME); the runner's /bin/bash is 3.2, so Homebrew's.

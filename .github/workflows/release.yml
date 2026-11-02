@@ -120,7 +120,10 @@ jobs:
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${asset}"
           echo "${LLVM_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/p19a-llvm"
-          tar --zstd -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/p19a-llvm" --strip-components=1
+          # System32 bsdtar reads .zst natively and takes drive paths; Git Bash's
+          # GNU tar would read "D:" as a remote host.
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$RUNNER_TEMP/$asset")" \
+            -C "$(cygpath -w "$RUNNER_TEMP/p19a-llvm")" --strip-components=1
           bindir="$(cygpath -w "$RUNNER_TEMP/p19a-llvm/bin")"
           echo "$bindir" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/p19a-llvm/bin/clang" --version
