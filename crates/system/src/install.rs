@@ -123,14 +123,15 @@ pub(crate) fn refused(path: &Path, detail: impl Into<String>) -> InstallError {
 }
 
 /// The last line of a failed install that had not begun to change anything
-/// (the pkg's `postinstall` matches on it).
+/// (the pkg's `postinstall` matches on it). True except for the lock file,
+/// [`INSTALL_LOCK`], which is empty and protects nothing but install itself.
 pub const NOTHING_CHANGED: &str = "saiife: nothing was changed";
 
 /// How long install waits for another install to finish.
 #[cfg(not(test))]
-const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(120);
+pub(crate) const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(120);
 #[cfg(test)]
-const INSTALL_LOCK_WAIT: Duration = Duration::from_millis(300);
+pub(crate) const INSTALL_LOCK_WAIT: Duration = Duration::from_millis(300);
 
 /// Held for one `system install`: an MDM can overlap the pkg's postinstall
 /// and its own fleet script. Released when dropped, or when the process ends.
@@ -152,11 +153,21 @@ fn lock_install_within(
     sip_seam: bool,
     wait: Duration,
 ) -> Result<InstallLock, InstallError> {
-    use rustix::fs::{flock, FlockOperation, Mode, OFlags};
+    host_refusals(layout, host, sip_seam)?;
+    take_install_lock(layout, host, wait)
+}
+
+/// Takes [`INSTALL_LOCK`] with no host checks: `system uninstall --purge`
+/// must work on a host install would refuse. The caller checked it is root.
+pub(crate) fn take_install_lock(
+    layout: &Layout,
+    host: &dyn Host,
+    wait: Duration,
+) -> Result<InstallLock, InstallError> {
+    use rustix::fs::{flock, FlockOperation};
     use rustix::io::Errno;
     use std::os::unix::fs::MetadataExt;
 
-    host_refusals(layout, host, sip_seam)?;
     let shown = Path::new(INSTALL_LOCK);
     let path = layout.at(INSTALL_LOCK);
     if !layout.is_system() {
@@ -164,20 +175,63 @@ fn lock_install_within(
             std::fs::create_dir_all(parent).map_err(step("lock"))?;
         }
     }
+    let start = Instant::now();
+    // More than once only when `--purge` removed the file while this waited.
+    loop {
+        let file = open_install_lock(host, shown, &path)?;
+        loop {
+            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(Errno::WOULDBLOCK | Errno::INTR) => {}
+                Err(e) => return Err(refused(shown, format!("cannot lock: {e}"))),
+            }
+            if start.elapsed() >= wait {
+                return Err(InstallError::Step {
+                    step: "lock".into(),
+                    detail: format!(
+                        "another saiife system install or purge holds {INSTALL_LOCK}; gave up \
+                         after {} s. Nothing was changed: run it again when that has finished",
+                        wait.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // A lock on a file no longer at the path excludes nobody.
+        let held = file
+            .metadata()
+            .map_err(|e| refused(shown, format!("cannot stat: {e}")))?;
+        let current = std::fs::symlink_metadata(&path).ok();
+        if current.is_some_and(|m| m.dev() == held.dev() && m.ino() == held.ino()) {
+            return Ok(InstallLock { _file: file });
+        }
+    }
+}
+
+/// The lock file, opened with `O_NOFOLLOW` and made if it is missing.
+fn open_install_lock(
+    host: &dyn Host,
+    shown: &Path,
+    path: &Path,
+) -> Result<std::fs::File, InstallError> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+    use std::os::unix::fs::MetadataExt;
+
     let not_a_symlink = |e: Errno| match e {
         Errno::LOOP => refused(shown, "is a symlink; saiife does not use it"),
         e => refused(shown, format!("cannot open: {e}")),
     };
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     // A file made here is ours. One that was there must prove it is root's.
-    let file = match rustix::fs::open(
-        &path,
+    match rustix::fs::open(
+        path,
         flags | OFlags::CREATE | OFlags::EXCL,
         Mode::from_raw_mode(0o600),
     ) {
-        Ok(fd) => std::fs::File::from(fd),
+        Ok(fd) => Ok(std::fs::File::from(fd)),
         Err(Errno::EXIST) => {
-            let fd = rustix::fs::open(&path, flags, Mode::empty()).map_err(not_a_symlink)?;
+            let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(not_a_symlink)?;
             let file = std::fs::File::from(fd);
             let m = file
                 .metadata()
@@ -192,7 +246,7 @@ fn lock_install_within(
                     "is not a regular file; saiife does not use it",
                 ));
             }
-            if host.owner_uid(&path, m.uid()) != root_uid {
+            if host.owner_uid(path, m.uid()) != root_uid {
                 return Err(refused(
                     shown,
                     "is not owned by root; saiife does not use it",
@@ -204,28 +258,9 @@ fn lock_install_within(
                     "gives access to group or others; saiife does not use it",
                 ));
             }
-            file
+            Ok(file)
         }
-        Err(e) => return Err(not_a_symlink(e)),
-    };
-    let start = Instant::now();
-    loop {
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(InstallLock { _file: file }),
-            Err(Errno::WOULDBLOCK | Errno::INTR) => {}
-            Err(e) => return Err(refused(shown, format!("cannot lock: {e}"))),
-        }
-        if start.elapsed() >= wait {
-            return Err(InstallError::Step {
-                step: "lock".into(),
-                detail: format!(
-                    "another saiife system install holds {INSTALL_LOCK}; gave up after {} s. \
-                     Nothing was changed: run install again when it has finished",
-                    wait.as_secs()
-                ),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        Err(e) => Err(not_a_symlink(e)),
     }
 }
 
@@ -2079,7 +2114,7 @@ pub(crate) mod tests {
             assert!(start.elapsed() >= INSTALL_LOCK_WAIT);
             let text = err.to_string();
             assert!(
-                text.starts_with("lock: another saiife system install holds"),
+                text.starts_with("lock: another saiife system install or purge holds"),
                 "{text}"
             );
             assert!(text.contains(INSTALL_LOCK), "{text}");
@@ -2100,6 +2135,34 @@ pub(crate) mod tests {
             assert!(!e.at(ETC_DIR).exists());
             drop(first);
             assert!(e.run(&all_agents()).is_ok());
+        }
+
+        /// `--purge` unlinks the file: a waiter must not then run on a lock
+        /// that excludes nobody.
+        #[test]
+        fn a_waiter_relocks_when_the_file_was_removed() {
+            use std::os::unix::fs::MetadataExt;
+            let e = env(255);
+            let first = lock_install(&e.layout, &e.host).expect("first");
+            let path = e.layout.at(INSTALL_LOCK);
+            let old_ino = fs::metadata(&path).unwrap().ino();
+            let got = std::thread::scope(|s| {
+                let waiter =
+                    s.spawn(|| take_install_lock(&e.layout, &e.host, Duration::from_secs(10)));
+                std::thread::sleep(Duration::from_millis(150));
+                // As --purge does: gone from the path while held, then
+                // released. Renamed, not removed, so the inode number cannot
+                // be used again for the new file.
+                let keep = path.with_extension("old");
+                fs::rename(&path, &keep).unwrap();
+                drop(first);
+                waiter.join().unwrap()
+            });
+            let lock = got.expect("relocked");
+            let held = lock._file.metadata().unwrap();
+            let now = fs::metadata(&path).unwrap();
+            assert_ne!(now.ino(), old_ino);
+            assert_eq!(held.ino(), now.ino(), "the lock is on the file at the path");
         }
 
         fn began(e: &crate::install::tests::Env) -> (bool, bool) {

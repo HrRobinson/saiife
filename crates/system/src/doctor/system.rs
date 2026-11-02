@@ -715,8 +715,10 @@ fn files_package(ctx: &Ctx) -> Option<Check> {
 /// `/usr`, which is not itself checked, must be no symlink, root's, and not
 /// writable by group or others. `/usr/local` has no SIP protection, so on
 /// macOS each must also have no ACL: one can grant write that the mode bits
-/// do not show. std has no API for ACLs, so `ls -ld` shows it, as a `+`. Not
-/// on Linux, whose package path is below the distribution's `/usr`.
+/// do not show. std has no API for ACLs, so `ls -lde` shows them, on lines of
+/// their own (the `+` after the mode alone is not enough: `@` replaces it when
+/// the path also has an extended attribute). Not on Linux, whose package path
+/// is below the distribution's `/usr`.
 fn package_path_problem(ctx: &Ctx) -> Option<String> {
     let root = ctx.host.user("root")?;
     let logical = Path::new(shown(ctx, PACKAGE_BINARY));
@@ -745,15 +747,22 @@ fn package_path_problem(ctx: &Ctx) -> Option<String> {
             let path = at.to_string_lossy();
             let ls = ctx.host.run(
                 "/bin/ls",
-                &["-ld", &path],
+                &["-lde", &path],
                 std::time::Duration::from_secs(5),
             );
-            let mode = match &ls {
-                Ok(out) if out.status == 0 => out.stdout.split_whitespace().next(),
+            let listing = match &ls {
+                Ok(out) if out.status == 0 && !out.stdout.trim().is_empty() => {
+                    Some(out.stdout.as_str())
+                }
                 _ => None,
             };
-            match mode {
-                Some(m) if m.contains('+') => return Some(format!("{shown}: has an ACL")),
+            match listing {
+                Some(l) if l.trim_end().lines().count() > 1 => {
+                    return Some(format!("{shown}: has an ACL"))
+                }
+                Some(l) if l.split_whitespace().next().is_some_and(|m| m.contains('+')) => {
+                    return Some(format!("{shown}: has an ACL"))
+                }
                 Some(_) => {}
                 None => return Some(format!("{shown}: cannot check for an ACL")),
             }
@@ -2759,8 +2768,12 @@ mod macos_tests {
         assert_eq!(c.status, s, "{id}: {c:?}\n{}", r.to_text());
     }
 
-    /// What `ls -ld` says for each step of the staging path.
+    /// What `ls -lde` says for each step of the staging path.
     fn staging_ls(e: &MacEnv, mode: &str) {
+        staging_ls_entries(e, mode, "")
+    }
+
+    fn staging_ls_entries(e: &MacEnv, mode: &str, entries: &str) {
         let root = e.layout.root().to_path_buf();
         e.host.set(|s| {
             for p in [
@@ -2770,8 +2783,8 @@ mod macos_tests {
                 "usr/local/libexec/saiife/saiife",
             ] {
                 s.run.insert(
-                    format!("/bin/ls -ld {}", root.join(p).display()),
-                    ok(&format!("{mode} 1 root wheel 0 Nov 2 07:00 {p}\n")),
+                    format!("/bin/ls -lde {}", root.join(p).display()),
+                    ok(&format!("{mode} 1 root wheel 0 Nov 2 07:00 {p}\n{entries}")),
                 );
             }
         });
@@ -3126,6 +3139,22 @@ mod macos_tests {
             "{}",
             get(&r, "files.package").detail
         );
+        // "@" replaces the "+" when there is an extended attribute too: the
+        // entry line is what shows the ACL.
+        staging_ls_entries(&e, "drwxr-xr-x@", " 0: group:everyone allow write\n");
+        let r = doctor(&e);
+        assert_status(&r, "files.package", Status::Warn);
+        assert!(
+            get(&r, "files.package")
+                .detail
+                .starts_with("/usr/local: has an ACL: "),
+            "{}",
+            get(&r, "files.package").detail
+        );
+        // An extended attribute alone is no ACL.
+        staging_ls(&e, "drwxr-xr-x@");
+        assert_status(&doctor(&e), "files.package", Status::Pass);
+
         // Could not look: not taken as clean.
         e.host
             .set(|s| s.run.retain(|k, _| !k.starts_with("/bin/ls ")));

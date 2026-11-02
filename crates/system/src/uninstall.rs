@@ -7,8 +7,8 @@ use crate::authright;
 use crate::fsops;
 use crate::host::{Host, SECURITY};
 use crate::install::{
-    beneath_links, check_trusted_owner_mode, read_previous, root_group, step, InstallError,
-    MACOS_TOOL_TIMEOUT, PREVIOUS,
+    beneath_links, check_trusted_owner_mode, read_previous, root_group, step, take_install_lock,
+    InstallError, INSTALL_LOCK_WAIT, MACOS_TOOL_TIMEOUT, PREVIOUS,
 };
 use crate::launchd;
 use crate::layout::*;
@@ -32,6 +32,13 @@ pub fn uninstall(
     if layout.is_system() && host.euid() != 0 {
         return Err(InstallError::NotRoot);
     }
+    // --purge removes the lock file: it takes the lock first, so it never
+    // unlinks one an install holds. Held until purge returns.
+    let _lock = if opts.purge {
+        Some(take_install_lock(layout, host, INSTALL_LOCK_WAIT)?)
+    } else {
+        None
+    };
     let installed_path = layout.at(INSTALLED);
     // 1. Nothing listed, nothing to do. After a plain uninstall, `--purge`
     // still finds what install created in the copy in the state dir.
@@ -44,7 +51,10 @@ pub fn uninstall(
         Some(r) => r,
         None if opts.purge => match read_previous(layout, host) {
             Some(r) => r,
-            None => return Ok(Vec::new()),
+            None => {
+                fsops::remove_if_listed(&layout.at(INSTALL_LOCK)).map_err(step("lock"))?;
+                return Ok(Vec::new());
+            }
         },
         None => return Ok(Vec::new()),
     };
@@ -631,6 +641,22 @@ mod tests {
         );
     }
 
+    /// --purge unlinks the lock file, so it must hold the lock to do it.
+    #[test]
+    fn purge_waits_for_an_install_and_removes_nothing_while_it_runs() {
+        let e = env(249);
+        e.install();
+        let before = e.tree();
+        let held = crate::install::lock_install(&e.layout, &e.host).expect("held");
+        let err = uninstall(&e.layout, &e.host, &UninstallOptions { purge: true })
+            .expect_err("the lock is held");
+        assert!(err.to_string().starts_with("lock: another saiife"), "{err}");
+        assert_eq!(e.tree(), before);
+        drop(held);
+        un(&e, true);
+        assert!(!e.at(INSTALL_LOCK).exists());
+    }
+
     #[test]
     fn purge_removes_all_and_created_users() {
         let e = env(249);
@@ -886,6 +912,8 @@ mod tests {
                 },
             );
         });
+        // The lock file is the caller's too, and would be refused first.
+        fs::remove_file(e.at(INSTALL_LOCK)).unwrap();
         let err = uninstall(&e.layout, &e.host, &UninstallOptions { purge: true }).unwrap_err();
         match &err {
             InstallError::Refused { path, detail } => {

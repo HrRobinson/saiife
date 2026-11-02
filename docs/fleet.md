@@ -475,7 +475,8 @@ just the subset, uninstall, then install again from the fleet files: run
   [Approvals on macOS](install.md#approvals-on-macos-a-second-account).
 - **Overlapping installs.** `system install` holds `/etc/saiife-install.lock` (root
   only) while it runs, on Linux too. Another install waits up to 2 minutes, then
-  exits 2 and changes nothing. `system uninstall --purge` removes the file.
+  exits 2 and changes nothing. `system uninstall --purge` takes the same lock and
+  removes the file.
 - **CI coverage.** CI runs the pkg on real macOS runners, which have SIP off, with
   a test build. It checks the staging refusals and the SIP refusal through the real
   `installer`, then runs the `postinstall`'s command by hand with the test seam,

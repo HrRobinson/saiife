@@ -408,6 +408,8 @@ fn postinstall_in(
         &[
             ("/usr/local", local.display().to_string()),
             ("STAGING_UID=0", format!("STAGING_UID={}", my_uid())),
+            // -e is macOS's; GNU ls refuses it.
+            ("ls -ldne", "ls -ldn".to_string()),
             (
                 r#""$PKG_BIN" system install"#,
                 r#"sh "$PKG_BIN" system install"#.to_string(),
@@ -488,6 +490,7 @@ fn pkg_postinstall_refuses_an_unsafe_staging_path() {
         &[
             ("/usr/local", local.display().to_string()),
             ("STAGING_UID=0", "STAGING_UID=4242".to_string()),
+            ("ls -ldne", "ls -ldn".to_string()),
             ("logger -t", ": -t".to_string()),
         ],
         &["/some/saiife.pkg", "/", "/"],
@@ -556,16 +559,51 @@ fn pkg_postinstall_claims_unchanged_only_when_install_says_so() {
     assert!(!err.contains("may be partial"), "{err}");
 }
 
-/// `ls -ld` here cannot show a macOS ACL, so a stub does: clean mode bits, a
-/// `+` after them.
+/// `ls` here cannot show a macOS ACL, so a stub does: clean mode bits, and
+/// then what macOS prints.
 #[test]
 fn pkg_postinstall_refuses_an_acl() {
+    for listing in [
+        // A "+" after the mode.
+        "drwxr-xr-x+ 3 UID 0 96 Nov  2 07:00 x",
+        // "@" instead of "+": an extended attribute hides it there, and only
+        // the entry line shows the ACL.
+        "drwxr-xr-x@ 3 UID 0 96 Nov  2 07:00 x\n 0: group:everyone allow write",
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let (local, _) = staging_tree(d.path(), 0);
+        let ls = d.path().join("fake-ls");
+        let listing = listing.replace("UID", &my_uid());
+        std::fs::write(&ls, format!("printf '%s\\n' '{listing}'\n")).unwrap();
+        let (rc, out, err) = run_copy(
+            d.path(),
+            POSTINSTALL,
+            &[
+                ("/usr/local", local.display().to_string()),
+                ("STAGING_UID=0", format!("STAGING_UID={}", my_uid())),
+                ("ls -ldne", format!("sh '{}'", ls.display())),
+                ("logger -t", ": -t".to_string()),
+            ],
+            &["/some/saiife.pkg", "/", "/"],
+        );
+        assert_eq!(rc, Some(2), "{listing}: {out}{err}");
+        assert!(!out.contains("called:"), "must not run it: {out}");
+        assert!(
+            err.contains(&format!("{} has an ACL", local.display())),
+            "{listing}: {err}"
+        );
+        assert!(err.contains("chmod -N"), "{err}");
+    }
+    // An extended attribute alone is not an ACL.
     let d = tempfile::tempdir().unwrap();
     let (local, _) = staging_tree(d.path(), 0);
     let ls = d.path().join("fake-ls");
     std::fs::write(
         &ls,
-        format!("echo 'drwxr-xr-x+ 3 {} 0 96 Nov  2 07:00 x'\n", my_uid()),
+        format!(
+            "printf '%s\\n' 'drwxr-xr-x@ 3 {} 0 96 Nov  2 07:00 x'\n",
+            my_uid()
+        ),
     )
     .unwrap();
     let (rc, out, err) = run_copy(
@@ -574,18 +612,17 @@ fn pkg_postinstall_refuses_an_acl() {
         &[
             ("/usr/local", local.display().to_string()),
             ("STAGING_UID=0", format!("STAGING_UID={}", my_uid())),
-            ("ls -ldn", format!("sh '{}'", ls.display())),
+            ("ls -ldne", format!("sh '{}'", ls.display())),
+            (
+                r#""$PKG_BIN" system install"#,
+                r#"sh "$PKG_BIN" system install"#.to_string(),
+            ),
             ("logger -t", ": -t".to_string()),
         ],
         &["/some/saiife.pkg", "/", "/"],
     );
-    assert_eq!(rc, Some(2), "{out}{err}");
-    assert!(!out.contains("called:"), "must not run it: {out}");
-    assert!(
-        err.contains(&format!("{} has an ACL", local.display())),
-        "{err}"
-    );
-    assert!(err.contains("chmod -N"), "{err}");
+    assert_eq!(rc, Some(0), "{out}{err}");
+    assert!(out.contains("called: system install --fleet"), "{out}");
 }
 
 #[test]

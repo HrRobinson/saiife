@@ -15,8 +15,10 @@ PKG_BIN=/usr/local/libexec/saiife/saiife
 # --- staging check: the same in postinstall and both fleet-files.sh ---
 # /usr/local is not protected by SIP, and root runs the staging copy. Prints
 # why it is not safe to run, or nothing: each step must be no symlink, owned
-# by root, not writable by group or others, and with no ACL (a "+" after the
-# mode: an ACL can grant write that the mode bits do not show).
+# by root, not writable by group or others, and with no ACL (one can grant
+# write that the mode bits do not show). ls -e prints ACL entries on lines of
+# their own; the "+" after the mode is not enough, since "@" replaces it when
+# the path also has an extended attribute.
 STAGING_UID=0
 staging_problem() {
     for p in /usr/local /usr/local/libexec /usr/local/libexec/saiife "$PKG_BIN"; do
@@ -24,9 +26,9 @@ staging_problem() {
             echo "$p is a symbolic link"
             return 0
         fi
-        # ls -n is the POSIX way to read a numeric owner.
+        # ls -n is the POSIX way to read a numeric owner; -e is macOS's.
         # shellcheck disable=SC2012
-        if ! line=$(ls -ldn "$p" 2>/dev/null); then
+        if ! line=$(ls -ldne "$p" 2>/dev/null); then
             echo "$p is missing"
             return 0
         fi
@@ -35,6 +37,10 @@ $line
 EOF
         if [ "$uid" != "$STAGING_UID" ]; then
             echo "$p is not owned by root"
+            return 0
+        fi
+        if [ "$(printf '%s\n' "$line" | wc -l)" -gt 1 ]; then
+            echo "$p has an ACL"
             return 0
         fi
         case "$mode" in

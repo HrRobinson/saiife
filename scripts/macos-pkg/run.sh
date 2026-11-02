@@ -118,10 +118,10 @@ first_unsafe() {
             return 0
         fi
         line="$(stat -f '%u %Lp' "$p")"
-        # ls is what shows an ACL, as a "+" after the mode.
+        # ls -e is what shows an ACL, on lines of their own.
         # shellcheck disable=SC2012
         if [[ "${line%% *}" != 0 ]] || (((8#${line##* } & 022) != 0)) ||
-            [[ "$(ls -ld "$p" | cut -d' ' -f1)" == *+* ]]; then
+            (($(ls -lde "$p" | wc -l) > 1)); then
             echo "$p"
             return 0
         fi
@@ -292,6 +292,17 @@ sudo -n chown root:wheel /usr/local/libexec
 sudo -n chmod +a "everyone allow write" /usr/local/libexec
 expect_staging_refusal "an ACL on libexec" /usr/local/libexec
 sudo -n chmod -N /usr/local/libexec
+# With an extended attribute too, ls shows "@" and no "+" after the mode.
+sudo -n xattr -w com.saiife.test x /usr/local/libexec
+sudo -n chmod +a "everyone allow write" /usr/local/libexec
+# shellcheck disable=SC2012
+at_mode="$(ls -ld /usr/local/libexec | cut -d' ' -f1)"
+[[ "$at_mode" == *@ ]] || fail "expected @ after the mode with an xattr and an ACL, got $at_mode"
+ok "ls shows $at_mode for an ACL with an extended attribute"
+expect_staging_refusal "an ACL and an xattr on libexec" /usr/local/libexec
+sudo -n chmod -N /usr/local/libexec
+install_refused "an xattr alone on libexec"
+sudo -n xattr -d com.saiife.test /usr/local/libexec
 [[ -z "$(first_unsafe)" ]] || fail "the dirs are still unsafe: $(first_unsafe)"
 
 phase "6. the fleet install from the staging copy"
@@ -320,6 +331,14 @@ as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor-acl.out" 2>/dev/null || tru
     { cat "$WORK/doctor-acl.out"; fail "doctor files.package does not name the ACL"; }
 sudo -n chmod -N /usr/local/libexec/saiife
 ok "doctor warns on an ACL"
+sudo -n xattr -w com.saiife.test x /usr/local/libexec/saiife
+sudo -n chmod +a "everyone allow write" /usr/local/libexec/saiife
+as_root_seam "$OPT_BIN" doctor --json >"$WORK/doctor-acl.out" 2>/dev/null || true
+[[ "$(jq -r '.checks[] | select(.id == "files.package") | .detail' "$WORK/doctor-acl.out")" == "/usr/local/libexec/saiife: has an ACL"* ]] ||
+    { cat "$WORK/doctor-acl.out"; fail "doctor files.package does not name the ACL beside an xattr"; }
+sudo -n chmod -N /usr/local/libexec/saiife
+sudo -n xattr -d com.saiife.test /usr/local/libexec/saiife
+ok "doctor warns on an ACL beside an extended attribute"
 got="$(as_root_seam sh "$REPO/deploy/jamf/extension-attribute.sh")"
 [[ "$got" == "<result>warn</result>" || "$got" == "<result>pass</result>" ]] || fail "extension attribute: $got"
 ok "extension attribute: $got"
