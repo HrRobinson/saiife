@@ -39,6 +39,45 @@ const NOTE_WORKDIR: &str = "Start-Process changes its working directory";
 const NOTE_START: &str = "Start-Process has no readable program";
 const NOTE_PURGE: &str = "robocopy deletes files in its target";
 const NOTE_ROBOCOPY: &str = "robocopy has no readable source and target";
+const NOTE_FUNCTION: &str = "a function or alias is defined through its drive";
+const NOTE_TOO_LONG: &str = "a path list too long to join";
+
+/// Bytes the paths joined from a list and a name may come to: `ni a,a,… -Name
+/// bbb…` is a product, and the hook runs on every call. Past this they stay
+/// apart, and the note says so.
+const MAX_JOINED: usize = 4 * 1024 * 1024;
+
+/// PowerShell's common parameters, on every cmdlet. None names a path.
+const COMMON: &[(&str, Act)] = &[
+    ("ErrorAction", Act::Skip),
+    ("ea", Act::Skip),
+    ("WarningAction", Act::Skip),
+    ("wa", Act::Skip),
+    ("InformationAction", Act::Skip),
+    ("infa", Act::Skip),
+    ("ProgressAction", Act::Skip),
+    ("proga", Act::Skip),
+    ("ErrorVariable", Act::Skip),
+    ("ev", Act::Skip),
+    ("WarningVariable", Act::Skip),
+    ("wv", Act::Skip),
+    ("InformationVariable", Act::Skip),
+    ("iv", Act::Skip),
+    ("OutVariable", Act::Skip),
+    ("ov", Act::Skip),
+    ("OutBuffer", Act::Skip),
+    ("ob", Act::Skip),
+    ("PipelineVariable", Act::Skip),
+    ("pv", Act::Skip),
+    ("Verbose", Act::Drop),
+    ("vb", Act::Drop),
+    ("Debug", Act::Drop),
+    ("db", Act::Drop),
+    ("WhatIf", Act::Drop),
+    ("wi", Act::Drop),
+    ("Confirm", Act::Drop),
+    ("cf", Act::Drop),
+];
 
 /// What one parameter does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +230,7 @@ const TABLE: &[Row] = &[
         ],
     },
     Row {
-        ps: &["copy-item", "cp", "copy", "cpi"],
+        ps: &["copy-item", "cp", "copy", "cpi", "xcopy"],
         cmd: &["copy", "xcopy"],
         to: To::Cp,
         params: with_literal![
@@ -293,6 +332,25 @@ const TABLE: &[Row] = &[
         cmd: &[],
         to: To::Write,
         params: WRITE_PARAMS,
+        slash: &[],
+    },
+    Row {
+        ps: &["start-transcript", "export-alias"],
+        cmd: &[],
+        to: To::Write,
+        params: with_literal![
+            ("OutputDirectory", Act::Path),
+            ("Name", Act::Skip),
+            ("As", Act::Skip),
+            ("Description", Act::Skip),
+            ("Scope", Act::Skip),
+            ("Append", Act::Drop),
+            ("Force", Act::Drop),
+            ("NoClobber", Act::Drop),
+            ("IncludeInvocationHeader", Act::Drop),
+            ("UseMinimalHeader", Act::Drop),
+            ("PassThru", Act::Drop),
+        ],
         slash: &[],
     },
     Row {
@@ -497,6 +555,10 @@ pub(crate) struct Context<'a> {
     /// `array[i]`: `argv[i]` followed a comma, so it extends the array before
     /// it (`Set-Content a,b hello`: `b` is a path, `hello` the value).
     pub array: &'a [bool],
+    /// `from_quote[i]`: `argv[i]` started with a quote, so it is a string
+    /// even when it reads `-Path:x`. `Word.quoted` cannot tell that from
+    /// `-Path:'x'`, which is the parameter.
+    pub from_quote: &'a [bool],
     pub depth: u32,
 }
 
@@ -543,7 +605,8 @@ pub(crate) fn translate_noted(
     };
     let cmd_mode = dialect == Dialect::Cmd || SLASH_PROGRAMS.contains(&lower.as_str());
     let array = cx.array.get(1..).unwrap_or(&[]);
-    let items = b.parse(row, &argv[1..], array, cmd_mode);
+    let from_quote = cx.from_quote.get(1..).unwrap_or(&[]);
+    let items = b.parse(row, &argv[1..], array, from_quote, cmd_mode);
     let mut out = match row.to {
         To::Rm => b.in_order("rm", items, cx.piped),
         To::Cat => b.in_order("cat", items, cx.piped),
@@ -563,7 +626,93 @@ pub(crate) fn translate_noted(
         To::Start => b.start(items, cx.depth),
     };
     out.append(&mut b.redirects);
+    if out.iter().skip(1).any(|w| names_function_drive(&w.text)) {
+        b.noted(NOTE_FUNCTION);
+    }
     (out, b.note)
+}
+
+/// `function:foo`, `alias:foo`: what is written there is a command later.
+fn names_function_drive(text: &str) -> bool {
+    ["function:", "alias:"].iter().any(|d| {
+        text.get(..d.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(d))
+    })
+}
+
+/// Does the table have a row for this command name?
+fn has_row(lower: &str, dialect: Dialect) -> bool {
+    TABLE.iter().any(|r| match dialect {
+        Dialect::Cmd => r.cmd.contains(&lower),
+        _ => r.ps.contains(&lower),
+    })
+}
+
+/// Path-shaped: it holds a separator or a wildcard, or starts like a relative
+/// or home path. A URL is not one.
+fn path_shaped(text: &str) -> bool {
+    !text.contains("://")
+        && (text.contains(['\\', '/', '*', '?', '['])
+            || text.starts_with('.')
+            || text.starts_with('~'))
+}
+
+/// The default for a command the table and `operands` do not know: `cat` of its
+/// path-shaped non-parameter words, so the read rules see them. `Test-Path
+/// .env` is denied by this, an accepted cost: `Format-Hex`, `Get-FileHash`,
+/// `Send-MailMessage -Attachments`, `notepad` and `certutil` all read, and no
+/// list of them could be complete.
+pub(crate) fn companion_read(seg: &[Word], dialect: Dialect) -> Option<Vec<Word>> {
+    let first = seg.first()?;
+    if first.redirect || first.has_substitution {
+        return None;
+    }
+    let lower = first.text.to_lowercase();
+    if lower == "echo"
+        || lower == "write"
+        || lower.starts_with("write-")
+        || is_nesting_command(&lower)
+        || matches!(lower.as_str(), "invoke-command" | "icm")
+        || has_row(&lower, dialect)
+        || crate::operands::understood(&lower)
+    {
+        return None;
+    }
+    let b = Builder {
+        dialect,
+        note: None,
+        redirects: Vec::new(),
+    };
+    let mut out = vec![plain("cat")];
+    let mut words = seg[1..].iter();
+    while let Some(w) = words.next() {
+        if w.redirect {
+            words.next();
+            continue;
+        }
+        if w.has_substitution {
+            continue;
+        }
+        let value = if is_parameter(w) {
+            param_shape(w).and_then(|(_, v)| v).unwrap_or("")
+        } else if w.text.starts_with("--") {
+            w.text.split_once('=').map_or("", |(_, v)| v)
+        } else if w.text.starts_with('-') {
+            ""
+        } else {
+            w.text.as_str()
+        };
+        if path_shaped(value) {
+            out.push(b.operand(
+                &Word {
+                    text: value.to_string(),
+                    ..w.clone()
+                },
+                false,
+            ));
+        }
+    }
+    (out.len() > 1).then_some(out)
 }
 
 /// A command word without its directory and extension.
@@ -659,6 +808,13 @@ fn home_spelled(text: &str) -> Option<String> {
     None
 }
 
+/// Is every `$` of two joined words literal? One live `$` makes the whole
+/// word live, so the path is read as the shell would expand it.
+fn joined_dollars_literal(a: &Word, b: &Word) -> bool {
+    let fine = |w: &Word| w.literal_dollars || !w.text.contains('$');
+    fine(a) && fine(b) && (a.text.contains('$') || b.text.contains('$'))
+}
+
 /// `\` as `/`, the leading run kept apart: `engine.rs` finds a directory by a
 /// trailing `/` and a base name after the last `/`.
 fn forward(text: &str) -> String {
@@ -696,7 +852,14 @@ impl Builder {
     }
 
     /// The row's words as parameters and positionals; redirections go aside.
-    fn parse(&mut self, row: &Row, args: &[Word], array: &[bool], cmd_mode: bool) -> Vec<Item> {
+    fn parse(
+        &mut self,
+        row: &Row,
+        args: &[Word],
+        array: &[bool],
+        from_quote: &[bool],
+        cmd_mode: bool,
+    ) -> Vec<Item> {
         let mut out = Vec::new();
         let mut done = false;
         let mut seen_pos = false;
@@ -726,16 +889,26 @@ impl Builder {
                     continue;
                 }
             }
-            if !done {
+            if !done && !from_quote.get(at).copied().unwrap_or(false) && is_parameter(w) {
                 if let Some((name, value)) = param_shape(w) {
-                    match lookup(row.params, name) {
+                    match resolve(row.params, name) {
                         Lookup::Found(act) => {
                             let value = take_value(act, value, w, args, &mut i);
+                            let extends = act.takes_value() && value.is_some();
                             out.push(Item::Param {
                                 act,
                                 value,
                                 written: w.clone(),
                             });
+                            // `-Value a,b`: `b` is the parameter's too.
+                            while extends && array.get(i) == Some(&true) && i < args.len() {
+                                out.push(Item::Param {
+                                    act,
+                                    value: Some(args[i].clone()),
+                                    written: w.clone(),
+                                });
+                                i += 1;
+                            }
                             continue;
                         }
                         Lookup::Ambiguous => {
@@ -798,8 +971,16 @@ impl Builder {
         if w.has_substitution {
             return out;
         }
-        if let Some(home) = home_spelled(&out.text) {
-            out.text = home;
+        // In single quotes it is a name, and names no variable to respell.
+        if !out.literal_dollars {
+            if let Some(home) = home_spelled(&out.text) {
+                out.text = home;
+            }
+        }
+        // Only a quoted word gets here with a dash: a file so named, which
+        // `operands` must not read as POSIX options.
+        if out.text.len() > 1 && out.text.starts_with('-') {
+            out.text = format!("./{}", out.text);
         }
         out.text = unc_text(&out.text, PathStyle::host() == PathStyle::Windows);
         let meta: &[char] = match self.dialect {
@@ -901,15 +1082,17 @@ impl Builder {
             target = sources.pop();
         }
         let mut target = target.unwrap_or_else(|| plain("./"));
+        if target.has_substitution {
+            self.noted(NOTE_TARGET);
+        }
         if rename {
             // `-NewName` is a name beside the item, not under the cwd.
-            let parent = sources
-                .first()
-                .filter(|s| !s.has_substitution)
-                .and_then(|s| s.text.rfind('/').map(|at| s.text[..at].to_string()));
-            if let Some(parent) = parent {
+            let source = sources.first().filter(|s| !s.has_substitution);
+            let parent = source.and_then(|s| s.text.rfind('/').map(|at| (s, at)));
+            if let Some((source, at)) = parent {
                 if !target.has_substitution && !target.text.contains('/') {
-                    target.text = format!("{parent}/{}", target.text);
+                    target.literal_dollars = joined_dollars_literal(source, &target);
+                    target.text = format!("{}/{}", &source.text[..at], target.text);
                 }
             }
         }
@@ -956,14 +1139,23 @@ impl Builder {
         let dst = dir(&pos[1]);
         let mut out = vec![plain(name)];
         out.append(&mut flags);
-        if pos.len() == 2 {
+        let files = &pos[2..];
+        let joined: usize = files.iter().map(|f| f.text.len()).sum::<usize>()
+            + files.len().saturating_mul(src.text.len());
+        if files.is_empty() || joined > MAX_JOINED {
             out.push(src.clone());
         }
-        for file in &pos[2..] {
-            let mut f = file.clone();
-            f.text = format!("{}{}", src.text, file.text);
-            f.has_substitution |= src.has_substitution;
-            out.push(f);
+        if joined > MAX_JOINED {
+            self.noted(NOTE_TOO_LONG);
+            out.extend(files.iter().cloned());
+        } else {
+            for file in files {
+                let mut f = file.clone();
+                f.literal_dollars = joined_dollars_literal(&src, file);
+                f.text = format!("{}{}", src.text, file.text);
+                f.has_substitution |= src.has_substitution;
+                out.push(f);
+            }
         }
         out.push(dst);
         out
@@ -1042,10 +1234,16 @@ impl Builder {
             }
         }
         if let Some(leaf) = leaf {
-            if paths.is_empty() {
+            let joined: usize = paths.iter().map(|p| p.text.len()).sum::<usize>()
+                + paths.len().saturating_mul(leaf.text.len());
+            if joined > MAX_JOINED {
+                self.noted(NOTE_TOO_LONG);
+                paths.push(self.path(&leaf, false));
+            } else if paths.is_empty() {
                 paths.push(self.path(&leaf, false));
             } else {
                 for p in &mut paths {
+                    p.literal_dollars = joined_dollars_literal(p, &leaf);
                     p.text = format!("{}/{}", p.text.trim_end_matches('/'), forward(&leaf.text));
                     p.has_substitution |= leaf.has_substitution;
                 }
@@ -1093,6 +1291,7 @@ impl Builder {
     fn grep(&mut self, items: Vec<Item>) -> Vec<Word> {
         let mut pattern = None;
         let mut paths = Vec::new();
+        let mut positional = Vec::new();
         let mut rest = Vec::new();
         for item in items {
             match item {
@@ -1102,20 +1301,29 @@ impl Builder {
                     (Act::Literal, Some(v)) => paths.push(self.operand(&v, true)),
                     (act, _) => self.dropped(act),
                 },
-                Item::Pos { word, .. } => paths.push(word),
+                Item::Pos { word, .. } => positional.push(word),
                 Item::Raw(w) => rest.push(w),
             }
         }
-        // Positionals were left raw: the first may be the pattern.
-        let positional_pattern = pattern.is_none() && !paths.is_empty();
+        // Only the first positional can be the pattern. `operands` skips its
+        // first operand as the pattern: an empty one holds the place, and an
+        // unknown one must not be left out, or a file would be skipped instead.
+        let mut positional = positional.into_iter();
         let mut out = vec![plain("grep")];
-        if let Some(p) = pattern {
-            out.push(p);
-        } else if positional_pattern {
-            out.push(paths.remove(0));
+        if pattern.is_none() {
+            pattern = positional.next();
         }
-        for p in &paths {
-            out.push(self.operand(p, false));
+        match pattern {
+            Some(p) => out.push(Word {
+                has_substitution: false,
+                ..p
+            }),
+            None if !paths.is_empty() => out.push(plain("")),
+            None => {}
+        }
+        out.append(&mut paths);
+        for p in positional {
+            out.push(self.operand(&p, false));
         }
         out.append(&mut rest);
         out
@@ -1269,6 +1477,12 @@ fn slash_parts<'a>(row: &Row, text: &'a str, cmd_mode: bool) -> Option<Vec<&'a s
     (cmd_mode || parts.iter().all(known)).then_some(parts)
 }
 
+/// Can the word be a parameter? A quoted word never is, but a quote in the
+/// value is fine: `-Path:'x'`. The reader tells `'-Path:x'` apart.
+fn is_parameter(w: &Word) -> bool {
+    param_shape(w).is_some() && (!w.quoted || w.text.contains(':'))
+}
+
 /// `-Name` or `-Name:value`, when the word has that shape.
 fn param_shape(w: &Word) -> Option<(&str, Option<&str>)> {
     let rest = w.text.strip_prefix('-')?;
@@ -1285,6 +1499,22 @@ enum Lookup {
     Found(Act),
     Ambiguous,
     Unknown,
+}
+
+/// A parameter of the row or a common one: exact names first.
+fn resolve(params: &[(&str, Act)], name: &str) -> Lookup {
+    let exact = |list: &[(&str, Act)]| {
+        list.iter()
+            .find(|(p, _)| p.eq_ignore_ascii_case(name))
+            .map(|&(_, act)| act)
+    };
+    if let Some(act) = exact(params).or_else(|| exact(COMMON)) {
+        return Lookup::Found(act);
+    }
+    match lookup(params, name) {
+        Lookup::Unknown => lookup(COMMON, name),
+        found => found,
+    }
 }
 
 fn lookup(params: &[(&str, Act)], name: &str) -> Lookup {
@@ -1418,7 +1648,10 @@ fn powershell_nested(args: &[Word]) -> Option<String> {
             return unresolved();
         }
         let option = ["--", "-", "/"].iter().find_map(|p| w.text.strip_prefix(p));
-        let Some(option) = option.filter(|_| !w.quoted && !w.has_substitution) else {
+        // Quotes do not count: PowerShell strips them for a native program, so
+        // `powershell '-c' 'x'` is `-c x`. Blanks mean a string, not an option.
+        let option = option.filter(|o| !w.has_substitution && !o.contains(char::is_whitespace));
+        let Some(option) = option else {
             // `powershell.exe`'s default parameter is -Command. `pwsh` takes a
             // file there: the text is judged either way.
             return Some(joined(None, &args[i - 1..]));
@@ -1486,25 +1719,36 @@ fn cmd_nested(args: &[Word]) -> Option<String> {
     None
 }
 
+/// All of `iex`'s words that are not parameters or their values, joined: it
+/// has one positional, so more than one word is a line PowerShell refuses.
 fn iex_nested(args: &[Word]) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let w = &args[i];
         i += 1;
-        let Some((name, value)) = param_shape(w).filter(|_| !w.quoted) else {
-            return Some(w.text.clone());
+        let shape = param_shape(w).filter(|_| is_parameter(w));
+        let Some((name, value)) = shape else {
+            parts.push(&w.text);
+            continue;
         };
+        let value = value.filter(|v| !v.is_empty());
         if abbreviates(&name.to_ascii_lowercase(), "command", 1) {
-            return match value.filter(|v| !v.is_empty()) {
-                Some(v) => Some(v.to_string()),
-                None => Some(
-                    args.get(i)
-                        .map_or_else(|| UNRESOLVED.to_string(), |v| v.text.clone()),
-                ),
-            };
+            match value {
+                Some(v) => parts.push(v),
+                None => match args.get(i) {
+                    Some(next) => {
+                        parts.push(&next.text);
+                        i += 1;
+                    }
+                    None => return Some(UNRESOLVED.to_string()),
+                },
+            }
+        } else if value.is_none() && matches!(lookup(COMMON, name), Lookup::Found(Act::Skip)) {
+            i += 1;
         }
     }
-    None
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn invoke_command_nested(args: &[Word]) -> Option<String> {

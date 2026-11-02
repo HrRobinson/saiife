@@ -1440,7 +1440,8 @@ impl Engine {
     pub(crate) fn judge_words(&self, seg: &[Word]) -> Option<Decision> {
         self.path_rules();
         let argv = crate::normalize::build_argv(seg);
-        let ops = operands(seg, seg, &argv);
+        let seg = winpath::path_words(seg, &self.vars);
+        let ops = operands(&seg, &seg, &self.path_argv(&argv, &seg));
         let cwds: Vec<PathBuf> = self.vars.cwd().map(Path::to_path_buf).into_iter().collect();
         self.judge_operands(ops, &cwds, false, Instant::now())
     }

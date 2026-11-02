@@ -47,6 +47,9 @@ const NOTE_OPAQUE: &str = "this PowerShell command cannot be judged";
 const NOTE_SCRIPT: &str = "a script's contents cannot be read";
 const NOTE_NESTED: &str = "a nested command cannot be read";
 const NOTE_FOREACH: &str = "ForEach-Object without a script block calls a method";
+const NOTE_PROVIDER: &str = "a variable reads through a PowerShell drive";
+const NOTE_FUNCTION: &str = "a function or alias is defined through its drive";
+const NOTE_COMMENT: &str = "`<#` touching a word may or may not open a comment";
 
 /// Commands whose effect the table cannot follow: defining a name, a provider,
 /// .NET or COM, or a file operation with no row of its own.
@@ -132,6 +135,9 @@ pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
         out: Vec::new(),
         note: None,
         depth: 0,
+        last_value: None,
+        pending: Vec::new(),
+        live: false,
     };
     r.statements(None, Mode::Top);
     (r.out, r.note)
@@ -156,6 +162,7 @@ enum Kind {
     Paren,
 }
 
+#[derive(Clone)]
 struct Raw {
     w: Word,
     kind: Kind,
@@ -247,6 +254,13 @@ struct Reader {
     out: Vec<Segment>,
     note: Option<&'static str>,
     depth: u32,
+    /// `out[n]` holds only quoted strings: a bracket around it folds.
+    last_value: Option<usize>,
+    /// `('a','b')`: the items after the first, waiting for their statement.
+    pending: Vec<Word>,
+    /// The word being read has a `$` PowerShell expands. One live `$` makes
+    /// the whole word live (`Word::literal_dollars`).
+    live: bool,
 }
 
 impl Reader {
@@ -314,7 +328,16 @@ impl Reader {
                     }
                 }
                 '#' => self.skip_line_comment(),
-                '<' if self.at(1) == Some('#') => self.skip_block_comment(),
+                '<' if self.at(1) == Some('#') => {
+                    if !st.words.is_empty() && st.last_end == self.i {
+                        // What follows is judged as if it were no comment:
+                        // over-judging it is the safe reading.
+                        self.noted(NOTE_COMMENT);
+                        self.i += 2;
+                    } else {
+                        self.skip_block_comment();
+                    }
+                }
                 ',' => {
                     self.i += 1;
                     st.next_cont = true;
@@ -362,6 +385,18 @@ impl Reader {
         }
         let block = raw.kind == Kind::Block;
         self.push(st, raw);
+        for w in std::mem::take(&mut self.pending) {
+            st.next_cont = true;
+            self.push(
+                st,
+                Raw {
+                    w,
+                    kind: Kind::Plain,
+                    cont: true,
+                    from_quote: true,
+                },
+            );
+        }
         if block && st.words.len() >= 2 && keyword_of(&st.words[0], BLOCK_KEYWORDS) {
             self.end_statement(st, false, mode);
         } else if block && st.words.len() >= 2 && keyword_of(&st.words[0], DEFINING_KEYWORDS) {
@@ -373,7 +408,8 @@ impl Reader {
     fn push(&mut self, st: &mut Stmt, mut raw: Raw) {
         raw.cont = std::mem::take(&mut st.next_cont);
         st.last_end = self.i;
-        st.not_lvalue |= !raw.lvalue();
+        // `$a = $b = x`: each `=` starts the left side over.
+        st.not_lvalue = raw.kind != Kind::Assign && (st.not_lvalue || !raw.lvalue());
         st.words.push(raw);
     }
 
@@ -544,6 +580,8 @@ impl Reader {
     }
 
     fn read_word(&mut self, can_assign: bool) -> Raw {
+        // A bracket reads words inside this one: each keeps its own state.
+        let outer_live = std::mem::take(&mut self.live);
         let start = self.i;
         let c = self.c[self.i];
         let mut w = Word::default();
@@ -559,20 +597,21 @@ impl Reader {
                 kind = Kind::Block;
                 after_piece = true;
             }
-            ('(', _) => {
-                self.i += 1;
-                self.body(')', Mode::Paren);
-                w.text = self.text(start);
-                w.has_substitution = true;
-                kind = Kind::Paren;
-                after_piece = true;
-            }
-            ('@', Some('(')) => {
-                self.i += 2;
-                self.body(')', Mode::Top);
-                w.text = self.text(start);
-                w.has_substitution = true;
-                kind = Kind::Paren;
+            ('(', _) | ('@', Some('(')) => {
+                let at_sign = c == '@';
+                self.i += if at_sign { 2 } else { 1 };
+                let mark = self.out.len();
+                self.body(')', if at_sign { Mode::Top } else { Mode::Paren });
+                if let Some(mut items) = self.literal_body(mark, false) {
+                    // `('.env')` is `.env`, and `('a','b')` is two words.
+                    w = items.remove(0);
+                    from_quote = true;
+                    self.pending = items;
+                } else {
+                    w.text = self.text(start);
+                    w.has_substitution = true;
+                    kind = Kind::Paren;
+                }
                 after_piece = true;
             }
             ('@', Some('{')) => {
@@ -622,6 +661,8 @@ impl Reader {
         if !w.quoted && w.text.contains("]::") {
             self.noted(NOTE_DOTNET);
         }
+        w.literal_dollars = !self.live && !w.has_substitution && w.text.contains('$');
+        self.live = outer_live;
         Raw {
             w,
             kind,
@@ -648,18 +689,10 @@ impl Reader {
                     w.has_substitution = true;
                     self.noted(NOTE_DOTNET);
                 }
-                '`' => {
-                    self.backtick(w);
-                    member = false;
-                }
-                c if is_single(c) => {
-                    self.single_quoted(w);
-                    member = false;
-                }
-                c if is_double(c) => {
-                    self.double_quoted(w);
-                    member = false;
-                }
+                // `(x)."Delete"()`, `.De`lete()`: still a member.
+                '`' => self.backtick(w),
+                c if is_single(c) => self.single_quoted(w),
+                c if is_double(c) => self.double_quoted(w),
                 '$' => {
                     if self.dollar(w) {
                         member = true;
@@ -767,7 +800,7 @@ impl Reader {
                     pieces += 2;
                     continue;
                 }
-                w.dq_substitution = pure_sub && pieces == 1;
+                w.dq_substitution = pure_sub && pieces == 1 && w.has_substitution;
                 return;
             }
             match c {
@@ -851,10 +884,20 @@ impl Reader {
     /// the constants `$true`, `$false` and `$null` are known.
     fn dollar(&mut self, w: &mut Word) -> bool {
         let start = self.i;
+        // Anything but a `$` that opens nothing: `c$\\`, `a$`.
+        let live = self
+            .at(1)
+            .is_some_and(|c| is_name(c) || matches!(c, '(' | '{' | '?' | '^' | '$'));
         let unknown = match self.at(1) {
             Some('(') => {
                 self.i += 2;
+                let mark = self.out.len();
                 self.body(')', Mode::Top);
+                if let Some(items) = self.literal_body(mark, true) {
+                    w.text.push_str(&items[0].text);
+                    w.quoted = true;
+                    return false;
+                }
                 true
             }
             Some('{') => {
@@ -876,6 +919,23 @@ impl Reader {
                 if self.peek() == Some('}') {
                     self.i += 1;
                 }
+                match namespace(&name) {
+                    Namespace::Function => self.noted(NOTE_FUNCTION),
+                    Namespace::Drive => {
+                        // `${C:\p\.env}` is the file's contents.
+                        self.out.push(vec![
+                            Word {
+                                text: "cat".to_string(),
+                                ..Word::default()
+                            },
+                            Word {
+                                text: name.clone(),
+                                ..Word::default()
+                            },
+                        ]);
+                    }
+                    Namespace::Variable => {}
+                }
                 !known_variable(&name)
             }
             Some(c) if is_name(c) => {
@@ -889,6 +949,11 @@ impl Reader {
                     }
                 }
                 let name = self.text(name_start);
+                match namespace(&name) {
+                    Namespace::Function => self.noted(NOTE_FUNCTION),
+                    Namespace::Drive => self.noted(NOTE_PROVIDER),
+                    Namespace::Variable => {}
+                }
                 let constant = ["true", "false", "null"]
                     .iter()
                     .any(|k| name.eq_ignore_ascii_case(k));
@@ -905,6 +970,7 @@ impl Reader {
         };
         w.text.push_str(&self.text(start));
         w.has_substitution |= unknown;
+        self.live |= live;
         unknown
     }
 
@@ -933,7 +999,7 @@ impl Reader {
             self.noted(NOTE_OPAQUE);
             return;
         }
-        if let Some(at) = words.iter().position(|r| r.kind == Kind::Assign) {
+        if let Some(at) = words.iter().rposition(|r| r.kind == Kind::Assign) {
             self.assignment(words, at, piped, mode);
             return;
         }
@@ -959,10 +1025,29 @@ impl Reader {
             return;
         }
         if first.from_quote && !call {
+            if words
+                .iter()
+                .all(|r| r.w.quoted && !r.w.has_substitution && !r.w.redirect)
+            {
+                self.last_value = Some(self.out.len());
+            }
             self.emit(words.into_iter().map(|r| r.w).collect());
             return;
         }
         self.command(words, piped);
+    }
+
+    /// The words of a bracket that held only quoted strings, taken back from
+    /// `out`. With `single`, only if there is one.
+    fn literal_body(&mut self, mark: usize, single: bool) -> Option<Vec<Word>> {
+        let literal = self.out.len() == mark + 1
+            && self.last_value == Some(mark)
+            && (!single || self.out[mark].len() == 1);
+        if !literal {
+            return None;
+        }
+        self.last_value = None;
+        self.out.pop()
     }
 
     fn emit(&mut self, seg: Segment) {
@@ -999,6 +1084,13 @@ impl Reader {
     fn assignment(&mut self, mut words: Vec<Raw>, at: usize, piped: bool, mode: Mode) {
         let rhs: Vec<Raw> = words.split_off(at + 1);
         let op = words[at].w.text.clone();
+        // A bare `=` the lexer did not take as an operator: whatever is before
+        // it, what is after it may run.
+        let after_last_equals = rhs
+            .iter()
+            .rposition(|r| r.kind == Kind::Plain && !r.w.quoted && r.w.text == "=")
+            .map(|p| rhs[p + 1..].to_vec());
+        let mode = if mode == Mode::Hash { Mode::Top } else { mode };
         let is_command = rhs.first().is_some_and(|r| {
             r.kind == Kind::Call
                 || (r.kind == Kind::Plain
@@ -1008,22 +1100,37 @@ impl Reader {
                     && !r.w.text.starts_with(|c: char| c.is_ascii_digit()))
         });
         let has_redirect = rhs.iter().any(|r| r.w.redirect);
-        if let Some(name) = words.first().and_then(|r| env_name(&r.w.text)) {
-            let op = if op == "+=" { "+=" } else { "=" };
-            let value = if is_command { None } else { rhs.first() };
-            let word = Word {
-                text: format!("{name}{op}{}", value.map_or("", |r| r.w.text.as_str())),
-                has_substitution: is_command
-                    || rhs.len() > 1
-                    || value.is_some_and(|r| r.w.has_substitution),
-                assignment: true,
-                quoted: value.is_some_and(|r| r.w.quoted),
-                ..Word::default()
-            };
-            self.emit(vec![word]);
+        let op = if op == "+=" { "+=" } else { "=" };
+        let value = if is_command { None } else { rhs.first() };
+        let unknown = is_command || rhs.len() > 1 || value.is_some_and(|r| r.w.has_substitution);
+        for lvalue in words[..at].iter().filter(|r| r.kind != Kind::Assign) {
+            if let Some(name) = env_name(&lvalue.w.text) {
+                self.emit(vec![Word {
+                    text: format!("{name}{op}{}", value.map_or("", |r| r.w.text.as_str())),
+                    has_substitution: unknown,
+                    assignment: true,
+                    quoted: value.is_some_and(|r| r.w.quoted),
+                    ..Word::default()
+                }]);
+            } else if let Some(path) = drive_variable(&lvalue.w.text) {
+                self.emit(vec![
+                    Word {
+                        text: ">".to_string(),
+                        redirect: true,
+                        ..Word::default()
+                    },
+                    Word {
+                        text: path.to_string(),
+                        ..Word::default()
+                    },
+                ]);
+            }
         }
         if is_command || has_redirect {
             self.finish(rhs, piped, mode);
+        }
+        if let Some(tail) = after_last_equals {
+            self.finish(tail, piped, mode);
         }
     }
 
@@ -1042,10 +1149,12 @@ impl Reader {
             self.noted(NOTE_FOREACH);
         }
         let array: Vec<bool> = words.iter().map(|r| r.cont).collect();
+        let from_quote: Vec<bool> = words.iter().map(|r| r.from_quote).collect();
         let argv: Vec<Word> = words.into_iter().map(|r| r.w).collect();
         let cx = Context {
             piped,
             array: &array,
+            from_quote: &from_quote,
             ..Context::default()
         };
         let (mut seg, note) = wintable::translate_noted(&argv, wintable::Dialect::PowerShell, &cx);
@@ -1053,7 +1162,11 @@ impl Reader {
             self.noted(n);
         }
         self.check_nested(&mut seg, piped);
+        let companion = wintable::companion_read(&seg, wintable::Dialect::PowerShell);
         self.emit(seg);
+        if let Some(read) = companion {
+            self.emit(read);
+        }
     }
 
     /// A nested command `wintable::nested` cannot read, or one that is a value,
@@ -1105,11 +1218,45 @@ fn env_name(text: &str) -> Option<&str> {
         .filter(|n| !n.is_empty())
 }
 
+/// What a `$name:` or `${name:…}` prefix makes of a variable.
+enum Namespace {
+    Variable,
+    Function,
+    Drive,
+}
+
+fn namespace(name: &str) -> Namespace {
+    let Some((prefix, _)) = name.split_once(':') else {
+        return Namespace::Variable;
+    };
+    match prefix.to_ascii_lowercase().as_str() {
+        "env" | "global" | "local" | "script" | "private" | "using" | "workflow" | "variable" => {
+            Namespace::Variable
+        }
+        "function" | "alias" => Namespace::Function,
+        _ => Namespace::Drive,
+    }
+}
+
+/// `${C:\p\.env}`: `C:\p\.env`.
+fn drive_variable(text: &str) -> Option<&str> {
+    let name = text.strip_prefix("${")?.strip_suffix('}')?;
+    matches!(namespace(name), Namespace::Drive).then_some(name)
+}
+
 /// `key = value` in `@{…}`: only the value can be a command.
 fn strip_hash_key(words: &mut Vec<Raw>) {
     if words.len() >= 2 && words[1].w.text == "=" {
         words.drain(..2);
         return;
+    }
+    // `'a'=gc .env`: a quoted key ends at its quote.
+    if words.len() >= 2 && words[0].from_quote {
+        if let Some(value) = words[1].w.text.strip_prefix('=').map(str::to_string) {
+            words[1].w.text = value;
+            words.remove(0);
+            return;
+        }
     }
     let Some(first) = words.first_mut() else {
         return;
@@ -1466,6 +1613,497 @@ reason = "secret"
             let _ = split_segments_noted(&cmd);
             assert!(start.elapsed().as_secs() < 20, "{}", &cmd[..20]);
         }
+    }
+
+    // Review round 1: each came out silently.
+
+    fn nested_text(cmd: &str) -> Option<String> {
+        split_segments_noted(cmd)
+            .0
+            .iter()
+            .find_map(|s| crate::wintable::nested(s))
+            .map(|n| n.1)
+    }
+
+    #[test]
+    fn chained_assignment_reads_the_last_right_side() {
+        for cmd in [
+            r"$a = $b = Remove-Item -r C:\x",
+            r"$a=$b=Remove-Item -r C:\x",
+            r"$a = $null = Remove-Item -r C:\x",
+            r"$a = $b = $c = Remove-Item -r C:\x",
+            r"[int]$a = [int]$b = Remove-Item -r C:\x",
+            r"$env:A = $b = Remove-Item -r C:\x",
+        ] {
+            assert!(has_rm_of(cmd, r"C:\x"), "{cmd}: {:?}", read(cmd));
+        }
+        assert!(read("$a = $null = rm x").iter().all(|s| s[0] != "$null"));
+        let (segs, _) = split_segments_noted("$env:A = $env:B = 'x'");
+        let t: Vec<_> = segs.iter().map(|s| s[0].text.as_str()).collect();
+        assert_eq!(t, ["A=x", "B=x"]);
+    }
+
+    #[test]
+    fn select_string_pattern_is_the_first_positional_only() {
+        assert_eq!(one("Select-String -Path .env x"), ["grep", "x", ".env"]);
+        assert_eq!(one("sls -Path .env"), ["grep", "", ".env"]);
+        assert_eq!(one("sls x -Path .env"), ["grep", "x", ".env"]);
+        assert_eq!(one("sls -Pattern x y"), ["grep", "x", "y"]);
+        assert!(denied(r"Select-String -Path ~\.ssh\id_rsa key"));
+        assert!(denied(r"sls -Path ~\.ssh\id_rsa"));
+        // An unknown pattern still holds the pattern's place.
+        assert!(denied(r"sls $p ~\.ssh\id_rsa"));
+    }
+
+    #[test]
+    fn a_comma_extends_the_parameter_before_it() {
+        let targets = |cmd: &str| -> Vec<String> {
+            let (segs, _) = split_segments_noted(cmd);
+            segs[0]
+                .windows(2)
+                .filter(|p| p[0].redirect)
+                .map(|p| p[1].text.clone())
+                .collect()
+        };
+        assert_eq!(
+            targets(r"Set-Content -Value a,C:\x\b C:\p\.env"),
+            [r"C:\p\.env"]
+        );
+        assert_eq!(
+            targets(r"Set-Content -Exclude a,b C:\p\.env x"),
+            [r"C:\p\.env"]
+        );
+        assert_eq!(targets(r"Set-Content -Path a,b -Value x"), ["a", "b"]);
+        assert_eq!(
+            one(r"Copy-Item -Exclude a,b C:\x C:\y"),
+            ["cp", "C:/x", "C:/y"]
+        );
+        assert_eq!(one("Remove-Item -Path a,b -r"), ["rm", "a", "b", "-r"]);
+    }
+
+    #[test]
+    fn iex_skips_its_parameters() {
+        for cmd in [
+            "iex -ErrorAction Stop 'rm x'",
+            "iex -ea 0 'rm x'",
+            "iex 'rm x' -ea 0",
+            "iex -ev e 'rm x'",
+            "iex -Verbose 'rm x'",
+            "Invoke-Expression -Command 'rm x' -ErrorAction Stop",
+        ] {
+            assert_eq!(nested_text(cmd).as_deref(), Some("rm x"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_native_shell_sees_no_quotes() {
+        for cmd in [
+            "powershell '-c' 'rm x'",
+            "powershell \"-c\" 'rm x'",
+            "powershell -`c 'rm x'",
+            "pwsh '-Command' 'rm x'",
+        ] {
+            assert_eq!(nested_text(cmd).as_deref(), Some("rm x"), "{cmd}");
+        }
+        assert_eq!(
+            nested_text("powershell \"-enc\" cgBtAA==").as_deref(),
+            Some("rm")
+        );
+        // A string that merely starts with a slash is the command text.
+        assert_eq!(
+            nested_text("powershell '/bin/x y'").as_deref(),
+            Some("/bin/x y")
+        );
+    }
+
+    #[test]
+    fn a_drive_variable_is_a_file() {
+        for cmd in [
+            r"echo ${C:\p\.env}",
+            r"$a = ${C:\p\.env}",
+            r#"echo "${C:\p\.env}""#,
+        ] {
+            assert!(
+                read(cmd).iter().any(|s| s == &["cat", r"C:\p\.env"]),
+                "{cmd}: {:?}",
+                read(cmd)
+            );
+        }
+        let (segs, _) = split_segments_noted(r"${C:\p\.env} = 'x'");
+        assert!(
+            segs.iter().any(|s| s.len() == 2
+                && s[0].redirect
+                && s[0].text == ">"
+                && s[1].text == r"C:\p\.env"),
+            "{segs:?}"
+        );
+        assert!(denied(r"$a = ${C:\Users\a\.ssh\id_rsa}"));
+        for cmd in ["echo $c:x", "$a = $c:x", "$c:x = 1", "echo $temp:x"] {
+            assert!(noted(cmd), "{cmd}");
+        }
+        for cmd in [
+            "echo ${env:X}",
+            "echo ${global:x}",
+            "echo ${script:x}",
+            "echo ${variable:x}",
+            "echo ${a b}",
+            "echo $global:x",
+            "echo $using:x",
+        ] {
+            assert_eq!(read(cmd).len(), 1, "{cmd}");
+            assert!(!noted(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn function_and_alias_targets_are_noted() {
+        for cmd in [
+            "$function:foo = 'gc .env'; foo",
+            "${function:foo} = 'gc .env'",
+            "$alias:foo = 'gc'; foo .env",
+            "ni function:foo -Value 'gc .env'",
+            "New-Item -Path Function:foo -Value x",
+            "ni alias:foo -Value gc",
+            "Set-Content function:foo 'gc .env'",
+            "Set-Content -Path ALIAS:foo gc",
+            "Copy-Item function:a function:b",
+            "Rename-Item function:a b",
+        ] {
+            assert!(noted(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_hash_key_hides_no_command() {
+        for cmd in [
+            "echo @{'a'=gc .env}",
+            "echo @{'a' = gc .env}",
+            "echo @{\"a\"=gc .env}",
+            "echo @{a=gc .env}",
+            "echo @{a = gc .env}",
+            "echo @{b=1; 'a'=gc .env}",
+        ] {
+            assert!(
+                read(cmd).iter().any(|s| s == &["cat", ".env"]),
+                "{cmd}: {:?}",
+                read(cmd)
+            );
+        }
+    }
+
+    #[test]
+    fn a_method_name_with_quotes_or_escapes_is_noted() {
+        for cmd in [
+            r#"(gi C:\x)."Delete"()"#,
+            r"(gi C:\x).'Delete'()",
+            r"(gi C:\x).De`lete()",
+            r#"$f."Delete"()"#,
+            r"$f.De`lete()",
+        ] {
+            assert!(noted(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn common_parameters_are_skipped_in_every_row() {
+        assert_eq!(
+            split_segments_noted(r"Set-Content -ea 0 .env x").0[0]
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>(),
+            [">", ".env"]
+        );
+        assert_eq!(
+            nested_text("Start-Process -ea 0 powershell '-c rm x'").as_deref(),
+            Some("rm x")
+        );
+        for p in [
+            "-ErrorAction",
+            "-ea",
+            "-WarningAction",
+            "-wa",
+            "-InformationAction",
+            "-infa",
+            "-ErrorVariable",
+            "-ev",
+            "-WarningVariable",
+            "-wv",
+            "-InformationVariable",
+            "-iv",
+            "-OutVariable",
+            "-ov",
+            "-OutBuffer",
+            "-ob",
+            "-PipelineVariable",
+            "-pv",
+        ] {
+            assert_eq!(one(&format!("Remove-Item {p} 0 x")), ["rm", "x"], "{p}");
+            assert_eq!(
+                one(&format!("Copy-Item {p} 0 a b")),
+                ["cp", "a", "b"],
+                "{p}"
+            );
+            assert_eq!(one(&format!("gc {p}:0 x")), ["cat", "x"], "{p}");
+        }
+        for p in [
+            "-Verbose", "-vb", "-Debug", "-db", "-WhatIf", "-wi", "-Confirm", "-cf",
+        ] {
+            assert_eq!(one(&format!("Remove-Item {p} x")), ["rm", "x"], "{p}");
+            assert_eq!(one(&format!("Copy-Item {p} a b")), ["cp", "a", "b"], "{p}");
+        }
+        // A row's own parameter wins over a common one's prefix.
+        assert_eq!(one("gc -Wait x"), ["cat", "-Wait", "x"]);
+    }
+
+    #[test]
+    fn hostile_input_is_bounded() {
+        const CAP: usize = 256 * 1024;
+        let lines = [
+            format!("ni {}a -Name {}", "a,".repeat(CAP / 4), "b".repeat(CAP / 2)),
+            format!(
+                "robocopy {} d {}",
+                "s".repeat(CAP / 2),
+                "a ".repeat(CAP / 4)
+            ),
+            format!("xcopy {}", "a/ ".repeat(CAP / 3)),
+            format!("Foo {}", "./a ".repeat(CAP / 4)),
+            format!("{}x{}", "(".repeat(64), ")".repeat(64)) + &"y".repeat(CAP),
+            format!("{}'{}'{}", "(".repeat(64), "y".repeat(CAP), ")".repeat(64)),
+            "$a = ".repeat(CAP / 5),
+            "gc ('a') ".repeat(CAP / 9),
+            "@{a=".repeat(CAP / 4),
+        ];
+        for line in &lines {
+            assert!(line.len() <= CAP + 1024, "{}", line.len());
+            let start = std::time::Instant::now();
+            let (segs, _) = split_segments_noted(line);
+            let bytes: usize = segs.iter().flatten().map(|w| w.text.len()).sum();
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "{}: {:?}",
+                &line[..30],
+                start.elapsed()
+            );
+            assert!(bytes < 64 * 1024 * 1024, "{}: {bytes}", &line[..30]);
+        }
+        // Past the product limit the words stay apart, and it says so.
+        assert!(noted(&lines[0]));
+        assert!(noted(&lines[1]));
+    }
+
+    #[test]
+    fn literal_only_brackets_fold() {
+        for cmd in [
+            "gc ('.env')",
+            "gc (\".env\")",
+            "gc \"$('.env')\"",
+            "gc $('.env')",
+            "gc @('.env')",
+            "gc (('.env'))",
+            "gc ('a','.env')",
+            "gc -Path ('.env')",
+        ] {
+            assert!(denied(cmd), "{cmd}: {:?}", read(cmd));
+            let (segs, _) = split_segments_noted(cmd);
+            assert_eq!(segs.len(), 1, "{cmd}: {segs:?}");
+            assert!(!segs[0].iter().any(|w| w.has_substitution), "{cmd}");
+        }
+        assert_eq!(nested_text("iex ('rm x')").as_deref(), Some("rm x"));
+        assert_eq!(one("& ('rm') -r x"), ["rm", "-r", "x"]);
+        // A value, not a command.
+        assert_eq!(one("('rm') > f")[0], "rm");
+        // An operator or a command inside is not literal.
+        let (segs, _) = split_segments_noted("gc ('.e' + 'nv')");
+        assert!(segs.iter().flatten().any(|w| w.has_substitution));
+    }
+
+    #[test]
+    fn a_quoted_word_is_never_a_parameter() {
+        assert!(denied(r"Copy-Item '-Filter' C:\Users\a\.ssh\id_rsa"));
+        assert_eq!(one("Remove-Item '-r' x"), ["rm", "./-r", "x"]);
+        assert_eq!(one("Remove-Item '-Path:x'"), ["rm", "./-Path:x"]);
+        assert_eq!(one("Remove-Item \"-r\" x"), ["rm", "./-r", "x"]);
+        assert_eq!(one("Remove-Item -`x y"), ["rm", "./-x", "y"]);
+        // A quote in the value of a real parameter changes nothing.
+        assert_eq!(one(r"Remove-Item -Path:'C:\x'"), ["rm", r"C:\x"]);
+        assert_eq!(one(r#"Remove-Item -Path:"C:\x" -r"#), ["rm", r"C:\x", "-r"]);
+    }
+
+    #[test]
+    fn a_comment_opener_touching_a_word_is_noted() {
+        let cmd = "echo a<# ; rm y #>";
+        assert!(noted(cmd));
+        assert!(has_rm_of(cmd, "y"), "{:?}", read(cmd));
+        assert!(!noted("echo a <# ; rm y #>"));
+    }
+
+    #[test]
+    fn a_command_with_no_row_reads_its_paths() {
+        for cmd in [
+            "Format-Hex .env",
+            "Send-MailMessage -Attachments .env",
+            "iwr -Form @{f=Get-Item .env}",
+            "Select-Xml -Path .env -XPath x",
+            "Import-PowerShellDataFile .env",
+            "notepad .env",
+            "notepad.exe .env",
+            r"C:\tools\notepad.exe .env",
+            "certutil -encode .env x",
+            "xcopy .env x",
+            "xcopy /e .env x",
+            "Get-FileHash .env",
+            "Get-Item .env",
+            "Test-Path .env",
+            "Get-Item -Path:.env",
+            "Foo -X:.env",
+            "Foo --path=.env",
+            r"Foo ~\.ssh\id_rsa",
+            r"Foo C:\Users\a\.ssh\id_rsa",
+            r"Foo $HOME\.ssh\id_rsa",
+            "saps notepad .env",
+            "Start-Process notepad -ArgumentList .env",
+            "New-Object x .env",
+            "& notepad .env",
+        ] {
+            assert!(denied(cmd), "{cmd}: {:?}", read(cmd));
+        }
+        assert_eq!(
+            read("Test-Path .env"),
+            [vec!["Test-Path", ".env"], vec!["cat", ".env"]]
+        );
+        // Wildcards of such a command expand like the cmdlets'.
+        let (segs, _) = split_segments_noted("Get-Item *");
+        assert_eq!(segs[1][1].text, "*");
+        assert!(segs[1][1].glob && segs[1][1].glob_dots);
+
+        // None for what is already judged or is not a path.
+        for cmd in [
+            "echo .env",
+            "Write-Host .env",
+            "Write-Output ./x",
+            "git add ./x",
+            "npm test",
+            "Get-Service saiifed",
+            "Foo https://x/y",
+            "Foo -X y",
+            "Foo -Path:y",
+            "Foo $x",
+            "gci ./x",
+            "gc ./x",
+            "Set-Location ./x",
+            "iex 'a/b'",
+            "powershell -c a/b",
+            "cmd /c a/b",
+        ] {
+            assert_eq!(read(cmd).len(), 1, "{cmd}: {:?}", read(cmd));
+        }
+        // A redirection target is judged as a target, not read.
+        assert!(!read("Foo > ./x").iter().any(|s| s[0] == "cat"));
+    }
+
+    #[test]
+    fn start_transcript_and_export_alias_write() {
+        for cmd in [
+            r"Start-Transcript C:\p\.env",
+            r"Start-Transcript -Path C:\p\.env -Append",
+            r"Start-Transcript -LiteralPath C:\p\.env",
+            r"Export-Alias C:\p\.env",
+            r"Export-Alias -Path C:\p\.env -Name x",
+            r"Export-Alias -LiteralPath C:\p\.env",
+        ] {
+            let (segs, _) = split_segments_noted(cmd);
+            assert_eq!(segs[0][0].text, ">", "{cmd}: {segs:?}");
+            assert_eq!(segs[0][1].text, r"C:\p\.env", "{cmd}: {segs:?}");
+            assert!(denied(cmd), "{cmd}");
+        }
+        // No target named: the transcript goes somewhere unseen.
+        assert!(noted("Start-Transcript"));
+    }
+
+    fn word_after_gc(cmd: &str) -> Word {
+        split_segments_noted(cmd).0.last().unwrap()[1].clone()
+    }
+
+    #[test]
+    fn single_quoted_dollars_are_literal() {
+        for word in [
+            r"'C:\$Recycle.Bin\x'",
+            r"-Path:'C:\$Recycle.Bin\x'",
+            "`$x",
+            "\"`$x\"",
+            "@'\n$x\n'@",
+            "('$x')",
+            "\"$('$x')\"",
+            r"\\host\c$\x",
+        ] {
+            let w = word_after_gc(&format!("gc {word}"));
+            assert!(w.text.contains('$'), "{word}");
+            assert!(w.literal_dollars, "{word}");
+        }
+        for word in [
+            "$x",
+            "\"$x\"",
+            "a'$x'$y",
+            r"$HOME\x",
+            r"$env:USERPROFILE\x",
+            "$(x)",
+            "@\"\n$x\n\"@",
+            "plain",
+            "'plain'",
+        ] {
+            let w = word_after_gc(&format!("gc {word}"));
+            assert!(!w.literal_dollars, "{word}");
+        }
+        // A nested word's state stays its own.
+        let (segs, _) = split_segments_noted("gc \"$x$('$y')\"");
+        assert!(!segs[0][1].literal_dollars);
+        let (segs, _) = split_segments_noted("gc '$a',$b");
+        assert!(segs[0][1].literal_dollars);
+        assert!(!segs[0][2].literal_dollars);
+    }
+
+    #[test]
+    fn a_literal_dollar_is_a_name_and_a_known_variable_stays_readable() {
+        // Neither denies as an unreadable path.
+        for cmd in [
+            r"Get-Content 'C:\$Recycle.Bin\x'",
+            r"Remove-Item 'C:\$Recycle.Bin\x'",
+            r"Copy-Item 'C:\$a\x' 'C:\$b\y'",
+            r"Get-Content C:\`$Recycle.Bin\x",
+            r"Get-Content $HOME\x",
+            r"Get-Content $env:USERPROFILE\x",
+            r"Get-Content ${env:USERPROFILE}\x",
+            r#"Get-Content "$env:USERPROFILE\x""#,
+            r"Copy-Item $HOME\x $HOME\y",
+        ] {
+            assert!(!denied(cmd), "{cmd}: {:?}", read(cmd));
+        }
+        // A live one with no value does.
+        for cmd in [
+            r"Get-Content C:\$Recycle.Bin\x",
+            r#"Get-Content "C:\$Recycle.Bin\x""#,
+            r"Get-Content 'C:\$a\'$b",
+        ] {
+            assert!(denied(cmd), "{cmd}: {:?}", read(cmd));
+        }
+        // Single quotes keep the text: it names no variable to rewrite.
+        assert_eq!(one(r"Remove-Item '$HOME\x'"), ["rm", r"$HOME\x"]);
+        assert_eq!(one(r"Remove-Item $env:USERPROFILE\x"), ["rm", r"$HOME\x"]);
+    }
+
+    #[test]
+    fn a_joined_path_with_a_live_part_is_live() {
+        let live = |cmd: &str, at: usize| {
+            let (segs, _) = split_segments_noted(cmd);
+            assert!(segs[0][at].text.contains('$'), "{cmd}: {segs:?}");
+            segs[0][at].literal_dollars
+        };
+        assert!(live(r"New-Item -Path 'C:\$a' -Name b", 1));
+        assert!(!live(r"New-Item -Path 'C:\$a' -Name $b", 1));
+        assert!(!live(r"New-Item -Path $HOME\p -Name '$b'", 1));
+        assert!(live(r"Rename-Item 'C:\$a\x' -NewName y", 2));
+        assert!(!live(r"Rename-Item $HOME\x -NewName '$y'", 2));
+        assert!(!live(r"robocopy $HOME\s d '$f'", 1));
     }
 
     // What an attacker would try.

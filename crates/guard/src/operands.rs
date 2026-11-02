@@ -86,6 +86,19 @@ pub fn path_operands(
         .collect()
 }
 
+/// Is `cmd` a command whose operands this module knows?
+pub(crate) fn understood(cmd: &str) -> bool {
+    READERS.contains(&cmd)
+        || COMPRESSORS.contains(&cmd)
+        || PATTERN_FIRST.contains(&cmd)
+        || COPIERS.contains(&cmd)
+        || WRITERS.contains(&cmd)
+        || matches!(
+            cmd,
+            "mv" | "git" | "dd" | "curl" | "wget" | "tar" | "perl" | "find"
+        )
+}
+
 /// Like `path_operands`, with whether each operand is a glob and, for a
 /// copy/move target, the names that land in it.
 pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Operand> {
@@ -95,16 +108,7 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
         return out.0;
     };
     let cmd = cmd.as_str();
-    let known = READERS.contains(&cmd)
-        || COMPRESSORS.contains(&cmd)
-        || PATTERN_FIRST.contains(&cmd)
-        || COPIERS.contains(&cmd)
-        || WRITERS.contains(&cmd)
-        || matches!(
-            cmd,
-            "mv" | "git" | "dd" | "curl" | "wget" | "tar" | "perl" | "find"
-        );
-    if !known {
+    if !understood(cmd) {
         return out.0;
     }
     // Words with a substitution (value unknown) and redirections (judged
