@@ -306,7 +306,23 @@ fn fixture_has_the_written_shape() {
 
 // ---------------------------------------------------------------------------
 // Locked mode: signed checkpoints and key rotation (spec §6.4.2, §6.4.3).
+// Unix only: the signing key's owner and mode checks need Unix, so on Windows
+// `AuditKey::load_or_create` refuses and there is no key to sign with (below).
+// Windows has no locked mode until plan 19b.
 
+/// Windows refuses a signing key: it never signs nothing.
+#[cfg(not(unix))]
+#[test]
+fn windows_refuses_the_signing_key() {
+    let d = tempfile::tempdir().unwrap();
+    let Err(e) = saiife_audit::sign::AuditKey::load_or_create(&d.path().join("k")) else {
+        panic!("no key on Windows");
+    };
+    assert!(e.to_string().contains("needs a Unix system"), "{e}");
+    assert!(!d.path().join("k").exists());
+}
+
+#[cfg(unix)]
 mod locked {
     use super::*;
     use saiife_audit::chain::sha256_hex;

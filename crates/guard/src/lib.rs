@@ -15,6 +15,9 @@
 pub mod builtins;
 pub mod canon;
 mod cdtrack;
+pub mod cmdexe;
+#[cfg(debug_assertions)]
+pub mod debug_read;
 pub mod engine;
 pub mod getopt;
 pub mod lexer;
@@ -25,7 +28,10 @@ pub mod pathrule;
 pub mod payload;
 pub mod prefilter;
 pub mod profile;
+pub mod pwsh;
 pub mod subst;
+pub mod winpath;
+pub mod wintable;
 pub mod wrappers;
 
 pub use engine::{AllowTrace, Decision, Engine};

@@ -5,12 +5,14 @@ use saiife_audit::{DecisionKind, NewRecord, Record};
 use time::{Duration, OffsetDateTime};
 
 /// `saiife audit` in developer mode whatever the host has installed: the
-/// system config named does not exist.
+/// system config named does not exist. Windows refuses that flag as a locked
+/// one and reads no system config in developer mode.
 fn saiife_audit(dir: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("saiife").unwrap();
-    c.arg("audit")
-        .arg("--system-config")
-        .arg(dir.join("absent.toml"));
+    c.arg("audit");
+    if cfg!(not(windows)) {
+        c.arg("--system-config").arg(dir.join("absent.toml"));
+    }
     c
 }
 

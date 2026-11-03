@@ -68,7 +68,13 @@ If you do not want to pipe a script into your shell:
 | macOS, Intel | `x86_64-apple-darwin` |
 | macOS, Apple silicon | `aarch64-apple-darwin` |
 
-Windows is not supported.
+| Windows 11 23H2 or later, Server 2022 or later, x64 | `x86_64-pc-windows-msvc` |
+| Windows 11 23H2 or later, Server 2022 or later, ARM64 | `aarch64-pc-windows-msvc` |
+
+On Windows, use `install.ps1`, not `install.sh`:
+`powershell -ExecutionPolicy Bypass -File .\install.ps1`. Developer mode only;
+locked mode is not available there yet. It has not run on real Windows outside CI.
+See [Windows](windows.md).
 
 ## Build from source
 

@@ -60,11 +60,16 @@ impl Sandbox {
     /// the system config named does not exist.
     fn audit(&self) -> Command {
         let mut c = Command::cargo_bin("saiife").unwrap();
-        c.arg("audit")
-            .arg("--system-config")
-            .arg(self.work.path().join("absent.toml"))
-            .env(DIR_ENV, self.audit.path())
+        c.arg("audit");
+        // Windows refuses this flag as a locked one and reads no system config
+        // in developer mode.
+        if cfg!(not(windows)) {
+            c.arg("--system-config")
+                .arg(self.work.path().join("absent.toml"));
+        }
+        c.env(DIR_ENV, self.audit.path())
             .env("HOME", self.home.path())
+            .env("USERPROFILE", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .current_dir(self.work.path());
         c
@@ -89,7 +94,10 @@ fn writes_default_named_report() {
         .args(["--report"])
         .assert()
         .success()
-        .stdout(format!("Report written: {} (2 decisions)\n", abs.display()));
+        .stdout(format!(
+            "Report written: {} (2 decisions)\n",
+            saiife_win::display::shown(&abs)
+        ));
     let html = read(&s.path(&name));
     assert!(html.contains("Blocked actions"));
     assert!(html.contains("rm -rf /"));
@@ -160,14 +168,18 @@ fn refuses_non_html_path() {
 #[test]
 fn refuses_symlink_target() {
     let s = Sandbox::new();
-    std::fs::write(s.path("target.json"), "precious").unwrap();
-    std::os::unix::fs::symlink(s.path("target.json"), s.path("r.html")).unwrap();
-    s.audit()
-        .args(["--report", "r.html"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("is not a regular file"));
-    assert_eq!(read(&s.path("target.json")), "precious");
+    // Symlink creation is privileged on Windows, so that half is Unix only.
+    #[cfg(unix)]
+    {
+        std::fs::write(s.path("target.json"), "precious").unwrap();
+        std::os::unix::fs::symlink(s.path("target.json"), s.path("r.html")).unwrap();
+        s.audit()
+            .args(["--report", "r.html"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("is not a regular file"));
+        assert_eq!(read(&s.path("target.json")), "precious");
+    }
 
     std::fs::create_dir(s.path("d.html")).unwrap();
     s.audit()
@@ -191,6 +203,8 @@ fn overwrites_existing_regular_report() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
+// Modes: Windows files inherit the folder's ACL (W-decision for dev mode).
+#[cfg(unix)]
 #[test]
 fn report_is_mode_0600_even_over_an_existing_0644_file() {
     use std::os::unix::fs::PermissionsExt;

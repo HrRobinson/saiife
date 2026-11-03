@@ -21,7 +21,8 @@
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::canon::PathVars;
+use crate::canon::{PathStyle, PathVars};
+use crate::winpath;
 
 /// What a tool or command does to a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,11 +112,11 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
         return Ok((Some("HOME"), &glob[glob.len() - rest.len() - 1..]));
     }
     let Some(after) = glob.strip_prefix('$') else {
-        if glob.starts_with('/') || glob.starts_with("**/") {
+        if glob.starts_with('/') || glob.starts_with("**/") || drive_anchored(glob) {
             return Ok((None, glob));
         }
         return Err(format!(
-            "path glob {glob:?} must start with /, ~/, **/ or a variable"
+            "path glob {glob:?} must start with /, ~/, **/, a drive (`c:/`, `?:/`) or a variable"
         ));
     };
     let end = after.find('/').unwrap_or(after.len());
@@ -127,6 +128,13 @@ fn split_var(glob: &str) -> Result<(Option<&'static str>, &str), String> {
             VARIABLES.join(", ")
         )),
     }
+}
+
+/// A glob anchored at a Windows drive: `c:/…` or, for any drive, `?:/…`. Only
+/// a Windows path can match it (a Linux path starts with `/`).
+fn drive_anchored(glob: &str) -> bool {
+    let b = glob.as_bytes();
+    b.len() > 3 && (b[0].is_ascii_alphabetic() || b[0] == b'?') && b[1] == b':' && b[2] == b'/'
 }
 
 /// The variable a valid glob starts with (`~` is `HOME`), if any.
@@ -201,23 +209,35 @@ pub fn ancestors_source(
     let Some(name) = var else {
         return Err(format!("path glob {glob:?}: ancestors need a variable"));
     };
+    let windows = vars.style() == PathStyle::Windows;
     let mut alts: Vec<String> = vec![];
     for v in vars.values(name) {
         let Some(v) = v.to_str() else {
             return Ok(None);
         };
         let full = format!("{}{}", v.trim_end_matches('/'), rest);
+        let full = if windows { winpath::fold(&full) } else { full };
         alts.push("/".to_string());
         for (i, c) in full.char_indices() {
             if c == '/' && i > 0 {
-                alts.push(regex::escape(&full[..i]));
+                let ancestor = &full[..i];
+                // A drive's root is `c:/`, never `c:`.
+                alts.push(if windows && ancestor.ends_with(':') {
+                    regex::escape(&format!("{ancestor}/"))
+                } else {
+                    regex::escape(ancestor)
+                });
             }
         }
     }
     if alts.is_empty() {
         return Ok(None);
     }
-    let flags = if case_insensitive { "(?is)" } else { "(?s)" };
+    let flags = if case_insensitive || windows {
+        "(?is)"
+    } else {
+        "(?s)"
+    };
     Ok(Some(format!("{flags}^(?:{})$", alts.join("|"))))
 }
 
@@ -240,7 +260,26 @@ pub fn glob_source(
 ) -> Result<Option<String>, String> {
     validate_glob(glob)?;
     let (var, rest) = split_var(glob)?;
-    let mut re = String::from(if case_insensitive { "(?is)^" } else { "(?s)^" });
+    // Windows: names compare case-folded (the glob is folded here, the regex
+    // folds the path), and a path the OS joined may hold a `\` separator.
+    let windows = vars.style() == PathStyle::Windows;
+    let (sep, name_char) = if windows {
+        (r"[/\\]", r"[^/\\]")
+    } else {
+        ("/", "[^/]")
+    };
+    let folded;
+    let rest = if windows {
+        folded = winpath::fold(rest);
+        folded.as_str()
+    } else {
+        rest
+    };
+    let mut re = String::from(if case_insensitive || windows {
+        "(?is)^"
+    } else {
+        "(?s)^"
+    });
     if let Some(name) = var {
         let values = vars.values(name);
         if values.is_empty() {
@@ -258,6 +297,15 @@ pub fn glob_source(
             // variable must still match `/`.
             alts.push(if v.is_empty() && rest.is_empty() {
                 "/".to_string()
+            } else if windows {
+                // A bare variable bound to a drive's root must match `c:/`.
+                let v = winpath::fold(v);
+                let tail = if rest.is_empty() && v.ends_with(':') {
+                    "/"
+                } else {
+                    ""
+                };
+                format!("{}{tail}", regex::escape(&v))
             } else {
                 regex::escape(v)
             });
@@ -271,17 +319,19 @@ pub fn glob_source(
             // The empty component before a leading `/` (or after a
             // variable): nothing to add, the separator comes next.
             (0, "") => {}
+            // A Windows path starts with its drive or share, not a `/`.
+            (0, "**") if windows => re.push_str(".*"),
             (0, "**") => re.push_str("(?:/.*)?"),
-            (_, "**") if i == last => re.push_str("(?:/.*)?"),
-            (_, "**") => re.push_str("(?:/[^/]+)*"),
+            (_, "**") if i == last => re.push_str(&format!("(?:{sep}.*)?")),
+            (_, "**") => re.push_str(&format!("(?:{sep}{name_char}+)*")),
             _ => {
                 if i > 0 {
-                    re.push('/');
+                    re.push_str(sep);
                 }
                 for c in comp.chars() {
                     match c {
-                        '*' => re.push_str("[^/]*"),
-                        '?' => re.push_str("[^/]"),
+                        '*' => re.push_str(&format!("{name_char}*")),
+                        '?' => re.push_str(name_char),
                         c => re.push_str(&regex::escape(&c.to_string())),
                     }
                 }
@@ -303,6 +353,28 @@ mod tests {
             .with_var("SAIIFE_BIN", "/usr/local/bin/saiife")
     }
 
+    #[test]
+    fn drive_anchored_globs_are_valid_and_match_only_windows_paths() {
+        for g in ["c:/programdata/saiife/**", "?:/programdata/saiife", "D:/x"] {
+            assert!(validate_glob(g).is_ok(), "{g}");
+        }
+        for g in ["cc:/x", "c:x", "c:/", ":/x", "1:/x", "c:\\x"] {
+            assert!(validate_glob(g).is_err(), "{g}");
+        }
+        let win = PathVars::new().with_style(PathStyle::Windows);
+        let re = compile_glob("?:/programdata/saiife/**", &win, false)
+            .unwrap()
+            .unwrap();
+        assert!(re.is_match("c:/ProgramData/saiife/bin/saiife.exe"));
+        assert!(re.is_match("d:/programdata/saiife/x"));
+        assert!(!re.is_match("c:/programdata/other/x"));
+        let posix = compile_glob("?:/programdata/saiife/**", &vars(), false)
+            .unwrap()
+            .unwrap();
+        assert!(!posix.is_match("/programdata/saiife/x"));
+        assert!(!posix.is_match("/home/u/c:/programdata/saiife/x"));
+    }
+
     fn m(glob: &str, path: &str) -> bool {
         compile_glob(glob, &vars(), false)
             .unwrap()
@@ -320,6 +392,10 @@ mod tests {
         assert!(!m("**/.env.*", "/p/.env"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn home_and_star() {
         assert!(m("~/.ssh/id_*", "/home/u/.ssh/id_ed25519"));
@@ -330,6 +406,10 @@ mod tests {
         assert!(m("~/.ssh/id_?sa", "/home/u/.ssh/id_rsa"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn trailing_double_star_includes_the_directory() {
         assert!(m("~/.config/gcloud/**", "/home/u/.config/gcloud"));
@@ -349,6 +429,10 @@ mod tests {
         assert!(!m("/a/**/b", "/a/xb"));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn multi_valued_variable_is_an_alternation() {
         assert!(m("$SAIIFE_BIN", "/opt/saiife/bin/saiife"));
@@ -387,6 +471,10 @@ mod tests {
         }
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn ancestors_match_proper_ancestors_only() {
         let v = PathVars::new()
@@ -426,6 +514,99 @@ mod tests {
         assert!(compile_ancestors("$HOME", &v, false).unwrap().is_none());
     }
 
+    /// The regex text of POSIX rules is pinned: Linux and macOS behaviour
+    /// must not move because Windows rules were added.
+    #[test]
+    fn posix_regex_sources_are_unchanged() {
+        // A root no host has: on macOS `/home` is a firmlink, and a resolved
+        // value would add its own alternative to the pinned text.
+        let v = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_var("HOME", "/zz/u");
+        if cfg!(windows) {
+            return;
+        }
+        let src = |g: &str| glob_source(g, &v, false).unwrap().unwrap();
+        assert_eq!(src("**/.env"), r"(?s)^(?:/.*)?/\.env$");
+        assert_eq!(src("~/.ssh/id_*"), r"(?s)^(?:/zz/u)/\.ssh/id_[^/]*$");
+        assert_eq!(src("~/.ssh/id_?sa"), r"(?s)^(?:/zz/u)/\.ssh/id_[^/]sa$");
+        assert_eq!(src("/a/**/b"), r"(?s)^/a(?:/[^/]+)*/b$");
+        assert_eq!(src("$HOME/x/**"), r"(?s)^(?:/zz/u)/x(?:/.*)?$");
+        assert_eq!(
+            glob_source("**/.ENV", &v, true).unwrap().unwrap(),
+            r"(?is)^(?:/.*)?/\.ENV$"
+        );
+        assert_eq!(
+            ancestors_source("$HOME/a", &v, false).unwrap().unwrap(),
+            "(?s)^(?:/|/zz|/zz/u)$"
+        );
+    }
+
+    fn win_vars() -> PathVars {
+        PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+    }
+
+    fn wm(glob: &str, path: &str) -> bool {
+        compile_glob(glob, &win_vars(), false)
+            .unwrap()
+            .unwrap()
+            .is_match(path)
+    }
+
+    #[test]
+    fn windows_globs_match_case_folded_under_any_root() {
+        assert!(wm("**/.env", "c:/p/.env"));
+        assert!(wm("**/.env", "c:/P/.ENV"));
+        assert!(wm("**/.env", "c:/.env"));
+        assert!(wm("**/.env", "//server/share/.env"));
+        assert!(!wm("**/.env", "c:/p/.env.example"));
+        assert!(!wm("**/.env", "c:/p/my.env"));
+        assert!(wm("~/.ssh/id_*", "c:/users/A/.SSH/ID_RSA"));
+        assert!(wm("~/.ssh/id_*", "c:/Users/a/.ssh/id_rsa"));
+        assert!(!wm("~/.ssh/id_*", "c:/Users/b/.ssh/id_rsa"));
+        assert!(!wm("~/.ssh/id_*", "c:/Users/a/.ssh/keys/id_rsa"));
+        assert!(wm("~/.ssh/ID_*", "c:/Users/a/.ssh/id_rsa"));
+        assert!(wm("**/.saiife/**", "c:/p/.saiife"));
+        assert!(wm("**/.saiife/**", "c:/p/.SAIIFE/config.toml"));
+        // A POSIX-rooted rule never matches a Windows path (W6).
+        assert!(!wm("/etc/passwd", "c:/etc/passwd"));
+    }
+
+    #[test]
+    fn windows_globs_accept_a_separator_the_os_joined() {
+        assert!(wm("**/.env", r"c:/p\.env"));
+        assert!(wm("~/.ssh/id_*", r"c:/Users/a/.ssh\id_rsa"));
+        assert!(!wm("~/.ssh/id_*", r"c:/Users/a/.ssh\keys\id_rsa"));
+    }
+
+    #[test]
+    fn windows_variable_bound_to_a_drive_root() {
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("HOME", r"C:\");
+        let c = |g: &str| compile_glob(g, &v, false).unwrap().unwrap();
+        assert!(c("~").is_match("c:/"));
+        assert!(!c("~").is_match("c:/x"));
+        assert!(c("~/**").is_match("c:/"));
+        assert!(c("~/.ssh/id_*").is_match("c:/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn windows_ancestors_stop_at_the_drive_root() {
+        let v = win_vars().with_var("SAIIFE_DATA_DIR", r"C:\Users\a\AppData\Local\saiife");
+        let r = compile_ancestors("$SAIIFE_DATA_DIR", &v, false)
+            .unwrap()
+            .unwrap();
+        for yes in ["c:/", "C:/", "c:/users", "c:/Users/A/AppData/Local"] {
+            assert!(r.is_match(yes), "{yes}");
+        }
+        for no in ["c:", "c:/Users/a/AppData/Local/saiife", "d:/", "c:/other"] {
+            assert!(!r.is_match(no), "{no}");
+        }
+    }
+
     #[test]
     fn access_coverage() {
         assert!(RuleAccess::Any.covers(Access::Read));
@@ -435,6 +616,10 @@ mod tests {
         assert!(!RuleAccess::Write.covers(Access::Read));
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn double_star_and_star_match_names_with_newlines() {
         assert!(m("~/.claude/**", "/home/u/.claude/a\nb"));
@@ -454,6 +639,10 @@ mod tests {
         }
     }
 
+    // POSIX style reads `/home/u` through `std::path`, and a Windows host calls
+    // that relative, so the variable never binds. No Windows host runs POSIX style;
+    // the `win_vars` tests pin the Windows reading.
+    #[cfg(unix)]
     #[test]
     fn a_variable_bound_to_the_root_matches_the_root() {
         let root = PathVars::new().with_var("HOME", "/");

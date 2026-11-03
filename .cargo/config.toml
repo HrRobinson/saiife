@@ -1,0 +1,7 @@
+# Windows builds (plan 19a): a static CRT, so the binary needs no
+# vcruntime140.dll, and load-time DLL dependencies are searched in System32
+# only (/DEPENDENTLOADFLAG:0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32), never in the
+# application or current directory. scripts/check-windows.sh sets RUSTFLAGS,
+# which replaces these for its compile-only check.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/DEPENDENTLOADFLAG:0x800"]

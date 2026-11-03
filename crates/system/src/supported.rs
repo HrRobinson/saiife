@@ -3,19 +3,26 @@
 //! systemd running, and macOS 15 or later (plan 13 decision 13). Alpine and
 //! containers get developer mode only.
 
+#[cfg(unix)]
 use crate::host::{Host, CONTAINER_UNKNOWN};
-use crate::layout::{Layout, Platform};
+use crate::layout::Layout;
+#[cfg(unix)]
+use crate::layout::Platform;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 
-/// The reason on any OS but Linux and macOS.
+/// The reason on any OS but Linux, macOS and Windows.
 pub const NOT_SUPPORTED_OS: &str = "locked mode needs Linux or macOS";
 
+#[cfg(unix)]
 /// The oldest macOS locked mode supports (Sequoia, plan 13 decision 13).
 pub const MIN_MACOS: (u32, u32) = (15, 0);
 
+#[cfg(unix)]
 /// The oldest systemd with `LoadCredential=`.
 const MIN_SYSTEMD: u32 = 247;
 
+#[cfg(unix)]
 const SUPPORTED_LIST: &str = "Ubuntu 22.04+, Debian 12+, RHEL 9+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +35,7 @@ pub enum Support {
     Refused(String),
 }
 
+#[cfg(unix)]
 /// Checks this machine (or the tree under `layout`'s root) by the
 /// layout's platform. On Linux: a container, systemd and its version, then
 /// the distribution from `<root>/etc/os-release`. On macOS: the version
@@ -36,6 +44,7 @@ pub fn check_supported(layout: &Layout, host: &dyn Host) -> Support {
     supported_on(Platform::current(), layout, host)
 }
 
+#[cfg(unix)]
 /// [`check_supported`] with the running OS given (`None`: neither Linux
 /// nor macOS).
 pub(crate) fn supported_on(current: Option<Platform>, layout: &Layout, host: &dyn Host) -> Support {
@@ -44,10 +53,12 @@ pub(crate) fn supported_on(current: Option<Platform>, layout: &Layout, host: &dy
     }
     match layout.platform() {
         Platform::Linux => linux_supported(layout, host),
+        Platform::Windows => Support::Refused(NOT_SUPPORTED_YET.to_string()),
         Platform::Macos => macos_supported(host),
     }
 }
 
+#[cfg(unix)]
 /// macOS [`MIN_MACOS`] or later. There is no systemd: `systemd` is 0.
 fn macos_supported(host: &dyn Host) -> Support {
     let (major, minor) = match host.macos_version() {
@@ -66,6 +77,7 @@ fn macos_supported(host: &dyn Host) -> Support {
     }
 }
 
+#[cfg(unix)]
 fn linux_supported(layout: &Layout, host: &dyn Host) -> Support {
     let container = host.container().or_else(|| {
         if layout.root().join(".dockerenv").exists() {
@@ -129,11 +141,22 @@ fn linux_supported(layout: &Layout, host: &dyn Host) -> Support {
     }
 }
 
+/// Why locked mode is not available on Windows yet (plan 19a); plan 19b
+/// replaces [`check_supported`] there with the real check.
+pub const NOT_SUPPORTED_YET: &str = "locked mode on Windows arrives in plan 19b";
+
+/// Windows: developer mode only until plan 19b, whatever the layout.
+#[cfg(windows)]
+pub fn check_supported(_layout: &Layout) -> Support {
+    Support::Refused(NOT_SUPPORTED_YET.to_string())
+}
+
 /// The one line `install` prints when it refuses.
 pub fn refusal_line(why: &str) -> String {
     format!("saiife: locked mode is not supported here: {why}. Developer mode works as before.")
 }
 
+#[cfg(unix)]
 /// `VERSION_ID` as (major, minor) ≥ `min`. A missing or odd version is not.
 fn version_at_least(version: &str, min: (u32, u32)) -> bool {
     let mut parts = version.split('.');
@@ -150,6 +173,7 @@ fn version_at_least(version: &str, min: (u32, u32)) -> bool {
     (major, minor) >= min
 }
 
+#[cfg(unix)]
 /// `KEY=value` lines of os-release(5); quotes and backslash escapes removed.
 pub(crate) fn parse_os_release(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -169,6 +193,7 @@ pub(crate) fn parse_os_release(text: &str) -> BTreeMap<String, String> {
     out
 }
 
+#[cfg(unix)]
 fn unquote(v: &str) -> String {
     let inner = match v.as_bytes() {
         [b'"', .., b'"'] | [b'\'', .., b'\''] if v.len() >= 2 => &v[1..v.len() - 1],
@@ -188,7 +213,7 @@ fn unquote(v: &str) -> String {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::host::FakeHost;

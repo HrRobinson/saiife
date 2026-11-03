@@ -20,11 +20,43 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
+use crate::winpath;
+
+/// Which operating system's rules a path follows. Windows paths are judged
+/// by pure text rules (`winpath`), so any host can run them. The default is
+/// the host's style, so a `PathVars` nobody configured is still right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStyle {
+    Posix,
+    Windows,
+}
+
+impl PathStyle {
+    pub fn host() -> PathStyle {
+        if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Posix
+        }
+    }
+}
+
+impl Default for PathStyle {
+    fn default() -> Self {
+        Self::host()
+    }
+}
+
 /// Directories the engine resolves paths and rule variables against.
 #[derive(Debug, Clone, Default)]
 pub struct PathVars {
+    style: PathStyle,
     cwd: Option<PathBuf>,
     vars: Vec<(String, PathBuf)>,
+    /// Every `with_cwd` (`None`) and `with_var` as given, in order, so
+    /// `with_style` can read them again: `C:\Users\a` is not absolute under
+    /// `Posix`, and must not be lost when the style is set afterwards.
+    given: Vec<(Option<String>, PathBuf)>,
 }
 
 impl PathVars {
@@ -32,11 +64,39 @@ impl PathVars {
         Self::default()
     }
 
+    /// Read paths by `style`'s rules. Values already given are read again,
+    /// so the order of the `with_*` calls does not matter.
+    pub fn with_style(self, style: PathStyle) -> Self {
+        if style == self.style {
+            return self;
+        }
+        let mut out = PathVars {
+            style,
+            ..PathVars::default()
+        };
+        for (name, value) in self.given {
+            out = match name {
+                Some(n) => out.with_var(&n, value),
+                None => out.with_cwd(value),
+            };
+        }
+        out
+    }
+
+    pub fn style(&self) -> PathStyle {
+        self.style
+    }
+
     /// The working directory relative paths are joined to. Must be
     /// absolute; anything else is ignored.
     pub fn with_cwd(mut self, cwd: impl AsRef<Path>) -> Self {
         let cwd = cwd.as_ref();
-        if cwd.is_absolute() {
+        self.given.push((None, cwd.to_path_buf()));
+        if self.style == PathStyle::Windows {
+            if let Some(c) = winpath::value_forms(cwd, &self).into_iter().next() {
+                self.cwd = Some(PathBuf::from(c));
+            }
+        } else if cwd.is_absolute() {
             self.cwd = resolve(cwd);
         }
         self
@@ -47,7 +107,21 @@ impl PathVars {
     /// on `PATH`). Relative values are ignored; values are canonicalized.
     pub fn with_var(mut self, name: &str, value: impl AsRef<Path>) -> Self {
         let value = value.as_ref();
-        if value.is_absolute() {
+        self.given
+            .push((Some(name.to_string()), value.to_path_buf()));
+        if self.style == PathStyle::Windows {
+            // The computer's name is no path: it tells `\\NAME\c$` is local.
+            let forms = if name == winpath::COMPUTER_NAME {
+                vec![value.to_string_lossy().into_owned()]
+            } else {
+                winpath::value_forms(value, &self)
+            };
+            for v in forms.into_iter().map(PathBuf::from) {
+                if !self.vars.iter().any(|(n, x)| n == name && *x == v) {
+                    self.vars.push((name.to_string(), v));
+                }
+            }
+        } else if value.is_absolute() {
             // The resolved value first, then the value as spelled (`..`
             // removed lexically): a symlinked directory is guarded under
             // both names.
@@ -70,23 +144,59 @@ impl PathVars {
     }
 
     pub fn values(&self, name: &str) -> Vec<&Path> {
+        // On Windows `~` and `$HOME` mean the profile dir, whichever
+        // variable named it (W6).
+        if self.style == PathStyle::Windows && name == "HOME" {
+            let mut out: Vec<&Path> = Vec::new();
+            for wanted in ["USERPROFILE", "HOME"] {
+                for (_, v) in self.vars.iter().filter(|(n, _)| n == wanted) {
+                    if !out.contains(&v.as_path()) {
+                        out.push(v);
+                    }
+                }
+            }
+            return out;
+        }
         self.vars
             .iter()
             .filter(|(n, _)| n == name)
             .map(|(_, v)| v.as_path())
             .collect()
     }
+
+    /// The first value of `name`, its case ignored as Windows ignores it.
+    pub(crate) fn value_ignoring_case(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.to_str())
+    }
 }
 
 /// Canonicalize `raw` against `cwd` (the working directory at this point
 /// of a command line, else the one in `vars`) and the home in `vars`.
 pub fn canonicalize(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        let spelled = winpath::canonical(raw, cwd, vars)?;
+        return Some(PathBuf::from(winpath::resolved(&spelled, vars)));
+    }
     absolute(raw, cwd, vars).and_then(|a| resolve(&a))
 }
 
 /// The forms path rules are matched against: the resolved path, and the
 /// path as spelled (absolute, lexically normalized) when that differs.
 pub fn path_forms(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Vec<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        let Some(spelled) = winpath::canonical(raw, cwd, vars) else {
+            return Vec::new();
+        };
+        let resolved = winpath::resolved(&spelled, vars);
+        return if resolved == spelled {
+            vec![PathBuf::from(spelled)]
+        } else {
+            vec![PathBuf::from(resolved), PathBuf::from(spelled)]
+        };
+    }
     let Some(abs) = absolute(raw, cwd, vars) else {
         return Vec::new();
     };
@@ -106,6 +216,9 @@ pub fn path_forms(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Vec<PathBuf
 /// resolution. `cwd` is used as given and should already be canonical
 /// (the engine's working directories are).
 pub fn lexical_form(raw: &str, cwd: Option<&Path>, vars: &PathVars) -> Option<PathBuf> {
+    if vars.style() == PathStyle::Windows {
+        return winpath::canonical(raw, cwd, vars).map(PathBuf::from);
+    }
     let abs = absolute_with(raw, cwd.map(Path::to_path_buf), cwd.is_some(), vars)?;
     Some(push_lexical(
         PathBuf::from("/"),
@@ -540,16 +653,27 @@ pub fn expand_glob_partial(
     let Some(alternatives) = expand_braces(word) else {
         return (Vec::new(), true);
     };
-    expand_alternatives(&alternatives, cwd, vars)
+    expand_alternatives(&alternatives, cwd, vars, false)
 }
 
 /// `expand_glob` for a shell operand the lexer already brace-expanded:
 /// braces left in it were quoted, so they are literal here.
 pub fn expand_operand_glob(word: &str, cwd: Option<&Path>, vars: &PathVars) -> GlobExpansion {
+    expand_operand_glob_dots(word, cwd, vars, false)
+}
+
+/// `expand_operand_glob`; with `dots`, wildcards also match a leading `.`,
+/// as PowerShell's and cmd's do: their `*` finds `.env` and `.ssh`.
+pub fn expand_operand_glob_dots(
+    word: &str,
+    cwd: Option<&Path>,
+    vars: &PathVars,
+    dots: bool,
+) -> GlobExpansion {
     if !word.contains(['*', '?', '[']) {
         return GlobExpansion::NotAGlob;
     }
-    match expand_alternatives(&[word.to_string()], cwd, vars) {
+    match expand_alternatives(&[word.to_string()], cwd, vars, dots) {
         (_, true) => GlobExpansion::Overflow,
         (m, false) => GlobExpansion::Matches(m),
     }
@@ -559,6 +683,7 @@ fn expand_alternatives(
     alternatives: &[String],
     cwd: Option<&Path>,
     vars: &PathVars,
+    dots: bool,
 ) -> (Vec<PathBuf>, bool) {
     let has_meta = |w: &str| w.contains(['*', '?', '[']);
     if alternatives.len() == 1 && !has_meta(&alternatives[0]) {
@@ -569,27 +694,56 @@ fn expand_alternatives(
     // it runs out on the broad ones.
     let mut ordered: Vec<&String> = alternatives.iter().collect();
     ordered.sort_by_key(|a| !a.rsplit('/').next().is_some_and(|l| l.starts_with('.')));
-    let mut budget = Budget::default();
+    let mut budget = Budget {
+        fold: vars.style() == PathStyle::Windows,
+        dots,
+        ..Budget::default()
+    };
     let mut all = Vec::new();
     let mut overflow = false;
     for alt in ordered {
-        let Some(abs) = absolute(alt, cwd, vars) else {
+        // The components below the root, and the root the walk starts at.
+        let anchored = if vars.style() == PathStyle::Windows {
+            winpath::canonical(alt, cwd, vars).map(|c| {
+                let (root, rest) = winpath::split_root(&c);
+                (PathBuf::from(rest), PathBuf::from(root))
+            })
+        } else {
+            absolute(alt, cwd, vars).map(|a| (a, PathBuf::from("/")))
+        };
+        let Some((abs, root)) = anchored else {
             continue;
         };
+        // Listing `\\host\share` would be a call to a host the command chose.
+        if vars.style() == PathStyle::Windows && root.to_string_lossy().starts_with("//") {
+            if several {
+                all.push(root.join(&abs));
+            }
+            continue;
+        }
         let comps: Vec<Component> = abs.components().collect();
         if comps.len() > GLOB_MAX_COMPONENTS || abs.as_os_str().len() > PATH_MAX {
             overflow = true;
             if several {
-                all.push(abs);
+                all.push(root.join(&abs));
             }
             continue;
         }
-        let (found, over) = expand_from(&comps, vec![PathBuf::from("/")], &mut budget);
+        let (found, over) = expand_from(&comps, vec![root.clone()], &mut budget);
         overflow |= over;
         if several && (over || found.is_empty()) {
-            all.push(push_lexical(PathBuf::from("/"), &comps));
+            all.push(push_lexical(root, &comps));
         }
         all.extend(found);
+    }
+    // A walk joins with the host's separator: `d:/a\\b` on Windows. The rest of
+    // the guard reads `/` as the one separator of a Windows path.
+    if vars.style() == PathStyle::Windows {
+        for p in &mut all {
+            if let Some(mixed) = p.to_str().filter(|s| s.contains('\\')) {
+                *p = PathBuf::from(mixed.replace('\\', "/"));
+            }
+        }
     }
     all.sort();
     all.dedup();
@@ -601,6 +755,10 @@ fn expand_alternatives(
 #[derive(Default)]
 struct Budget {
     spent: usize,
+    /// Names compare case-folded (Windows): `.EN*` finds `.env`.
+    fold: bool,
+    /// Wildcards match a leading `.` (PowerShell, cmd).
+    dots: bool,
 }
 
 impl Budget {
@@ -678,7 +836,11 @@ fn walk(
                     literal_tail = false;
                     continue;
                 }
-                let pat: Vec<char> = text.chars().collect();
+                let pat: Vec<char> = if budget.fold {
+                    winpath::fold(&text).chars().collect()
+                } else {
+                    text.chars().collect()
+                };
                 if !pat.iter().any(|c| matches!(c, '*' | '?' | '[')) {
                     bases.iter_mut().for_each(|b| b.push(name));
                     literal_tail = true;
@@ -704,8 +866,13 @@ fn walk(
                             };
                         }
                         let n = e.file_name();
-                        let s: Vec<char> = n.to_string_lossy().chars().collect();
-                        if s.first() == Some(&'.') && pat.first() != Some(&'.') {
+                        let name = n.to_string_lossy();
+                        let s: Vec<char> = if budget.fold {
+                            winpath::fold(&name).chars().collect()
+                        } else {
+                            name.chars().collect()
+                        };
+                        if !budget.dots && s.first() == Some(&'.') && pat.first() != Some(&'.') {
                             continue;
                         }
                         if glob_match(&pat, &s) {
@@ -756,7 +923,7 @@ fn descend(
                 return None;
             }
             let n = e.file_name();
-            if n.to_string_lossy().starts_with('.') {
+            if !budget.dots && n.to_string_lossy().starts_with('.') {
                 continue;
             }
             let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
@@ -853,10 +1020,172 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// A temp dir by its canonical path (macOS: /var -> /private/var).
+    /// POSIX behaviour is pinned byte for byte, Windows-looking spellings
+    /// included: under `Posix` a backslash is an ordinary character.
+    #[test]
+    fn posix_style_unchanged() {
+        if cfg!(windows) {
+            return;
+        }
+        let v = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_cwd("/nonexistent-p19a/p")
+            .with_var("HOME", "/nonexistent-p19a/home")
+            .with_var("USERPROFILE", "/nonexistent-p19a/profile");
+        assert_eq!(v.style(), PathStyle::Posix);
+        assert_eq!(v.home(), Some(Path::new("/nonexistent-p19a/home")));
+        for (raw, want) in [
+            (".env", "/nonexistent-p19a/p/.env"),
+            ("../q/./x", "/nonexistent-p19a/q/x"),
+            ("~/.ssh/id_rsa", "/nonexistent-p19a/home/.ssh/id_rsa"),
+            ("$HOME/x", "/nonexistent-p19a/home/x"),
+            ("${PWD}/x", "/nonexistent-p19a/p/x"),
+            (".env.", "/nonexistent-p19a/p/.env."),
+            (".env ", "/nonexistent-p19a/p/.env "),
+            (".env::$DATA", "/nonexistent-p19a/p/.env::$DATA"),
+            (r"~\.ssh\id_rsa", r"/nonexistent-p19a/p/~\.ssh\id_rsa"),
+            (r"C:\Users\a", r"/nonexistent-p19a/p/C:\Users\a"),
+            ("c:/Users/a", "/nonexistent-p19a/p/c:/Users/a"),
+            ("/c/Users/a", "/c/Users/a"),
+            ("%USERPROFILE%/x", "/nonexistent-p19a/p/%USERPROFILE%/x"),
+            (
+                "$env:USERPROFILE/x",
+                "/nonexistent-p19a/p/$env:USERPROFILE/x",
+            ),
+            ("$USERPROFILE/x", "/nonexistent-p19a/p/$USERPROFILE/x"),
+        ] {
+            let want = PathBuf::from(want);
+            assert_eq!(lexical_form(raw, None, &v).as_ref(), Some(&want), "{raw}");
+            assert_eq!(canonicalize(raw, None, &v).as_ref(), Some(&want), "{raw}");
+            assert_eq!(path_forms(raw, None, &v), vec![want], "{raw}");
+        }
+        // Values a POSIX host cannot call absolute stay unbound.
+        let w = PathVars::new()
+            .with_style(PathStyle::Posix)
+            .with_var("HOME", r"C:\Users\a")
+            .with_cwd(r"C:\p");
+        assert!(w.home().is_none() && w.cwd().is_none());
+        assert_eq!(lexical_form("", None, &v), None);
+        assert_eq!(lexical_form("a\0b", None, &v), None);
+    }
+
+    #[test]
+    fn host_style_is_the_default() {
+        let want = if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Posix
+        };
+        assert_eq!(PathStyle::host(), want);
+        assert_eq!(PathVars::new().style(), want);
+        assert_eq!(PathVars::default().style(), want);
+    }
+
+    #[test]
+    fn style_can_be_set_after_the_values() {
+        let early = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_cwd(r"C:\p");
+        let late = PathVars::new()
+            .with_var("USERPROFILE", r"C:\Users\a")
+            .with_cwd(r"C:\p")
+            .with_style(PathStyle::Windows);
+        for v in [early, late] {
+            assert_eq!(v.home(), Some(Path::new("c:/Users/a")));
+            assert_eq!(v.cwd(), Some(Path::new("c:/p")));
+            assert_eq!(
+                path_forms(".env", None, &v),
+                vec![PathBuf::from("c:/p/.env")]
+            );
+            assert_eq!(
+                canonicalize("~/x", None, &v),
+                Some(PathBuf::from("c:/Users/a/x"))
+            );
+            assert_eq!(
+                lexical_form(r"..\y", Some(Path::new(r"D:\q\r")), &v),
+                Some(PathBuf::from("d:/q/y"))
+            );
+        }
+    }
+
+    /// `.EN*` finds `.env` on Windows: a glob that missed it would come back
+    /// as spelled and match no rule. Exact everywhere else.
+    #[test]
+    fn windows_glob_matching_ignores_case() {
+        let (_d, root) = tmp();
+        fs::create_dir(root.join("Sub")).unwrap();
+        fs::write(root.join(".env"), "").unwrap();
+        fs::write(root.join("Sub/Token.txt"), "").unwrap();
+        let run = |pattern: &str, fold: bool| {
+            let pattern = Path::new(pattern);
+            let comps: Vec<Component> = pattern.components().collect();
+            let mut budget = Budget {
+                spent: 0,
+                fold,
+                dots: false,
+            };
+            expand_from(&comps, vec![root.clone()], &mut budget).0
+        };
+        assert_eq!(run(".EN*", true), vec![root.join(".env")]);
+        assert_eq!(run(".E?V", true), vec![root.join(".env")]);
+        assert_eq!(
+            run("SUB*/t[a-z]ken.TXT", true),
+            vec![root.join("Sub/Token.txt")]
+        );
+        assert!(run(".EN*", false).is_empty());
+        assert!(run("SUB*/t[a-z]ken.TXT", false).is_empty());
+    }
+
+    /// Expanding a glob under `\\host\share` would be a call to that host.
+    /// `//…` is a real local path on a POSIX test host, so a walk would find it.
+    #[cfg(unix)]
+    #[test]
+    fn windows_globs_do_not_walk_unc_paths() {
+        let (_d, root) = tmp();
+        fs::write(root.join("found.txt"), "").unwrap();
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_cwd(r"C:\p");
+        let pattern = format!("/{}/*.txt", root.display());
+        assert!(pattern.starts_with("//"));
+        // A wildcard there has no form at all: the engine denies the word.
+        assert_eq!(expand_glob_partial(&pattern, None, &v), (Vec::new(), false));
+        // A brace with no wildcard: each alternative comes back as spelled.
+        let (found, over) = expand_glob_partial(&format!("/{}/{{a,b}}", root.display()), None, &v);
+        assert!(!over);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn windows_globs_keep_their_root() {
+        let v = PathVars::new()
+            .with_style(PathStyle::Windows)
+            .with_cwd(r"C:\p");
+        // Nothing exists there on a test host: each alternative comes back
+        // as spelled, from its own root.
+        let (found, over) = expand_glob_partial(r"Q:\p19a-none\{a,b}*", None, &v);
+        assert!(!over);
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("q:/").join("p19a-none").join("a*"),
+                PathBuf::from("q:/").join("p19a-none").join("b*")
+            ]
+        );
+    }
+
+    /// A temp dir by its canonical path (macOS: /var -> /private/var). Windows:
+    /// without the `\\\\?\\` that `fs::canonicalize` adds. `Path` compares by
+    /// component there, so `D:\\a\\b` equals the reader's `d:/a/b`, and a verbatim
+    /// path equals neither.
     fn tmp() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let p = fs::canonicalize(d.path()).unwrap();
+        let p = match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => p,
+        };
         (d, p)
     }
 
@@ -876,9 +1205,12 @@ mod tests {
         assert_eq!(c("$PWD/.env"), app.join(".env"));
         assert_eq!(c(".env"), app.join(".env"));
         assert_eq!(c("./.env"), app.join(".env"));
-        // Not variables: left as literal names.
-        assert_eq!(c("$HOMEDIR/x"), app.join("$HOMEDIR/x"));
-        assert_eq!(c("~user/x"), app.join("~user/x"));
+        // Not variables: left as literal names. Windows has no form for them:
+        // the engine denies a variable it does not know (W5).
+        if cfg!(not(windows)) {
+            assert_eq!(c("$HOMEDIR/x"), app.join("$HOMEDIR/x"));
+            assert_eq!(c("~user/x"), app.join("~user/x"));
+        }
     }
 
     #[test]
@@ -891,7 +1223,10 @@ mod tests {
         assert_eq!(c("src/../.env"), app.join(".env"));
         assert_eq!(c("nope/../.env"), app.join(".env"));
         assert_eq!(c("src/../../app/.env"), app.join(".env"));
-        assert_eq!(c("/../../.."), PathBuf::from("/"));
+        // Windows: `/` is the root of the working directory's drive.
+        if cfg!(not(windows)) {
+            assert_eq!(c("/../../.."), PathBuf::from("/"));
+        }
     }
 
     #[cfg(unix)]
@@ -930,13 +1265,22 @@ mod tests {
         assert!(path_forms("x", None, &PathVars::new()).is_empty());
     }
 
+    /// An absolute path on this host.
+    fn host_absolute() -> &'static str {
+        if cfg!(windows) {
+            r"C:\etc\hosts"
+        } else {
+            "/etc/hosts"
+        }
+    }
+
     #[test]
     fn relative_without_cwd_or_tilde_without_home_is_none() {
         let v = PathVars::new();
         assert_eq!(canonicalize(".env", None, &v), None);
         assert_eq!(canonicalize("~/.ssh/id_rsa", None, &v), None);
         assert_eq!(canonicalize("", None, &v), None);
-        assert!(canonicalize("/etc/hosts", None, &v).is_some());
+        assert!(canonicalize(host_absolute(), None, &v).is_some());
     }
 
     #[test]
@@ -1025,7 +1369,7 @@ mod tests {
         assert_eq!(canonicalize(".env", Some(Path::new("sub")), &v), None);
         assert!(path_forms(".env", Some(Path::new("sub")), &v).is_empty());
         // An absolute path does not need the cwd.
-        assert!(canonicalize("/etc/hosts", Some(Path::new("sub")), &v).is_some());
+        assert!(canonicalize(host_absolute(), Some(Path::new("sub")), &v).is_some());
     }
 
     #[cfg(unix)]
@@ -1109,6 +1453,9 @@ mod tests {
         ));
     }
 
+    // POSIX spellings: a Windows host calls `/h` and `/p` relative. No Windows host
+    // runs POSIX style; `style_can_be_set_after_the_values` pins the Windows form.
+    #[cfg(unix)]
     #[test]
     fn lexical_form_needs_no_filesystem() {
         let v = PathVars::new().with_var("HOME", "/h");
@@ -1216,6 +1563,7 @@ mod tests {
         assert_eq!(expand_glob_partial("plain", None, &v), (vec![], false));
     }
 
+    #[cfg(unix)] // symlink creation needs a privilege on Windows (W-decision: dev mode skips)
     #[test]
     fn variables_keep_the_spelled_form_of_a_symlink() {
         let (_d, root) = tmp();

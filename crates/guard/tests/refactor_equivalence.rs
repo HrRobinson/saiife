@@ -6,6 +6,11 @@
 //!
 //! The expected values were recorded with `saiife explain` from the code
 //! before the refactor, run in a tempdir laid out like the fixture below.
+//!
+//! Unix only: they are a POSIX host's decisions, for the POSIX reader. Under
+//! Windows style `cd $(x)` denies (W5) and these counts do not hold;
+//! `corpus_windows_round1` and `corpus_windows_wave` pin that reading.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;

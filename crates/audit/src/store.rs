@@ -22,8 +22,15 @@ pub fn default_dir() -> Option<PathBuf> {
 fn dir_from(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
     match var {
         Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
-        _ => dirs::data_dir().map(|d| d.join("saiife").join("audit")),
+        _ => default_audit_dir(),
     }
+}
+
+/// The per-user audit directory with no override: `saiife/audit` under the
+/// data dir. On Windows that is the local (non-roaming) app data (W3), so the
+/// log never follows a roaming profile; elsewhere it is `dirs::data_dir()`.
+pub fn default_audit_dir() -> Option<PathBuf> {
+    saiife_win::profile::data_base_dir().map(|d| d.join("saiife").join("audit"))
 }
 
 /// Append one record as a single line to `<dir>/<YYYY-MM>.jsonl`, creating the
@@ -280,12 +287,7 @@ impl Filter {
             }
         }
         if let Some(p) = &self.project {
-            let p = p.trim_end_matches('/');
-            let under = r.project == p
-                || r.project
-                    .strip_prefix(p)
-                    .is_some_and(|rest| rest.starts_with('/'));
-            if !under {
+            if !project_holds(p, &r.project, cfg!(windows)) {
                 return false;
             }
         }
@@ -299,11 +301,79 @@ impl Filter {
     }
 }
 
+/// `recorded` is `project` or a directory below it. On Windows an agent reports
+/// its working directory in the system's spelling (`D:\\p\\src`), and it may
+/// differ from saiife's in the verbatim marker, the separator or the case.
+fn project_holds(project: &str, recorded: &str, windows: bool) -> bool {
+    if windows {
+        let fold = |s: &str| {
+            saiife_win::display::strip_verbatim(s)
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        let (project, recorded) = (fold(project), fold(recorded));
+        return recorded == project
+            || recorded
+                .strip_prefix(&project)
+                .is_some_and(|rest| rest.starts_with('\\'));
+    }
+    let project = project.trim_end_matches('/');
+    recorded == project
+        || recorded
+            .strip_prefix(project)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_windows_project_holds_its_subdirectories_however_they_are_spelled() {
+        for recorded in [
+            r"D:\p",
+            r"D:\p\src",
+            r"D:\p\",
+            "D:/p/src",
+            r"d:\P\SRC",
+            r"\\?\D:\p",
+            r"\\?\D:\p\src",
+        ] {
+            for project in [r"D:\p", r"\\?\D:\p", "d:/p/"] {
+                assert!(
+                    project_holds(project, recorded, true),
+                    "{project} {recorded}"
+                );
+            }
+        }
+        for recorded in [r"D:\pp", r"D:\pp\src", r"E:\p", "src", "."] {
+            assert!(!project_holds(r"D:\p", recorded, true), "{recorded}");
+        }
+    }
+
+    #[test]
+    fn a_posix_project_compares_its_bytes() {
+        assert!(project_holds("/p", "/p", false));
+        assert!(project_holds("/p/", "/p/src", false));
+        assert!(!project_holds("/p", "/pp", false));
+        // A backslash is a character of a file name there, and case counts.
+        assert!(!project_holds("/p", r"/p\src", false));
+        assert!(!project_holds("/p", "/P/src", false));
+    }
     use crate::record::NewRecord;
     use time::macros::datetime;
+
+    #[cfg(windows)]
+    #[test]
+    fn default_audit_dir_windows_is_local() {
+        // W3: local app data, never the roaming profile. CI-only (windows-latest).
+        let want = saiife_win::profile::data_base_dir()
+            .unwrap()
+            .join("saiife")
+            .join("audit");
+        assert_eq!(default_audit_dir(), Some(want));
+    }
 
     fn rec(project: &str, agent: &str, decision: DecisionKind, at: OffsetDateTime) -> Record {
         Record::at(
@@ -689,11 +759,13 @@ mod tests {
     #[test]
     fn default_dir_honors_env_override() {
         // Only this test touches DIR_ENV in this test binary.
-        std::env::set_var(DIR_ENV, "/tmp/saiife-audit-override");
-        assert_eq!(
-            default_dir(),
-            Some(PathBuf::from("/tmp/saiife-audit-override"))
-        );
+        let absolute = if cfg!(windows) {
+            r"C:\saiife-audit-override"
+        } else {
+            "/tmp/saiife-audit-override"
+        };
+        std::env::set_var(DIR_ENV, absolute);
+        assert_eq!(default_dir(), Some(PathBuf::from(absolute)));
         std::env::set_var(DIR_ENV, "");
         assert!(default_dir().unwrap().ends_with("saiife/audit"));
         std::env::remove_var(DIR_ENV);
@@ -767,9 +839,14 @@ mod tests {
         assert!(default.as_ref().unwrap().ends_with("saiife/audit"));
         assert_eq!(dir_from(Some("rel-audit".into())), default);
         assert_eq!(dir_from(Some("".into())), default);
+        let absolute = if cfg!(windows) {
+            r"C:\abs\audit"
+        } else {
+            "/abs/audit"
+        };
         assert_eq!(
-            dir_from(Some("/abs/audit".into())),
-            Some(PathBuf::from("/abs/audit"))
+            dir_from(Some(absolute.into())),
+            Some(PathBuf::from(absolute))
         );
     }
 

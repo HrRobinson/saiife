@@ -97,6 +97,9 @@ pub struct Word {
     /// Contains an unquoted glob character (`*`, `?`, `[`), so the shell
     /// would expand it against the filesystem.
     pub glob: bool,
+    /// Its wildcards also match dotfiles (PowerShell and cmd do, bash does
+    /// not). The POSIX lexer never sets it.
+    pub glob_dots: bool,
     /// A shell assignment word as bash sees it: an unquoted `NAME=`,
     /// `NAME+=`, `NAME[…]=` or `NAME[…]+=` prefix. In front of a command
     /// it sets a variable; it is not the command.
@@ -110,6 +113,10 @@ pub struct Word {
     /// ``"`…`"``: its value is one word, never split on blanks or globbed.
     /// (`$(…)""` is not: there the substitution itself is unquoted.)
     pub dq_substitution: bool,
+    /// It holds a `$` and no shell can expand any: each is in single quotes,
+    /// in `$'…'` or escaped. False for a word with no `$`, and for a word not
+    /// built by this lexer: a `$` counts as live unless shown otherwise.
+    pub literal_dollars: bool,
 }
 
 impl AsRef<str> for Word {
@@ -313,6 +320,9 @@ fn lex_in(
 struct WordState {
     text: String,
     has_sub: bool,
+    /// The word so far has a `$` a shell may expand: not in single quotes,
+    /// not in `$'…'` and not escaped.
+    live_dollar: bool,
     /// A word is in progress (possibly still empty, as after `""`).
     in_word: bool,
     /// The word so far has a quoted or escaped piece (so `"2">f` is the
@@ -399,15 +409,18 @@ impl Lexer<'_, '_> {
         }
         let w = std::mem::take(&mut self.word);
         let dq_substitution = w.dq_sub_end == Some(w.text.len());
+        let text_has_dollar = w.text.contains('$');
         let word = Word {
             text: w.text,
             has_substitution: w.has_sub,
             redirect: false,
             glob: w.glob,
+            glob_dots: false,
             assignment: w.assignment,
             brace_overflow: false,
             quoted: w.quoted,
             dq_substitution,
+            literal_dollars: !w.live_dollar && !w.has_sub && text_has_dollar,
         };
         // Brace expansion happens before anything else looks at
         // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
@@ -742,6 +755,7 @@ impl Lexer<'_, '_> {
                     self.chars,
                     &mut w.text,
                     &mut w.has_sub,
+                    &mut w.live_dollar,
                     self.ctx,
                     self.depth,
                     &mut self.pending_docs,
@@ -770,6 +784,7 @@ impl Lexer<'_, '_> {
     /// (ANSI-C), `${…}`, and backtick substitution.
     fn dollar(&mut self, c: char) -> bool {
         let w = &mut self.word;
+        w.live_dollar |= self.chars.peek() != Some('\'');
         match (c, self.chars.peek()) {
             ('`', _) => {
                 w.in_word = true;
@@ -1004,7 +1019,15 @@ fn arith_body(
             }
             '\'' => scan_single_quoted(look, &mut String::new()),
             '"' => {
-                scan_double_quoted(look, &mut String::new(), &mut false, ctx, depth + 1, docs);
+                scan_double_quoted(
+                    look,
+                    &mut String::new(),
+                    &mut false,
+                    &mut false,
+                    ctx,
+                    depth + 1,
+                    docs,
+                );
             }
             '$' if look.peek() == Some('(') => {
                 look.next();
@@ -1189,10 +1212,12 @@ fn redirect_tok(text: String) -> LexTok {
         has_substitution: false,
         redirect: true,
         glob: false,
+        glob_dots: false,
         assignment: false,
         brace_overflow: false,
         quoted: false,
         dq_substitution: false,
+        literal_dollars: false,
     })
 }
 
@@ -1295,6 +1320,7 @@ fn scan_double_quoted(
     chars: &mut Chars,
     out: &mut String,
     has_sub: &mut bool,
+    live_dollar: &mut bool,
     ctx: &mut Ctx,
     depth: usize,
     docs: &mut Vec<PendingDoc>,
@@ -1334,6 +1360,7 @@ fn scan_double_quoted(
             }
             c => {
                 other = true;
+                *live_dollar |= c == '$';
                 out.push(c);
             }
         }
@@ -2058,6 +2085,54 @@ mod tests {
     }
 
     // ---- command substitution ------------------------------------------
+
+    /// A `$` is literal only if the shell cannot expand it: single quotes,
+    /// `$'…'` and an escape. One live `$` makes the whole word live.
+    #[test]
+    fn literal_dollars_says_no_dollar_expands() {
+        let lit = |s: &str| split_segments(s)[0][1].literal_dollars;
+        for word in [
+            "'$x'",
+            "'a/$x/b'",
+            r"\$x",
+            r"a/\$x",
+            r#""\$x""#,
+            "$'$x'",
+            "'$x'$'$y'",
+            r"'$x'\$y",
+        ] {
+            assert!(lit(&format!("cat {word}")), "{word}");
+        }
+        for word in [
+            "$x",
+            "./$x",
+            "\"$x\"",
+            "\"./$x\"",
+            "${x}",
+            "\"${x}\"",
+            "'$x'$y",
+            r"\$x$y",
+            "'$x'\"$y\"",
+            "c$",
+            "$(x)",
+            "\"$(x)\"",
+            "'$x'$(y)",
+            "'$x'`y`",
+            // No `$` to speak of.
+            "plain",
+            "'plain'",
+        ] {
+            assert!(!lit(&format!("cat {word}")), "{word}");
+        }
+        // Every word of a brace expansion, and the default for one built by hand.
+        for w in &split_segments("cat '$x'{a,b}")[0][1..] {
+            assert!(w.literal_dollars, "{}", w.text);
+        }
+        for w in &split_segments("cat {$x,b}/y")[0][1..] {
+            assert!(!w.literal_dollars, "{}", w.text);
+        }
+        assert!(!Word::default().literal_dollars);
+    }
 
     #[test]
     fn dollar_paren_is_opaque_and_flagged() {

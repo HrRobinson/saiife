@@ -102,6 +102,9 @@ pub const LAUNCHD_LABEL: &str = "com.saiife.saiifed";
 pub enum Platform {
     Linux,
     Macos,
+    /// Developer mode only until plan 19b: locked mode's paths and names
+    /// are the Linux ones as placeholders, and nothing installs from them.
+    Windows,
 }
 
 impl Platform {
@@ -111,6 +114,8 @@ impl Platform {
             Some(Platform::Linux)
         } else if cfg!(target_os = "macos") {
             Some(Platform::Macos)
+        } else if cfg!(windows) {
+            Some(Platform::Windows)
         } else {
             None
         }
@@ -120,6 +125,7 @@ impl Platform {
         match self {
             Platform::Linux => "linux",
             Platform::Macos => "macos",
+            Platform::Windows => "windows",
         }
     }
 }
@@ -210,28 +216,28 @@ impl Layout {
     /// names it, without the root.
     pub fn logical<'a>(&self, abs: &'a str) -> &'a str {
         match self.platform {
-            Platform::Linux => abs,
+            Platform::Linux | Platform::Windows => abs,
             Platform::Macos => macos_path(abs).unwrap_or(abs),
         }
     }
 
     pub fn daemon_user(&self) -> &'static str {
         match self.platform {
-            Platform::Linux => DAEMON_USER,
+            Platform::Linux | Platform::Windows => DAEMON_USER,
             Platform::Macos => MACOS_DAEMON_USER,
         }
     }
 
     pub fn daemon_group(&self) -> &'static str {
         match self.platform {
-            Platform::Linux => DAEMON_GROUP,
+            Platform::Linux | Platform::Windows => DAEMON_GROUP,
             Platform::Macos => MACOS_DAEMON_GROUP,
         }
     }
 
     pub fn audit_group(&self) -> &'static str {
         match self.platform {
-            Platform::Linux => AUDIT_GROUP,
+            Platform::Linux | Platform::Windows => AUDIT_GROUP,
             Platform::Macos => MACOS_AUDIT_GROUP,
         }
     }
@@ -239,7 +245,7 @@ impl Layout {
     /// The systemd unit, or the launchd label on macOS.
     pub fn unit_name(&self) -> &'static str {
         match self.platform {
-            Platform::Linux => UNIT_NAME,
+            Platform::Linux | Platform::Windows => UNIT_NAME,
             Platform::Macos => LAUNCHD_LABEL,
         }
     }
@@ -322,6 +328,20 @@ fn resolve_root(raw: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn platform_windows_name() {
+        assert_eq!(Platform::Windows.name(), "windows");
+        #[cfg(windows)]
+        assert_eq!(Platform::current(), Some(Platform::Windows));
+    }
+}
+
+// The path constants and the root resolution are POSIX; the Windows layout is
+// plan 19b's, so these tests assume Unix paths and do not run on Windows.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_agents::Agent;

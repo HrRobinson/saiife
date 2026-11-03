@@ -231,7 +231,7 @@ mod tests {
 
     /// Upgrading from plan 2: the Codex and Gemini entries (and so the
     /// fingerprints in existing integrity records) are unchanged; only
-    /// Claude's entry changed (Glob and LS added to the matcher).
+    /// Claude's entry changed (Glob and LS, then PowerShell, added to the matcher).
     #[test]
     fn entry_fingerprints_across_the_plan_3_upgrade() {
         assert_eq!(
@@ -243,6 +243,11 @@ mod tests {
             "d3f7042e8a85f8e053ae3864fdce1921d8e5620f542fb5ca8a1f5e1183eb53fc"
         );
         assert_eq!(
+            Agent::Claude.expected_entry(),
+            "79bee8986b3cf00133dd2f437b9980d6b199d60e1b1b048a1447165145d758f4"
+        );
+        // The pre-PowerShell entry (MATCHER_V2) is no longer the expected one.
+        assert_ne!(
             Agent::Claude.expected_entry(),
             "96fb881e404f7fed07a75eff98c42bf1c31553d8678c5e36c7216caadc5e2dca"
         );

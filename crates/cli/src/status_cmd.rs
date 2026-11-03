@@ -16,9 +16,12 @@ use saiife_audit::store::{self, Filter};
 use saiife_audit::Record;
 use saiife_policy::installed::{read_installed, FileKind, Installed};
 use saiife_policy::{load_system, PackInfo};
+#[cfg(unix)]
 use saiife_system::doctor::system::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use saiife_system::layout::{CONFIG, INSTALLED};
-use saiife_system::{host_for, Host, Layout};
+use saiife_system::Layout;
+#[cfg(unix)]
+use saiife_system::{host_for, Host};
 use saiifeguard::canon::PathVars;
 use saiifeguard::Pack;
 use time::OffsetDateTime;
@@ -38,7 +41,7 @@ const SCAN_SKIP: [&str; 3] = [".git", "target", "node_modules"];
 /// A path as status prints it: sanitized, since directory names (and the
 /// paths built from them) are anything anyone can create.
 fn shown(path: &Path) -> String {
-    sanitize(&path.display().to_string())
+    sanitize(&saiife_win::display::shown(path))
 }
 
 /// The fix for a removed or changed hook or config: `init` in the project
@@ -157,7 +160,7 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
         .map(|(a, _)| a.as_str())
         .collect();
     let (last_calls, scan) = last_calls(&root, &hooked, &mut problems, &mut notes);
-    let home = dirs::home_dir();
+    let home = saiife_win::profile::home_dir();
 
     for agent in Agent::ALL {
         let rel = agent.config_rel();
@@ -221,6 +224,19 @@ pub fn run(builtin: &[Pack], system_root: Option<PathBuf>) -> ExitCode {
                 fix: format!("repair {rel}, then {}", restore(&root)),
             }),
             Ok(f) if f.contains(&rec.sha256) && rec.sha256 != agent.expected_entry() => {
+                if agent == Agent::Claude
+                    && saiife_agents::claude::project_matcher(&root)
+                        .is_some_and(|m| saiife_agents::claude::matcher_is_outdated(&m))
+                {
+                    problems.push(Problem {
+                        what: format!(
+                            "The saiife hook for {} in {rel}: hook matcher predates the PowerShell tool; run saiife init to update",
+                            agent.label()
+                        ),
+                        fix: String::new(),
+                    });
+                    continue;
+                }
                 problems.push(Problem {
                     what: format!(
                         "The saiife hook for {} in {rel} was written by an older saiife and does not cover every tool this version guards.",
@@ -539,7 +555,7 @@ fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Ve
     let scan = nested_configs(root, limit);
     for dir in scan.found {
         let abs = root.join(&dir);
-        let rel = sanitize(&dir.display().to_string());
+        let rel = sanitize(&relative_text(&dir.display().to_string(), cfg!(windows)));
         let has_config = abs.join(CONFIG_REL).is_file();
         match load_record(&abs) {
             Ok(Some(record)) => problems.extend(config_drift(
@@ -568,6 +584,18 @@ fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Ve
     }
     if scan.cut_short {
         notes.push(format!("nested-config scan stopped after {limit} entries"));
+    }
+}
+
+/// A directory below the project as status prints it, with the `/` every other
+/// path in these messages has (`sub/.saiife/config.toml`). On Windows that is a
+/// separator it can print without changing what it names; on Linux and macOS a
+/// backslash is part of the name.
+fn relative_text(rel: &str, windows: bool) -> String {
+    if windows {
+        rel.replace('\\', "/")
+    } else {
+        rel.to_string()
     }
 }
 
@@ -663,7 +691,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             what: format!(
                 "the saiife on PATH ({}) is not the one that ran `saiife init` ({}).",
                 shown(&on_path),
-                sanitize(&record.saiife_path)
+                shown(Path::new(&record.saiife_path))
             ),
             fix: fix.into(),
         });
@@ -775,6 +803,14 @@ struct LockedState {
 /// Spec section 10, verbatim.
 const WORDING_RULE: &str = "note: the agent never holds a credential for a brokered service; it holds its own model-provider login unless you run a local model";
 
+/// Windows: no locked mode exists until plan 19b, so there is no install
+/// record to read and `status` reports developer mode only.
+#[cfg(not(unix))]
+fn locked_block(_layout: &Layout, _builtin: &[Pack]) -> Option<LockedState> {
+    None
+}
+
+#[cfg(unix)]
 fn locked_block(layout: &Layout, builtin: &[Pack]) -> Option<LockedState> {
     let installed_path = layout.at(INSTALLED);
     // A dangling or symlinked record still means locked mode (and fails).
@@ -1046,15 +1082,6 @@ fn daemon_status(
     ))
 }
 
-#[cfg(not(unix))]
-fn daemon_status(
-    _layout: &Layout,
-    _host: &dyn Host,
-    _cfg: Option<&saiife_policy::SystemConfig>,
-) -> Result<DaemonStatus, String> {
-    Err(saiife_system::NOT_SUPPORTED_OS.to_string())
-}
-
 /// Installed files whose fingerprint differs from `installed.toml`: the
 /// binary, the unit and the managed agent configs. The config is the
 /// admin's to edit, and the vault key has no digest on record.
@@ -1115,6 +1142,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_nested_directory_prints_with_the_separator_of_the_messages() {
+        assert_eq!(relative_text(r"sub\deep", true), "sub/deep");
+        assert_eq!(relative_text("sub/deep", true), "sub/deep");
+        // On Linux and macOS a backslash is part of the name.
+        assert_eq!(relative_text(r"sub\deep", false), r"sub\deep");
+    }
+
+    #[test]
     fn status_prints_gateway_line() {
         let mcp = serde_json::json!([
             {"name":"fs","state":"running","tools":3,"since":"t","last_error":null},
@@ -1137,21 +1172,29 @@ mod tests {
     fn inactive_lines_name_the_unbound_variable_and_its_packs() {
         let (packs, _) = saiifeguard::builtins::builtin_packs();
         let active: Vec<Pack> = packs.into_iter().filter(|p| p.default_on).collect();
+        // A Windows host calls `/home/u` relative, so the value would not bind.
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:{p}")
+            } else {
+                p.to_string()
+            }
+        };
         let bound = PathVars::new()
-            .with_var("HOME", "/home/u")
-            .with_var("PROJECT", "/home/u/app")
-            .with_var("SAIIFE_DATA_DIR", "/home/u/.local/share/saiife")
-            .with_var("CLAUDE_CONFIG_DIR", "/home/u/.claude")
-            .with_var("CODEX_HOME", "/home/u/.codex")
-            .with_var("SAIIFE_BIN", "/usr/bin/saiife")
-            .with_var("XDG_CONFIG_HOME", "/home/u/.config");
+            .with_var("HOME", abs("/home/u"))
+            .with_var("PROJECT", abs("/home/u/app"))
+            .with_var("SAIIFE_DATA_DIR", abs("/home/u/.local/share/saiife"))
+            .with_var("CLAUDE_CONFIG_DIR", abs("/home/u/.claude"))
+            .with_var("CODEX_HOME", abs("/home/u/.codex"))
+            .with_var("SAIIFE_BIN", abs("/usr/bin/saiife"))
+            .with_var("XDG_CONFIG_HOME", abs("/home/u/.config"));
         let text = inactive_lines(&active, &bound);
         assert!(
             text.starts_with("inactive here: $SAIIFE_AUDIT_DIR is not set: "),
             "{text}"
         );
         assert!(text.contains("core.self"), "{text}");
-        let all = bound.with_var("SAIIFE_AUDIT_DIR", "/home/u/.local/share/saiife/audit");
+        let all = bound.with_var("SAIIFE_AUDIT_DIR", abs("/home/u/.local/share/saiife/audit"));
         assert_eq!(inactive_lines(&active, &all), "");
     }
 }

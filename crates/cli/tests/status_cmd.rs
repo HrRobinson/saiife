@@ -38,16 +38,15 @@ fn untouched_project_passes() {
     assert!(text.contains("cannot stop a determined agent"), "{text}");
 }
 
-/// Upgrade path (plan 3): a hook written by plan 2's saiife (Claude matcher
-/// without Glob/LS) passes its own fingerprint but is out of date; status
-/// says so and `saiife init` brings it up to date.
-#[test]
-fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
-    use saiife_agents::claude::{MATCHER, MATCHER_V1};
+/// Upgrade path: a hook written by an older saiife (a Claude matcher
+/// without PowerShell) passes its own fingerprint but is out of date;
+/// status says so and `saiife init` brings it up to date.
+fn old_matcher_is_reported_and_init_updates_it(old_matcher: &str) {
+    use saiife_agents::claude::MATCHER;
     let env = initialized(&["claude"]);
     let old = env
         .read(".claude/settings.json")
-        .replace(MATCHER, MATCHER_V1);
+        .replace(MATCHER, old_matcher);
     env.write(".claude/settings.json", &old);
     let old_fp = saiife_agents::Agent::Claude.entries(env.root()).unwrap()[0].clone();
     for e in std::fs::read_dir(env.data.path().join("projects")).unwrap() {
@@ -60,11 +59,7 @@ fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
     let (c, text) = status(&env);
     assert_eq!(c, 1, "{text}");
     assert!(
-        text.contains("was written by an older saiife and does not cover every tool"),
-        "{text}"
-    );
-    assert!(
-        text.contains("Fix: run `saiife init` to update it"),
+        text.contains("hook matcher predates the PowerShell tool; run saiife init to update"),
         "{text}"
     );
 
@@ -73,6 +68,17 @@ fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
     assert!(env.read(".claude/settings.json").contains(MATCHER));
     let (c, text) = status(&env);
     assert_eq!(c, 0, "{text}");
+}
+
+#[test]
+fn status_warns_on_old_matcher() {
+    old_matcher_is_reported_and_init_updates_it(saiife_agents::claude::MATCHER_V2);
+}
+
+/// Plan 2's matcher (no Glob/LS either) is upgraded the same way.
+#[test]
+fn hook_from_an_older_saiife_is_reported_and_init_updates_it() {
+    old_matcher_is_reported_and_init_updates_it(saiife_agents::claude::MATCHER_V1);
 }
 
 #[test]
@@ -96,7 +102,7 @@ fn hook_removed_by_hand_is_reported_with_the_fix() {
     assert!(
         text.contains(&format!(
             "Fix: run `saiife init` in {} to restore it",
-            std::fs::canonicalize(env.root()).unwrap().display()
+            common::canonical_shown(env.root())
         )),
         "{text}"
     );
@@ -161,12 +167,15 @@ fn config_deleted_is_reported() {
 #[test]
 fn swapped_binary_on_path_is_reported() {
     let env = initialized(&["claude"]);
-    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
-    fake_exe(env.bin.path(), "saiife", "echo 'saiife 0.1.0'");
+    let name = format!("saiife{}", std::env::consts::EXE_SUFFIX);
+    std::fs::remove_file(env.bin.path().join(&name)).unwrap();
+    fake_exe(env.bin.path(), &name, "echo 'saiife 0.1.0'");
     let (c, text) = status(&env);
     assert_eq!(c, 1);
+    // Windows has a copy on PATH, and `init` ran that copy: same path, new bytes.
     assert!(
-        text.contains("is not the one that ran `saiife init`"),
+        text.contains("is not the one that ran `saiife init`")
+            || (cfg!(windows) && text.contains("was replaced since `saiife init`")),
         "{text}"
     );
 }
@@ -174,7 +183,8 @@ fn swapped_binary_on_path_is_reported() {
 #[test]
 fn saiife_missing_from_path_is_reported() {
     let env = initialized(&["claude"]);
-    std::fs::remove_file(env.bin.path().join("saiife")).unwrap();
+    let name = format!("saiife{}", std::env::consts::EXE_SUFFIX);
+    std::fs::remove_file(env.bin.path().join(name)).unwrap();
     let (c, text) = status(&env);
     assert_eq!(c, 1);
     assert!(text.contains("`saiife` is not on PATH"), "{text}");
@@ -217,6 +227,7 @@ fn last_hook_call_is_shown_per_agent() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", "claude"])
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -256,6 +267,7 @@ fn unreadable_audit_dir_is_a_failed_check() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", &file)
@@ -300,6 +312,7 @@ fn symlinked_path_and_subdirectory_find_the_same_project() {
 
 /// Replace the symlink to the binary under test with a real copy, so the
 /// test can later change the file's content in place.
+#[cfg(unix)]
 fn with_real_copy(agents: &[&str]) -> Env {
     let env = Env::new(agents);
     let exe = env.bin.path().join("saiife");
@@ -315,6 +328,7 @@ fn with_real_copy(agents: &[&str]) -> Env {
             .current_dir(env.root())
             .env("PATH", env.bin.path())
             .env("HOME", env.home.path())
+            .env("USERPROFILE", env.home.path())
             .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
             .env("SAIIFE_DATA_DIR", env.data.path())
             .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -352,6 +366,7 @@ fn binary_replaced_in_place_is_reported() {
 /// Absolute path of `sleep`: the fakes run with PATH = the test's bin dir
 /// only, where a bare `sleep` would not be found (and no grandchild would
 /// hold the pipe).
+#[cfg(unix)]
 fn sleep_bin() -> std::path::PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .chain([std::path::PathBuf::from("/bin")])
@@ -538,6 +553,7 @@ fn last_hook_call_through_a_symlinked_cwd_is_shown() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
         .args(["check", "--hook-exit", "--agent", "claude"])
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -587,6 +603,7 @@ fn unhashable_binary_at_init_is_a_failed_check() {
             .current_dir(env.root())
             .env("PATH", env.bin.path())
             .env("HOME", env.home.path())
+            .env("USERPROFILE", env.home.path())
             .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
             .env("SAIIFE_DATA_DIR", env.data.path())
             .env("SAIIFE_AUDIT_DIR", env.audit.path())
@@ -668,8 +685,10 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
 
 /// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
 fn audit_line(project: &str, agent: &str, ts: &str) -> String {
+    // A Windows path holds backslashes, which JSON has to escape.
+    let project = serde_json::to_string(project).unwrap();
     format!(
-        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":\"{project}\",\"tool\":\"Bash\",\
+        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":{project},\"tool\":\"Bash\",\
          \"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}}\n"
     )
 }
@@ -748,10 +767,11 @@ fn status_in_subdir_after_config_removed() {
     let out = env.saiife_in(&env.root().join("src"), &["status"]);
     let text = stdout(&out);
     assert_eq!(code(&out), 1, "{text}");
-    let canonical = std::fs::canonicalize(env.root()).unwrap();
     assert!(
-        text.contains(&format!("saiife status for {}", canonical.display()))
-            || text.contains(&format!("saiife status for {}", env.root().display())),
+        text.contains(&format!(
+            "saiife status for {}",
+            common::canonical_shown(env.root())
+        )) || text.contains(&format!("saiife status for {}", env.root().display())),
         "{text}"
     );
     assert!(text.contains(".saiife/config.toml was removed"), "{text}");
@@ -845,7 +865,10 @@ fn nearer_project_with_removed_config_is_named() {
     let text = stdout(&out);
     assert_eq!(code(&out), 1, "{text}");
     let first = text.lines().next().unwrap();
-    assert!(first.ends_with("/child"), "{text}");
+    assert!(
+        first.ends_with(&format!("{}child", std::path::MAIN_SEPARATOR)),
+        "{text}"
+    );
     assert!(text.contains(".saiife/config.toml was removed"), "{text}");
 }
 
@@ -877,6 +900,7 @@ fn unreadable_audit_dir_says_last_call_unknown() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", &audit)
@@ -921,7 +945,7 @@ fn init_from_inner_with_removed_saiife_restores_inner_not_outer() {
     assert!(
         text.contains(&format!(
             "run `saiife init` in {}",
-            std::fs::canonicalize(&inner).unwrap().display()
+            common::canonical_shown(&inner)
         )),
         "{text}"
     );
@@ -955,7 +979,7 @@ fn init_from_subdir_after_config_removed_restores_the_project() {
     assert!(
         text.contains(&format!(
             "run `saiife init` in {} to restore it",
-            std::fs::canonicalize(env.root()).unwrap().display()
+            common::canonical_shown(env.root())
         )),
         "{text}"
     );
@@ -983,8 +1007,10 @@ fn packs_line_names_a_config_from_another_directory() {
     env.write(".saiife/config.toml", "packs = []\n");
     let out = env.saiife_in(&proj, &["status"]);
     let text = stdout(&out);
-    let root = std::fs::canonicalize(env.root()).unwrap();
-    let want = format!("packs (from {}/.saiife/config.toml):", root.display());
+    let want = format!(
+        "packs (from {}/.saiife/config.toml):",
+        common::canonical_shown(env.root())
+    );
     assert!(text.contains(&want), "{text}");
 }
 
@@ -1041,11 +1067,12 @@ fn scan_stops_at_limit() {
     }
     env.write("zz/.saiife/config.toml", "packs = []\n");
     // SAIIFE_SCAN_LIMIT is read only in debug builds (tests run those).
-    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let out = Command::new(env.exe())
         .arg("status")
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("XDG_RUNTIME_DIR", env.no_runtime_dir())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())

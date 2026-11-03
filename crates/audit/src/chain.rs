@@ -1348,7 +1348,8 @@ mod tests {
         assert_eq!(r.seq, Some(1));
         assert_eq!(r.prev, Some(sha256_hex(&ls[0])));
         assert_eq!(r.host, g.host, "host is carried over from the chain");
-        assert!(r.uid.is_some());
+        // Windows has no uid: a developer record there carries none.
+        assert_eq!(r.uid.is_some(), cfg!(unix));
         assert_eq!(r.tool, "Bash");
     }
 

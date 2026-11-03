@@ -48,6 +48,9 @@ fn broken_config_warns_and_shows_the_defaults() {
 /// user's data dir; a relative HOME (and no XDG_DATA_HOME) leaves that
 /// default undeterminable too, so the audit-dir rules cannot apply and
 /// `packs <id>` marks them inactive.
+// Windows always finds the data dir through the known folder (ruling P4), so a
+// relative profile leaves nothing undeterminable and the note never appears.
+#[cfg(unix)]
 #[test]
 fn explain_prints_inactive_note() {
     let env = Env::new(&[]);

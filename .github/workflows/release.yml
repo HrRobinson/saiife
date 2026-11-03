@@ -9,6 +9,7 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - 'install.sh'
+      - 'install.ps1'
       - 'scripts/release/**'
       - 'packaging/**'
       - 'scripts/package-linux/**'
@@ -75,10 +76,20 @@ jobs:
             os: macos-latest
             lipo_arch: arm64
             run: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            pe_machine: '0x8664'
+            run: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            pe_machine: '0xAA64'
+            # Cross-compiled on an x64 runner: it cannot run here.
+            run: false
     runs-on: ${{ matrix.os }}
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.check-version.outputs.version }}
+      EXE: ${{ contains(matrix.target, 'windows') && '.exe' || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -87,11 +98,42 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       # rust-toolchain.toml selects the toolchain; make sure it has the target.
-      - run: rustup target add "$TARGET"
+      - name: rustup target add
+        shell: bash
+        run: rustup target add "$TARGET"
       - name: install musl-tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked --target "$TARGET" -p saiife
+      # ring compiles C for ARM64 Windows with LLVM's clang. Pinned release
+      # (older than 14 days) and a committed SHA-256 (GitHub's published
+      # digest of the asset); the build fails if the download does not match.
+      - name: clang on PATH (Windows ARM64 cross-build)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        env:
+          LLVM_VERSION: 23.1.2
+          LLVM_SHA256: 8fb91cdc44fcbbdcf6b3ffd0a1f9859abd14a3c3aae4423c2b6d4a4f90bf0095
+        run: |
+          set -euo pipefail
+          asset="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${asset}"
+          echo "${LLVM_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/p19a-llvm"
+          # System32 bsdtar takes drive paths; Git Bash's GNU tar would read "D:" as
+          # a remote host. The .xz, because bsdtar cannot decode this release's .zst:
+          # "Frame requires too much memory for decoding".
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$RUNNER_TEMP/$asset")" \
+            -C "$(cygpath -w "$RUNNER_TEMP/p19a-llvm")" --strip-components=1
+          # 901 MB, on the drive the build uses too.
+          rm -f "$RUNNER_TEMP/$asset"
+          df -h "$RUNNER_TEMP"
+          bindir="$(cygpath -w "$RUNNER_TEMP/p19a-llvm/bin")"
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/p19a-llvm/bin/clang" --version
+      - name: cargo build
+        shell: bash
+        run: cargo build --release --locked --target "$TARGET" -p saiife
       - name: verify architecture (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -124,6 +166,23 @@ jobs:
             echo "::error::expected exactly '$LIPO_ARCH', got '$archs'"
             exit 1
           fi
+      - name: verify architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PE_MACHINE: ${{ matrix.pe_machine }}
+        run: |
+          $exe = Join-Path $PWD "target/$env:TARGET/release/saiife.exe"
+          $b = [System.IO.File]::ReadAllBytes($exe)
+          # e_lfanew at 0x3C, then "PE\0\0", then the Machine field.
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          $got = '0x{0:X4}' -f $machine
+          Write-Output "PE Machine: $got"
+          if ([Convert]::ToUInt16($env:PE_MACHINE, 16) -ne $machine) {
+            Write-Output "::error::expected PE Machine $env:PE_MACHINE, got $got"
+            exit 1
+          }
       # Hardened runtime always; Developer ID + notarization only when all six
       # secrets exist (none: ad-hoc with a warning; some: fail). The secrets
       # reach this step only, never the job. Fork PRs have none, so they stay
@@ -142,18 +201,61 @@ jobs:
           APPLE_NOTARY_APPLE_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_APPLE_ID || '' }}
           APPLE_NOTARY_PASSWORD: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_NOTARY_PASSWORD || '' }}
         run: bash scripts/release/macos-sign.sh "target/$TARGET/release/saiife" "$TARGET"
+      # Authenticode via Azure Artifact Signing, only when all six secrets
+      # exist (none: unsigned with a warning; some: fail). Same gate as macOS:
+      # the secrets exist only on v* tag refs, so PRs, forks and a
+      # workflow_dispatch on a branch get empty strings and stay green. They
+      # reach this step and the signing action's inputs, never the job env.
+      # Secret-based auth, so no id-token permission is needed.
+      - name: signing mode (Windows)
+        id: winsign
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          WINDOWS_SIGN_AZURE_TENANT_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_TENANT_ID || '' }}
+          WINDOWS_SIGN_AZURE_CLIENT_ID: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_ID || '' }}
+          WINDOWS_SIGN_AZURE_CLIENT_SECRET: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_SECRET || '' }}
+          WINDOWS_SIGN_ENDPOINT: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ENDPOINT || '' }}
+          WINDOWS_SIGN_ACCOUNT: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ACCOUNT || '' }}
+          WINDOWS_SIGN_PROFILE: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_PROFILE || '' }}
+        run: bash scripts/release/windows-sign-mode.sh "$TARGET"
+      - name: sign (Windows)
+        if: runner.os == 'Windows' && steps.winsign.outputs.mode == 'artifact-signing'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_TENANT_ID || '' }}
+          azure-client-id: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_ID || '' }}
+          azure-client-secret: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_AZURE_CLIENT_SECRET || '' }}
+          endpoint: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ENDPOINT || '' }}
+          signing-account-name: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_ACCOUNT || '' }}
+          certificate-profile-name: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.WINDOWS_SIGN_PROFILE || '' }}
+          cache-dependencies: 'false'
+          files: ${{ github.workspace }}\target\${{ matrix.target }}\release\saiife.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: signtool verify (Windows)
+        if: runner.os == 'Windows' && steps.winsign.outputs.mode == 'artifact-signing'
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if ($null -eq $signtool) { Write-Output '::error::signtool.exe not found'; exit 1 }
+          & $signtool.FullName verify /pa /v "target/$env:TARGET/release/saiife.exe"
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::signtool verify failed'; exit 1 }
       - name: saiife --version
         if: matrix.run
         shell: bash
         run: |
           set -euo pipefail
-          out="$("target/$TARGET/release/saiife" --version)"
+          out="$("target/$TARGET/release/saiife$EXE" --version)"
           echo "$out"
           case "$out" in
             *"$VERSION"*) ;;
             *) echo "::error::--version does not report $VERSION"; exit 1 ;;
           esac
       - name: package
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -162,11 +264,25 @@ jobs:
           cp "target/$TARGET/release/saiife" LICENSE README.md "dist/$name/"
           COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
           tar -tzf "dist/$name.tar.gz"
+      # A flat zip: saiife.exe, LICENSE, README.md (install.ps1 reads saiife.exe).
+      - name: package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "saiife-$env:VERSION-$env:TARGET"
+          $stage = Join-Path $PWD "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$env:TARGET/release/saiife.exe", 'LICENSE', 'README.md' -Destination $stage
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = Join-Path $PWD "dist/$name.zip"
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+          $a = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try { $a.Entries | ForEach-Object { $_.FullName } } finally { $a.Dispose() }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
           path: |
-            dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/saiife-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}
             dist/SIGNING-*.txt
           if-no-files-found: error
 
@@ -375,13 +491,18 @@ jobs:
             echo "::error::expected 2 debs and 2 rpms, found ${#debs[@]} and ${#rpms[@]}"
             exit 1
           fi
+          zips="$(ls -1 saiife-*.zip | wc -l)"
+          if [ "$zips" -ne 2 ]; then
+            echo "::error::expected 2 Windows zips, found $zips"
+            exit 1
+          fi
           want_pkgs=0
           if [ "$PKG_SIGNED" = true ]; then want_pkgs=2; fi
           if [ "${#pkgs[@]}" -ne "$want_pkgs" ]; then
             echo "::error::expected $want_pkgs signed pkgs, found ${#pkgs[@]}"
             exit 1
           fi
-          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm ${pkgs[@]+"${pkgs[@]}"} | LC_ALL=C sort -k2 > SHA256SUMS
+          sha256sum saiife-*.tar.gz saiife_*.deb saiife-*.rpm saiife-*.zip ${pkgs[@]+"${pkgs[@]}"} | LC_ALL=C sort -k2 > SHA256SUMS
           cat SHA256SUMS
       - name: sign SHA256SUMS
         shell: bash
@@ -428,11 +549,25 @@ jobs:
           # One SIGNING-<target>.txt per macOS build: a missing one must
           # not drop the ad-hoc note silently.
           shopt -s nullglob
-          signing=(dist/SIGNING-*.txt)
+          signing=(dist/SIGNING-*-apple-darwin.txt)
+          wsigning=(dist/SIGNING-*-windows-msvc.txt)
           shopt -u nullglob
           if [ "${#signing[@]}" -ne 2 ]; then
-            echo "::error::expected 2 SIGNING-*.txt files (one per macOS target), found ${#signing[@]}: ${signing[*]}"
+            echo "::error::expected 2 macOS SIGNING-*.txt files, found ${#signing[@]}: ${signing[*]}"
             exit 1
+          fi
+          if [ "${#wsigning[@]}" -ne 2 ]; then
+            echo "::error::expected 2 Windows SIGNING-*.txt files, found ${#wsigning[@]}: ${wsigning[*]}"
+            exit 1
+          fi
+          for f in "${wsigning[@]}"; do
+            case "$(cat "$f")" in
+              unsigned | artifact-signing) ;;
+              *) echo "::error::$f holds '$(cat "$f")', want unsigned or artifact-signing"; exit 1 ;;
+            esac
+          done
+          if grep -qx 'unsigned' "${wsigning[@]}"; then
+            printf '\nWindows binaries in this release are not Authenticode-signed; SmartScreen will warn on first run.\n' >> notes.md
           fi
           for f in "${signing[@]}"; do
             case "$(cat "$f")" in
@@ -452,7 +587,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          files=(dist/*.tar.gz dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh)
+          files=(dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/SHA256SUMS install.sh install.ps1)
           if [ -f dist/SHA256SUMS.asc ]; then
             files+=(dist/SHA256SUMS.asc)
           fi
@@ -504,6 +639,52 @@ jobs:
             *"$VERSION"*) ;;
             *) echo "::error::installed saiife does not report $VERSION"; exit 1 ;;
           esac
+
+  # install.ps1 from the draft assets on Windows: checksums, install, and the
+  # Authenticode state the build recorded (Valid when signed, NotSigned if not).
+  install-test-windows:
+    needs: [check-version, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - name: download the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" -D rel
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-x86_64-pc-windows-msvc
+          path: signing
+      - name: install from the draft assets
+        shell: pwsh
+        run: |
+          Get-ChildItem rel | Format-Table Name, Length
+          $rel = ([System.Uri]((Resolve-Path rel).Path + '\')).AbsoluteUri
+          & powershell.exe -NoProfile -File rel/install.ps1 -Version $env:VERSION -BaseUrl $rel
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: saiife --version and Authenticode state
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\saiife\bin\saiife.exe'
+          $out = & $exe --version
+          Write-Output $out
+          if (-not ("$out" -like "*$env:VERSION*")) {
+            Write-Output "::error::installed saiife does not report $env:VERSION"
+            exit 1
+          }
+          $mode = (Get-Content signing/SIGNING-x86_64-pc-windows-msvc.txt -Raw).Trim()
+          $want = if ($mode -eq 'artifact-signing') { 'Valid' } else { 'NotSigned' }
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Output "mode=$mode Authenticode=$($sig.Status)"
+          if ([string]$sig.Status -ne $want) {
+            Write-Output "::error::expected Authenticode status $want, got $($sig.Status)"
+            exit 1
+          }
 
   package-test:
     needs: [check-version, publish]
@@ -561,7 +742,7 @@ jobs:
             bash scripts/package-linux/run.sh "$KIND" rel "$pkg" "$pkg"
 
   release:
-    needs: [install-test, package-test]
+    needs: [install-test, install-test-windows, package-test]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

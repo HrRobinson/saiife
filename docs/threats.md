@@ -277,6 +277,23 @@ process itself to die or hang.
     shell function named `saiife`)
   - [Limits of the guard as a whole](#limits-of-the-guard-as-a-whole)
 
+## Limits of the guard on Windows
+
+Developer mode only; locked mode on Windows is not built yet. None of this has run
+on real Windows until CI does. The full list is in
+[Windows: limits](windows.md#limits). Most of all, the PowerShell and cmd readers do
+not see:
+
+- aliases and functions defined in the same command (`Set-Alias`, `function f {…}`),
+- the contents of `.ps1` scripts,
+- .NET calls (`[IO.File]::Delete(…)`) and COM objects,
+- the registry provider beyond the `core.lock` rules.
+
+Under the PowerShell reading, a line holding these is denied instead of read. Some
+writers (`Start-BitsTransfer -Destination`, `Export-Certificate`, `Save-Module`) are
+judged only as reads. Budget overruns, panics and oversize lines stay
+`error_allowed` in developer mode.
+
 ## Limits of the guard as a whole
 
 These apply to every pack:

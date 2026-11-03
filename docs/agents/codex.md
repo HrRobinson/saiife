@@ -52,6 +52,12 @@ start, Codex runs the tool anyway (it "fails open"). This is on purpose for
 v1, where a person is nearby. When saiife itself hits an error, it allows the
 tool and records `error_allowed` in the audit log.
 
+On Windows, Codex runs commands through PowerShell, according to its docs (not
+checked on a live install). saiife reads each `Bash` call as both PowerShell and
+POSIX, and the stricter verdict wins. A line the PowerShell reading cannot read is
+denied. There is no separate `PowerShell` tool to match. See
+[Windows](../windows.md#shells-and-the-guard).
+
 ## Turning it off
 
 Run `saiife init --off` in your own terminal, in the project folder. It

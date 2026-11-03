@@ -12,9 +12,11 @@
 //!
 //! ```toml
 //! [pack]        # id, name, description, default_on, version, triggers,
-//!               # substitution_failsafe
+//!               # windows_triggers, substitution_failsafe
 //! [[allow]] / [[deny]]
 //! pattern = "regex"           # matched against the effective command line
+//! platform = "windows"        # any rule, path rules too: applies on a
+//!                             # Windows-style host only (see below)
 //! reason = "..."              # required for deny
 //! whole_segment = true        # match the whole segment instead: wrappers
 //!                             # (`env`, `sudo`) and leading `NAME=value`
@@ -54,6 +56,22 @@
 //! An `[[allow]]` match exempts the command only from its own pack's
 //! `[[deny]]` rules (as `[[allow_path]]` does for paths); other packs still
 //! judge it, and their first deny wins.
+//!
+//! `platform = "windows"` (W7): the rule is for a Windows-style host
+//! ([`PathStyle::Windows`]: a Windows build of saiife, whichever shell or
+//! dialect a line comes from, Git Bash too; WSL runs a Linux build, so it is
+//! POSIX). `"windows"` is the only value; any other is a load error for the
+//! pack, like an unknown key. `windows_triggers` are `triggers` that only such
+//! a host adds, so a pack's other rules keep their cost and their failsafe.
+//!
+//! The two ways to load treat a rule for another OS differently:
+//! - The shipped packs ([`crate::builtins::Catalog`]) skip it unread, so its
+//!   regex is not compiled. A hook compiles its packs on every call. Tests pin
+//!   exactly which shipped rules are marked.
+//! - Anything else ([`load_pack_str`], [`load_pack_for`], [`load_packs_dir`])
+//!   checks it like any other rule, compiling it, and then leaves it out with a
+//!   [`PackWarning`] that names it. So a marker cannot hide a broken rule, and
+//!   a deny that is not in force on this host is never left out silently.
 
 use std::cell::Cell;
 use std::fs;
@@ -63,9 +81,32 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::canon::PathStyle;
 use crate::getopt::{Opt, OwnedSpec};
 use crate::pathrule::{validate_ancestors, validate_glob, PathRule, RuleAccess};
 use crate::prefilter::Prefilter;
+
+/// `platform` of a rule: the one kind of host it applies on. A value not
+/// listed here fails the pack's load; it never means "everywhere" or "nowhere".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RulePlatform {
+    Windows,
+}
+
+impl RulePlatform {
+    fn applies_on(self, style: PathStyle) -> bool {
+        match self {
+            RulePlatform::Windows => style == PathStyle::Windows,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RulePlatform::Windows => "windows",
+        }
+    }
+}
 
 /// A compiled matching rule: a regex plus the reason shown when it fires.
 #[derive(Debug, Clone)]
@@ -677,6 +718,10 @@ pub struct Pack {
     pub deny_path: Vec<PathRule>,
     /// Built once from `triggers` at load.
     prefilter: Prefilter,
+    /// The host style the pack was loaded for, and how many of its rules carry
+    /// a `platform` marker (kept or not): see [`Pack::fits`].
+    loaded_for: PathStyle,
+    marked: usize,
     /// `[pack] lazy = true` from a catalog: `allow` and `deny` are empty
     /// and the rules are compiled on first use ([`Pack::allow_rules`],
     /// [`Pack::deny_rules`]), which the engine asks for only when a command
@@ -689,6 +734,7 @@ pub struct Pack {
 struct LazyRules {
     source: &'static str,
     toml: &'static str,
+    style: PathStyle,
     has_deny: bool,
     rules: std::sync::OnceLock<(Vec<Rule>, Vec<Rule>)>,
 }
@@ -700,7 +746,7 @@ impl LazyRules {
             // `load_all` (eager) reports it, and the tests keep every
             // built-in loading clean.
             let mut warnings = Vec::new();
-            match load_pack_str(self.source, self.toml, &mut warnings) {
+            match load_shipped(self.source, self.toml, self.style, &mut warnings) {
                 Ok(p) => (p.allow, p.deny),
                 Err(_) => (Vec::new(), Vec::new()),
             }
@@ -772,6 +818,14 @@ impl Pack {
         Some(p)
     }
 
+    /// Were this pack's rules chosen for `style`? A pack with no `platform`
+    /// marker fits every style. The engine checks this: Windows-style paths
+    /// over a pack loaded for POSIX would judge without the Windows rules, and
+    /// a test would pass for the wrong reason.
+    pub fn fits(&self, style: PathStyle) -> bool {
+        self.marked == 0 || self.loaded_for == style
+    }
+
     /// The rules are compiled on first use.
     pub fn is_lazy(&self) -> bool {
         self.lazy.is_some()
@@ -841,6 +895,8 @@ struct RawMeta {
     version: u32,
     #[serde(default)]
     triggers: Vec<String>,
+    #[serde(default)]
+    windows_triggers: Vec<String>,
     #[serde(default = "default_true")]
     substitution_failsafe: bool,
     /// Compile the rules on first use (a catalog load; see [`Pack::lazy`]).
@@ -854,6 +910,8 @@ struct RawMeta {
 struct RawRule {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    platform: Option<RulePlatform>,
     pattern: String,
     #[serde(default)]
     reason: Option<String>,
@@ -894,6 +952,8 @@ struct RawRule {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPathRule {
+    #[serde(default)]
+    platform: Option<RulePlatform>,
     glob: String,
     #[serde(default = "default_access")]
     access: RuleAccess,
@@ -916,6 +976,50 @@ fn default_version() -> u32 {
 
 // ---- Loading -----------------------------------------------------------------
 
+/// What a load does with a rule for another OS.
+struct HostFilter {
+    style: PathStyle,
+    /// A shipped pack on a hook's path: skip the rule unread. Otherwise check
+    /// it in full and warn that it was left out.
+    shipped: bool,
+    /// Rules left out for another OS, so far.
+    left_out: usize,
+    /// Rules with a `platform` marker, so far.
+    marked: usize,
+}
+
+impl HostFilter {
+    /// `platform` of a rule: does it apply here?
+    fn notes(&mut self, platform: Option<RulePlatform>) -> bool {
+        let Some(p) = platform else {
+            return true;
+        };
+        self.marked += 1;
+        let here = p.applies_on(self.style);
+        if !here {
+            self.left_out += 1;
+        }
+        here
+    }
+}
+
+/// The warning for a checked rule that is not in force on this host.
+fn warn_left_out(
+    source: &str,
+    kind: &str,
+    rule: &str,
+    platform: Option<RulePlatform>,
+    warnings: &mut Vec<PackWarning>,
+) {
+    warnings.push(PackWarning {
+        source: source.to_string(),
+        message: format!(
+            "{kind} {rule:?} is not in force on this host: platform = {:?}",
+            platform.map_or("", RulePlatform::name)
+        ),
+    });
+}
+
 /// Compile a rule list. A rule whose regex fails to compile is dropped with a
 /// warning. For deny rules, a missing reason is a hard error (fail-open matters
 /// only when the guard malfunctions, not when a rule is authored to block
@@ -924,11 +1028,22 @@ fn compile_rules(
     source: &str,
     raw: Vec<RawRule>,
     require_reason: bool,
+    filter: &mut HostFilter,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Vec<Rule>, PackError> {
     let mut out = Vec::with_capacity(raw.len());
     let mut ids = std::collections::HashSet::new();
+    let kind = if require_reason {
+        "deny rule"
+    } else {
+        "allow rule"
+    };
     for mut r in raw {
+        let platform = r.platform;
+        let here = filter.notes(platform);
+        if !here && filter.shipped {
+            continue;
+        }
         // A bad or repeated id is dropped, never the rule (that would
         // fail open).
         if let Some(id) = r.id.take() {
@@ -1044,6 +1159,7 @@ fn compile_rules(
         };
         let when_option = table.clone().filter(|_| gates);
         match Regex::new(&r.pattern) {
+            Ok(_) if !here => warn_left_out(source, kind, &r.pattern, platform, warnings),
             Ok(regex) => out.push(Rule {
                 id: r.id,
                 when_option,
@@ -1081,10 +1197,20 @@ fn check_path_rules(
     source: &str,
     raw: Vec<RawPathRule>,
     require_reason: bool,
+    filter: &mut HostFilter,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Vec<PathRule>, PackError> {
     let mut out = Vec::with_capacity(raw.len());
+    let kind = if require_reason {
+        "deny_path rule"
+    } else {
+        "allow_path rule"
+    };
     for r in raw {
+        let here = filter.notes(r.platform);
+        if !here && filter.shipped {
+            continue;
+        }
         if require_reason && r.reason.as_deref().unwrap_or("").trim().is_empty() {
             return Err(PackError::MissingReason(r.glob));
         }
@@ -1094,6 +1220,7 @@ fn check_path_rules(
             validate_glob(&r.glob)
         };
         match valid {
+            Ok(()) if !here => warn_left_out(source, kind, &r.glob, r.platform, warnings),
             Ok(()) => out.push(PathRule {
                 glob: r.glob,
                 access: r.access,
@@ -1113,11 +1240,22 @@ fn check_path_rules(
 struct RawHeader {
     pack: RawHeaderMeta,
     #[serde(default)]
-    deny: Vec<serde::de::IgnoredAny>,
+    allow: Vec<RawHeaderRule>,
     #[serde(default)]
-    allow_path: Vec<serde::de::IgnoredAny>,
+    deny: Vec<RawHeaderRule>,
     #[serde(default)]
-    deny_path: Vec<serde::de::IgnoredAny>,
+    allow_path: Vec<RawHeaderRule>,
+    #[serde(default)]
+    deny_path: Vec<RawHeaderRule>,
+}
+
+/// All a header needs of a rule. A bad `platform` fails the read, so such a
+/// pack is loaded eagerly and its failure reported, never compiled lazily and
+/// lost.
+#[derive(Deserialize)]
+struct RawHeaderRule {
+    #[serde(default)]
+    platform: Option<RulePlatform>,
 }
 
 #[derive(Deserialize)]
@@ -1133,6 +1271,8 @@ struct RawHeaderMeta {
     description: String,
     #[serde(default)]
     triggers: Vec<String>,
+    #[serde(default)]
+    windows_triggers: Vec<String>,
     #[serde(default = "default_true")]
     substitution_failsafe: bool,
     #[serde(default)]
@@ -1147,6 +1287,15 @@ pub(crate) struct LazyMeta {
     triggers: Vec<String>,
     substitution_failsafe: bool,
     has_deny: bool,
+    marked: usize,
+}
+
+/// A pack's triggers on a host of `style`.
+fn triggers_for(mut triggers: Vec<String>, windows: Vec<String>, style: PathStyle) -> Vec<String> {
+    if style == PathStyle::Windows {
+        triggers.extend(windows);
+    }
+    triggers
 }
 
 /// A pack's `id`, `default_on` and `version` without compiling any of its
@@ -1154,7 +1303,10 @@ pub(crate) struct LazyMeta {
 /// pack that says `lazy = true` (with triggers and no path rules), what
 /// [`lazy_pack`] needs. `None` if the TOML or its `[pack]` table cannot be
 /// read (a full load reports why).
-pub(crate) fn peek_header(toml_str: &str) -> Option<((String, bool, u32), Option<LazyMeta>)> {
+pub(crate) fn peek_header(
+    toml_str: &str,
+    style: PathStyle,
+) -> Option<((String, bool, u32), Option<LazyMeta>)> {
     let h: RawHeader = toml::from_str(toml_str).ok()?;
     if h.pack.id.trim().is_empty() {
         return None;
@@ -1163,12 +1315,21 @@ pub(crate) fn peek_header(toml_str: &str) -> Option<((String, bool, u32), Option
         && !h.pack.triggers.is_empty()
         && h.allow_path.is_empty()
         && h.deny_path.is_empty())
-    .then_some(LazyMeta {
+    .then(|| LazyMeta {
         name: h.pack.name,
         description: h.pack.description,
-        triggers: h.pack.triggers,
+        triggers: triggers_for(h.pack.triggers, h.pack.windows_triggers, style),
         substitution_failsafe: h.pack.substitution_failsafe,
-        has_deny: !h.deny.is_empty(),
+        has_deny: h
+            .deny
+            .iter()
+            .any(|r| r.platform.is_none_or(|p| p.applies_on(style))),
+        marked: h
+            .allow
+            .iter()
+            .chain(&h.deny)
+            .filter(|r| r.platform.is_some())
+            .count(),
     });
     Some(((h.pack.id, h.pack.default_on, h.pack.version), lazy))
 }
@@ -1179,9 +1340,12 @@ pub(crate) fn lazy_pack(
     toml: &'static str,
     (id, default_on, version): &(String, bool, u32),
     meta: &LazyMeta,
+    style: PathStyle,
 ) -> Pack {
     Pack {
         prefilter: Prefilter::new(meta.triggers.clone()),
+        loaded_for: style,
+        marked: meta.marked,
         id: id.clone(),
         name: meta.name.clone(),
         description: meta.description.clone(),
@@ -1196,6 +1360,7 @@ pub(crate) fn lazy_pack(
         lazy: Some(std::sync::Arc::new(LazyRules {
             source,
             toml,
+            style,
             has_deny: meta.has_deny,
             rules: std::sync::OnceLock::new(),
         })),
@@ -1213,11 +1378,43 @@ pub(crate) fn compiled_packs() -> usize {
     COMPILED.with(|c| c.get())
 }
 
-/// Load and compile a single pack from a TOML string. `source` labels the pack
-/// in any warnings (a filename, or `"<builtin>"`).
+/// Load and compile a single pack from a TOML string, for this host. `source`
+/// labels the pack in any warnings (a filename, or `"<builtin>"`). A rule for
+/// another OS is checked and then left out with a warning: see the module docs.
 pub fn load_pack_str(
     source: &str,
     toml_str: &str,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
+    load_pack_for(source, toml_str, PathStyle::host(), warnings)
+}
+
+/// [`load_pack_str`] for a host of `style`.
+pub fn load_pack_for(
+    source: &str,
+    toml_str: &str,
+    style: PathStyle,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
+    load_filtered(source, toml_str, style, false, warnings)
+}
+
+/// A shipped pack for a host of `style`: a rule for another OS is skipped
+/// unread, which is what keeps it off a hook's clock.
+pub(crate) fn load_shipped(
+    source: &str,
+    toml_str: &str,
+    style: PathStyle,
+    warnings: &mut Vec<PackWarning>,
+) -> Result<Pack, PackError> {
+    load_filtered(source, toml_str, style, true, warnings)
+}
+
+fn load_filtered(
+    source: &str,
+    toml_str: &str,
+    style: PathStyle,
+    shipped: bool,
     warnings: &mut Vec<PackWarning>,
 ) -> Result<Pack, PackError> {
     #[cfg(test)]
@@ -1226,21 +1423,36 @@ pub fn load_pack_str(
     if raw.pack.id.trim().is_empty() {
         return Err(PackError::MissingId);
     }
-    let allow = compile_rules(source, raw.allow, false, warnings)?;
-    let deny = compile_rules(source, raw.deny, true, warnings)?;
-    let allow_path = check_path_rules(source, raw.allow_path, false, warnings)?;
-    let deny_path = check_path_rules(source, raw.deny_path, true, warnings)?;
-    if allow.is_empty() && deny.is_empty() && allow_path.is_empty() && deny_path.is_empty() {
+    let mut filter = HostFilter {
+        style,
+        shipped,
+        left_out: 0,
+        marked: 0,
+    };
+    let allow = compile_rules(source, raw.allow, false, &mut filter, warnings)?;
+    let deny = compile_rules(source, raw.deny, true, &mut filter, warnings)?;
+    let allow_path = check_path_rules(source, raw.allow_path, false, &mut filter, warnings)?;
+    let deny_path = check_path_rules(source, raw.deny_path, true, &mut filter, warnings)?;
+    // A pack with rules for another OS only is not broken; its warnings say so.
+    if allow.is_empty()
+        && deny.is_empty()
+        && allow_path.is_empty()
+        && deny_path.is_empty()
+        && filter.left_out == 0
+    {
         return Err(PackError::NoRules);
     }
+    let triggers = triggers_for(raw.pack.triggers, raw.pack.windows_triggers, style);
     Ok(Pack {
-        prefilter: Prefilter::new(raw.pack.triggers.clone()),
+        prefilter: Prefilter::new(triggers.clone()),
+        loaded_for: style,
+        marked: filter.marked,
         id: raw.pack.id,
         name: raw.pack.name,
         description: raw.pack.description,
         default_on: raw.pack.default_on,
         version: raw.pack.version,
-        triggers: raw.pack.triggers,
+        triggers,
         substitution_failsafe: raw.pack.substitution_failsafe,
         allow,
         deny,
@@ -1950,6 +2162,173 @@ reason = "bad glob: dropped with a warning"
             assert!(p.deny_path.is_empty(), "{bad}");
             assert_eq!(w.len(), 1, "{bad}: {w:?}");
             assert!(w[0].message.contains("ancestors"), "{w:?}");
+        }
+    }
+
+    /// A deny, a marked deny, a marked path deny and a marked allow.
+    const MARKED: &str = r#"
+[pack]
+id = "t.marked"
+triggers = ["always"]
+windows_triggers = ["(?i)winword"]
+[[allow]]
+platform = "windows"
+pattern = 'winallow'
+[[deny]]
+pattern = 'always'
+reason = "r"
+[[deny]]
+platform = "windows"
+pattern = 'winword'
+reason = "r"
+[[deny_path]]
+platform = "windows"
+glob = "**/winpath"
+reason = "r"
+"#;
+
+    #[test]
+    fn an_unknown_platform_is_a_pack_error_in_every_table() {
+        for value in [
+            "\"linux\"",
+            "\"Windows\"",
+            "\"\"",
+            "\"windows \"",
+            "1",
+            "true",
+        ] {
+            for rule in [
+                "[[deny]]\npattern = \"x\"\nreason = \"r\"",
+                "[[allow]]\npattern = \"x\"",
+                "[[deny_path]]\nglob = \"/x\"\nreason = \"r\"",
+                "[[allow_path]]\nglob = \"/x\"",
+            ] {
+                let toml = format!(
+                    "[pack]\nid = \"t\"\n[[deny]]\npattern = \"y\"\nreason = \"r\"\n{rule}\nplatform = {value}\n"
+                );
+                let mut w = Vec::new();
+                for style in [PathStyle::Posix, PathStyle::Windows] {
+                    for got in [
+                        load_pack_for("<t>", &toml, style, &mut w),
+                        load_shipped("<t>", &toml, style, &mut w),
+                    ] {
+                        assert!(matches!(got, Err(PackError::Toml(_))), "{value} {rule}");
+                    }
+                    assert!(peek_header(&toml, style).is_none(), "{value} {rule}");
+                }
+            }
+        }
+    }
+
+    /// A rule for another OS never leaves a pack unnoticed outside the catalog.
+    #[test]
+    fn a_marked_rule_for_another_os_is_checked_and_named() {
+        let mut w = Vec::new();
+        let p = load_pack_for("<t>", MARKED, PathStyle::Posix, &mut w).unwrap();
+        assert_eq!(p.deny.len(), 1);
+        assert!(p.allow.is_empty() && p.deny_path.is_empty());
+        assert_eq!(p.triggers, ["always"]);
+        assert_eq!(w.len(), 3, "{w:?}");
+        for (kind, rule) in [
+            ("allow rule", "winallow"),
+            ("deny rule", "winword"),
+            ("deny_path rule", "**/winpath"),
+        ] {
+            assert!(
+                w.iter().any(|x| x.message.contains(kind)
+                    && x.message.contains(rule)
+                    && x.message.contains("not in force on this host")
+                    && x.message.contains("windows")),
+                "{kind}: {w:?}"
+            );
+        }
+
+        let mut w = Vec::new();
+        let p = load_pack_for("<t>", MARKED, PathStyle::Windows, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!((p.allow.len(), p.deny.len(), p.deny_path.len()), (1, 2, 1));
+        assert_eq!(p.triggers, ["always", "(?i)winword"]);
+    }
+
+    #[test]
+    fn the_marker_hides_no_broken_rule_outside_the_catalog() {
+        let bad_regex = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"ok\"\nreason = \"r\"\n[[deny]]\nplatform = \"windows\"\npattern = \"(\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        load_pack_for("<t>", bad_regex, PathStyle::Posix, &mut w).unwrap();
+        assert!(w[0].message.contains("uncompilable"), "{w:?}");
+        let no_reason = "[pack]\nid = \"t\"\n[[deny]]\nplatform = \"windows\"\npattern = \"x\"\n";
+        let mut w = Vec::new();
+        assert!(matches!(
+            load_pack_for("<t>", no_reason, PathStyle::Posix, &mut w),
+            Err(PackError::MissingReason(_))
+        ));
+        let bad_glob = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"ok\"\nreason = \"r\"\n[[deny_path]]\nplatform = \"windows\"\nglob = \"relative/x\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        load_pack_for("<t>", bad_glob, PathStyle::Posix, &mut w).unwrap();
+        assert!(w[0].message.contains("relative/x"), "{w:?}");
+    }
+
+    /// A pack with rules for another OS only loads, with nothing in force here
+    /// and its warnings saying so.
+    #[test]
+    fn a_pack_for_another_os_only_is_not_a_broken_pack() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\nplatform = \"windows\"\npattern = \"x\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        let p = load_pack_for("<t>", toml, PathStyle::Posix, &mut w).unwrap();
+        assert_eq!(p.rule_count(), 0);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    /// What keeps it off a hook's clock: a shipped pack's rule for another OS is
+    /// not read, not even a broken one. A Windows load does read it.
+    #[test]
+    fn a_shipped_rule_for_another_os_is_not_compiled() {
+        let toml = "[pack]\nid = \"t\"\n[[deny]]\npattern = \"ok\"\nreason = \"r\"\n[[deny]]\nplatform = \"windows\"\npattern = \"(\"\nreason = \"r\"\n";
+        let mut w = Vec::new();
+        let p = load_shipped("<t>", toml, PathStyle::Posix, &mut w).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(p.deny.len(), 1);
+        load_shipped("<t>", toml, PathStyle::Windows, &mut w).unwrap();
+        assert!(w[0].message.contains("uncompilable"), "{w:?}");
+    }
+
+    #[test]
+    fn a_pack_fits_the_style_it_was_loaded_for() {
+        let mut w = Vec::new();
+        let posix = load_shipped("<t>", MARKED, PathStyle::Posix, &mut w).unwrap();
+        assert!(posix.fits(PathStyle::Posix) && !posix.fits(PathStyle::Windows));
+        let win = load_shipped("<t>", MARKED, PathStyle::Windows, &mut w).unwrap();
+        assert!(win.fits(PathStyle::Windows) && !win.fits(PathStyle::Posix));
+        // No marker: nothing to choose, so it fits both.
+        let plain = load_pack_for("<t>", VALID, PathStyle::Posix, &mut w).unwrap();
+        assert!(plain.fits(PathStyle::Posix) && plain.fits(PathStyle::Windows));
+    }
+
+    #[test]
+    fn a_packs_dir_reports_what_a_marker_leaves_out() {
+        let dir = tempdir();
+        std::fs::write(dir.join("a.toml"), MARKED).unwrap();
+        std::fs::write(
+            dir.join("b.toml"),
+            "[pack]\nid = \"b\"\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nplatform = \"beos\"\n",
+        )
+        .unwrap();
+        let (packs, warnings) = load_packs_dir(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(packs.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.source.ends_with("b.toml") && w.message.contains("skipping pack")),
+            "{warnings:?}"
+        );
+        if PathStyle::host() == PathStyle::Posix {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.message.contains("not in force on this host")),
+                "{warnings:?}"
+            );
         }
     }
 

@@ -1,8 +1,11 @@
 use saiife_policy::{load_system, Fail, Fsync, PolicyError, SystemConfig};
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(unix)]
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/etc/config.toml")
 }
@@ -21,12 +24,16 @@ fn etc(config: &str, dropins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
     (dir, cfg)
 }
 
+#[cfg(unix)]
 fn is_hex64(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn spec_example_parses() {
     let p = load_system(&fixture()).unwrap();
@@ -425,6 +432,9 @@ fn profile_key_reserved() {
     ));
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn run_allow_refuses_interpreters() {
     for bad in [
@@ -582,6 +592,9 @@ fn profile_as_param_name_is_fine() {
     ));
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn run_allow_hardening() {
     for bad in [
@@ -772,6 +785,9 @@ fn mode_defaults_to_sign() {
     .is_err());
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn sts_needs_role_arn_and_run_allow() {
     assert!(refused("mode = \"sts\"\n").contains("role_arn"));
@@ -816,6 +832,9 @@ fn bad_role_arn_refused() {
     svc_cfg("[services.s3.cloud]\nexternal_id = \"ab:c/d@e\"\n").unwrap();
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn run_allow_interpreter_refused_in_cloud() {
     let e = refused("[services.s3.cloud]\nrun_allow = [\"/usr/bin/aws\", \"/bin/bash\"]\n");
@@ -874,8 +893,13 @@ fn policy_hash_changes_with_mode() {
         let (packs, _) = active_packs(&p.config, &[], None);
         policy_hash(&effective_policy(&p.config, &packs, None, None))
     };
-    let body =
-        format!("[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"/usr/bin/aws\"]\n");
+    // Absolute on this host; the hash does not care which program it is.
+    let aws = if cfg!(windows) {
+        "C:/tools/aws.exe"
+    } else {
+        "/usr/bin/aws"
+    };
+    let body = format!("[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"{aws}\"]\n");
     let sts = format!("mode = \"sts\"\n{body}");
     assert_ne!(h(""), h(&sts));
     assert_ne!(h(&sts), h(&body));
@@ -903,6 +927,9 @@ fn cloud_keys_keep_old_hashes() {
     assert_eq!(h, want);
 }
 
+// The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+// host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+#[cfg(unix)]
 #[test]
 fn run_allow_without_file_name_refused() {
     for bad in ["/", "/usr/bin/.."] {

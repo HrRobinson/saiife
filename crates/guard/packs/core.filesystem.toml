@@ -10,13 +10,16 @@ id = "core.filesystem"
 name = "Core: filesystem"
 description = "Guards catastrophic filesystem destruction (root/home/system wipes, device writes, mkfs)."
 default_on = true
-version = 1
+version = 3
 # `sudo` (with or without flags/options) is unwrapped structurally by the
 # engine before matching (see `wrappers::unwrap_transparent_prefix`), so
 # these rules see the effective command at argv[0], not `sudo` itself. The
 # `(?:sudo\s+)?` prefix below predates that and is now redundant/harmless —
 # kept rather than churned. Triggers stay broad + cheap.
+# A `(?i)` trigger ignores case (Windows commands do). `windows_triggers` and the
+# rules marked `platform = "windows"` exist on a Windows-style host only.
 triggers = ["rm", "dd", "mkfs", "truncate", "chmod", "chown", "/dev/"]
+windows_triggers = ["(?i)format", "(?i)diskpart", "(?i)clear-disk", "(?i)remove-partition", "(?i)initialize-disk", "(?i)reset-physicaldisk", "(?i)remove-virtualdisk", "(?i)cipher", "(?i)vssadmin", "(?i)wbadmin", "(?i)wmic", "(?i)bcdedit", "(?i)hklm", "(?i)hkcu", "(?i)hkcr", "(?i)hku", "(?i)hkcc", "(?i)hkey_"]
 
 # --- rm: recursive delete of a catastrophic target ----------------------------
 # Requires a recursive flag (combined like -rf/-fr/-Rf, or -r/-R, or
@@ -69,3 +72,77 @@ reason = "recursive chmod on a filesystem root or system directory breaks the sy
 [[deny]]
 pattern = '^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-zA-Z]*R[a-zA-Z]*\s+(?:\S+\s+)*\S+\s+(?:/\*|/(?:etc|usr|var|bin|sbin|lib|lib64|boot|dev|sys|proc|opt|root|home|srv|mnt|System|Library|Applications|Users)/?\*?|/)(?:\s|$)'
 reason = "recursive chown on a filesystem root or system directory breaks ownership system-wide"
+
+# --- Windows (plan 19a, W7) -----------------------------------------------------
+# These rules exist only on a Windows-style host, Git Bash included: Linux and
+# macOS, WSL too, never compile them. PowerShell and cmd forms arrive translated
+# (`Remove-Item -Recurse -Force C:\`, `rd /s /q C:\` are `rm -r -f C:\`), so
+# `rm` is what is named here.
+#
+# On a Windows host the engine judges a recursive delete by what its operands
+# name too: each goes through the path reader (W6) and is written `c:/x`, or
+# `~/x` inside the profile. So every spelling of a root is one line here: `\`,
+# `\Windows`, `C:\.\Windows`, `C:\Users\a\..\..\Windows`, `\\?\C:\`, an admin
+# share, `/c/`, `/cygdrive/c/`, `/mnt/c/`, and the profile, which the home rules
+# above judge as `~`. The rule reads only that form and the variables below,
+# whose value may not be known. A top-level wildcard counts, since it can name a
+# protected directory
+# (`C:\Win*`). 8.3 names are matched by shape (`PROGRA~1`).
+[[deny]]
+platform = "windows"
+id = "windows-root-rm"
+pattern = '(?i)^rm\s+(?:\S+\s+)*(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:\S+\s+)*(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)|(?:[a-z]:/+(?:[^/\s]*[*?][^/\s]*|(?:windows|program files(?: \(x86\))?|progra~\d|programdata|users)/*(?:[^/\s]*[*?][^/\s]*)?)?|(?:%(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programfiles\(x86\)|programw6432|public)%|\$\{?env:(?:systemroot|windir|systemdrive|homedrive|programdata|allusersprofile|programfiles|programw6432|public)\}?)[\\/]*(?:\*(?:\.\*)?)?)\s+(?:\S+\s+)*(?:-[a-z]*r[a-z]*|--recursive))(?:\s|$)'
+reason = "recursive delete of a drive root, Windows, Program Files, ProgramData or Users is catastrophic and irreversible"
+
+# `cd / && chmod -R 777 *` arrives as `chmod -R 777 c:/*` (ruling P1): the same
+# deny as POSIX `/*`.
+[[deny]]
+platform = "windows"
+id = "windows-root-chmod"
+pattern = '(?i)^(?:sudo\s+)?chmod\s+(?:\S+\s+)*-[a-z]*r[a-z]*\s+(?:\S+\s+)*[a-z]:/+\*?(?:\s|$)'
+reason = "recursive chmod on a drive root breaks the system"
+
+[[deny]]
+platform = "windows"
+id = "windows-root-chown"
+pattern = '(?i)^(?:sudo\s+)?chown\s+(?:\S+\s+)*-[a-z]*r[a-z]*\s+(?:\S+\s+)*\S+\s+[a-z]:/+\*?(?:\s|$)'
+reason = "recursive chown on a drive root breaks ownership system-wide"
+
+[[deny]]
+platform = "windows"
+# `format C: /q`, `format.com D: /fs:ntfs`, the storage cmdlets (even fed from
+# a pipe: `Get-Volume D | Format-Volume`) and `diskpart`, which runs commands
+# the guard cannot see. `Format-Table` and `Format-List` do not match.
+id = "windows-format"
+pattern = '(?i)^(?:\S*[\\/])?(?:format(?:\.com|\.exe)?\s+(?:\S+\s+)*(?:(?:[\\/]{2}[?.][\\/])?[a-z]:|\\\\\?\\volume\{\S+)[\\/]*(?:\s|$)|diskpart(?:\.exe)?(?:\s|$)|(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk|remove-virtualdisk)(?:\s|$))'
+reason = "formatting, partitioning or wiping a disk destroys its data"
+
+[[deny]]
+platform = "windows"
+# `cipher /w:C:\` overwrites all free space; `cipher /e` and `/d` stay allowed.
+id = "windows-cipher-wipe"
+pattern = '(?i)^(?:\S*[\\/])?cipher(?:\.exe)?\s+(?:\S+\s+)*[/-]+w(?::|\s|$)'
+reason = "cipher /w overwrites all the free space on a volume, which erases deleted files for good"
+
+[[deny]]
+platform = "windows"
+# `bcdedit /delete` and `/set` (also `/deletevalue`, `/import`): an unbootable
+# machine, or a boot with its protections off. `/enum` only reads.
+id = "windows-boot-config"
+pattern = '(?i)^(?:\S*[\\/])?bcdedit(?:\.exe)?\s+(?:\S+\s+)*[/-]+(?:delete|deletevalue|set|import)(?:\s|$)'
+reason = "changing the boot configuration can leave the machine unbootable or switch its protections off"
+
+[[deny]]
+platform = "windows"
+# A hive root: `reg delete HKLM /f`, `Remove-Item -Recurse HKCU:\`. Keys under
+# it stay allowed, and `rm hklm` is a file: a provider path has its colon.
+id = "windows-registry-root"
+pattern = '(?i)^(?:\S*[\\/])?(?:reg(?:\.exe)?\s+delete\s+(?:\S+\s+)*?(?:hklm|hkcu|hkcr|hku|hkcc|hkey_\w+):?[\\/]*|rm\s+(?:\S+\s+)*?(?:\S*(?:hklm|hkcu|hkcr|hku|hkcc):|\S*registry::(?:hklm|hkcu|hkcr|hku|hkcc|hkey_\w+))[\\/]*)(?:\s|$)'
+reason = "deleting a registry hive root is catastrophic and irreversible"
+
+[[deny]]
+platform = "windows"
+# Shadow copies and backups are the way back from a bad delete.
+id = "windows-shadow-copies"
+pattern = '(?i)^(?:\S*[\\/])?(?:vssadmin(?:\.exe)?\s+(?:delete\s+shadows|resize\s+shadowstorage)|wbadmin(?:\.exe)?\s+delete\s|wmic(?:\.exe)?\s+(?:\S+\s+)*shadowcopy\s+(?:\S+\s+)*delete)'
+reason = "deleting shadow copies or backups removes the way back from a bad delete"

@@ -16,6 +16,7 @@
 //!   `subst::command_position_substitution`.
 
 use saiifeguard::builtins::builtin_packs;
+use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{Decision, Engine};
 use saiifeguard::profile::select_active;
 
@@ -24,7 +25,19 @@ use saiifeguard::profile::select_active;
 fn default_engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
-    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
+    Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(host_paths())
+}
+
+/// No paths bound on Linux and macOS. Under Windows style an unbound `~` is a
+/// path nothing can read, which denies (W5): those hosts get a profile.
+fn host_paths() -> PathVars {
+    if PathStyle::host() == PathStyle::Windows {
+        PathVars::new().with_var("USERPROFILE", r"C:\Users\a")
+    } else {
+        PathVars::new()
+    }
 }
 
 /// cloud.gcloud is opt-in; the gcloud/gsutil corpus lines need it enabled.

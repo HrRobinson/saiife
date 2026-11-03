@@ -20,6 +20,7 @@ pub const BROKER_LABEL: &str = "personal broker, not a security boundary";
 /// The personal broker's audit dir, `$XDG_DATA_HOME/saiife/broker/audit`
 /// (its fallback: `~/.local/share`). Reading the log does not need the
 /// broker's runtime dir, so `XDG_RUNTIME_DIR` is not required here.
+#[cfg(unix)]
 fn broker_audit_dir() -> Result<PathBuf, String> {
     let env = |k: &str| match k {
         "XDG_RUNTIME_DIR" => Some(std::ffi::OsString::from("/")),
@@ -27,6 +28,13 @@ fn broker_audit_dir() -> Result<PathBuf, String> {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     saiife_system::personal::personal_paths(&env, home.as_deref()).map(|p| p.audit_dir)
+}
+
+/// The personal broker is Linux and macOS only (plan 16); `main` refuses
+/// `--broker` on Windows first, this is the typed refusal behind it.
+#[cfg(not(unix))]
+fn broker_audit_dir() -> Result<PathBuf, String> {
+    Err("the personal broker is not available on Windows".to_string())
 }
 
 /// `text` with every `audit chain` line labelled [`BROKER_LABEL`].

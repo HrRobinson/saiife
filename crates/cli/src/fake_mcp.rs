@@ -164,6 +164,7 @@ pub fn run(args: FakeArgs) -> ExitCode {
 
 /// Connect to a unix socket, send `payload`, and log whether anything came
 /// back within 3 s.
+#[cfg(unix)]
 fn probe(label: &str, path: &str, payload: &[u8]) {
     use std::io::Read;
     let outcome = match std::os::unix::net::UnixStream::connect(path) {
@@ -182,6 +183,12 @@ fn probe(label: &str, path: &str, payload: &[u8]) {
         }
     };
     eprintln!("fake-mcp: {label}: {outcome}");
+}
+
+/// A test seam for the locked gateway's sockets; there are none on Windows.
+#[cfg(not(unix))]
+fn probe(label: &str, _path: &str, _payload: &[u8]) {
+    eprintln!("fake-mcp: {label}: unix sockets are not available here");
 }
 
 fn send(m: &Message) {

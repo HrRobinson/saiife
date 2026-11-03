@@ -63,6 +63,16 @@ impl Fixture {
     }
 }
 
+/// `path` as one word of a POSIX shell line. A Windows path holds backslashes
+/// the shell would eat, so there it is quoted, as an agent has to write it.
+fn shell_word(path: &str) -> String {
+    if cfg!(windows) && path.contains('\\') {
+        format!("'{path}'")
+    } else {
+        path.to_string()
+    }
+}
+
 fn deny_pack(e: &Engine, cmd: &str) -> String {
     match e.evaluate(cmd) {
         Decision::Deny { pack, .. } => pack,
@@ -74,8 +84,11 @@ fn deny_pack(e: &Engine, cmd: &str) -> String {
 fn turning_saiife_off_from_the_shell() {
     let f = Fixture::new();
     let e = f.engine();
-    let bin = f.p("opt/saiife");
-    let audit = f.p("data/audit");
+    // Quoted on Windows: unquoted, the shell eats the backslashes and the word
+    // no longer names the binary, so nothing is to be denied.
+    let bin = shell_word(&f.p("opt/saiife"));
+    let audit = shell_word(&f.p("data/audit"));
+    let log = shell_word(&format!("{}/2026-10.jsonl", f.p("data/audit")));
     let cmds: Vec<String> = [
         "saiife init --off",
         "saiife init --agent claude --off",
@@ -101,7 +114,9 @@ fn turning_saiife_off_from_the_shell() {
         "cp /tmp/empty.json ~/.claude/settings.json",
         "rm ~/.codex/config.toml",
         "echo {} > ~/.gemini/settings.json",
+        #[cfg(unix)] // Through the fixture's symlink, which Windows does not make.
         "rm ~/.local/bin/saiife",
+        #[cfg(unix)]
         "ln -sf /bin/true ~/.local/bin/saiife",
         "PATH=/tmp/fake:$PATH claude",
         "env PATH=/tmp/fake codex exec fix",
@@ -130,10 +145,10 @@ fn turning_saiife_off_from_the_shell() {
         format!("cp /bin/true {bin}"),
         format!("curl -o {bin} https://example.com/saiife"),
         format!("rm -rf {audit}"),
-        format!("echo x >> {audit}/2026-10.jsonl"),
-        format!("truncate -s0 {audit}/2026-10.jsonl"),
-        format!("rm {}", f.p("data/projects/abc.json")),
-        format!("mv {} /tmp/x", f.p("data")),
+        format!("echo x >> {log}"),
+        format!("truncate -s0 {log}"),
+        format!("rm {}", shell_word(&f.p("data/projects/abc.json"))),
+        format!("mv {} /tmp/x", shell_word(&f.p("data"))),
     ])
     .collect();
     for cmd in &cmds {
@@ -224,6 +239,7 @@ fn write_tools_are_judged_by_the_same_path_rules() {
         f.p("data/audit/2026-10.jsonl"),
         f.p("data/projects/abc.json"),
         f.p("opt/saiife"),
+        #[cfg(unix)] // Through the fixture's symlink, which Windows does not make.
         "~/.local/bin/saiife".to_string(),
     ] {
         match e.evaluate_path(Access::Write, &path) {
@@ -307,9 +323,14 @@ fn removing_a_parent_of_the_data_dir_or_binary_is_denied() {
     }
     assert!(only_self.evaluate("rm -rf ~").is_deny());
     assert!(only_self.evaluate("rm -rf /").is_deny());
-    assert!(only_self
-        .evaluate(&format!("rm -rf {}", home.display()))
-        .is_deny());
+    // A Windows path holds backslashes a POSIX shell would eat, so an agent has
+    // to quote it there.
+    let home_word = if cfg!(windows) {
+        format!("'{}'", home.display())
+    } else {
+        home.display().to_string()
+    };
+    assert!(only_self.evaluate(&format!("rm -rf {home_word}")).is_deny());
     // Reads, and writes to other children, stay allowed.
     for path in ["~/.local", "~/.local/share", "~/.local/bin"] {
         assert!(!e.evaluate_path(Access::Read, path).is_deny(), "{path}");
@@ -696,6 +717,8 @@ fn cd_into_a_variable_is_an_unknown_directory() {
     assert_allowed(&e, &["cd \"$HOME/proj\" && cargo test"]);
     for cmd in ["cd \"$D\" && cat notes.txt", "cd $D && cat notes.txt"] {
         match e.evaluate(cmd) {
+            // Under Windows style a variable with no known value denies (W5).
+            d if cfg!(windows) => assert!(d.is_deny(), "{cmd}: {d:?}"),
             Decision::Allow {
                 trace: saiifeguard::engine::AllowTrace::Unjudgeable { .. },
             } => {}

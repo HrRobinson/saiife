@@ -325,6 +325,7 @@ fn install_managed_twice_is_unchanged() {
     assert_eq!(gemini::managed_entry(&g).unwrap(), ge);
 }
 
+#[cfg(unix)] // modes and symlinks: Windows has no 0644 and symlink creation is privileged
 #[test]
 fn managed_writers_write_0644_and_refuse_symlinks() {
     use std::os::unix::fs::PermissionsExt;

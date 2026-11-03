@@ -28,21 +28,71 @@ pub struct Env {
     pub managed: TempDir,
 }
 
-/// An executable shell script `dir/name` with `body` after the shebang.
+/// An executable shell script `dir/name` with `body` after the shebang. On
+/// Windows an agent's script takes the name production looks for
+/// (`claude.exe`, `codex.cmd`, `gemini.cmd`).
 pub fn fake_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let p = dir.join(name);
+    let p = dir.join(platform_name(name));
     fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    // Unix needs the executable bit. On Windows `which` accepts any file of
+    // that exact name, so the script is found but never run: a test that
+    // runs the script is `#[cfg(unix)]`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     p
+}
+
+/// `name` as it goes on `PATH` on this host: an agent's first name from
+/// `agent_binaries`, anything else as given.
+fn platform_name(name: &str) -> String {
+    saiife_agents::Agent::ALL
+        .into_iter()
+        .find(|a| a.binary() == name)
+        .and_then(|a| {
+            saiife_agents::detect::agent_binaries(a, cfg!(windows))
+                .into_iter()
+                .next()
+        })
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Point every lookup of the user's profile at `home`: `HOME`, and on Windows
+/// `USERPROFILE`, `LOCALAPPDATA` and `APPDATA` (ruling P4). Linux and macOS
+/// ignore the last three.
+pub fn set_profile(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("LOCALAPPDATA", home.join("AppData").join("Local"))
+        .env("APPDATA", home.join("AppData").join("Roaming"));
+}
+
+/// `path` canonical, as saiife prints it: on Windows without the `\\\\?\\`
+/// that canonicalizing adds there.
+pub fn canonical_shown(path: &Path) -> String {
+    saiife_win::display::shown(&fs::canonicalize(path).unwrap())
 }
 
 impl Env {
     /// Fake `agents` on PATH plus a symlink `saiife` -> the binary under test.
     pub fn new(agents: &[&str]) -> Env {
         let env = Env::bare(agents);
+        #[cfg(unix)]
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_saiife"), env.bin.path().join("saiife"))
             .unwrap();
+        // Creating a symlink needs a privilege on Windows: copy the binary.
+        // The copy carries the platform's executable suffix (`saiife.exe`),
+        // the name production has; `which` finds it through `PATHEXT`.
+        #[cfg(not(unix))]
+        fs::copy(
+            env!("CARGO_BIN_EXE_saiife"),
+            env.bin
+                .path()
+                .join(format!("saiife{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
         env
     }
 
@@ -75,16 +125,36 @@ impl Env {
         self.command_in(dir, args).output().unwrap()
     }
 
+    /// The saiife a test runs. `init` and `status` compare the running binary
+    /// with the `saiife` on PATH. On Unix that is a symlink to the binary under
+    /// test, which resolves to the same file. Windows has a copy, which does
+    /// not, so the copy is what runs, as an installed saiife does. A test may
+    /// have swapped the copy for a script that cannot start: then the binary
+    /// under test runs, a different one from PATH's.
+    pub fn exe(&self) -> PathBuf {
+        #[cfg(windows)]
+        {
+            use std::io::Read;
+            let copy = self.bin.path().join("saiife.exe");
+            let mut magic = [0u8; 2];
+            let real = fs::File::open(&copy).and_then(|mut f| f.read_exact(&mut magic));
+            if real.is_ok() && &magic == b"MZ" {
+                return copy;
+            }
+        }
+        PathBuf::from(env!("CARGO_BIN_EXE_saiife"))
+    }
+
     fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+        let mut cmd = Command::new(self.exe());
         cmd.args(args)
             .current_dir(dir)
             .env("PATH", self.bin.path())
-            .env("HOME", self.home.path())
             .env("SAIIFE_DATA_DIR", self.data.path())
             .env("SAIIFE_AUDIT_DIR", self.audit.path())
             .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", self.managed.path())
             .env("XDG_RUNTIME_DIR", self.no_runtime_dir());
+        set_profile(&mut cmd, self.home.path());
         cmd
     }
 
@@ -150,8 +220,8 @@ pub fn hermetic(cmd: &mut Command, audit: &Path) -> TempDir {
     let data = sandbox.path().join("data");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&data).unwrap();
-    cmd.env("HOME", &home)
-        .env("SAIIFE_DATA_DIR", &data)
+    set_profile(cmd, &home);
+    cmd.env("SAIIFE_DATA_DIR", &data)
         .env("SAIIFE_AUDIT_DIR", audit);
     sandbox
 }
@@ -165,17 +235,19 @@ pub fn absent_system_config(dir: &Path) -> PathBuf {
 
 /// [`hermetic`] for `saiife audit <args>` (the table, `--report` and
 /// `verify`): the args, then `--system-config` naming a file that does not
-/// exist, so no test reads /etc/saiife.
+/// exist, so no test reads /etc/saiife. Windows refuses that flag as a locked
+/// one and reads no system config in developer mode, so it goes without.
 pub fn hermetic_audit<I, S>(cmd: &mut Command, audit: &Path, args: I) -> TempDir
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
     let sandbox = hermetic(cmd, audit);
-    cmd.arg("audit")
-        .args(args)
-        .arg("--system-config")
-        .arg(absent_system_config(sandbox.path()));
+    cmd.arg("audit").args(args);
+    if cfg!(not(windows)) {
+        cmd.arg("--system-config")
+            .arg(absent_system_config(sandbox.path()));
+    }
     sandbox
 }
 
@@ -211,14 +283,19 @@ impl FixtureHome {
         assert_no_host_config(&root);
         FixtureHome {
             _dir: dir,
-            root: root.to_str().unwrap().to_string(),
+            root: fixture_spelling(root.to_str().unwrap()),
         }
     }
 
+    /// `s`, a shell line or a path, with the stand-in in place of `/home/u`.
+    /// Under POSIX rules a backslash would be an escape, so on Windows the
+    /// stand-in is spelled with `/`, which every reader takes.
     pub fn real(&self, s: &str) -> String {
         s.replace(FIXTURE_HOME, &self.root)
     }
 
+    /// `b`, serialized JSON, with the stand-in in place of `/home/u`: its
+    /// spelling holds no `\\`, so it is valid inside a JSON string as it is.
     pub fn real_bytes(&self, b: &[u8]) -> Vec<u8> {
         match std::str::from_utf8(b) {
             Ok(s) => self.real(s).into_bytes(),
@@ -226,15 +303,48 @@ impl FixtureHome {
         }
     }
 
+    /// `s` from an answer or a record, with `/home/u` in place of the stand-in,
+    /// however the answer spells it (Windows: `d:/x`, lower-case drive).
     pub fn spelled(&self, s: &str) -> String {
-        s.replace(&self.root, FIXTURE_HOME)
+        if cfg!(not(windows)) {
+            return s.replace(&self.root, FIXTURE_HOME);
+        }
+        let lower = self.root[..1].to_ascii_lowercase() + &self.root[1..];
+        let back = self.root.replace('/', "\\");
+        let mut out = s.to_string();
+        for form in [
+            format!(r"\\?\{back}"),
+            back.clone(),
+            back.replace('\\', r"\\"),
+            self.root.clone(),
+            lower,
+        ] {
+            out = out.replace(&form, FIXTURE_HOME);
+        }
+        out
     }
 
     pub fn spelled_record(&self, mut r: saiife_audit::Record) -> saiife_audit::Record {
         r.project = self.spelled(&r.project);
+        if cfg!(windows) {
+            r.project = r.project.replace('\\', "/");
+        }
         r.input = self.spelled(&r.input);
         r.reason = r.reason.map(|x| self.spelled(&x));
         r
+    }
+}
+
+/// A canonical path as JSON text and shell lines can carry it. On Windows
+/// `canonicalize` gives `\\\\?\\D:\\x`: raw backslashes break the serialized JSON
+/// the fixtures are rewritten in, so it becomes `D:/x`. Elsewhere it is as given.
+fn fixture_spelling(path: &str) -> String {
+    if cfg!(windows) {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('\\', "/")
+    } else {
+        path.to_string()
     }
 }
 

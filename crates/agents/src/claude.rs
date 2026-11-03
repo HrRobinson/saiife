@@ -10,13 +10,24 @@ use crate::{Agent, AgentError, Change, HookBlocker};
 
 pub const SETTINGS_REL: &str = ".claude/settings.json";
 
-/// Shell, read and write tools (spec §5.2). Only `[A-Za-z0-9_|]`, so Claude
-/// Code reads it as an exact list of tool names.
-pub const MATCHER: &str = "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit";
+/// Shell (Bash and, on Windows, PowerShell), read and write tools (spec
+/// §5.2). Only `[A-Za-z0-9_|]`, so Claude Code reads it as an exact list of
+/// tool names. The matcher is the same on every platform.
+pub const MATCHER: &str = "Bash|PowerShell|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit";
+
+/// The matcher before the `PowerShell` tool was added (plan 3 to plan 19a).
+/// A project hooked by it is upgraded by `saiife init`.
+pub const MATCHER_V2: &str = "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit";
 
 /// The matcher plan 2's saiife wrote. A project hooked by it is upgraded by
 /// running `saiife init` again (`status` reports the entry as out of date).
 pub const MATCHER_V1: &str = "Bash|Read|Grep|Write|Edit|MultiEdit|NotebookEdit";
+
+/// Whether `m` is a matcher an older saiife wrote, which lacks the
+/// `PowerShell` tool.
+pub fn matcher_is_outdated(m: &str) -> bool {
+    m == MATCHER_V1 || m == MATCHER_V2
+}
 
 /// Seconds. No `onFailure: "block"`: v1 developer mode fails open (spec §1.2
 /// rule 4).
@@ -25,10 +36,18 @@ pub const TIMEOUT_SECS: u64 = 10;
 pub const NEXT_STEP: &str = "Claude Code holds back project hooks until you accept the workspace trust prompt: start `claude` in this folder and accept it. `/hooks` shows the saiife hook.";
 
 /// Managed-settings directories (Linux, macOS). Read-only checks.
+#[cfg(not(windows))]
 pub const MANAGED_DIRS: &[&str] = &[
     "/etc/claude-code",
     "/Library/Application Support/ClaudeCode",
 ];
+
+/// Managed-settings directory on Windows (`managed-settings.json` inside).
+#[cfg(windows)]
+pub const MANAGED_DIRS: &[&str] = &[WINDOWS_MANAGED_DIR];
+
+/// Claude Code's managed-settings directory on Windows (spec §5.3a).
+pub const WINDOWS_MANAGED_DIR: &str = r"C:\Program Files\ClaudeCode";
 
 /// The managed drop-in `/etc/claude-code/managed-settings.d/50-saiife.json`
 /// (locked mode), byte for byte spec §8.3.
@@ -124,6 +143,31 @@ pub fn remove(project: &Path, delete_if_empty: bool) -> Result<Change, AgentErro
 
 pub fn entries(project: &Path) -> Result<Vec<String>, AgentError> {
     HOOKS.entries(project)
+}
+
+/// The matcher of saiife's group in the project's settings (the first), or
+/// `None` when the file is missing, unreadable, not plain JSON, or has no
+/// saiife hook. `status` uses it to tell an out-of-date matcher from other
+/// changes.
+pub fn project_matcher(project: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(project.join(SETTINGS_REL)).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("hooks")?
+        .get("PreToolUse")?
+        .as_array()?
+        .iter()
+        .find(|g| {
+            g.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
+                hs.iter().any(|h| {
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::is_saiife_command)
+                })
+            })
+        })?
+        .get("matcher")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub fn expected_entry() -> String {
@@ -387,11 +431,49 @@ mod tests {
         assert!(!p.path().join(SETTINGS_REL).exists());
     }
 
+    /// `status` reads Claude's managed file on Windows too.
+    #[test]
+    fn windows_managed_dir_is_pinned() {
+        assert_eq!(WINDOWS_MANAGED_DIR, "C:\\Program Files\\ClaudeCode");
+        #[cfg(windows)]
+        assert_eq!(MANAGED_DIRS, [WINDOWS_MANAGED_DIR]);
+    }
+
+    #[test]
+    fn matcher_covers_powershell() {
+        assert!(MATCHER.split('|').any(|t| t == "PowerShell"));
+        assert!(!MATCHER_V2.contains("PowerShell"));
+        assert!(!MATCHER_V1.contains("PowerShell"));
+        assert!(matcher_is_outdated(MATCHER_V1));
+        assert!(matcher_is_outdated(MATCHER_V2));
+        assert!(!matcher_is_outdated(MATCHER));
+        assert_eq!(MATCHER.replace("PowerShell|", ""), MATCHER_V2);
+    }
+
+    /// A project hooked by the pre-PowerShell matcher gets the new one; the
+    /// user's other groups and the key order are untouched.
+    #[test]
+    fn matcher_v2_project_upgraded() {
+        let p = project_with(USER_SETTINGS);
+        install(p.path()).unwrap();
+        let fresh = read(p.path());
+        let old = fresh.replace(MATCHER, MATCHER_V2);
+        assert_ne!(old, fresh);
+        fs::write(p.path().join(SETTINGS_REL), &old).unwrap();
+        assert_ne!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        assert_eq!(install(p.path()).unwrap(), Change::Updated);
+        assert_eq!(entries(p.path()).unwrap(), vec![expected_entry()]);
+        // Byte for byte what a fresh install wrote: the user's groups and
+        // the key order are as they were.
+        assert_eq!(read(p.path()), fresh);
+    }
+
     #[test]
     fn matcher_covers_read_list_and_write_tools() {
         let tools: Vec<&str> = MATCHER.split('|').collect();
         for t in [
             "Bash",
+            "PowerShell",
             "Read",
             "Grep",
             "Glob",
@@ -411,7 +493,7 @@ mod tests {
     fn expected_entry_fingerprint_is_pinned() {
         assert_eq!(
             expected_entry(),
-            "96fb881e404f7fed07a75eff98c42bf1c31553d8678c5e36c7216caadc5e2dca"
+            "79bee8986b3cf00133dd2f437b9980d6b199d60e1b1b048a1447165145d758f4"
         );
     }
 

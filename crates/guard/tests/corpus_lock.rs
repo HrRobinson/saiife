@@ -13,6 +13,10 @@ use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::pathrule::Access;
 
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// The compile allowance is wall-clock time, and the fixed 5 ms of production
+/// turned `pkill --full 'python app.py'` into a deny on a loaded machine.
+/// `a_spent_allowance_only_ever_denies` pins what it does.
+const NO_ALLOWANCE_LIMIT: std::time::Duration = std::time::Duration::MAX;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -64,6 +68,7 @@ impl Fixture {
         assert!(!lock[0].default_on, "core.lock is off outside locked mode");
         Engine::new(lock)
             .with_budget(TEST_BUDGET)
+            .with_pattern_allowance(NO_ALLOWANCE_LIMIT)
             .with_paths(self.vars())
     }
 }
@@ -164,6 +169,10 @@ fn touching_the_service_is_denied() {
     }
 }
 
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn persistence_is_denied() {
     let f = Fixture::new();
@@ -510,6 +519,10 @@ fn safety_switches_are_denied() {
     }
 }
 
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn writes_to_saiifes_system_paths_are_denied() {
     let f = Fixture::new();
@@ -674,6 +687,10 @@ fn everyday_work_and_reading_the_setup_are_allowed() {
 
 /// The locked config dir and audit dir are guarded under every value they
 /// are bound to, not only the defaults.
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn extra_locked_values_are_guarded() {
     let f = Fixture::new();
@@ -780,6 +797,10 @@ fn signal_words_do_not_hide_options() {
 
 /// Fix round 4 (F2): the file `xargs` reads is found whatever the
 /// spelling of `--arg-file`.
+// Locked mode: `/etc/saiife`, `/var/log/saiife` and the like are POSIX paths, and a
+// Windows host calls them relative, so they never bind. Windows has no locked mode
+// until plan 19b; `corpus_windows` pins its lock rules.
+#[cfg(unix)]
 #[test]
 fn xargs_arg_file_abbreviations_are_read() {
     let f = Fixture::new();
@@ -1065,4 +1086,21 @@ fn macos_rights_and_saiife_accounts_are_denied() {
         let d = e.evaluate(cmd);
         assert!(!d.is_deny(), "expected ALLOW for {cmd:?}, got {d:?}");
     }
+}
+
+/// What the compile allowance does in production once it is spent, with the wall
+/// clock taken out: a later pattern counts as a match, so an allow can become a
+/// deny and a deny never becomes an allow. Each `pkill` here reaches two operand
+/// rules or more, so the first compile spends the zero allowance.
+#[test]
+fn a_spent_allowance_only_ever_denies() {
+    let f = Fixture::new();
+    let spent = f.engine().with_pattern_allowance(std::time::Duration::ZERO);
+    let unlimited = f.engine();
+    let allow = "pkill --full 'python app.py'";
+    assert!(!unlimited.evaluate(allow).is_deny());
+    assert!(spent.evaluate(allow).is_deny());
+    let deny = "pkill --full 'opt/s.*e'";
+    assert!(unlimited.evaluate(deny).is_deny());
+    assert!(spent.evaluate(deny).is_deny());
 }

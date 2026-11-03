@@ -365,10 +365,10 @@ fn guard_records(audit: &Path) -> Vec<saiife_audit::Record> {
         .collect()
 }
 
-/// Claude Code's lock holds on Linux only: on macOS its label is
-/// `unverified` until a macOS recording exists, so the project hook judges
-/// there (`project_hook_judges_when_managed_hook_does_not_hold`).
-#[cfg(not(target_os = "macos"))]
+/// Claude Code's lock holds on Linux only: on macOS and Windows its label is
+/// `unverified` until a recording exists there (Windows: plan 19b), so the
+/// project hook judges (`project_hook_judges_when_managed_hook_does_not_hold`).
+#[cfg(target_os = "linux")]
 #[test]
 fn project_hook_quiet_when_agent_managed() {
     let etc = Etc::new();
@@ -412,8 +412,8 @@ fn project_hook_judges_when_managed_hook_does_not_hold() {
         (vec![("codex", "cc")], "codex", "codex/bash-deny.json"),
         (vec![("gemini", "cc")], "gemini", "gemini/shell-deny.json"),
     ];
-    // On macOS every lock label is unverified (no macOS recording yet).
-    if cfg!(target_os = "macos") {
+    // On macOS and Windows every lock label is unverified (no recording yet).
+    if cfg!(not(target_os = "linux")) {
         cases.push((vec![("claude", "cc")], "claude", "claude/bash-deny.json"));
     }
     for (installed, agent, payload) in cases {

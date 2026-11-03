@@ -313,6 +313,9 @@ mod tests {
         toml::from_str(&format!("command = \"/usr/bin/x\"\n{extra}")).unwrap()
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn read_paths_never_expose_saiife_dirs() {
         let refused = [
@@ -484,6 +487,9 @@ mod tests {
         assert!(toml::from_str::<McpServerCfg>("command=\"/a\"\nbogus=1").is_err());
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn relative_command_refused() {
         assert!(cfg("").validate("x").is_ok());
@@ -492,6 +498,9 @@ mod tests {
         assert!(c.validate("x").unwrap_err().contains("absolute"));
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn reserved_env_var_refused() {
         for v in ["PATH", "HOME", "LANG", "LD_PRELOAD", "lower", "1X"] {
@@ -501,6 +510,9 @@ mod tests {
         assert!(cfg("env = { LINEAR_TOKEN = \"s\" }").validate("x").is_ok());
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn bad_server_name_refused() {
         let c = cfg("");
@@ -510,6 +522,9 @@ mod tests {
         }
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn amount_cap_refused_for_mcp() {
         for l in [
@@ -528,6 +543,9 @@ mod tests {
         );
     }
 
+    // The locked-mode config with POSIX paths: `/usr/bin/x` is not absolute to a Windows
+    // host. Windows reads no locked config until plan 19b, which brings its own fixtures.
+    #[cfg(unix)]
     #[test]
     fn timeout_default_and_cap() {
         assert_eq!(cfg("").timeout, Duration::from_secs(30));

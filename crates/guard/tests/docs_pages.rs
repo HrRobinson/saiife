@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use saiifeguard::builtins::builtin_packs;
+use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::Engine;
 use saiifeguard::pack::Pack;
 
@@ -20,6 +21,24 @@ const HEADINGS: [&str; 5] = [
 /// Generous budget so a loaded runner cannot turn a deny into a latency
 /// fail-open; the budget path itself is covered by dedicated tests.
 const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Page examples that are POSIX lock paths: a Windows-style host has no such
+/// path, and no locked mode until plan 19b.
+const POSIX_LOCK_EXAMPLES: [&str; 3] = [
+    "rm -rf /etc/codex",
+    "mv /etc/claude-code /tmp/x",
+    "echo '{}' > /etc/claude-code/managed-settings.json",
+];
+
+/// No paths bound on Linux and macOS. Under Windows style an unbound `~` is a
+/// path nothing can read, which denies (W5): those hosts get a profile.
+fn host_paths() -> PathVars {
+    if PathStyle::host() == PathStyle::Windows {
+        PathVars::new().with_var("USERPROFILE", r"C:\Users\a")
+    } else {
+        PathVars::new()
+    }
+}
 
 fn docs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/packs")
@@ -86,7 +105,9 @@ fn examples_match_the_engine() {
     for pack in packs() {
         let id = pack.id.clone();
         let lines = example_lines(&page(&id));
-        let engine = Engine::new(vec![pack]).with_budget(TEST_BUDGET);
+        let engine = Engine::new(vec![pack])
+            .with_budget(TEST_BUDGET)
+            .with_paths(host_paths());
         let (mut denies, mut allows) = (0, 0);
         for line in lines {
             let (want_deny, cmd) = if let Some(cmd) = line.strip_prefix("deny ") {
@@ -98,6 +119,9 @@ fn examples_match_the_engine() {
             } else {
                 panic!("{id}: example line must start with `deny ` or `allow `: {line:?}");
             };
+            if PathStyle::host() == PathStyle::Windows && POSIX_LOCK_EXAMPLES.contains(&cmd) {
+                continue;
+            }
             let got = engine.evaluate(cmd);
             // Only this pack is on, so any deny is its doing, including the
             // engine's own check for a hidden `$(...)` target of its commands.
