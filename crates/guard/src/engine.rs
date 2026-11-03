@@ -638,13 +638,13 @@ impl Engine {
             Dialect::Posix => split_segments_noted(raw_cmd),
         };
         // Bash on Windows moves the profile too, and `evaluate_call` closes only a
-        // reader's line, so this one closes itself at the end.
+        // reader's line, so this one closes itself at the end, after the rules.
         let profile_moved = if reader {
             reader_assignments(&mut segments, &mut found);
             false
         } else {
             self.vars.style() == PathStyle::Windows
-                && posix_profile_assignments(&mut segments, &mut found)
+                && posix_profile_assignments(raw_cmd, &mut segments, &mut found)
         };
         null_device_words(&mut segments, dialect, state.null_redirect_discards);
         if self.vars.style() == PathStyle::Windows {
@@ -2034,17 +2034,19 @@ fn reader_assignments(segments: &mut [Vec<Word>], found: &mut Findings) {
 
 const PROFILE_MOVED: &str = "a profile variable changes on this line";
 
+const PROFILE_VARIABLES: &[&str] = &[
+    "home",
+    "userprofile",
+    "homedrive",
+    "homepath",
+    "localappdata",
+    "appdata",
+];
+
 fn is_profile_variable(name: &str) -> bool {
-    [
-        "HOME",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "LOCALAPPDATA",
-        "APPDATA",
-    ]
-    .iter()
-    .any(|p| name.eq_ignore_ascii_case(p))
+    PROFILE_VARIABLES
+        .iter()
+        .any(|p| name.eq_ignore_ascii_case(p))
 }
 
 /// What may stand in front of an assignment in a POSIX segment.
@@ -2052,63 +2054,269 @@ const POSIX_LEADING_WORDS: &[&str] = &[
     "if", "then", "elif", "else", "while", "until", "do", "{", "(", "!", "time",
 ];
 
-/// `reader_assignments` for a POSIX line on a Windows host. Other names keep their
-/// case, since `$x` is not `$X` to bash. The lexer flags `NAME=` in any position, so
-/// only what the shell assigns counts: words in front of a command, and the
-/// arguments of `export` and its kin. `echo HOME=x` assigns nothing. True when one
-/// of them moved the profile.
-fn posix_profile_assignments(segments: &mut [Vec<Word>], found: &mut Findings) -> bool {
-    let mut moved = false;
-    for seg in segments.iter_mut() {
-        let mut i = 0;
-        let mut assigned = Vec::new();
-        while let Some(w) = seg.get(i) {
-            if w.redirect {
-                i += 2;
-            } else if w.assignment {
-                assigned.push(i);
-                i += 1;
-            } else if !w.quoted && POSIX_LEADING_WORDS.contains(&w.text.as_str()) {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        while seg
-            .get(i)
-            .is_some_and(|w| !w.quoted && matches!(w.text.as_str(), "builtin" | "command"))
-        {
+/// How deep quoted command text is read for a read through a moved variable.
+const MAX_PROFILE_TEXT_DEPTH: u32 = 4;
+
+/// The shape of a POSIX segment, as far as assignments go.
+struct PosixAssignments {
+    /// The words in front of the command.
+    leading: Vec<usize>,
+    /// The command's word: past `builtin` and `command`.
+    command: Option<usize>,
+    /// The arguments of `export` and its kin, which stay set, or of `env`, which
+    /// the command under it sees.
+    arguments: Vec<usize>,
+}
+
+/// The lexer flags `NAME=` in any position, so only what the shell or `env` assigns
+/// counts. `echo HOME=x` assigns nothing.
+fn posix_assignments(seg: &[Word]) -> PosixAssignments {
+    let mut i = 0;
+    let mut leading = Vec::new();
+    while let Some(w) = seg.get(i) {
+        if w.redirect {
+            i += 2;
+        } else if w.assignment {
+            leading.push(i);
             i += 1;
+        } else if !w.quoted && POSIX_LEADING_WORDS.contains(&w.text.as_str()) {
+            i += 1;
+        } else {
+            break;
         }
-        let declares = seg.get(i).is_some_and(|w| {
-            !w.quoted
-                && matches!(
-                    w.text.as_str(),
-                    "export" | "readonly" | "declare" | "typeset" | "local"
-                )
-        });
-        if declares {
-            assigned.extend((i + 1..seg.len()).filter(|&at| seg[at].assignment));
-        }
-        for at in assigned {
+    }
+    let plain = |w: &Word, names: &[&str]| !w.quoted && names.contains(&w.text.as_str());
+    while seg
+        .get(i)
+        .is_some_and(|w| plain(w, &["builtin", "command"]))
+    {
+        i += 1;
+    }
+    let command = (i < seg.len()).then_some(i);
+    let names_values = command.is_some_and(|c| {
+        plain(
+            &seg[c],
+            &["export", "readonly", "declare", "typeset", "local", "env"],
+        )
+    });
+    let arguments = if names_values {
+        (i + 1..seg.len())
+            .filter(|&at| seg[at].assignment)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    PosixAssignments {
+        leading,
+        command,
+        arguments,
+    }
+}
+
+fn assigned_profile_variable(w: &Word) -> bool {
+    w.text
+        .split_once('=')
+        .is_some_and(|(name, _)| is_profile_variable(name.strip_suffix('+').unwrap_or(name)))
+}
+
+/// `reader_assignments` for a POSIX line on a Windows host. Other names keep their
+/// case, since `$x` is not `$X` to bash. Moving a profile variable alone judges
+/// nothing (`HOME=/tmp/x cargo test`): only a later read through it leaves a path
+/// that is not what it says. True when the line has one.
+fn posix_profile_assignments(
+    raw_cmd: &str,
+    segments: &mut [Vec<Word>],
+    found: &mut Findings,
+) -> bool {
+    let any_order = posix_runs_out_of_order(raw_cmd, segments);
+    let reads = reads_moved_profile(segments, false, any_order, 0).0;
+    for seg in segments.iter_mut() {
+        let shape = posix_assignments(seg);
+        for at in shape.leading.into_iter().chain(shape.arguments) {
             let w = &mut seg[at];
+            if !assigned_profile_variable(w) {
+                continue;
+            }
             let Some((name, value)) = w.text.split_once('=') else {
                 continue;
             };
-            let (name, plus) = match name.strip_suffix('+') {
-                Some(n) => (n, "+"),
-                None => (name, ""),
-            };
-            if is_profile_variable(name) {
-                w.text = format!("HOME{plus}={value}");
-                moved = true;
-            }
+            let plus = if name.ends_with('+') { "+" } else { "" };
+            w.text = format!("HOME{plus}={value}");
         }
     }
-    if moved {
+    if reads {
         found.unjudged(PROFILE_MOVED);
     }
-    moved
+    reads
+}
+
+/// A loop or a function runs text written before the move after it. The lexer does
+/// not keep a function's `()`, so that is looked for on the line.
+fn posix_runs_out_of_order(raw_cmd: &str, segments: &[Vec<Word>]) -> bool {
+    let unspaced: String = raw_cmd.split_whitespace().collect();
+    unspaced.contains("()")
+        || segments.iter().flatten().any(|w| {
+            !w.quoted
+                && matches!(
+                    w.text.as_str(),
+                    "for" | "while" | "until" | "select" | "function"
+                )
+        })
+}
+
+/// Does a word read through a profile variable moved before it, and is one moved at
+/// the end of `segments`? With `any_order`, a move counts for every word.
+///
+/// A persisting assignment (one alone, or under `export`) reaches everything after
+/// it. An inline one ends with its command, and bash expands that command's words
+/// before it applies, so `HOME=/x cat ~/y` reads the real `~/y`, which the rules
+/// judge as that. It does reach `cd`, the words that are assignments too, and quoted
+/// text the command may run itself: `HOME=/x bash -c 'cat ~/y'`.
+fn reads_moved_profile(
+    segments: &[Vec<Word>],
+    moved_before: bool,
+    any_order: bool,
+    depth: u32,
+) -> (bool, bool) {
+    let mut moved = moved_before
+        || (any_order
+            && segments.iter().any(|seg| {
+                let shape = posix_assignments(seg);
+                shape
+                    .leading
+                    .iter()
+                    .chain(&shape.arguments)
+                    .any(|&at| assigned_profile_variable(&seg[at]))
+            }));
+    for seg in segments {
+        let shape = posix_assignments(seg);
+        let keeps = |at: usize| {
+            shape.command.is_none()
+                || (shape.arguments.contains(&at)
+                    && shape.command.is_some_and(|c| seg[c].text != "env"))
+        };
+        let mut inline = false;
+        for (at, w) in seg.iter().enumerate() {
+            let assigns = shape.leading.contains(&at) || shape.arguments.contains(&at);
+            let text = if assigns {
+                w.text.split_once('=').map_or("", |(_, value)| value)
+            } else {
+                w.text.as_str()
+            };
+            if (moved || (inline && (assigns || w.quoted)))
+                && (names_profile_read(text) || (w.quoted && runs_bare_cd(text, depth)))
+            {
+                return (true, moved);
+            }
+            if assigns && assigned_profile_variable(w) {
+                if keeps(at) {
+                    moved = true;
+                } else {
+                    inline = true;
+                }
+            }
+        }
+        let Some(command) = shape.command else {
+            continue;
+        };
+        if (moved || inline) && is_bare_cd(&seg[command..]) {
+            return (true, moved);
+        }
+        // `eval` runs its words in this shell, so what they move stays moved.
+        if !seg[command].quoted && seg[command].text == "eval" && depth < MAX_PROFILE_TEXT_DEPTH {
+            let text: Vec<&str> = seg[command + 1..].iter().map(|w| w.text.as_str()).collect();
+            let (inner, _) = split_segments_noted(&text.join(" "));
+            let (reads, after) = reads_moved_profile(&inner, moved, any_order, depth + 1);
+            if reads {
+                return (true, after);
+            }
+            moved = after;
+        }
+    }
+    (false, moved)
+}
+
+/// `cd` that goes to `HOME`: no directory, whatever its options.
+fn is_bare_cd(words: &[Word]) -> bool {
+    words.first().is_some_and(|w| w.text == "cd")
+        && !words
+            .iter()
+            .skip(1)
+            .any(|w| !w.redirect && !matches!(w.text.as_str(), "-L" | "-P" | "-e" | "-@" | "--"))
+}
+
+/// Quoted text that, run as a line, reads through a moved variable by `cd` alone.
+fn runs_bare_cd(text: &str, depth: u32) -> bool {
+    if depth >= MAX_PROFILE_TEXT_DEPTH || !text.contains("cd") {
+        return false;
+    }
+    let (inner, _) = split_segments_noted(text);
+    reads_moved_profile(&inner, true, false, depth + 1).0
+}
+
+/// Text spelling a read of a profile variable, in any shell's way, or of `~`. Names
+/// fold case, and quoting is not told apart: `echo '$HOME'` over-reads.
+fn names_profile_read(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let ends_name = |rest: &str| {
+        !rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let names = |prefix: &str, name: &str| {
+        let spelled = format!("{prefix}{name}");
+        lower
+            .match_indices(&spelled)
+            .any(|(at, _)| ends_name(&lower[at + spelled.len()..]))
+    };
+    let variable = PROFILE_VARIABLES.iter().any(|name| {
+        ["$", "${", "${#", "${!", "env:"]
+            .iter()
+            .any(|prefix| names(prefix, name))
+            || lower.contains(&format!("%{name}%"))
+    });
+    variable || names_tilde(&lower)
+}
+
+/// `~` where a shell expands it: at the start of a word, not `HEAD~1` or `~bob`.
+fn names_tilde(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices('~').any(|(at, _)| {
+        let starts = at == 0
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t'
+                    | b'\n'
+                    | b':'
+                    | b'='
+                    | b'('
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'`'
+                    | b'"'
+                    | b'\''
+            );
+        let ends = bytes.get(at + 1).is_none_or(|b| {
+            matches!(
+                b,
+                b'/' | b'\\'
+                    | b' '
+                    | b'\t'
+                    | b'\n'
+                    | b':'
+                    | b')'
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'`'
+                    | b'"'
+                    | b'\''
+            )
+        });
+        starts && ends
+    })
 }
 
 /// `dir/<name>` for each name copied or moved into `dir`.

@@ -170,6 +170,93 @@ fn a_cd_function_with_a_scope_prefix_moves_the_cwd() {
     );
 }
 
+/// `corpus_self`'s everyday lines and agent launches, on the Windows style they
+/// otherwise see only in CI. Moving a profile variable alone denies nothing, and the
+/// agent-launch rule keeps its name on the deny.
+#[test]
+fn moving_a_profile_variable_alone_is_not_denied() {
+    let e = engine();
+    not_denied(
+        &e,
+        BASH,
+        &[
+            "HOME=/tmp/x cargo test",
+            "HOME=$(mktemp -d) cargo test",
+            "HOME=$HOME/x cargo test",
+            "USERPROFILE=/tmp/x cargo test",
+            "export HOME=/tmp/x; cargo test",
+            "export USERPROFILE=/tmp/x; npm test",
+            "HOME=/tmp/x; git status",
+            "claude -p hi; export HOME=/tmp/x",
+            "echo claude; export HOME=/tmp/x",
+            "export HOME=x; echo claude",
+            "export HOME=x; grep claude notes.txt",
+            "claude -p hi; export HOME=x",
+            "bash -c 'export HOME=x'; claude -p hi",
+            "export HOME=/tmp/x; git log HEAD~1",
+            "export HOME=/tmp/x; cd src",
+            "HOME=/tmp/x bash -c 'cargo test'",
+            // The shell expands these before an inline assignment applies, and the
+            // assignment ends with its command.
+            "HOME=/tmp/x cat ~/notes.txt",
+            "HOME=/tmp/x cat $HOME/notes.txt",
+            "HOME=/tmp/x cargo test; cat ~/notes.txt",
+            // Read before the move.
+            "cat ~/notes.txt; export HOME=/tmp/x",
+        ],
+    );
+    for line in [
+        "eval 'export HOME=/tmp/x'; claude",
+        "eval 'export HOME=x; true' && claude",
+        "export HOME=x; claude",
+        "export FOO=1 HOME=/tmp/x; claude",
+        "export HOME=x; bash -c 'claude'",
+        "{ export HOME=x; }; claude",
+        "HOME=/tmp/x claude",
+        "USERPROFILE=/tmp/x claude",
+        "export USERPROFILE=x; claude",
+    ] {
+        let got = e.evaluate_call(line, BASH);
+        assert!(
+            matches!(&got, Decision::Deny { pack, .. } if pack == "core.self"),
+            "{line}: {got:?}"
+        );
+    }
+}
+
+/// An inline assignment reaches what runs under it, and `cd` is the shell's own.
+/// What the shell expanded first read the old value, and is judged as that.
+#[test]
+fn a_read_through_a_moved_profile_variable_is_denied() {
+    let e = engine();
+    let lines = [
+        "HOME=/c/Users/a/.ssh; cat ${HOME}/id_rsa",
+        "USERPROFILE=/c/Users/a/.ssh; cat ${USERPROFILE}/id_rsa",
+        "HOME=/c/Users/a/.ssh; cat \"$HOME/id_rsa\"",
+        "HOME=/c/Users/a/.ssh; cat ~",
+        "HOME=/c/Users/a/.ssh; cd; cat id_rsa",
+        "HOME=/c/Users/a/.ssh cd; cat id_rsa",
+        "export HOME=/c/Users/a/.ssh; cd && cat id_rsa",
+        "HOME=/c/Users/a/.ssh; y=$HOME; cat $y/id_rsa",
+        "HOME=/c/Users/a/.ssh; cat $(echo ~)/id_rsa",
+        "env HOME=/c/Users/a/.ssh bash -c 'cat ~/id_rsa'",
+        "HOME=/c/Users/a/.ssh bash -c \"cat ~/id_rsa\"",
+        "HOME=/c/Users/a/.ssh bash -c 'cd; cat id_rsa'",
+        "HOME=/c/Users/a/.ssh eval 'cat ~/id_rsa'",
+        "export HOME=/c/Users/a/.ssh; bash -c 'cat ~/id_rsa'",
+        "export HOME=/c/Users/a/.ssh; bash -c 'cd; cat id_rsa'",
+        "eval 'export HOME=/c/Users/a/.ssh'; cat ~/id_rsa",
+        "export USERPROFILE=/c/Users/a/.ssh; powershell -c 'cat $env:USERPROFILE/id_rsa'",
+        "export USERPROFILE=/c/Users/a/.ssh; cmd /c 'type %USERPROFILE%\\id_rsa'",
+        // The text comes first, and runs after.
+        "f() { cat ~/id_rsa; }; HOME=/c/Users/a/.ssh; f",
+        "for i in 1 2; do cat ~/id_rsa; HOME=/c/Users/a/.ssh; done",
+        // Inline, `~` is the real one, and that is what the rules see.
+        "HOME=/tmp/x cat ~/.ssh/id_rsa",
+    ];
+    denied(&e, BASH, &lines);
+}
+
 /// Windows folds names, and a profile variable is its `HOME`: Bash sets one as cmd
 /// and PowerShell do, so a path spelled with it is not what it says.
 #[test]
