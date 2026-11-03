@@ -219,7 +219,12 @@
     { "raw": "C:\\Windows.", "reference": "fullpath" },
     { "raw": "C:\\Windows  ", "reference": "fullpath" },
     { "raw": "/c/Windows", "reference": "cygpath" },
-    { "raw": "/cygdrive/c/Windows", "reference": "cygpath" },
+    {
+      "raw": "/cygdrive/c/Windows",
+      "reference": "cygpath",
+      "over_reader": "c:/windows",
+      "over": "Git Bash does not mount /cygdrive by default, so cygpath puts it under the install folder of Git (C:\\Program Files\\Git\\cygdrive\\c\\Windows). The reader says c:/Windows, which can at most deny a delete of a harmless folder there and never allows one of the real Windows folder: the safe direction. Accepted only while cygpath's answer ends in the raw path (unmounted) and the reader says exactly over_reader; a mounted /cygdrive that disagrees still fails."
+    },
     { "raw": "/mnt/c/Windows", "reference": "report" },
     { "raw": "/proc/cygdrive/c/Windows", "reference": "report" },
     { "raw": "\\\\?\\C:\\Windows", "reference": "report" },

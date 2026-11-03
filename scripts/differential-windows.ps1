@@ -444,7 +444,14 @@ function Test-Paths {
       if ($null -eq $want) {
         Write-Output "report only: $raw reads as $mine"
       } elseif ((& $fold $want) -cne (& $fold $mine)) {
-        Add-Failure "path: $raw is $want, and the reader says $mine"
+        # A documented over-read: cygpath did not mount the prefix (its answer ends in
+        # the raw path), and the reader says exactly what the fixture pins.
+        $over = $fixtures[$i].PSObject.Properties.Name -contains 'over'
+        if ($over -and (& $fold $want).EndsWith((& $fold $raw)) -and (& $fold $mine) -ceq $fixtures[$i].over_reader) {
+          Write-Output "documented over-read of a path: $raw is $want, the reader says $mine"
+        } else {
+          Add-Failure "path: $raw is $want, and the reader says $mine"
+        }
       }
     }
   } finally {

@@ -136,6 +136,14 @@ What happens when the guard cannot judge something:
 - **Agents.** Every Windows lock label is `unverified`, and which shells Codex and
   Gemini CLI use comes from their docs, not a run.
 
+## Speed
+
+The hook is slower on Windows than on Linux and macOS, whose budget stays 50 ms p95.
+On the GitHub `windows-latest` runner, starting any process costs 20.3 ms (median),
+`saiife --version` 26.9 ms, and the hook 84.7 ms (median) and 90.4 ms (p95). The
+owner set the Windows CI budget to 100 ms p95 for now. A speed-up is planned; no
+figure is promised.
+
 ## Locked mode
 
 Locked mode on Windows is plan 19b. It is not available yet: `saiife system install`

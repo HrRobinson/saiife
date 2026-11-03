@@ -82,6 +82,13 @@ fn an_alias_reads_as_the_command_it_resolves_to() {
         ("spsv", "Stop-Service"),
         ("iwmi", "Invoke-WmiMethod"),
         ("icim", "Invoke-CimMethod"),
+        ("gcai", "Get-CimAssociatedInstance"),
+        ("gcls", "Get-CimClass"),
+        ("gcms", "Get-CimSession"),
+        ("ncms", "New-CimSession"),
+        ("ncso", "New-CimSessionOption"),
+        ("rcie", "Register-CimIndicationEvent"),
+        ("rcms", "Remove-CimSession"),
         ("SP", "Set-ItemProperty"),
     ] {
         assert_eq!(
@@ -291,4 +298,35 @@ fn a_bare_drive_moves_cmds_cwd_too() {
     }
     let got = e.evaluate_call("D:", Dialects::One(Cmd));
     assert!(!got.is_deny(), "{got:?}");
+}
+
+/// Commands that change WMI or CIM objects, or re-run history, cannot be read:
+/// each is noted, by name and by alias. `r` is an alias only in command position.
+#[test]
+fn wmi_cim_and_history_commands_are_opaque() {
+    for line in [
+        "Remove-WmiObject x",
+        "rwmi x",
+        "Set-WmiInstance x",
+        "swmi x",
+        "Remove-CimInstance x",
+        "rcim x",
+        "Invoke-History 1",
+        "ihy 1",
+        "r",
+        "r 1",
+    ] {
+        assert_eq!(
+            split_for_host(line, true).1,
+            Some("this PowerShell command cannot be judged"),
+            "{line}"
+        );
+    }
+    // Not in command position, or not an alias on a POSIX host.
+    for line in ["echo r", "grep -r x", "cat r", "ls r", "Write-Output r"] {
+        assert_eq!(split_for_host(line, true).1, None, "{line}");
+    }
+    assert_eq!(split_for_host("r 1", false).1, None);
+    denied(&developer(), &["rwmi x", "swmi x", "rcim x", "ihy 1", "r"]);
+    allowed(&developer(), &["echo r"]);
 }

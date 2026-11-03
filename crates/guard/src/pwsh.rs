@@ -96,6 +96,12 @@ pub(crate) const OPAQUE: &[&str] = &[
     "register-scheduledtask",
     "invoke-wmimethod",
     "invoke-cimmethod",
+    // These change a WMI or CIM object by a path, a query or a history entry
+    // the reader cannot see (`r` re-runs a line from history).
+    "remove-wmiobject",
+    "set-wmiinstance",
+    "remove-ciminstance",
+    "invoke-history",
 ];
 
 /// `keyword … { }`: the statement is its blocks, and ends at one.
