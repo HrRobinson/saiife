@@ -163,6 +163,20 @@ fn a_negated_command_is_denied_and_recorded_masked() {
     assert_eq!(r.input, "! GH_TOKEN=[MASKED] rm -rf /");
 }
 
+/// A line this long overruns the budget in a debug build, and the rule at its
+/// end is still a normal deny with its pack and rule, whatever the machine's
+/// speed: judged in full or in the cheap pass, the record is the same.
+#[test]
+fn a_rule_after_a_padded_line_is_recorded_as_a_deny() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}x; rm -rf /", "$(true) ".repeat(20_000));
+    assert_eq!(check(dir.path(), &["--hook-exit"], &payload(&line)), 2);
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
+    assert!(r.rule.is_some(), "{r:?}");
+}
+
 #[test]
 fn unwritable_audit_dir_keeps_verdict() {
     let dir = tempfile::tempdir().unwrap();

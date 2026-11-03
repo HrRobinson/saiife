@@ -134,6 +134,12 @@ impl RuleCwd {
         }
     }
 
+    /// About what copying or rewriting through these directories costs, in
+    /// bytes, without reading each part.
+    pub(crate) fn weight(&self) -> usize {
+        self.dirs.iter().map(|d| 24 * d.parts.len()).sum()
+    }
+
     /// A segment ran: the target of a `cd`/`pushd` (`argv` normalized,
     /// `words` the resolved words in the same positions) is added to the
     /// set from each directory in it; `popd` adds an unknown one. Any other

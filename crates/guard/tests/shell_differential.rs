@@ -243,6 +243,36 @@ const RESERVED_WORD_CASES: &[(&str, bool)] = &[
     ("! cat <<EOF\ntouch ran\nEOF", true),
 ];
 
+/// Cases bash before 4 does not run and newer bash does: 3.2.57 (macOS's
+/// `/bin/bash` and `/bin/sh`) leaves `! ! touch ran` without running `touch`.
+/// The guard must keep denying them, because newer bash runs the command, so
+/// there a deny with nothing run is an accepted over-deny, on the safe side.
+const OVER_DENIED_BEFORE_BASH_4: &[&str] = &["! ! touch ran"];
+
+/// Does the engine's verdict on `case` disagree with what the shell did? A
+/// command that ran and was not denied always does. A listed case on old bash
+/// only has to stay denied.
+fn is_mismatch(old_bash: bool, case: &str, ran: bool, denied: bool) -> bool {
+    if old_bash && OVER_DENIED_BEFORE_BASH_4.contains(&case) {
+        return !denied;
+    }
+    ran != denied
+}
+
+#[test]
+fn only_the_listed_over_deny_is_accepted_on_old_bash() {
+    let listed = OVER_DENIED_BEFORE_BASH_4[0];
+    assert!(!is_mismatch(true, listed, false, true));
+    // Ran and not denied fails, and so does no longer denying it.
+    assert!(is_mismatch(true, listed, true, false));
+    assert!(is_mismatch(true, listed, false, false));
+    // Newer bash runs it, so there the two must agree.
+    assert!(is_mismatch(false, listed, false, true));
+    // Any other case still has to match on old bash.
+    assert!(is_mismatch(true, "! touch ran", false, true));
+    assert!(is_mismatch(true, "! touch ran", true, false));
+}
+
 #[test]
 fn reserved_words_match_bash() {
     let e = engine();
@@ -273,7 +303,7 @@ fn reserved_words_match_bash() {
             }
             let ran = tmp.path().join("ran").exists();
             let denied = matches!(e.evaluate(case), Decision::Deny { .. });
-            if ran != denied {
+            if is_mismatch(old, case, ran, denied) {
                 failures.push(format!(
                     "{shell} ({version}): ran={ran} denied={denied}\n  case: {case:?}"
                 ));

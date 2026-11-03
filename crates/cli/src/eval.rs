@@ -1038,11 +1038,7 @@ mod tests {
     #[test]
     fn over_budget_is_unjudged() {
         let a = judge(
-            &payload(
-                "/",
-                "Bash",
-                serde_json::json!({ "command": "rm -rf /tmp/x" }),
-            ),
+            &payload("/", "Bash", serde_json::json!({ "command": "ls -la" })),
             &defaults(),
             Duration::ZERO,
         );
@@ -1051,6 +1047,24 @@ mod tests {
             a.reason.as_deref(),
             Some("guard exceeded its latency budget")
         );
+    }
+
+    /// What is left when the budget runs out is still judged: a rule that
+    /// denies is an ordinary deny, with its pack and pattern.
+    #[test]
+    fn over_budget_still_denies_by_rule() {
+        let a = judge(
+            &payload(
+                "/",
+                "Bash",
+                serde_json::json!({ "command": "ls; rm -rf /" }),
+            ),
+            &defaults(),
+            Duration::ZERO,
+        );
+        assert_eq!(a.verdict, Verdict::Deny, "{a:?}");
+        assert_eq!(a.pack.as_deref(), Some("core.filesystem"), "{a:?}");
+        assert!(a.rule.is_some(), "{a:?}");
     }
 
     #[test]
