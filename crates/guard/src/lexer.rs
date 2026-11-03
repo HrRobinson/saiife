@@ -176,20 +176,69 @@ fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>
 /// Shell keywords that only ever *introduce* a real command inside a
 /// compound construct (`if X; then CMD; fi`, `for i in 1; do CMD; done`) —
 /// stripping a leading run of them off a segment reveals the actual
-/// command at argv[0]. Deliberately narrow: `if`/`for`/`while`/`until`
-/// themselves are left alone, since they head their own condition/list
-/// segment (harmless as an argv[0] no pack cares about), not the guarded
-/// command.
+/// command at argv[0]. Matched quoted or not: judging what follows a quoted
+/// one (a command of that name) can only over-deny.
 const LEADING_KEYWORDS: &[&str] = &["then", "do", "else", "elif"];
 
-/// Drop a leading run of `LEADING_KEYWORDS` words from a segment. One pass,
-/// one `drain` — bounded by the segment's own length, so this can't turn an
-/// adversarially long segment into quadratic work.
-fn strip_leading_keywords(mut seg: Segment) -> Segment {
+/// Unquoted words that run the command after them, where a command starts:
+/// `!`, the condition heads `if`/`while`/`until` and `coproc`; zsh's
+/// precommand modifiers `noglob`, `nocorrect` and `-`; fish's `not`, `and`,
+/// `or` and `begin`. Quoted (`"!" cmd`, `\! cmd`) it is a command of that
+/// name, with `cmd` an argument. In a shell without the word it is an unknown
+/// command, so stripping it only over-denies.
+const RESERVED_PREFIXES: &[&str] = &[
+    "!",
+    "if",
+    "while",
+    "until",
+    "coproc",
+    "noglob",
+    "nocorrect",
+    "-",
+    "not",
+    "and",
+    "or",
+    "begin",
+];
+
+/// How many leading words of a segment are reserved words in front of its
+/// command: `RESERVED_PREFIXES` and `LEADING_KEYWORDS`; `for NAME do` and
+/// `select NAME do` with no separator before `do` (`for ((…)) do` too);
+/// zsh's `repeat N`. `time [-p] [--]` counts only in front of another such
+/// word (`time ! cmd`): before a plain command it stays for `wrappers`, which
+/// also knows GNU time's options. This only looks at the front of the
+/// segment, so a word after a wrapper, an assignment or a redirection is an
+/// argument, as in bash (`env ! cmd`, `FOO=1 ! cmd`, `echo !`).
+pub(crate) fn reserved_prefix_len(seg: &[Word]) -> usize {
+    let bare = |i: usize, s: &str| seg.get(i).is_some_and(|w| !w.quoted && w.text == s);
+    let mut stripped = 0;
     let mut i = 0;
-    while i < seg.len() && LEADING_KEYWORDS.contains(&seg[i].text.as_str()) {
-        i += 1;
+    while let Some(w) = seg.get(i) {
+        let t = w.text.as_str();
+        if LEADING_KEYWORDS.contains(&t) || (!w.quoted && RESERVED_PREFIXES.contains(&t)) {
+            i += 1;
+        } else if bare(i, "time") {
+            i += 1;
+            i += usize::from(bare(i, "-p"));
+            i += usize::from(bare(i, "--"));
+            continue;
+        } else if (bare(i, "for") || bare(i, "select")) && bare(i + 2, "do") {
+            i += 3;
+        } else if bare(i, "repeat") && i + 1 < seg.len() {
+            i += 2;
+        } else {
+            break;
+        }
+        stripped = i;
     }
+    stripped
+}
+
+/// Drop the leading reserved words from a segment. One pass, one `drain` —
+/// bounded by the segment's own length, so this can't turn an adversarially
+/// long segment into quadratic work.
+fn strip_leading_keywords(mut seg: Segment) -> Segment {
+    let i = reserved_prefix_len(&seg);
     if i > 0 {
         seg.drain(0..i);
     }
@@ -1028,7 +1077,15 @@ fn starts_a_command(words: &[Word]) -> bool {
         let reserved = !w.quoted
             && (matches!(
                 w.text.as_str(),
-                "!" | "time" | "if" | "elif" | "while" | "until" | "then" | "do" | "else"
+                "!" | "time"
+                    | "if"
+                    | "elif"
+                    | "while"
+                    | "until"
+                    | "then"
+                    | "do"
+                    | "else"
+                    | "coproc"
             ) || (after_time && w.text == "-p"));
         after_time = w.text == "time";
         reserved
@@ -1101,6 +1158,9 @@ fn current_segment(toks: &[LexTok]) -> Vec<Word> {
 /// Does this command (one pipeline segment) run its stdin as commands, or
 /// is it unknown?
 fn runs_stdin(words: &[Word]) -> bool {
+    // These words are still in front of the command here (`! bash <<EOF`,
+    // `if bash <<EOF`, `then bash <<EOF`).
+    let words = &words[reserved_prefix_len(words)..];
     // After a compound command's end (`done <<EOF`, `fi <<EOF`): the body
     // feeds the whole compound command; judge it as commands.
     if words
@@ -2116,7 +2176,7 @@ mod tests {
     fn leading_then_do_else_elif_are_stripped_revealing_the_real_command() {
         assert_eq!(
             segs("if true; then rm -rf /; fi"),
-            vec![vec!["if", "true"], vec!["rm", "-rf", "/"], vec!["fi"]]
+            vec![vec!["true"], vec!["rm", "-rf", "/"], vec!["fi"]]
         );
         assert_eq!(
             segs("for i in 1; do rm -rf /; done"),
@@ -2128,8 +2188,34 @@ mod tests {
         );
         assert_eq!(
             segs("while true; do rm -rf /; done"),
-            vec![vec!["while", "true"], vec!["rm", "-rf", "/"], vec!["done"]]
+            vec![vec!["true"], vec!["rm", "-rf", "/"], vec!["done"]]
         );
+    }
+
+    #[test]
+    fn reserved_words_are_stripped_only_where_a_command_starts() {
+        let first = |cmd: &str| segs(cmd).remove(0);
+        assert_eq!(first("! rm -rf /"), ["rm", "-rf", "/"]);
+        assert_eq!(first("! ! time ! if rm"), ["rm"]);
+        assert_eq!(first("time -p -- ! rm"), ["rm"]);
+        assert_eq!(first("for i do rm"), ["rm"]);
+        assert_eq!(first("for ((i=0;i<1;i++)) do rm"), ["rm"]);
+        assert_eq!(first("repeat 3 rm"), ["rm"]);
+        assert_eq!(first("coproc rm"), ["rm"]);
+        // `time` alone is left to the wrapper table.
+        assert_eq!(first("time -p rm"), ["time", "-p", "rm"]);
+        assert_eq!(first("time -o f rm"), ["time", "-o", "f", "rm"]);
+        assert_eq!(first("time time rm"), ["time", "time", "rm"]);
+        // Not reserved here.
+        assert_eq!(first("echo ! rm"), ["echo", "!", "rm"]);
+        assert_eq!(first("\"!\" rm"), ["!", "rm"]);
+        assert_eq!(first("\\! rm"), ["!", "rm"]);
+        assert_eq!(first("!rm"), ["!rm"]);
+        assert_eq!(first("FOO=1 ! rm"), ["FOO=1", "!", "rm"]);
+        assert_eq!(first("env ! rm"), ["env", "!", "rm"]);
+        assert_eq!(first("for i in a"), ["for", "i", "in", "a"]);
+        // Nothing left.
+        assert!(segs("! !").is_empty() || segs("! !")[0].is_empty());
     }
 
     #[test]

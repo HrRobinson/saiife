@@ -121,26 +121,6 @@ pub(crate) struct RuleCwd {
     overflowed: bool,
 }
 
-/// Leading words that make a segment a condition or time it (`if cd /;
-/// then …`, `while cd x; do …`, `! cd /`, `time -p cd /`): the command
-/// after them still runs in this shell.
-const CONDITION_WORDS: &[&str] = &["if", "elif", "while", "until", "!", "time"];
-
-/// How many leading words of `argv` are `CONDITION_WORDS` (unquoted), with
-/// the `-p` of `time -p`.
-fn condition_prefix_len(argv: &[String], words: &[Word]) -> usize {
-    let mut n = 0;
-    while let Some(a) = argv.get(n) {
-        let quoted = words.get(n).is_some_and(|w| w.quoted);
-        let after_time = n > 0 && argv[n - 1] == "time";
-        if quoted || !(CONDITION_WORDS.contains(&a.as_str()) || (after_time && a == "-p")) {
-            break;
-        }
-        n += 1;
-    }
-    n
-}
-
 impl RuleCwd {
     /// The directory the command line starts in (the agent's), if known.
     pub(crate) fn start(cwd: Option<&Path>) -> RuleCwd {
@@ -157,10 +137,9 @@ impl RuleCwd {
     /// A segment ran: the target of a `cd`/`pushd` (`argv` normalized,
     /// `words` the resolved words in the same positions) is added to the
     /// set from each directory in it; `popd` adds an unknown one. Any other
-    /// command is ignored.
+    /// command is ignored. The lexer has already stripped the reserved
+    /// words (`if cd /`, `! cd /`) and the engine the wrappers (`time cd /`).
     pub(crate) fn command(&mut self, argv: &[String], words: &[Word], home: Option<&Path>) {
-        let lead = condition_prefix_len(argv, words);
-        let (argv, words) = (&argv[lead..], words.get(lead..).unwrap_or(&[]));
         let pushd = match argv.first().map(String::as_str) {
             Some("cd") => false,
             // `pushd -n DIR` only edits the directory stack.
@@ -383,11 +362,6 @@ mod tests {
         assert_eq!(
             r(&["cd /"], "chmod -R 777 *").as_deref(),
             Some("chmod -R 777 /*")
-        );
-        assert_eq!(r(&["if cd /"], "rm -rf *").as_deref(), Some("rm -rf /*"));
-        assert_eq!(
-            r(&["! time -p cd /"], "rm -rf *").as_deref(),
-            Some("rm -rf /*")
         );
     }
 

@@ -140,6 +140,30 @@ fn secrets_never_reach_the_audit_file() {
 }
 
 #[test]
+fn a_negated_command_is_denied_and_recorded_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        check(dir.path(), &["--hook-exit"], &payload("! rm -rf /")),
+        2
+    );
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.pack.as_deref(), Some("core.filesystem"));
+    assert_eq!(r.input, "! rm -rf /");
+
+    let dir = tempfile::tempdir().unwrap();
+    let tok = format!("ghp_{}", "z".repeat(36));
+    check(
+        dir.path(),
+        &["--hook-exit"],
+        &payload(&format!("! GH_TOKEN={tok} rm -rf /")),
+    );
+    let r = &guard_records(dir.path())[0];
+    assert_eq!(r.decision, DecisionKind::Deny);
+    assert_eq!(r.input, "! GH_TOKEN=[MASKED] rm -rf /");
+}
+
+#[test]
 fn unwritable_audit_dir_keeps_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("a-file");

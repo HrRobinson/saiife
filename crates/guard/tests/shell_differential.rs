@@ -181,3 +181,89 @@ fn heredoc_matches_installed_shells() {
     }
     assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
 }
+
+/// Reserved words in command position, against bash itself: the marker runs
+/// exactly when the engine denies. The flag is false for forms bash 3.2
+/// (macOS's `/bin/bash`) does not have.
+const RESERVED_WORD_CASES: &[(&str, bool)] = &[
+    // These run the marker.
+    ("! touch ran", true),
+    ("! ! touch ran", true),
+    ("! time touch ran", true),
+    ("time ! touch ran", true),
+    ("time -p ! touch ran", true),
+    ("true && ! touch ran", true),
+    ("(! touch ran)", true),
+    ("!(touch ran)", true),
+    ("{ ! touch ran; }", true),
+    ("! { touch ran; }", true),
+    ("sh -c '! touch ran'", true),
+    ("! FOO=1 touch ran", true),
+    ("if ! touch ran; then :; fi", true),
+    ("if touch ran; then :; fi", true),
+    ("while ! touch ran; do :; done", true),
+    ("while touch ran; do break; done", true),
+    ("until touch ran; do :; done", true),
+    ("if true; then ! touch ran; fi", true),
+    ("time if touch ran; then :; fi", true),
+    ("set -- a; for x do touch ran; done", true),
+    ("for ((i=0;i<1;i++)) do touch ran; done", true),
+    ("! bash <<EOF\ntouch ran\nEOF", true),
+    ("time ! bash <<EOF\ntouch ran\nEOF", true),
+    ("if bash <<EOF\ntouch ran\nEOF\nthen :; fi", true),
+    ("if true; then bash <<EOF\ntouch ran\nEOF\nfi", true),
+    ("time -- ! touch ran", false),
+    ("coproc touch ran; wait", false),
+    ("time -p -- ! touch ran", false),
+    // These do not.
+    (">out ! touch ran", true),
+    ("!touch ran", true),
+    ("\"!\" touch ran", true),
+    ("\\! touch ran", true),
+    ("FOO=1 ! touch ran", true),
+    ("env ! touch ran", true),
+    ("echo ! touch ran", true),
+    ("\"if\" touch ran", true),
+    ("echo if touch ran", true),
+    ("! cat <<EOF\ntouch ran\nEOF", true),
+];
+
+#[test]
+fn reserved_words_match_bash() {
+    let e = engine();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let mut failures = Vec::new();
+    for shell in candidate_shells() {
+        let version = version_line(&shell);
+        if !version.contains("bash") {
+            continue;
+        }
+        let old = version.contains("version 3.");
+        for (case, in_old) in RESERVED_WORD_CASES {
+            if old && !in_old {
+                continue;
+            }
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let run = Command::new(&shell)
+                .arg("-c")
+                .arg(case)
+                .current_dir(tmp.path())
+                .env("HOME", home.path())
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
+                .output();
+            if let Err(err) = run {
+                println!("note: {shell} cannot be executed ({err}); skipped");
+                break;
+            }
+            let ran = tmp.path().join("ran").exists();
+            let denied = matches!(e.evaluate(case), Decision::Deny { .. });
+            if ran != denied {
+                failures.push(format!(
+                    "{shell} ({version}): ran={ran} denied={denied}\n  case: {case:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
+}
