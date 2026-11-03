@@ -638,6 +638,7 @@ impl Engine {
             literal_path: reader
                 || has_literal_path_ref(raw_cmd)
                 || !path_refs_are_plain(raw_cmd, &segments),
+            only_command: depth == 0 && segments.iter().filter(|s| !s.is_empty()).count() == 1,
             clock,
             dialect,
         };
@@ -693,6 +694,7 @@ impl Engine {
             start,
             depth: cx.depth,
             literal_path: cx.literal_path,
+            only_command: false,
             clock: &clock,
             dialect: cx.dialect,
         };
@@ -1400,6 +1402,19 @@ impl Engine {
             return None;
         }
         if let Some(reason) = wintable::unread_shell(&words) {
+            // `exec bash` alone: nothing here gives it a stdin to run, so there
+            // is nothing unread to judge. A pipe or a nested line is another
+            // command on the line, and a redirection is in this segment. A word
+            // that is no plain option (`cmd x.bat`) may name what it runs.
+            let fed = view.seg.iter().any(|w| w.redirect && w.text.contains('<'));
+            let plain_option = |w: &Word| {
+                !w.has_substitution
+                    && w.text.starts_with(['-', '/'])
+                    && !w.text[1..].contains(['/', '\\', '.'])
+            };
+            if cx.only_command && !fed && words.iter().skip(1).all(plain_option) {
+                return None;
+            }
             return unread(reason.to_string(), found);
         }
         let (dialect, inner) = cmdexe::nested(&words)?;
@@ -2353,6 +2368,9 @@ struct Ctx<'a> {
     /// The line holds a path reference spelled out literally (see
     /// `has_literal_path_ref`, `path_refs_are_plain`).
     literal_path: bool,
+    /// The line is this one command and is no nested line: no pipe, group or
+    /// outer shell can be giving it a stdin.
+    only_command: bool,
     clock: &'a Clock,
     /// Which reader read this line.
     dialect: Dialect,

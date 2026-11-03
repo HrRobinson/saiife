@@ -345,8 +345,8 @@ fn path_warning(exe: &Path) {
         Some(p) if p != exe => outln!(
             "\nWARNING: the hooks will run {} (the saiife on your PATH), not this binary ({}). \
              Run `saiife init` with the saiife on your PATH.",
-            p.display(),
-            exe.display()
+            saiife_win::display::shown(&p),
+            saiife_win::display::shown(exe)
         ),
         Some(_) => {}
     }

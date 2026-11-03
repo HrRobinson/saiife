@@ -94,7 +94,10 @@ fn writes_default_named_report() {
         .args(["--report"])
         .assert()
         .success()
-        .stdout(format!("Report written: {} (2 decisions)\n", abs.display()));
+        .stdout(format!(
+            "Report written: {} (2 decisions)\n",
+            saiife_win::display::shown(&abs)
+        ));
     let html = read(&s.path(&name));
     assert!(html.contains("Blocked actions"));
     assert!(html.contains("rm -rf /"));

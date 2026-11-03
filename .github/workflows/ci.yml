@@ -44,35 +44,37 @@ jobs:
       - name: Windows signing mode (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-windows-sign-mode.sh
+      # The Windows steps below run after a failed step too, so one run reports
+      # them all; a failed step still fails the job.
       # install.ps1 against a fake file:// release (parses both scripts first).
       - name: install.ps1 (PowerShell 7)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: pwsh
         run: ./scripts/test-install.ps1
       # Windows PowerShell 5.1 is what users have.
       - name: install.ps1 (Windows PowerShell 5.1)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: powershell
         run: ./scripts/test-install.ps1
       # The developer hook's p95 against D10's budget (plan 19a). Over it is an
       # owner decision, not a silent raise.
       - name: developer hook bench (Windows, p95 budget)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: bash
         run: BENCH_MAX_P95_MS=50 bash scripts/bench-check.sh 50
       # The guard's readers against the real shells: [Parser]::ParseInput and
       # harmless cmd.exe probes. Any mismatch fails. Only a debug build has
       # the seam it reads with.
       - name: build for the reader differential (Windows)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: bash
         run: cargo build --locked -p saiife --bin saiife
       - name: reader differential (PowerShell 7)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: pwsh
         run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
       - name: reader differential (Windows PowerShell 5.1)
-        if: matrix.os == 'windows-latest'
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: powershell
         run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
       # The macOS managed hook against a live `daemon --system` (plan 13):
@@ -87,6 +89,7 @@ jobs:
       # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
+        if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}
         shell: bash
         run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
       # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).

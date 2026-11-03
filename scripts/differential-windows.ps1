@@ -57,7 +57,10 @@ function Read-Lines($Requests) {
   [IO.File]::WriteAllText($in, (ConvertTo-Json -InputObject @($Requests) -Depth 4), $Utf8)
   & $Saiife __read-segments $in $out
   if ($LASTEXITCODE -ne 0) { throw "saiife __read-segments exited $LASTEXITCODE" }
-  return @([IO.File]::ReadAllText($out, $Utf8) | ConvertFrom-Json)
+  # In a variable first: Windows PowerShell 5.1's ConvertFrom-Json writes a JSON
+  # array as one object, which would come back as a single element.
+  $parsed = [IO.File]::ReadAllText($out, $Utf8) | ConvertFrom-Json
+  return $parsed
 }
 
 function Get-Dashless([string]$Text) {

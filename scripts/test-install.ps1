@@ -30,6 +30,27 @@ foreach ($f in @($installer, $PSCommandPath)) {
   if ($errors.Count -gt 0) { Bad "parse $f" ($errors | Out-String) } else { Ok "parse $(Split-Path -Leaf $f)" }
 }
 
+# New-UnsignedExe <path> <marker>: a real, unsigned PE, which is what a release
+# holds until the signing identity exists. Get-AuthenticodeSignature must say
+# NotSigned for it; for a file that only starts with MZ it need not, and the
+# installer rightly refuses anything but Valid or NotSigned. The base64 is the
+# headers of an x64 console image with one .text section, checked with `file`
+# and `objdump -x`. Never run. The marker follows the image, so each is distinct.
+$UnsignedPeHeaders = 'TVoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAFBFAABkhgEAAAAAAAAAAAAAAAAA8AAiAAsCDgAAAgAAAAAAAAAAAAAAEAAAABAAAAAAAEABAAAAABAAAAACAAAGAAAAAAAAAAYAAAAAAAAAACAAAAACAAAAAAAAAwBggQAAEAAAAAAAABAAAAAAAAAAABAAAAAAAAAQAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC50ZXh0AAAAEAAAAAAQAAAAAgAAAAIAAAAAAAAAAAAAAAAAACAAAGA='
+function New-UnsignedExe([string]$Path, [string]$Marker) {
+  $head = [System.Convert]::FromBase64String($UnsignedPeHeaders)
+  $tail = [System.Text.Encoding]::ASCII.GetBytes($Marker)
+  $image = New-Object byte[] (0x400 + $tail.Length)
+  [System.Array]::Copy($head, $image, $head.Length)
+  $image[0x200] = 0xC3
+  [System.Array]::Copy($tail, 0, $image, 0x400, $tail.Length)
+  [System.IO.File]::WriteAllBytes($Path, $image)
+}
+function Test-ExeMarker([string]$Path, [string]$Marker) {
+  $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($Path))
+  return $text.EndsWith($Marker, [System.StringComparison]::Ordinal)
+}
+
 function Get-Sha256([string]$Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 
 function New-ZipFrom([string]$Dir, [string]$Zip) {
@@ -46,7 +67,7 @@ function New-Release([string]$Dir, [string]$Version) {
   foreach ($t in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
     $stage = Join-Path $scratch ("stage-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $stage | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $stage 'saiife.exe'), "MZ fake saiife $Version $t")
+    New-UnsignedExe (Join-Path $stage 'saiife.exe') "fake saiife $Version $t"
     Copy-Item (Join-Path $repo 'LICENSE') $stage
     Copy-Item (Join-Path $repo 'README.md') $stage
     New-ZipFrom $stage (Join-Path $Dir "saiife-$Version-$t.zip")
@@ -79,7 +100,8 @@ function Invoke-Install([string]$Case, [string]$Rel, [string]$Arch, [string[]]$E
   # split the install path the cases look for.
   $lines = & $pwsh -NoProfile -File $installer -BaseUrl $url @ExtraArgs 2>&1 | ForEach-Object { "$_" }
   $status = $LASTEXITCODE
-  return @{ Status = $status; Out = (@($lines) -join "`n"); Dir = (Join-Path $Case 'local\Programs\saiife\bin') }
+  # Flat: what a host that wraps at its own width still prints in one piece.
+  return @{ Status = $status; Out = (@($lines) -join "`n"); Flat = (@($lines) -join ''); Dir = (Join-Path $Case 'local\Programs\saiife\bin') }
 }
 
 # The user Path is read and restored raw (unexpanded, same value kind), like
@@ -117,6 +139,15 @@ try {
     return @($p.Split(';') | Where-Object { $_.TrimEnd('\') -ieq $Dir.TrimEnd('\') }).Count
   }
 
+  # --- the stand-in is what the install cases need --------------------------
+  # Said first: if this fails, the install cases below fail for the fixture's
+  # reason and not the installer's.
+  $probe = Join-Path $scratch 'probe.exe'
+  New-UnsignedExe $probe 'probe'
+  $status = [string](Get-AuthenticodeSignature -LiteralPath $probe).Status
+  if ($status -eq 'NotSigned') { Ok 'stand_in_exe_is_not_signed' }
+  else { Bad 'stand_in_exe_is_not_signed' "Get-AuthenticodeSignature says $status" }
+
   # --- install_pinned_version (AMD64) -------------------------------------
   Reset-UserPath
   $c = Join-Path $scratch 'pinned'
@@ -124,8 +155,8 @@ try {
   $r = Invoke-Install $c (Join-Path $c 'rel') 'AMD64' @('-Version', '0.1.0')
   $exe = Join-Path $r.Dir 'saiife.exe'
   if ($r.Status -eq 0 -and (Test-Path $exe) -and
-    ([System.IO.File]::ReadAllText($exe) -eq 'MZ fake saiife 0.1.0 x86_64-pc-windows-msvc') -and
-    $r.Out.Contains("saiife 0.1.0 installed to $exe") -and $r.Out.Contains('saiife init') -and
+    (Test-ExeMarker $exe 'fake saiife 0.1.0 x86_64-pc-windows-msvc') -and
+    $r.Flat.Contains("saiife 0.1.0 installed to $exe") -and $r.Out.Contains('saiife init') -and
     $r.Out.Contains('not Authenticode-signed')) { Ok 'install_pinned_version' }
   else { Bad 'install_pinned_version' "status=$($r.Status); $($r.Out)" }
 
@@ -136,7 +167,7 @@ try {
   $r = Invoke-Install $c (Join-Path $c 'rel') 'ARM64'
   $exe = Join-Path $r.Dir 'saiife.exe'
   if ($r.Status -eq 0 -and (Test-Path $exe) -and
-    ([System.IO.File]::ReadAllText($exe) -eq 'MZ fake saiife 0.2.0 aarch64-pc-windows-msvc') -and
+    (Test-ExeMarker $exe 'fake saiife 0.2.0 aarch64-pc-windows-msvc') -and
     $r.Out.Contains('saiife 0.2.0 installed')) { Ok 'install_latest' }
   else { Bad 'install_latest' "status=$($r.Status); $($r.Out)" }
 
@@ -156,7 +187,7 @@ try {
   $r1 = Invoke-Install $c (Join-Path $c 'rel') 'AMD64' @('-Version', '0.1.0')
   $r2 = Invoke-Install $c (Join-Path $c 'rel') 'AMD64' @('-Version', '0.1.0')
   if ($r1.Status -eq 0 -and $r2.Status -eq 0 -and (Count-PathEntry $r1.Dir) -eq 1 -and
-    $r1.Out.Contains('user PATH') -and -not $r2.Out.Contains('user PATH')) { Ok 'path_added_once' }
+    $r1.Flat.Contains('user PATH') -and -not $r2.Flat.Contains('user PATH')) { Ok 'path_added_once' }
   else { Bad 'path_added_once' "entries=$(Count-PathEntry $r1.Dir); $($r1.Out) / $($r2.Out)" }
 
   # --- checksum_mismatch_installs_nothing ------------------------------------
@@ -205,6 +236,29 @@ try {
   if ($r.Status -eq 1 -and $r.Out.Contains('could not find saiife.exe') -and
     -not (Test-Path (Join-Path $r.Dir 'saiife.exe'))) { Ok 'zip_without_saiife_exe_installs_nothing' }
   else { Bad 'zip_without_saiife_exe_installs_nothing' "status=$($r.Status); $($r.Out)" }
+
+  # --- a_bad_signature_state_installs_nothing (hash matches) ------------------
+  # A file that only starts with MZ. What Windows says of it is reported, not
+  # assumed: if that is neither Valid nor NotSigned, the installer must refuse.
+  Reset-UserPath
+  $c = Join-Path $scratch 'not-a-pe'
+  New-Release (Join-Path $c 'rel') '0.1.0'
+  $stage = Join-Path $c 'stage'
+  New-Item -ItemType Directory -Path $stage | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $stage 'saiife.exe'), 'MZ not a real image')
+  $status = [string](Get-AuthenticodeSignature -LiteralPath (Join-Path $stage 'saiife.exe')).Status
+  Write-Output "a file that only starts with MZ has the signature status: $status"
+  $zip = Join-Path $c 'rel\saiife-0.1.0-x86_64-pc-windows-msvc.zip'
+  Remove-Item $zip
+  New-ZipFrom $stage $zip
+  Write-Sums (Join-Path $c 'rel')
+  $r = Invoke-Install $c (Join-Path $c 'rel') 'AMD64' @('-Version', '0.1.0')
+  if ($status -eq 'NotSigned' -or $status -eq 'Valid') {
+    if ($r.Status -eq 0) { Ok 'a_bad_signature_state_installs_nothing (not reached on this host)' }
+    else { Bad 'a_bad_signature_state_installs_nothing' "status=$($r.Status); $($r.Out)" }
+  } elseif ($r.Status -eq 1 -and $r.Out.Contains('refusing to install') -and -not (Test-Path (Join-Path $r.Dir 'saiife.exe'))) {
+    Ok 'a_bad_signature_state_installs_nothing'
+  } else { Bad 'a_bad_signature_state_installs_nothing' "status=$($r.Status); $($r.Out)" }
 
   # --- unsupported_architecture (nothing is downloaded) -----------------------
   Reset-UserPath

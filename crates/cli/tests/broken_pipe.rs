@@ -9,7 +9,7 @@ use common::{code, stderr, stdout, Env};
 
 /// Run saiife with the read end of its stdout already closed.
 fn run_with_closed_stdout(env: &Env, args: &[&str]) -> (Option<i32>, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let mut child = Command::new(env.exe())
         .args(args)
         .current_dir(env.root())
         .env("PATH", env.bin.path())

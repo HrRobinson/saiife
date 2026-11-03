@@ -41,7 +41,7 @@ const SCAN_SKIP: [&str; 3] = [".git", "target", "node_modules"];
 /// A path as status prints it: sanitized, since directory names (and the
 /// paths built from them) are anything anyone can create.
 fn shown(path: &Path) -> String {
-    sanitize(&path.display().to_string())
+    sanitize(&saiife_win::display::shown(path))
 }
 
 /// The fix for a removed or changed hook or config: `init` in the project
@@ -555,7 +555,7 @@ fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Ve
     let scan = nested_configs(root, limit);
     for dir in scan.found {
         let abs = root.join(&dir);
-        let rel = sanitize(&dir.display().to_string());
+        let rel = sanitize(&relative_text(&dir.display().to_string(), cfg!(windows)));
         let has_config = abs.join(CONFIG_REL).is_file();
         match load_record(&abs) {
             Ok(Some(record)) => problems.extend(config_drift(
@@ -584,6 +584,18 @@ fn check_nested_configs(root: &Path, problems: &mut Vec<Problem>, notes: &mut Ve
     }
     if scan.cut_short {
         notes.push(format!("nested-config scan stopped after {limit} entries"));
+    }
+}
+
+/// A directory below the project as status prints it, with the `/` every other
+/// path in these messages has (`sub/.saiife/config.toml`). On Windows that is a
+/// separator it can print without changing what it names; on Linux and macOS a
+/// backslash is part of the name.
+fn relative_text(rel: &str, windows: bool) -> String {
+    if windows {
+        rel.replace('\\', "/")
+    } else {
+        rel.to_string()
     }
 }
 
@@ -679,7 +691,7 @@ fn check_binary(record: &Integrity, problems: &mut Vec<Problem>) {
             what: format!(
                 "the saiife on PATH ({}) is not the one that ran `saiife init` ({}).",
                 shown(&on_path),
-                sanitize(&record.saiife_path)
+                shown(Path::new(&record.saiife_path))
             ),
             fix: fix.into(),
         });
@@ -1128,6 +1140,14 @@ fn fingerprint_problems(layout: &Layout, i: &Installed) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nested_directory_prints_with_the_separator_of_the_messages() {
+        assert_eq!(relative_text(r"sub\deep", true), "sub/deep");
+        assert_eq!(relative_text("sub/deep", true), "sub/deep");
+        // On Linux and macOS a backslash is part of the name.
+        assert_eq!(relative_text(r"sub\deep", false), r"sub\deep");
+    }
 
     #[test]
     fn status_prints_gateway_line() {

@@ -893,8 +893,13 @@ fn policy_hash_changes_with_mode() {
         let (packs, _) = active_packs(&p.config, &[], None);
         policy_hash(&effective_policy(&p.config, &packs, None, None))
     };
-    let body =
-        format!("[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"/usr/bin/aws\"]\n");
+    // Absolute on this host; the hash does not care which program it is.
+    let aws = if cfg!(windows) {
+        "C:/tools/aws.exe"
+    } else {
+        "/usr/bin/aws"
+    };
+    let body = format!("[services.s3.cloud]\nrole_arn = \"{ROLE}\"\nrun_allow = [\"{aws}\"]\n");
     let sts = format!("mode = \"sts\"\n{body}");
     assert_ne!(h(""), h(&sts));
     assert_ne!(h(&sts), h(&body));

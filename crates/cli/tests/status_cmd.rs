@@ -102,7 +102,7 @@ fn hook_removed_by_hand_is_reported_with_the_fix() {
     assert!(
         text.contains(&format!(
             "Fix: run `saiife init` in {} to restore it",
-            std::fs::canonicalize(env.root()).unwrap().display()
+            common::canonical_shown(env.root())
         )),
         "{text}"
     );
@@ -172,8 +172,10 @@ fn swapped_binary_on_path_is_reported() {
     fake_exe(env.bin.path(), &name, "echo 'saiife 0.1.0'");
     let (c, text) = status(&env);
     assert_eq!(c, 1);
+    // Windows has a copy on PATH, and `init` ran that copy: same path, new bytes.
     assert!(
-        text.contains("is not the one that ran `saiife init`"),
+        text.contains("is not the one that ran `saiife init`")
+            || (cfg!(windows) && text.contains("was replaced since `saiife init`")),
         "{text}"
     );
 }
@@ -683,8 +685,10 @@ fn relative_recorded_project_does_not_count_as_a_hook_call() {
 
 /// One JSONL audit line for `project` / `agent` at `ts` (RFC 3339 UTC).
 fn audit_line(project: &str, agent: &str, ts: &str) -> String {
+    // A Windows path holds backslashes, which JSON has to escape.
+    let project = serde_json::to_string(project).unwrap();
     format!(
-        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":\"{project}\",\"tool\":\"Bash\",\
+        "{{\"v\":1,\"ts\":\"{ts}\",\"agent\":\"{agent}\",\"project\":{project},\"tool\":\"Bash\",\
          \"input\":\"ls\",\"decision\":\"allow\",\"saiife\":\"0.1.0\"}}\n"
     )
 }
@@ -763,10 +767,11 @@ fn status_in_subdir_after_config_removed() {
     let out = env.saiife_in(&env.root().join("src"), &["status"]);
     let text = stdout(&out);
     assert_eq!(code(&out), 1, "{text}");
-    let canonical = std::fs::canonicalize(env.root()).unwrap();
     assert!(
-        text.contains(&format!("saiife status for {}", canonical.display()))
-            || text.contains(&format!("saiife status for {}", env.root().display())),
+        text.contains(&format!(
+            "saiife status for {}",
+            common::canonical_shown(env.root())
+        )) || text.contains(&format!("saiife status for {}", env.root().display())),
         "{text}"
     );
     assert!(text.contains(".saiife/config.toml was removed"), "{text}");
@@ -860,7 +865,10 @@ fn nearer_project_with_removed_config_is_named() {
     let text = stdout(&out);
     assert_eq!(code(&out), 1, "{text}");
     let first = text.lines().next().unwrap();
-    assert!(first.ends_with("/child"), "{text}");
+    assert!(
+        first.ends_with(&format!("{}child", std::path::MAIN_SEPARATOR)),
+        "{text}"
+    );
     assert!(text.contains(".saiife/config.toml was removed"), "{text}");
 }
 
@@ -937,7 +945,7 @@ fn init_from_inner_with_removed_saiife_restores_inner_not_outer() {
     assert!(
         text.contains(&format!(
             "run `saiife init` in {}",
-            std::fs::canonicalize(&inner).unwrap().display()
+            common::canonical_shown(&inner)
         )),
         "{text}"
     );
@@ -971,7 +979,7 @@ fn init_from_subdir_after_config_removed_restores_the_project() {
     assert!(
         text.contains(&format!(
             "run `saiife init` in {} to restore it",
-            std::fs::canonicalize(env.root()).unwrap().display()
+            common::canonical_shown(env.root())
         )),
         "{text}"
     );
@@ -999,10 +1007,9 @@ fn packs_line_names_a_config_from_another_directory() {
     env.write(".saiife/config.toml", "packs = []\n");
     let out = env.saiife_in(&proj, &["status"]);
     let text = stdout(&out);
-    let root = std::fs::canonicalize(env.root()).unwrap();
     let want = format!(
-        "packs (from {}):",
-        root.join(".saiife/config.toml").display()
+        "packs (from {}/.saiife/config.toml):",
+        common::canonical_shown(env.root())
     );
     assert!(text.contains(&want), "{text}");
 }
@@ -1060,7 +1067,7 @@ fn scan_stops_at_limit() {
     }
     env.write("zz/.saiife/config.toml", "packs = []\n");
     // SAIIFE_SCAN_LIMIT is read only in debug builds (tests run those).
-    let out = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let out = Command::new(env.exe())
         .arg("status")
         .current_dir(env.root())
         .env("PATH", env.bin.path())

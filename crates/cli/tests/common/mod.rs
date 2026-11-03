@@ -69,6 +69,12 @@ pub fn set_profile(cmd: &mut Command, home: &Path) {
         .env("APPDATA", home.join("AppData").join("Roaming"));
 }
 
+/// `path` canonical, as saiife prints it: on Windows without the `\\\\?\\`
+/// that canonicalizing adds there.
+pub fn canonical_shown(path: &Path) -> String {
+    saiife_win::display::shown(&fs::canonicalize(path).unwrap())
+}
+
 impl Env {
     /// Fake `agents` on PATH plus a symlink `saiife` -> the binary under test.
     pub fn new(agents: &[&str]) -> Env {
@@ -119,8 +125,28 @@ impl Env {
         self.command_in(dir, args).output().unwrap()
     }
 
+    /// The saiife a test runs. `init` and `status` compare the running binary
+    /// with the `saiife` on PATH. On Unix that is a symlink to the binary under
+    /// test, which resolves to the same file. Windows has a copy, which does
+    /// not, so the copy is what runs, as an installed saiife does. A test may
+    /// have swapped the copy for a script that cannot start: then the binary
+    /// under test runs, a different one from PATH's.
+    pub fn exe(&self) -> PathBuf {
+        #[cfg(windows)]
+        {
+            use std::io::Read;
+            let copy = self.bin.path().join("saiife.exe");
+            let mut magic = [0u8; 2];
+            let real = fs::File::open(&copy).and_then(|mut f| f.read_exact(&mut magic));
+            if real.is_ok() && &magic == b"MZ" {
+                return copy;
+            }
+        }
+        PathBuf::from(env!("CARGO_BIN_EXE_saiife"))
+    }
+
     fn command_in(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_saiife"));
+        let mut cmd = Command::new(self.exe());
         cmd.args(args)
             .current_dir(dir)
             .env("PATH", self.bin.path())
