@@ -314,6 +314,8 @@ pub fn unwrap_transparent_prefix(seg: &[Word]) -> &[Word] {
 /// Peel one transparent wrapper off the front of `rest`: its (lowered,
 /// directory-stripped) name and the words after it and its options.
 fn unwrap_one(rest: &[Word]) -> Option<(String, &[Word])> {
+    #[cfg(test)]
+    crate::work::add(1);
     let head = rest.first()?;
     // Strip any leading directory (`/usr/bin/time` -> `time`) and
     // case-fold before matching — the same canonicalization
@@ -565,6 +567,8 @@ fn skip_options<'a>(
 ) -> &'a [Word] {
     let mut i = 0;
     while let Some(w) = rest.get(i) {
+        #[cfg(test)]
+        crate::work::add(1);
         let t = w.text.as_str();
         if assignments && is_env_assignment(t) || lone_dash && t == "-" {
             i += 1;

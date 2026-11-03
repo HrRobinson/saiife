@@ -215,6 +215,8 @@ pub(crate) fn reserved_prefix_len(seg: &[Word]) -> usize {
     let mut stripped = 0;
     let mut i = 0;
     while let Some(w) = seg.get(i) {
+        #[cfg(test)]
+        crate::work::add(1);
         let t = w.text.as_str();
         if LEADING_KEYWORDS.contains(&t) || (!w.quoted && RESERVED_PREFIXES.contains(&t)) {
             i += 1;
@@ -349,6 +351,11 @@ fn lex_in(
         case_depth: 0,
         case_await_in: false,
         case_pattern: false,
+        start: CommandStart {
+            seen: 0,
+            open: true,
+            after_time: false,
+        },
     };
     while let Some(c) = lx.chars.next() {
         if !lx.step(c) {
@@ -420,6 +427,19 @@ struct Lexer<'s, 'c> {
     case_depth: usize,
     case_await_in: bool,
     case_pattern: bool,
+    /// What `starts_a_command` has read of `toks` so far.
+    start: CommandStart,
+}
+
+/// Whether the next word is where a command starts: first in its segment, or
+/// after reserved words that are themselves in one (`if`, `while`, `!`,
+/// `time [-p]`, …). Kept up to date as tokens arrive, so a line of many
+/// `[[` or `case` words costs one pass.
+struct CommandStart {
+    /// Tokens already read.
+    seen: usize,
+    open: bool,
+    after_time: bool,
 }
 
 impl Lexer<'_, '_> {
@@ -500,11 +520,45 @@ impl Lexer<'_, '_> {
         }
     }
 
+    /// See `CommandStart`.
+    fn starts_a_command(&mut self) -> bool {
+        let start = &mut self.start;
+        for tok in &self.toks[start.seen..] {
+            #[cfg(test)]
+            crate::work::add(1);
+            match tok {
+                LexTok::Operator(_) => {
+                    start.open = true;
+                    start.after_time = false;
+                }
+                LexTok::Word(w) => {
+                    let reserved = !w.quoted
+                        && (matches!(
+                            w.text.as_str(),
+                            "!" | "time"
+                                | "if"
+                                | "elif"
+                                | "while"
+                                | "until"
+                                | "then"
+                                | "do"
+                                | "else"
+                                | "coproc"
+                        ) || (start.after_time && w.text == "-p"));
+                    start.open &= reserved;
+                    start.after_time = w.text == "time";
+                }
+            }
+        }
+        start.seen = self.toks.len();
+        start.open
+    }
+
     /// An unquoted word just completed: track `case … in … esac` and
     /// `[[ … ]]`.
     fn keyword(&mut self, text: &str) {
         match text {
-            "case" if starts_a_command(&current_segment(&self.toks)) => {
+            "case" if self.starts_a_command() => {
                 self.case_depth += 1;
                 self.case_await_in = true;
             }
@@ -512,10 +566,7 @@ impl Lexer<'_, '_> {
                 self.case_await_in = false;
                 self.case_pattern = true;
             }
-            "esac"
-                if self.case_depth > 0
-                    && (self.case_pattern || starts_a_command(&current_segment(&self.toks))) =>
-            {
+            "esac" if self.case_depth > 0 && (self.case_pattern || self.starts_a_command()) => {
                 self.case_depth -= 1;
                 self.case_pattern = false;
             }
@@ -526,7 +577,7 @@ impl Lexer<'_, '_> {
             // or after reserved words that start one (`if`, `!`,
             // `time`, …). `echo [[`, `env [[`, `sudo [[` and (as
             // in bash) `FOO=1 [[` are a command and its arguments.
-            self.in_test = starts_a_command(&current_segment(&self.toks));
+            self.in_test = self.starts_a_command();
         } else if text == "]]" {
             self.in_test = false;
         }
@@ -576,6 +627,7 @@ impl Lexer<'_, '_> {
     fn newline(&mut self) {
         self.flush_word();
         self.toks.push(LexTok::Operator(Operator::Newline));
+        let mut pipeline = None;
         for doc in std::mem::take(&mut self.pending_docs) {
             // The body is commands when a shell in its pipeline
             // reads it (or that cannot be known); otherwise data,
@@ -590,7 +642,7 @@ impl Lexer<'_, '_> {
             );
             let commands = doc
                 .commands
-                .unwrap_or_else(|| body_is_commands(&self.toks, doc.op));
+                .unwrap_or_else(|| body_is_commands(&self.toks, doc.op, &mut pipeline));
             if commands && self.depth + 1 >= MAX_FRAME_DEPTH {
                 self.ctx.note(TOO_DEEP);
             } else if commands {
@@ -963,9 +1015,10 @@ impl Lexer<'_, '_> {
         // their consumer decided from this frame's tokens.
         if !pending_docs.is_empty() {
             toks.push(LexTok::Operator(Operator::Newline));
+            let mut pipeline = None;
             for doc in &mut pending_docs {
                 if doc.commands.is_none() {
-                    doc.commands = Some(body_is_commands(&toks, doc.op));
+                    doc.commands = Some(body_is_commands(&toks, doc.op, &mut pipeline));
                 }
             }
             toks.pop();
@@ -1078,30 +1131,6 @@ fn arith_body(
     None
 }
 
-/// Does a `[[` after these words (the current command so far) start a
-/// test? Only in a reserved word's position: first, or after reserved
-/// words that are themselves in one (`if`, `while`, `!`, `time [-p]`, …).
-fn starts_a_command(words: &[Word]) -> bool {
-    let mut after_time = false;
-    words.iter().all(|w| {
-        let reserved = !w.quoted
-            && (matches!(
-                w.text.as_str(),
-                "!" | "time"
-                    | "if"
-                    | "elif"
-                    | "while"
-                    | "until"
-                    | "then"
-                    | "do"
-                    | "else"
-                    | "coproc"
-            ) || (after_time && w.text == "-p"));
-        after_time = w.text == "time";
-        reserved
-    })
-}
-
 /// Commands that run what they read on stdin as commands (or pass it to
 /// something that does).
 const STDIN_RUNNERS: &[&str] = &[
@@ -1114,8 +1143,13 @@ const STDIN_RUNNERS: &[&str] = &[
 /// (its consumer comes later), or when a command of its pipeline, with
 /// wrappers, assignments, redirections and `exec` peeled, is a shell (see
 /// `STDIN_RUNNERS`) or cannot be known (none left: `sudo -s`; a variable
-/// or substitution: `$SHELL`).
-fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
+/// or substitution: `$SHELL`). `pipeline` holds the last pipeline judged, so
+/// many here-documents on one line (`cat <<A <<A …`) judge it once.
+fn body_is_commands(
+    toks: &[LexTok],
+    op: usize,
+    pipeline: &mut Option<(std::ops::Range<usize>, bool)>,
+) -> bool {
     // A list operator ends the pipeline; `|` does not.
     let ends_pipeline = |t: &LexTok| matches!(t, LexTok::Operator(o) if *o != Operator::Pipe);
     // `toks` ends with the newline of the heredoc's line.
@@ -1128,6 +1162,11 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
     ) {
         return true;
     }
+    if let Some((range, commands)) = pipeline {
+        if range.contains(&op) {
+            return *commands;
+        }
+    }
     let start = toks[..op]
         .iter()
         .rposition(ends_pipeline)
@@ -1136,7 +1175,9 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
         .iter()
         .position(ends_pipeline)
         .map_or(end, |i| op + i);
-    toks[start..stop]
+    #[cfg(test)]
+    crate::work::add(stop - start);
+    let commands = toks[start..stop]
         .split(|t| matches!(t, LexTok::Operator(_)))
         .any(|seg| {
             let words: Vec<Word> = seg
@@ -1147,22 +1188,9 @@ fn body_is_commands(toks: &[LexTok], op: usize) -> bool {
                 })
                 .collect();
             runs_stdin(&words)
-        })
-}
-
-/// The words of the segment being lexed (after the last operator).
-fn current_segment(toks: &[LexTok]) -> Vec<Word> {
-    let start = toks
-        .iter()
-        .rposition(|t| matches!(t, LexTok::Operator(_)))
-        .map_or(0, |i| i + 1);
-    toks[start..]
-        .iter()
-        .filter_map(|t| match t {
-            LexTok::Word(w) => Some(w.clone()),
-            LexTok::Operator(_) => None,
-        })
-        .collect()
+        });
+    *pipeline = Some((start..stop, commands));
+    commands
 }
 
 /// Does this command (one pipeline segment) run its stdin as commands, or

@@ -93,24 +93,42 @@ pub fn command_position_substitution_kind(seg: &[Word]) -> Option<(String, bool)
 /// since the text does not tell the quotes apart, which only over-denies).
 /// Literal text beside the expansion keeps the word.
 pub fn may_expand_to_nothing(word: &Word) -> bool {
+    #[cfg(test)]
+    crate::work::add(1 + word.text.len());
     if word.redirect || word.assignment {
         return false;
     }
     if word.text.is_empty() {
         return !word.quoted;
     }
-    let mut rest = word.text.clone();
-    if word.has_substitution {
-        for (inner, dollar) in find_all_substitution_kinds(&word.text) {
-            let written = if dollar {
-                format!("$({inner})")
-            } else {
-                format!("`{inner}`")
-            };
-            rest = rest.replacen(&written, "", 1);
-        }
+    if !word.text.starts_with(['$', '`']) {
+        return false;
     }
-    only_parameters(&rest) && (!word.quoted || expands_a_list(&rest))
+    let vanishes = |rest: &str| only_parameters(rest) && (!word.quoted || expands_a_list(rest));
+    if word.has_substitution {
+        without_substitutions(&word.text).is_some_and(|rest| vanishes(&rest))
+    } else {
+        vanishes(&word.text)
+    }
+}
+
+/// `text` with its substitutions cut out, in one pass over it. `None` if one
+/// of them is not written the way it was found.
+fn without_substitutions(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pos = 0;
+    for (inner, dollar) in find_all_substitution_kinds(text) {
+        let written = if dollar {
+            format!("$({inner})")
+        } else {
+            format!("`{inner}`")
+        };
+        let at = pos + text[pos..].find(&written)?;
+        out.push_str(&text[pos..at]);
+        pos = at + written.len();
+    }
+    out.push_str(&text[pos..]);
+    Some(out)
 }
 
 /// Is `text` nothing but `$NAME`, `${…}` (nested braces matched) and the

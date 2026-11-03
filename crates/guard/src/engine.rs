@@ -1597,13 +1597,19 @@ fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
         return None;
     }
     let mut kept: Vec<Word> = Vec::new();
+    let mut last_command: Option<Option<usize>> = None;
     let mut removed = false;
     let mut cursor = seg;
     loop {
         let rest = effective_command(cursor);
         kept.extend_from_slice(&cursor[..cursor.len() - rest.len()]);
         let empty = rest.iter().take_while(|w| may_expand_to_nothing(w)).count();
-        if empty == 0 || !names_a_command(&rest[empty..]) {
+        let after = seg.len() - (rest.len() - empty);
+        let command_follows = empty > 0
+            && last_command
+                .get_or_insert_with(|| last_command_word(seg))
+                .is_some_and(|last| last >= after);
+        if !command_follows {
             kept.extend_from_slice(rest);
             break;
         }
@@ -1613,20 +1619,24 @@ fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
     removed.then_some(kept)
 }
 
-/// Is any of `words` more than an assignment, a redirection with its target,
-/// or a word that may expand to nothing?
-fn names_a_command(words: &[Word]) -> bool {
+/// The last of `words` that is more than an assignment, a redirection with
+/// its target, or a word that may expand to nothing.
+fn last_command_word(words: &[Word]) -> Option<usize> {
+    let mut last = None;
     let mut i = 0;
     while let Some(w) = words.get(i) {
+        #[cfg(test)]
+        crate::work::add(1);
         if w.redirect {
             i += 2;
-        } else if w.assignment || may_expand_to_nothing(w) {
-            i += 1;
-        } else {
-            return true;
+            continue;
         }
+        if !w.assignment && !may_expand_to_nothing(w) {
+            last = Some(i);
+        }
+        i += 1;
     }
-    false
+    last
 }
 
 /// A segment of bare assignments (`PATH=/x`, no command): they stay set.
@@ -2758,6 +2768,87 @@ reason = "other pack says no"
                 trace: AllowTrace::NoMatch
             }
         );
+    }
+
+    /// Lines of about `kb` KB built from one repeated part, for the growth
+    /// test: reserved words, assignments, wrappers and expansions, mixed.
+    const REPEATED: &[&str] = &[
+        "$v X=1 ",
+        "$(true) X=1 ",
+        "$v ",
+        "$(true) ",
+        "\"$@\" ",
+        "{,} ",
+        "$v env ",
+        "$(true) env ",
+        "\"$@\" env ",
+        "$v env X=1 ",
+        "$v sudo -u u ",
+        "$v > f ",
+        "> f $v ",
+        "X=1 ",
+        "env ",
+        "time ",
+        "time -p ",
+        "! ",
+        "if ",
+        "while ",
+        "then ",
+        "for i do ",
+        "repeat 3 ",
+        "function f ",
+        "coproc ",
+        "! if time $v X=1 env \"$@\" ",
+        "! time -p ! $v env X=1 \"$@\" > f ",
+        "! $v; ",
+        "if $v X=1 env \"$@\"; then ",
+        "echo [[ ",
+        "[[ x ]] ",
+        "(( 1 )) ",
+        "case ",
+        "esac ",
+        "cat <<A ",
+        "bash <<A ",
+        "! bash <<A ",
+        "cat <<A; ",
+    ];
+
+    /// Work for one line: the repeated part, then a command, then a deny.
+    fn work_for(part: &str, kb: usize) -> usize {
+        let line = format!("{}x; git reset --hard", part.repeat(kb * 1024 / part.len()));
+        let e = test_engine().with_budget(Duration::from_secs(60));
+        crate::work::take();
+        assert!(e.evaluate(&line).is_deny(), "{part:?} x {kb} KB");
+        crate::work::take()
+    }
+
+    #[test]
+    fn the_stripping_path_grows_linearly_with_the_line() {
+        let mut failures = Vec::new();
+        for part in REPEATED {
+            let (w10, w20, w40) = (work_for(part, 10), work_for(part, 20), work_for(part, 40));
+            // About double each time.
+            if w20 > w10 * 5 / 2 || w40 > w20 * 5 / 2 {
+                failures.push(format!("{part:?}: {w10} {w20} {w40}"));
+            }
+        }
+        assert!(failures.is_empty(), "superlinear:\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn one_word_of_many_expansions_is_linear() {
+        for part in ["$(true)", "`true`", "$v", "\"$@\"", "${x:-${y}}"] {
+            let line = |kb: usize| {
+                let word = part.repeat(kb * 1024 / part.len());
+                let line = format!("{word} x; git reset --hard");
+                let e = test_engine().with_budget(Duration::from_secs(60));
+                crate::work::take();
+                assert!(e.evaluate(&line).is_deny(), "{part:?} x {kb} KB");
+                crate::work::take()
+            };
+            let (w10, w20) = (line(10), line(20));
+            assert!(w20 <= w10 * 5 / 2, "{part:?}: {w10} {w20}");
+        }
     }
 
     /// `$v env ` x40 + `$(…) z`, nested `levels` deep around `true`.

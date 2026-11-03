@@ -480,9 +480,21 @@ fn nested_empties_do_not_exhaust_the_budget() {
         saiifeguard::engine::DEFAULT_BUDGET
     };
     let e = f.engine().with_budget(budget);
-    let start = std::time::Instant::now();
-    assert_eq!(deny_pack(&e, &cmd).as_deref(), Some("core.filesystem"));
-    assert!(start.elapsed() < budget);
+    for cmd in [
+        cmd,
+        // A scan of every later word per empty word was quadratic.
+        format!("{}x; rm -rf /", "$(true) X=1 ".repeat(800)),
+        format!("{}x; rm -rf /", "$v X=1 ".repeat(3000)),
+    ] {
+        let start = std::time::Instant::now();
+        assert_eq!(
+            deny_pack(&e, &cmd).as_deref(),
+            Some("core.filesystem"),
+            "{} bytes",
+            cmd.len()
+        );
+        assert!(start.elapsed() < budget, "{} bytes", cmd.len());
+    }
 }
 
 #[test]
