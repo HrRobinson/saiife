@@ -104,7 +104,20 @@
     "cd\\; git status",
     "cd..; git status",
     "cd~; git status",
-    "C:; git status"
+    "C:; git status",
+    "& 'cd\\'; git status",
+    ". 'cd\\'; git status",
+    "c`d\\; git status",
+    "& 'cd~'; git status",
+    "& 'D:'; git status",
+    "& ('cd\\'); git status",
+    "global:cd\\; git status",
+    "script:cd\\; git status",
+    "local:cd~; git status",
+    "private:cd..; git status",
+    "function:cd\\; git status",
+    "global:C:; git status",
+    "& 'global:cd\\'; git status"
   ],
   "powershell_over": [
     "$a = foo = bar"

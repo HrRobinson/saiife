@@ -140,9 +140,10 @@ What happens when the guard cannot judge something:
 
 The hook is slower on Windows than on Linux and macOS, whose budget stays 50 ms p95.
 On the GitHub `windows-latest` runner, starting any process costs 20.3 ms (median),
-`saiife --version` 26.9 ms, and the hook 84.7 ms (median) and 90.4 ms (p95). The
-owner set the Windows CI budget to 100 ms p95 for now. A speed-up is planned; no
-figure is promised.
+`saiife --version` 26.9 ms, and the hook 84.7 ms (median) and 90.4 ms (p95). With no
+code change, runner noise has since moved that p95 from 83-87 ms to 102-114 ms. So the
+owner set the Windows CI budget to 130 ms p95, which allows for slow runners. The
+planned speed-up should tighten it; no figure is promised.
 
 ## Locked mode
 

@@ -109,6 +109,12 @@ pub(crate) const OPAQUE: &[&str] = &[
     "register-cimindicationevent",
     "register-objectevent",
     "register-engineevent",
+    // These act on a WS-Management resource by a URI or a file the reader cannot
+    // see: `Invoke-WSManAction` can start a process.
+    "invoke-wsmanaction",
+    "set-wsmaninstance",
+    "new-wsmaninstance",
+    "remove-wsmaninstance",
 ];
 
 /// `keyword … { }`: the statement is its blocks, and ends at one.
@@ -1415,16 +1421,18 @@ fn call_word() -> Raw {
 }
 
 /// `cd..`, `cd\`, `cd~` and `C:` are PowerShell's own functions: `Set-Location`
-/// to that place, whatever else the line gives them.
+/// to that place, whatever else the line gives them. Only a command name gets
+/// here (`Reader::finish`), so a quoted one is being called: `& 'cd\'`, `. 'cd\'`,
+/// `` c`d\ ``.
 fn expand_cd_function(words: &mut Vec<Raw>) {
     let first = &words[0];
-    if first.w.quoted || first.from_quote || first.kind != Kind::Plain {
+    if first.kind != Kind::Plain {
         return;
     }
-    let text = &first.w.text;
+    let text = without_function_scope(&first.w.text);
     let drive = text.len() == 2 && text.ends_with(':') && text.as_bytes()[0].is_ascii_alphabetic();
     let place = if drive {
-        text.clone()
+        text.to_string()
     } else {
         match text.to_ascii_lowercase().as_str() {
             "cd.." => "..".to_string(),
@@ -1435,8 +1443,31 @@ fn expand_cd_function(words: &mut Vec<Raw>) {
     };
     let mut arg = first.clone();
     arg.w.text = place;
-    words[0].w.text = "cd".to_string();
+    arg.w.quoted = false;
+    arg.from_quote = false;
+    let name = &mut words[0];
+    name.w.text = "cd".to_string();
+    name.w.quoted = false;
+    name.from_quote = false;
     words.insert(1, arg);
+}
+
+/// `name` without the scope and the `function:` drive PowerShell looks a function
+/// up through: `global:cd\` is `cd\`. Stacked in either order: if a real shell
+/// refuses one, the line has only moved the directory the rules judge from.
+fn without_function_scope(name: &str) -> &str {
+    let mut rest = name;
+    while let Some(after) = ["global:", "script:", "local:", "private:", "function:"]
+        .iter()
+        .find_map(|p| {
+            rest.get(..p.len())
+                .filter(|head| head.eq_ignore_ascii_case(p))
+                .map(|_| &rest[p.len()..])
+        })
+    {
+        rest = after;
+    }
+    rest
 }
 
 /// `$_.Name`, `$x.y.z`: a member read, unknown but no command. With a `(` it is

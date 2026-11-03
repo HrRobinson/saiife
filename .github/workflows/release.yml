@@ -112,18 +112,22 @@ jobs:
         shell: bash
         env:
           LLVM_VERSION: 23.1.2
-          LLVM_SHA256: ceaee048142fece144752c6f6431cb0905a7a6160f78ab8cf5cf0b6216f99418
+          LLVM_SHA256: 8fb91cdc44fcbbdcf6b3ffd0a1f9859abd14a3c3aae4423c2b6d4a4f90bf0095
         run: |
           set -euo pipefail
-          asset="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.zst"
+          asset="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz"
           curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$RUNNER_TEMP/$asset" \
             "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${asset}"
           echo "${LLVM_SHA256}  $RUNNER_TEMP/$asset" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/p19a-llvm"
-          # System32 bsdtar reads .zst natively and takes drive paths; Git Bash's
-          # GNU tar would read "D:" as a remote host.
+          # System32 bsdtar takes drive paths; Git Bash's GNU tar would read "D:" as
+          # a remote host. The .xz, because bsdtar cannot decode this release's .zst:
+          # "Frame requires too much memory for decoding".
           /c/Windows/System32/tar.exe -xf "$(cygpath -w "$RUNNER_TEMP/$asset")" \
             -C "$(cygpath -w "$RUNNER_TEMP/p19a-llvm")" --strip-components=1
+          # 901 MB, on the drive the build uses too.
+          rm -f "$RUNNER_TEMP/$asset"
+          df -h "$RUNNER_TEMP"
           bindir="$(cygpath -w "$RUNNER_TEMP/p19a-llvm/bin")"
           echo "$bindir" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/p19a-llvm/bin/clang" --version

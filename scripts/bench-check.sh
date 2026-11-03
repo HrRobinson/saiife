@@ -13,7 +13,8 @@
 #
 # With BENCH_MAX_P95_MS=<ms> it exits 1 when a payload's p95 is above that
 # budget (the macOS CI test job uses 40 for --managed; the windows-latest test
-# job uses 50 for the developer hook).
+# job uses 130 for the developer hook, which allows for slow runners; the planned
+# speed-up should tighten it).
 #
 # On Windows (or with BENCH_SPLIT=1 anywhere) the same N calls of cheaper things
 # come first, so a number over budget can be read: a program of Git Bash's own, the

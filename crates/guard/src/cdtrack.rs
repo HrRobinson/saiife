@@ -489,12 +489,16 @@ fn target(
 /// Where `cd a` leaves a shell in `from`, with `a` spelled the Windows way.
 /// `/x` and `\x` are on `from`'s drive. `C:x` is relative to that drive's
 /// directory and `\\h\s` is a share: neither is known here, and an unknown
-/// directory is judged as written. `/c/x` is Git Bash's `c:/x`.
+/// directory is judged as written. `/c/x` is Git Bash's `c:/x`. `C:` alone is that
+/// drive's own directory, read as its root: a false deny is the safe side there.
 fn windows_target(from: Option<&Dir>, a: &str, home: Option<&Path>) -> Option<Dir> {
     if let Some(d) = git_bash_drive(a) {
         return Some(d);
     }
     let a = a.replace('\\', "/");
+    if a.len() == 2 && a.ends_with(':') && a.as_bytes()[0].is_ascii_alphabetic() {
+        return Dir::from_windows(&format!("{a}/"));
+    }
     if let Some(d) = Dir::from_windows(&a) {
         return Some(d);
     }

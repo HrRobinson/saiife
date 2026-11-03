@@ -637,9 +637,15 @@ impl Engine {
             Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
             Dialect::Posix => split_segments_noted(raw_cmd),
         };
-        if reader {
+        // Bash on Windows moves the profile too, and `evaluate_call` closes only a
+        // reader's line, so this one closes itself at the end.
+        let profile_moved = if reader {
             reader_assignments(&mut segments, &mut found);
-        }
+            false
+        } else {
+            self.vars.style() == PathStyle::Windows
+                && posix_profile_assignments(&mut segments, &mut found)
+        };
         null_device_words(&mut segments, dialect, state.null_redirect_discards);
         if self.vars.style() == PathStyle::Windows {
             windows_words(&mut segments, reader, dialect);
@@ -677,7 +683,11 @@ impl Engine {
         if let Some(out) = out {
             *out = state.rule_cwd.clone();
         }
-        found.finish()
+        let decision = found.finish();
+        if profile_moved {
+            return closed_reading(decision);
+        }
+        decision
     }
 
     /// The budget ran out with `segments` left to judge. On a Windows host, and
@@ -2014,15 +2024,91 @@ fn reader_assignments(segments: &mut [Vec<Word>], found: &mut Findings) {
             None => (name, ""),
         };
         let mut upper = name.to_ascii_uppercase();
-        if matches!(
-            upper.as_str(),
-            "HOME" | "USERPROFILE" | "HOMEDRIVE" | "HOMEPATH" | "LOCALAPPDATA" | "APPDATA"
-        ) {
-            found.unjudged("a profile variable changes on this line");
+        if is_profile_variable(&upper) {
+            found.unjudged(PROFILE_MOVED);
             upper = "HOME".to_string();
         }
         w.text = format!("{upper}{plus}={value}");
     }
+}
+
+const PROFILE_MOVED: &str = "a profile variable changes on this line";
+
+fn is_profile_variable(name: &str) -> bool {
+    [
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ]
+    .iter()
+    .any(|p| name.eq_ignore_ascii_case(p))
+}
+
+/// What may stand in front of an assignment in a POSIX segment.
+const POSIX_LEADING_WORDS: &[&str] = &[
+    "if", "then", "elif", "else", "while", "until", "do", "{", "(", "!", "time",
+];
+
+/// `reader_assignments` for a POSIX line on a Windows host. Other names keep their
+/// case, since `$x` is not `$X` to bash. The lexer flags `NAME=` in any position, so
+/// only what the shell assigns counts: words in front of a command, and the
+/// arguments of `export` and its kin. `echo HOME=x` assigns nothing. True when one
+/// of them moved the profile.
+fn posix_profile_assignments(segments: &mut [Vec<Word>], found: &mut Findings) -> bool {
+    let mut moved = false;
+    for seg in segments.iter_mut() {
+        let mut i = 0;
+        let mut assigned = Vec::new();
+        while let Some(w) = seg.get(i) {
+            if w.redirect {
+                i += 2;
+            } else if w.assignment {
+                assigned.push(i);
+                i += 1;
+            } else if !w.quoted && POSIX_LEADING_WORDS.contains(&w.text.as_str()) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        while seg
+            .get(i)
+            .is_some_and(|w| !w.quoted && matches!(w.text.as_str(), "builtin" | "command"))
+        {
+            i += 1;
+        }
+        let declares = seg.get(i).is_some_and(|w| {
+            !w.quoted
+                && matches!(
+                    w.text.as_str(),
+                    "export" | "readonly" | "declare" | "typeset" | "local"
+                )
+        });
+        if declares {
+            assigned.extend((i + 1..seg.len()).filter(|&at| seg[at].assignment));
+        }
+        for at in assigned {
+            let w = &mut seg[at];
+            let Some((name, value)) = w.text.split_once('=') else {
+                continue;
+            };
+            let (name, plus) = match name.strip_suffix('+') {
+                Some(n) => (n, "+"),
+                None => (name, ""),
+            };
+            if is_profile_variable(name) {
+                w.text = format!("HOME{plus}={value}");
+                moved = true;
+            }
+        }
+    }
+    if moved {
+        found.unjudged(PROFILE_MOVED);
+    }
+    moved
 }
 
 /// `dir/<name>` for each name copied or moved into `dir`.

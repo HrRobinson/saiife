@@ -763,8 +763,10 @@ run.
 
 **Windows hook budget.** D10's 50 ms does not hold on the `windows-latest` runner:
 process start alone is 20.3 ms, `saiife --version` 26.9 ms, and the developer hook
-84.7 ms median and 90.4 ms p95. By the owner's ruling the Windows CI budget is 100 ms
-p95; Linux and macOS keep theirs. A speed-up is planned, with no figure promised.
+84.7 ms median and 90.4 ms p95. With no code change, runner noise has since moved that
+p95 from 83-87 ms to 102-114 ms. By the owner's ruling the Windows CI budget is 130 ms
+p95, which allows for slow runners; Linux and macOS keep theirs. The planned speed-up
+should tighten it, with no figure promised.
 
 **New pack rules (W7).** Amended by the owner's ruling on the hook budget (plan 19a
 Task 10, +1 ms against `main`): compiling these rules on every OS cost about 5 ms

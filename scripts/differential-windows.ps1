@@ -35,8 +35,8 @@ Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
 
 # The fewest fixtures each shell must really compare. Raise these with the fixtures.
-$PowerShellFloor = 55
-$CmdFloor = 50
+$PowerShellFloor = 80
+$CmdFloor = 58
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Failures = New-Object System.Collections.Generic.List[string]
@@ -296,6 +296,7 @@ function Test-DocumentedLines {
 # count: PowerShell's command names do not have it.
 function Test-Aliases {
   Import-Module CimCmdlets -ErrorAction SilentlyContinue
+  Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue
   $real = @{}
   foreach ($a in Get-Alias) {
     $target = $a.ResolvedCommandName

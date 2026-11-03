@@ -61,7 +61,7 @@ jobs:
       - name: developer hook bench (Windows, p95 budget)
         if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
         shell: bash
-        run: BENCH_MAX_P95_MS=100 bash scripts/bench-check.sh 100
+        run: BENCH_MAX_P95_MS=130 bash scripts/bench-check.sh 130
       # The guard's readers against the real shells: [Parser]::ParseInput and
       # harmless cmd.exe probes. Any mismatch fails. Only a debug build has
       # the seam it reads with.
