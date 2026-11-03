@@ -353,6 +353,150 @@ fn a_word_that_only_looks_reserved_runs_something_else() {
 }
 
 #[test]
+fn a_substitution_in_command_position_does_not_end_the_segment() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for (cmd, pack) in [
+        ("if $(true) $(cat .env); then x; fi", "core.secrets"),
+        ("$(true) $(cat .env)", "core.secrets"),
+        ("! $(true) $(cat .env)", "core.secrets"),
+        ("`true` `cat .env`", "core.secrets"),
+        ("! `true` `cat .env`", "core.secrets"),
+        ("$(true) $(rm -rf /)", "core.filesystem"),
+        ("! $(true) $(rm -rf /)", "core.filesystem"),
+        ("$(true) < .env", "core.secrets"),
+        ("! $(true) < .env", "core.secrets"),
+        ("$(true) > .saiife/config.toml", "core.self"),
+        ("if $(true) > .saiife/config.toml; then x; fi", "core.self"),
+        // A leading assignment holding the substitution.
+        ("X=$(true) $(cat .env)", "core.secrets"),
+        ("! X=$(true) $(cat .env)", "core.secrets"),
+        ("X=$(true) Y=$(cat .env)", "core.secrets"),
+        ("! X=`true` `cat .env`", "core.secrets"),
+        ("X=$(true) < .env", "core.secrets"),
+        ("X=$(true) > .saiife/config.toml", "core.self"),
+        ("env X=$(true) $(cat .env)", "core.secrets"),
+        // The substitution itself is still judged.
+        ("$(cat .env) x", "core.secrets"),
+        ("X=$(cat .env) y", "core.secrets"),
+        ("$(rm -rf /)", "core.filesystem"),
+        ("X=$(rm -rf /)", "core.filesystem"),
+    ] {
+        assert_eq!(deny_pack(&e, cmd).as_deref(), Some(pack), "{cmd:?}");
+    }
+}
+
+#[test]
+fn a_word_that_may_expand_to_nothing_does_not_hide_the_next_one() {
+    // An unquoted expansion that comes out empty is removed before the
+    // command is chosen, so `rm` runs in all of these when it does.
+    let f = Fixture::new();
+    let e = f.engine();
+    for (cmd, pack) in [
+        ("$(true) rm -rf /", "core.filesystem"),
+        ("`true` rm -rf /", "core.filesystem"),
+        ("$x rm -rf /", "core.filesystem"),
+        ("${x} rm -rf /", "core.filesystem"),
+        ("$x$y rm -rf /", "core.filesystem"),
+        ("$(true)$x rm -rf /", "core.filesystem"),
+        ("$1 rm -rf /", "core.filesystem"),
+        ("$x $y $(true) rm -rf /", "core.filesystem"),
+        ("! $x rm -rf /", "core.filesystem"),
+        ("X=1 $x rm -rf /", "core.filesystem"),
+        ("sudo $x rm -rf /", "core.filesystem"),
+        ("$x sudo $y rm -rf /", "core.filesystem"),
+        ("$x cat .env", "core.secrets"),
+        ("$(true) saiife init --off", "core.self"),
+    ] {
+        assert_eq!(deny_pack(&e, cmd).as_deref(), Some(pack), "{cmd:?}");
+    }
+    // Quoted it stays a word, so the command is an empty name; `$x` with
+    // literal text beside it is never empty.
+    for cmd in [
+        "\"$x\" rm -rf /",
+        "\"$(true)\" rm -rf /",
+        "a$x rm -rf /",
+        "$x/bin/tool rm -rf /",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
+    }
+}
+
+#[test]
+fn a_function_body_without_braces_is_judged() {
+    assert_judged_as_inner(&[
+        "function f if CMD; then :; fi; f",
+        "function f while CMD; do :; done",
+        "function f CMD",
+        "function f { CMD; }",
+        "! function f if CMD; then :; fi",
+    ]);
+}
+
+#[test]
+fn zsh_short_forms_after_a_test_or_arithmetic() {
+    assert_judged_as_inner(&[
+        "if [[ x ]] CMD",
+        "if (( 1 )) CMD",
+        "while [[ x ]] CMD",
+        "while (( 1 )) CMD",
+        "[[ x ]] CMD",
+        "(( 1 )) CMD",
+    ]);
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "[[ a < b ]]",
+        "if [[ -f x ]]; then echo y; fi",
+        "[[ a == b ]] && echo y",
+        "(( i++ ))",
+        "for ((i=0;i<3;i++)); do echo $i; done",
+        "for ((i=0;i<3;i++)) do echo $i; done",
+        "echo ]] rm -rf /",
+        "echo '[[' x ']]' rm -rf /",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
+    }
+}
+
+#[test]
+fn ordinary_lines_with_a_leading_expansion_stay_allowed() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for cmd in [
+        "$EDITOR notes.txt",
+        "$PAGER README.md",
+        "$CC -o out main.c",
+        "$PYTHON -m pytest",
+        "$GIT status",
+        "$SHELL -c 'echo hi'",
+        "$SUDO apt update",
+        "$MAKE clean",
+        "$DOCKER ps",
+        "$NPM run build",
+        "$(which python) script.py",
+        "$(which node) --version",
+        "$(brew --prefix)/bin/tool --help",
+        "$(npm bin)/eslint .",
+        "$HOME/bin/tool run",
+        "${HOME}/bin/tool run",
+        "$x",
+        "$(date)",
+        "`date`",
+        "X=$(date)",
+        "X=$(date) Y=$(id -u)",
+        "X=$(date) make",
+        "$(true) > /dev/null",
+        "$(true) 2>&1",
+        "function greet { echo hi; }",
+        "function greet() { echo hi; }; greet",
+        "greet() { echo hi; }",
+    ] {
+        assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
+    }
+}
+
+#[test]
 fn benign_commands_after_reserved_words_stay_allowed() {
     let f = Fixture::new();
     let e = f.engine();

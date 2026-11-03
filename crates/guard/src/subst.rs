@@ -43,7 +43,7 @@
 //! literal argv[0] left to judge), then falls through to the more general
 //! any-position scan only when this one found nothing.
 
-use crate::lexer::{pure_substitution_body, Word};
+use crate::lexer::{find_all_substitution_kinds, pure_substitution_body, Word};
 
 /// If `seg`'s effective command position is filled by a command
 /// substitution, return its raw, unevaluated inner text so the caller can
@@ -82,6 +82,54 @@ pub fn command_position_substitution_kind(seg: &[Word]) -> Option<(String, bool)
         }
     }
     None
+}
+
+/// Can this word vanish when the shell expands it? Only an unquoted word made
+/// entirely of substitutions and parameters (`$(true)`, `` `true` ``, `$x`,
+/// `${x}`, `$1`, `$@`, `$x$(y)`): word splitting removes an empty result, and
+/// the next word becomes the command. `"$x"` stays an empty word, and any
+/// literal text beside the expansion keeps the word.
+pub fn may_expand_to_nothing(word: &Word) -> bool {
+    if word.quoted || word.redirect || word.assignment {
+        return false;
+    }
+    if !word.has_substitution {
+        return !word.text.is_empty() && only_parameters(&word.text);
+    }
+    let mut rest = word.text.clone();
+    for (inner, dollar) in find_all_substitution_kinds(&word.text) {
+        let written = if dollar {
+            format!("$({inner})")
+        } else {
+            format!("`{inner}`")
+        };
+        rest = rest.replacen(&written, "", 1);
+    }
+    only_parameters(&rest)
+}
+
+/// Is `text` nothing but `$NAME`, `${…}` and the `$1`, `$@`, `$*` forms?
+fn only_parameters(mut text: &str) -> bool {
+    while !text.is_empty() {
+        let Some(after) = text.strip_prefix('$') else {
+            return false;
+        };
+        let len = match after.chars().next() {
+            Some('{') => match after.find('}') {
+                Some(close) => close + 1,
+                None => return false,
+            },
+            Some('@' | '*' | '0'..='9') => 1,
+            _ => after
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after.len()),
+        };
+        if len == 0 {
+            return false;
+        }
+        text = &after[len..];
+    }
+    true
 }
 
 /// If `tok` is a `NAME=value` shell-assignment word, return `value` (the

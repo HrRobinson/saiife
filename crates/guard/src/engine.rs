@@ -35,7 +35,7 @@ use crate::pack::{Hit, Pack};
 use crate::pathrule::{ancestors_source, glob_source, Access, RuleAccess};
 use crate::payload::{inline_payload, watch_payload};
 use crate::prefilter::Prefilter;
-use crate::subst::{command_position_substitution, command_position_substitution_kind};
+use crate::subst::{command_position_substitution_kind, may_expand_to_nothing};
 use crate::wrappers::{
     effective_command, env_split_payloads, is_env_assignment, peeled_wrappers,
     unknown_wrapper_options, unwrap_transparent_prefix, wrapper_reads,
@@ -459,7 +459,7 @@ impl Engine {
         // the engine reasons about the *effective* command, not the
         // wrapper, so packs never need to know these wrappers exist.
         let effective = unwrap_transparent_prefix(seg);
-        match self.command_position_phase(seg, effective, cx, state, found) {
+        match self.command_position_phase(seg, cx, state, found) {
             Flow::Proceed => {}
             Flow::NextSegment => return None,
             Flow::Done(d) => return Some(d),
@@ -490,6 +490,24 @@ impl Engine {
             let nested = self.recurse(&split.line, cx, state, false, "env -S command", None);
             if let Some(d) = found.nested(nested) {
                 return Some(d);
+            }
+        }
+        // `$x rm -rf /`, `$(true) rm -rf /`: if the first word comes out
+        // empty, the shell runs the next one. Judged that way as well as
+        // the way it is written below.
+        if let Some(without) = without_leading_empty_expansions(seg) {
+            if cx.depth >= MAX_INLINE_DEPTH {
+                found.unjudged("words after an empty expansion nested too deeply to judge");
+            } else {
+                let deeper = Ctx {
+                    start: cx.start,
+                    depth: cx.depth + 1,
+                    literal_path: cx.literal_path,
+                    clock: cx.clock,
+                };
+                if let Some(d) = self.evaluate_segment(&without, &deeper, state, found) {
+                    return Some(d);
+                }
             }
         }
         let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
@@ -554,36 +572,29 @@ impl Engine {
         }
     }
 
-    /// Command substitution occupying *command position* — the whole
-    /// (unwrapped) segment, or the value of a leading `NAME=$(...)`
-    /// assignment word: a real shell evaluates `$(...)`/`` `...` ``
-    /// eagerly, so `$(rm -rf /)` runs `rm -rf /` for real regardless of
-    /// what (if anything) consumes its output. There's no argv[0] here for
-    /// a pack to match against — recurse into the substitution's inner text
-    /// and judge that instead, the same structural re-entry used for inline
-    /// `bash -c '...'` payloads (same depth cap, same budget).
+    /// A segment that is one command substitution (`$(rm -rf /)`,
+    /// `` `id` ``) or one assignment of it (`X=$(rm -rf /)`): a real shell
+    /// evaluates it eagerly, so `$(rm -rf /)` runs `rm -rf /` for real
+    /// regardless of what (if anything) consumes its output. There's no
+    /// argv[0] here for a pack to match against — recurse into the inner
+    /// text and judge that instead, the same structural re-entry used for
+    /// inline `bash -c '...'` payloads (same depth cap, same budget).
+    ///
+    /// With any other word in the segment (`$(true) $(cat .env)`,
+    /// `$(true) < .env`, `X=$(true) Y=$(cat .env)`, `sudo $(id)`) the later
+    /// phases must see those words too: `embedded_substitutions_phase`
+    /// judges every substitution, the rest the redirections and arguments.
     fn command_position_phase(
         &self,
         seg: &[Word],
-        effective: &[Word],
         cx: &Ctx,
         state: &mut ShellState,
         found: &mut Findings,
     ) -> Flow {
-        // A leading `NAME=$(…)` assignment in front of a real command
-        // (`FOO=$(date) git reset --hard`) is not the command: the
-        // command after it is judged by `command_rules_phase` and
-        // `operands_phase`, the substitution by `embedded_substitutions_phase`.
-        let substitution_is_the_command = {
-            let rest = effective_command(effective);
-            rest.is_empty()
-                || rest.first().is_some_and(|w| {
-                    command_position_substitution(rest).is_some() && w.has_substitution
-                })
-        };
-        let Some((inner, dollar)) =
-            command_position_substitution_kind(effective).filter(|_| substitution_is_the_command)
-        else {
+        if seg.len() != 1 {
+            return Flow::Proceed;
+        }
+        let Some((inner, dollar)) = command_position_substitution_kind(seg) else {
             return Flow::Proceed;
         };
         let nested = self.recurse(&inner, cx, state, dollar, "command substitution", None);
@@ -1554,6 +1565,22 @@ fn assignment_changes_environment(text: &str, literal_path: bool) -> bool {
         .strip_prefix("${PATH}")
         .or_else(|| value.strip_prefix("$PATH"));
     !matches!(rest, Some(r) if r.is_empty() || r.starts_with(':'))
+}
+
+/// The segment without the words in command position that may expand to
+/// nothing, when other words follow them; wrappers, assignments and
+/// redirections in front stay (`sudo $x rm` is `sudo rm`).
+fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
+    if !seg.iter().any(|w| w.text.starts_with(['$', '`'])) {
+        return None;
+    }
+    let rest = effective_command(seg);
+    let empty = rest.iter().take_while(|w| may_expand_to_nothing(w)).count();
+    if empty == 0 || empty == rest.len() {
+        return None;
+    }
+    let front = &seg[..seg.len() - rest.len()];
+    Some(front.iter().chain(&rest[empty..]).cloned().collect())
 }
 
 /// A segment of bare assignments (`PATH=/x`, no command): they stay set.

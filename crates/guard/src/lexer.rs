@@ -203,8 +203,9 @@ const RESERVED_PREFIXES: &[&str] = &[
 
 /// How many leading words of a segment are reserved words in front of its
 /// command: `RESERVED_PREFIXES` and `LEADING_KEYWORDS`; `for NAME do` and
-/// `select NAME do` with no separator before `do` (`for ((…)) do` too);
-/// zsh's `repeat N`. `time [-p] [--]` counts only in front of another such
+/// `select NAME do` with no separator before `do`; `function NAME`, whose
+/// body need not have braces (`function f if …`); zsh's `repeat N`.
+/// `time [-p] [--]` counts only in front of another such
 /// word (`time ! cmd`): before a plain command it stays for `wrappers`, which
 /// also knows GNU time's options. This only looks at the front of the
 /// segment, so a word after a wrapper, an assignment or a redirection is an
@@ -224,7 +225,7 @@ pub(crate) fn reserved_prefix_len(seg: &[Word]) -> usize {
             continue;
         } else if (bare(i, "for") || bare(i, "select")) && bare(i + 2, "do") {
             i += 3;
-        } else if bare(i, "repeat") && i + 1 < seg.len() {
+        } else if (bare(i, "repeat") || bare(i, "function")) && i + 1 < seg.len() {
             i += 2;
         } else {
             break;
@@ -471,8 +472,15 @@ impl Lexer<'_, '_> {
                 commands: None,
             });
         }
+        // zsh runs what follows a test with no separator (`if [[ x ]] cmd`).
+        let closes_test = self.in_test && !w.quoted && word.text == "]]";
         if !w.quoted {
             self.keyword(&word.text);
+        }
+        if closes_test {
+            self.toks.push(LexTok::Word(word));
+            self.toks.push(LexTok::Operator(Operator::Semi));
+            return;
         }
         if w.brace_marks.is_empty() {
             self.toks.push(LexTok::Word(word));
@@ -738,6 +746,8 @@ impl Lexer<'_, '_> {
                 w.text.push_str(body);
                 w.text.push_str("))");
                 self.flush_word();
+                // zsh runs what follows with no separator (`if (( 1 )) cmd`).
+                self.toks.push(LexTok::Operator(Operator::Semi));
             }
             other => {
                 // Too long to tell: judged as the subshells it may
@@ -2199,7 +2209,17 @@ mod tests {
         assert_eq!(first("! ! time ! if rm"), ["rm"]);
         assert_eq!(first("time -p -- ! rm"), ["rm"]);
         assert_eq!(first("for i do rm"), ["rm"]);
-        assert_eq!(first("for ((i=0;i<1;i++)) do rm"), ["rm"]);
+        assert_eq!(
+            segs("for ((i=0;i<1;i++)) do rm"),
+            [vec!["for", "((i=0;i<1;i++))"], vec!["rm"]]
+        );
+        assert_eq!(first("function f if rm"), ["rm"]);
+        assert_eq!(segs("if [[ x ]] rm"), [vec!["[[", "x", "]]"], vec!["rm"]]);
+        assert_eq!(segs("if (( 1 )) rm"), [vec!["(( 1 ))"], vec!["rm"]]);
+        assert_eq!(first("echo ]] rm"), ["echo", "]]", "rm"]);
+        // A test after `coproc`: `<` compares, it does not redirect.
+        assert!(!split_segments("coproc [[ a < b ]]")[0][2].redirect);
+        assert!(split_segments("coproc x < b")[0][1].redirect);
         assert_eq!(first("repeat 3 rm"), ["rm"]);
         assert_eq!(first("coproc rm"), ["rm"]);
         // `time` alone is left to the wrapper table.
