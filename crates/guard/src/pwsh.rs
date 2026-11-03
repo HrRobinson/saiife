@@ -10,6 +10,9 @@
 //! - An unquoted comma separates: `Remove-Item a,C:\Windows` has two paths.
 //! - Typographic quotes and dashes count as quotes and dashes.
 //! - `(`, `{` and `}` end a word, as do `;`, `|`, `&`, `,`, `)`.
+//! - On a Windows-style host an alias is the command it resolves to
+//!   (`wintable::POWERSHELL_ALIASES`), and `cd\`, `cd..`, `cd~` and `C:` are `cd`s.
+//!   Elsewhere many of those names are real programs.
 //!
 //! Every `(…)`, `$(…)`, `@(…)`, `@{…}` and `{…}` is read as statements wherever
 //! it stands, and those are segments of their own. So a script block is judged
@@ -124,7 +127,14 @@ const PREFIX_KEYWORDS: &[&str] = &["return", "throw", "exit"];
 /// argv-order words after translation; the note is `Some(reason)` when
 /// something was not fully read.
 pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
+    split_for_host(cmd, false)
+}
+
+/// `split_segments_noted`, on a host that is `windows`-style or not: there
+/// PowerShell's aliases are in force, and elsewhere many are real programs.
+pub fn split_for_host(cmd: &str, windows: bool) -> (Vec<Segment>, Option<&'static str>) {
     let mut r = Reader::new(cmd);
+    r.windows = windows;
     r.statements(None, Mode::Top);
     (r.out, r.note)
 }
@@ -134,12 +144,14 @@ pub fn split_segments_noted(cmd: &str) -> (Vec<Segment>, Option<&'static str>) {
 #[allow(clippy::type_complexity)]
 pub(crate) fn read_with_commands(
     cmd: &str,
+    windows: bool,
 ) -> (
     Vec<Vec<crate::debug_read::RawWord>>,
     Vec<Segment>,
     Option<&'static str>,
 ) {
     let mut r = Reader::new(cmd);
+    r.windows = windows;
     r.statements(None, Mode::Top);
     (r.commands, r.out, r.note)
 }
@@ -275,6 +287,8 @@ struct Reader {
     /// `out[n]` is strings an operator computes with (`'.en'+'v'`): a value that
     /// cannot be read, so it cannot go on as a path (`read_piped_value`).
     computed_value: Option<usize>,
+    /// A Windows-style host: PowerShell's aliases are in force.
+    windows: bool,
     #[cfg(debug_assertions)]
     commands: Vec<Vec<crate::debug_read::RawWord>>,
 }
@@ -294,6 +308,7 @@ impl Reader {
             lists_all_processes: false,
             folded_end: None,
             computed_value: None,
+            windows: false,
             #[cfg(debug_assertions)]
             commands: Vec::new(),
         }
@@ -803,14 +818,11 @@ impl Reader {
             return;
         };
         self.i += 1;
+        // A newline here is the word's own character: only between words does a
+        // backtick continue the line (`skip_blanks`). After a CR the LF is still
+        // to come, and it ends the word and the statement: `` cat a`<CR><LF>rm x ``
+        // runs `rm x`.
         let decoded = match c {
-            '\r' => {
-                if self.peek() == Some('\n') {
-                    self.i += 1;
-                }
-                return;
-            }
-            '\n' => return,
             '0' => '\0',
             'a' => '\u{7}',
             'b' => '\u{8}',
@@ -841,9 +853,10 @@ impl Reader {
             };
             self.i += 1;
             if is_single(c) {
-                if self.peek().is_some_and(is_single) {
+                // The second quote is the character, whichever kind it is.
+                if let Some(second) = self.peek().filter(|n| is_single(*n)) {
                     self.i += 1;
-                    w.text.push('\'');
+                    w.text.push(second);
                     continue;
                 }
                 return;
@@ -866,9 +879,9 @@ impl Reader {
             };
             if is_double(c) {
                 self.i += 1;
-                if self.peek().is_some_and(is_double) {
+                if let Some(second) = self.peek().filter(|n| is_double(*n)) {
                     self.i += 1;
-                    w.text.push('"');
+                    w.text.push(second);
                     pieces += 2;
                     continue;
                 }
@@ -1253,7 +1266,7 @@ impl Reader {
     }
 
     /// A command: the notes its name earns, then the table.
-    fn command(&mut self, words: Vec<Raw>, piped: bool) {
+    fn command(&mut self, mut words: Vec<Raw>, piped: bool) {
         #[cfg(debug_assertions)]
         self.commands.push(
             words
@@ -1265,7 +1278,15 @@ impl Reader {
                 })
                 .collect(),
         );
-        let name = CommandName::of(&words[0].w.text).lower();
+        if self.windows {
+            expand_cd_function(&mut words);
+        }
+        let written_name = CommandName::of(&words[0].w.text);
+        let alias = self
+            .windows
+            .then(|| wintable::powershell_alias(&written_name))
+            .flatten();
+        let name = alias.map_or_else(|| written_name.lower(), str::to_lowercase);
         let all_processes = std::mem::replace(
             &mut self.lists_all_processes,
             lists_every_process(&name, &words),
@@ -1311,6 +1332,7 @@ impl Reader {
             array: &array,
             from_quote: &from_quote,
             all_processes,
+            windows: self.windows,
             ..Context::default()
         };
         let (mut seg, note) = wintable::translate_noted(&argv, wintable::Dialect::PowerShell, &cx);
@@ -1377,6 +1399,31 @@ fn call_word() -> Raw {
         from_quote: false,
         whole: false,
     }
+}
+
+/// `cd..`, `cd\`, `cd~` and `C:` are PowerShell's own functions: `Set-Location`
+/// to that place, whatever else the line gives them.
+fn expand_cd_function(words: &mut Vec<Raw>) {
+    let first = &words[0];
+    if first.w.quoted || first.from_quote || first.kind != Kind::Plain {
+        return;
+    }
+    let text = &first.w.text;
+    let drive = text.len() == 2 && text.ends_with(':') && text.as_bytes()[0].is_ascii_alphabetic();
+    let place = if drive {
+        text.clone()
+    } else {
+        match text.to_ascii_lowercase().as_str() {
+            "cd.." => "..".to_string(),
+            "cd\\" => "\\".to_string(),
+            "cd~" => "~".to_string(),
+            _ => return,
+        }
+    };
+    let mut arg = first.clone();
+    arg.w.text = place;
+    words[0].w.text = "cd".to_string();
+    words.insert(1, arg);
 }
 
 /// `$_.Name`, `$x.y.z`: a member read, unknown but no command. With a `(` it is

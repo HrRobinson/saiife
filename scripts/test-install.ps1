@@ -94,7 +94,10 @@ function Invoke-Install([string]$Case, [string]$Rel, [string]$Arch, [string[]]$E
   $env:TEMP = Join-Path $Case 'tmp'
   $env:TMP = $env:TEMP
   $env:PROCESSOR_ARCHITECTURE = $Arch
-  $env:PROCESSOR_ARCHITEW6432 = ''
+  # $null, not '': from PowerShell 7.5 '' leaves the variable set and empty, where
+  # 5.1 removes it. With it set and empty the child read an empty
+  # PROCESSOR_ARCHITECTURE as well, whatever was set above.
+  $env:PROCESSOR_ARCHITEW6432 = $null
   if ($Rel -match '^[a-z]+://') { $url = $Rel } else { $url = ([System.Uri]($Rel.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar)).AbsoluteUri }
   # Joined by hand: Out-String wraps long lines at the host's width, which would
   # split the install path the cases look for.
@@ -285,7 +288,8 @@ try {
 }
 finally {
   Set-RawUserPath $origPath
-  foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+  # Set-Item, not SetEnvironmentVariable: PowerShell hands that method '' for $null.
+  foreach ($n in $saved.Keys) { Set-Item -LiteralPath "Env:$n" -Value $saved[$n] }
   Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 

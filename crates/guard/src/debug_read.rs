@@ -2,6 +2,7 @@
 //! `scripts/differential-windows.ps1`, which compares it with the real shells.
 //! Debug builds only: a shipped binary has no use for it.
 
+use crate::canon::PathStyle;
 use crate::cmdexe;
 use crate::lexer::{Segment, Word};
 use crate::pwsh;
@@ -34,10 +35,15 @@ pub struct Read {
 
 /// `line` as `dialect` reads it.
 pub fn read(line: &str, dialect: Dialect) -> Read {
+    read_on(line, dialect, PathStyle::host() == PathStyle::Windows)
+}
+
+/// `read`, on a host that is `windows`-style or not, as the engine reads a line.
+fn read_on(line: &str, dialect: Dialect, windows: bool) -> Read {
     let mut out = Read::default();
     match dialect {
         Dialect::PowerShell => {
-            let (commands, segments, note) = pwsh::read_with_commands(line);
+            let (commands, segments, note) = pwsh::read_with_commands(line, windows);
             out.commands = commands;
             out.segments = segments;
             out.note = note;
@@ -54,11 +60,11 @@ pub fn read(line: &str, dialect: Dialect) -> Read {
         }
     }
     let top = out.segments.clone();
-    follow(&top, 0, &mut out);
+    follow(&top, 0, windows, &mut out);
     out
 }
 
-fn follow(segments: &[Segment], depth: u32, out: &mut Read) {
+fn follow(segments: &[Segment], depth: u32, windows: bool, out: &mut Read) {
     for seg in segments {
         let Some((dialect, inner)) = cmdexe::nested(seg) else {
             continue;
@@ -68,14 +74,14 @@ fn follow(segments: &[Segment], depth: u32, out: &mut Read) {
             continue;
         }
         let (segs, note) = match dialect {
-            Dialect::PowerShell => pwsh::split_segments_noted(&inner),
+            Dialect::PowerShell => pwsh::split_for_host(&inner, windows),
             Dialect::Cmd => cmdexe::split_segments_noted(&inner),
             Dialect::Posix => crate::lexer::split_segments_noted(&inner),
         };
         if let Some(n) = note {
             out.note.get_or_insert(n);
         }
-        follow(&segs, depth + 1, out);
+        follow(&segs, depth + 1, windows, out);
         out.nested.extend(segs);
     }
 }
@@ -100,6 +106,14 @@ mod tests {
         );
         assert_eq!(r.segments[0][0].text, "rm");
         assert_eq!(r.note, None);
+    }
+
+    #[test]
+    fn a_windows_host_reads_aliases_as_the_engine_does() {
+        let r = read_on("sp x y", Dialect::PowerShell, true);
+        assert_eq!(r.segments[0][0].text, "Set-ItemProperty");
+        let r = read_on("sp x y", Dialect::PowerShell, false);
+        assert_eq!(r.segments[0][0].text, "sp");
     }
 
     #[test]

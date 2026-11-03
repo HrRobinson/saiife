@@ -607,6 +607,62 @@ const POSIX_PROGRAMS: &[&str] = &[
     "rm", "cp", "mv", "cat", "ls", "curl", "wget", "kill", "mkdir", "rmdir", "sc",
 ];
 
+/// PowerShell's own aliases on Windows, 5.1 and 7 together, for those the table
+/// has no row of (and `tee`, whose row keeps the real program's reading): from
+/// the shells' `InitialSessionState` and module manifests.
+/// `scripts/differential-windows.ps1` checks this against `Get-Alias` on both
+/// versions. Not here, because they read the same either way: what `TABLE` lists,
+/// and `sc`, `curl` and `wget`, which are aliases in 5.1 and real programs in 7
+/// (their rows read both). Only on a Windows-style host: elsewhere many of these
+/// are real programs (`ps`, `sort`, `tee`, `diff`).
+#[rustfmt::skip]
+const POWERSHELL_ALIASES: &[(&str, &str)] = &[
+    ("%", "ForEach-Object"), ("?", "Where-Object"), ("asnp", "Add-PSSnapin"), ("cfs", "ConvertFrom-String"),
+    ("clear", "Clear-Host"), ("clhy", "Clear-History"), ("cli", "Clear-Item"), ("clp", "Clear-ItemProperty"),
+    ("cls", "Clear-Host"), ("clv", "Clear-Variable"), ("cnsn", "Connect-PSSession"), ("compare", "Compare-Object"),
+    ("cpp", "Copy-ItemProperty"), ("cvpa", "Convert-Path"), ("dbp", "Disable-PSBreakpoint"), ("diff", "Compare-Object"),
+    ("dnsn", "Disconnect-PSSession"), ("ebp", "Enable-PSBreakpoint"), ("echo", "Write-Output"), ("epsn", "Export-PSSession"),
+    ("etsn", "Enter-PSSession"), ("exsn", "Exit-PSSession"), ("fc", "Format-Custom"), ("fhx", "Format-Hex"),
+    ("fl", "Format-List"), ("foreach", "ForEach-Object"), ("ft", "Format-Table"), ("fw", "Format-Wide"),
+    ("gal", "Get-Alias"), ("gbp", "Get-PSBreakpoint"), ("gcb", "Get-Clipboard"), ("gcim", "Get-CimInstance"),
+    ("gcm", "Get-Command"), ("gcs", "Get-PSCallStack"), ("gdr", "Get-PSDrive"), ("gerr", "Get-Error"),
+    ("ghy", "Get-History"), ("gi", "Get-Item"), ("gin", "Get-ComputerInfo"), ("gjb", "Get-Job"),
+    ("gl", "Get-Location"), ("gm", "Get-Member"), ("gmo", "Get-Module"), ("gp", "Get-ItemProperty"),
+    ("gps", "Get-Process"), ("gpv", "Get-ItemPropertyValue"), ("group", "Group-Object"), ("gsn", "Get-PSSession"),
+    ("gsnp", "Get-PSSnapin"), ("gsv", "Get-Service"), ("gtz", "Get-TimeZone"), ("gu", "Get-Unique"),
+    ("gv", "Get-Variable"), ("gwmi", "Get-WmiObject"), ("h", "Get-History"), ("history", "Get-History"),
+    ("icim", "Invoke-CimMethod"), ("icm", "Invoke-Command"), ("iex", "Invoke-Expression"), ("ihy", "Invoke-History"),
+    ("ii", "Invoke-Item"), ("ipal", "Import-Alias"), ("ipcsv", "Import-Csv"), ("ipmo", "Import-Module"),
+    ("ipsn", "Import-PSSession"), ("ise", "powershell_ise"), ("iwmi", "Invoke-WmiMethod"), ("lp", "Out-Printer"),
+    ("man", "help"), ("measure", "Measure-Object"), ("mount", "New-PSDrive"), ("mp", "Move-ItemProperty"),
+    ("nal", "New-Alias"), ("ncim", "New-CimInstance"), ("ndr", "New-PSDrive"), ("nmo", "New-Module"),
+    ("npssc", "New-PSSessionConfigurationFile"), ("nsn", "New-PSSession"), ("nv", "New-Variable"), ("ogv", "Out-GridView"),
+    ("oh", "Out-Host"), ("ps", "Get-Process"), ("pwd", "Get-Location"), ("r", "Invoke-History"),
+    ("rbp", "Remove-PSBreakpoint"), ("rcim", "Remove-CimInstance"), ("rcjb", "Receive-Job"), ("rcsn", "Receive-PSSession"),
+    ("rdr", "Remove-PSDrive"), ("rjb", "Remove-Job"), ("rmo", "Remove-Module"), ("rnp", "Rename-ItemProperty"),
+    ("rp", "Remove-ItemProperty"), ("rsn", "Remove-PSSession"), ("rsnp", "Remove-PSSnapin"), ("rujb", "Resume-Job"),
+    ("rv", "Remove-Variable"), ("rvpa", "Resolve-Path"), ("rwmi", "Remove-WmiObject"), ("sajb", "Start-Job"),
+    ("sal", "Set-Alias"), ("sasv", "Start-Service"), ("sbp", "Set-PSBreakpoint"), ("scb", "Set-Clipboard"),
+    ("scim", "Set-CimInstance"), ("select", "Select-Object"), ("set", "Set-Variable"), ("shcm", "Show-Command"),
+    ("si", "Set-Item"), ("sleep", "Start-Sleep"), ("sort", "Sort-Object"), ("sp", "Set-ItemProperty"),
+    ("spjb", "Stop-Job"), ("spsv", "Stop-Service"), ("stz", "Set-TimeZone"), ("sujb", "Suspend-Job"),
+    ("sv", "Set-Variable"), ("swmi", "Set-WmiInstance"), ("tee", "Tee-Object"), ("trcm", "Trace-Command"),
+    ("where", "Where-Object"), ("wjb", "Wait-Job"), ("write", "Write-Output"),
+];
+
+/// What PowerShell runs for this name, when it is an alias: a name with a
+/// directory or an extension is a program.
+pub(crate) fn powershell_alias(name: &CommandName) -> Option<&'static str> {
+    if name.program {
+        return None;
+    }
+    let lower = name.lower();
+    POWERSHELL_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lower)
+        .map(|(_, command)| *command)
+}
+
 /// The translation's context beyond the words: the reader knows these.
 #[derive(Default)]
 pub(crate) struct Context<'a> {
@@ -622,6 +678,9 @@ pub(crate) struct Context<'a> {
     pub depth: u32,
     /// The pipeline's input is every process (`Get-Process | Stop-Process`).
     pub all_processes: bool,
+    /// A Windows-style host: PowerShell's aliases are in force
+    /// (`POWERSHELL_ALIASES`).
+    pub windows: bool,
 }
 
 /// The W5 table: `argv` as the POSIX command the packs judge. `argv[0]` is
@@ -644,10 +703,13 @@ pub(crate) fn translate_noted(
         return (argv.to_vec(), None);
     }
     let name = CommandName::of(&first.text);
-    let lower = name.lower();
+    let alias = (dialect == Dialect::PowerShell && cx.windows)
+        .then(|| powershell_alias(&name))
+        .flatten();
+    let lower = alias.map_or_else(|| name.lower(), str::to_lowercase);
     let renamed = || {
         let mut out = argv.to_vec();
-        out[0].text = name.base.to_string();
+        out[0].text = alias.unwrap_or(name.base).to_string();
         out
     };
     if name.program && POSIX_PROGRAMS.contains(&lower.as_str()) {

@@ -9,7 +9,8 @@
   - PowerShell: each fixture is parsed with
     [System.Management.Automation.Language.Parser]::ParseInput, never run. The command
     names and arguments must equal the words saiife read.
-  - Aliases: an alias and the command it resolves to must read the same.
+  - Aliases: every alias this shell has (Get-Alias) and the command it resolves to
+    must read the same. Which exist depends on the version: see alias_only_51.
   - cmd: each fixture runs under cmd.exe in a throwaway directory. The only program
     that does anything is p19adiffstub, a batch file that logs that it ran. Whether it
     ran must agree with what saiife read. See the fixtures' header for `over`.
@@ -169,7 +170,9 @@ function Get-ParserCommands([string]$Line) {
     if ($c -isnot [System.Management.Automation.Language.CommandAst]) { continue }
     $words = @()
     foreach ($e in $c.CommandElements) { $words += @(Get-ElementToken $e) }
-    if ($words.Count -gt 0) { $words[0] = 'S|' + $words[0].Substring(2) }
+    # `& { … }`: only a block, whose commands are found on their own.
+    if ($words.Count -eq 0) { continue }
+    $words[0] = 'S|' + $words[0].Substring(2)
     $commands += , ($words -join "`n")
   }
   return @{
@@ -186,16 +189,23 @@ function Get-ReaderCommands($Read) {
   foreach ($command in @($Read.commands)) {
     $words = @()
     $skip = $false
+    # The parser's first `--` is a parameter, and nothing after it is one.
+    $dashes = $false
     foreach ($w in @($command)) {
       if ($skip) { $skip = $false; continue }
       if ($w.redirect) { $skip = $true; continue }
       if ($w.block) { continue }
       $text = Get-Dashless $w.text
+      if (-not $dashes -and $text -ceq '--' -and -not $w.from_quote) {
+        $dashes = $true
+        $words += 'P|--'
+        continue
+      }
       if ($words.Count -gt 0 -and $words[-1] -match '^P\|.*:$') {
         $words[-1] = $words[-1] + $text
         continue
       }
-      $param = (-not $w.from_quote) -and ($text -cmatch '^-[\p{L}_?]') -and ((-not $w.quoted) -or $text.Contains(':'))
+      $param = (-not $dashes) -and (-not $w.from_quote) -and ($text -cmatch '^-[\p{L}_?]') -and ((-not $w.quoted) -or $text.Contains(':'))
       $words += $(if ($param) { "P|$text" } else { "S|$text" })
     }
     if ($words.Count -gt 0) {
@@ -258,16 +268,57 @@ function Test-PowerShell {
   }
 }
 
+# Lines read differently from the parser on purpose, each reading pinned, so that any
+# other difference on them still fails. And lines that are only printed.
+function Test-DocumentedLines {
+  $documented = @($Fixtures.powershell_documented)
+  $reads = @(Read-Lines @($documented | ForEach-Object { @{ dialect = 'powershell'; line = $_.line } }))
+  for ($i = 0; $i -lt $documented.Count; $i++) {
+    $d = $documented[$i]
+    $parsed = Get-ParserCommands $d.line
+    $read = Get-ReaderCommands $reads[$i]
+    if (-not (Test-SameList $parsed.Commands @($d.parser)) -or -not (Test-SameList $read.Commands @($d.reader))) {
+      Add-Failure "powershell, not as documented: $($d.line)`n  parser: $($parsed.Commands -join ' ;; ')`n  reader: $($read.Commands -join ' ;; ')"
+    } else {
+      Write-Output "documented over-read: $($d.line)"
+    }
+  }
+  $report = @($Fixtures.powershell_report)
+  $reads = @(Read-Lines @($report | ForEach-Object { @{ dialect = 'powershell'; line = $_ } }))
+  for ($i = 0; $i -lt $report.Count; $i++) {
+    $parsed = Get-ParserCommands $report[$i]
+    $read = Get-ReaderCommands $reads[$i]
+    Write-Output "report only: $($report[$i])`n  parser: $($parsed.Commands -join ' ;; ') > $($parsed.Targets -join ', ')`n  reader: $($read.Commands -join ' ;; ') > $($read.Targets -join ', ')"
+  }
+}
+
+# Every alias this shell really has, and the fixtures' list on top. Case does not
+# count: PowerShell's command names do not have it.
 function Test-Aliases {
-  $names = @($Fixtures.aliases)
+  Import-Module CimCmdlets -ErrorAction SilentlyContinue
+  $real = @{}
+  foreach ($a in Get-Alias) {
+    $target = $a.ResolvedCommandName
+    if ([string]::IsNullOrEmpty($target)) { $target = $a.Definition }
+    $real[$a.Name] = $target
+  }
+  $only51 = @($Fixtures.alias_only_51)
+  $is51 = $PSVersionTable.PSVersion.Major -le 5
+  $over = @{}
+  foreach ($o in @($Fixtures.alias_over)) { $over[$o.alias] = $o.reason }
+  $names = @(@($Fixtures.aliases) + @($real.Keys) | Sort-Object -Unique)
   $pairs = @()
   foreach ($alias in $names) {
-    $c = Get-Command -Name $alias -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $c -or $c.CommandType -ne 'Alias') {
-      Write-Output "not an alias in $($PSVersionTable.PSVersion): $alias"
-      continue
+    if ($real.ContainsKey($alias)) {
+      if ($only51 -contains $alias -and -not $is51) {
+        Add-Failure "alias: $alias is an alias in $($PSVersionTable.PSVersion), and the fixtures say only 5.1 has it"
+      }
+      $pairs += , @($alias, $real[$alias])
+    } elseif ($only51 -contains $alias -and -not $is51) {
+      Write-Output "not an alias in $($PSVersionTable.PSVersion), as expected: $alias"
+    } else {
+      Add-Failure "alias: the fixtures name $alias, and $($PSVersionTable.PSVersion) has no such alias"
     }
-    $pairs += , @($alias, $c.ResolvedCommandName)
   }
   $requests = @()
   foreach ($p in $pairs) {
@@ -276,14 +327,26 @@ function Test-Aliases {
   }
   $reads = Read-Lines $requests
   for ($i = 0; $i -lt $pairs.Count; $i++) {
+    $alias = $pairs[$i][0]
     $a = ConvertTo-Json -InputObject $reads[2 * $i].segments -Depth 4 -Compress
     $b = ConvertTo-Json -InputObject $reads[2 * $i + 1].segments -Depth 4 -Compress
-    if ($a -cne $b) {
-      Add-Failure "alias: $($pairs[$i][0]) is $($pairs[$i][1]), which reads differently`n  $a`n  $b"
+    if ($over.ContainsKey($alias)) {
+      # All the command reads, and more: `[[…]]` without its outer brackets.
+      if ($a.IndexOf($b.Substring(2, $b.Length - 4), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        Write-Output "documented over-read of an alias: $alias"
+      } else {
+        Add-Failure "alias: $alias no longer reads all that $($pairs[$i][1]) does`n  $a`n  $b"
+      }
+    } elseif ($a -ine $b) {
+      Add-Failure "alias: $alias is $($pairs[$i][1]), which reads differently`n  $a`n  $b"
+    } elseif ($reads[2 * $i].note -cne $reads[2 * $i + 1].note) {
+      Add-Failure "alias: $alias is $($pairs[$i][1]), noted differently: $($reads[2 * $i].note) / $($reads[2 * $i + 1].note)"
     }
   }
+  Write-Output "aliases: compared $($pairs.Count) in $($PSVersionTable.PSVersion)"
 }
 
+# Whether the stub ran: $true or $false, and $null for a line that did not finish.
 function Invoke-CmdLine([string]$Line, [string]$Dir, [string]$Log) {
   if (Test-Path -LiteralPath $Log) { Remove-Item -LiteralPath $Log }
   $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -303,10 +366,12 @@ function Invoke-CmdLine([string]$Line, [string]$Dir, [string]$Log) {
   $p.StandardInput.Close()
   $stdout = $p.StandardOutput.ReadToEndAsync()
   $stderr = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit(30000)) {
-    $p.Kill()
-    $p.WaitForExit() | Out-Null
-    throw "cmd.exe did not finish: $Line"
+  if (-not $p.WaitForExit(10000)) {
+    # `start /b /wait cmd/c x` has hung here on a runner, and one line must not cost
+    # the fixtures after it. What it means for the reader is decided by the caller.
+    try { $p.Kill() } catch { }
+    if (Test-Path -LiteralPath $Log) { return $true }
+    return $null
   }
   $null = $stdout.Result
   $null = $stderr.Result
@@ -330,7 +395,14 @@ function Test-Cmd {
     $read = [bool]$reads[$i].sees_stub
     $noted = $null -ne $reads[$i].note
     if (-not $noted) { $compared++ }
-    if ($ran -and -not $read -and -not $noted) {
+    if ($null -eq $ran) {
+      # No answer from the shell. Only a line the reader saw through is safe.
+      if ($read -or $noted) {
+        Write-Output "did not finish on cmd, and the reader judged the stub: $shown"
+      } else {
+        Add-Failure "cmd: it did not finish, and the reader did not see the stub: $shown"
+      }
+    } elseif ($ran -and -not $read -and -not $noted) {
       Add-Failure "cmd, a bypass: it ran the stub and the reader did not see it: $shown"
     } elseif (-not $ran -and $read -and -not $over) {
       Add-Failure "cmd: the reader saw a stub that did not run, and this is no documented over-read: $shown"
@@ -383,6 +455,7 @@ function Test-Paths {
 try {
   Write-Output "PowerShell $($PSVersionTable.PSVersion)"
   Test-PowerShell
+  Test-DocumentedLines
   Test-Aliases
   Test-Cmd
   Test-Paths

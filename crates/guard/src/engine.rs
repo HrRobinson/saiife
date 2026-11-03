@@ -214,8 +214,18 @@ fn null_device_words(segments: &mut [Vec<Word>], dialect: Dialect, redirect_disc
 /// What a Windows-style host means by a segment's words: its programs' names
 /// (`normalize::windows_program_names`), and for a reader a leading `//`, which
 /// is a share there. `build_argv` would collapse it to `/`.
-fn windows_words(segments: &mut [Vec<Word>], reader: bool) {
+fn windows_words(segments: &mut [Vec<Word>], reader: bool, dialect: Dialect) {
     for seg in segments {
+        // `C:` at cmd's prompt moves there, as it does in PowerShell (`pwsh`):
+        // to that drive's own current directory, which a new shell has at its root.
+        // Read as the root: `cd C:` alone would only print where that is. First,
+        // because a program name loses what follows a colon.
+        if dialect == Dialect::Cmd && seg.first().is_some_and(is_bare_drive) {
+            let mut place = seg[0].clone();
+            place.text.push('\\');
+            seg[0].text = "cd".to_string();
+            seg.insert(1, place);
+        }
         windows_program_names(seg);
         if reader {
             for w in seg.iter_mut().skip(1).filter(|w| !w.has_substitution) {
@@ -225,6 +235,11 @@ fn windows_words(segments: &mut [Vec<Word>], reader: bool) {
             }
         }
     }
+}
+
+fn is_bare_drive(w: &Word) -> bool {
+    let t = w.text.as_bytes();
+    !w.quoted && !w.has_substitution && t.len() == 2 && t[0].is_ascii_alphabetic() && t[1] == b':'
 }
 
 /// The name `null` on the line in any form but `$null` and `/dev/null`, so a POSIX
@@ -615,7 +630,9 @@ impl Engine {
         state.ifs_named |= !reader && mentions_ifs(raw_cmd);
         let mut found = Findings::default();
         let (mut segments, lex_note) = match dialect {
-            Dialect::PowerShell => pwsh::split_segments_noted(raw_cmd),
+            Dialect::PowerShell => {
+                pwsh::split_for_host(raw_cmd, self.vars.style() == PathStyle::Windows)
+            }
             Dialect::Cmd => cmdexe::split_segments_noted(raw_cmd),
             Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
             Dialect::Posix => split_segments_noted(raw_cmd),
@@ -625,7 +642,7 @@ impl Engine {
         }
         null_device_words(&mut segments, dialect, state.null_redirect_discards);
         if self.vars.style() == PathStyle::Windows {
-            windows_words(&mut segments, reader);
+            windows_words(&mut segments, reader, dialect);
         }
         if let Some(reason) = lex_note {
             found.unjudged(reason);

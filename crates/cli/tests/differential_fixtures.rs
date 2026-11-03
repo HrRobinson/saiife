@@ -57,3 +57,37 @@ fn the_differential_runs_nothing_destructive() {
     assert!(!script.contains("Invoke-Expression"));
     assert!(!script.contains("iex "));
 }
+
+/// A mismatch only becomes an exception with a reason, and nothing else: the plain
+/// `over: true` of the first fixtures is closed, and an exception for one line
+/// leaves every other mismatch failing.
+#[test]
+fn every_new_exception_says_why_it_is_safe() {
+    let text =
+        fs::read_to_string(root().join("scripts/differential-windows.fixtures.json")).unwrap();
+    let fixtures: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let reason = |v: &serde_json::Value, what: &str| {
+        let why = v.as_str().unwrap_or_default();
+        assert!(why.len() > 40, "{what} has no reason: {v}");
+    };
+    let cmd = fixtures["cmd"].as_array().unwrap();
+    let bare = cmd.iter().filter(|f| f["over"] == true).count();
+    assert_eq!(
+        bare, 15,
+        "a new over-read needs its reason as the value of `over`"
+    );
+    let with_reason: Vec<_> = cmd.iter().filter(|f| f["over"].is_string()).collect();
+    assert_eq!(with_reason.len(), 5);
+    for f in with_reason {
+        reason(&f["over"], f["line"].as_str().unwrap());
+    }
+    for d in fixtures["powershell_documented"].as_array().unwrap() {
+        let line = d["line"].as_str().unwrap();
+        reason(&d["reason"], line);
+        assert!(!d["parser"].as_array().unwrap().is_empty(), "{line}");
+        assert!(!d["reader"].as_array().unwrap().is_empty(), "{line}");
+    }
+    for a in fixtures["alias_over"].as_array().unwrap() {
+        reason(&a["reason"], a["alias"].as_str().unwrap());
+    }
+}

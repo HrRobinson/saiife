@@ -15,6 +15,11 @@
 # budget (the macOS CI test job uses 40 for --managed; the windows-latest test
 # job uses 50 for the developer hook).
 #
+# On Windows (or with BENCH_SPLIT=1 anywhere) the same N calls of cheaper things
+# come first, so a number over budget can be read: a program of Git Bash's own, the
+# release binary and its fresh copy doing nothing, and `explain`, which loads every
+# pack and judges one line but writes no audit record. They have no budget.
+#
 # With SAIIFE_BENCH_BIN=<file> it times that binary and builds nothing, so two
 # builds can be compared with the same script. SAIIFE_BENCH_TMP=<dir> is where
 # the scratch dir goes (default: next to the repo, then the system's).
@@ -172,8 +177,23 @@ report() {
   fi
 }
 
+# What a hook call's time is made of, in steps that each add one thing. Printed
+# before the budget's verdict, which ends the script.
+step() {
+  local label="$1"
+  shift
+  echo "baseline $label: $(stats_ms "" "$@")/call"
+}
+
 if [[ "$managed" == 0 ]]; then
   cd "$tmp/project"
+  if [[ "$windows" == 1 || -n "${BENCH_SPLIT:-}" ]]; then
+    # Not `true`: that is a bash builtin, and starts no process.
+    step "process start only (/usr/bin/true)" /usr/bin/true
+    step "saiife --version, the release binary" "$bin" --version
+    step "saiife --version, its fresh copy on PATH" saiife --version
+    step "saiife explain, all packs and one line" saiife explain 'git status && ls -la src'
+  fi
   report "" saiife check --hook-exit --agent claude
   exit 0
 fi

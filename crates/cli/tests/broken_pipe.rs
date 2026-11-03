@@ -38,10 +38,17 @@ fn commands_exit_quietly_when_the_reader_goes_away() {
     // Developer mode whatever the host has installed.
     let absent = env.home.path().join("absent.toml");
     let absent = absent.to_str().unwrap();
+    // `--system-config` is locked mode, which Windows refuses until plan 19b:
+    // there it is developer mode anyway.
+    let audit: &[&str] = if cfg!(windows) {
+        &["audit"]
+    } else {
+        &["audit", "--system-config", absent]
+    };
     for args in [
         &["status"][..],
         &["packs"],
-        &["audit", "--system-config", absent],
+        audit,
         &["explain", "git status"],
         &["init"],
     ] {

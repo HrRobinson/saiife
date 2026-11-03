@@ -1,5 +1,5 @@
 {
-  "_comment": "Plan 19a: what scripts/differential-windows.ps1 checks. Nothing here deletes or changes anything: PowerShell lines are only parsed, never run. cmd lines run in a throwaway directory and call only `echo`, `type` of a scratch file, `cd`, and p19adiffstub, a batch file that logs its arguments. `over` and `powershell_over` mark a documented over-read: the reader sees a command the shell does not run, which is a false deny and not a bypass.",
+  "_comment": "Plan 19a: what scripts/differential-windows.ps1 checks. Nothing here deletes or changes anything: PowerShell lines are only parsed, never run. cmd lines run in a throwaway directory and call only `echo`, `type` of a scratch file, `cd`, and p19adiffstub, a batch file that logs its arguments. `over` and `powershell_over` mark a documented over-read: the reader sees a command the shell does not run, which is a false deny and not a bypass. A string in `over` is why that is safe. `powershell_documented` pins a line the reader reads differently from the parser, both readings exact, so any other mismatch still fails; `powershell_report` is only printed. `alias_only_51` are aliases in Windows PowerShell 5.1 and real programs in 7; `alias_over` are aliases the reader over-reads, with why.",
   "powershell": [
     "gc ('.env')",
     "gc ( '.env' )",
@@ -40,11 +40,14 @@
     "g`it status",
     "git reset \\--hard",
     "cat a`\nb",
+    "cat a`\r\nb",
+    "echo a`\r\ngit status",
     "cat \u2018a\u2019",
     "cat \u201ca\u201d",
     "cat \u201aa\u201b",
     "cat \u201ea\u201d",
     "cat 'a\u2018\u2019b'",
+    "cat \"a\u201c\u201db\"",
     "cat $c:x",
     "cat ${C:\\p\\.env}",
     "cat $env:X.y",
@@ -66,7 +69,6 @@
     "a *> f",
     "a 3> f",
     "a 2>&1",
-    "a2>f",
     "'x'>f",
     "a > $null",
     "a --% b ; c",
@@ -98,10 +100,35 @@
     "powershell '-c' 'x'",
     "Start-Process cmd -ArgumentList '/c echo x'",
     "icacls x (OI)(CI)F",
-    "Remove-Item -Recurse C:"
+    "Remove-Item -Recurse C:",
+    "cd\\; git status",
+    "cd..; git status",
+    "cd~; git status",
+    "C:; git status"
   ],
   "powershell_over": [
     "$a = foo = bar"
+  ],
+  "powershell_documented": [
+    {
+      "line": "a2>f",
+      "parser": ["S|a2>f"],
+      "reader": ["S|a2"],
+      "reason": "To the parser `>` does not end a bare word, so this runs a command named `a2>f`, which no file can be called on Windows: nothing runs. The reader takes the redirection a bare word might be: it judges a write to `f` that does not happen, and can only deny more. It stays, because the same characters after a quote or a variable are a real redirection ('x'>f)."
+    }
+  ],
+  "powershell_report": [
+    "a>f",
+    "cat a>f",
+    "cat a2>f",
+    "cat a<f"
+  ],
+  "alias_only_51": ["curl", "wget", "sc"],
+  "alias_over": [
+    {
+      "alias": "sc",
+      "reason": "`sc` is Set-Content in 5.1 and sc.exe in 7, and one reader judges both: the service rules see `sc x y`, and the write rules see `> x`. Under 5.1 the first is an over-read, which `sc stop saiifed` would deny for a write that names a file `saiifed`."
+    }
   ],
   "aliases": [
     "ri", "rm", "rmdir", "del", "erase", "rd", "cp", "copy", "cpi", "mv", "move", "mi",
@@ -127,7 +154,7 @@
     { "line": "echo \"x ^\" & p19adiffstub a" },
     { "line": "p19adiff^stub a" },
     { "line": "i^f a==a p19adiffstub b" },
-    { "line": "echo ^\n& p19adiffstub a" },
+    { "line": "echo ^\n& p19adiffstub a", "over": "Real cmd did not run what follows a caret and a line feed. The reader reads a statement after it, as it does after any newline: the cost is a deny on a line nobody writes by hand, and reading less here could hide a command." },
     { "line": "if a==b echo x else p19adiffstub y", "over": true },
     { "line": "if a==a echo x else p19adiffstub y", "over": true },
     { "line": "if a==b (echo x) else p19adiffstub y" },
@@ -144,10 +171,10 @@
     { "line": "if exist . p19adiffstub a" },
     { "line": "if(a)==(a) p19adiffstub b" },
     { "line": "if a==a else(p19adiffstub b)", "over": true },
-    { "line": "if a==b (echo x) else(p19adiffstub b)" },
-    { "line": "if a==b (echo x) else@p19adiffstub b" },
-    { "line": "for %x in (a) do(p19adiffstub b)" },
-    { "line": "for %x in (a) do@p19adiffstub b" },
+    { "line": "if a==b (echo x) else(p19adiffstub b)", "over": "Real cmd takes `else(` and `else@` for no keyword: a syntax error, and nothing runs. The reader splits the keyword off and judges what follows, so the only cost is a deny on a line that would only print an error." },
+    { "line": "if a==b (echo x) else@p19adiffstub b", "over": "Real cmd takes `else(` and `else@` for no keyword: a syntax error, and nothing runs. The reader splits the keyword off and judges what follows, so the only cost is a deny on a line that would only print an error." },
+    { "line": "for %x in (a) do(p19adiffstub b)", "over": "Real cmd accepts `do` before a comma or a blank but not before `(` or `@`: a syntax error, and nothing runs. The reader judges the body, so the only cost is a deny on a line that would only print an error." },
+    { "line": "for %x in (a) do@p19adiffstub b", "over": "Real cmd accepts `do` before a comma or a blank but not before `(` or `@`: a syntax error, and nothing runs. The reader judges the body, so the only cost is a deny on a line that would only print an error." },
     { "line": "for %x in (a) do,p19adiffstub b" },
     { "line": "for %x in (a) do p19adiffstub b" },
     { "line": "for for for", "over": true },
