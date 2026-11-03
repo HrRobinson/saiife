@@ -102,6 +102,13 @@ pub(crate) const OPAQUE: &[&str] = &[
     "set-wmiinstance",
     "remove-ciminstance",
     "invoke-history",
+    "set-ciminstance",
+    "new-ciminstance",
+    // These run an action when an event fires.
+    "register-wmievent",
+    "register-cimindicationevent",
+    "register-objectevent",
+    "register-engineevent",
 ];
 
 /// `keyword … { }`: the statement is its blocks, and ends at one.

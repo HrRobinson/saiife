@@ -315,6 +315,15 @@ fn wmi_cim_and_history_commands_are_opaque() {
         "ihy 1",
         "r",
         "r 1",
+        "Set-CimInstance x",
+        "scim x",
+        "New-CimInstance x",
+        "ncim x",
+        "Register-WmiEvent x",
+        "Register-CimIndicationEvent x",
+        "rcie x",
+        "Register-ObjectEvent x",
+        "Register-EngineEvent x",
     ] {
         assert_eq!(
             split_for_host(line, true).1,
@@ -327,6 +336,24 @@ fn wmi_cim_and_history_commands_are_opaque() {
         assert_eq!(split_for_host(line, true).1, None, "{line}");
     }
     assert_eq!(split_for_host("r 1", false).1, None);
-    denied(&developer(), &["rwmi x", "swmi x", "rcim x", "ihy 1", "r"]);
+    denied(
+        &developer(),
+        &[
+            "rwmi x",
+            "swmi x",
+            "rcim x",
+            "ihy 1",
+            "r",
+            "Set-CimInstance x",
+            "scim x",
+            "New-CimInstance x",
+            "ncim x",
+            "Register-WmiEvent x",
+            "Register-CimIndicationEvent x",
+            "rcie x",
+            "Register-ObjectEvent x",
+            "Register-EngineEvent x",
+        ],
+    );
     allowed(&developer(), &["echo r"]);
 }
