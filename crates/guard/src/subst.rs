@@ -84,52 +84,82 @@ pub fn command_position_substitution_kind(seg: &[Word]) -> Option<(String, bool)
     None
 }
 
-/// Can this word vanish when the shell expands it? Only an unquoted word made
+/// Can this word vanish when the shell expands it? An unquoted word made
 /// entirely of substitutions and parameters (`$(true)`, `` `true` ``, `$x`,
-/// `${x}`, `$1`, `$@`, `$x$(y)`): word splitting removes an empty result, and
-/// the next word becomes the command. `"$x"` stays an empty word, and any
-/// literal text beside the expansion keeps the word.
+/// `${x:-${y}}`, `$1`, `$!`, `$x$(y)`): word splitting removes an empty
+/// result, and the next word becomes the command. A word a brace expansion
+/// left empty (`{,}`) is removed too. Quoted, only `"$@"` and `"${a[@]}"` can
+/// vanish; `"$x"` stays an empty word (`'$@'` counts as vanishing as well,
+/// since the text does not tell the quotes apart, which only over-denies).
+/// Literal text beside the expansion keeps the word.
 pub fn may_expand_to_nothing(word: &Word) -> bool {
-    if word.quoted || word.redirect || word.assignment {
+    if word.redirect || word.assignment {
         return false;
     }
-    if !word.has_substitution {
-        return !word.text.is_empty() && only_parameters(&word.text);
+    if word.text.is_empty() {
+        return !word.quoted;
     }
     let mut rest = word.text.clone();
-    for (inner, dollar) in find_all_substitution_kinds(&word.text) {
-        let written = if dollar {
-            format!("$({inner})")
-        } else {
-            format!("`{inner}`")
-        };
-        rest = rest.replacen(&written, "", 1);
+    if word.has_substitution {
+        for (inner, dollar) in find_all_substitution_kinds(&word.text) {
+            let written = if dollar {
+                format!("$({inner})")
+            } else {
+                format!("`{inner}`")
+            };
+            rest = rest.replacen(&written, "", 1);
+        }
     }
-    only_parameters(&rest)
+    only_parameters(&rest) && (!word.quoted || expands_a_list(&rest))
 }
 
-/// Is `text` nothing but `$NAME`, `${…}` and the `$1`, `$@`, `$*` forms?
+/// Is `text` nothing but `$NAME`, `${…}` (nested braces matched) and the
+/// `$1`, `$@`, `$*`, `$!` forms?
 fn only_parameters(mut text: &str) -> bool {
     while !text.is_empty() {
-        let Some(after) = text.strip_prefix('$') else {
+        let Some(len) = parameter_len(text) else {
             return false;
         };
-        let len = match after.chars().next() {
-            Some('{') => match after.find('}') {
-                Some(close) => close + 1,
-                None => return false,
-            },
-            Some('@' | '*' | '0'..='9') => 1,
-            _ => after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len()),
-        };
-        if len == 0 {
-            return false;
-        }
-        text = &after[len..];
+        text = &text[len..];
     }
     true
+}
+
+/// The length of the parameter expansion `text` starts with, if it does.
+fn parameter_len(text: &str) -> Option<usize> {
+    let after = text.strip_prefix('$')?;
+    let len = match after.chars().next()? {
+        '{' => {
+            let mut open = 0usize;
+            let close = after.char_indices().find_map(|(i, c)| {
+                match c {
+                    '{' => open += 1,
+                    '}' => open -= 1,
+                    _ => {}
+                }
+                (open == 0).then_some(i)
+            })?;
+            close + 1
+        }
+        '@' | '*' | '!' | '0'..='9' => 1,
+        _ => after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len()),
+    };
+    (len > 0).then_some(len + 1)
+}
+
+/// Do the parameters in `text` hold one that expands to no word at all even
+/// inside double quotes: `$@`, `${@}`, `${a[@]}`, with any slice or default?
+fn expands_a_list(mut text: &str) -> bool {
+    while let Some(len) = parameter_len(text) {
+        let (p, rest) = text.split_at(len);
+        if p == "$@" || p.starts_with("${@") || p.contains("[@]") {
+            return true;
+        }
+        text = rest;
+    }
+    false
 }
 
 /// If `tok` is a `NAME=value` shell-assignment word, return `value` (the

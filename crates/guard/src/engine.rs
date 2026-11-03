@@ -384,8 +384,13 @@ impl Engine {
         let clock = Clock {
             start,
             spent: Cell::default(),
+            #[cfg(test)]
+            runs: Cell::default(),
         };
-        self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None)
+        let decision = self.evaluate_inner(raw_cmd, &clock, 0, &state, false, None);
+        #[cfg(test)]
+        LAST_RUNS.with(|last| last.set(clock.runs.get()));
+        decision
     }
 
     /// `state`: the shell state at the start of `raw_cmd`; a nested
@@ -402,6 +407,8 @@ impl Engine {
         sub_body: bool,
         out: Option<&mut RuleCwd>,
     ) -> Decision {
+        #[cfg(test)]
+        clock.runs.set(clock.runs.get() + 1);
         let start = clock.start;
         let mut state = state.clone();
         // The line names IFS somewhere (`IFS=: …`, `export IFS`, a
@@ -467,15 +474,22 @@ impl Engine {
         if let Some(d) = self.embedded_substitutions_phase(seg, cx, state, found) {
             return Some(d);
         }
+        // `$x rm -rf /`, `$(true) rm -rf /`: if a word in command position
+        // comes out empty, the shell runs the next one. Judged that way as
+        // well as the way it is written, with no second look at substitutions
+        // (done above). As written, the command is that word, so the phases
+        // below that recurse have nothing to read there.
+        let without = without_leading_empty_expansions(seg);
+        let full = without.as_deref().unwrap_or(seg);
         // A wrapper option saiife does not know may take a value, which
         // would make the wrong word the command: not fully judged.
-        for opt in unknown_wrapper_options(seg) {
+        for opt in unknown_wrapper_options(full) {
             found.unjudged(format!(
                 "unknown or ambiguous wrapper option `{opt}`: the command after it may not be judged"
             ));
         }
         // `env -S 'sudo ls'`: the split string is a command line of its own.
-        for split in env_split_payloads(seg) {
+        for split in env_split_payloads(full) {
             // env has its own escapes (`\_` is a space, `\c` ends the
             // string), `${NAME}` expansion and `#` comments, which the
             // shell lexer does not model: fail closed.
@@ -492,24 +506,27 @@ impl Engine {
                 return Some(d);
             }
         }
-        // `$x rm -rf /`, `$(true) rm -rf /`: if the first word comes out
-        // empty, the shell runs the next one. Judged that way as well as
-        // the way it is written below.
-        if let Some(without) = without_leading_empty_expansions(seg) {
-            if cx.depth >= MAX_INLINE_DEPTH {
-                found.unjudged("words after an empty expansion nested too deeply to judge");
-            } else {
-                let deeper = Ctx {
-                    start: cx.start,
-                    depth: cx.depth + 1,
-                    literal_path: cx.literal_path,
-                    clock: cx.clock,
-                };
-                if let Some(d) = self.evaluate_segment(&without, &deeper, state, found) {
-                    return Some(d);
-                }
+        if let Some(without) = &without {
+            let effective = unwrap_transparent_prefix(without);
+            if let Some(d) = self.judge_command(without, effective, cx, state, found) {
+                return Some(d);
             }
         }
+        self.judge_command(seg, effective, cx, state, found)
+    }
+
+    /// The phases that judge a segment's command, its arguments and its
+    /// redirections.
+    fn judge_command(
+        &self,
+        seg: &[Word],
+        effective: &[Word],
+        cx: &Ctx,
+        state: &mut ShellState,
+        found: &mut Findings,
+    ) -> Option<Decision> {
+        #[cfg(test)]
+        cx.clock.runs.set(cx.clock.runs.get() + 1);
         let view = SegmentView::new(seg, effective, state, cx.literal_path, found);
         if view.argv.is_empty() || view.argv[0].is_empty() {
             return self.bare_segment_phase(&view, cx, state, found);
@@ -1568,19 +1585,48 @@ fn assignment_changes_environment(text: &str, literal_path: bool) -> bool {
 }
 
 /// The segment without the words in command position that may expand to
-/// nothing, when other words follow them; wrappers, assignments and
-/// redirections in front stay (`sudo $x rm` is `sudo rm`).
+/// nothing, at every point the command could start: `$v env $w rm` is
+/// `env rm`, with wrappers, assignments and redirections kept. Words with no
+/// command after them stay: `env "$@"` is a wrapper around its list, not a
+/// bare `env`. `None` when nothing was removed. One pass over the segment.
 fn without_leading_empty_expansions(seg: &[Word]) -> Option<Vec<Word>> {
-    if !seg.iter().any(|w| w.text.starts_with(['$', '`'])) {
+    if !seg
+        .iter()
+        .any(|w| w.text.is_empty() || w.text.starts_with(['$', '`']))
+    {
         return None;
     }
-    let rest = effective_command(seg);
-    let empty = rest.iter().take_while(|w| may_expand_to_nothing(w)).count();
-    if empty == 0 || empty == rest.len() {
-        return None;
+    let mut kept: Vec<Word> = Vec::new();
+    let mut removed = false;
+    let mut cursor = seg;
+    loop {
+        let rest = effective_command(cursor);
+        kept.extend_from_slice(&cursor[..cursor.len() - rest.len()]);
+        let empty = rest.iter().take_while(|w| may_expand_to_nothing(w)).count();
+        if empty == 0 || !names_a_command(&rest[empty..]) {
+            kept.extend_from_slice(rest);
+            break;
+        }
+        removed = true;
+        cursor = &rest[empty..];
     }
-    let front = &seg[..seg.len() - rest.len()];
-    Some(front.iter().chain(&rest[empty..]).cloned().collect())
+    removed.then_some(kept)
+}
+
+/// Is any of `words` more than an assignment, a redirection with its target,
+/// or a word that may expand to nothing?
+fn names_a_command(words: &[Word]) -> bool {
+    let mut i = 0;
+    while let Some(w) = words.get(i) {
+        if w.redirect {
+            i += 2;
+        } else if w.assignment || may_expand_to_nothing(w) {
+            i += 1;
+        } else {
+            return true;
+        }
+    }
+    false
 }
 
 /// A segment of bare assignments (`PATH=/x`, no command): they stay set.
@@ -1719,6 +1765,16 @@ struct Clock {
     /// Time spent compiling operand patterns so far
     /// (`pack::MAX_PATTERN_COMPILE`).
     spent: Cell<Duration>,
+    /// Lines evaluated and segment views judged, so a test can bound the
+    /// work without reading a clock.
+    #[cfg(test)]
+    runs: Cell<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `Clock::runs` of this thread's last `evaluate`.
+    static LAST_RUNS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// What the segments of one command line found short of a deny.
@@ -2702,6 +2758,34 @@ reason = "other pack says no"
                 trace: AllowTrace::NoMatch
             }
         );
+    }
+
+    /// `$v env ` x40 + `$(…) z`, nested `levels` deep around `true`.
+    fn nested_empties(levels: usize) -> String {
+        let mut line = "true".to_string();
+        for _ in 0..levels {
+            line = format!("{}$({line}) z", "$v env ".repeat(40));
+        }
+        line
+    }
+
+    #[test]
+    fn empty_expansions_across_wrappers_cost_one_extra_view() {
+        let e = test_engine();
+        // Per level: the line, and the segment as written and without its
+        // empties. The innermost `true` is a line and a view.
+        for levels in [1, 2, 8] {
+            let line = nested_empties(levels);
+            assert!(!e.evaluate(&line).is_deny(), "{line}");
+            let runs = LAST_RUNS.with(Cell::get);
+            assert_eq!(runs, 3 * levels + 2, "{levels} levels");
+        }
+        // No substitution judged twice, however many runs of empties.
+        e.evaluate(&format!("{}$(true) z", "$v env ".repeat(40)));
+        assert_eq!(LAST_RUNS.with(Cell::get), 5);
+        // A line with no empties judges each segment once.
+        e.evaluate("ls; git status");
+        assert_eq!(LAST_RUNS.with(Cell::get), 3);
     }
 
     #[test]

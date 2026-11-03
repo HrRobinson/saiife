@@ -210,6 +210,12 @@ const RESERVED_WORD_CASES: &[(&str, bool)] = &[
     ("$(true) $(touch ran)", true),
     ("X=$(true) $(touch ran)", true),
     ("X=$(touch ran) Y=1", true),
+    ("$! touch ran", true),
+    ("${x:-${y}} touch ran", true),
+    ("\"$@\" touch ran", true),
+    ("\"${x[@]}\" touch ran", true),
+    ("{,} touch ran", true),
+    ("$v env $v env touch ran", true),
     ("time if touch ran; then :; fi", true),
     ("set -- a; for x do touch ran; done", true),
     ("for ((i=0;i<1;i++)) do touch ran; done", true),
@@ -231,6 +237,9 @@ const RESERVED_WORD_CASES: &[(&str, bool)] = &[
     ("\"if\" touch ran", true),
     ("echo if touch ran", true),
     ("\"$(true)\" touch ran", true),
+    ("\"$x\" touch ran", true),
+    ("\"$*\" touch ran", true),
+    ("\"${x[*]}\" touch ran", true),
     ("! cat <<EOF\ntouch ran\nEOF", true),
 ];
 

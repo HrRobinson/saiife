@@ -410,16 +410,79 @@ fn a_word_that_may_expand_to_nothing_does_not_hide_the_next_one() {
     ] {
         assert_eq!(deny_pack(&e, cmd).as_deref(), Some(pack), "{cmd:?}");
     }
-    // Quoted it stays a word, so the command is an empty name; `$x` with
-    // literal text beside it is never empty.
+    // Quoted, most stay one empty word, so the command is an empty name; `$x`
+    // with literal text beside it is never empty.
     for cmd in [
         "\"$x\" rm -rf /",
+        "\"$*\" rm -rf /",
         "\"$(true)\" rm -rf /",
+        "\"${x}\" rm -rf /",
+        "\"${a[*]}\" rm -rf /",
+        "\"\" rm -rf /",
         "a$x rm -rf /",
+        "\"a$@\" rm -rf /",
         "$x/bin/tool rm -rf /",
     ] {
         assert_eq!(deny_pack(&e, cmd), None, "{cmd:?}");
     }
+}
+
+#[test]
+fn other_forms_that_expand_to_nothing() {
+    assert_judged_as_inner(&[
+        "$! CMD",
+        "${x:-${y}} CMD",
+        "${x:-${y:-${z}}} CMD",
+        "\"$@\" CMD",
+        "\"${@}\" CMD",
+        "\"${x[@]}\" CMD",
+        "\"$@\"\"$@\" CMD",
+        "{,} CMD",
+        "{,,} CMD",
+        "sudo \"$@\" CMD",
+        "sudo {,} CMD",
+        "$x {,} \"$@\" CMD",
+        "! \"$@\" CMD",
+    ]);
+}
+
+#[test]
+fn empties_across_many_wrappers_are_judged_in_one_pass() {
+    let f = Fixture::new();
+    let e = f.engine();
+    for n in [1, 8, 9, 40, 4000] {
+        let cmd = format!("{}rm -rf /", "$v env ".repeat(n));
+        assert_eq!(
+            deny_pack(&e, &cmd).as_deref(),
+            Some("core.filesystem"),
+            "{n}"
+        );
+    }
+    let cmd = format!("{}{{,}} sudo rm -rf /", "$v sudo ".repeat(9));
+    assert_eq!(deny_pack(&e, &cmd).as_deref(), Some("core.filesystem"));
+}
+
+#[test]
+fn nested_empties_do_not_exhaust_the_budget() {
+    // Each level would judge its substitution once per run of empties.
+    let mut inner = "true".to_string();
+    for _ in 0..8 {
+        inner = format!("{}$({inner}) z", "$v env ".repeat(40));
+    }
+    let cmd = format!("{inner}; rm -rf /");
+    assert!(cmd.len() < 3000);
+    let f = Fixture::new();
+    // About 12 ms in a debug build. An optimized build gets the budget the
+    // hook runs with; the exact work is pinned by a count in `engine.rs`.
+    let budget = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(200)
+    } else {
+        saiifeguard::engine::DEFAULT_BUDGET
+    };
+    let e = f.engine().with_budget(budget);
+    let start = std::time::Instant::now();
+    assert_eq!(deny_pack(&e, &cmd).as_deref(), Some("core.filesystem"));
+    assert!(start.elapsed() < budget);
 }
 
 #[test]
@@ -481,6 +544,27 @@ fn ordinary_lines_with_a_leading_expansion_stay_allowed() {
         "$HOME/bin/tool run",
         "${HOME}/bin/tool run",
         "$x",
+        "\"$@\"",
+        "\"${a[@]}\"",
+        "exec \"$@\"",
+        "cmd \"$@\"",
+        "\"$@\" --verbose",
+        "sudo \"$@\"",
+        "command \"$@\"",
+        "nohup \"$@\" &",
+        "$CMD \"$@\"",
+        // Nothing after the list: `env` wraps it, not a dump of the environment.
+        "env \"$@\"",
+        "env FOO=1 \"$@\"",
+        "env \"$@\" > out.txt",
+        "env $x",
+        "env -i HOME=/home/agent \"${agent_env[@]}\" \"${cmd[@]}\"",
+        "sudo -n -u \"$user\" env -C \"$home\" \"$@\" >\"$work/out\" 2>&1 || code=$?",
+        "set -- \"$@\" extra",
+        "echo {,}",
+        "cp f{,.bak}",
+        "{,} ls",
+        "$! ls",
         "$(date)",
         "`date`",
         "X=$(date)",
