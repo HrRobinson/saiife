@@ -309,8 +309,10 @@ impl Layout {
 
     pub fn daemon_group(&self) -> &'static str {
         match self.platform {
-            Platform::Linux | Platform::Windows => DAEMON_GROUP,
+            Platform::Linux => DAEMON_GROUP,
             Platform::Macos => MACOS_DAEMON_GROUP,
+            // No group of its own: the virtual account is its own principal (W10).
+            Platform::Windows => WIN_DAEMON_ACCOUNT,
         }
     }
 
@@ -1157,5 +1159,8 @@ mod tests {
             ),
             ("_saiife", "_saiife", "_saiifeaudit", "com.saiife.saiifed")
         );
+        // Windows has no daemon group: the virtual account stands for itself.
+        let w = Layout::under_for("/x", Platform::Windows);
+        assert_eq!(w.daemon_group(), WIN_DAEMON_ACCOUNT);
     }
 }

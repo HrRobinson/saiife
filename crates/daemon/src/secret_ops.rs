@@ -813,7 +813,9 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     if !allow.iter().any(|a| a == exe) {
         // Say why when an entry resolves to this file by another path.
         for a in allow {
-            if std::fs::canonicalize(a).is_ok_and(|c| c == exe) {
+            if std::fs::canonicalize(a)
+                .is_ok_and(|c| saiife_system::wintrust::plain_path(&c) == exe)
+            {
                 if let Err(why) = entry_is_canonical(a, exe) {
                     return Err(no(why));
                 }
@@ -821,7 +823,8 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
         }
         return Err(no("the executable is not in run_allow for this secret"));
     }
-    match std::fs::canonicalize(exe) {
+    // `plain_path`: Windows answers `\\?\C:\...`, and a policy says `C:\...`.
+    match std::fs::canonicalize(exe).map(|c| saiife_system::wintrust::plain_path(&c)) {
         Ok(c) if c == exe => {}
         _ => return Err(no("the executable path is not canonical")),
     }
@@ -836,11 +839,21 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     {
         saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
     }
-    // W19's chain check arrives with `run` on Windows (Task 10). Until then no lease.
-    #[cfg(not(unix))]
+    // W19: no writer but the admins, on the file, and no one else who can replace it.
+    #[cfg(windows)]
+    {
+        use saiife_system::host::{Host, RealHost};
+        saiife_system::wintrust::exe_chain(
+            exe,
+            &|p| RealHost.get_sddl(p),
+            saiife_system::wintrust::test_trust_sid().as_deref(),
+        )
+        .map_err(|e| no(&format!("not protected: {e}")))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(no(
-            "run_allow's ownership check is not available on Windows yet",
+            "run_allow's ownership check is not available on this OS",
         ))
     }
 }

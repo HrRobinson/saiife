@@ -534,8 +534,12 @@ fn current_user() -> Option<String> {
     Getent.name_of(rustix::process::getuid().as_raw())
 }
 
-/// `policy show` is locked mode: `main` refuses it on Windows first.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn current_user() -> Option<String> {
+    crate::win_locked::own_account_name()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn current_user() -> Option<String> {
     None
 }
@@ -552,8 +556,26 @@ fn manifest_owner() -> u32 {
     0
 }
 
+/// The directory `policy show` asks about users.
+#[cfg(not(windows))]
+fn own_directory() -> Getent {
+    Getent
+}
+
+#[cfg(windows)]
+fn own_directory() -> saiife_policy::WinDirectory<saiife_policy::FfiAccounts> {
+    saiife_policy::WinDirectory::system()
+}
+
 fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitCode {
     let config = config.unwrap_or_else(|| PathBuf::from(SYSTEM_CONFIG));
+    // On Windows a file that fails the DACL check is not the policy and says nothing about
+    // where one is: only a config that passes (or none) goes further.
+    if let Err(e) = crate::win_locked::check_trusted(&crate::win_locked::system_file_trust, &config)
+    {
+        eprintln!("saiife: {}", crate::text::sanitize(&e));
+        return ExitCode::from(2);
+    }
     // A running daemon knows the policy in force, whatever state the file
     // on disk is in.
     if let Some(code) = show_from_daemon(&config, effective, &user) {
@@ -596,7 +618,7 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
         eprintln!("saiife: cannot tell which user you are; use --user");
         return ExitCode::from(2);
     };
-    let (applied, env) = match applied_for(&cfg, &Getent, &user) {
+    let (applied, env) = match applied_for(&cfg, &own_directory(), &user) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("saiife: {}", crate::text::sanitize(&e.to_string()));
@@ -625,7 +647,7 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
     };
     let eff = effective_policy(&cfg, &packs, project.as_ref(), env.as_deref());
     let hash = policy_hash(&eff);
-    let view = user_view(&cfg, &Getent, &user);
+    let view = user_view(&cfg, &own_directory(), &user);
     print_show(&view, Some(&hash), &env_hashes, effective.then_some(&eff));
     outln!("{DEVELOPER_ENV_NOTE}");
     ExitCode::SUCCESS
@@ -637,23 +659,22 @@ fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitC
 const DEVELOPER_ENV_NOTE: &str = "note: developer mode: this does not reflect the project env; \
 an environment changes connector calls only, its guard packs apply in locked mode";
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn show_from_daemon(_config: &Path, _effective: bool, _user: &Option<String>) -> Option<ExitCode> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn reload(_config: Option<PathBuf>) -> ExitCode {
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-/// `Some` when a daemon answered (or refused); `None` when there is none
-/// to ask. The socket directory and user come from the config when it
-/// loads, else the defaults.
+/// A connection to the daemon, if one answers. The socket directory and user come from the
+/// config when it loads, else the defaults.
 #[cfg(unix)]
-fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Option<ExitCode> {
-    use saiife_ipc::client::{system_uid, Client, ClientError};
+fn daemon_for(config: &Path) -> Option<saiife_ipc::client::Client> {
+    use saiife_ipc::client::{system_uid, Client};
     use std::time::Instant;
     // Where the daemon is: `[daemon]` of the file even when the rest of it
     // is invalid (read as a plain table), else the defaults.
@@ -666,7 +687,22 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
     let name = field("user").map_or(d.user.clone(), str::to_string);
     let dir = field("socket_dir").map_or(d.socket_dir.clone(), PathBuf::from);
     let uid = system_uid(&name)?;
-    let mut c = Client::connect(&dir, uid, Instant::now() + Duration::from_secs(2)).ok()?;
+    Client::connect(&dir, uid, Instant::now() + Duration::from_secs(2)).ok()
+}
+
+/// A connection to the daemon, if one answers: the pipe, whatever the config says.
+#[cfg(windows)]
+fn daemon_for(_config: &Path) -> Option<saiife_ipc::client::Client> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    crate::broker::system_client(Path::new(""), 0, deadline).ok()
+}
+
+/// `Some` when a daemon answered (or refused); `None` when there is none to ask.
+#[cfg(any(unix, windows))]
+fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Option<ExitCode> {
+    use saiife_ipc::client::ClientError;
+    use std::time::Instant;
+    let mut c = daemon_for(config)?;
     let mut args = serde_json::Map::new();
     if let Some(u) = user {
         args.insert("user".into(), u.clone().into());
@@ -709,7 +745,7 @@ fn show_from_daemon(config: &Path, effective: bool, user: &Option<String>) -> Op
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn reload(config: Option<PathBuf>) -> ExitCode {
     use crate::secret_cmd::linux::{call_to, target};
     let t = match target(config.as_deref()) {
@@ -739,7 +775,7 @@ fn reload(config: Option<PathBuf>) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn stop(s: crate::secret_cmd::linux::Stop) -> ExitCode {
     let (code, m) = exit_of(s);
     eprintln!("saiife: {m}");
@@ -749,7 +785,7 @@ fn stop(s: crate::secret_cmd::linux::Stop) -> ExitCode {
 /// The exit code and message for a stop. `Unrecorded` (the reload took
 /// effect but is not on record) is exit 5 like an unreachable daemon, as
 /// in `lockdown_cmd` and `approvals_cmd`: the caller must check.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn exit_of(s: crate::secret_cmd::linux::Stop) -> (u8, String) {
     use crate::secret_cmd::linux::Stop;
     match s {

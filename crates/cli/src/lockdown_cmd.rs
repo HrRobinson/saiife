@@ -37,25 +37,27 @@ pub enum LockdownAction {
     Off,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(_config: Option<PathBuf>, _action: Option<LockdownAction>) -> ExitCode {
     eprintln!("saiife: {}", saiife_system::NOT_SUPPORTED_OS);
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode {
     use crate::secret_cmd::linux::call;
     use serde_json::{json, Map, Value};
 
-    let config = config.unwrap_or_else(|| PathBuf::from("/etc/saiife/config.toml"));
+    let config = config.unwrap_or_else(|| PathBuf::from(crate::paths::DEV_SYSTEM_CONFIG));
     // Prepares a possible re-authentication; when that fails the daemon
     // decides without it and refuses a same-user change (fail closed). On
     // macOS same-user re-authentication is off: nothing is prepared, the
     // daemon still decides (root and `[admin]` pass, an approver is
-    // refused), and the CLI says so first.
-    let mac = cfg!(target_os = "macos");
+    // refused), and the CLI says so first. Windows sends nothing either: W16's password
+    // belongs to approvals, and the daemon refuses a same-user change without it.
+    #[cfg(unix)]
     let reauth = |args: &mut Map<String, Value>, what: &str| {
+        let mac = cfg!(target_os = "macos");
         eprintln!("saiife: {}", reauth_notice(mac, what));
         if mac {
             return None;
@@ -63,6 +65,13 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
         crate::approvals_cmd::prepare_reauth(args)
             .map_err(|e| eprintln!("saiife: warning: {e}"))
             .ok()
+    };
+    #[cfg(windows)]
+    let reauth = |_args: &mut Map<String, Value>, what: &str| -> Option<()> {
+        eprintln!(
+            "saiife: {what}: on Windows only an elevated admin or an [admin] user can do this"
+        );
+        None
     };
     let shown = |a: &Map<String, Value>, key: &str| match a.get(key) {
         Some(Value::Object(l)) => {
@@ -98,7 +107,7 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             // Only turning it on when off, or widening `connectors` to
             // `all`, is free; any other change of an active lockdown may
             // ask for a password (the daemon decides; this only prepares).
-            let active = if rustix::process::geteuid().is_root() {
+            let active = if crate::win_locked::own_is_root() {
                 None
             } else {
                 call(&config, "status", Map::new()).ok().and_then(|a| {
@@ -121,7 +130,7 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
             args.insert("on".into(), json!(false));
             // Root never re-authenticates; anyone else may be asked for a
             // password (Linux), so say first what it is for.
-            let _held = if rustix::process::geteuid().is_root() {
+            let _held = if crate::win_locked::own_is_root() {
                 None
             } else {
                 reauth(&mut args, "turning lockdown off")
@@ -151,7 +160,7 @@ fn reauth_notice(mac: bool, what: &str) -> String {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// The exit code and message for a stop. `Unrecorded` (the change is made
 /// but not on record) is exit 5 like an unreachable daemon, as in
 /// `approvals_cmd`: the caller must check.

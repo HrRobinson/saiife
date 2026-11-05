@@ -12,7 +12,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use saiife_ipc::client::{system_uid, Client, ClientError};
+#[cfg(unix)]
+use saiife_ipc::client::system_uid;
+use saiife_ipc::client::{Client, ClientError};
+use saiife_system::wintrust::Trust;
 
 /// The broker not running (or its socket gone).
 const START_IT: &str = "start it with saiife daemon --user (docs/personal-broker.md)";
@@ -27,6 +30,7 @@ pub(crate) enum Target {
         owner_uid: u32,
     },
     /// The personal broker, as the user's own uid.
+    #[cfg_attr(windows, allow(dead_code))] // `personal` makes none there yet
     Personal {
         config: PathBuf,
         socket_dir: PathBuf,
@@ -54,18 +58,47 @@ pub(crate) fn resolve(
     system_config: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Target, String> {
+    resolve_with(
+        &crate::win_locked::system_file_trust,
+        config_flag,
+        system_config,
+        env,
+    )
+}
+
+/// [`resolve`] with Windows' DACL check given. A system file on a tree that is not ours
+/// was perhaps planted, so it decides nothing: a warning, and on to the broker. On our
+/// tree one that fails is an error, never the broker. A flag names a config to use, so
+/// one that fails is an error wherever it lies.
+fn resolve_with(
+    trust: &dyn Fn(&Path) -> Trust,
+    config_flag: Option<&Path>,
+    system_config: &Path,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Target, String> {
     if let Some(flag) = config_flag {
+        crate::win_locked::check_trusted(trust, flag)?;
         return locked(flag);
     }
+    // `false`: the file says nothing, because it was not checked or is not ours.
+    let believed = |path: &Path| match trust(path) {
+        Trust::Absent | Trust::Trusted => Ok(true),
+        Trust::Damaged(why) => Err(crate::win_locked::not_protected(path, &why)),
+        Trust::NotOurs(why) => {
+            let line = crate::win_locked::not_protected(path, &why);
+            crate::warn(&format!("{}; ignored", crate::text::sanitize(&line)));
+            Ok(false)
+        }
+    };
     // Read as a raw table (as `saiife audit` does): any failure other than
     // "does not exist" is an error, so a locked host never falls back.
-    if crate::audit_locked::locked_audit_dir(system_config)?.is_some() {
+    if believed(system_config)? && crate::audit_locked::locked_audit_dir(system_config)?.is_some() {
         return locked(system_config);
     }
     // Only a marker that is certainly absent lets the broker in: any other
     // failure to look (permission, I/O) is an error.
     let marker = system_config.with_file_name("installed.toml");
-    if installed(&marker)? {
+    if believed(&marker)? && installed(&marker)? {
         return Err(format!(
             "locked mode is installed ({}) but {} does not say locked = true; the personal broker is not used on a locked host",
             marker.display(),
@@ -96,9 +129,7 @@ pub(crate) fn locked(config: &Path) -> Result<Target, String> {
     if !loaded.config.locked {
         return Err(format!("{}: locked is not true", config.display()));
     }
-    let user = &loaded.config.daemon.user;
-    let owner_uid =
-        system_uid(user).ok_or_else(|| format!("the daemon user {user} does not exist"))?;
+    let owner_uid = daemon_owner(&loaded.config.daemon.user)?;
     Ok(Target::Locked {
         config: config.to_path_buf(),
         socket_dir: loaded.config.daemon.socket_dir,
@@ -106,7 +137,53 @@ pub(crate) fn locked(config: &Path) -> Result<Target, String> {
     })
 }
 
+/// Whom the daemon's socket must belong to.
+#[cfg(unix)]
+fn daemon_owner(user: &str) -> Result<u32, String> {
+    system_uid(user).ok_or_else(|| format!("the daemon user {user} does not exist"))
+}
+
+/// On Windows the pipe's owner is the service's SID (W10), whatever the config names.
+#[cfg(windows)]
+fn daemon_owner(_user: &str) -> Result<u32, String> {
+    Ok(0)
+}
+
+/// The system daemon's channel, its owner checked before a byte is sent.
+#[cfg(unix)]
+pub(crate) fn system_client(
+    socket_dir: &Path,
+    owner_uid: u32,
+    deadline: Instant,
+) -> Result<Client, ClientError> {
+    Client::connect(socket_dir, owner_uid, deadline)
+}
+
+/// The system daemon's pipe (W11): the arguments name a socket, which Windows has not.
+/// The owner must be exactly the service's SID, read from the handle that then writes.
+#[cfg(windows)]
+pub(crate) fn system_client(
+    _socket_dir: &Path,
+    _owner_uid: u32,
+    deadline: Instant,
+) -> Result<Client, ClientError> {
+    let (pipe, owner) = crate::win_locked::control_target()
+        .map_err(|e| ClientError::Connect(std::io::Error::other(e)))?;
+    Client::connect_pipe(&pipe, &owner, deadline)
+}
+
+/// The personal broker's target. On Windows it reaches the CLI once `saiife daemon --user`
+/// is there (Task 11); until then this is an error, never the system daemon.
+#[cfg(windows)]
+pub(crate) fn personal(_env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> {
+    Err(
+        "no locked mode is installed here, and the personal broker is not available on Windows yet"
+            .into(),
+    )
+}
+
 /// The personal broker's target from the environment (the XDG paths).
+#[cfg(unix)]
 pub(crate) fn personal(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> {
     let home = env("HOME").map(PathBuf::from);
     let p = saiife_system::personal::personal_paths(env, home.as_deref())?;
@@ -117,6 +194,7 @@ pub(crate) fn personal(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target,
     })
 }
 
+#[cfg(unix)]
 fn owner_err(path: &Path, detail: impl Into<String>) -> ClientError {
     ClientError::Owner {
         path: path.to_path_buf(),
@@ -143,10 +221,16 @@ pub(crate) fn connect(t: &Target, deadline: Instant) -> Result<Client, ClientErr
             owner_uid,
             ..
         } => hello_mode(
-            Client::connect(socket_dir, *owner_uid, deadline)?,
+            system_client(socket_dir, *owner_uid, deadline)?,
             "locked",
             "not the locked-mode daemon",
         ),
+        // `personal` makes no such target on Windows yet.
+        #[cfg(windows)]
+        Target::Personal { .. } => {
+            Err(ClientError::Connect(std::io::ErrorKind::Unsupported.into()))
+        }
+        #[cfg(unix)]
         Target::Personal {
             socket_dir,
             owner_uid,
@@ -221,7 +305,8 @@ fn system_config() -> PathBuf {
     PathBuf::from(crate::audit_locked::SYSTEM_CONFIG)
 }
 
-#[cfg(test)]
+// Real uids, unix modes and the XDG paths.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -330,6 +415,60 @@ mod tests {
             "{e}"
         );
         assert_eq!(installed(&w.root.join("absent.toml")), Ok(false));
+    }
+
+    /// A planted `locked = true` on a tree that is not ours switches nothing, and nor does
+    /// a planted install record: this is a host without locked mode.
+    #[test]
+    fn a_planted_system_file_decides_nothing() {
+        let w = World::new();
+        let etc = w.etc();
+        fs::write(&etc, w.locked_text(&own_user())).unwrap();
+        fs::write(etc.with_file_name("installed.toml"), "").unwrap();
+        let planted = |_: &Path| Trust::NotOurs("owned by me".into());
+        let t = resolve_with(&planted, None, &etc, &w.env()).unwrap();
+        assert_eq!(t, w.personal());
+    }
+
+    /// On our tree a file that fails is no way out to the broker.
+    #[test]
+    fn a_damaged_system_file_is_an_error() {
+        let w = World::new();
+        let etc = w.etc();
+        fs::write(&etc, "version = 2\n").unwrap();
+        let marker = etc.with_file_name("installed.toml");
+        let damaged = |_: &Path| Trust::Damaged("users may write".into());
+        let e = resolve_with(&damaged, None, &etc, &w.env()).unwrap_err();
+        assert!(e.contains("users may write"), "{e}");
+        // The record alone fails too.
+        fs::write(&marker, "").unwrap();
+        let record_only = |p: &Path| {
+            if p == marker {
+                Trust::Damaged("loose".into())
+            } else {
+                Trust::Trusted
+            }
+        };
+        let e = resolve_with(&record_only, None, &etc, &w.env()).unwrap_err();
+        assert!(e.contains("loose"), "{e}");
+    }
+
+    /// A flag names a config: one that fails the check never reaches a daemon.
+    #[test]
+    fn a_flag_must_pass_the_check_too() {
+        let w = World::new();
+        let cfg = w.root.join("flag.toml");
+        fs::write(&cfg, w.locked_text(&own_user())).unwrap();
+        for bad in [Trust::NotOurs("a".into()), Trust::Damaged("b".into())] {
+            let e = resolve_with(
+                &|_: &Path| bad.clone(),
+                Some(&cfg),
+                &w.root.join("absent.toml"),
+                &w.env(),
+            )
+            .unwrap_err();
+            assert!(e.contains("flag.toml"), "{e}");
+        }
     }
 
     #[test]

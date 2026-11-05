@@ -50,7 +50,7 @@ pub struct McpArgs {
     pub system_config: Option<PathBuf>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(a: McpArgs) -> ExitCode {
     let McpArgs {
         wait: _,
@@ -60,12 +60,12 @@ pub fn run(a: McpArgs) -> ExitCode {
     ExitCode::from(5)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(a: McpArgs) -> ExitCode {
     linux::run(a)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod linux {
     use super::McpArgs;
     use crate::api_cmd::linux::{self as api, Daemon, Stop};
@@ -1412,6 +1412,7 @@ mod linux {
             assert!(m.starts_with("SAIIFE_MCP_WAIT: "), "{m}");
             // A bad env value is not read when the flag is given.
             assert!(ok(wait_setting(Some("1s"), env("soon"))).is_some());
+            #[cfg(unix)]
             {
                 use std::os::unix::ffi::OsStringExt;
                 let bad = Some(std::ffi::OsString::from_vec(vec![0xff]));

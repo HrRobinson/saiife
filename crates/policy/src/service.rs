@@ -265,6 +265,20 @@ const INTERPRETERS: &[&str] = &[
     "gdb",
     "make",
     "coreutils",
+    // Windows: shells, script hosts and what loads code it is given (W19).
+    "cmd",
+    "powershell",
+    "powershell_ise",
+    "wscript",
+    "cscript",
+    "mshta",
+    "rundll32",
+    "regsvr32",
+    "msbuild",
+    "installutil",
+    "regasm",
+    "regsvcs",
+    "forfiles",
 ];
 
 /// True when `path` names an interpreter or shell (by basename).
@@ -274,9 +288,11 @@ pub fn is_interpreter(path: &Path) -> bool {
     };
     // Lowercase, and a version suffix (digits and dots) does not help:
     // `python2`, `ruby3.2`, `perl5.36`, `lua5.4`, `php8.2`, `python3.12`.
+    // `.exe` does not help either: the same name on Windows, in any case.
     let lower = name.to_ascii_lowercase();
+    let lower = lower.strip_suffix(".exe").unwrap_or(&lower);
     let base = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    INTERPRETERS.contains(&lower.as_str())
+    INTERPRETERS.contains(&lower)
         || INTERPRETERS.contains(&base)
         || lower.starts_with("perl-")
         || lower.starts_with("python-")

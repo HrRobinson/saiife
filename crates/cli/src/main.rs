@@ -30,17 +30,15 @@ mod api_cmd;
 mod approvals_cmd;
 mod audit_cmd;
 mod audit_locked;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod broker;
 mod check;
 mod check_managed;
-// Used by `saiife api collection`, which needs Linux or macOS.
-#[cfg_attr(not(unix), allow(dead_code))]
 mod collection;
 mod connect_cmd;
 #[cfg(unix)]
 mod doctor_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod env_cmd;
 mod eval;
 #[cfg(debug_assertions)]
@@ -62,12 +60,12 @@ mod report;
 mod report_html;
 mod run_cmd;
 mod secret_cmd;
-#[cfg_attr(not(unix), allow(dead_code, unused_imports))] // the locked block is unix-only
 mod status_cmd;
 #[cfg(unix)]
 mod system_cmd;
 mod system_view;
 mod text;
+mod win_locked;
 
 use saiifeguard::builtins::builtin_packs;
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
@@ -369,19 +367,12 @@ enum Cmd {
     },
     /// Environments (`[environments.<name>]`): list them, or choose the
     /// one that applies (locked mode: root rebinds a scope).
-    #[cfg(unix)]
     Env {
         /// The system config (default /etc/saiife/config.toml).
         #[arg(long = "system-config", hide = true, global = true)]
         system_config: Option<std::path::PathBuf>,
         #[command(subcommand)]
         action: env_cmd::EnvAction,
-    },
-    /// Locked mode (not on Windows until plan 19b): environments.
-    #[cfg(windows)]
-    Env {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
     /// Locked mode on Linux: install or uninstall the system setup (root).
     #[cfg(unix)]
@@ -414,82 +405,72 @@ enum AuditAction {
     },
 }
 
-/// What a locked-mode subcommand prints and exits 2 with on Windows, until
-/// plan 19b brings locked mode there. Developer mode (`init`, `status`,
-/// `check`, `test`, `explain`, `packs`, `audit`) works.
+/// What Windows still cannot do, as the spec's refusal says it. `None`: the command runs.
 #[cfg(windows)]
-pub const LOCKED_ON_WINDOWS_LATER: &str =
-    "saiife: locked mode on Windows arrives in plan 19b. Developer mode works.";
-
-/// The subcommands (and flags) that need locked mode or the personal broker,
-/// neither of which exists on Windows yet.
-#[cfg(windows)]
-fn locked_only(cmd: &Cmd) -> bool {
+fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
+    /// W18: no sandbox for a gateway's children.
+    const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
+    /// A command the rest of plan 19b brings: it is not ported in this build.
+    const NOT_YET: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
     match cmd {
-        Cmd::Check { managed, event, .. } => *managed || event.is_some(),
-        Cmd::Audit {
-            action,
-            broker,
-            system_config,
-            kind,
-            service,
-            ..
-        } => {
-            *broker
-                || system_config.is_some()
-                || kind.is_some()
-                || service.is_some()
-                || matches!(action, Some(AuditAction::Verify { broker: true, .. }))
-                || matches!(
-                    action,
-                    Some(AuditAction::Verify {
-                        system_config: Some(_),
-                        ..
-                    })
-                )
-        }
-        Cmd::Policy { action, .. } => matches!(
-            action,
-            policy_cmd::PolicyAction::Show { .. } | policy_cmd::PolicyAction::Reload
-        ),
+        Cmd::McpSpawn => Some(NO_GATEWAY),
+        // The personal broker: its daemon, keys and log.
+        Cmd::Audit { action, broker, .. } => (*broker
+            || matches!(action, Some(AuditAction::Verify { broker: true, .. })))
+        .then_some(NOT_YET),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
-        Cmd::Daemon { .. } => false,
-        Cmd::Doctor { .. }
+        Cmd::Daemon { .. } => None,
+        // Install, doctor and re-authentication.
+        Cmd::System { .. }
+        | Cmd::Doctor { .. }
+        | Cmd::Approvals { .. }
+        | Cmd::Approve { .. }
+        | Cmd::Reject { .. } => Some(NOT_YET),
+        // No wildcard: a new subcommand must be put on one side or the other here, or this
+        // does not compile.
+        Cmd::Check { .. }
         | Cmd::Eval
-        | Cmd::McpSpawn
         | Cmd::Secret { .. }
         | Cmd::Connect(..)
         | Cmd::Run { .. }
         | Cmd::Api(_)
         | Cmd::Mcp(_)
-        | Cmd::Approvals { .. }
-        | Cmd::Approve { .. }
-        | Cmd::Reject { .. }
         | Cmd::Lockdown { .. }
         | Cmd::Env { .. }
-        | Cmd::System { .. } => true,
-        // Developer mode. No wildcard: a new subcommand must be put on one
-        // side or the other here, or this does not compile.
-        Cmd::Test { .. }
+        | Cmd::Policy { .. }
+        | Cmd::Test { .. }
         | Cmd::Explain { .. }
         | Cmd::Init { .. }
         | Cmd::Status { .. }
-        | Cmd::Packs { .. } => false,
+        | Cmd::Packs { .. } => None,
         #[cfg(debug_assertions)]
-        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => false,
+        Cmd::FakeMcpServer(_) | Cmd::ReadSegments { .. } => None,
     }
 }
 
 fn main() -> ExitCode {
+    // W28: first thing, before anything can load a DLL. The hook denies without it; any
+    // other command says so and goes on.
+    #[cfg(windows)]
+    let dll_problem = saiife_win::ffi::process::harden_dll_search().err();
+    #[cfg(not(windows))]
+    let dll_problem: Option<std::io::Error> = None;
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => return arg_error(e),
     };
 
     #[cfg(windows)]
-    if locked_only(&cli.command) {
-        eprintln!("{LOCKED_ON_WINDOWS_LATER}");
+    if let Some(line) = windows_refusal(&cli.command) {
+        eprintln!("{line}");
         return ExitCode::from(2);
+    }
+    if let Some(e) = &dll_problem {
+        let managed_hook = matches!(&cli.command, Cmd::Check { managed: true, .. });
+        if !managed_hook {
+            warn(&format!("cannot restrict the DLL search: {e}"));
+        }
     }
 
     // Hook mode compiles only the packs it needs (it runs on every agent
@@ -506,6 +487,10 @@ fn main() -> ExitCode {
             let config = system_config
                 .as_deref()
                 .unwrap_or(std::path::Path::new(check_managed::SYSTEM_CONFIG));
+            if let Some(e) = dll_problem {
+                let why = format!("cannot restrict the DLL search: {e}");
+                return check_managed::run_denied(agent, config, event.as_deref(), why);
+            }
             return check_managed::run(agent, config, event.as_deref());
         }
         return check::run(&cli.packs, *hook_exit, agent, system_config.as_deref());
@@ -666,7 +651,6 @@ fn main() -> ExitCode {
     {
         return policy_cmd::run(system_config, action);
     }
-    #[cfg(unix)]
     if let Cmd::Env {
         system_config,
         action,
@@ -836,10 +820,6 @@ mod win_daemon {
     }
 
     pub fn run(paths: Paths) -> ExitCode {
-        // W28; Task 10 moves this to the top of `main`.
-        if let Err(e) = saiife_win::ffi::process::harden_dll_search() {
-            eprintln!("saiife: warning: cannot restrict the DLL search: {e}");
-        }
         *PATHS.lock().unwrap_or_else(|p| p.into_inner()) = Some(paths);
         match run_as_service(saiife_system::layout::WIN_SERVICE, service_main) {
             Ok(()) => ExitCode::SUCCESS,

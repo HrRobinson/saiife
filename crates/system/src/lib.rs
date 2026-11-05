@@ -51,6 +51,7 @@ pub mod unit;
 pub mod user_unit;
 pub mod winacl;
 pub mod winservice;
+pub mod wintrust;
 
 #[cfg(any(unix, windows))]
 pub use host::{

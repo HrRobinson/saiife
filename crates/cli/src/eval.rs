@@ -672,12 +672,18 @@ pub fn claude_pin_ok(path: &std::path::Path, owner: u32) -> bool {
     saiife_agents::claude::managed_mcp_pinned(&text)
 }
 
-/// Windows has no root-owned drop-in until plan 19b (spec 5.3a), so the pin
-/// can never be confirmed: any doubt is `false`, never a pass.
-#[cfg(not(unix))]
-#[allow(dead_code)]
-pub fn claude_pin_ok(_path: &std::path::Path, _owner: u32) -> bool {
-    false
+/// [`claude_pin_ok`] on Windows: the file's descriptors stand in for the owner and the
+/// mode. Any doubt is `false`.
+#[cfg(windows)]
+pub fn claude_pin_ok(path: &std::path::Path, _owner: u32) -> bool {
+    use saiife_system::wintrust::Trust;
+    if crate::win_locked::system_file_trust(path) != Trust::Trusted {
+        return false;
+    }
+    let Ok(Some(bytes)) = crate::system_view::read_regular(path, false, 1 << 20) else {
+        return false;
+    };
+    String::from_utf8(bytes).is_ok_and(|t| saiife_agents::claude::managed_mcp_pinned(&t))
 }
 
 /// The MCP server identity a payload states (Gemini CLI's `mcp_context`).

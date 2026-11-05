@@ -12,6 +12,7 @@ use saiifeguard::Pack;
 
 use saiife_policy::installed::read_installed;
 use saiife_system::layout::INSTALLED;
+use saiife_system::wintrust::Trust;
 use saiife_system::Layout;
 
 use crate::project::project_root;
@@ -22,22 +23,41 @@ use crate::project::project_root;
 /// whose lock does not hold still gets a project hook. An unreadable record
 /// is locked mode with no agent known to be managed.
 fn locked_mode(system_root: Option<PathBuf>) -> Option<Vec<String>> {
-    locked_mode_on(cfg!(windows), system_root)
+    locked_mode_with(&crate::win_locked::system_file_trust, system_root)
 }
 
-/// [`locked_mode`] with the OS given. On Windows there is no locked mode
-/// before plan 19b, and `\etc\saiife\installed.toml` on the current drive
-/// is not root-owned: a planted file must not make `init` skip the project
-/// hook. Plan 19b reads the record again behind a DACL check.
-fn locked_mode_on(windows: bool, system_root: Option<PathBuf>) -> Option<Vec<String>> {
-    if windows {
-        return None;
-    }
+/// [`locked_mode`] with Windows' DACL check given. ProgramData is not root-owned, so a
+/// planted record must not make `init` skip the project hook. On a tree that is not ours
+/// the record is ignored: developer mode, with a warning. On our tree one that fails is
+/// locked mode with no agent known to be managed, as an unreadable record is. In both
+/// every agent gets a project hook.
+fn locked_mode_with(
+    trust: &dyn Fn(&Path) -> Trust,
+    system_root: Option<PathBuf>,
+) -> Option<Vec<String>> {
     let layout = system_root
         .map(Layout::under)
         .unwrap_or_else(Layout::system);
     let path = layout.at(INSTALLED);
     std::fs::symlink_metadata(&path).ok()?;
+    let warn_ignored = |why: &str| {
+        let line = crate::win_locked::not_protected(&path, why);
+        crate::warn(&format!(
+            "{}; every agent gets a project hook",
+            crate::text::sanitize(&line)
+        ));
+    };
+    match trust(&path) {
+        Trust::Absent | Trust::Trusted => {}
+        Trust::NotOurs(why) => {
+            warn_ignored(&why);
+            return None;
+        }
+        Trust::Damaged(why) => {
+            warn_ignored(&why);
+            return Some(Vec::new());
+        }
+    }
     match read_installed(&path) {
         Ok(i) => Some(
             i.map(|i| {
@@ -555,18 +575,26 @@ fn describe(change: &Change, updated: &str, unchanged: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::locked_mode_on;
+    use super::{locked_mode_with, Trust};
+    use std::path::Path;
 
-    /// A planted install record makes `init` skip the project hook on Unix
-    /// (locked mode); on Windows it must not (no locked mode before 19b).
+    /// A record that lists an agent, which would make `init` skip its project hook.
+    const LISTED: &str = "[[agents]]\nagent = \"claude\"\nsha256 = \"ab\"\n";
+
+    /// What the DACL check says decides, before the record is read.
     #[test]
-    fn a_planted_installed_toml_cannot_silence_init_on_windows() {
+    fn a_planted_installed_toml_cannot_silence_init() {
         let root = tempfile::tempdir().unwrap();
         // The layout's own spelling: a test on Windows has the Windows tree.
         let installed = saiife_system::Layout::under(root.path()).at(super::INSTALLED);
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, LISTED).unwrap();
+        let on = || Some(root.path().to_path_buf());
+        let with = |t: Trust| locked_mode_with(&move |_: &Path| t.clone(), on());
+        assert_eq!(with(Trust::NotOurs("owned by me".into())), None);
+        assert_eq!(with(Trust::Damaged("loose".into())), Some(Vec::new()));
+        // A record that is trusted but unreadable is locked mode with no agent, as ever.
         std::fs::write(&installed, "not toml [").unwrap();
-        assert!(locked_mode_on(false, Some(root.path().into())).is_some());
-        assert_eq!(locked_mode_on(true, Some(root.path().into())), None);
+        assert_eq!(with(Trust::Trusted), Some(Vec::new()));
     }
 }

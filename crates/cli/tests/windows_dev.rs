@@ -1,4 +1,4 @@
-//! Windows (plan 19a): locked mode is refused with one line and exit 2, and
+//! Windows: what is not ported yet is refused with one line and exit 2, and
 //! developer mode works. Compiled and run on `windows-latest` only; Linux and
 //! macOS never see this file.
 //!
@@ -13,7 +13,11 @@ use predicates::prelude::*;
 use predicates::str::contains;
 use std::path::Path;
 
-const REFUSAL: &str = "saiife: locked mode on Windows arrives in plan 19b. Developer mode works.";
+/// The spec's refusal, for what the rest of plan 19b brings. Each task that ports a
+/// command takes its line out of [`locked_commands_refuse_on_windows`].
+const REFUSAL: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
+/// W18.
+const NO_GATEWAY: &str = "saiife: locked mode is not supported here: the MCP gateway needs Linux. Developer mode works as before.";
 
 fn saiife(home: &Path) -> Command {
     let mut c = Command::cargo_bin("saiife").unwrap();
@@ -87,23 +91,8 @@ fn locked_commands_refuse_on_windows() {
         &["approve", "1"],
         &["reject", "1"],
         &["approvals"],
-        &["secret", "list"],
-        &["connect", "svc"],
-        &["api", "--list"],
-        &["mcp"],
-        &["run", "--secret", "x", "--", "cmd"],
         &["doctor"],
-        &["env", "list"],
-        &["lockdown"],
-        &["policy", "show"],
-        &["policy", "reload"],
-        &["check", "--managed"],
-        &["__eval"],
-        &["__mcp-spawn"],
         &["audit", "--broker"],
-        &["audit", "--kind", "guard"],
-        &["audit", "--service", "x"],
-        &["audit", "--system-config", "x.toml"],
         &["audit", "verify", "--broker"],
     ];
     for args in cases {
@@ -113,6 +102,77 @@ fn locked_commands_refuse_on_windows() {
             .code(2)
             .stderr(contains(REFUSAL));
     }
+    // W18 stays: no sandbox for a gateway's children.
+    saiife(home.path())
+        .args(["__mcp-spawn"])
+        .assert()
+        .code(2)
+        .stderr(contains(NO_GATEWAY));
+}
+
+/// A client on a host with no install says it cannot reach a daemon or names the missing
+/// broker. Neither is the old blanket refusal, and neither sends anything anywhere.
+#[test]
+fn locked_clients_no_longer_refuse_outright() {
+    let home = tempfile::tempdir().unwrap();
+    let cases: &[&[&str]] = &[
+        &["secret", "list"],
+        &["connect", "svc"],
+        &["api", "--list"],
+        &["run", "--secret", "x", "--", "cmd"],
+        &["lockdown"],
+        &["policy", "reload"],
+    ];
+    for args in cases {
+        let out = saiife(home.path()).args(*args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!text.contains(REFUSAL), "{args:?}: {text}");
+    }
+}
+
+/// `check --managed` denies when the policy cannot be loaded: the first thing a missing
+/// install gets, with no daemon to tell.
+#[test]
+fn managed_hook_denies_without_an_install() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("absent.toml");
+    saiife(home.path())
+        .args(["check", "--managed", "--hook-exit", "--agent", "claude"])
+        .arg("--system-config")
+        .arg(&missing)
+        .write_stdin(r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#)
+        .assert()
+        .code(2)
+        .stderr(contains("BLOCKED (fail closed)"));
+}
+
+/// `--managed` with a flag this binary does not know is denied too.
+#[test]
+fn managed_hook_denies_on_bad_arguments() {
+    let home = tempfile::tempdir().unwrap();
+    saiife(home.path())
+        .args(["check", "--managed", "--no-such-flag"])
+        .write_stdin("{}")
+        .assert()
+        .code(2)
+        .stderr(contains("BLOCKED (fail closed)"));
+}
+
+/// The worker runs on Windows: a plain `__eval` answers its request.
+#[test]
+fn the_worker_runs() {
+    let home = tempfile::tempdir().unwrap();
+    let out = saiife(home.path())
+        .arg("__eval")
+        .write_stdin(
+            r#"{"payload":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git status\"}}","packs":[],"budget_ms":50}"#,
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("\"verdict\""), "{text}");
 }
 
 #[test]
