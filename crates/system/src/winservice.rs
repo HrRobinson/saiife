@@ -6,12 +6,13 @@ use crate::layout::{
     Layout, Platform, BINARY, WIN_DAEMON_ACCOUNT, WIN_SERVICE, WIN_SERVICE_DISPLAY,
     WIN_SERVICE_SDDL,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// When the service starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StartKind {
     /// `SERVICE_AUTO_START`.
     Auto,
@@ -32,7 +33,7 @@ impl StartKind {
 }
 
 /// The service SID type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidType {
     None,
     /// `SERVICE_SID_TYPE_UNRESTRICTED`: the service SID is added to the token.
@@ -52,7 +53,7 @@ impl SidType {
 
 /// What the service manager does when the service fails: the analogue of
 /// `Restart=always`, `RestartSec=1`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailurePolicy {
     /// Restart after this delay, `restarts` times.
     pub restart_delay: Duration,
@@ -65,7 +66,7 @@ pub struct FailurePolicy {
 }
 
 /// Everything `Create`/`Update` needs to set up the service.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceSpec {
     pub name: String,
     pub display: String,
@@ -214,6 +215,21 @@ mod tests {
             ServiceSpec::saiifed(&sys).binary,
             Path::new(windows_path(BINARY).unwrap())
         );
+    }
+
+    /// Task 8's `daemon.unit` compares this parsed: the service rights print as the
+    /// directory-service letters, and `SU` is in the aliases.
+    #[test]
+    fn service_sddl_parses() {
+        let sd = saiife_win::sddl::parse(crate::layout::WIN_SERVICE_SDDL).unwrap();
+        assert_eq!(sd.aces.len(), 5);
+        assert!(sd.aces.iter().all(|a| a.allow));
+        assert_eq!(sd.aces[3].sid, "S-1-5-6");
+        // CCLCSWRPWPDTLOCRRC, CCDCLCSWRPWPDTLOCRSDRCWDWO, CCLCSWLOCRRC, CCLCSWLORC.
+        assert_eq!(sd.aces[0].mask, 0x0002_01fd);
+        assert_eq!(sd.aces[1].mask, 0x000f_01ff);
+        assert_eq!(sd.aces[2].mask, 0x0002_018d);
+        assert_eq!(sd.aces[4].mask, 0x0002_008d);
     }
 
     #[test]

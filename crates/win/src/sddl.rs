@@ -30,6 +30,79 @@ pub struct AceFlags {
     pub inherited: bool,
 }
 
+/// `APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES`, alias `AC`.
+pub const ALL_APP_PACKAGES: &str = "S-1-15-2-1";
+
+/// Every SID alias [`parse`] reads, with its SID. A Windows CI test checks each
+/// against Windows' own reading (`sid_aliases_match_windows`).
+pub const SID_ALIASES: &[(&str, &str)] = &[
+    ("SY", sid::SYSTEM),
+    ("BA", sid::ADMINISTRATORS),
+    ("BU", sid::USERS),
+    ("AU", sid::AUTHENTICATED_USERS),
+    ("WD", "S-1-1-0"),
+    ("OW", "S-1-3-4"),
+    ("CO", "S-1-3-0"),
+    ("CG", "S-1-3-1"),
+    ("NU", sid::NETWORK),
+    ("IU", "S-1-5-4"),
+    ("SU", "S-1-5-6"),
+    ("AN", "S-1-5-7"),
+    ("ED", "S-1-5-9"),
+    ("PS", "S-1-5-10"),
+    ("RC", "S-1-5-12"),
+    ("LS", "S-1-5-19"),
+    ("NS", "S-1-5-20"),
+    ("WR", "S-1-5-33"),
+    ("AC", ALL_APP_PACKAGES),
+    ("BG", "S-1-5-32-546"),
+    ("PU", "S-1-5-32-547"),
+    ("AO", "S-1-5-32-548"),
+    ("SO", "S-1-5-32-549"),
+    ("PO", "S-1-5-32-550"),
+    ("BO", "S-1-5-32-551"),
+    ("RE", "S-1-5-32-552"),
+    ("RU", "S-1-5-32-554"),
+    ("RD", "S-1-5-32-555"),
+    ("NO", "S-1-5-32-556"),
+    ("MU", "S-1-5-32-558"),
+    ("LU", "S-1-5-32-559"),
+    ("IS", "S-1-5-32-568"),
+    ("CY", "S-1-5-32-569"),
+    ("ER", "S-1-5-32-573"),
+    ("HA", "S-1-5-32-578"),
+    ("AA", "S-1-5-32-579"),
+];
+
+/// Every rights letter pair [`parse`] reads, with its bits (`ADS_RIGHT_*` for the
+/// first nine). They are named after directory-service rights, but Windows prints
+/// file rights with the same letters, and on a file the names mislead: read them by
+/// bit, as the comments do. A Windows CI test checks each against Windows' reading
+/// (`right_letters_match_windows`).
+pub const RIGHT_LETTERS: &[(&str, u32)] = &[
+    ("CC", 0x0000_0001), // FILE_READ_DATA, FILE_LIST_DIRECTORY
+    ("DC", 0x0000_0002), // FILE_WRITE_DATA, FILE_ADD_FILE
+    ("LC", 0x0000_0004), // FILE_APPEND_DATA, FILE_ADD_SUBDIRECTORY
+    ("SW", 0x0000_0008), // FILE_READ_EA
+    ("RP", 0x0000_0010), // FILE_WRITE_EA
+    ("WP", 0x0000_0020), // FILE_EXECUTE, FILE_TRAVERSE
+    ("DT", 0x0000_0040), // FILE_DELETE_CHILD
+    ("LO", 0x0000_0080), // FILE_READ_ATTRIBUTES
+    ("CR", 0x0000_0100), // FILE_WRITE_ATTRIBUTES
+    ("SD", 0x0001_0000),
+    ("RC", 0x0002_0000),
+    ("WD", 0x0004_0000),
+    ("WO", 0x0008_0000),
+    ("GA", 0x1000_0000),
+    ("GX", 0x2000_0000),
+    ("GW", 0x4000_0000),
+    ("GR", 0x8000_0000),
+    ("FA", 0x001f_01ff),
+    ("FR", 0x0012_0089),
+    ("FW", 0x0012_0116),
+    ("FX", 0x0012_00a0),
+];
+
 /// Every right that lets a holder change a file or its protection.
 pub const WRITE_LIKE: u32 = 0x0000_0002 // FILE_WRITE_DATA
     | 0x0000_0004 // FILE_APPEND_DATA
@@ -49,6 +122,18 @@ pub const WRITE_LIKE: u32 = 0x0000_0002 // FILE_WRITE_DATA
 /// [`writers`] must not call the first two "no writers". The `AI` and `AR`
 /// DACL flags are accepted and not kept. Anything else is an error, never a
 /// guess: SACLs, other ACE types and flags, object ACEs, whitespace.
+///
+/// Refused on purpose, since a refusal fails an install and a misread is a hole:
+/// - `S:`: `ffi::acl::get_sddl` never asks for a SACL, so real output has none;
+/// - the `SA` and `FA` ACE flags: audit flags, which belong to SACL ACEs;
+/// - the `NP` ACE flag: [`AceFlags`] has no field for it, and I know of no default
+///   ACL above ours that carries it. It changes only what children inherit, so a
+///   folder carrying it is refused, not misjudged;
+/// - the `TP` and `CR` ACE flags, and every ACE type but `A` and `D`;
+/// - the registry rights `KA`, `KR`, `KW`, `KX` and the label rights `NR`, `NW`,
+///   `NX`: not file rights;
+/// - domain-relative aliases such as `LA` and `DU`, and integrity labels such
+///   as `ME`: their SID is not known from the text alone.
 pub fn parse(s: &str) -> Result<Sd, String> {
     if !s.is_ascii() {
         return Err("SDDL is not ASCII".to_string());
@@ -168,41 +253,37 @@ fn parse_rights(text: &str) -> Result<u32, String> {
     }
     let mut mask = 0;
     for letters in pairs(text)? {
-        mask |= match letters {
-            "GA" => 0x1000_0000,
-            "GR" => 0x8000_0000,
-            "GW" => 0x4000_0000,
-            "GX" => 0x2000_0000,
-            "FA" => 0x001f_01ff,
-            "FR" => 0x0012_0089,
-            "FW" => 0x0012_0116,
-            "FX" => 0x0012_00a0,
-            "RC" => 0x0002_0000,
-            "SD" => 0x0001_0000,
-            "WD" => 0x0004_0000,
-            "WO" => 0x0008_0000,
-            _ => return Err(format!("unknown ACE right {letters:?}")),
-        };
+        let (_, bits) = RIGHT_LETTERS
+            .iter()
+            .find(|(l, _)| *l == letters)
+            .ok_or_else(|| format!("unknown ACE right {letters:?}"))?;
+        mask |= bits;
     }
     Ok(mask)
 }
 
 fn parse_sid(text: &str) -> Result<String, String> {
-    let sid = match text {
-        "SY" => sid::SYSTEM,
-        "BA" => sid::ADMINISTRATORS,
-        "BU" => sid::USERS,
-        "AU" => sid::AUTHENTICATED_USERS,
-        "WD" => "S-1-1-0",
-        "OW" => "S-1-3-4",
-        "CO" => "S-1-3-0",
-        "NU" => sid::NETWORK,
-        "IU" => "S-1-5-4",
-        "AN" => "S-1-5-7",
-        _ if sid::valid_sid(text) => text,
-        _ => return Err(format!("unknown SID or alias {text:?}")),
-    };
-    Ok(sid.to_string())
+    if let Some((_, sid)) = SID_ALIASES.iter().find(|(alias, _)| *alias == text) {
+        return Ok((*sid).to_string());
+    }
+    if sid::valid_sid(text) {
+        return Ok(text.to_string());
+    }
+    Err(format!("unknown SID or alias {text:?}"))
+}
+
+/// Parses a descriptor about to be applied to a file: it must name an owner and
+/// have a protected DACL (`D:P`). So no ACL reaches disk that would inherit from
+/// its parent, and a NULL DACL never gets as far as the FFI.
+pub fn check_settable(s: &str) -> Result<Sd, String> {
+    let sd = parse(s)?;
+    if sd.owner.is_none() {
+        return Err(format!("{s:?} names no owner"));
+    }
+    if !sd.dacl_protected {
+        return Err(format!("{s:?} has no protected DACL"));
+    }
+    Ok(sd)
 }
 
 /// Canonical text: hex rights and full SIDs. `D:` is always there, and the
@@ -336,6 +417,91 @@ mod tests {
     }
 
     #[test]
+    fn sddl_alias_table_expands_and_is_complete() {
+        for (alias, sid) in SID_ALIASES {
+            assert_eq!(sole_ace(&format!("D:(A;;FA;;;{alias})")).sid, *sid);
+            assert!(crate::sid::valid_sid(sid), "{sid}");
+        }
+        assert_eq!(sole_ace("D:(A;;FA;;;AC)").sid, "S-1-15-2-1");
+        assert_eq!(sole_ace("D:(A;;FA;;;SU)").sid, "S-1-5-6");
+    }
+
+    /// Microsoft's ACE Strings page: this text is mask 0x100e003f.
+    #[test]
+    fn rights_match_the_documented_example() {
+        assert_eq!(
+            sole_ace("D:(A;;RPWPCCDCLCSWRCWDWOGA;;;S-1-1-0)").mask,
+            0x100e_003f
+        );
+    }
+
+    /// The directory-service letters, on a file. A misread here under-reports
+    /// writers: `RP` writes EAs, `CR` writes attributes, `DT` deletes children,
+    /// `DC` and `LC` add entries. `WP`, `SW`, `CC` and `LO` only read or traverse,
+    /// whatever their names say.
+    #[test]
+    fn letters_mean_their_file_bits() {
+        for (letters, mask, writes) in [
+            ("CC", 0x1, false),
+            ("DC", 0x2, true),
+            ("LC", 0x4, true),
+            ("SW", 0x8, false),
+            ("RP", 0x10, true),
+            ("WP", 0x20, false),
+            ("DT", 0x40, true),
+            ("LO", 0x80, false),
+            ("CR", 0x100, true),
+        ] {
+            let sd = parse(&format!("D:(A;;{letters};;;BU)")).unwrap();
+            assert_eq!(sd.aces[0].mask, mask, "{letters}");
+            assert_eq!(writers(&sd).contains(USERS), writes, "{letters}");
+        }
+        // C:\ProgramData's grant to Users, as Windows prints it.
+        assert_eq!(sole_ace("D:(A;CI;DCLCRPCR;;;BU)").mask, 0x116);
+    }
+
+    /// These shapes come from memory of default Windows ACLs, not from a machine.
+    /// The Windows CI test `real_folders_parse` reads the real ones.
+    #[test]
+    fn default_folder_shapes_parse() {
+        let ti = crate::sid::TRUSTED_INSTALLER;
+        for s in [
+            // C:\
+            "O:SYG:SYD:AI(A;OICIIO;SDGXGWGR;;;AU)(A;;LC;;;AU)(A;OICI;FA;;;SY)\
+             (A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
+            // C:\ProgramData
+            "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)\
+             (A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)",
+            // C:\Program Files and C:\Windows
+            &format!(
+                "O:{ti}G:{ti}D:PAI(A;OICIIO;GA;;;CO)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;SY)\
+                 (A;OICIIO;GA;;;BA)(A;;0x1301bf;;;BA)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)\
+                 (A;CIIO;GA;;;{ti})(A;;FA;;;{ti})(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)\
+                 (A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)"
+            ),
+        ] {
+            parse(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        }
+    }
+
+    #[test]
+    fn check_settable_needs_an_owner_and_protection() {
+        check_settable("O:BAD:P(A;;FA;;;SY)").unwrap();
+        check_settable("O:BAG:SYD:PAI(A;OICI;FA;;;SY)").unwrap();
+        check_settable("O:BAD:P").unwrap();
+        for s in [
+            "D:P(A;;FA;;;SY)",
+            "O:BAD:(A;;FA;;;SY)",
+            "O:BAD:AI(A;;FA;;;SY)",
+            "O:BA",
+            "O:BAD:NO_ACCESS_CONTROL",
+            "",
+        ] {
+            assert!(check_settable(s).is_err(), "{s:?}");
+        }
+    }
+
+    #[test]
     fn sddl_rights_letters() {
         for (letters, mask) in [
             ("GA", 0x1000_0000),
@@ -419,6 +585,10 @@ mod tests {
             "D:(a;;FA;;;SY)",
             "D:(XA;;FA;;;SY)",
             "D:(A;NP;FA;;;SY)",
+            "D:(A;SA;FA;;;SY)",
+            "D:(A;FA;FA;;;SY)",
+            "D:(A;TP;FA;;;SY)",
+            "D:(A;CR;FA;;;SY)",
             "D:(A;O;FA;;;SY)",
             "D:(A;oi;FA;;;SY)",
             "D:(A;;FA;ab;;SY)",
@@ -433,9 +603,15 @@ mod tests {
             "D:(A;;0x+1;;;SY)",
             "D:(A;;0x100000000;;;SY)",
             "D:(A;;123;;;SY)",
+            "D:(A;;KA;;;SY)",
+            "D:(A;;KR;;;SY)",
+            "D:(A;;NW;;;SY)",
             // SIDs.
             "D:(A;;FA;;;)",
             "D:(A;;FA;;;sy)",
+            "D:(A;;FA;;;LA)",
+            "D:(A;;FA;;;DU)",
+            "D:(A;;FA;;;ME)",
             "D:(A;;FA;;;S-1-5)",
             "D:(A;;FA;;;S-1-5-018)",
             "D:(A;;FA;;;S:1)",

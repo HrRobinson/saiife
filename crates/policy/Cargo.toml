@@ -18,6 +18,9 @@ sha2 = "0.10"
 thiserror = "1"
 # Random temp-file names for installed.toml.
 getrandom = "0.3"
+# The uid label of a SID. On every OS, so Linux tests run `WinDirectory` with a
+# fake; the FFI behind it exists on Windows only.
+saiife-win = { path = "../win" }
 
 [dev-dependencies]
 tempfile = "3"

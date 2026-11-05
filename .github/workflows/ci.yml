@@ -92,8 +92,8 @@ jobs:
         if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}
         shell: bash
         run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
-      # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
-      - name: unsafe only in saiife-darwin
+      # unsafe only in crates/darwin and crates/win/src/ffi; every other crate root forbids it (plan 13, decision 1; plan 19a, W1).
+      - name: unsafe only in saiife-darwin and saiife-win's ffi
         if: matrix.os != 'windows-latest'
         run: bash scripts/check-unsafe.sh
       # Windows code compile-checked from Linux, with a stand-in C compiler (plan 19a).

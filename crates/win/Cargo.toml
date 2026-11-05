@@ -1,6 +1,6 @@
 [package]
 name = "saiife-win"
-description = "Windows pieces of saiife: service SIDs, the uid mapping and SDDL parsing. All pure until plan 19b adds FFI."
+description = "Windows pieces of saiife: service SIDs, the uid mapping, SDDL parsing and the one FFI boundary on Windows."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -20,10 +20,20 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = [] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_System_Threading",
+] }
 
-# The workspace forbid, like every other crate: there is no FFI in plan 19a.
-# Plan 19b drops this when it adds FFI, along with the crate root's forbid and
-# the matching rules in scripts/check-unsafe.sh.
-[lints]
-workspace = true
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"
+
+# Not the workspace lints: the second crate allowed unsafe (W1), after
+# saiife-darwin. Denied here, allowed only in src/ffi/ (one attribute, in
+# src/ffi/mod.rs), and forbidden off Windows by the crate root.
+[lints.rust]
+unsafe_code = "deny"

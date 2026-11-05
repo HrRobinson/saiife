@@ -37,6 +37,11 @@ nix = { version = "=0.31.3", default-features = false, features = ["user"] }
 # The sandbox of MCP gateway children (plan 17 decision 12); safe bindings.
 landlock = "=0.4.7"
 
+[target.'cfg(windows)'.dependencies]
+# The service manager and registry reads through safe APIs (W1).
+windows-service = "=0.8.1"
+winreg = "=0.56.0"
+
 [dev-dependencies]
 tempfile = "3"
 

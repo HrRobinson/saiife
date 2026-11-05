@@ -1,28 +1,40 @@
 //! Which systems locked mode supports (spec §0 decision 8): Ubuntu 22.04+,
 //! Debian 12+, RHEL 9+ (and distributions `ID_LIKE` rhel, 9+), each with
-//! systemd running, and macOS 15 or later (plan 13 decision 13). Alpine and
-//! containers get developer mode only.
+//! systemd running, macOS 15 or later (plan 13 decision 13), and Windows 11 23H2 or
+//! Server 2022 or later (plan 19b). Alpine and containers get developer mode only.
 
-#[cfg(unix)]
-use crate::host::{Host, CONTAINER_UNKNOWN};
-use crate::layout::Layout;
-#[cfg(unix)]
-use crate::layout::Platform;
-#[cfg(unix)]
+use crate::host::{Host, CONTAINER_UNKNOWN, REG_NT_CURRENT_VERSION};
+use crate::layout::{Layout, Platform};
 use std::collections::BTreeMap;
 
-/// The reason on any OS but Linux, macOS and Windows.
-pub const NOT_SUPPORTED_OS: &str = "locked mode needs Linux or macOS";
+/// The reason on any other OS.
+pub const NOT_SUPPORTED_OS: &str = "locked mode needs Linux, macOS or Windows";
 
-#[cfg(unix)]
+/// The oldest client locked mode supports: Windows 11 23H2.
+pub const MIN_WIN_CLIENT_BUILD: u32 = 22631;
+/// The oldest server locked mode supports: Server 2022.
+pub const MIN_WIN_SERVER_BUILD: u32 = 20348;
+
+/// The key of `ProgramFilesDir`, below HKLM.
+pub const REG_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion";
+/// The key of `ProgramData`, below HKLM. The value is `REG_EXPAND_SZ`, stored as
+/// `%SystemDrive%\ProgramData`.
+pub const REG_PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+/// The key of the `ContainerType` value, below HKLM.
+pub const REG_CONTROL: &str = r"SYSTEM\CurrentControlSet\Control";
+
+/// W9's refusal.
+pub const NON_DEFAULT_FOLDERS: &str =
+    "non-default system folders are not supported in this version";
+/// W26's refusal.
+pub const NOT_ELEVATED: &str = "run this from an elevated terminal (Run as administrator)";
+
 /// The oldest macOS locked mode supports (Sequoia, plan 13 decision 13).
 pub const MIN_MACOS: (u32, u32) = (15, 0);
 
-#[cfg(unix)]
 /// The oldest systemd with `LoadCredential=`.
 const MIN_SYSTEMD: u32 = 247;
 
-#[cfg(unix)]
 const SUPPORTED_LIST: &str = "Ubuntu 22.04+, Debian 12+, RHEL 9+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,30 +47,93 @@ pub enum Support {
     Refused(String),
 }
 
-#[cfg(unix)]
 /// Checks this machine (or the tree under `layout`'s root) by the
 /// layout's platform. On Linux: a container, systemd and its version, then
 /// the distribution from `<root>/etc/os-release`. On macOS: the version
-/// `sw_vers` reports. Any other OS is refused.
+/// `sw_vers` reports. On Windows: a container, the build, the system folders and
+/// an elevated token. Any other OS is refused.
 pub fn check_supported(layout: &Layout, host: &dyn Host) -> Support {
     supported_on(Platform::current(), layout, host)
 }
 
-#[cfg(unix)]
-/// [`check_supported`] with the running OS given (`None`: neither Linux
-/// nor macOS).
+/// [`check_supported`] with the running OS given (`None`: none of the three).
 pub(crate) fn supported_on(current: Option<Platform>, layout: &Layout, host: &dyn Host) -> Support {
     if current.is_none() {
         return Support::Refused(NOT_SUPPORTED_OS.to_string());
     }
     match layout.platform() {
         Platform::Linux => linux_supported(layout, host),
-        Platform::Windows => Support::Refused(NOT_SUPPORTED_YET.to_string()),
+        Platform::Windows => windows_supported(host),
         Platform::Macos => macos_supported(host),
     }
 }
 
-#[cfg(unix)]
+/// A Windows container: `ContainerType` is present, of whichever type it was written.
+pub(crate) fn windows_container(host: &dyn Host) -> bool {
+    host.reg_dword(REG_CONTROL, "ContainerType").is_some()
+        || host.reg_string(REG_CONTROL, "ContainerType").is_some()
+}
+
+/// W9: the registry says `C:\Program Files` and `C:\ProgramData`. Never read from
+/// environment variables, which the caller controls. `ProgramData` is stored as
+/// `%SystemDrive%\ProgramData`, and the variable is read off `SystemRoot`, for the
+/// same reason.
+pub(crate) fn default_folders(host: &dyn Host) -> bool {
+    let is = |got: Option<String>, want: &str| got.is_some_and(|g| g.eq_ignore_ascii_case(want));
+    if !is(
+        host.reg_string(REG_CURRENT_VERSION, "ProgramFilesDir"),
+        r"C:\Program Files",
+    ) {
+        return false;
+    }
+    let data = host.reg_string(REG_PROFILE_LIST, "ProgramData");
+    if is(data.clone(), r"C:\ProgramData") {
+        return true;
+    }
+    is(data, r"%SystemDrive%\ProgramData")
+        && is(
+            host.reg_string(REG_NT_CURRENT_VERSION, "SystemRoot"),
+            r"C:\Windows",
+        )
+}
+
+/// The checks of [`check_supported`] on Windows, in that order. `systemd` is 0.
+fn windows_supported(host: &dyn Host) -> Support {
+    if windows_container(host) {
+        return Support::Refused("inside a Windows container: developer mode only".into());
+    }
+    let build = match host.windows_build() {
+        Ok(b) => b,
+        Err(e) => return Support::Refused(format!("the Windows build could not be read: {e}")),
+    };
+    let min = if build.server {
+        MIN_WIN_SERVER_BUILD
+    } else {
+        MIN_WIN_CLIENT_BUILD
+    };
+    if build.build < min {
+        return Support::Refused(format!(
+            "Windows build {} is not supported for locked mode \
+             (Windows 11 23H2 / Server 2022 or later)",
+            build.build
+        ));
+    }
+    if !default_folders(host) {
+        return Support::Refused(NON_DEFAULT_FOLDERS.to_string());
+    }
+    if host.euid() != 0 {
+        return Support::Refused(NOT_ELEVATED.to_string());
+    }
+    Support::Supported {
+        distro: format!(
+            "Windows {} build {}",
+            if build.server { "Server" } else { "client" },
+            build.build
+        ),
+        systemd: 0,
+    }
+}
+
 /// macOS [`MIN_MACOS`] or later. There is no systemd: `systemd` is 0.
 fn macos_supported(host: &dyn Host) -> Support {
     let (major, minor) = match host.macos_version() {
@@ -77,7 +152,6 @@ fn macos_supported(host: &dyn Host) -> Support {
     }
 }
 
-#[cfg(unix)]
 fn linux_supported(layout: &Layout, host: &dyn Host) -> Support {
     let container = host.container().or_else(|| {
         if layout.root().join(".dockerenv").exists() {
@@ -141,22 +215,11 @@ fn linux_supported(layout: &Layout, host: &dyn Host) -> Support {
     }
 }
 
-/// Why locked mode is not available on Windows yet (plan 19a); plan 19b
-/// replaces [`check_supported`] there with the real check.
-pub const NOT_SUPPORTED_YET: &str = "locked mode on Windows arrives in plan 19b";
-
-/// Windows: developer mode only until plan 19b, whatever the layout.
-#[cfg(windows)]
-pub fn check_supported(_layout: &Layout) -> Support {
-    Support::Refused(NOT_SUPPORTED_YET.to_string())
-}
-
 /// The one line `install` prints when it refuses.
 pub fn refusal_line(why: &str) -> String {
     format!("saiife: locked mode is not supported here: {why}. Developer mode works as before.")
 }
 
-#[cfg(unix)]
 /// `VERSION_ID` as (major, minor) ≥ `min`. A missing or odd version is not.
 fn version_at_least(version: &str, min: (u32, u32)) -> bool {
     let mut parts = version.split('.');
@@ -173,7 +236,6 @@ fn version_at_least(version: &str, min: (u32, u32)) -> bool {
     (major, minor) >= min
 }
 
-#[cfg(unix)]
 /// `KEY=value` lines of os-release(5); quotes and backslash escapes removed.
 pub(crate) fn parse_os_release(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -193,7 +255,6 @@ pub(crate) fn parse_os_release(text: &str) -> BTreeMap<String, String> {
     out
 }
 
-#[cfg(unix)]
 fn unquote(v: &str) -> String {
     let inner = match v.as_bytes() {
         [b'"', .., b'"'] | [b'\'', .., b'\''] if v.len() >= 2 => &v[1..v.len() - 1],
@@ -211,6 +272,182 @@ fn unquote(v: &str) -> String {
         }
     }
     out
+}
+
+/// Pure, on every OS: the fake host stands in for Windows.
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+    use crate::host::{FakeHost, RegValue, WinBuild};
+
+    /// A stock, elevated machine reporting `build`.
+    fn machine(build: u32, server: bool) -> (tempfile::TempDir, Layout, FakeHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::under_for(dir.path(), Platform::Windows);
+        let host = FakeHost::open(dir.path()).unwrap();
+        host.set(|s| {
+            s.build = WinBuild { build, server };
+            s.euid = 0;
+        });
+        (dir, layout, host)
+    }
+
+    fn check(l: &Layout, h: &FakeHost) -> Support {
+        supported_on(Some(Platform::Windows), l, h)
+    }
+
+    fn refused(s: Support) -> String {
+        match s {
+            Support::Refused(why) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    fn set_str(h: &FakeHost, key: &str, value: &str, v: &str) {
+        let k = (key.to_string(), value.to_string());
+        h.set(|s| {
+            s.registry.insert(k, RegValue::Str(v.to_string()));
+        });
+    }
+
+    #[test]
+    fn windows_supported_from_22631() {
+        assert_eq!(MIN_WIN_CLIENT_BUILD, 22631);
+        let (_d, l, h) = machine(22631, false);
+        assert_eq!(
+            check(&l, &h),
+            Support::Supported {
+                distro: "Windows client build 22631".into(),
+                systemd: 0
+            }
+        );
+        let (_d, l, h) = machine(26100, false);
+        assert!(matches!(check(&l, &h), Support::Supported { .. }));
+        let (_d, l, h) = machine(22621, false);
+        assert!(refused(check(&l, &h)).starts_with("Windows build 22621 is not supported"));
+    }
+
+    #[test]
+    fn windows_19045_refused() {
+        let (_d, l, h) = machine(19045, false);
+        assert_eq!(
+            refused(check(&l, &h)),
+            "Windows build 19045 is not supported for locked mode \
+             (Windows 11 23H2 / Server 2022 or later)"
+        );
+    }
+
+    /// The server floor is lower than the client's, and a client does not get it.
+    #[test]
+    fn server_2022_supported() {
+        assert_eq!(MIN_WIN_SERVER_BUILD, 20348);
+        let (_d, l, h) = machine(20348, true);
+        assert_eq!(
+            check(&l, &h),
+            Support::Supported {
+                distro: "Windows Server build 20348".into(),
+                systemd: 0
+            }
+        );
+        let (_d, l, h) = machine(20347, true);
+        assert!(refused(check(&l, &h)).starts_with("Windows build 20347 is not supported"));
+        let (_d, l, h) = machine(20348, false);
+        assert!(refused(check(&l, &h)).starts_with("Windows build 20348 is not supported"));
+    }
+
+    #[test]
+    fn container_refused() {
+        let (_d, l, h) = machine(26100, true);
+        let k = (REG_CONTROL.to_string(), "ContainerType".to_string());
+        h.set(|s| {
+            s.registry.insert(k.clone(), RegValue::Dword(2));
+        });
+        let why = refused(check(&l, &h));
+        assert_eq!(why, "inside a Windows container: developer mode only");
+        // Of whichever type, and before anything else is asked.
+        h.set(|s| {
+            s.registry.insert(k, RegValue::Str("x".into()));
+            s.build.build = 1;
+            s.euid = 1000;
+        });
+        assert_eq!(refused(check(&l, &h)), why);
+    }
+
+    #[test]
+    fn non_default_program_files_refused() {
+        let (_d, l, h) = machine(26100, true);
+        set_str(
+            &h,
+            REG_CURRENT_VERSION,
+            "ProgramFilesDir",
+            r"D:\Program Files",
+        );
+        assert_eq!(
+            refused(check(&l, &h)),
+            "non-default system folders are not supported in this version"
+        );
+
+        // Missing is no default either: fail closed.
+        let (_d, l, h) = machine(26100, true);
+        h.set(|s| {
+            s.registry.clear();
+        });
+        assert_eq!(refused(check(&l, &h)), NON_DEFAULT_FOLDERS);
+    }
+
+    #[test]
+    fn program_data_is_read_as_the_registry_stores_it() {
+        // The stock value holds the variable, on a C: system drive.
+        let (_d, l, h) = machine(26100, true);
+        assert!(matches!(check(&l, &h), Support::Supported { .. }));
+        for (data, ok) in [
+            (r"C:\ProgramData", true),
+            (r"c:\programdata", true),
+            (r"%SYSTEMDRIVE%\ProgramData", true),
+            (r"D:\ProgramData", false),
+            (r"%SystemDrive%\Data", false),
+            (r"%ProgramData%", false),
+        ] {
+            set_str(&h, REG_PROFILE_LIST, "ProgramData", data);
+            assert_eq!(default_folders(&h), ok, "{data}");
+        }
+        // The variable means another drive when Windows lives on one.
+        set_str(
+            &h,
+            REG_PROFILE_LIST,
+            "ProgramData",
+            r"%SystemDrive%\ProgramData",
+        );
+        set_str(&h, REG_NT_CURRENT_VERSION, "SystemRoot", r"D:\Windows");
+        assert!(!default_folders(&h));
+        // A plain C: value does not depend on it.
+        set_str(&h, REG_PROFILE_LIST, "ProgramData", r"C:\ProgramData");
+        assert!(default_folders(&h));
+    }
+
+    #[test]
+    fn not_elevated_refused() {
+        let (_d, l, h) = machine(26100, true);
+        h.set(|s| s.euid = 0x4000_1234);
+        assert_eq!(
+            refused(check(&l, &h)),
+            "run this from an elevated terminal (Run as administrator)"
+        );
+    }
+
+    #[test]
+    fn unreadable_build_refused() {
+        assert!(crate::host::parse_win_build(None, None).is_err());
+    }
+
+    #[test]
+    fn other_os_refused_with_the_new_text() {
+        let (_d, l, h) = machine(26100, true);
+        assert_eq!(
+            refused(supported_on(None, &l, &h)),
+            "locked mode needs Linux, macOS or Windows"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -246,7 +483,7 @@ mod tests {
         h.set(|s| s.container = Some("docker".into()));
         assert_eq!(
             refused(supported_on(None, &l, &h)),
-            "locked mode needs Linux or macOS"
+            "locked mode needs Linux, macOS or Windows"
         );
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert_eq!(refused(check_supported(&l, &h)), NOT_SUPPORTED_OS);

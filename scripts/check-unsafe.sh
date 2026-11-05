@@ -1,36 +1,32 @@
 #!/usr/bin/env bash
-# Unsafe boundary gate (plan 13, decision 1): `unsafe` may appear only in
-# crates/darwin (saiife-darwin).
+# Unsafe boundary gate (plan 13, decision 1; plan 19a, W1): `unsafe` may appear
+# only in crates/darwin (saiife-darwin) and crates/win/src/ffi/ (saiife-win).
 #
 # The compiler does the real enforcement: the workspace Cargo.toml sets
-# `[workspace.lints.rust] unsafe_code = "forbid"` and every crate but darwin
+# `[workspace.lints.rust] unsafe_code = "forbid"` and every crate but those two
 # opts in with `[lints] workspace = true`, which covers lib, bins, tests,
 # examples and build scripts. This script keeps that wiring from being
 # dropped, and backs it with a grep. It fails when:
-#   - the workspace lint, or a crate's `[lints] workspace = true` (darwin
-#     aside), is missing;
-#   - a crate root crates/*/src/lib.rs or crates/*/src/main.rs, darwin's
-#     aside, lacks `#![forbid(unsafe_code)]` at column 0 (an inner attribute
-#     inside `mod m {}` does not count);
-#   - outside crates/darwin/, a .rs file under crates/ has `unsafe` as Rust
-#     syntax (followed by `{`, `(`, a comment, `fn`, `impl`, `trait`, `extern`
-#     or the end of the line), an `extern` block, or a `no_mangle`,
-#     `export_name` or `link_section` attribute. Lines that start, after
-#     whitespace, with `//` or `/*` are skipped;
+#   - the workspace lint, or a crate's `[lints] workspace = true` (darwin and
+#     win aside), is missing;
+#   - a crate root crates/*/src/lib.rs or crates/*/src/main.rs, darwin's and
+#     win's aside, lacks `#![forbid(unsafe_code)]` at column 0 (an inner
+#     attribute inside `mod m {}` does not count);
+#   - outside crates/darwin/ and crates/win/src/ffi/, a .rs file under crates/
+#     has `unsafe` as Rust syntax (followed by `{`, `(`, a comment, `fn`, `impl`,
+#     `trait`, `extern` or the end of the line), an `extern` block, or a
+#     `no_mangle`, `export_name` or `link_section` attribute. Lines that start,
+#     after whitespace, with `//` or `/*` are skipped;
 #   - crates/darwin/src/lib.rs drops its `unsafe_op_in_unsafe_fn` /
 #     `undocumented_unsafe_blocks` lints, its non-macOS forbid or its macOS
 #     deny, or crates/darwin/src has other than exactly two
 #     `allow(unsafe_code)` sites;
-#   - crates/win (saiife-win, plan 19a) drops its `unsafe_op_in_unsafe_fn` /
-#     `undocumented_unsafe_blocks` lints, leaves `ffi` compiled off Windows, or
-#     has an `allow(unsafe_code)`. Linux never compiles `ffi`, so the compiler
-#     lint alone would catch those only on Windows.
-#
-# saiife-win has no FFI in plan 19a, so it gets no exemption: the rules above
-# hold for it as for any other crate, on every target. Plan 19b, which adds the
-# FFI, makes it the second exempt crate in this script: crates/win/src/ffi/ for
-# the grep, and its `cfg_attr(not(windows), forbid(unsafe_code))` form for the
-# crate root.
+#   - crates/win drops its `unsafe_op_in_unsafe_fn` /
+#     `undocumented_unsafe_blocks` lints, its non-Windows forbid, its Windows
+#     deny or its manifest's `unsafe_code = "deny"`; leaves `ffi` compiled off
+#     Windows; or has any `allow(unsafe_code)` but the one at the top of
+#     crates/win/src/ffi/mod.rs, which covers ffi and nothing else. Linux never
+#     compiles `ffi`, so the compiler lint alone would catch those only on Windows.
 #
 # Known limit: `unsafe` that a dependency's macro expands into our code is
 # invisible to the grep. The compiler lint still catches it, unless the macro
@@ -68,7 +64,7 @@ if [ ! -e Cargo.toml ] || [ "$(in_table Cargo.toml workspace.lints.rust '^[[:spa
 fi
 for m in crates/*/Cargo.toml; do
     [ -e "$m" ] || continue
-    case "$m" in crates/darwin/*) continue ;; esac
+    case "$m" in crates/darwin/* | crates/win/*) continue ;; esac
     if [ "$(in_table "$m" lints '^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true')" != 1 ]; then
         err "$m lacks [lints] workspace = true"
     fi
@@ -77,13 +73,13 @@ done
 # 2. Every other crate root forbids unsafe code, at column 0.
 for f in crates/*/src/lib.rs crates/*/src/main.rs; do
     [ -e "$f" ] || continue
-    case "$f" in crates/darwin/*) continue ;; esac
+    case "$f" in crates/darwin/* | crates/win/src/lib.rs) continue ;; esac
     if ! grep -qE '^#!\[forbid\(unsafe_code\)\][[:space:]]*$' "$f"; then
         err "$f lacks #![forbid(unsafe_code)] at column 0"
     fi
 done
 
-# 3. The keyword outside crates/darwin. `grep -w` alone also hits prose such
+# 3. The keyword outside crates/darwin and crates/win/src/ffi. `grep -w` alone also hits prose such
 # as "lockdown dir unsafe" or CSP's 'unsafe-inline' in string literals, so a
 # hit must look like Rust syntax.
 pre='(^|[^[:alnum:]_"'"'"'-])'
@@ -91,10 +87,10 @@ kw="${pre}unsafe([[:space:]]*(\$|[{(]|//|/\\*)|[[:space:]]+(fn|impl|trait|extern
 kw="$kw|${pre}extern([[:space:]]+\"[^\"]*\")?[[:space:]]*(\$|\\{)"
 kw="$kw|#!?\\[[[:space:]]*(unsafe[[:space:]]*\\([[:space:]]*)?(no_mangle|export_name|link_section)"
 hits="$(grep -rnE --include='*.rs' "$kw" crates \
-    | grep -v '^crates/darwin/' \
+    | grep -vE '^crates/(darwin|win/src/ffi)/' \
     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|/\*)' || true)"
 if [ -n "$hits" ]; then
-    err "unsafe outside crates/darwin:"
+    err "unsafe outside crates/darwin and crates/win/src/ffi:"
     printf '%s\n' "$hits" >&2
 fi
 
@@ -119,18 +115,31 @@ w=crates/win/src/lib.rs
 if [ -e "$w" ]; then
     grep -qE '^#!\[deny\(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks\)\]' "$w" \
         || err "$w lacks #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]"
+    grep -qE '^#!\[cfg_attr\(not\(windows\), forbid\(unsafe_code\)\)\]' "$w" \
+        || err "$w lacks #![cfg_attr(not(windows), forbid(unsafe_code))]"
+    grep -qE '^#!\[cfg_attr\(windows, deny\(unsafe_code\)\)\]' "$w" \
+        || err "$w lacks #![cfg_attr(windows, deny(unsafe_code))]"
+    grep -qE '^#\[cfg\(windows\)\]' "$w" \
+        || err "$w lacks #[cfg(windows)] on its ffi module"
+    if [ "$(in_table crates/win/Cargo.toml lints.rust '^[[:space:]]*unsafe_code[[:space:]]*=[[:space:]]*"deny"')" != 1 ]; then
+        err 'crates/win/Cargo.toml lacks [lints.rust] unsafe_code = "deny"'
+    fi
     ffi=crates/win/src/ffi/mod.rs
     if [ -e "$ffi" ] && ! grep -qE '^#!\[cfg\(windows\)\]' "$ffi"; then
         err "$ffi lacks #![cfg(windows)] at column 0"
     fi
-    allows="$(grep -rhE --include='*.rs' 'allow\([^)]*unsafe_code' crates/win/src \
-        | grep -cvE '^[[:space:]]*(//|/\*)' || true)"
-    if [ "$allows" != 0 ]; then
-        err "crates/win/src has $allows allow(unsafe_code) sites, want none"
+    if [ -e "$ffi" ] && ! grep -qE '^#!\[allow\(unsafe_code\)\]' "$ffi"; then
+        err "$ffi lacks #![allow(unsafe_code)] at column 0"
+    fi
+    allows="$(grep -rHE --include='*.rs' 'allow\([^)]*unsafe_code' crates/win/src \
+        | grep -vE '^[^:]+:[[:space:]]*(//|/\*)' || true)"
+    if [ "$allows" != "$ffi:#![allow(unsafe_code)]" ]; then
+        err "crates/win/src must have one allow(unsafe_code), at the top of $ffi; has:"
+        printf '%s\n' "$allows" >&2
     fi
 fi
 
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
-echo "check-unsafe: ok (unsafe only in crates/darwin)"
+echo "check-unsafe: ok (unsafe only in crates/darwin and crates/win/src/ffi)"

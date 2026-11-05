@@ -10,9 +10,9 @@
 //!
 //! - `winacl`: the Windows ACL table (§5.3a.3), pure, on every OS.
 //!
-//! On Windows `layout`, `supported`, `binary`, `winservice` and `winacl` exist:
-//! every other module uses Unix owners, modes or rustix, and locked mode on Windows
-//! arrives in plan 19b.
+//! On Windows `layout`, `host`, `supported`, `sip`, `binary`, `winservice` and `winacl`
+//! exist: every other module still uses Unix owners, modes or rustix, until the
+//! rest of plan 19b.
 //!
 //! No tokio: the CLI links this crate.
 
@@ -28,7 +28,7 @@ pub mod doctor;
 pub mod fleet;
 #[cfg(unix)]
 pub mod fsops;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod host;
 #[cfg(unix)]
 pub mod install;
@@ -40,7 +40,6 @@ pub mod personal;
 pub mod polkit;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
-#[cfg(unix)]
 pub mod sip;
 pub mod supported;
 #[doc(hidden)]
@@ -53,11 +52,11 @@ pub mod user_unit;
 pub mod winacl;
 pub mod winservice;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use host::{
-    host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost,
-    ReloadAnswer, UserInfo, CONTAINER_UNKNOWN,
+    host_for, host_kind, Chown, CmdOutput, FakeHost, FakeState, Host, HostKind, RealHost, RegValue,
+    ReloadAnswer, UserInfo, WinBuild, CONTAINER_UNKNOWN,
 };
 pub use layout::Layout;
-pub use supported::{check_supported, refusal_line, Support, NOT_SUPPORTED_OS, NOT_SUPPORTED_YET};
+pub use supported::{check_supported, refusal_line, Support, NOT_SUPPORTED_OS};
 pub use unit::{unit_text, vault_key_mode};
