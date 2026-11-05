@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The saiife MSI (plan 19b Task 13, W20). WiX v5 (packaging/windows/wix.version).
+
+  Build: scripts/package-windows/build.ps1, which passes
+    -d Version=<a.b.c>   the MSI ProductVersion
+    -d SourceDir=<dir>   a folder holding saiife.exe, LICENSE and README.md
+    -arch x64|arm64
+  and loads the Util extension (WixToolset.Util.wixext, same version as wix).
+
+  The package ships only the staging copy, C:\Program Files\saiife\saiife.exe, as the
+  Linux packages do. `saiife system install` with the fleet and package flags (the SaiifeInstall action)
+  copies it to C:\ProgramData\saiife\bin and sets up the service, the hooks and the
+  descriptors. The package owns nothing under C:\ProgramData.
+
+  UpgradeCode: generated once with uuidgen. Never change it: Windows finds earlier
+  installs by it, and a new one would leave both installed.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="saiife" Manufacturer="saiife" Version="$(Version)"
+           UpgradeCode="A20B5BB9-A4A3-4029-9345-EFDEEC899ACC"
+           Scope="perMachine" InstallerVersion="500" Compressed="yes">
+
+    <!-- The new version installs first, then the old one is removed: the old uninstall
+         action is skipped (UPGRADINGPRODUCTCODE), so the service is never uninstalled in
+         the middle of an upgrade. The install action restarts it once. -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  DowngradeErrorMessage="A newer saiife is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch Condition="Privileged" Message="saiife installs for the whole machine: run it as an administrator." />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="saiife" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Payload" Directory="INSTALLFOLDER">
+      <Component Id="SaiifeExeComponent" Guid="*">
+        <File Id="SaiifeExe" Source="$(SourceDir)\saiife.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseComponent" Guid="*">
+        <File Id="LicenseFile" Source="$(SourceDir)\LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="ReadmeComponent" Guid="*">
+        <File Id="ReadmeFile" Source="$(SourceDir)\README.md" KeyPath="yes" />
+      </Component>
+      <!-- The system PATH, so `saiife` works in every shell. The key path is a value of
+           ours, as an Environment row cannot be one. -->
+      <Component Id="PathComponent" Guid="*">
+        <RegistryValue Root="HKLM" Key="Software\saiife" Name="InstallFolder" Type="string"
+                       Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <Environment Id="SaiifePath" Name="PATH" Value="[INSTALLFOLDER]" Action="set"
+                     Part="last" System="yes" Permanent="no" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="saiife" Level="1">
+      <ComponentGroupRef Id="Payload" />
+    </Feature>
+
+    <!--
+      The actions run the staging copy through WixQuietExec, so the program's output
+      reaches msi.log. A plain exe action drops it, and the uninstall warning below has to
+      be in the log. Each deferred action takes its command line from the property of the
+      same name. Deferred with Impersonate="no" runs as SYSTEM.
+    -->
+    <SetProperty Id="SaiifeInstall"
+                 Value="&quot;[INSTALLFOLDER]saiife.exe&quot; system install --fleet --package"
+                 Before="SaiifeInstall" Sequence="execute" Condition="NOT REMOVE" />
+    <!-- Exit 0 and 1 both succeed: the package flag maps doctor's exit 1 to 0 and logs its text to
+         C:\ProgramData\saiife\log\install.log. Exit 2 fails the action and the install
+         rolls back. -->
+    <CustomAction Id="SaiifeInstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <SetProperty Id="SaiifeUninstallWarn"
+                 Value="&quot;[System64Folder]cmd.exe&quot; /c echo saiife: removing the package uninstalls locked mode: agents on this machine will no longer be locked"
+                 Before="SaiifeUninstallWarn" Sequence="execute"
+                 Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="SaiifeUninstallWarn" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- No purge flag: the audit, the vault key, the state and the config stay, as on Linux. -->
+    <SetProperty Id="SaiifeUninstall"
+                 Value="&quot;[INSTALLFOLDER]saiife.exe&quot; system uninstall"
+                 Before="SaiifeUninstall" Sequence="execute"
+                 Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="SaiifeUninstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SaiifeInstall" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="SaiifeUninstallWarn" Before="SaiifeUninstall"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="SaiifeUninstall" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
