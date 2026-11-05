@@ -18,12 +18,15 @@ pipe-server = ["dep:tokio"]
 dirs = "5"
 sha1 = "0.10"
 sha2 = "0.10"
+# zeroize 1.9.1 is from 2026-10-06 (already in Cargo.lock): a credential read is wiped on drop.
+zeroize = "=1.9.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_NetManagement",
     "Win32_System_Console",

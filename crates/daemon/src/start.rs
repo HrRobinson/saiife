@@ -340,8 +340,61 @@ struct PersonalStart {
 
 /// The lock file in the personal state dir that keeps a second broker of
 /// the same user from starting (and from making a second vault key).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PERSONAL_LOCK: &str = "broker.lock";
+
+/// Whether the personal broker may run as this token on Windows (Task 11). Never as an
+/// administrator or SYSTEM, whose uid label is 0 and would read as root; never as a
+/// service account, which has no profile or credential store of its own. A debug build's
+/// test pipe runs as the runner, an elevated admin on CI (W23).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn personal_start_problem(sid: &str, elevated: bool, test_pipe: bool) -> Option<String> {
+    use saiife_win::sid::uid_of;
+    if test_pipe {
+        return None;
+    }
+    if uid_of(sid, elevated) == 0 {
+        return Some("the personal broker runs as your own user, not an administrator".into());
+    }
+    sid.starts_with("S-1-5-80-")
+        .then(|| format!("the personal broker runs as a user, not the service account {sid}"))
+}
+
+/// The personal broker's pipe name and descriptor: a name per user SID, and a descriptor
+/// that owns the pipe as that user and admits that user alone. A test pipe has its own
+/// name and the same descriptor.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn personal_pipe_spec(test_pipe: Option<&str>, own_sid: &str) -> Result<(String, String), String> {
+    let name = match test_pipe {
+        Some(n) => n.to_string(),
+        None => saiife_system::personal::personal_pipe_name(own_sid)?,
+    };
+    Ok((name, saiife_win::pipe::personal_sddl(own_sid)))
+}
+
+/// See [`crate::personal_preflight`]. Windows: the locked-host marker and a locked config;
+/// who this process is, is [`personal_start_problem`]'s, read from the token.
+#[cfg(windows)]
+pub(crate) fn personal_preflight(
+    config: &Path,
+    _socket_dir: &Path,
+    locked_marker: &Path,
+) -> Result<(), String> {
+    // Decision 10: a locked host wins.
+    if std::fs::symlink_metadata(locked_marker).is_ok() {
+        return Err(format!(
+            "this host is in locked mode ({} exists): connectors go through the system daemon, not daemon --user",
+            locked_marker.display()
+        ));
+    }
+    if bootstrap(config).locked == Some(true) {
+        return Err(format!(
+            "{}: locked = true is a locked-mode config; the personal broker does not serve it",
+            config.display()
+        ));
+    }
+    Ok(())
+}
 
 /// See [`crate::personal_preflight`].
 #[cfg(unix)]
@@ -376,6 +429,49 @@ pub(crate) fn personal_preflight(
         ));
     }
     Ok(())
+}
+
+/// Windows: a dir of the personal broker's own is created with its parent's ACL (the
+/// user's profile), and must then have no writer but this user, SYSTEM and
+/// Administrators ([`crate::fsx::check_private_dir`]).
+#[cfg(windows)]
+fn private_dir(dir: &Path, _euid: u32) -> Result<(), String> {
+    crate::fsx::create_private_dirs(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::fsx::check_private_dir(dir).map_err(|e| e.to_string())
+}
+
+/// Windows: the single-instance lock is a file opened with no sharing, so a second broker
+/// of this state dir cannot open it, and Windows drops it when this process ends. A
+/// reparse point is not followed.
+#[cfg(windows)]
+fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let path = state_dir.join(PERSONAL_LOCK);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(|e| match e.raw_os_error() {
+            // ERROR_SHARING_VIOLATION
+            Some(32) => format!(
+                "another personal broker of this user is running (it holds {})",
+                path.display()
+            ),
+            _ => format!("{}: {e}", path.display()),
+        })?;
+    let md = f
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if md.file_attributes() & 0x400 != 0 {
+        return Err(format!("{}: a link, not a lock file", path.display()));
+    }
+    Ok(f)
 }
 
 /// A dir of the personal broker's own (state, audit): created 0700 when
@@ -451,22 +547,30 @@ fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, String> {
 /// security order of Task 5): the refusals, the config, the state dir and
 /// its lock, then the key from the keychain. The keychain is dropped here,
 /// before any runtime exists.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[allow(clippy::too_many_arguments)]
 fn personal_start(
     config: &Path,
     state_dir: &Path,
     directory: &dyn saiife_policy::Directory,
     euid: u32,
+    own_sid: Option<&str>,
     socket_dir: PathBuf,
     audit_dir: PathBuf,
     keychain: Box<dyn saiife_keychain::Keychain>,
     locked_marker: &Path,
 ) -> Result<PersonalStart, Refuse> {
     personal_preflight(config, &socket_dir, locked_marker)?;
-    let own_user = directory
-        .name_of(euid)
-        .ok_or_else(|| format!("uid {euid} has no user name"))?;
+    // Windows: the SID is the identity, so the name comes from the SID, never from a uid
+    // label that two accounts could share.
+    let own_user = match own_sid {
+        Some(sid) => directory
+            .name_of_sid(sid)
+            .ok_or_else(|| format!("cannot find the account name of {sid}"))?,
+        None => directory
+            .name_of(euid)
+            .ok_or_else(|| format!("uid {euid} has no user name"))?,
+    };
     match personal::ensure_config(config) {
         Ok(true) => eprintln!("saiife: created {}", config.display()),
         Ok(false) => {}
@@ -603,19 +707,29 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     // for a debug build's elevated runner.
     #[cfg(windows)]
     let (euid, own_sid): (u32, Option<String>) = {
-        if matches!(daemon_mode, DaemonMode::Personal { .. }) {
-            return Err(crate::PERSONAL_UNSUPPORTED
-                .trim_start_matches("saiife: ")
-                .into());
-        }
         let token = saiife_win::ffi::token::current()
             .map_err(|e| format!("cannot read this process's token: {e}"))?;
-        if let Some(why) =
-            windows_start_problem(&token.sid, token.elevated_admin, test_pipe.is_some())
-        {
+        let problem = match daemon_mode {
+            DaemonMode::System => {
+                windows_start_problem(&token.sid, token.elevated_admin, test_pipe.is_some())
+            }
+            DaemonMode::Personal { .. } => {
+                personal_start_problem(&token.sid, token.elevated_admin, test_pipe.is_some())
+            }
+        };
+        if let Some(why) = problem {
             return Err(why.into());
         }
         (saiife_win::sid::uid_of(&token.sid, false), Some(token.sid))
+    };
+    // The personal broker's pipe: a name per SID, owned by and open to that user alone.
+    // Worked out here so a bad SID refuses before anything is created.
+    #[cfg(windows)]
+    let personal_place = match (&daemon_mode, own_sid.as_deref()) {
+        (DaemonMode::Personal { .. }, Some(sid)) => {
+            Some(personal_pipe_spec(test_pipe.as_deref(), sid)?)
+        }
+        _ => None,
     };
     let boot = bootstrap(&config);
     let directory: Arc<dyn saiife_policy::Directory + Send + Sync> = Arc::from(directory);
@@ -640,7 +754,6 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
             }
             (Mode::Locked, None)
         }
-        #[cfg(unix)]
         DaemonMode::Personal {
             socket_dir,
             audit_dir,
@@ -653,19 +766,13 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
                 &state_dir,
                 directory.as_ref(),
                 euid,
+                own_sid.as_deref(),
                 socket_dir,
                 audit_dir,
                 keychain,
                 &locked_marker,
             )?),
         ),
-        // Refused above: the personal broker on Windows is Task 11.
-        #[cfg(windows)]
-        DaemonMode::Personal { .. } => {
-            return Err(crate::PERSONAL_UNSUPPORTED
-                .trim_start_matches("saiife: ")
-                .into())
-        }
     };
     let pcfg = personal.as_ref().map(|p| p.cfg.clone());
     let name = match &pcfg {
@@ -726,7 +833,7 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     };
 
     // 5. The chain: one writer, checked at start.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if mode == Mode::Personal {
         private_dir(&audit_cfg.dir, euid)?;
     }
@@ -943,7 +1050,8 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     #[cfg(unix)]
     let place = daemon_cfg.socket_dir.clone();
     #[cfg(windows)]
-    let place = pipe_spec(test_pipe.as_deref(), own_sid.as_deref().unwrap_or_default());
+    let place = personal_place
+        .unwrap_or_else(|| pipe_spec(test_pipe.as_deref(), own_sid.as_deref().unwrap_or_default()));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         service,
@@ -1977,6 +2085,45 @@ mod windows_start_tests {
     #[test]
     fn a_test_pipe_runs_as_the_runner() {
         assert_eq!(windows_start_problem(RUNNER, true, true), None);
+    }
+
+    #[test]
+    fn the_personal_broker_runs_as_a_plain_user() {
+        assert_eq!(personal_start_problem(RUNNER, false, false), None);
+        // An elevated admin, SYSTEM and a service account are refused.
+        assert!(personal_start_problem(RUNNER, true, false).is_some());
+        assert!(personal_start_problem(SYSTEM, false, false).is_some());
+        assert!(personal_start_problem(&service_sid("saiifed"), false, false).is_some());
+        // A debug build's test pipe runs as the CI runner.
+        assert_eq!(personal_start_problem(RUNNER, true, true), None);
+    }
+
+    #[test]
+    fn the_personal_pipe_is_per_user_and_owned_by_that_user() {
+        let other = "S-1-5-21-1-2-3-1002";
+        let (name, sddl) = personal_pipe_spec(None, RUNNER).unwrap();
+        assert_eq!(name, format!(r"\\.\pipe\saiife-user-{RUNNER}"));
+        assert!(
+            sddl.starts_with(&format!("O:{RUNNER}G:{RUNNER}D:P(D;;GA;;;NU)")),
+            "{sddl}"
+        );
+        // Nobody else is named, and not the service, SYSTEM or Users either.
+        assert!(!sddl.contains(other) && !sddl.contains("SY") && !sddl.contains("BU"));
+        assert_ne!(name, personal_pipe_spec(None, other).unwrap().0);
+        // A test pipe keeps the descriptor, and a bad SID makes no pipe at all.
+        let (n, s) = personal_pipe_spec(Some(r"\\.\pipe\saiife-test-1"), RUNNER).unwrap();
+        assert_eq!((n.as_str(), s), (r"\\.\pipe\saiife-test-1", sddl));
+        assert!(personal_pipe_spec(None, "not-a-sid").is_err());
+    }
+
+    #[test]
+    fn the_personal_broker_admits_only_its_own_sid() {
+        // The peer check is `same_principal`: SIDs decide when both sides have one, and a
+        // uid label shared by two accounts decides nothing.
+        let other = "S-1-5-21-1-2-3-1002";
+        assert!(crate::ops::same_principal(7, Some(RUNNER), 7, Some(RUNNER)));
+        assert!(!crate::ops::same_principal(7, Some(other), 7, Some(RUNNER)));
+        assert!(!crate::ops::same_principal(7, None, 7, Some(RUNNER)));
     }
 
     #[test]

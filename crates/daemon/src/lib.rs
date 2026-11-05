@@ -53,8 +53,8 @@ use saiife_policy::{Directory, PackInfo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The line `saiife daemon --user` refuses with outside Linux and macOS.
-pub const PERSONAL_UNSUPPORTED: &str = "saiife: the personal broker needs Linux or macOS";
+/// The line `saiife daemon --user` refuses with outside Linux, macOS and Windows.
+pub const PERSONAL_UNSUPPORTED: &str = "saiife: the personal broker needs Linux, macOS or Windows";
 
 /// Which daemon to run.
 pub enum DaemonMode {
@@ -124,7 +124,7 @@ impl saiife_keychain::Keychain for UnavailableKeychain {
 /// root, a locked host (`locked_marker` exists), a bad `$XDG_RUNTIME_DIR`
 /// (the parent of `socket_dir`) and a config with `locked = true`. The CLI
 /// runs this before it opens the keychain; the start runs it again.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn personal_preflight(
     config: &Path,
     socket_dir: &Path,
@@ -133,7 +133,19 @@ pub fn personal_preflight(
     start::personal_preflight(config, socket_dir, locked_marker)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows: whether this process may run the personal broker (not an elevated admin,
+/// SYSTEM or a service account), read from its token. The CLI asks before it opens the
+/// keychain; the start asks again. `test_pipe` is a debug build's seam, which runs as the
+/// CI runner. `None` means it may.
+#[cfg(windows)]
+pub fn personal_identity_problem(test_pipe: bool) -> Option<String> {
+    match saiife_win::ffi::token::current() {
+        Ok(t) => start::personal_start_problem(&t.sid, t.elevated_admin, test_pipe),
+        Err(e) => Some(format!("cannot read this process's token: {e}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn personal_preflight(
     config: &Path,
     socket_dir: &Path,

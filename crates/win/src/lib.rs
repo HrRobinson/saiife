@@ -12,6 +12,7 @@
 #![cfg_attr(windows, deny(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
+pub mod cred;
 pub mod display;
 pub mod pipe;
 pub mod proc;

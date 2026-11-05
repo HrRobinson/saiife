@@ -1570,6 +1570,7 @@ version = "0.2.0"
 dependencies = [
  "futures-lite",
  "rustix",
+ "saiife-win",
  "security-framework",
  "tempfile",
  "tokio",
@@ -1639,6 +1640,7 @@ dependencies = [
  "tokio",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

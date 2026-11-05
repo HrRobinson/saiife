@@ -34,7 +34,7 @@ pub mod host;
 pub mod install;
 pub mod launchd;
 pub mod layout;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod personal;
 #[cfg(unix)]
 pub mod polkit;

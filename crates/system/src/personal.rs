@@ -8,6 +8,7 @@
 //! XDG fallbacks follow the XDG spec; relative values are ignored.
 
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -51,6 +52,9 @@ pub fn personal_paths_for(
     home: Option<&Path>,
     platform: Platform,
 ) -> Result<PersonalPaths, String> {
+    if platform == Platform::Windows {
+        return windows_personal_paths(env, home);
+    }
     let socket_dir = match (abs_var(env, "XDG_RUNTIME_DIR"), platform) {
         (Some(r), _) => r.join("saiife"),
         (None, Platform::Macos) => match home {
@@ -89,8 +93,47 @@ pub fn personal_paths_for(
     })
 }
 
+const NO_LOCALAPPDATA: &str =
+    "%LOCALAPPDATA% is not set or not absolute, and there is no home directory to fall back to";
+
+/// Windows: everything under `%LOCALAPPDATA%\saiife\personal` (the user's own profile, whose
+/// ACL names that user, SYSTEM and Administrators). There is no socket dir: the control
+/// endpoint is a pipe, named by the user's SID ([`personal_pipe_name`]), so `socket_dir`
+/// is empty.
+fn windows_personal_paths(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    home: Option<&Path>,
+) -> Result<PersonalPaths, String> {
+    let local = match abs_var(env, "LOCALAPPDATA") {
+        Some(p) => p,
+        None => match home {
+            Some(h) if h.is_absolute() => h.join("AppData").join("Local"),
+            _ => return Err(NO_LOCALAPPDATA.to_string()),
+        },
+    };
+    let root = local.join("saiife").join("personal");
+    Ok(PersonalPaths {
+        socket_dir: PathBuf::new(),
+        config: root.join("config.toml"),
+        state_dir: root.join("state"),
+        audit_dir: root.join("audit"),
+    })
+}
+
+/// The personal broker's pipe: [`WIN_PERSONAL_PIPE_PREFIX`] and the user's SID. A name per
+/// user, so one account's broker never takes another's name; the name is no proof of
+/// anything (anyone may create a free pipe name), so the owner is checked as well
+/// (`saiife_win::pipe::check_owner`) and the descriptor admits that one SID.
+pub fn personal_pipe_name(sid: &str) -> Result<String, String> {
+    if !saiife_win::sid::valid_sid(sid) {
+        return Err(format!("{sid:?} is not a SID"));
+    }
+    Ok(format!("{}{sid}", crate::layout::WIN_PERSONAL_PIPE_PREFIX))
+}
+
 /// Create the runtime dir 0700 when it is missing (macOS has no session
 /// manager to make one). An existing dir is left for [`check_runtime_dir`].
+#[cfg(unix)]
 pub fn ensure_runtime_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
     if !dir.is_absolute() || std::fs::symlink_metadata(dir).is_ok() {
@@ -105,6 +148,7 @@ pub fn ensure_runtime_dir(dir: &Path) -> Result<(), String> {
 
 /// The `$XDG_RUNTIME_DIR` dir itself: a real dir (no symlink), owned by
 /// `euid`, mode 0700.
+#[cfg(unix)]
 pub fn check_runtime_dir(dir: &Path, euid: u32) -> Result<(), String> {
     if !dir.is_absolute() {
         return Err(NO_RUNTIME.to_string());
@@ -140,7 +184,7 @@ pub fn check_runtime_dir(dir: &Path, euid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -322,5 +366,101 @@ mod tests {
 
         assert!(check_runtime_dir(&t.path().join("missing"), euid()).is_err());
         assert!(check_runtime_dir(Path::new("rel"), euid()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const ME: &str = "S-1-5-21-1111-2222-3333-1001";
+    const OTHER: &str = "S-1-5-21-1111-2222-3333-1002";
+
+    fn abs(unix: &str, win: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { win } else { unix })
+    }
+
+    fn envf(m: HashMap<&'static str, PathBuf>) -> impl Fn(&str) -> Option<OsString> {
+        move |k| m.get(k).map(|p| p.clone().into_os_string())
+    }
+
+    #[test]
+    fn windows_personal_paths() {
+        let local = abs("/Users/u/AppData/Local", r"C:\Users\u\AppData\Local");
+        let e = envf(HashMap::from([("LOCALAPPDATA", local.clone())]));
+        let p = personal_paths_for(&e, None, Platform::Windows).unwrap();
+        let root = local.join("saiife").join("personal");
+        assert_eq!(p.config, root.join("config.toml"));
+        assert_eq!(p.state_dir, root.join("state"));
+        assert_eq!(p.audit_dir, root.join("audit"));
+        // No socket dir, and XDG does not matter here.
+        assert_eq!(p.socket_dir, PathBuf::new());
+        let xdg = envf(HashMap::from([
+            ("LOCALAPPDATA", local),
+            ("XDG_RUNTIME_DIR", abs("/run/u", r"C:\run\u")),
+            ("XDG_STATE_HOME", abs("/s", r"C:\s")),
+        ]));
+        assert_eq!(
+            personal_paths_for(&xdg, None, Platform::Windows).unwrap(),
+            p
+        );
+    }
+
+    #[test]
+    fn windows_paths_fall_back_to_the_home_and_refuse_without_one() {
+        let home = abs("/Users/u", r"C:\Users\u");
+        let none = envf(HashMap::new());
+        let p = personal_paths_for(&none, Some(&home), Platform::Windows).unwrap();
+        assert_eq!(
+            p.state_dir,
+            home.join("AppData")
+                .join("Local")
+                .join("saiife")
+                .join("personal")
+                .join("state")
+        );
+        assert_eq!(
+            personal_paths_for(&none, None, Platform::Windows).unwrap_err(),
+            NO_LOCALAPPDATA
+        );
+        // A relative %LOCALAPPDATA% is no better than none.
+        let rel = envf(HashMap::from([("LOCALAPPDATA", PathBuf::from("rel"))]));
+        assert!(personal_paths_for(&rel, None, Platform::Windows).is_err());
+    }
+
+    #[test]
+    fn personal_pipe_name_has_sid() {
+        assert_eq!(
+            personal_pipe_name(ME).unwrap(),
+            format!(r"\\.\pipe\saiife-user-{ME}")
+        );
+        // One name per user: two accounts never share a name.
+        assert_ne!(personal_pipe_name(ME), personal_pipe_name(OTHER));
+        // What goes in the name must be a SID, and the result a plain local pipe name.
+        saiife_win::pipe::check_pipe_name(&personal_pipe_name(ME).unwrap()).unwrap();
+        for bad in [
+            "",
+            "saiife",
+            r"..\evil",
+            "S-1-5-21-1\\x",
+            "S-1-5-21-1-2-3-1001 ",
+        ] {
+            assert!(personal_pipe_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The walls against a second account: the name is per user, the descriptor admits only
+    /// the user, and a pipe owned by anyone else is refused.
+    #[test]
+    fn another_user_cannot_use_or_hold_a_users_pipe() {
+        let name = personal_pipe_name(ME).unwrap();
+        let sd = saiife_win::sddl::parse(&saiife_win::pipe::personal_sddl(ME)).unwrap();
+        assert!(sd.aces.iter().all(|a| !a.allow || a.sid == ME));
+        // The other account created the name first: its pipe's owner is not ME.
+        assert!(saiife_win::pipe::check_owner(OTHER, ME).is_err());
+        assert!(saiife_win::pipe::check_owner(ME, ME).is_ok());
+        // And the other account's own broker lives under a different name.
+        assert_ne!(name, personal_pipe_name(OTHER).unwrap());
     }
 }

@@ -4,8 +4,11 @@
 //! [`crate::from_env`]). It is not compiled into release builds.
 
 use crate::{ItemId, Keychain, KeychainError};
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -30,6 +33,11 @@ impl DirKeychain {
         match fs::symlink_metadata(&dir) {
             Ok(m) if m.file_type().is_symlink() => return Err(unavailable("is a symlink")),
             Ok(m) if !m.is_dir() => return Err(unavailable("is not a directory")),
+            // Windows: a test dir's ACL is the temp dir's. This seam is debug-only and
+            // holds test bytes; the real backend is Credential Manager.
+            #[cfg(windows)]
+            Ok(_) => {}
+            #[cfg(unix)]
             Ok(m) => {
                 let euid = rustix::process::geteuid().as_raw();
                 if m.uid() != euid {
@@ -54,12 +62,13 @@ impl DirKeychain {
                 }
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&dir)
-                    .map_err(|e| unavailable(&e.to_string()))?;
+                let mut b = DirBuilder::new();
+                b.recursive(true);
+                #[cfg(unix)]
+                b.mode(0o700);
+                b.create(&dir).map_err(|e| unavailable(&e.to_string()))?;
                 // We just made it, so pin the mode against the umask.
+                #[cfg(unix)]
                 fs::set_permissions(&dir, Permissions::from_mode(0o700))
                     .map_err(|e| unavailable(&e.to_string()))?;
             }
@@ -108,11 +117,12 @@ impl Keychain for DirKeychain {
         let tmp = self.dir.join(format!(".{}.{}.tmp", id.service, id.account));
         let _ = fs::remove_file(&tmp);
         let write = || -> std::io::Result<()> {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut o = OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            o.mode(0o600);
+            let mut f = o.open(&tmp)?;
+            #[cfg(unix)]
             f.set_permissions(Permissions::from_mode(0o600))?;
             f.write_all(secret)?;
             f.sync_all()?;

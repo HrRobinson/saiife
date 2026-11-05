@@ -40,6 +40,14 @@ pub fn control_sddl(service_sid: &str) -> String {
     )
 }
 
+/// The personal broker's pipe descriptor: owned by the user it serves, and only that
+/// user may open it or add an instance. No SYSTEM, no Users, no service: a second account
+/// on the machine gets `ERROR_ACCESS_DENIED` before a byte moves. The daemon's own peer
+/// check (`same_principal`) still runs on the token, as a second wall.
+pub fn personal_sddl(user_sid: &str) -> String {
+    format!("O:{user_sid}G:{user_sid}D:P(D;;GA;;;NU)(A;;GA;;;{user_sid})")
+}
+
 /// Refuses anything but a plain pipe on this machine. A `\\host\pipe\…` name would send
 /// the caller's credentials to that host, and `..` would leave the pipe namespace.
 pub fn check_pipe_name(name: &str) -> io::Result<()> {
@@ -290,6 +298,36 @@ mod tests {
             control_sddl(&s),
             format!("O:{s}G:{s}D:P(D;;GA;;;NU)(A;;GA;;;{s})(A;;GA;;;SY)(A;;0x12019b;;;BU)")
         );
+    }
+
+    #[test]
+    fn personal_sddl_admits_only_its_user() {
+        let me = AGENT;
+        let text = personal_sddl(me);
+        assert_eq!(text, format!("O:{me}G:{me}D:P(D;;GA;;;NU)(A;;GA;;;{me})"));
+        let sd = sddl::parse(&text).unwrap();
+        assert_eq!(sd.owner.as_deref(), Some(me));
+        assert!(sd.dacl_protected);
+        let allowed: Vec<&str> = sd
+            .aces
+            .iter()
+            .filter(|a| a.allow)
+            .map(|a| a.sid.as_str())
+            .collect();
+        assert_eq!(allowed, vec![me]);
+        // Another account's SID is nowhere in it, so it falls under no allow.
+        assert!(!text.contains(ADMIN));
+        assert!(!text.contains("BU") && !text.contains("SY") && !text.contains("WD"));
+    }
+
+    #[test]
+    fn the_owner_check_tells_a_squatter_from_the_user() {
+        // A squatter's pipe under the user's name is owned by the squatter's SID.
+        assert!(check_owner(AGENT, AGENT).is_ok());
+        assert!(check_owner(ADMIN, AGENT).is_err());
+        assert!(check_owner(SYSTEM, AGENT).is_err());
+        // The expectation must itself be a SID: an empty one never matches by accident.
+        assert!(check_owner("", "").is_err());
     }
 
     #[test]

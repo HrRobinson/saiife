@@ -203,6 +203,11 @@ enum Cmd {
         /// for this binary and exit (writes no file, runs no service manager).
         #[arg(long = "print-unit", value_name = "KIND", requires = "user", value_parser = ["systemd", "launchd"])]
         print_unit: Option<String>,
+        /// With --user (Windows): start the personal broker at logon (a value under
+        /// HKCU\...\Run) or stop doing so.
+        #[cfg(windows)]
+        #[arg(long, value_name = "on|off", requires = "user", conflicts_with = "print_unit", value_parser = ["on", "off"])]
+        autostart: Option<String>,
         /// Test seam (debug builds): the locked-host marker to check.
         #[cfg(debug_assertions)]
         #[arg(long = "locked-marker", value_name = "PATH", hide = true)]
@@ -447,8 +452,8 @@ fn locked_only(cmd: &Cmd) -> bool {
             action,
             policy_cmd::PolicyAction::Show { .. } | policy_cmd::PolicyAction::Reload
         ),
-        // `daemon --system` runs on Windows (plan 19b); the personal broker is Task 11.
-        Cmd::Daemon { system, .. } => !*system,
+        // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
+        Cmd::Daemon { .. } => false,
         Cmd::Doctor { .. }
         | Cmd::Eval
         | Cmd::McpSpawn
@@ -552,13 +557,33 @@ fn main() -> ExitCode {
     }
     #[cfg(windows)]
     if let Cmd::Daemon {
+        system,
+        user,
+        print_unit,
+        autostart,
+        #[cfg(debug_assertions)]
+        locked_marker,
         config,
         state_dir,
         credentials_dir,
-        ..
     } = cli.command
     {
-        // `locked_only` let through only `--system`.
+        if user {
+            #[cfg(not(debug_assertions))]
+            let locked_marker: Option<std::path::PathBuf> = None;
+            return cmd_daemon_user(UserArgs {
+                print_unit,
+                autostart,
+                locked_marker,
+                paths_given: config.is_some() || state_dir.is_some() || credentials_dir.is_some(),
+            });
+        }
+        if !system {
+            eprintln!(
+                "saiife: use `saiife daemon --system` (locked mode) or `saiife daemon --user` (personal broker)"
+            );
+            return ExitCode::from(2);
+        }
         return win_daemon::run(win_daemon::Paths {
             config,
             state_dir,
@@ -826,6 +851,115 @@ mod win_daemon {
                 eprintln!("saiife: the service dispatcher failed: {e}");
                 ExitCode::from(2)
             }
+        }
+    }
+}
+
+/// The `saiife daemon --user` flags on Windows.
+#[cfg(windows)]
+struct UserArgs {
+    print_unit: Option<String>,
+    /// `--autostart on|off`.
+    autostart: Option<String>,
+    /// `--locked-marker` (debug builds); `None` is the real marker.
+    locked_marker: Option<std::path::PathBuf>,
+    /// A `--config`, `--state-dir` or `--credentials-dir` was given.
+    paths_given: bool,
+}
+
+/// `saiife daemon --user` on Windows (plan 19b, Task 11): the personal broker, as the
+/// logged-in user, with its vault key in Credential Manager and its control pipe named
+/// by the user's SID. `--autostart on|off` edits the logon `Run` value and exits.
+#[cfg(windows)]
+fn cmd_daemon_user(a: UserArgs) -> ExitCode {
+    use saiife_system::layout::{Layout, INSTALLED};
+    if a.print_unit.is_some() {
+        eprintln!(
+            "saiife: --print-unit is for systemd and launchd; on Windows use `saiife daemon --user --autostart on`"
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(v) = &a.autostart {
+        return user_autostart(v == "on");
+    }
+    if a.paths_given {
+        eprintln!(
+            "saiife: daemon --user takes no --config, --state-dir or --credentials-dir: its paths are fixed (%LOCALAPPDATA%\\saiife\\personal)"
+        );
+        return ExitCode::from(2);
+    }
+    let home = saiife_win::profile::home_dir();
+    let paths =
+        match saiife_system::personal::personal_paths(&|k| std::env::var_os(k), home.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("saiife: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    // Debug builds only: a test pipe, owned by this process's SID.
+    #[cfg(debug_assertions)]
+    let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
+    #[cfg(not(debug_assertions))]
+    let test_pipe: Option<String> = None;
+    let locked_marker = a
+        .locked_marker
+        .unwrap_or_else(|| Layout::system().at(INSTALLED));
+    // An elevated admin, SYSTEM or a service account, a locked host or a locked config
+    // are refused before the keychain is touched.
+    if let Some(why) = saiife_daemon::personal_identity_problem(test_pipe.is_some()) {
+        eprintln!("saiife: {why}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) =
+        saiife_daemon::personal_preflight(&paths.config, &paths.socket_dir, &locked_marker)
+    {
+        eprintln!("saiife: {e}");
+        return ExitCode::from(2);
+    }
+    let keychain: Box<dyn saiife_keychain::Keychain> = match saiife_keychain::from_env() {
+        Ok(k) => k,
+        Err(e) => Box::new(saiife_daemon::UnavailableKeychain(e)),
+    };
+    saiife_daemon::run(saiife_daemon::DaemonOptions {
+        config: paths.config,
+        state_dir: paths.state_dir,
+        credentials_dir: None,
+        catalog: daemon_catalog(),
+        directory: Box::new(saiife_policy::WinDirectory::system()),
+        mode: saiife_daemon::DaemonMode::Personal {
+            socket_dir: paths.socket_dir,
+            audit_dir: paths.audit_dir,
+            keychain,
+            locked_marker,
+        },
+        test_pipe,
+    })
+}
+
+/// `saiife daemon --user --autostart on|off`: the logon `Run` value for this binary.
+#[cfg(windows)]
+fn user_autostart(on: bool) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("saiife: cannot find this binary: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match saiife_system::user_unit::autostart(&mut saiife_system::user_unit::HkcuRun, &exe, on) {
+        Ok(changed) => {
+            let what = match (on, changed) {
+                (true, _) => "on: the personal broker starts at logon",
+                (false, true) => "off",
+                (false, false) => "off (it was not on)",
+            };
+            println!("saiife: autostart {what}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("saiife: {e}");
+            ExitCode::from(2)
         }
     }
 }

@@ -96,9 +96,157 @@ pub fn launchd_plist_text(exe: &Path) -> Result<String, String> {
     ))
 }
 
+/// The per-user autostart key on Windows (`HKCU`, no admin rights).
+pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// The value under [`RUN_KEY`] that starts the personal broker at logon.
+pub const RUN_VALUE: &str = "saiife-broker";
+
+/// The command the logon `Run` value holds: `"<exe>" daemon --user`. The path is quoted
+/// whole, so a space in it (`C:\Program Files\...`) cannot split the command.
+/// [`windows_run_command`] is the checked form that writes it.
+pub fn windows_run_value(exe: &Path) -> String {
+    format!("\"{}\" daemon --user", exe.display())
+}
+
+/// [`windows_run_value`] for a path that is safe to put in the registry: a drive or UNC
+/// absolute path, valid UTF-8, with no quote and no control character (a quote would end
+/// the quoting early, and Windows paths cannot hold one anyway).
+pub fn windows_run_command(exe: &Path) -> Result<String, String> {
+    let s = exe
+        .to_str()
+        .ok_or_else(|| format!("the executable path {} is not valid UTF-8", exe.display()))?;
+    let b = s.as_bytes();
+    let drive = b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    if !(drive || s.starts_with(r"\\")) {
+        return Err(format!("the executable path {s} is not absolute"));
+    }
+    if s.chars().any(|c| c.is_control() || c == '"') {
+        return Err(format!(
+            "the executable path {s:?} contains a quote or a control character"
+        ));
+    }
+    Ok(windows_run_value(exe))
+}
+
+/// The registry key [`autostart`] writes to. A trait so Linux tests run the logic.
+pub trait RunKey {
+    fn set(&mut self, name: &str, value: &str) -> Result<(), String>;
+    /// `false` when there was no such value.
+    fn delete(&mut self, name: &str) -> Result<bool, String>;
+}
+
+/// Turn the logon start of the personal broker on or off. Returns whether anything
+/// changed (`off` with no value is not an error and changes nothing).
+pub fn autostart(reg: &mut dyn RunKey, exe: &Path, on: bool) -> Result<bool, String> {
+    if on {
+        reg.set(RUN_VALUE, &windows_run_command(exe)?)?;
+        Ok(true)
+    } else {
+        reg.delete(RUN_VALUE)
+    }
+}
+
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, through `winreg`.
+#[cfg(windows)]
+pub struct HkcuRun;
+
+#[cfg(windows)]
+impl RunKey for HkcuRun {
+    fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(RUN_KEY)
+            .map_err(|e| format!("HKCU\\{RUN_KEY}: {e}"))?;
+        key.set_value(name, &value)
+            .map_err(|e| format!("HKCU\\{RUN_KEY}\\{name}: {e}"))
+    }
+
+    fn delete(&mut self, name: &str) -> Result<bool, String> {
+        use winreg::{
+            enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+            RegKey,
+        };
+        let key = match RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
+        {
+            Ok(k) => k,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("HKCU\\{RUN_KEY}: {e}")),
+        };
+        match key.delete_value(name) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("HKCU\\{RUN_KEY}\\{name}: {e}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_run_value_quotes_exe() {
+        assert_eq!(
+            windows_run_value(Path::new(r"C:\Program Files\saiife\saiife.exe")),
+            r#""C:\Program Files\saiife\saiife.exe" daemon --user"#
+        );
+        assert_eq!(
+            windows_run_value(Path::new(r"C:\x\saiife.exe")),
+            r#""C:\x\saiife.exe" daemon --user"#
+        );
+    }
+
+    #[test]
+    fn windows_run_command_refuses_what_could_break_the_quoting() {
+        assert!(windows_run_command(Path::new(r"C:\Program Files\s\saiife.exe")).is_ok());
+        assert!(windows_run_command(Path::new(r"\\host\share\saiife.exe")).is_ok());
+        for p in [
+            "saiife.exe",
+            r"C:saiife.exe",
+            "C:\\a\"b\\saiife.exe",
+            "C:\\a\nb\\saiife.exe",
+            "C:\\a\0b\\saiife.exe",
+            "/opt/x/saiife",
+        ] {
+            assert!(windows_run_command(Path::new(p)).is_err(), "{p:?}");
+        }
+    }
+
+    #[derive(Default)]
+    struct Reg(std::collections::BTreeMap<String, String>);
+
+    impl RunKey for Reg {
+        fn set(&mut self, n: &str, v: &str) -> Result<(), String> {
+            self.0.insert(n.into(), v.into());
+            Ok(())
+        }
+        fn delete(&mut self, n: &str) -> Result<bool, String> {
+            Ok(self.0.remove(n).is_some())
+        }
+    }
+
+    #[test]
+    fn autostart_on_and_off() {
+        let mut r = Reg::default();
+        let exe = Path::new(r"C:\Program Files\saiife\saiife.exe");
+        assert!(!autostart(&mut r, exe, false).unwrap());
+        assert!(autostart(&mut r, exe, true).unwrap());
+        assert_eq!(
+            r.0.get("saiife-broker").map(String::as_str),
+            Some(r#""C:\Program Files\saiife\saiife.exe" daemon --user"#)
+        );
+        assert_eq!(r.0.len(), 1);
+        // On again replaces; off removes only our value.
+        r.0.insert("other".into(), "x".into());
+        assert!(autostart(&mut r, exe, true).unwrap());
+        assert!(autostart(&mut r, exe, false).unwrap());
+        assert_eq!(r.0.keys().collect::<Vec<_>>(), vec!["other"]);
+        // A bad path writes nothing.
+        let mut r = Reg::default();
+        assert!(autostart(&mut r, Path::new("rel.exe"), true).is_err());
+        assert!(r.0.is_empty());
+    }
 
     #[cfg(unix)]
     const EXPECT: &str = "[Unit]

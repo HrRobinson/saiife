@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod acl;
+pub mod cred;
 pub mod pipe;
 pub mod proc;
 pub mod process;

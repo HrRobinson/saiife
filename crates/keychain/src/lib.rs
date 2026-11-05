@@ -5,10 +5,10 @@
 //!
 //! - [`platform`] is the real backend: Secret Service on Linux
 //!   ([`secret_service::SecretService`]), the login Keychain on macOS
-//!   ([`MacKeychain`]).
+//!   ([`MacKeychain`]), Credential Manager on Windows ([`wincred::WinCredential`]).
 //! - [`FakeKeychain`] is an in-memory backend for unit tests.
-//! - [`DirKeychain`] (debug builds only) keeps one 0600 file per item in a
-//!   0700 dir. [`from_env`] selects it when `SAIIFE_TEST_KEYCHAIN=<dir>` is
+//! - [`DirKeychain`] (debug builds only) keeps one file per item in a
+//!   dir (0600 in 0700 on Unix). [`from_env`] selects it when `SAIIFE_TEST_KEYCHAIN=<dir>` is
 //!   set, so integration tests never reach the desktop keyring. Release
 //!   builds have no such seam.
 //!
@@ -19,19 +19,22 @@
 use std::fmt;
 use zeroize::Zeroizing;
 
-#[cfg(all(debug_assertions, unix))]
+#[cfg(debug_assertions)]
 mod dir;
 mod fake;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "linux")]
 pub mod secret_service;
+pub mod wincred;
 
-#[cfg(all(debug_assertions, unix))]
+#[cfg(debug_assertions)]
 pub use dir::DirKeychain;
 pub use fake::FakeKeychain;
 #[cfg(target_os = "macos")]
 pub use macos::MacKeychain;
+#[cfg(windows)]
+pub use wincred::WinCredential;
 
 /// One keychain item: a service and an account name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,7 +100,11 @@ pub fn platform() -> Result<Box<dyn Keychain>, KeychainError> {
     {
         Ok(Box::new(secret_service::SecretService::session()?))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(WinCredential::new()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         Err(KeychainError::Unavailable(
             "no keychain backend on this platform".into(),
@@ -108,7 +115,7 @@ pub fn platform() -> Result<Box<dyn Keychain>, KeychainError> {
 /// The keychain the broker uses: in debug builds `SAIIFE_TEST_KEYCHAIN=<dir>`
 /// selects a [`DirKeychain`]; otherwise [`platform`].
 pub fn from_env() -> Result<Box<dyn Keychain>, KeychainError> {
-    #[cfg(all(debug_assertions, unix))]
+    #[cfg(debug_assertions)]
     if let Some(dir) = std::env::var_os("SAIIFE_TEST_KEYCHAIN").filter(|d| !d.is_empty()) {
         return Ok(Box::new(DirKeychain::new(dir)?));
     }
