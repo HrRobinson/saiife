@@ -270,9 +270,14 @@ impl Host for RealHost {
         Err(windows_only())
     }
 
-    /// The registry's `ContainerType` value, of whichever type it was written.
+    /// From the registry's `ContainerType` value. A failed read is
+    /// [`CONTAINER_UNKNOWN`](super::CONTAINER_UNKNOWN), as on Linux.
     fn container(&self) -> Option<String> {
-        crate::supported::windows_container(self).then(|| "windows".to_string())
+        match crate::supported::windows_container(self) {
+            Ok(true) => Some("windows".to_string()),
+            Ok(false) => None,
+            Err(_) => Some(super::CONTAINER_UNKNOWN.to_string()),
+        }
     }
 
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> io::Result<CmdOutput> {
@@ -338,6 +343,18 @@ impl Host for RealHost {
         hklm(key)?.get_value::<u32, _>(value).ok()
     }
 
+    fn reg_value_present(&self, key: &str, value: &str) -> io::Result<bool> {
+        let not_found = |e: io::Error| match e.kind() {
+            io::ErrorKind::NotFound => Ok(false),
+            _ => Err(e),
+        };
+        let opened = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(key, KEY_READ);
+        match opened {
+            Ok(k) => k.get_raw_value(value).map(|_| true).or_else(not_found),
+            Err(e) => not_found(e),
+        }
+    }
+
     fn windows_build(&self) -> io::Result<WinBuild> {
         parse_win_build(
             self.reg_string(REG_NT_CURRENT_VERSION, "CurrentBuildNumber"),
@@ -399,7 +416,53 @@ mod tests {
         let build = RealHost.windows_build().unwrap();
         assert!(build.build >= 17763, "{build:?}");
         // GitHub's `windows-latest` is a server, and no container.
-        assert!(!crate::supported::windows_container(&RealHost));
+        assert!(!crate::supported::windows_container(&RealHost).unwrap());
+    }
+
+    #[test]
+    fn real_probe_finds_any_value_and_only_not_found_is_absent() {
+        let host = RealHost;
+        assert!(host
+            .reg_value_present(REG_NT_CURRENT_VERSION, "CurrentBuildNumber")
+            .unwrap());
+        assert!(!host
+            .reg_value_present(REG_NT_CURRENT_VERSION, "NoSuchValueSaiifeTest")
+            .unwrap());
+        assert!(!host
+            .reg_value_present(r"SOFTWARE\NoSuchKeySaiifeTest", "x")
+            .unwrap());
+        // `DigitalProductId` is REG_BINARY: neither reg_string nor reg_dword reads it.
+        assert!(host
+            .reg_value_present(REG_NT_CURRENT_VERSION, "DigitalProductId")
+            .unwrap());
+    }
+
+    /// `saiife.exe` and the managed files are `OICI` rows on files, compared exactly by
+    /// `actual_ok`. If Windows strips those flags from a file, this says so.
+    #[test]
+    fn oici_row_on_a_file_passes_actual_ok() {
+        let facts = token::current().unwrap();
+        if !facts.elevated_admin {
+            // Only an administrator can make `BA` the owner, so this cannot run. Not
+            // being able to on the runner is itself a failure: W23 says it is elevated.
+            assert!(
+                std::env::var_os("RUNNER_TEMP").is_none(),
+                "the CI runner is expected to be elevated"
+            );
+            return;
+        }
+        let base = std::env::var_os("RUNNER_TEMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let file = dir.path().join("saiife.exe");
+        std::fs::write(&file, b"x").unwrap();
+        let row = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        RealHost.set_sddl(&file, row).unwrap();
+        let text = RealHost.get_sddl(&file).unwrap();
+        let _ = writeln!(std::io::stderr(), "OICI row on a file reads: {text}");
+        let sd = parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        crate::winacl::actual_ok(row, &sd).unwrap_or_else(|e| panic!("{text}: {e}"));
     }
 
     #[test]
@@ -411,11 +474,12 @@ mod tests {
         assert_eq!(RealHost.user(&name).unwrap().uid, uid_of(&facts.sid, false));
     }
 
+    /// The runner has no saiifed, and anyone may connect and ask.
     #[test]
-    fn real_query_of_a_missing_service_is_missing_or_refused() {
-        // The runner has no saiifed; a job that lacks SCM rights gets an error.
-        if let Ok(state) = RealHost.service(ServiceOp::Query) {
-            assert_eq!(state, ServiceState::Missing);
-        }
+    fn real_query_of_a_missing_service_is_missing() {
+        assert_eq!(
+            RealHost.service(ServiceOp::Query).unwrap(),
+            ServiceState::Missing
+        );
     }
 }

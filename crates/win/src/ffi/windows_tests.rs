@@ -88,14 +88,25 @@ fn set_sddl_on_temp_dir_roundtrips() {
     let dir = temp_dir();
     let target = dir.path().join("target");
     std::fs::create_dir(&target).unwrap();
+    let child = target.join("child");
+    std::fs::write(&child, b"x").unwrap();
     let wanted = own_sddl("PAI", &me);
     acl::set_sddl(&target, &wanted).unwrap();
 
-    let read = sddl::parse(&acl::get_sddl(&target).unwrap()).unwrap();
+    // Printed first, and in every failure: Windows may spell a RID-500 owner `LA`, which
+    // `parse` refuses, and only a real run can say.
+    let text = acl::get_sddl(&target).unwrap();
+    log(&format!("set_sddl roundtrip wrote {wanted}, reads {text}"));
+    // Whether a set on a handle reaches existing children decides how install walks a tree.
+    log(&format!(
+        "its existing child reads {}",
+        acl::get_sddl(&child).unwrap()
+    ));
+    let read = sddl::parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
     let want = sddl::parse(&wanted).unwrap();
-    assert_eq!(read.owner, want.owner);
-    assert!(read.dacl_protected);
-    assert_eq!(read.aces, want.aces);
+    assert_eq!(read.owner, want.owner, "{text}");
+    assert!(read.dacl_protected, "{text}");
+    assert_eq!(read.aces, want.aces, "{text}");
 }
 
 /// `winacl::actual_ok` compares the group, so a row's `G:SY` must reach disk.
@@ -152,15 +163,26 @@ fn reparse_points_are_refused() {
     let real = dir.path().join("real");
     std::fs::create_dir(&real).unwrap();
     let link = dir.path().join("link");
-    // Creating a symlink needs a privilege the runner normally holds; without it the
-    // refusal cannot be shown here.
-    if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+    // Creating a symlink needs a privilege. The CI runner holds it, so there this test
+    // must run; only a local machine without it may skip.
+    if let Err(e) = std::os::windows::fs::symlink_dir(&real, &link) {
+        assert!(
+            std::env::var_os("RUNNER_TEMP").is_none(),
+            "the CI runner could not make a symlink: {e}"
+        );
         log("reparse_points_are_refused: no symlink privilege, skipped");
         return;
     }
     let me = token::current().unwrap().sid;
     assert!(acl::get_sddl(&link).is_err());
-    assert!(acl::set_sddl(&link, &own_sddl("P", &me)).is_err());
+    let before = acl::get_sddl(&real).unwrap();
+    let e = acl::set_sddl(&link, &own_sddl("P", &me)).unwrap_err();
+    assert!(e.to_string().contains("reparse point"), "{e}");
+    assert_eq!(
+        acl::get_sddl(&real).unwrap(),
+        before,
+        "the target must not change"
+    );
 }
 
 #[test]
@@ -215,7 +237,9 @@ fn real_folders_parse() {
 fn sid_aliases_match_windows() {
     for (alias, want) in sddl::SID_ALIASES {
         let desc = sd::from_sddl(&format!("O:{alias}D:")).unwrap();
-        let got = account::sid_to_string(desc.owner_sid().unwrap()).unwrap();
+        let owner = desc.owner_sid().unwrap();
+        // SAFETY: `owner` points into `desc`, alive here.
+        let got = unsafe { account::sid_to_string(owner) }.unwrap();
         assert_eq!(got, *want, "{alias}");
     }
 }
@@ -239,7 +263,9 @@ fn right_letters_match_windows() {
 #[test]
 fn from_sddl_gives_the_owner_and_refuses_a_null_dacl() {
     let desc = sd::from_sddl("O:BAD:P(A;;FA;;;SY)").unwrap();
-    let owner = account::sid_to_string(desc.owner_sid().unwrap()).unwrap();
+    let owner = desc.owner_sid().unwrap();
+    // SAFETY: `owner` points into `desc`, alive here.
+    let owner = unsafe { account::sid_to_string(owner) }.unwrap();
     assert_eq!(owner, ADMINISTRATORS);
     desc.dacl().unwrap();
 

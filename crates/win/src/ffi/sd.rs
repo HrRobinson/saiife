@@ -106,15 +106,18 @@ impl SecurityDescriptor {
 
     /// The parts `info` names, as SDDL.
     pub fn to_sddl(&self, info: u32) -> io::Result<String> {
-        to_sddl(self.as_ptr(), info)
+        // SAFETY: the descriptor is valid while `self` lives.
+        unsafe { to_sddl(self.as_ptr(), info) }
     }
 }
 
-/// The parts `info` names of the descriptor at `sd`, as SDDL. `sd` must be valid
-/// for the call, which every caller in this module tree guarantees.
-pub(crate) fn to_sddl(sd: PSECURITY_DESCRIPTOR, info: u32) -> io::Result<String> {
+/// The parts `info` names of the descriptor at `sd`, as SDDL.
+///
+/// # Safety
+/// `sd` points to a valid security descriptor, alive for the call.
+pub(crate) unsafe fn to_sddl(sd: PSECURITY_DESCRIPTOR, info: u32) -> io::Result<String> {
     let mut text: *mut u16 = ptr::null_mut();
-    // SAFETY: the callers pass a descriptor they hold alive; `text` is a valid out
+    // SAFETY: the caller promises a valid descriptor; `text` is a valid out
     // pointer. The length out pointer may be null. On success `text` is ours to free.
     let ok = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(

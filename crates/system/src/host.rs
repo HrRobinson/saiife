@@ -140,6 +140,9 @@ pub struct WinBuild {
 pub enum RegValue {
     Str(String),
     Dword(u32),
+    /// Any other type: `reg_string` and `reg_dword` cannot read it, and
+    /// `reg_value_present` still finds it.
+    Other,
 }
 
 pub trait Host: Send + Sync {
@@ -229,6 +232,10 @@ pub trait Host: Send + Sync {
     fn reg_string(&self, key: &str, value: &str) -> Option<String>;
     /// A `DWORD` value below HKLM.
     fn reg_dword(&self, key: &str, value: &str) -> Option<u32>;
+    /// Whether a value exists below HKLM, of any type. Only "not found", of the key
+    /// or the value, is `false`: any other failure is an `Err`, for callers that must
+    /// fail closed. `reg_string` and `reg_dword` cannot tell those cases apart.
+    fn reg_value_present(&self, key: &str, value: &str) -> io::Result<bool>;
     /// The Windows build. Unreadable or unrecognised values are an error.
     fn windows_build(&self) -> io::Result<WinBuild>;
     /// One operation on the service `saiifed`.
@@ -555,6 +562,10 @@ impl Host for RealHost {
 
     fn reg_dword(&self, _key: &str, _value: &str) -> Option<u32> {
         None
+    }
+
+    fn reg_value_present(&self, _key: &str, _value: &str) -> io::Result<bool> {
+        Err(windows_only())
     }
 
     fn windows_build(&self) -> io::Result<WinBuild> {
@@ -1616,6 +1627,8 @@ pub struct FakeState {
     /// HKLM, by (key, value). The default holds a stock machine's folders.
     #[serde(with = "registry_entries")]
     pub registry: BTreeMap<(String, String), RegValue>,
+    /// When set, `reg_value_present` fails with this error (access denied, say).
+    pub reg_probe_error: Option<String>,
     /// What `windows_build` returns (default 26100, server).
     pub build: WinBuild,
     /// The services that exist, by name. `service` acts on `saiifed`.
@@ -1692,6 +1705,7 @@ impl Default for FakeState {
             sddl: BTreeMap::new(),
             sids: BTreeMap::new(),
             registry: stock_registry(),
+            reg_probe_error: None,
             build: WinBuild {
                 build: 26100,
                 server: true,
@@ -2328,6 +2342,18 @@ impl Host for FakeHost {
             )
         })
         .ok()?
+    }
+
+    fn reg_value_present(&self, key: &str, value: &str) -> io::Result<bool> {
+        self.update(|s| {
+            s.calls.push(format!("reg_value_present {key} {value}"));
+            match &s.reg_probe_error {
+                Some(e) => Err(io::Error::other(e.clone())),
+                None => Ok(s
+                    .registry
+                    .contains_key(&(key.to_string(), value.to_string()))),
+            }
+        })
     }
 
     fn windows_build(&self) -> io::Result<WinBuild> {

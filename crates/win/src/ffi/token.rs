@@ -102,7 +102,7 @@ pub fn facts_of(token: HANDLE) -> io::Result<TokenFacts> {
     }
     // SAFETY: the buffer holds a TOKEN_USER (just checked), aligned by Vec<u64>. Its
     // SID points into the same buffer, alive across the read and the conversion.
-    let sid = sid_to_string(unsafe { (*user.buf.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
+    let sid = unsafe { sid_to_string((*user.buf.as_ptr().cast::<TOKEN_USER>()).User.Sid) }?;
 
     let groups = info(token, TokenGroups)?;
     let base = groups.buf.as_ptr().cast::<TOKEN_GROUPS>();
@@ -126,7 +126,8 @@ pub fn facts_of(token: HANDLE) -> io::Result<TokenFacts> {
     };
     let groups_with_attrs = entries
         .iter()
-        .map(|g| Ok((sid_to_string(g.Sid)?, g.Attributes)))
+        // SAFETY: each entry's SID points into `groups.buf`, alive across this.
+        .map(|g| Ok((unsafe { sid_to_string(g.Sid) }?, g.Attributes)))
         .collect::<io::Result<Vec<_>>>()?;
     Ok(TokenFacts::from_groups(sid, groups_with_attrs))
 }

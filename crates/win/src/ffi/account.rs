@@ -23,11 +23,13 @@ use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID, 
 /// so a "no other members" check refuses it.
 pub const UNNAMED_MEMBER: &str = "<member without a name>";
 
-/// The SID at `sid` as text. `sid` must be valid for the call, which every caller in
-/// this module tree guarantees.
-pub(crate) fn sid_to_string(sid: PSID) -> io::Result<String> {
+/// The SID at `sid` as text.
+///
+/// # Safety
+/// `sid` points to a valid SID, alive for the call.
+pub(crate) unsafe fn sid_to_string(sid: PSID) -> io::Result<String> {
     let mut text: *mut u16 = ptr::null_mut();
-    // SAFETY: the callers pass a SID they hold alive; `text` is a valid out pointer.
+    // SAFETY: the caller promises a valid SID; `text` is a valid out pointer.
     // On success `text` is ours to free with LocalFree.
     let ok = unsafe { ConvertSidToStringSidW(sid, &mut text) };
     if ok == 0 {
@@ -101,7 +103,8 @@ pub fn lookup_name(name: &str) -> io::Result<(String, String)> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let sid = sid_to_string(sid_buf.as_mut_ptr().cast())?;
+    // SAFETY: the successful call above wrote a SID into `sid_buf`, alive here.
+    let sid = unsafe { sid_to_string(sid_buf.as_mut_ptr().cast()) }?;
     let canonical = lookup_sid(&sid)?;
     Ok((sid, canonical))
 }
@@ -240,8 +243,16 @@ pub fn local_groups_of(user: &str) -> io::Result<Vec<String>> {
     };
     entries
         .iter()
-        // SAFETY: each name is a NUL-terminated string inside the same buffer.
-        .map(|e| unsafe { text_at(e.lgrui0_name) })
+        .map(|e| {
+            if e.lgrui0_name.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a local group without a name",
+                ));
+            }
+            // SAFETY: a non-null name is a NUL-terminated string inside the same buffer.
+            unsafe { text_at(e.lgrui0_name) }
+        })
         .collect()
 }
 

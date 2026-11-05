@@ -68,39 +68,44 @@ pub(crate) fn supported_on(current: Option<Platform>, layout: &Layout, host: &dy
     }
 }
 
-/// A Windows container: `ContainerType` is present, of whichever type it was written.
-pub(crate) fn windows_container(host: &dyn Host) -> bool {
-    host.reg_dword(REG_CONTROL, "ContainerType").is_some()
-        || host.reg_string(REG_CONTROL, "ContainerType").is_some()
+/// A Windows container: `ContainerType` is present, whatever its type. A failed read
+/// is an `Err`, never "no container", so callers fail closed as on Linux.
+pub(crate) fn windows_container(host: &dyn Host) -> std::io::Result<bool> {
+    host.reg_value_present(REG_CONTROL, "ContainerType")
 }
 
-/// W9: the registry says `C:\Program Files` and `C:\ProgramData`. Never read from
-/// environment variables, which the caller controls. `ProgramData` is stored as
-/// `%SystemDrive%\ProgramData`, and the variable is read off `SystemRoot`, for the
-/// same reason.
+/// W9: the registry says `C:\Windows`, `C:\Program Files` and `C:\ProgramData`. Never
+/// read from environment variables, which the caller controls. `ProgramData` is stored
+/// as `%SystemDrive%\ProgramData`, and `SystemRoot` says that drive is `C:`.
+///
+/// `SystemRoot` counts on its own too: install runs `C:\Windows\System32\net.exe` and
+/// `sc.exe`. With Windows on another drive, that folder would be unmade, and
+/// Authenticated Users may create entries in `C:\`.
 pub(crate) fn default_folders(host: &dyn Host) -> bool {
     let is = |got: Option<String>, want: &str| got.is_some_and(|g| g.eq_ignore_ascii_case(want));
-    if !is(
+    let data = host.reg_string(REG_PROFILE_LIST, "ProgramData");
+    is(
+        host.reg_string(REG_NT_CURRENT_VERSION, "SystemRoot"),
+        r"C:\Windows",
+    ) && is(
         host.reg_string(REG_CURRENT_VERSION, "ProgramFilesDir"),
         r"C:\Program Files",
-    ) {
-        return false;
-    }
-    let data = host.reg_string(REG_PROFILE_LIST, "ProgramData");
-    if is(data.clone(), r"C:\ProgramData") {
-        return true;
-    }
-    is(data, r"%SystemDrive%\ProgramData")
-        && is(
-            host.reg_string(REG_NT_CURRENT_VERSION, "SystemRoot"),
-            r"C:\Windows",
-        )
+    ) && (is(data.clone(), r"C:\ProgramData") || is(data, r"%SystemDrive%\ProgramData"))
 }
 
 /// The checks of [`check_supported`] on Windows, in that order. `systemd` is 0.
 fn windows_supported(host: &dyn Host) -> Support {
-    if windows_container(host) {
-        return Support::Refused("inside a Windows container: developer mode only".into());
+    match windows_container(host) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Support::Refused("inside a Windows container: developer mode only".into())
+        }
+        Err(e) => {
+            return Support::Refused(format!(
+                "container detection failed (the registry's ContainerType could not be \
+                 read: {e}); locked mode needs it to rule out a container"
+            ))
+        }
     }
     let build = match host.windows_build() {
         Ok(b) => b,
@@ -420,9 +425,61 @@ mod windows_tests {
         );
         set_str(&h, REG_NT_CURRENT_VERSION, "SystemRoot", r"D:\Windows");
         assert!(!default_folders(&h));
-        // A plain C: value does not depend on it.
+    }
+
+    /// Windows on D: with both folder values on C: leaves `C:\Windows` unmade, and
+    /// Authenticated Users can create entries in `C:\`. They could plant
+    /// `C:\Windows\System32\net.exe`, which an elevated install then runs. So the
+    /// tools' own folder is checked whatever the other two say.
+    #[test]
+    fn windows_elsewhere_refused_whatever_the_folders_say() {
+        let (_d, l, h) = machine(26100, true);
         set_str(&h, REG_PROFILE_LIST, "ProgramData", r"C:\ProgramData");
         assert!(default_folders(&h));
+        set_str(&h, REG_NT_CURRENT_VERSION, "SystemRoot", r"C:\WINDOWS");
+        assert!(default_folders(&h), "the case does not matter");
+
+        set_str(&h, REG_NT_CURRENT_VERSION, "SystemRoot", r"D:\Windows");
+        assert!(!default_folders(&h));
+        assert_eq!(refused(check(&l, &h)), NON_DEFAULT_FOLDERS);
+
+        h.set(|s| {
+            s.registry
+                .remove(&(REG_NT_CURRENT_VERSION.to_string(), "SystemRoot".to_string()));
+        });
+        assert!(!default_folders(&h), "a missing SystemRoot is no default");
+    }
+
+    /// Present is present: the value's type does not matter.
+    #[test]
+    fn container_value_of_any_type_refused() {
+        let k = (REG_CONTROL.to_string(), "ContainerType".to_string());
+        for value in [
+            RegValue::Dword(2),
+            RegValue::Str("x".into()),
+            RegValue::Other,
+        ] {
+            let (_d, l, h) = machine(26100, true);
+            h.set(|s| {
+                s.registry.insert(k.clone(), value.clone());
+            });
+            assert_eq!(
+                refused(check(&l, &h)),
+                "inside a Windows container: developer mode only",
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Only "not found" means no container, as on Linux (`unknown_container_refused`).
+    #[test]
+    fn container_probe_failure_refused() {
+        let (_d, l, h) = machine(26100, true);
+        h.set(|s| s.reg_probe_error = Some("Access is denied.".into()));
+        let why = refused(check(&l, &h));
+        assert!(why.starts_with("container detection failed"), "{why}");
+        assert!(why.contains("Access is denied."), "{why}");
+        assert!(!why.starts_with("inside a"), "{why}");
     }
 
     #[test]
