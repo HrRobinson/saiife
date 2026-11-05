@@ -373,6 +373,11 @@ impl Layout {
     ///
     /// On Windows it also panics on a constant with no Windows path, rather
     /// than make `C:\run\saiife`, which any user could have created first.
+    /// These callers pass such a constant and are `cfg(unix)` today, so they
+    /// must branch on the platform first when plan 19b Tasks 7 and 8 un-gate
+    /// them: `crates/cli/src/status_cmd.rs:1043` (`RUN_DIR`),
+    /// `doctor/system.rs:338` (`RUN_DIR`), `:469` (`CREDSTORE`), `:981` (`UNIT`),
+    /// `uninstall.rs:55` and `:298` (`INSTALL_LOCK`).
     pub fn at(&self, abs: &str) -> PathBuf {
         self.try_at(Path::new(self.logical(abs)))
             .unwrap_or_else(|e| panic!("{e}"))

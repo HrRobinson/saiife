@@ -6,8 +6,9 @@
 //! caller checks for reparse points, which an SDDL string cannot show.
 
 use crate::layout::{Layout, WIN_SERVICE};
-use saiife_win::sddl::{writers, Sd, WRITE_LIKE};
+use saiife_win::sddl::{parse, render, writers, Sd, WRITE_LIKE};
 use saiife_win::sid::{service_sid, valid_sid, ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// `C:\ProgramData\saiife`.
@@ -29,6 +30,10 @@ const DAEMON_LOG: &str =
     "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;FR;;;<A>)";
 /// The managed files and every dir install creates for them.
 const MANAGED: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+
+/// `CREATOR OWNER`: a placeholder for whoever creates a child, stock on
+/// `C:\Program Files` and on what is below it.
+const CREATOR_OWNER: &str = "S-1-3-0";
 
 /// The owners a protected path or an ancestor may have.
 const TRUSTED: [&str; 3] = [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER];
@@ -55,14 +60,23 @@ const RIGHTS: [(u32, &str); 10] = [
 
 /// The W14 SDDL for `path`, a path of `layout`, with `<S>` and `<A>` filled in.
 ///
-/// `None` for a path the table does not cover: an ancestor (`C:\ProgramData`
-/// must never get one of these), another layout, an `audit_sid` that is not a
-/// SID, and any spelling that is not plainly a name of the tree (`..`, a data
-/// stream, a trailing dot). Names compare as Windows does, ignoring case.
-pub fn expected(layout: &Layout, path: &Path, audit_sid: &str) -> Option<String> {
+/// `Ok(None)` for a path the table does not cover: an ancestor
+/// (`C:\ProgramData` must never get one of these), another layout, and any
+/// spelling that is not plainly a name of the tree (`..`, a data stream, a
+/// trailing dot). Names compare as Windows does, ignoring case.
+///
+/// `Err` when `audit_sid` is not a SID, on every path: a caller that skips what
+/// the table does not cover must not skip every check because of a bad lookup.
+/// A well-formed but wrong SID (`S-1-1-0`) passes here; plan 19b Task 7 checks
+/// that the lookup found a local group.
+pub fn expected(layout: &Layout, path: &Path, audit_sid: &str) -> Result<Option<String>, String> {
     if !valid_sid(audit_sid) {
-        return None;
+        return Err(format!("{audit_sid:?} is not a SID"));
     }
+    Ok(row_for(layout, path, audit_sid))
+}
+
+fn row_for(layout: &Layout, path: &Path, audit_sid: &str) -> Option<String> {
     let (drive, names) = layout.windows_location(path)?;
     if !drive.eq_ignore_ascii_case(&'C') {
         return None;
@@ -99,19 +113,70 @@ pub fn expected(layout: &Layout, path: &Path, audit_sid: &str) -> Option<String>
 
 /// Whether an existing path of ours is safe to keep (W14): a trusted owner, and
 /// no writer but SYSTEM, Administrators, TrustedInstaller and `extra_writers`
-/// (`<S>` where the table grants it). `extra_writers` are SIDs.
+/// (`<S>` where the table grants it, see [`service_may_write`]). `extra_writers`
+/// are SIDs.
+///
+/// The service may own what it may write, since a file it creates reads back
+/// that way. No other SID in `extra_writers` may own anything.
+///
+/// Inherit-only grants count, unlike in [`writers`]: every new child would get
+/// them until its descriptor is reset, and a handle opened in that window
+/// outlives the reset. `CREATOR OWNER` is exempt as a placeholder only.
 pub fn protected_ok(sd: &Sd, extra_writers: &[&str]) -> Result<(), String> {
-    owner_ok(sd)?;
-    for sid in writers(sd) {
-        if TRUSTED.contains(&sid.as_str()) || extra_writers.contains(&sid.as_str()) {
-            continue;
+    let service = service_sid(WIN_SERVICE);
+    let owned_by_service = sd.owner.as_deref() == Some(service.as_str());
+    if !(owned_by_service && extra_writers.contains(&service.as_str())) {
+        owner_ok(sd)?;
+    }
+    let mut held: BTreeMap<&str, u32> = BTreeMap::new();
+    for ace in sd.aces.iter().filter(|a| a.allow) {
+        if !(ace.flags.inherit_only && ace.sid == CREATOR_OWNER) {
+            *held.entry(ace.sid.as_str()).or_default() |= ace.mask & WRITE_LIKE;
         }
-        let held = sd
-            .aces
+    }
+    for (sid, mask) in held {
+        if mask != 0 && !TRUSTED.contains(&sid) && !extra_writers.contains(&sid) {
+            return Err(refusal(sid, mask));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the table lets the service write on the row `want`, an SDDL from
+/// [`expected`].
+pub fn service_may_write(want: &str) -> bool {
+    parse(want).is_ok_and(|sd| writers(&sd).contains(&service_sid(WIN_SERVICE)))
+}
+
+/// Whether `actual`, read back from a path, is what its row `want` asks for
+/// (spec §5.3a.3).
+///
+/// On a row the service may write, it may also have created the file, which
+/// then reads back with itself as owner, its token's group, and the parent's
+/// ACEs marked inherited. So there the owner may be `<S>`, the group and the
+/// inheritance flags are not compared, and the grants must be the row's grants,
+/// no more and no fewer. On every other row the descriptor must be exact.
+pub fn actual_ok(want: &str, actual: &Sd) -> Result<(), String> {
+    let table = parse(want)?;
+    let differs = || format!("reads {}, expected {}", render(actual), render(&table));
+    if !service_may_write(want) {
+        protected_ok(actual, &[])?;
+        return if *actual == table {
+            Ok(())
+        } else {
+            Err(differs())
+        };
+    }
+    protected_ok(actual, &[service_sid(WIN_SERVICE).as_str()])?;
+    let grants = |sd: &'_ Sd| -> BTreeSet<(bool, String, u32)> {
+        sd.aces
             .iter()
-            .filter(|a| a.allow && !a.flags.inherit_only && a.sid == sid)
-            .fold(0, |mask, a| mask | a.mask);
-        return Err(refusal(&sid, held & WRITE_LIKE));
+            .map(|a| (a.allow, a.sid.clone(), a.mask))
+            .collect()
+    };
+    let passed_on_only = actual.aces.iter().any(|a| a.flags.inherit_only);
+    if passed_on_only || grants(actual) != grants(&table) {
+        return Err(differs());
     }
     Ok(())
 }
@@ -155,9 +220,7 @@ fn refusal(sid: &str, held: u32) -> String {
 mod tests {
     use super::*;
     use crate::layout::{self, Platform};
-    use saiife_win::sddl::parse;
     use saiife_win::sid::{AUTHENTICATED_USERS, USERS};
-    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     const A: &str = "S-1-5-21-1-2-3-1009";
@@ -298,6 +361,10 @@ mod tests {
         },
     ];
 
+    fn covered(l: &Layout, path: &Path) -> Option<String> {
+        expected(l, path, A).unwrap()
+    }
+
     fn at(l: &Layout, windows: &str) -> PathBuf {
         l.try_at(Path::new(windows)).unwrap()
     }
@@ -309,13 +376,13 @@ mod tests {
         for row in ROWS {
             let want = row.sddl.replace("<S>", S).replace("<A>", A);
             assert_eq!(
-                expected(&l, &at(&l, row.path), A).as_deref(),
+                covered(&l, &at(&l, row.path)).as_deref(),
                 Some(want.as_str()),
                 "{}",
                 row.path
             );
             assert_eq!(
-                expected(&sys, Path::new(row.path), A).as_deref(),
+                covered(&sys, Path::new(row.path)).as_deref(),
                 Some(want.as_str()),
                 "real spelling of {}",
                 row.path
@@ -329,7 +396,7 @@ mod tests {
     fn table_grants_nothing_beyond_the_spec() {
         let (_d, l) = test_layout();
         for row in ROWS {
-            let text = expected(&l, &at(&l, row.path), A).unwrap();
+            let text = covered(&l, &at(&l, row.path)).unwrap();
             let sd = parse(&text).unwrap_or_else(|e| panic!("{}: {e}", row.path));
             assert_eq!(sd.owner.as_deref(), Some(ADMINISTRATORS), "{}", row.path);
             assert_eq!(sd.group.as_deref(), Some(SYSTEM), "{}", row.path);
@@ -371,7 +438,7 @@ mod tests {
     #[test]
     fn every_constant_of_the_tree_has_its_row() {
         let (_d, l) = test_layout();
-        let row = |constant: &str| expected(&l, &l.at(constant), A).unwrap();
+        let row = |constant: &str| covered(&l, &l.at(constant)).unwrap();
         let fill = |s: &str| s.replace("<S>", S).replace("<A>", A);
         for c in [
             layout::BIN_DIR,
@@ -411,7 +478,7 @@ mod tests {
     #[test]
     fn vault_key_readable_only_by_service() {
         let (_d, l) = test_layout();
-        let text = expected(&l, &l.at(layout::VAULT_KEY), A).unwrap();
+        let text = covered(&l, &l.at(layout::VAULT_KEY)).unwrap();
         let sd = parse(&text).unwrap();
         assert!(sd.dacl_protected);
         let sids: Vec<&str> = sd.aces.iter().map(|a| a.sid.as_str()).collect();
@@ -421,7 +488,7 @@ mod tests {
         assert_eq!(service.mask & WRITE_LIKE, 0);
         // Windows ignores case, so another spelling is still the key.
         let shouted = at(&l, r"C:\PROGRAMDATA\SAIIFE\STATE\KEYS\VAULT.KEY");
-        assert_eq!(expected(&l, &shouted, A), Some(text));
+        assert_eq!(covered(&l, &shouted), Some(text));
     }
 
     /// The service SID in the table is the service's own.
@@ -455,8 +522,8 @@ mod tests {
             // Another drive.
             r"D:\ProgramData\saiife\etc",
         ] {
-            assert_eq!(expected(&l, &at(&l, path), A), None, "{path}");
-            assert_eq!(expected(&sys, Path::new(path), A), None, "{path}");
+            assert_eq!(covered(&l, &at(&l, path)), None, "{path}");
+            assert_eq!(covered(&sys, Path::new(path)), None, "{path}");
         }
         // Spellings Win32 would read as some other path of the tree.
         for path in [
@@ -470,7 +537,7 @@ mod tests {
             r"\\server\share\ProgramData\saiife\etc",
             r"ProgramData\saiife\etc",
         ] {
-            assert_eq!(expected(&sys, Path::new(path), A), None, "{path}");
+            assert_eq!(covered(&sys, Path::new(path)), None, "{path}");
         }
         // The same names below a test root, each as one path component where
         // this OS allows it.
@@ -481,19 +548,18 @@ mod tests {
             "CC/ProgramData/saiife/etc",
             "1/ProgramData/saiife/etc",
         ] {
-            assert_eq!(expected(&l, &l.root().join(rest), A), None, "{rest}");
+            assert_eq!(covered(&l, &l.root().join(rest)), None, "{rest}");
         }
         #[cfg(unix)]
         assert_eq!(
-            expected(
+            covered(
                 &l,
-                &l.root().join(r"C/ProgramData/saiife/state/keys\vault.key"),
-                A
+                &l.root().join(r"C/ProgramData/saiife/state/keys\vault.key")
             ),
             None
         );
         // Outside the root.
-        assert_eq!(expected(&l, Path::new("/ProgramData/saiife"), A), None);
+        assert_eq!(covered(&l, Path::new("/ProgramData/saiife")), None);
     }
 
     #[test]
@@ -501,22 +567,40 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         for p in [Platform::Linux, Platform::Macos] {
             let l = Layout::under_for(d.path(), p);
-            assert_eq!(expected(&l, &l.at(layout::CONFIG), A), None);
+            assert_eq!(covered(&l, &l.at(layout::CONFIG)), None);
             assert_eq!(
-                expected(&l, &l.root().join("C/ProgramData/saiife/etc"), A),
+                covered(&l, &l.root().join("C/ProgramData/saiife/etc")),
                 None
             );
         }
     }
 
-    /// `audit_sid` goes into the descriptor as text: it can never add an ACE.
+    /// `audit_sid` goes into the descriptor as text, so a bad one can never add
+    /// an ACE. It is an error, not "not covered": a caller that skips on `None`
+    /// would silently check nothing. That holds on every row and for a path the
+    /// table does not cover.
     #[test]
-    fn expected_refuses_a_malformed_audit_sid() {
+    fn expected_errors_on_a_malformed_audit_sid() {
         let (_d, l) = test_layout();
         let audit = l.at(layout::AUDIT_DIR);
+        let config = l.at(layout::CONFIG);
+        let outside = at(&l, r"C:\Windows");
         for bad in ["", "BU", "saiife-audit", "S-1-5-1)(A;;FA;;;BU"] {
-            assert_eq!(expected(&l, &audit, bad), None, "{bad:?}");
+            for path in [&audit, &config, &outside] {
+                let got = expected(&l, path, bad);
+                assert!(got.is_err(), "{bad:?} {path:?}: {got:?}");
+            }
         }
+        assert_eq!(expected(&l, &outside, A), Ok(None));
+    }
+
+    /// A well-formed SID is taken as given: Task 7 checks that the lookup is a
+    /// local group.
+    #[test]
+    fn expected_takes_any_well_formed_audit_sid() {
+        let (_d, l) = test_layout();
+        let row = expected(&l, &l.at(layout::AUDIT_DIR), "S-1-1-0").unwrap();
+        assert!(row.unwrap().contains(";;;S-1-1-0)"));
     }
 
     fn ok_sd(owner: &str, aces: &str) -> Sd {
@@ -593,6 +677,213 @@ mod tests {
             assert_eq!(
                 protected_ok(&sd, &[]),
                 Err(format!("{USERS} may {name} here"))
+            );
+        }
+    }
+
+    /// An inheritable grant is a grant to every new child, from the moment it
+    /// is created until the descriptor is reset, and a handle opened in that
+    /// window outlives the reset.
+    #[test]
+    fn protected_ok_refuses_inherit_only_write() {
+        assert_eq!(
+            protected_ok(&ok_sd("BA", "(A;OICIIO;FA;;;BU)"), &[]),
+            Err(format!("{USERS} may WRITE_DAC here"))
+        );
+        assert_eq!(
+            protected_ok(&ok_sd("BA", "(A;CIIO;0x4;;;BU)"), &[]),
+            Err(format!("{USERS} may FILE_APPEND_DATA here"))
+        );
+        assert_eq!(
+            protected_ok(&ok_sd("BA", "(A;OICIIO;GA;;;AU)"), &[]),
+            Err(format!("{AUTHENTICATED_USERS} may GENERIC_ALL here"))
+        );
+        // The rights an ACE holds now and passes on count together.
+        assert_eq!(
+            protected_ok(&ok_sd("BA", "(A;;0x4;;;BU)(A;OICIIO;WD;;;BU)"), &[]),
+            Err(format!("{USERS} may WRITE_DAC here"))
+        );
+    }
+
+    #[test]
+    fn protected_ok_inherit_only_exemptions() {
+        // Trusted SIDs, stock `Program Files` shapes.
+        protected_ok(
+            &ok_sd(
+                "BA",
+                &format!("(A;OICIIO;GA;;;SY)(A;OICIIO;GA;;;BA)(A;CIIO;GA;;;{TRUSTED_INSTALLER})"),
+            ),
+            &[],
+        )
+        .unwrap();
+        // CREATOR OWNER is a placeholder, stock in Program Files.
+        protected_ok(&ok_sd("BA", "(A;OICIIO;GA;;;CO)"), &[]).unwrap();
+        // ... only as a placeholder: effective, it is no exemption.
+        assert!(protected_ok(&ok_sd("BA", "(A;;FA;;;CO)"), &[]).is_err());
+        // OWNER RIGHTS is not CREATOR OWNER.
+        assert!(protected_ok(&ok_sd("BA", "(A;OICIIO;GA;;;OW)"), &[]).is_err());
+        // `<S>` only where the caller says the table grants it.
+        let sd = ok_sd("BA", &format!("(A;OICIIO;FA;;;{S})"));
+        assert!(protected_ok(&sd, &[]).is_err());
+        protected_ok(&sd, &[S]).unwrap();
+        // An inheritable read is no write.
+        protected_ok(&ok_sd("BA", "(A;OICIIO;GXGR;;;BU)"), &[]).unwrap();
+    }
+
+    /// `ancestor_ok` keeps ignoring these: stock `C:\` has an inherit-only
+    /// Modify for Authenticated Users, and our dirs are created protected.
+    #[test]
+    fn ancestor_ok_still_ignores_inherit_only() {
+        ancestor_ok(&ok_sd("SY", "(A;OICIIO;FA;;;BU)")).unwrap();
+    }
+
+    /// `want` for `path`, with the fixed `<A>`.
+    fn want(l: &Layout, path: &str) -> String {
+        covered(l, &at(l, path)).unwrap()
+    }
+
+    const DAEMON_LOG_1: &str = r"C:\ProgramData\saiife\log\daemon\daemon.log.1";
+    const SEGMENT: &str = r"C:\ProgramData\saiife\log\audit\2026-11.jsonl";
+
+    /// A file the service created under the daemon log dir: its owner, whatever
+    /// group its token has, and the parent's ACEs marked inherited.
+    fn inherited_daemon_log(owner: &str, extra: &str) -> Sd {
+        parse(&format!(
+            "O:{owner}G:S-1-5-21-1-2-3-513D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})(A;ID;FR;;;{A}){extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn service_created_files_match_on_rows_it_may_write() {
+        let (_d, l) = test_layout();
+        let log = want(&l, DAEMON_LOG_1);
+        assert!(service_may_write(&log));
+        actual_ok(&log, &inherited_daemon_log(S, "")).unwrap();
+        // A subdir carries the inherit flags on as well.
+        let subdir = parse(&format!(
+            "O:{S}G:{S}D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;{S})(A;OICIID;0x1200a9;;;{A})"
+        ))
+        .unwrap();
+        actual_ok(&want(&l, SEGMENT), &subdir).unwrap();
+        // The exact descriptor, as install sets it, matches too.
+        actual_ok(&log, &parse(&log).unwrap()).unwrap();
+        // And a reinstall keeps the file.
+        protected_ok(&inherited_daemon_log(S, ""), &[S]).unwrap();
+        // State files the service writes.
+        let state = want(&l, r"C:\ProgramData\saiife\state\sessions.db");
+        let file = parse(&format!(
+            "O:{S}G:{S}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})"
+        ))
+        .unwrap();
+        actual_ok(&state, &file).unwrap();
+    }
+
+    #[test]
+    fn service_owner_needs_the_table_to_grant_the_service() {
+        assert!(protected_ok(&inherited_daemon_log(S, ""), &[]).is_err());
+        assert_eq!(
+            protected_ok(&ok_sd(S, ""), &[]),
+            Err(format!(
+                "owned by {S}, expected SYSTEM, Administrators or TrustedInstaller"
+            ))
+        );
+        protected_ok(&ok_sd(S, ""), &[S]).unwrap();
+        // Any other SID stays refused as an owner, even when named as a writer.
+        assert!(protected_ok(&ok_sd(A, ""), &[A]).is_err());
+    }
+
+    #[test]
+    fn normalising_lets_no_foreign_file_through() {
+        let (_d, l) = test_layout();
+        let log = want(&l, DAEMON_LOG_1);
+        let user = "S-1-5-21-1-2-3-1001";
+        for (why, sd) in [
+            ("user owner", inherited_daemon_log(user, "")),
+            ("Users owner", inherited_daemon_log("BU", "")),
+            ("audit group owner", inherited_daemon_log(A, "")),
+            ("Users write", inherited_daemon_log(S, "(A;ID;FA;;;BU)")),
+            ("Users append", inherited_daemon_log(S, "(A;ID;0x4;;;BU)")),
+            (
+                "explicit Users write",
+                inherited_daemon_log(S, "(A;;FA;;;BU)"),
+            ),
+            (
+                "inheritable Users write",
+                inherited_daemon_log(S, "(A;OICIIO;FA;;;BU)"),
+            ),
+            (
+                "Users read",
+                inherited_daemon_log(S, "(A;ID;0x1200a9;;;BU)"),
+            ),
+            ("a stray deny", inherited_daemon_log(S, "(D;;FA;;;BA)")),
+            (
+                "audit group write",
+                parse(&format!(
+                    "O:{S}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})(A;ID;FA;;;{A})"
+                ))
+                .unwrap(),
+            ),
+            (
+                "audit group lost",
+                parse(&format!(
+                    "O:{S}D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})"
+                ))
+                .unwrap(),
+            ),
+            (
+                "rights only passed on",
+                parse(&format!(
+                    "O:{S}D:AI(A;OICIIO;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{S})(A;ID;FR;;;{A})"
+                ))
+                .unwrap(),
+            ),
+        ] {
+            let got = actual_ok(&log, &sd);
+            assert!(got.is_err(), "{why}: {got:?}");
+        }
+    }
+
+    /// Off the service's rows the descriptor must be exact: no service owner,
+    /// no inherited form. The vault key is the one that matters most.
+    #[test]
+    fn rows_the_service_cannot_write_stay_exact() {
+        let (_d, l) = test_layout();
+        for path in [
+            r"C:\ProgramData\saiife",
+            r"C:\ProgramData\saiife\bin\saiife.exe",
+            r"C:\ProgramData\saiife\etc\config.toml",
+            r"C:\ProgramData\saiife\state\keys\vault.key",
+            r"C:\ProgramData\saiife\log",
+            r"C:\ProgramData\gemini-cli\settings.json",
+        ] {
+            let row = want(&l, path);
+            assert!(!service_may_write(&row), "{path}");
+            let exact = parse(&row).unwrap();
+            actual_ok(&row, &exact).unwrap_or_else(|e| panic!("{path}: {e}"));
+            // Owned by the service.
+            let mut sd = exact.clone();
+            sd.owner = Some(S.to_string());
+            assert!(actual_ok(&row, &sd).is_err(), "{path}: service owner");
+            // Inherited.
+            let mut sd = exact.clone();
+            sd.dacl_protected = false;
+            for ace in &mut sd.aces {
+                ace.flags.inherited = true;
+            }
+            assert!(actual_ok(&row, &sd).is_err(), "{path}: inherited form");
+        }
+    }
+
+    #[test]
+    fn service_may_write_follows_the_table() {
+        let (_d, l) = test_layout();
+        for row in ROWS {
+            assert_eq!(
+                service_may_write(&want(&l, row.path)),
+                row.writers.contains(&S),
+                "{}",
+                row.path
             );
         }
     }

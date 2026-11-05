@@ -588,7 +588,15 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
 - **Our own paths** must satisfy `protected_ok`. The owner is SYSTEM,
   Administrators or TrustedInstaller. There is no reparse point. The
   `writers` are a subset of SYSTEM, Administrators, TrustedInstaller, plus
-  `<S>` where the table grants it.
+  `<S>` where the table grants it. Inherit-only grants count here, since new
+  children would get them; only `CREATOR OWNER` is exempt, as a placeholder.
+- **Files the service creates.** On a row the service may write, a file or
+  dir it created reads back with `<S>` as owner, its token's group, and the
+  parent's ACEs marked inherited (`AI`, `ID`). So on those rows `<S>` may be
+  the owner, and the comparison ignores the group and the inheritance flags.
+  The grants must still be exactly the row's, so a file another account owns,
+  or that Users or `<A>` can write, still fails. Every other row is compared
+  exactly. To be confirmed on a real machine in `locked-windows`.
 - **An existing path that fails `protected_ok`** is refused with exit 2
   naming the path. Examples: a `C:\ProgramData\saiife`,
   `C:\ProgramData\OpenAI` or `C:\ProgramData\gemini-cli` created by a user,

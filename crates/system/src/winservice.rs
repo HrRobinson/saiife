@@ -2,30 +2,13 @@
 //! operations a service host performs. Pure data and text: nothing here
 //! talks to the service control manager.
 
-use crate::layout::Layout;
+use crate::layout::{
+    Layout, Platform, BINARY, WIN_DAEMON_ACCOUNT, WIN_SERVICE, WIN_SERVICE_DISPLAY,
+    WIN_SERVICE_SDDL,
+};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::Duration;
-
-/// The service name.
-pub const WIN_SERVICE: &str = "saiifed";
-/// The display name.
-pub const WIN_SERVICE_DISPLAY: &str = "saiife daemon";
-/// The logon account: a virtual account, no password.
-pub const WIN_DAEMON_ACCOUNT: &str = r"NT SERVICE\saiifed";
-/// The locked binary. Forward-slash form is used in hook commands; the
-/// service binary path uses backslashes.
-pub const WIN_BINARY: &str = r"C:\ProgramData\saiife\bin\saiife.exe";
-/// The binary below a layout root that is not the real machine.
-const WIN_BINARY_BELOW_ROOT: &str = r"ProgramData\saiife\bin\saiife.exe";
-/// The service's own DACL: the Windows default plus query rights for
-/// Authenticated Users. Only SYSTEM and Administrators can stop, pause,
-/// reconfigure or delete it.
-pub const WIN_SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)\
-(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
-(A;;CCLCSWLOCRRC;;;IU)\
-(A;;CCLCSWLOCRRC;;;SU)\
-(A;;CCLCSWLORC;;;AU)";
 
 /// When the service starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,11 +82,12 @@ impl ServiceSpec {
     /// The W10 values. Below a layout root that is not the real machine
     /// (a test tree), the binary sits below that root.
     pub fn saiifed(layout: &Layout) -> ServiceSpec {
-        let binary = if layout.is_system() {
-            PathBuf::from(WIN_BINARY)
+        let windows = if layout.is_system() {
+            Layout::system_for(Platform::Windows)
         } else {
-            layout.root().join(WIN_BINARY_BELOW_ROOT)
+            Layout::under_for(layout.root(), Platform::Windows)
         };
+        let binary = windows.at(BINARY);
         ServiceSpec {
             name: WIN_SERVICE.to_string(),
             display: WIN_SERVICE_DISPLAY.to_string(),
@@ -183,6 +167,7 @@ pub enum ServiceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn spec() -> ServiceSpec {
         ServiceSpec::saiifed(&Layout::system())
@@ -212,12 +197,31 @@ mod tests {
         );
     }
 
+    /// One source of truth: the layout's values, in every field.
+    #[test]
+    fn spec_uses_the_layouts_values() {
+        use crate::layout::{self, windows_path, Platform, BINARY};
+        let dir = tempfile::tempdir().unwrap();
+        let tree = Layout::under_for(dir.path(), Platform::Windows);
+        let s = ServiceSpec::saiifed(&tree);
+        assert_eq!(s.name, layout::WIN_SERVICE);
+        assert_eq!(s.display, layout::WIN_SERVICE_DISPLAY);
+        assert_eq!(s.account, layout::WIN_DAEMON_ACCOUNT);
+        assert_eq!(s.sddl, layout::WIN_SERVICE_SDDL);
+        assert_eq!(s.binary, tree.at(BINARY));
+        let sys = Layout::system_for(Platform::Windows);
+        assert_eq!(
+            ServiceSpec::saiifed(&sys).binary,
+            Path::new(windows_path(BINARY).unwrap())
+        );
+    }
+
     #[test]
     fn test_tree_binary_sits_below_the_root() {
         let dir = tempfile::tempdir().unwrap();
         let s = ServiceSpec::saiifed(&Layout::under(dir.path()));
         assert!(s.binary.starts_with(Layout::under(dir.path()).root()));
-        assert!(s.binary.ends_with(r"ProgramData\saiife\bin\saiife.exe"));
+        assert!(s.binary.ends_with("saiife.exe"));
     }
 
     #[test]
