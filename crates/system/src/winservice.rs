@@ -1,0 +1,260 @@
+//! The Windows service of the daemon (plan 19b, W10): its fixed spec and the
+//! operations a service host performs. Pure data and text: nothing here
+//! talks to the service control manager.
+
+use crate::layout::Layout;
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// The service name.
+pub const WIN_SERVICE: &str = "saiifed";
+/// The display name.
+pub const WIN_SERVICE_DISPLAY: &str = "saiife daemon";
+/// The logon account: a virtual account, no password.
+pub const WIN_DAEMON_ACCOUNT: &str = r"NT SERVICE\saiifed";
+/// The locked binary. Forward-slash form is used in hook commands; the
+/// service binary path uses backslashes.
+pub const WIN_BINARY: &str = r"C:\ProgramData\saiife\bin\saiife.exe";
+/// The binary below a layout root that is not the real machine.
+const WIN_BINARY_BELOW_ROOT: &str = r"ProgramData\saiife\bin\saiife.exe";
+/// The service's own DACL: the Windows default plus query rights for
+/// Authenticated Users. Only SYSTEM and Administrators can stop, pause,
+/// reconfigure or delete it.
+pub const WIN_SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)\
+(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
+(A;;CCLCSWLOCRRC;;;IU)\
+(A;;CCLCSWLOCRRC;;;SU)\
+(A;;CCLCSWLORC;;;AU)";
+
+/// When the service starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKind {
+    /// `SERVICE_AUTO_START`.
+    Auto,
+    /// `SERVICE_DEMAND_START`.
+    Manual,
+    /// `SERVICE_DISABLED`.
+    Disabled,
+}
+
+impl StartKind {
+    fn name(self) -> &'static str {
+        match self {
+            StartKind::Auto => "auto",
+            StartKind::Manual => "manual",
+            StartKind::Disabled => "disabled",
+        }
+    }
+}
+
+/// The service SID type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidType {
+    None,
+    /// `SERVICE_SID_TYPE_UNRESTRICTED`: the service SID is added to the token.
+    Unrestricted,
+    Restricted,
+}
+
+impl SidType {
+    fn name(self) -> &'static str {
+        match self {
+            SidType::None => "none",
+            SidType::Unrestricted => "unrestricted",
+            SidType::Restricted => "restricted",
+        }
+    }
+}
+
+/// What the service manager does when the service fails: the analogue of
+/// `Restart=always`, `RestartSec=1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailurePolicy {
+    /// Restart after this delay, `restarts` times.
+    pub restart_delay: Duration,
+    pub restarts: u32,
+    /// The failure count resets after this long without a failure.
+    pub reset_after: Duration,
+    /// Also restart when the service exits with a non-zero code without
+    /// crashing (`SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`).
+    pub on_non_crash: bool,
+}
+
+/// Everything `Create`/`Update` needs to set up the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSpec {
+    pub name: String,
+    pub display: String,
+    pub binary: PathBuf,
+    pub args: Vec<String>,
+    pub account: String,
+    pub start: StartKind,
+    pub sid_type: SidType,
+    pub failure: FailurePolicy,
+    pub sddl: String,
+}
+
+impl ServiceSpec {
+    /// The W10 values. Below a layout root that is not the real machine
+    /// (a test tree), the binary sits below that root.
+    pub fn saiifed(layout: &Layout) -> ServiceSpec {
+        let binary = if layout.is_system() {
+            PathBuf::from(WIN_BINARY)
+        } else {
+            layout.root().join(WIN_BINARY_BELOW_ROOT)
+        };
+        ServiceSpec {
+            name: WIN_SERVICE.to_string(),
+            display: WIN_SERVICE_DISPLAY.to_string(),
+            binary,
+            args: vec!["daemon".to_string(), "--system".to_string()],
+            account: WIN_DAEMON_ACCOUNT.to_string(),
+            start: StartKind::Auto,
+            sid_type: SidType::Unrestricted,
+            failure: FailurePolicy {
+                restart_delay: Duration::from_secs(1),
+                restarts: 3,
+                reset_after: Duration::from_secs(86_400),
+                on_non_crash: true,
+            },
+            sddl: WIN_SERVICE_SDDL.to_string(),
+        }
+    }
+
+    /// The canonical `key=value;…` text the fingerprint hashes. Strings
+    /// are Debug-quoted, so no value can forge another key.
+    pub fn canonical(&self) -> String {
+        format!(
+            "name={:?};display={:?};binary={:?};args={:?};account={:?};start={};sid_type={};\
+             restart_delay_ms={};restarts={};reset_after_s={};on_non_crash={};sddl={:?}",
+            self.name,
+            self.display,
+            self.binary.to_string_lossy(),
+            self.args,
+            self.account,
+            self.start.name(),
+            self.sid_type.name(),
+            self.failure.restart_delay.as_millis(),
+            self.failure.restarts,
+            self.failure.reset_after.as_secs(),
+            self.failure.on_non_crash,
+            self.sddl,
+        )
+    }
+
+    /// SHA-256 (hex) of [`ServiceSpec::canonical`].
+    pub fn fingerprint(&self) -> String {
+        Sha256::digest(self.canonical().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+/// One operation on the service, as a service host performs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceOp {
+    Query,
+    Create(ServiceSpec),
+    Update(ServiceSpec),
+    Start,
+    Stop {
+        wait: Duration,
+    },
+    Delete,
+    SetSddl(String),
+    /// `SERVICE_CONTROL_PARAMCHANGE`: reload the policy.
+    ParamChange,
+}
+
+/// Where the service is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceState {
+    Missing,
+    Stopped,
+    Running {
+        pid: u32,
+    },
+    /// Start-pending, stop-pending, paused and the like, as a word.
+    Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> ServiceSpec {
+        ServiceSpec::saiifed(&Layout::system())
+    }
+
+    #[test]
+    fn saiifed_spec_values() {
+        let s = spec();
+        assert_eq!(s.name, "saiifed");
+        assert_eq!(s.display, "saiife daemon");
+        assert_eq!(
+            s.binary,
+            PathBuf::from(r"C:\ProgramData\saiife\bin\saiife.exe")
+        );
+        assert_eq!(s.args, ["daemon", "--system"]);
+        assert_eq!(s.account, r"NT SERVICE\saiifed");
+        assert_eq!(s.start, StartKind::Auto);
+        assert_eq!(s.sid_type, SidType::Unrestricted);
+        assert_eq!(s.failure.restart_delay, Duration::from_secs(1));
+        assert_eq!(s.failure.restarts, 3);
+        assert_eq!(s.failure.reset_after, Duration::from_secs(86_400));
+        assert!(s.failure.on_non_crash);
+        assert_eq!(
+            s.sddl,
+            "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
+             (A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLORC;;;AU)"
+        );
+    }
+
+    #[test]
+    fn test_tree_binary_sits_below_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ServiceSpec::saiifed(&Layout::under(dir.path()));
+        assert!(s.binary.starts_with(Layout::under(dir.path()).root()));
+        assert!(s.binary.ends_with(r"ProgramData\saiife\bin\saiife.exe"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_hex() {
+        let (a, b) = (spec().fingerprint(), spec().fingerprint());
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fingerprint_changes_with_any_field() {
+        let base = spec().fingerprint();
+        type Edit = fn(&mut ServiceSpec);
+        let edits: Vec<(&str, Edit)> = vec![
+            ("name", |s| s.name.push('x')),
+            ("display", |s| s.display.push('x')),
+            ("binary", |s| s.binary.push("x")),
+            ("args", |s| s.args.push("x".into())),
+            ("args split", |s| s.args = vec!["daemon --system".into()]),
+            ("account", |s| s.account.push('x')),
+            ("start", |s| s.start = StartKind::Manual),
+            ("sid_type", |s| s.sid_type = SidType::Restricted),
+            ("restart_delay", |s| {
+                s.failure.restart_delay = Duration::from_millis(1001)
+            }),
+            ("restarts", |s| s.failure.restarts = 4),
+            ("reset_after", |s| {
+                s.failure.reset_after = Duration::from_secs(86_401)
+            }),
+            ("on_non_crash", |s| s.failure.on_non_crash = false),
+            ("sddl", |s| s.sddl.push('x')),
+        ];
+        for (what, edit) in edits {
+            let mut s = spec();
+            edit(&mut s);
+            assert_ne!(s.fingerprint(), base, "{what}");
+        }
+    }
+}
