@@ -210,7 +210,7 @@ async fn connection(s: tokio::net::UnixStream, ctx: Arc<Ctx>, opts: Opts) {
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(_) => {
-            ctx.notice(peer.uid, Notice::Connections);
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Connections);
             refuse_busy(s).await;
             return;
         }
@@ -603,7 +603,7 @@ async fn admit_inner(
             let slot = match ctx.conns.try_open(uid) {
                 Ok(slot) => slot,
                 Err(_) => {
-                    ctx.notice(uid, Notice::Connections);
+                    ctx.notice_sid(uid, sid.as_deref(), Notice::Connections);
                     return busy("too many open connections");
                 }
             };
@@ -628,7 +628,7 @@ async fn admit_inner(
     match ctx.limits.try_begin(uid, Instant::now()) {
         Ok(in_flight) => route(ctx, &caller, req, raw, opts, in_flight).await,
         Err(_) => {
-            ctx.notice(uid, Notice::Requests);
+            ctx.notice_sid(uid, caller.sid(), Notice::Requests);
             busy("too many requests from this uid")
         }
     }
@@ -653,27 +653,30 @@ async fn route(
     match classify(req.method(), req.uri(), raw.as_deref()) {
         Target::BadRequest(m) => refused(
             ctx,
-            uid,
+            caller,
             GatewayRefusal::BadRequest,
             error(StatusCode::BAD_REQUEST, "bad_request", m),
         ),
         Target::Services => {
-            let services = api_ops::services_for(ctx, uid, &BTreeMap::new()).await;
+            let services = api_ops::services_for(ctx, (uid, caller.sid()), &BTreeMap::new()).await;
             json_resp(StatusCode::OK, json!({"services": services}))
         }
-        Target::MethodNotAllowed(allow) => {
-            refused(ctx, uid, GatewayRefusal::Method, method_not_allowed(allow))
-        }
+        Target::MethodNotAllowed(allow) => refused(
+            ctx,
+            caller,
+            GatewayRefusal::Method,
+            method_not_allowed(allow),
+        ),
         Target::Api { service, op } => {
             let body = match read_body(req, opts).await {
                 Ok((_, b)) => b,
-                Err(r) => return body_refused(ctx, uid, *r),
+                Err(r) => return body_refused(ctx, caller, *r),
             };
             match api_args(&service, &op, &body) {
                 Ok(args) => call(ctx, caller, args, Route::Api, in_flight).await,
                 Err(m) => refused(
                     ctx,
-                    uid,
+                    caller,
                     GatewayRefusal::BadRequest,
                     error(StatusCode::BAD_REQUEST, "bad_request", m),
                 ),
@@ -683,7 +686,7 @@ async fn route(
             let method = req.method().as_str().to_string();
             let (parts, body) = match read_body(req, opts).await {
                 Ok(x) => x,
-                Err(r) => return body_refused(ctx, uid, *r),
+                Err(r) => return body_refused(ctx, caller, *r),
             };
             let args = proxy_args(&service, &method, &upstream, &parts.headers, &body);
             call(ctx, caller, args, Route::Proxy, in_flight).await
@@ -695,19 +698,19 @@ async fn route(
 
 /// `r`, a refusal before the pipeline: no `connector` record, only a
 /// `gateway_refused` notice (at most one per uid and kind a minute).
-fn refused(ctx: &Ctx, uid: u32, why: GatewayRefusal, r: Resp) -> Resp {
-    ctx.notice(uid, Notice::Gateway(why));
+fn refused(ctx: &Ctx, caller: &Caller, why: GatewayRefusal, r: Resp) -> Resp {
+    ctx.notice_sid(caller.uid(), caller.sid(), Notice::Gateway(why));
     r
 }
 
 /// [`refused`] for a body [`read_body`] would not take.
-fn body_refused(ctx: &Ctx, uid: u32, r: Resp) -> Resp {
+fn body_refused(ctx: &Ctx, caller: &Caller, r: Resp) -> Resp {
     let why = if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
         GatewayRefusal::TooLarge
     } else {
         GatewayRefusal::BadRequest
     };
-    refused(ctx, uid, why, r)
+    refused(ctx, caller, why, r)
 }
 
 /// Where a request goes, decided from its method and target alone (no IO).
@@ -968,7 +971,7 @@ async fn call(
         Err(m) => {
             return refused(
                 ctx,
-                caller.uid(),
+                caller,
                 GatewayRefusal::BadRequest,
                 error(StatusCode::BAD_REQUEST, "bad_request", m),
             )
@@ -1219,7 +1222,7 @@ fn sent_response(r: &Value) -> Resp {
     resp
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

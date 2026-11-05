@@ -159,10 +159,9 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
             if let Err(code) = crate::disk::disk_gate(
                 free.unwrap_or(0),
                 ctx.policy().min_free_mb,
-                peer.uid,
-                ctx.own_uid,
+                ctx.peer_is_own(peer),
             ) {
-                ctx.notice(peer.uid, Notice::LowDisk);
+                ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
                 return err(id, code, "the audit volume is below [audit] min_free_mb");
             }
             decide(
@@ -340,8 +339,8 @@ async fn decide(
             "the limits could not be rebuilt",
         ));
     }
-    let session_of =
-        agent_ancestor(ctx.proc.as_ref(), peer.pid).and_then(|a| ctx.sessions.lookup(a));
+    let session_of = agent_ancestor(ctx.proc.as_ref(), peer.pid)
+        .and_then(|a| ctx.sessions.lookup_as(peer.sid.as_deref(), a));
     // The record carries it, so a restart rebuilds the same bucket.
     facts.agent_session.clone_from(&session_of);
     let key = Key {

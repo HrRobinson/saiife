@@ -164,6 +164,9 @@ pub struct Request {
     pub request_sealed: Option<String>,
     pub state: State,
     pub decided_by: Option<u32>,
+    /// Windows: the SID behind `decided_by`, as every elevated admin's uid is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_sid: Option<String>,
     pub note: Option<String>,
     pub result_ref: Option<String>,
 }
@@ -436,6 +439,9 @@ pub fn record_for(
     }
     if let Some(b) = r.decided_by {
         base.extra.insert("by_uid".into(), b.into());
+    }
+    if let Some(sid) = &r.decided_by_sid {
+        base.extra.insert("by_sid".into(), sid.clone().into());
     }
     if let Some(n) = &r.note {
         base.extra.insert("note".into(), n.clone().into());
@@ -807,6 +813,7 @@ impl Store {
             request_sealed: sealed.map(|s| b64().encode(s)),
             state: State::Pending,
             decided_by: None,
+            decided_by_sid: None,
             note: None,
             result_ref: None,
         };
@@ -857,6 +864,20 @@ impl Store {
         note: Option<String>,
         now: SystemTime,
     ) -> Result<Request, StoreError> {
+        self.transition_by(id, from, to, by.map(|uid| (uid, None)), note, now)
+    }
+
+    /// [`Store::transition`] with the decider's SID too, so later records of the request
+    /// still name them on Windows.
+    pub fn transition_by(
+        &self,
+        id: u64,
+        from: &[State],
+        to: State,
+        by: Option<(u32, Option<String>)>,
+        note: Option<String>,
+        now: SystemTime,
+    ) -> Result<Request, StoreError> {
         if let Some(n) = &note {
             check_note(n)?;
         }
@@ -881,8 +902,9 @@ impl Store {
             });
         }
         r.state = to;
-        if by.is_some() {
-            r.decided_by = by;
+        if let Some((uid, sid)) = by {
+            r.decided_by = Some(uid);
+            r.decided_by_sid = sid;
         }
         if note.is_some() {
             r.note = note;
@@ -1021,6 +1043,47 @@ mod sid_tests {
         assert!(!mine(A, B));
     }
 
+    /// The decider's SID stays on the request, so `sent` and `send_failed` name them too.
+    #[test]
+    fn a_later_record_names_the_deciders_sid() {
+        const BY: &str = "S-1-5-21-1-2-3-500";
+        let mut r: Request = serde_json::from_value(serde_json::json!({
+            "id": 1, "created": "c", "expires": "e", "uid": 1000, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": null, "operation": null, "capability": null, "params": {},
+            "input": null, "grant_key": null, "state": "sent", "decided_by": 0
+        }))
+        .unwrap();
+        let base = || {
+            saiife_audit::Record::new(
+                saiife_audit::NewRecord {
+                    agent: "a",
+                    project: "p",
+                    session: None,
+                    tool: "t",
+                    input: "",
+                    decision: saiife_audit::DecisionKind::Allow,
+                    pack: None,
+                    rule: None,
+                    reason: None,
+                    mode: "locked",
+                    policy: None,
+                    permission_mode: None,
+                },
+                "0",
+            )
+        };
+        assert!(serde_json::to_value(&r)
+            .unwrap()
+            .get("decided_by_sid")
+            .is_none());
+        assert!(!record_for(base(), &r, "sent").extra.contains_key("by_sid"));
+        r.decided_by_sid = Some(BY.to_string());
+        let rec = record_for(base(), &r, "sent");
+        assert_eq!(rec.extra["by_uid"], 0);
+        assert_eq!(rec.extra["by_sid"], BY);
+    }
+
     /// A record of a Windows requester names its SID; one of a Unix requester has none.
     #[test]
     fn the_requester_sid_stays_out_of_a_unix_file() {
@@ -1036,10 +1099,12 @@ mod sid_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::vault::{Shared, VaultState};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1090,6 +1155,7 @@ mod tests {
         Env { t, store }
     }
 
+    #[cfg(unix)]
     fn vault(t: &tempfile::TempDir) -> Shared {
         let key = t.path().join("vault-key");
         std::fs::write(&key, [7u8; 32]).unwrap();
@@ -1104,6 +1170,7 @@ mod tests {
         Shared::new(s)
     }
 
+    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
     }
@@ -1197,6 +1264,7 @@ mod tests {
         assert_ne!(p.id, q.id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn files_0600_dir_0700() {
         let t = tempfile::tempdir().unwrap();
@@ -1414,6 +1482,7 @@ mod tests {
         assert!(s.put_result(77, vec![1], t0()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sealed_request_is_what_is_sent() {
         let e = env();
@@ -1461,6 +1530,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn vault_unavailable_seal_fails_closed() {
         let e = env();

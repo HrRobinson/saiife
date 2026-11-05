@@ -381,9 +381,10 @@ pub fn rfc3339(secs: u64) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -457,6 +458,7 @@ mod tests {
         assert_eq!(t.verify(&other.token), Some(6));
     }
 
+    #[cfg(unix)]
     #[test]
     fn token_hashed_on_disk() {
         let d = scratch();
@@ -493,6 +495,7 @@ mod tests {
         assert!(!text.contains(&hex(&sha256(&i.token))), "{text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_file_resets() {
         let d = scratch();

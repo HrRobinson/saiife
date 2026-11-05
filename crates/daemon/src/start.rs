@@ -1064,15 +1064,29 @@ fn start(opts: DaemonOptions, service: Service) -> Result<ExitCode, Refuse> {
     .chain(rebuild_note)
     .chain(capped_note)
     .collect();
+    // W11: a name someone else holds ends the start here, before any record, so the service
+    // manager's restarts every second can't grow the log, and nothing below is taken as done
+    // (an interrupted approval's state, say) with its record unwritten.
+    #[cfg(windows)]
+    let place = {
+        let place = personal_place.unwrap_or_else(|| {
+            pipe_spec(test_pipe.as_deref(), own_sid.as_deref().unwrap_or_default())
+        });
+        match rt.block_on(Endpoints::open(&ctx, place)) {
+            Ok(endpoints) => endpoints,
+            Err(code) => {
+                drop(ctx);
+                let _ = join.join();
+                return Ok(code);
+            }
+        }
+    };
     let mut more = start_notes(&ctx, notes, &expired_at_start);
     // Requests approved but not sent when the daemon stopped become
     // `send_failed` (`interrupted`); none is sent again by itself.
     more.extend(crate::approval_ops::reconcile_interrupted(&ctx));
     #[cfg(unix)]
     let place = daemon_cfg.socket_dir.clone();
-    #[cfg(windows)]
-    let place = personal_place
-        .unwrap_or_else(|| pipe_spec(test_pipe.as_deref(), own_sid.as_deref().unwrap_or_default()));
     let code = rt.block_on(serve(
         Arc::clone(&ctx),
         service,
@@ -1703,7 +1717,7 @@ async fn serve(
     ctx: Arc<Ctx>,
     service: Service,
     #[cfg(unix)] place: PathBuf,
-    #[cfg(windows)] place: (String, String),
+    #[cfg(windows)] place: Endpoints,
     check: saiife_audit::StartupCheck,
     policy_err: Option<String>,
     loaded_files: Option<Value>,
@@ -1757,10 +1771,13 @@ async fn serve(
         }
     }
 
+    #[cfg(unix)]
     let mut endpoints = match Endpoints::open(&ctx, place).await {
         Ok(e) => e,
         Err(code) => return code,
     };
+    #[cfg(windows)]
+    let mut endpoints = place;
     // The optional loopback TCP listener: a bind failure is a record and
     // no listener; the Unix sockets stay.
     let gateway_tcp = match tcp {

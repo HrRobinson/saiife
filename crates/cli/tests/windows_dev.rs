@@ -81,6 +81,53 @@ fn daemon_system_runs_outside_the_service_manager_and_refuses_this_user() {
     assert!(text.contains("the daemon"), "{text}");
 }
 
+/// W11's line reaches stderr, which the service's log takes over: the CLI, a squatted test
+/// pipe, and exit 1. Task 5's own test could not read stderr, as it is one per process.
+#[test]
+fn a_squatted_pipe_is_w11s_line_and_exit_1() {
+    use saiife_win::ffi::pipe::create_server;
+    use saiife_win::ffi::{acl, token};
+    use saiife_win::pipe::control_sddl;
+    let home = tempfile::tempdir().unwrap();
+    let me = token::current().unwrap().sid;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let pipe = format!(r"\\.\pipe\saiife-test-{}-w11", std::process::id());
+    let _squat = create_server(&pipe, &control_sddl(&me), true).unwrap();
+    let user = saiife_win::ffi::account::lookup_sid(&me).unwrap();
+    let top = home.path().join("t");
+    acl::create_dir_with_sddl(
+        &top,
+        &format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)"),
+    )
+    .unwrap();
+    let audit = top.join("audit");
+    std::fs::create_dir_all(&audit).unwrap();
+    let config = top.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "version = 2\nlocked = true\n[daemon]\nuser = {user:?}\n[audit]\ndir = {:?}\nmin_free_mb = 0\n",
+            audit.display().to_string()
+        ),
+    )
+    .unwrap();
+    saiife(home.path())
+        .args(["daemon", "--system", "--config"])
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(top.join("state"))
+        .arg("--credentials-dir")
+        .arg(top.join("state").join("keys"))
+        .env("SAIIFE_TEST_PIPE", &pipe)
+        .assert()
+        .code(1)
+        .stderr(contains("exists and is not ours; refusing to start"));
+}
+
 #[test]
 fn locked_commands_refuse_on_windows() {
     let home = tempfile::tempdir().unwrap();

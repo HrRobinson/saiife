@@ -123,6 +123,19 @@ pub fn may_read_all(dir: &dyn Directory, uid: u32) -> bool {
             .is_some_and(|n| dir.groups_of(&n).iter().any(|g| g == AUDIT_GROUP))
 }
 
+/// [`may_read_all`] for a peer. On Windows the uid is a label, and the group is read from the
+/// token: that's what counts for a low-integrity or restricted child, and a group nested
+/// into the local one shows there. A name that can't be resolved is "no".
+pub fn peer_may_read_all(dir: &dyn Directory, peer: &saiife_ipc::peer::PeerCred) -> bool {
+    let Some(sid) = peer.sid.as_deref() else {
+        return may_read_all(dir, peer.uid);
+    };
+    crate::ops::token_is_admin(sid, &peer.group_sids)
+        || dir
+            .sid_of(AUDIT_GROUP)
+            .is_some_and(|s| peer.group_sids.contains(&s))
+}
+
 /// The scope of a query by `uid`: its own records, or with `all` every
 /// record when `auditor()` says so (asked only then).
 pub fn scope_for(all: bool, uid: u32, auditor: impl FnOnce() -> bool) -> Result<Scope, String> {
@@ -421,7 +434,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let auditor = if q.all {
         // Decision 6: the current groups, looked up for this request.
         let dir = Arc::clone(&ctx.directory);
-        tokio::task::spawn_blocking(move || may_read_all(dir.as_ref(), uid))
+        let peer = peer.clone();
+        tokio::task::spawn_blocking(move || peer_may_read_all(dir.as_ref(), &peer))
             .await
             .unwrap_or(false)
     } else {
@@ -458,7 +472,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use saiife_audit::{DecisionKind, NewRecord};
@@ -531,6 +545,52 @@ mod tests {
         // Another uid sees only its own.
         let p = page(&mixed(), Scope::Uid(OTHER), &q(json!({})));
         assert_eq!(inputs(&p), ["other-guard", "other-conn", "other-approval"]);
+    }
+
+    /// Windows: the token decides, and the label says nothing.
+    #[test]
+    fn a_peer_with_a_sid_is_judged_by_its_token() {
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                Some("wrong".into())
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                vec![AUDIT_GROUP.to_string()]
+            }
+            fn sid_of(&self, name: &str) -> Option<String> {
+                (name == AUDIT_GROUP).then(|| "S-1-5-21-9-9-9-2000".to_string())
+            }
+        }
+        let peer = |uid: u32, groups: &[&str]| saiife_ipc::peer::PeerCred {
+            uid,
+            gid: 0,
+            pid: 1,
+            sid: Some("S-1-5-21-1-1-1-1001".into()),
+            group_sids: groups.iter().map(|g| g.to_string()).collect(),
+        };
+        assert!(!peer_may_read_all(&D, &peer(7, &[])));
+        // A uid of 0 with no token group behind it is no admin here.
+        assert!(!peer_may_read_all(&D, &peer(0, &[])));
+        assert!(peer_may_read_all(&D, &peer(7, &["S-1-5-21-9-9-9-2000"])));
+        assert!(peer_may_read_all(
+            &D,
+            &peer(7, &[saiife_win::sid::ADMINISTRATORS])
+        ));
+        // Unix: as it was.
+        let mut unix = peer(1002, &[]);
+        unix.sid = None;
+        let dir = FixedDirectory::from_text(
+            "aud:x:1002:1002::/:/bin/sh\n",
+            &format!("{AUDIT_GROUP}:x:1002:aud\n"),
+        );
+        assert!(peer_may_read_all(&dir, &unix));
     }
 
     #[test]

@@ -114,7 +114,7 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred,
     let _slot = match ctx.conns.try_open(peer.uid) {
         Ok(slot) => slot,
         Err(code) => {
-            ctx.notice(peer.uid, Notice::Connections);
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Connections);
             let msg = "too many open connections";
             write_within(&mut s, &err(0, code, msg), REFUSE_WRITE_TIMEOUT).await;
             return;
@@ -182,7 +182,7 @@ async fn serve_peer<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, peer: PeerCred,
         let answer = match ctx.limits.try_begin(peer.uid, Instant::now()) {
             Ok(_in_flight) => ops::dispatch_conn(&ctx, &conn, req).await,
             Err(code) => {
-                ctx.notice(peer.uid, Notice::Requests);
+                ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::Requests);
                 err(req.id, code, "too many requests from this uid")
             }
         };

@@ -240,7 +240,7 @@ mod requester_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sessions::ProcStat;
@@ -650,8 +650,10 @@ mod tests {
 
     /// The macOS check with a fake `security`, made available (the real
     /// test needs a root-owned binary).
+    #[cfg(unix)]
     struct AvailableMac(crate::reauth::MacAuthorize);
 
+    #[cfg(unix)]
     impl Reauth for AvailableMac {
         fn available(&self) -> bool {
             true
@@ -661,12 +663,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn mac(dir: &std::path::Path, answer: &str, code: i32) -> AvailableMac {
         AvailableMac(crate::reauth::MacAuthorize::with_path(
             crate::reauth::fakes::security(dir, answer, false, code, 0),
         ))
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_auth_is_unavailable() {
         let d = tempfile::tempdir().unwrap();
@@ -716,6 +720,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unavailable_starts_no_cooldown() {
         let d = tempfile::tempdir().unwrap();

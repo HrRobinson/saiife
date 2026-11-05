@@ -304,7 +304,7 @@ fn write(file: &Path, m: &HashMap<[u8; 32], Grant>) -> io::Result<()> {
     crate::fsx::sync_dir(dir)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -408,6 +408,7 @@ mod tests {
         assert_eq!(g.consume(&key(UID, CMD), inside).unwrap(), Some(43));
     }
 
+    #[cfg(unix)]
     #[test]
     fn grants_survive_restart() {
         use std::os::unix::fs::PermissionsExt;
@@ -446,6 +447,7 @@ mod tests {
         assert!(why.unwrap().contains("corrupt"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsafe_dir_is_no_grants() {
         use std::os::unix::fs::PermissionsExt;

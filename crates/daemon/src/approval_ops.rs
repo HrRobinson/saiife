@@ -673,8 +673,9 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     } else {
         State::Rejected
     };
+    let by = (peer.uid, peer.sid.clone());
     let moved = on_store(ctx, move |_, s| {
-        s.transition(rid, &[State::Pending], to, Some(peer.uid), note, now())
+        s.transition_by(rid, &[State::Pending], to, Some(by), note, now())
     })
     .await;
     let r = match moved {
@@ -1286,9 +1287,6 @@ async fn finish(ctx: &Arc<Ctx>, r: &ApprovalRequest, to: State, result: Option<V
         _ => state_name(to),
     };
     let mut rec = ctx.approval_record(&r, action);
-    if let Some(by) = r.decided_by {
-        rec.extra.insert("by_uid".into(), by.into());
-    }
     rec.rule = d.rule;
     rec.reason = d.reason;
     if r.state != to {
@@ -1658,9 +1656,6 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
                 rec.decision = DecisionKind::Deny;
                 rec.rule = Some(INTERRUPTED.into());
                 rec.reason = Some(message.into());
-                if let Some(by) = r.decided_by {
-                    rec.extra.insert("by_uid".into(), by.into());
-                }
                 out.push(rec);
             }
             Err(e) => eprintln!(

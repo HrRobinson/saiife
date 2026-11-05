@@ -31,13 +31,8 @@ const MAX_FIELD_BYTES: usize = 64 * 1024;
 type Refusal = (ErrorCode, String);
 
 /// The audit-volume gate; an unknown free space counts as too little.
-fn gate(
-    free: std::io::Result<u64>,
-    min_free_mb: u64,
-    peer_uid: u32,
-    own_uid: u32,
-) -> Result<(), ErrorCode> {
-    crate::disk::disk_gate(free.unwrap_or(0), min_free_mb, peer_uid, own_uid)
+fn gate(free: std::io::Result<u64>, min_free_mb: u64, is_own: bool) -> Result<(), ErrorCode> {
+    crate::disk::disk_gate(free.unwrap_or(0), min_free_mb, is_own)
 }
 
 fn bad(m: impl Into<String>) -> Refusal {
@@ -82,8 +77,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     let admin = ctx.peer_is_admin(peer).await;
     if event != "secret_list" || !admin {
         let free = crate::disk::free_mb(&ctx.audit_dir);
-        if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
-            ctx.notice(peer.uid, Notice::LowDisk);
+        if let Err(code) = gate(free, ctx.policy().min_free_mb, ctx.peer_is_own(peer)) {
+            ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
             return err(id, code, "the audit volume is below [audit] min_free_mb");
         }
     }
@@ -652,15 +647,15 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         _ => return err(id, ErrorCode::BadRequest, "secret.lease takes an exe path"),
     };
     let free = crate::disk::free_mb(&ctx.audit_dir);
-    if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
-        ctx.notice(peer.uid, Notice::LowDisk);
+    if let Err(code) = gate(free, ctx.policy().min_free_mb, ctx.peer_is_own(peer)) {
+        ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     // Under any lockdown scope no secret value is handed out.
     let verdict = if let Some(l) = ctx.lockdown.get() {
         Err(deny("lockdown", crate::lockdown::message(&l)))
     } else {
-        match check_lease(ctx, peer.uid, &name, &exe).await {
+        match check_lease(ctx, peer, &name, &exe).await {
             Ok(services) => take_value(ctx, &name, services).await,
             Err(d) => Err(d),
         }
@@ -744,11 +739,16 @@ fn out_of_scope() -> Deny {
 
 /// Scope (the caller's, and the secret's services within it), then the
 /// executable. Returns the scope's services.
-async fn check_lease(ctx: &Arc<Ctx>, uid: u32, name: &str, exe: &str) -> Result<Vec<String>, Deny> {
+async fn check_lease(
+    ctx: &Arc<Ctx>,
+    peer: &PeerCred,
+    name: &str,
+    exe: &str,
+) -> Result<Vec<String>, Deny> {
     let Some(sys) = ctx.policy().system else {
         return Err(deny("run_not_allowed", "no valid policy is loaded"));
     };
-    let Some(user) = ctx.name_of(uid).await else {
+    let Some(user) = ctx.peer_name(peer).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
     let dir = Arc::clone(&ctx.directory);
@@ -1154,9 +1154,9 @@ mod tests {
     #[test]
     fn gate_refuses_below_the_floor_and_fails_closed() {
         let io_err = || Err(std::io::Error::other("x"));
-        assert_eq!(gate(Ok(10), 512, 1000, 990), Err(ErrorCode::LowDisk));
-        assert_eq!(gate(Ok(512), 512, 1000, 990), Ok(()));
-        assert_eq!(gate(io_err(), 512, 1000, 990), Err(ErrorCode::LowDisk));
+        assert_eq!(gate(Ok(10), 512, false), Err(ErrorCode::LowDisk));
+        assert_eq!(gate(Ok(512), 512, false), Ok(()));
+        assert_eq!(gate(io_err(), 512, false), Err(ErrorCode::LowDisk));
     }
 
     #[test]

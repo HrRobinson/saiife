@@ -123,6 +123,10 @@ async fn daemon_refuses_existing_pipe() {
         .join()
         .unwrap();
     assert_eq!(code, 1);
+    // The restarts every second must not grow the log: nothing is written before the name
+    // is ours.
+    let text = audit_text(&t.audit);
+    assert!(!text.contains("\"start\""), "{text}");
     // W11's line is `create_server`'s text, checked in saiife-win; the log is
     // `service_log`'s. Stderr is one per process, so it is not read here.
     // The name is still held, and open_client still opens it: only the owner check,
@@ -200,4 +204,148 @@ fn the_runner_resolves_through_the_directory() {
     let dir = WinDirectory::system();
     assert_eq!(dir.sid_of(&user).as_deref(), Some(me.as_str()));
     assert_eq!(dir.name_of_sid(&me).as_deref(), Some(user.as_str()));
+}
+
+/// What the loopback listener answers `GET /v1/services` with (W13).
+fn services_status(addr: std::net::SocketAddr, token: Option<&str>) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let auth = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    write!(
+        s,
+        "GET /v1/services HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut got = String::new();
+    s.read_to_string(&mut got).unwrap();
+    got.lines().next().unwrap_or_default().to_string()
+}
+
+/// W13: on Windows the gateway is loopback TCP and the bearer token, whose SID is what a
+/// call runs as. A token comes through the pipe; without one nothing is answered.
+#[test]
+fn the_gateway_goes_by_the_token_over_tcp() {
+    let t = tree();
+    let pipe = pipe_name("tcp");
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = free.local_addr().unwrap();
+    drop(free);
+    let user = account::lookup_sid(&me()).unwrap();
+    let text = std::fs::read_to_string(&t.config).unwrap();
+    std::fs::write(
+        &t.config,
+        format!(
+            "{text}[gateway]\ntcp = \"{addr}\"\n[[scope]]\nname = \"s\"\nusers = [{user:?}]\nservices = []\n"
+        ),
+    )
+    .unwrap();
+    let (tx, join) = start(&t, &pipe);
+    let mut c = connect(&pipe);
+    let answer = call(&mut c, "api.token", serde_json::json!({}));
+    let token = answer["token"].as_str().unwrap().to_string();
+
+    assert!(services_status(addr, None).contains(" 401"));
+    assert!(services_status(addr, Some("wrong")).contains(" 401"));
+    assert!(services_status(addr, Some(&token)).contains(" 200"));
+
+    tx.send(Control::Stop).unwrap();
+    assert_eq!(join.join().unwrap(), 0);
+}
+
+fn call(
+    c: &mut Client,
+    op: &str,
+    args: serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    c.call(op, args.as_object().unwrap().clone(), deadline)
+        .unwrap()
+}
+
+/// The record's `sid` is the peer's token, whatever the client's record says.
+#[test]
+fn audit_append_carries_the_sid() {
+    let t = tree();
+    let pipe = pipe_name("append");
+    let (tx, join) = start(&t, &pipe);
+    let mut c = connect(&pipe);
+    let mut rec = serde_json::to_value(saiife_audit::Record::new(
+        saiife_audit::NewRecord {
+            agent: "claude",
+            project: "C:\\p",
+            session: None,
+            tool: "Bash",
+            input: "git status",
+            decision: saiife_audit::DecisionKind::Allow,
+            pack: None,
+            rule: None,
+            reason: None,
+            mode: "locked",
+            policy: Some("x"),
+            permission_mode: None,
+        },
+        "0",
+    ))
+    .unwrap();
+    let fields = rec.as_object_mut().unwrap();
+    fields.remove("ts");
+    fields.insert("sid".into(), "S-1-5-21-9-9-9-9".into());
+    call(&mut c, "audit.append", serde_json::json!({ "rec": rec }));
+    tx.send(Control::Stop).unwrap();
+    assert_eq!(join.join().unwrap(), 0);
+    let text = audit_text(&t.audit);
+    assert!(text.contains(&me()), "{text}");
+    assert!(!text.contains("S-1-5-21-9-9-9-9"), "{text}");
+}
+
+/// `policy.reload` from an elevated admin; a runner that isn't elevated gets a refusal.
+#[test]
+fn policy_reload_goes_by_the_token() {
+    let t = tree();
+    let pipe = pipe_name("reload-op");
+    let (tx, join) = start(&t, &pipe);
+    let mut c = connect(&pipe);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = c.call("policy.reload", serde_json::Map::new(), deadline);
+    if token::current().unwrap().elevated_admin {
+        answer.unwrap();
+    } else {
+        assert!(answer.is_err());
+    }
+    tx.send(Control::Stop).unwrap();
+    assert_eq!(join.join().unwrap(), 0);
+}
+
+/// The start record opens this month's file, in the audit dir, where it can be listed.
+#[test]
+fn the_start_opens_a_month_file() {
+    let t = tree();
+    let pipe = pipe_name("month");
+    let (tx, join) = start(&t, &pipe);
+    tx.send(Control::Stop).unwrap();
+    assert_eq!(join.join().unwrap(), 0);
+    let months = std::fs::read_dir(&t.audit)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .count();
+    assert_eq!(months, 1);
+}
+
+/// A second daemon run on the same tree reads what the first wrote: the chain's ACL check on
+/// real inherited descriptors passes both times.
+#[test]
+fn a_restart_keeps_the_chain() {
+    let t = tree();
+    for name in ["chain-1", "chain-2"] {
+        let pipe = pipe_name(name);
+        let (tx, join) = start(&t, &pipe);
+        let _ = connect(&pipe);
+        tx.send(Control::Stop).unwrap();
+        assert_eq!(join.join().unwrap(), 0);
+    }
+    assert_eq!(audit_text(&t.audit).matches("\"stop\"").count(), 2);
 }

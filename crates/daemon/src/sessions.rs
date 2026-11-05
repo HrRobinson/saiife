@@ -117,12 +117,22 @@ impl WinProc {
 impl Proc for WinProc {
     fn stat(&self, pid: u32) -> Option<ProcStat> {
         let mut c = self.cached.lock().unwrap_or_else(|p| p.into_inner());
-        if c.as_ref().is_none_or(|t| t.at.elapsed() >= SNAPSHOT_FOR) {
+        let fresh = |c: &mut Option<WinTable>| -> Option<()> {
             let procs = (self.snapshot)().ok()?;
             *c = Some(WinTable {
                 at: std::time::Instant::now(),
                 procs: procs.into_iter().map(|e| (e.pid, e)).collect(),
             });
+            Some(())
+        };
+        let stale = c.as_ref().is_none_or(|t| t.at.elapsed() >= SNAPSHOT_FOR);
+        if stale {
+            fresh(&mut c)?;
+        }
+        // A process newer than the cached table: one more look, so it isn't attributed
+        // to nobody for the rest of the 200 ms.
+        if !stale && !c.as_ref()?.procs.contains_key(&pid) {
+            fresh(&mut c)?;
         }
         let e = c.as_ref()?.procs.get(&pid)?;
         Some(ProcStat {
@@ -242,9 +252,12 @@ pub fn agent_ancestor(p: &dyn Proc, pid: u32) -> Option<(u32, u64)> {
 
 #[derive(Default)]
 struct Inner {
-    map: HashMap<(u32, u64), String>,
-    order: VecDeque<(u32, u64)>,
+    map: HashMap<SessionKey, String>,
+    order: VecDeque<SessionKey>,
 }
+
+/// The peer's SID (Windows), and its agent ancestor's pid and start time.
+type SessionKey = (Option<String>, (u32, u64));
 
 /// Agent process -> its latest session id.
 #[derive(Default)]
@@ -258,15 +271,24 @@ impl Sessions {
     }
 
     /// The newest session wins. Beyond 4 096 entries the oldest goes.
+    #[cfg(test)]
     pub fn record(&self, ancestor: (u32, u64), session_id: &str) {
+        self.record_as(None, ancestor, session_id);
+    }
+
+    /// [`Sessions::record`] for the peer with this SID. Windows gives no start time, so a
+    /// reused pid looks like the same ancestor: the SID keeps another user's process from
+    /// taking this session over. `None` on Linux and macOS, where the start time does it.
+    pub fn record_as(&self, sid: Option<&str>, ancestor: (u32, u64), session_id: &str) {
         if session_id.len() > MAX_SESSION_ID {
             return;
         }
+        let key = (sid.map(str::to_string), ancestor);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.map.insert(ancestor, session_id.to_string()).is_some() {
-            g.order.retain(|k| *k != ancestor);
+        if g.map.insert(key.clone(), session_id.to_string()).is_some() {
+            g.order.retain(|k| *k != key);
         }
-        g.order.push_back(ancestor);
+        g.order.push_back(key);
         while g.map.len() > MAX_SESSIONS {
             if let Some(old) = g.order.pop_front() {
                 g.map.remove(&old);
@@ -276,9 +298,15 @@ impl Sessions {
         }
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, ancestor: (u32, u64)) -> Option<String> {
+        self.lookup_as(None, ancestor)
+    }
+
+    /// The session of this ancestor, as the peer with this SID recorded it.
+    pub fn lookup_as(&self, sid: Option<&str>, ancestor: (u32, u64)) -> Option<String> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.map.get(&ancestor).cloned()
+        g.map.get(&(sid.map(str::to_string), ancestor)).cloned()
     }
 }
 
@@ -299,6 +327,41 @@ mod win_tests {
 
     fn fixture(table: Vec<ProcEntry>) -> WinProc {
         WinProc::with_snapshot(Box::new(move || Ok(table.clone())))
+    }
+
+    /// A process started after the cached table was read is found, at the cost of one
+    /// more snapshot; a pid that's still missing does not loop.
+    #[test]
+    fn a_miss_takes_one_more_snapshot() {
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        let p = WinProc::with_snapshot(Box::new(move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            let mut table = vec![entry(100, 4, "a.exe")];
+            if n > 0 {
+                table.push(entry(200, 100, "b.exe"));
+            }
+            Ok(table)
+        }));
+        assert!(p.stat(100).is_some());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(p.stat(200).unwrap().comm, "b");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(p.stat(999).is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// With no start time on Windows, only the SID tells two users apart at one pid.
+    #[test]
+    fn sessions_are_keyed_by_sid() {
+        let s = Sessions::new();
+        s.record_as(Some("S-1-5-21-1"), (100, 0), "mine");
+        assert_eq!(
+            s.lookup_as(Some("S-1-5-21-1"), (100, 0)).as_deref(),
+            Some("mine")
+        );
+        assert_eq!(s.lookup_as(Some("S-1-5-21-2"), (100, 0)), None);
+        assert_eq!(s.lookup((100, 0)), None);
     }
 
     #[test]

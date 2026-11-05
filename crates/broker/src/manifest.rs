@@ -1109,11 +1109,8 @@ fn manifest_meta_trusted(meta: &std::fs::Metadata, owner_uid: u32) -> bool {
     meta.uid() == owner_uid && meta.mode() & 0o022 == 0
 }
 
-/// Windows (developer mode, plan 19a): a reparse point (symlink, junction,
-/// mount point) is refused, and there is NO owner or DACL check. That is a
-/// known gap: the locked daemon and its root-owned manifests do not exist on
-/// Windows until plan 19b, whose Task adds the DACL check through
-/// `saiife-win` (W-decision on developer-mode paths). `owner_uid` is unused.
+/// Windows: a reparse point (symlink, junction, mount point) is refused here, and the
+/// owner and writers are [`manifest_acl`]'s. `owner_uid` is unused here.
 #[cfg(not(unix))]
 fn manifest_meta_trusted(meta: &std::fs::Metadata, owner_uid: u32) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -1122,12 +1119,51 @@ fn manifest_meta_trusted(meta: &std::fs::Metadata, owner_uid: u32) -> bool {
     meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
 
+/// Windows: who owns `path`, and who else may write it. A manifest moved in from a user's
+/// folder keeps its descriptor, so the folder's ACL alone proves nothing, and a manifest
+/// names where credentials go. With `owner_uid` 0, only SYSTEM, Administrators and
+/// TrustedInstaller count. With any other, this process's own SID as well: the personal
+/// broker's files are its user's.
+#[cfg(windows)]
+fn manifest_acl(path: &Path, owner_uid: u32) -> Result<(), String> {
+    let own = match owner_uid {
+        0 => String::new(),
+        _ => {
+            saiife_win::ffi::token::current()
+                .map_err(|e| e.to_string())?
+                .sid
+        }
+    };
+    let text = saiife_win::ffi::acl::get_sddl(path).map_err(|e| e.to_string())?;
+    match saiife_win::sddl::private_problem(&text, &own, false) {
+        None => Ok(()),
+        Some(why) => Err(why),
+    }
+}
+
+/// Unix: the owner and the mode are all there is, in [`manifest_meta_trusted`].
+#[cfg(not(windows))]
+fn manifest_acl(_path: &Path, _owner_uid: u32) -> Result<(), String> {
+    Ok(())
+}
+
 /// [`load_local`] with the built-in list and the required owner as inputs
 /// (a seam for tests, which cannot create root-owned files).
 pub fn load_local_with(
     dir: &Path,
     builtin: &[Manifest],
     owner_uid: u32,
+) -> Result<Vec<Manifest>, BrokerError> {
+    load_local_checked(dir, builtin, owner_uid, &|p| manifest_acl(p, owner_uid))
+}
+
+/// [`load_local_with`] with the ACL check as an input: it is asked about the directory and
+/// each manifest, before a byte of it is read.
+pub fn load_local_checked(
+    dir: &Path,
+    builtin: &[Manifest],
+    owner_uid: u32,
+    acl: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<Vec<Manifest>, BrokerError> {
     let err = |p: &Path, why: &str| BrokerError::Manifest(format!("{}: {why}", p.display()));
     // Root for the locked daemon, the user for the personal broker.
@@ -1144,6 +1180,7 @@ pub fn load_local_with(
     if !manifest_meta_trusted(&dmeta, owner_uid) {
         return Err(err(dir, &owned));
     }
+    acl(dir).map_err(|why| err(dir, &why))?;
     let mut names = Vec::new();
     for e in std::fs::read_dir(dir).map_err(|e| err(dir, &e.to_string()))? {
         let e = e.map_err(|e| err(dir, &e.to_string()))?;
@@ -1163,6 +1200,7 @@ pub fn load_local_with(
         if !manifest_meta_trusted(&meta, owner_uid) {
             return Err(err(&path, &owned));
         }
+        acl(&path).map_err(|why| err(&path, &why))?;
         if meta.len() > MAX_MANIFEST_BYTES {
             return Err(err(&path, "larger than 1 MiB"));
         }

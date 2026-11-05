@@ -544,8 +544,9 @@ fn current_user() -> Option<String> {
     None
 }
 
-/// The uid `load_local_with` expects as the manifests' owner. Windows has no
-/// uid and the loader ignores it there (no owner check before plan 19b).
+/// The uid `load_local_with` expects as the manifests' owner. On Windows any uid but 0
+/// means "this process's SID, and the machine's admins": a policy kept in git belongs to
+/// whoever checked it out, elevated or not.
 #[cfg(unix)]
 fn manifest_owner() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -553,7 +554,7 @@ fn manifest_owner() -> u32 {
 
 #[cfg(not(unix))]
 fn manifest_owner() -> u32 {
-    0
+    1
 }
 
 /// The directory `policy show` asks about users.

@@ -398,6 +398,112 @@ async fn no_scope_denied() {
     assert_eq!(l["servers"], json!([]), "{l}");
 }
 
+/// A directory that knows one SID, as Windows' does, and no uid: on Windows the uid is a
+/// label, and all elevated admins share 0.
+struct SidDirectory;
+
+const ANN_SID: &str = "S-1-5-21-1-2-3-1001";
+
+impl saiife_policy::Directory for SidDirectory {
+    fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+        None
+    }
+    fn name_of(&self, _: u32) -> Option<String> {
+        None
+    }
+    fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+        None
+    }
+    fn groups_of(&self, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn name_of_sid(&self, sid: &str) -> Option<String> {
+        (sid == ANN_SID).then(|| "ann".to_string())
+    }
+}
+
+fn sid_peer(uid: u32) -> PeerCred {
+    PeerCred {
+        uid,
+        gid: 0,
+        pid: std::process::id(),
+        sid: Some(ANN_SID.to_string()),
+        group_sids: vec![saiife_win::sid::ADMINISTRATORS.to_string()],
+    }
+}
+
+impl W {
+    async fn op_as(&self, peer: &PeerCred, op: &str, args: Value) -> Value {
+        let req = IpcRequest {
+            id: 5,
+            op: op.into(),
+            args: args.as_object().unwrap().clone(),
+        };
+        crate::ops::dispatch(&self.ctx, peer, req).await
+    }
+}
+
+/// An elevated admin in a scope lists its servers, gets a token and passes the scope step of a lease.
+/// With its label alone (uid 0, no name) it would get none of these.
+#[tokio::test]
+async fn a_sid_peer_is_named_by_its_sid() {
+    let w = world_dir("[\"mcp:linear\"]", "", "", Arc::new(SidDirectory));
+    let peer = sid_peer(0);
+
+    let l = w.op_as(&peer, "mcp.list", json!({})).await;
+    assert_eq!(l["servers"][0]["name"], "linear", "{l}");
+
+    let t = w.op_as(&peer, "api.token", json!({})).await;
+    assert!(t["token"].is_string(), "{t}");
+
+    let a = w
+        .op_as(&peer, "secret.lease", json!({"name": "k", "exe": "/nope"}))
+        .await;
+    assert_eq!(a["rule"], "run_not_allowed", "{a}");
+}
+
+/// Two SIDs can share a label. Only the daemon's own identity passes the audit floor.
+#[tokio::test]
+async fn the_disk_floor_goes_by_identity_and_its_notice_names_the_sid() {
+    let w = world("[\"mcp:linear\"]", "");
+    w.ctx
+        .policy
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .min_free_mb = u64::MAX;
+    // This process's own uid as a label, with someone else's SID behind it.
+    let peer = sid_peer(me().uid);
+    let t = w.op_as(&peer, "api.token", json!({})).await;
+    assert_eq!(t["error"], "low_disk", "{t}");
+    for _ in 0..100 {
+        if w.records().iter().any(|r| r["sid"] == ANN_SID) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let found = w.records();
+    assert!(found.iter().any(|r| r["sid"] == ANN_SID), "{found:?}");
+}
+
+/// The lockdown's refused token names the SID as the issued one does.
+#[tokio::test]
+async fn a_refused_token_names_the_sid() {
+    let w = world_dir("[\"mcp:linear\"]", "", "", Arc::new(SidDirectory));
+    w.ctx
+        .lockdown
+        .set(Some(saiife_broker::pipeline::Lockdown {
+            scope: saiife_broker::pipeline::LockScope::Connectors,
+            reason: "incident".into(),
+            by_uid: 0,
+            since: "2026-10-29T00:00:00Z".into(),
+        }))
+        .unwrap();
+    let t = w.op_as(&sid_peer(0), "api.token", json!({})).await;
+    assert_eq!(t["rule"], "lockdown", "{t}");
+    let found = w.records();
+    assert!(found.iter().any(|r| r["token_sid"] == ANN_SID), "{found:?}");
+}
+
 #[tokio::test]
 async fn lockdown_denied() {
     let w = world("[\"mcp:linear\"]", "");

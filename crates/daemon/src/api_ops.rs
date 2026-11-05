@@ -448,9 +448,9 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
 
 /// The audit-volume gate (as for `audit.append`): a call that cannot be
 /// recorded is not made.
-pub(crate) fn disk_ok(ctx: &Ctx, uid: u32) -> Result<(), ErrorCode> {
+pub(crate) fn disk_ok(ctx: &Ctx, uid: u32, sid: Option<&str>) -> Result<(), ErrorCode> {
     let free = crate::disk::free_mb(&ctx.audit_dir).unwrap_or(0);
-    crate::disk::disk_gate(free, ctx.policy().min_free_mb, uid, ctx.own_uid)
+    crate::disk::disk_gate(free, ctx.policy().min_free_mb, ctx.is_own(uid, sid))
 }
 
 /// A snapshot for the record of a call made without a valid policy.
@@ -583,7 +583,7 @@ pub(crate) async fn identify(ctx: &Ctx, caller: &Caller, id: &mut Identity) {
     let ancestor = caller
         .pid()
         .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
-    id.session = ancestor.and_then(|a| ctx.sessions.lookup(a));
+    id.session = ancestor.and_then(|a| ctx.sessions.lookup_as(caller.sid(), a));
     id.agent = ancestor
         .and_then(|(pid, _)| ctx.proc.stat(pid))
         .map(|s| s.comm)
@@ -620,8 +620,8 @@ pub(crate) async fn execute_in(
     // A stop waits for this call (and its record) before it ends the log.
     let _busy = ctx.calls.enter();
     let uid = caller.uid();
-    if let Err(code) = disk_ok(ctx, uid) {
-        ctx.notice(uid, Notice::LowDisk);
+    if let Err(code) = disk_ok(ctx, uid, caller.sid()) {
+        ctx.notice_sid(uid, caller.sid(), Notice::LowDisk);
         return Err(Refused::LowDisk(code));
     }
     // 1. Identify: the caller's uid, the session by attribution.
@@ -812,8 +812,8 @@ pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
 pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
     let uid = peer.uid;
     // No record, no token: below the audit floor none is issued.
-    if let Err(code) = disk_ok(ctx, uid) {
-        ctx.notice(uid, Notice::LowDisk);
+    if let Err(code) = disk_ok(ctx, uid, peer.sid.as_deref()) {
+        ctx.notice_sid(uid, peer.sid.as_deref(), Notice::LowDisk);
         return err(id, code, LOW_DISK);
     }
     // No credential of any kind is handed out during a lockdown.
@@ -824,6 +824,9 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
         r.rule = Some("lockdown".into());
         r.reason = Some(why.clone());
         r.extra.insert("token_uid".into(), uid.into());
+        if let Some(sid) = &peer.sid {
+            r.extra.insert("token_sid".into(), sid.clone().into());
+        }
         if let Err(e) = ctx.writer.append(r).await {
             eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
         }
@@ -833,7 +836,7 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
         }
         return v;
     }
-    if !has_scope(ctx, uid).await {
+    if !has_scope(ctx, peer).await {
         return err(
             id,
             ErrorCode::Forbidden,
@@ -879,9 +882,9 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
 
 /// Whether `uid` has a scope in the policy in force (a scope conflict or no
 /// valid policy: no).
-async fn has_scope(ctx: &Arc<Ctx>, uid: u32) -> bool {
+async fn has_scope(ctx: &Arc<Ctx>, peer: &PeerCred) -> bool {
     let state = ctx.policy();
-    let (Some(g), Some(user)) = (&state.gateway, ctx.name_of(uid).await) else {
+    let (Some(g), Some(user)) = (&state.gateway, ctx.peer_name(peer).await) else {
         return false;
     };
     let groups = Groups(ctx.groups_of(&user).await);
@@ -908,8 +911,14 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Some(Value::Bool(b)) => *b,
         Some(_) => return bad(id, "schema must be a boolean"),
     };
-    let (mut services, warning) =
-        services_in(ctx, peer.uid, &overlays, project_env.as_deref(), true).await;
+    let (mut services, warning) = services_in(
+        ctx,
+        (peer.uid, peer.sid.as_deref()),
+        &overlays,
+        project_env.as_deref(),
+        true,
+    )
+    .await;
     let tools_hash = format!(
         "sha256:{}",
         hex(&Sha256::digest(
@@ -952,10 +961,10 @@ fn strip_schemas(services: &mut [Value]) {
 /// valid policy, a name for the uid or a scope.
 pub(crate) async fn services_for(
     ctx: &Arc<Ctx>,
-    uid: u32,
+    who: (u32, Option<&str>),
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
-    services_in(ctx, uid, overlays, None, false).await.0
+    services_in(ctx, who, overlays, None, false).await.0
 }
 
 /// [`services_for`] under the environment `api.call` would choose for the
@@ -964,7 +973,7 @@ pub(crate) async fn services_for(
 /// [`pipeline::list_operations`].
 pub(crate) async fn services_in(
     ctx: &Arc<Ctx>,
-    uid: u32,
+    (uid, sid): (u32, Option<&str>),
     overlays: &BTreeMap<String, ServiceOverlay>,
     project_env: Option<&str>,
     schema: bool,
@@ -972,7 +981,7 @@ pub(crate) async fn services_in(
     let mut services = Vec::new();
     let mut warning = None;
     let state = ctx.policy();
-    let user = ctx.name_of(uid).await;
+    let user = ctx.principal_name(uid, sid).await;
     if let (Some(g), Some(user)) = (&state.gateway, user) {
         let groups = Groups(ctx.groups_of(&user).await);
         // A locked scope env with no snapshot lists nothing (a call is

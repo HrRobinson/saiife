@@ -54,8 +54,10 @@ impl PipeListener {
                 continue;
             };
             if let Err(e) = free.connect().await {
-                // A client that came and went leaves this instance unusable.
-                self.free = None;
+                // A client that came and went leaves this instance unusable. Its successor
+                // comes first, so the name is never free for someone else to take. The
+                // old one goes when the assignment drops it. A full pipe gives `None`.
+                self.free = self.next_instance()?;
                 return Err(e);
             }
             let connected = self.free.take();

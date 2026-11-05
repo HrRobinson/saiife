@@ -730,12 +730,12 @@ impl Ctx {
 
     /// Whether `peer` is this daemon's own identity.
     pub(crate) fn peer_is_own(&self, peer: &PeerCred) -> bool {
-        same_principal(
-            peer.uid,
-            peer.sid.as_deref(),
-            self.own_uid,
-            self.own_sid.as_deref(),
-        )
+        self.is_own(peer.uid, peer.sid.as_deref())
+    }
+
+    /// Whether this uid and SID are this daemon's own identity.
+    pub(crate) fn is_own(&self, uid: u32, sid: Option<&str>) -> bool {
+        same_principal(uid, sid, self.own_uid, self.own_sid.as_deref())
     }
 
     /// [`Ctx::is_admin`] for a peer. On Windows the uid is a label, so this decides on
@@ -807,12 +807,18 @@ impl Ctx {
     /// Write the record of notice `n` for `uid`, at most once per uid and
     /// notice per minute, without waiting for it.
     pub fn notice(&self, uid: u32, n: Notice) {
+        self.notice_sid(uid, None, n)
+    }
+
+    /// [`Ctx::notice`], naming the SID behind the label on Windows.
+    pub fn notice_sid(&self, uid: u32, sid: Option<&str>, n: Notice) {
         if !notice_due(&mut lock(&self.notices), uid, n, Instant::now()) {
             return;
         }
         let event = n.event();
         let mut r = self.event(event);
         r.reason = Some(n.reason(uid));
+        r.sid = sid.map(str::to_string);
         let writer = self.writer.clone();
         tokio::spawn(async move {
             if let Err(e) = writer.append(r).await {
@@ -1141,12 +1147,12 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     }
     let min_free = ctx.policy().min_free_mb;
     let gate = match disk::free_mb(&ctx.audit_dir) {
-        Ok(mb) => disk::disk_gate(mb, min_free, peer.uid, ctx.own_uid),
+        Ok(mb) => disk::disk_gate(mb, min_free, ctx.peer_is_own(peer)),
         // Fail closed: an unknown free space counts as too little.
-        Err(_) => disk::disk_gate(0, min_free, peer.uid, ctx.own_uid),
+        Err(_) => disk::disk_gate(0, min_free, ctx.peer_is_own(peer)),
     };
     if let Err(code) = gate {
-        ctx.notice(peer.uid, Notice::LowDisk);
+        ctx.notice_sid(peer.uid, peer.sid.as_deref(), Notice::LowDisk);
         return err(id, code, "the audit volume is below [audit] min_free_mb");
     }
     rec.v = saiife_audit::record::RECORD_VERSION;
@@ -1194,7 +1200,7 @@ async fn append(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(seq) => {
             if let Some(sid) = session {
                 if let Some(a) = agent_ancestor(ctx.proc.as_ref(), peer.pid) {
-                    ctx.sessions.record(a, &sid);
+                    ctx.sessions.record_as(peer.sid.as_deref(), a, &sid);
                 }
             }
             let mut m = Map::new();

@@ -288,6 +288,12 @@ pub fn facility_code(name: Option<&str>) -> Option<u8> {
     }
 }
 
+/// What a platform refuses in a `command` notification target. Windows has no check yet of
+/// who can replace the file, so every delivery would fail: a load error says so at once.
+pub fn command_target_problem(windows: bool) -> Option<&'static str> {
+    windows.then_some("command notifications are not available on Windows yet")
+}
+
 /// What a platform refuses in a syslog address: Windows has no local syslog socket.
 pub fn syslog_address_problem(address: &str, windows: bool) -> Option<&'static str> {
     (windows && address.starts_with("unix:")).then_some(
@@ -678,6 +684,9 @@ impl NotifyCfg {
                     if !c.path.is_absolute() {
                         return bad("command path must be absolute");
                     }
+                    if let Some(why) = command_target_problem(cfg!(windows)) {
+                        return bad(why);
+                    }
                 }
             }
         }
@@ -859,6 +868,12 @@ mod tests {
             let b = format!("[audit.forward.a]\ntype = \"https\"\nurl = \"{u}\"\n");
             assert!(fwd_valid(&b).is_ok(), "{u}");
         }
+    }
+
+    #[test]
+    fn command_target_refused_on_windows() {
+        assert!(command_target_problem(true).is_some());
+        assert_eq!(command_target_problem(false), None);
     }
 
     #[test]

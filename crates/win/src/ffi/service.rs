@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -21,6 +21,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 /// `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`: this process was not started by the
 /// service manager, so [`run_as_service`] has nothing to attach to.
 pub const NOT_A_SERVICE: i32 = 1063;
+
+/// How long the service manager is told a stop may take: calls in flight and the last record.
+const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
 
 /// What the service manager asks of the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,25 @@ impl StatusPort {
                 | ServiceControlAccept::PARAM_CHANGE,
             0,
         );
+    }
+
+    /// A stop was asked for, and the daemon is finishing its calls and its log.
+    fn set_stop_pending(&self) {
+        let Some(handle) = self.0 else {
+            return;
+        };
+        let status = ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: STOP_WAIT_HINT,
+            process_id: None,
+        };
+        if let Err(e) = handle.set_service_status(status) {
+            eprintln!("saiife: warning: cannot report the service state: {e}");
+        }
     }
 
     /// The daemon has stopped with exit code `code`.
@@ -120,13 +142,22 @@ fn service_main(_args: Vec<OsString>) {
     let (tx, control) = channel();
     // The handler runs on the dispatcher's thread, and needs Fn + Sync.
     let tx = Mutex::new(tx);
+    // Registering gives the handle, and the handler is what's registered.
+    let port = Arc::new(OnceLock::<StatusPort>::new());
+    let stopping = Arc::clone(&port);
     let handler = move |c: ServiceControl| {
         let send = |what| {
             let _ = tx.lock().unwrap_or_else(|p| p.into_inner()).send(what);
             ServiceControlHandlerResult::NoError
         };
         match c {
-            ServiceControl::Stop | ServiceControl::Shutdown => send(Control::Stop),
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                // Before the daemon hears of it, so its Stopped can't be overwritten.
+                if let Some(status) = stopping.get() {
+                    status.set_stop_pending();
+                }
+                send(Control::Stop)
+            }
             ServiceControl::ParamChange => send(Control::Reload),
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
@@ -140,6 +171,7 @@ fn service_main(_args: Vec<OsString>) {
         }
     };
     let status = StatusPort(Some(handle));
+    let _ = port.set(status);
     status.set(ServiceState::StartPending, ServiceControlAccept::empty(), 0);
     let code = (entry.main)(ServiceCtl { control, status });
     status.set_stopped(code);

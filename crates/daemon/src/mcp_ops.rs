@@ -928,8 +928,8 @@ pub(crate) async fn execute(
     let _busy = ctx.calls.enter();
     // 2. Disk gate: a call that cannot be recorded is not made.
     let uid = caller.uid();
-    if let Err(code) = api_ops::disk_ok(ctx, uid) {
-        ctx.notice(uid, Notice::LowDisk);
+    if let Err(code) = api_ops::disk_ok(ctx, uid, caller.sid()) {
+        ctx.notice_sid(uid, caller.sid(), Notice::LowDisk);
         return Err(Refused::LowDisk(code));
     }
     // 1. Identify.
@@ -1029,7 +1029,7 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(o) => o,
         Err(m) => return bad(id, m),
     };
-    let servers = servers_for(ctx, ctx.tool_caller.as_ref(), peer.uid, &overlays).await;
+    let servers = servers_for(ctx, ctx.tool_caller.as_ref(), peer, &overlays).await;
     let servers = Value::Array(servers);
     let tools_hash = format!(
         "sha256:{}",
@@ -1043,16 +1043,16 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     ok(id, m)
 }
 
-/// The servers of `uid`'s scope and their listed tools (see [`list`]).
+/// The servers of the peer's scope and their listed tools (see [`list`]).
 pub(crate) async fn servers_for(
     ctx: &Arc<Ctx>,
     tools: &dyn ToolCaller,
-    uid: u32,
+    peer: &PeerCred,
     overlays: &BTreeMap<String, ServiceOverlay>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let state = ctx.policy();
-    let (Some(g), Some(user)) = (&state.gateway, ctx.name_of(uid).await) else {
+    let (Some(g), Some(user)) = (&state.gateway, ctx.peer_name(peer).await) else {
         return out;
     };
     let groups = Groups(ctx.groups_of(&user).await);

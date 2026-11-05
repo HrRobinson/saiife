@@ -1481,6 +1481,7 @@ dependencies = [
  "rustls-pemfile",
  "saiife-audit",
  "saiife-policy",
+ "saiife-win",
  "serde",
  "serde_json",
  "sha2",
