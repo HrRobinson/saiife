@@ -209,9 +209,10 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
 /// is an error. So `path` must be the long, canonical spelling.
 ///
 /// This propagates, as CI showed: `SetSecurityInfo` on a directory handle gave an
-/// existing child that inherits the new inheritable entries, as inherited entries
-/// (`A;ID;0x1200a9;;;BU` beside its old `A;ID;FA`). It does not reach a child with
-/// `P` set, nor an explicit entry a child holds, so the caller still sets those
+/// existing child that inherits exactly the new inheritable entries, as inherited
+/// entries, in place of what it inherited before (its `A;ID;FA;;;BA` became
+/// `A;ID;FA;;;LA` with the parent's). Not yet seen in CI, and expected: it does not reach
+/// a child with `P` set, nor an explicit entry a child holds, so the caller still sets those
 /// itself (`winacl::set_sddl_tree`). Pinned by `set_sddl_on_temp_dir_roundtrips`.
 pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let desc = settable(sddl_text)?;
