@@ -235,27 +235,27 @@ mod tests {
     #[test]
     fn reauth_default_when_polkit_exists() {
         use saiife_policy::SameUser;
-        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], true);
+        let t = default_config(&Layout::system_for(Platform::Linux), &[], true);
         assert_eq!(load(&t).approval.same_user, SameUser::Reauth);
         assert!(t.contains("same_user = \"reauth\"\n"), "{t}");
         let t = default_config(&Layout::system(), &[], false);
         assert_eq!(load(&t).approval.same_user, SameUser::Deny);
         // Never on macOS, even with the authorization right registered.
-        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], true);
+        let t = default_config(&Layout::system_for(Platform::Macos), &[], true);
         assert_eq!(load(&t).approval.same_user, SameUser::Deny);
         assert!(!t.contains("same_user = \"reauth\""), "{t}");
     }
 
     #[test]
     fn macos_defaults_are_the_macos_daemon_values() {
-        let t = default_config(&Layout::under_for("/", Platform::Macos), &[], false);
+        let t = default_config(&Layout::system_for(Platform::Macos), &[], false);
         assert!(
             t.contains(
                 "\n# [daemon]\n# user = \"_saiife\"\n# socket_dir = \"/var/db/saiife-run\"\n"
             ),
             "{t}"
         );
-        let t = default_config(&Layout::under_for("/", Platform::Linux), &[], false);
+        let t = default_config(&Layout::system_for(Platform::Linux), &[], false);
         assert!(
             t.contains("\n# [daemon]\n# user = \"saiife\"\n# socket_dir = \"/run/saiife\"\n"),
             "{t}"
@@ -276,7 +276,7 @@ mod tests {
     fn windows_defaults_are_the_windows_values() {
         use crate::layout::{windows_path, WIN_DAEMON_ACCOUNT};
         use saiife_policy::system::DaemonCfg;
-        let t = default_config(&Layout::under_for("/", Platform::Windows), &[], false);
+        let t = default_config(&Layout::system_for(Platform::Windows), &[], false);
         // The commented defaults are the policy crate's Windows values, read
         // back through TOML (the backslashes must survive).
         let all = uncomment(&t);

@@ -904,7 +904,7 @@ fn policy_hash_changes_with_mode() {
     };
     // Absolute on this host; the hash does not care which program it is.
     let aws = if cfg!(windows) {
-        "C:/tools/aws.exe"
+        r"C:\\tools\\aws.exe"
     } else {
         "/usr/bin/aws"
     };

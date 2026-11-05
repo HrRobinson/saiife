@@ -1068,8 +1068,14 @@ mod tests {
         assert_eq!(sets["AWS_SESSION_TOKEN"], LEASE_TOKEN);
         assert_eq!(sets["AWS_REGION"], "eu-west-1");
         assert_eq!(sets["AWS_DEFAULT_REGION"], "eu-west-1");
-        assert_eq!(sets["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
-        assert_eq!(sets["AWS_CONFIG_FILE"], "/dev/null");
+        assert_eq!(
+            sets["AWS_SHARED_CREDENTIALS_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
+        assert_eq!(
+            sets["AWS_CONFIG_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
         // Every credential is masked; the region is not a secret.
         let masked: Vec<&str> = env.masked.iter().map(|v| v.as_str()).collect();
         assert_eq!(masked, [LEASE_AK, LEASE_SK, LEASE_TOKEN]);
@@ -1177,8 +1183,14 @@ mod tests {
         }
         assert_eq!(vars["AWS_REGION"], "eu-west-1");
         assert_eq!(vars["AWS_DEFAULT_REGION"], "eu-west-1");
-        assert_eq!(vars["AWS_SHARED_CREDENTIALS_FILE"], "/dev/null");
-        assert_eq!(vars["AWS_CONFIG_FILE"], "/dev/null");
+        assert_eq!(
+            vars["AWS_SHARED_CREDENTIALS_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
+        assert_eq!(
+            vars["AWS_CONFIG_FILE"],
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        );
         assert!(
             !text.contains("inherited-"),
             "an inherited credential reached the child"

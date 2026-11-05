@@ -306,20 +306,36 @@ fn fixture_has_the_written_shape() {
 
 // ---------------------------------------------------------------------------
 // Locked mode: signed checkpoints and key rotation (spec §6.4.2, §6.4.3).
-// Unix only: the signing key's owner and mode checks need Unix, so on Windows
-// `AuditKey::load_or_create` refuses and there is no key to sign with (below).
-// Windows has no locked mode until plan 19b.
 
-/// Windows refuses a signing key: it never signs nothing.
-#[cfg(not(unix))]
+/// Windows keeps a signing key only where nobody else can read it (plan 19b, W14).
+#[cfg(windows)]
 #[test]
-fn windows_refuses_the_signing_key() {
+fn windows_keeps_the_signing_key_in_a_private_dir() {
+    use saiife_audit::sign::AuditKey;
+    use saiife_win::ffi::{acl, token};
     let d = tempfile::tempdir().unwrap();
-    let Err(e) = saiife_audit::sign::AuditKey::load_or_create(&d.path().join("k")) else {
-        panic!("no key on Windows");
+    let me = token::current().unwrap().sid;
+    let private = d.path().join("private");
+    acl::create_dir_with_sddl(
+        &private,
+        &format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)"),
+    )
+    .unwrap();
+    let key = private.join("k");
+    AuditKey::load_or_create(&key).unwrap();
+    AuditKey::load_or_create(&key).unwrap();
+
+    let open = d.path().join("open");
+    acl::create_dir_with_sddl(
+        &open,
+        &format!("O:{me}D:PAI(A;OICI;FA;;;{me})(A;OICI;0x1200a9;;;BU)"),
+    )
+    .unwrap();
+    let Err(e) = AuditKey::load_or_create(&open.join("k")) else {
+        panic!("a key where Users can read it");
     };
-    assert!(e.to_string().contains("needs a Unix system"), "{e}");
-    assert!(!d.path().join("k").exists());
+    assert!(e.to_string().contains("may read it"), "{e}");
+    assert!(!open.join("k").exists());
 }
 
 #[cfg(unix)]

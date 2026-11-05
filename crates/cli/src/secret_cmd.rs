@@ -185,7 +185,7 @@ pub(crate) mod linux {
                 home,
             } => {
                 #[cfg(not(debug_assertions))]
-                let home = None;
+                let home: Option<PathBuf> = None;
                 // Import moves plaintext out of the agent's reach; the
                 // personal broker cannot (the same uid reads the key).
                 if !config.is_locked() {

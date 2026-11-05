@@ -425,7 +425,9 @@ pub fn private_problem(text: &str, own: &str, readers_too: bool) -> Option<Strin
         Ok(sd) => sd,
         Err(e) => return Some(format!("cannot read its descriptor: {e}")),
     };
-    let trusted = |sid: &str| [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, own].contains(&sid);
+    // `LA` is how Windows prints the built-in Administrator, always in Administrators.
+    let trusted =
+        |sid: &str| [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, LOCAL_ADMIN, own].contains(&sid);
     match sd.owner.as_deref() {
         Some(o) if trusted(o) => {}
         Some(o) => return Some(format!("owned by {o}")),
@@ -831,6 +833,19 @@ mod tests {
             let ace = sole_ace(&format!("D:(A;;{letters};;;SY)"));
             assert_eq!(ace.mask & WRITE_LIKE, 0, "{letters}");
         }
+    }
+
+    /// Windows prints the built-in Administrator (RID 500) as `LA`, whoever asks. It's a
+    /// member of Administrators, so it may own and read what they may; and when that account
+    /// runs saiife, its own files print this way too, under its own SID.
+    #[test]
+    fn private_problem_reads_the_alias_of_the_builtin_admin() {
+        let text = "O:LAG:LAD:PAI(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)";
+        assert_eq!(private_problem(text, ME, true), None);
+        assert_eq!(private_problem(text, "", false), None);
+        // The alias is no way in for anyone else.
+        let loose = "O:LAG:LAD:PAI(A;;FA;;;LA)(A;;FA;;;S-1-5-21-9-9-9-9)";
+        assert!(private_problem(loose, ME, false).is_some());
     }
 
     #[test]

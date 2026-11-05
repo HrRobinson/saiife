@@ -203,7 +203,7 @@ mod tests {
         if let Some(t) = config {
             std::fs::write(&c, t).unwrap();
         }
-        let v = read(&c);
+        let v = read_with(&|_: &Path| Trust::Trusted, &c);
         (d, v)
     }
 

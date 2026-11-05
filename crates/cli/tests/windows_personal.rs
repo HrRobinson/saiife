@@ -600,6 +600,10 @@ fn a_locked_host_never_uses_the_broker() {
         .cli(&["secret", "list"])
         .env("SAIIFE_TEST_SYSTEM_CONFIG", &config)
         .env("SAIIFE_TEST_TRUST_SID", me())
+        .env(
+            "SAIIFE_TEST_TRUST_BELOW",
+            config.parent().unwrap().parent().unwrap(),
+        )
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(5), "{}", err(&o));

@@ -41,6 +41,7 @@ fn check_as(dir: &Path, audit: &Path, stdin: &[u8], config: &Path) -> (i32, Stri
             "--system-config",
         ])
         .arg(config)
+        .env("SAIIFE_TEST_TRUST_BELOW", dir)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

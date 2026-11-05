@@ -1,11 +1,10 @@
 //! The CLI's locked mode on Windows against the real daemon, unprivileged, in temp dirs
 //! (plan 19b, Task 10). A debug-build test pipe `\\.\pipe\saiife-test-<random>`, owned by
 //! the runner's SID, stands in for W11's, and `SAIIFE_TEST_TRUST_SID` makes the runner one
-//! of the trusted writers, since it owns its own temp dir. These run in CI's `test` job
-//! only: no Windows machine runs this file locally.
-//!
-//! The tree sits below the user's temp folder, whose folders above are the machine's or
-//! the user's own. The runner's work drive has no such promise.
+//! of the trusted writers, since it owns its own temp dir, and `SAIIFE_TEST_TRUST_BELOW` keeps
+//! the walk off the folders above the tree: the runner's temp folder is on a work drive
+//! that Network Service owns. These run in CI's `test` job only: no Windows machine runs
+//! this file locally.
 #![cfg(windows)]
 
 use assert_cmd::Command;
@@ -42,6 +41,13 @@ struct Tree {
     state: PathBuf,
 }
 
+impl Tree {
+    /// What `SAIIFE_TEST_TRUST_BELOW` names: the tree's own top folder is still read.
+    fn below(&self) -> &Path {
+        self.top.parent().unwrap()
+    }
+}
+
 fn tree() -> Tree {
     let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
     let me = me();
@@ -70,15 +76,16 @@ fn tree() -> Tree {
     }
 }
 
-/// `saiife` as a client of `pipe`, in a profile of its own.
-fn client(home: &Path, pipe: &str) -> Command {
+/// `saiife` as a client of `pipe`, in a profile of its own, with `t` trusted.
+fn client(t: &Tree, home: &Path, pipe: &str) -> Command {
     let mut c = Command::cargo_bin("saiife").unwrap();
     c.env("USERPROFILE", home)
         .env("LOCALAPPDATA", home.join("AppData").join("Local"))
         .env("SAIIFE_DATA_DIR", home.join("data"))
         .env("SAIIFE_AUDIT_DIR", home.join("audit"))
         .env("SAIIFE_TEST_PIPE", pipe)
-        .env("SAIIFE_TEST_TRUST_SID", me());
+        .env("SAIIFE_TEST_TRUST_SID", me())
+        .env("SAIIFE_TEST_TRUST_BELOW", t.below());
     c
 }
 
@@ -104,6 +111,7 @@ fn daemon(t: &Tree, home: &Path, pipe: &str) -> Daemon {
         .env("SAIIFE_TEST_PIPE", pipe)
         // `run_allow`'s chain check is in the daemon too, on the runner's own tree.
         .env("SAIIFE_TEST_TRUST_SID", me())
+        .env("SAIIFE_TEST_TRUST_BELOW", t.below())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -146,7 +154,7 @@ fn hook_allows_and_records_with_the_daemon() {
     let home = tempfile::tempdir().unwrap();
     let pipe = pipe_name("allow");
     let _d = daemon(&t, home.path(), &pipe);
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     hook(&mut c, &t.config, GIT_STATUS);
     c.assert().code(0);
     let text = audit_text(&t.audit);
@@ -162,7 +170,7 @@ fn hook_denies_and_records_with_the_daemon() {
     let home = tempfile::tempdir().unwrap();
     let pipe = pipe_name("deny");
     let _d = daemon(&t, home.path(), &pipe);
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     hook(&mut c, &t.config, FORCE_PUSH);
     c.assert().code(2).stderr(contains("BLOCKED by"));
     assert!(audit_text(&t.audit).contains("\"deny\""));
@@ -183,7 +191,7 @@ fn hook_home_is_not_the_agents() {
         "tool_input": {"file_path": key.display().to_string()},
         "cwd": "C:\\",
     });
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     hook(&mut c, &t.config, &payload.to_string());
     // A rule's deny: a bare exit 2 passes on any error.
     c.assert().code(2).stderr(contains("BLOCKED by"));
@@ -193,7 +201,7 @@ fn hook_home_is_not_the_agents() {
 fn hook_denies_with_no_daemon() {
     let t = tree();
     let home = tempfile::tempdir().unwrap();
-    let mut c = client(home.path(), &pipe_name("nobody"));
+    let mut c = client(&t, home.path(), &pipe_name("nobody"));
     hook(&mut c, &t.config, GIT_STATUS);
     c.assert()
         .code(2)
@@ -215,7 +223,8 @@ fn hook_denies_a_squatted_pipe() {
     let mut c = Command::cargo_bin("saiife").unwrap();
     c.env("USERPROFILE", home.path())
         .env_remove("SAIIFE_TEST_PIPE")
-        .env("SAIIFE_TEST_TRUST_SID", me());
+        .env("SAIIFE_TEST_TRUST_SID", me())
+        .env("SAIIFE_TEST_TRUST_BELOW", t.below());
     hook(&mut c, &t.config, GIT_STATUS);
     c.assert()
         .code(2)
@@ -258,7 +267,11 @@ fn planted_files_change_no_mode() {
     c.args(["check", "--agent", "claude", "--system-config"])
         .arg(&t.config)
         .write_stdin(FORCE_PUSH);
-    c.assert().code(2).stderr(contains("not protected"));
+    // Still judged: without `--hook-exit` a deny is JSON on stdout, with exit 0.
+    c.assert()
+        .code(0)
+        .stdout(contains("BLOCKED by"))
+        .stderr(contains("not protected"));
 
     let mut c = Command::cargo_bin("saiife").unwrap();
     plain(&mut c);
@@ -279,14 +292,14 @@ fn clients_reach_the_daemon_through_the_pipe() {
         &["lockdown", "--system-config"],
     ];
     for args in cases {
-        let out = client(home.path(), &pipe)
+        let out = client(&t, home.path(), &pipe)
             .args(*args)
             .arg(&t.config)
             .output()
             .unwrap();
         assert_ne!(out.status.code(), Some(5), "{args:?}: {out:?}");
     }
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     c.args(["policy", "--system-config"])
         .arg(&t.config)
         .arg("reload");
@@ -295,7 +308,7 @@ fn clients_reach_the_daemon_through_the_pipe() {
 
 /// `policy reload` through `pipe`, so the daemon reads what the test wrote.
 fn reload(t: &Tree, home: &Path, pipe: &str) {
-    let mut c = client(home, pipe);
+    let mut c = client(t, home, pipe);
     c.args(["policy", "--system-config"])
         .arg(&t.config)
         .arg("reload");
@@ -351,7 +364,7 @@ fn run_checks_the_chain_before_any_lease() {
     reload(&t, home.path(), &pipe);
 
     let run = |exe: &Path| {
-        let mut c = client(home.path(), &pipe);
+        let mut c = client(&t, home.path(), &pipe);
         c.args(["run", "--secret", "k:TOK", "--system-config"])
             .arg(&t.config)
             .arg("--")
@@ -389,8 +402,9 @@ fn a_failed_config_check_is_recorded() {
     let home = tempfile::tempdir().unwrap();
     let pipe = pipe_name("record");
     let _d = daemon(&t, home.path(), &pipe);
-    let mut c = client(home.path(), &pipe);
-    c.env_remove("SAIIFE_TEST_TRUST_SID");
+    let mut c = client(&t, home.path(), &pipe);
+    c.env_remove("SAIIFE_TEST_TRUST_SID")
+        .env_remove("SAIIFE_TEST_TRUST_BELOW");
     hook(&mut c, &t.config, GIT_STATUS);
     c.assert().code(2).stderr(contains("not protected"));
     let text = audit_text(&t.audit);
@@ -425,25 +439,25 @@ fn same_user_approval_is_off_and_the_requester_can_withdraw() {
         "tool_input": {"command": "git push --force origin main"},
         "cwd": project.display().to_string(),
     });
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     hook(&mut c, &t.config, &ask.to_string());
     c.assert().code(2);
 
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     c.args(["approvals", "--json", "--system-config"])
         .arg(&t.config);
     let out = c.output().unwrap();
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = list[0]["id"].as_u64().unwrap().to_string();
 
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     c.args(["approve", &id, "--system-config"]).arg(&t.config);
     c.assert()
         .code(2)
         .stderr(contains("same-user approval is off on Windows"))
         .stderr(contains("second account"));
 
-    let mut c = client(home.path(), &pipe);
+    let mut c = client(&t, home.path(), &pipe);
     c.args(["reject", &id, "--system-config"]).arg(&t.config);
     c.assert().code(0).stdout(contains("rejected"));
     assert!(audit_text(&t.audit).contains("reauth_unavailable"));

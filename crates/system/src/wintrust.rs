@@ -52,6 +52,21 @@ pub fn test_trust_sid() -> Option<String> {
     }
 }
 
+/// The folder named by the debug-build test seam `SAIIFE_TEST_TRUST_BELOW`: it and the folders
+/// above it aren't read. A test tree can't vouch for the machine above it: a runner's work
+/// drive is owned by Network Service, so everything on it is rightly not ours. Release builds
+/// have no such seam, and the file and folders below are checked as ever.
+pub fn test_trust_below() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("SAIIFE_TEST_TRUST_BELOW").map(PathBuf::from)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
 /// `text` parsed, with `trust_sid` read as `Administrators` wherever it appears.
 fn read_sd(text: &str, trust_sid: Option<&str>) -> Result<Sd, String> {
     let mut sd = parse(text)?;
@@ -80,11 +95,13 @@ fn path_ok(layout: &Layout, path: &Path, sd: &Sd) -> Result<(), String> {
 
 /// The folders above `path`, nearest first: below the root of a test layout, and all the
 /// way up on the real machine.
-fn folders_above<'a>(layout: &Layout, path: &'a Path) -> Vec<&'a Path> {
+fn folders_above<'a>(layout: &Layout, path: &'a Path, stop: Option<&Path>) -> Vec<&'a Path> {
     let under = !layout.is_system() && path.starts_with(layout.root());
     path.ancestors()
         .skip(1)
-        .take_while(|p| !p.as_os_str().is_empty() && !(under && *p == layout.root()))
+        .take_while(|p| {
+            !p.as_os_str().is_empty() && !(under && *p == layout.root()) && Some(*p) != stop
+        })
         .collect()
 }
 
@@ -97,7 +114,8 @@ fn folders_problem(
     sddl_of: &dyn Fn(&Path) -> io::Result<String>,
     trust_sid: Option<&str>,
 ) -> Option<String> {
-    for folder in folders_above(layout, path) {
+    let stop = test_trust_below();
+    for folder in folders_above(layout, path, stop.as_deref()) {
         let shown = folder.display();
         let text = match sddl_of(folder) {
             Ok(t) => t,
@@ -169,9 +187,11 @@ pub fn exe_chain(
     let text = sddl_of(exe).map_err(|e| shown(exe, &e))?;
     let sd = read_sd(&text, trust_sid).map_err(|e| shown(exe, &e))?;
     protected_ok(&sd, &[]).map_err(|e| shown(exe, &e))?;
+    let stop = test_trust_below();
     let folders = exe
         .ancestors()
         .skip(1)
+        .take_while(|p| Some(*p) != stop.as_deref())
         .filter(|p| !p.as_os_str().is_empty());
     for (i, folder) in folders.enumerate() {
         let text = sddl_of(folder).map_err(|e| shown(folder, &e))?;
@@ -345,6 +365,18 @@ mod tests {
             s.reg_probe_error = Some("Access is denied.".into());
         });
         assert!(service_registered(&host));
+    }
+
+    /// The test seam: what's named and above it isn't read; what's below it still is.
+    #[test]
+    fn the_seam_stops_the_walk_above_a_test_tree() {
+        let layout = Layout::system_for(Platform::Linux);
+        let file = Path::new("/a/b/c/config.toml");
+        assert_eq!(
+            folders_above(&layout, file, Some(Path::new("/a/b"))),
+            [Path::new("/a/b/c")]
+        );
+        assert_eq!(folders_above(&layout, file, None).len(), 4);
     }
 
     #[test]
