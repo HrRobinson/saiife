@@ -437,8 +437,8 @@ mod tests {
             .unwrap());
     }
 
-    /// `saiife.exe` and the managed files are `OICI` rows on files, compared exactly by
-    /// `actual_ok`. If Windows strips those flags from a file, this says so.
+    /// `saiife.exe` and the managed files are `OICI` rows on files. Windows strips
+    /// `OI` and `CI` from a file, so they are checked with `actual_file_ok`.
     #[test]
     fn oici_row_on_a_file_passes_actual_ok() {
         let facts = token::current().unwrap();
@@ -462,7 +462,7 @@ mod tests {
         let text = RealHost.get_sddl(&file).unwrap();
         let _ = writeln!(std::io::stderr(), "OICI row on a file reads: {text}");
         let sd = parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
-        crate::winacl::actual_ok(row, &sd).unwrap_or_else(|e| panic!("{text}: {e}"));
+        crate::winacl::actual_file_ok(row, &sd).unwrap_or_else(|e| panic!("{text}: {e}"));
     }
 
     #[test]

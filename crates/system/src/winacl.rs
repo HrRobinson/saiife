@@ -5,10 +5,12 @@
 //! [`protected_ok`] and [`ancestor_ok`] read a security descriptor only. The
 //! caller checks for reparse points, which an SDDL string cannot show.
 
+use crate::host::Host;
 use crate::layout::{Layout, WIN_SERVICE};
 use saiife_win::sddl::{parse, render, writers, Sd, LOCAL_ADMIN, WRITE_LIKE};
 use saiife_win::sid::{service_sid, valid_sid, ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::Path;
 
 /// `C:\ProgramData\saiife`.
@@ -158,8 +160,30 @@ pub fn service_may_write(want: &str) -> bool {
 /// ACEs marked inherited. So there the owner may be `<S>`, the group and the
 /// inheritance flags are not compared, and the grants must be the row's grants,
 /// no more and no fewer. On every other row the descriptor must be exact.
+///
+/// This is for a directory, which keeps `OI` and `CI`. For a file use
+/// [`actual_file_ok`]. The `AI` flag is not compared at all: [`Sd`] does not keep
+/// it, so what protects a path is `P`, which is compared on every row.
 pub fn actual_ok(want: &str, actual: &Sd) -> Result<(), String> {
-    let table = parse(want)?;
+    check(want, actual, false)
+}
+
+/// [`actual_ok`] for a file. Windows keeps no `OI` or `CI` on a file, so a row
+/// written `OICI` reads back without them (seen in CI on `saiife.exe`). They are
+/// cleared from the row before comparing, and a file that reads back with them is
+/// refused. Owner, group, `P`, every other flag, and each ACE stay exact.
+pub fn actual_file_ok(want: &str, actual: &Sd) -> Result<(), String> {
+    check(want, actual, true)
+}
+
+fn check(want: &str, actual: &Sd, file: bool) -> Result<(), String> {
+    let mut table = parse(want)?;
+    if file {
+        for ace in &mut table.aces {
+            ace.flags.object_inherit = false;
+            ace.flags.container_inherit = false;
+        }
+    }
     let differs = || format!("reads {}, expected {}", render(actual), render(&table));
     if !service_may_write(want) {
         protected_ok(actual, &[])?;
@@ -179,6 +203,73 @@ pub fn actual_ok(want: &str, actual: &Sd) -> Result<(), String> {
     let passed_on_only = actual.aces.iter().any(|a| a.flags.inherit_only);
     if passed_on_only || grants(actual) != grants(&table) {
         return Err(differs());
+    }
+    Ok(())
+}
+
+/// Sets a descriptor on `root` and on everything below it, top-down. `row` gives the
+/// SDDL of one entry from its path and whether it is a directory.
+///
+/// `Host::set_sddl` does not propagate to existing children (see its note), so a
+/// directory's new descriptor leaves what is inside as it was. Install and
+/// reinstall call this to reach a tree that is already there.
+///
+/// Nothing is followed. A reparse point (symlink, junction, or any other reparse
+/// tag) anywhere in the tree is an error, as is a hard-linked file, which
+/// `set_sddl` refuses. The walk stops at the first error, so an entry past it is
+/// untouched. Returns how many entries were set.
+///
+/// `Host` cannot list a directory, so this reads the tree with `std::fs`: the
+/// real one on Windows, and the fake host's root on Linux.
+pub fn set_sddl_tree(
+    host: &dyn Host,
+    root: &Path,
+    row: &mut dyn FnMut(&Path, bool) -> io::Result<String>,
+) -> io::Result<usize> {
+    let meta = std::fs::symlink_metadata(root)?;
+    refuse_reparse(root, &meta)?;
+    let mut count = 0;
+    walk(host, root, meta.is_dir(), row, &mut count)?;
+    Ok(count)
+}
+
+fn walk(
+    host: &dyn Host,
+    path: &Path,
+    is_dir: bool,
+    row: &mut dyn FnMut(&Path, bool) -> io::Result<String>,
+    count: &mut usize,
+) -> io::Result<()> {
+    host.set_sddl(path, &row(path, is_dir)?)?;
+    *count += 1;
+    if !is_dir {
+        return Ok(());
+    }
+    let mut names = std::fs::read_dir(path)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    for child in names {
+        let meta = std::fs::symlink_metadata(&child)?;
+        refuse_reparse(&child, &meta)?;
+        walk(host, &child, meta.is_dir(), row, count)?;
+    }
+    Ok(())
+}
+
+fn refuse_reparse(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+    #[cfg(windows)]
+    let reparse = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let reparse = meta.file_type().is_symlink();
+    if reparse {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
     }
     Ok(())
 }
@@ -881,6 +972,149 @@ mod tests {
             }
             assert!(actual_ok(&row, &sd).is_err(), "{path}: inherited form");
         }
+    }
+
+    fn file_row(l: &Layout) -> String {
+        want(l, r"C:\ProgramData\saiife\bin\saiife.exe")
+    }
+
+    /// What Windows printed in CI for an `OICI` row set on a file.
+    #[test]
+    fn a_file_reads_back_without_oici_and_passes_actual_file_ok() {
+        let (_d, l) = test_layout();
+        let row = file_row(&l);
+        let mut sd = parse(&row).unwrap();
+        for ace in &mut sd.aces {
+            ace.flags.object_inherit = false;
+            ace.flags.container_inherit = false;
+        }
+        actual_file_ok(&row, &sd).unwrap();
+        // For a directory the same read-back is wrong.
+        assert!(actual_ok(&row, &sd).is_err());
+        // A file keeping OICI is refused: the row was cleared, so it must match.
+        assert!(actual_file_ok(&row, &parse(&row).unwrap()).is_err());
+    }
+
+    #[test]
+    fn actual_file_ok_relaxes_only_oici() {
+        let (_d, l) = test_layout();
+        let row = file_row(&l);
+        let mut good = parse(&row).unwrap();
+        for ace in &mut good.aces {
+            ace.flags.object_inherit = false;
+            ace.flags.container_inherit = false;
+        }
+        actual_file_ok(&row, &good).unwrap();
+        let mut sd = good.clone();
+        sd.dacl_protected = false;
+        assert!(actual_file_ok(&row, &sd).is_err(), "P is required");
+        let mut sd = good.clone();
+        sd.owner = Some(S.to_string());
+        assert!(actual_file_ok(&row, &sd).is_err(), "owner");
+        let mut sd = good.clone();
+        sd.group = Some(ADMINISTRATORS.to_string());
+        assert!(actual_file_ok(&row, &sd).is_err(), "group");
+        let mut sd = good.clone();
+        sd.aces[0].mask ^= 0x1;
+        assert!(actual_file_ok(&row, &sd).is_err(), "mask");
+        let mut sd = good.clone();
+        sd.aces.pop();
+        assert!(actual_file_ok(&row, &sd).is_err(), "missing ACE");
+        let mut sd = good.clone();
+        sd.aces[0].flags.inherited = true;
+        assert!(actual_file_ok(&row, &sd).is_err(), "inherited flag");
+        let mut sd = good;
+        sd.aces[0].flags.inherit_only = true;
+        assert!(actual_file_ok(&row, &sd).is_err(), "inherit-only");
+    }
+
+    /// A directory keeps `OICI` (seen in CI), so a dir row stays exact.
+    #[test]
+    fn dir_rows_stay_exact_including_oici() {
+        let (_d, l) = test_layout();
+        let row = want(&l, r"C:\ProgramData\saiife\etc");
+        actual_ok(&row, &parse(&row).unwrap()).unwrap();
+        let mut sd = parse(&row).unwrap();
+        sd.aces[0].flags.container_inherit = false;
+        assert!(actual_ok(&row, &sd).is_err());
+    }
+
+    fn tree_host() -> (tempfile::TempDir, crate::host::FakeHost) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = crate::host::FakeHost::open(dir.path()).unwrap();
+        (dir, host)
+    }
+
+    const ROW: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)";
+
+    #[test]
+    fn set_sddl_tree_sets_every_entry_top_down() {
+        let (dir, host) = tree_host();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/f"), b"x").unwrap();
+        std::fs::write(root.join("g"), b"x").unwrap();
+        let mut seen = Vec::new();
+        let n = set_sddl_tree(&host, &root, &mut |p, d| {
+            seen.push((p.strip_prefix(&root).unwrap().to_path_buf(), d));
+            Ok(ROW.to_string())
+        })
+        .unwrap();
+        assert_eq!(n, 5);
+        let names: Vec<_> = seen.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(names, ["", "a", "a/b", "a/b/f", "g"]);
+        assert!(seen[1].1 && !seen[3].1);
+        assert_eq!(host.get_sddl(&root.join("a/b/f")).unwrap(), ROW);
+    }
+
+    #[test]
+    fn set_sddl_tree_stops_at_a_row_error() {
+        let (dir, host) = tree_host();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let e = set_sddl_tree(&host, &root, &mut |p, _| {
+            if p.ends_with("f") {
+                Err(io::Error::other("no row"))
+            } else {
+                Ok(ROW.to_string())
+            }
+        })
+        .unwrap_err();
+        assert!(e.to_string().contains("no row"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_sddl_tree_refuses_a_reparse_point_without_following_it() {
+        let (dir, host) = tree_host();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("t");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let e = set_sddl_tree(&host, &root, &mut |_, _| Ok(ROW.to_string())).unwrap_err();
+        assert!(e.to_string().contains("reparse point"), "{e}");
+        assert!(host.get_sddl(&outside.join("secret")).is_err());
+        assert!(host.get_sddl(&outside).is_err());
+        // A link as the root is refused too.
+        let e = set_sddl_tree(&host, &root.join("link"), &mut |_, _| Ok(ROW.to_string()));
+        assert!(e.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_sddl_tree_refuses_a_hard_link() {
+        let (dir, host) = tree_host();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), b"x").unwrap();
+        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        let e = set_sddl_tree(&host, &root, &mut |_, _| Ok(ROW.to_string())).unwrap_err();
+        assert!(e.to_string().contains("hard link"), "{e}");
+        assert!(host.get_sddl(&root.join("b")).is_err());
     }
 
     #[test]

@@ -220,6 +220,12 @@ pub trait Host: Send + Sync {
     ) -> io::Result<ReloadAnswer>;
     /// Windows: sets the owner, a protected DACL and any group of `path`, which must
     /// not be a reparse point. The text must name an owner and say `D:P`.
+    ///
+    /// This does not propagate: a directory's new descriptor does not change the
+    /// entries already inside it, which keep their old inherited ACEs
+    /// (`SetNamedSecurityInfoW` would have propagated, `SetSecurityInfo` on a handle
+    /// does not, as far as CI has shown). To fix a tree that is already there, call
+    /// [`crate::winacl::set_sddl_tree`], which sets each entry itself.
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()>;
     /// Windows: the owner, group and DACL of `path`. A reparse point is an error.
     fn get_sddl(&self, path: &Path) -> io::Result<String>;
@@ -1810,6 +1816,26 @@ fn already(what: &str, name: &str) -> io::Error {
     )
 }
 
+/// What the real `set_sddl` refuses: a reparse point (here, a symlink) and a file
+/// with more than one hard link (here, on Unix). A missing path is an error too.
+fn refuse_like_windows(path: &Path) -> io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if meta.is_file() && std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has more than one hard link", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn missing(what: &str, name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -2281,7 +2307,7 @@ impl Host for FakeHost {
 
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()> {
         self.fake_applies(path, sddl)?;
-        std::fs::symlink_metadata(path)?;
+        refuse_like_windows(path)?;
         self.update(|s| {
             s.calls.push(format!("set_sddl {} {sddl}", path.display()));
             s.sddl.insert(path.to_path_buf(), sddl.to_string());

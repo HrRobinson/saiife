@@ -115,6 +115,13 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
 /// must name an owner and say `D:P`. The group counts because `winacl::actual_ok`
 /// compares it: `G:SY` left unset would fail every later check of the path. A reparse
 /// point, or a file with more than one hard link, is an error.
+///
+/// This does not propagate. `SetSecurityInfo` on a handle sets the one object: an
+/// existing child keeps the entries it inherited before, where the old
+/// `SetNamedSecurityInfoW` walked the tree. So a reinstall, or a tree an older
+/// ACL left user-writable, is not fixed by setting its top directory. The caller
+/// sets each entry (`winacl::set_sddl_tree`). Pinned by
+/// `set_sddl_on_temp_dir_roundtrips`.
 pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let desc = settable(sddl_text)?;
     let parsed =

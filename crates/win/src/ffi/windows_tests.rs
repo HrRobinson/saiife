@@ -123,22 +123,37 @@ fn set_sddl_on_temp_dir_roundtrips() {
     std::fs::create_dir(&target).unwrap();
     let child = target.join("child");
     std::fs::write(&child, b"x").unwrap();
-    let wanted = own_sddl("PAI", &me);
+    let child_before = acl::get_sddl(&child).unwrap();
+    // Not the temp dir's own ACEs, so a propagated change would show in the child.
+    let wanted = format!("{}(A;OICI;0x1200a9;;;BU)", own_sddl("PAI", &me));
     acl::set_sddl(&target, &wanted).unwrap();
 
     // Printed first, and in every failure: only a real run can say how Windows spells it.
     let text = acl::get_sddl(&target).unwrap();
     log(&format!("set_sddl roundtrip wrote {wanted}, reads {text}"));
-    // Whether a set on a handle reaches existing children decides how install walks a tree.
+    let child_after = acl::get_sddl(&child).unwrap();
     log(&format!(
-        "its existing child reads {}",
-        acl::get_sddl(&child).unwrap()
+        "its existing child read {child_before}, now {child_after}"
     ));
     let read = sddl::parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
     let want = sddl::parse(&as_printed(&wanted, &me)).unwrap();
     assert_eq!(read.owner, want.owner, "{text}");
     assert!(read.dacl_protected, "{text}");
     assert_eq!(read.aces, want.aces, "{text}");
+
+    // CI showed the child keeping its old inherited entries (`A;ID;FA` for the
+    // account and SYSTEM). set_sddl does not propagate, so install walks the tree.
+    let before = sddl::parse(&child_before).unwrap();
+    let after = sddl::parse(&child_after).unwrap_or_else(|e| panic!("{child_after}: {e}"));
+    assert!(
+        after.aces.iter().all(|a| a.flags.inherited),
+        "{child_after}"
+    );
+    assert_eq!(after.aces, before.aces, "{child_after}");
+    assert!(
+        after.aces.iter().all(|a| a.mask != 0x1200a9),
+        "the new Users entry reached the child: {child_after}"
+    );
 }
 
 /// `winacl::actual_ok` compares the group, so a row's `G:SY` must reach disk.
