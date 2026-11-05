@@ -83,7 +83,7 @@ const NOLOGIN_SHELLS: &[&str] = &[
 ];
 
 /// A managed writer and its fingerprint (Codex, Gemini CLI).
-type InstallFn = fn(&Path) -> Result<Change, AgentError>;
+type InstallFn = fn(&Path, bool) -> Result<Change, AgentError>;
 type EntryFn = fn(&Path) -> Result<Option<String>, AgentError>;
 
 /// How long a system install waits for the daemon's socket.
@@ -1573,6 +1573,7 @@ impl Run<'_> {
             Agent::Codex => (CODEX_DIR, CODEX_REQUIREMENTS),
             Agent::Gemini => (GEMINI_DIR, GEMINI_SETTINGS),
         };
+        let windows = self.layout.platform() == Platform::Windows;
         self.dir(dir_abs, 0o755, false)?;
         let p = self.at(file_abs);
         let shown = self.layout.logical(file_abs);
@@ -1585,7 +1586,8 @@ impl Run<'_> {
         self.save()?;
         let (sha, whole) = match a {
             Agent::Claude => {
-                let bytes = claude::managed_settings().as_bytes();
+                let text = claude::managed_settings_for(windows);
+                let bytes = text.as_bytes();
                 let current = fsops::sha256_file(&p).map_err(|e| refused(&p, e.to_string()))?;
                 let want = fsops::sha256_hex(bytes);
                 if current.as_deref() != Some(want.as_str()) {
@@ -1598,11 +1600,11 @@ impl Run<'_> {
             }
             Agent::Codex | Agent::Gemini => {
                 let (install, entry): (InstallFn, EntryFn) = if a == Agent::Codex {
-                    (codex::install_managed, codex::managed_entry)
+                    (codex::install_managed_for, codex::managed_entry)
                 } else {
-                    (gemini::install_managed, gemini::managed_entry)
+                    (gemini::install_managed_for, gemini::managed_entry)
                 };
-                match install(&p).map_err(agent_step("managed"))? {
+                match install(&p, windows).map_err(agent_step("managed"))? {
                     Change::Unchanged => self.unchanged(shown),
                     _ => self.changed(shown),
                 }

@@ -56,10 +56,18 @@ pub fn expected_entry() -> String {
 /// The managed group (locked mode, spec §8.3): no matcher, which means
 /// every tool, and the absolute path of the root-owned binary.
 fn managed_group() -> Value {
+    managed_group_on(false)
+}
+
+fn managed_group_win() -> Value {
+    managed_group_on(true)
+}
+
+fn managed_group_on(windows: bool) -> Value {
     json!({
         "hooks": [{
             "type": "command",
-            "command": Agent::Gemini.managed_command(),
+            "command": Agent::Gemini.managed_command_on(windows),
             "name": "saiife",
             "timeout": TIMEOUT_MS,
         }]
@@ -72,10 +80,22 @@ const MANAGED: JsonHooks = JsonHooks {
     group: managed_group,
 };
 
+const MANAGED_WIN: JsonHooks = JsonHooks {
+    rel: "",
+    event: "BeforeTool",
+    group: managed_group_win,
+};
+
 /// Adds saiife's managed group to the system `settings.json` at `file`
 /// (an absolute path; the directory must exist), keeping everything else.
 pub fn install_managed(file: &Path) -> Result<Change, AgentError> {
-    MANAGED.install_file(file)
+    install_managed_for(file, cfg!(windows))
+}
+
+/// [`install_managed`] with the platform given (Windows: the W9 command).
+pub fn install_managed_for(file: &Path, windows: bool) -> Result<Change, AgentError> {
+    let hooks = if windows { &MANAGED_WIN } else { &MANAGED };
+    hooks.install_file(file)
 }
 
 /// Removes saiife's handlers from `file`; never deletes the file.

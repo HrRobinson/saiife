@@ -74,6 +74,76 @@ pub fn managed_settings() -> &'static str {
     MANAGED_SETTINGS
 }
 
+/// [`managed_settings`] for a platform. On Windows only the binary path
+/// differs (spec W9), so the two files differ in the command alone.
+pub fn managed_settings_for(windows: bool) -> String {
+    if windows {
+        MANAGED_SETTINGS.replace(crate::UNIX_BINARY, crate::WINDOWS_BINARY)
+    } else {
+        MANAGED_SETTINGS.to_string()
+    }
+}
+
+/// Where Claude Code's Windows policy lives (spec W24).
+pub const HKLM_POLICY_KEY: &str = r"SOFTWARE\Policies\ClaudeCode";
+/// The value under [`HKLM_POLICY_KEY`] that holds the settings JSON.
+pub const HKLM_POLICY_VALUE: &str = "Settings";
+
+/// The `agents.claude.policy` failure (spec W24).
+pub const HKLM_OVERRIDES_TEXT: &str = "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it";
+
+/// What the HKLM `Settings` value does to saiife's drop-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HklmPolicy {
+    /// No `Settings` value, or one with no policy key: Claude Code moves on
+    /// to the files.
+    Absent,
+    /// A policy source that merges with the files.
+    Merge,
+    /// A policy source that replaces the files: the drop-in is ignored.
+    Overrides,
+}
+
+/// Keys that steer how sources combine and are not policy themselves.
+const CONTROL_KEYS: &[&str] = &["managedSourcesBehavior", "wslInheritsWindowsSettings"];
+
+/// Reads the policy through `reg(key, value)` (the registry read is the
+/// caller's; on Windows see [`hklm_policy_live`]). A value that is not a
+/// JSON object but is not empty counts as `Overrides`: it fails closed.
+pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> Option<String>) -> HklmPolicy {
+    let Some(text) = reg(HKLM_POLICY_KEY, HKLM_POLICY_VALUE) else {
+        return HklmPolicy::Absent;
+    };
+    if text.trim().is_empty() {
+        return HklmPolicy::Absent;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return HklmPolicy::Overrides;
+    };
+    if map.keys().all(|k| CONTROL_KEYS.contains(&k.as_str())) {
+        return HklmPolicy::Absent;
+    }
+    if map.get("managedSourcesBehavior").and_then(Value::as_str) == Some("merge") {
+        HklmPolicy::Merge
+    } else {
+        HklmPolicy::Overrides
+    }
+}
+
+/// [`hklm_policy`] against the real registry (64-bit view of HKLM).
+#[cfg(windows)]
+pub fn hklm_policy_live() -> HklmPolicy {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    hklm_policy(&|key, value| {
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(key, KEY_READ | KEY_WOW64_64KEY)
+            .ok()?
+            .get_value::<String, _>(value)
+            .ok()
+    })
+}
+
 /// The managed drop-in `60-saiife-mcp.json`: Claude Code may start only
 /// what it names. The broker's own server is pinned by command, so a
 /// project `.mcp.json` cannot define its own `saiife` server; the admin's
@@ -429,6 +499,78 @@ mod tests {
         );
         assert_eq!(remove(p.path(), true).unwrap(), Change::Deleted);
         assert!(!p.path().join(SETTINGS_REL).exists());
+    }
+
+    fn reg(v: Option<&'static str>) -> impl Fn(&str, &str) -> Option<String> {
+        move |k, n| {
+            assert_eq!((k, n), (HKLM_POLICY_KEY, HKLM_POLICY_VALUE));
+            v.map(str::to_string)
+        }
+    }
+
+    #[test]
+    fn hklm_settings_without_merge_fails() {
+        let r = reg(Some(r#"{"permissions":{"deny":["x"]}}"#));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Overrides);
+        let r = reg(Some(r#"{"hooks":{},"managedSourcesBehavior":"replace"}"#));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Overrides);
+        assert_eq!(hklm_policy(&reg(Some("not json"))), HklmPolicy::Overrides);
+    }
+
+    #[test]
+    fn hklm_merge_passes() {
+        let r = reg(Some(
+            r#"{"env":{"A":"1"},"managedSourcesBehavior":"merge"}"#,
+        ));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Merge);
+    }
+
+    #[test]
+    fn hklm_absent() {
+        assert_eq!(hklm_policy(&reg(None)), HklmPolicy::Absent);
+        assert_eq!(hklm_policy(&reg(Some(""))), HklmPolicy::Absent);
+    }
+
+    #[test]
+    fn hklm_only_control_keys_is_absent() {
+        let r = reg(Some(
+            r#"{"managedSourcesBehavior":"merge","wslInheritsWindowsSettings":true}"#,
+        ));
+        assert_eq!(hklm_policy(&r), HklmPolicy::Absent);
+        assert_eq!(hklm_policy(&reg(Some("{}"))), HklmPolicy::Absent);
+    }
+
+    #[test]
+    fn hklm_text_is_the_spec_line() {
+        assert_eq!(
+            HKLM_OVERRIDES_TEXT,
+            "HKLM\\SOFTWARE\\Policies\\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add \"managedSourcesBehavior\": \"merge\" there, or put saiife's hooks in it"
+        );
+    }
+
+    /// Linux output is the pinned bytes; Windows differs in the command only.
+    #[test]
+    fn windows_claude_dropin_golden() {
+        assert_eq!(managed_settings_for(false), MANAGED_SETTINGS);
+        let w = managed_settings_for(true);
+        assert_eq!(
+            w.matches(
+                "C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent claude"
+            )
+            .count(),
+            2
+        );
+        assert_eq!(
+            w.replace(crate::WINDOWS_BINARY, crate::UNIX_BINARY),
+            MANAGED_SETTINGS
+        );
+        assert!(!w.contains("/opt/"));
+        let v: Value = serde_json::from_str(&w).unwrap();
+        assert_eq!(v["disableAllHooks"], false);
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
     }
 
     /// `status` reads Claude's managed file on Windows too.

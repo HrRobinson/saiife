@@ -81,8 +81,15 @@ impl Agent {
     /// The hook command in the machine-wide managed config (locked mode,
     /// spec §8.3): the absolute path of the root-owned binary, never `PATH`.
     pub fn managed_command(self) -> String {
+        self.managed_command_on(cfg!(windows))
+    }
+
+    /// [`Agent::managed_command`] for a given platform. On Windows (spec
+    /// W9) it has forward slashes and no spaces, so no shell needs quotes.
+    pub fn managed_command_on(self, windows: bool) -> String {
         format!(
-            "/opt/saiife/bin/saiife check --managed --hook-exit --agent {}",
+            "{} check --managed --hook-exit --agent {}",
+            if windows { WINDOWS_BINARY } else { UNIX_BINARY },
             self.name()
         )
     }
@@ -206,6 +213,11 @@ impl AgentError {
     }
 }
 
+/// The locked binary, as the managed hook names it.
+pub(crate) const UNIX_BINARY: &str = "/opt/saiife/bin/saiife";
+/// Windows (spec W9): forward slashes, no spaces.
+pub(crate) const WINDOWS_BINARY: &str = "C:/ProgramData/saiife/bin/saiife.exe";
+
 /// True when `command` runs `saiife check` (any path to the binary). This is
 /// how saiife recognizes its own hook entries.
 pub fn is_saiife_command(command: &str) -> bool {
@@ -214,7 +226,7 @@ pub fn is_saiife_command(command: &str) -> bool {
         return false;
     };
     let base = bin.rsplit('/').next().unwrap_or(bin);
-    base == "saiife" && sub == "check"
+    (base == "saiife" || base.eq_ignore_ascii_case("saiife.exe")) && sub == "check"
 }
 
 #[cfg(test)]
@@ -267,6 +279,27 @@ mod tests {
             Agent::Gemini.hook_command(),
             "saiife check --hook-exit --agent gemini"
         );
+    }
+
+    #[test]
+    fn windows_managed_commands() {
+        for (a, n) in [
+            (Agent::Claude, "claude"),
+            (Agent::Codex, "codex"),
+            (Agent::Gemini, "gemini"),
+        ] {
+            assert_eq!(
+                a.managed_command_on(true),
+                format!(
+                    "C:/ProgramData/saiife/bin/saiife.exe check --managed --hook-exit --agent {n}"
+                )
+            );
+            assert!(is_saiife_command(&a.managed_command_on(true)));
+            assert_eq!(
+                a.managed_command_on(false),
+                format!("/opt/saiife/bin/saiife check --managed --hook-exit --agent {n}")
+            );
+        }
     }
 
     #[test]
