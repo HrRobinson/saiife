@@ -1652,7 +1652,8 @@ impl Run<'_> {
                 Vec::new()
             }
         };
-        let text = claude::managed_mcp_settings(&allow);
+        let windows = self.layout.platform() == Platform::Windows;
+        let text = claude::managed_mcp_settings_for(windows, &allow);
         self.file(
             CLAUDE_MCP,
             text.as_bytes(),

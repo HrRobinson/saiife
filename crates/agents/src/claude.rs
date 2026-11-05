@@ -104,15 +104,26 @@ pub enum HklmPolicy {
     Overrides,
 }
 
+/// A registry read that failed for a reason other than "not found".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HklmReadError;
+
+/// What a registry read gives [`hklm_policy`]: the value, none, or an error.
+pub type HklmRead = Result<Option<String>, HklmReadError>;
+
 /// Keys that steer how sources combine and are not policy themselves.
 const CONTROL_KEYS: &[&str] = &["managedSourcesBehavior", "wslInheritsWindowsSettings"];
 
 /// Reads the policy through `reg(key, value)` (the registry read is the
 /// caller's; on Windows see [`hklm_policy_live`]). A value that is not a
 /// JSON object but is not empty counts as `Overrides`: it fails closed.
-pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> Option<String>) -> HklmPolicy {
-    let Some(text) = reg(HKLM_POLICY_KEY, HKLM_POLICY_VALUE) else {
-        return HklmPolicy::Absent;
+pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> HklmRead) -> HklmPolicy {
+    let text = match reg(HKLM_POLICY_KEY, HKLM_POLICY_VALUE) {
+        Ok(Some(t)) => t,
+        Ok(None) => return HklmPolicy::Absent,
+        // Access denied, a value of the wrong type, any read error: the
+        // policy may be there, so the drop-in may be ignored.
+        Err(HklmReadError) => return HklmPolicy::Overrides,
     };
     if text.trim().is_empty() {
         return HklmPolicy::Absent;
@@ -130,17 +141,30 @@ pub fn hklm_policy(reg: &dyn Fn(&str, &str) -> Option<String>) -> HklmPolicy {
     }
 }
 
+/// One registry read as [`hklm_policy`] wants it: only "not found" means
+/// absent. Every other error (access denied, a REG_DWORD or REG_BINARY
+/// value where a string is expected, ...) is `Err`.
+pub fn hklm_read(r: std::io::Result<String>) -> HklmRead {
+    match r {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(HklmReadError),
+    }
+}
+
 /// [`hklm_policy`] against the real registry (64-bit view of HKLM).
 #[cfg(windows)]
 pub fn hklm_policy_live() -> HklmPolicy {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
     use winreg::RegKey;
     hklm_policy(&|key, value| {
-        RegKey::predef(HKEY_LOCAL_MACHINE)
+        match RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey_with_flags(key, KEY_READ | KEY_WOW64_64KEY)
-            .ok()?
-            .get_value::<String, _>(value)
-            .ok()
+        {
+            // A missing key is as absent as a missing value.
+            Err(e) => hklm_read(Err(e)),
+            Ok(k) => hklm_read(k.get_value::<String, _>(value)),
+        }
     })
 }
 
@@ -150,9 +174,21 @@ pub fn hklm_policy_live() -> HklmPolicy {
 /// `allow_servers` (gateway servers) follow by name, in order, without
 /// repeats. `saiife` is never allowed by name.
 pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
-    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [SAIIFE_BINARY, "mcp"] })];
+    managed_mcp_settings_for(cfg!(windows), allow_servers)
+}
+
+/// [`managed_mcp_settings`] for a platform. On Windows the pinned command
+/// is the W9 binary and no gateway names follow: W18 refuses the gateway
+/// there, so `allow_servers` is ignored.
+pub fn managed_mcp_settings_for(windows: bool, allow_servers: &[String]) -> String {
+    let bin = if windows {
+        crate::WINDOWS_BINARY
+    } else {
+        SAIIFE_BINARY
+    };
+    let mut entries: Vec<Value> = vec![json!({ "serverCommand": [bin, "mcp"] })];
     let mut seen: Vec<&str> = Vec::new();
-    for s in allow_servers {
+    for s in allow_servers.iter().filter(|_| !windows) {
         if s != "saiife" && !seen.contains(&s.as_str()) {
             seen.push(s);
             entries.push(json!({ "serverName": s }));
@@ -170,6 +206,11 @@ pub fn managed_mcp_settings(allow_servers: &[String]) -> String {
 /// `serverUrl`, a `saiife` by name, another key) could let a server that
 /// is not saiife's own run under the name `saiife`.
 pub fn managed_mcp_pinned(text: &str) -> bool {
+    managed_mcp_pinned_for(cfg!(windows), text)
+}
+
+/// [`managed_mcp_pinned`] for a platform (on Windows: the pin alone).
+pub fn managed_mcp_pinned_for(windows: bool, text: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return false;
     };
@@ -180,7 +221,8 @@ pub fn managed_mcp_pinned(text: &str) -> bool {
         .iter()
         .filter_map(|e| e.get("serverName")?.as_str().map(str::to_string))
         .collect();
-    serde_json::from_str::<Value>(&managed_mcp_settings(&names)).is_ok_and(|want| want == v)
+    serde_json::from_str::<Value>(&managed_mcp_settings_for(windows, &names))
+        .is_ok_and(|want| want == v)
 }
 
 /// The installed binary (the same path the hook command uses).
@@ -501,11 +543,65 @@ mod tests {
         assert!(!p.path().join(SETTINGS_REL).exists());
     }
 
-    fn reg(v: Option<&'static str>) -> impl Fn(&str, &str) -> Option<String> {
+    fn reg(v: Option<&'static str>) -> impl Fn(&str, &str) -> HklmRead {
         move |k, n| {
             assert_eq!((k, n), (HKLM_POLICY_KEY, HKLM_POLICY_VALUE));
-            v.map(str::to_string)
+            Ok(v.map(str::to_string))
         }
+    }
+
+    /// Any read error except "not found" fails closed.
+    #[test]
+    fn hklm_read_errors_fail_closed() {
+        let failing = |_: &str, _: &str| Err(HklmReadError);
+        assert_eq!(hklm_policy(&failing), HklmPolicy::Overrides);
+    }
+
+    #[test]
+    fn hklm_only_not_found_is_absent() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(hklm_read(Err(Error::from(ErrorKind::NotFound))), Ok(None));
+        assert_eq!(hklm_read(Ok("{}".into())), Ok(Some("{}".to_string())));
+        for k in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData, // a REG_DWORD or REG_BINARY value
+            ErrorKind::Other,
+            ErrorKind::InvalidInput,
+        ] {
+            assert_eq!(hklm_read(Err(Error::from(k))), Err(HklmReadError), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn windows_mcp_dropin_pins_the_windows_binary() {
+        let w = managed_mcp_settings_for(true, &["github".into()]);
+        let v: Value = serde_json::from_str(&w).unwrap();
+        assert_eq!(
+            v,
+            json!({"allowedMcpServers": [
+                {"serverCommand": ["C:/ProgramData/saiife/bin/saiife.exe", "mcp"]}
+            ]})
+        );
+        assert!(managed_mcp_pinned_for(true, &w));
+        assert!(!managed_mcp_pinned_for(false, &w));
+        assert!(!w.contains("/opt/"));
+        // A gateway name on Windows is not what install writes.
+        let with_name = serde_json::to_string(&json!({"allowedMcpServers": [
+            {"serverCommand": ["C:/ProgramData/saiife/bin/saiife.exe", "mcp"]},
+            {"serverName": "github"}]}))
+        .unwrap();
+        assert!(!managed_mcp_pinned_for(true, &with_name));
+    }
+
+    #[test]
+    fn linux_mcp_dropin_unchanged() {
+        let a = managed_mcp_settings_for(false, &["x".into(), "saiife".into(), "x".into()]);
+        assert_eq!(
+            a,
+            "{\n  \"allowedMcpServers\": [\n    {\n      \"serverCommand\": [\n        \"/opt/saiife/bin/saiife\",\n        \"mcp\"\n      ]\n    },\n    {\n      \"serverName\": \"x\"\n    }\n  ]\n}\n"
+        );
+        assert!(managed_mcp_pinned_for(false, &a));
+        assert!(!managed_mcp_pinned_for(true, &a));
     }
 
     #[test]

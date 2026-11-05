@@ -221,12 +221,31 @@ pub(crate) const WINDOWS_BINARY: &str = "C:/ProgramData/saiife/bin/saiife.exe";
 /// True when `command` runs `saiife check` (any path to the binary). This is
 /// how saiife recognizes its own hook entries.
 pub fn is_saiife_command(command: &str) -> bool {
+    is_saiife_command_on(cfg!(windows), command)
+}
+
+/// [`is_saiife_command`] for a platform. Off Windows only the exact W9
+/// managed path counts as a `.exe` command (so a Windows-layout write from
+/// another OS can replace its own entry). On Windows any `saiife.exe`
+/// counts, with `/` or `\` separators; a path with a space is split at the
+/// space, so it never counts.
+pub(crate) fn is_saiife_command_on(windows: bool, command: &str) -> bool {
     let mut words = command.split_whitespace();
     let (Some(bin), Some(sub)) = (words.next(), words.next()) else {
         return false;
     };
-    let base = bin.rsplit('/').next().unwrap_or(bin);
-    (base == "saiife" || base.eq_ignore_ascii_case("saiife.exe")) && sub == "check"
+    if sub != "check" {
+        return false;
+    }
+    if bin == WINDOWS_BINARY {
+        return true;
+    }
+    let base = if windows {
+        bin.rsplit(['/', '\\']).next().unwrap_or(bin)
+    } else {
+        bin.rsplit('/').next().unwrap_or(bin)
+    };
+    base == "saiife" || (windows && base.eq_ignore_ascii_case("saiife.exe"))
 }
 
 #[cfg(test)]
@@ -279,6 +298,35 @@ mod tests {
             Agent::Gemini.hook_command(),
             "saiife check --hook-exit --agent gemini"
         );
+    }
+
+    #[test]
+    fn exe_arm_is_windows_only_and_exact() {
+        let w = |c: &str| is_saiife_command_on(true, c);
+        let u = |c: &str| is_saiife_command_on(false, c);
+        assert!(w("saiife.exe check"));
+        assert!(w("C:/ProgramData/saiife/bin/saiife.exe check --managed"));
+        assert!(w("SAIIFE.EXE check"));
+        // A person may write the backslash form; on Windows it is ours.
+        assert!(w(r"C:\x\saiife.exe check"));
+        assert!(!u(r"C:\x\saiife.exe check"));
+        // Off Windows only the exact managed path counts.
+        assert!(!u("saiife.exe check"));
+        assert!(!u("/tmp/saiife.exe check"));
+        let managed = Agent::Claude.managed_command_on(true);
+        assert!(u(&managed));
+        for bad in [
+            "saiife.exe.bat check",
+            "saiife.exe.evil check",
+            "evilsaiife.exe check",
+            "\"C:/Program Files/saiife.exe\" check",
+            "C:/Program Files/saiife.exe check",
+            "C:/ProgramData/saiife/bin/saiife.exe.evil check",
+            "saiife.exe status",
+        ] {
+            assert!(!w(bad), "{bad}");
+            assert!(!u(bad), "{bad}");
+        }
     }
 
     #[test]
