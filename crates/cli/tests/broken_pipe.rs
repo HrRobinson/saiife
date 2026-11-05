@@ -9,11 +9,12 @@ use common::{code, stderr, stdout, Env};
 
 /// Run saiife with the read end of its stdout already closed.
 fn run_with_closed_stdout(env: &Env, args: &[&str]) -> (Option<i32>, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saiife"))
+    let mut child = Command::new(env.exe())
         .args(args)
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
         .env("SAIIFE_TEST_CLAUDE_MANAGED_DIRS", env.managed.path())
@@ -37,10 +38,17 @@ fn commands_exit_quietly_when_the_reader_goes_away() {
     // Developer mode whatever the host has installed.
     let absent = env.home.path().join("absent.toml");
     let absent = absent.to_str().unwrap();
+    // `--system-config` is locked mode, which Windows refuses until plan 19b:
+    // there it is developer mode anyway.
+    let audit: &[&str] = if cfg!(windows) {
+        &["audit"]
+    } else {
+        &["audit", "--system-config", absent]
+    };
     for args in [
         &["status"][..],
         &["packs"],
-        &["audit", "--system-config", absent],
+        audit,
         &["explain", "git status"],
         &["init"],
     ] {
@@ -93,6 +101,7 @@ fn json_mode_deny_fails_closed_when_stdout_is_gone() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
         .stdin(Stdio::piped())
@@ -131,6 +140,7 @@ fn hook_exit_deny_with_broken_stdout_pipe_exits_2() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
         .stdin(Stdio::piped())
@@ -174,6 +184,7 @@ fn hook_exit_deny_with_stdout_fd_closed_exits_2() {
         .current_dir(env.root())
         .env("PATH", env.bin.path())
         .env("HOME", env.home.path())
+        .env("USERPROFILE", env.home.path())
         .env("SAIIFE_DATA_DIR", env.data.path())
         .env("SAIIFE_AUDIT_DIR", env.audit.path())
         .stdin(Stdio::piped())

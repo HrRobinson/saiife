@@ -19,6 +19,7 @@
 //!   every repeated-slash spelling of a catastrophic path.
 
 use crate::lexer::Word;
+use crate::wrappers::effective_command;
 
 /// Build the matching argv for one segment: `argv[0]` case-folded and
 /// directory-stripped, every other token with its leading slashes collapsed.
@@ -56,6 +57,64 @@ fn collapse_leading_slashes(tok: &str) -> String {
         Some(rest) => format!("/{}", rest.trim_start_matches('/')),
         None => tok.to_string(),
     }
+}
+
+/// A Windows-style host: each program word of a segment as the name it runs,
+/// here and past every wrapper (`sudo.exe env rm.EXE`). Every phase after this
+/// reads word text as a POSIX name (the wrappers, the rules, `operands`, `bash
+/// -c`), so the word itself changes. Each pass starts where the last stopped, so
+/// a long chain of wrappers stays linear.
+pub fn windows_program_names(seg: &mut [Word]) {
+    let mut from = 0;
+    while from < seg.len() {
+        let at = seg.len() - effective_command(&seg[from..]).len();
+        let Some(w) = seg.get_mut(at) else {
+            return;
+        };
+        if w.has_substitution || w.redirect {
+            return;
+        }
+        let Some(name) = windows_program_text(&w.text) else {
+            return;
+        };
+        w.text = name;
+        from = at;
+    }
+}
+
+/// `text` as a program name on Windows, if that differs: `/` for `\\`, no
+/// extension `.exe`, `.cmd`, `.bat` or `.com` (in any case), and none of what
+/// Win32 ignores at the end of a name: dots, blanks, a stream (`rm.exe::$DATA`).
+/// A name that is only that (`.exe`, `.`, `..`) stays: `.` is a command.
+fn windows_program_text(text: &str) -> Option<String> {
+    let forward = text.replace('\\', "/");
+    let (dir, file) = match forward.rfind('/') {
+        Some(at) => forward.split_at(at + 1),
+        None => ("", forward.as_str()),
+    };
+    // `C:rm.exe`: the drive is no stream.
+    let (drive, file) = match file.as_bytes() {
+        [letter, b':', ..] if dir.is_empty() && letter.is_ascii_alphabetic() => file.split_at(2),
+        _ => ("", file),
+    };
+    let file = file.split(':').next().unwrap_or(file);
+    let name = file.trim_end_matches(['.', ' ']);
+    let stem = match name.rfind('.') {
+        Some(at)
+            if at > 0
+                && [".exe", ".cmd", ".bat", ".com"]
+                    .iter()
+                    .any(|e| name[at..].eq_ignore_ascii_case(e)) =>
+        {
+            &name[..at]
+        }
+        _ => name,
+    };
+    let stem = if stem.is_empty() { file } else { stem };
+    // A drive stands for a directory: `build_argv` drops it with the rest.
+    let sep = if drive.is_empty() { "" } else { "/" };
+    let out = format!("{dir}{drive}{sep}{stem}");
+    (out != text).then_some(out)
 }
 
 #[cfg(test)]
@@ -106,6 +165,52 @@ mod tests {
     fn program_case_fold_and_dir_strip_compose() {
         let argv = build_argv(&[w("/USR/BIN/GIT"), w("Reset"), w("--Hard")]);
         assert_eq!(argv, vec!["git", "Reset", "--Hard"]);
+    }
+
+    #[test]
+    fn a_windows_program_loses_what_windows_ignores() {
+        for (text, want) in [
+            ("rm.exe", "rm"),
+            ("RM.EXE", "RM"),
+            ("git.Cmd", "git"),
+            ("x.bat", "x"),
+            ("format.com", "format"),
+            (r"C:\Git\usr\bin\rm.exe", "C:/Git/usr/bin/rm"),
+            ("/usr/bin/rm.exe", "/usr/bin/rm"),
+            ("./rm.exe", "./rm"),
+            ("rm.exe.", "rm"),
+            ("rm.exe ", "rm"),
+            ("rm.exe::$DATA", "rm"),
+            ("C:rm.exe", "C:/rm"),
+            // Only one extension: `a.exe.exe` is the file `a.exe`.
+            ("a.exe.exe", "a.exe"),
+        ] {
+            assert_eq!(windows_program_text(text).as_deref(), Some(want), "{text}");
+        }
+        for text in [
+            "rm", ".exe", ".cmd", ".", "..", "x.txt", "x.ps1", "a/b", "./x",
+        ] {
+            assert_eq!(windows_program_text(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn program_names_are_stripped_past_wrappers_only() {
+        let mut seg = vec![
+            w("sudo.exe"),
+            w("-u"),
+            w("x.exe"),
+            w("env.EXE"),
+            w("A=b.exe"),
+            w("rm.cmd"),
+            w("c.exe"),
+        ];
+        windows_program_names(&mut seg);
+        let texts: Vec<&str> = seg.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["sudo", "-u", "x.exe", "env", "A=b.exe", "rm", "c.exe"]
+        );
     }
 
     #[test]

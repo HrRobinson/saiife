@@ -489,6 +489,8 @@ it.
 Windows, a central multi-machine dashboard (likely the successor of
 `saiife-hub`), the Electron app.
 
+Windows developer mode ships in v2.2 (plan 19a; v2 spec §5.3a).
+
 ## 10. Testing
 
 - **Guard:** all 20 existing test files move over unchanged and stay green.

@@ -214,12 +214,16 @@ pub fn write_installed(path: &Path, i: &Installed) -> io::Result<()> {
     result?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
+    // Windows cannot open a directory for sync; the rename is the commit.
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     fn sample() -> Installed {

@@ -132,8 +132,13 @@ pub fn run(
         context_from_hook_json_bounded(&buf, PARSE_MAX_BYTES),
         cli_packs,
     );
-    match eval::plan(&buf) {
-        Plan::TooLarge { command } => unusable(
+    let plan = eval::plan(&buf, Some(agent));
+    let fail = Fail {
+        closed: fail.closed || eval::must_fail_closed(&plan, &buf),
+        ..fail
+    };
+    match plan {
+        Plan::TooLarge { command, .. } => unusable(
             fail,
             &audit,
             &command,
@@ -141,12 +146,14 @@ pub fn run(
                 limit: MAX_PAYLOAD_BYTES,
             },
         ),
-        Plan::Shell { command } => {
+        Plan::Shell { command, dialects } => {
             // Built inside `decide`'s unwind guard: a panic while reading
             // the project config, building the engine or hashing the policy
             // fails open too.
             decide(&audit, &command, fail, |c| {
-                active_engine(&audit, cli_packs).0.evaluate(c)
+                active_engine(&audit, cli_packs)
+                    .0
+                    .evaluate_call(c, dialects)
             })
         }
         Plan::Files(call) => decide(&audit, &call.input(), fail, |_| {
@@ -589,6 +596,42 @@ mod tests {
         );
         // Open, the same calls are allowed.
         assert_eq!(decide(&audit, "x", OPEN, |_| timeout()), ExitCode::SUCCESS);
+    }
+
+    /// Fail policy under `Strictest`: a note from the POSIX or cmd reading, a
+    /// timeout and a panic are recorded and follow `Fail`: `error_allowed` in
+    /// developer mode, `error_denied` in locked. A PowerShell reading it cannot
+    /// read is a deny in both.
+    #[test]
+    fn fail_policy_under_strictest() {
+        use saiifeguard::payload::Dialects;
+        use saiifeguard::wintable::Dialect::{Posix, PowerShell};
+        const STRICTEST: Dialects = Dialects::Strictest(PowerShell, Posix);
+        let engine = Engine::new(Vec::new());
+        let timeout = || Decision::Allow {
+            trace: AllowTrace::FailedOpenTimeout,
+        };
+        for (fail, code, kind) in [
+            (OPEN, ExitCode::SUCCESS, DecisionKind::ErrorAllowed),
+            (CLOSED, ExitCode::from(2), DecisionKind::ErrorDenied),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let audit = audit_in(dir.path());
+            // cmd: `%h%d`. POSIX: a brace expansion too large to judge.
+            for cmd in ["git log --format=%h%d", "echo a{1..99999999}b"] {
+                let got = decide(&audit, cmd, fail, |c| engine.evaluate_call(c, STRICTEST));
+                assert_eq!(got, code, "{cmd}");
+            }
+            assert_eq!(decide(&audit, "x", fail, |_| timeout()), code);
+            assert_eq!(decide(&audit, "y", fail, |_| panic!("engine bug")), code);
+            let got = decide(&audit, "iex $x", fail, |c| {
+                engine.evaluate_call(c, STRICTEST)
+            });
+            assert_eq!(got, ExitCode::from(2));
+            let recs = store::read_all(dir.path()).records;
+            let kinds: Vec<_> = recs.iter().rev().take(5).map(|r| r.decision).collect();
+            assert_eq!(kinds, [DecisionKind::Deny, kind, kind, kind, kind]);
+        }
     }
 
     fn audit_in(dir: &std::path::Path) -> Audit {

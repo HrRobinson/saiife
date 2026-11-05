@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// The label of the user's home log in locked mode, verbatim (spec §6.4.5).
 pub const V1_LABEL: &str = "v1, before locked mode, not tamper-evident";
-pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+pub const SYSTEM_CONFIG: &str = crate::paths::DEV_SYSTEM_CONFIG;
 const LOCKED_AUDIT_DIR: &str = "/var/log/saiife/audit";
 
 /// Where the records come from: the one locked-mode decision behind both
@@ -30,6 +30,16 @@ pub enum Source {
 /// read it is an error naming the path (fail closed: a locked host never
 /// falls back to the home log alone).
 pub fn source(system_config: Option<&Path>) -> Result<Source, String> {
+    source_on(cfg!(windows), system_config)
+}
+
+/// [`source`] with the OS given. Windows is always `Developer` until plan
+/// 19b reads the config behind a DACL check: ProgramData is not root-owned,
+/// and a planted locked config would otherwise hide the user's own log.
+fn source_on(windows: bool, system_config: Option<&Path>) -> Result<Source, String> {
+    if windows {
+        return Ok(Source::Developer);
+    }
     let config = system_config.unwrap_or(Path::new(SYSTEM_CONFIG));
     let Some(dir) = locked_audit_dir(config)? else {
         return Ok(Source::Developer);
@@ -69,23 +79,27 @@ pub fn locked_audit_dir(config: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 /// Root, or `audit_gid` among the process's groups.
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 pub fn auditor(euid_is_root: bool, my_gids: &[u32], audit_gid: Option<u32>) -> bool {
     euid_is_root || audit_gid.is_some_and(|g| my_gids.contains(&g))
 }
 
 /// The audit group's name; debug builds take `SAIIFE_TEST_AUDIT_GROUP`
 /// so a test never depends on the host's groups.
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 #[cfg(debug_assertions)]
 fn audit_group() -> String {
     std::env::var("SAIIFE_TEST_AUDIT_GROUP").unwrap_or_else(|_| system_audit_group().to_string())
 }
 
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 #[cfg(not(debug_assertions))]
 fn audit_group() -> String {
     system_audit_group().to_string()
 }
 
 /// The group whose members read the audit files (spec §5.2, §5.3).
+#[cfg_attr(not(unix), allow(dead_code))] // only `is_auditor` (unix) uses it
 fn system_audit_group() -> &'static str {
     saiife_system::layout::Layout::system().audit_group()
 }
@@ -217,6 +231,20 @@ pub fn query(config: &Path, q: &QueryArgs) -> Result<(Vec<Record>, usize), Strin
 mod tests {
     use super::*;
 
+    /// Windows reads no locked config before plan 19b (DACL check): a
+    /// planted `locked = true` file there cannot change the audit source.
+    #[test]
+    fn windows_source_is_developer_whatever_the_config_says() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "locked = true\n").unwrap();
+        assert!(matches!(source_on(true, Some(&cfg)), Ok(Source::Developer)));
+        assert!(!matches!(
+            source_on(false, Some(&cfg)),
+            Ok(Source::Developer)
+        ));
+    }
+
     #[test]
     fn auditor_is_root_or_a_group_member() {
         assert!(auditor(true, &[], None));
@@ -226,6 +254,9 @@ mod tests {
         assert!(!auditor(false, &[10, 3000], None));
     }
 
+    // Reads the locked config, which Windows never does in plan 19a:
+    // `windows_source_is_developer_whatever_the_config_says` pins that.
+    #[cfg(unix)]
     #[test]
     fn no_locked_config_is_developer_mode() {
         let d = tempfile::tempdir().unwrap();
@@ -263,6 +294,8 @@ mod tests {
         assert!(source(Some(&file.join("config.toml"))).is_err());
     }
 
+    // Locked config with POSIX paths; Windows has no locked mode until plan 19b.
+    #[cfg(unix)]
     #[test]
     fn locked_audit_dir_reads_the_system_config() {
         let d = tempfile::tempdir().unwrap();

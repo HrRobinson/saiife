@@ -9,11 +9,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use saiife_agents::detect::which;
+use saiife_agents::detect::{agent_paths, which};
 use saiife_agents::integrity;
+use saiife_agents::Agent;
 use saiife_audit::store;
 use saiife_system::layout::Platform;
-use saiifeguard::canon::PathVars;
+use saiifeguard::canon::{PathStyle, PathVars};
+
+/// The system config the developer hook and `saiife audit` read for locked
+/// mode (`locked = true`, `[guard] fail`). On Windows it is under ProgramData
+/// (plan 19a, W-decisions); no locked install writes it before plan 19b.
+#[cfg(unix)]
+pub const DEV_SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+#[cfg(windows)]
+pub const DEV_SYSTEM_CONFIG: &str = r"C:\ProgramData\saiife\etc\config.toml";
 
 /// An agent config dir: `value` when set and absolute, else `default` under
 /// `home` (`None` when neither is known).
@@ -28,11 +37,29 @@ fn config_dir(
     }
 }
 
+/// An agent's config dir: `value` when set and absolute, else the default
+/// from [`agent_paths`] under `home`.
+fn agent_config_dir(
+    value: Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    agent: Agent,
+    windows: bool,
+) -> Option<PathBuf> {
+    match value {
+        Some(d) if Path::new(&d).is_absolute() => Some(PathBuf::from(d)),
+        _ => agent_paths(home?, windows)
+            .of(agent)
+            .map(|p| p.config_dir.clone()),
+    }
+}
+
 /// Locked mode's system paths (spec §5.2), at their defaults; on macOS the
 /// §5.3 ones. Always bound: only `core.lock` uses them, and it is on only
 /// in locked mode (or when a project turns it on).
 const SYSTEM_PATHS: [(&str, &str); 6] = system_paths(if cfg!(target_os = "macos") {
     Platform::Macos
+} else if cfg!(windows) {
+    Platform::Windows
 } else {
     Platform::Linux
 });
@@ -43,6 +70,20 @@ const fn system_paths(p: Platform) -> [(&'static str, &'static str); 6] {
     use saiife_system::layout::{ETC_DIR, LOG_DIR, OPT_DIR, RUN_DIR, STATE_DIR, UNIT};
     let (state, run, unit) = match p {
         Platform::Linux => (STATE_DIR, RUN_DIR, UNIT),
+        // Spec §5.3a: everything under C:\ProgramData\saiife. Windows has no
+        // run dir (the endpoint is a pipe) and no unit file; those two names
+        // bind the run dir path and the service binary so `core.lock` still
+        // protects what is there.
+        Platform::Windows => {
+            return [
+                ("SAIIFE_ETC", r"C:\ProgramData\saiife\etc"),
+                ("SAIIFE_STATE", r"C:\ProgramData\saiife\state"),
+                ("SAIIFE_LOG", r"C:\ProgramData\saiife\log"),
+                ("SAIIFE_RUN", r"C:\ProgramData\saiife\run"),
+                ("SAIIFE_OPT", r"C:\ProgramData\saiife"),
+                ("SAIIFE_UNIT", r"C:\ProgramData\saiife\bin\saiife.exe"),
+            ];
+        }
         Platform::Macos => (
             "/var/db/saiife",
             "/var/db/saiife-run",
@@ -71,6 +112,31 @@ pub struct LockedPaths {
     pub socket_dir: PathBuf,
 }
 
+/// The Windows variables a path may be spelled with (W6), bound when set.
+const WINDOWS_VARS: [&str; 12] = [
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "PROGRAMDATA",
+    "ALLUSERSPROFILE",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "COMPUTERNAME",
+];
+
+/// `v` in `PathStyle::Windows`, with the variables `env` has a value for.
+fn bind_windows_vars(v: PathVars, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathVars {
+    let v = v.with_style(PathStyle::Windows);
+    WINDOWS_VARS.iter().fold(v, |v, name| match env(name) {
+        Some(value) => v.with_var(name, value),
+        None => v,
+    })
+}
+
 /// `cwd`: where relative paths start (the hook payload's `cwd`); `project`:
 /// the saiife project root, `cwd` if there is none. Every value the
 /// process cannot determine is left out, so rules that need it do not apply.
@@ -86,25 +152,32 @@ pub fn path_vars_locked(
     project: Option<&Path>,
     locked: Option<&LockedPaths>,
 ) -> PathVars {
-    let mut v = PathVars::new();
+    let mut v = PathVars::new().with_style(PathStyle::host());
+    if v.style() == PathStyle::Windows {
+        v = bind_windows_vars(v, |name| std::env::var_os(name));
+    }
     if let Some(c) = cwd {
         v = v.with_cwd(c);
     }
-    if let Some(h) = dirs::home_dir() {
+    if let Some(h) = saiife_win::profile::home_dir() {
         v = v.with_var("HOME", h);
     }
     // The agents' config dirs: the variable when set (and absolute), else
     // the default under HOME, so the rules naming them are always active.
     // `XDG_CONFIG_HOME` the same way (`~/.config`); in locked mode the
     // worker's environment is cleared, so it is always the default there.
-    for (name, default) in [
-        ("CLAUDE_CONFIG_DIR", ".claude"),
-        ("CODEX_HOME", ".codex"),
-        ("XDG_CONFIG_HOME", ".config"),
+    let home = saiife_win::profile::home_dir();
+    for (name, agent) in [
+        ("CLAUDE_CONFIG_DIR", Agent::Claude),
+        ("CODEX_HOME", Agent::Codex),
     ] {
-        if let Some(d) = config_dir(std::env::var_os(name), dirs::home_dir(), default) {
+        let value = std::env::var_os(name);
+        if let Some(d) = agent_config_dir(value, home.as_deref(), agent, cfg!(windows)) {
             v = v.with_var(name, d);
         }
+    }
+    if let Some(d) = config_dir(std::env::var_os("XDG_CONFIG_HOME"), home, ".config") {
+        v = v.with_var("XDG_CONFIG_HOME", d);
     }
     if let Some(p) = project.or(cwd) {
         v = v.with_var("PROJECT", p);
@@ -140,18 +213,78 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
+    /// An absolute path on this host.
+    fn host_absolute() -> &'static str {
+        if cfg!(windows) {
+            r"C:\opt\x"
+        } else {
+            "/opt/x"
+        }
+    }
+
     #[test]
     fn config_dir_falls_back_to_the_default_under_home() {
         let home = || Some(PathBuf::from("/home/u"));
-        let want = Some(PathBuf::from("/home/u/.claude"));
+        let want = Some(PathBuf::from("/home/u").join(".claude"));
         assert_eq!(config_dir(None, home(), ".claude"), want);
         assert_eq!(config_dir(Some(OsString::new()), home(), ".claude"), want);
         assert_eq!(config_dir(Some("rel/dir".into()), home(), ".claude"), want);
+        let absolute = host_absolute();
         assert_eq!(
-            config_dir(Some("/opt/claude".into()), home(), ".claude"),
-            Some(PathBuf::from("/opt/claude"))
+            config_dir(Some(absolute.into()), home(), ".claude"),
+            Some(PathBuf::from(absolute))
         );
         assert_eq!(config_dir(None, None, ".claude"), None);
+    }
+
+    /// The defaults now come from `agent_paths`; they are the ones the
+    /// literals gave (`~/.claude`, `~/.codex`) on every platform.
+    #[test]
+    fn agent_config_dirs_match_the_old_defaults() {
+        let home = Path::new("/home/u");
+        for windows in [false, true] {
+            for (agent, old) in [(Agent::Claude, ".claude"), (Agent::Codex, ".codex")] {
+                let want = config_dir(None, Some(home.to_path_buf()), old);
+                assert_eq!(agent_config_dir(None, Some(home), agent, windows), want);
+                assert_eq!(
+                    agent_config_dir(Some("rel".into()), Some(home), agent, windows),
+                    want
+                );
+                assert_eq!(
+                    agent_config_dir(Some(host_absolute().into()), Some(home), agent, windows),
+                    Some(PathBuf::from(host_absolute()))
+                );
+                assert_eq!(agent_config_dir(None, None, agent, windows), None);
+            }
+        }
+    }
+
+    #[test]
+    fn windows_variables_are_bound_in_windows_style() {
+        let env = |name: &str| match name {
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\a")),
+            "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\a\AppData\Local")),
+            "APPDATA" => Some(OsString::from(r"C:\Users\a\AppData\Roaming")),
+            "TEMP" => Some(OsString::from(r"C:\Users\a\AppData\Local\Temp")),
+            _ => None,
+        };
+        let v = bind_windows_vars(PathVars::new(), env);
+        assert_eq!(v.style(), PathStyle::Windows);
+        assert_eq!(v.home(), Some(Path::new("c:/Users/a")));
+        for (name, want) in [
+            ("LOCALAPPDATA", "c:/Users/a/AppData/Local"),
+            ("APPDATA", "c:/Users/a/AppData/Roaming"),
+            ("TEMP", "c:/Users/a/AppData/Local/Temp"),
+        ] {
+            assert_eq!(v.values(name), vec![Path::new(want)], "{name}");
+        }
+        assert!(v.values("PROGRAMDATA").is_empty());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn the_cli_uses_posix_style_off_windows() {
+        assert_eq!(path_vars(None, None).style(), PathStyle::Posix);
     }
 
     #[test]
@@ -159,16 +292,29 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let real = std::fs::canonicalize(d.path()).unwrap();
         let v = path_vars(Some(d.path()), None);
-        assert_eq!(v.cwd(), Some(real.as_path()));
+        // Each compared in the form this host's rules read it (Windows:
+        // `d:/x`, where `fs::canonicalize` gives `\\\\?\\D:\\x`).
+        let read = |p: &Path| {
+            PathVars::new()
+                .with_style(PathStyle::host())
+                .with_var("X", p)
+        };
+        let form = |p: &Path| read(p).values("X")[0].to_path_buf();
+        assert_eq!(v.cwd(), Some(form(&real).as_path()));
         // Both the spelled and the resolved value are bound (they differ on
         // macOS, where the temp dir is `/var/…` -> `/private/var/…`).
-        assert!(v.values("PROJECT").contains(&real.as_path()));
-        assert!(v.values("PROJECT").contains(&d.path()));
+        assert!(v.values("PROJECT").contains(&form(&real).as_path()));
+        assert!(read(d.path())
+            .values("X")
+            .iter()
+            .all(|p| v.values("PROJECT").contains(p)));
         let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        assert!(v.values("SAIIFE_BIN").contains(&exe.as_path()));
+        assert!(v.values("SAIIFE_BIN").contains(&form(&exe).as_path()));
         assert!(path_vars(None, None).cwd().is_none());
     }
 
+    // Locked mode with the POSIX system paths; Windows has none until plan 19b.
+    #[cfg(unix)]
     #[test]
     fn locked_paths_add_values() {
         let d = tempfile::tempdir().unwrap();
@@ -229,6 +375,18 @@ mod tests {
     }
 
     #[test]
+    fn system_paths_windows_values() {
+        let w = system_paths(Platform::Windows);
+        assert_eq!(w[0], ("SAIIFE_ETC", r"C:\ProgramData\saiife\etc"));
+        assert_eq!(w[4], ("SAIIFE_OPT", r"C:\ProgramData\saiife"));
+        assert!(w
+            .iter()
+            .all(|(_, v)| v.starts_with(r"C:\ProgramData\saiife")));
+        #[cfg(windows)]
+        assert_eq!(SYSTEM_PATHS, w);
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn system_paths_are_always_bound_to_their_defaults() {
         let v = path_vars(None, None);
@@ -253,7 +411,7 @@ mod tests {
             config_dir(None, Some(PathBuf::from("/home/u")), ".config"),
             Some(PathBuf::from("/home/u/.config"))
         );
-        if dirs::home_dir().is_some() {
+        if saiife_win::profile::home_dir().is_some() {
             assert!(!v.values("XDG_CONFIG_HOME").is_empty());
         }
     }

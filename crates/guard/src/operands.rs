@@ -23,6 +23,8 @@ pub struct Operand {
     pub access: Access,
     /// The word had an unquoted `*`, `?` or `[`: the shell expands it.
     pub glob: bool,
+    /// Its wildcards also match dotfiles (`Word::glob_dots`).
+    pub dots: bool,
     /// For a copy/move target: its sources. If the target is a directory
     /// (ends in `/` or exists as one), what is written is
     /// `path/<base name>` for each source, not the directory itself; a
@@ -36,6 +38,8 @@ pub struct Source {
     pub path: String,
     /// Expand it (unquoted `*?[`) to know the names that land.
     pub glob: bool,
+    /// Its wildcards also match dotfiles (`Word::glob_dots`).
+    pub dots: bool,
     /// Its entries land in the target, not itself: `cp -T dir t`,
     /// `rsync dir/ t`.
     pub contents: bool,
@@ -82,6 +86,19 @@ pub fn path_operands(
         .collect()
 }
 
+/// Is `cmd` a command whose operands this module knows?
+pub(crate) fn understood(cmd: &str) -> bool {
+    READERS.contains(&cmd)
+        || COMPRESSORS.contains(&cmd)
+        || PATTERN_FIRST.contains(&cmd)
+        || COPIERS.contains(&cmd)
+        || WRITERS.contains(&cmd)
+        || matches!(
+            cmd,
+            "mv" | "git" | "dd" | "curl" | "wget" | "tar" | "perl" | "find"
+        )
+}
+
 /// Like `path_operands`, with whether each operand is a glob and, for a
 /// copy/move target, the names that land in it.
 pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Operand> {
@@ -91,16 +108,7 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
         return out.0;
     };
     let cmd = cmd.as_str();
-    let known = READERS.contains(&cmd)
-        || COMPRESSORS.contains(&cmd)
-        || PATTERN_FIRST.contains(&cmd)
-        || COPIERS.contains(&cmd)
-        || WRITERS.contains(&cmd)
-        || matches!(
-            cmd,
-            "mv" | "git" | "dd" | "curl" | "wget" | "tar" | "perl" | "find"
-        );
-    if !known {
+    if !understood(cmd) {
         return out.0;
     }
     // Words with a substitution (value unknown) and redirections (judged
@@ -112,6 +120,7 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
             (!w.has_substitution).then_some(Tok {
                 s: a.as_str(),
                 glob: w.glob,
+                dots: w.glob_dots,
             })
         })
         .collect();
@@ -172,6 +181,7 @@ pub fn operands(segment: &[Word], effective: &[Word], argv: &[String]) -> Vec<Op
 struct Tok<'a> {
     s: &'a str,
     glob: bool,
+    dots: bool,
 }
 
 impl<'a> Tok<'a> {
@@ -192,6 +202,7 @@ impl Out {
                 path: t.s.to_string(),
                 access,
                 glob: t.glob,
+                dots: t.dots,
                 into,
             });
         }
@@ -336,6 +347,7 @@ fn rm_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
             path,
             access: Access::Write,
             glob,
+            dots: t.dots,
             into: Vec::new(),
         });
     }
@@ -354,6 +366,7 @@ fn mv_like(words: &[Option<Tok>], out: &mut Out, dir: Option<&str>) {
             path,
             access,
             glob,
+            dots: t.dots,
             into,
         });
     };
@@ -400,6 +413,7 @@ fn sources_of(sources: &[Tok], contents: impl Fn(&Tok) -> bool, dir: Option<&str
         .map(|s| Source {
             path: under(dir, *s).0,
             glob: s.glob,
+            dots: s.dots,
             contents: contents(s),
         })
         .collect()
@@ -653,6 +667,7 @@ fn find(words: &[Option<Tok>], out: &mut Out) {
         out.write(Tok {
             s: ".",
             glob: false,
+            dots: false,
         });
     }
     for t in starts {
@@ -770,6 +785,7 @@ fn tar(words: &[Option<Tok>], out: &mut Out) {
             path,
             access,
             glob,
+            dots: false,
             into: Vec::new(),
         });
     }
@@ -905,6 +921,7 @@ fn redirections(segment: &[Word], out: &mut Out) {
         let t = Tok {
             s: &target.text,
             glob: target.glob,
+            dots: target.glob_dots,
         };
         match redirection_kind(&op.text) {
             Redirection::Read => out.read(t),
@@ -1215,6 +1232,7 @@ mod tests {
         let src = |p: &str, glob, contents| Source {
             path: p.to_string(),
             glob,
+            dots: false,
             contents,
         };
         assert_eq!(

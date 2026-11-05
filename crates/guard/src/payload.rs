@@ -21,6 +21,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Deserializer};
 
 use crate::getopt::{flag, opt, req, Opt, Spec};
+use crate::wintable::Dialect;
 
 /// Hard cap on hook-payload size. Anything larger is refused (fail open) rather
 /// than parsed — a guard must not become a memory amplifier.
@@ -230,6 +231,8 @@ pub fn command_from_hook_json(input: &str, max_bytes: usize) -> Result<String, P
 pub enum ToolCall {
     Shell {
         command: String,
+        /// How the command is read (`dialects_for`).
+        dialects: Dialects,
     },
     File {
         tool: String,
@@ -241,8 +244,49 @@ pub enum ToolCall {
     },
 }
 
-/// Shell tools: Claude Code and Codex `Bash`, Gemini `run_shell_command`.
-const SHELL_TOOLS: &[&str] = &["Bash", "run_shell_command"];
+/// How a shell command is read (W4). A wrong dialect is a bypass: a command
+/// read under the wrong grammar comes out as something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialects {
+    /// The tool's shell is known.
+    One(Dialect),
+    /// The shell is not known: every reading is judged and the stricter wins.
+    Strictest(Dialect, Dialect),
+}
+
+impl Dialects {
+    /// Is the command read by the PowerShell or cmd reader? What such a reader
+    /// cannot read is never allowed (`Engine::evaluate_call`).
+    pub fn has_reader(self) -> bool {
+        match self {
+            Dialects::One(d) => d != Dialect::Posix,
+            Dialects::Strictest(a, b) => a != Dialect::Posix || b != Dialect::Posix,
+        }
+    }
+}
+
+/// The W4 rules. `PowerShell` wins for any agent on every OS, whatever the
+/// case of the name: such a payload never reaches the POSIX reader. Claude's
+/// `Bash` is Git Bash on Windows. Any other shell tool on a Windows host, a
+/// renamed or an unnamed one included, may run in PowerShell, cmd or bash, so
+/// it gets the strictest reading.
+pub fn dialects_for(agent: Option<&str>, tool: Option<&str>, windows_host: bool) -> Dialects {
+    if tool.is_some_and(|t| t.eq_ignore_ascii_case("PowerShell")) {
+        return Dialects::One(Dialect::PowerShell);
+    }
+    if !windows_host {
+        return Dialects::One(Dialect::Posix);
+    }
+    let claude = agent.is_some_and(|a| a.eq_ignore_ascii_case("claude"));
+    if claude && tool == Some("Bash") {
+        return Dialects::One(Dialect::Posix);
+    }
+    Dialects::Strictest(Dialect::PowerShell, Dialect::Posix)
+}
+
+/// Shell tools: Claude Code and Codex `Bash`, Claude Code `PowerShell`,
+/// Gemini `run_shell_command`.
+const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell", "run_shell_command"];
 
 /// File tools that only read or list.
 const READ_TOOLS: &[&str] = &[
@@ -283,12 +327,27 @@ const WRITE_TOOLS: &[&str] = &[
 /// Errors (oversize, not JSON, shell call without a command) make the caller
 /// fail open.
 pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError> {
+    classify_for(input, max_bytes, None, false)
+}
+
+/// `classify`, with what picks the dialect of a shell call: the agent and the
+/// host.
+pub fn classify_for(
+    input: &str,
+    max_bytes: usize,
+    agent: Option<&str>,
+    windows_host: bool,
+) -> Result<ToolCall, PayloadError> {
     let env = envelope(input, max_bytes)?;
+    let dialects = dialects_for(agent, env.tool(), windows_host);
+    let shell = |command| ToolCall::Shell { command, dialects };
     let Some(tool) = env.tool() else {
-        return env.command().map(|command| ToolCall::Shell { command });
+        return env.command().map(shell);
     };
-    if SHELL_TOOLS.contains(&tool) {
-        return env.command().map(|command| ToolCall::Shell { command });
+    // `dialects_for` reads `PowerShell` in any case; the POSIX tools keep their
+    // exact names.
+    if SHELL_TOOLS.contains(&tool) || tool.eq_ignore_ascii_case("PowerShell") {
+        return env.command().map(shell);
     }
     let empty = ToolInput::default();
     let write = WRITE_TOOLS.contains(&tool);
@@ -321,9 +380,7 @@ pub fn classify(input: &str, max_bytes: usize) -> Result<ToolCall, PayloadError>
         });
     }
     match tool_input.command.as_deref() {
-        Some(cmd) if !cmd.trim().is_empty() => Ok(ToolCall::Shell {
-            command: cmd.to_string(),
-        }),
+        Some(cmd) if !cmd.trim().is_empty() => Ok(shell(cmd.to_string())),
         _ => Ok(ToolCall::Other {
             tool: tool.to_string(),
         }),
@@ -850,6 +907,70 @@ mod tests {
     }
 
     #[test]
+    fn dialects_for_table() {
+        use Dialect::{Posix, PowerShell};
+        use Dialects::{One, Strictest};
+        let both = Strictest(PowerShell, Posix);
+        let rows: &[(Option<&str>, Option<&str>, bool, Dialects)] = &[
+            // Claude `Bash` is Git Bash on Windows.
+            (Some("claude"), Some("Bash"), false, One(Posix)),
+            (Some("claude"), Some("Bash"), true, One(Posix)),
+            (Some("Claude"), Some("Bash"), true, One(Posix)),
+            // `PowerShell`: any agent, every OS.
+            (Some("claude"), Some("PowerShell"), false, One(PowerShell)),
+            (Some("claude"), Some("PowerShell"), true, One(PowerShell)),
+            (Some("codex"), Some("PowerShell"), false, One(PowerShell)),
+            (None, Some("PowerShell"), false, One(PowerShell)),
+            (None, Some("powershell"), false, One(PowerShell)),
+            // Codex and Gemini on a Windows host: both.
+            (Some("codex"), Some("Bash"), true, both),
+            (Some("gemini"), Some("run_shell_command"), true, both),
+            // A renamed, unnamed or unattributed call: not known, so both.
+            (Some("claude"), Some("shell"), true, both),
+            (Some("claude"), None, true, both),
+            (None, Some("Bash"), true, both),
+            (None, None, true, both),
+            // Everything else stays POSIX off Windows.
+            (Some("codex"), Some("Bash"), false, One(Posix)),
+            (Some("gemini"), Some("run_shell_command"), false, One(Posix)),
+            (None, None, false, One(Posix)),
+        ];
+        for (agent, tool, windows, want) in rows {
+            assert_eq!(
+                dialects_for(*agent, *tool, *windows),
+                *want,
+                "{agent:?} {tool:?} {windows}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_powershell_payload_is_never_posix() {
+        // Every shape `classify` reads a shell call from.
+        for input in [
+            r#"{"tool_name":"PowerShell","tool_input":{"command":"ls"}}"#,
+            r#"{"toolName":"PowerShell","toolInput":{"command":"ls"}}"#,
+            r#"{"tool_name":"PowerShell","command":"ls"}"#,
+            r#"{"tool_name":"powershell","tool_input":{"command":"ls"}}"#,
+        ] {
+            for windows in [false, true] {
+                for agent in [None, Some("claude"), Some("codex"), Some("gemini")] {
+                    let Ok(ToolCall::Shell { dialects, .. }) =
+                        classify_for(input, 4096, agent, windows)
+                    else {
+                        panic!("{input}");
+                    };
+                    assert_eq!(dialects, Dialects::One(Dialect::PowerShell), "{input}");
+                }
+            }
+            let Ok(ToolCall::Shell { dialects, .. }) = classify(input, 4096) else {
+                panic!("{input}");
+            };
+            assert_eq!(dialects, Dialects::One(Dialect::PowerShell), "{input}");
+        }
+    }
+
+    #[test]
     fn classify_shell_tools() {
         for tool in ["Bash", "run_shell_command"] {
             let c =
@@ -857,7 +978,8 @@ mod tests {
             assert_eq!(
                 c,
                 ToolCall::Shell {
-                    command: "rm -rf /".into()
+                    command: "rm -rf /".into(),
+                    dialects: Dialects::One(Dialect::Posix),
                 },
                 "{tool}"
             );
@@ -1137,7 +1259,8 @@ mod tests {
         assert_eq!(
             c,
             ToolCall::Shell {
-                command: "rm -rf /".into()
+                command: "rm -rf /".into(),
+                dialects: Dialects::One(Dialect::Posix),
             }
         );
     }
@@ -1148,7 +1271,8 @@ mod tests {
         assert_eq!(
             c,
             ToolCall::Shell {
-                command: "ls".into()
+                command: "ls".into(),
+                dialects: Dialects::One(Dialect::Posix),
             }
         );
         assert!(matches!(

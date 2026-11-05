@@ -131,6 +131,8 @@ enum Case {
     Command {
         command: String,
         tool: &'static str,
+        /// Whose hook judges it: with the tool and the host it picks the dialect.
+        agent: &'static str,
     },
 }
 
@@ -170,9 +172,10 @@ fn parse_example(ex: &Example) -> Result<Case, String> {
             if c.trim().is_empty() {
                 return Err("command is empty".into());
             }
-            let tool = match ex.agent.as_deref() {
-                None | Some("claude" | "codex") => "Bash",
-                Some("gemini") => "run_shell_command",
+            let (tool, agent) = match ex.agent.as_deref() {
+                None | Some("claude") => ("Bash", "claude"),
+                Some("codex") => ("Bash", "codex"),
+                Some("gemini") => ("run_shell_command", "gemini"),
                 Some(other) => {
                     return Err(format!("agent {other:?} is not claude, codex or gemini"))
                 }
@@ -180,14 +183,16 @@ fn parse_example(ex: &Example) -> Result<Case, String> {
             Ok(Case::Command {
                 command: c.clone(),
                 tool,
+                agent,
             })
         }
     }
 }
 
-/// The built-in packs with their `[[deny]]` rule ids (for `[guard] ask`).
+/// The built-in packs with their `[[deny]]` rule ids (for `[guard] ask`), those
+/// of every OS: a policy can be shared across a fleet and checked on any host.
 fn pack_catalog() -> Vec<PackInfo> {
-    let (packs, _) = saiifeguard::builtins::builtin_packs();
+    let (packs, _) = saiifeguard::builtins::builtin_packs_every_rule();
     packs
         .iter()
         .map(|p| PackInfo {
@@ -256,7 +261,7 @@ fn validate(file: &Path, loaded: LoadedPolicy, dir: &dyn Directory) -> Checked {
     // the daemon does, except for the owner: a policy kept in git belongs to
     // whoever checked it out.
     let cdir = file.parent().unwrap_or(Path::new("")).join("connectors");
-    let me = rustix::process::geteuid().as_raw();
+    let me = manifest_owner();
     let local = match manifest::load_local_with(&cdir, manifest::builtin(), me) {
         Ok(l) => l,
         Err(e) => {
@@ -464,7 +469,11 @@ fn run_case(
                 },
             })
         }
-        Case::Command { command, tool } => {
+        Case::Command {
+            command,
+            tool,
+            agent,
+        } => {
             let (active, _) = active_packs(cfg, &pack_catalog(), None);
             let ids: Vec<String> = active.into_iter().map(|p| p.id).collect();
             let payload = serde_json::json!({
@@ -485,7 +494,14 @@ fn run_case(
             });
             // Long enough that a slow runner never fails open.
             let budget = Duration::from_millis(cfg.guard.budget_ms.max(10_000));
-            let a = judge_with(&payload, &ids, budget, locked.as_ref(), &cfg.guard.ask);
+            let a = judge_with(
+                &payload,
+                &ids,
+                budget,
+                locked.as_ref(),
+                &cfg.guard.ask,
+                Some(agent),
+            );
             let why = a.reason.as_deref().unwrap_or("");
             let rule = a.rule_id.as_deref().or(a.rule.as_deref()).unwrap_or("");
             Ok(match a.verdict {
@@ -513,8 +529,27 @@ fn run_case(
 // ------------------------------------------------------------------- show
 
 /// The user running this command.
+#[cfg(unix)]
 fn current_user() -> Option<String> {
     Getent.name_of(rustix::process::getuid().as_raw())
+}
+
+/// `policy show` is locked mode: `main` refuses it on Windows first.
+#[cfg(not(unix))]
+fn current_user() -> Option<String> {
+    None
+}
+
+/// The uid `load_local_with` expects as the manifests' owner. Windows has no
+/// uid and the loader ignores it there (no owner check before plan 19b).
+#[cfg(unix)]
+fn manifest_owner() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn manifest_owner() -> u32 {
+    0
 }
 
 fn show(config: Option<PathBuf>, effective: bool, user: Option<String>) -> ExitCode {
@@ -803,6 +838,15 @@ fn print_show(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_catalog_names_the_rules_of_every_os() {
+        let catalog = pack_catalog();
+        let rules = |id: &str| &catalog.iter().find(|p| p.id == id).unwrap().rules;
+        assert!(rules("core.filesystem").contains(&"windows-format".to_string()));
+        assert!(rules("core.lock").contains(&"windows-service".to_string()));
+        assert!(rules("core.git").contains(&"force-push".to_string()));
+    }
+
     const PASSWD: &str = "alice:x:1000:1000::/home/alice:/bin/sh\n\
         bob:x:1001:1001::/home/bob:/bin/sh\n\
         carol:x:1002:2000::/home/carol:/bin/sh\n";
@@ -990,6 +1034,35 @@ expect = "deny"
         assert_eq!(test(&f, &dir()).code, 1);
     }
 
+    /// `policy test` reads a command as the hook of that agent does, so on a
+    /// Windows host Claude's `Bash` is Git Bash there too.
+    #[test]
+    fn a_command_example_names_its_agent() {
+        let case = |agent: Option<&str>| {
+            parse_example(&Example {
+                user: "alice".into(),
+                request: None,
+                command: Some("ls".into()),
+                agent: agent.map(str::to_string),
+                expect: saiife_policy::system::Expect::Allow,
+            })
+            .unwrap()
+        };
+        for (given, tool, agent) in [
+            (None, "Bash", "claude"),
+            (Some("claude"), "Bash", "claude"),
+            (Some("codex"), "Bash", "codex"),
+            (Some("gemini"), "run_shell_command", "gemini"),
+        ] {
+            match case(given) {
+                Case::Command {
+                    tool: t, agent: a, ..
+                } => assert_eq!((t, a), (tool, agent)),
+                Case::Request { .. } => panic!("{given:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_command_example_uses_guard_and_ask() {
         let text = format!(
@@ -1020,6 +1093,9 @@ expect = "deny"
         assert!(o.out.contains("FAIL example 2"), "{o:?}");
     }
 
+    // `/etc/saiife/config.toml` is a POSIX lock path; Windows has no locked mode until
+    // plan 19b, and `corpus_windows` pins the rules it will use.
+    #[cfg(unix)]
     #[test]
     fn test_command_example_protects_the_deployed_path() {
         // The file under test is somewhere else; the paths core.lock guards

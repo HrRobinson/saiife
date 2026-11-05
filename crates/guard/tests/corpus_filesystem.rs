@@ -1,6 +1,7 @@
 //! Golden corpus for `core.filesystem` (default-on, catastrophic-only).
 
-use saiifeguard::builtins::builtin_packs;
+use saiifeguard::builtins::{builtin_packs, builtin_packs_for};
+use saiifeguard::canon::{PathStyle, PathVars};
 use saiifeguard::engine::{AllowTrace, Decision, Engine};
 use saiifeguard::profile::select_active;
 
@@ -8,7 +9,30 @@ fn engine() -> Engine {
     let (packs, warnings) = builtin_packs();
     assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
     // core.filesystem is default-on, so the default profile suffices.
-    Engine::new(select_active(packs, &[])).with_budget(TEST_BUDGET)
+    Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(host_paths())
+}
+
+/// No paths bound on Linux and macOS. Under Windows style an unbound `~` is a
+/// path nothing can read, which denies (W5): those hosts get a profile.
+fn host_paths() -> PathVars {
+    if PathStyle::host() == PathStyle::Windows {
+        PathVars::new().with_var("USERPROFILE", r"C:\Users\a")
+    } else {
+        PathVars::new()
+    }
+}
+
+/// POSIX reading on any host, for the corpus that names POSIX directories
+/// (`/etc`, `/usr`). No path is bound, so it is text alone and a Windows host
+/// runs it too. `corpus_windows_ci` pins the Windows reading (ruling P1).
+fn posix_engine() -> Engine {
+    let (packs, warnings) = builtin_packs_for(PathStyle::Posix);
+    assert!(warnings.is_empty(), "built-in load warnings: {warnings:?}");
+    Engine::new(select_active(packs, &[]))
+        .with_budget(TEST_BUDGET)
+        .with_paths(PathVars::new().with_style(PathStyle::Posix))
 }
 
 fn deny_pack(e: &Engine, cmd: &str) -> String {
@@ -135,7 +159,7 @@ fn literal_substitution_values_are_judged() {
 
 #[test]
 fn rm_targets_are_judged_against_an_earlier_cd() {
-    let e = engine();
+    let e = posix_engine();
     for cmd in [
         "cd / && rm -rf *",
         "cd /; rm -rf *",
@@ -272,7 +296,7 @@ fn every_cd_target_counts_even_when_bash_would_not_be_there() {
 
 #[test]
 fn a_cd_that_cannot_reach_a_catastrophic_target_still_allows() {
-    let e = engine();
+    let e = posix_engine();
     for cmd in [
         "cd /tmp && rm -rf ./build",
         // A relative cd into a project subdirectory.

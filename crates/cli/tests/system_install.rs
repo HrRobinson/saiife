@@ -3,6 +3,9 @@
 //! is Linux-only: on macOS install refuses every root, so the tests that
 //! install run on Linux only.
 
+// Locked mode installs on Unix only; `system` is refused on Windows (19a).
+#![cfg(unix)]
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;

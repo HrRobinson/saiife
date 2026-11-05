@@ -322,7 +322,7 @@ fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError>
 /// macOS the socket dir install made.
 fn purge_trees(layout: &Layout) -> Vec<&'static str> {
     match layout.platform() {
-        Platform::Linux => vec![STATE_DIR, AUDIT_DIR],
+        Platform::Linux | Platform::Windows => vec![STATE_DIR, AUDIT_DIR],
         Platform::Macos => vec![STATE_DIR, AUDIT_DIR, RUN_DIR],
     }
 }

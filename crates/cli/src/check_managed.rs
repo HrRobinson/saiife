@@ -29,7 +29,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 /// Where the system policy lives; `--system-config` overrides it in tests.
-pub const SYSTEM_CONFIG: &str = "/etc/saiife/config.toml";
+pub const SYSTEM_CONFIG: &str = crate::paths::DEV_SYSTEM_CONFIG;
 
 /// Exit 2 with `saiife: BLOCKED (fail closed): <reason>` on stderr.
 fn blocked(reason: &str) -> ExitCode {
@@ -99,6 +99,9 @@ mod imp {
     ) -> ExitCode {
         // Drain stdin so the agent gets no EPIPE.
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        #[cfg(windows)]
+        eprintln!("{}", crate::LOCKED_ON_WINDOWS_LATER);
+        #[cfg(not(windows))]
         crate::warn(saiife_system::NOT_SUPPORTED_OS);
         ExitCode::from(2)
     }
@@ -531,6 +534,7 @@ mod imp {
                 locked: Some(locked_paths(cfg, config)),
                 event: event.map(str::to_string),
                 ask: cfg.guard.ask.clone(),
+                agent: Some(agent.to_string()),
             })),
             _ => None,
         };
@@ -618,8 +622,8 @@ mod imp {
     /// What the record names when the worker gave no answer: the command
     /// or the paths, as the worker would have.
     fn recorded_input(payload: &str) -> String {
-        match eval::plan(payload) {
-            Plan::Shell { command } | Plan::TooLarge { command } => command,
+        match eval::plan(payload, None) {
+            Plan::Shell { command, .. } | Plan::TooLarge { command, .. } => command,
             Plan::Files(call) => call.input(),
             Plan::NoPath | Plan::Other | Plan::Unusable(_) => String::new(),
         }

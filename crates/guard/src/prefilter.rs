@@ -11,6 +11,11 @@
 
 use regex::Regex;
 
+/// A trigger that starts with this ignores case (`(?i)format-volume`): Windows
+/// commands are case-insensitive, and the readers pass an unknown command's
+/// name as it was written.
+const NOCASE: &str = "(?i)";
+
 /// A set of literal trigger substrings. Built per pack (and, for the engine's
 /// combined gate, from the union of all packs' triggers).
 #[derive(Debug, Clone, Default)]
@@ -33,7 +38,13 @@ impl Prefilter {
         let set = if triggers.is_empty() {
             None
         } else {
-            let alts: Vec<String> = triggers.iter().map(|t| regex::escape(t)).collect();
+            let alts: Vec<String> = triggers
+                .iter()
+                .map(|t| match t.strip_prefix(NOCASE) {
+                    Some(rest) => format!("(?i:{})", regex::escape(rest)),
+                    None => regex::escape(t),
+                })
+                .collect();
             Regex::new(&alts.join("|")).ok()
         };
         Self { triggers, set }
@@ -47,10 +58,12 @@ impl Prefilter {
         }
         match &self.set {
             Some(set) => set.is_match(normalized),
-            None => self
-                .triggers
-                .iter()
-                .any(|t| normalized.contains(t.as_str())),
+            None => self.triggers.iter().any(|t| match t.strip_prefix(NOCASE) {
+                Some(rest) => normalized
+                    .to_lowercase()
+                    .contains(rest.to_lowercase().as_str()),
+                None => normalized.contains(t.as_str()),
+            }),
         }
     }
 }
@@ -70,6 +83,16 @@ mod tests {
     fn rejects_when_no_trigger_present() {
         let pf = Prefilter::new(["git", "rm"]);
         assert!(!pf.might_match("ls -la"));
+    }
+
+    #[test]
+    fn nocase_triggers_ignore_case_and_the_rest_stay_exact() {
+        let pf = Prefilter::new(["(?i)format-volume", "PATH="]);
+        assert!(pf.might_match("Format-Volume -DriveLetter C"));
+        assert!(pf.might_match("FORMAT-VOLUME"));
+        assert!(pf.might_match("PATH=x"));
+        assert!(!pf.might_match("path=x"));
+        assert!(!pf.might_match("format volume"));
     }
 
     #[test]

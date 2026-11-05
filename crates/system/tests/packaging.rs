@@ -1,7 +1,8 @@
 //! Layout guard for the packages (plan 18, decision 1): a package owns the
 //! staging binary, its symlink and the docs, and no path that `system install`
 //! records in `installed.toml`. The macOS checks read text and run scripts
-//! that stop before they change anything, so they run on every platform.
+//! that stop before they change anything, so they run on Linux and macOS; on
+//! Windows only the text checks run.
 
 use saiife_system::layout::{self, Layout, Platform};
 use std::path::PathBuf;
@@ -185,6 +186,7 @@ fn rpm_key_file_is_in_the_yaml() {
     assert!(b.contains("export NFPM_RPM_KEY_FILE=$SAIIFE_PKG_GPG_KEY_FILE"));
 }
 
+#[cfg(unix)]
 fn build_sh(version: &str) -> (Option<i32>, String) {
     let out = std::process::Command::new("bash")
         .arg(linux_dir().join("build.sh"))
@@ -200,6 +202,9 @@ fn build_sh(version: &str) -> (Option<i32>, String) {
 
 /// A Cargo prerelease becomes a dpkg/rpm one ('-' -> '~'); the version
 /// check runs before anything is built.
+// Runs `packaging/build.sh`, the Linux .deb and .rpm build, with its tools. Windows
+// Git Bash exits earlier on a missing tool, and nothing packages for Linux there.
+#[cfg(unix)]
 #[test]
 fn build_maps_a_cargo_prerelease() {
     for (given, want) in [
@@ -333,6 +338,7 @@ fn pkg_is_for_one_architecture() {
 /// `sh` on `rel` from a copy under `d`, with the paths in `swap` replaced. The
 /// replacements call the stubs through `sh`: a test never execs a file it just
 /// wrote (ETXTBSY when another test thread forks at that moment).
+#[cfg(unix)]
 fn run_copy(
     d: &std::path::Path,
     rel: &str,
@@ -362,6 +368,7 @@ fn run_copy(
 const POSTINSTALL: &str = "packaging/macos/scripts/postinstall";
 
 /// The test's uid: a staging tree here cannot be root's.
+#[cfg(unix)]
 fn my_uid() -> String {
     let out = std::process::Command::new("id").arg("-u").output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -369,6 +376,7 @@ fn my_uid() -> String {
 
 /// A safe staging tree below `d`, as `/usr/local`: returns that dir and the
 /// binary, a stub that exits `code`.
+#[cfg(unix)]
 fn staging_tree(d: &std::path::Path, code: i32) -> (PathBuf, PathBuf) {
     let local = d.join("local");
     let bin = local.join("libexec/saiife/saiife");
@@ -394,6 +402,7 @@ fn staging_tree(d: &std::path::Path, code: i32) -> (PathBuf, PathBuf) {
 /// The postinstall in the tree `local`, with a `logger` stub; the `logger`
 /// arguments, if any, are returned last. The check's expected owner is the
 /// test's uid.
+#[cfg(unix)]
 fn postinstall_in(
     d: &std::path::Path,
     local: &std::path::Path,
@@ -422,12 +431,14 @@ fn postinstall_in(
     (rc, out, err, logged)
 }
 
+#[cfg(unix)]
 fn postinstall(code: i32, volume: &str) -> (Option<i32>, String, String, String) {
     let d = tempfile::tempdir().unwrap();
     let (local, _) = staging_tree(d.path(), code);
     postinstall_in(d.path(), &local, volume)
 }
 
+#[cfg(unix)]
 #[test]
 fn pkg_postinstall_refuses_an_unsafe_staging_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -516,6 +527,7 @@ fn staging_check_is_the_same_in_all_three_scripts() {
     assert_eq!(p, check("deploy/intune/macos/fleet-files.sh"));
 }
 
+#[cfg(unix)]
 #[test]
 fn pkg_postinstall_passes_on_0_and_1_and_fails_loudly_on_2() {
     let (rc, out, err, logged) = postinstall(0, "/");
@@ -540,6 +552,7 @@ fn pkg_postinstall_passes_on_0_and_1_and_fails_loudly_on_2() {
 }
 
 /// Only an install that says it changed nothing gets the claim.
+#[cfg(unix)]
 #[test]
 fn pkg_postinstall_claims_unchanged_only_when_install_says_so() {
     let d = tempfile::tempdir().unwrap();
@@ -561,6 +574,7 @@ fn pkg_postinstall_claims_unchanged_only_when_install_says_so() {
 
 /// `ls` here cannot show a macOS ACL, so a stub does: clean mode bits, and
 /// then what macOS prints.
+#[cfg(unix)]
 #[test]
 fn pkg_postinstall_refuses_an_acl() {
     for listing in [
@@ -625,6 +639,7 @@ fn pkg_postinstall_refuses_an_acl() {
     assert!(out.contains("called: system install --fleet"), "{out}");
 }
 
+#[cfg(unix)]
 #[test]
 fn pkg_postinstall_skips_another_volume() {
     let (rc, out, err, logged) = postinstall(2, "/Volumes/Other");
@@ -639,6 +654,7 @@ fn pkg_postinstall_skips_another_volume() {
 /// The attribute script against a `doctor` that exits `code` (`None`: not
 /// installed). BIN becomes /bin/sh, which then runs the file `doctor` in the
 /// script's cwd, so no file written here is ever exec'd.
+#[cfg(unix)]
 fn attribute(rel: &str, code: Option<i32>) -> (Option<i32>, String) {
     let d = tempfile::tempdir().unwrap();
     let bin = match code {
@@ -652,6 +668,7 @@ fn attribute(rel: &str, code: Option<i32>) -> (Option<i32>, String) {
     (rc, out)
 }
 
+#[cfg(unix)]
 #[test]
 fn jamf_extension_attribute_follows_doctor() {
     let rel = "deploy/jamf/extension-attribute.sh";
@@ -669,6 +686,7 @@ fn jamf_extension_attribute_follows_doctor() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn intune_custom_attribute_prints_doctors_exit() {
     let rel = "deploy/intune/macos/custom-attribute.sh";
@@ -686,6 +704,7 @@ fn intune_custom_attribute_prints_doctors_exit() {
     }
 }
 
+#[cfg(unix)]
 fn is_root() -> bool {
     let out = std::process::Command::new("id").arg("-u").output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim() == "0"
@@ -693,6 +712,7 @@ fn is_root() -> bool {
 
 /// The Jamf fleet script: its input checks, then its root check. Never run
 /// as root here: past that check it writes /etc.
+#[cfg(unix)]
 fn jamf_fleet_files(config_b64: &str, agents: &str) -> (Option<i32>, String) {
     let out = std::process::Command::new("sh")
         .arg(repo().join("deploy/jamf/fleet-files.sh"))
@@ -705,6 +725,7 @@ fn jamf_fleet_files(config_b64: &str, agents: &str) -> (Option<i32>, String) {
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn fleet_files_check_their_input_then_refuse_non_root() {
     if is_root() {
@@ -748,6 +769,7 @@ fn fleet_scripts_share_one_body() {
     assert!(repo_read("deploy/intune/macos/fleet-files.sh").contains("CONFIG_B64=\"\"\n"));
 }
 
+#[cfg(unix)]
 #[test]
 fn jamf_uninstall_warns_then_removes() {
     let s = repo_read("deploy/jamf/uninstall.sh");
@@ -779,6 +801,7 @@ fn jamf_uninstall_warns_then_removes() {
 
 /// These two touch the machine past their gate, so they are only ever run with
 /// the gate's variables removed.
+#[cfg(unix)]
 #[test]
 fn macos_ci_scripts_refuse_outside_ci() {
     for rel in ["packaging/macos/build-pkg.sh", "scripts/macos-pkg/run.sh"] {

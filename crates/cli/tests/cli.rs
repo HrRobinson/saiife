@@ -55,6 +55,7 @@ fn check_denies_via_hook_json() {
         .arg("check")
         .env("SAIIFE_AUDIT_DIR", audit.path())
         .env("HOME", audit.path().join("home"))
+        .env("USERPROFILE", audit.path().join("home"))
         .env("SAIIFE_DATA_DIR", audit.path().join("data"))
         .current_dir(audit.path())
         .write_stdin(
@@ -74,6 +75,7 @@ fn check_fails_open_on_garbage() {
         .arg("check")
         .env("SAIIFE_AUDIT_DIR", audit.path())
         .env("HOME", audit.path().join("home"))
+        .env("USERPROFILE", audit.path().join("home"))
         .env("SAIIFE_DATA_DIR", audit.path().join("data"))
         .current_dir(audit.path())
         .write_stdin("{not json at all")

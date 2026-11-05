@@ -1,6 +1,5 @@
 //! Built-in packs, embedded at compile time so the CLI works standalone with
-//! no external pack files. At runtime saiife also loads `guard/packs/*.toml`
-//! from userData; the built-ins are the shipped defaults.
+//! no external pack files.
 //!
 //! Ships `core.filesystem`, `core.git`, `core.secrets`, `core.self`,
 //! `core.process` (default-on),
@@ -9,7 +8,8 @@
 //! `db.mysql`, `db.mongo`, `container.docker`, and `container.k8s` (activated
 //! via a profile — see `profile`).
 
-use crate::pack::{lazy_pack, load_pack_str, peek_header, LazyMeta, Pack, PackWarning};
+use crate::canon::PathStyle;
+use crate::pack::{lazy_pack, load_shipped, peek_header, LazyMeta, Pack, PackWarning};
 
 /// `(source_label, toml)` for every embedded pack.
 const BUILTIN_SOURCES: &[(&str, &str)] = &[
@@ -72,10 +72,22 @@ const BUILTIN_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Load and compile the embedded built-in packs (fail-open: a bad built-in is
-/// skipped with a warning, never fatal — though built-ins are covered by tests).
+/// Load and compile the embedded built-in packs for this host (fail-open: a bad
+/// built-in is skipped with a warning, never fatal — though built-ins are
+/// covered by tests).
 pub fn builtin_packs() -> (Vec<Pack>, Vec<PackWarning>) {
     Catalog::builtin().load_all()
+}
+
+/// [`builtin_packs`] for a host of `style`, so any host can run the Windows rules.
+pub fn builtin_packs_for(style: PathStyle) -> (Vec<Pack>, Vec<PackWarning>) {
+    Catalog::builtin_for(style).load_all()
+}
+
+/// Every built-in pack with every rule, whatever this host is: what a policy may
+/// name. A fleet's `[guard] ask` can name a Windows rule and be checked on Linux.
+pub fn builtin_packs_every_rule() -> (Vec<Pack>, Vec<PackWarning>) {
+    builtin_packs_for(PathStyle::Windows)
 }
 
 /// Whether the built-in pack `pack`'s `[[deny]]` rule `id` (alone, with the
@@ -106,6 +118,7 @@ pub fn builtin_rule_denies(pack: &str, id: &str, command: &str) -> bool {
 /// most of a hook call's fixed cost, and a hook needs only the active packs.
 pub struct Catalog {
     entries: Vec<Entry>,
+    style: PathStyle,
 }
 
 struct Entry {
@@ -121,17 +134,27 @@ struct Entry {
 }
 
 impl Catalog {
-    /// The embedded built-in packs.
+    /// The embedded built-in packs, for this host.
     pub fn builtin() -> Self {
-        Self::from_sources(BUILTIN_SOURCES)
+        Self::builtin_for(PathStyle::host())
     }
 
-    /// `(source_label, toml)` pairs, in load order.
+    /// The embedded built-in packs, for a host of `style`: `platform` rules for
+    /// another style are not compiled. See `pack`'s module docs.
+    pub fn builtin_for(style: PathStyle) -> Self {
+        Self::from_sources_for(BUILTIN_SOURCES, style)
+    }
+
+    /// `(source_label, toml)` pairs, in load order, for this host.
     pub fn from_sources(sources: &[(&'static str, &'static str)]) -> Self {
+        Self::from_sources_for(sources, PathStyle::host())
+    }
+
+    fn from_sources_for(sources: &[(&'static str, &'static str)], style: PathStyle) -> Self {
         let entries = sources
             .iter()
             .map(|&(source, toml)| {
-                let (header, lazy) = match peek_header(toml) {
+                let (header, lazy) = match peek_header(toml, style) {
                     Some((h, l)) => (Some(h), l),
                     None => (None, None),
                 };
@@ -143,7 +166,7 @@ impl Catalog {
                 }
             })
             .collect();
-        Self { entries }
+        Self { entries, style }
     }
 
     /// True if a pack with this id is in the catalog.
@@ -192,10 +215,10 @@ impl Catalog {
                 continue;
             }
             if let (true, Some(h), Some(meta)) = (allow_lazy, &e.header, &e.lazy) {
-                packs.push(lazy_pack(e.source, e.toml, h, meta));
+                packs.push(lazy_pack(e.source, e.toml, h, meta, self.style));
                 continue;
             }
-            match load_pack_str(e.source, e.toml, &mut warnings) {
+            match load_shipped(e.source, e.toml, self.style, &mut warnings) {
                 Ok(p) => packs.push(p),
                 Err(err) => {
                     let what = if err.is_broken_rule() {
@@ -345,6 +368,45 @@ reason = "zaps everything"
         assert!(p.deny_rules().len() > 5);
     }
 
+    /// A lazy pack keeps the rule and the triggers of its load's host style, and
+    /// matches an eager load of the same style.
+    #[test]
+    fn a_lazy_pack_follows_the_host_style() {
+        let has = |p: &Pack| {
+            p.deny_rules()
+                .iter()
+                .any(|r| r.id.as_deref() == Some("windows-kill-saiife"))
+        };
+        for (style, windows) in [(PathStyle::Posix, false), (PathStyle::Windows, true)] {
+            let (lazy, w) = Catalog::builtin_for(style).load_active(&[]);
+            assert!(w.is_empty(), "{w:?}");
+            let lazy = lazy.iter().find(|p| p.id == "core.process").unwrap();
+            assert!(lazy.is_lazy());
+            assert_eq!(has(lazy), windows);
+            assert_eq!(lazy.triggers.iter().any(|t| t == "(?i)wmic"), windows);
+            assert!(lazy.fits(style));
+            let (eager, _) = builtin_packs_for(style);
+            let eager = eager.iter().find(|p| p.id == "core.process").unwrap();
+            assert_eq!(lazy.deny_rules().len(), eager.deny_rules().len());
+            assert_eq!(lazy.triggers, eager.triggers);
+        }
+    }
+
+    /// A bad marker in a lazy pack must not be lost inside `LazyRules::get`: the
+    /// header cannot be read, so the catalog loads it at once and reports it.
+    #[test]
+    fn a_bad_marker_in_a_lazy_pack_is_reported() {
+        const BAD: &str = "[pack]\nid = \"t\"\ntriggers = [\"x\"]\nlazy = true\n[[deny]]\npattern = \"x\"\nreason = \"r\"\nplatform = \"plan9\"\n";
+        let (packs, warnings) = Catalog::from_sources(&[("<t>", BAD)]).load_active(&[]);
+        assert!(packs.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("built-in pack failed to load")),
+            "{warnings:?}"
+        );
+    }
+
     /// Only the active packs are compiled, and loading them reports the
     /// same warnings an eager load does.
     #[test]
@@ -428,15 +490,40 @@ reason = "zaps everything"
         }
     }
 
+    /// For both styles: a broken Windows rule fails here on any host.
     #[test]
     fn all_builtins_load_clean() {
-        let (packs, warnings) = builtin_packs();
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        assert!(!packs.is_empty(), "at least one built-in pack ships");
-        assert!(
-            packs.iter().any(|p| p.id == "core.git"),
-            "core.git always ships"
-        );
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            let (packs, warnings) = builtin_packs_for(style);
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+            assert!(!packs.is_empty(), "at least one built-in pack ships");
+            assert!(
+                packs.iter().any(|p| p.id == "core.git"),
+                "core.git always ships"
+            );
+        }
+    }
+
+    /// A policy may name a rule of any OS, on any OS.
+    #[test]
+    fn the_every_rule_load_holds_every_rule() {
+        let (every, w) = builtin_packs_every_rule();
+        assert!(w.is_empty(), "{w:?}");
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            let (packs, _) = builtin_packs_for(style);
+            for p in &packs {
+                let all = every.iter().find(|e| e.id == p.id).unwrap();
+                assert_eq!(all.version, p.version);
+                for r in p.deny_rules() {
+                    assert!(
+                        all.deny_rules().iter().any(|a| a.pattern == r.pattern),
+                        "{}: {:?}",
+                        p.id,
+                        r.id
+                    );
+                }
+            }
+        }
     }
 
     /// Naming convention: `core.*` packs are default-on; other namespaces

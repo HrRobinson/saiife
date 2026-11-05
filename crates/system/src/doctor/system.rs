@@ -10,7 +10,7 @@ use crate::install::MACOS_TOOL_TIMEOUT;
 use crate::launchd;
 use crate::layout::*;
 use crate::supported::{check_supported, Support};
-use saiife_agents::lock::{label_for, LockLabel};
+use saiife_agents::lock::{label_for, LockLabel, LockPlatform};
 use saiife_agents::Agent;
 use saiife_audit::sign::{judge, Kind};
 use saiife_policy::installed::{FileKind, Installed, VaultKeyMode};
@@ -176,6 +176,15 @@ fn sip_check(enabled: bool, seam: bool) -> Check {
             format!("not enabled {SIP_BYPASSED}: {SIP_REQUIRED}"),
         ),
         SipVerdict::Required => Check::new(ID, Status::Fail, TITLE, SIP_REQUIRED),
+    }
+}
+
+/// The lock-label platform of the layout being checked.
+fn lock_platform(ctx: &Ctx) -> LockPlatform {
+    match ctx.layout.platform() {
+        Platform::Linux => LockPlatform::Linux,
+        Platform::Macos => LockPlatform::Macos,
+        Platform::Windows => LockPlatform::Windows,
     }
 }
 
@@ -1576,7 +1585,7 @@ fn agent_label(ctx: &Ctx, name: &str) -> Check {
     let id = format!("agents.{name}.label");
     match Agent::from_name(name) {
         Some(a) => {
-            let l = label_for(a, mac(ctx));
+            let l = label_for(a, lock_platform(ctx));
             let title = format!("{} lock label", a.label());
             let status = if l == LockLabel::Lockable {
                 Status::Pass

@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -26,13 +26,57 @@ jobs:
       # A short temp base keeps unix socket paths under 108 bytes.
       # TMPDIR too: tempfile::tempdir() (and anything else using the
       # system temp dir) stays off a quota'd or shared /tmp.
+      # On windows-latest (plan 19a) TMP, TEMP and LOCALAPPDATA sit under the
+      # runner temp dir too, so no test writes the runner's real profile
+      # paths that honour them; the other OSes ignore the three. USERPROFILE is
+      # not set here: cargo and rustup find their own homes through it. Each test
+      # child sets it instead (`common::set_profile`).
       - run: cargo test --workspace --no-fail-fast
         env:
           SAIIFE_TEST_TMP: ${{ runner.temp }}/s
           TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          LOCALAPPDATA: ${{ runner.temp }}/localappdata
       - name: release signing script (offline)
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/release/test-macos-sign.sh
+      - name: Windows signing mode (offline)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/release/test-windows-sign-mode.sh
+      # The Windows steps below run after a failed step too, so one run reports
+      # them all; a failed step still fails the job.
+      # install.ps1 against a fake file:// release (parses both scripts first).
+      - name: install.ps1 (PowerShell 7)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: ./scripts/test-install.ps1
+      # Windows PowerShell 5.1 is what users have.
+      - name: install.ps1 (Windows PowerShell 5.1)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: powershell
+        run: ./scripts/test-install.ps1
+      # The developer hook's p95 against D10's budget (plan 19a). Over it is an
+      # owner decision, not a silent raise.
+      - name: developer hook bench (Windows, p95 budget)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: BENCH_MAX_P95_MS=130 bash scripts/bench-check.sh 130
+      # The guard's readers against the real shells: [Parser]::ParseInput and
+      # harmless cmd.exe probes. Any mismatch fails. Only a debug build has
+      # the seam it reads with.
+      - name: build for the reader differential (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: cargo build --locked -p saiife --bin saiife
+      - name: reader differential (PowerShell 7)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
+      - name: reader differential (Windows PowerShell 5.1)
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        shell: powershell
+        run: ./scripts/differential-windows.ps1 -Saiife target/debug/saiife.exe
       # The macOS managed hook against a live `daemon --system` (plan 13):
       # p95 of 50 calls per payload within 40 ms. The script needs bash 5
       # (EPOCHREALTIME); the runner's /bin/bash is 3.2, so Homebrew's.
@@ -42,16 +86,26 @@ jobs:
           bash5="$(brew --prefix)/bin/bash"
           [ -x "$bash5" ] || brew install bash
           BENCH_MAX_P95_MS=40 "$bash5" scripts/bench-check.sh --managed 50
-      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp and saiife-darwin must not
+      # The hook path (guard, audit, policy, ipc), saiife-system, saiife-mcp, saiife-darwin and saiife-win must not
       # link tokio: only the daemon crate does (spec §4.2). Both OSes, so macOS-only deps count too.
       - name: no tokio in hook crates
-        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin | grep -c tokio)" = 0
+        if: ${{ success() || (!cancelled() && matrix.os == 'windows-latest') }}
+        shell: bash
+        run: test "$(cargo tree -e normal -p saiife-guard -p saiife-audit -p saiife-policy -p saiife-ipc -p saiife-system -p saiife-mcp -p saiife-darwin -p saiife-win | grep -c tokio)" = 0
       # unsafe only in crates/darwin; every other crate root forbids it (plan 13, decision 1).
       - name: unsafe only in saiife-darwin
+        if: matrix.os != 'windows-latest'
         run: bash scripts/check-unsafe.sh
+      # Windows code compile-checked from Linux, with a stand-in C compiler (plan 19a).
+      - name: windows target check
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          bash scripts/check-windows.sh
       # install.sh against a fake file:// release: checksums, latest lookup,
       # unsupported platform, PATH hint. No network.
       - name: install.sh
+        if: matrix.os != 'windows-latest'
         run: bash scripts/test-install.sh
       # End-to-end demo in a sandboxed HOME: three recorded Claude Code calls
       # must be blocked and the HTML report written (docs/demo.md).
