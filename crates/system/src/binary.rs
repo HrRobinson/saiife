@@ -474,7 +474,8 @@ pub struct PeInfo {
     /// Imported DLL names (regular and delay-load), lowercased.
     pub imports: Vec<String>,
     pub dependent_load_flags: u16,
-    pub debug_marker: bool,
+    /// The build marker: only `Profile::Release` is fit for locked mode.
+    pub profile: Profile,
 }
 
 impl PeInfo {
@@ -482,12 +483,14 @@ impl PeInfo {
     /// `allow` lists the permitted import DLLs (lowercase).
     pub fn problems(&self, allow: &[&str]) -> Vec<String> {
         let mut out = Vec::new();
-        if self.debug_marker {
-            out.push(
+        match self.profile {
+            Profile::Release => {}
+            Profile::DebugAssertions => out.push(
                 "it is a test build (debug assertions on: test seams such as \
-                 SAIIFE_EVAL_FAULT and SAIIFE_TEST_ALLOW_SIP_OFF are compiled in)"
+                 SAIIFE_EVAL_FAULT are compiled in)"
                     .to_string(),
-            );
+            ),
+            Profile::Unknown => out.push("it carries no saiife build marker".to_string()),
         }
         if self.dependent_load_flags & LOAD_LIBRARY_SEARCH_SYSTEM32 == 0 {
             out.push(
@@ -498,7 +501,9 @@ impl PeInfo {
         }
         for name in &self.imports {
             let n = name.to_ascii_lowercase();
-            let api_set = n.starts_with("api-ms-win-") || n.starts_with("ext-ms-win-");
+            let plain = n.ends_with(".dll")
+                && !n.contains(|c: char| matches!(c, '/' | '\\' | ':') || c.is_whitespace());
+            let api_set = plain && (n.starts_with("api-ms-win-") || n.starts_with("ext-ms-win-"));
             if !api_set && !allow.iter().any(|a| a.eq_ignore_ascii_case(&n)) {
                 out.push(format!(
                     "it imports {name}, which is not an allowed system DLL"
@@ -548,7 +553,7 @@ type Section = (u64, u64, u64, u64);
 fn rva_to_off(sections: &[Section], rva: u64) -> Option<u64> {
     sections.iter().find_map(|&(va, vsize, raw, rsize)| {
         let rel = rva.checked_sub(va)?;
-        if rel < vsize.max(rsize) {
+        if rel < vsize.min(rsize) {
             raw.checked_add(rel)
         } else {
             None
@@ -617,13 +622,22 @@ pub fn inspect_pe(bytes: &[u8]) -> Result<PeInfo, String> {
         ));
     }
 
+    for (i, a) in sections.iter().enumerate() {
+        for b in &sections[i + 1..] {
+            if a.0 < b.0 + b.1.max(1) && b.0 < a.0 + a.1.max(1) {
+                return Err("overlapping sections".to_string());
+            }
+        }
+    }
+
     let mut imports = Vec::new();
     // Import descriptors are 20 bytes with the name RVA at +12; delay-load
     // descriptors are 32 bytes with the name RVA at +4. Delay-loaded DLLs
     // are searched for like any other, so they count.
     for (idx, stride, name_at) in [(DIR_IMPORT, 20u64, 12u64), (DIR_DELAY_IMPORT, 32, 4)] {
-        let (rva, size) = dir(idx)?;
-        if rva == 0 || size == 0 {
+        // The loader ignores the directory's Size and walks from the RVA.
+        let (rva, _size) = dir(idx)?;
+        if rva == 0 {
             continue;
         }
         let base = rva_to_off(&sections, rva).ok_or("import directory outside any section")?;
@@ -632,6 +646,12 @@ pub fn inspect_pe(bytes: &[u8]) -> Result<PeInfo, String> {
             let at = base.checked_add(n * stride).ok_or("offset out of range")?;
             let desc = pe_slice(bytes, at, stride)?;
             let name_rva = pe_u32(bytes, at + name_at)?;
+            if idx == DIR_DELAY_IMPORT
+                && !desc.iter().all(|&c| c == 0)
+                && pe_u32(bytes, at)? & 1 == 0
+            {
+                return Err("delay-load descriptor uses virtual addresses".to_string());
+            }
             if name_rva == 0 || desc.iter().all(|&c| c == 0) {
                 terminated = true;
                 break;
@@ -665,7 +685,7 @@ pub fn inspect_pe(bytes: &[u8]) -> Result<PeInfo, String> {
         signed,
         imports,
         dependent_load_flags,
-        debug_marker: profile(bytes) == Profile::DebugAssertions,
+        profile: profile(bytes),
     })
 }
 
@@ -1036,6 +1056,9 @@ mod tests {
             };
         put(&mut b, &f.imports, 0x000, 20, 12);
         put(&mut b, &f.delay, 0x400, 32, 4);
+        for i in 0..f.delay.len() {
+            w32(&mut b, RAW_AT + 0x400 + i * 32, 1);
+        }
         w32(&mut b, dir(1), 0x1000);
         w32(&mut b, dir(1) + 4, 20 * (f.imports.len() as u32 + 1));
         if !f.delay.is_empty() {
@@ -1071,7 +1094,7 @@ mod tests {
         assert_eq!(i.machine, 0x8664);
         assert_eq!(i.imports, ["kernel32.dll", "ntdll.dll", "shell32.dll"]);
         assert_eq!(i.dependent_load_flags, 0x800);
-        assert!(i.signed && !i.debug_marker);
+        assert!(i.signed && i.profile == Profile::Release);
         assert!(i.problems(PE_IMPORT_ALLOWLIST).is_empty());
         assert!(i.warnings().is_empty());
     }
@@ -1140,8 +1163,33 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
-        assert!(i.debug_marker);
+        assert_eq!(i.profile, Profile::DebugAssertions);
         assert!(i.problems(PE_IMPORT_ALLOWLIST)[0].contains("test build"));
+    }
+
+    #[test]
+    fn pe_missing_or_contradicting_marker_refused() {
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            marker: None,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.profile, Profile::Unknown);
+        assert_eq!(
+            i.problems(PE_IMPORT_ALLOWLIST),
+            ["it carries no saiife build marker"]
+        );
+        let mut b = pe_fixture(PeFixture {
+            marker: Some(true),
+            ..Default::default()
+        });
+        b.extend_from_slice(&build_marker(false));
+        let i = inspect_pe(&b).unwrap();
+        assert_eq!(i.profile, Profile::Unknown);
+        assert_eq!(
+            i.problems(PE_IMPORT_ALLOWLIST),
+            ["it carries no saiife build marker"]
+        );
     }
 
     #[test]
@@ -1235,6 +1283,72 @@ mod tests {
         let mut b = good;
         w32(&mut b, dir(1), 0x9000);
         assert!(inspect_pe(&b).is_err());
+    }
+
+    #[test]
+    fn pe_zero_size_directories_are_still_walked() {
+        let mut b = pe_fixture(PeFixture {
+            imports: vec!["evil.dll"],
+            delay: vec!["sneaky.dll"],
+            ..Default::default()
+        });
+        w32(&mut b, dir(1) + 4, 0);
+        w32(&mut b, dir(13) + 4, 0);
+        let i = inspect_pe(&b).unwrap();
+        assert_eq!(i.imports, ["evil.dll", "sneaky.dll"]);
+        assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 2);
+    }
+
+    #[test]
+    fn pe_api_set_exemption_needs_a_plain_dll_name() {
+        for n in [
+            "api-ms-win-x\\..\\evil.dll",
+            "api-ms-win-x/evil.dll",
+            "api-ms-win-x:evil.dll",
+            "api-ms-win-x evil.dll",
+            "api-ms-win-core-foo",
+            "api-ms-win-core-foo.dll.",
+            "ext-ms-win-a\\b.dll",
+        ] {
+            let i = inspect_pe(&pe_fixture(PeFixture {
+                imports: vec![n],
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 1, "{n}");
+        }
+        let i = inspect_pe(&pe_fixture(PeFixture {
+            imports: vec!["kernel32.dll."],
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(i.problems(PE_IMPORT_ALLOWLIST).len(), 1);
+    }
+
+    #[test]
+    fn pe_rva_past_raw_size_and_overlaps_are_refused() {
+        // Virtual size larger than raw size: the table RVA falls in the zero
+        // fill the loader sees, not in file bytes.
+        let mut b = pe_fixture(PeFixture::default());
+        w32(&mut b, SEC_AT + 16, 0x100); // raw size
+        w32(&mut b, SEC_AT + 8, 0x1000); // virtual size
+        w32(&mut b, dir(1), 0x1800);
+        assert!(inspect_pe(&b).is_err());
+        // Two sections that overlap.
+        let mut b = pe_fixture(PeFixture::default());
+        w16(&mut b, PE_AT + 6, 2);
+        b.copy_within(SEC_AT..SEC_AT + 40, SEC_AT + 40);
+        assert_eq!(inspect_pe(&b).unwrap_err(), "overlapping sections");
+    }
+
+    #[test]
+    fn pe_delay_descriptor_with_virtual_addresses_is_refused() {
+        let mut b = pe_fixture(PeFixture {
+            delay: vec!["a.dll"],
+            ..Default::default()
+        });
+        w32(&mut b, RAW_AT + 0x400, 0);
+        assert!(inspect_pe(&b).unwrap_err().contains("virtual addresses"));
     }
 
     #[test]
