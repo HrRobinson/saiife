@@ -117,6 +117,10 @@ pub struct Word {
     /// in `$'…'` or escaped. False for a word with no `$`, and for a word not
     /// built by this lexer: a `$` counts as live unless shown otherwise.
     pub literal_dollars: bool,
+    /// The first word of a segment that had more in front of it than `then`, `do`,
+    /// `else` or `elif` (`! cd x`, `if cd x`), or a word that may vanish: its `cd`
+    /// has directory slots of its own (`engine::ShellState::plain_cwds`).
+    pub behind_reserved: bool,
 }
 
 impl AsRef<str> for Word {
@@ -176,7 +180,11 @@ fn split_noted(cmd: &str, body_top: bool) -> (Vec<Segment>, Option<&'static str>
     }
     (
         segments.into_iter().map(strip_leading_keywords).collect(),
-        ctx.note,
+        if ctx.braces_spent {
+            Some(BRACES_PAST_LINE_LIMIT)
+        } else {
+            ctx.note
+        },
     )
 }
 
@@ -250,7 +258,13 @@ pub(crate) fn reserved_prefix_len(seg: &[Word]) -> usize {
 fn strip_leading_keywords(mut seg: Segment) -> Segment {
     let i = reserved_prefix_len(&seg);
     if i > 0 {
+        let behind = seg[..i]
+            .iter()
+            .any(|w| !LEADING_KEYWORDS.contains(&w.text.as_str()));
         seg.drain(0..i);
+        if let (true, Some(first)) = (behind, seg.first_mut()) {
+            first.behind_reserved = true;
+        }
     }
     seg
 }
@@ -287,13 +301,47 @@ struct Ctx {
     arith_budget: usize,
     /// Why part of the line could not be lexed exactly (the first reason).
     note: Option<&'static str>,
+    /// Words and bytes brace expansion may still make on this line.
+    brace_words: usize,
+    brace_bytes: usize,
+    /// The line went past that: what is left stays as written.
+    braces_spent: bool,
 }
+
+/// The most words brace expansion makes on one line, far past any command a person
+/// or an agent writes, and the bytes. One word's expansion has its own limits
+/// (`canon::BRACE_LIMIT`), but dense braces on a 256 KiB line would otherwise make
+/// millions of words and hundreds of megabytes. A line past these is denied
+/// (`engine`), since bash would expand what stays as written here.
+const BRACE_LINE_WORDS: usize = 64 * 1024;
+const BRACE_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The note for a line past those limits. Nothing else can stand in for it: the
+/// engine denies on it.
+pub const BRACES_PAST_LINE_LIMIT: &str = "brace expansions past what one line may make";
 
 impl Ctx {
     fn new() -> Ctx {
         Ctx {
             arith_budget: ARITH_LOOKAHEAD_TOTAL,
             note: None,
+            brace_words: BRACE_LINE_WORDS,
+            brace_bytes: BRACE_LINE_BYTES,
+            braces_spent: false,
+        }
+    }
+
+    fn spend_braces(&mut self, words: &[String]) {
+        let bytes: usize = words.iter().map(String::len).sum();
+        match (
+            self.brace_words.checked_sub(words.len()),
+            self.brace_bytes.checked_sub(bytes),
+        ) {
+            (Some(w), Some(b)) => {
+                self.brace_words = w;
+                self.brace_bytes = b;
+            }
+            _ => self.braces_spent = true,
         }
     }
 
@@ -491,6 +539,7 @@ impl Lexer<'_, '_> {
             quoted: w.quoted,
             dq_substitution,
             literal_dollars: !w.live_dollar && !w.has_sub && text_has_dollar,
+            behind_reserved: false,
         };
         // Brace expansion happens before anything else looks at
         // the words: `{rm,-rf,/}` runs `rm -rf /`. Past the limits
@@ -518,13 +567,21 @@ impl Lexer<'_, '_> {
         if w.brace_marks.is_empty() {
             self.toks.push(LexTok::Word(word));
         } else {
-            match crate::canon::expand_marked(&word.text, &w.brace_marks) {
-                Some(words) => self.toks.extend(words.into_iter().map(|text| {
-                    LexTok::Word(Word {
-                        text,
-                        ..word.clone()
-                    })
-                })),
+            let expanded = if self.ctx.braces_spent {
+                None
+            } else {
+                crate::canon::expand_marked(&word.text, &w.brace_marks)
+            };
+            match expanded {
+                Some(words) => {
+                    self.ctx.spend_braces(&words);
+                    self.toks.extend(words.into_iter().map(|text| {
+                        LexTok::Word(Word {
+                            text,
+                            ..word.clone()
+                        })
+                    }));
+                }
                 None => self.toks.push(LexTok::Word(Word {
                     brace_overflow: true,
                     ..word
@@ -1316,6 +1373,7 @@ fn redirect_tok(text: String) -> LexTok {
         quoted: false,
         dq_substitution: false,
         literal_dollars: false,
+        behind_reserved: false,
     })
 }
 

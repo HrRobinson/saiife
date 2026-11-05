@@ -71,7 +71,9 @@ pub fn windows_program_names(seg: &mut [Word]) {
         let Some(w) = seg.get_mut(at) else {
             return;
         };
-        if w.has_substitution || w.redirect {
+        // A word that may vanish names no program, and its `:` is no stream
+        // (`${v:-}`): the engine judges what follows it when it does.
+        if w.has_substitution || w.redirect || crate::subst::may_expand_to_nothing(w) {
             return;
         }
         let Some(name) = windows_program_text(&w.text) else {

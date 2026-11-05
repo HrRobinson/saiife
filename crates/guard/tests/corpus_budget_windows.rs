@@ -432,6 +432,206 @@ fn the_cheap_pass_asks_no_host_on_windows() {
     );
 }
 
+const BUDGETS: [Duration; 3] = [Duration::ZERO, saiifeguard::engine::DEFAULT_BUDGET, FULL];
+
+/// `${v:-}` may vanish too. A program name's stream is cut at a `:`, and that must
+/// not make the word look like anything else.
+#[test]
+fn a_parameter_with_an_operator_may_vanish_on_windows() {
+    let lines = owned(&[
+        "${v:-} rm -rf /",
+        "${v:+x} rm -rf /",
+        "${v:=} rm -rf /",
+        "${v:0} rm -rf /",
+        "${v:-} rm.exe -rf /c/Windows",
+        "! ${v:-} cat.exe .env",
+        "env ${v:-} rm -rf /",
+        "${v:-} ${w:+x} rm -rf /",
+        "${v:-} powershell -c \"gc .env\"",
+    ]);
+    for budget in [Duration::ZERO, FULL] {
+        assert_denied(&windows(budget), BASH, &lines);
+        assert_denied(&windows(budget), STRICTEST, &lines);
+    }
+    let e = windows(FULL);
+    for line in ["${CC:-gcc} -c foo.c", "${EDITOR:-vi} notes.txt"] {
+        let got = e.evaluate_call(line, BASH);
+        assert!(!got.is_deny(), "{line}: {got:?}");
+    }
+}
+
+#[test]
+fn a_parameter_with_an_operator_may_vanish_on_posix() {
+    for budget in [Duration::ZERO, FULL] {
+        let e = posix(budget);
+        for line in ["${v:-} rm -rf /", "${v:+x} rm -rf /", "env ${v:-} rm -rf /"] {
+            let got = e.evaluate(line);
+            assert!(got.is_deny(), "{line}: {got:?}");
+        }
+    }
+}
+
+const EMPTIES: &str = "{,,,,,,,,,}{,,,,,,,,,}{,,,,,,,,,}";
+const NUMBERS: &str = "{0..9}{0..9}{0..9}";
+
+/// Bash removes the empty words and runs the command, so no number of braces may
+/// leave a segment unjudged, wherever the command stands among them.
+#[test]
+fn braces_on_a_line_do_not_hide_its_command() {
+    let mut lines = Vec::new();
+    for pad in [EMPTIES, NUMBERS] {
+        let braces = format!("{pad} ").repeat(530);
+        for head in [
+            "rm -rf / ",
+            "cat .env ",
+            "git reset --hard ",
+            "cmd /c x ",
+            "powershell -enc x ",
+        ] {
+            lines.push(format!("{head}{braces}"));
+        }
+        for tail in ["; rm -rf /", "; cat .env", "; {rm,-rf,/}", "; $(rm -rf /)"] {
+            lines.push(format!("{braces}{tail}"));
+        }
+    }
+    for budget in BUDGETS {
+        assert_denied(&windows(budget), BASH, &lines);
+        assert_denied(&windows(budget), STRICTEST, &lines);
+    }
+    let posix_lines: Vec<String> = lines
+        .into_iter()
+        .filter(|l| !l.starts_with("cmd") && !l.starts_with("powershell"))
+        .collect();
+    for budget in BUDGETS {
+        let e = posix(budget);
+        for line in &posix_lines {
+            let got = e.evaluate(line);
+            let shown: String = line.chars().take(40).collect();
+            assert!(got.is_deny(), "{budget:?} {shown}: {got:?}");
+        }
+    }
+}
+
+/// Past the line's brace limit the line is denied, naming why. Below it nothing
+/// changes: one word too large to expand stays what it was, a note.
+#[test]
+fn past_the_brace_limit_a_line_is_denied_and_below_it_nothing_changes() {
+    let over = format!("echo {}", format!("{NUMBERS} ").repeat(200));
+    for got in [
+        windows(FULL).evaluate_call(&over, BASH),
+        posix(FULL).evaluate(&over),
+    ] {
+        match got {
+            Decision::Deny { reason, .. } => assert!(reason.contains("split"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let one_word = format!("cat {}", "{a,b}".repeat(40));
+    assert!(matches!(
+        posix(FULL).evaluate(&one_word),
+        Decision::Allow {
+            trace: AllowTrace::Unjudgeable { .. }
+        }
+    ));
+    let fine = format!("echo {}", "{a,b,c} ".repeat(100));
+    assert!(!posix(FULL).evaluate(&fine).is_deny());
+    assert!(!windows(FULL).evaluate_call(&fine, BASH).is_deny());
+}
+
+/// A `cd` behind a word must not take the slot of a plain `cd` after it, nor push
+/// out one before it. Bash runs all of them, and any may fail.
+#[test]
+fn a_cd_behind_a_word_keeps_the_slots_of_plain_ones() {
+    let mut lines = Vec::new();
+    for part in [
+        "! cd x; ",
+        "if cd x; then ",
+        "while cd x; do ",
+        "until cd x; do ",
+        "time ! cd x; ",
+        "$v cd x; ",
+        "${v:-} cd x; ",
+        "$(true) cd x; ",
+    ] {
+        for times in [20, 240, 2000] {
+            let pad = part.repeat(times);
+            lines.push(format!("{pad}x; cd ~/.ssh; cat id_rsa"));
+            lines.push(format!("{pad}x; cd ~; cd .ssh; cat id_rsa"));
+            lines.push(format!("cd ~/.ssh; {pad}x; cat id_rsa"));
+        }
+    }
+    assert_denied(&windows(FULL), BASH, &lines);
+    let e = posix(FULL);
+    for line in &lines {
+        let got = e.evaluate(line);
+        let shown: String = line.chars().rev().take(40).collect();
+        assert!(got.is_deny(), "...{shown}: {got:?}");
+    }
+}
+
+/// Each nested line has its own brace limit, so what they make together is charged
+/// to the last look: 14,000 of `eval '{1..1000}'` took half a minute without that.
+#[test]
+fn braces_in_many_nested_lines_are_bounded() {
+    for part in ["eval '{1..1000}'; ", "bash -c 'echo {1..1000}'; "] {
+        let line = format!("{}x; ls", part.repeat(255 * 1024 / part.len()));
+        for got in [
+            windows(Duration::ZERO).evaluate_call(&line, BASH),
+            posix(Duration::ZERO).evaluate(&line),
+        ] {
+            match got {
+                Decision::Deny { reason, .. } => assert!(reason.contains("split"), "{reason}"),
+                other => panic!("{part}: {other:?}"),
+            }
+        }
+    }
+}
+
+fn long_cds(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("cd {}{i}; ", "A".repeat(8000)))
+        .collect()
+}
+
+/// Long `cd` targets make each nested line dearer. However dear, what a nested
+/// line or a later path would be denied for stays denied. Each relative `cd` is
+/// tried from every directory so far, so 4 fill the 16 slots, and a later `cd` has
+/// none: main leaves that line unjudged too. So `~/.ssh` gets its slot here.
+#[test]
+fn long_cd_targets_do_not_spend_what_a_later_rule_needs() {
+    let mut lines = Vec::new();
+    for tail in [
+        "$(cat .env)",
+        "$(rm -rf /)",
+        "bash -c \"rm -rf /\"",
+        "eval 'rm -rf /'",
+    ] {
+        lines.push(format!("{}{}{tail}", long_cds(15), "$(x); ".repeat(1000)));
+    }
+    for pad in ["$(x); ", "cat a; "] {
+        lines.push(format!(
+            "{}{}cd ~/.ssh; cat id_rsa",
+            long_cds(3),
+            pad.repeat(1000)
+        ));
+        // A directory reached before the padding holds too, past any limit.
+        lines.push(format!(
+            "cd ~/.ssh; {}{}$(cat id_rsa)",
+            long_cds(14),
+            pad.repeat(500)
+        ));
+    }
+    for budget in [Duration::ZERO, FULL] {
+        assert_denied(&windows(budget), BASH, &lines);
+        let e = posix(budget);
+        for line in &lines {
+            let got = e.evaluate(line);
+            let shown: String = line.chars().rev().take(30).collect();
+            assert!(got.is_deny(), "{budget:?} ...{shown}: {got:?}");
+        }
+    }
+}
+
 /// The padded shapes on a POSIX host, each ending in a command a rule denies, at no
 /// budget, at the default budget and at full time.
 #[test]

@@ -29,7 +29,8 @@ use crate::canon::{
 use crate::cdtrack::RuleCwd;
 use crate::cmdexe;
 use crate::lexer::{
-    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted, Word,
+    find_all_substitution_kinds, literal_word, split_segments_noted, split_substitution_noted,
+    Word, BRACES_PAST_LINE_LIMIT,
 };
 use crate::normalize::{build_argv, windows_program_names};
 use crate::operands::{operands, Operand, Source};
@@ -589,6 +590,7 @@ impl Engine {
         let start = Instant::now();
         let state = ShellState {
             cwds: self.vars.cwd().map(Path::to_path_buf).into_iter().collect(),
+            plain_cwds: usize::from(self.vars.cwd().is_some()),
             cwd_unknown: false,
             rule_cwd: RuleCwd::start_styled(
                 self.vars.cwd(),
@@ -604,7 +606,6 @@ impl Engine {
             lexical: false,
             lines_left: Cell::new(0),
             paths_left: Cell::new(0),
-            words_left: Cell::new(0),
             #[cfg(test)]
             runs: Cell::default(),
         };
@@ -648,6 +649,15 @@ impl Engine {
             Dialect::Posix if sub_body => split_substitution_noted(raw_cmd),
             Dialect::Posix => split_segments_noted(raw_cmd),
         };
+        if lex_note == Some(BRACES_PAST_LINE_LIMIT) {
+            return too_costly(BRACES_PAST_LINE_LIMIT);
+        }
+        // What the line made is what it costs: each nested line has its own brace
+        // limit, and 14,000 of `eval '{1..1000}'` fit in one 256 KiB line.
+        let words: usize = segments.iter().map(Vec::len).sum();
+        if !clock.afford_line(words * CHEAP_WORD_COST) {
+            return too_costly("too many words in its lines");
+        }
         // Bash on Windows moves the profile too, and `evaluate_call` closes only a
         // reader's line, so this one closes itself at the end, after the rules.
         let profile_moved = if reader {
@@ -717,9 +727,11 @@ impl Engine {
     /// A nested line only reports the timeout: the outermost one starts again
     /// from its current segment, which holds the nested line, so nothing is
     /// judged once per level. Every segment of the line is judged, at a cost
-    /// linear in its words; what multiplies that cost has `MAX_CHEAP_WORK`
+    /// linear in its words. What multiplies that cost has `MAX_CHEAP_WORK`
     /// (`Clock::afford_line`, `Clock::afford_paths`), and brace expansion, the
-    /// one way to many more words than bytes, has `MAX_CHEAP_WORDS`.
+    /// one way to many more words than bytes, has its limit in the lexer. Past
+    /// either the line is denied (`too_costly`): dropping a directory or a nested
+    /// line to save the time could allow what a rule would deny.
     fn out_of_budget(
         &self,
         segments: &[Vec<Word>],
@@ -740,7 +752,6 @@ impl Engine {
             lexical: true,
             lines_left: Cell::new(max_cheap_work()),
             paths_left: Cell::new(max_cheap_work()),
-            words_left: Cell::new(max_cheap_words()),
             #[cfg(test)]
             runs: Cell::default(),
         };
@@ -770,9 +781,6 @@ impl Engine {
         state: &mut ShellState,
         found: &mut Findings,
     ) -> Option<Decision> {
-        if !cx.clock.afford_words(seg.len()) && seg.len() > CHEAP_SHORT_SEGMENT {
-            return None;
-        }
         // A word whose brace expansion was too large is judged as
         // written, and the command is recorded as not fully judged.
         if seg.iter().any(|w| w.brace_overflow) {
@@ -800,12 +808,20 @@ impl Engine {
         // well as the way it is written, with no second look at substitutions
         // (done above). As written, the command is that word, so the phases
         // below that recurse have nothing to read there.
-        let mut without = without_leading_empty_expansions(seg);
+        // POSIX only: a reader's `$x rm` is a syntax error or a program named `$x`.
+        let mut without = if cx.dialect == Dialect::Posix {
+            without_leading_empty_expansions(seg)
+        } else {
+            None
+        };
         // `windows_words` stopped at the word that may vanish, so what it hid
         // still has its Windows name: `$v rm.exe` must read as `rm`.
-        if self.vars.style() == PathStyle::Windows {
-            if let Some(words) = &mut without {
+        if let Some(words) = &mut without {
+            if self.vars.style() == PathStyle::Windows {
                 windows_program_names(words);
+            }
+            if let Some(first) = words.first_mut() {
+                first.behind_reserved = true;
             }
         }
         let full = without.as_deref().unwrap_or(seg);
@@ -949,7 +965,7 @@ impl Engine {
             return Nested::TimedOut;
         }
         if !cx.clock.afford_line(inner.len() + state.weight()) {
-            return Nested::Unjudged(format!("{what} left unjudged out of budget"));
+            return Nested::Deny(too_costly(&format!("{what} past the work limit")));
         }
         #[cfg(test)]
         crate::work::add(1 + inner.len());
@@ -1091,7 +1107,9 @@ impl Engine {
                 .chain(alt_ops)
                 .collect();
         for ops in all_ops {
-            let dirs = Self::dirs_to_judge(&ops, state, cx);
+            let Some(dirs) = Self::dirs_to_judge(&ops, state, cx) else {
+                return Some(too_costly(PATHS_PAST_LIMIT));
+            };
             let judged =
                 self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
             if let Some(d) = found.operands(judged) {
@@ -1183,7 +1201,7 @@ impl Engine {
         }
         let rewrites = state.rule_cwd.weight() + MAX_CWDS * view.matching_line.len();
         if !cx.clock.afford_paths(rewrites) {
-            return None;
+            return Some(too_costly(PATHS_PAST_LIMIT));
         }
         // `build_argv` collapses a leading `//`, which on Windows is a share.
         let written = self.path_argv(&view.argv, &view.resolved);
@@ -1238,7 +1256,9 @@ impl Engine {
             &view.argv,
             view.reads.clone(),
         );
-        let dirs = Self::dirs_to_judge(&ops, state, cx);
+        let Some(dirs) = Self::dirs_to_judge(&ops, state, cx) else {
+            return Some(too_costly(PATHS_PAST_LIMIT));
+        };
         let judged = self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
         if let Some(d) = found.operands(judged) {
             return Some(d);
@@ -1270,7 +1290,9 @@ impl Engine {
                 }
             }
             let ops = self.shell_ops(alt_seg, alt_eff, &alt_argv, view.reads.clone());
-            let dirs = Self::dirs_to_judge(&ops, state, cx);
+            let Some(dirs) = Self::dirs_to_judge(&ops, state, cx) else {
+                return Some(too_costly(PATHS_PAST_LIMIT));
+            };
             let judged =
                 self.judge_operands(ops, dirs, state.cwd_unknown, cx.start, cx.clock.lexical);
             if let Some(d) = found.operands(judged) {
@@ -1328,12 +1350,17 @@ impl Engine {
     /// `Some`: its target cannot be read (Windows), so what follows could not
     /// be judged either.
     fn cd_phase(&self, view: &SegmentView, state: &mut ShellState, cx: &Ctx) -> Option<Decision> {
-        if cx.clock.afford_paths(state.rule_cwd.weight()) {
-            state
-                .rule_cwd
-                .command(&view.argv, &view.resolved, self.vars.home());
+        if !cx.clock.afford_paths(state.rule_cwd.weight()) {
+            return Some(too_costly(PATHS_PAST_LIMIT));
         }
+        state
+            .rule_cwd
+            .command(&view.argv, &view.resolved, self.vars.home());
         if view.argv[0] == "cd" || view.argv[0] == "pushd" {
+            // Read and resolved from each directory there is.
+            if !cx.clock.afford_paths(state.weight()) {
+                return Some(too_costly(PATHS_PAST_LIMIT));
+            }
             let words = winpath::path_words(&view.resolved, &self.vars);
             let argv = self.path_argv(&view.argv, &words);
             let target = argv
@@ -1355,7 +1382,9 @@ impl Engine {
             }
             // Out of budget the target is worked out on paper, with no system
             // call (`cd`), so `cd ~/.ssh; cat id_rsa` still denies.
-            state.cwd_unknown |= self.cd(&argv, &words, &mut state.cwds, cx.clock.lexical);
+            let behind = view.seg.first().is_some_and(|w| w.behind_reserved);
+            let lexical = cx.clock.lexical;
+            state.cwd_unknown |= self.cd(&argv, &words, state, behind, lexical);
         }
         None
     }
@@ -1437,12 +1466,15 @@ impl Engine {
         found.nested(nested)
     }
 
-    /// The directories to judge `ops` in: all of them, unless the lexical
-    /// pass has spent its work on paths, and then the one the line started in,
-    /// which keeps the cost of the rest linear in its words.
-    fn dirs_to_judge<'a>(ops: &[Operand], state: &'a ShellState, cx: &Ctx) -> &'a [PathBuf] {
+    /// The directories to judge `ops` in: all of them. `None` when the lexical
+    /// pass has spent its work on paths, and judging fewer could miss a rule.
+    fn dirs_to_judge<'a>(
+        ops: &[Operand],
+        state: &'a ShellState,
+        cx: &Ctx,
+    ) -> Option<&'a [PathBuf]> {
         if !cx.clock.lexical {
-            return &state.cwds;
+            return Some(&state.cwds);
         }
         let dirs = state.cwds.len().max(1);
         let per_path = CHEAP_PATH_COST * dirs
@@ -1455,11 +1487,7 @@ impl Engine {
             .iter()
             .map(|op| (1 + op.into.len()) * (per_path + dirs * op.path.len()))
             .sum();
-        if cx.clock.afford_paths(cost) {
-            &state.cwds
-        } else {
-            &state.cwds[..state.cwds.len().min(1)]
-        }
+        cx.clock.afford_paths(cost).then_some(state.cwds.as_slice())
     }
 
     /// `powershell -enc …`, `cmd /c …`, `iex '…'`: the text is a command line
@@ -1814,14 +1842,20 @@ impl Engine {
     /// resolved against each directory, home without one. The old
     /// directories always stay. Returns true when the shell may now be
     /// somewhere `cwds` does not hold: `cd -`, a target with a substitution,
-    /// one that cannot be resolved, or more directories than `MAX_CWDS`, where
-    /// nothing more is resolved. `lexical`: the target is worked out without
-    /// the filesystem (`out_of_budget`), so a symlink is not followed.
+    /// one that cannot be resolved, or more directories than `MAX_CWDS` in its
+    /// tier, where nothing more is resolved. `lexical`: the target is worked out
+    /// without the filesystem (`out_of_budget`), so a symlink is not followed.
+    ///
+    /// `behind`: the `cd` stands behind a reserved word or a word that may vanish.
+    /// What it reaches, and what a plain `cd` reaches from there, goes in the second
+    /// tier (`ShellState::plain_cwds`), so padding of such `cd`s cannot use up the
+    /// slots a plain one needs, before or after it.
     fn cd(
         &self,
         argv: &[String],
         effective: &[Word],
-        cwds: &mut Vec<PathBuf>,
+        state: &mut ShellState,
+        behind: bool,
         lexical: bool,
     ) -> bool {
         let arg = argv
@@ -1829,9 +1863,10 @@ impl Engine {
             .zip(effective)
             .skip(1)
             .find(|(a, _)| !a.starts_with('-') || *a == "-");
-        let (new, mut unknown): (Vec<PathBuf>, bool) = match arg {
+        // Each new directory, and whether it is for the plain tier.
+        let (new, mut unknown): (Vec<(PathBuf, bool)>, bool) = match arg {
             None => match self.vars.home() {
-                Some(h) => (vec![h.to_path_buf()], false),
+                Some(h) => (vec![(h.to_path_buf(), !behind)], false),
                 None => (Vec::new(), true),
             },
             // A `$` is a variable to POSIX. On Windows `path_words` has already
@@ -1843,38 +1878,59 @@ impl Engine {
             {
                 (Vec::new(), true)
             }
-            Some(_) if cwds.len() >= MAX_CWDS => return true,
             Some((a, _)) => {
-                let anchors: Vec<Option<&Path>> = if cwds.is_empty() {
-                    vec![None]
+                let plain_full = state.plain_cwds >= MAX_CWDS;
+                let other_full = state.cwds.len() - state.plain_cwds >= MAX_CWDS;
+                let anchors: Vec<(Option<&Path>, bool)> = if state.cwds.is_empty() {
+                    vec![(None, !behind)]
                 } else {
-                    cwds.iter().map(|c| Some(c.as_path())).collect()
+                    state
+                        .cwds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (Some(c.as_path()), !behind && i < state.plain_cwds))
+                        .collect()
                 };
+                let all = anchors.len();
+                let anchors: Vec<_> = anchors
+                    .into_iter()
+                    .filter(|(_, plain)| if *plain { !plain_full } else { !other_full })
+                    .collect();
+                let mut unknown = anchors.len() < all;
                 #[cfg(test)]
                 CD_RESOLVES.with(|n| n.set(n.get() + anchors.len()));
-                let resolved: Vec<Option<PathBuf>> = anchors
-                    .into_iter()
-                    .map(|c| {
-                        if lexical {
-                            lexical_form(a, c, &self.vars)
-                        } else {
-                            canonicalize(a, c, &self.vars)
-                        }
-                    })
-                    .collect();
-                let unknown = resolved.iter().any(Option::is_none);
-                (resolved.into_iter().flatten().collect(), unknown)
+                let mut new = Vec::with_capacity(anchors.len());
+                for (c, plain) in anchors {
+                    let dir = if lexical {
+                        lexical_form(a, c, &self.vars)
+                    } else {
+                        canonicalize(a, c, &self.vars)
+                    };
+                    match dir {
+                        Some(d) => new.push((d, plain)),
+                        None => unknown = true,
+                    }
+                }
+                (new, unknown)
             }
         };
-        for n in new {
-            if cwds.contains(&n) {
+        for (n, plain) in new {
+            let tier = if plain {
+                0..state.plain_cwds
+            } else {
+                state.plain_cwds..state.cwds.len()
+            };
+            if state.cwds[tier.clone()].contains(&n) {
                 continue;
             }
-            if cwds.len() >= MAX_CWDS {
+            if tier.len() >= MAX_CWDS {
                 unknown = true;
-                break;
+                continue;
             }
-            cwds.push(n);
+            state.cwds.insert(tier.end, n);
+            if plain {
+                state.plain_cwds += 1;
+            }
         }
         unknown
     }
@@ -2019,8 +2075,8 @@ impl Engine {
     }
 }
 
-/// Directories a command line's paths are judged against at most (the
-/// starting one plus `cd` targets).
+/// Directories a command line's paths are judged against at most, in each of the
+/// two tiers of `ShellState::plain_cwds` (the plain one holds the starting one).
 const MAX_CWDS: usize = 16;
 
 /// The last component of `path` (`a/b/` is `b`). Under Windows style `\\`
@@ -2837,6 +2893,11 @@ struct ShellState {
     /// (`cd /nonexistent; …`), run in a subshell (`(cd x); …`) or go
     /// somewhere unknown (`cd $(…)`).
     cwds: Vec<PathBuf>,
+    /// The first this many of `cwds` come from plain `cd`s, up to `MAX_CWDS`; the
+    /// rest, up to `MAX_CWDS` more, from a `cd` behind a reserved word or a word that
+    /// may vanish, or from one of those directories. Without the split, padding of
+    /// `! cd x` would use up the slots of a real `cd ~/.ssh`.
+    plain_cwds: usize,
     /// A `cd` went somewhere `cwds` does not hold (`cd $(…)`, `cd -`, an
     /// unresolvable target, or past `MAX_CWDS`).
     cwd_unknown: bool,
@@ -2914,8 +2975,6 @@ struct Clock {
     /// What it may still spend on paths in more than one directory, in bytes.
     /// Apart from `lines_left`, so paths cannot use up what nested lines need.
     paths_left: Cell<usize>,
-    /// Words of segments it may still judge at any length.
-    words_left: Cell<usize>,
     /// Lines evaluated and segment views judged, so a test can bound the
     /// work without reading a clock.
     #[cfg(test)]
@@ -2933,16 +2992,9 @@ impl Clock {
     fn afford_paths(&self, cost: usize) -> bool {
         !self.lexical || spend(&self.paths_left, cost)
     }
-
-    /// May the lexical pass judge a segment of this many words whatever its
-    /// length? As `afford_line`.
-    fn afford_words(&self, words: usize) -> bool {
-        !self.lexical || spend(&self.words_left, words)
-    }
 }
 
-/// Takes `cost` from `left` if it is all there. Too large a part is skipped
-/// and spends nothing, so what comes after it can still be judged.
+/// Takes `cost` from `left` if it is all there.
 fn spend(left: &Cell<usize>, cost: usize) -> bool {
     match left.get().checked_sub(cost) {
         Some(rest) => {
@@ -2957,33 +3009,22 @@ fn spend(left: &Cell<usize>, cost: usize) -> bool {
 /// takes as long as judging about this many bytes.
 const CHEAP_LINE_COST: usize = 1024;
 
+/// What judging one word of a line costs the lexical pass, measured the same way:
+/// about 1.5 µs, against about a second for `MAX_CHEAP_WORK`.
+const CHEAP_WORD_COST: usize = 256;
+
 /// What judging one path in one directory costs the lexical pass before its
 /// bytes, measured the same way.
 const CHEAP_PATH_COST: usize = 256;
 
 /// How much the lexical pass may spend on each of what multiplies its work,
 /// once the budget has run out: nested lines, and paths in more than one
-/// directory. Each comes to about a second in an optimized build. Past it the
-/// line still ends as it would have: every segment gets the rules, and paths
-/// in the directory the line started in.
-const MAX_CHEAP_WORK: usize = 256 * 1024 * 1024;
+/// directory. Each comes to about a second in an optimized build, measured on the
+/// worst shapes a 256 KiB line can have. Past it the line is denied (`too_costly`).
+/// Only a hostile line gets there: this is about 200,000 short paths.
+const MAX_CHEAP_WORK: usize = 64 * 1024 * 1024;
 
-/// Words the lexical pass judges in segments of any length, about a second's
-/// worth. Only brace expansion gets here on a line under 1 MiB, the most a
-/// shell can be handed as `-c` on Linux or macOS. Past it a segment of more than
-/// `CHEAP_SHORT_SEGMENT` words is not judged, and the line can fail open.
-const MAX_CHEAP_WORDS: usize = 512 * 1024;
-
-/// A segment this short is judged however many words came before it.
-const CHEAP_SHORT_SEGMENT: usize = 128;
-
-fn max_cheap_words() -> usize {
-    #[cfg(test)]
-    if let Some(limit) = CHEAP_WORK_LIMIT.with(Cell::get) {
-        return limit;
-    }
-    MAX_CHEAP_WORDS
-}
+const PATHS_PAST_LIMIT: &str = "paths in too many long directories";
 
 fn max_cheap_work() -> usize {
     #[cfg(test)]
@@ -3072,6 +3113,20 @@ impl Findings {
 fn timed_out() -> Decision {
     Decision::Allow {
         trace: AllowTrace::FailedOpenTimeout,
+    }
+}
+
+/// The deny for a line that costs more to judge than a line should. No rule decided
+/// it, and the agent can do something about it.
+fn too_costly(why: &str) -> Decision {
+    Decision::Deny {
+        pack: SUBSTITUTION_GUARD_PACK.to_string(),
+        pattern: "line-too-costly-to-judge".to_string(),
+        reason: format!(
+            "this line is too costly to judge ({why}), so it fails safe and blocks; \
+             split it into smaller commands"
+        ),
+        via_inline: None,
     }
 }
 
@@ -4290,48 +4345,48 @@ reason = "other pack says no"
         assert!(failures.is_empty(), "superlinear:\n{}", failures.join("\n"));
     }
 
-    /// Past the limit nested lines and extra directories are left out, the
-    /// rules and the starting directory never are.
+    /// Past the limit the line is denied and says why: dropping a nested line or a
+    /// directory could allow what a rule denies. A rule found first keeps its name.
     #[test]
-    fn past_the_work_limit_every_segment_still_gets_the_rules() {
+    fn past_the_work_limit_the_line_is_denied() {
         let (_d, root) = canonical_tmp();
         let e = cheap_engine(&root);
-        let timeout = Decision::Allow {
-            trace: AllowTrace::FailedOpenTimeout,
+        let costly = |d: Decision| match d {
+            Decision::Deny {
+                pattern, reason, ..
+            } => pattern == "line-too-costly-to-judge" && reason.contains("split"),
+            _ => false,
         };
         let moved = "cd ~/.ssh; cat id_rsa";
-        assert!(e.evaluate(moved).is_deny());
-        assert!(e.evaluate("$(cat .env)").is_deny());
+        assert!(!costly(e.evaluate(moved)));
+        assert!(!costly(e.evaluate("$(cat .env)")));
 
         CHEAP_WORK_LIMIT.with(|l| l.set(Some(0)));
-        for cmd in ["rm -rf /", "ls; rm -rf /", "cat .env", "$v cat .env"] {
-            assert!(e.evaluate(cmd).is_deny(), "{cmd}");
+        assert!(costly(e.evaluate("$(cat .env)")));
+        assert!(costly(e.evaluate("ls a; $(ls)")));
+        assert!(costly(e.evaluate(moved)));
+        match e.evaluate("rm -rf /") {
+            Decision::Deny { pack, .. } => assert_eq!(pack, "core.filesystem"),
+            d => panic!("{d:?}"),
         }
-        assert_eq!(e.evaluate(moved), timeout);
-        assert_eq!(e.evaluate("$(cat .env)"), timeout);
 
-        // A part too large for what is left spends nothing.
-        CHEAP_WORK_LIMIT.with(|l| l.set(Some(4096)));
-        let big = format!("$(true {}); $(cat .env)", "x".repeat(8192));
-        assert!(e.evaluate(&big).is_deny());
-
-        // Paths cannot use up what nested lines need.
+        // Below the limit nothing changes.
+        CHEAP_WORK_LIMIT.with(|l| l.set(Some(1 << 20)));
+        assert_eq!(
+            e.evaluate("ls"),
+            Decision::Allow {
+                trace: AllowTrace::FailedOpenTimeout,
+            }
+        );
+        // Paths cannot use up what nested lines need, nor the other way.
         let line = format!("{}cat {}; $(rm -rf /)", all_the_dirs(), "a ".repeat(4096));
         assert!(e.evaluate(&line).is_deny(), "after spent paths");
-
-        // Past the words, a long segment is not judged and a short one is. The
-        // first segment spends what the second would need.
-        CHEAP_WORK_LIMIT.with(|l| l.set(Some(200)));
-        let long = "a ".repeat(2 * CHEAP_SHORT_SEGMENT);
-        let spent = "x ".repeat(150);
-        assert_eq!(e.evaluate(&format!("{spent}; cat {long}.env")), timeout);
-        assert!(e.evaluate(&format!("{spent}; cat .env")).is_deny());
-        assert!(e.evaluate(&format!("{spent}; rm -rf /")).is_deny());
         CHEAP_WORK_LIMIT.with(|l| l.set(None));
     }
 
-    /// Past `MAX_CWDS` a `cd` is not resolved at all: the first 15 add a
-    /// directory each, and each one resolves against those there are so far.
+    /// Past `MAX_CWDS` in its tier a `cd` is not resolved at all: each one before
+    /// adds a directory, and resolves against those there are so far. Plain ones
+    /// start from the one directory with 15 slots left, the others with 16.
     #[test]
     fn a_cd_past_the_directory_limit_resolves_nothing() {
         let (_d, root) = canonical_tmp();
@@ -4342,15 +4397,16 @@ reason = "other pack says no"
                 reason: "working directory unknown after cd".to_string(),
             },
         };
-        for part in ["cd x; ", "! cd x; ", "if cd x; then ", "$v cd x; "] {
+        for (part, resolves) in [
+            ("cd x; ", (1..16).sum::<usize>()),
+            ("! cd x; ", (1..17).sum()),
+            ("if cd x; then ", (1..17).sum()),
+            ("$v cd x; ", (1..17).sum()),
+        ] {
             CD_RESOLVES.with(|n| n.set(0));
             let line = format!("{}cat notes.txt", part.repeat(240));
             assert_eq!(e.evaluate(&line), unknown, "{part:?}");
-            assert_eq!(
-                CD_RESOLVES.with(Cell::get),
-                (1..16).sum::<usize>(),
-                "{part:?}"
-            );
+            assert_eq!(CD_RESOLVES.with(Cell::get), resolves, "{part:?}");
         }
     }
 

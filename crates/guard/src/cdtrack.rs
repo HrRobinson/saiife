@@ -202,8 +202,9 @@ pub(crate) struct RuleCwd {
 
 /// Leading words that make a segment a condition or time it (`if cd /;
 /// then …`, `while cd x; do …`, `! cd /`, `time -p cd /`): the command
-/// after them still runs in this shell. The POSIX lexer has already stripped
-/// these; the PowerShell and cmd readers have not, and `!` runs `cd` there too.
+/// after them still runs in this shell. The POSIX lexer drops all of these but a
+/// `time` before a plain command (`time -p cd /`), which it keeps for the wrapper
+/// table; the PowerShell and cmd readers keep them all, and `!` runs `cd` there too.
 const CONDITION_WORDS: &[&str] = &["if", "elif", "while", "until", "!", "time"];
 
 /// How many leading words of `argv` are `CONDITION_WORDS` (unquoted), with

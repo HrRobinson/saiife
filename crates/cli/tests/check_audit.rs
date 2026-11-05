@@ -107,19 +107,34 @@ fn garbage_payload_is_audited_as_error_allowed() {
 }
 
 #[test]
-fn oversize_payload_is_error_allowed() {
+fn oversize_payload_is_error_denied() {
     let dir = tempfile::tempdir().unwrap();
     let big = payload(&format!("echo {}", "a".repeat(300 * 1024)));
-    assert_eq!(check(dir.path(), &["--hook-exit"], &big), 0);
+    assert_eq!(check(dir.path(), &["--hook-exit"], &big), 2);
     let r = &guard_records(dir.path())[0];
-    assert_eq!(r.decision, DecisionKind::ErrorAllowed);
+    assert_eq!(r.decision, DecisionKind::ErrorDenied);
     assert!(
         r.input.starts_with("echo "),
         "command kept: {:.40}",
         r.input
     );
     assert!(r.input.ends_with("…[truncated]"));
-    assert!(r.reason.as_deref().unwrap().contains("payload"));
+    assert!(r.reason.as_deref().unwrap().contains("not judged"));
+}
+
+/// The owner's pin: 300 KiB ending in `rm -rf /` and in `ls`, developer mode.
+#[test]
+fn a_line_over_the_limit_is_denied_whatever_it_ends_in() {
+    for tail in ["rm -rf /", "ls"] {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}; {tail}", "a".repeat(300 * 1024));
+        assert_eq!(check(dir.path(), &["--hook-exit"], &payload(&line)), 2);
+        let r = &guard_records(dir.path())[0];
+        assert_eq!(r.decision, DecisionKind::ErrorDenied, "{tail}");
+        let reason = r.reason.as_deref().unwrap();
+        assert!(reason.contains("not judged"), "{reason}");
+        assert!(reason.contains("split"), "{reason}");
+    }
 }
 
 #[test]

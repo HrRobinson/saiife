@@ -726,10 +726,15 @@ applies and the engine is unchanged.
   stdin (`echo x | cmd`, `cat f | bash`), and `wsl` with an unknown option. `wsl CMD`
   is a nested POSIX line. On Linux and macOS this route stays as it was: `pwsh -c`
   from the `Bash` tool is not read inside.
-- **Budget, panic and oversize follow `Fail`,** in every dialect:
-  `error_allowed` in developer mode, `error_denied` in locked. A failed stdin
-  read in developer mode stays open. So a padded line can force a recorded
-  allow in developer mode, the gap POSIX already has; the record shows it.
+- **Budget and panic follow `Fail`,** in every dialect: `error_allowed` in
+  developer mode, `error_denied` in locked. A failed stdin read in developer mode
+  stays open. Out of budget, what is left of the line still gets the rules and
+  lexical paths, and a line that denies there is a deny; one no rule denies stays
+  a recorded allow in developer mode.
+- **A shell line over the size limit (256 KiB) is denied in every mode** (owner's
+  ruling), `error_denied`, with a message telling the agent to split it, on any
+  OS. Padding must not be a way past the guard. File tools are not affected, and
+  a broken or unreadable stdin stays as it is.
 - **Limits, written down** (as `cd` tracking is for POSIX in §10):
   aliases and functions defined in the same command (`Set-Alias`,
   `function f {…}`), `.ps1` script contents, .NET calls
