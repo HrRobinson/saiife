@@ -887,12 +887,18 @@ mod mcp_tests {
 
     #[test]
     fn managed_mcp_settings_pins_saiife_by_command() {
-        let text = managed_mcp_settings(&[
-            "github".into(),
-            "saiife".into(),
-            "jira".into(),
-            "github".into(),
-        ]);
+        let servers = [
+            "github".to_string(),
+            "saiife".to_string(),
+            "jira".to_string(),
+            "github".to_string(),
+        ];
+        // What production calls follows the host.
+        assert_eq!(
+            managed_mcp_settings(&servers),
+            managed_mcp_settings_for(cfg!(windows), &servers)
+        );
+        let text = managed_mcp_settings_for(false, &servers);
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             v,

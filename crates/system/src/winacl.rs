@@ -6,7 +6,7 @@
 //! caller checks for reparse points, which an SDDL string cannot show.
 
 use crate::layout::{Layout, WIN_SERVICE};
-use saiife_win::sddl::{parse, render, writers, Sd, WRITE_LIKE};
+use saiife_win::sddl::{parse, render, writers, Sd, LOCAL_ADMIN, WRITE_LIKE};
 use saiife_win::sid::{service_sid, valid_sid, ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -35,8 +35,10 @@ const MANAGED: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x12
 /// `C:\Program Files` and on what is below it.
 const CREATOR_OWNER: &str = "S-1-3-0";
 
-/// The owners a protected path or an ancestor may have.
-const TRUSTED: [&str; 3] = [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER];
+/// The owners a protected path or an ancestor may have, and the writers it may have
+/// without being named. `LA` is this machine's built-in Administrator, who is always in
+/// `Administrators`; Windows prints that account by alias.
+const TRUSTED: [&str; 4] = [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, LOCAL_ADMIN];
 
 /// `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_ALL`,
 /// `GENERIC_WRITE`: what no non-admin may hold on an ancestor. Creating entries
@@ -220,18 +222,12 @@ fn refusal(sid: &str, held: u32) -> String {
 mod tests {
     use super::*;
     use crate::layout::{self, Platform};
+    use saiife_win::sddl::stock;
     use saiife_win::sid::{AUTHENTICATED_USERS, USERS};
     use std::path::PathBuf;
 
     const A: &str = "S-1-5-21-1-2-3-1009";
     const S: &str = "S-1-5-80-1485410291-497971702-176010752-1662630379-411534723";
-
-    /// `C:\ProgramData` as Microsoft Q&A question 1841814 prints it with
-    /// `icacls`, written as SDDL by hand in the letters Windows prints
-    /// (`WD,AD,WEA,WA` is `DCLCRPCR`, 0x116). `icacls` does not show the owner;
-    /// SYSTEM is assumed. `real_ancestors_pass_ancestor_ok` reads the real one in CI.
-    const PROGRAMDATA: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)\
-         (A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
 
     fn test_layout() -> (tempfile::TempDir, Layout) {
         let d = tempfile::tempdir().unwrap();
@@ -540,15 +536,27 @@ mod tests {
             assert_eq!(covered(&sys, Path::new(path)), None, "{path}");
         }
         // The same names below a test root, each as one path component where
-        // this OS allows it.
+        // this OS allows it. Built as text: on Windows the root is canonical, so `\\?\`,
+        // and `join` there resolves `..` itself and hands back a path that truly is
+        // `state`, which is right for that path and tests nothing here.
+        let root = l.root().to_str().unwrap();
         for rest in [
-            "C/ProgramData/saiife/etc/../state",
-            "C/ProgramData/saiife/state/keys/vault.key.",
-            "C/ProgramData/saiife/state/keys/vault.key::$DATA",
-            "CC/ProgramData/saiife/etc",
-            "1/ProgramData/saiife/etc",
+            ["C", "ProgramData", "saiife", "etc", "..", "state"].as_slice(),
+            &["C", "ProgramData", "saiife", "state", "keys", "vault.key."],
+            &[
+                "C",
+                "ProgramData",
+                "saiife",
+                "state",
+                "keys",
+                "vault.key::$DATA",
+            ],
+            &["CC", "ProgramData", "saiife", "etc"],
+            &["1", "ProgramData", "saiife", "etc"],
         ] {
-            assert_eq!(covered(&l, &l.root().join(rest)), None, "{rest}");
+            let sep = std::path::MAIN_SEPARATOR_STR;
+            let path = PathBuf::from(format!("{root}{sep}{}", rest.join(sep)));
+            assert_eq!(covered(&l, &path), None, "{}", path.display());
         }
         #[cfg(unix)]
         assert_eq!(
@@ -901,9 +909,48 @@ mod tests {
 
     #[test]
     fn ancestor_ok_accepts_programdata_default() {
-        ancestor_ok(&parse(PROGRAMDATA).unwrap()).unwrap();
+        let program_data = parse(stock::PROGRAM_DATA).unwrap();
+        ancestor_ok(&program_data).unwrap();
         // The same folder is not fit to be ours: Users may create entries.
-        assert!(protected_ok(&parse(PROGRAMDATA).unwrap(), &[]).is_err());
+        assert_eq!(
+            protected_ok(&program_data, &[]),
+            Err(format!("{USERS} may FILE_WRITE_DATA here"))
+        );
+    }
+
+    /// A refusal here would stop install on every stock machine.
+    #[test]
+    fn ancestor_ok_accepts_the_real_folders() {
+        for text in [
+            stock::DRIVE_ROOT,
+            stock::PROGRAM_DATA,
+            stock::PROGRAM_FILES,
+            stock::WINDOWS,
+        ] {
+            ancestor_ok(&parse(text).unwrap()).unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+    }
+
+    /// `LA` is the built-in Administrator: fit to own or write, and nothing more. Windows
+    /// prints it for that account; the row still has to read back as the table says.
+    #[test]
+    fn la_counts_as_admin_for_owner_and_writers() {
+        protected_ok(&ok_sd(LOCAL_ADMIN, ""), &[]).unwrap();
+        ancestor_ok(&ok_sd(LOCAL_ADMIN, "")).unwrap();
+        for ace in ["(A;;FA;;;LA)", "(A;OICI;FA;;;LA)", "(A;OICIIO;GA;;;LA)"] {
+            protected_ok(&ok_sd("BA", ace), &[]).unwrap_or_else(|e| panic!("{ace}: {e}"));
+            ancestor_ok(&ok_sd("SY", ace)).unwrap_or_else(|e| panic!("{ace}: {e}"));
+        }
+        // Others are not excused by its being there.
+        assert!(protected_ok(&ok_sd("LA", "(A;;FA;;;BU)"), &[]).is_err());
+        assert!(ancestor_ok(&ok_sd("LA", "(A;;WD;;;BU)")).is_err());
+
+        let (_d, l) = test_layout();
+        let row = want(&l, r"C:\ProgramData\saiife\etc\config.toml");
+        let mut sd = parse(&row).unwrap();
+        actual_ok(&row, &sd).unwrap();
+        sd.owner = Some(LOCAL_ADMIN.to_string());
+        assert!(actual_ok(&row, &sd).is_err(), "off-row owner");
     }
 
     /// `C:\Program Files` is owned by TrustedInstaller, and an inherit-only

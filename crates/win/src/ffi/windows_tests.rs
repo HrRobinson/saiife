@@ -3,7 +3,7 @@
 
 use super::{account, acl, sd, token};
 use crate::sddl;
-use crate::sid::{self, ADMINISTRATORS, USERS};
+use crate::sid::{self, ADMINISTRATORS};
 use std::io::Write;
 use std::path::PathBuf;
 use windows_sys::Win32::Security::{
@@ -27,6 +27,39 @@ fn own_sddl(flags: &str, sid: &str) -> String {
 /// libtest captures `print!`, also on a pass; this reaches the CI log anyway.
 fn log(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// The SID behind `LA` on this machine, by Windows' own reading.
+fn local_admin_sid() -> String {
+    let desc = sd::from_sddl(&format!("O:{}D:", sddl::LOCAL_ADMIN)).unwrap();
+    let owner = desc.owner_sid().unwrap();
+    // SAFETY: `owner` points into `desc`, alive here.
+    unsafe { account::sid_to_string(owner) }.unwrap()
+}
+
+/// `text`, with `me` as Windows prints it back: `LA` if it is the built-in Administrator
+/// of this machine, which the runner is.
+fn as_printed(text: &str, me: &str) -> String {
+    if me == local_admin_sid() {
+        text.replace(me, sddl::LOCAL_ADMIN)
+    } else {
+        text.to_string()
+    }
+}
+
+/// The alias [`sddl::parse`] keeps by name is the account the plan takes it for: RID 500,
+/// and in `Administrators`, the claim `writers` and `owner_ok` rest on.
+#[test]
+fn la_is_the_builtin_administrator_of_this_machine() {
+    let la = local_admin_sid();
+    assert!(la.starts_with("S-1-5-21-") && la.ends_with("-500"), "{la}");
+    let name = account::lookup_sid(&la).unwrap();
+    let sids: Vec<String> = account::local_groups_of(&name)
+        .unwrap()
+        .iter()
+        .map(|g| account::lookup_name(g).unwrap().0)
+        .collect();
+    assert!(sids.iter().any(|s| s == ADMINISTRATORS), "{name}: {sids:?}");
 }
 
 #[test]
@@ -93,8 +126,7 @@ fn set_sddl_on_temp_dir_roundtrips() {
     let wanted = own_sddl("PAI", &me);
     acl::set_sddl(&target, &wanted).unwrap();
 
-    // Printed first, and in every failure: Windows may spell a RID-500 owner `LA`, which
-    // `parse` refuses, and only a real run can say.
+    // Printed first, and in every failure: only a real run can say how Windows spells it.
     let text = acl::get_sddl(&target).unwrap();
     log(&format!("set_sddl roundtrip wrote {wanted}, reads {text}"));
     // Whether a set on a handle reaches existing children decides how install walks a tree.
@@ -103,7 +135,7 @@ fn set_sddl_on_temp_dir_roundtrips() {
         acl::get_sddl(&child).unwrap()
     ));
     let read = sddl::parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
-    let want = sddl::parse(&wanted).unwrap();
+    let want = sddl::parse(&as_printed(&wanted, &me)).unwrap();
     assert_eq!(read.owner, want.owner, "{text}");
     assert!(read.dacl_protected, "{text}");
     assert_eq!(read.aces, want.aces, "{text}");
@@ -151,7 +183,10 @@ fn create_dir_with_sddl_has_no_inherited_aces() {
     let read = sddl::parse(&acl::get_sddl(&target).unwrap()).unwrap();
     assert!(read.dacl_protected);
     assert!(read.aces.iter().all(|a| !a.flags.inherited), "{read:?}");
-    assert_eq!(read.aces, sddl::parse(&wanted).unwrap().aces);
+    assert_eq!(
+        read.aces,
+        sddl::parse(&as_printed(&wanted, &me)).unwrap().aces
+    );
 
     // A second create is an error, and leaves the first alone.
     assert!(acl::create_dir_with_sddl(&target, &wanted).is_err());
@@ -185,10 +220,38 @@ fn reparse_points_are_refused() {
     );
 }
 
+/// A descriptor belongs to the file, so a set through either name would reach both.
 #[test]
-fn local_groups_of_runner_includes_users() {
+fn hard_linked_files_are_refused() {
     let me = token::current().unwrap().sid;
-    let name = account::lookup_sid(&me).unwrap();
+    let dir = temp_dir();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"x").unwrap();
+    let link = dir.path().join("link");
+    std::fs::hard_link(&target, &link).unwrap();
+    let before = acl::get_sddl(&target).unwrap();
+    for name in [&link, &target] {
+        let e = acl::set_sddl(name, &own_sddl("P", &me)).unwrap_err();
+        assert!(e.to_string().contains("hard link"), "{e}");
+        assert_eq!(
+            acl::get_sddl(&target).unwrap(),
+            before,
+            "the target must not change"
+        );
+    }
+    // With the link gone it is a plain file again, and the refusal was the link's.
+    std::fs::remove_file(&link).unwrap();
+    acl::set_sddl(&target, &own_sddl("P", &me)).unwrap();
+    assert_ne!(acl::get_sddl(&target).unwrap(), before);
+}
+
+/// Not every account is in `Users`: the runner's built-in Administrator has only
+/// `Administrators`. So this reads what the account is in, and nothing in saiife may
+/// take `Users` for granted.
+#[test]
+fn local_groups_of_runner_resolve() {
+    let facts = token::current().unwrap();
+    let name = account::lookup_sid(&facts.sid).unwrap();
     let groups = account::local_groups_of(&name).unwrap();
     log(&format!("local groups of {name}: {groups:?}"));
     // By SID: the names are localized.
@@ -196,7 +259,16 @@ fn local_groups_of_runner_includes_users() {
         .iter()
         .map(|g| account::lookup_name(g).unwrap().0)
         .collect();
-    assert!(sids.iter().any(|s| s == USERS), "{groups:?} {sids:?}");
+    assert!(
+        sids.iter().all(|s| sid::valid_sid(s)),
+        "{groups:?} {sids:?}"
+    );
+    if facts.elevated_admin {
+        assert!(
+            sids.iter().any(|s| s == ADMINISTRATORS),
+            "{groups:?} {sids:?}"
+        );
+    }
 }
 
 #[test]

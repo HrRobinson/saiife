@@ -166,7 +166,7 @@ fn codex_fresh_file_matches_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("requirements.toml");
     assert!(matches!(
-        codex::install_managed(&f).unwrap(),
+        codex::install_managed_for(&f, false).unwrap(),
         Change::Created { .. }
     ));
     let got = fs::read_to_string(&f).unwrap();
@@ -182,7 +182,7 @@ fn gemini_fresh_file_matches_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
     assert!(matches!(
-        gemini::install_managed(&f).unwrap(),
+        gemini::install_managed_for(&f, false).unwrap(),
         Change::Created { .. }
     ));
     assert_eq!(json_file(&f), json("gemini/settings.json"));
@@ -206,7 +206,10 @@ fn codex_requirements_keeps_admin_entries() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("requirements.toml");
     fs::write(&f, ADMIN_CODEX).unwrap();
-    assert_eq!(codex::install_managed(&f).unwrap(), Change::Updated);
+    assert_eq!(
+        codex::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
     let text = fs::read_to_string(&f).unwrap();
     assert!(text.starts_with("# company policy\n"), "{text}");
     let d = text.parse::<DocumentMut>().unwrap();
@@ -290,7 +293,10 @@ fn gemini_settings_keeps_admin_entries() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("settings.json");
     fs::write(&f, ADMIN_GEMINI).unwrap();
-    assert_eq!(gemini::install_managed(&f).unwrap(), Change::Updated);
+    assert_eq!(
+        gemini::install_managed_for(&f, false).unwrap(),
+        Change::Updated
+    );
     let v = json_file(&f);
     assert_eq!(v["general"]["vimMode"], true);
     let groups = v["hooks"]["BeforeTool"].as_array().unwrap();

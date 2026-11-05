@@ -353,17 +353,25 @@ mod tests {
     #[test]
     fn managed_commands_use_the_opt_binary() {
         assert_eq!(
-            Agent::Claude.managed_command(),
+            Agent::Claude.managed_command_on(false),
             "/opt/saiife/bin/saiife check --managed --hook-exit --agent claude"
         );
         assert_eq!(
-            Agent::Codex.managed_command(),
+            Agent::Codex.managed_command_on(false),
             "/opt/saiife/bin/saiife check --managed --hook-exit --agent codex"
         );
         assert_eq!(
-            Agent::Gemini.managed_command(),
+            Agent::Gemini.managed_command_on(false),
             "/opt/saiife/bin/saiife check --managed --hook-exit --agent gemini"
         );
+    }
+
+    /// What production calls picks the binary of the OS it runs on.
+    #[test]
+    fn managed_command_follows_the_host() {
+        for a in Agent::ALL {
+            assert_eq!(a.managed_command(), a.managed_command_on(cfg!(windows)));
+        }
     }
 
     #[test]

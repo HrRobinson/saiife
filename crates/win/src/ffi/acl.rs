@@ -1,12 +1,17 @@
 //! File and directory ACLs as SDDL.
 //!
-//! FFI calls: `GetSecurityInfo`, `SetSecurityInfo`, `CreateDirectoryW`.
+//! FFI calls: `GetSecurityInfo`, `SetSecurityInfo`, `GetFileInformationByHandle`,
+//! `CreateDirectoryW`.
 //!
 //! The named-path calls follow a reparse point, and between any check and such a call
 //! a writer of the parent could swap one in, and an elevated `set_sddl` would re-ACL its
 //! target. So both functions here open the path itself, without following the last
 //! component, check that handle, and act on the same handle. The object checked is the
 //! object changed.
+//!
+//! `set_sddl` also refuses a file with more than one hard link, read from that handle: a
+//! descriptor belongs to the file, so the set would reach the link's target. As Linux
+//! does in `check_daemon_file`.
 //!
 //! This covers the last component only. A junction higher up the path is still followed
 //! on open, so callers check the ancestors top-down before every set (W14, `ancestor_ok`).
@@ -30,8 +35,9 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 
 /// `path` itself, file or dir, opened with `access` and without following a final
@@ -50,6 +56,25 @@ fn open_no_follow(path: &Path, access: u32) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+/// An error if `file`, open as `path`, is a file with more than one hard link
+/// ([`sddl::check_links`]). The handle stays open across the set that follows, so what
+/// this reads is the object changed.
+fn refuse_hard_links(file: &File, path: &Path) -> io::Result<()> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open with FILE_READ_ATTRIBUTES and `file` outlives the call;
+    // `info` is a valid place for the call to write.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sddl::check_links(info.dwFileAttributes, info.nNumberOfLinks).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: {e}", path.display()),
+        )
+    })
 }
 
 /// The descriptor text `sddl` as [`sddl::check_settable`] allows, parsed by Windows.
@@ -89,7 +114,7 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
 /// Sets the owner, a protected DACL and any group of `path` from `sddl_text`, which
 /// must name an owner and say `D:P`. The group counts because `winacl::actual_ok`
 /// compares it: `G:SY` left unset would fail every later check of the path. A reparse
-/// point is an error.
+/// point, or a file with more than one hard link, is an error.
 pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let desc = settable(sddl_text)?;
     let parsed =
@@ -106,6 +131,7 @@ pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let owner = desc.owner_sid()?;
     let dacl = desc.dacl()?;
     let file = open_no_follow(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER)?;
+    refuse_hard_links(&file, path)?;
     // SAFETY: the handle is open with WRITE_DAC and WRITE_OWNER, and `file` outlives the
     // call. `owner` and `dacl` point into `desc`, alive across the call, and neither is
     // null. `group_ptr` is alive in `group`, and null only when its flag is not passed.

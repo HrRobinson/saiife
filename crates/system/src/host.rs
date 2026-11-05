@@ -2512,29 +2512,18 @@ mod windows_tests {
         assert_eq!(again.get_sddl(&made).unwrap(), other);
     }
 
-    /// The folders above ours, in the letters Windows prints. From memory of the
-    /// defaults, not from a machine: `real_ancestors_pass_ancestor_ok` reads the real
-    /// ones in CI. A refusal here would stop install on every stock machine.
+    /// The folders above ours, as a real machine prints them
+    /// (`real_ancestors_pass_ancestor_ok` keeps reading them in CI). A refusal here would
+    /// stop install on every stock machine.
     #[test]
     fn ancestor_ok_reads_the_printed_letters() {
         use crate::winacl::{ancestor_ok, protected_ok};
-        use saiife_win::sddl::parse;
-        use saiife_win::sid::TRUSTED_INSTALLER as TI;
-        let program_data = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)\
-             (A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
-        let drive = "O:SYG:SYD:AI(A;OICIIO;SDGXGWGR;;;AU)(A;;LC;;;AU)(A;OICI;FA;;;SY)\
-             (A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
-        let program_files = format!(
-            "O:{TI}G:{TI}D:PAI(A;OICIIO;GA;;;CO)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;SY)\
-             (A;OICIIO;GA;;;BA)(A;;0x1301bf;;;BA)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)\
-             (A;CIIO;GA;;;{TI})(A;;FA;;;{TI})(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)\
-             (A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)"
-        );
-        for text in [program_data, drive, &program_files] {
+        use saiife_win::sddl::{parse, stock};
+        for text in [stock::PROGRAM_DATA, stock::DRIVE_ROOT, stock::PROGRAM_FILES] {
             ancestor_ok(&parse(text).unwrap()).unwrap_or_else(|e| panic!("{text}: {e}"));
         }
         // Users may create entries there, so it is no fit for a path of ours.
-        assert!(protected_ok(&parse(program_data).unwrap(), &[]).is_err());
+        assert!(protected_ok(&parse(stock::PROGRAM_DATA).unwrap(), &[]).is_err());
         // What may not pass, in the same letters.
         for rights in ["DT", "SD", "WD", "WO", "GA", "GW"] {
             let text = format!("O:SYG:SYD:P(A;;FA;;;SY)(A;;{rights};;;BU)");

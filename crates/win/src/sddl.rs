@@ -74,6 +74,36 @@ pub const SID_ALIASES: &[(&str, &str)] = &[
     ("AA", "S-1-5-32-579"),
 ];
 
+/// The SDDL alias of this machine's built-in Administrator (RID 500), as Windows
+/// prints it for that account. Its SID needs the machine's domain SID, which the text
+/// does not hold, so [`parse`] keeps the alias as the name of the principal. That
+/// account is always in `Administrators`, so [`writers`] reports it as that group.
+pub const LOCAL_ADMIN: &str = "LA";
+
+/// Descriptors of the folders above saiife's tree, as a stock `windows-latest` runner
+/// printed them through `acl::get_sddl` (CI run 41998930399, `real_folders_parse`).
+/// Tests read these, not a memory of what Windows ships.
+pub mod stock {
+    /// `C:\`.
+    pub const DRIVE_ROOT: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+         G:SYD:AI(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-\
+         4239452838-1296943325-355587736-700089176)(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)\
+         (A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+    /// `C:\ProgramData`.
+    pub const PROGRAM_DATA: &str = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\
+         (A;OICIIO;GA;;;CO)(A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
+    /// `C:\Program Files`.
+    pub const PROGRAM_FILES: &str = WINDOWS;
+    /// `C:\Windows`, the same text as `C:\Program Files` on the runner.
+    pub const WINDOWS: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+         G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+         D:PAI(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)\
+         (A;CIIO;GA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)\
+         (A;;0x1301bf;;;SY)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;BA)(A;OICIIO;GA;;;BA)\
+         (A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)(A;OICIIO;GA;;;CO)(A;;0x1200a9;;;AC)\
+         (A;OICIIO;GXGR;;;AC)(A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)";
+}
+
 /// Every rights letter pair [`parse`] reads, with its bits (`ADS_RIGHT_*` for the
 /// first nine). They are named after directory-service rights, but Windows prints
 /// file rights with the same letters, and on a file the names mislead: read them by
@@ -132,8 +162,11 @@ pub const WRITE_LIKE: u32 = 0x0000_0002 // FILE_WRITE_DATA
 /// - the `TP` and `CR` ACE flags, and every ACE type but `A` and `D`;
 /// - the registry rights `KA`, `KR`, `KW`, `KX` and the label rights `NR`, `NW`,
 ///   `NX`: not file rights;
-/// - domain-relative aliases such as `LA` and `DU`, and integrity labels such
+/// - domain-relative aliases such as `LG` and `DU`, and integrity labels such
 ///   as `ME`: their SID is not known from the text alone.
+///
+/// [`LOCAL_ADMIN`] is the one domain-relative alias read, because real output carries
+/// it. It stays `LA` in [`Sd`], where every other principal is a SID.
 pub fn parse(s: &str) -> Result<Sd, String> {
     if !s.is_ascii() {
         return Err("SDDL is not ASCII".to_string());
@@ -266,7 +299,7 @@ fn parse_sid(text: &str) -> Result<String, String> {
     if let Some((_, sid)) = SID_ALIASES.iter().find(|(alias, _)| *alias == text) {
         return Ok((*sid).to_string());
     }
-    if sid::valid_sid(text) {
+    if text == LOCAL_ADMIN || sid::valid_sid(text) {
         return Ok(text.to_string());
     }
     Err(format!("unknown SID or alias {text:?}"))
@@ -286,7 +319,23 @@ pub fn check_settable(s: &str) -> Result<Sd, String> {
     Ok(sd)
 }
 
-/// Canonical text: hex rights and full SIDs. `D:` is always there, and the
+/// Whether a descriptor may be set on an open file with these `dwFileAttributes` and
+/// `nNumberOfLinks`, read from the handle about to be changed. A descriptor belongs to
+/// the file, not to a name, so setting one through a hard link rewrites the target's
+/// too, and whoever planted the link chose that target. A directory cannot be
+/// hard-linked. The count must be 1 exactly: anything else is not a file we understand.
+pub fn check_links(attributes: u32, links: u32) -> Result<(), String> {
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 || links == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "has {links} hard links, and its descriptor would change for every one of them"
+    ))
+}
+
+/// Canonical text: hex rights and full SIDs, or [`LOCAL_ADMIN`] for that account.
+/// `D:` is always there, and the
 /// `AI` and `AR` flags are not, since [`Sd`] does not keep them. So
 /// `parse(render(x)) == x`.
 pub fn render(sd: &Sd) -> String {
@@ -321,7 +370,8 @@ pub fn render(sd: &Sd) -> String {
 
 /// The SIDs an allow ACE grants any [`WRITE_LIKE`] bit, inherit-only ACEs
 /// aside. Deny ACEs are not subtracted: an allow is enough to fail, which errs
-/// on the safe side.
+/// on the safe side. [`LOCAL_ADMIN`] is reported as `Administrators`, the group it
+/// cannot leave.
 ///
 /// This covers DACL ACEs only. The owner holds implicit `WRITE_DAC` unless an
 /// `OW` ACE limits it, so callers must check the owner separately.
@@ -329,7 +379,13 @@ pub fn writers(sd: &Sd) -> BTreeSet<String> {
     sd.aces
         .iter()
         .filter(|a| a.allow && !a.flags.inherit_only && a.mask & WRITE_LIKE != 0)
-        .map(|a| a.sid.clone())
+        .map(|a| {
+            if a.sid == LOCAL_ADMIN {
+                sid::ADMINISTRATORS.to_string()
+            } else {
+                a.sid.clone()
+            }
+        })
         .collect()
 }
 
@@ -460,27 +516,18 @@ mod tests {
         assert_eq!(sole_ace("D:(A;CI;DCLCRPCR;;;BU)").mask, 0x116);
     }
 
-    /// These shapes come from memory of default Windows ACLs, not from a machine.
-    /// The Windows CI test `real_folders_parse` reads the real ones.
+    /// The real folders, whose owner and grants these tests read as Windows prints them.
     #[test]
-    fn default_folder_shapes_parse() {
+    fn stock_descriptors_parse() {
         let ti = crate::sid::TRUSTED_INSTALLER;
-        for s in [
-            // C:\
-            "O:SYG:SYD:AI(A;OICIIO;SDGXGWGR;;;AU)(A;;LC;;;AU)(A;OICI;FA;;;SY)\
-             (A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
-            // C:\ProgramData
-            "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)\
-             (A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)",
-            // C:\Program Files and C:\Windows
-            &format!(
-                "O:{ti}G:{ti}D:PAI(A;OICIIO;GA;;;CO)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;SY)\
-                 (A;OICIIO;GA;;;BA)(A;;0x1301bf;;;BA)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)\
-                 (A;CIIO;GA;;;{ti})(A;;FA;;;{ti})(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)\
-                 (A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)"
-            ),
+        for (s, owner) in [
+            (stock::DRIVE_ROOT, ti),
+            (stock::PROGRAM_DATA, SYSTEM),
+            (stock::PROGRAM_FILES, ti),
+            (stock::WINDOWS, ti),
         ] {
-            parse(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            let sd = parse(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(sd.owner.as_deref(), Some(owner), "{s}");
         }
     }
 
@@ -609,7 +656,7 @@ mod tests {
             // SIDs.
             "D:(A;;FA;;;)",
             "D:(A;;FA;;;sy)",
-            "D:(A;;FA;;;LA)",
+            "D:(A;;FA;;;LG)",
             "D:(A;;FA;;;DU)",
             "D:(A;;FA;;;ME)",
             "D:(A;;FA;;;S-1-5)",
@@ -617,6 +664,50 @@ mod tests {
             "D:(A;;FA;;;S:1)",
         ] {
             assert!(parse(s).is_err(), "{s:?} parsed as {:?}", parse(s));
+        }
+    }
+
+    /// Windows prints the machine's built-in Administrator (RID 500) as `LA`, and the
+    /// SID behind it needs the machine's domain SID. So it stays a name.
+    #[test]
+    fn la_stays_a_name_and_counts_as_admin() {
+        let sd = parse("O:LAG:LAD:PAI(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)").unwrap();
+        assert_eq!(sd.owner.as_deref(), Some(LOCAL_ADMIN));
+        assert_eq!(sd.group.as_deref(), Some(LOCAL_ADMIN));
+        assert_eq!(sd.aces[0].sid, LOCAL_ADMIN);
+        assert_eq!(parse(&render(&sd)).unwrap(), sd);
+        assert_eq!(
+            writers(&sd),
+            BTreeSet::from([ADMINISTRATORS.to_string(), SYSTEM.to_string()])
+        );
+        // A read grant to it writes nothing.
+        assert!(writers(&parse("D:(A;;0x1200a9;;;LA)").unwrap()).is_empty());
+    }
+
+    /// The other domain-relative aliases stay refused, the Guest account first.
+    #[test]
+    fn la_opens_no_other_domain_relative_alias() {
+        for alias in ["LG", "DA", "DU", "DG", "DC", "la", "La", "LAX"] {
+            assert!(parse(&format!("O:{alias}D:")).is_err(), "{alias}");
+            assert!(parse(&format!("D:(A;;FA;;;{alias})")).is_err(), "{alias}");
+        }
+    }
+
+    /// A descriptor set through one name of a hard-linked file changes all of them, and
+    /// the other name may be a file the setter must not touch.
+    #[test]
+    fn check_links_refuses_a_hard_linked_file() {
+        const DIRECTORY: u32 = 0x10;
+        const ARCHIVE: u32 = 0x20;
+        check_links(ARCHIVE, 1).unwrap();
+        for links in [0, 2, 3, u32::MAX] {
+            let e = check_links(ARCHIVE, links).unwrap_err();
+            assert!(e.contains("hard link"), "{e}");
+        }
+        // A directory has no hard links to refuse, whatever the count says.
+        for links in [0, 1, 2] {
+            check_links(DIRECTORY, links).unwrap();
+            check_links(DIRECTORY | ARCHIVE, links).unwrap();
         }
     }
 
