@@ -11,9 +11,12 @@ use super::{
     argv_net_add_member, argv_net_create_group, argv_net_delete_group, argv_net_remove_member,
     argv_sc_paramchange, argv_sc_sdset, check_exit, exec, parse_win_build, windows_only, CmdOutput,
     Hold, Host, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT, REG_NT_CURRENT_VERSION,
+    SC_EXE,
 };
 use crate::layout::WIN_SERVICE;
-use crate::winservice::{ServiceOp, ServiceSpec, ServiceState, SidType, StartKind};
+use crate::winservice::{
+    parse_command_line, FailurePolicy, ServiceOp, ServiceSpec, ServiceState, SidType, StartKind,
+};
 use saiife_ipc::client::Client;
 use saiife_win::ffi::{account, acl, token};
 use saiife_win::pipe::peer_facts;
@@ -201,6 +204,75 @@ fn stop(wait: Duration) -> io::Result<ServiceState> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// What the service manager's failure actions say, as W10 writes them. Anything else, a
+/// mix of actions say, reads as no restarts at all, which doctor reports.
+fn failure_policy(service: &Service) -> io::Result<FailurePolicy> {
+    let actions = service.get_failure_actions().map_err(scm_error)?;
+    let list = actions.actions.unwrap_or_default();
+    let restart = |a: &ServiceAction| a.action_type == ServiceActionType::Restart;
+    let same = list.first().map(|a| a.delay);
+    let uniform = list.iter().all(|a| restart(a) && Some(a.delay) == same);
+    Ok(FailurePolicy {
+        restart_delay: same.unwrap_or_default(),
+        restarts: if uniform { list.len() as u32 } else { 0 },
+        reset_after: match actions.reset_period {
+            ServiceFailureResetPeriod::After(d) => d,
+            ServiceFailureResetPeriod::Never => Duration::ZERO,
+        },
+        on_non_crash: service
+            .get_failure_actions_on_non_crash_failures()
+            .map_err(scm_error)?,
+    })
+}
+
+/// `sc.exe sdshow saiifed`: W10 grants Authenticated Users `RC`, so a plain shell may
+/// ask. An exit code is all that is read of a failure: its text is localized.
+fn sdshow() -> io::Result<String> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    let out = exec(SC_EXE, &["sdshow", WIN_SERVICE], None, ADMIN_TIMEOUT)?;
+    match out.status {
+        0 => Ok(out.stdout.trim().to_string()),
+        ERROR_ACCESS_DENIED => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        code => Err(io::Error::other(format!(
+            "{SC_EXE} sdshow {WIN_SERVICE} exited {code}"
+        ))),
+    }
+}
+
+fn live_spec() -> io::Result<Option<ServiceSpec>> {
+    let service = match open(ServiceAccess::QUERY_CONFIG) {
+        Ok(s) => s,
+        Err(e) if is_missing(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let config = service.query_config().map_err(scm_error)?;
+    let (binary, args) = parse_command_line(&config.executable_path.to_string_lossy());
+    Ok(Some(ServiceSpec {
+        name: WIN_SERVICE.to_string(),
+        display: config.display_name.to_string_lossy().into_owned(),
+        binary,
+        args,
+        account: config
+            .account_name
+            .map(|a| a.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        start: match config.start_type {
+            ServiceStartType::AutoStart => StartKind::Auto,
+            ServiceStartType::OnDemand => StartKind::Manual,
+            // Boot and system start are for drivers: neither is W10's, and the compare
+            // needs only that this differs.
+            _ => StartKind::Disabled,
+        },
+        sid_type: match service.get_config_service_sid_info().map_err(scm_error)? {
+            ServiceSidType::None => SidType::None,
+            ServiceSidType::Unrestricted => SidType::Unrestricted,
+            ServiceSidType::Restricted => SidType::Restricted,
+        },
+        failure: failure_policy(&service)?,
+        sddl: sdshow()?,
+    }))
 }
 
 impl Host for RealHost {
@@ -430,6 +502,25 @@ impl Host for RealHost {
 
     fn wait_for_pipe(&self, wait: Duration) -> io::Result<()> {
         connect_pipe(Instant::now() + wait).map(|_| ())
+    }
+
+    fn service_spec(&self) -> io::Result<Option<ServiceSpec>> {
+        live_spec()
+    }
+
+    fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
+        account::local_groups_of(user)
+    }
+
+    fn daemon_status(
+        &self,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        use saiife_ipc::msg::OP_STATUS;
+        let deadline = Instant::now() + wait;
+        connect_pipe(deadline)?
+            .call(OP_STATUS, serde_json::Map::new(), deadline)
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
 

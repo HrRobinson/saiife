@@ -137,6 +137,21 @@ impl ServiceSpec {
     }
 }
 
+/// A service's command line, as the service manager gives it back, in the binary and its
+/// arguments. The binary may be quoted. An argument is split at spaces and not unquoted,
+/// since W10's have neither: a command line that has them must read as different.
+pub fn parse_command_line(line: &str) -> (PathBuf, Vec<String>) {
+    let line = line.trim();
+    let (binary, rest) = match line.strip_prefix('"').and_then(|l| l.split_once('"')) {
+        Some(quoted) => quoted,
+        None => line.split_once(' ').unwrap_or((line, "")),
+    };
+    (
+        PathBuf::from(binary),
+        rest.split_whitespace().map(str::to_string).collect(),
+    )
+}
+
 /// One operation on the service, as a service host performs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceOp {
@@ -230,6 +245,30 @@ mod tests {
         assert_eq!(sd.aces[1].mask, 0x000f_01ff);
         assert_eq!(sd.aces[2].mask, 0x0002_018d);
         assert_eq!(sd.aces[4].mask, 0x0002_008d);
+    }
+
+    #[test]
+    fn command_line_reads_back_in_every_form() {
+        let want = (
+            PathBuf::from(r"C:\ProgramData\saiife\bin\saiife.exe"),
+            vec!["daemon".to_string(), "--system".to_string()],
+        );
+        for line in [
+            r"C:\ProgramData\saiife\bin\saiife.exe daemon --system",
+            r#""C:\ProgramData\saiife\bin\saiife.exe" daemon --system"#,
+        ] {
+            assert_eq!(parse_command_line(line), want, "{line}");
+        }
+        // An unquoted path with a space is a different binary, which is what Windows
+        // would try to run first.
+        assert_eq!(
+            parse_command_line(r"C:\Program Files\x.exe daemon").0,
+            PathBuf::from(r"C:\Program")
+        );
+        assert_ne!(
+            parse_command_line(r#"C:\ProgramData\saiife\bin\saiife.exe daemon "--system""#).1,
+            want.1
+        );
     }
 
     #[test]

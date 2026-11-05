@@ -1,8 +1,14 @@
 //! The system checks of `saiife doctor`: supported system, install record,
 //! config, root-owned paths, installed files, owners and modes, the audit
 //! key, the daemon, lock labels, MCP servers and host facts. Each check id
-//! is fixed; fleet tools match on it.
+//! is fixed; fleet tools match on it. Linux and macOS: a Windows layout goes to
+//! [`super::windows`] instead, where `Layout::at` has no run dir, unit or credstore.
 
+use super::common::{
+    agent_label, allow_server_warnings, cloud_sts, config_valid, entry_fingerprint, health_check,
+    install_record, mcp_restrictions, HEALTH_TITLE, NOT_INSTALLED,
+};
+pub use super::common::{unpinned_saiife, SAIIFE_LISTED_UNPINNED};
 use super::report::{Check, Status};
 use super::Ctx;
 use crate::host::SECURITY;
@@ -10,18 +16,14 @@ use crate::install::MACOS_TOOL_TIMEOUT;
 use crate::launchd;
 use crate::layout::*;
 use crate::supported::{check_supported, Support};
-use saiife_agents::lock::{label_for, LockLabel, LockPlatform};
-use saiife_agents::Agent;
 use saiife_audit::sign::{judge, Kind};
 use saiife_policy::installed::{FileKind, Installed, VaultKeyMode};
-use saiife_policy::system::WINDOWS_SOCKET_DIR;
 use sha2::{Digest, Sha256};
 use std::fs::{self, Metadata};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-const NOT_INSTALLED: &str = "locked mode is not installed: developer mode checks only";
 const NOT_CHECKED: &str = "not checked (run as root)";
 /// Largest file `files.installed` fingerprints (16 MiB), the binary
 /// excepted ([`MAX_BINARY`]).
@@ -68,25 +70,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         }
         out.extend(i.agents.iter().map(|a| agent_label(ctx, &a.agent)));
     }
-    if let Ok(p) = &ctx.config {
-        // A listed `saiife` changes nothing on Claude Code (pinned by
-        // command there). On Codex and Gemini CLI it allows any server a
-        // project or user config registers under that name.
-        let unpinned = ctx
-            .installed
-            .as_ref()
-            .is_some_and(|i| i.agents.iter().any(|a| unpinned_saiife(&a.agent)));
-        out.extend(p.config.guard.mcp.allow_servers.iter().filter_map(|s| {
-            let title = if s != "saiife" {
-                format!("MCP server {s} bypasses saiife: its requests are not brokered or limited")
-            } else if unpinned {
-                SAIIFE_LISTED_UNPINNED.to_string()
-            } else {
-                return None;
-            };
-            Some(Check::new(format!("mcp.{s}"), Status::Warn, title, ""))
-        }));
-    }
+    out.extend(allow_server_warnings(ctx));
     out.extend(mcp_checks(ctx));
     if let Ok(p) = &ctx.config {
         out.extend(cloud_sts(&p.config));
@@ -101,7 +85,7 @@ pub fn checks(ctx: &Ctx) -> Vec<Check> {
         "forwarding",
         Status::Info,
         "audit forwarding",
-        forwarding_detail(&ctx.config),
+        super::common::forwarding_detail(&ctx.config),
     ));
     out
 }
@@ -180,15 +164,6 @@ fn sip_check(enabled: bool, seam: bool) -> Check {
     }
 }
 
-/// The lock-label platform of the layout being checked.
-fn lock_platform(ctx: &Ctx) -> LockPlatform {
-    match ctx.layout.platform() {
-        Platform::Linux => LockPlatform::Linux,
-        Platform::Macos => LockPlatform::Macos,
-        Platform::Windows => LockPlatform::Windows,
-    }
-}
-
 /// Whether this layout is macOS's.
 fn mac(ctx: &Ctx) -> bool {
     ctx.layout.platform() == Platform::Macos
@@ -197,68 +172,6 @@ fn mac(ctx: &Ctx) -> bool {
 /// A path constant as this platform names it.
 fn shown<'a>(ctx: &Ctx, c: &'a str) -> &'a str {
     ctx.layout.logical(c)
-}
-
-/// One `warn` per service in STS mode (plan 15): `run --cloud` hands a
-/// short-lived AWS credential to agent-controlled code, which can copy it.
-/// With any, one `info` notes how far `run_allow` is checked.
-fn cloud_sts(config: &saiife_policy::SystemConfig) -> Vec<Check> {
-    use saiife_policy::CloudMode;
-    let mut out: Vec<Check> = config
-        .services
-        .iter()
-        .filter(|(_, s)| s.mode == CloudMode::Sts)
-        .map(|(name, _)| {
-            Check::new(
-                format!("cloud_sts.{name}"),
-                Status::Warn,
-                format!(
-                    "service {name} is in STS mode: run --cloud hands a 15-minute AWS credential to agent-controlled code, which can copy it"
-                ),
-                "",
-            )
-        })
-        .collect();
-    if !out.is_empty() {
-        out.push(Check::new(
-            "cloud_sts.run_allow",
-            Status::Info,
-            "STS run_allow entries are checked by basename only",
-            "a symlink to an interpreter is not caught at config time; run --cloud checks the resolved path at runtime",
-        ));
-    }
-    out
-}
-
-/// The `[audit.forward.*]` targets of the system config, by name and
-/// type. Their live state (`connected`, `failing`, ...) is in the audit
-/// log as `forward` records, not here: doctor does not ask the targets.
-fn forwarding_detail(config: &Result<saiife_policy::LoadedPolicy, String>) -> String {
-    use saiife_policy::ForwardCfg;
-    let Ok(p) = config else {
-        return "unknown: the system config does not load".into();
-    };
-    let targets = &p.config.audit.forward;
-    if targets.is_empty() {
-        return "not configured".into();
-    }
-    let names: Vec<String> = targets
-        .iter()
-        .map(|(name, t)| {
-            let kind = match t {
-                ForwardCfg::Syslog { .. } => "syslog",
-                ForwardCfg::File { .. } => "file",
-                ForwardCfg::Https { .. } => "https",
-            };
-            format!("{name} ({kind})")
-        })
-        .collect();
-    let s = if names.len() == 1 { "" } else { "s" };
-    format!(
-        "{} target{s}: {}; their state is in the audit log (forward records)",
-        names.len(),
-        names.join(", ")
-    )
 }
 
 // ------------------------------------------------------------ helpers
@@ -336,13 +249,6 @@ fn socket_dir(ctx: &Ctx) -> (String, PathBuf) {
             let v = &p.config.daemon.socket_dir;
             (v.display().to_string(), configured(ctx, v, RUN_DIR))
         }
-        // No run dir on Windows, and `at` panics on one. Task 8 owns these checks there.
-        Err(_) if ctx.layout.platform() == Platform::Windows => (
-            WINDOWS_SOCKET_DIR.to_string(),
-            ctx.layout
-                .try_at(Path::new(WINDOWS_SOCKET_DIR))
-                .unwrap_or_default(),
-        ),
         Err(_) => (shown(ctx, RUN_DIR).to_string(), ctx.layout.at(RUN_DIR)),
     }
 }
@@ -402,34 +308,6 @@ fn supported(ctx: &Ctx) -> Check {
     }
 }
 
-fn install_record(ctx: &Ctx) -> Check {
-    const TITLE: &str = "install record";
-    match (&ctx.installed, &ctx.installed_error) {
-        (_, Some(e)) => Check::new("install.record", Status::Fail, TITLE, e.clone()),
-        (Some(i), None) => Check::new(
-            "install.record",
-            Status::Pass,
-            TITLE,
-            format!("saiife {}, installed {}", i.saiife, i.installed_at),
-        ),
-        (None, None) => Check::new("install.record", Status::Info, TITLE, NOT_INSTALLED),
-    }
-}
-
-fn config_valid(ctx: &Ctx) -> Check {
-    const TITLE: &str = "system config";
-    match &ctx.config {
-        Ok(p) if p.warnings.is_empty() => Check::new("config.valid", Status::Pass, TITLE, ""),
-        Ok(p) => Check::new("config.valid", Status::Warn, TITLE, p.warnings.join("; ")),
-        Err(e) => Check::new(
-            "config.valid",
-            Status::Fail,
-            TITLE,
-            format!("{e}. Every managed hook call is denied, and nothing is recorded"),
-        ),
-    }
-}
-
 /// §5.6 item 2: every directory from `/` down to the binary, and the
 /// `/etc/saiife` files, owned by root and not writable by group or others.
 fn paths_owner(ctx: &Ctx) -> Check {
@@ -475,10 +353,7 @@ fn paths_owner(ctx: &Ctx) -> Check {
         Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
     }
     paths.push(fixed(INSTALLED));
-    // No credstore on Windows, and `at` panics on one.
-    if ctx.layout.platform() != Platform::Windows {
-        paths.push(fixed(CREDSTORE));
-    }
+    paths.push(fixed(CREDSTORE));
     for (shown, at) in &paths {
         let Stat::Found(m) = lstat(ctx, shown, at, &mut t) else {
             // A missing path is reported by the checks that need it.
@@ -557,17 +432,6 @@ fn verify_file(ctx: &Ctx, listed: &Path, want: Option<&str>, max: u64, t: &mut T
         Err(e) if e.kind() == io::ErrorKind::InvalidData => t.bad(format!("{shown}: {e}")),
         Err(e) => t.bad(format!("{shown}: cannot read: {e}")),
     }
-}
-
-/// The fingerprint of saiife's entry in a shared managed file (Codex,
-/// Gemini CLI; §8.3), as `system install` recorded it.
-fn entry_fingerprint(agent: &str, file: &Path) -> Result<Option<String>, String> {
-    let r = match agent {
-        "codex" => saiife_agents::codex::managed_entry(file),
-        "gemini" => saiife_agents::gemini::managed_entry(file),
-        other => return Err(format!("unknown managed agent {other:?}")),
-    };
-    r.map_err(|e| e.to_string())
 }
 
 /// The installed binary must be the static release build (spec §9.2 A4): a
@@ -990,10 +854,7 @@ fn files_modes(ctx: &Ctx) -> Check {
             VaultKeyMode::DaemonFile => want(vault, l(VAULT_KEY), daemon, 0o400, Ty::File, false),
         });
     }
-    // No unit file on Windows, and `at` panics on one.
-    if ctx.layout.platform() != Platform::Windows {
-        wants.push(want(sh(UNIT), l(UNIT), root, 0o644, Ty::File, false));
-    }
+    wants.push(want(sh(UNIT), l(UNIT), root, 0o644, Ty::File, false));
 
     for w in &wants {
         let m = match lstat(ctx, &w.shown, &w.at, &mut t) {
@@ -1248,10 +1109,9 @@ fn launchd_unit(ctx: &Ctx) -> Check {
 fn daemon_health(ctx: &Ctx) -> Check {
     use saiife_ipc::client::Client;
     use saiife_ipc::msg::OP_STATUS;
-    use serde_json::{Map, Value};
+    use serde_json::Map;
     use std::time::{Duration, Instant};
-    const TITLE: &str = "daemon health";
-    let fail = |d: String| Check::new("daemon.health", Status::Fail, TITLE, d);
+    let fail = |d: String| Check::new("daemon.health", Status::Fail, HEALTH_TITLE, d);
     let user = match &ctx.config {
         Ok(p) => p.config.daemon.user.clone(),
         Err(_) => ctx.layout.daemon_user().to_string(),
@@ -1263,29 +1123,7 @@ fn daemon_health(ctx: &Ctx) -> Check {
     let deadline = Instant::now() + Duration::from_secs(2);
     let status = Client::connect(&dir, uid, deadline)
         .and_then(|mut c| c.call(OP_STATUS, Map::new(), deadline));
-    let m = match status {
-        Ok(m) => m,
-        Err(e) => return fail(e.to_string()),
-    };
-    if m.get("policy_ok").and_then(Value::as_bool) != Some(true) {
-        return fail("policy not loaded: connector calls are denied".into());
-    }
-    let show = |k: &str| match m.get(k) {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Null) | None => "none".to_string(),
-        Some(v) => v.to_string(),
-    };
-    Check::new(
-        "daemon.health",
-        Status::Pass,
-        TITLE,
-        format!(
-            "chain {}, head seq {}, last checkpoint seq {}",
-            show("chain"),
-            show("head_seq"),
-            show("last_checkpoint_seq")
-        ),
-    )
+    health_check(status.map_err(|e| e.to_string()))
 }
 
 // ------------------------------------------------------------ MCP gateway
@@ -1345,17 +1183,6 @@ fn daemon_mcp_status(ctx: &Ctx) -> McpStatus {
         Some(Value::Array(a)) => a.clone(),
         _ => Vec::new(),
     })
-}
-
-/// The warning for `saiife` in `[guard.mcp] allow_servers` while an agent
-/// that does not pin its command (Codex, Gemini CLI) is installed: there
-/// the listing allows any server registered under that name.
-pub const SAIIFE_LISTED_UNPINNED: &str = "MCP server saiife is listed: on Codex and Gemini CLI any server named saiife is allowed, and nothing pins its command";
-
-/// Whether `agent` may run any MCP server named `saiife` (nothing pins its
-/// command): every agent but Claude Code, whose managed drop-in pins it.
-pub fn unpinned_saiife(agent: &str) -> bool {
-    agent != "claude"
 }
 
 fn mcp_checks(ctx: &Ctx) -> Vec<Check> {
@@ -1419,34 +1246,7 @@ fn mcp_checks_with(ctx: &Ctx, status: &McpStatus, abi: u32) -> Vec<Check> {
         }
     }
     if let Some(i) = &ctx.installed {
-        let saiife_listed = ctx.config.as_ref().is_ok_and(|p| {
-            p.config
-                .guard
-                .mcp
-                .allow_servers
-                .iter()
-                .any(|s| s == "saiife")
-        });
-        let saiife = if saiife_listed {
-            "the saiife server is not brokered here (nothing pins its command); it is in [guard.mcp] allow_servers, so its calls are allowed by name; nothing checks which program serves them"
-        } else {
-            "the saiife server is not brokered here (nothing pins its command); its tools are denied unless [guard.mcp] allow_servers lists \"saiife\""
-        };
-        for a in &i.agents {
-            if matches!(a.agent.as_str(), "codex" | "gemini") {
-                if let Some(ag) = Agent::from_name(&a.agent) {
-                    out.push(Check::new(
-                        format!("mcp.{}.restriction", a.agent),
-                        Status::Info,
-                        format!(
-                            "MCP servers for {} are restricted by the hook only",
-                            ag.label()
-                        ),
-                        saiife,
-                    ));
-                }
-            }
-        }
+        out.extend(mcp_restrictions(ctx, i));
         if i.agents.iter().any(|a| a.agent == "claude") {
             out.push(claude_allowlist(ctx, i));
         }
@@ -1594,30 +1394,6 @@ fn claude_allowlist(ctx: &Ctx, i: &Installed) -> Check {
     )
 }
 
-/// The label recorded for the layout's platform (the host's, outside
-/// tests), so a macOS tree checked from Linux reads as a Mac reads it.
-fn agent_label(ctx: &Ctx, name: &str) -> Check {
-    let id = format!("agents.{name}.label");
-    match Agent::from_name(name) {
-        Some(a) => {
-            let l = label_for(a, lock_platform(ctx));
-            let title = format!("{} lock label", a.label());
-            let status = if l == LockLabel::Lockable {
-                Status::Pass
-            } else {
-                Status::Warn
-            };
-            Check::new(id, status, title, l.wording())
-        }
-        None => Check::new(
-            id,
-            Status::Warn,
-            format!("{name} lock label"),
-            "unknown agent",
-        ),
-    }
-}
-
 /// `SO_PEERPIDFD` arrived in Linux 6.5.
 pub(crate) fn pidfd_release(release: &str) -> bool {
     let mut parts = release.split(['.', '-']);
@@ -1672,7 +1448,7 @@ mod tests {
             fs::write(&cfg, text).unwrap();
             saiife_policy::load_system(&cfg).map_err(|e| e.to_string())
         };
-        let detail = |text: &str| super::forwarding_detail(&load(text));
+        let detail = |text: &str| super::super::common::forwarding_detail(&load(text));
         assert_eq!(detail("version = 2\n"), "not configured");
         assert_eq!(
             detail(
@@ -1681,7 +1457,7 @@ mod tests {
             ),
             "2 targets: copy (file), siem (https); their state is in the audit log (forward records)"
         );
-        assert!(super::forwarding_detail(&Err("bad".into())).starts_with("unknown"));
+        assert!(super::super::common::forwarding_detail(&Err("bad".into())).starts_with("unknown"));
     }
 
     struct T {

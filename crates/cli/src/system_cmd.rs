@@ -9,7 +9,6 @@ use clap::Subcommand;
 use saiife_agents::Agent;
 #[cfg(unix)]
 use saiife_policy::Getent;
-#[cfg(unix)]
 use saiife_system::doctor::{self, DoctorOptions};
 use saiife_system::fleet::fleet_options;
 use saiife_system::install::{
@@ -124,15 +123,19 @@ fn report_untouched(e: InstallError) -> ExitCode {
 /// `doctor` after a successful install (spec §7): its text on stdout.
 /// Returns that text, and true when it found a failure (the caller exits 1;
 /// the install itself stays done; install errors are exit 2).
-#[cfg(unix)]
 fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
-    let opts = DoctorOptions {
-        user: None,
-        home: std::env::var_os("HOME")
+    #[cfg(unix)]
+    let (dir, home) = (
+        Getent,
+        std::env::var_os("HOME")
             .map(PathBuf::from)
             .filter(|h| h.is_absolute()),
-    };
-    let report = doctor::run(layout, host, &Getent, &opts);
+    );
+    // The profile comes from the registry by SID: the environment is the caller's.
+    #[cfg(windows)]
+    let (dir, home) = (saiife_policy::WinDirectory::system(), None);
+    let opts = DoctorOptions { user: None, home };
+    let report = doctor::run(layout, host, &dir, &opts);
     let text = report.to_text();
     outln!();
     out!("{text}");
@@ -144,12 +147,6 @@ fn after_install_doctor(layout: &Layout, host: &dyn Host) -> (String, bool) {
     } else {
         (text, false)
     }
-}
-
-/// `doctor` does not exist on Windows until plan 19b Task 8, which replaces this.
-#[cfg(not(unix))]
-fn after_install_doctor(_layout: &Layout, _host: &dyn Host) -> (String, bool) {
-    (String::new(), false)
 }
 
 /// The command an admin runs to restart the daemon on `platform`.

@@ -88,7 +88,6 @@ fn locked_commands_refuse_on_windows() {
         &["approve", "1"],
         &["reject", "1"],
         &["approvals"],
-        &["doctor"],
         &["audit", "--broker"],
         &["audit", "verify", "--broker"],
     ];
@@ -135,6 +134,14 @@ fn ported_commands_no_longer_refuse() {
         .assert()
         .code(2)
         .stderr(contains("takes no --config"))
+        .stderr(contains(REFUSAL).not());
+    // Doctor on the runner, which has no install: developer mode, and no refusal.
+    saiife(home.path())
+        .args(["doctor", "--json"])
+        .assert()
+        .code(0)
+        .stdout(contains("\"saiife_doctor\": 1"))
+        .stdout(contains("install.record"))
         .stderr(contains(REFUSAL).not());
 }
 

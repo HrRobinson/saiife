@@ -36,7 +36,7 @@ mod check;
 mod check_managed;
 mod collection;
 mod connect_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod doctor_cmd;
 #[cfg(any(unix, windows))]
 mod env_cmd;
@@ -415,13 +415,12 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         .then_some(NOT_YET),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
-        // Doctor and approvals.
-        Cmd::Doctor { .. } | Cmd::Approvals { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } => {
-            Some(NOT_YET)
-        }
+        // Approvals.
+        Cmd::Approvals { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } => Some(NOT_YET),
         // No wildcard: a new subcommand must be put on one side or the other here, or this
         // does not compile.
         Cmd::System { .. }
+        | Cmd::Doctor { .. }
         | Cmd::Check { .. }
         | Cmd::Eval
         | Cmd::Secret { .. }
@@ -656,7 +655,7 @@ fn main() -> ExitCode {
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Cmd::Doctor { user, json, root } = cli.command {
         return doctor_cmd::run(user, json, root);
     }

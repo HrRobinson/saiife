@@ -13,8 +13,8 @@
 //! - `install_win`: `system install` and `system uninstall` on Windows, behind `Host`,
 //!   on every OS, so Linux tests drive them.
 //!
-//! On Windows `fsops`, `doctor`, `polkit` and `testing` do not exist yet: they still use
-//! Unix owners, modes or rustix, until the rest of plan 19b.
+//! On Windows `fsops`, `polkit` and `testing` do not exist: they use Unix owners, modes or
+//! rustix. `doctor` does, with its Windows checks only.
 //!
 //! No tokio: the CLI links this crate.
 
@@ -23,7 +23,7 @@
 pub mod authright;
 pub mod binary;
 pub mod default_config;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod doctor;
 pub mod fleet;
 #[cfg(unix)]

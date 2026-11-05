@@ -40,6 +40,9 @@ pub const SECURITY: &str = "/usr/bin/security";
 // Windows (plan 19b). `exec` runs them by this path, never through `PATH`.
 pub const NET_EXE: &str = r"C:\Windows\System32\net.exe";
 pub const SC_EXE: &str = r"C:\Windows\System32\sc.exe";
+/// Windows PowerShell, which ships with every supported build. Doctor asks it for a
+/// binary's Authenticode status.
+pub const POWERSHELL_EXE: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 /// The registry key of `CurrentBuildNumber` and `InstallationType`, below HKLM.
 pub const REG_NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
@@ -48,7 +51,7 @@ pub const REG_NT_CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\Current
 pub const MACOS_ID_RANGE: RangeInclusive<u32> = 200..=400;
 
 /// Every program locked mode runs on Windows.
-pub const WIN_PROGRAMS: &[&str] = &[NET_EXE, SC_EXE];
+pub const WIN_PROGRAMS: &[&str] = &[NET_EXE, SC_EXE, POWERSHELL_EXE];
 
 /// Every program locked mode runs (plan 9b global constraints), always by
 /// absolute path.
@@ -265,6 +268,27 @@ pub trait Host: Send + Sync {
     fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy;
     /// Windows: connects to the daemon's pipe, checking its owner, within `wait`.
     fn wait_for_pipe(&self, wait: Duration) -> io::Result<()>;
+    /// Windows: the service `saiifed` as the service manager has it now, so doctor can
+    /// compare it with W10. `Ok(None)` when it does not exist. Its `sddl` is what
+    /// `sc.exe sdshow` prints, which may hold a SACL.
+    fn service_spec(&self) -> io::Result<Option<crate::winservice::ServiceSpec>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: the local groups `user` is in, nested ones included. Names only, and
+    /// they are localized, so compare the SIDs [`Host::lookup_sid`] gives for them.
+    fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
+        let _ = user;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    /// Windows: the daemon's answer to `status` over its pipe, whose owner is checked,
+    /// within `wait`.
+    fn daemon_status(
+        &self,
+        wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        let _ = wait;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
     /// Renames a file. Its descriptor goes with it, which the fake must be told.
     fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
@@ -1697,6 +1721,16 @@ pub struct FakeState {
     pub pipe_error: Option<String>,
     /// `service` answers `Stop` with a timeout, and the service keeps running.
     pub service_will_not_stop: bool,
+    /// What `local_groups_of` answers, by user (default: no groups).
+    pub local_groups: BTreeMap<String, Vec<String>>,
+    /// When set, `local_groups_of` fails with this error.
+    pub local_groups_error: Option<String>,
+    /// What `daemon_status` answers; `None` is a daemon that does not answer.
+    pub daemon_status: Option<serde_json::Map<String, serde_json::Value>>,
+    /// When set, `service_spec` fails with this error.
+    pub service_spec_error: Option<String>,
+    /// Paths whose `get_sddl` is access denied, as a plain user's is on `state`.
+    pub sddl_denied: Vec<PathBuf>,
 }
 
 /// JSON maps need string keys, so the registry is saved as a list.
@@ -1778,6 +1812,11 @@ impl Default for FakeState {
             not_local_groups: Vec::new(),
             pipe_error: None,
             service_will_not_stop: false,
+            local_groups: BTreeMap::new(),
+            local_groups_error: None,
+            daemon_status: None,
+            service_spec_error: None,
+            sddl_denied: Vec::new(),
         }
     }
 }
@@ -2399,6 +2438,9 @@ impl Host for FakeHost {
         }
         self.update(|s| {
             s.calls.push(format!("get_sddl {}", path.display()));
+            if s.sddl_denied.iter().any(|p| p == path) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
             s.sddl
                 .get(path)
                 .cloned()
@@ -2607,6 +2649,31 @@ impl Host for FakeHost {
                 None => Ok(()),
             }
         })
+    }
+
+    fn service_spec(&self) -> io::Result<Option<ServiceSpec>> {
+        let s = self.state();
+        match s.service_spec_error {
+            Some(e) => Err(io::Error::other(e)),
+            None => Ok(s.services.get(crate::layout::WIN_SERVICE).cloned()),
+        }
+    }
+
+    fn local_groups_of(&self, user: &str) -> io::Result<Vec<String>> {
+        let s = self.state();
+        match s.local_groups_error {
+            Some(e) => Err(io::Error::other(e)),
+            None => Ok(s.local_groups.get(user).cloned().unwrap_or_default()),
+        }
+    }
+
+    fn daemon_status(
+        &self,
+        _wait: Duration,
+    ) -> io::Result<serde_json::Map<String, serde_json::Value>> {
+        self.state()
+            .daemon_status
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "the daemon did not answer"))
     }
 }
 
