@@ -23,8 +23,6 @@ use saiife_policy::{load_system, parse_project, Directory, SystemConfig};
 use serde_json::json;
 use toml_edit::{value, DocumentMut};
 
-#[cfg(not(unix))]
-use crate::audit_locked::{locked_audit_dir, SYSTEM_CONFIG};
 use crate::text::sanitize;
 
 #[derive(Subcommand)]
@@ -82,7 +80,8 @@ fn locked_flag(config: PathBuf) -> Result<Place, String> {
     Ok(Place::Locked(config))
 }
 
-#[cfg(unix)]
+/// A system file on a tree that isn't ours is left out by the resolver, on Windows, with
+/// its warning; a damaged one is its error.
 fn resolve_default() -> Result<Place, String> {
     use crate::broker::{self, Target};
     Ok(match broker::resolve_here(None)? {
@@ -91,31 +90,6 @@ fn resolve_default() -> Result<Place, String> {
             system: config.is_file().then_some(config),
         },
     })
-}
-
-/// The personal broker's config is not read here yet: the system config, as locked mode
-/// when it says so, else the developer-mode definitions. What Windows' DACL check says comes
-/// first: on a tree that is not ours the file was perhaps planted, so it defines nothing;
-/// on our tree one that fails is an error.
-#[cfg(not(unix))]
-fn resolve_default() -> Result<Place, String> {
-    use saiife_system::wintrust::Trust;
-    let config = PathBuf::from(SYSTEM_CONFIG);
-    match crate::win_locked::system_file_trust(&config) {
-        Trust::Absent | Trust::Trusted => {}
-        Trust::NotOurs(why) => {
-            let line = crate::win_locked::not_protected(&config, &why);
-            crate::warn(&format!("{}; ignored", sanitize(&line)));
-            return Ok(Place::Developer { system: None });
-        }
-        Trust::Damaged(why) => return Err(crate::win_locked::not_protected(&config, &why)),
-    }
-    match locked_audit_dir(&config)? {
-        Some(_) => Ok(Place::Locked(config)),
-        None => Ok(Place::Developer {
-            system: config.is_file().then_some(config),
-        }),
-    }
 }
 
 pub fn run(system_config: Option<PathBuf>, action: EnvAction) -> ExitCode {

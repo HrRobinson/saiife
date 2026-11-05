@@ -140,7 +140,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
       - Install and doctor read it with `winreg`. With a `Settings` value present and no `"managedSourcesBehavior": "merge"` in it, `agents.claude.policy` **fails**: `HKLM\SOFTWARE\Policies\ClaudeCode sets Claude Code's managed settings, so saiife's drop-in is ignored; add "managedSourcesBehavior": "merge" there, or put saiife's hooks in it`. Install exits 1 with the same line.
       - The user-writable HKCU key is never consulted by Claude Code when an admin source exists, so it is not checked.
   25. **W25. The personal broker (`saiife daemon --user`) on Windows:**
-      - The state dir is `%LOCALAPPDATA%\saiife\personal`. The control pipe is `\\.\pipe\saiife-user-<SID>`, owned by the user's SID, with a DACL for that SID and SYSTEM only. The client checks that the owner is its own SID.
+      - The state dir is `%LOCALAPPDATA%\saiife\personal`. The control pipe is `\\.\pipe\saiife-user-<SID>`, owned by the user's SID, with a DACL for that SID only (ruling: `personal_sddl` stays user-only). The client checks that the owner is its own SID.
       - The gateway is TCP plus the token only (W13).
       - The vault key is a Credential Manager generic credential: target `saiife:vault-key`, persist `CRED_PERSIST_LOCAL_MACHINE` (never roaming), blob 32 bytes, through `CredReadW`, `CredWriteW` and `CredDeleteW`.
       - Autostart is the value `saiife-broker` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, set to `"<exe>" daemon --user`, written by `saiife daemon --user --autostart on`.

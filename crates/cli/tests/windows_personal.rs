@@ -421,11 +421,51 @@ fn personal_refused_as_locked_config() {
 fn personal_refused_on_locked_host() {
     let b = TestBroker::prepare("lockedhost");
     fs::write(b.locked_marker(), "installed = true\n").unwrap();
-    let o = b.run_to_exit(b.command());
+    let mut cmd = b.command();
+    cmd.env("SAIIFE_TEST_TRUST_SID", me())
+        .env("SAIIFE_TEST_TRUST_BELOW", b.top.parent().unwrap());
+    let o = b.run_to_exit(cmd);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
     assert!(err(&o).contains("locked mode"), "{}", err(&o));
     // Refused before the keychain was opened, which would have made its dir.
     assert!(!b.keychain_dir().exists());
+}
+
+/// No install, and anyone can make the path: a planted marker keeps no one's broker down.
+#[test]
+fn a_planted_marker_stops_no_broker() {
+    let b = TestBroker::prepare("plantedmark");
+    fs::write(b.locked_marker(), "installed = true\n").unwrap();
+    let mut b = b;
+    b.spawn_and_wait();
+    assert!(
+        b.stderr_text().contains("not protected"),
+        "{}",
+        b.stderr_text()
+    );
+}
+
+/// `saiife env` on a developer's host reads the broker's config, which defines the
+/// environments, as on Unix.
+#[test]
+fn env_reads_the_brokers_config() {
+    let b = TestBroker::prepare("envconfig");
+    b.write_config("version = 2\n[environments.staging]\n");
+    let o = b.cli(&["env", "list"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("staging"), "{said}");
+}
+
+/// `audit --broker` and `audit verify --broker` read the broker's own log, labelled.
+#[test]
+fn audit_broker_reads_the_brokers_log() {
+    let b = TestBroker::start("auditbroker");
+    let o = b.cli(&["audit", "verify", "--broker"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("not a security boundary"), "{said}");
+    let o = b.cli(&["audit", "--broker"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
 }
 
 #[test]

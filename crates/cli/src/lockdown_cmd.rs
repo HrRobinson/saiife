@@ -53,8 +53,8 @@ pub fn run(config: Option<PathBuf>, action: Option<LockdownAction>) -> ExitCode 
     // decides without it and refuses a same-user change (fail closed). On
     // macOS same-user re-authentication is off: nothing is prepared, the
     // daemon still decides (root and `[admin]` pass, an approver is
-    // refused), and the CLI says so first. Windows sends nothing either: W16's password
-    // belongs to approvals, and the daemon refuses a same-user change without it.
+    // refused), and the CLI says so first. Windows sends nothing either: same-user
+    // approval is off there (W16), and the daemon refuses such a change.
     #[cfg(unix)]
     let reauth = |args: &mut Map<String, Value>, what: &str| {
         let mac = cfg!(target_os = "macos");

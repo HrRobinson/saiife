@@ -30,11 +30,12 @@ fn broker_audit_dir() -> Result<PathBuf, String> {
     saiife_system::personal::personal_paths(&env, home.as_deref()).map(|p| p.audit_dir)
 }
 
-/// The personal broker is Linux and macOS only (plan 16); `main` refuses
-/// `--broker` on Windows first, this is the typed refusal behind it.
+/// Windows: below `%LOCALAPPDATA%\\saiife\\personal`, as `saiife daemon --user` finds it (W25).
 #[cfg(not(unix))]
 fn broker_audit_dir() -> Result<PathBuf, String> {
-    Err("the personal broker is not available on Windows".to_string())
+    let home = saiife_win::profile::home_dir();
+    saiife_system::personal::personal_paths(&|k| std::env::var_os(k), home.as_deref())
+        .map(|p| p.audit_dir)
 }
 
 /// `text` with every `audit chain` line labelled [`BROKER_LABEL`].

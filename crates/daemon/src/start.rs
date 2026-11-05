@@ -393,6 +393,32 @@ fn personal_pipe_spec(test_pipe: Option<&str>, own_sid: &str) -> Result<(String,
     Ok((name, saiife_win::pipe::personal_sddl(own_sid)))
 }
 
+/// What the locked-host marker says of a personal broker. Anyone may create the path on a
+/// machine with no install, so a file on a tree that isn't ours marks nothing: it must not
+/// keep another user's broker from starting while the CLI, which ignores it too, tells them
+/// to start one. On our tree, trusted or damaged, this is a locked host.
+#[cfg(any(windows, test))]
+pub(crate) fn locked_marker_problem(
+    trust: saiife_system::wintrust::Trust,
+    marker: &Path,
+) -> Result<(), String> {
+    use saiife_system::wintrust::Trust;
+    match trust {
+        Trust::Absent => Ok(()),
+        Trust::NotOurs(why) => {
+            eprintln!(
+                "saiife: warning: {} ignored: not protected as a system file ({why})",
+                marker.display()
+            );
+            Ok(())
+        }
+        Trust::Trusted | Trust::Damaged(_) => Err(format!(
+            "this host is in locked mode ({} exists): connectors go through the system daemon, not daemon --user",
+            marker.display()
+        )),
+    }
+}
+
 /// See [`crate::personal_preflight`]. Windows: the locked-host marker and a locked config;
 /// who this process is, is [`personal_start_problem`]'s, read from the token.
 #[cfg(windows)]
@@ -401,13 +427,17 @@ pub(crate) fn personal_preflight(
     _socket_dir: &Path,
     locked_marker: &Path,
 ) -> Result<(), String> {
-    // Decision 10: a locked host wins.
-    if std::fs::symlink_metadata(locked_marker).is_ok() {
-        return Err(format!(
-            "this host is in locked mode ({} exists): connectors go through the system daemon, not daemon --user",
-            locked_marker.display()
-        ));
-    }
+    use saiife_system::host::RealHost;
+    use saiife_system::wintrust::{service_registered, system_file, test_trust_sid};
+    // Decision 10: a locked host wins, when it is one.
+    let trust = system_file(
+        &saiife_system::Layout::system(),
+        locked_marker,
+        &|p| saiife_win::ffi::acl::get_sddl(p),
+        test_trust_sid().as_deref(),
+        &|| service_registered(&RealHost),
+    );
+    locked_marker_problem(trust, locked_marker)?;
     if bootstrap(config).locked == Some(true) {
         return Err(format!(
             "{}: locked = true is a locked-mode config; the personal broker does not serve it",
@@ -2118,6 +2148,22 @@ mod windows_start_tests {
         assert!(windows_start_problem(RUNNER, true, false).is_some());
         // A non-elevated user is still not the service.
         assert!(windows_start_problem(RUNNER, false, false).is_some());
+    }
+
+    #[test]
+    fn a_planted_marker_stops_no_broker() {
+        use saiife_system::wintrust::Trust;
+        let m = Path::new("installed.toml");
+        assert_eq!(locked_marker_problem(Trust::Absent, m), Ok(()));
+        assert_eq!(
+            locked_marker_problem(Trust::NotOurs("owned by me".into()), m),
+            Ok(())
+        );
+        for t in [Trust::Trusted, Trust::Damaged("loose".into())] {
+            assert!(locked_marker_problem(t, m)
+                .unwrap_err()
+                .contains("locked mode"));
+        }
     }
 
     #[test]

@@ -409,16 +409,13 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     const NOT_YET: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
-        // The personal broker's log: `audit_cmd::broker_audit_dir` has no Windows path yet.
-        Cmd::Audit { action, broker, .. } => (*broker
-            || matches!(action, Some(AuditAction::Verify { broker: true, .. })))
-        .then_some(NOT_YET),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
         // No wildcard: a new subcommand must be put on one side or the other here, or this
         // does not compile.
         Cmd::System { .. }
         | Cmd::Doctor { .. }
+        | Cmd::Audit { .. }
         | Cmd::Approvals { .. }
         | Cmd::Approve { .. }
         | Cmd::Reject { .. }
