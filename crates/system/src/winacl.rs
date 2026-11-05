@@ -227,11 +227,11 @@ mod tests {
     const S: &str = "S-1-5-80-1485410291-497971702-176010752-1662630379-411534723";
 
     /// `C:\ProgramData` as Microsoft Q&A question 1841814 prints it with
-    /// `icacls`, written as SDDL by hand (`WD,AD,WEA,WA` is `0x116`). `icacls`
-    /// does not show the owner; SYSTEM is assumed. Confirm against a real
-    /// machine in `locked-windows`.
+    /// `icacls`, written as SDDL by hand in the letters Windows prints
+    /// (`WD,AD,WEA,WA` is `DCLCRPCR`, 0x116). `icacls` does not show the owner;
+    /// SYSTEM is assumed. `real_ancestors_pass_ancestor_ok` reads the real one in CI.
     const PROGRAMDATA: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)\
-         (A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)";
+         (A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
 
     fn test_layout() -> (tempfile::TempDir, Layout) {
         let d = tempfile::tempdir().unwrap();
