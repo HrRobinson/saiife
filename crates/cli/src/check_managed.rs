@@ -364,7 +364,11 @@ mod imp {
         // 2. The system policy. Without it there is no daemon to tell.
         let cfg = match load_locked(config) {
             Ok(c) => c,
-            Err(e) => return blocked(&format!("saiife policy could not be loaded: {e}")),
+            Err(e) => {
+                let why = format!("saiife policy could not be loaded: {e}");
+                record_failed_load(agent, event, &input, &why);
+                return blocked(&why);
+            }
         };
         let Some(daemon_uid) = daemon_owner(&cfg) else {
             return blocked(&format!(
@@ -501,6 +505,61 @@ mod imp {
             }
             Outcome::Error(reason) => blocked(&reason),
         }
+    }
+
+    /// The record of a call denied because the system policy would not load.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn failed_load_record(
+        agent: &str,
+        event: Option<&str>,
+        input: &Result<String, String>,
+        why: &str,
+    ) -> Value {
+        let mut ctx = match input {
+            Ok(buf) => context_from_hook_json_bounded(buf, PARSE_MAX_BYTES),
+            Err(_) => HookContext::default(),
+        };
+        if event == Some(EVENT_CONFIG_CHANGE) {
+            ctx.tool = Some("ConfigChange".into());
+        }
+        let shown = input.as_deref().map(recorded_input).unwrap_or_default();
+        let judged = Judged::error(shown, why.to_string());
+        let mut rec = record(agent, &ctx, "unavailable", &judged);
+        if !fit(&mut rec) {
+            rec = minimal_record(agent, "unavailable");
+        }
+        rec
+    }
+
+    /// On Windows the control pipe and its owner come from the layout, never from the
+    /// config (W11), so a call denied over a config that fails its check can still reach
+    /// the audit log. The deny stands whether or not this gets through.
+    #[cfg(windows)]
+    fn record_failed_load(
+        agent: &str,
+        event: Option<&str>,
+        input: &Result<String, String>,
+        why: &str,
+    ) {
+        let connect = Instant::now() + CONNECT_TIMEOUT;
+        let Ok(mut client) = crate::broker::system_client(Path::new(""), 0, connect) else {
+            return;
+        };
+        if client.hello_answer().get("mode").and_then(Value::as_str) != Some("locked") {
+            return;
+        }
+        let rec = failed_load_record(agent, event, input, why);
+        let _ = append(&mut client, rec, Instant::now() + ACK_TIMEOUT);
+    }
+
+    /// Off Windows the socket's dir and owner are in the config that failed to load.
+    #[cfg(not(windows))]
+    fn record_failed_load(
+        _agent: &str,
+        _event: Option<&str>,
+        _input: &Result<String, String>,
+        _why: &str,
+    ) {
     }
 
     /// Steps 3 to 7: the project, the policy, the worker and the daemon
@@ -1363,6 +1422,27 @@ mod imp {
         use saiife_policy::{Directory, FixedDirectory};
 
         const PASSWD: &str = "alice:x:1000:1000::/h:/bin/sh\n";
+
+        #[test]
+        fn a_failed_load_is_recorded_as_error_denied() {
+            let payload = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+            let rec = failed_load_record(
+                "claude",
+                None,
+                &Ok(payload.to_string()),
+                "saiife policy could not be loaded: not protected",
+            );
+            assert_eq!(rec["decision"], "error_denied");
+            assert_eq!(rec["tool"], "Bash");
+            assert_eq!(rec["input"], "git status");
+            assert_eq!(rec["policy"], "unavailable");
+            assert!(rec["reason"].as_str().unwrap().contains("not protected"));
+
+            // No payload to read: still a record, with what is known.
+            let rec = failed_load_record("claude", None, &Err("too large".into()), "why");
+            assert_eq!(rec["decision"], "error_denied");
+            assert_eq!(rec["reason"], "why");
+        }
         const GROUP: &str = "alice:x:1000:\ndevs:x:2000:alice\n";
         const FILES: &str = "passwd: files\ngroup: files\n";
 

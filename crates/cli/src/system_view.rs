@@ -60,10 +60,22 @@ pub fn read(config: &Path) -> SystemView {
 /// - `installed.toml` that fails is ignored either way, with a warning: no agent is
 ///   managed, so the project hooks stay on.
 fn read_with(trust: &dyn Fn(&Path) -> Trust, config: &Path) -> SystemView {
+    read_on(trust, config, cfg!(windows))
+}
+
+/// [`read_with`] with the OS given. Any user may read the config on Windows, and so may
+/// hold it open with no sharing: a read that fails there says nothing about what the file
+/// holds, and must not open the hook. A file that is not ours stays ignored, so a planted
+/// and locked one cannot fail every other user's hook closed.
+fn read_on(trust: &dyn Fn(&Path) -> Trust, config: &Path, windows: bool) -> SystemView {
     let mut view = SystemView::default();
     match read_regular(config, false, MAX_BYTES) {
         Ok(None) => {}
-        Err(e) => view.warnings.push(ignored(config, &e)),
+        Err(e) => {
+            view.fail_closed =
+                windows && matches!(trust(config), Trust::Trusted | Trust::Damaged(_));
+            view.warnings.push(ignored(config, &e));
+        }
         Ok(Some(bytes)) => match trust(config) {
             Trust::NotOurs(why) => view.warnings.push(ignored(config, &unprotected(&why))),
             Trust::Damaged(why) => {
@@ -246,6 +258,28 @@ mod tests {
         std::fs::write(&c, "version = 2\nlocked = true\n").unwrap();
         let open = read_with(&|_: &Path| Trust::Trusted, &c);
         (open, read_with(trust, &c))
+    }
+
+    /// A file held open with no sharing reads as an error on Windows, and is no reason to
+    /// open the hook. A directory in its place makes the read fail the same way here.
+    #[test]
+    fn an_unreadable_config_fails_closed_on_windows_only() {
+        let d = tempfile::tempdir().unwrap();
+        let c = d.path().join("config.toml");
+        std::fs::create_dir(&c).unwrap();
+        let trust = |t: Trust| move |_: &Path| t.clone();
+
+        for t in [Trust::Trusted, Trust::Damaged("users may write".into())] {
+            let v = read_on(&trust(t), &c, true);
+            assert!(v.fail_closed);
+            assert!(!v.warnings.is_empty());
+        }
+        // Linux and macOS stay as they were, and nothing planted closes anyone's hook.
+        let v = read_on(&trust(Trust::Trusted), &c, false);
+        assert!(!v.fail_closed);
+        let v = read_on(&trust(Trust::NotOurs("planted".into())), &c, true);
+        assert!(!v.fail_closed);
+        assert!(!v.warnings.is_empty());
     }
 
     /// A planted `locked = true` on a tree that is not ours tightens nothing.

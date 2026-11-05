@@ -931,6 +931,18 @@ mod tests {
         }
     }
 
+    /// These names mean the same only on Windows: `run_allow` elsewhere is as it was.
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_interpreters_do_not_touch_a_posix_path() {
+        for name in ["py", "wsl", "dotnet", "msiexec", "conhost", "wmic", "javaw"] {
+            let path = format!("/usr/bin/{name}");
+            assert!(!is_interpreter(Path::new(&path)), "{path}");
+            let exe = format!("{name}.exe");
+            assert!(is_interpreter(Path::new(&exe)), "{exe}");
+        }
+    }
+
     #[test]
     fn run_allow_windows_refuses_interpreters() {
         for bad in [
@@ -942,6 +954,14 @@ mod tests {
             r"C:\Windows\System32\wscript.exe",
             r"C:\Windows\System32\rundll32.exe",
             r"C:\Program Files\nodejs\node.exe",
+            r"C:\Windows\py.exe",
+            r"C:\Windows\pyw.exe",
+            r"C:\Windows\System32\wsl.exe",
+            r"C:\Program Files\dotnet\dotnet.exe",
+            r"C:\Windows\System32\msiexec.exe",
+            r"C:\Windows\System32\conhost.exe",
+            r"C:\Windows\System32\wbem\WMIC.exe",
+            r"C:\Program Files\Java\jdk\bin\javaw.exe",
         ] {
             let list = [PathBuf::from(bad)];
             assert!(

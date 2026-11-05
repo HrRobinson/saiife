@@ -364,6 +364,14 @@ pub(crate) fn cloud_notice(service: &str, expires: &str) -> String {
     )
 }
 
+/// The command's exit code as this process can pass it on. Only 0 to 255 fit. A Windows
+/// crash is a large code such as `0xC0000005`, negative as an `i32`, and must never read
+/// as success.
+#[cfg(any(unix, windows))]
+fn exit_byte(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(1)
+}
+
 #[cfg(any(unix, windows))]
 mod linux {
     #[cfg(unix)]
@@ -568,7 +576,7 @@ mod linux {
         #[cfg(windows)]
         let signal: Option<i32> = None;
         Ok(match (status.code(), signal) {
-            (Some(c), _) => ExitCode::from(c.clamp(0, 255) as u8),
+            (Some(c), _) => ExitCode::from(super::exit_byte(c)),
             (None, Some(sig)) => ExitCode::from((128 + sig).clamp(0, 255) as u8),
             (None, None) => ExitCode::from(1),
         })
@@ -626,6 +634,17 @@ mod tests {
     use super::*;
     use saiife_broker::mask::Masker;
     use std::io::Read;
+
+    #[test]
+    fn a_crash_is_never_exit_zero() {
+        // STATUS_ACCESS_VIOLATION, as Windows reports it through an i32.
+        assert_eq!(exit_byte(0xC000_0005_u32 as i32), 1);
+        assert_eq!(exit_byte(-1), 1);
+        assert_eq!(exit_byte(256), 1);
+        assert_eq!(exit_byte(0), 0);
+        assert_eq!(exit_byte(7), 7);
+        assert_eq!(exit_byte(255), 255);
+    }
 
     /// Hands out `parts` one read at a time.
     struct Parts(std::collections::VecDeque<Vec<u8>>);

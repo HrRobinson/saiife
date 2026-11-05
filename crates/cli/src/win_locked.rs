@@ -20,6 +20,7 @@ pub(crate) fn system_file_trust(path: &Path) -> Trust {
             &path,
             &|p| saiife_win::ffi::acl::get_sddl(p),
             saiife_system::wintrust::test_trust_sid().as_deref(),
+            &|| saiife_system::wintrust::service_registered(&saiife_system::host::RealHost),
         )
     }
     #[cfg(not(windows))]

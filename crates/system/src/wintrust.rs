@@ -10,7 +10,7 @@
 //! who edits `config.toml` leaves it with inherited entries, which is safe, and doctor
 //! is what reports a descriptor that drifted.
 
-use crate::layout::{Layout, WIN_SERVICE};
+use crate::layout::{Layout, OPT_DIR, WIN_SERVICE};
 use crate::winacl::{ancestor_ok, expected, protected_ok, service_may_write};
 use saiife_win::sddl::{parse, Sd};
 use saiife_win::sid::{service_sid, ADMINISTRATORS};
@@ -29,13 +29,13 @@ pub enum Trust {
     /// Only the machine's admins (and the service, where the table says so) could have
     /// written it.
     Trusted,
-    /// The folders above it are not ours, so this is no install: someone may have
-    /// planted the file. It says nothing, and must neither switch a mode nor silence a
-    /// hook.
+    /// The folders above it are not ours and the machine has no service `saiifed`, so this
+    /// is no install: someone may have planted the file. It says nothing, and must neither
+    /// switch a mode nor silence a hook.
     NotOurs(String),
-    /// The folders above it are ours, so this is an install, and this file is open to
-    /// someone else or cannot be read. A locked host stays locked: this is an error, never
-    /// a fallback.
+    /// This is an install, and it has gone wrong: the folders above are ours and this file
+    /// is open to someone else or cannot be read, or the service exists and a folder has
+    /// drifted. A locked host stays locked: this is an error, never a fallback.
     Damaged(String),
 }
 
@@ -124,11 +124,14 @@ fn folders_problem(
 /// reparse point, so none can be anywhere in the chain of a file that is trusted.
 ///
 /// A missing file costs one failed call: only a file that exists has its folders read.
+/// `service_registered` says whether the machine has the service; only an admin can make
+/// that true, so a planted tree cannot.
 pub fn system_file(
     layout: &Layout,
     path: &Path,
     sddl_of: &dyn Fn(&Path) -> io::Result<String>,
     trust_sid: Option<&str>,
+    service_registered: &dyn Fn() -> bool,
 ) -> Trust {
     let text = match sddl_of(path) {
         Ok(t) => Ok(t),
@@ -136,6 +139,11 @@ pub fn system_file(
         Err(e) => Err(e.to_string()),
     };
     if let Some(why) = folders_problem(layout, path, sddl_of, trust_sid) {
+        // Only the install's own tree can be drifted: elsewhere the service proves nothing,
+        // and it is read only here, off the path of a file that passes.
+        if path.starts_with(layout.at(OPT_DIR)) && service_registered() {
+            return Trust::Damaged(why);
+        }
         return Trust::NotOurs(why);
     }
     let verdict = text
@@ -147,8 +155,8 @@ pub fn system_file(
     }
 }
 
-/// W19: `exe` must pass [`protected_ok`] with no writer beyond SYSTEM, Administrators and
-/// TrustedInstaller, and every folder above it [`ancestor_ok`]. `sddl_of` refuses a
+/// W19: `exe` and the folder that holds it must pass [`protected_ok`] with no writer beyond
+/// SYSTEM, Administrators and TrustedInstaller, and every folder above that [`ancestor_ok`]. `sddl_of` refuses a
 /// reparse point, so none can be anywhere in the chain. Runs where Linux runs
 /// `root_owned_chain`, and with no exception for any row of the table: the service may
 /// not write what it hands a secret to.
@@ -161,16 +169,37 @@ pub fn exe_chain(
     let text = sddl_of(exe).map_err(|e| shown(exe, &e))?;
     let sd = read_sd(&text, trust_sid).map_err(|e| shown(exe, &e))?;
     protected_ok(&sd, &[]).map_err(|e| shown(exe, &e))?;
-    for folder in exe
+    let folders = exe
         .ancestors()
         .skip(1)
-        .filter(|p| !p.as_os_str().is_empty())
-    {
+        .filter(|p| !p.as_os_str().is_empty());
+    for (i, folder) in folders.enumerate() {
         let text = sddl_of(folder).map_err(|e| shown(folder, &e))?;
         let sd = read_sd(&text, trust_sid).map_err(|e| shown(folder, &e))?;
-        ancestor_ok(&sd).map_err(|e| shown(folder, &e))?;
+        // The folder that holds the exe is where a DLL beside it would land, so it must let
+        // no one add an entry. A folder above may, as a stock `C:\ProgramData` does.
+        let verdict = if i == 0 {
+            protected_ok(&sd, &[])
+        } else {
+            ancestor_ok(&sd)
+        };
+        verdict.map_err(|e| shown(folder, &e))?;
     }
     Ok(())
+}
+
+/// The service's key below HKLM, and a value every service has.
+pub const REG_SERVICE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\saiifed";
+pub const REG_SERVICE_VALUE: &str = "ImagePath";
+
+/// Whether the machine has the service `saiifed`. Only an admin can register one, so this
+/// tells an install whose folders drifted from a tree someone planted. Any failure other
+/// than "not found" reads as registered, the side that stays locked.
+pub fn service_registered(host: &dyn crate::host::Host) -> bool {
+    !matches!(
+        host.reg_value_present(REG_SERVICE_KEY, REG_SERVICE_VALUE),
+        Ok(false)
+    )
 }
 
 /// `path` as a policy names it: `canonicalize` on Windows answers `\\?\C:\Tools\aws.exe`,
@@ -186,7 +215,7 @@ pub fn plain_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{Platform, CONFIG, ETC_DIR, INSTALLED, OPT_DIR};
+    use crate::layout::{Platform, CONFIG, ETC_DIR, INSTALLED};
     use crate::winacl::expected;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -200,6 +229,8 @@ mod tests {
         _dir: tempfile::TempDir,
         layout: Layout,
         sddl: BTreeMap<PathBuf, String>,
+        /// Whether the machine has the service.
+        service: fn() -> bool,
     }
 
     impl Tree {
@@ -223,6 +254,7 @@ mod tests {
                 _dir: dir,
                 layout,
                 sddl,
+                service: || false,
             }
         }
 
@@ -233,7 +265,13 @@ mod tests {
                     .cloned()
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
             };
-            system_file(&self.layout, &self.layout.at(what), &lookup, None)
+            system_file(
+                &self.layout,
+                &self.layout.at(what),
+                &lookup,
+                None,
+                &self.service,
+            )
         }
     }
 
@@ -254,6 +292,61 @@ mod tests {
         assert_eq!(t.check(CONFIG), Trust::Trusted);
     }
 
+    /// The service exists, so this is an install whose folder drifted (an admin's stray
+    /// entry), not somebody's planted tree. Only an admin can register a service.
+    #[test]
+    fn a_drifted_folder_with_the_service_is_damaged() {
+        let mut t = Tree::installed();
+        let mine = format!("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{ME})");
+        t.sddl.insert(t.layout.at(ETC_DIR), mine);
+        assert!(matches!(t.check(CONFIG), Trust::NotOurs(_)));
+        t.service = || true;
+        match t.check(CONFIG) {
+            Trust::Damaged(why) => assert!(why.contains(ME), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The service says something about the install's own tree and nowhere else: a config
+    /// the user keeps at `--system-config` below their profile stays not ours.
+    #[test]
+    fn the_service_vouches_for_no_other_tree() {
+        let t = Tree::installed();
+        let elsewhere = t.layout.root().join("elsewhere");
+        let file = elsewhere.join("config.toml");
+        let mine = format!("O:{ME}G:{ME}D:(A;OICI;FA;;;{ME})");
+        let lookup = |p: &Path| {
+            if p == file || p == elsewhere {
+                return Ok(mine.clone());
+            }
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        };
+        let got = system_file(&t.layout, &file, &lookup, None, &|| true);
+        assert!(matches!(got, Trust::NotOurs(_)), "{got:?}");
+    }
+
+    /// Only "the value is not there" says there is no service. A registry that cannot be
+    /// read proves nothing, so the hook, status and audit keep to the locked side.
+    #[test]
+    fn a_failed_service_read_counts_as_registered() {
+        use crate::host::{FakeHost, RegValue};
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::open(dir.path()).unwrap();
+        assert!(!service_registered(&host));
+        host.set(|s| {
+            s.registry.insert(
+                (REG_SERVICE_KEY.to_string(), REG_SERVICE_VALUE.to_string()),
+                RegValue::Str(r"C:\ProgramData\saiife\bin\saiife.exe".into()),
+            );
+        });
+        assert!(service_registered(&host));
+        host.set(|s| {
+            s.registry.clear();
+            s.reg_probe_error = Some("Access is denied.".into());
+        });
+        assert!(service_registered(&host));
+    }
+
     #[test]
     fn a_missing_file_is_absent_and_reads_no_folder() {
         let t = Tree::installed();
@@ -262,7 +355,7 @@ mod tests {
             reads.set(reads.get() + 1);
             Err(io::Error::from(io::ErrorKind::NotFound))
         };
-        let got = system_file(&t.layout, &t.layout.at(CONFIG), &lookup, None);
+        let got = system_file(&t.layout, &t.layout.at(CONFIG), &lookup, None, &|| false);
         assert_eq!(got, Trust::Absent);
         assert_eq!(reads.get(), 1);
     }
@@ -303,7 +396,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
         };
-        let got = system_file(&t.layout, &t.layout.at(CONFIG), &lookup, None);
+        let got = system_file(&t.layout, &t.layout.at(CONFIG), &lookup, None, &|| false);
         assert!(matches!(got, Trust::NotOurs(_)), "{got:?}");
     }
 
@@ -341,7 +434,7 @@ mod tests {
             Ok(t.sddl.get(p).cloned().unwrap_or_default())
         };
         assert!(matches!(
-            system_file(&t.layout, &config, &lookup, None),
+            system_file(&t.layout, &config, &lookup, None, &|| false),
             Trust::Damaged(_)
         ));
     }
@@ -360,15 +453,15 @@ mod tests {
         };
         let at = t.layout.at(CONFIG);
         assert!(matches!(
-            system_file(&t.layout, &at, &lookup, None),
+            system_file(&t.layout, &at, &lookup, None, &|| false),
             Trust::Damaged(_)
         ));
         assert_eq!(
-            system_file(&t.layout, &at, &lookup, Some(ME)),
+            system_file(&t.layout, &at, &lookup, Some(ME), &|| false),
             Trust::Trusted
         );
         assert!(matches!(
-            system_file(&t.layout, &at, &lookup, Some("S-1-5-21-9-9-9-9")),
+            system_file(&t.layout, &at, &lookup, Some("S-1-5-21-9-9-9-9"), &|| false),
             Trust::Damaged(_)
         ));
     }
@@ -408,6 +501,26 @@ mod tests {
         let user_owned = format!("O:{ME}G:SYD:PAI(A;;FA;;;SY)");
         let of = chain(&[("/d/aws.exe", &user_owned), ("/d", STOCK), ("/", STOCK)]);
         assert!(exe_chain(Path::new("/d/aws.exe"), &of, None).is_err());
+
+        // The folder that holds it must be as closed as the file. A stock `C:\ProgramData`
+        // passes as an ancestor, and Users could drop a DLL beside the exe in it.
+        let creatable = "O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x116;;;BU)";
+        let of = chain(&[
+            ("/d/t/aws.exe", SAFE_EXE),
+            ("/d/t", creatable),
+            ("/d", STOCK),
+            ("/", STOCK),
+        ]);
+        let e = exe_chain(Path::new("/d/t/aws.exe"), &of, None).unwrap_err();
+        assert!(e.starts_with("/d/t:"), "{e}");
+        // Above that folder, the same descriptor is what a stock machine has.
+        let of = chain(&[
+            ("/d/t/aws.exe", SAFE_EXE),
+            ("/d/t", STOCK),
+            ("/d", creatable),
+            ("/", STOCK),
+        ]);
+        assert_eq!(exe_chain(Path::new("/d/t/aws.exe"), &of, None), Ok(()));
 
         // A folder a user may replace things in.
         let user_dir = format!("O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;;0x10000;;;{ME})");

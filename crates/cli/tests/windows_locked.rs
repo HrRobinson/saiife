@@ -102,6 +102,8 @@ fn daemon(t: &Tree, home: &Path, pipe: &str) -> Daemon {
         .arg(t.state.join("keys"))
         .env("USERPROFILE", home)
         .env("SAIIFE_TEST_PIPE", pipe)
+        // `run_allow`'s chain check is in the daemon too, on the runner's own tree.
+        .env("SAIIFE_TEST_TRUST_SID", me())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -183,7 +185,8 @@ fn hook_home_is_not_the_agents() {
     });
     let mut c = client(home.path(), &pipe);
     hook(&mut c, &t.config, &payload.to_string());
-    c.assert().code(2);
+    // A rule's deny: a bare exit 2 passes on any error.
+    c.assert().code(2).stderr(contains("BLOCKED by"));
 }
 
 #[test]
@@ -290,9 +293,32 @@ fn clients_reach_the_daemon_through_the_pipe() {
     c.assert().code(0).stdout(contains("loaded"));
 }
 
-/// W19. With the seam the runner's tree passes the chain check on both sides, which leaves
-/// the daemon to refuse a secret it does not hold. With the seam naming someone else the
-/// runner's own files are refused before any daemon is asked.
+/// `policy reload` through `pipe`, so the daemon reads what the test wrote.
+fn reload(t: &Tree, home: &Path, pipe: &str) {
+    let mut c = client(home, pipe);
+    c.args(["policy", "--system-config"])
+        .arg(&t.config)
+        .arg("reload");
+    c.assert().code(0).stdout(contains("loaded"));
+}
+
+/// `secret.lease` as a client that skips the CLI's own check would send it. The message of
+/// the daemon's refusal.
+fn lease_refusal(pipe: &str, exe: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut c = saiife_ipc::client::Client::connect_pipe(pipe, &me(), deadline).unwrap();
+    let mut args = serde_json::Map::new();
+    args.insert("name".into(), "k".into());
+    args.insert("exe".into(), exe.display().to_string().into());
+    match c.call("secret.lease", args, deadline) {
+        Err(saiife_ipc::client::ClientError::Refused { message, .. }) => message,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// W19, under a config that passes its own check and a daemon that has read it. A tool only
+/// admins could change gets past both chain checks and stops at the missing secret. One
+/// that Users can write is refused by each of them on the chain, whatever the CLI skips.
 #[test]
 fn run_checks_the_chain_before_any_lease() {
     let t = tree();
@@ -300,33 +326,74 @@ fn run_checks_the_chain_before_any_lease() {
     let pipe = pipe_name("run");
     let _d = daemon(&t, home.path(), &pipe);
     let tool = t.top.join("tool.exe");
-    std::fs::copy(assert_cmd::cargo::cargo_bin("saiife"), &tool).unwrap();
+    let loose = t.top.join("loose.exe");
+    for exe in [&tool, &loose] {
+        std::fs::copy(assert_cmd::cargo::cargo_bin("saiife"), exe).unwrap();
+    }
+    let me = me();
+    acl::set_sddl(
+        &loose,
+        &format!("O:{me}G:{me}D:P(A;;FA;;;{me})(A;;FA;;;SY)(A;;FA;;;BU)"),
+    )
+    .unwrap();
+    let user = account::lookup_sid(&me).unwrap();
     let text = std::fs::read_to_string(&t.config).unwrap();
     std::fs::write(
         &t.config,
         format!(
-            "{text}[secrets.k]\nrun_allow = [{:?}]\n",
-            tool.display().to_string()
+            "{text}[[scope]]\nname = \"s\"\nusers = [{user:?}]\nservices = []\n\
+             [secrets.k]\nrun_allow = [{:?}, {:?}]\n",
+            tool.display().to_string(),
+            loose.display().to_string()
         ),
     )
     .unwrap();
+    reload(&t, home.path(), &pipe);
 
-    let run = |c: &mut Command| {
+    let run = |exe: &Path| {
+        let mut c = client(home.path(), &pipe);
         c.args(["run", "--secret", "k:TOK", "--system-config"])
             .arg(&t.config)
             .arg("--")
-            .arg(&tool)
+            .arg(exe)
             .arg("--version");
+        c.output().unwrap()
     };
-    let mut c = client(home.path(), &pipe);
-    run(&mut c);
-    let out = c.output().unwrap();
+
+    let out = run(&tool);
     let said = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(2), "{said}");
     assert!(!said.contains("not protected"), "{said}");
+    let said = lease_refusal(&pipe, &tool);
+    assert!(!said.contains("not protected"), "{said}");
+    assert!(!said.contains("no_scope"), "{said}");
+    assert!(!said.contains("run_not_allowed"), "{said}");
 
+    // The CLI's check, with the exe's name in it: the config passed.
+    let out = run(&loose);
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "{said}");
+    assert!(said.contains("loose.exe: not protected"), "{said}");
+    assert!(said.contains("S-1-5-32-545"), "{said}");
+    // The daemon's, for a client that never ran the CLI's.
+    let said = lease_refusal(&pipe, &loose);
+    assert!(said.contains("run_not_allowed"), "{said}");
+    assert!(said.contains("not protected"), "{said}");
+    assert!(said.contains("S-1-5-32-545"), "{said}");
+}
+
+/// The pipe doesn't depend on the config, so a call denied over a failed check is on record.
+#[test]
+fn a_failed_config_check_is_recorded() {
+    let t = tree();
+    let home = tempfile::tempdir().unwrap();
+    let pipe = pipe_name("record");
+    let _d = daemon(&t, home.path(), &pipe);
     let mut c = client(home.path(), &pipe);
-    c.env("SAIIFE_TEST_TRUST_SID", "S-1-5-21-9-9-9-9");
-    run(&mut c);
-    c.assert().code(5).stderr(contains("not protected"));
+    c.env_remove("SAIIFE_TEST_TRUST_SID");
+    hook(&mut c, &t.config, GIT_STATUS);
+    c.assert().code(2).stderr(contains("not protected"));
+    let text = audit_text(&t.audit);
+    assert!(text.contains("error_denied"), "{text}");
+    assert!(text.contains("not protected"), "{text}");
 }

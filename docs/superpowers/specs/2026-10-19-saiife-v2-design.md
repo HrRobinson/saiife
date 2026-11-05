@@ -1013,10 +1013,15 @@ docs.firegiant.com/wix/osmf/; docs.rs `windows-service` 0.8.1.
 - **`run --secret` and `run --cloud` (W19).**
   - A `run_allow` entry must be an absolute `X:\…\name.exe` path on a local
     fixed drive. UNC paths and relative paths are load errors.
-  - The file must pass `protected_ok` with writers limited to SYSTEM,
-    Administrators and TrustedInstaller. Every ancestor must pass
-    `ancestor_ok`. There may be no reparse point anywhere in the chain. This
-    check runs where the Linux `root_owned_chain` check runs.
+  - The file and the folder that holds it must pass `protected_ok` with
+    writers limited to SYSTEM, Administrators and TrustedInstaller. A stock
+    `C:\ProgramData` is not enough for that folder: Users could drop a DLL
+    beside the exe. Every ancestor above it must pass `ancestor_ok`. There may
+    be no reparse point anywhere in the chain. This check runs where the Linux
+    `root_owned_chain` check runs.
+  - The list of refused interpreters also holds `py`, `pyw`, `wsl`, `dotnet`,
+    `msiexec`, `conhost`, `wmic` and `javaw`. These count only for a `.exe` or
+    on Windows, so `run_allow` on Linux and macOS means what it did.
   - The loader-variable scrub gains `COR_ENABLE_PROFILING`, `COR_PROFILER`,
     `COR_PROFILER_PATH`, `COR_PROFILER_PATH_32`, `COR_PROFILER_PATH_64`,
     `CORECLR_ENABLE_PROFILING`, `CORECLR_PROFILER`, `CORECLR_PROFILER_PATH*`,
