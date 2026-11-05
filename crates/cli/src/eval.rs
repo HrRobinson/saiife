@@ -881,7 +881,16 @@ pub fn fault() -> String {
 /// `parent_hang` and `watchdog_spawn` are the parent's).
 #[cfg(debug_assertions)]
 fn fault_seam() {
-    match fault().as_str() {
+    let fault = fault();
+    // A deliberate crash must not leave a core dump: the owner's crash
+    // reporter would file every test run. Not dumpable still dies by the
+    // same signal. Failure is harmless.
+    #[cfg(target_os = "linux")]
+    if matches!(fault.as_str(), "abort" | "segv" | "overflow") {
+        let _ =
+            rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    }
+    match fault.as_str() {
         "abort" => std::process::abort(),
         #[cfg(unix)]
         "segv" => {
