@@ -562,9 +562,10 @@ mod tests {
     #[test]
     fn a_planted_installed_toml_cannot_silence_init_on_windows() {
         let root = tempfile::tempdir().unwrap();
-        let etc = root.path().join("etc/saiife");
-        std::fs::create_dir_all(&etc).unwrap();
-        std::fs::write(etc.join("installed.toml"), "not toml [").unwrap();
+        // The layout's own spelling: a test on Windows has the Windows tree.
+        let installed = saiife_system::Layout::under(root.path()).at(super::INSTALLED);
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "not toml [").unwrap();
         assert!(locked_mode_on(false, Some(root.path().into())).is_some());
         assert_eq!(locked_mode_on(true, Some(root.path().into())), None);
     }

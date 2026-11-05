@@ -8,8 +8,10 @@
 //! - `supported`: which systems locked mode supports (§0 decision 8);
 //! - `unit`: the systemd unit text (§5.4.1).
 //!
-//! On Windows `layout`, `supported`, `binary` and `winservice` exist: every other
-//! module uses Unix owners, modes or rustix, and locked mode on Windows
+//! - `winacl`: the Windows ACL table (§5.3a.3), pure, on every OS.
+//!
+//! On Windows `layout`, `supported`, `binary`, `winservice` and `winacl` exist:
+//! every other module uses Unix owners, modes or rustix, and locked mode on Windows
 //! arrives in plan 19b.
 //!
 //! No tokio: the CLI links this crate.
@@ -48,6 +50,7 @@ pub mod testing;
 pub mod uninstall;
 pub mod unit;
 pub mod user_unit;
+pub mod winacl;
 pub mod winservice;
 
 #[cfg(unix)]

@@ -65,12 +65,35 @@ pub struct DaemonCfg {
     pub socket_dir: PathBuf,
 }
 
+/// The daemon's account on Windows (§5.3a, W10). `saiife_system::layout`,
+/// which this crate cannot depend on, checks it against `WIN_DAEMON_ACCOUNT`.
+pub const WINDOWS_DAEMON_USER: &str = r"NT SERVICE\saiifed";
+/// `[daemon] socket_dir` on Windows. Nothing listens here (the endpoint is a
+/// pipe, W11); the name stays bound inside the protected tree, so `core.lock`'s
+/// `$SAIIFE_RUN` rules still have a value.
+pub const WINDOWS_SOCKET_DIR: &str = r"C:\ProgramData\saiife\run";
+/// `[audit] dir` on Windows (W9).
+pub const WINDOWS_AUDIT_DIR: &str = r"C:\ProgramData\saiife\log\audit";
+
+impl DaemonCfg {
+    /// The defaults on Windows, whatever OS this runs on.
+    pub fn windows_default() -> Self {
+        DaemonCfg {
+            user: WINDOWS_DAEMON_USER.to_string(),
+            socket_dir: PathBuf::from(WINDOWS_SOCKET_DIR),
+        }
+    }
+}
+
 impl Default for DaemonCfg {
     /// The §5.2 values; on macOS the §5.3 ones (`_saiife`, and the socket
-    /// dir `/var/db/saiife-run`, plan 13 decision 2). Kept in step with
-    /// `saiife_system::layout` (`MACOS_DAEMON_USER`, `RUN_DIR`), which this
-    /// crate cannot depend on.
+    /// dir `/var/db/saiife-run`, plan 13 decision 2); on Windows the §5.3a
+    /// ones. Kept in step with `saiife_system::layout` (`MACOS_DAEMON_USER`,
+    /// `RUN_DIR`), which this crate cannot depend on.
     fn default() -> Self {
+        if cfg!(windows) {
+            return DaemonCfg::windows_default();
+        }
         let (user, socket_dir) = if cfg!(target_os = "macos") {
             ("_saiife", "/var/db/saiife-run")
         } else {
@@ -133,7 +156,13 @@ pub struct AuditCfg {
 impl Default for AuditCfg {
     fn default() -> Self {
         AuditCfg {
-            dir: PathBuf::from("/var/log/saiife/audit"),
+            // On Windows `\var\log` would be on the current drive, in a dir
+            // any user could have created first.
+            dir: PathBuf::from(if cfg!(windows) {
+                WINDOWS_AUDIT_DIR
+            } else {
+                "/var/log/saiife/audit"
+            }),
             retention_months: 24,
             checkpoint_every: 1000,
             checkpoint_interval: Duration::from_secs(15 * 60),
@@ -679,7 +708,20 @@ mod tests {
         assert_eq!(d.socket_dir, PathBuf::from("/var/db/saiife-run"));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn daemon_cfg_default_windows() {
+        let d = DaemonCfg::windows_default();
+        assert_eq!(d.user, r"NT SERVICE\saiifed");
+        assert_eq!(d.socket_dir, PathBuf::from(r"C:\ProgramData\saiife\run"));
+        assert_eq!(WINDOWS_AUDIT_DIR, r"C:\ProgramData\saiife\log\audit");
+        #[cfg(windows)]
+        {
+            assert_eq!(DaemonCfg::default(), d);
+            assert_eq!(AuditCfg::default().dir, PathBuf::from(WINDOWS_AUDIT_DIR));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn daemon_cfg_default_linux() {
         let d = DaemonCfg::default();

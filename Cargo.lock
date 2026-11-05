@@ -1609,6 +1609,7 @@ dependencies = [
  "saiife-audit",
  "saiife-ipc",
  "saiife-policy",
+ "saiife-win",
  "serde",
  "serde_json",
  "sha2",
