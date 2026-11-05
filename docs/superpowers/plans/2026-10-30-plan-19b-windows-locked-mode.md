@@ -297,7 +297,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
 **Interfaces:**
 - Consumes `token::facts_of`, `sd::from_sddl` (Task 2) and `sid::{service_sid, uid_of}`.
 - Produces, in `saiife_win::ffi::pipe`:
-  - `create_server(name: &str, sddl: &str, first: bool) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer>` (feature `pipe-server`). It sets `first_pipe_instance(first)`, `reject_remote_clients(true)`, `max_instances(64)` and byte mode;
+  - `create_server(name: &str, sddl: &str, first: bool) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer>` (feature `pipe-server`). It sets `first_pipe_instance(first)`, `reject_remote_clients(true)`, `max_instances(254)` and byte mode;
   - `client_facts(pipe: &impl AsRawHandle) -> io::Result<PipeClient>`, where `PipeClient { facts: TokenFacts, pid: u32 }`. It is synchronous and impersonates, reads and reverts in one call (W11). A failing `RevertToSelf` aborts the process;
   - `owner_sid(handle: &impl AsRawHandle) -> io::Result<String>`.
 - Produces, in `saiife-ipc`:
