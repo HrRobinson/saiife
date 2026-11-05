@@ -2339,7 +2339,7 @@ impl Host for FakeHost {
     }
 
     fn service(&self, op: ServiceOp) -> io::Result<ServiceState> {
-        use crate::winservice::WIN_SERVICE;
+        use crate::layout::WIN_SERVICE;
         self.update(|s| {
             s.calls.push(match &op {
                 ServiceOp::Query => "service query".to_string(),
@@ -2548,7 +2548,7 @@ mod windows_tests {
         }
         for argv in [
             argv_net_create_group("g").unwrap(),
-            argv_sc_sdset("saiifed", crate::winservice::WIN_SERVICE_SDDL).unwrap(),
+            argv_sc_sdset("saiifed", crate::layout::WIN_SERVICE_SDDL).unwrap(),
             argv_sc_paramchange("saiifed").unwrap(),
         ] {
             assert!(WIN_PROGRAMS.contains(&argv[0].as_str()), "{argv:?}");

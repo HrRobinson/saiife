@@ -12,7 +12,8 @@ use super::{
     argv_sc_paramchange, argv_sc_sdset, check_exit, exec, parse_win_build, windows_only, CmdOutput,
     Host, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT, REG_NT_CURRENT_VERSION,
 };
-use crate::winservice::{ServiceOp, ServiceSpec, ServiceState, SidType, StartKind, WIN_SERVICE};
+use crate::layout::WIN_SERVICE;
+use crate::winservice::{ServiceOp, ServiceSpec, ServiceState, SidType, StartKind};
 use saiife_win::ffi::{account, acl, token};
 use saiife_win::sid::uid_of;
 use std::ffi::OsString;
