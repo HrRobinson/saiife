@@ -96,7 +96,7 @@ pub async fn connection(mut s: UnixStream, ctx: Arc<Ctx>) {
     // approval's re-authentication names this process, and polkit and the
     // daemon check it was not replaced by another with the same pid.
     let conn = ops::Conn::new(
-        peer,
+        peer.clone(),
         crate::reauth::start_time_of(ctx.proc.as_ref(), peer.pid),
     );
     let mut greeted = false;

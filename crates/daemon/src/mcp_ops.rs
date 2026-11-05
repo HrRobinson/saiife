@@ -899,7 +899,7 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Err(m) => return bad(id, m),
     };
     let tools = Arc::clone(&ctx.tool_caller);
-    match execute(ctx, tools.as_ref(), &Caller::Unix(*peer), call).await {
+    match execute(ctx, tools.as_ref(), &Caller::Unix(peer.clone()), call).await {
         Ok(outcome) => answer(id, outcome),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
         Err(Refused::Unrecorded(m)) => err(id, ErrorCode::Internal, &m),

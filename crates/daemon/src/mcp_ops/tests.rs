@@ -267,6 +267,8 @@ fn me() -> PeerCred {
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     }
 }
 

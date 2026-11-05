@@ -1138,6 +1138,8 @@ mod inproc {
                     uid,
                     gid: uid,
                     pid: std::process::id(),
+                    sid: None,
+                    group_sids: Vec::new(),
                 },
                 None,
             );

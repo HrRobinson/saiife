@@ -1555,10 +1555,12 @@ dependencies = [
  "nix",
  "rustix",
  "saiife-darwin",
+ "saiife-win",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1633,6 +1635,7 @@ dependencies = [
  "sha1",
  "sha2",
  "tempfile",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

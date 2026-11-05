@@ -276,7 +276,7 @@ async fn may_turn_off(
         return Err(Refusal::NotApprover);
     };
     let c = Arc::clone(ctx);
-    let peer = conn.peer;
+    let peer = conn.peer.clone();
     let start = conn.start_time;
     tokio::task::spawn_blocking(move || {
         // Without the caller's start time re-authentication cannot run

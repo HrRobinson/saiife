@@ -483,7 +483,14 @@ async fn call(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(e) => e,
         Err(m) => return bad(id, m),
     };
-    match execute_in(ctx, &Caller::Unix(*peer), call, project_env.as_deref()).await {
+    match execute_in(
+        ctx,
+        &Caller::Unix(peer.clone()),
+        call,
+        project_env.as_deref(),
+    )
+    .await
+    {
         // 12. Return.
         Ok((outcome, warning)) => with_warning(answer(id, outcome), warning),
         Err(Refused::LowDisk(code)) => err(id, code, LOW_DISK),
@@ -502,7 +509,7 @@ fn with_warning(mut v: Value, warning: Option<String>) -> Value {
 /// Who makes a connector call: a Unix-socket peer (uid and pid from the
 /// kernel), or a bearer token on the gateway's loopback TCP listener (the
 /// uid the token is bound to, and nothing else: no pid, so no session).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum Caller {
     Unix(PeerCred),
     Token {

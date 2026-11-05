@@ -295,6 +295,8 @@ mod tests {
             uid,
             gid: uid,
             pid: PID,
+            sid: None,
+            group_sids: Vec::new(),
         }
     }
 

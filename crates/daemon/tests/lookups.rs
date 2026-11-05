@@ -112,6 +112,8 @@ fn alice() -> PeerCred {
         uid: 4242,
         gid: 4242,
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     }
 }
 

@@ -558,6 +558,8 @@ impl World {
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
             pid: std::process::id(),
+            sid: None,
+            group_sids: Vec::new(),
         };
         let req = IpcRequest {
             id: 9,
@@ -1238,6 +1240,8 @@ async fn reload_op(ctx: &Arc<Ctx>, id: u64) -> Value {
         uid: 0,
         gid: 0,
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     };
     let req = IpcRequest {
         id,
@@ -1292,6 +1296,8 @@ async fn api_token_withheld_without_its_record_or_below_the_disk_floor() {
         uid: me + 1,
         gid: rustix::process::getgid().as_raw(),
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     };
     let req = IpcRequest {
         id: 9,
@@ -1793,6 +1799,8 @@ fn me() -> PeerCred {
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
         pid: std::process::id(),
+        sid: None,
+        group_sids: Vec::new(),
     }
 }
 

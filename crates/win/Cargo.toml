@@ -11,8 +11,8 @@ name = "saiife_win"
 path = "src/lib.rs"
 
 [features]
-# The named-pipe server (plan 19b). Empty until then.
-pipe-server = []
+# The named-pipe server (plan 19b). The hook path never turns this on, so it stays free of tokio.
+pipe-server = ["dep:tokio"]
 
 [dependencies]
 dirs = "5"
@@ -26,10 +26,13 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_NetManagement",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+tokio = { version = "1", features = ["net"], optional = true }
 
 [target.'cfg(windows)'.dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros"] }
 tempfile = "3"
 
 # Not the workspace lints: the second crate allowed unsafe (W1), after

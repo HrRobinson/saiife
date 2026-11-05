@@ -932,7 +932,7 @@ impl Conn {
 /// Every op but `hello` (which the connection handles itself), for a
 /// caller whose process start time is not known.
 pub async fn dispatch(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
-    dispatch_conn(ctx, &Conn::new(*peer, None), req).await
+    dispatch_conn(ctx, &Conn::new(peer.clone(), None), req).await
 }
 
 /// Every op but `hello`.
@@ -1219,6 +1219,8 @@ mod tests {
             uid,
             gid: uid,
             pid: std::process::id(),
+            sid: None,
+            group_sids: Vec::new(),
         }
     }
 

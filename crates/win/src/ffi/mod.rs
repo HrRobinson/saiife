@@ -7,6 +7,7 @@
 
 pub mod account;
 pub mod acl;
+pub mod pipe;
 pub mod sd;
 pub mod token;
 

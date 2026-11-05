@@ -1,10 +1,11 @@
 //! Who a token is.
 //!
 //! FFI calls: `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`,
-//! `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`),
-//! `CloseHandle`.
+//! `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`,
+//! `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle`.
 
 use super::account::sid_to_string;
+use crate::pipe::PeerToken;
 pub use crate::sid::TokenFacts;
 use std::io;
 use std::mem::size_of;
@@ -13,8 +14,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, HANDLE, TRUE,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenGroups, TokenUser, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenGroups, TokenIntegrityLevel, TokenRestrictedSids, TokenUser,
+    SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
@@ -130,6 +132,52 @@ pub fn facts_of(token: HANDLE) -> io::Result<TokenFacts> {
         .map(|g| Ok((unsafe { sid_to_string(g.Sid) }?, g.Attributes)))
         .collect::<io::Result<Vec<_>>>()?;
     Ok(TokenFacts::from_groups(sid, groups_with_attrs))
+}
+
+/// The token this thread impersonates, for a pipe client's identity. A thread with no such
+/// token is `ERROR_NO_TOKEN` and an anonymous client `ERROR_CANT_OPEN_ANONYMOUS`, both
+/// errors. Never the process token, unlike [`current`]: that would make the client the
+/// daemon.
+///
+/// `OpenAsSelf = TRUE`: the access check runs as the process, since a token at
+/// identification level could open nothing, its own self included.
+pub(crate) fn impersonated() -> io::Result<PeerToken> {
+    let mut handle: HANDLE = ptr::null_mut();
+    // SAFETY: GetCurrentThread takes nothing and returns a pseudo handle that needs no
+    // closing. `handle` is a valid out pointer.
+    let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &mut handle) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = Token(handle);
+    let facts = facts_of(token.0)?;
+
+    let label = info(token.0, TokenIntegrityLevel)?;
+    if label.bytes < size_of::<TOKEN_MANDATORY_LABEL>() {
+        return Err(short_answer());
+    }
+    // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL (just checked), aligned by
+    // Vec<u64>. Its SID points into the same buffer, alive across the conversion.
+    let integrity_sid = unsafe {
+        sid_to_string(
+            (*label.buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+                .Label
+                .Sid,
+        )
+    }?;
+
+    let restricted = info(token.0, TokenRestrictedSids)?;
+    if restricted.bytes < std::mem::offset_of!(TOKEN_GROUPS, Groups) {
+        return Err(short_answer());
+    }
+    // SAFETY: the buffer holds at least the count (just checked), aligned by Vec<u64>.
+    let restricted_sids = unsafe { (*restricted.buf.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount };
+
+    Ok(PeerToken {
+        facts,
+        integrity_sid,
+        restricted_sids: restricted_sids as usize,
+    })
 }
 
 fn short_answer() -> io::Error {

@@ -13,6 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 pub mod display;
+pub mod pipe;
 pub mod profile;
 pub mod sddl;
 pub mod sid;

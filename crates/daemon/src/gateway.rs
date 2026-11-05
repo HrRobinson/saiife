@@ -969,7 +969,7 @@ async fn call(
     // the slot back while its call still runs.
     let task = {
         let ctx = Arc::clone(ctx);
-        let caller = *caller;
+        let caller = caller.clone();
         tokio::spawn(async move {
             let _in_flight = in_flight;
             api_ops::execute(&ctx, &caller, call).await

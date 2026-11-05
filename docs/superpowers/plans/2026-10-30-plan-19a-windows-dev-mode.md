@@ -66,7 +66,7 @@ Plan 13 (macOS) sets the style and the patterns.
     | Security descriptors (`sd.rs`) | `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `ConvertSecurityDescriptorToStringSecurityDescriptorW`, `GetSecurityDescriptorOwner`, `GetSecurityDescriptorDacl`, `LocalFree` |
     | File ACLs (`acl.rs`) | `GetSecurityInfo`, `SetSecurityInfo` (each on a handle opened with `FILE_FLAG_OPEN_REPARSE_POINT` and checked, so a final reparse point swapped in cannot redirect them), `CreateDirectoryW` (with a descriptor) |
     | SIDs, accounts, local groups (`account.rs`) | `ConvertSidToStringSidW`, `ConvertStringSidToSidW`, `LookupAccountNameW`, `LookupAccountSidW`, `NetUserGetLocalGroups`, `NetLocalGroupGetMembers`, `NetApiBufferFree` |
-    | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`), `CloseHandle` |
+    | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
     | Pipes (`pipe.rs`) | `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
     | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
     | Re-authentication (`logon.rs`) | `LogonUserW` |

@@ -522,7 +522,7 @@ fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: u32) -> Reco
 
 async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let id = req.id;
-    let peer = conn.peer;
+    let peer = conn.peer.clone();
     let rid = match request_id(&req) {
         Ok(r) => r,
         Err(v) => return v,
@@ -605,6 +605,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
             None => Some(Refusal::NotApprover),
             Some(name) => {
                 let c = Arc::clone(ctx);
+                let peer = peer.clone();
                 let start = conn.start_time;
                 let requester = r.uid;
                 let detail = crate::approvals::reauth_detail(&r);
@@ -1772,6 +1773,8 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 pid: 1,
+                sid: None,
+                group_sids: Vec::new(),
             },
             Some(1),
         );

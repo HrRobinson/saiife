@@ -508,11 +508,15 @@ configuration (geminicli.com/docs/reference/configuration).
     When it passes, the hook denies and exits.
   - **Server.** After `connect().await`, one synchronous call does
     `ImpersonateNamedPipeClient`, `OpenThreadToken(TOKEN_QUERY, OpenAsSelf =
-    TRUE)`, `GetTokenInformation(TokenUser)`, `GetTokenInformation(TokenGroups)`
+    TRUE)`, `GetTokenInformation(TokenUser)`, `GetTokenInformation(TokenGroups)`,
+    `GetTokenInformation(TokenIntegrityLevel)`,
+    `GetTokenInformation(TokenRestrictedSids)`
     and `RevertToSelf`. There is no `.await` inside. It also reads
     `GetNamedPipeClientProcessId`, for attribution only. If `RevertToSelf`
     ever fails, the process aborts. It must never go on running as the
-    client.
+    client. A pipe peer counts as an elevated admin only at High integrity or
+    above with no restricted SIDs: a low-integrity or restricted child of an
+    elevated admin holds `Administrators` enabled, and is not uid 0.
   - **Why not AF_UNIX.** Windows supports AF_UNIX sockets but gives no peer
     credentials. `SIO_AF_UNIX_GETPEERPID` gives only a pid, and opening
     another user's process from a service account is denied, so a pid
@@ -891,7 +895,7 @@ updating this list and this section.
 | Security descriptors (`sd.rs`) | `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `ConvertSecurityDescriptorToStringSecurityDescriptorW`, `GetSecurityDescriptorOwner`, `GetSecurityDescriptorDacl`, `LocalFree` |
 | File ACLs (`acl.rs`) | `GetSecurityInfo`, `SetSecurityInfo` (each on a handle opened with `FILE_FLAG_OPEN_REPARSE_POINT` and checked, so a final reparse point swapped in cannot redirect them), `CreateDirectoryW` (with a descriptor) |
 | SIDs, accounts, local groups (`account.rs`) | `ConvertSidToStringSidW`, `ConvertStringSidToSidW`, `LookupAccountNameW`, `LookupAccountSidW`, `NetUserGetLocalGroups`, `NetLocalGroupGetMembers`, `NetApiBufferFree` |
-| Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`), `CloseHandle` |
+| Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
 | Pipes (`pipe.rs`) | `ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
 | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
 | Re-authentication (`logon.rs`) | `LogonUserW` |

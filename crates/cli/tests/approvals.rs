@@ -481,6 +481,8 @@ impl World {
                 uid,
                 gid: uid,
                 pid: std::process::id(),
+                sid: None,
+                group_sids: Vec::new(),
             },
             None,
         )
