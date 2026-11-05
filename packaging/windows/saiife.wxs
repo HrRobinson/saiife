@@ -33,10 +33,10 @@
     <Property Id="ARPNOMODIFY" Value="1" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="saiife" />
+      <Directory Id="InstallFolder" Name="saiife" />
     </StandardDirectory>
 
-    <ComponentGroup Id="Payload" Directory="INSTALLFOLDER">
+    <ComponentGroup Id="Payload" Directory="InstallFolder">
       <Component Id="SaiifeExeComponent" Guid="*">
         <File Id="SaiifeExe" Source="$(SourceDir)\saiife.exe" KeyPath="yes" />
       </Component>
@@ -50,8 +50,8 @@
            ours, as an Environment row cannot be one. -->
       <Component Id="PathComponent" Guid="*">
         <RegistryValue Root="HKLM" Key="Software\saiife" Name="InstallFolder" Type="string"
-                       Value="[INSTALLFOLDER]" KeyPath="yes" />
-        <Environment Id="SaiifePath" Name="PATH" Value="[INSTALLFOLDER]" Action="set"
+                       Value="[InstallFolder]" KeyPath="yes" />
+        <Environment Id="SaiifePath" Name="PATH" Value="[InstallFolder]" Action="set"
                      Part="last" System="yes" Permanent="no" />
       </Component>
     </ComponentGroup>
@@ -67,7 +67,7 @@
       same name. Deferred with Impersonate="no" runs as SYSTEM.
     -->
     <SetProperty Id="SaiifeInstall"
-                 Value="&quot;[INSTALLFOLDER]saiife.exe&quot; system install --fleet --package"
+                 Value="&quot;[ProgramFiles64Folder]saiife\saiife.exe&quot; system install --fleet --package"
                  Before="SaiifeInstall" Sequence="execute" Condition="NOT REMOVE" />
     <!-- Exit 0 and 1 both succeed: the package flag maps doctor's exit 1 to 0 and logs its text to
          C:\ProgramData\saiife\log\install.log. Exit 2 fails the action and the install
@@ -84,7 +84,7 @@
 
     <!-- No purge flag: the audit, the vault key, the state and the config stay, as on Linux. -->
     <SetProperty Id="SaiifeUninstall"
-                 Value="&quot;[INSTALLFOLDER]saiife.exe&quot; system uninstall"
+                 Value="&quot;[ProgramFiles64Folder]saiife\saiife.exe&quot; system uninstall"
                  Before="SaiifeUninstall" Sequence="execute"
                  Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     <CustomAction Id="SaiifeUninstall" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"

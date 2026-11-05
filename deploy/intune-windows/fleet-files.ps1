@@ -38,7 +38,10 @@ param(
 Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
 
+# A temp file being written: Refuse exits, which skips any catch, so it removes this first.
+$script:pendingTemp = $null
 function Refuse([string]$why) {
+  if ($script:pendingTemp) { Remove-Item -LiteralPath $script:pendingTemp -Force -ErrorAction SilentlyContinue }
   [Console]::Error.WriteLine("saiife: fleet-files: $why")
   exit 2
 }
@@ -151,12 +154,14 @@ function Write-FleetFile([string]$name, [byte[]]$bytes) {
   $target = Join-Path $fleet $name
   if (Test-Path -LiteralPath $target) { Test-Safe $target $false }
   $tmp = Join-Path $fleet ("$name." + [Guid]::NewGuid().ToString('N') + '.new')
+  $script:pendingTemp = $tmp
   $fs = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() }
   try {
     Test-Safe $tmp $false
     if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
     [IO.File]::Move($tmp, $target)
+    $script:pendingTemp = $null
   } catch {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     throw

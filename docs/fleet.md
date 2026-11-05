@@ -590,14 +590,26 @@ Configuration > Policies > Windows Settings > Scripts > Startup > PowerShell Scr
 $share = '\\fileserver\saiife'
 & "$share\fleet-files.ps1" -ConfigB64 '<base64>' -Agents 'claude,codex,gemini'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', "$share\saiife-<version>-x64.msi", '/qn', '/l*v', 'C:\Windows\Temp\saiife-msi.log'
+$p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList '/i', "$share\saiife-<version>-x64.msi", '/qn', '/l*v', 'C:\ProgramData\saiife\log\saiife-msi.log'
 exit $p.ExitCode
 ```
 
+The log goes to `C:\ProgramData\saiife\log`, never to `C:\Windows\Temp`: the startup
+script runs as SYSTEM, and a user can plant a link in a folder like Temp. The script's
+first line already made that folder's parent, because `fleet-files.ps1` creates
+`C:\ProgramData\saiife` but not `log`. On a first install `log` does not exist yet, so
+`msiexec` cannot open the log and fails. Create it from the script first, with the
+permissions saiife expects, or drop `/l*v` on the first run: after the first install the
+folder is there. Do not create `log` by hand with `mkdir`, as it would inherit
+Users-writable entries and saiife would refuse it.
+
 The startup script runs as SYSTEM, so nobody has to be an administrator on the device. To
 change the fleet files, edit the script: every boot writes them and runs the MSI again.
-The same version is a repair, which runs the install action and is safe to repeat, and
-that is what applies the new files. To upgrade, replace the MSI on the share and change
+The same version is meant to run the install action again, which is safe to repeat, and
+that is what applies the new files. **Unverified:** whether Windows Installer runs a custom
+action for `msiexec /i` of the package that is already installed (it may only open
+maintenance mode). Test it in your rollout. If it does not run, use `msiexec /fa` (repair
+all files) or run `system install --fleet --package` from the script instead. To upgrade, replace the MSI on the share and change
 its name in the script.
 
 ### Upgrades and removal on Windows
@@ -627,8 +639,15 @@ run `saiife system uninstall --purge` first, then remove the package.
   is dropped, so `0.4.0-rc1` and `0.4.0` look equal to Windows Installer, and the final
   release does not upgrade the candidate. Uninstall the candidate first; that keeps the
   audit and the config.
-- **Install folder.** Do not set `INSTALLFOLDER` on the command line. Doctor and the
-  install expect the staging copy in `C:\Program Files\saiife`.
+- **Install folder.** The folder is fixed at `C:\Program Files\saiife`. It is not a
+  property you can set: the install and uninstall actions run as SYSTEM and start
+  `[ProgramFiles64Folder]saiife\saiife.exe`, so a folder chosen on the command line cannot
+  make them run another binary.
+- **Preview.** Windows locked mode is a preview. See [Windows](windows.md). Every lock
+  label there is unverified until it has been tried on real machines. The Codex and
+  Gemini CLI hooks are preview on Windows too. Same-user approval is off, by the owner's
+  ruling, so approvals come from a second account in a separate session. Set approvers in
+  the fleet `config.toml`.
 - **Rollback.** The MSI rolls back its files when the install action fails, but it does
   not undo what `system install` already did (the service, the managed files). Run
   `saiife system uninstall` from the daemon's copy,
