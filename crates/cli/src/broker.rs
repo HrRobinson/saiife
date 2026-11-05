@@ -29,12 +29,14 @@ pub(crate) enum Target {
         socket_dir: PathBuf,
         owner_uid: u32,
     },
-    /// The personal broker, as the user's own uid.
-    #[cfg_attr(windows, allow(dead_code))] // `personal` makes none there yet
+    /// The personal broker, as the user's own uid. On Windows `socket_dir` holds the pipe's
+    /// name, `owner_uid` is only a label, and `owner_sid` is the identity that is checked.
     Personal {
         config: PathBuf,
         socket_dir: PathBuf,
         owner_uid: u32,
+        #[cfg(windows)]
+        owner_sid: String,
     },
 }
 
@@ -172,14 +174,20 @@ pub(crate) fn system_client(
     Client::connect_pipe(&pipe, &owner, deadline)
 }
 
-/// The personal broker's target. On Windows it reaches the CLI once `saiife daemon --user`
-/// is there (Task 11); until then this is an error, never the system daemon.
+/// The personal broker's target on Windows: the broker's own paths (W25), and the pipe
+/// named by this token's SID, which must also own it.
 #[cfg(windows)]
-pub(crate) fn personal(_env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> {
-    Err(
-        "no locked mode is installed here, and the personal broker is not available on Windows yet"
-            .into(),
-    )
+pub(crate) fn personal(env: &dyn Fn(&str) -> Option<OsString>) -> Result<Target, String> {
+    // As `saiife daemon --user` finds them, so both sides name the same files.
+    let home = saiife_win::profile::home_dir();
+    let p = saiife_system::personal::personal_paths(env, home.as_deref())?;
+    let (pipe, owner_sid) = crate::win_locked::personal_target()?;
+    Ok(Target::Personal {
+        config: p.config,
+        socket_dir: PathBuf::from(pipe),
+        owner_uid: saiife_win::sid::uid_of(&owner_sid, false),
+        owner_sid,
+    })
 }
 
 /// The personal broker's target from the environment (the XDG paths).
@@ -225,11 +233,19 @@ pub(crate) fn connect(t: &Target, deadline: Instant) -> Result<Client, ClientErr
             "locked",
             "not the locked-mode daemon",
         ),
-        // `personal` makes no such target on Windows yet.
+        // The owner is read from the handle that then writes, before a byte is sent. A
+        // squatter on this name has its own SID as owner, so it gets nothing, and the
+        // system daemon's pipe has another name and another owner.
         #[cfg(windows)]
-        Target::Personal { .. } => {
-            Err(ClientError::Connect(std::io::ErrorKind::Unsupported.into()))
-        }
+        Target::Personal {
+            socket_dir,
+            owner_sid,
+            ..
+        } => hello_mode(
+            Client::connect_pipe(&socket_dir.to_string_lossy(), owner_sid, deadline)?,
+            "personal",
+            "not a personal broker",
+        ),
         #[cfg(unix)]
         Target::Personal {
             socket_dir,

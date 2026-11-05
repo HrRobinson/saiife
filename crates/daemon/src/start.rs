@@ -345,16 +345,37 @@ const PERSONAL_LOCK: &str = "broker.lock";
 
 /// Whether the personal broker may run as this token on Windows (Task 11). Never as an
 /// administrator or SYSTEM, whose uid label is 0 and would read as root; never as a
-/// service account, which has no profile or credential store of its own. A debug build's
-/// test pipe runs as the runner, an elevated admin on CI (W23).
+/// service account, which has no profile or credential store of its own; never as
+/// anonymous or the machine's guest account, which are nobody's own. A debug build's test
+/// pipe runs as the runner, an elevated admin on CI (W23).
+///
+/// With UAC off, or as the built-in Administrator, every token of that user is elevated,
+/// so that user can never run it. This fails closed, and the line says so.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn personal_start_problem(sid: &str, elevated: bool, test_pipe: bool) -> Option<String> {
     use saiife_win::sid::uid_of;
+    /// Anonymous, SYSTEM, LocalService and NetworkService.
+    const NOT_A_PERSON: [&str; 4] = ["S-1-5-7", "S-1-5-18", "S-1-5-19", "S-1-5-20"];
     if test_pipe {
         return None;
     }
+    if NOT_A_PERSON.contains(&sid) {
+        return Some(format!(
+            "the personal broker runs as your own user, not the system account {sid}"
+        ));
+    }
+    if sid.starts_with("S-1-5-21-") && sid.ends_with("-501") {
+        return Some(format!(
+            "the personal broker runs as your own user, not the guest account {sid}"
+        ));
+    }
     if uid_of(sid, elevated) == 0 {
-        return Some("the personal broker runs as your own user, not an administrator".into());
+        return Some(
+            "the personal broker runs as your own user, not an administrator: this token is \
+             elevated. Start it from a shell that is not elevated. With UAC off, or as the \
+             built-in Administrator, every shell is elevated, so use another account"
+                .into(),
+        );
     }
     sid.starts_with("S-1-5-80-")
         .then(|| format!("the personal broker runs as a user, not the service account {sid}"))
@@ -2094,6 +2115,30 @@ mod windows_start_tests {
         assert!(personal_start_problem(RUNNER, true, false).is_some());
         assert!(personal_start_problem(SYSTEM, false, false).is_some());
         assert!(personal_start_problem(&service_sid("saiifed"), false, false).is_some());
+        // Anonymous, SYSTEM, LocalService, NetworkService, and this machine's guest, elevated
+        // or not: none is anyone's own account.
+        for sid in [
+            "S-1-5-7",
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-21-1-2-3-501",
+        ] {
+            for elevated in [false, true] {
+                let why = personal_start_problem(sid, elevated, false)
+                    .unwrap_or_else(|| panic!("{sid} was let through"));
+                assert!(why.contains(sid), "{why}");
+            }
+        }
+        // Only the exact SIDs and the guest's RID: a person whose SID merely starts alike runs.
+        assert_eq!(
+            personal_start_problem("S-1-5-21-1-2-3-1501", false, false),
+            None
+        );
+        // An always-elevated user is refused, and the line says why and what to do.
+        let why = personal_start_problem(RUNNER, true, false).unwrap();
+        assert!(why.contains("elevated") && why.contains("UAC"), "{why}");
+        assert!(why.contains("use another account"), "{why}");
         // A debug build's test pipe runs as the CI runner.
         assert_eq!(personal_start_problem(RUNNER, true, true), None);
     }

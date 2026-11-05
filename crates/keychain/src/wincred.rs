@@ -18,7 +18,7 @@ pub const BACKEND: &str = "windows-credential-manager";
 /// `ERROR_NO_SUCH_LOGON_SESSION`: no logon session to hold a credential, as in a
 /// service on a machine that has no profile for it.
 const NO_LOGON_SESSION: i32 = 1312;
-/// `ERROR_INVALID_FLAGS`: Credential Manager refused the call as formed (an item too big).
+/// `ERROR_INVALID_PARAMETER`: Credential Manager refused the call as formed (an item too big).
 const INVALID_PARAMETER: i32 = 87;
 
 /// The credential target for `id`: `<service>:<account>`.
@@ -206,16 +206,38 @@ mod tests {
         assert!(matches!(e, KeychainError::Unavailable(_)), "{e}");
     }
 
-    /// Windows CI only: the real Credential Manager under a throwaway item.
+    /// Deletes the test's credential however the test ends.
+    #[cfg(windows)]
+    struct Remove(ItemId);
+
+    #[cfg(windows)]
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = WinCredential::new().delete(&self.0);
+        }
+    }
+
+    /// The real Credential Manager under a random throwaway item, so it runs in CI only
+    /// (`build.rs`): on someone's machine this would write to their own store.
     #[cfg(windows)]
     #[test]
+    #[cfg_attr(
+        not(saiife_ci),
+        ignore = "writes to Credential Manager; runs when CI is set"
+    )]
     fn wincred_roundtrip() {
+        use std::hash::{BuildHasher, Hasher};
+        // The std hasher's seed is random per instance, and needs no RNG crate here.
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
         let id = ItemId {
             service: "saiife-test",
-            account: "keychain-roundtrip",
+            account: Box::leak(format!("{random:016x}").into_boxed_str()),
         };
         let k = WinCredential::new();
-        let _ = k.delete(&id);
+        let _remove = Remove(id);
+        assert!(k.get(&id).unwrap().is_none());
         k.set(&id, "saiife test item", &[8u8; 32]).unwrap();
         assert_eq!(k.get(&id).unwrap().unwrap().as_slice(), &[8u8; 32]);
         assert!(k.delete(&id).unwrap());

@@ -386,8 +386,8 @@ impl Layout {
     /// than make `C:\run\saiife`, which any user could have created first.
     /// `uninstall.rs` passes such a constant (`INSTALL_LOCK`) only after its Windows
     /// branch, and `doctor/system.rs` (`RUN_DIR`, `CREDSTORE`, `UNIT`) branches at each
-    /// call. `crates/cli/src/status_cmd.rs:1043` (`RUN_DIR`), `cfg(unix)` today, must branch
-    /// on the platform first when plan 19b Task 10 un-gates it.
+    /// call. `status_client` in `crates/cli/src/status_cmd.rs` (`RUN_DIR`) has a Windows form
+    /// that names the pipe, so its `RUN_DIR` is never asked for there.
     pub fn at(&self, abs: &str) -> PathBuf {
         self.try_at(Path::new(self.logical(abs)))
             .unwrap_or_else(|e| panic!("{e}"))

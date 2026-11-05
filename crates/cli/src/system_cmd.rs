@@ -157,7 +157,6 @@ fn restart_command(platform: Platform) -> &'static str {
     match platform {
         Platform::Linux => "systemctl restart saiifed",
         Platform::Macos => "launchctl kickstart -k system/com.saiife.saiifed",
-        // This module does not build on Windows; plan 19b's locked mode reads this.
         Platform::Windows => "Restart-Service saiifed",
     }
 }

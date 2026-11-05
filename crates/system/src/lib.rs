@@ -13,8 +13,8 @@
 //! - `install_win`: `system install` and `system uninstall` on Windows, behind `Host`,
 //!   on every OS, so Linux tests drive them.
 //!
-//! On Windows `fsops`, `doctor`, `personal`, `polkit` and `testing` do not exist yet: they
-//! still use Unix owners, modes or rustix, until the rest of plan 19b.
+//! On Windows `fsops`, `doctor`, `polkit` and `testing` do not exist yet: they still use
+//! Unix owners, modes or rustix, until the rest of plan 19b.
 //!
 //! No tokio: the CLI links this crate.
 

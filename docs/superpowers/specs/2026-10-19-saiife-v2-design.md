@@ -915,7 +915,7 @@ updating this list and this section.
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 38 functions and one macro (`GetSecurityInfo` is listed twice). The tokio call needs the crate feature
+That is 38 functions and one macro (`GetSecurityInfo` is listed twice). 37 of them are in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. `LogonUserW` is the one not there, and `logon.rs` does not exist. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 

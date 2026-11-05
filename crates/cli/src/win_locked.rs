@@ -97,6 +97,21 @@ pub(crate) fn pipe_target(
     }
 }
 
+/// The personal broker's pipe and the SID that must own it: this user's in both places
+/// (W25). `test_pipe` is the debug-build seam, whose owner to expect is the runner, so the
+/// seam changes the name and never the owner.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn personal_pipe_target(
+    test_pipe: Option<String>,
+    own_sid: &str,
+) -> Result<(String, String), String> {
+    let pipe = match test_pipe {
+        Some(pipe) => pipe,
+        None => saiife_system::personal::personal_pipe_name(own_sid)?,
+    };
+    Ok((pipe, own_sid.to_string()))
+}
+
 /// `ProfileImagePath` of a profile as a home directory. The value is `REG_EXPAND_SZ`, and
 /// the only variable Windows writes there is `%SystemRoot%` (for the service accounts).
 /// Anything else, or a path not on a drive, is `None`: the caller denies.
@@ -164,6 +179,18 @@ pub(crate) fn control_target() -> Result<(String, String), String> {
     )
 }
 
+/// The personal broker's pipe, and the owner it must have.
+#[cfg(windows)]
+pub(crate) fn personal_target() -> Result<(String, String), String> {
+    #[cfg(debug_assertions)]
+    let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
+    #[cfg(not(debug_assertions))]
+    let test_pipe = None;
+    let token = saiife_win::ffi::token::current()
+        .map_err(|e| format!("cannot read this process's token: {e}"))?;
+    personal_pipe_target(test_pipe, &token.sid)
+}
+
 /// The running user's canonical `DOMAIN\name`, as the daemon names its peer.
 #[cfg(windows)]
 pub(crate) fn own_account_name() -> Option<String> {
@@ -220,6 +247,28 @@ mod tests {
         );
         // No SID: no owner to check against, so no connection.
         assert!(pipe_target(&l.control_endpoint(), Some("p".into()), || None).is_err());
+    }
+
+    /// The name and the owner both come from the SID, and the owner is never the service's:
+    /// a client of the personal broker must not accept the system daemon, nor the reverse.
+    #[test]
+    fn the_personal_pipe_must_be_owned_by_this_user() {
+        const ME: &str = "S-1-5-21-1111-2222-3333-1001";
+        let (name, owner) = personal_pipe_target(None, ME).unwrap();
+        assert_eq!(name, format!(r"\\.\pipe\saiife-user-{ME}"));
+        assert_eq!(owner, ME);
+        assert_ne!(name, WIN_PIPE);
+        assert_ne!(owner, saiife_win::sid::service_sid("saiifed"));
+        // What a daemon of the same user opens, so the two sides meet.
+        assert_eq!(
+            name,
+            saiife_system::personal::personal_pipe_name(ME).unwrap()
+        );
+        // The seam moves the name, not the owner.
+        let (name, owner) = personal_pipe_target(Some("p".into()), ME).unwrap();
+        assert_eq!((name.as_str(), owner.as_str()), ("p", ME));
+        // A token whose SID is no SID makes no name.
+        assert!(personal_pipe_target(None, r"..\evil").is_err());
     }
 
     #[test]

@@ -85,9 +85,6 @@ fn daemon_system_runs_outside_the_service_manager_and_refuses_this_user() {
 fn locked_commands_refuse_on_windows() {
     let home = tempfile::tempdir().unwrap();
     let cases: &[&[&str]] = &[
-        &["system", "install"],
-        &["system", "uninstall"],
-        &["daemon", "--user"],
         &["approve", "1"],
         &["reject", "1"],
         &["approvals"],
@@ -108,6 +105,37 @@ fn locked_commands_refuse_on_windows() {
         .assert()
         .code(2)
         .stderr(contains(NO_GATEWAY));
+}
+
+/// `system` and `daemon --user` are ported, so neither gets the refusal. Nothing here can
+/// change the runner: `--help` installs nothing, `--root` uses the fake host below a temp
+/// dir, and `daemon --user` stops at a flag it takes no value for. `system install` itself
+/// is never run here, because the runner is elevated: that is `locked-windows`.
+#[test]
+fn ported_commands_no_longer_refuse() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    saiife(home.path())
+        .args(["system", "--help"])
+        .assert()
+        .code(0)
+        .stdout(contains("install"));
+    let out = saiife(home.path())
+        .args(["system", "uninstall", "--root"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains(REFUSAL),
+        "{out:?}"
+    );
+    saiife(home.path())
+        .args(["daemon", "--user", "--config", "elsewhere"])
+        .assert()
+        .code(2)
+        .stderr(contains("takes no --config"))
+        .stderr(contains(REFUSAL).not());
 }
 
 /// A client on a host with no install says it cannot reach a daemon or names the missing

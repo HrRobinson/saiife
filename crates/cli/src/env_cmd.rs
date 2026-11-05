@@ -93,8 +93,8 @@ fn resolve_default() -> Result<Place, String> {
     })
 }
 
-/// No personal broker here in this version: the system config, as locked mode when it
-/// says so, else the developer-mode definitions. What Windows' DACL check says comes
+/// The personal broker's config is not read here yet: the system config, as locked mode
+/// when it says so, else the developer-mode definitions. What Windows' DACL check says comes
 /// first: on a tree that is not ours the file was perhaps planted, so it defines nothing;
 /// on our tree one that fails is an error.
 #[cfg(not(unix))]

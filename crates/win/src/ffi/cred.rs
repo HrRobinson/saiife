@@ -103,26 +103,39 @@ pub fn delete(target: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Run in CI's `test` job on `windows-latest`. They touch the runner's own Credential
-/// Manager under a random `saiife-test:` target and delete it again.
+/// Run in CI's `test` job on `windows-latest`. The one that touches the real Credential
+/// Manager uses a random `saiife-test:` target, deletes it however it ends, and is ignored
+/// unless `CI` is set at build time (`build.rs`), since it would write to a developer's store.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// No RNG crate here: the clock and the process id are random enough for a test name.
+    /// No RNG crate here: the std hasher's seed is random per instance.
     fn target() -> String {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        format!(
-            "saiife-test:{:016x}",
-            t ^ (u64::from(std::process::id()) << 40)
-        )
+        use std::hash::{BuildHasher, Hasher};
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        format!("saiife-test:{random:016x}")
+    }
+
+    /// Deletes the test's credential however the test ends.
+    struct Remove<'a>(&'a str);
+
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = delete(self.0);
+        }
     }
 
     #[test]
+    #[cfg_attr(
+        not(saiife_ci),
+        ignore = "writes to Credential Manager; runs when CI is set"
+    )]
     fn wincred_roundtrip() {
         let t = target();
+        let _remove = Remove(&t);
         assert_eq!(read(&t).unwrap(), None);
         write(&t, "saiife test item", &[9u8; 32]).unwrap();
         assert_eq!(read(&t).unwrap().unwrap().as_slice(), &[9u8; 32]);

@@ -198,7 +198,8 @@ fn set_sddl_on_temp_dir_roundtrips() {
     let child = target.join("child");
     std::fs::write(&child, b"x").unwrap();
     let child_before = acl::get_sddl(&child).unwrap();
-    // Not the temp dir's own ACEs, so a propagated change would show in the child.
+    // The runner's own SID in place of the temp dir's `BA`, so a propagated change shows
+    // in the child. The Users entry does not show it: the child already had that one.
     let wanted = format!("{}(A;OICI;0x1200a9;;;BU)", own_sddl("PAI", &me));
     acl::set_sddl(&target, &wanted).unwrap();
 
@@ -215,10 +216,14 @@ fn set_sddl_on_temp_dir_roundtrips() {
     assert!(read.dacl_protected, "{text}");
     assert_eq!(read.aces, want.aces, "{text}");
 
-    // CI showed `SetSecurityInfo` on a directory propagating to a child that
-    // inherits: the child read back `AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)`,
-    // its old inherited entries plus the new Users entry, all inherited. `LA` and
-    // `S-1-5-32-544` can name the same account, so both sides are normalised.
+    // CI run 42011879941 showed `SetSecurityInfo` on a directory propagating to a child
+    // that inherits, and replacing what it inherited. On windows-latest the child read
+    // `O:BAG:<g>D:(A;ID;FA;;;BA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)` before and
+    // `O:BAG:<g>D:AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)` after: the old `BA`
+    // entry is gone, and each entry the parent hands down is there, in the parent's order,
+    // as inherited and not inheritable (the child is a file). The child's owner did not
+    // change. `LA` and the machine's `-500` SID name the same account, so both sides are
+    // normalised.
     let norm = |sid: &str| {
         if sid == sddl::LOCAL_ADMIN {
             local_admin_sid()
@@ -234,21 +239,19 @@ fn set_sddl_on_temp_dir_roundtrips() {
     };
     let before = sddl::parse(&child_before).unwrap();
     let after = sddl::parse(&child_after).unwrap_or_else(|e| panic!("{child_after}: {e}"));
-    let after_aces = aces_of(&after);
-    for old in aces_of(&before) {
-        assert!(after_aces.contains(&old), "{old:?} lost: {child_after}");
-    }
-    assert!(
-        after.aces.iter().all(|a| a.flags.inherited),
-        "{child_after}"
-    );
-    assert!(
-        after
-            .aces
-            .iter()
-            .any(|a| a.allow && a.mask == 0x1200a9 && (a.sid == "BU" || a.sid == "S-1-5-32-545")),
-        "the new Users entry did not reach the child: {child_after}"
-    );
+    let handed_down: Vec<_> = read
+        .aces
+        .iter()
+        .map(|a| {
+            let flags = sddl::AceFlags {
+                inherited: true,
+                ..Default::default()
+            };
+            (a.allow, flags, a.mask, norm(&a.sid))
+        })
+        .collect();
+    assert_eq!(aces_of(&after), handed_down, "{child_after}");
+    assert_eq!(after.owner, before.owner, "{child_after}");
 
     // A protected child (`P`) does not receive it; its own entries stay.
     let prot = target.join("prot");

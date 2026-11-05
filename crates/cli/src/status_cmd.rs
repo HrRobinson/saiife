@@ -68,7 +68,7 @@ struct Problem {
 
 /// One line when the personal broker answers hello on its own socket
 /// (plan 16); nothing otherwise. Never on a locked host.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn personal_broker_line() {
     let up = crate::broker::personal(&|k| std::env::var_os(k)).is_ok_and(|t| {
         crate::broker::connect(&t, std::time::Instant::now() + Duration::from_millis(500)).is_ok()
@@ -78,7 +78,7 @@ fn personal_broker_line() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn personal_broker_line() {}
 
 /// `system_root`: the hidden `--root` (tests); the real `/` otherwise.

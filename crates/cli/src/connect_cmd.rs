@@ -235,8 +235,9 @@ mod linux {
         saiife_system::fsops::write_new_file(target, bytes, file_mode)
     }
 
-    /// The drop-in, in `dir`, made if missing. New entries inherit `etc`'s descriptor
-    /// (W14), so there are no modes to set; only an admin can write there.
+    /// The drop-in, in `dir`, made if missing. New entries inherit the descriptor above
+    /// them, so there are no modes to set: `etc`'s on a locked host (W14), where only an
+    /// admin can write, and the user's own profile's for the personal broker.
     #[cfg(windows)]
     fn write_policy(
         dir: &Path,

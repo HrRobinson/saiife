@@ -61,7 +61,7 @@ mod report_html;
 mod run_cmd;
 mod secret_cmd;
 mod status_cmd;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod system_cmd;
 mod system_view;
 mod text;
@@ -374,17 +374,12 @@ enum Cmd {
         #[command(subcommand)]
         action: env_cmd::EnvAction,
     },
-    /// Locked mode on Linux: install or uninstall the system setup (root).
-    #[cfg(unix)]
+    /// Locked mode: install or uninstall the system setup (root, or an elevated
+    /// administrator on Windows).
+    #[cfg(any(unix, windows))]
     System {
         #[command(subcommand)]
         action: system_cmd::SystemAction,
-    },
-    /// Locked mode (not on Windows until plan 19b): install or uninstall.
-    #[cfg(windows)]
-    System {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
 }
 
@@ -414,21 +409,20 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
     const NOT_YET: &str = "saiife: locked mode is not supported here: this command is not ported to Windows yet. Developer mode works as before.";
     match cmd {
         Cmd::McpSpawn => Some(NO_GATEWAY),
-        // The personal broker: its daemon, keys and log.
+        // The personal broker's log: `audit_cmd::broker_audit_dir` has no Windows path yet.
         Cmd::Audit { action, broker, .. } => (*broker
             || matches!(action, Some(AuditAction::Verify { broker: true, .. })))
         .then_some(NOT_YET),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
-        // Install, doctor and re-authentication.
-        Cmd::System { .. }
-        | Cmd::Doctor { .. }
-        | Cmd::Approvals { .. }
-        | Cmd::Approve { .. }
-        | Cmd::Reject { .. } => Some(NOT_YET),
+        // Doctor and approvals.
+        Cmd::Doctor { .. } | Cmd::Approvals { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } => {
+            Some(NOT_YET)
+        }
         // No wildcard: a new subcommand must be put on one side or the other here, or this
         // does not compile.
-        Cmd::Check { .. }
+        Cmd::System { .. }
+        | Cmd::Check { .. }
         | Cmd::Eval
         | Cmd::Secret { .. }
         | Cmd::Connect(..)
@@ -658,7 +652,7 @@ fn main() -> ExitCode {
     {
         return env_cmd::run(system_config, action);
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Cmd::System { action } = cli.command {
         return system_cmd::run(action);
     }
