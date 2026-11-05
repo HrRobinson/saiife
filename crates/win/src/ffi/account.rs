@@ -107,9 +107,16 @@ pub fn lookup_name(name: &str) -> io::Result<(String, String)> {
 }
 
 /// The SID in binary, as `ConvertStringSidToSidW` made it.
-struct BinarySid(LocalMem);
+pub(crate) struct BinarySid(LocalMem);
 
-fn binary_sid(sid: &str) -> io::Result<BinarySid> {
+impl BinarySid {
+    /// The SID, valid while `self` lives.
+    pub(crate) fn as_psid(&self) -> PSID {
+        (self.0).0
+    }
+}
+
+pub(crate) fn binary_sid(sid: &str) -> io::Result<BinarySid> {
     let text = wide(sid)?;
     let mut raw: PSID = ptr::null_mut();
     // SAFETY: `text` is NUL-terminated and outlives the call; `raw` is a valid out
@@ -124,7 +131,7 @@ fn binary_sid(sid: &str) -> io::Result<BinarySid> {
 /// The canonical `DOMAIN\name` of the SID in text.
 pub fn lookup_sid(sid: &str) -> io::Result<String> {
     let binary = binary_sid(sid)?;
-    let raw: PSID = (binary.0).0;
+    let raw = binary.as_psid();
     let mut name_len = 0u32;
     let mut domain_len = 0u32;
     let mut kind: SID_NAME_USE = 0;

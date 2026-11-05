@@ -98,6 +98,23 @@ fn set_sddl_on_temp_dir_roundtrips() {
     assert_eq!(read.aces, want.aces);
 }
 
+/// `winacl::actual_ok` compares the group, so a row's `G:SY` must reach disk.
+#[test]
+fn set_sddl_applies_a_group_and_leaves_it_when_absent() {
+    let me = token::current().unwrap().sid;
+    let dir = temp_dir();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let group_of = || sddl::parse(&acl::get_sddl(&target).unwrap()).unwrap().group;
+
+    let with_group = format!("O:{me}G:SYD:PAI(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+    acl::set_sddl(&target, &with_group).unwrap();
+    assert_eq!(group_of().as_deref(), Some(sid::SYSTEM));
+
+    acl::set_sddl(&target, &own_sddl("PAI", &me)).unwrap();
+    assert_eq!(group_of().as_deref(), Some(sid::SYSTEM));
+}
+
 #[test]
 fn set_sddl_refuses_an_unprotected_or_ownerless_descriptor() {
     let me = token::current().unwrap().sid;

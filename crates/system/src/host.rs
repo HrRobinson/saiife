@@ -215,9 +215,8 @@ pub trait Host: Send + Sync {
         daemon_uid: u32,
         wait: Duration,
     ) -> io::Result<ReloadAnswer>;
-    /// Windows: sets the owner and a protected DACL of `path`, which must not be a
-    /// reparse point. The text must name an owner and say `D:P`; a group in it is
-    /// not applied.
+    /// Windows: sets the owner, a protected DACL and any group of `path`, which must
+    /// not be a reparse point. The text must name an owner and say `D:P`.
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()>;
     /// Windows: the owner, group and DACL of `path`. A reparse point is an error.
     fn get_sddl(&self, path: &Path) -> io::Result<String>;

@@ -7,6 +7,7 @@
 //! and the call are two steps, so it stops a planted link, not one a writer of the
 //! parent swaps in between; callers also check that the ancestors are safe (W14).
 
+use super::account;
 use super::sd::{self, LocalMem};
 use super::wide;
 use crate::sddl;
@@ -70,27 +71,41 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
     sd::to_sddl(guard.0, info)
 }
 
-/// Sets the owner and a protected DACL of `path` from `sddl_text`, which must name an
-/// owner and say `D:P`. A group in the text is not applied. A reparse point is an
-/// error.
+/// Sets the owner, a protected DACL and any group of `path` from `sddl_text`, which
+/// must name an owner and say `D:P`. The group counts because `winacl::actual_ok`
+/// compares it: `G:SY` left unset would fail every later check of the path. A reparse
+/// point is an error.
 pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let desc = settable(sddl_text)?;
+    let parsed =
+        sddl::parse(sddl_text).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let group = parsed
+        .group
+        .as_deref()
+        .map(account::binary_sid)
+        .transpose()?;
+    let (group_ptr, group_flag) = match &group {
+        Some(g) => (g.as_psid(), GROUP_SECURITY_INFORMATION),
+        None => (ptr::null_mut(), 0),
+    };
     let owner = desc.owner_sid()?;
     let dacl = desc.dacl()?;
     refuse_reparse_point(path)?;
     let name = wide(path)?;
     // SAFETY: `name` is NUL-terminated and outlives the call. `owner` and `dacl` point
-    // into `desc`, alive across the call, and neither is null. The group and SACL may
-    // be null, as their flags are not passed.
+    // into `desc`, alive across the call, and neither is null. `group_ptr` is alive in
+    // `group`, and null only when its flag is not passed. The SACL may be null, as its
+    // flag is not passed.
     let status = unsafe {
         SetNamedSecurityInfoW(
             name.as_ptr(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+                | PROTECTED_DACL_SECURITY_INFORMATION
+                | group_flag,
             owner,
-            ptr::null_mut(),
+            group_ptr,
             dacl,
             ptr::null(),
         )
