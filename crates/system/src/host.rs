@@ -245,7 +245,34 @@ pub trait Host: Send + Sync {
     fn windows_build(&self) -> io::Result<WinBuild>;
     /// One operation on the service `saiifed`.
     fn service(&self, op: ServiceOp) -> io::Result<ServiceState>;
+    /// Whether this process may do what needs root or an elevated administrator. On
+    /// Windows that is more than [`Host::euid`]: a low-integrity or restricted child of an
+    /// elevated admin still holds `Administrators`, enabled (W26).
+    fn elevated(&self) -> bool {
+        self.euid() == 0
+    }
+    /// Windows: the SID of the local group `name`. `Ok(None)` when no account has that
+    /// name; an account of another kind is an `Err`, as is a failed lookup.
+    fn lookup_local_group(&self, name: &str) -> io::Result<Option<String>>;
+    /// Windows: holds the directory `path` so it cannot be renamed or deleted until the
+    /// result is dropped. A reparse point is an error.
+    fn hold_dir(&self, path: &Path) -> io::Result<Hold>;
+    /// Windows: takes the lock file `path`, which goes when the result is dropped or the
+    /// process ends. `Ok(None)` when another holds it.
+    fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>>;
+    /// Windows: whether Claude Code's machine policy leaves saiife's drop-in in force
+    /// (W24).
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy;
+    /// Windows: connects to the daemon's pipe, checking its owner, within `wait`.
+    fn wait_for_pipe(&self, wait: Duration) -> io::Result<()>;
+    /// Renames a file. Its descriptor goes with it, which the fake must be told.
+    fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
 }
+
+/// Something [`Host`] keeps open for as long as this lives.
+pub type Hold = Box<dyn std::any::Any + Send>;
 
 /// [`Host::policy_reload`] over the control socket. A socket that does not
 /// answer yet is tried again until `wait` has passed. Linux and macOS: the
@@ -578,6 +605,26 @@ impl Host for RealHost {
     }
 
     fn service(&self, _op: ServiceOp) -> io::Result<ServiceState> {
+        Err(windows_only())
+    }
+
+    fn lookup_local_group(&self, _name: &str) -> io::Result<Option<String>> {
+        Err(windows_only())
+    }
+
+    fn hold_dir(&self, _path: &Path) -> io::Result<Hold> {
+        Err(windows_only())
+    }
+
+    fn lock_file(&self, _path: &Path) -> io::Result<Option<Hold>> {
+        Err(windows_only())
+    }
+
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy {
+        saiife_agents::claude::HklmPolicy::Absent
+    }
+
+    fn wait_for_pipe(&self, _wait: Duration) -> io::Result<()> {
         Err(windows_only())
     }
 }
@@ -1640,6 +1687,16 @@ pub struct FakeState {
     pub services: BTreeMap<String, ServiceSpec>,
     /// Whether `saiifed` is running.
     pub service_running: bool,
+    /// The token holds `Administrators` but cannot use it (low integrity, or restricted
+    /// SIDs): `elevated` answers false whatever `euid` says.
+    pub limited_token: bool,
+    /// Accounts that exist and are no local group: `lookup_local_group` refuses them.
+    pub not_local_groups: Vec<String>,
+    /// When set, `wait_for_pipe` fails with this error: the daemon never answered, or
+    /// somebody else owns the pipe.
+    pub pipe_error: Option<String>,
+    /// `service` answers `Stop` with a timeout, and the service keeps running.
+    pub service_will_not_stop: bool,
 }
 
 /// JSON maps need string keys, so the registry is saved as a list.
@@ -1717,6 +1774,10 @@ impl Default for FakeState {
             },
             services: BTreeMap::new(),
             service_running: false,
+            limited_token: false,
+            not_local_groups: Vec::new(),
+            pipe_error: None,
+            service_will_not_stop: false,
         }
     }
 }
@@ -1815,14 +1876,29 @@ fn already(what: &str, name: &str) -> io::Error {
     )
 }
 
-/// What the real `set_sddl` refuses: a reparse point (here, a symlink) and a file
-/// with more than one hard link (here, on Unix). A missing path is an error too.
-fn refuse_like_windows(path: &Path) -> io::Result<()> {
+/// What the real `set_sddl` refuses: a reparse point (here, a symlink), a file
+/// with more than one hard link (here, on Unix), and a path whose handle really is
+/// somewhere else (a link above the last component). A missing path is an error too.
+fn refuse_like_windows(root: &Path, path: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is a reparse point", path.display()),
+        ));
+    }
+    // Against the root's own resolved path, so a temp dir below a system link (macOS's
+    // `/var`) is no redirect.
+    let real = std::fs::canonicalize(path)?;
+    let want = std::fs::canonicalize(root)?.join(path.strip_prefix(root).unwrap_or(path));
+    if real != want {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is really {}: a reparse point is on the way",
+                path.display(),
+                real.display()
+            ),
         ));
     }
     #[cfg(unix)]
@@ -2306,7 +2382,7 @@ impl Host for FakeHost {
 
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()> {
         self.fake_applies(path, sddl)?;
-        refuse_like_windows(path)?;
+        refuse_like_windows(&self.root, path)?;
         self.update(|s| {
             s.calls.push(format!("set_sddl {} {sddl}", path.display()));
             s.sddl.insert(path.to_path_buf(), sddl.to_string());
@@ -2315,6 +2391,12 @@ impl Host for FakeHost {
     }
 
     fn get_sddl(&self, path: &Path) -> io::Result<String> {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a reparse point", path.display()),
+            ));
+        }
         self.update(|s| {
             s.calls.push(format!("get_sddl {}", path.display()));
             s.sddl
@@ -2421,6 +2503,12 @@ impl Host for FakeHost {
                     return Err(gone());
                 }
                 ServiceOp::Start => s.service_running = true,
+                ServiceOp::Stop { .. } if s.service_will_not_stop => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{WIN_SERVICE} did not stop within 10 s"),
+                    ));
+                }
                 ServiceOp::Stop { .. } => s.service_running = false,
                 ServiceOp::ParamChange => {}
                 ServiceOp::Delete => {
@@ -2439,6 +2527,111 @@ impl Host for FakeHost {
                 ServiceState::Stopped
             })
         })
+    }
+
+    fn elevated(&self) -> bool {
+        let s = self.state();
+        s.euid == 0 && !s.limited_token
+    }
+
+    fn lookup_local_group(&self, name: &str) -> io::Result<Option<String>> {
+        self.update(|s| {
+            s.calls.push(format!("lookup_local_group {name}"));
+            if s.not_local_groups.iter().any(|n| n == name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} is no local group"),
+                ));
+            }
+            Ok(s.sids.get(name).cloned())
+        })
+    }
+
+    fn hold_dir(&self, path: &Path) -> io::Result<Hold> {
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a reparse point", path.display()),
+            ));
+        }
+        self.update(|s| {
+            s.calls.push(format!("hold {}", path.display()));
+            Ok(())
+        })?;
+        Ok(Box::new(FakeDirHold {
+            root: self.root.clone(),
+            path: path.to_path_buf(),
+        }))
+    }
+
+    fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(_) => Ok(Some(Box::new(FakeLockHold(path.to_path_buf())))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy {
+        use saiife_agents::claude::{hklm_policy, HklmReadError};
+        let s = self.state();
+        hklm_policy(&|key, value| {
+            match s.registry.get(&(key.to_string(), value.to_string())) {
+                Some(RegValue::Str(v)) => Ok(Some(v.clone())),
+                None => Ok(None),
+                // A value of the wrong type: the real read fails too.
+                Some(_) => Err(HklmReadError),
+            }
+        })
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)?;
+        self.update(|s| {
+            if let Some(sddl) = s.sddl.remove(from) {
+                s.sddl.insert(to.to_path_buf(), sddl);
+            }
+            Ok(())
+        })
+    }
+
+    fn wait_for_pipe(&self, _wait: Duration) -> io::Result<()> {
+        self.update(|s| {
+            s.calls.push("wait_for_pipe".to_string());
+            match &s.pipe_error {
+                Some(e) => Err(io::Error::new(io::ErrorKind::TimedOut, e.clone())),
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+/// What the fake's [`Host::hold_dir`] returns: says so in `calls` when dropped.
+struct FakeDirHold {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for FakeDirHold {
+    fn drop(&mut self) {
+        let _ = FakeHost::unopened(&self.root).update(|s| {
+            s.calls.push(format!("release {}", self.path.display()));
+            Ok(())
+        });
+    }
+}
+
+/// What the fake's [`Host::lock_file`] returns: the file goes when dropped, as the real
+/// one does when its handle closes.
+struct FakeLockHold(PathBuf);
+
+impl Drop for FakeLockHold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

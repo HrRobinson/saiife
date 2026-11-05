@@ -14,6 +14,7 @@ use saiife_agents::lock::{label_for, LockLabel, LockPlatform};
 use saiife_agents::Agent;
 use saiife_audit::sign::{judge, Kind};
 use saiife_policy::installed::{FileKind, Installed, VaultKeyMode};
+use saiife_policy::system::WINDOWS_SOCKET_DIR;
 use sha2::{Digest, Sha256};
 use std::fs::{self, Metadata};
 use std::io;
@@ -335,6 +336,13 @@ fn socket_dir(ctx: &Ctx) -> (String, PathBuf) {
             let v = &p.config.daemon.socket_dir;
             (v.display().to_string(), configured(ctx, v, RUN_DIR))
         }
+        // No run dir on Windows, and `at` panics on one. Task 8 owns these checks there.
+        Err(_) if ctx.layout.platform() == Platform::Windows => (
+            WINDOWS_SOCKET_DIR.to_string(),
+            ctx.layout
+                .try_at(Path::new(WINDOWS_SOCKET_DIR))
+                .unwrap_or_default(),
+        ),
         Err(_) => (shown(ctx, RUN_DIR).to_string(), ctx.layout.at(RUN_DIR)),
     }
 }
@@ -466,7 +474,11 @@ fn paths_owner(ctx: &Ctx) -> Check {
         }
         Err(e) => t.bad(format!("{POLICY_D}: cannot list: {e}")),
     }
-    paths.extend([INSTALLED, CREDSTORE].map(fixed));
+    paths.push(fixed(INSTALLED));
+    // No credstore on Windows, and `at` panics on one.
+    if ctx.layout.platform() != Platform::Windows {
+        paths.push(fixed(CREDSTORE));
+    }
     for (shown, at) in &paths {
         let Stat::Found(m) = lstat(ctx, shown, at, &mut t) else {
             // A missing path is reported by the checks that need it.
@@ -978,7 +990,10 @@ fn files_modes(ctx: &Ctx) -> Check {
             VaultKeyMode::DaemonFile => want(vault, l(VAULT_KEY), daemon, 0o400, Ty::File, false),
         });
     }
-    wants.push(want(sh(UNIT), l(UNIT), root, 0o644, Ty::File, false));
+    // No unit file on Windows, and `at` panics on one.
+    if ctx.layout.platform() != Platform::Windows {
+        wants.push(want(sh(UNIT), l(UNIT), root, 0o644, Ty::File, false));
+    }
 
     for w in &wants {
         let m = match lstat(ctx, &w.shown, &w.at, &mut t) {

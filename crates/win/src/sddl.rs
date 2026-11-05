@@ -334,6 +334,27 @@ pub fn check_links(attributes: u32, links: u32) -> Result<(), String> {
     ))
 }
 
+/// Whether `actual`, the path `GetFinalPathNameByHandleW` gives for an open handle, is
+/// `expected`, the path that was asked for. A junction anywhere on the way makes them
+/// differ, which a check of the last component cannot see.
+///
+/// The `\\?\` prefix is not compared, and `/` counts as `\`. Letters compare as ASCII,
+/// ignoring case: a non-ASCII name in another case is refused, which fails closed, and
+/// the install tree has none. So does an 8.3 short name, since Windows answers with the
+/// long one: canonicalize a path before setting a descriptor on it.
+pub fn same_final_path(expected: &str, actual: &str) -> bool {
+    fn plain(p: &str) -> String {
+        let p = p.replace('/', r"\");
+        let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
+        // `C:\` keeps its slash; `C:\a\` loses it.
+        match p.strip_suffix('\\') {
+            Some(rest) if !rest.ends_with(':') => rest.to_string(),
+            _ => p.to_string(),
+        }
+    }
+    plain(expected).eq_ignore_ascii_case(&plain(actual))
+}
+
 /// Canonical text: hex rights and full SIDs, or [`LOCAL_ADMIN`] for that account.
 /// `D:` is always there, and the
 /// `AI` and `AR` flags are not, since [`Sd`] does not keep them. So
@@ -757,6 +778,35 @@ mod tests {
 
     /// A descriptor set through one name of a hard-linked file changes all of them, and
     /// the other name may be a file the setter must not touch.
+    #[test]
+    fn final_path_compare() {
+        let want = r"C:\ProgramData\saiife\etc";
+        for same in [
+            r"\\?\C:\ProgramData\saiife\etc",
+            r"\\?\c:\programdata\SAIIFE\etc",
+            r"C:/ProgramData/saiife/etc",
+            r"C:\ProgramData\saiife\etc\",
+        ] {
+            assert!(same_final_path(want, same), "{same}");
+        }
+        assert!(same_final_path(r"\\?\D:\a\_temp\x", r"\\?\D:\a\_temp\x"));
+        assert!(same_final_path(r"C:\", r"\\?\C:\"));
+        for other in [
+            // A junction took it elsewhere.
+            r"\\?\C:\Users\agent\planted\etc",
+            r"\\?\C:\Windows\System32\config",
+            r"\\?\D:\ProgramData\saiife\etc",
+            r"\\?\C:\ProgramData\saiife\etc2",
+            r"\\?\C:\ProgramData\saiife",
+            r"\\?\UNC\server\share\ProgramData\saiife\etc",
+            r"\\?\C:\PROGRA~1\saiife\etc",
+            "",
+        ] {
+            assert!(!same_final_path(want, other), "{other}");
+        }
+        assert!(!same_final_path(r"C:\", r"\\?\C:"));
+    }
+
     #[test]
     fn check_links_refuses_a_hard_linked_file() {
         const DIRECTORY: u32 = 0x10;

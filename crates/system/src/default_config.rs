@@ -135,7 +135,14 @@ fn platform_default(layout: &Layout, section: &str, key: &str, default: &str) ->
     }
 }
 
+/// This process's user name, for a test tree's config.
+#[cfg(not(unix))]
+fn own_user_name() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| "nobody".to_string())
+}
+
 /// This process's user name from `/etc/passwd` (else `$USER`).
+#[cfg(unix)]
 fn own_user_name() -> String {
     let uid = rustix::process::getuid().as_raw();
     std::fs::read_to_string("/etc/passwd")

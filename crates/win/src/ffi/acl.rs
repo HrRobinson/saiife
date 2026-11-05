@@ -1,7 +1,7 @@
 //! File and directory ACLs as SDDL.
 //!
 //! FFI calls: `GetSecurityInfo`, `SetSecurityInfo`, `GetFileInformationByHandle`,
-//! `CreateDirectoryW`.
+//! `GetFinalPathNameByHandleW`, `CreateDirectoryW`.
 //!
 //! The named-path calls follow a reparse point, and between any check and such a call
 //! a writer of the parent could swap one in, and an elevated `set_sddl` would re-ACL its
@@ -13,11 +13,13 @@
 //! descriptor belongs to the file, so the set would reach the link's target. As Linux
 //! does in `check_daemon_file`.
 //!
-//! This covers the last component only. A junction higher up the path is still followed
-//! on open, so callers check the ancestors top-down before every set (W14, `ancestor_ok`).
+//! A junction higher up the path is still followed on open. So `set_sddl` also asks the
+//! handle where it really is and refuses if that is not the path it was given. Callers
+//! check the ancestors top-down before every set as well (W14, `ancestor_ok`).
 
 use super::account;
 use super::sd::{self, LocalMem};
+use super::text_of;
 use super::wide;
 use crate::sddl;
 use std::fs::{File, OpenOptions};
@@ -35,10 +37,14 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    CreateDirectoryW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
+
+const ERROR_SHARING_VIOLATION: i32 = 32;
 
 /// `path` itself, file or dir, opened with `access` and without following a final
 /// reparse point. An error if it is one.
@@ -75,6 +81,91 @@ fn refuse_hard_links(file: &File, path: &Path) -> io::Result<()> {
             format!("{}: {e}", path.display()),
         )
     })
+}
+
+/// An error unless `file`, opened as `path`, really is at `path`
+/// ([`sddl::same_final_path`]). The open follows a junction above the last component;
+/// this is what catches one swapped in after the caller checked the chain.
+fn refuse_redirect(file: &File, path: &Path) -> io::Result<()> {
+    let mut buf = vec![0u16; 1024];
+    let len = loop {
+        // SAFETY: the handle is open and `file` outlives the call; `buf` holds as many
+        // units as the length passed.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            break n;
+        }
+        // Too small: `n` is the size it needs, terminator included.
+        buf.resize(n, 0);
+    };
+    let actual = text_of(&buf[..len])?;
+    let expected = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not valid text", path.display()),
+        )
+    })?;
+    if !sddl::same_final_path(expected, &actual) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{expected} is really {actual}: a reparse point is on the way"),
+        ));
+    }
+    Ok(())
+}
+
+/// Holds the directory `path` so it cannot be renamed or deleted while the handle lives:
+/// it gives no `FILE_SHARE_DELETE`. A reparse point is an error.
+///
+/// It asks for `FILE_LIST_DIRECTORY` on purpose. Windows leaves a handle out of its
+/// sharing checks when it asks only for attributes, and such a handle would deny nothing.
+pub fn hold_dir(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Takes the lock file `path`: open with no sharing at all, so one holder at a time, and
+/// deleted when the handle closes, a crash included. `Ok(None)` when another holds it. The
+/// caller has checked that only administrators can write the directory.
+pub fn lock_file(path: &Path) -> io::Result<Option<File>> {
+    let opened = OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+        .share_mode(0)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path);
+    let file = match opened {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    Ok(Some(file))
 }
 
 /// The descriptor text `sddl` as [`sddl::check_settable`] allows, parsed by Windows.
@@ -114,7 +205,8 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
 /// Sets the owner, a protected DACL and any group of `path` from `sddl_text`, which
 /// must name an owner and say `D:P`. The group counts because `winacl::actual_ok`
 /// compares it: `G:SY` left unset would fail every later check of the path. A reparse
-/// point, or a file with more than one hard link, is an error.
+/// point, a file with more than one hard link, or a handle that is not really at `path`
+/// is an error. So `path` must be the long, canonical spelling.
 ///
 /// This propagates, as CI showed: `SetSecurityInfo` on a directory handle gave an
 /// existing child that inherits the new inheritable entries, as inherited entries
@@ -138,6 +230,7 @@ pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let dacl = desc.dacl()?;
     let file = open_no_follow(path, READ_CONTROL | WRITE_DAC | WRITE_OWNER)?;
     refuse_hard_links(&file, path)?;
+    refuse_redirect(&file, path)?;
     // SAFETY: the handle is open with WRITE_DAC and WRITE_OWNER, and `file` outlives the
     // call. `owner` and `dacl` point into `desc`, alive across the call, and neither is
     // null. `group_ptr` is alive in `group`, and null only when its flag is not passed.

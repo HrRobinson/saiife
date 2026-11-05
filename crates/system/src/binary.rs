@@ -808,7 +808,7 @@ pub fn fake_macho(sig: Option<(bool, bool, bool)>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -988,13 +988,13 @@ mod tests {
 
     // ---- PE ----
 
-    struct PeFixture {
-        pe32: bool,
-        flags: u16,
-        imports: Vec<&'static str>,
-        delay: Vec<&'static str>,
-        signed: bool,
-        marker: Option<bool>,
+    pub(crate) struct PeFixture {
+        pub(crate) pe32: bool,
+        pub(crate) flags: u16,
+        pub(crate) imports: Vec<&'static str>,
+        pub(crate) delay: Vec<&'static str>,
+        pub(crate) signed: bool,
+        pub(crate) marker: Option<bool>,
     }
 
     impl Default for PeFixture {
@@ -1024,7 +1024,7 @@ mod tests {
 
     /// Minimal PE32+: one section at RVA 0x1000 / file 0x200 holding the
     /// import and delay-import tables, the names and a load config.
-    fn pe_fixture(f: PeFixture) -> Vec<u8> {
+    pub(crate) fn pe_fixture(f: PeFixture) -> Vec<u8> {
         let mut b = vec![0u8; RAW_AT + 0x1000];
         b[..2].copy_from_slice(b"MZ");
         w32(&mut b, 0x3c, PE_AT as u32);

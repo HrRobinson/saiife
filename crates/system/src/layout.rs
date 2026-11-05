@@ -105,6 +105,14 @@ pub const LAUNCHD_LABEL: &str = "com.saiife.saiifed";
 
 /// The root CA dir (`<config dir>/ca`), named here for [`windows_path`].
 pub const CA_DIR: &str = "/etc/saiife/ca";
+/// Held while `system install` runs (the Windows [`INSTALL_LOCK`]): inside the root, whose
+/// descriptor is checked before this is opened, because Users may create entries in
+/// `C:\ProgramData`. Gone when its handle closes.
+pub const WIN_INSTALL_LOCK: &str = r"C:\ProgramData\saiife\install.lock";
+/// A plain uninstall's copy of `installed.toml` (the Windows `PREVIOUS`).
+pub const WIN_PREVIOUS: &str = r"C:\ProgramData\saiife\etc\installed.previous.toml";
+/// Where `--package` appends the doctor's text (W20).
+pub const WIN_INSTALL_LOG: &str = r"C:\ProgramData\saiife\log\install.log";
 /// The control endpoint (W11).
 pub const WIN_PIPE: &str = r"\\.\pipe\saiife";
 /// The personal broker's pipe is this and the user's SID (W25).
@@ -183,7 +191,8 @@ pub fn macos_path(linux: &str) -> Option<&'static str> {
 
 /// The Windows path (spec §5.3a, W9) for a Linux path constant. `None` means
 /// the constant has no Windows path: there is no run dir, unit file, polkit or
-/// credstore there, and no install lock is specified yet.
+/// credstore there, and the install lock is [`WIN_INSTALL_LOCK`], not a constant of this
+/// table, so it can never pass for a path outside a checked directory.
 pub fn windows_path(linux: &str) -> Option<&'static str> {
     Some(match linux {
         OPT_DIR => r"C:\ProgramData\saiife",
@@ -375,11 +384,10 @@ impl Layout {
     ///
     /// On Windows it also panics on a constant with no Windows path, rather
     /// than make `C:\run\saiife`, which any user could have created first.
-    /// These callers pass such a constant and are `cfg(unix)` today, so they
-    /// must branch on the platform first when plan 19b Tasks 7 and 8 un-gate
-    /// them: `crates/cli/src/status_cmd.rs:1043` (`RUN_DIR`),
-    /// `doctor/system.rs:338` (`RUN_DIR`), `:469` (`CREDSTORE`), `:981` (`UNIT`),
-    /// `uninstall.rs:55` and `:298` (`INSTALL_LOCK`).
+    /// `uninstall.rs` passes such a constant (`INSTALL_LOCK`) only after its Windows
+    /// branch, and `doctor/system.rs` (`RUN_DIR`, `CREDSTORE`, `UNIT`) branches at each
+    /// call. `crates/cli/src/status_cmd.rs:1043` (`RUN_DIR`), `cfg(unix)` today, must branch
+    /// on the platform first when plan 19b Task 10 un-gates it.
     pub fn at(&self, abs: &str) -> PathBuf {
         self.try_at(Path::new(self.logical(abs)))
             .unwrap_or_else(|e| panic!("{e}"))

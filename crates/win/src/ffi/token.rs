@@ -149,7 +149,17 @@ pub(crate) fn impersonated() -> io::Result<PeerToken> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = Token(handle);
+    peer_token_of(Token(handle))
+}
+
+/// What the current token is ([`open_current`]), with its integrity level and restricted
+/// SIDs. For W26: `elevated_admin` alone is true for a low-integrity or restricted child
+/// of an elevated admin. `crate::pipe::peer_facts` says what it counts as.
+pub fn current_peer() -> io::Result<PeerToken> {
+    peer_token_of(open_current()?)
+}
+
+fn peer_token_of(token: Token) -> io::Result<PeerToken> {
     let facts = facts_of(token.0)?;
 
     let label = info(token.0, TokenIntegrityLevel)?;

@@ -10,9 +10,11 @@
 //!
 //! - `winacl`: the Windows ACL table (§5.3a.3), pure, on every OS.
 //!
-//! On Windows `layout`, `host`, `supported`, `sip`, `binary`, `winservice` and `winacl`
-//! exist: every other module still uses Unix owners, modes or rustix, until the
-//! rest of plan 19b.
+//! - `install_win`: `system install` and `system uninstall` on Windows, behind `Host`,
+//!   on every OS, so Linux tests drive them.
+//!
+//! On Windows `fsops`, `doctor`, `personal`, `polkit` and `testing` do not exist yet: they
+//! still use Unix owners, modes or rustix, until the rest of plan 19b.
 //!
 //! No tokio: the CLI links this crate.
 
@@ -20,18 +22,16 @@
 
 pub mod authright;
 pub mod binary;
-#[cfg(unix)]
 pub mod default_config;
 #[cfg(unix)]
 pub mod doctor;
-#[cfg(unix)]
 pub mod fleet;
 #[cfg(unix)]
 pub mod fsops;
 #[cfg(any(unix, windows))]
 pub mod host;
-#[cfg(unix)]
 pub mod install;
+mod install_win;
 pub mod launchd;
 pub mod layout;
 #[cfg(any(unix, windows))]
@@ -45,7 +45,6 @@ pub mod supported;
 #[doc(hidden)]
 #[cfg(unix)]
 pub mod testing;
-#[cfg(unix)]
 pub mod uninstall;
 pub mod unit;
 pub mod user_unit;

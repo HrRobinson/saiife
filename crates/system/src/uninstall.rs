@@ -3,20 +3,33 @@
 //! groups are kept unless `--purge`. Listed paths that are gone are
 //! skipped; unlisted paths are never touched.
 
+#[cfg(unix)]
 use crate::authright;
+#[cfg(unix)]
 use crate::fsops;
-use crate::host::{Host, SECURITY};
+use crate::host::Host;
+#[cfg(unix)]
+use crate::host::SECURITY;
+use crate::install::InstallError;
+#[cfg(unix)]
 use crate::install::{
     beneath_links, check_trusted_owner_mode, read_previous, root_group, step, take_install_lock,
-    InstallError, INSTALL_LOCK_WAIT, MACOS_TOOL_TIMEOUT, PREVIOUS,
+    INSTALL_LOCK_WAIT, MACOS_TOOL_TIMEOUT, PREVIOUS,
 };
+#[cfg(unix)]
 use crate::launchd;
 use crate::layout::*;
+#[cfg(unix)]
 use saiife_agents::{codex, gemini, AgentError, Change};
+#[cfg(unix)]
 use saiife_policy::installed::{read_installed, FileKind};
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 pub struct UninstallOptions {
     pub purge: bool,
@@ -25,6 +38,24 @@ pub struct UninstallOptions {
 /// Removes what install listed. Returns one line per thing done (and
 /// `warning: …` lines), in order.
 pub fn uninstall(
+    layout: &Layout,
+    host: &dyn Host,
+    opts: &UninstallOptions,
+) -> Result<Vec<String>, InstallError> {
+    // Before any constant Windows has no path for: `Layout::at` panics on those.
+    if layout.platform() == Platform::Windows {
+        return crate::install_win::uninstall(layout, host, opts.purge);
+    }
+    #[cfg(unix)]
+    {
+        uninstall_unix(layout, host, opts)
+    }
+    #[cfg(not(unix))]
+    Err(crate::install::wrong_platform())
+}
+
+#[cfg(unix)]
+fn uninstall_unix(
     layout: &Layout,
     host: &dyn Host,
     opts: &UninstallOptions,
@@ -311,6 +342,7 @@ pub fn uninstall(
 
 /// Before `--purge` deletes the state and audit trees: each is checked as
 /// [`purge_target`] checks it, before anything is removed.
+#[cfg(unix)]
 fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError> {
     for abs in purge_trees(layout) {
         purge_target(layout, host, abs)?;
@@ -320,6 +352,7 @@ fn purge_preflight(layout: &Layout, host: &dyn Host) -> Result<(), InstallError>
 
 /// The daemon's trees `--purge` removes: the state and audit dirs, and on
 /// macOS the socket dir install made.
+#[cfg(unix)]
 fn purge_trees(layout: &Layout) -> Vec<&'static str> {
     match layout.platform() {
         Platform::Linux | Platform::Windows => vec![STATE_DIR, AUDIT_DIR],
@@ -328,6 +361,7 @@ fn purge_trees(layout: &Layout) -> Vec<&'static str> {
 }
 
 /// A tree `--purge` removes: its parent, open, and its `stat`.
+#[cfg(unix)]
 struct PurgeTarget {
     parent: OwnedFd,
     name: OsString,
@@ -335,16 +369,19 @@ struct PurgeTarget {
 }
 
 /// `(parent, name)` of an absolute path.
+#[cfg(unix)]
 fn split(p: &Path) -> (PathBuf, OsString) {
     let parent = p.parent().unwrap_or(Path::new("/")).to_path_buf();
     (parent, p.file_name().unwrap_or_default().to_os_string())
 }
 
 /// An absolute path relative to the root.
+#[cfg(unix)]
 fn rel(p: &Path) -> &Path {
     p.strip_prefix("/").unwrap_or(p)
 }
 
+#[cfg(unix)]
 fn io_at(abs: &str, e: std::io::Error) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("{abs}: {e}"))
 }
@@ -356,6 +393,7 @@ fn io_at(abs: &str, e: std::io::Error) -> std::io::Error {
 /// itself must be root's and not writable by group or others (sticky
 /// dirs excepted), and the tree a real directory owned by root or the
 /// daemon user: nobody else can have swapped it in.
+#[cfg(unix)]
 fn purge_target(
     layout: &Layout,
     host: &dyn Host,
@@ -416,6 +454,7 @@ fn purge_target(
 /// systemd says the daemon is not running (`inactive` or `failed`, as for
 /// a unit a plain uninstall already removed). Otherwise stop: the state and
 /// audit must not go while the daemon may still write them.
+#[cfg(unix)]
 fn stopped_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError> {
     let state = host
         .systemctl(&["is-active", UNIT_NAME])
@@ -439,6 +478,7 @@ fn stopped_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError
 
 /// `launchctl bootout` failed: go on only when launchd no longer has the
 /// job (`launchctl print` fails). Otherwise stop: the daemon may still run.
+#[cfg(unix)]
 fn unloaded_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallError> {
     let loaded = host
         .launchctl(&["print", launchd::SERVICE])
@@ -461,6 +501,7 @@ fn unloaded_or_refuse(host: &dyn Host, out: &[String]) -> Result<(), InstallErro
 
 /// Runs `launchctl args`; a failure is a `warning:` line. True when it
 /// succeeded.
+#[cfg(unix)]
 fn launchctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool {
     let line = args.join(" ");
     match host.launchctl(args) {
@@ -483,6 +524,7 @@ fn launchctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool
 /// A plain uninstall keeps installed.toml as `/etc/saiife/installed.previous.toml`
 /// (root:root 0600), so a later install or `--purge` knows what install
 /// created.
+#[cfg(unix)]
 fn keep_copy(
     layout: &Layout,
     host: &dyn Host,
@@ -505,6 +547,7 @@ fn keep_copy(
 
 /// Runs `systemctl args`; a failure is a `warning:` line. True when it
 /// succeeded.
+#[cfg(unix)]
 fn systemctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool {
     let line = args.join(" ");
     match host.systemctl(args) {
@@ -525,7 +568,7 @@ fn systemctl_warn(host: &dyn Host, args: &[&str], out: &mut Vec<String>) -> bool
 }
 
 /// True when a managed config holds nothing (after saiife's entry left).
-fn is_empty_config(agent: &str, p: &Path) -> bool {
+pub(crate) fn is_empty_config(agent: &str, p: &Path) -> bool {
     let Ok(Some(text)) = saiife_agents::fsutil::read_managed(p) else {
         return false;
     };

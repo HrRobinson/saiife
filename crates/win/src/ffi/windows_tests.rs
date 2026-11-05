@@ -16,7 +16,9 @@ fn temp_dir() -> tempfile::TempDir {
     let base = std::env::var_os("RUNNER_TEMP")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    tempfile::tempdir_in(base).unwrap()
+    // Canonical: `set_sddl` compares the path it gets with where the handle really is,
+    // and the runner's %TEMP% can hold an 8.3 name.
+    tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap()
 }
 
 /// A descriptor only the runner's user can use: owner and full control.
@@ -113,6 +115,78 @@ fn get_sddl_of_temp_dir_parses() {
 fn get_sddl_of_a_missing_path_is_an_error() {
     let dir = temp_dir();
     assert!(acl::get_sddl(&dir.path().join("missing")).is_err());
+}
+
+/// W1: a junction above the last component is followed on open, and `set_sddl` must see
+/// through it. The target keeps its descriptor.
+#[test]
+fn set_sddl_refuses_a_junction_above_the_path() {
+    let me = token::current().unwrap().sid;
+    let dir = temp_dir();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let child = real.join("child");
+    std::fs::create_dir(&child).unwrap();
+    let before = acl::get_sddl(&child).unwrap();
+    let link = dir.path().join("link");
+    if let Err(e) = std::os::windows::fs::symlink_dir(&real, &link) {
+        assert!(
+            std::env::var_os("RUNNER_TEMP").is_none(),
+            "the CI runner should be able to make a link: {e}"
+        );
+        return;
+    }
+    let e = acl::set_sddl(&link.join("child"), &own_sddl("P", &me)).unwrap_err();
+    assert!(e.to_string().contains("is really"), "{e}");
+    assert_eq!(acl::get_sddl(&child).unwrap(), before);
+    // Its true path is fine.
+    acl::set_sddl(&child, &own_sddl("P", &me)).unwrap();
+}
+
+/// A handle with no `FILE_SHARE_DELETE` stops a rename of the directory, but not a
+/// descriptor change or a listing of it.
+#[test]
+fn hold_dir_stops_a_rename_only() {
+    let me = token::current().unwrap().sid;
+    let dir = temp_dir();
+    let target = dir.path().join("held");
+    std::fs::create_dir(&target).unwrap();
+    let other = dir.path().join("moved");
+    let held = acl::hold_dir(&target).unwrap();
+    assert!(std::fs::rename(&target, &other).is_err());
+    acl::set_sddl(&target, &own_sddl("P", &me)).unwrap();
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    drop(held);
+    std::fs::rename(&target, &other).unwrap();
+}
+
+/// One holder at a time, and the file goes with the handle.
+#[test]
+fn lock_file_excludes_and_cleans_up() {
+    let dir = temp_dir();
+    let path = dir.path().join("install.lock");
+    let first = acl::lock_file(&path).unwrap().expect("free");
+    assert!(acl::lock_file(&path).unwrap().is_none(), "held");
+    drop(first);
+    assert!(!path.exists());
+    assert!(acl::lock_file(&path).unwrap().is_some());
+}
+
+#[test]
+fn local_group_lookup_reads_the_kind() {
+    assert!(account::lookup_local_group("no-such-account-saiife-test")
+        .unwrap()
+        .is_none());
+    // A user is an account, and no group.
+    let me = token::current().unwrap().sid;
+    let name = account::lookup_sid(&me).unwrap();
+    assert!(account::lookup_local_group(&name).is_err());
+    // `Users` is a builtin alias, the same kind as a local group.
+    let users = account::lookup_sid("S-1-5-32-545").unwrap();
+    assert_eq!(
+        account::lookup_local_group(&users).unwrap().as_deref(),
+        Some("S-1-5-32-545")
+    );
 }
 
 #[test]

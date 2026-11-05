@@ -53,6 +53,26 @@ fn qualified(domain: &str, name: &str) -> String {
 /// The SID and the canonical `DOMAIN\name` of the account `name`, which may be
 /// written `name` or `DOMAIN\name`.
 pub fn lookup_name(name: &str) -> io::Result<(String, String)> {
+    lookup(name).map(|(sid, canonical, _)| (sid, canonical))
+}
+
+/// The SID of the local group `name`. `Ok(None)` when no account has that name. An
+/// account of any other kind is an error: it must not be taken for the group.
+pub fn lookup_local_group(name: &str) -> io::Result<Option<String>> {
+    const ERROR_NONE_MAPPED: i32 = 1332;
+    match lookup(name) {
+        Ok((sid, _, kind)) if kind == crate::sid::SID_TYPE_ALIAS => Ok(Some(sid)),
+        Ok((sid, canonical, kind)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{canonical} ({sid}) is no local group (account kind {kind})"),
+        )),
+        Err(e) if e.raw_os_error() == Some(ERROR_NONE_MAPPED) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The SID, the canonical `DOMAIN\name` and the `SID_NAME_USE` of the account `name`.
+fn lookup(name: &str) -> io::Result<(String, String, SID_NAME_USE)> {
     if name.is_empty() {
         // Windows answers an empty name with the machine's own SID.
         return Err(io::Error::new(
@@ -106,7 +126,7 @@ pub fn lookup_name(name: &str) -> io::Result<(String, String)> {
     // SAFETY: the successful call above wrote a SID into `sid_buf`, alive here.
     let sid = unsafe { sid_to_string(sid_buf.as_mut_ptr().cast()) }?;
     let canonical = lookup_sid(&sid)?;
-    Ok((sid, canonical))
+    Ok((sid, canonical, kind))
 }
 
 /// The SID in binary, as `ConvertStringSidToSidW` made it.

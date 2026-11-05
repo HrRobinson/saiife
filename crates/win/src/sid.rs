@@ -17,6 +17,9 @@ pub const TRUSTED_INSTALLER: &str =
 /// `NT AUTHORITY\NETWORK`.
 pub const NETWORK: &str = "S-1-5-2";
 
+/// `SidTypeAlias`: what `LookupAccountNameW` says of a local group.
+pub const SID_TYPE_ALIAS: i32 = 4;
+
 /// `SE_GROUP_ENABLED`, an attribute of a group in a token.
 pub const SE_GROUP_ENABLED: u32 = 0x4;
 /// `SE_GROUP_USE_FOR_DENY_ONLY`: the group can only deny. This is how a

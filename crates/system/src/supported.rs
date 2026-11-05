@@ -50,8 +50,9 @@ pub enum Support {
 /// Checks this machine (or the tree under `layout`'s root) by the
 /// layout's platform. On Linux: a container, systemd and its version, then
 /// the distribution from `<root>/etc/os-release`. On macOS: the version
-/// `sw_vers` reports. On Windows: a container, the build, the system folders and
-/// an elevated token. Any other OS is refused.
+/// `sw_vers` reports. On Windows: a container, the build and the system folders. Whether
+/// the caller is elevated is no fact about the machine: see W26 in
+/// `install_win::host_refusals`. Any other OS is refused.
 pub fn check_supported(layout: &Layout, host: &dyn Host) -> Support {
     supported_on(Platform::current(), layout, host)
 }
@@ -125,9 +126,6 @@ fn windows_supported(host: &dyn Host) -> Support {
     }
     if !default_folders(host) {
         return Support::Refused(NON_DEFAULT_FOLDERS.to_string());
-    }
-    if host.euid() != 0 {
-        return Support::Refused(NOT_ELEVATED.to_string());
     }
     Support::Supported {
         distro: format!(
@@ -482,14 +480,13 @@ mod windows_tests {
         assert!(!why.starts_with("inside a"), "{why}");
     }
 
+    /// W26 is about the caller, not the machine: doctor from a plain shell must still say
+    /// this machine is supported. Install refuses, in `install_win::host_refusals`.
     #[test]
-    fn not_elevated_refused() {
+    fn a_plain_token_does_not_make_the_machine_unsupported() {
         let (_d, l, h) = machine(26100, true);
         h.set(|s| s.euid = 0x4000_1234);
-        assert_eq!(
-            refused(check(&l, &h)),
-            "run this from an elevated terminal (Run as administrator)"
-        );
+        assert!(matches!(check(&l, &h), Support::Supported { .. }));
     }
 
     #[test]

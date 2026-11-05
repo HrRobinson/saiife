@@ -10,11 +10,13 @@
 use super::{
     argv_net_add_member, argv_net_create_group, argv_net_delete_group, argv_net_remove_member,
     argv_sc_paramchange, argv_sc_sdset, check_exit, exec, parse_win_build, windows_only, CmdOutput,
-    Host, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT, REG_NT_CURRENT_VERSION,
+    Hold, Host, RealHost, ReloadAnswer, UserInfo, WinBuild, ADMIN_TIMEOUT, REG_NT_CURRENT_VERSION,
 };
 use crate::layout::WIN_SERVICE;
 use crate::winservice::{ServiceOp, ServiceSpec, ServiceState, SidType, StartKind};
+use saiife_ipc::client::Client;
 use saiife_win::ffi::{account, acl, token};
+use saiife_win::pipe::peer_facts;
 use saiife_win::sid::uid_of;
 use std::ffi::OsString;
 use std::io;
@@ -310,13 +312,26 @@ impl Host for RealHost {
         on_disk
     }
 
+    /// Over the pipe: Windows has no socket dir, and the owner check is on the service's
+    /// SID, not a uid.
     fn policy_reload(
         &self,
         _socket_dir: &Path,
         _daemon_uid: u32,
-        _wait: Duration,
+        wait: Duration,
     ) -> io::Result<ReloadAnswer> {
-        Err(windows_only())
+        use saiife_ipc::client::ClientError;
+        use saiife_ipc::msg::OP_POLICY_RELOAD;
+        let deadline = Instant::now() + wait;
+        let mut c = connect_pipe(deadline)?;
+        match c.call(OP_POLICY_RELOAD, serde_json::Map::new(), deadline) {
+            Ok(a) => Ok(ReloadAnswer::from_answer(&a)),
+            Err(ClientError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no answer to policy.reload within {} s", wait.as_secs()),
+            )),
+            Err(e) => Err(io::Error::other(format!("policy.reload: {e}"))),
+        }
     }
 
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()> {
@@ -389,6 +404,52 @@ impl Host for RealHost {
             }
         }
     }
+
+    /// W26. Read as a pipe peer's token is: `Administrators` counts only at high
+    /// integrity or above with no restricted SIDs. SYSTEM (the MSI's custom action) holds
+    /// it enabled at System integrity. A token that cannot be read is not elevated.
+    fn elevated(&self) -> bool {
+        token::current_peer().is_ok_and(|t| peer_facts(t).elevated_admin)
+    }
+
+    fn lookup_local_group(&self, name: &str) -> io::Result<Option<String>> {
+        account::lookup_local_group(name)
+    }
+
+    fn hold_dir(&self, path: &Path) -> io::Result<Hold> {
+        Ok(Box::new(acl::hold_dir(path)?))
+    }
+
+    fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>> {
+        Ok(acl::lock_file(path)?.map(|f| Box::new(f) as Hold))
+    }
+
+    fn claude_hklm_policy(&self) -> saiife_agents::claude::HklmPolicy {
+        saiife_agents::claude::hklm_policy_live()
+    }
+
+    fn wait_for_pipe(&self, wait: Duration) -> io::Result<()> {
+        connect_pipe(Instant::now() + wait).map(|_| ())
+    }
+}
+
+/// The daemon's pipe, retried until `deadline`. `connect_pipe` checks that the service
+/// owns it, so a squatted pipe never answers.
+fn connect_pipe(deadline: Instant) -> io::Result<Client> {
+    use crate::layout::WIN_PIPE;
+    use saiife_ipc::client::system_sid;
+    loop {
+        let per_try = (Instant::now() + Duration::from_secs(1)).min(deadline);
+        let err = match Client::connect_pipe(WIN_PIPE, &system_sid(), per_try) {
+            Ok(c) => return Ok(c),
+            Err(e) => e,
+        };
+        let pause = Duration::from_millis(200);
+        if Instant::now() + pause >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, err.to_string()));
+        }
+        std::thread::sleep(pause);
+    }
 }
 
 /// Run in CI's `test` job on `windows-latest`. No admin rights assumed.
@@ -454,7 +515,9 @@ mod tests {
         let base = std::env::var_os("RUNNER_TEMP")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let dir = tempfile::tempdir_in(base).unwrap();
+        // Canonical: `set_sddl` compares the path with where the handle really is, and the
+        // runner's %TEMP% can hold an 8.3 name.
+        let dir = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
         let file = dir.path().join("saiife.exe");
         std::fs::write(&file, b"x").unwrap();
         let row = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";

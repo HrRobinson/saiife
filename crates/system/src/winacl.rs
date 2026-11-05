@@ -220,17 +220,30 @@ fn check(want: &str, actual: &Sd, file: bool) -> Result<(), String> {
 /// `set_sddl` refuses. The walk stops at the first error, so an entry past it is
 /// untouched. Returns how many entries were set.
 ///
+/// The walk goes by path, so what it was told must stay true while it works:
+/// - `check` runs before every set, and is the caller's check of all the entry's
+///   ancestors (W14);
+/// - a handle with no `FILE_SHARE_DELETE` holds `root`, so it cannot be renamed;
+/// - the real `set_sddl` refuses a handle that is not at the path it was given, which
+///   catches a junction swapped in below `root` after `check` read it.
+///
 /// `Host` cannot list a directory, so this reads the tree with `std::fs`: the
 /// real one on Windows, and the fake host's root on Linux.
 pub fn set_sddl_tree(
     host: &dyn Host,
     root: &Path,
+    check: &mut dyn FnMut(&Path) -> io::Result<()>,
     row: &mut dyn FnMut(&Path, bool) -> io::Result<String>,
 ) -> io::Result<usize> {
     let meta = std::fs::symlink_metadata(root)?;
     refuse_reparse(root, &meta)?;
+    let _hold = if meta.is_dir() {
+        Some(host.hold_dir(root)?)
+    } else {
+        None
+    };
     let mut count = 0;
-    walk(host, root, meta.is_dir(), row, &mut count)?;
+    walk(host, root, meta.is_dir(), check, row, &mut count)?;
     Ok(count)
 }
 
@@ -238,10 +251,13 @@ fn walk(
     host: &dyn Host,
     path: &Path,
     is_dir: bool,
+    check: &mut dyn FnMut(&Path) -> io::Result<()>,
     row: &mut dyn FnMut(&Path, bool) -> io::Result<String>,
     count: &mut usize,
 ) -> io::Result<()> {
-    host.set_sddl(path, &row(path, is_dir)?)?;
+    let want = row(path, is_dir)?;
+    check(path)?;
+    host.set_sddl(path, &want)?;
     *count += 1;
     if !is_dir {
         return Ok(());
@@ -253,12 +269,12 @@ fn walk(
     for child in names {
         let meta = std::fs::symlink_metadata(&child)?;
         refuse_reparse(&child, &meta)?;
-        walk(host, &child, meta.is_dir(), row, count)?;
+        walk(host, &child, meta.is_dir(), check, row, count)?;
     }
     Ok(())
 }
 
-fn refuse_reparse(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
+pub(crate) fn refuse_reparse(path: &Path, meta: &std::fs::Metadata) -> io::Result<()> {
     #[cfg(windows)]
     let reparse = {
         use std::os::windows::fs::MetadataExt;
@@ -1048,6 +1064,79 @@ mod tests {
 
     const ROW: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)";
 
+    fn no_check(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The security scan's finding: the check runs before every set, the root is held
+    /// across the walk and let go after it.
+    #[test]
+    fn set_sddl_tree_checks_before_every_set_and_holds_the_root() {
+        let (dir, host) = tree_host();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/f"), b"x").unwrap();
+        let mut checked = Vec::new();
+        set_sddl_tree(
+            &host,
+            &root,
+            &mut |p| {
+                assert!(host.get_sddl(p).is_err(), "checked before its set: {p:?}");
+                checked.push(p.to_path_buf());
+                Ok(())
+            },
+            &mut |_, _| Ok(ROW.to_string()),
+        )
+        .unwrap();
+        assert_eq!(checked, [root.clone(), root.join("a"), root.join("a/f")]);
+        let calls = host.state().calls;
+        let at = |line: String| calls.iter().position(|c| *c == line).unwrap();
+        let held = at(format!("hold {}", root.display()));
+        let freed = at(format!("release {}", root.display()));
+        for p in &checked {
+            let set = at(format!("set_sddl {} {ROW}", p.display()));
+            assert!(held < set && set < freed, "{calls:?}");
+        }
+    }
+
+    /// A check that fails stops the walk before anything is set on that entry.
+    #[test]
+    fn set_sddl_tree_stops_at_a_failed_check() {
+        let (dir, host) = tree_host();
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let e = set_sddl_tree(
+            &host,
+            &root,
+            &mut |p| {
+                if p.ends_with("a") {
+                    Err(io::Error::other("chain"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_, _| Ok(ROW.to_string()),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("chain"));
+        assert!(host.get_sddl(&root.join("a")).is_err());
+    }
+
+    /// A junction swapped in below the root: the fake answers as the handle compare does.
+    #[cfg(unix)]
+    #[test]
+    fn set_refuses_a_path_redirected_above_the_last_component() {
+        let (dir, host) = tree_host();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/f"), b"x").unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let e = host.set_sddl(&base.join("link/f"), ROW).unwrap_err();
+        assert!(e.to_string().contains("is really"), "{e}");
+        assert!(host.get_sddl(&base.join("real/f")).is_err());
+        host.set_sddl(&base.join("real/f"), ROW).unwrap();
+    }
+
     #[test]
     fn set_sddl_tree_sets_every_entry_top_down() {
         let (dir, host) = tree_host();
@@ -1056,7 +1145,7 @@ mod tests {
         std::fs::write(root.join("a/b/f"), b"x").unwrap();
         std::fs::write(root.join("g"), b"x").unwrap();
         let mut seen = Vec::new();
-        let n = set_sddl_tree(&host, &root, &mut |p, d| {
+        let n = set_sddl_tree(&host, &root, &mut no_check, &mut |p, d| {
             seen.push((p.strip_prefix(&root).unwrap().to_path_buf(), d));
             Ok(ROW.to_string())
         })
@@ -1086,7 +1175,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap().join("t");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("f"), b"x").unwrap();
-        let e = set_sddl_tree(&host, &root, &mut |p, _| {
+        let e = set_sddl_tree(&host, &root, &mut no_check, &mut |p, _| {
             if p.ends_with("f") {
                 Err(io::Error::other("no row"))
             } else {
@@ -1108,12 +1197,15 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret"), b"x").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let e = set_sddl_tree(&host, &root, &mut |_, _| Ok(ROW.to_string())).unwrap_err();
+        let e = set_sddl_tree(&host, &root, &mut no_check, &mut |_, _| Ok(ROW.to_string()))
+            .unwrap_err();
         assert!(e.to_string().contains("reparse point"), "{e}");
         assert!(host.get_sddl(&outside.join("secret")).is_err());
         assert!(host.get_sddl(&outside).is_err());
         // A link as the root is refused too.
-        let e = set_sddl_tree(&host, &root.join("link"), &mut |_, _| Ok(ROW.to_string()));
+        let e = set_sddl_tree(&host, &root.join("link"), &mut no_check, &mut |_, _| {
+            Ok(ROW.to_string())
+        });
         assert!(e.is_err());
     }
 
@@ -1125,7 +1217,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("a"), b"x").unwrap();
         std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
-        let e = set_sddl_tree(&host, &root, &mut |_, _| Ok(ROW.to_string())).unwrap_err();
+        let e = set_sddl_tree(&host, &root, &mut no_check, &mut |_, _| Ok(ROW.to_string()))
+            .unwrap_err();
         assert!(e.to_string().contains("hard link"), "{e}");
         assert!(host.get_sddl(&root.join("b")).is_err());
     }
