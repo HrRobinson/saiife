@@ -276,11 +276,16 @@ impl Check<'_> {
     /// An existing dir another product may own, which saiife relies on and never re-ACLs.
     /// `false` when it is missing.
     ///
-    /// Its owner and writers pass `ancestor_ok`, which allows Users to create entries, as
-    /// a stock `C:\ProgramData\OpenAI` does. `protected_ok` would refuse every such dir an
-    /// admin's installer made. Not `managed-settings.d`: Claude Code reads every file in
-    /// it, so one a user could add to is a way around the hooks, and it must pass
-    /// `protected_ok`. For the others a warning says what is left.
+    /// W14 as written, for the dirs an agent reads its policy from (`ClaudeCode`,
+    /// `managed-settings.d`, `Codex`, `gemini-cli`): they must pass `protected_ok`. Where
+    /// Users can create entries, a user could plant a settings file before install, which
+    /// install would merge and re-ACL, or one later, which the agent would read. Cost: an
+    /// admin must correct such a dir's ACL first; a stock `C:\ProgramData` child inherits
+    /// Users' right to create. It also closes the window on Codex and Gemini, which write
+    /// the file before its row: what it inherits meanwhile lets no one else write.
+    ///
+    /// Only `C:\ProgramData\OpenAI` holds no policy of an agent. It passes on `ancestor_ok`,
+    /// which allows Users to create entries, and a warning says so.
     fn check_foreign(
         &self,
         logical: &str,
@@ -298,17 +303,24 @@ impl Check<'_> {
         let no_takeover = "saiife does not write below it (move it away first)";
         ancestor_ok(&sd).map_err(|e| refused(shown, format!("{e}; {no_takeover}")))?;
         let strict = protected_ok(&sd, &[]);
-        if logical.eq_ignore_ascii_case(self.layout.logical(CLAUDE_MANAGED_DIR)) {
+        let holds_no_policy =
+            logical.eq_ignore_ascii_case(parent_of(self.layout.logical(CODEX_DIR)));
+        if holds_no_policy {
+            if let Err(e) = strict {
+                warnings.push(format!(
+                    "{logical} belongs to another product and is left as it is: {e}"
+                ));
+            }
+        } else {
             strict.map_err(|e| {
                 refused(
                     shown,
-                    format!("{e}: Claude Code reads every file here; {no_takeover}"),
+                    format!(
+                        "{e}: an agent reads its policy here, so a user could plant one; \
+                         let only administrators write this dir, then run install again"
+                    ),
                 )
             })?;
-        } else if let Err(e) = strict {
-            warnings.push(format!(
-                "{logical} belongs to another product and is left as it is: {e}"
-            ));
         }
         Ok(true)
     }
@@ -703,7 +715,10 @@ fn replace_with(
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             rename(path, aside)?;
-            rename(tmp, path)
+            // With the second rename refused, the old file goes back: never no binary.
+            rename(tmp, path).inspect_err(|_| {
+                let _ = rename(aside, path);
+            })
         }
         Err(e) => Err(e),
     }
@@ -1112,6 +1127,8 @@ impl Run<'_> {
     fn managed(&mut self, a: Agent) -> Result<(), InstallError> {
         self.managed_dirs(a)?;
         let logical = self.layout.logical(agent_file(a));
+        // Again, right before the write: what the preflight read may have changed.
+        self.check.existing_own(logical, false)?;
         let shown = Path::new(logical);
         let real = self.at(logical)?;
         let new = plain_meta(&real)
@@ -1226,6 +1243,11 @@ impl Run<'_> {
             self.changed(format!("service {WIN_SERVICE} (updated)"));
             true
         } else {
+            // The record says what install last wrote, not what's there now. An admin may
+            // have changed it since, so it's set again; no restart for that alone.
+            self.host
+                .service(ServiceOp::Update(spec.clone()))
+                .map_err(&service_step)?;
             self.unchanged(format!("service {WIN_SERVICE}"));
             false
         };
@@ -1475,12 +1497,8 @@ pub(crate) fn uninstall(
     }
     check.chain(root_shown)?;
     check.existing_own(root_shown, true)?;
-    // --purge takes the lock, so it never removes what a running install is writing.
-    let lock = if purge {
-        Some(take_lock(layout, host, crate::install::INSTALL_LOCK_WAIT)?)
-    } else {
-        None
-    };
+    // Never removes what a running install is writing, purge or not.
+    let lock = take_lock(layout, host, crate::install::INSTALL_LOCK_WAIT)?;
     let installed_logical = layout.logical(INSTALLED);
     let installed_path = check.at(installed_logical)?;
     let listed =
@@ -1585,7 +1603,17 @@ pub(crate) fn uninstall(
         }
     }
 
+    // A hook left behind names `bin\saiife.exe`: see `naming_the_binary`.
+    let still_named = naming_the_binary(&check)?;
+
     if !purge {
+        for logical in &still_named {
+            out.push(format!(
+                "warning: {logical} still names {} after uninstall, so the hook stays, and Claude \
+                 then blocks every tool; remove saiife's hook from that file",
+                layout.logical(BINARY)
+            ));
+        }
         keep_copy(&check, &installed_path, &mut out)?;
         if remove_plain(&installed_path).map_err(step("installed.toml"))? {
             out.push(format!("removed {installed_logical}"));
@@ -1625,10 +1653,44 @@ pub(crate) fn uninstall(
     }
     // Last, and only once the lock in it has gone.
     drop(lock);
+    if !still_named.is_empty() {
+        out.push(format!(
+            "warning: kept {root_shown}: {} still name {}, and with the folder gone any user \
+             could put a program there that the hook runs for every user; remove saiife's hook \
+             from them, then run uninstall --purge again",
+            still_named.join(", "),
+            layout.logical(BINARY)
+        ));
+        return Ok(out);
+    }
     if remove_empty_dir(&check.at(root_shown)?).map_err(step("dirs"))? {
         out.push(format!("removed {root_shown}"));
     }
     Ok(out)
+}
+
+/// The managed files still on disk that name W9's binary. A file changed since install stays,
+/// and `read_previous` clears the list after a plain uninstall, so this reads the files.
+fn naming_the_binary(check: &Check<'_>) -> Result<Vec<&'static str>, InstallError> {
+    let mut found = Vec::new();
+    for file in [
+        CLAUDE_MANAGED,
+        CLAUDE_MCP,
+        CODEX_REQUIREMENTS,
+        GEMINI_SETTINGS,
+    ] {
+        let logical = check.layout.logical(file);
+        let real = check.at(logical)?;
+        // One that can't be read might name it: a kept root costs little.
+        let names = match std::fs::read_to_string(&real) {
+            Ok(text) => text.contains(saiife_agents::WINDOWS_BINARY),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        };
+        if names {
+            found.push(logical);
+        }
+    }
+    Ok(found)
 }
 
 /// `Stop` (10 s; if it still runs, nothing is removed, as `stopped_or_refuse` does on
@@ -1926,6 +1988,12 @@ mod windows_tests {
             s.sddl.insert(p.clone(), sddl.to_string());
         });
     }
+
+    /// A dir an admin has closed: only admins write, Users read.
+    const ADMIN_CLOSED: &str =
+        "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+    const CLAUDE_MANAGED_WIN: &str =
+        r"C:\Program Files\ClaudeCode\managed-settings.d\50-saiife.json";
 
     fn user_owned() -> String {
         format!("O:{USER}G:{USER}D:(A;OICI;FA;;;{USER})")
@@ -2234,19 +2302,19 @@ mod windows_tests {
         let e = env();
         let (openai, gemini) = (r"C:\ProgramData\OpenAI", r"C:\ProgramData\gemini-cli");
         plant_dir(&e, openai, &admin_made_inherited());
-        plant_dir(&e, gemini, &admin_made_inherited());
+        plant_dir(&e, gemini, ADMIN_CLOSED);
         plant_dir(&e, r"C:\Program Files\ClaudeCode", stock::PROGRAM_FILES);
         for _ in 0..2 {
             let r = e.run().unwrap();
             let s = e.host.state();
             assert_eq!(s.sddl[&e.at(openai)], admin_made_inherited());
-            assert_eq!(s.sddl[&e.at(gemini)], admin_made_inherited());
+            assert_eq!(s.sddl[&e.at(gemini)], ADMIN_CLOSED);
             assert_eq!(
                 s.sddl[&e.at(r"C:\Program Files\ClaudeCode")],
                 stock::PROGRAM_FILES
             );
             assert!(
-                r.warnings.iter().any(|w| w.starts_with(gemini)),
+                r.warnings.iter().any(|w| w.starts_with(openai)),
                 "{:?}",
                 r.warnings
             );
@@ -2277,14 +2345,14 @@ mod windows_tests {
             path,
             Path::new(r"C:\Program Files\ClaudeCode\managed-settings.d")
         );
-        assert!(detail.contains("reads every file"), "{detail}");
+        assert!(detail.contains("reads its policy here"), "{detail}");
     }
 
-    /// A managed file a user planted first, in a dir they could create entries in.
+    /// A managed file a user planted, and the admin then closed the dir over it.
     #[test]
     fn a_planted_managed_file_is_refused() {
         let e = env();
-        plant_dir(&e, r"C:\ProgramData\gemini-cli", &admin_made_inherited());
+        plant_dir(&e, r"C:\ProgramData\gemini-cli", ADMIN_CLOSED);
         let settings = r"C:\ProgramData\gemini-cli\settings.json";
         let p = e.at(settings);
         fs::write(&p, b"{}").unwrap();
@@ -2374,7 +2442,10 @@ mod windows_tests {
         assert_eq!(spec.binary, e.at(e.layout.logical(BINARY)));
         e.host.set(|s| s.calls.clear());
         let r = e.run().unwrap();
-        assert_eq!(service_calls(&e.calls()), ["service sdset"]);
+        assert_eq!(
+            service_calls(&e.calls()),
+            ["service update", "service sdset"]
+        );
         assert!(r.changed.is_empty(), "{:?}", r.changed);
     }
 
@@ -2389,7 +2460,7 @@ mod windows_tests {
         e.run().unwrap();
         assert_eq!(
             service_calls(&e.calls()),
-            ["service sdset", "service start"]
+            ["service update", "service sdset", "service start"]
         );
         // The record no longer says this spec.
         let p = e.at(e.layout.logical(INSTALLED));
@@ -2425,7 +2496,7 @@ mod windows_tests {
         let r = e.run_with(&o).unwrap();
         assert_eq!(
             service_calls(&e.calls()),
-            ["service sdset", "service paramchange"]
+            ["service update", "service sdset", "service paramchange"]
         );
         assert_eq!(r.policy_hash.as_deref(), Some("fake"));
         assert_eq!(r.exit_code(false), 0);
@@ -2457,7 +2528,12 @@ mod windows_tests {
         let r = e.run().unwrap();
         assert_eq!(
             service_calls(&e.calls()),
-            ["service sdset", "service stop", "service start"]
+            [
+                "service update",
+                "service sdset",
+                "service stop",
+                "service start"
+            ]
         );
         assert_eq!(fs::read(e.at(e.layout.logical(BINARY))).unwrap(), newer);
         assert!(r.changed.iter().any(|c| c == e.layout.logical(BINARY)));
@@ -2493,6 +2569,151 @@ mod windows_tests {
             aside,
         );
         assert_eq!(e.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    /// The old file is aside and the new one won't go in: the old one comes back.
+    #[test]
+    fn a_failed_second_rename_puts_the_old_file_back() {
+        let mut steps = Vec::new();
+        let (tmp, path, aside) = (Path::new("t"), Path::new("p"), Path::new("a"));
+        let mut n = 0;
+        let e = replace_with(
+            &mut |a, b| {
+                steps.push((a.to_path_buf(), b.to_path_buf()));
+                n += 1;
+                match n {
+                    1 | 3 => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                    _ => Ok(()),
+                }
+            },
+            tmp,
+            path,
+            aside,
+        );
+        assert_eq!(e.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        assert_eq!(
+            steps,
+            [
+                pair("t", "p"),
+                pair("p", "a"),
+                pair("t", "p"),
+                pair("a", "p")
+            ]
+        );
+    }
+
+    /// W14 for the leaf dirs: a stock child of `C:\ProgramData`, where Users create entries,
+    /// is refused before anything is written, and the refusal says what to do.
+    #[test]
+    fn a_policy_dir_users_can_add_to_is_refused() {
+        for dir in [
+            r"C:\ProgramData\OpenAI\Codex",
+            r"C:\ProgramData\gemini-cli",
+            r"C:\Program Files\ClaudeCode",
+            r"C:\Program Files\ClaudeCode\managed-settings.d",
+        ] {
+            let e = env();
+            // What's above it is fine, so this dir is what gets refused.
+            let above = parent_of(dir);
+            if above.ends_with("OpenAI") {
+                plant_dir(&e, above, &admin_made_inherited());
+            } else if above.ends_with("ClaudeCode") {
+                plant_dir(&e, above, stock::PROGRAM_FILES);
+            }
+            plant_dir(&e, dir, &admin_made_inherited());
+            let before = e.tree();
+            let (path, detail) = refused_at(e.run().unwrap_err());
+            assert_eq!(path, Path::new(dir));
+            assert!(detail.contains("let only administrators write"), "{detail}");
+            assert_eq!(e.tree(), before, "nothing written for {dir}");
+        }
+    }
+
+    /// A file a user put there between the preflight and the write.
+    #[test]
+    fn a_file_planted_after_the_preflight_is_refused() {
+        let e = env();
+        e.run().unwrap();
+        let settings = r"C:\ProgramData\gemini-cli\settings.json";
+        e.host.set(|s| {
+            s.sddl.insert(e.at(settings), user_owned());
+        });
+        let check = Check {
+            layout: &e.layout,
+            host: &e.host,
+        };
+        assert!(check.existing_own(settings, false).is_err());
+    }
+
+    /// W9's binary path stays named in a file that stays. Removing the root would let any user
+    /// recreate `C:\ProgramData\saiife\bin\saiife.exe`, which the hook would run for everyone.
+    #[test]
+    fn purge_keeps_the_root_while_a_managed_file_names_the_binary() {
+        let e = env();
+        e.run().unwrap();
+        let settings = e.at(CLAUDE_MANAGED_WIN);
+        let text = fs::read_to_string(&settings).unwrap();
+        fs::write(&settings, format!("{text}\n")).unwrap();
+        let out =
+            crate::uninstall::uninstall(&e.layout, &e.host, &UninstallOptions { purge: true })
+                .unwrap();
+        assert!(e.at(r"C:\ProgramData\saiife").is_dir(), "{out:?}");
+        let said = out.join("\n");
+        assert!(said.contains("kept C:\\ProgramData\\saiife"), "{said}");
+        assert!(said.contains(CLAUDE_MANAGED_WIN), "{said}");
+    }
+
+    /// A plain uninstall, then a purge from the kept copy, whose agents are cleared: the file
+    /// is what's read, not the list.
+    #[test]
+    fn purge_after_plain_uninstall_still_finds_a_changed_file() {
+        let e = env();
+        e.run().unwrap();
+        let settings = e.at(CLAUDE_MANAGED_WIN);
+        let text = fs::read_to_string(&settings).unwrap();
+        fs::write(&settings, format!("{text}\n")).unwrap();
+        let out =
+            crate::uninstall::uninstall(&e.layout, &e.host, &UninstallOptions { purge: false })
+                .unwrap();
+        let said = out.join("\n");
+        assert!(said.contains("the hook stays"), "{said}");
+        assert!(said.contains("blocks every tool"), "{said}");
+        crate::uninstall::uninstall(&e.layout, &e.host, &UninstallOptions { purge: true }).unwrap();
+        assert!(e.at(r"C:\ProgramData\saiife").is_dir());
+    }
+
+    /// With every hook gone, purge takes the root as before.
+    #[test]
+    fn purge_removes_the_root_when_nothing_names_the_binary() {
+        let e = env();
+        e.run().unwrap();
+        crate::uninstall::uninstall(&e.layout, &e.host, &UninstallOptions { purge: true }).unwrap();
+        assert!(!e.at(r"C:\ProgramData\saiife").exists());
+    }
+
+    /// Plain uninstall can't race an install: it waits on the same lock, and gives up.
+    #[test]
+    fn plain_uninstall_takes_the_lock() {
+        let e = env();
+        e.run().unwrap();
+        e.host.set(|s| s.calls.clear());
+        let _held = e.host.lock_file(&e.at(WIN_INSTALL_LOCK)).unwrap().unwrap();
+        let e2 =
+            crate::uninstall::uninstall(&e.layout, &e.host, &UninstallOptions { purge: false });
+        assert!(e2.is_err(), "{e2:?}");
+        assert!(e.host.state().services.contains_key(WIN_SERVICE));
+    }
+
+    /// A service someone changed under the same record is set back on a reinstall.
+    #[test]
+    fn a_reinstall_sets_the_service_again() {
+        let e = env();
+        e.run().unwrap();
+        e.host.set(|s| s.calls.clear());
+        e.run().unwrap();
+        let calls = e.calls();
+        assert!(calls.iter().any(|c| c.contains("update")), "{calls:?}");
     }
 
     #[test]

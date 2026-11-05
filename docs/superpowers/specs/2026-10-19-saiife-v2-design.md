@@ -618,6 +618,17 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
   `C:\ProgramData\OpenAI` or `C:\ProgramData\gemini-cli` created by a user,
   and so owned by them. Install never takes over a dir someone else may
   still control.
+- **The dirs an agent reads its policy from** (`ClaudeCode`,
+  `managed-settings.d`, `OpenAI\Codex`, `gemini-cli`) must pass `protected_ok`
+  even when an admin made them (ruling, plan 19b Task 7's review). A stock child
+  of `C:\ProgramData` lets Users create entries, so a user could plant a settings
+  file that install would merge and re-ACL, or that the agent would read. The
+  refusal tells the admin to correct that dir's ACL. Only `C:\ProgramData\OpenAI`
+  holds no policy, so it needs `ancestor_ok` alone, with a warning.
+- **`--purge` keeps the root while a managed file still names the binary.** With
+  the root gone any user could recreate `C:\ProgramData\saiife\bin\saiife.exe`,
+  and a hook left behind would run it for every user. It warns instead. A plain
+  uninstall warns that the hook stays, and that Claude then blocks every tool.
 - **Ancestors** (`C:\`, `C:\ProgramData`, `C:\Program Files`) must satisfy
   `ancestor_ok`. The owner is SYSTEM, Administrators or TrustedInstaller
   (`C:\Program Files` is owned by TrustedInstaller by default). There is no

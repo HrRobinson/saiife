@@ -216,7 +216,7 @@ impl AgentError {
 /// The locked binary, as the managed hook names it.
 pub(crate) const UNIX_BINARY: &str = "/opt/saiife/bin/saiife";
 /// Windows (spec W9): forward slashes, no spaces.
-pub(crate) const WINDOWS_BINARY: &str = "C:/ProgramData/saiife/bin/saiife.exe";
+pub const WINDOWS_BINARY: &str = "C:/ProgramData/saiife/bin/saiife.exe";
 
 /// True when `command` runs `saiife check` (any path to the binary). This is
 /// how saiife recognizes its own hook entries.

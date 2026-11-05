@@ -2607,6 +2607,8 @@ impl Host for FakeHost {
     }
 
     fn lock_file(&self, path: &Path) -> io::Result<Option<Hold>> {
+        // What the real open must get past first.
+        saiife_win::open_rules::LOCK_FILE.check()?;
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

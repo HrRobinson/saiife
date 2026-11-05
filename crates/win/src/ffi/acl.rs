@@ -148,10 +148,13 @@ pub fn hold_dir(path: &Path) -> io::Result<File> {
 /// deleted when the handle closes, a crash included. `Ok(None)` when another holds it. The
 /// caller has checked that only administrators can write the directory.
 pub fn lock_file(path: &Path) -> io::Result<Option<File>> {
+    let spec = crate::open_rules::LOCK_FILE;
     let opened = OpenOptions::new()
+        .write(spec.write)
+        .append(spec.append)
+        .create(spec.create)
         .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
         .share_mode(0)
-        .create(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE)
         .open(path);
     let file = match opened {

@@ -14,6 +14,7 @@
 
 pub mod cred;
 pub mod display;
+pub mod open_rules;
 pub mod pipe;
 pub mod proc;
 pub mod profile;
