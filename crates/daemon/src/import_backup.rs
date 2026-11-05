@@ -4,9 +4,8 @@
 //! after 7 days (at start and daily). A backup is a secret too: its bytes
 //! are never logged, echoed or put in a record.
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -65,14 +64,20 @@ fn stamp(t: SystemTime) -> String {
 
 /// The dir, created 0700 when missing; a symlink or a non-dir is refused.
 fn ensure_dir(dir: &Path) -> io::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    crate::fsx::create_private_dirs(dir)?;
     let m = fs::symlink_metadata(dir)?;
-    if !m.file_type().is_dir() {
+    if crate::fsx::is_link(&m) || !m.file_type().is_dir() {
         return Err(io::Error::other("the backup dir is not a directory"));
     }
-    if m.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if m.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
     }
+    #[cfg(windows)]
+    crate::fsx::check_private_dir(dir)?;
     Ok(())
 }
 
@@ -89,12 +94,7 @@ pub fn write(dir: &Path, t: SystemTime, source: &str, bytes: &[u8]) -> io::Resul
             format!("{base}-{n}")
         };
         let path = dir.join(name);
-        let f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&path);
+        let f = crate::fsx::new_private_file(&path);
         match f {
             Ok(mut f) => {
                 let done = f.write_all(bytes).and_then(|()| f.sync_all());
@@ -103,7 +103,7 @@ pub fn write(dir: &Path, t: SystemTime, source: &str, bytes: &[u8]) -> io::Resul
                     let _ = fs::remove_file(&path);
                     return Err(e);
                 }
-                File::open(dir)?.sync_all()?;
+                crate::fsx::sync_dir(dir)?;
                 return Ok(path);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
@@ -150,7 +150,7 @@ pub fn purge(dir: &Path, t: SystemTime) -> usize {
     n
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;

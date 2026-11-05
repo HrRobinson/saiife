@@ -21,10 +21,20 @@ pub fn free_mb(dir: &Path) -> io::Result<u64> {
             return Ok(*mb);
         }
     }
-    let st = rustix::fs::statvfs(dir)?;
-    let mb = st.f_bavail.saturating_mul(st.f_frsize) / (1024 * 1024);
+    let mb = free_bytes(dir)? / (1024 * 1024);
     *c = Some((dir.to_path_buf(), now, mb));
     Ok(mb)
+}
+
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> io::Result<u64> {
+    let st = rustix::fs::statvfs(dir)?;
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+#[cfg(windows)]
+fn free_bytes(dir: &Path) -> io::Result<u64> {
+    saiife_win::ffi::process::disk_free_bytes(dir)
 }
 
 /// Below the floor, appends from anyone but the daemon itself are refused.

@@ -62,13 +62,27 @@ fn the_profile_comes_from_the_environment() {
     assert!(log.is_dir(), "{}", log.display());
 }
 
+/// Outside the service manager `daemon --system` runs on its own, and as anything but
+/// the service account it refuses (plan 19b, W10).
+#[test]
+fn daemon_system_runs_outside_the_service_manager_and_refuses_this_user() {
+    let home = tempfile::tempdir().unwrap();
+    let out = saiife(home.path())
+        .args(["daemon", "--system"])
+        .env_remove("SAIIFE_TEST_PIPE")
+        .assert()
+        .code(2);
+    let text = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(!text.contains(REFUSAL), "{text}");
+    assert!(text.contains("the daemon"), "{text}");
+}
+
 #[test]
 fn locked_commands_refuse_on_windows() {
     let home = tempfile::tempdir().unwrap();
     let cases: &[&[&str]] = &[
         &["system", "install"],
         &["system", "uninstall"],
-        &["daemon", "--system"],
         &["daemon", "--user"],
         &["approve", "1"],
         &["reject", "1"],

@@ -84,6 +84,9 @@ impl Via {
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredCall {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -158,6 +161,7 @@ impl StoredCall {
         };
         let call = Call {
             uid: self.uid,
+            sid: self.sid.clone(),
             user: self.user.clone(),
             session: self.session.clone(),
             project: self.project.clone(),
@@ -229,6 +233,8 @@ pub type ApprovalFuture<'a> =
 /// credentials, the session by attribution, the project as reported).
 pub struct Call {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. `None` elsewhere.
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -961,6 +967,7 @@ async fn steps(
         let pending = PendingCall {
             stored: StoredCall {
                 uid: call.uid,
+                sid: call.sid.clone(),
                 user: call.user.clone(),
                 session: call.session.clone(),
                 project: call.project.clone(),
@@ -1531,6 +1538,7 @@ pub fn record(
     );
     r.kind = Some("connector".into());
     r.uid = Some(call.uid);
+    r.sid = call.sid.clone();
     r.user = Some(call.user.clone());
     let e = &mut r.extra;
     e.insert("service".into(), call.service.clone().into());
@@ -1735,6 +1743,7 @@ mod tests {
     fn call_debug_hides_values() {
         let c = Call {
             uid: 1,
+            sid: None,
             user: "u".into(),
             session: None,
             project: "/p".into(),

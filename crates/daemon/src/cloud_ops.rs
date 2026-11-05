@@ -179,7 +179,8 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     };
     let mut r = ctx.record("secret", &format!("cloud_lease {service} {exe}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), "cloud_lease".into());
     r.extra.insert("service".into(), service.clone().into());
     r.extra.insert("exe".into(), exe.clone().into());
@@ -266,7 +267,7 @@ async fn decide(
     // for `api.call`: the scope's in locked mode (a client `env` ignored);
     // the project `env` for the personal broker, an undefined one the base
     // config with a warning.
-    let Some(user) = ctx.name_of(peer.uid).await else {
+    let Some(user) = ctx.peer_name(peer).await else {
         return Err(deny("no_scope", "the caller has no user name"));
     };
     let groups = Groups(ctx.groups_of(&user).await);
@@ -454,7 +455,7 @@ fn check_cloud_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

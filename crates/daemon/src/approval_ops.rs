@@ -72,10 +72,10 @@ async fn on_store<T: Send + 'static>(
 /// Whether `uid` is listed in `[approval] approvers` (by name or a current
 /// group). Lookups are the context's cached, off-thread ones; any failure
 /// is no.
-pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
+pub(crate) async fn is_approver(ctx: &Ctx, peer: &PeerCred) -> bool {
     // The personal broker: its own user approves (§6.10.2).
     if ctx.mode == crate::ops::Mode::Personal {
-        return uid == ctx.own_uid;
+        return ctx.peer_is_own(peer);
     }
     let approvers = match ctx.policy().system {
         Some(s) => s.approval.approvers.clone(),
@@ -84,9 +84,20 @@ pub(crate) async fn is_approver(ctx: &Ctx, uid: u32) -> bool {
     if approvers.is_empty() {
         return false;
     }
-    let Some(name) = ctx.name_of(uid).await else {
+    let Some(name) = ctx.peer_name(peer).await else {
         return false;
     };
+    // Windows: a `group:` entry matches the token's groups (W12). A later lookup of the
+    // name's groups can only add to that.
+    if peer.sid.is_some() {
+        let wanted: Vec<String> = approvers
+            .iter()
+            .filter_map(|a| a.strip_prefix("group:").map(str::to_string))
+            .collect();
+        if ctx.token_in_any_group(&peer.group_sids, &wanted).await {
+            return true;
+        }
+    }
     let mut groups: Option<Vec<String>> = None;
     for a in &approvers {
         match a.strip_prefix("group:") {
@@ -140,6 +151,7 @@ pub(crate) async fn create(ctx: &Arc<Ctx>, p: &PendingCall, agent: &str) -> Resu
     let faithful = display_is_faithful(p);
     let new = NewRequest {
         uid: p.stored.uid,
+        sid: p.stored.sid.clone(),
         user: p.stored.user.clone(),
         session: p.stored.session.clone(),
         agent: agent.to_string(),
@@ -194,6 +206,7 @@ pub(crate) async fn create_mcp(
     );
     let new = NewRequest {
         uid: p.stored.uid,
+        sid: p.stored.sid.clone(),
         user: p.stored.user.clone(),
         session: p.stored.session.clone(),
         agent: agent.to_string(),
@@ -408,8 +421,9 @@ async fn list(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // `own: true`: only the caller's requests (`saiife status`), even for
     // an approver.
     let own = req.args.get("own").and_then(Value::as_bool) == Some(true);
-    let uid = (own || !is_approver(ctx, peer.uid).await).then_some(peer.uid);
-    let Some(items) = on_store(ctx, move |_, s| s.list(Filter { uid, states })).await else {
+    let uid = (own || !is_approver(ctx, peer).await).then_some(peer.uid);
+    let sid = peer.sid.clone();
+    let Some(items) = on_store(ctx, move |_, s| s.list(Filter { uid, sid, states })).await else {
         return unavailable(id, ctx);
     };
     let mut m = Map::new();
@@ -435,11 +449,16 @@ fn request_id(req: &Request) -> Result<u64, Value> {
         })
 }
 
-/// Request `rid` when `uid` may see it.
-async fn visible(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Result<Option<ApprovalRequest>, ()> {
+/// Whether `peer` made request `r`.
+fn is_requester(r: &ApprovalRequest, peer: &PeerCred) -> bool {
+    crate::ops::same_principal(r.uid, r.sid.as_deref(), peer.uid, peer.sid.as_deref())
+}
+
+/// Request `rid` when `peer` may see it.
+async fn visible(ctx: &Arc<Ctx>, peer: &PeerCred, rid: u64) -> Result<Option<ApprovalRequest>, ()> {
     let r = on_store(ctx, move |_, s| s.get(rid)).await.ok_or(())?;
     match r {
-        Some(r) if r.uid == uid || is_approver(ctx, uid).await => Ok(Some(r)),
+        Some(r) if is_requester(&r, peer) || is_approver(ctx, peer).await => Ok(Some(r)),
         _ => Ok(None),
     }
 }
@@ -450,7 +469,7 @@ async fn show(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(r) => r,
         Err(v) => return v,
     };
-    match visible(ctx, peer.uid, rid).await {
+    match visible(ctx, peer, rid).await {
         Err(()) => unavailable(id, ctx),
         Ok(None) => unknown(id, rid),
         Ok(Some(r)) => {
@@ -489,7 +508,7 @@ pub(crate) fn auth_arg(args: &Map<String, Value>) -> Result<Option<[u8; 32]>, St
 async fn refuse(
     ctx: &Arc<Ctx>,
     r: &ApprovalRequest,
-    by: u32,
+    by: &PeerCred,
     id: u64,
     rule: &str,
     why: &str,
@@ -514,9 +533,13 @@ async fn refuse(
 }
 
 /// An `approval` record of `action` for `r`, decided by `by`.
-fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: u32) -> Record {
+fn decided_record(ctx: &Ctx, r: &ApprovalRequest, action: &str, by: &PeerCred) -> Record {
     let mut rec = ctx.approval_record(r, action);
-    rec.extra.insert("by_uid".into(), by.into());
+    rec.extra.insert("by_uid".into(), by.uid.into());
+    // Windows: every elevated admin's uid is 0, so `by_uid` alone names nobody.
+    if let Some(sid) = &by.sid {
+        rec.extra.insert("by_sid".into(), sid.clone().into());
+    }
     rec
 }
 
@@ -552,7 +575,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         Ok(a) => a,
         Err(e) => return err(id, ErrorCode::BadRequest, &e),
     };
-    let r = match visible(ctx, peer.uid, rid).await {
+    let r = match visible(ctx, &peer, rid).await {
         Err(()) => return unavailable(id, ctx),
         Ok(None) => return unknown(id, rid),
         Ok(Some(r)) => r,
@@ -574,12 +597,12 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         } else {
             "the body is over 1 MiB and shown cut; approve with ack_truncated (--accept-truncated)"
         };
-        return refuse(ctx, &r, peer.uid, id, "truncated_not_acknowledged", why).await;
+        return refuse(ctx, &r, &peer, id, "truncated_not_acknowledged", why).await;
     }
 
     // The requester may always withdraw its own request: a rejection that
     // lets nothing through needs no approver and no re-authentication.
-    let cancel = !approve && r.uid == peer.uid;
+    let cancel = !approve && is_requester(&r, &peer);
     let note = if cancel {
         Some(match note {
             // (Within the note limit; a note too long for the prefix is dropped.)
@@ -599,15 +622,19 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let refusal = if cancel {
         None
     } else if ctx.mode == crate::ops::Mode::Personal {
-        crate::approvers::personal_may_decide(ctx.own_uid, peer.uid).err()
+        match ctx.peer_is_own(&peer) {
+            true => None,
+            false => Some(Refusal::NotApprover),
+        }
     } else {
-        match ctx.name_of(peer.uid).await {
+        match ctx.peer_name(&peer).await {
             None => Some(Refusal::NotApprover),
             Some(name) => {
                 let c = Arc::clone(ctx);
                 let peer = peer.clone();
                 let start = conn.start_time;
                 let requester = r.uid;
+                let requester_sid = r.sid.clone();
                 let detail = crate::approvals::reauth_detail(&r);
                 tokio::task::spawn_blocking(move || {
                     // Re-authentication names the approver's process: without
@@ -621,7 +648,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
                         &cfg,
                         c.directory.as_ref(),
                         &name,
-                        requester,
+                        (requester, requester_sid.as_deref()),
                         reauth,
                         &peer,
                         start.unwrap_or(0),
@@ -638,7 +665,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
         }
     };
     if let Some(why) = refusal {
-        return refuse(ctx, &r, peer.uid, id, why.rule(), &why.to_string()).await;
+        return refuse(ctx, &r, &peer, id, why.rule(), &why.to_string()).await;
     }
 
     let to = if approve {
@@ -672,7 +699,7 @@ async fn decide(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     let action = if approve { "approved" } else { "rejected" };
     let recorded = ctx
         .writer
-        .append(decided_record(ctx, &r, action, peer.uid))
+        .append(decided_record(ctx, &r, action, &peer))
         .await;
     if let Err(e) = recorded {
         if approve {
@@ -733,11 +760,21 @@ struct CallFields {
 }
 
 impl CallFields {
-    /// The grant key for this call by `uid`: computed here, never taken
+    /// The grant key for this call by `peer`: computed here, never taken
     /// from the client.
-    fn key(&self, uid: u32) -> [u8; 32] {
+    fn key(&self, peer: &PeerCred) -> [u8; 32] {
+        if let Some(sid) = &peer.sid {
+            return crate::grants::grant_key_for_sid(
+                sid,
+                &self.agent,
+                &self.key_project,
+                &self.tool,
+                &self.input,
+                &self.raw_sha256,
+            );
+        }
         crate::grants::grant_key(
-            uid,
+            peer.uid,
             &self.agent,
             &self.key_project,
             &self.tool,
@@ -850,7 +887,7 @@ async fn grant_consume(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> (Value,
             None,
         );
     }
-    let key = f.key(peer.uid);
+    let key = f.key(peer);
     let c = Arc::clone(ctx);
     let used = tokio::task::spawn_blocking(move || c.grants.consume(&key, now()))
         .await
@@ -909,6 +946,7 @@ async fn grant_used_record(
             rec.extra.insert("approval".into(), approval.into());
             rec.extra.insert("type".into(), "command".into());
             rec.uid = Some(peer.uid);
+            rec.sid = peer.sid.clone();
             rec.agent = f.agent.clone();
             rec.project = f.project.clone();
             rec
@@ -931,7 +969,8 @@ async fn refuse_create(
 ) -> Value {
     let mut rec = ctx.record("approval", &f.input);
     rec.uid = Some(peer.uid);
-    rec.user = ctx.name_of(peer.uid).await;
+    rec.sid = peer.sid.clone();
+    rec.user = ctx.peer_name(peer).await;
     rec.agent = f.agent.clone();
     rec.project = f.project.clone();
     rec.session = f.session.clone();
@@ -1031,7 +1070,8 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
     }
     let new = NewRequest {
         uid: peer.uid,
-        user: ctx.name_of(peer.uid).await.unwrap_or_default(),
+        sid: peer.sid.clone(),
+        user: ctx.peer_name(peer).await.unwrap_or_default(),
         session: f.session.clone(),
         agent: f.agent.clone(),
         project: f.project.clone(),
@@ -1041,7 +1081,7 @@ async fn command_create(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value 
         capability: None,
         params: Default::default(),
         input: Some(f.input.clone()),
-        grant_key: Some(crate::grants::hex(&f.key(peer.uid))),
+        grant_key: Some(crate::grants::hex(&f.key(peer))),
         scope: Some(f.key_project.clone()),
         ask_rule: f.ask(),
         send: SendDisplay::default(),
@@ -1576,6 +1616,7 @@ pub fn reconcile_interrupted(ctx: &Ctx) -> Vec<Record> {
     let mut out = Vec::new();
     for r in store.list(Filter {
         uid: None,
+        sid: None,
         states: vec![State::Approved],
     }) {
         // A command's grant may or may not have been kept: revoke it, so
@@ -1646,10 +1687,16 @@ pub(crate) enum ResultView {
 
 /// Request `rid` as `uid` may see it: the requester only (decision 4).
 /// `Err` when the store is unavailable.
-pub(crate) async fn result_for(ctx: &Arc<Ctx>, uid: u32, rid: u64) -> Result<ResultView, ()> {
+pub(crate) async fn result_for(
+    ctx: &Arc<Ctx>,
+    uid: u32,
+    sid: Option<&str>,
+    rid: u64,
+) -> Result<ResultView, ()> {
+    let sid = sid.map(str::to_string);
     let got = on_store(ctx, move |c, s| {
         let r = s.get(rid)?;
-        if r.uid != uid {
+        if !crate::ops::same_principal(r.uid, r.sid.as_deref(), uid, sid.as_deref()) {
             return None;
         }
         let done = matches!(r.state, State::Sent | State::SendFailed);
@@ -1689,7 +1736,7 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
         Ok(r) => r,
         Err(v) => return v,
     };
-    let view = match result_for(ctx, peer.uid, rid).await {
+    let view = match result_for(ctx, peer.uid, peer.sid.as_deref(), rid).await {
         Ok(v) => v,
         Err(()) => return unavailable(id, ctx),
     };
@@ -1711,6 +1758,58 @@ pub(crate) async fn api_result(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) ->
 }
 
 #[cfg(test)]
+mod requester_tests {
+    use super::*;
+
+    fn peer(uid: u32, sid: Option<&str>) -> PeerCred {
+        PeerCred {
+            uid,
+            gid: 0,
+            pid: 1,
+            sid: sid.map(str::to_string),
+            group_sids: Vec::new(),
+        }
+    }
+
+    fn request(uid: u32, sid: Option<&str>) -> ApprovalRequest {
+        serde_json::from_value(json!({
+            "id": 1, "created": "c", "expires": "e", "uid": uid, "sid": sid, "user": "u",
+            "session": null, "agent": "a", "project": "p", "type": "connector",
+            "service": null, "operation": null, "capability": null, "params": {},
+            "input": null, "grant_key": null, "state": "pending"
+        }))
+        .unwrap()
+    }
+
+    const A: &str = "S-1-5-21-1-2-3-1001";
+    const B: &str = "S-1-5-21-1-2-3-1002";
+
+    /// `visible` and withdraw: another admin, with the same uid 0, did not make it.
+    #[test]
+    fn the_requester_is_a_sid_on_windows() {
+        let r = request(0, Some(A));
+        assert!(is_requester(&r, &peer(0, Some(A))));
+        assert!(!is_requester(&r, &peer(0, Some(B))));
+        // The same SID elevated later: same person, another label.
+        assert!(is_requester(&r, &peer(0x4000_0001, Some(A))));
+    }
+
+    /// A label collision is no identity either.
+    #[test]
+    fn a_shared_label_is_not_the_requester() {
+        let r = request(0x4000_0001, Some(A));
+        assert!(!is_requester(&r, &peer(0x4000_0001, Some(B))));
+    }
+
+    #[test]
+    fn unix_requesters_stay_uids() {
+        let r = request(1000, None);
+        assert!(is_requester(&r, &peer(1000, None)));
+        assert!(!is_requester(&r, &peer(1001, None)));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_broker::mask::Masker;

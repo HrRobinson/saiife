@@ -1518,6 +1518,7 @@ dependencies = [
  "saiife-mcp",
  "saiife-policy",
  "saiife-system",
+ "saiife-win",
  "serde",
  "serde_json",
  "sha2",
@@ -1636,6 +1637,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "windows-service",
  "windows-sys 0.61.2",
 ]
 

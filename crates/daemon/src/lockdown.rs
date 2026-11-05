@@ -12,7 +12,6 @@ use saiife_ipc::msg::{err, err_with, ok, ErrorCode, Request};
 use saiife_ipc::peer::{comm, PeerCred};
 use serde_json::{json, Map, Value};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -123,7 +122,6 @@ impl Store {
 /// The dir holding the flag file: a real directory, ours, not group- or world-writable. A
 /// missing dir is fine (the flag is off). Nothing is created or fixed.
 pub(crate) fn check_parent(file: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Some(dir) = file.parent() else {
         return Ok(());
     };
@@ -138,19 +136,25 @@ pub(crate) fn check_parent(file: &Path) -> io::Result<()> {
             dir.display()
         )));
     }
-    if md.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::other(format!(
-            "{} is not owned by this user",
-            dir.display()
-        )));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if md.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::other(format!(
+                "{} is not owned by this user",
+                dir.display()
+            )));
+        }
+        // Not writable by group or others (the rule of `check_state_paths`).
+        if md.permissions().mode() & 0o022 != 0 {
+            return Err(io::Error::other(format!(
+                "{} is writable by group or others",
+                dir.display()
+            )));
+        }
     }
-    // Not writable by group or others (the rule of `check_state_paths`).
-    if md.permissions().mode() & 0o022 != 0 {
-        return Err(io::Error::other(format!(
-            "{} is writable by group or others",
-            dir.display()
-        )));
-    }
+    #[cfg(windows)]
+    crate::fsx::check_private_dir(dir)?;
     Ok(())
 }
 
@@ -184,11 +188,7 @@ fn write(file: &Path, l: &Lockdown) -> io::Result<()> {
     let tmp = dir.join(format!(".{FILE_NAME}.tmp"));
     let _ = std::fs::remove_file(&tmp);
     let staged = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::fsx::new_private_file(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, file)
@@ -197,7 +197,7 @@ fn write(file: &Path, l: &Lockdown) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 fn remove(file: &Path) -> io::Result<()> {
@@ -267,12 +267,15 @@ async fn may_turn_off(
     auth: Option<[u8; 32]>,
 ) -> Result<(), Refusal> {
     if ctx.mode == crate::ops::Mode::Personal {
-        return crate::approvers::personal_may_decide(ctx.own_uid, conn.peer.uid);
+        return match ctx.peer_is_own(&conn.peer) {
+            true => Ok(()),
+            false => Err(Refusal::NotApprover),
+        };
     }
     let Some(cfg) = ctx.policy().system.map(|s| s.approval.clone()) else {
         return Err(Refusal::NotApprover);
     };
-    let Some(name) = ctx.name_of(conn.peer.uid).await else {
+    let Some(name) = ctx.peer_name(&conn.peer).await else {
         return Err(Refusal::NotApprover);
     };
     let c = Arc::clone(ctx);
@@ -290,7 +293,7 @@ async fn may_turn_off(
             &cfg,
             c.directory.as_ref(),
             &name,
-            peer.uid,
+            (peer.uid, peer.sid.as_deref()),
             reauth,
             &peer,
             start.unwrap_or(0),
@@ -355,11 +358,12 @@ pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     };
     let action = if on { "on" } else { "off" };
 
-    let admin = ctx.is_admin(peer.uid).await;
-    let allowed = admin || crate::approval_ops::is_approver(ctx, peer.uid).await;
+    let admin = ctx.peer_is_admin(peer).await;
+    let allowed = admin || crate::approval_ops::is_approver(ctx, peer).await;
     let mut rec = ctx.record("lockdown", action);
     rec.uid = Some(peer.uid);
-    rec.user = ctx.name_of(peer.uid).await;
+    rec.sid = peer.sid.clone();
+    rec.user = ctx.peer_name(peer).await;
     rec.extra.insert("action".into(), action.into());
     rec.extra.insert(
         "peer".into(),
@@ -479,7 +483,7 @@ pub async fn set(ctx: &Arc<Ctx>, conn: &Conn, req: Request) -> Value {
     ok(id, m)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

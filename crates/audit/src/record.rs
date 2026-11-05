@@ -55,6 +55,10 @@ pub struct Record {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    /// Windows: the peer's exact SID (W12). `uid` is only a label there, so the hash is
+    /// never the only identity on record. Never set on Linux or macOS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +129,7 @@ impl Record {
             kind: Some("guard".to_string()),
             host: None,
             uid: None,
+            sid: None,
             user: None,
             mode: Some(r.mode.to_string()),
             policy: r.policy.map(str::to_string),
@@ -179,6 +184,35 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_sid_serialized_only_when_set() {
+        let mut r = Record::new(
+            NewRecord {
+                agent: "a",
+                project: "/p",
+                session: None,
+                tool: "Bash",
+                input: "ls",
+                decision: DecisionKind::Allow,
+                pack: None,
+                rule: None,
+                reason: None,
+                mode: "locked",
+                policy: None,
+                permission_mode: None,
+            },
+            "1.0.0",
+        );
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(!line.contains("\"sid\""), "{line}");
+        r.sid = Some("S-1-5-21-1-2-3-1001".into());
+        let line = serde_json::to_string(&r).unwrap();
+        assert!(line.contains("\"sid\":\"S-1-5-21-1-2-3-1001\""), "{line}");
+        let back: Record = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.sid.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        assert!(!back.extra.contains_key("sid"));
+    }
     use time::macros::datetime;
 
     fn base<'a>(input: &'a str) -> NewRecord<'a> {

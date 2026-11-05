@@ -44,7 +44,11 @@ pub const PKCHECK_PATH_ENV: &str = "/usr/bin:/bin";
 
 /// Where a polkit daemon binary may live: the one list shared with
 /// `system install` and `doctor`.
+#[cfg(unix)]
 pub use saiife_system::polkit::POLKITD_PATHS;
+/// No polkit on Windows; re-authentication there is `LogonUserW` (Task 9).
+#[cfg(not(unix))]
+pub const POLKITD_PATHS: [&str; 0] = [];
 /// pkcheck(1) exit statuses.
 const EXIT_AUTHORIZED: i32 = 0;
 const EXIT_NOT_AUTHORIZED: i32 = 1;
@@ -684,7 +688,16 @@ fn is_regular(p: &Path) -> bool {
 }
 
 fn root_owned_file(p: &Path) -> bool {
-    is_regular(p) && saiife_system::fsops::root_owned_chain(p).is_ok()
+    #[cfg(unix)]
+    {
+        is_regular(p) && saiife_system::fsops::root_owned_chain(p).is_ok()
+    }
+    // No polkit or `security` tool to trust on Windows (Task 9 replaces them).
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        false
+    }
 }
 
 /// Whether any of `candidates` is a regular file (a polkit daemon binary).
@@ -698,7 +711,7 @@ pub fn start_time_of(proc: &dyn Proc, pid: u32) -> Option<u64> {
     proc.stat(pid).map(|s| s.start_time)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use std::fs;
@@ -1357,7 +1370,7 @@ pub(crate) mod tests {
 }
 
 /// Fake re-authentication tools for tests (shell scripts in a tempdir).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod fakes {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

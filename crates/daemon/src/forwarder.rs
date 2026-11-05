@@ -343,14 +343,10 @@ pub fn write_cursor(path: &Path, c: &Cursor) -> io::Result<()> {
     let Some(hash) = &c.hash else {
         return Err(io::Error::other("a cursor needs the hash of its line"));
     };
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("cursor path has no directory"))?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    crate::fsx::create_private_dirs(dir)?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -359,11 +355,7 @@ pub fn write_cursor(path: &Path, c: &Cursor) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
     let body = format!("{} {hash}\n", c.seq);
     let staged = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut f = crate::fsx::new_private_file(&tmp)?;
         f.write_all(body.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -372,7 +364,7 @@ pub fn write_cursor(path: &Path, c: &Cursor) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::File::open(dir)?.sync_all()
+    crate::fsx::sync_dir(dir)
 }
 
 /// A place in the log: a month file and a byte offset at a line start.
@@ -1198,7 +1190,7 @@ pub mod testing {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::testing::*;
     use super::*;

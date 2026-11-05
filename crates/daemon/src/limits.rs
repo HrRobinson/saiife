@@ -123,11 +123,22 @@ impl ConnLimits {
     }
 
     /// From the process's soft `RLIMIT_NOFILE`.
+    #[cfg(unix)]
     pub fn from_rlimit() -> ConnLimits {
         let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile)
             .current
             .unwrap_or(u64::MAX);
         ConnLimits::new(total_cap(soft))
+    }
+
+    /// Windows has no such limit. What bounds connections there is the pipe's instances
+    /// plus the loopback gateway's [`crate::gateway::MAX_TCP_CONNS`]; a uid's cap of
+    /// [`MAX_CONNS_PER_UID`] keeps one user from holding every instance.
+    #[cfg(windows)]
+    pub fn from_rlimit() -> ConnLimits {
+        ConnLimits::new(
+            saiife_win::pipe::MAX_INSTANCES as u64 + crate::gateway::MAX_TCP_CONNS as u64,
+        )
     }
 
     /// Connections `uid` has open now.

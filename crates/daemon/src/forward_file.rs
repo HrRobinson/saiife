@@ -26,8 +26,10 @@
 
 use crate::forwarder::{SendError, SendFuture, Transport};
 use bytes::Bytes;
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,12 +40,30 @@ pub const MAX_RECORDS: usize = 500;
 /// Bytes per batch.
 pub const MAX_BYTES: usize = 1 << 20;
 
+/// Who must own a month file: the daemon's effective uid.
+#[cfg(unix)]
+type Owner = u32;
+/// Who must own a month file: the daemon's SID.
+#[cfg(windows)]
+type Owner = String;
+
+#[cfg(unix)]
+fn own_owner() -> Owner {
+    rustix::process::geteuid().as_raw()
+}
+
+/// A token that cannot be read owns nothing: every month file is refused.
+#[cfg(windows)]
+fn own_owner() -> Owner {
+    crate::fsx::own_sid().unwrap_or_default()
+}
+
 /// Appends to `<dir>/<host>-YYYY-MM.jsonl`.
 pub struct FileTransport {
     dir: PathBuf,
     host: String,
-    /// The owner a month file must have: the daemon's effective uid.
-    owner: u32,
+    /// The owner a month file must have.
+    owner: Owner,
     /// A blocking write is running (possibly hung).
     busy: Arc<AtomicBool>,
     /// Test seam: runs in the blocking write before anything else.
@@ -66,7 +86,7 @@ impl FileTransport {
         FileTransport {
             dir,
             host,
-            owner: rustix::process::geteuid().as_raw(),
+            owner: own_owner(),
             busy: Arc::default(),
             #[cfg(test)]
             before_write: None,
@@ -98,8 +118,68 @@ fn this_month() -> String {
     format!("{:04}-{:02}", now.year(), u8::from(now.month()))
 }
 
+/// The target directory on Windows: no reparse point, and only the system's accounts and
+/// this daemon may write in it. The same rule as on Unix: someone else's file there is
+/// someone else's to plant. There is no sticky bit to look for.
+#[cfg(windows)]
+fn open_dir(dir: &Path, owner: &Owner) -> Result<(), String> {
+    let md = std::fs::symlink_metadata(dir).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "directory {} does not exist (saiife does not create it)",
+            dir.display()
+        ),
+        _ => format!("{}: {e}", dir.display()),
+    })?;
+    if crate::fsx::is_link(&md) || !md.is_dir() {
+        return Err(format!(
+            "{} is not a directory (a link is not followed)",
+            dir.display()
+        ));
+    }
+    let text =
+        saiife_win::ffi::acl::get_sddl(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    match saiife_win::sddl::private_problem(&text, owner, false) {
+        None => Ok(()),
+        Some(why) => Err(format!("directory {}: {why}; refused", dir.display())),
+    }
+}
+
+/// Opens `name` in `dir` for appending, creating it when it is not there. Refuses
+/// anything but a regular file, never through a reparse point, owned by `owner`. A hard
+/// link cannot be counted without a call off the W1 list; [`open_dir`] keeps out anyone
+/// who could plant one.
+#[cfg(windows)]
+fn open_month(dir_path: &Path, name: &str, owner: &Owner) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let path = dir_path.join(name);
+    let what = |e: std::io::Error| format!("{}: {e}", path.display());
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .map_err(what)?;
+    let md = f.metadata().map_err(what)?;
+    if crate::fsx::is_link(&md) || !md.is_file() {
+        return Err(format!("{} is not a regular file; refused", path.display()));
+    }
+    let text = saiife_win::ffi::acl::get_sddl(&path).map_err(what)?;
+    let actual = saiife_win::sddl::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if owner.is_empty() || actual.owner.as_deref() != Some(owner.as_str()) {
+        return Err(format!(
+            "{} is owned by {}, not {owner} (a planted file?); refused",
+            path.display(),
+            actual.owner.as_deref().unwrap_or("nobody"),
+        ));
+    }
+    Ok(f)
+}
+
 /// The target directory: no symlink, not writable by group or others
 /// unless sticky.
+#[cfg(unix)]
 fn open_dir(dir: &Path) -> Result<OwnedFd, String> {
     let fd = rustix::fs::open(
         dir,
@@ -136,6 +216,7 @@ fn open_dir(dir: &Path) -> Result<OwnedFd, String> {
 /// busy loop.
 pub const OPEN_TRIES: usize = 5;
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum OpenError {
     Errno(rustix::io::Errno),
@@ -146,6 +227,7 @@ enum OpenError {
 /// Open an existing file with `open`, else create it with `create`
 /// (exclusive). When it was created by someone else in between (EEXIST),
 /// open that one, at most [`OPEN_TRIES`] rounds. `true` when we created it.
+#[cfg(unix)]
 fn open_or_create(
     mut open: impl FnMut() -> rustix::io::Result<OwnedFd>,
     mut create: impl FnMut() -> rustix::io::Result<OwnedFd>,
@@ -166,6 +248,7 @@ fn open_or_create(
     Err(OpenError::Raced)
 }
 
+#[cfg(unix)]
 fn open_month(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -236,8 +319,11 @@ fn append(mut f: std::fs::File, path: &Path, body: &[u8]) -> Result<(), String> 
     f.sync_all().map_err(what)
 }
 
-fn write_batch(dir: &Path, host: &str, owner: u32, lines: &[Bytes]) -> Result<(), String> {
+fn write_batch(dir: &Path, host: &str, owner: &Owner, lines: &[Bytes]) -> Result<(), String> {
+    #[cfg(unix)]
     let dfd = open_dir(dir)?;
+    #[cfg(windows)]
+    open_dir(dir, owner)?;
     // Consecutive runs of one month, in order; each file fsynced once.
     let mut month: Option<String> = None;
     let mut runs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -260,7 +346,10 @@ fn write_batch(dir: &Path, host: &str, owner: u32, lines: &[Bytes]) -> Result<()
     }
     for (m, body) in runs {
         let name = format!("{host}-{m}.jsonl");
-        let f = open_month(&dfd, dir, &name, owner)?;
+        #[cfg(unix)]
+        let f = open_month(&dfd, dir, &name, *owner)?;
+        #[cfg(windows)]
+        let f = open_month(dir, &name, owner)?;
         append(f, &dir.join(&name), &body)?;
     }
     Ok(())
@@ -287,7 +376,9 @@ impl Transport for FileTransport {
             let busy = Busy(Arc::clone(&self.busy));
             let dir = self.dir.clone();
             let host = self.host.clone();
-            let owner = self.owner;
+            // A uid on Unix, a SID on Windows.
+            #[cfg_attr(unix, allow(clippy::clone_on_copy))]
+            let owner = self.owner.clone();
             let lines = lines.to_vec();
             #[cfg(test)]
             let before = self.before_write.clone();
@@ -299,7 +390,7 @@ impl Transport for FileTransport {
                 if let Some(f) = before {
                     f();
                 }
-                write_batch(&dir, &host, owner, &lines)
+                write_batch(&dir, &host, &owner, &lines)
             })
             .await
             .map_err(|e| SendError::Retry(format!("file target: {e}")))?
@@ -312,7 +403,7 @@ impl Transport for FileTransport {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

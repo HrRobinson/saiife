@@ -227,6 +227,10 @@ impl Drop for Reaper {
 /// group id cannot have been reused; and only when the child leads its
 /// own group (`getpgid(pid) == pid`: the helper calls `setsid`). A syscall
 /// on a group we created, never a shell `kill`.
+#[cfg(windows)]
+fn kill_group(_pid: u32) {}
+
+#[cfg(unix)]
 fn kill_group(pid: u32) {
     use rustix::process::{getpgid, kill_process_group, Pid, Signal};
     let Some(raw) = Pid::from_raw(pid as i32) else {
@@ -287,6 +291,10 @@ impl ExitWatch {
 
 /// `waitid(P_PID, pid, WEXITED | WNOWAIT)` on a blocking thread. Any error
 /// other than EINTR (ECHILD: already reaped) counts as exited.
+#[cfg(windows)]
+async fn wait_nowait(_pid: u32) {}
+
+#[cfg(unix)]
 async fn wait_nowait(pid: u32) {
     use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
     let Some(raw) = Pid::from_raw(pid as i32) else {
@@ -975,7 +983,7 @@ fn mask_strings(v: &mut Value, masker: &Masker) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

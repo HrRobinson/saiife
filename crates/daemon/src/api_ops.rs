@@ -430,6 +430,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<(String, OpRef, Ca
     // `api.result` from the client.
     let call = Call {
         uid: 0,
+        sid: None,
         user: String::new(),
         session: None,
         project,
@@ -514,6 +515,8 @@ pub(crate) enum Caller {
     Unix(PeerCred),
     Token {
         uid: u32,
+        /// Windows: the SID the token is bound to.
+        sid: Option<String>,
         addr: std::net::SocketAddr,
     },
 }
@@ -523,6 +526,14 @@ impl Caller {
         match self {
             Caller::Unix(p) => p.uid,
             Caller::Token { uid, .. } => *uid,
+        }
+    }
+
+    /// Windows: the identity behind [`Caller::uid`]. `None` elsewhere.
+    pub(crate) fn sid(&self) -> Option<&str> {
+        match self {
+            Caller::Unix(p) => p.sid.as_deref(),
+            Caller::Token { sid, .. } => sid.as_deref(),
         }
     }
 
@@ -548,6 +559,8 @@ impl Caller {
 pub(crate) struct Identity {
     /// From the caller's identity (peer credentials or token).
     pub(crate) uid: u32,
+    /// Windows: the identity behind `uid`.
+    pub(crate) sid: Option<String>,
     /// The daemon's name for `uid`; empty when it has none.
     pub(crate) user: String,
     /// The session of the caller's agent ancestor, by attribution.
@@ -562,7 +575,11 @@ pub(crate) struct Identity {
 /// fills `id` from `caller`.
 pub(crate) async fn identify(ctx: &Ctx, caller: &Caller, id: &mut Identity) {
     id.uid = caller.uid();
-    id.user = ctx.name_of(id.uid).await.unwrap_or_default();
+    id.sid = caller.sid().map(str::to_string);
+    id.user = ctx
+        .principal_name(id.uid, caller.sid())
+        .await
+        .unwrap_or_default();
     let ancestor = caller
         .pid()
         .and_then(|pid| agent_ancestor(ctx.proc.as_ref(), pid));
@@ -612,12 +629,14 @@ pub(crate) async fn execute_in(
     identify(ctx, caller, &mut who).await;
     let Identity {
         uid,
+        sid,
         user,
         session,
         agent,
         groups,
     } = who;
     call.uid = uid;
+    call.sid = sid;
     call.user = user;
     call.session = session;
 
@@ -790,7 +809,8 @@ pub(crate) fn answer(id: u64, outcome: Outcome) -> Value {
 /// bound to the caller's uid, valid 12 h. Only a uid with a scope gets one
 /// (without a scope it could call nothing). The token is in this answer
 /// and nowhere else; the daemon keeps its SHA-256.
-pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
+pub(crate) async fn token(ctx: &Arc<Ctx>, peer: &PeerCred, id: u64) -> Value {
+    let uid = peer.uid;
     // No record, no token: below the audit floor none is issued.
     if let Err(code) = disk_ok(ctx, uid) {
         ctx.notice(uid, Notice::LowDisk);
@@ -821,7 +841,7 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
         );
     }
     let tokens = Arc::clone(&ctx.tokens);
-    let issued = tokens::issue_blocking(tokens, uid).await;
+    let issued = tokens::issue_blocking(tokens, uid, peer.sid.clone()).await;
     let issued = match issued {
         Ok(i) => i,
         Err(e) => {
@@ -833,6 +853,9 @@ pub(crate) async fn token(ctx: &Arc<Ctx>, uid: u32, id: u64) -> Value {
     let mut r = ctx.event("gateway_token");
     r.reason = Some(format!("issued to uid {uid}, expires {expires}"));
     r.extra.insert("token_uid".into(), uid.into());
+    if let Some(sid) = &peer.sid {
+        r.extra.insert("token_sid".into(), sid.clone().into());
+    }
     if let Err(e) = ctx.writer.append(r).await {
         // No record, no token: it is withdrawn before anyone saw it.
         eprintln!("saiife: warning: cannot write the gateway_token record: {e}");
@@ -973,7 +996,7 @@ pub(crate) async fn services_in(
     (services, warning)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

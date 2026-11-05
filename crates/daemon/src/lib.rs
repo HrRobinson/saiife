@@ -1,80 +1,52 @@
 //! saiifed: the locked-mode daemon (spec §4.1, §6.2, §6.3). Control server
 //! on `saiife.sock`, the single audit writer, signed checkpoints, policy
-//! reload on SIGHUP and a clean stop on SIGTERM/SIGINT. Linux and macOS
-//! (plan 13); elsewhere `run` refuses.
+//! reload on SIGHUP and a clean stop on SIGTERM/SIGINT. Linux and macOS (plan 13).
+//!
+//! On Windows (plan 19b) the control endpoint is a named pipe, a peer is its token's SID,
+//! and the service manager stops and reloads it. The personal broker there is Task 11.
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
 pub mod api_ops;
-#[cfg(unix)]
 pub mod approval_ops;
-#[cfg(unix)]
 pub mod approvals;
-#[cfg(unix)]
 pub mod approvers;
-#[cfg(unix)]
 pub mod audit_query;
-#[cfg(unix)]
 pub mod cloud_ops;
-#[cfg(unix)]
 pub mod disk;
-#[cfg(unix)]
 pub mod forward_file;
-#[cfg(unix)]
 pub mod forward_https;
-#[cfg(unix)]
 pub mod forward_syslog;
-#[cfg(unix)]
 pub mod forwarder;
-#[cfg(unix)]
+pub mod fsx;
 pub mod gateway;
-#[cfg(unix)]
 pub mod grants;
-#[cfg(unix)]
 pub mod import_backup;
-#[cfg(unix)]
 pub mod limits;
-#[cfg(unix)]
 pub mod lockdown;
-#[cfg(unix)]
 pub mod mcp_gateway;
-#[cfg(unix)]
 pub mod mcp_ops;
-#[cfg(unix)]
 pub mod notifier;
 #[cfg(unix)]
 pub mod notify;
-#[cfg(unix)]
 pub mod oauth;
-#[cfg(unix)]
 pub mod ops;
-#[cfg(unix)]
 pub mod personal;
-#[cfg(unix)]
+#[cfg(windows)]
+pub mod pipe_listener;
 pub mod policy_ops;
-#[cfg(unix)]
 pub mod reauth;
-#[cfg(unix)]
 pub mod secret_ops;
-#[cfg(unix)]
 pub mod server;
-#[cfg(unix)]
+pub mod service_log;
 pub mod sessions;
-#[cfg(unix)]
 pub mod signals;
 /// The SMTP client lives in the broker's mail transport (plan 14, Task 6);
 /// the notifier sends through it.
-#[cfg(unix)]
 pub use saiife_broker::mail::smtp;
-#[cfg(unix)]
 mod start;
-#[cfg(unix)]
 pub use start::VAULT_KEY_FILE;
-#[cfg(unix)]
 pub mod tokens;
-#[cfg(unix)]
 pub mod vault;
-#[cfg(unix)]
 pub mod writer;
 
 use saiife_policy::{Directory, PackInfo};
@@ -115,6 +87,10 @@ pub struct DaemonOptions {
     /// vault key. Always `None` for the personal broker.
     pub credentials_dir: Option<PathBuf>,
     pub mode: DaemonMode,
+    /// A debug build's test: this pipe, owned by this process's SID, instead of W11's.
+    /// Release builds of the CLI always pass `None`.
+    #[cfg(windows)]
+    pub test_pipe: Option<String>,
 }
 
 /// A keychain that could not be opened: every call fails with that error,
@@ -176,11 +152,50 @@ pub fn run(opts: DaemonOptions) -> ExitCode {
     start::run(opts)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Run the daemon outside the service manager (the tests): Ctrl+C stops it.
+#[cfg(windows)]
+pub fn run(opts: DaemonOptions) -> ExitCode {
+    start::run(opts, None)
+}
+
+/// Run the daemon under the service manager: `ctl` stops and reloads it, and its stderr
+/// goes to `log` (W10). The exit code goes to the service manager, and a non-zero one
+/// runs the restart actions.
+#[cfg(windows)]
+pub fn run_service(
+    opts: DaemonOptions,
+    log: &Path,
+    ctl: saiife_win::ffi::service::ServiceCtl,
+) -> i32 {
+    match service_log::open(log, service_log::MAX_LOG_BYTES)
+        .and_then(saiife_win::ffi::process::redirect_stderr)
+    {
+        Ok(()) => {}
+        // Stderr goes nowhere under the service manager: say so where it may be seen.
+        Err(e) => eprintln!("saiife: warning: {}: {e}", log.display()),
+    }
+    run_controlled(opts, ctl)
+}
+
+/// [`run_service`] with stderr left alone. Standard error is one per process, so a test
+/// process with several daemons must not move it.
+#[cfg(windows)]
+pub fn run_controlled(opts: DaemonOptions, ctl: saiife_win::ffi::service::ServiceCtl) -> i32 {
+    let code = start::run(opts, Some(ctl));
+    if code == ExitCode::SUCCESS {
+        0
+    } else if code == ExitCode::from(1) {
+        1
+    } else {
+        2
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn run(opts: DaemonOptions) -> ExitCode {
     match opts.mode {
         DaemonMode::System => {
-            eprintln!("saiife: locked mode needs Linux or macOS")
+            eprintln!("saiife: locked mode needs Linux, macOS or Windows")
         }
         DaemonMode::Personal { .. } => eprintln!("{PERSONAL_UNSUPPORTED}"),
     }

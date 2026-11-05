@@ -287,7 +287,7 @@ impl Transport for HttpsTransport {
 
 /// Loopback TLS for the transport tests: an `rcgen` CA, a leaf for
 /// [`TEST_HOST`], and a client that resolves every name to 127.0.0.1.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod testing {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -351,7 +351,7 @@ pub(crate) mod testing {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::testing::{acceptor, pki, upstream, Pki, TEST_HOST};
     use super::*;

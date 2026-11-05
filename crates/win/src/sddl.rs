@@ -389,10 +389,72 @@ pub fn writers(sd: &Sd) -> BTreeSet<String> {
         .collect()
 }
 
+/// `CREATOR OWNER`: an inherit-only ACE for it grants nothing on this object.
+const CREATOR_OWNER: &str = "S-1-3-0";
+/// What holds a read right: `FILE_READ_DATA`, `GENERIC_READ`, `GENERIC_ALL`.
+const READ_LIKE: u32 = 0x0000_0001 | 0x8000_0000 | 0x1000_0000;
+
+/// Why `text`, a path's descriptor, is not private to the SID `own`: an owner other than
+/// SYSTEM, Administrators, TrustedInstaller or `own`, or another SID that may write (and,
+/// with `readers_too`, read). `None` when it is private. Text that cannot be read is a
+/// problem, never a pass.
+pub fn private_problem(text: &str, own: &str, readers_too: bool) -> Option<String> {
+    use crate::sid::{ADMINISTRATORS, SYSTEM, TRUSTED_INSTALLER};
+    let sd = match parse(text) {
+        Ok(sd) => sd,
+        Err(e) => return Some(format!("cannot read its descriptor: {e}")),
+    };
+    let trusted = |sid: &str| [SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER, own].contains(&sid);
+    match sd.owner.as_deref() {
+        Some(o) if trusted(o) => {}
+        Some(o) => return Some(format!("owned by {o}")),
+        None => return Some("no owner in its descriptor".to_string()),
+    }
+    let wanted = if readers_too {
+        WRITE_LIKE | READ_LIKE
+    } else {
+        WRITE_LIKE
+    };
+    sd.aces
+        .iter()
+        .filter(|a| a.allow && !(a.flags.inherit_only && a.sid == CREATOR_OWNER))
+        .find(|a| a.mask & wanted != 0 && !trusted(&a.sid))
+        .map(|a| match a.mask & WRITE_LIKE {
+            0 => format!("{} may read it", a.sid),
+            _ => format!("{} may write it", a.sid),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sid::{ADMINISTRATORS, AUTHENTICATED_USERS, SYSTEM, USERS};
+
+    const ME: &str = "S-1-5-21-1-2-3-1001";
+
+    #[test]
+    fn private_problem_reads_owner_writers_and_readers() {
+        let ok = format!("O:{ME}G:{ME}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{ME})");
+        assert_eq!(private_problem(&ok, ME, true), None);
+        assert_eq!(private_problem(MAIN, ME, false), None);
+        // Users hold read and execute here: fine for a dir, not for a secret.
+        assert!(private_problem(MAIN, ME, true)
+            .unwrap()
+            .contains("may read"));
+        let foreign_owner = "O:S-1-5-21-1-2-3-1002D:P(A;;FA;;;SY)";
+        assert!(private_problem(foreign_owner, ME, false)
+            .unwrap()
+            .contains("owned by"));
+        let writer = format!("O:{ME}D:P(A;;FA;;;{ME})(A;;FA;;;BU)");
+        assert!(private_problem(&writer, ME, false)
+            .unwrap()
+            .contains("may write"));
+        assert!(private_problem("nonsense", ME, false).is_some());
+        assert!(private_problem("D:P(A;;FA;;;SY)", ME, false).is_some());
+        // The inherit-only template for new objects grants nothing here.
+        let template = format!("O:{ME}D:P(A;;FA;;;{ME})(A;OICIIO;FA;;;CO)");
+        assert_eq!(private_problem(&template, ME, true), None);
+    }
 
     const MAIN: &str = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
 

@@ -47,10 +47,12 @@ pub const USER_KINDS: [&str; 3] = ["guard", "connector", "approval"];
 const MAX_FILTER: usize = 4096;
 
 /// Whose records a query may see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// The records of this uid, of [`USER_KINDS`].
     Uid(u32),
+    /// Windows: the records of this SID, of [`USER_KINDS`]. The uid is a label there.
+    Sid(String),
     /// Every record (auditors and root).
     All,
 }
@@ -201,10 +203,11 @@ pub fn parse(args: &Map<String, Value>) -> Result<Query, String> {
 
 /// `r` is inside `scope`. A uid scope needs the record's own uid and one
 /// of [`USER_KINDS`]; a record without a uid is outside every uid scope.
-pub fn in_scope(r: &Record, scope: Scope) -> bool {
+pub fn in_scope(r: &Record, scope: &Scope) -> bool {
     match scope {
         Scope::All => true,
-        Scope::Uid(uid) => r.uid == Some(uid) && USER_KINDS.contains(&r.kind()),
+        Scope::Uid(uid) => r.uid == Some(*uid) && USER_KINDS.contains(&r.kind()),
+        Scope::Sid(sid) => r.sid.as_deref() == Some(sid) && USER_KINDS.contains(&r.kind()),
     }
 }
 
@@ -292,7 +295,7 @@ impl<'q> Pager<'q> {
             return true;
         }
         let q = self.q;
-        if !in_scope(r, self.scope)
+        if !in_scope(r, &self.scope)
             || q.after.as_ref().is_some_and(|a| pos <= a)
             || !r.seq.is_some_and(|s| q.after_seq.is_none_or(|a| s > a))
             || !matches(r, q)
@@ -428,6 +431,10 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
         Ok(s) => s,
         Err(m) => return err(id, ErrorCode::Forbidden, &m),
     };
+    let scope = match (scope, &peer.sid) {
+        (Scope::Uid(_), Some(sid)) => Scope::Sid(sid.clone()),
+        (s, _) => s,
+    };
     let Ok(_permit) = QUERIES.acquire().await else {
         return err(id, ErrorCode::Internal, "audit.query failed");
     };
@@ -451,7 +458,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_audit::{DecisionKind, NewRecord};
@@ -530,7 +537,7 @@ mod tests {
     fn records_without_uid_excluded() {
         let records = mixed();
         for scope in [Scope::Uid(ME), Scope::Uid(OTHER), Scope::Uid(0)] {
-            let p = page(&records, scope, &q(json!({})));
+            let p = page(&records, scope.clone(), &q(json!({})));
             assert!(
                 !inputs(&p).iter().any(|i| i.starts_with("no-uid")),
                 "{scope:?}: {p:?}"
@@ -661,6 +668,24 @@ mod tests {
         assert!(parse(json!({"after_seq": "1"}).as_object().unwrap()).is_err());
     }
 
+    /// Windows: two SIDs with one uid label see their own records only.
+    #[test]
+    fn a_sid_scope_sees_only_that_sids_records() {
+        const A: &str = "S-1-5-21-1-2-3-1001";
+        const B: &str = "S-1-5-21-1-2-3-1002";
+        let mut mine = rec(1, "guard", Some(7), "mine");
+        mine.sid = Some(A.into());
+        let mut theirs = rec(2, "guard", Some(7), "theirs");
+        theirs.sid = Some(B.into());
+        let unlabeled = rec(3, "guard", Some(7), "no-sid");
+        let p = page(
+            &[mine, theirs, unlabeled],
+            Scope::Sid(A.into()),
+            &q(json!({})),
+        );
+        assert_eq!(inputs(&p), ["mine"]);
+    }
+
     /// Pages every record of `scope` out of `dir` by the `next` cursor.
     fn page_all(dir: &Path, scope: Scope, limit: u64) -> (Vec<String>, usize) {
         let (mut seen, mut pages, mut after) = (Vec::new(), 0, None::<String>);
@@ -669,7 +694,7 @@ mod tests {
             if let Some(c) = &after {
                 a["after"] = c.clone().into();
             }
-            let p = run(dir, scope, &q(a)).unwrap();
+            let p = run(dir, scope.clone(), &q(a)).unwrap();
             pages += 1;
             seen.extend(inputs(&p));
             if !p.more {

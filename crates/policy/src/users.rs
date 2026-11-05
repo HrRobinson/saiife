@@ -29,6 +29,18 @@ pub trait Directory {
     fn try_groups_of(&self, user: &str) -> Result<Vec<String>, String> {
         Ok(self.groups_of(user))
     }
+    /// Windows: the SID of an account or group, the identity behind its uid label.
+    /// `None` on Linux and macOS, where the uid is the identity, and on a failed lookup.
+    fn sid_of(&self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
+    /// Windows: the canonical name of a SID, and that SID noted so
+    /// [`name_of`](Directory::name_of) can answer for its label. `None` elsewhere.
+    fn name_of_sid(&self, sid: &str) -> Option<String> {
+        let _ = sid;
+        None
+    }
 }
 
 /// NSS lookups through `getent passwd|group` and `id -Gn`. macOS has no
@@ -270,6 +282,17 @@ impl<A: WinAccounts> WinDirectory<A> {
     /// Notes a SID this process met, say a peer's, so [`Directory::name_of`] can
     /// answer for its label. Returns its name when Windows knows one.
     pub fn saw_sid(&self, sid: &str) -> Option<String> {
+        // A hook connects on every tool call: a known SID needs no second lookup.
+        if let Some(Seen::One { sid: known, name }) = self
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uid_of(sid, false))
+        {
+            if known == sid {
+                return Some(name.clone());
+            }
+        }
         let name = self.accounts.lookup_sid(sid).ok()?;
         self.remember(sid, &name);
         Some(name)
@@ -322,6 +345,17 @@ impl<A: WinAccounts> Directory for WinDirectory<A> {
         self.accounts
             .local_groups_of(user)
             .map_err(|e| format!("cannot look up the groups of {user}: {e}"))
+    }
+
+    fn sid_of(&self, name: &str) -> Option<String> {
+        if !valid_win_name(name) {
+            return None;
+        }
+        self.accounts.lookup_name(name).ok().map(|(sid, _)| sid)
+    }
+
+    fn name_of_sid(&self, sid: &str) -> Option<String> {
+        self.saw_sid(sid)
     }
 }
 

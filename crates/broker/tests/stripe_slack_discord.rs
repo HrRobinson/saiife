@@ -783,6 +783,7 @@ fn snap(text: &str) -> PolicySnapshot {
 fn call(service: &str, op_id: &str, params: &[(&str, &str)]) -> Call {
     Call {
         uid: 1001,
+        sid: None,
         user: "agent".into(),
         session: Some("sess-1".into()),
         project: "/srv/app".into(),

@@ -26,9 +26,14 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_NetManagement",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+# The one service entry (W1): `define_windows_service!` expands to unsafe, so it is here.
+windows-service = "=0.8.1"
 tokio = { version = "1", features = ["net"], optional = true }
 
 [target.'cfg(windows)'.dev-dependencies]

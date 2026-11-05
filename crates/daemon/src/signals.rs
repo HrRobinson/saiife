@@ -118,8 +118,14 @@ fn read_hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
 }
 
+/// `COMPUTERNAME`, from the service environment.
+#[cfg(windows)]
+fn read_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// No `/proc` on macOS: `uname(3)`'s nodename.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn read_hostname() -> Option<String> {
     Some(
         rustix::system::uname()
@@ -205,7 +211,7 @@ impl Ctx {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -361,6 +361,7 @@ fn catalog() -> Catalog {
 fn call(op: &str, params: &[(&str, &str)]) -> Call {
     Call {
         uid: 1001,
+        sid: None,
         user: "agent".into(),
         session: Some("sess-1".into()),
         project: "/srv/shop".into(),

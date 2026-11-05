@@ -79,7 +79,7 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
     // Whatever writes a record (every op but an admin's list) is refused
     // before it changes anything when the audit volume is below the floor
     // (same gate as audit.append).
-    let admin = ctx.is_admin(peer.uid).await;
+    let admin = ctx.peer_is_admin(peer).await;
     if event != "secret_list" || !admin {
         let free = crate::disk::free_mb(&ctx.audit_dir);
         if let Err(code) = gate(free, ctx.policy().min_free_mb, peer.uid, ctx.own_uid) {
@@ -165,7 +165,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 async fn record(ctx: &Ctx, peer: &PeerCred, event: &str, name: &str) -> saiife_audit::Record {
     let mut r = ctx.record("secret", &format!("{event} {name}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), event.into());
     r.extra.insert("name".into(), name.into());
     r.extra.insert(
@@ -716,7 +717,8 @@ pub async fn lease(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 async fn use_record(ctx: &Ctx, peer: &PeerCred, name: &str, exe: &str) -> saiife_audit::Record {
     let mut r = ctx.record("secret", &format!("run {name} {exe}"));
     r.uid = Some(peer.uid);
-    r.user = ctx.name_of(peer.uid).await;
+    r.sid = peer.sid.clone();
+    r.user = ctx.peer_name(peer).await;
     r.extra.insert("event".into(), "secret_use".into());
     r.extra.insert("name".into(), name.into());
     r.extra.insert(
@@ -830,7 +832,17 @@ pub(crate) fn check_exe(exe: &Path, allow: &[PathBuf]) -> Result<(), Deny> {
         Ok(m) if m.is_file() => {}
         _ => return Err(no("the executable is not a regular file")),
     }
-    saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
+    #[cfg(unix)]
+    {
+        saiife_system::fsops::root_owned_chain(exe).map_err(|e| no(&format!("not root-owned: {e}")))
+    }
+    // W19's chain check arrives with `run` on Windows (Task 10). Until then no lease.
+    #[cfg(not(unix))]
+    {
+        Err(no(
+            "run_allow's ownership check is not available on Windows yet",
+        ))
+    }
 }
 
 /// The value for the answer, and the use noted in the vault.
@@ -886,7 +898,7 @@ async fn take_value(
     .map_err(|_| deny("run_not_allowed", "vault read failed"))?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

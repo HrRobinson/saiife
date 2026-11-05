@@ -51,6 +51,8 @@ pub enum PolicyError {
     ScopeConflict { user: String, scopes: Vec<String> },
     #[error("environment {env}: {detail}")]
     Environment { env: String, detail: String },
+    #[error("uid collision between {a} and {b}; rename one or tell the saiife maintainers")]
+    UidCollision { a: String, b: String },
 }
 
 /// Largest config file or drop-in read (1 MiB).

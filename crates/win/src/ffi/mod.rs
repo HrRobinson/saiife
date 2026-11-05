@@ -8,7 +8,10 @@
 pub mod account;
 pub mod acl;
 pub mod pipe;
+pub mod proc;
+pub mod process;
 pub mod sd;
+pub mod service;
 pub mod token;
 
 #[cfg(test)]

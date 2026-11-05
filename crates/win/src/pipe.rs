@@ -137,6 +137,29 @@ pub fn create_checked<N: Namespace>(
     Ok(instance)
 }
 
+/// What a failed later instance means to an accept loop.
+#[derive(Debug)]
+pub enum LaterInstance {
+    /// `ERROR_PIPE_BUSY`: every instance is taken. Clients retry, and so does the loop.
+    Full,
+    /// Anything else. `ErrorKind::AlreadyExists` (W11's line as its text) says the name
+    /// is someone else's: our own DACL lets us add an instance, so a refusal means this
+    /// pipe has another's DACL. The daemon must stop serving.
+    Failed(io::Error),
+}
+
+/// Reads an error of [`create_checked`] with `first` false.
+pub fn later_instance(name: &str, e: io::Error) -> LaterInstance {
+    match e.raw_os_error() {
+        Some(ERROR_PIPE_BUSY) => LaterInstance::Full,
+        Some(ERROR_ACCESS_DENIED) => LaterInstance::Failed(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("pipe {name} exists and is not ours; refusing to start"),
+        )),
+        _ => LaterInstance::Failed(e),
+    }
+}
+
 /// Who is on the other end of a server instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeClient {
@@ -448,6 +471,34 @@ mod tests {
             owner: AGENT.to_string(),
             lets_us_add,
         })
+    }
+
+    #[test]
+    fn a_full_pipe_is_no_failure_for_a_later_instance() {
+        let busy = io::Error::from_raw_os_error(ERROR_PIPE_BUSY);
+        assert!(matches!(later_instance(CONTROL, busy), LaterInstance::Full));
+    }
+
+    #[test]
+    fn a_refused_later_instance_means_the_name_is_not_ours() {
+        let denied = io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+        let LaterInstance::Failed(e) = later_instance(CONTROL, denied) else {
+            panic!("a refusal is no full pipe");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            e.to_string(),
+            r"pipe \\.\pipe\saiife exists and is not ours; refusing to start"
+        );
+    }
+
+    #[test]
+    fn other_later_instance_errors_keep_their_code() {
+        let LaterInstance::Failed(e) = later_instance(CONTROL, io::Error::from_raw_os_error(2))
+        else {
+            panic!("not a full pipe");
+        };
+        assert_eq!(e.raw_os_error(), Some(2));
     }
 
     #[test]

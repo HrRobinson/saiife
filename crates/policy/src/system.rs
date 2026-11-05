@@ -288,6 +288,13 @@ pub fn facility_code(name: Option<&str>) -> Option<u8> {
     }
 }
 
+/// What a platform refuses in a syslog address: Windows has no local syslog socket.
+pub fn syslog_address_problem(address: &str, windows: bool) -> Option<&'static str> {
+    (windows && address.starts_with("unix:")).then_some(
+        "syslog to a local socket is not available on Windows; use a udp, tcp or tls target",
+    )
+}
+
 impl AuditCfg {
     /// The checks a parse cannot make; `Err` names the target.
     pub fn validate(&self) -> Result<(), String> {
@@ -309,6 +316,9 @@ impl AuditCfg {
                     ca,
                     ..
                 } => {
+                    if let Some(why) = syslog_address_problem(address, cfg!(windows)) {
+                        return bad(why);
+                    }
                     let unix = address.starts_with("unix:");
                     let ok = match address.strip_prefix("unix:") {
                         Some(p) => p.starts_with('/') && p.len() > 1 && !has_ws(p),
@@ -852,6 +862,28 @@ mod tests {
     }
 
     #[test]
+    fn local_syslog_refused_on_windows() {
+        assert_eq!(
+            syslog_address_problem("unix:/dev/log", true),
+            Some(
+                "syslog to a local socket is not available on Windows; use a udp, tcp or tls target"
+            )
+        );
+        assert_eq!(syslog_address_problem("tls://log.test:6514", true), None);
+        assert_eq!(syslog_address_problem("unix:/dev/log", false), None);
+    }
+
+    /// W13: Windows serves the gateway on loopback TCP only. No `socket` key exists in
+    /// `[gateway]`, so a config that sets one fails to parse, on every OS.
+    #[test]
+    fn gateway_socket_setting_refused_on_windows() {
+        let e = toml::from_str::<GatewayCfg>("socket = \"/run/saiife/gateway.sock\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    #[test]
     fn bad_syslog_address_refused() {
         for a in [
             "tls://h",
@@ -870,15 +902,12 @@ mod tests {
             let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
             assert!(fwd_valid(&b).is_err(), "{a}");
         }
-        for a in [
-            "tls://[::1]:6514",
-            "tls://h.test:6514",
-            "tls://h:65535",
-            "unix:/dev/log",
-        ] {
+        for a in ["tls://[::1]:6514", "tls://h.test:6514", "tls://h:65535"] {
             let b = format!("[audit.forward.a]\ntype = \"syslog\"\naddress = \"{a}\"\n");
             assert!(fwd_valid(&b).is_ok(), "{a}");
         }
+        let local = "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\n";
+        assert_eq!(fwd_valid(local).is_ok(), cfg!(unix));
         let b =
             "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nca = \"/x.pem\"\n";
         assert!(fwd_valid(b).is_err());
@@ -919,7 +948,7 @@ mod tests {
         }
         for f in ["local0", "local7", "user", "daemon"] {
             let b = format!(
-                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"unix:/dev/log\"\nfacility = \"{f}\"\n"
+                "[audit.forward.a]\ntype = \"syslog\"\naddress = \"tls://h.test:6514\"\nfacility = \"{f}\"\n"
             );
             assert!(fwd_valid(&b).is_ok(), "{f}");
         }

@@ -122,15 +122,11 @@ fn write_config(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
 ) -> io::Result<bool> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .ok_or_else(|| io::Error::other("the config path has no directory"))?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    crate::fsx::create_private_dirs(dir)?;
     let md = std::fs::symlink_metadata(dir)?;
     if !md.file_type().is_dir() {
         return Err(io::Error::other(format!(
@@ -138,25 +134,26 @@ fn write_config(
             dir.display()
         )));
     }
-    if md.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::other(format!(
-            "{} is not owned by this user",
-            dir.display()
-        )));
-    }
-    if md.permissions().mode() & 0o7777 != 0o700 {
-        return Err(io::Error::other(format!(
-            "{} must be mode 0700",
-            dir.display()
-        )));
-    }
-    // `create_new` never follows or replaces anything already there.
-    let mut f = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if md.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::other(format!(
+                "{} is not owned by this user",
+                dir.display()
+            )));
+        }
+        if md.permissions().mode() & 0o7777 != 0o700 {
+            return Err(io::Error::other(format!(
+                "{} must be mode 0700",
+                dir.display()
+            )));
+        }
+    }
+    #[cfg(windows)]
+    crate::fsx::check_private_dir(dir)?;
+    // `create_new` never follows or replaces anything already there.
+    let mut f = match crate::fsx::new_private_file(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e),
@@ -240,7 +237,7 @@ pub fn admits(own_uid: u32, peer_uid: u32) -> bool {
     peer_uid == own_uid
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use saiife_keychain::{FakeKeychain, KeychainError};

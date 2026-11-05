@@ -14,6 +14,7 @@
 
 pub mod display;
 pub mod pipe;
+pub mod proc;
 pub mod profile;
 pub mod sddl;
 pub mod sid;

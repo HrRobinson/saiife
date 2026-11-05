@@ -100,6 +100,25 @@ pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
     }
 }
 
+/// Who made a request: a uid on Linux and macOS, a SID with its uid label on Windows.
+#[derive(Debug, Clone, Copy)]
+pub struct Requester<'a> {
+    pub uid: u32,
+    pub sid: Option<&'a str>,
+}
+
+impl From<u32> for Requester<'_> {
+    fn from(uid: u32) -> Self {
+        Requester { uid, sid: None }
+    }
+}
+
+impl<'a> From<(u32, Option<&'a str>)> for Requester<'a> {
+    fn from((uid, sid): (u32, Option<&'a str>)) -> Self {
+        Requester { uid, sid }
+    }
+}
+
 /// May the CLI connected as `peer` decide a request made by
 /// `requester_uid`? The approver's uid is `peer.uid`. Every error refuses
 /// (fail closed).
@@ -125,11 +144,11 @@ pub fn personal_may_decide(own_uid: u32, peer_uid: u32) -> Result<(), Refusal> {
 ///   decides on it, never on `peer.pid`. Without it a macOS check is
 ///   unavailable. The start-time re-check after it only ever refuses.
 #[allow(clippy::too_many_arguments)]
-pub fn may_decide(
+pub fn may_decide<'r>(
     cfg: &ApprovalCfg,
     dir: &dyn Directory,
     approver_user: &str,
-    requester_uid: u32,
+    requester: impl Into<Requester<'r>>,
     reauth: &dyn Reauth,
     peer: &PeerCred,
     start_time: u64,
@@ -138,14 +157,26 @@ pub fn may_decide(
     detail: &str,
     auth: Option<[u8; 32]>,
 ) -> Result<(), Refusal> {
+    let requester = requester.into();
     let approver_uid = peer.uid;
-    if dir.user(approver_user).map(|u| u.uid) != Some(approver_uid) {
+    // The name was looked up from this peer. On Windows that is by SID, and an elevated
+    // admin's uid label is 0 whatever its name's label is, so the SIDs are compared.
+    let same_account = match peer.sid.as_deref() {
+        Some(sid) => dir.sid_of(approver_user).as_deref() == Some(sid),
+        None => dir.user(approver_user).map(|u| u.uid) == Some(approver_uid),
+    };
+    if !same_account {
         return Err(Refusal::ReauthError(MISMATCH.to_string()));
     }
     if !is_approver(cfg, dir, approver_user) {
         return Err(Refusal::NotApprover);
     }
-    if approver_uid != requester_uid {
+    if !crate::ops::same_principal(
+        approver_uid,
+        peer.sid.as_deref(),
+        requester.uid,
+        requester.sid,
+    ) {
         return Ok(());
     }
     match cfg.same_user {
@@ -197,6 +228,19 @@ pub fn may_decide(
 }
 
 #[cfg(test)]
+mod requester_tests {
+    use super::*;
+
+    #[test]
+    fn a_uid_is_a_requester_without_a_sid() {
+        let r: Requester<'_> = 1000u32.into();
+        assert_eq!((r.uid, r.sid), (1000, None));
+        let r: Requester<'_> = (7u32, Some("S-1-5-18")).into();
+        assert_eq!(r.sid, Some("S-1-5-18"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sessions::ProcStat;

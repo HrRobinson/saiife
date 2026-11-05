@@ -85,6 +85,66 @@ impl Proc for MacProc {
     }
 }
 
+/// How long one process snapshot answers for (Windows).
+const SNAPSHOT_FOR: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A process table as one list: the Toolhelp snapshot on Windows, a fixture in a test.
+type Snapshot = Box<dyn Fn() -> std::io::Result<Vec<saiife_win::proc::ProcEntry>> + Send + Sync>;
+
+/// Windows (W17): names and parents from one snapshot per lookup, cached for 200 ms, so
+/// one walk reads one table. There is no start time, so a reused pid goes unnoticed, and
+/// no command line, so a `node` ancestor never matches an agent: such a request gets no
+/// session. Attribution only; nothing is allowed because of it.
+pub struct WinProc {
+    snapshot: Snapshot,
+    cached: Mutex<Option<WinTable>>,
+}
+
+struct WinTable {
+    at: std::time::Instant,
+    procs: HashMap<u32, saiife_win::proc::ProcEntry>,
+}
+
+impl WinProc {
+    pub fn with_snapshot(snapshot: Snapshot) -> WinProc {
+        WinProc {
+            snapshot,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+impl Proc for WinProc {
+    fn stat(&self, pid: u32) -> Option<ProcStat> {
+        let mut c = self.cached.lock().unwrap_or_else(|p| p.into_inner());
+        if c.as_ref().is_none_or(|t| t.at.elapsed() >= SNAPSHOT_FOR) {
+            let procs = (self.snapshot)().ok()?;
+            *c = Some(WinTable {
+                at: std::time::Instant::now(),
+                procs: procs.into_iter().map(|e| (e.pid, e)).collect(),
+            });
+        }
+        let e = c.as_ref()?.procs.get(&pid)?;
+        Some(ProcStat {
+            ppid: e.ppid,
+            comm: saiife_win::proc::comm_of(&e.exe),
+            start_time: 0,
+        })
+    }
+
+    fn cmdline(&self, _pid: u32) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// The host's process table: the Toolhelp snapshot on Windows.
+#[cfg(windows)]
+pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
+    Box::new(WinProc::with_snapshot(Box::new(
+        saiife_win::ffi::proc::snapshot,
+    )))
+}
+
 /// The host's process table: `/proc` on Linux, `KERN_PROC_PID` on macOS.
 #[cfg(target_os = "linux")]
 pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
@@ -98,7 +158,7 @@ pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
 }
 
 /// Other unix: no process table, so no session is ever attributed.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn host_proc() -> Box<dyn Proc + Send + Sync> {
     struct NoProc;
     impl Proc for NoProc {
@@ -219,6 +279,85 @@ impl Sessions {
     pub fn lookup(&self, ancestor: (u32, u64)) -> Option<String> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.map.get(&ancestor).cloned()
+    }
+}
+
+#[cfg(test)]
+mod win_tests {
+    use super::*;
+    use saiife_win::proc::ProcEntry;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    fn entry(pid: u32, ppid: u32, exe: &str) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            exe: exe.to_string(),
+        }
+    }
+
+    fn fixture(table: Vec<ProcEntry>) -> WinProc {
+        WinProc::with_snapshot(Box::new(move || Ok(table.clone())))
+    }
+
+    #[test]
+    fn win_proc_walks_names_from_fixture_snapshot() {
+        let p = fixture(vec![
+            entry(4, 0, "System"),
+            entry(100, 4, "Claude.EXE"),
+            entry(200, 100, "pwsh.exe"),
+            entry(300, 200, "saiife.exe"),
+        ]);
+        assert_eq!(agent_ancestor(&p, 300), Some((100, 0)));
+        let st = p.stat(200).unwrap();
+        assert_eq!(st.comm, "pwsh");
+        assert_eq!(st.ppid, 100);
+        assert_eq!(st.start_time, 0);
+        assert_eq!(p.cmdline(100), None);
+    }
+
+    #[test]
+    fn node_ancestor_has_no_session() {
+        let p = fixture(vec![
+            entry(100, 4, "node.exe"),
+            entry(200, 100, "pwsh.exe"),
+            entry(300, 200, "saiife.exe"),
+        ]);
+        assert_eq!(agent_ancestor(&p, 300), None);
+    }
+
+    /// A parent that is gone, as Windows keeps the pid of a dead parent, ends the walk.
+    #[test]
+    fn a_dead_parent_ends_the_walk() {
+        let p = fixture(vec![entry(300, 999, "saiife.exe")]);
+        assert_eq!(agent_ancestor(&p, 300), None);
+    }
+
+    /// Reused pids can make a parent cycle: the depth bound ends it.
+    #[test]
+    fn a_parent_cycle_ends_the_walk() {
+        let p = fixture(vec![entry(1, 2, "a.exe"), entry(2, 1, "b.exe")]);
+        assert_eq!(agent_ancestor(&p, 1), None);
+    }
+
+    /// One walk reads one table, however many levels it climbs.
+    #[test]
+    fn one_snapshot_per_lookup() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&calls);
+        let p = WinProc::with_snapshot(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![entry(100, 4, "claude.exe"), entry(200, 100, "x.exe")])
+        }));
+        assert!(agent_ancestor(&p, 200).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_no_process() {
+        let p = WinProc::with_snapshot(Box::new(|| Err(std::io::Error::other("no"))));
+        assert_eq!(p.stat(1), None);
     }
 }
 

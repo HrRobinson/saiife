@@ -447,8 +447,9 @@ fn locked_only(cmd: &Cmd) -> bool {
             action,
             policy_cmd::PolicyAction::Show { .. } | policy_cmd::PolicyAction::Reload
         ),
-        Cmd::Daemon { .. }
-        | Cmd::Doctor { .. }
+        // `daemon --system` runs on Windows (plan 19b); the personal broker is Task 11.
+        Cmd::Daemon { system, .. } => !*system,
+        Cmd::Doctor { .. }
         | Cmd::Eval
         | Cmd::McpSpawn
         | Cmd::Secret { .. }
@@ -544,6 +545,21 @@ fn main() -> ExitCode {
             user,
             print_unit,
             locked_marker,
+            config,
+            state_dir,
+            credentials_dir,
+        });
+    }
+    #[cfg(windows)]
+    if let Cmd::Daemon {
+        config,
+        state_dir,
+        credentials_dir,
+        ..
+    } = cli.command
+    {
+        // `locked_only` let through only `--system`.
+        return win_daemon::run(win_daemon::Paths {
             config,
             state_dir,
             credentials_dir,
@@ -744,6 +760,76 @@ fn main() -> ExitCode {
     }
 }
 
+/// `saiife daemon --system` on Windows (W10): inside the service dispatcher when the
+/// service manager started this process, else on its own, where Ctrl+C stops it.
+#[cfg(windows)]
+mod win_daemon {
+    use saiife_system::layout::{Layout, CONFIG, DAEMON_LOG, KEYS_DIR, STATE_DIR};
+    use saiife_win::ffi::service::{run_as_service, ServiceCtl, NOT_A_SERVICE};
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+    use std::sync::Mutex;
+
+    /// The flags; each default comes from the W9 layout, never from the environment.
+    pub struct Paths {
+        pub config: Option<PathBuf>,
+        pub state_dir: Option<PathBuf>,
+        pub credentials_dir: Option<PathBuf>,
+    }
+
+    /// `run_as_service` takes a plain function, so what it runs waits here.
+    static PATHS: Mutex<Option<Paths>> = Mutex::new(None);
+
+    fn options(paths: Paths) -> saiife_daemon::DaemonOptions {
+        let layout = Layout::system();
+        // Debug builds only: a test pipe, owned by this process's SID.
+        #[cfg(debug_assertions)]
+        let test_pipe = std::env::var("SAIIFE_TEST_PIPE").ok();
+        #[cfg(not(debug_assertions))]
+        let test_pipe = None;
+        saiife_daemon::DaemonOptions {
+            config: paths.config.unwrap_or_else(|| layout.at(CONFIG)),
+            state_dir: paths.state_dir.unwrap_or_else(|| layout.at(STATE_DIR)),
+            credentials_dir: Some(paths.credentials_dir.unwrap_or_else(|| layout.at(KEYS_DIR))),
+            catalog: super::daemon_catalog(),
+            directory: Box::new(saiife_policy::WinDirectory::system()),
+            mode: saiife_daemon::DaemonMode::System,
+            test_pipe,
+        }
+    }
+
+    fn take_paths() -> Option<Paths> {
+        PATHS.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn service_main(ctl: ServiceCtl) -> i32 {
+        let Some(paths) = take_paths() else {
+            return 2;
+        };
+        let log = Layout::system().at(DAEMON_LOG);
+        saiife_daemon::run_service(options(paths), &log, ctl)
+    }
+
+    pub fn run(paths: Paths) -> ExitCode {
+        // W28; Task 10 moves this to the top of `main`.
+        if let Err(e) = saiife_win::ffi::process::harden_dll_search() {
+            eprintln!("saiife: warning: cannot restrict the DLL search: {e}");
+        }
+        *PATHS.lock().unwrap_or_else(|p| p.into_inner()) = Some(paths);
+        match run_as_service(saiife_system::layout::WIN_SERVICE, service_main) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.raw_os_error() == Some(NOT_A_SERVICE) => match take_paths() {
+                Some(paths) => saiife_daemon::run(options(paths)),
+                None => ExitCode::from(2),
+            },
+            Err(e) => {
+                eprintln!("saiife: the service dispatcher failed: {e}");
+                ExitCode::from(2)
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 /// The `saiife daemon` flags.
 struct DaemonArgs {
@@ -909,7 +995,7 @@ fn print_unit(kind: &str) -> ExitCode {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// The built-in packs as the daemon's policy catalog.
 fn daemon_catalog() -> Vec<saiife_policy::PackInfo> {
     let (packs, warnings) = saiifeguard::builtins::builtin_packs_every_rule();

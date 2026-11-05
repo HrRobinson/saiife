@@ -74,6 +74,8 @@ pub async fn handle(ctx: &Arc<Ctx>, peer: &PeerCred, req: Request) -> Value {
 /// One `mcp.call` after step 1.
 pub struct McpCall {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. `None` elsewhere.
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -106,6 +108,9 @@ impl std::fmt::Debug for McpCall {
 #[serde(deny_unknown_fields)]
 pub struct StoredMcpCall {
     pub uid: u32,
+    /// Windows: the caller's SID, the identity behind `uid`. Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     pub user: String,
     pub session: Option<String>,
     pub project: String,
@@ -144,6 +149,7 @@ impl StoredMcpCall {
     pub fn call(&self) -> McpCall {
         McpCall {
             uid: self.uid,
+            sid: self.sid.clone(),
             user: self.user.clone(),
             session: self.session.clone(),
             project: self.project.clone(),
@@ -289,6 +295,7 @@ pub(crate) fn parse_call(args: &Map<String, Value>) -> Result<McpCall, &'static 
     };
     Ok(McpCall {
         uid: 0,
+        sid: None,
         user: String::new(),
         session: None,
         project,
@@ -661,6 +668,7 @@ async fn steps(
         let pending = PendingMcp {
             stored: StoredMcpCall {
                 uid: call.uid,
+                sid: call.sid.clone(),
                 user: call.user.clone(),
                 session: call.session.clone(),
                 project: call.project.clone(),
@@ -867,6 +875,7 @@ pub fn mcp_record(
     );
     r.kind = Some("connector".into());
     r.uid = Some(call.uid);
+    r.sid = call.sid.clone();
     r.user = Some(call.user.clone());
     let e = &mut r.extra;
     e.insert("service".into(), service.into());
@@ -927,6 +936,7 @@ pub(crate) async fn execute(
     let mut who = Identity::default();
     api_ops::identify(ctx, caller, &mut who).await;
     call.uid = who.uid;
+    call.sid = who.sid;
     call.user = who.user;
     call.session = who.session;
     let agent = who.agent;
