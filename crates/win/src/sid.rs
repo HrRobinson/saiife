@@ -94,7 +94,17 @@ pub fn service_sid(service_name: &str) -> String {
 /// The uid is a display label, and two SIDs can collide. The SID is the
 /// identity: never use the uid as a security key.
 pub fn uid_of(sid: &str, elevated_admin: bool) -> u32 {
-    if sid == SYSTEM || elevated_admin {
+    if sid == SYSTEM {
+        return 0;
+    }
+    peer_uid(sid, elevated_admin)
+}
+
+/// The uid of a named pipe peer: as [`uid_of`], but 0 only when `elevated_admin`, even
+/// for SYSTEM. A low-integrity or restricted SYSTEM token is not root. A real SYSTEM
+/// token holds `Administrators` enabled at System integrity, so it still gets 0.
+pub fn peer_uid(sid: &str, elevated_admin: bool) -> u32 {
+    if elevated_admin {
         return 0;
     }
     let hash = Sha256::digest(sid.as_bytes());
@@ -179,6 +189,17 @@ mod tests {
         assert_eq!(uid_of(SYSTEM, false), 0);
         assert_eq!(uid_of(SYSTEM, true), 0);
         assert_eq!(uid_of("S-1-5-21-1-2-3-1001", true), 0);
+    }
+
+    #[test]
+    fn peer_uid_is_0_only_when_elevated() {
+        assert_eq!(peer_uid(SYSTEM, true), 0);
+        assert_eq!(peer_uid("S-1-5-21-1-2-3-1001", true), 0);
+        assert_ne!(peer_uid(SYSTEM, false), 0);
+        assert_eq!(
+            peer_uid("S-1-5-21-1-2-3-1001", false),
+            uid_of("S-1-5-21-1-2-3-1001", false)
+        );
     }
 
     /// Computed independently with Python's hashlib.

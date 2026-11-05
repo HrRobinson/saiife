@@ -167,7 +167,7 @@ pub(crate) fn impersonated() -> io::Result<PeerToken> {
     }?;
 
     let restricted = info(token.0, TokenRestrictedSids)?;
-    if restricted.bytes < std::mem::offset_of!(TOKEN_GROUPS, Groups) {
+    if restricted.bytes < size_of::<u32>() {
         return Err(short_answer());
     }
     // SAFETY: the buffer holds at least the count (just checked), aligned by Vec<u64>.

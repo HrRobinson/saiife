@@ -264,6 +264,21 @@ mod tests {
         );
     }
 
+    /// A client that lets the server see nothing gets no identity, and no fallback to the
+    /// process token.
+    #[tokio::test]
+    async fn anonymous_client_gets_no_identity() {
+        let name = unique_name("anonymous");
+        let server = create_server(&name, &full_sddl(&me()), true).unwrap();
+        let _client = std::fs::OpenOptions::new()
+            .access_mode(CLIENT_ACCESS)
+            .security_qos_flags(windows_sys::Win32::Storage::FileSystem::SECURITY_ANONYMOUS)
+            .open(&name)
+            .unwrap();
+        server.connect().await.unwrap();
+        assert!(client_facts(&server).is_err());
+    }
+
     /// No client has connected, so impersonation fails: an error, not the process token.
     #[tokio::test]
     async fn client_facts_with_no_client_is_an_error() {

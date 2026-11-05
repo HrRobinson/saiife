@@ -27,7 +27,7 @@ pub const CLIENT_ACCESS: u32 = 0x0012_0083;
 /// as the client. `ffi::pipe` asserts this equals the Windows constant.
 pub const CLIENT_QOS: u32 = 0x0001_0000;
 /// How many instances of a pipe may exist.
-pub const MAX_INSTANCES: usize = 64;
+pub const MAX_INSTANCES: usize = 254;
 
 /// Longest name Windows accepts for a pipe.
 const MAX_NAME: usize = 256;
@@ -370,7 +370,7 @@ mod tests {
             let plan = ServerPlan::instance(first);
             assert!(plan.reject_remote_clients);
             assert!(plan.byte_mode);
-            assert_eq!(plan.max_instances, 64);
+            assert_eq!(plan.max_instances, 254);
             assert_eq!(plan.first_pipe_instance, first);
         }
     }

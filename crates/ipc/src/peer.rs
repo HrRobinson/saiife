@@ -84,7 +84,7 @@ pub fn pipe_peer(server: &impl std::os::windows::io::AsRawHandle) -> io::Result<
 fn cred_of_client(client: saiife_win::pipe::PipeClient) -> PeerCred {
     let facts = client.facts;
     PeerCred {
-        uid: saiife_win::sid::uid_of(&facts.sid, facts.elevated_admin),
+        uid: saiife_win::sid::peer_uid(&facts.sid, facts.elevated_admin),
         gid: 0,
         pid: client.pid,
         sid: Some(facts.sid),
@@ -115,7 +115,7 @@ pub fn comm(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use saiife_win::pipe::PipeClient;
+    use saiife_win::pipe::{peer_facts, PeerToken, PipeClient};
     use saiife_win::sid::{
         uid_of, TokenFacts, ADMINISTRATORS, SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, SYSTEM,
         USERS,
@@ -199,15 +199,48 @@ mod tests {
         assert_eq!(c.group_sids, [USERS]);
     }
 
+    /// A SYSTEM token as the pipe reads it, through `peer_facts`. A real one holds
+    /// `Administrators` enabled at System integrity.
+    fn system_cred(integrity: &str, restricted_sids: usize) -> PeerCred {
+        let facts = TokenFacts::from_groups(
+            SYSTEM.to_string(),
+            vec![(ADMINISTRATORS.to_string(), SE_GROUP_ENABLED)],
+        );
+        cred_of_client(PipeClient {
+            facts: peer_facts(PeerToken {
+                facts,
+                integrity_sid: integrity.to_string(),
+                restricted_sids,
+            }),
+            pid: 77,
+        })
+    }
+
     /// Two elevated admins and SYSTEM share uid 0, and their SIDs still tell them apart.
     #[test]
     fn pipe_cred_of_root_equivalents_keeps_them_apart() {
         let admin = cred("S-1-5-21-1-2-3-500", &[(ADMINISTRATORS, SE_GROUP_ENABLED)]);
         let other = cred("S-1-5-21-1-2-3-501", &[(ADMINISTRATORS, SE_GROUP_ENABLED)]);
-        let system = cred(SYSTEM, &[]);
+        let system = system_cred("S-1-16-16384", 0);
         assert_eq!((admin.uid, other.uid, system.uid), (0, 0, 0));
         assert_ne!(admin.sid, other.sid);
         assert_ne!(admin.sid, system.sid);
         assert_ne!(admin, other);
+    }
+
+    /// A low-integrity or restricted child of SYSTEM cannot use what SYSTEM holds, so on
+    /// a pipe it is not uid 0. Its SID still says SYSTEM.
+    #[test]
+    fn pipe_cred_of_a_lowered_system_token_is_not_root() {
+        for lowered in [
+            system_cred("S-1-16-4096", 0),
+            system_cred("S-1-16-16384", 1),
+        ] {
+            assert_ne!(lowered.uid, 0);
+            assert_eq!(lowered.sid.as_deref(), Some(SYSTEM));
+            assert!(lowered.group_sids.is_empty());
+        }
+        // No enabled Administrators at all: elevated_admin is false, so not 0 either.
+        assert_ne!(cred(SYSTEM, &[]).uid, 0);
     }
 }
