@@ -397,3 +397,54 @@ fn a_failed_config_check_is_recorded() {
     assert!(text.contains("error_denied"), "{text}");
     assert!(text.contains("not protected"), "{text}");
 }
+
+/// W16: an `ask` rule files a request. Its own user can't approve it, even listed as an
+/// approver, even with `same_user = "reauth"`, even elevated; the refusal says what to do.
+/// The same user may still withdraw it. No second account on this runner: `locked-windows`
+/// has the approver's side.
+#[test]
+fn same_user_approval_is_off_and_the_requester_can_withdraw() {
+    let t = tree();
+    let home = tempfile::tempdir().unwrap();
+    let pipe = pipe_name("approve");
+    let user = account::lookup_sid(&me()).unwrap();
+    let text = std::fs::read_to_string(&t.config).unwrap();
+    std::fs::write(
+        &t.config,
+        format!(
+            "{text}[approval]\napprovers = [{user:?}]\nsame_user = \"reauth\"\n\
+             [guard]\nask = [\"core.git/force-push\"]\nbudget_ms = 10000\n"
+        ),
+    )
+    .unwrap();
+    let _d = daemon(&t, home.path(), &pipe);
+    let project = t.top.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let ask = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push --force origin main"},
+        "cwd": project.display().to_string(),
+    });
+    let mut c = client(home.path(), &pipe);
+    hook(&mut c, &t.config, &ask.to_string());
+    c.assert().code(2);
+
+    let mut c = client(home.path(), &pipe);
+    c.args(["approvals", "--json", "--system-config"])
+        .arg(&t.config);
+    let out = c.output().unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = list[0]["id"].as_u64().unwrap().to_string();
+
+    let mut c = client(home.path(), &pipe);
+    c.args(["approve", &id, "--system-config"]).arg(&t.config);
+    c.assert()
+        .code(2)
+        .stderr(contains("same-user approval is off on Windows"))
+        .stderr(contains("second account"));
+
+    let mut c = client(home.path(), &pipe);
+    c.args(["reject", &id, "--system-config"]).arg(&t.config);
+    c.assert().code(0).stdout(contains("rejected"));
+    assert!(audit_text(&t.audit).contains("reauth_unavailable"));
+}

@@ -66,6 +66,10 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 # approver with a second uid at the ops level); the version saiife-daemon uses.
 tokio = { version = "=1.53.2", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+# A console prompt without echo, for `secret add` and `connect` (never for approvals: W16).
+rpassword = "=7.4.0"
+
 [target.'cfg(windows)'.dev-dependencies]
 # A squatter on the control pipe, in `windows_locked`; the version saiife-daemon uses.
 saiife-win = { path = "../win", features = ["pipe-server"] }

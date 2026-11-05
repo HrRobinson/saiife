@@ -14,7 +14,7 @@
 **Tech Stack:** Rust workspace. New dependencies, all `cfg(windows)` and pinned with `=` to the newest release older than 14 days on the day they are added:
 - `windows-service` (0.8.1 or later) in `saiife-win` and `saiife-system`;
 - `winreg` in `saiife-system` and `saiife-agents` (registry reads);
-- `rpassword` in `saiife` (the CLI's console password prompt);
+- `rpassword` in `saiife` (a console value without echo, for `secret add` and `connect`; never for approvals);
 - `windows-sys =0.61.2` features for the W1 calls, and `tokio` (`net`) behind `saiife-win`'s `pipe-server` feature.
 
 Tools in CI only: WiX Toolset v5.0.2 (`dotnet tool`), `signtool`, `IntuneWinAppUtil.exe` (Microsoft-Win32-Content-Prep-Tool, pinned by SHA-256), and the MSVC `cl` for test DLLs.
@@ -41,12 +41,11 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   - **token.rs:** `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle`;
   - **pipe.rs:** `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw`, `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side);
   - **proc.rs:** `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW`;
-  - **logon.rs:** `LogonUserW`;
   - **cred.rs:** `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree`;
   - **process.rs:** `SetDefaultDllDirectories` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), `SetStdHandle` (`STD_ERROR_HANDLE`, for the service log), `GetDiskFreeSpaceExW`;
   - **service.rs:** the one `extern "system"` service entry that `windows_service::define_windows_service!` expands to. The macro's expansion contains `unsafe`, so it must live in `saiife-win` and nowhere else.
 
-  That is 38 functions and one macro (`GetSecurityInfo` is listed twice). 37 of them are in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. `LogonUserW` is the one not there, and `logon.rs` does not exist. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
+  That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. If a failure of `RevertToSelf` is ever seen, the process calls `std::process::abort()`: it must never go on running as the client.
 - **Decisions this plan makes** (W1–W8 are in plan 19a; each one here is restated in its task, and plan 19a Task 1 copies all of them into spec §5.3a):
   9. **W9. The Windows layout.** `windows_path(linux: &str) -> Option<&'static str>` maps:
 
@@ -110,21 +109,10 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   15. **W15. The vault key** is `state\keys\vault.key`: 32 random bytes written by install, mode `daemon_file`, never rotated, readable only by `<S>` (plus SYSTEM and Administrators).
       - DPAPI is not used. Install runs as an admin, not as the virtual account, so it cannot seal a key for that account. A DPAPI key that the daemon makes at first start would be lost when the service profile is reset, and the vault with it.
       - On a running machine, the DACL is the barrier, as the file mode is on Linux. Disk encryption (BitLocker) protects backups and images. doctor does not probe it; it prints one Info line that points to the docs.
-  16. **W16. Same-user approvals re-authenticate with the account password.**
-      - The CLI prompts on the console, with no echo (`rpassword`): `saiife: approving request #<n> as <DOMAIN\user>. Windows password: `. It sends the password as `password` in `approval.decide`, held in `Zeroizing` and never logged.
-      - The daemon takes the account from the **peer's SID** (`LookupAccountSidW`), never from the client. It calls `LogonUserW(LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT)` on a blocking thread with a 10 s limit. On success, it checks that the new token's `TokenUser` equals the peer SID, then closes it.
-      - **Outcomes:**
-
-        | Win32 error | Result |
-        |---|---|
-        | success with a matching SID | `Authorized` |
-        | `ERROR_LOGON_FAILURE` (1326), `ERROR_ACCOUNT_LOCKED_OUT` (1909), `ERROR_PASSWORD_EXPIRED` (1330), `ERROR_PASSWORD_MUST_CHANGE` (1907), `ERROR_ACCOUNT_DISABLED` (1331) | `Denied` |
-        | `ERROR_ACCOUNT_RESTRICTION` (1327, for example a blank password), `ERROR_LOGON_TYPE_NOT_GRANTED` (1385) | `Unavailable` |
-        | any other code, the timeout, or a SID mismatch | `Error` |
-
-      - **Failure limit:** after 3 `Denied` for one uid within 15 minutes, further same-user approvals are `Unavailable("too many failed re-authentications; wait 15 minutes")`, without calling `LogonUserW`. Each failed `LogonUserW` counts toward the Windows account-lockout policy, so this stops an agent from locking its user out.
-      - **Windows Hello is not used.** `UserConsentVerifier` proves presence only to the process that asked, which here is the CLI, running as the same user as the agent. The daemon cannot verify that answer, so the agent could forge it. Accounts that sign in only with Hello (no known password) get `Unavailable` and use a second account, the Linux fallback (`REAUTH_UNAVAILABLE`).
-      - `CredUIPromptForWindowsCredentials` is not used either. A console prompt needs no FFI, and the password still ends up in a process of the same user, as with Linux `pkttyagent`.
+  16. **W16. Same-user approval is off on Windows (owner ruling 2026-11-05), as on macOS.**
+      - `same_user = "reauth"` acts as `"deny"`. A same-user decision is refused with `reauth_unavailable` and `same-user approval is off on Windows: approvals need a second account, from a separate session`. No prompt, no cooldown, no password anywhere, no `LogonUserW`. A requester may still withdraw its own request.
+      - Why: the agent's user can capture a console prompt, read the CLI that holds the password, print a prompt of its own or shadow `saiife`. One capture gives it the human's Windows password. See Task 9's report and spec §5.3a.4.
+      - **The second account must approve from a separate session.** `runas` on the agent's desktop can be captured. OpenSSH is probably refused by W11's `NU` deny. Switching user and RDP are unverified; handwork step 6 checks them.
   17. **W17. Session attribution uses process names only.** `CreateToolhelp32Snapshot` gives each pid's parent and exe name for every user, with no rights needed. It gives no start time, so pid reuse cannot be detected. `ProcStat.start_time` is 0, and `cmdline` is `None` (as on macOS). Attribution only; nothing is allowed because of it. `node.exe` ancestors get `session = null`.
   18. **W18. The MCP gateway is refused on Windows.** `[mcp.<name>]` is a load error with `MCP_NEEDS_LINUX`, as on macOS. Windows has no Landlock analogue that saiife uses; AppContainer or a job object sandbox is a follow-up. `saiife mcp` (connector tools) works.
   19. **W19. `run --secret` and `run --cloud` work on Windows.**
@@ -178,7 +166,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
 2. **A squatted pipe.** The agent's user creates `\\.\pipe\saiife` while the service is stopped or restarting. Expected: the daemon refuses to start, with the log line; every hook denies with `error_denied` because the owner check fails, and no record or payload reaches the fake server (Task 4: `client_refuses_foreign_pipe_owner`; Task 5: `daemon_refuses_existing_pipe`; Task 12: phase `attacks`).
 3. **The agent user is a local admin.** UAC elevates it with one click. Expected: doctor fails host checks for that user unless the consent policy asks for credentials on the secure desktop, and then it warns (Task 8: `admin_agent_user_fails_by_default`, `admin_agent_user_warns_with_credential_prompt`, `backup_operators_fails`).
 4. **Claude Code settings also pushed through HKLM** (Intune, GPO). Expected: install exits 1 and doctor fails `agents.claude.policy` with the W24 text. With `"managedSourcesBehavior": "merge"` in the HKLM JSON, it passes (Task 6: `hklm_settings_without_merge_fails`, `hklm_merge_passes`; Task 8).
-5. **Same-user approval on Windows under stress.** A wrong password, a locked account, a Hello-only account (blank or unknown password), a hung logon, and the agent retrying a wrong password in a loop. Expected: the W16 table, the 10 s limit, and after 3 failures in 15 minutes no more `LogonUserW` calls for that uid (Task 9: `logon_outcomes_table`, `fourth_failure_not_tried`, `hung_logon_is_error`, `account_comes_from_peer_sid`).
+5. **Same-user approval on Windows is off.** Expected: `same_user = "reauth"` refuses with W16's text and no prompt or password path exists (Task 9: `same_user_approval_is_off_on_windows`; Task 10's `same_user_approval_is_off_and_the_requester_can_withdraw`). Superseded by the owner's ruling, not checked: A wrong password, a locked account, a Hello-only account (blank or unknown password), a hung logon, and the agent retrying a wrong password in a loop. Expected: the W16 table, the 10 s limit, and after 3 failures in 15 minutes no more `LogonUserW` calls for that uid (Task 9: `logon_outcomes_table`, `fourth_failure_not_tried`, `hung_logon_is_error`, `account_comes_from_peer_sid`).
 
 ---
 
@@ -423,7 +411,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   - `files.binary`: `inspect_pe` problems fail and warnings warn. When signed, `Get-AuthenticodeSignature -LiteralPath C:\ProgramData\saiife\bin\saiife.exe` (run through `Host::run` with `powershell.exe -NoProfile -NonInteractive -Command`, the path fixed) must report `Valid`;
   - `files.acl` (new): every path in the W14 table has its expected descriptor; ancestors pass `ancestor_ok`;
   - `vault.key`: `daemon key file, readable only by NT SERVICE\saiifed`;
-  - `reauth`: Info `Windows password re-authentication (LogonUserW); accounts without a password need a second account`;
+  - `reauth`: Info `same-user approval is off on Windows: approvals need a second account, from a separate session`;
   - `peer.pidfd`: Info `named pipe; caller identity from its token (the pid is used for attribution only)`;
   - `agents.claude.policy` (new): W24;
   - host checks per agent user: W27 (the groups through `account::local_groups_of`; the UAC values through `reg_dword` under `SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`); agent binaries writable by the agent user warn as on Linux (`%USERPROFILE%\.local\bin\claude.exe`, `%APPDATA%\npm`);
@@ -443,39 +431,14 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
 - [ ] **Step 4:** the tests pass; the Windows check is clean.
 - [ ] **Step 5:** commit `feat(doctor): Windows checks (service, ACLs, PE, UAC, HKLM policy)`.
 
-### Task 9: same-user re-authentication on Windows
+### Task 9: same-user approval off on Windows
 
-**Files:**
-- Create `crates/win/src/ffi/logon.rs`.
-- Modify in `crates/daemon/src/`: `reauth.rs`, `approvers.rs`, `approval_ops.rs`, `ops.rs` (pick `WinLogon` on Windows).
-- Modify `crates/ipc/src/msg.rs` (`approval.decide` gains `password`), `crates/cli/Cargo.toml` (Windows: `rpassword`) and `crates/cli/src/approvals_cmd.rs`.
+Rewritten by the owner's ruling of 2026-11-05 (W16). The first design, password re-authentication through `LogonUserW`, was never built.
 
-**Interfaces:**
-- Consumes plan 13's `Subject` and `Reauth`, and Task 5's peer SIDs.
-- Produces:
-  - `Subject` gains `pub password: Option<Zeroizing<String>>` and `pub sid: Option<String>`;
-  - `saiife_win::ffi::logon::check_password(sid: &str, password: &str) -> io::Result<()>`: `lookup_sid`, then `LogonUserW`, then the `TokenUser == sid` check, then the token is closed. `Err` carries the Win32 code;
-  - `reauth::WinLogon` implements `Reauth` on top of a `LogonFn = Box<dyn Fn(&str, &str) -> Result<(), u32> + Send + Sync>` seam, so Linux tests inject codes. `check` runs it on a blocking thread with `timeout` = min(given, 10 s);
-  - `reauth::logon_result(r: Result<(), u32>) -> ReauthResult`: the W16 table;
-  - `reauth::FailureWindow` (3 per uid per 15 min, in memory), consulted before the seam is called;
-  - in `approval_ops`: a same-user approval on Windows without `password` is `ReauthUnavailable("the approving CLI sent no password")`; a password over 256 chars is `bad_request`;
-  - in the CLI (Windows): `approvals_cmd::win::prompt_password(account: &str, id: u64) -> Result<Zeroizing<String>, String>` with the W16 prompt. In debug builds only, `SAIIFE_TEST_PASSWORD` replaces the prompt (for `locked-windows`, which uses the `ci-locked` profile with debug assertions).
-- The audit records the outcome as on Linux; the password never reaches a record, a log line or an error text. A test greps for it.
+**Files:** `crates/daemon/src/reauth.rs` (`SecondAccountOnly`), `approvers.rs` (`Refusal::SameUserOff`), `crates/system/src/layout.rs` (`WIN_SAME_USER_OFF`), `install_win.rs`, `crates/cli/src/approvals_cmd.rs` and `main.rs` (approvals run on Windows), `crates/cli/src/secret_cmd.rs` and `Cargo.toml` (`rpassword`, for secret values only).
 
-- [ ] **Step 1: failing tests** (Linux, the seam):
-  - `logon_outcomes_table` (each W16 row);
-  - `fourth_failure_not_tried` (the seam's call counter stays at 3);
-  - `failures_expire_after_15_minutes` (an injected clock);
-  - `hung_logon_is_error` (the seam sleeps; timeout 200 ms);
-  - `account_comes_from_peer_sid` (the seam receives the subject's SID, never a name from the request);
-  - `missing_password_is_unavailable`, `long_password_is_bad_request`;
-  - `password_never_in_record_or_log` (run an approval with password `hunter2-<random>`; it appears in no record, no daemon stderr line and no error text);
-  - `unavailable_starts_no_cooldown`;
-  - Windows CI (`test` job): `logon_wrong_password_is_1326` against the runner account (no lockout risk: one attempt).
-- [ ] **Step 2:** run `cargo test -p saiife-daemon reauth approv`; expect FAIL.
-- [ ] **Step 3:** implement. Reuse `InFlight` and `Cooldowns`.
-- [ ] **Step 4:** the tests pass; the Windows check is clean.
-- [ ] **Step 5:** commit `feat(approvals): Windows password re-authentication through LogonUserW`.
+- [x] Tests: `same_user_approval_is_off_on_windows`, and in Windows CI `same_user_approval_is_off_and_the_requester_can_withdraw`.
+- [x] Docs and spec say the second account approves from a separate session, and which ways of doing that are unverified.
 
 ### Task 10: the CLI's locked mode on Windows (hook, clients, `run`)
 
@@ -562,7 +525,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
   7. `phase_doctor`: `saiife doctor --json` exits 1. The `files.binary` warning (unsigned test build) is among the warnings, and no check fails.
   8. `phase_approvals`:
      - `approver` approves an `agent` request;
-     - `agent` self-approves with `same_user = "reauth"` and `SAIIFE_TEST_PASSWORD` set to its real password → approved; with a wrong one → denied, recorded; a fourth wrong attempt within 15 minutes → refused without a logon (the Security log shows three 4625 events, not four);
+     - `agent` tries to approve its own request with `same_user = "reauth"` → refused, `reauth_unavailable`, W16's text, recorded, and no logon in the Security log;
      - lockdown by a non-approver is refused.
   9. `phase_lockdown`: as in `locked-linux`.
   10. `phase_reinstall_uninstall`: a reinstall is unchanged; `uninstall` removes exactly the listed paths and the service (`Get-Service saiifed` fails); `--purge` removes the group and the tree.
@@ -618,7 +581,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
 - [ ] **Step 1: failing tests:**
   - `windows_labels_unverified_without_recordings` (from 19a) still passes, and the fixtures test covers `windows/`;
   - `test-lib.sh` gains `windows_platform_paths` (with `LC_ROOT` a tempdir: the Claude managed dir is `$LC_ROOT/C/Program Files/ClaudeCode/managed-settings.d`);
-  - `docs_wording`: `docs/windows.md` names `NT SERVICE\saiifed`, `\\.\pipe\saiife`, `C:\ProgramData\saiife` and `LogonUserW`; `docs/mcp.md` says the gateway is Linux-only.
+  - `docs_wording`: `docs/windows.md` names `NT SERVICE\saiifed`, `\\.\pipe\saiife`, `C:\ProgramData\saiife` and `separate session`; `docs/mcp.md` says the gateway is Linux-only.
 - [ ] **Step 2:** run `cargo test -p saiife-agents -p saiife --test docs_wording` and `bash scripts/lock-check/test-lib.sh`; expect FAIL.
 - [ ] **Step 3:** write the harness, the docs and the spec notes.
 - [ ] **Step 4:** the tests pass; `bash -n` and `shellcheck` are clean; the `.ps1` parse check passes in CI.
@@ -648,7 +611,7 @@ Plans 13 and 18 set the style. Read plan 19a's Global Constraints first: its rul
 
 Nothing here runs on Claude's machine. Everything privileged happens in CI or in a throwaway Windows VM, so no machine of yours is modified.
 
-- [ ] **Confirm the spec departures** (each with its reason in the plan 19 report): §5.3a numbering; the binary in `C:\ProgramData` (W9); the virtual account (W10); the named pipe instead of a Unix socket (W11); hashed uids and `sid` in records (W12); gateway on TCP only (W13); no DPAPI (W15); password re-authentication, no Windows Hello (W16); session names only (W17); the MCP gateway refused (W18); HKLM policy fails doctor (W24); admin agent users fail (W27); WiX v5 (W20).
+- [ ] **Confirm the spec departures** (each with its reason in the plan 19 report): §5.3a numbering; the binary in `C:\ProgramData` (W9); the virtual account (W10); the named pipe instead of a Unix socket (W11); hashed uids and `sid` in records (W12); gateway on TCP only (W13); no DPAPI (W15); same-user approval off (W16); session names only (W17); the MCP gateway refused (W18); HKLM policy fails doctor (W24); admin agent users fail (W27); WiX v5 (W20).
 - [ ] **Signing:** set the six `WINDOWS_SIGN_*` secrets (plan 19a, Owner handwork). The same secrets sign the MSIs.
 - [ ] **The real-Windows live lock check, in a throwaway VM:**
   1. Make a Windows 11 VM: UTM on your Mac with a Windows 11 ARM64 image, or a small Azure VM (`Standard_B2s`, Windows 11 Pro, x64). Use an evaluation or a licensed image.
@@ -656,7 +619,7 @@ Nothing here runs on Claude's machine. Everything privileged happens in CI or in
   3. Copy in the signed MSI from a release (or the `ci-locked` build), and a checkout of the repo. Put the fleet files in `C:\ProgramData\saiife\etc\fleet\` and run the MSI. `saiife doctor` (elevated) should pass except for expected warnings.
   4. Run `$env:SAIIFE_LOCKCHECK_WINDOWS_VM='1'; .\scripts\lock-check\windows-vm.ps1 -Agent all` elevated. Copy each `target\lock-check\windows-<agent>-*.tsv` to `crates/agents/tests/fixtures/lock-check/windows/<agent>.tsv` and send them to Claude, who sets the labels.
   5. Check the hook command form (W9): the `claude` rows must fire from `managed-settings.d` in both Git Bash and the PowerShell tool. For Codex, check whether `command` or `command_windows` is used (Task 6). Report anything that does not fire.
-  6. **Re-authentication**, logged in as `agent`, in Windows Terminal: set `[approval] same_user = "reauth"` and `approvers = ["agent"]` as admin, `saiife policy reload`, trigger an `ask` rule, run `saiife approve <id>`, and type the password. Wrong → refused; right → approved; again → asked again.
+  6. **A second account, from a separate session.** As `agent`, trigger an `ask` rule and try `saiife approve <id>`: refused with W16's text, no prompt. Then, for each of **switch user**, **RDP** and **OpenSSH**: as `approver`, run `saiife approvals` and `saiife approve <id>`. Note which work. OpenSSH is expected to be refused (W11's `NU` deny). Report so the docs can name what works; until then they say these are unverified.
   7. **Claude Code via HKLM:** set a test `HKLM\SOFTWARE\Policies\ClaudeCode` `Settings` value with `{"model":"x"}`. `saiife doctor` must fail `agents.claude.policy`. Add `"managedSourcesBehavior":"merge"`; it must pass, and Claude's `/status` must list both sources. Remove the value.
   8. Download the release zip with Edge (so it gets Mark of the Web), unpack it and run `saiife --version`. On a signed release, SmartScreen may still warn until reputation builds; note what it shows.
   9. Restart the VM. The service must come back, and hooks must work without a reinstall.

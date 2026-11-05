@@ -488,6 +488,9 @@ impl Reauth for NoStartTime<'_> {
     fn available(&self) -> bool {
         self.0.available()
     }
+    fn off_text(&self) -> Option<&'static str> {
+        self.0.off_text()
+    }
     fn check(&self, _who: &Subject, _d: &str, _t: Duration) -> ReauthResult {
         ReauthResult::Error("the approver's process start time is unknown".into())
     }

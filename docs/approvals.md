@@ -161,6 +161,24 @@ has no macOS counterpart the daemon can set. So on macOS:
   on once the prompt can carry the request. `doctor` reports
   `same-user approval is off on macOS: approvals need a second account`.
 
+## Windows
+
+**Same-user approval is off on Windows.** The agent runs as you, so it can capture what you
+type on your desktop, read the process that holds it, show you a prompt of its own, or put
+another `saiife` first on your `PATH`. A prompt for your Windows password would hand it that
+password. So on Windows:
+
+- `same_user = "reauth"` acts as `"deny"`. A same-user decision is refused with
+  `reauth_unavailable` and the reason `same-user approval is off on Windows: approvals need a
+  second account, from a separate session`. No prompt is shown, no cooldown starts, and saiife
+  never handles your password.
+- You can still withdraw your own request with `saiife reject <id>`.
+- Approve from a second account in `approvers`, **in a separate session**:
+  - `runas /user:approver` on the agent's desktop does not count: it can be captured.
+  - OpenSSH is probably refused, because the control pipe denies network logons.
+  - Switching user and RDP should work. **Neither has been verified yet.**
+- Only an elevated admin, SYSTEM and `[admin]` users can lift or narrow `saiife lockdown`.
+
 ## Command grants
 
 When a command is denied by a rule you listed in `[guard] ask`, the hook creates

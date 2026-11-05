@@ -132,9 +132,6 @@ fn a_squatted_pipe_is_w11s_line_and_exit_1() {
 fn locked_commands_refuse_on_windows() {
     let home = tempfile::tempdir().unwrap();
     let cases: &[&[&str]] = &[
-        &["approve", "1"],
-        &["reject", "1"],
-        &["approvals"],
         &["audit", "--broker"],
         &["audit", "verify", "--broker"],
     ];

@@ -58,7 +58,7 @@ Plan 13 (macOS) sets the style and the patterns.
   - **A new crate, `crates/win` (`saiife-win`), is the second crate allowed to use `unsafe`**, after `saiife-darwin`. It mirrors `saiife-darwin`.
   - `unsafe` may appear only in `crates/win/src/ffi/*.rs`, and only under `cfg(windows)`. The crate root has `#![cfg_attr(not(windows), forbid(unsafe_code))]` and `#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]`. Every `unsafe` block has a `SAFETY:` comment. Every handle and every `LocalFree`/`NetApiBufferFree`/`CredFree` buffer is owned by a small RAII guard.
   - Its FFI dependency is `windows-sys = "=0.61.2"`, already in Cargo.lock. It is a target dependency under `cfg(windows)` only.
-  - Why our own crate: no safe crate covers named-pipe client identity, SDDL ACLs, local group lookups and `LogonUserW` together. Two needs do have safe crates, and those are used instead of FFI: `windows-service` (the SCM: create, configure, start, stop, delete, the dispatcher) and `winreg` (registry reads). `std` covers the pipe client open (`OpenOptionsExt::security_qos_flags`), reparse-point checks (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads the console password.
+  - Why our own crate: no safe crate covers named-pipe client identity, SDDL ACLs and local group lookups together. Two needs do have safe crates, and those are used instead of FFI: `windows-service` (the SCM: create, configure, start, stop, delete, the dispatcher) and `winreg` (registry reads). `std` covers the pipe client open (`OpenOptionsExt::security_qos_flags`), reparse-point checks (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads the console password.
   - **The complete list of FFI calls** (19b adds them, each in `crates/win/src/ffi/<area>.rs`; no other call may be added without updating this list and the spec):
 
     | Area (file) | Calls |
@@ -69,12 +69,11 @@ Plan 13 (macOS) sets the style and the patterns.
     | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
     | Pipes (`pipe.rs`) | `tokio::net::windows::named_pipe::ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
     | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
-    | Re-authentication (`logon.rs`) | `LogonUserW` |
     | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
     | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
     | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to (its expansion contains `unsafe`, so the macro may be used only here) |
 
-    That is 38 functions and one macro (`GetSecurityInfo` is listed twice). 37 of them are in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. `LogonUserW` is the one not there, and `logon.rs` does not exist. The tokio call needs the crate feature `pipe-server` (`tokio` with `net`), which only `saiife-daemon` enables. So `saiife-win` stays tokio-free on the hook path.
+    That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. The tokio call needs the crate feature `pipe-server` (`tokio` with `net`), which only `saiife-daemon` enables. So `saiife-win` stays tokio-free on the hook path.
   - `scripts/check-unsafe.sh` (plan 13) is extended: `unsafe` is allowed in `crates/darwin/` and in `crates/win/src/ffi/`, nowhere else. The crate-root rule accepts `crates/win/src/lib.rs` with its `cfg_attr` form. On Windows the crate denies `unsafe_code`, and one `#![allow(unsafe_code)]` at the top of `crates/win/src/ffi/mod.rs` covers `ffi`.
 - **Tokio-free:** `guard`, `audit`, `policy`, `ipc`, `system`, `mcp`, `darwin` and `win` (without `pipe-server`) stay tokio-free. The CI gate `no tokio in hook crates` adds `-p saiife-win` and also runs on `windows-latest`.
 - **Hook budget:** the hook path may cost at most +1 ms against `main` on Linux (`scripts/bench-check.sh`). On `windows-latest`, the developer hook's p95 must be under the 50 ms budget (D10), measured with `BENCH_MAX_P95_MS=50` (Task 10). If the runner cannot meet it, that is an owner decision, not a silent raise.
@@ -187,7 +186,7 @@ Plan 13 (macOS) sets the style and the patterns.
   - **5.3a.1 Layout:** W2 and W3 here, and plan 19b's W9 table (paths, the service, the pipe, the managed files, the hook command form).
   - **5.3a.2 Identity and IPC:** plan 19b's W10 (virtual account), W11 (pipe, impersonation, owner check, squatting), W12 (uid mapping, `sid` in records), W13 (gateway on TCP only), W25 (personal broker), W26 (install needs elevation).
   - **5.3a.3 ACLs:** plan 19b's W14 (the SDDL table and the ancestor rule) and W15 (the vault key).
-  - **5.3a.4 Approvals:** plan 19b's W16 (password re-authentication, no Windows Hello, with the reason) and its outcome table.
+  - **5.3a.4 Approvals:** plan 19b's W16 (same-user approval off, with the reason).
   - **5.3a.5 Guard:** W4–W8 here.
   - **5.3a.6 Packaging and signing:** plan 19b's W20–W23 and W28 (binary hardening), and W1 (the FFI boundary and its call list).
   - **5.3a.7 Linux-only or different:** plan 19b's W17 (session names only), W18 (MCP gateway refused), W19 (`run --secret`/`--cloud` on Windows), W24 (Claude HKLM policy), W27 (admin agent users).

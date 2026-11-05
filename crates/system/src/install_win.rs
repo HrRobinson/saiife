@@ -588,6 +588,7 @@ pub(crate) fn install(
     if agents.is_empty() {
         warnings.push(NO_AGENTS.to_string());
     }
+    warnings.push(crate::layout::WIN_SAME_USER_OFF.to_string());
 
     let rec = known.cloned().unwrap_or_else(|| Installed {
         version: INSTALLED_VERSION,

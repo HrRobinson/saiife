@@ -32,6 +32,10 @@ pub const REAUTH_UNAVAILABLE: &str =
 /// macOS refuses every same-user approval (install and doctor).
 pub const MAC_SAME_USER_OFF: &str =
     "same-user approval is off on macOS: approvals need a second account";
+/// Windows refuses every same-user approval (W16): install, doctor and the refusal. An
+/// agent running as the user can capture a password prompted for on its own desktop.
+pub const WIN_SAME_USER_OFF: &str =
+    "same-user approval is off on Windows: approvals need a second account, from a separate session";
 pub const UNIT: &str = "/etc/systemd/system/saiifed.service";
 /// The warning when an install lists no agents (install and doctor).
 pub const NO_AGENTS: &str = "no agents listed: no agent is guarded";

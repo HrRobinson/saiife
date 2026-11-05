@@ -29,6 +29,8 @@ pub enum Refusal {
     SameUserDenied,
     /// The re-authentication tool's answer, if any.
     ReauthUnavailable(String),
+    /// Same-user approval never runs on this host: the whole text (Windows, W16).
+    SameUserOff(&'static str),
     /// The re-authentication tool's answer, if any.
     ReauthFailed(String),
     ReauthError(String),
@@ -44,7 +46,7 @@ impl Refusal {
         match self {
             Refusal::NotApprover => "not_approver",
             Refusal::SameUserDenied => "same_user",
-            Refusal::ReauthUnavailable(_) => "reauth_unavailable",
+            Refusal::ReauthUnavailable(_) | Refusal::SameUserOff(_) => "reauth_unavailable",
             Refusal::ReauthFailed(_) => "reauth_failed",
             Refusal::ReauthError(_) => "reauth_error",
             Refusal::ReauthBusy => "reauth_busy",
@@ -60,6 +62,7 @@ impl fmt::Display for Refusal {
             Refusal::SameUserDenied => {
                 f.write_str("the requester cannot approve its own request (same_user = \"deny\")")
             }
+            Refusal::SameUserOff(text) => f.write_str(text),
             Refusal::ReauthUnavailable(d) if d.is_empty() => f.write_str(REAUTH_UNAVAILABLE),
             Refusal::ReauthUnavailable(d) => write!(f, "{REAUTH_UNAVAILABLE} ({TOOL}: {d})"),
             Refusal::ReauthFailed(d) if d.is_empty() => f.write_str("re-authentication failed"),
@@ -183,7 +186,10 @@ pub fn may_decide<'r>(
         SameUser::Deny => Err(Refusal::SameUserDenied),
         SameUser::Reauth => {
             if !reauth.available() {
-                return Err(Refusal::ReauthUnavailable(String::new()));
+                return Err(match reauth.off_text() {
+                    Some(text) => Refusal::SameUserOff(text),
+                    None => Refusal::ReauthUnavailable(String::new()),
+                });
             }
             let Some(_slot) = InFlight::begin(approver_uid) else {
                 return Err(Refusal::ReauthBusy);
@@ -615,6 +621,74 @@ mod tests {
             Some(Duration::from_secs(60))
         );
         assert_eq!(Refusal::ReauthCooldown(5).rule(), "reauth_cooldown");
+    }
+
+    /// W16: on Windows `same_user = "reauth"` acts as `"deny"`. No prompt, no cooldown, and
+    /// the refusal says what to do. It names no tool, because none would have run.
+    #[test]
+    fn same_user_approval_is_off_on_windows() {
+        use crate::reauth::SecondAccountOnly;
+        use saiife_policy::SameUser;
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        struct D;
+        impl Directory for D {
+            fn user(&self, _: &str) -> Option<saiife_policy::UserEntry> {
+                None
+            }
+            fn name_of(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn group(&self, _: &str) -> Option<saiife_policy::GroupEntry> {
+                None
+            }
+            fn groups_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn sid_of(&self, _: &str) -> Option<String> {
+                Some(SID.to_string())
+            }
+        }
+        let cfg = ApprovalCfg {
+            approvers: vec!["agent".into()],
+            same_user: SameUser::Reauth,
+            ..Default::default()
+        };
+        let peer = PeerCred {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+            sid: Some(SID.to_string()),
+            group_sids: Vec::new(),
+        };
+        let proc = FakeProc {
+            starts: vec![Some(0)],
+            reads: AtomicU64::new(0),
+        };
+        let cooldowns = Mutex::new(Cooldowns::default());
+        let decide = |requester: Option<&'static str>| {
+            may_decide(
+                &cfg,
+                &D,
+                "agent",
+                (0, requester),
+                &SecondAccountOnly,
+                &peer,
+                0,
+                &proc,
+                &cooldowns,
+                "",
+                None,
+            )
+        };
+        let refused = decide(Some(SID)).unwrap_err();
+        assert_eq!(refused.rule(), "reauth_unavailable");
+        let text = refused.to_string();
+        assert!(text.contains("off on Windows"), "{text}");
+        assert!(text.contains("second account"), "{text}");
+        assert!(text.contains("separate session"), "{text}");
+        assert!(!text.contains("pkcheck"), "{text}");
+        // A second account, in the same `approvers`, is what works.
+        assert_eq!(decide(Some("S-1-5-21-1-2-3-1002")), Ok(()));
     }
 
     #[test]

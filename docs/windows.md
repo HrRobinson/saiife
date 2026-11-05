@@ -145,6 +145,17 @@ code change, runner noise has since moved that p95 from 83-87 ms to 102-114 ms. 
 owner set the Windows CI budget to 130 ms p95, which allows for slow runners. The
 planned speed-up should tighten it; no figure is promised.
 
+## Approvals in locked mode
+
+**Same-user approval is off on Windows, as on macOS.** Approvals need a second account.
+`same_user = "reauth"` acts as `"deny"`, and saiife never asks for or handles your Windows
+password. See [approvals](approvals.md#windows).
+
+The second account must approve **from a separate session**. `runas /user:approver` on the
+agent's desktop does not count: anything the agent's user runs can capture what is typed
+there. OpenSSH is probably refused, because the control pipe denies network logons. Switching
+user and RDP should work, but **neither has been verified**.
+
 ## Locked mode
 
 Locked mode on Windows is plan 19b. It is not available yet: `saiife system install`

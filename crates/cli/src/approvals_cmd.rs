@@ -1,5 +1,6 @@
 //! `saiife approvals`, `saiife approve`, `saiife reject` (spec §6.10.1):
-//! the approver's side of ask-gated requests. Linux and macOS.
+//! the approver's side of ask-gated requests. On Windows same-user approval is off (W16),
+//! so `approve` works from a second account, and the daemon refuses the agent's own.
 //!
 //! Exit codes: 0 done, 2 refused (the rule is printed), 5 the daemon
 //! cannot be reached (or could not record the decision: `unrecorded`).
@@ -14,7 +15,7 @@
 //! `approvals show --json` prints the whole masked request: `--full` only
 //! changes the text output.
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Args, Subcommand};
@@ -62,7 +63,7 @@ pub enum Decision {
     },
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(
     _config: Option<PathBuf>,
     _list: ListArgs,
@@ -72,7 +73,7 @@ pub fn run(
     ExitCode::from(5)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn decide(_config: Option<PathBuf>, d: Decision) -> ExitCode {
     match d {
         Decision::Approve {
@@ -147,10 +148,10 @@ pub(crate) mod mac {
 
 #[cfg(unix)]
 pub(crate) use linux::prepare_reauth;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use linux::{decide, run};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod linux {
     use super::{ApprovalsAction, Decision, ListArgs};
     use crate::broker::{self, Target};
@@ -503,7 +504,7 @@ mod linux {
             let uid = shown["item"]["uid"].as_u64();
             // The personal broker needs no re-authentication for the
             // user's own requests (spec 6.10.2): no prompt agent.
-            if config.is_locked() && uid == Some(u64::from(rustix::process::getuid().as_raw())) {
+            if config.is_locked() && is_own_uid(uid) {
                 Some(prepare_reauth(&mut a).map_err(unavailable)?)
             } else {
                 None
@@ -515,6 +516,18 @@ mod linux {
         let state = ans.get("state").and_then(Value::as_str).unwrap_or(action);
         outln!("request #{id} {state}");
         Ok(())
+    }
+
+    /// Whether a re-authentication could be asked for this request's uid.
+    #[cfg(unix)]
+    fn is_own_uid(uid: Option<u64>) -> bool {
+        uid == Some(u64::from(rustix::process::getuid().as_raw()))
+    }
+
+    /// Windows has no same-user approval (W16): nothing to prepare, and the daemon refuses.
+    #[cfg(not(unix))]
+    fn is_own_uid(_uid: Option<u64>) -> bool {
+        false
     }
 
     /// What keeps the prompt possible until the daemon answers.

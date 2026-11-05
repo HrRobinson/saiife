@@ -665,15 +665,25 @@ pub(crate) mod linux {
         Ok(buf)
     }
 
-    /// No way yet to read a console without echo on Windows: Task 9 brings `rpassword`.
-    /// A value must never be echoed, so this refuses.
+    /// One line from the console without echo: `rpassword` reads `CONIN$`, never a piped
+    /// stdin. For the values of `secret add` and `connect`. Approvals never ask for a
+    /// password on Windows (W16). With no console it refuses and says what else works.
     #[cfg(windows)]
     fn prompt(label: &str) -> Result<Zeroizing<String>, Stop> {
-        let _ = label;
-        Err(Stop::Refused(
-            "saiife cannot read a value from the console without echo on Windows yet; use --from-file or --from-env"
-                .into(),
-        ))
+        let line = rpassword::prompt_password(label)
+            .map(Zeroizing::new)
+            .map_err(|e| {
+                Stop::Refused(format!(
+                    "cannot read the console ({e}); use --from-file or --from-env"
+                ))
+            })?;
+        if line.is_empty() {
+            return Err(Stop::Refused("no value read".into()));
+        }
+        if line.len() > MAX_VALUE_BYTES {
+            return Err(Stop::Refused("secret value is too long".into()));
+        }
+        Ok(line)
     }
 
     /// Puts the terminal back as it was, on every path out (return, error,

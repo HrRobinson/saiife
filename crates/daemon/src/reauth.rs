@@ -46,7 +46,7 @@ pub const PKCHECK_PATH_ENV: &str = "/usr/bin:/bin";
 /// `system install` and `doctor`.
 #[cfg(unix)]
 pub use saiife_system::polkit::POLKITD_PATHS;
-/// No polkit on Windows; re-authentication there is `LogonUserW` (Task 9).
+/// No polkit on Windows, and no same-user re-authentication (W16).
 #[cfg(not(unix))]
 pub const POLKITD_PATHS: [&str; 0] = [];
 /// pkcheck(1) exit statuses.
@@ -263,6 +263,11 @@ pub struct Subject {
 pub trait Reauth: Send + Sync {
     /// Whether re-authentication can run at all on this host.
     fn available(&self) -> bool;
+    /// When it never runs on this host by design, the refusal's whole text. `None` means
+    /// the host's tool may just be missing.
+    fn off_text(&self) -> Option<&'static str> {
+        None
+    }
     /// Asks whether `who` proved a human is present, within `timeout`.
     /// `detail` names what is approved; polkit shows it in the prompt.
     fn check(&self, who: &Subject, detail: &str, timeout: Duration) -> ReauthResult;
@@ -270,13 +275,17 @@ pub trait Reauth: Send + Sync {
 
 /// The host's re-authentication: polkit on Linux; on macOS, none in this
 /// version ([`PromptWithoutDetail`]: `same_user = "reauth"` acts as
-/// `"deny"`).
+/// `"deny"`); on Windows, none ([`SecondAccountOnly`]).
 pub fn host_reauth() -> std::sync::Arc<dyn Reauth> {
     #[cfg(target_os = "macos")]
     {
         std::sync::Arc::new(PromptWithoutDetail)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        std::sync::Arc::new(SecondAccountOnly)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         std::sync::Arc::new(PkCheck::new())
     }
@@ -542,6 +551,28 @@ impl Reauth for PromptWithoutDetail {
     }
 }
 
+/// Windows (W16): same-user re-authentication is off, so `same_user = "reauth"` acts as
+/// `"deny"`, and a second account approves.
+///
+/// Why: a process of the user can capture what's typed on the user's desktop (a global hook,
+/// `AttachConsole`, or the memory of the CLI that read it), print a prompt of its own, or
+/// put another `saiife` first on the user's `PATH`. Nothing the daemon can verify is out of
+/// its reach, and what it would capture is the account's password.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SecondAccountOnly;
+
+impl Reauth for SecondAccountOnly {
+    fn available(&self) -> bool {
+        false
+    }
+    fn off_text(&self) -> Option<&'static str> {
+        Some(saiife_system::layout::WIN_SAME_USER_OFF)
+    }
+    fn check(&self, _who: &Subject, _detail: &str, _timeout: Duration) -> ReauthResult {
+        ReauthResult::Unavailable(saiife_system::layout::WIN_SAME_USER_OFF.into())
+    }
+}
+
 /// How many used external forms [`MacAuthorize`] remembers.
 const USED_FORMS: usize = 1024;
 
@@ -692,7 +723,7 @@ fn root_owned_file(p: &Path) -> bool {
     {
         is_regular(p) && saiife_system::fsops::root_owned_chain(p).is_ok()
     }
-    // No polkit or `security` tool to trust on Windows (Task 9 replaces them).
+    // No polkit or `security` tool to trust on Windows (W16).
     #[cfg(not(unix))]
     {
         let _ = p;

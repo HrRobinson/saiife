@@ -547,8 +547,8 @@ configuration (geminicli.com/docs/reference/configuration).
 - **Personal broker (W25).**
   - The state dir is `%LOCALAPPDATA%\saiife\personal`.
   - The pipe is `\\.\pipe\saiife-user-<SID>`, owned by the user's SID, with
-    a DACL for that SID and SYSTEM only. The client checks that the owner
-    is its own SID.
+    a DACL for that SID only (ruling: SYSTEM needs no access to a user's
+    broker). The client checks that the owner is its own SID.
   - The vault key is a Credential Manager generic credential. Target
     `saiife:vault-key`, persist `CRED_PERSIST_LOCAL_MACHINE` (never
     roaming), blob 32 bytes.
@@ -642,41 +642,32 @@ References: Microsoft Learn, "Security Descriptor String Format".
 
 #### 5.3a.4 Approvals
 
-Same-user approvals re-authenticate with the account password (W16).
+Same-user approval is off on Windows (W16, owner ruling 2026-11-05), as on macOS.
+Approvals need a second account. `same_user = "reauth"` acts as `"deny"`: a same-user
+decision is refused with `reauth_unavailable` and the text `same-user approval is off on
+Windows: approvals need a second account, from a separate session`. There is no prompt, no
+cooldown and no password anywhere: not in `approval.decide`, not in the CLI, not in the
+daemon. `LogonUserW` is not called. A requester can still withdraw its own request. Only
+SYSTEM, an elevated admin and `[admin]` users can lift or narrow lockdown.
 
-- The CLI prompts on the console with no echo: `saiife: approving request
-  #<n> as <DOMAIN\user>. Windows password: `. It sends the password as
-  `password` in `approval.decide`. The password is held in `Zeroizing` and
-  never logged.
-- The daemon takes the account from the **peer's SID** (`LookupAccountSidW`),
-  never from the client. It calls `LogonUserW(LOGON32_LOGON_NETWORK,
-  LOGON32_PROVIDER_DEFAULT)` on a blocking thread with a 10 s limit. On
-  success, it checks that the new token's `TokenUser` equals the peer SID,
-  then closes the token.
+- **Why.** The agent runs as the human's user. As that user it can capture a console prompt
+  (a global hook covers the whole desktop, and `AttachConsole` reads the input queue), read
+  or inject into the CLI that holds the password, print a prompt of its own, or put another
+  `saiife` first on the user's `PATH`. One capture is enough, and what it captures is the
+  human's Windows password, which is good for far more than saiife. `CREDUIWIN_SECURE_PROMPT`
+  doesn't help: the blob still returns to a process of the same user. Windows Hello doesn't
+  either: the answer reaches only the CLI, and the daemon can't verify it.
+- **The second account must approve from a separate session.** `runas /user:approver` on the
+  agent's desktop can be captured by the same means, so it does not count.
+  - OpenSSH is probably refused: W11's pipe DACL denies `NU` (network logons), and an SSH
+    logon is probably a network logon. This is not verified.
+  - Switching user and RDP should give a separate session. **Neither is verified.** The
+    owner's VM checks them before the docs may recommend one.
+- A later daemon-verified factor outside the agent's reach (a phone code, a hardware key
+  signing a challenge built from the request) could bring same-user approval back. It is new
+  design work and is not planned.
 
-| Win32 error | Result |
-|---|---|
-| success with a matching SID | `Authorized` |
-| `ERROR_LOGON_FAILURE` (1326), `ERROR_ACCOUNT_LOCKED_OUT` (1909), `ERROR_PASSWORD_EXPIRED` (1330), `ERROR_PASSWORD_MUST_CHANGE` (1907), `ERROR_ACCOUNT_DISABLED` (1331) | `Denied` |
-| `ERROR_ACCOUNT_RESTRICTION` (1327, for example a blank password), `ERROR_LOGON_TYPE_NOT_GRANTED` (1385) | `Unavailable` |
-| any other code, the timeout, or a SID mismatch | `Error` |
-
-- **Failure limit.** After 3 `Denied` for one uid within 15 minutes, further
-  same-user approvals are `Unavailable("too many failed re-authentications;
-  wait 15 minutes")`, without calling `LogonUserW`. Each failed `LogonUserW`
-  counts toward the Windows account-lockout policy, so this stops an agent
-  from locking its user out.
-- **Windows Hello is not used.** `UserConsentVerifier` proves presence only
-  to the process that asked. Here that is the CLI, running as the same user
-  as the agent. The daemon cannot verify that answer, so the agent could
-  forge it. Accounts that sign in only with Hello (no known password) get
-  `Unavailable` and use a second account, the Linux fallback
-  (`REAUTH_UNAVAILABLE`).
-- **`CredUIPromptForWindowsCredentials` is not used either.** A console
-  prompt needs no FFI. The password still ends up in a process of the same
-  user, as with Linux `pkttyagent`.
-
-References: Microsoft Learn, `LogonUserW`, `UserConsentVerifier`.
+References: Microsoft Learn, "Hooks Overview", `AttachConsole`, `CredUIPromptForWindowsCredentialsW`.
 
 #### 5.3a.5 Guard: shell dialects, paths and rules
 
@@ -887,12 +878,13 @@ geminicli.com/docs/tools/shell/; code.claude.com/docs/en/settings.
 - The FFI dependency is `windows-sys = "=0.61.2"`, a target dependency under
   `cfg(windows)` only.
 - Why our own crate: no safe crate covers named-pipe client identity, SDDL
-  ACLs, local group lookups and `LogonUserW` together. Two needs have safe
+  ACLs and local group lookups together. Two needs have safe
   crates, and those are used instead of FFI: `windows-service` (the service
   manager) and `winreg` (registry reads). `std` covers the pipe client open
   (`OpenOptionsExt::security_qos_flags`), reparse-point checks
-  (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads
-  the console password.
+  (`MetadataExt::file_attributes`) and `fs::canonicalize`. `rpassword` reads a
+  console value without echo, for `secret add` and `connect` only. Approvals
+  never ask for a password (W16).
 - `scripts/check-unsafe.sh` allows `unsafe` in `crates/darwin/` and in
   `crates/win/src/ffi/`, and nowhere else. `unsafe` that a dependency's macro
   expands into is not caught.
@@ -910,12 +902,11 @@ updating this list and this section.
 | Tokens (`token.rs`) | `GetCurrentProcess`, `OpenProcessToken`, `GetCurrentThread`, `OpenThreadToken`, `GetTokenInformation` (`TokenUser`, `TokenGroups`, `TokenIntegrityLevel`, `TokenRestrictedSids`), `CloseHandle` |
 | Pipes (`pipe.rs`) | `ServerOptions::create_with_security_attributes_raw` (an `unsafe fn` of tokio), `GetNamedPipeClientProcessId`, `ImpersonateNamedPipeClient`, `RevertToSelf`, `GetSecurityInfo` (the pipe owner, client side) |
 | Process list (`proc.rs`) | `CreateToolhelp32Snapshot`, `Process32FirstW`, `Process32NextW` |
-| Re-authentication (`logon.rs`) | `LogonUserW` |
 | Personal broker keychain (`cred.rs`) | `CredReadW`, `CredWriteW`, `CredDeleteW`, `CredFree` |
 | Process setup and disk (`process.rs`) | `SetDefaultDllDirectories`, `SetStdHandle`, `GetDiskFreeSpaceExW` |
 | Service entry (`service.rs`) | the `extern "system"` entry that `windows_service::define_windows_service!` expands to. Its expansion contains `unsafe`, so the macro may be used only here |
 
-That is 38 functions and one macro (`GetSecurityInfo` is listed twice). 37 of them are in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. `LogonUserW` is the one not there, and `logon.rs` does not exist. The tokio call needs the crate feature
+That is 37 functions and one macro (`GetSecurityInfo` is listed twice), all in `crates/win/src/ffi/`: 36 `windows-sys` calls and the tokio call. The tokio call needs the crate feature
 `pipe-server`, which only `saiife-daemon` enables. So `saiife-win` stays
 tokio-free on the hook path.
 
@@ -1763,6 +1754,10 @@ that does not depend on the agent's judgment.
   still registers the right. Spec departure, for the owner to confirm; the
   follow-up is a daemon-side prompt that carries the request (a small
   audited FFI in `saiife-darwin`, owner decision).
+- **Note (plan 19b, W16): same-user approval is off on Windows.** See §5.3a.4.
+  `same_user = "reauth"` acts as `"deny"`, with no password handling at all. The
+  second account must approve from a separate session; `runas` on the agent's
+  desktop can be captured.
 - **Fallback without polkit** (owner decision 3). When `pkcheck` or the
   polkit daemon is missing (common on minimal servers), `same_user =
   "reauth"` behaves as `same_user = "deny"`: only a second uid in

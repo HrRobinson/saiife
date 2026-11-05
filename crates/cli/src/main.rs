@@ -415,12 +415,13 @@ fn windows_refusal(cmd: &Cmd) -> Option<&'static str> {
         .then_some(NOT_YET),
         // `daemon --system` and `daemon --user` both run on Windows (plan 19b).
         Cmd::Daemon { .. } => None,
-        // Approvals.
-        Cmd::Approvals { .. } | Cmd::Approve { .. } | Cmd::Reject { .. } => Some(NOT_YET),
         // No wildcard: a new subcommand must be put on one side or the other here, or this
         // does not compile.
         Cmd::System { .. }
         | Cmd::Doctor { .. }
+        | Cmd::Approvals { .. }
+        | Cmd::Approve { .. }
+        | Cmd::Reject { .. }
         | Cmd::Check { .. }
         | Cmd::Eval
         | Cmd::Secret { .. }
