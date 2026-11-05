@@ -141,18 +141,60 @@ fn set_sddl_on_temp_dir_roundtrips() {
     assert!(read.dacl_protected, "{text}");
     assert_eq!(read.aces, want.aces, "{text}");
 
-    // CI showed the child keeping its old inherited entries (`A;ID;FA` for the
-    // account and SYSTEM). set_sddl does not propagate, so install walks the tree.
+    // CI showed `SetSecurityInfo` on a directory propagating to a child that
+    // inherits: the child read back `AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)`,
+    // its old inherited entries plus the new Users entry, all inherited. `LA` and
+    // `S-1-5-32-544` can name the same account, so both sides are normalised.
+    let norm = |sid: &str| {
+        if sid == sddl::LOCAL_ADMIN {
+            local_admin_sid()
+        } else {
+            sid.to_string()
+        }
+    };
+    let aces_of = |sd: &sddl::Sd| {
+        sd.aces
+            .iter()
+            .map(|a| (a.allow, a.flags, a.mask, norm(&a.sid)))
+            .collect::<Vec<_>>()
+    };
     let before = sddl::parse(&child_before).unwrap();
     let after = sddl::parse(&child_after).unwrap_or_else(|e| panic!("{child_after}: {e}"));
+    let after_aces = aces_of(&after);
+    for old in aces_of(&before) {
+        assert!(after_aces.contains(&old), "{old:?} lost: {child_after}");
+    }
     assert!(
         after.aces.iter().all(|a| a.flags.inherited),
         "{child_after}"
     );
-    assert_eq!(after.aces, before.aces, "{child_after}");
     assert!(
-        after.aces.iter().all(|a| a.mask != 0x1200a9),
-        "the new Users entry reached the child: {child_after}"
+        after
+            .aces
+            .iter()
+            .any(|a| a.allow && a.mask == 0x1200a9 && (a.sid == "BU" || a.sid == "S-1-5-32-545")),
+        "the new Users entry did not reach the child: {child_after}"
+    );
+
+    // A protected child (`P`) does not receive it; its own entries stay.
+    let prot = target.join("prot");
+    std::fs::create_dir(&prot).unwrap();
+    let prot_text = own_sddl("PAI", &me);
+    acl::set_sddl(&prot, &prot_text).unwrap();
+    // Set the parent again so propagation runs after the child is protected.
+    acl::set_sddl(&target, &wanted).unwrap();
+    let prot_after = acl::get_sddl(&prot).unwrap();
+    log(&format!("protected child reads {prot_after}"));
+    let prot_sd = sddl::parse(&prot_after).unwrap_or_else(|e| panic!("{prot_after}: {e}"));
+    assert!(prot_sd.dacl_protected, "{prot_after}");
+    assert!(
+        prot_sd.aces.iter().all(|a| a.mask != 0x1200a9),
+        "the new Users entry reached a protected child: {prot_after}"
+    );
+    assert_eq!(
+        aces_of(&prot_sd),
+        aces_of(&sddl::parse(&prot_text).unwrap()),
+        "{prot_after}"
     );
 }
 

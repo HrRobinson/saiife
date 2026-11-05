@@ -210,9 +210,10 @@ fn check(want: &str, actual: &Sd, file: bool) -> Result<(), String> {
 /// Sets a descriptor on `root` and on everything below it, top-down. `row` gives the
 /// SDDL of one entry from its path and whether it is a directory.
 ///
-/// `Host::set_sddl` does not propagate to existing children (see its note), so a
-/// directory's new descriptor leaves what is inside as it was. Install and
-/// reinstall call this to reach a tree that is already there.
+/// `Host::set_sddl` propagates to children that inherit, but not to a protected
+/// child (`P`) or to an explicit entry a child holds (see its note). A tree an older
+/// ACL left with such entries stays user-writable there, so install and reinstall
+/// call this to set every entry itself.
 ///
 /// Nothing is followed. A reparse point (symlink, junction, or any other reparse
 /// tag) anywhere in the tree is an error, as is a hard-linked file, which
@@ -1061,8 +1062,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(n, 5);
-        let names: Vec<_> = seen.iter().map(|(p, _)| p.to_str().unwrap()).collect();
-        assert_eq!(names, ["", "a", "a/b", "a/b/f", "g"]);
+        let names: Vec<Vec<_>> = seen
+            .iter()
+            .map(|(p, _)| p.components().map(|c| c.as_os_str().to_owned()).collect())
+            .collect();
+        let want: Vec<Vec<_>> = ["", "a", "a/b", "a/b/f", "g"]
+            .iter()
+            .map(|p| {
+                Path::new(p)
+                    .components()
+                    .map(|c| c.as_os_str().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(names, want);
         assert!(seen[1].1 && !seen[3].1);
         assert_eq!(host.get_sddl(&root.join("a/b/f")).unwrap(), ROW);
     }

@@ -585,13 +585,14 @@ local group `saiife-audit`, and `RX = 0x1200a9` (read and execute).
 | `…\log\daemon` and everything below it | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;<S>)(A;OICI;FR;;;<A>)` |
 | the managed files and every dir install creates for them | `O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)` |
 
-- **Setting a descriptor does not propagate.** `set_sddl` (`SetSecurityInfo` on
-  an open handle, which is not a reparse point or a hard-linked file) sets that
-  one object. An entry already inside a directory keeps the entries it
-  inherited before: CI read an existing child back as `AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)`
-  after its parent was set, where `SetNamedSecurityInfoW` would have walked the
-  tree. So a reinstall or a pre-existing tree (a child an old ACL left
-  user-writable) is fixed only by setting each entry: install walks the tree
+- **Setting a descriptor propagates only to children that inherit.** `set_sddl`
+  (`SetSecurityInfo` on an open handle, which is not a reparse point or a
+  hard-linked file) reaches an existing child that inherits: CI read one back as
+  `AI(A;ID;FA;;;LA)(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)`, its old inherited entries
+  plus the new Users entry. It does not reach a child with `P` set, nor an
+  explicit entry a child holds. So a pre-existing tree (a protected child, or one
+  an old ACL left user-writable by an explicit entry) is fixed only by setting
+  each entry: install walks the tree
   top-down without following reparse points and sets every entry
   (`winacl::set_sddl_tree`), refusing a reparse point or a hard link. On a
   file, Windows drops `OI` and `CI`, so an `OICI` row reads back without them

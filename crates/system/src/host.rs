@@ -221,11 +221,10 @@ pub trait Host: Send + Sync {
     /// Windows: sets the owner, a protected DACL and any group of `path`, which must
     /// not be a reparse point. The text must name an owner and say `D:P`.
     ///
-    /// This does not propagate: a directory's new descriptor does not change the
-    /// entries already inside it, which keep their old inherited ACEs
-    /// (`SetNamedSecurityInfoW` would have propagated, `SetSecurityInfo` on a handle
-    /// does not, as far as CI has shown). To fix a tree that is already there, call
-    /// [`crate::winacl::set_sddl_tree`], which sets each entry itself.
+    /// This propagates inheritable entries to existing children that inherit, as CI
+    /// showed (`SetSecurityInfo` on a directory handle). It does not reach a
+    /// protected child (`P`) or an explicit entry a child holds. To set those too,
+    /// call [`crate::winacl::set_sddl_tree`], which sets each entry itself.
     fn set_sddl(&self, path: &Path, sddl: &str) -> io::Result<()>;
     /// Windows: the owner, group and DACL of `path`. A reparse point is an error.
     fn get_sddl(&self, path: &Path) -> io::Result<String>;

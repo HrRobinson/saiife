@@ -116,12 +116,11 @@ pub fn get_sddl(path: &Path) -> io::Result<String> {
 /// compares it: `G:SY` left unset would fail every later check of the path. A reparse
 /// point, or a file with more than one hard link, is an error.
 ///
-/// This does not propagate. `SetSecurityInfo` on a handle sets the one object: an
-/// existing child keeps the entries it inherited before, where the old
-/// `SetNamedSecurityInfoW` walked the tree. So a reinstall, or a tree an older
-/// ACL left user-writable, is not fixed by setting its top directory. The caller
-/// sets each entry (`winacl::set_sddl_tree`). Pinned by
-/// `set_sddl_on_temp_dir_roundtrips`.
+/// This propagates, as CI showed: `SetSecurityInfo` on a directory handle gave an
+/// existing child that inherits the new inheritable entries, as inherited entries
+/// (`A;ID;0x1200a9;;;BU` beside its old `A;ID;FA`). It does not reach a child with
+/// `P` set, nor an explicit entry a child holds, so the caller still sets those
+/// itself (`winacl::set_sddl_tree`). Pinned by `set_sddl_on_temp_dir_roundtrips`.
 pub fn set_sddl(path: &Path, sddl_text: &str) -> io::Result<()> {
     let desc = settable(sddl_text)?;
     let parsed =
